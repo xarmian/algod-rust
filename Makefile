@@ -180,6 +180,7 @@ validate-api-up:
 	@cargo test --release -p algod-rust --test live_endpoint_sweep --no-run
 	@cargo test --release -p algod-rust --test live_txn_cross_verification --no-run
 	@cargo test --release -p algod-rust --test live_box_pagination_parity --no-run
+	@cargo test --release -p algod-rust --test live_state_delta_parity --no-run
 	@cargo test --release -p algod-rust --test live_longpoll_parity --no-run
 	@cargo test --release -p algod-rust --test live_online_circulation_expiry --no-run
 	@echo "==> Starting algod-rust natively on :4002..."
@@ -249,6 +250,7 @@ validate-api:
 	 cargo test --release -p algod-rust --test live_endpoint_sweep -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_txn_cross_verification -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_box_pagination_parity -- --ignored --nocapture --test-threads=1 && \
+	 cargo test --release -p algod-rust --test live_state_delta_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_longpoll_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_online_circulation_expiry -- --ignored --nocapture --test-threads=1; \
 	  STATUS=$$?; \

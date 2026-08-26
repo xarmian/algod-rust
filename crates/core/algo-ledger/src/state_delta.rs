@@ -81,51 +81,142 @@ pub struct AccountTotals {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KvValueDelta {
     /// New value (empty if deleted).
-    #[serde(rename = "Data", default, skip_serializing_if = "Vec::is_empty")]
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        rename = "Data",
+        default,
+        serialize_with = "serialize_kv_bytes",
+        deserialize_with = "deserialize_kv_bytes"
+    )]
     pub data: Vec<u8>,
 
     /// Previous value.
-    #[serde(rename = "OldData", default, skip_serializing_if = "Vec::is_empty")]
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        rename = "OldData",
+        default,
+        serialize_with = "serialize_kv_bytes",
+        deserialize_with = "deserialize_kv_bytes"
+    )]
     pub old_data: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
-// KvMods key-type note (issue #570)
+// KvValueDelta byte-field wire encoding (issue #573)
+// ---------------------------------------------------------------------------
+//
+// Two real conformance bugs were found here while building the live
+// `/v2/deltas/{round}` comparison test for this issue, both fixed below:
+//
+// 1. **Base64 vs number-array.** go-algorand's `ledgercore.KvValueDelta.
+//    Data`/`.OldData` are plain `[]byte` with no struct tags at all, so its
+//    REST API encodes them through the same generic go-codec (ugorji)
+//    handle every other `[]byte` API field uses: base64 for the
+//    human-readable JSON handle, raw bytes for the msgpack handle.
+//    `#[serde(with = "serde_bytes")]` alone does not reproduce this —
+//    serde_json's `Serializer::serialize_bytes` has no native "bytes" type
+//    and falls back to a JSON array of numbers (verified empirically: a
+//    plain `serde_bytes`-tagged `Vec<u8>` field serialized as
+//    `[104,101,108,108,111]` for `b"hello"`, not `"aGVsbG8="`).
+//
+// 2. **`skip_serializing_if` where go never omits.** Unlike most other types
+//    in this file, `KvValueDelta` carries no `_struct \`codec:",omitempty,
+//    omitemptyarray"\`` directive on the Go side (contrast
+//    `ledgercore.AlgoCount`/`AccountTotals`, which do) — go-codec's
+//    `OmitEmpty` defaults to false absent that directive, so a real node's
+//    response always includes both `Data` and `OldData` keys, with JSON
+//    `null` (msgpack nil) for an unset (nil in Go) value rather than
+//    omitting the key. Live-verified: a box-create round's real response is
+//    `{"Data":"...","OldData":null}`, not `{"Data":"..."}`. `serialize_kv_
+//    bytes` below always emits the field, using `serialize_none()` (JSON
+//    `null` / msgpack nil, matching a nil Go `[]byte`) for an empty value.
+fn serialize_kv_bytes<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    if bytes.is_empty() {
+        return serializer.serialize_none();
+    }
+    if serializer.is_human_readable() {
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use base64::Engine as _;
+        serializer.serialize_str(&BASE64_STANDARD.encode(bytes))
+    } else {
+        serde_bytes::serialize(bytes, serializer)
+    }
+}
+
+fn deserialize_kv_bytes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    if deserializer.is_human_readable() {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        match opt {
+            None => Ok(Vec::new()),
+            Some(s) => {
+                use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+                use base64::Engine as _;
+                BASE64_STANDARD
+                    .decode(s.as_bytes())
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+    } else {
+        let opt = Option::<serde_bytes::ByteBuf>::deserialize(deserializer)?;
+        Ok(opt.map(serde_bytes::ByteBuf::into_vec).unwrap_or_default())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KvMods key-type note (issues #570, #573)
 // ---------------------------------------------------------------------------
 //
 // go-algorand's `ledgercore.StateDelta.KvMods` is `map[string][]byte`, where
 // the key is the *raw* KV-store key (`"bx:" + big-endian(app_id) + box_name`,
 // see `apps.MakeBoxKey`) cast to a Go `string` without any UTF-8 validation —
-// box names are arbitrary bytes, not guaranteed valid UTF-8. Rust's `String`
-// cannot losslessly hold that, so `kv_mods` is keyed by `Vec<u8>` internally
-// (matching this crate's own existing convention for box keys, e.g.
-// `avm_context.rs`'s `available_boxes: HashMap<(u64, Vec<u8>), bool>` and
-// `sqlite.rs`'s `make_box_key`) — this is what the round-reconstruction logic
-// in `SqliteLedger` uses, and it stays byte-exact for every key.
+// box names are arbitrary bytes, not guaranteed valid UTF-8, and neither is
+// the embedded big-endian `app_id` (any app id whose byte pattern doesn't
+// happen to form valid UTF-8 triggers this, which is the common case, not a
+// rare one). Rust's `String` cannot losslessly hold that, so `kv_mods` is
+// keyed by `Vec<u8>` internally (matching this crate's own existing
+// convention for box keys, e.g. `avm_context.rs`'s
+// `available_boxes: HashMap<(u64, Vec<u8>), bool>` and `sqlite.rs`'s
+// `make_box_key`) — this is what the round-reconstruction logic in
+// `SqliteLedger` uses, and it stays byte-exact for every key.
 //
-// The wire encoding (JSON and msgpack, both driven through
-// `[de]serialize_kv_mods` below) renders each key via
-// `String::from_utf8_lossy`. This intentionally matches go's own *JSON*
-// behavior: `encoding/json` also cannot emit invalid UTF-8 inside a JSON
-// string and substitutes the Unicode replacement character (U+FFFD) for
-// invalid byte sequences when marshaling a Go string. For msgpack, go's
-// codec writes the raw string bytes verbatim (a msgpack "str" is not
-// required to be valid UTF-8), so a box name containing invalid UTF-8 would
-// make algod-rust's msgpack `kv_mods` output diverge from go's at the byte
-// level — a known, accepted limitation for that specific edge case (rare in
-// practice; box names are conventionally ASCII/UTF-8 identifiers). Exact
-// msgpack parity for non-UTF-8 box names, if ever needed, is out of scope
-// here and should be filed as its own follow-up.
+// The wire encoding differs by format, matching go's own codec exactly:
+// - **JSON**: go's `encoding/json`-compatible codec cannot emit invalid
+//   UTF-8 inside a JSON string and substitutes the Unicode replacement
+//   character (U+FFFD) for invalid byte sequences when marshaling a Go
+//   string — reproduced here via `String::from_utf8_lossy`.
+// - **msgpack**: go's codec writes the raw string bytes verbatim (a
+//   msgpack "str" payload has no UTF-8 validity requirement, unlike JSON).
+//   Issue #573's live-verification test caught this codepath actually
+//   applying `from_utf8_lossy` unconditionally (a #570 bug, not just a
+//   theoretical gap for non-UTF-8 *box names*): since the embedded app_id
+//   bytes are binary, the lossy conversion corrupted the key for ordinary
+//   ASCII box names too, any time the app_id's bytes formed an invalid
+//   partial UTF-8 sequence. Fixed by tunneling the raw bytes through an
+//   unchecked `&str` for the non-human-readable path — see the `unsafe`
+//   block's safety comment below.
 fn serialize_kv_mods<S: Serializer>(
     map: &HashMap<Vec<u8>, KvValueDelta>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeMap;
+    let human_readable = serializer.is_human_readable();
     let mut m = serializer.serialize_map(Some(map.len()))?;
     for (k, v) in map {
-        m.serialize_entry(&String::from_utf8_lossy(k), v)?;
+        if human_readable {
+            m.serialize_entry(&String::from_utf8_lossy(k), v)?;
+        } else {
+            // SAFETY: msgpack's "str" format has no UTF-8 validity
+            // requirement for its payload (unlike JSON strings), and this
+            // branch only runs for non-human-readable formats (msgpack, via
+            // `rmp_serde`, the only such format this crate feeds through
+            // this function). `serde::Serializer::serialize_str` only
+            // accepts `&str`, so we tunnel the raw key bytes through a
+            // `&str` that may not be valid UTF-8; `rmp_serde` copies the
+            // `&str`'s bytes directly onto the wire without revalidating
+            // them, so this reproduces go's exact msgpack output — the
+            // `str` type here never has its characters inspected, only its
+            // raw byte buffer written out.
+            let raw = unsafe { std::str::from_utf8_unchecked(k) };
+            m.serialize_entry(raw, v)?;
+        }
     }
     m.end()
 }
@@ -133,8 +224,31 @@ fn serialize_kv_mods<S: Serializer>(
 fn deserialize_kv_mods<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<HashMap<Vec<u8>, KvValueDelta>, D::Error> {
-    let m: HashMap<String, KvValueDelta> = HashMap::deserialize(deserializer)?;
-    Ok(m.into_iter().map(|(k, v)| (k.into_bytes(), v)).collect())
+    if deserializer.is_human_readable() {
+        let m: HashMap<String, KvValueDelta> = HashMap::deserialize(deserializer)?;
+        Ok(m.into_iter().map(|(k, v)| (k.into_bytes(), v)).collect())
+    } else {
+        struct RawKeyMapVisitor;
+        impl<'de> serde::de::Visitor<'de> for RawKeyMapVisitor {
+            type Value = HashMap<Vec<u8>, KvValueDelta>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a map of raw byte keys to KvValueDelta")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut out = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((k, v)) = map.next_entry::<serde_bytes::ByteBuf, KvValueDelta>()? {
+                    out.insert(k.into_vec(), v);
+                }
+                Ok(out)
+            }
+        }
+        deserializer.deserialize_map(RawKeyMapVisitor)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -868,6 +982,201 @@ mod state_delta_subset_tests {
         assert!(
             obj.contains_key("Accts"),
             "Accts must still be present: {obj:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod kv_value_delta_wire_format_tests {
+    use super::*;
+
+    /// Issue #573: go-algorand's `ledgercore.KvValueDelta.Data`/`.OldData`
+    /// are untagged `[]byte`, which its REST API's JSON codec handle
+    /// base64-encodes (the same convention every other `[]byte` API field
+    /// uses) — not a JSON array of byte values. Pins the fix for the
+    /// mismatch discovered while building the live `/v2/deltas/{round}`
+    /// comparison test: a plain `#[serde(with = "serde_bytes")]` field
+    /// serializes as `[104,101,...]` under `serde_json`, not
+    /// `"aGVsbG8h"`, because `serde_json::Serializer::serialize_bytes` has
+    /// no native byte-string form and falls back to a JSON array.
+    #[test]
+    fn json_encodes_data_and_old_data_as_base64_strings() {
+        let kv = KvValueDelta {
+            data: b"hello!".to_vec(),
+            old_data: b"bye".to_vec(),
+        };
+        let json = serde_json::to_value(&kv).expect("must serialize");
+        assert_eq!(
+            json["Data"],
+            serde_json::Value::String("aGVsbG8h".to_string()),
+            "Data must be base64-encoded like go's real JSON output: {json}"
+        );
+        assert_eq!(
+            json["OldData"],
+            serde_json::Value::String("Ynll".to_string()),
+            "OldData must be base64-encoded like go's real JSON output: {json}"
+        );
+    }
+
+    /// The msgpack wire form is unaffected by the JSON fix above: go's
+    /// msgpack codec handle writes `[]byte` fields as raw msgpack bin
+    /// bytes, not base64, so algod-rust's msgpack output must too.
+    #[test]
+    fn msgpack_encodes_data_and_old_data_as_raw_bytes() {
+        let kv = KvValueDelta {
+            data: b"hello!".to_vec(),
+            old_data: vec![],
+        };
+        let bytes = rmp_serde::to_vec_named(&kv).expect("must serialize to msgpack");
+        let decoded: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..])
+            .expect("must decode as an rmpv value for structural inspection");
+        let map = decoded.as_map().expect("KvValueDelta encodes as a map");
+        let data_val = map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("Data"))
+            .map(|(_, v)| v)
+            .expect("map must contain a Data entry");
+        assert_eq!(
+            data_val.as_slice(),
+            Some(b"hello!".as_slice()),
+            "Data must round-trip as raw msgpack bytes, not base64: {data_val:?}"
+        );
+
+        // Round-trips back through the typed deserializer too.
+        let round_tripped: KvValueDelta =
+            rmp_serde::from_slice(&bytes).expect("must deserialize back");
+        assert_eq!(round_tripped, kv);
+    }
+
+    /// The base64 JSON encoding round-trips back into the original bytes
+    /// through `deserialize_kv_bytes`.
+    #[test]
+    fn json_round_trips_through_base64() {
+        let kv = KvValueDelta {
+            data: b"box-value-with-\x00\xffbytes".to_vec(),
+            old_data: vec![],
+        };
+        let json = serde_json::to_string(&kv).expect("serialize");
+        let round_tripped: KvValueDelta = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, kv);
+    }
+
+    /// Issue #573 (live-verified against a real go-algorand v4.7.0-stable
+    /// node): unlike most types in this file, `KvValueDelta` carries no
+    /// `_struct \`codec:",omitempty,omitemptyarray"\`` directive on the Go
+    /// side, so a real node's JSON response always includes both `Data` and
+    /// `OldData`, using `null` for an unset (nil in Go) value rather than
+    /// omitting the key. A box-create round's real response looks like
+    /// `{"Data":"...","OldData":null}`.
+    #[test]
+    fn json_never_omits_data_or_old_data_uses_null_when_empty() {
+        let kv = KvValueDelta {
+            data: b"created".to_vec(),
+            old_data: vec![],
+        };
+        let json = serde_json::to_value(&kv).expect("must serialize");
+        let obj = json.as_object().expect("KvValueDelta encodes as an object");
+        assert!(
+            obj.contains_key("Data"),
+            "Data key must always be present: {obj:?}"
+        );
+        assert!(
+            obj.contains_key("OldData"),
+            "OldData key must always be present (never omitted), matching go's \
+             no-omitempty KvValueDelta: {obj:?}"
+        );
+        assert_eq!(
+            obj["OldData"],
+            serde_json::Value::Null,
+            "an empty/unset value must serialize as JSON null, not an empty \
+             string or an omitted key: {obj:?}"
+        );
+
+        let round_tripped: KvValueDelta = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped, kv);
+    }
+
+    /// Issue #573 (live-verified): the msgpack encoding must likewise
+    /// always include both keys, with msgpack nil (not an empty bin/str)
+    /// for an unset value.
+    #[test]
+    fn msgpack_never_omits_data_or_old_data_uses_nil_when_empty() {
+        let kv = KvValueDelta {
+            data: b"created".to_vec(),
+            old_data: vec![],
+        };
+        let bytes = rmp_serde::to_vec_named(&kv).expect("serialize");
+        let decoded: rmpv::Value =
+            rmpv::decode::read_value(&mut &bytes[..]).expect("decode as rmpv");
+        let map = decoded.as_map().expect("KvValueDelta encodes as a map");
+        let old_data = map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("OldData"))
+            .map(|(_, v)| v.clone())
+            .expect("OldData entry must always be present, not omitted");
+        assert!(
+            old_data.is_nil(),
+            "an empty/unset value must serialize as msgpack nil: {old_data:?}"
+        );
+
+        let round_tripped: KvValueDelta = rmp_serde::from_slice(&bytes).expect("deserialize");
+        assert_eq!(round_tripped, kv);
+    }
+
+    /// Issue #573 (live-verified): `serialize_kv_mods`'s msgpack path must
+    /// write the *raw* key bytes, not the same `from_utf8_lossy` conversion
+    /// JSON uses. Regression for a real bug caught by the live comparison
+    /// test: an app id whose big-endian bytes happen to form an invalid
+    /// partial UTF-8 sequence (common, not rare -- e.g. app id 1007 =
+    /// `0x03EF`, where the trailing `0xEF` byte starts a 3-byte UTF-8
+    /// sequence with no valid continuation bytes after it) got silently
+    /// mangled into the 3-byte U+FFFD replacement character even though
+    /// msgpack itself has no UTF-8 validity requirement for "str" payloads.
+    #[test]
+    fn msgpack_kv_mods_key_is_raw_bytes_not_lossy_utf8() {
+        let mut key = Vec::new();
+        key.extend_from_slice(b"bx:");
+        key.extend_from_slice(&1007u64.to_be_bytes()); // trailing 0xEF byte
+        key.extend_from_slice(b"svc-box");
+        assert!(
+            String::from_utf8(key.clone()).is_err(),
+            "fixture key must actually be invalid UTF-8 for this regression to mean anything"
+        );
+
+        let mut kv_mods = HashMap::new();
+        kv_mods.insert(
+            key.clone(),
+            KvValueDelta {
+                data: b"v".to_vec(),
+                old_data: vec![],
+            },
+        );
+        let delta = StateDelta {
+            kv_mods,
+            ..Default::default()
+        };
+
+        let bytes = rmp_serde::to_vec_named(&delta).expect("serialize");
+        let decoded: rmpv::Value =
+            rmpv::decode::read_value(&mut &bytes[..]).expect("decode as rmpv");
+        let kv_mods_val = decoded
+            .as_map()
+            .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("KvMods")))
+            .map(|(_, v)| v.clone())
+            .expect("StateDelta must have a KvMods entry");
+        let map = kv_mods_val.as_map().expect("KvMods encodes as a map");
+        assert_eq!(map.len(), 1);
+        let (wire_key, _) = &map[0];
+        // `Value::as_slice()` returns the raw payload bytes for a String
+        // value even when it isn't valid UTF-8 (unlike `as_str()`, which
+        // returns `None` in that case) -- exactly what this assertion needs.
+        let raw_key_bytes = wire_key
+            .as_slice()
+            .unwrap_or_else(|| panic!("KvMods key must decode as a msgpack str: {wire_key:?}"))
+            .to_vec();
+        assert_eq!(
+            raw_key_bytes, key,
+            "msgpack KvMods key must be the exact raw bytes, not a lossy-UTF8 substitution"
         );
     }
 }

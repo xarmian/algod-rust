@@ -7651,12 +7651,18 @@ mod tests {
         let at_round_2 = ledger
             .reconstruct_box_state_at_round(app_id, 2)
             .expect("round 2 is within the delta cache window");
-        assert_eq!(at_round_2.get(b"mybox".as_slice()), Some(&b"bbbbb".to_vec()));
+        assert_eq!(
+            at_round_2.get(b"mybox".as_slice()),
+            Some(&b"bbbbb".to_vec())
+        );
 
         let at_round_1 = ledger
             .reconstruct_box_state_at_round(app_id, 1)
             .expect("round 1 is within the delta cache window");
-        assert_eq!(at_round_1.get(b"mybox".as_slice()), Some(&b"aaaaa".to_vec()));
+        assert_eq!(
+            at_round_1.get(b"mybox".as_slice()),
+            Some(&b"aaaaa".to_vec())
+        );
 
         let at_round_0 = ledger
             .reconstruct_box_state_at_round(app_id, 0)

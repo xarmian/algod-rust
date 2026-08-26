@@ -586,6 +586,42 @@ impl AlgodClient {
             })
     }
 
+    /// `GET /v2/deltas/{round}?format=json` — the ledger state delta for a
+    /// round, as a raw JSON value (`ledgercore.StateDelta`'s wire shape).
+    ///
+    /// Used by `algo-fixtures`' state-delta capture (issue #573) to golden
+    /// a real go-algorand node's `KvMods` output for conformance testing
+    /// against algod-rust's own `StateDelta.kv_mods`.
+    pub async fn get_state_delta_json(&self, round: u64) -> Result<serde_json::Value> {
+        let path = format!("/v2/deltas/{round}?format=json");
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("parsing GET /v2/deltas/{round}?format=json response"),
+            })
+    }
+
+    /// `GET /v2/deltas/{round}?format=msgpack` — the ledger state delta for
+    /// a round, as raw msgpack bytes exactly as the node sent them.
+    ///
+    /// See [`Self::get_state_delta_json`]; kept separate (rather than a
+    /// generic `format` parameter) to match this file's existing
+    /// one-purpose-per-method convention (`get_account_json`,
+    /// `get_application_json`).
+    pub async fn get_state_delta_msgpack_raw(&self, round: u64) -> Result<Vec<u8>> {
+        let path = format!("/v2/deltas/{round}?format=msgpack");
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("reading GET /v2/deltas/{round}?format=msgpack response body"),
+            })
+    }
+
     /// `GET /v2/status` — current last committed round.
     ///
     /// Mirrors `client.CurrentRound` in `MakeDryrunStateGenerated`.
