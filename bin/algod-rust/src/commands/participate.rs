@@ -37,7 +37,7 @@ use algo_validate::signature::verify_transaction_signature;
 use rand::Rng;
 use sha2::{Digest as _, Sha512_256};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::commands::dual_gossip_node;
 use crate::commands::network_common::genesis_id_for;
@@ -92,6 +92,78 @@ impl NetworkAdvancer for GossipNetworkAdvancer {
     }
 }
 
+/// Fetch a block+cert for `round` from a set of [`UnicastPeer`]s via
+/// [`GossipBlockSource`], shared by every [`BlockFetcher`] adapter in this
+/// module regardless of which transport supplied the peer list — the
+/// `UniEnsBlockReq`/`TopicMsgResp` wire protocol
+/// ([`algo_network::block_fetcher`]) and its response decoding are
+/// transport-agnostic (issue #591: this is what let the P2P transport reuse
+/// the exact same fetch protocol the WS-gossip transport already had,
+/// rather than inventing a parallel one).
+///
+/// Mirrors Go's `universalFetcher.fetchBlock` used in `catchup/service.go`,
+/// which is likewise transport-agnostic over its `FetcherClient`
+/// implementations.
+async fn fetch_block_via_unicast_peers(
+    peers: Vec<Arc<dyn algo_network::gossip_node::UnicastPeer>>,
+    round: Round,
+) -> Result<FetchedBlockCert, FetchError> {
+    if peers.is_empty() {
+        return Err(FetchError::NoPeersAvailable);
+    }
+    let source = GossipBlockSource::new(peers);
+    let (response, raw_block_data) = source.get_block_with_raw_data(round).await.map_err(|e| {
+        FetchError::NetworkError(format!("block fetch failed for round {}: {}", round, e))
+    })?;
+
+    // Extract raw payset blobs from the wire-format block bytes.
+    // These are used for payset commitment verification, avoiding
+    // re-encoding from typed structs which may lose unknown fields.
+    let raw_payset_blobs = match algo_codec::extract_raw_payset_blobs_from_block(&raw_block_data) {
+        Ok(blobs) => Some(blobs),
+        Err(e) => {
+            tracing::warn!(
+                round = %round,
+                error = %e,
+                "could not extract raw payset blobs, falling back to typed re-encoding"
+            );
+            None
+        }
+    };
+
+    // Try to parse the gossip response's certificate data
+    // (rmpv::Value) into a typed Certificate for fork detection.
+    // If parsing fails, gracefully degrade to cert: None — the
+    // catchup service already has the agreement cert and can
+    // still commit blocks; fork detection just won't fire.
+    //
+    // The rmpv::Value preserves Go's codec tags ("rnd", "per",
+    // "prop", etc.) as map keys. We re-encode to bytes and then
+    // use the agreement codec's `decode_bundle` which understands
+    // those tags, rather than rmp_serde which expects Rust field
+    // names.
+    let cert = response.cert.and_then(|val| {
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &val).ok()?;
+        match algo_agreement::codec::decode_bundle(&bytes) {
+            Ok(bundle) => Some(algo_agreement::Certificate::from_bundle(&bundle)),
+            Err(e) => {
+                tracing::debug!(
+                    round = %round,
+                    error = %e,
+                    "could not parse fetched certificate, fork detection unavailable for this block"
+                );
+                None
+            }
+        }
+    });
+    Ok(FetchedBlockCert {
+        block: response.block,
+        cert,
+        raw_payset_blobs,
+    })
+}
+
 /// A concrete [`BlockFetcher`] that fetches blocks from peers via the gossip
 /// network's WebSocket unicast protocol.
 ///
@@ -112,66 +184,61 @@ impl BlockFetcher for GossipBlockFetcher {
         // runtime would panic.
         self.rt_handle.block_on(async {
             let peers = self.ws_network.get_unicast_peers().await;
-            if peers.is_empty() {
-                return Err(FetchError::NoPeersAvailable);
-            }
-            let source = GossipBlockSource::new(peers);
-            let (response, raw_block_data) =
-                source.get_block_with_raw_data(round).await.map_err(|e| {
-                    FetchError::NetworkError(format!(
-                        "block fetch failed for round {}: {}",
-                        round, e
-                    ))
-                })?;
-
-            // Extract raw payset blobs from the wire-format block bytes.
-            // These are used for payset commitment verification, avoiding
-            // re-encoding from typed structs which may lose unknown fields.
-            let raw_payset_blobs =
-                match algo_codec::extract_raw_payset_blobs_from_block(&raw_block_data) {
-                    Ok(blobs) => Some(blobs),
-                    Err(e) => {
-                        tracing::warn!(
-                            round = %round,
-                            error = %e,
-                            "could not extract raw payset blobs, falling back to typed re-encoding"
-                        );
-                        None
-                    }
-                };
-
-            // Try to parse the gossip response's certificate data
-            // (rmpv::Value) into a typed Certificate for fork detection.
-            // If parsing fails, gracefully degrade to cert: None — the
-            // catchup service already has the agreement cert and can
-            // still commit blocks; fork detection just won't fire.
-            //
-            // The rmpv::Value preserves Go's codec tags ("rnd", "per",
-            // "prop", etc.) as map keys. We re-encode to bytes and then
-            // use the agreement codec's `decode_bundle` which understands
-            // those tags, rather than rmp_serde which expects Rust field
-            // names.
-            let cert = response.cert.and_then(|val| {
-                let mut bytes = Vec::new();
-                rmpv::encode::write_value(&mut bytes, &val).ok()?;
-                match algo_agreement::codec::decode_bundle(&bytes) {
-                    Ok(bundle) => Some(algo_agreement::Certificate::from_bundle(&bundle)),
-                    Err(e) => {
-                        tracing::debug!(
-                            round = %round,
-                            error = %e,
-                            "could not parse fetched certificate, fork detection unavailable for this block"
-                        );
-                        None
-                    }
-                }
-            });
-            Ok(FetchedBlockCert {
-                block: response.block,
-                cert,
-                raw_payset_blobs,
-            })
+            fetch_block_via_unicast_peers(peers, round).await
         })
+    }
+}
+
+/// A concrete [`BlockFetcher`] that fetches blocks from peers via the P2P
+/// transport's `/algorand-ws/2.2.0` stream (issue #591) — the P2P-transport
+/// counterpart of [`GossipBlockFetcher`], using
+/// [`crate::commands::p2p_transport::P2pTransport::unicast_peers`] instead
+/// of `WebsocketNetwork::get_unicast_peers()`.
+///
+/// This is what `P2pOnly` mode was entirely missing before this issue: with
+/// no WS-gossip listener and no WS-gossip peers by design, a single missed
+/// live-agreement round previously had no recovery path at all — every
+/// catch-up attempt failed with `FetchError::NoPeersAvailable` forever.
+struct P2pBlockFetcher {
+    p2p_transport: Arc<P2pTransport>,
+    rt_handle: tokio::runtime::Handle,
+}
+
+impl BlockFetcher for P2pBlockFetcher {
+    fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+        // SAFETY: see `GossipBlockFetcher::fetch_block` — same
+        // background-thread / `block_on` constraint applies here.
+        self.rt_handle.block_on(async {
+            let peers = self.p2p_transport.unicast_peers();
+            fetch_block_via_unicast_peers(peers, round).await
+        })
+    }
+}
+
+/// Tries `primary`, falling back to `secondary` only if `primary` fails.
+/// Used to wire `Hybrid` mode's [`CatchupService`] (issue #591's acceptance
+/// criteria: "ideally Hybrid, falling back to WS-gossip only when P2P fetch
+/// fails") — the P2P transport is preferred since it is the transport
+/// `Hybrid` mode's agreement traffic actually flows over, but WS-gossip
+/// stays available as a safety net exactly as it already was pre-#591.
+struct FallbackBlockFetcher {
+    primary: Arc<dyn BlockFetcher>,
+    secondary: Arc<dyn BlockFetcher>,
+}
+
+impl BlockFetcher for FallbackBlockFetcher {
+    fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+        match self.primary.fetch_block(round) {
+            Ok(fetched) => Ok(fetched),
+            Err(primary_err) => {
+                debug!(
+                    round = %round,
+                    error = %primary_err,
+                    "P2P block fetch failed, falling back to WS-gossip"
+                );
+                self.secondary.fetch_block(round)
+            }
+        }
     }
 }
 
@@ -3199,6 +3266,13 @@ pub async fn run(
 
         // Inbound TX routing: register the same pool/seen-cache-backed
         // handler WS-gossip uses, before any P2P traffic can be dispatched.
+        //
+        // Also register the same `UniEnsBlockReq` handler WS-gossip uses
+        // (issue #591): without this, a P2P peer that falls behind and
+        // tries to catch up from *this* node gets no reply at all — the
+        // P2P `/algorand-ws` stream now writes back a handler's `Respond`
+        // result (see `p2p_transport.rs`'s `spawn_ws_peer`), but only if a
+        // handler is actually registered here to produce one.
         transport.multiplexer().register_handlers(vec![
             algo_network::handler::TaggedMessageHandler {
                 tag: algo_network::Tag::Transaction,
@@ -3206,6 +3280,12 @@ pub async fn run(
                     pool.clone(),
                     tx_seen_cache.clone(),
                 )),
+            },
+            algo_network::handler::TaggedMessageHandler {
+                tag: algo_network::Tag::UniEnsBlockReq,
+                handler: Arc::new(ParticipateBlockRequestHandler {
+                    block_service: Arc::clone(&block_service),
+                }),
             },
         ]);
 
@@ -3479,10 +3559,33 @@ pub async fn run(
         agreement_ledger.round_advanced_condvar(),
     ));
 
-    let block_fetcher: Arc<dyn BlockFetcher> = Arc::new(GossipBlockFetcher {
+    // Issue #591: which transport(s) `CatchupService` fetches missed
+    // blocks+certs from must track `network_mode` exactly the same way the
+    // live agreement traffic routing (`p2p_active_gossip_node`, above) does
+    // — `P2pOnly` has no WS-gossip peers at all (`WebsocketNetwork::get_unicast_peers()`
+    // is always empty), so `GossipBlockFetcher` alone left a `P2pOnly` node
+    // with zero fault tolerance against a single missed live-agreement
+    // round. `Hybrid` prefers the P2P fetch path (the transport its
+    // agreement traffic actually flows over) but keeps WS-gossip as a
+    // fallback.
+    let ws_block_fetcher: Arc<dyn BlockFetcher> = Arc::new(GossipBlockFetcher {
         ws_network: gossip_node.clone(),
-        rt_handle,
+        rt_handle: rt_handle.clone(),
     });
+    let block_fetcher: Arc<dyn BlockFetcher> = match (&network_mode, &p2p_transport) {
+        (NetworkMode::P2pOnly, Some(p2p)) => Arc::new(P2pBlockFetcher {
+            p2p_transport: Arc::clone(p2p),
+            rt_handle: rt_handle.clone(),
+        }),
+        (NetworkMode::Hybrid, Some(p2p)) => Arc::new(FallbackBlockFetcher {
+            primary: Arc::new(P2pBlockFetcher {
+                p2p_transport: Arc::clone(p2p),
+                rt_handle: rt_handle.clone(),
+            }),
+            secondary: ws_block_fetcher,
+        }),
+        _ => ws_block_fetcher,
+    };
 
     let catchup_ledger: Arc<dyn algo_ledger::CatchupLedger> = catchup_bridge;
 

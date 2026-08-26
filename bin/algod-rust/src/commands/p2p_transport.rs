@@ -43,8 +43,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use algo_network::gossip_node::UnicastPeer;
 use algo_network::handler::{Multiplexer, TaggedMessageHandler, TaggedMessageValidatorHandler};
-use algo_network::{GossipNode, IncomingMessage, Peer, PeerOption, Router, Tag};
+use algo_network::topics::{Topic, Topics};
+use algo_network::{
+    encode_uvarint, hash_topics, ForwardingPolicy, GossipNode, IncomingMessage, Peer, PeerError,
+    PeerOption, RequestTracker, Router, Tag, DEFAULT_REQUEST_TIMEOUT, RESPONSE_HASH_FIELD,
+};
 use algo_p2p::{
     build_headers, handshake_inbound, handshake_outbound, read_frame, write_frame, IdentityConfig,
     MessageValidationResult, P2pBehaviourEvent, P2pHost, PeerMetaHeaders, ALGORAND_WS_PROTOCOL_V22,
@@ -65,17 +70,41 @@ use crate::config::P2pConfig;
 /// `algo_p2p::wsproto`'s doc comment).
 const ALGORAND_WS_SUPPORTED_VERSIONS: &[&str] = &["2.2"];
 
+/// Everything [`P2pTransport`] tracks for one currently-established
+/// `/algorand-ws/2.2.0` stream peer: the outgoing frame sender
+/// [`P2pTransport::stream_broadcast`] fans agreement traffic out to, and
+/// (issue #591) the [`RequestTracker`] that correlates this peer's
+/// `TopicMsgResp` replies to our own outstanding `UniEnsBlockReq`
+/// catch-up-fetch requests — mirroring `ws_peer.rs`'s per-peer
+/// `request_tracker`, since a P2P `/algorand-ws` stream is a
+/// request/response-capable channel exactly like a WS peer connection.
+struct StreamPeerHandle {
+    /// Sends a pre-framed (tag+payload) byte string to this peer's writer
+    /// task, mirroring `algo_network::framing::encode_frame`'s output.
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Correlates outbound unicast requests (see [`P2pTransport::unicast_peers`])
+    /// to this peer's `TopicMsgResp` replies.
+    request_tracker: Arc<RequestTracker>,
+}
+
 /// Registry of currently-established `/algorand-ws/2.2.0` streams, keyed by
-/// peer, used to fan agreement traffic out (see this module's doc comment).
-/// Each sender feeds a per-peer writer task a pre-framed (tag+payload)
-/// byte string, mirroring `algo_network::framing::encode_frame`'s output.
-type StreamPeers = Arc<Mutex<HashMap<PeerId, mpsc::UnboundedSender<Vec<u8>>>>>;
+/// peer (see this module's doc comment and [`StreamPeerHandle`]).
+type StreamPeers = Arc<Mutex<HashMap<PeerId, StreamPeerHandle>>>;
 
 /// Run the post-handshake read/write loop for one peer's `/algorand-ws`
-/// stream: registers a sender in `stream_peers` that
-/// [`P2pTransport::stream_broadcast`] fans frames out to, and dispatches
-/// every frame this peer sends into `mux` (the same [`Multiplexer`]
-/// gossipsub messages are dispatched to).
+/// stream: registers a [`StreamPeerHandle`] in `stream_peers` (its sender is
+/// what [`P2pTransport::stream_broadcast`] fans agreement traffic out to,
+/// and what [`P2pTransport::unicast_peers`] hands to a
+/// [`P2pUnicastPeer`] for request/response traffic), dispatches every
+/// non-`TopicMsgResp` frame this peer sends into `mux` (the same
+/// [`Multiplexer`] gossipsub messages are dispatched to), and — issue #591 —
+/// actually writes back a `Respond`-action handler result as a `TopicMsgResp`
+/// frame, and routes an incoming `TopicMsgResp` to this peer's own
+/// `RequestTracker` instead of `mux` (mirroring `ws_peer.rs`'s read loop's
+/// "(c) Request/response correlation" step, which this stream never had
+/// before this issue — every P2P catch-up fetch attempt failed with
+/// `NoPeersAvailable` because `mux.handle`'s `Respond` result was silently
+/// dropped and no `TopicMsgResp` was ever written back).
 fn spawn_ws_peer(
     peer_id: PeerId,
     stream: P2pRawStream,
@@ -83,10 +112,21 @@ fn spawn_ws_peer(
     stream_peers: StreamPeers,
 ) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let request_tracker = Arc::new(RequestTracker::new());
+    // A clone of `tx` outlives the map insertion below so the reader half
+    // (see the `Respond` handling further down) can still queue a reply
+    // frame onto this same peer's writer task.
+    let reply_tx = tx.clone();
     stream_peers
         .lock()
         .expect("stream_peers mutex poisoned")
-        .insert(peer_id, tx);
+        .insert(
+            peer_id,
+            StreamPeerHandle {
+                tx,
+                request_tracker: Arc::clone(&request_tracker),
+            },
+        );
 
     tokio::spawn(async move {
         let (mut read_half, mut write_half) = stream.split();
@@ -105,6 +145,22 @@ fn spawn_ws_peer(
                     Err(_) => break,
                 };
                 if let Ok((tag, payload)) = algo_network::framing::decode_frame(&body) {
+                    // Request/response correlation (issue #591): a
+                    // `TopicMsgResp` reply to one of *our* outbound unicast
+                    // requests (see [`P2pUnicastPeer::request`]) is routed to
+                    // this peer's `RequestTracker`, not dispatched into
+                    // `mux` — mirrors `ws_peer.rs`'s read loop step "(c)
+                    // Request/response correlation".
+                    if tag == Tag::TopicMsgResp {
+                        if let Err(e) = request_tracker.handle_response(payload).await {
+                            tracing::debug!(
+                                %peer_id,
+                                error = %e,
+                                "P2P algorand-ws stream: failed to handle TopicMsgResp"
+                            );
+                        }
+                        continue;
+                    }
                     // Decompress PP (proposal) payloads that carry the zstd
                     // frame magic — go-algorand compresses *every* proposal
                     // broadcast unconditionally once the wsnet protocol
@@ -143,13 +199,52 @@ fn spawn_ws_peer(
                     } else {
                         payload.to_vec()
                     };
+                    // The response-hash correlation (below) is computed over
+                    // the exact bytes the requester hashed on their side —
+                    // the raw, pre-dispatch request payload — so capture it
+                    // before `msg` (and thus `payload`) is moved into
+                    // `mux.handle`.
+                    let request_payload_for_hash = payload.clone();
                     let msg = IncomingMessage::new(
                         tag,
                         payload,
                         peer_id.to_string(),
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
                     );
-                    let _ = mux.handle(msg).await;
+                    let out = mux.handle(msg).await;
+
+                    // Issue #591: a handler that answers with
+                    // `ForwardingPolicy::Respond` (e.g.
+                    // `ParticipateBlockRequestHandler` answering an inbound
+                    // `UniEnsBlockReq`) previously had its result silently
+                    // dropped — this stream never wrote a `TopicMsgResp`
+                    // back, so a P2P peer's catch-up fetch against this node
+                    // always timed out. Mirrors `ws_peer.rs`'s read loop's
+                    // `ForwardingPolicy::Respond` arm: hash the *request*
+                    // payload, append it as the `RequestHash` topic, and
+                    // send the result back as a `TopicMsgResp` frame over
+                    // this same peer's stream.
+                    if out.action == ForwardingPolicy::Respond {
+                        let request_hash = hash_topics(&request_payload_for_hash);
+                        let mut response_topics = out.topics.unwrap_or_else(Topics::new);
+                        response_topics.0.push(Topic::new(
+                            RESPONSE_HASH_FIELD,
+                            encode_uvarint(request_hash),
+                        ));
+                        let serialized = response_topics.marshal();
+                        match algo_network::framing::encode_frame(&Tag::TopicMsgResp, &serialized) {
+                            Ok(frame) => {
+                                let _ = reply_tx.send(frame);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    %peer_id,
+                                    error = %e,
+                                    "P2P algorand-ws stream: failed to encode TopicMsgResp reply"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         };
@@ -240,6 +335,88 @@ impl Peer for P2pPeerRef {
 
     fn routing_addr(&self) -> &[u8] {
         &[]
+    }
+}
+
+/// A [`UnicastPeer`] backed by one peer's `/algorand-ws/2.2.0` stream
+/// (issue #591): request/response traffic (currently `UniEnsBlockReq`
+/// catch-up block fetches) is sent as a normal tag+payload frame over the
+/// same stream AV/PP/VB traffic already uses, correlated to its
+/// `TopicMsgResp` reply via `request_tracker` — the same mechanism
+/// `ws_peer.rs`'s `UnicastPeerRef` uses for the WS-gossip transport,
+/// re-implemented here because the P2P stream's framing/dispatch lives in
+/// this module (`algo-p2p` deliberately has no `algo-network` dependency —
+/// see `algo_p2p::wsproto`'s doc comment).
+struct P2pUnicastPeer {
+    /// `PeerId`'s string form, cached at construction since
+    /// [`Peer::get_address`] returns `&str` and `PeerId::to_string()`
+    /// allocates.
+    peer_id_str: String,
+    /// Sends a pre-framed (tag+payload) byte string to this peer's writer
+    /// task — the same channel [`P2pTransport::stream_broadcast`] uses.
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    request_tracker: Arc<RequestTracker>,
+    request_timeout: Duration,
+}
+
+impl Peer for P2pUnicastPeer {
+    fn get_address(&self) -> &str {
+        &self.peer_id_str
+    }
+
+    fn get_connection_latency(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn routing_addr(&self) -> &[u8] {
+        &[]
+    }
+}
+
+#[async_trait]
+impl UnicastPeer for P2pUnicastPeer {
+    /// Send a `UniEnsBlockReq`-style request over this peer's
+    /// `/algorand-ws` stream and await the correlated `TopicMsgResp`.
+    /// Mirrors `ws_peer.rs`'s `UnicastPeerRef::request` exactly (same
+    /// `RequestTracker` protocol), just framed onto this stream's own
+    /// outgoing sender instead of a WS write-command channel.
+    async fn request(&self, tag: Tag, topics: Topics) -> Result<Topics, PeerError> {
+        let (serialized, hash, rx) = self.request_tracker.prepare_request(topics).await;
+
+        let frame = algo_network::framing::encode_frame(&tag, &serialized).map_err(|e| {
+            PeerError::WriteError(format!("failed to encode P2P unicast request: {e}"))
+        })?;
+        if self.tx.send(frame).is_err() {
+            self.request_tracker.cancel_request(hash).await;
+            return Err(PeerError::ConnectionClosed);
+        }
+
+        match tokio::time::timeout(self.request_timeout, rx).await {
+            Ok(Ok(response_topics)) => Ok(response_topics),
+            Ok(Err(_recv_error)) => Err(PeerError::ResponseChannelClosed),
+            Err(_timeout) => {
+                self.request_tracker.cancel_request(hash).await;
+                Err(PeerError::RequestTimeout)
+            }
+        }
+    }
+
+    /// Send a response to a previously received request over this peer's
+    /// stream. Not exercised by the catch-up-fetch client path (this
+    /// module's read loop replies to inbound requests directly — see
+    /// `spawn_ws_peer`'s `ForwardingPolicy::Respond` handling), but
+    /// implemented for `UnicastPeer` trait completeness and parity with
+    /// `ws_peer.rs`'s `UnicastPeerRef::respond`.
+    async fn respond(&self, request_hash: u64, topics: Topics) -> Result<(), PeerError> {
+        let mut response_topics = topics;
+        response_topics.0.push(Topic::new(
+            RESPONSE_HASH_FIELD,
+            encode_uvarint(request_hash),
+        ));
+        let serialized = response_topics.marshal();
+        let frame = algo_network::framing::encode_frame(&Tag::TopicMsgResp, &serialized)
+            .map_err(|e| PeerError::WriteError(format!("failed to encode P2P response: {e}")))?;
+        self.tx.send(frame).map_err(|_| PeerError::ConnectionClosed)
     }
 }
 
@@ -648,6 +825,28 @@ impl P2pTransport {
             .len()
     }
 
+    /// Every currently-established `/algorand-ws/2.2.0` stream peer, as
+    /// [`UnicastPeer`]s a [`algo_rest_client::GossipBlockSource`]-style
+    /// catch-up fetcher can send `UniEnsBlockReq` requests to and await a
+    /// correlated `TopicMsgResp` from (issue #591) — the P2P-transport
+    /// equivalent of `WebsocketNetwork::get_unicast_peers()`. Empty until at
+    /// least one peer's stream handshake completes.
+    pub fn unicast_peers(&self) -> Vec<Arc<dyn UnicastPeer>> {
+        self.stream_peers
+            .lock()
+            .expect("stream_peers mutex poisoned")
+            .iter()
+            .map(|(peer_id, handle)| {
+                Arc::new(P2pUnicastPeer {
+                    peer_id_str: peer_id.to_string(),
+                    tx: handle.tx.clone(),
+                    request_tracker: Arc::clone(&handle.request_tracker),
+                    request_timeout: DEFAULT_REQUEST_TIMEOUT,
+                }) as Arc<dyn UnicastPeer>
+            })
+            .collect()
+    }
+
     /// The [`Multiplexer`] inbound gossipsub messages (for topics this
     /// transport subscribes to — TX/AV/PP/VB) are dispatched to. Callers
     /// register handlers here the same way they register on
@@ -692,8 +891,8 @@ impl P2pTransport {
                     .stream_peers
                     .lock()
                     .expect("stream_peers mutex poisoned");
-                for sender in peers.values() {
-                    let _ = sender.send(frame.clone());
+                for handle in peers.values() {
+                    let _ = handle.tx.send(frame.clone());
                 }
             }
             Err(e) => {
@@ -1182,6 +1381,141 @@ mod tests {
             dialer.stream_peer_count(),
             1,
             "dialer should have opened exactly one outbound algorand-ws stream"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P2P catch-up block/cert fetch (issue #591) — TDD anchor.
+    //
+    // Before this issue, `P2pTransport::unicast_peers()` did not exist and
+    // this stream's read loop silently dropped every `ForwardingPolicy::Respond`
+    // handler result (see `spawn_ws_peer`'s doc comment), so a `P2pOnly`-mode
+    // node that missed a live-agreement round had no way to fetch the
+    // missing block+cert from a P2P peer — every catch-up attempt failed
+    // with `NoPeersAvailable` forever (`participate.rs`'s
+    // `GossipBlockFetcher` is hardcoded to `WebsocketNetwork`, which has no
+    // peers in `P2pOnly` mode).
+    // -----------------------------------------------------------------------
+
+    /// A [`LedgerForBlockService`] serving one fixed block+cert pair for a
+    /// single round, mirroring `block_service.rs`'s own `MockLedger` test
+    /// double.
+    struct FixedRoundLedger {
+        round: u64,
+        block_data: Vec<u8>,
+        cert_data: Vec<u8>,
+    }
+
+    impl algo_network::block_service::LedgerForBlockService for FixedRoundLedger {
+        fn encoded_block_cert(
+            &self,
+            round: u64,
+        ) -> Result<(Vec<u8>, Vec<u8>), algo_network::block_service::BlockServiceError> {
+            if round == self.round {
+                Ok((self.block_data.clone(), self.cert_data.clone()))
+            } else {
+                Err(
+                    algo_network::block_service::BlockServiceError::BlockNotAvailable {
+                        round,
+                        latest_round: Some(self.round),
+                    },
+                )
+            }
+        }
+
+        fn latest_round(&self) -> u64 {
+            self.round
+        }
+    }
+
+    /// Serves `UniEnsBlockReq` requests from a [`BlockService`], mirroring
+    /// `participate.rs`'s `ParticipateBlockRequestHandler`.
+    struct BlockRequestHandler {
+        block_service: Arc<algo_network::block_service::BlockService>,
+    }
+
+    #[async_trait]
+    impl algo_network::handler::MessageHandler for BlockRequestHandler {
+        async fn handle(&self, msg: IncomingMessage) -> algo_network::OutgoingMessage {
+            let (response_topics, _guard) = self.block_service.handle_ws_block_request(&msg.data);
+            algo_network::OutgoingMessage {
+                action: ForwardingPolicy::Respond,
+                tag: Tag::TopicMsgResp,
+                payload: Vec::new(),
+                topics: Some(response_topics),
+            }
+        }
+    }
+
+    /// TDD anchor for issue #591: without a P2P block-fetch protocol wired
+    /// up, `dialer.unicast_peers()` doesn't exist / is always empty, so a
+    /// `CatchupService::sync_cert`-style consumer has no way to fetch a
+    /// missed block over the P2P transport. This pins the fix: once both
+    /// sides' `/algorand-ws/2.2.0` streams are up, the dialer can send a
+    /// `UniEnsBlockReq` to the listener over that stream (via
+    /// `GossipBlockSource`, exactly as `participate.rs`'s `GossipBlockFetcher`
+    /// does for the WS-gossip transport) and get back the exact block the
+    /// listener's `BlockService` serves.
+    #[tokio::test]
+    async fn p2p_unicast_peer_fetches_a_block_via_uni_ens_block_req() {
+        use algo_network::block_service::BlockService;
+        use algo_types::{Block, Round};
+
+        let (listener, dialer) = connected_pair().await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (listener.stream_peer_count() == 0 || dialer.stream_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            dialer.stream_peer_count(),
+            1,
+            "precondition: stream established"
+        );
+
+        // Build a minimal, canonically-encoded block for round 7 to serve.
+        let block = Block {
+            round: Round(7),
+            current_protocol: "future".to_string(),
+            ..Default::default()
+        };
+        let block_data = algo_codec::canonical_encode_block(&block);
+
+        let ledger = Arc::new(FixedRoundLedger {
+            round: 7,
+            block_data,
+            cert_data: Vec::new(),
+        });
+        let block_service = Arc::new(BlockService::new(ledger, "test-591".to_string(), 0));
+        listener
+            .multiplexer()
+            .register_handlers(vec![TaggedMessageHandler {
+                tag: Tag::UniEnsBlockReq,
+                handler: Arc::new(BlockRequestHandler { block_service }),
+            }]);
+
+        let peers = dialer.unicast_peers();
+        assert_eq!(
+            peers.len(),
+            1,
+            "dialer should see exactly one P2P unicast peer (the listener)"
+        );
+
+        let source = algo_rest_client::GossipBlockSource::new(peers);
+        let (response, _raw) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            source.get_block_with_raw_data(Round(7)),
+        )
+        .await
+        .expect("fetch should not time out")
+        .expect("fetch should succeed against a peer serving round 7");
+
+        assert_eq!(
+            response.block.round,
+            Round(7),
+            "fetched block should be exactly the round the listener served"
         );
     }
 

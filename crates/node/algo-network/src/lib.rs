@@ -174,7 +174,7 @@ pub use gossip_node::{substitute_genesis_id, GossipNode, Peer, PeerOption, Route
 
 // Request/response tracker and constants
 pub use request_response::{
-    hash_topics, RequestResponseError, RequestTracker, DEFAULT_REQUEST_TIMEOUT,
+    encode_uvarint, hash_topics, RequestResponseError, RequestTracker, DEFAULT_REQUEST_TIMEOUT,
     REQUEST_NONCE_FIELD, RESPONSE_HASH_FIELD,
 };
 
