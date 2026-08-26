@@ -2021,6 +2021,33 @@ pub(crate) fn block_state_delta_is_complete(block: &algo_types::Block) -> bool {
         .all(|stx| matches!(stx.txn.txn_type, TxnType::Pay | TxnType::Keyreg))
 }
 
+/// Whether `block` contains any `appl` transaction (issue #574).
+///
+/// Box create/put/replace/resize/splice/delete only ever happen inside AVM
+/// execution (`avm_context.rs`'s box-mutation call sites), and
+/// go-algorand's own `ApplyData`/`EvalDelta` carries no box-content field
+/// at all (`../go-algorand/data/transactions/teal.go`,
+/// `data/transactions/transaction.go`) — box mutations are ledger-level
+/// `KvMods`, entirely outside `ApplyData`. A block replayed purely from
+/// recorded `EvalDelta` (`ApplyMode::Replay`) therefore can never observe a
+/// box mutation, by construction. go-algorand itself has no
+/// "replay-from-recorded-delta" fast path for normal block application —
+/// `ledger/eval/eval.go`'s `Eval()` (used for every synced block, not just
+/// proposal validation) always calls `eval.TransactionGroup()`, which runs
+/// the AVM for real. `apply_block_caching_delta` uses this predicate to
+/// route any block containing an `appl` call through `ApplyMode::Execute`
+/// instead of the cheaper `Replay` path, so box storage stays correct for
+/// normally-synced nodes too. Blocks with no `appl` transactions (even
+/// `Acfg`/`Axfer`/`Afrz`/`Stpf`/`Hb`, none of which can touch box storage)
+/// keep using the cheap Replay path.
+fn block_has_app_call(block: &algo_types::Block) -> bool {
+    use algo_types::TxnType;
+    block
+        .payset
+        .iter()
+        .any(|stx| stx.txn.txn_type == TxnType::Appl)
+}
+
 impl SqliteLedger {
     /// Open or create a SQLite ledger database pair.
     ///
@@ -2781,12 +2808,17 @@ impl SqliteLedger {
     /// [`crate::apply::apply_block_with_delta`] builder — practically that
     /// means a payset of only `Pay` / `Keyreg` / `Hb` transactions. Blocks
     /// that contain `Acfg` / `Axfer` / `Afrz` / `Appl` / `Stpf` transactions
-    /// (or any unrecognized type) skip the delta build entirely and run the
-    /// faster bare [`crate::apply::apply_block`] path — the REST endpoint
-    /// returns `NotFound` for those rounds, which is strictly preferable to
-    /// serving a known-incomplete `StateDelta` (app / asset / kv deltas,
-    /// `creatables`, and `state_proof_next` are all still
-    /// `TODO(#190)`-stubbed in the builder).
+    /// (or any unrecognized type) skip the delta build entirely — the REST
+    /// endpoint returns `NotFound` for those rounds, which is strictly
+    /// preferable to serving a known-incomplete `StateDelta` (app / asset /
+    /// kv deltas, `creatables`, and `state_proof_next` are all still
+    /// `TODO(#190)`-stubbed in the builder). Of those uncached blocks, one
+    /// containing an `appl` call still runs [`crate::apply::ApplyMode::Execute`]
+    /// (real AVM execution) rather than the cheaper bare
+    /// [`crate::apply::apply_block`] Replay path — see [`block_has_app_call`]
+    /// (issue #574) for why: box mutations only happen inside AVM
+    /// execution, and go-algorand's own `EvalDelta`/`ApplyData` carries no
+    /// box-content field for `Replay` to fall back on.
     ///
     /// **Known limitation even on cached rounds** (#190): a few
     /// `StateDelta` fields are still unconditionally defaulted by
@@ -2909,13 +2941,25 @@ impl SqliteLedger {
                 t.advance(block.round.0);
             }
             // Payset contains a transaction type the builder doesn't yet
-            // fully cover. Apply via the bare path and leave the cache
-            // empty — the handler will return `NotFound` for this round
-            // rather than a partial delta. Still advance the rolling
-            // window so stale entries from earlier cached rounds are
-            // evicted on schedule even when long runs of unsupported
-            // blocks intervene.
-            crate::apply::apply_block(self, block)?;
+            // fully cover. Leave the cache empty — the handler will return
+            // `NotFound` for this round rather than a partial delta. Still
+            // advance the rolling window so stale entries from earlier
+            // cached rounds are evicted on schedule even when long runs of
+            // unsupported blocks intervene.
+            //
+            // Issue #574: a block containing an `appl` call must still run
+            // the AVM for real (`ApplyMode::Execute`), or box mutations
+            // (create/put/replace/resize/splice/delete) are silently never
+            // applied to `LedgerStore` — see `block_has_app_call`'s doc
+            // comment for why `ApplyMode::Replay` can never observe them.
+            // Blocks with no `appl` transaction (Acfg/Axfer/Afrz/Stpf/Hb)
+            // cannot touch box storage, so they keep the cheaper Replay
+            // path.
+            if block_has_app_call(block) {
+                crate::apply::apply_block_with_mode(self, block, crate::apply::ApplyMode::Execute)?;
+            } else {
+                crate::apply::apply_block(self, block)?;
+            }
             self.delta_cache.advance(block.round.0);
             Ok(())
         }
@@ -7529,6 +7573,109 @@ mod tests {
         .unwrap();
         ledger.cache_state_delta(round, delta);
         ledger.commit_block().unwrap();
+    }
+
+    /// TDD regression for issue #574: the *real* default sync path
+    /// (`apply_block_caching_delta`, called unconditionally by
+    /// `bin/algod-rust/src/commands/sync.rs`'s non-`--avm-execute` branch,
+    /// which is the default) must still replicate box mutations from `appl`
+    /// transactions.
+    ///
+    /// Before the fix, `apply_block_caching_delta` routed any block whose
+    /// payset failed `block_state_delta_is_complete` (which excludes `Appl`
+    /// among other types) to the bare `apply_block` helper -- always
+    /// `ApplyMode::Replay`. Replay mode never runs the AVM, so it never
+    /// reaches the box-mutation call sites in `avm_context.rs`; a normally
+    /// synced node would silently never see this `box_put`, even though the
+    /// app call was itself successful (go-algorand's own `EvalDelta` /
+    /// `ApplyData` has no box-content field, so nothing in the block itself
+    /// could have replayed the box write either -- see issue #574).
+    #[test]
+    fn apply_block_caching_delta_replicates_box_put_for_real_sync_path() {
+        use algo_types::{AppParams, Block, BoxRef, SignedTransaction, StateSchema, Transaction};
+        use serde_bytes::ByteBuf;
+
+        let creator = Address([1u8; 32]);
+        let sender = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let app_id = 950u64;
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_account(
+            &creator,
+            AccountData {
+                micro_algos: 50_000_000,
+                total_created_apps: 1,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(
+            &sender,
+            AccountData {
+                micro_algos: 50_000_000,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(&fee_sink, AccountData::default());
+        ledger.set_app_params(
+            app_id,
+            AppParams {
+                creator,
+                approval_program: box_put_program("mybox", "hello"),
+                clear_state_program: vec![0x08, 0x81, 0x01], // v8, pushint 1
+                global_state: BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                extra_program_pages: 0,
+            },
+        );
+
+        let stx = SignedTransaction {
+            txn: Transaction {
+                txn_type: "appl".into(),
+                sender,
+                fee: 1_000,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                application_id: app_id,
+                on_completion: 0,
+                boxes: Some(vec![BoxRef {
+                    index: 0,
+                    name: Some(ByteBuf::from(b"mybox".to_vec())),
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stx],
+            ..Block::default()
+        };
+
+        // This is exactly what `commands/sync.rs`'s default (non-
+        // `--avm-execute`) branch calls per received block.
+        ledger.begin_block().unwrap();
+        ledger.apply_block_caching_delta(&block).unwrap();
+        ledger.commit_block().unwrap();
+
+        assert_eq!(
+            ledger.get_box(app_id, b"mybox"),
+            Some(b"hello".to_vec()),
+            "box_put via an appl transaction must be reflected in box \
+             storage even when the block arrives through the default \
+             (Replay-mode-gated) sync path, not just the --avm-execute / \
+             dev-mode Execute path"
+        );
     }
 
     /// TDD regression for issue #570's box-list `round` reconstruction:
