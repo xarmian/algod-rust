@@ -1243,9 +1243,27 @@ async fn get_application_boxes_paginated<N: NodeInterface>(
     // in the past cannot be served faithfully; only `None` (implicitly
     // "latest") or a round matching latest is supported. This mirrors
     // go-algorand's `errRoundGreaterThanTheLatest` check for the "future
-    // round" case; the "past round" case is a documented limitation of
-    // this node (tracked as a follow-up, see issue #536's audit) rather
-    // than silently returning data for the wrong round.
+    // round" case.
+    //
+    // The "past round" case is a real, investigated architecture gap, not
+    // an arbitrary limitation (issue #552): go-algorand itself only
+    // serves a bounded lookback here too (`accountUpdates.deltas` walked
+    // backward, bounded by `MaxAcctLookback`, default 4 --
+    // `ledger/acctupdates.go`'s `LookupKvPairsByPrefix` +
+    // `roundOffset`/`RoundOffsetError` in `../go-algorand`), so this is
+    // not a case of algod-rust lacking something go-algorand freely
+    // gives. algod-rust *does* have the matching building blocks --
+    // `SqliteLedger`'s `DeltaCache` (`delta_cache.rs`, 320-round rolling
+    // window, already wired to `GET /v2/deltas/{round}`, issue #190) and
+    // `StateDelta::kv_mods`'s `KvValueDelta { data, old_data }` shape are
+    // exactly what a backward reconstruction would need -- but
+    // `kv_mods` is never actually populated during block apply
+    // (`apply.rs` stubs it as `HashMap::new()` under a `TODO(#190)`
+    // comment; box create/put/replace/resize/splice/delete happen deep
+    // inside AVM execution in `avm_context.rs` with no delta recorded
+    // back up to the block's `StateDelta`). Wiring that up -- plus
+    // resolving `kv_mods`'s `String`-keyed type against arbitrary-byte
+    // box names -- is tracked as its own scoped follow-up, issue #570.
     if let Some(requested_round) = params.round {
         let latest_round = match node.status().await {
             Ok(status) => status.last_round,

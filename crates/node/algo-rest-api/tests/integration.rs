@@ -4320,6 +4320,39 @@ async fn get_application_boxes_round_greater_than_latest_returns_400() {
     );
 }
 
+/// Regression test pinning the current, intentional 400 for a `round`
+/// strictly older than latest (issue #552's investigated finding).
+///
+/// go-algorand itself only serves a bounded backward lookback for this
+/// query (`accountUpdates.deltas`, bounded by `MaxAcctLookback`,
+/// `ledger/acctupdates.go` in `../go-algorand`) -- so this isn't algod-rust
+/// lacking something go-algorand freely grants. algod-rust has the
+/// matching building blocks (`SqliteLedger`'s `DeltaCache` rolling window,
+/// `StateDelta::kv_mods`'s old/new-value shape) but `kv_mods` is never
+/// populated during block apply yet (`apply.rs`'s `TODO(#190)`), so a
+/// historically-accurate reconstruction isn't possible today. Wiring that
+/// up is tracked as its own scoped follow-up, issue #570. This test should
+/// be replaced with one asserting real historical data once #570 lands.
+#[tokio::test]
+async fn get_application_boxes_round_older_than_latest_returns_400() {
+    let node = MockNode::synced(); // status.last_round == 1000
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/406/boxes?round=999"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "historical round queries are not supported for application boxes"
+    );
+}
+
 /// Minimal percent-encoding for a `next-token` string (contains only
 /// base64 alphabet characters plus `:` and possibly `+`, `/`, `=`) when
 /// used as a raw query-string value in these tests.
