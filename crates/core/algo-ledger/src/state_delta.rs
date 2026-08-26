@@ -956,11 +956,22 @@ pub struct AppParamsDelta {
 ///
 /// `basics.AppParams` declares go-codec short tags (`codec:"approv"`,
 /// `codec:"clearp"`, `codec:"gs"`, `codec:"lsch"`/`"gsch"` via its embedded
-/// `StateSchemas`, `codec:"epp"`), not the full field names (issue #579,
-/// live-verified against a real go-algorand v4.7.0-stable node's
-/// `/v2/deltas/{round}` response). Note: go's `AppParams` also carries
-/// `Version` (`codec:"v"`) and `SizeSponsor` (`codec:"ss"`) fields this type
-/// doesn't yet track -- out of scope for this rename fix, filed separately.
+/// `StateSchemas`, `codec:"epp"`, `codec:"v"`, `codec:"ss"`), not the full
+/// field names (issue #579, live-verified against a real go-algorand
+/// v4.7.0-stable node's `/v2/deltas/{round}` response).
+///
+/// Issue #583: `Version`/`SizeSponsor` are carried here with their correct
+/// short tags, but nothing in algod-rust populates them yet with a real
+/// value -- `algo_types::AppParams` (the ledger's own app-params type)
+/// doesn't track either field at all, and more fundamentally
+/// `AccountDeltas::app_resources` (where an `AppParamsRecord` would live)
+/// is never populated from real apply-time state in the first place
+/// (`TODO(#190)` in `apply.rs`, `Vec::new()` always) -- so this type is
+/// not yet constructed anywhere outside its own tests. Both gaps are
+/// pre-existing and out of scope here; this fix only closes the
+/// wire-format gap so that whichever future work populates
+/// `app_resources` (superseding the stale `#190` TODO -- that issue is
+/// closed) has a complete, correctly-tagged type to fill in.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppParamsRecord {
     /// Go codec tag: `"approv"`.
@@ -983,6 +994,13 @@ pub struct AppParamsRecord {
     /// Go codec tag: `"epp"`.
     #[serde(rename = "epp", default, skip_serializing_if = "is_zero_u32")]
     pub extra_program_pages: u32,
+    /// Go codec tag: `"v"`.
+    #[serde(rename = "v", default, skip_serializing_if = "is_zero_u64")]
+    pub version: u64,
+    /// Go codec tag: `"ss"`. Non-zero only when the app pays MBR for extra
+    /// program pages / global schema via a sponsoring account.
+    #[serde(rename = "ss", default, skip_serializing_if = "is_default_address")]
+    pub size_sponsor: Address,
 }
 
 #[cfg(test)]
@@ -1121,6 +1139,8 @@ mod issue_579_short_codec_tag_wire_format_tests {
                 num_byte_slice: 4,
             },
             extra_program_pages: 1,
+            version: 0,
+            size_sponsor: Address([0u8; 32]),
         };
         let json = serde_json::to_value(&record).expect("must serialize");
         let obj = json.as_object().expect("encodes as a JSON object");
@@ -1145,6 +1165,59 @@ mod issue_579_short_codec_tag_wire_format_tests {
                  {full_name:?}: {obj:?}"
             );
         }
+    }
+
+    /// Issue #583: `basics.AppParams` also declares `Version` (`codec:"v"`)
+    /// and `SizeSponsor` (`codec:"ss"`) -- fields the #579 short-codec-tag
+    /// rewrite of `AppParamsRecord` didn't carry at all (a distinct
+    /// missing-fields bug, not a naming bug). Because `AppParams` declares
+    /// the `_struct codec:",omitempty,omitemptyarray"` marker, both fields
+    /// are omitted from the wire when zero-valued (pinned by the sibling
+    /// `..._omitted_when_zero` test below) but must appear under their
+    /// short tags -- never the full Go field name -- when non-zero.
+    #[test]
+    fn app_params_record_json_uses_go_short_codec_tags_for_version_and_size_sponsor() {
+        let record = AppParamsRecord {
+            approval_program: vec![0x06, 0x81, 0x01],
+            clear_state_program: vec![0x06, 0x81, 0x01],
+            global_state: None,
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+            version: 7,
+            size_sponsor: Address([9u8; 32]),
+        };
+        let json = serde_json::to_value(&record).expect("must serialize");
+        let obj = json.as_object().expect("encodes as a JSON object");
+
+        assert_eq!(obj["v"], serde_json::json!(7), "obj: {obj:?}");
+        assert!(obj.contains_key("ss"), "obj: {obj:?}");
+        assert!(obj.get("Version").is_none(), "obj: {obj:?}");
+        assert!(obj.get("SizeSponsor").is_none(), "obj: {obj:?}");
+
+        let back: AppParamsRecord = serde_json::from_value(json).expect("must deserialize");
+        assert_eq!(back, record);
+    }
+
+    /// `Version`/`SizeSponsor` zero-valued must be omitted entirely (go's
+    /// `_struct codec:",omitempty,omitemptyarray"` marker on `AppParams`),
+    /// matching every other field on this type.
+    #[test]
+    fn app_params_record_omits_zero_version_and_size_sponsor() {
+        let record = AppParamsRecord {
+            approval_program: Vec::new(),
+            clear_state_program: Vec::new(),
+            global_state: None,
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+            version: 0,
+            size_sponsor: Address([0u8; 32]),
+        };
+        let json = serde_json::to_value(&record).expect("must serialize");
+        let obj = json.as_object().expect("encodes as a JSON object");
+        assert!(!obj.contains_key("v"), "obj: {obj:?}");
+        assert!(!obj.contains_key("ss"), "obj: {obj:?}");
     }
 }
 
