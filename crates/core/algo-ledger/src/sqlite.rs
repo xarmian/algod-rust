@@ -4,7 +4,7 @@
 //! trackerdb table layout. AccountData is serialized as msgpack blobs
 //! using Go-compatible codec keys.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -549,8 +549,11 @@ const BOX_PREFIX: &[u8] = b"bx:";
 
 /// Build the full kvstore key for a box: `"bx:" + big-endian(app_id) + box_name`.
 ///
-/// This matches go-algorand's `apps.MakeBoxKey(appIdx, name)`.
-fn make_box_key(app_id: u64, name: &[u8]) -> Vec<u8> {
+/// This matches go-algorand's `apps.MakeBoxKey(appIdx, name)`. `pub(crate)`
+/// so `avm_context.rs` can key its per-round `kv_mods` box-delta recorder
+/// (issue #570) with the same raw bytes this module uses for the box store
+/// itself, keeping both sides byte-exact and consistent.
+pub(crate) fn make_box_key(app_id: u64, name: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(BOX_PREFIX.len() + 8 + name.len());
     key.extend_from_slice(BOX_PREFIX);
     key.extend_from_slice(&app_id.to_be_bytes());
@@ -2653,6 +2656,121 @@ impl SqliteLedger {
     /// Number of entries currently held in the delta cache. Test helper.
     pub fn delta_cache_len(&self) -> usize {
         self.delta_cache.len()
+    }
+
+    /// Reconstruct an application's full box-name/value map as of `round`
+    /// (a round strictly older than the latest committed round), by walking
+    /// the in-memory delta cache's `kv_mods` backward from latest down to
+    /// `round + 1` and applying each touched key's `old_data` on top of the
+    /// current committed state (issue #570).
+    ///
+    /// Returns `None` when `round` is not reconstructable: at or beyond
+    /// latest (the caller should use the normal, non-historical lookup
+    /// instead), or older than [`Self::delta_cache_min_round`] -- the
+    /// `DeltaCache`'s rolling window, analogous to go-algorand's own
+    /// `RoundOffsetError` for a round outside `accountUpdates.deltas`'
+    /// lookback (`ledger/acctupdates.go`).
+    ///
+    /// Walking backward and taking the *last-applied* (i.e. smallest-round)
+    /// touch's `old_data` for each key is what recovers the value at the
+    /// round boundary: `kv_mods` for round `r` records the box's value
+    /// immediately before `r`'s block was applied, so the smallest `r` in
+    /// `(round, latest]` that touched a given key tells us exactly what
+    /// that key held at the end of `round`. A key untouched anywhere in
+    /// that range is unchanged since `round`, so the current committed
+    /// value is already correct and needs no adjustment.
+    pub fn reconstruct_box_state_at_round(
+        &self,
+        app_id: u64,
+        round: u64,
+    ) -> Option<HashMap<Vec<u8>, Vec<u8>>> {
+        let latest = self.current_round().0;
+        if round >= latest {
+            return None;
+        }
+        if round < self.delta_cache_min_round() {
+            return None;
+        }
+
+        // Start from the current committed box state for this app.
+        let mut state: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        for name in self.box_keys_for_app(app_id) {
+            if let Some(v) = self.get_box(app_id, &name) {
+                state.insert(name, v);
+            }
+        }
+
+        let app_prefix = make_box_key(app_id, b"");
+        for r in (round + 1..=latest).rev() {
+            let Some(delta) = self.delta_cache.get(r) else {
+                continue;
+            };
+            for (key, kv_delta) in &delta.kv_mods {
+                let Some(name) = key.strip_prefix(app_prefix.as_slice()) else {
+                    continue;
+                };
+                if kv_delta.old_data.is_empty() {
+                    state.remove(name);
+                } else {
+                    state.insert(name.to_vec(), kv_delta.old_data.clone());
+                }
+            }
+        }
+
+        Some(state)
+    }
+
+    /// Historical variant of [`box_keys_by_prefix_paginated`
+    /// default](crate::store_trait::LedgerStore::box_keys_by_prefix_paginated):
+    /// filters, sorts, and paginates [`Self::reconstruct_box_state_at_round`]'s
+    /// output the same way the live path does, so callers get identical
+    /// ordering/pagination semantics for a historical round (issue #570).
+    /// Returns `None` when the round can't be reconstructed (see
+    /// `reconstruct_box_state_at_round`).
+    #[allow(clippy::type_complexity)]
+    pub fn lookup_kv_pairs_by_prefix_at_round(
+        &self,
+        app_id: u64,
+        round: u64,
+        prefix: &[u8],
+        cursor: Option<&[u8]>,
+        limit: Option<u64>,
+        include_values: bool,
+    ) -> Option<(crate::store_trait::BoxPage, bool)> {
+        let state = self.reconstruct_box_state_at_round(app_id, round)?;
+
+        let mut names: Vec<Vec<u8>> = state
+            .keys()
+            .filter(|name| name.starts_with(prefix))
+            .filter(|name| match cursor {
+                Some(c) => name.as_slice() > c,
+                None => true,
+            })
+            .cloned()
+            .collect();
+        names.sort();
+
+        let more_data = match limit {
+            Some(l) => (names.len() as u64) > l,
+            None => false,
+        };
+        if let Some(l) = limit {
+            names.truncate(l as usize);
+        }
+
+        let results = names
+            .into_iter()
+            .map(|name| {
+                let value = if include_values {
+                    state.get(&name).cloned()
+                } else {
+                    None
+                };
+                (name, value)
+            })
+            .collect();
+
+        Some((results, more_data))
     }
 
     /// Apply a block and, when safe, populate the in-memory delta cache as
@@ -7361,6 +7479,221 @@ mod tests {
             committed_root(true),
             "enabling the group tracer must not change the committed trie root"
         );
+    }
+
+    /// Build a v8 program that `box_put`s a fixed-size value into `name` and
+    /// approves, for issue #570's historical-box-reconstruction tests.
+    fn box_put_program(name: &str, value: &str) -> Vec<u8> {
+        let source = format!(
+            "#pragma version 8\nbyte \"{name}\"\nbyte \"{value}\"\nbox_put\nint 1\nreturn\n"
+        );
+        algo_avm::assembler::assemble_string(&source)
+            .expect("box_put program must assemble")
+            .program
+    }
+
+    /// Build a v8 program that `box_del`s `name` and approves.
+    fn box_del_program(name: &str) -> Vec<u8> {
+        let source = format!("#pragma version 8\nbyte \"{name}\"\nbox_del\npop\nint 1\nreturn\n");
+        algo_avm::assembler::assemble_string(&source)
+            .expect("box_del program must assemble")
+            .program
+    }
+
+    /// Apply `stx` as round `round`'s sole payset entry in Execute mode
+    /// (so any box opcodes really run), caching the resulting `StateDelta`
+    /// into the ledger's `DeltaCache` the same way a real Execute-mode
+    /// apply driver would (issue #570 -- `apply_block_caching_delta`
+    /// itself stays Replay-mode-only; see `apply_block_with_delta_mode`'s
+    /// doc comment for why).
+    fn apply_execute_round(
+        ledger: &mut SqliteLedger,
+        round: u64,
+        fee_sink: Address,
+        stx: algo_types::SignedTransaction,
+    ) {
+        use algo_types::Block;
+        let block = Block {
+            round: Round(round),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stx],
+            ..Block::default()
+        };
+        ledger.begin_block().unwrap();
+        let delta = crate::apply::apply_block_with_delta_mode(
+            ledger,
+            &block,
+            crate::apply::ApplyMode::Execute,
+        )
+        .unwrap();
+        ledger.cache_state_delta(round, delta);
+        ledger.commit_block().unwrap();
+    }
+
+    /// TDD regression for issue #570's box-list `round` reconstruction:
+    /// across a box created, mutated, and deleted at three different
+    /// rounds, `reconstruct_box_state_at_round` must recover the exact
+    /// value the box held at the end of each historical round.
+    #[test]
+    fn reconstruct_box_state_at_round_across_create_mutate_delete() {
+        use algo_types::{AppParams, BoxRef, SignedTransaction, StateSchema, Transaction};
+        use serde_bytes::ByteBuf;
+
+        let creator = Address([1u8; 32]);
+        let sender = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let app_id = 900u64;
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_account(
+            &creator,
+            AccountData {
+                micro_algos: 50_000_000,
+                total_created_apps: 1,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(
+            &sender,
+            AccountData {
+                micro_algos: 50_000_000,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(&fee_sink, AccountData::default());
+        ledger.set_app_params(
+            app_id,
+            AppParams {
+                creator,
+                approval_program: box_put_program("mybox", "aaaaa"),
+                clear_state_program: vec![0x08, 0x81, 0x01], // v8, pushint 1
+                global_state: BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                extra_program_pages: 0,
+            },
+        );
+
+        let appl_txn = |fee: u64| SignedTransaction {
+            txn: Transaction {
+                txn_type: "appl".into(),
+                sender,
+                fee,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                application_id: app_id,
+                on_completion: 0,
+                boxes: Some(vec![BoxRef {
+                    index: 0,
+                    name: Some(ByteBuf::from(b"mybox".to_vec())),
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Round 1: create the box with "aaaaa".
+        apply_execute_round(&mut ledger, 1, fee_sink, appl_txn(1_000));
+
+        // Round 2: mutate to "bbbbb" (same size, box_put requires it).
+        ledger.set_app_params(
+            app_id,
+            AppParams {
+                creator,
+                approval_program: box_put_program("mybox", "bbbbb"),
+                clear_state_program: vec![0x08, 0x81, 0x01],
+                global_state: BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                extra_program_pages: 0,
+            },
+        );
+        apply_execute_round(&mut ledger, 2, fee_sink, appl_txn(1_001));
+
+        // Round 3: delete the box.
+        ledger.set_app_params(
+            app_id,
+            AppParams {
+                creator,
+                approval_program: box_del_program("mybox"),
+                clear_state_program: vec![0x08, 0x81, 0x01],
+                global_state: BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                extra_program_pages: 0,
+            },
+        );
+        apply_execute_round(&mut ledger, 3, fee_sink, appl_txn(1_002));
+
+        // Current (round 3) state: box deleted.
+        assert_eq!(ledger.get_box(app_id, b"mybox"), None);
+
+        // Historical reconstruction.
+        let at_round_2 = ledger
+            .reconstruct_box_state_at_round(app_id, 2)
+            .expect("round 2 is within the delta cache window");
+        assert_eq!(at_round_2.get(b"mybox".as_slice()), Some(&b"bbbbb".to_vec()));
+
+        let at_round_1 = ledger
+            .reconstruct_box_state_at_round(app_id, 1)
+            .expect("round 1 is within the delta cache window");
+        assert_eq!(at_round_1.get(b"mybox".as_slice()), Some(&b"aaaaa".to_vec()));
+
+        let at_round_0 = ledger
+            .reconstruct_box_state_at_round(app_id, 0)
+            .expect("round 0 is within the delta cache window");
+        assert!(
+            !at_round_0.contains_key(b"mybox".as_slice()),
+            "box did not exist before round 1"
+        );
+
+        // "Latest" (round 3) and beyond are not historical queries.
+        assert!(ledger.reconstruct_box_state_at_round(app_id, 3).is_none());
+        assert!(ledger.reconstruct_box_state_at_round(app_id, 4).is_none());
+
+        // Paginated wrapper matches the raw reconstruction for the same round.
+        let (page, more) = ledger
+            .lookup_kv_pairs_by_prefix_at_round(app_id, 1, b"", None, None, true)
+            .expect("round 1 is within the delta cache window");
+        assert!(!more);
+        assert_eq!(page, vec![(b"mybox".to_vec(), Some(b"aaaaa".to_vec()))]);
+    }
+
+    /// A round older than the `DeltaCache`'s retained window must fail to
+    /// reconstruct (issue #570's acceptance criterion: still 400s, but for
+    /// the documented window-boundary reason rather than a blanket
+    /// "not supported").
+    #[test]
+    fn reconstruct_box_state_at_round_outside_window_returns_none() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        // Directly advance the delta cache's window past round 1 without
+        // going through 320 real rounds, mirroring how `DeltaCache::advance`
+        // is exercised in `delta_cache.rs`'s own unit tests.
+        ledger
+            .delta_cache
+            .advance(1 + crate::delta_cache::DEFAULT_WINDOW_SIZE as u64);
+        ledger.set_current_round(Round(1 + crate::delta_cache::DEFAULT_WINDOW_SIZE as u64));
+
+        assert!(ledger.reconstruct_box_state_at_round(1, 0).is_none());
     }
 
     #[test]

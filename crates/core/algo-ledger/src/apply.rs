@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use algo_avm::eval::{
     run_approval_program, run_approval_program_with_tracer, run_clear_state_program,
@@ -26,6 +27,11 @@ use crate::rewards::apply_rewards;
 // `use super::*` in the test module from bringing the trait into scope,
 // which would shadow LedgerState's inherent `get_or_default_account(&mut self)
 // -> &mut AccountData` with the trait's `get_or_default_account(&self) -> AccountData`.
+
+/// Box-modification deltas accumulated during a block apply, keyed by the
+/// raw KV-store key bytes (`make_box_key`). See [`apply_block_with_delta_mode`]
+/// and [`crate::state_delta::StateDelta::kv_mods`] (issue #570).
+pub type KvModsMap = std::collections::HashMap<Vec<u8>, crate::state_delta::KvValueDelta>;
 
 /// Results of applying a transaction, capturing all side-effect data.
 ///
@@ -123,6 +129,12 @@ pub struct ApplyContext {
     /// `.take()` by the caller so a stale value never leaks into an
     /// unrelated later transaction.
     pub failed_eval_delta: Cell<Option<rmpv::Value>>,
+    /// Shared per-round box-modification recorder for `StateDelta.kv_mods`
+    /// (issue #570). Only set (by [`apply_block_with_delta_mode`]) when the
+    /// caller runs in [`ApplyMode::Execute`] and wants box deltas back —
+    /// `Replay` mode never mutates box storage (box mutations only happen
+    /// inside AVM execution), so there is nothing to record there.
+    pub kv_mods_recorder: Option<crate::avm_context::KvModsRecorder>,
 }
 
 /// AVM evaluation overrides applied by the simulation engine.
@@ -158,6 +170,7 @@ impl ApplyContext {
             consensus: ConsensusParams::default(),
             avm_overrides: AvmEvalOverrides::default(),
             failed_eval_delta: Cell::new(None),
+            kv_mods_recorder: None,
         }
     }
 
@@ -180,6 +193,9 @@ impl ApplyContext {
         if let Some(named) = &self.avm_overrides.unnamed_tracking {
             avm_ctx.enable_unnamed_resource_tracking(named.clone());
         }
+        if let Some(recorder) = &self.kv_mods_recorder {
+            avm_ctx.kv_mods_recorder = Some(recorder.clone());
+        }
     }
 }
 
@@ -191,7 +207,16 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, ApplyMode::Replay, false, None, None, None)
+    apply_block_impl(
+        store,
+        block,
+        ApplyMode::Replay,
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Apply a full block to the ledger state with the specified mode.
@@ -202,7 +227,7 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, mode, false, None, None, None)
+    apply_block_impl(store, block, mode, false, None, None, None, None)
 }
 
 /// Apply a full block to the ledger state with validation enabled.
@@ -214,7 +239,16 @@ pub fn apply_block_validating<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, ApplyMode::Replay, true, None, None, None)
+    apply_block_impl(
+        store,
+        block,
+        ApplyMode::Replay,
+        true,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Apply a full block (Execute mode) while capturing per-transaction-group
@@ -235,6 +269,7 @@ pub fn apply_block_capturing_group_deltas<L: crate::store_trait::LedgerStore>(
         None,
         Some(group_deltas),
         None,
+        None,
     )
 }
 
@@ -251,8 +286,35 @@ pub fn apply_block_capturing_apply_data<L: crate::store_trait::LedgerStore>(
     mode: ApplyMode,
 ) -> Result<Vec<ApplyData>, AlgoError> {
     let mut out = Vec::with_capacity(block.payset.len());
-    apply_block_impl(store, block, mode, false, None, None, Some(&mut out))?;
+    apply_block_impl(store, block, mode, false, None, None, Some(&mut out), None)?;
     Ok(out)
+}
+
+/// Like [`apply_block_capturing_apply_data`], but also returns the box
+/// deltas recorded during the apply (issue #570) — non-empty only in
+/// `ApplyMode::Execute` (Replay mode never runs the AVM, so it can never
+/// observe box mutations; see [`apply_block_with_delta_mode`]'s doc
+/// comment). Used by the dev-mode block producer, which already runs
+/// Execute mode for real, so it can cache a `kv_mods`-populated delta and
+/// make historical box-list queries work for locally-produced blocks.
+pub fn apply_block_capturing_apply_data_with_kv_mods<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+) -> Result<(Vec<ApplyData>, KvModsMap), AlgoError> {
+    let mut out = Vec::with_capacity(block.payset.len());
+    let mut kv_mods = std::collections::HashMap::new();
+    apply_block_impl(
+        store,
+        block,
+        mode,
+        false,
+        None,
+        None,
+        Some(&mut out),
+        Some(&mut kv_mods),
+    )?;
+    Ok((out, kv_mods))
 }
 
 /// Build a `StateDelta` balance record from an account's post-state, matching
@@ -305,14 +367,40 @@ fn transaction_id(txn: &algo_types::Transaction) -> algo_types::Digest {
     algo_types::Digest(hash)
 }
 
+/// Apply a full block and return the resulting [`StateDelta`], using
+/// `ApplyMode::Replay`. See [`apply_block_with_delta_mode`] for the
+/// `Execute`-mode variant that can populate `kv_mods` with real box deltas
+/// (issue #570).
+pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<crate::state_delta::StateDelta, AlgoError> {
+    apply_block_with_delta_mode(store, block, ApplyMode::Replay)
+}
+
 /// Apply a full block and return the resulting [`StateDelta`].
 ///
 /// Wraps [`apply_block_impl`]: snapshots pre-state for all addresses
 /// referenced in the payset (and end-of-block participation lists), applies
 /// the block, then diffs pre vs post state to build the delta.
-pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
+///
+/// `mode` controls how the block is applied. `Replay` (the historical
+/// default, still what [`apply_block_with_delta`] uses) never runs the AVM,
+/// so it can never observe box mutations — box create/put/replace/resize/
+/// splice/delete only happen inside AVM execution
+/// (`avm_context.rs`), and go-algorand's own `ApplyData`/`EvalDelta` (which
+/// `Replay` mode replays from) carries no box-content field either, so a
+/// block replayed from recorded `EvalDelta` alone genuinely cannot know
+/// what changed in box storage — this is a go-algorand-shared limitation,
+/// not something `Replay` mode is missing relative to the reference node.
+/// `Execute` mode runs the AVM for real, so it *can* populate `kv_mods`
+/// with real box deltas (issue #570); callers that want historical box-list
+/// reconstruction (`SqliteLedger`'s `DeltaCache`) need an `Execute`-mode
+/// apply path (e.g. dev-mode block production) to get non-empty `kv_mods`.
+pub fn apply_block_with_delta_mode<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
+    mode: ApplyMode,
 ) -> Result<crate::state_delta::StateDelta, AlgoError> {
     use std::collections::{HashMap, HashSet};
 
@@ -352,7 +440,17 @@ pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
     let prev_timestamp = 0i64;
 
     // ── 3. Apply the block ────────────────────────────────────────
-    apply_block_impl(store, block, ApplyMode::Replay, false, None, None, None)?;
+    let mut kv_mods: HashMap<Vec<u8>, crate::state_delta::KvValueDelta> = HashMap::new();
+    apply_block_impl(
+        store,
+        block,
+        mode,
+        false,
+        None,
+        None,
+        None,
+        Some(&mut kv_mods),
+    )?;
 
     // ── 4. Build the StateDelta by diffing pre vs post state ──────
     let mut accts = Vec::new();
@@ -472,8 +570,7 @@ pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
             // TODO(#190): Track asset resource deltas (asset params + holding changes).
             asset_resources: Vec::new(),
         },
-        // TODO(#190): Track KV (box) modifications during block apply.
-        kv_mods: HashMap::new(),
+        kv_mods,
         txids,
         txleases: if txleases.is_empty() {
             None
@@ -553,6 +650,7 @@ fn collect_txn_addresses(
 /// NOT rolled back — the caller should treat the state as corrupted on error.
 /// In practice, committed blocks are already validated and should never
 /// produce errors — the checks here are defensive safety nets.
+#[allow(clippy::too_many_arguments)]
 fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
@@ -561,7 +659,15 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     mut tracer: Option<&mut dyn EvalTracer>,
     mut group_deltas: Option<&mut crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
+    kv_mods_out: Option<&mut KvModsMap>,
 ) -> Result<(), AlgoError> {
+    // Issue #570: only allocate the shared box-delta recorder when a caller
+    // actually wants `kv_mods` back (Execute mode, via
+    // `apply_block_with_delta_mode`) — this keeps the hot Replay-mode sync
+    // path free of the extra `Rc<RefCell<_>>` bookkeeping.
+    let kv_mods_recorder = kv_mods_out
+        .is_some()
+        .then(|| std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())));
     // Validate round monotonicity.
     let expected = Round(store.current_round().0 + 1);
     if block.round != expected {
@@ -615,6 +721,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
         consensus: consensus.clone(),
         avm_overrides: Default::default(),
         failed_eval_delta: Cell::new(None),
+        kv_mods_recorder: kv_mods_recorder.clone(),
     };
 
     // Re-borrow the tracer per iteration with `Option::as_deref_mut` so
@@ -886,6 +993,13 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     let txtail_data = algo_codec::canonical_encode_txtail_round(&txtail);
     if let Err(e) = store.put_txtail(block.round.0, &txtail_data) {
         tracing::warn!("put_txtail failed for round {}: {e}", block.round.0);
+    }
+
+    // Issue #570: hand the accumulated box deltas back to the caller.
+    if let (Some(out), Some(recorder)) = (kv_mods_out, kv_mods_recorder) {
+        *out = Rc::try_unwrap(recorder)
+            .map(RefCell::into_inner)
+            .unwrap_or_else(|rc| rc.borrow().clone());
     }
 
     Ok(())
@@ -5528,6 +5642,7 @@ mod tests {
             consensus,
             avm_overrides: Default::default(),
             failed_eval_delta: Cell::new(None),
+            kv_mods_recorder: None,
         }
     }
 
@@ -6231,6 +6346,7 @@ mod tests {
             consensus,
             avm_overrides: Default::default(),
             failed_eval_delta: Cell::new(None),
+            kv_mods_recorder: None,
         };
         let stx = heartbeat_txn(sender, target, vote_id, 10, 1_000);
         let result = apply_transaction(&mut state, &stx, &ctx, 0);
@@ -6412,6 +6528,7 @@ mod tests {
             consensus,
             avm_overrides: Default::default(),
             failed_eval_delta: Cell::new(None),
+            kv_mods_recorder: None,
         }
     }
 
@@ -7256,6 +7373,7 @@ mod tests {
             consensus,
             avm_overrides: Default::default(),
             failed_eval_delta: Cell::new(None),
+            kv_mods_recorder: None,
         };
 
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();

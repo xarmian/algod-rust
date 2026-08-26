@@ -91,6 +91,12 @@ struct MockNode {
     /// the mock (unlike `keys_by_prefix` above, which ignores its prefix
     /// argument), so pagination tests exercise real handler behavior.
     box_store: BTreeMap<u64, BTreeMap<Vec<u8>, Vec<u8>>>,
+    /// Historical box state for `lookup_kv_pairs_by_prefix_at_round`
+    /// (issue #570), keyed by (app_id, round) -> box name -> value. A
+    /// missing (app_id, round) entry simulates "round outside the node's
+    /// retained lookback window" (`Ok(None)`), matching
+    /// `SqliteLedger::reconstruct_box_state_at_round`'s real contract.
+    historical_box_store: BTreeMap<(u64, u64), BTreeMap<Vec<u8>, Vec<u8>>>,
     /// Total boxes count results, keyed by app_id. Returns (total_boxes, round).
     total_boxes_map: BTreeMap<u64, (u64, u64)>,
     /// Max API boxes per application.
@@ -191,6 +197,7 @@ impl Clone for MockNode {
             kv_lookups: self.kv_lookups.clone(),
             keys_by_prefix: self.keys_by_prefix.clone(),
             box_store: self.box_store.clone(),
+            historical_box_store: self.historical_box_store.clone(),
             total_boxes_map: self.total_boxes_map.clone(),
             max_api_boxes: self.max_api_boxes,
             blocks: self.blocks.clone(),
@@ -302,6 +309,7 @@ impl MockNode {
             kv_lookups: BTreeMap::new(),
             keys_by_prefix: BTreeMap::new(),
             box_store: BTreeMap::new(),
+            historical_box_store: BTreeMap::new(),
             total_boxes_map: BTreeMap::new(),
             max_api_boxes: 100_000,
             blocks: BTreeMap::new(),
@@ -735,6 +743,52 @@ impl NodeInterface for MockNode {
             .collect();
 
         Ok((results, 1000, more_data))
+    }
+
+    async fn lookup_kv_pairs_by_prefix_at_round(
+        &self,
+        app_id: u64,
+        round: u64,
+        prefix: &[u8],
+        cursor: Option<&[u8]>,
+        limit: Option<u64>,
+        include_values: bool,
+    ) -> Result<Option<(algo_ledger::store_trait::BoxPage, bool)>, NodeError> {
+        let Some(boxes) = self.historical_box_store.get(&(app_id, round)) else {
+            return Ok(None);
+        };
+        let mut names: Vec<Vec<u8>> = boxes
+            .keys()
+            .filter(|name| name.starts_with(prefix))
+            .filter(|name| match cursor {
+                Some(c) => name.as_slice() > c,
+                None => true,
+            })
+            .cloned()
+            .collect();
+        names.sort();
+
+        let more_data = match limit {
+            Some(l) => (names.len() as u64) > l,
+            None => false,
+        };
+        if let Some(l) = limit {
+            names.truncate(l as usize);
+        }
+
+        let results = names
+            .into_iter()
+            .map(|name| {
+                let value = if include_values {
+                    boxes.get(&name).cloned()
+                } else {
+                    None
+                };
+                (name, value)
+            })
+            .collect();
+
+        Ok(Some((results, more_data)))
     }
 
     async fn total_boxes(&self, app_id: u64) -> Result<(u64, u64), NodeError> {
@@ -4320,36 +4374,66 @@ async fn get_application_boxes_round_greater_than_latest_returns_400() {
     );
 }
 
-/// Regression test pinning the current, intentional 400 for a `round`
-/// strictly older than latest (issue #552's investigated finding).
-///
-/// go-algorand itself only serves a bounded backward lookback for this
-/// query (`accountUpdates.deltas`, bounded by `MaxAcctLookback`,
-/// `ledger/acctupdates.go` in `../go-algorand`) -- so this isn't algod-rust
-/// lacking something go-algorand freely grants. algod-rust has the
-/// matching building blocks (`SqliteLedger`'s `DeltaCache` rolling window,
-/// `StateDelta::kv_mods`'s old/new-value shape) but `kv_mods` is never
-/// populated during block apply yet (`apply.rs`'s `TODO(#190)`), so a
-/// historically-accurate reconstruction isn't possible today. Wiring that
-/// up is tracked as its own scoped follow-up, issue #570. This test should
-/// be replaced with one asserting real historical data once #570 lands.
+/// Issue #570: a `round` strictly older than latest, but within the node's
+/// retained lookback window, now serves real historical box data instead
+/// of the old blanket 400 (issue #552's investigated finding, resolved by
+/// wiring `StateDelta.kv_mods` through to `lookup_kv_pairs_by_prefix_at_round`).
 #[tokio::test]
-async fn get_application_boxes_round_older_than_latest_returns_400() {
-    let node = MockNode::synced(); // status.last_round == 1000
+async fn get_application_boxes_round_older_than_latest_serves_historical_data() {
+    let mut node = MockNode::synced(); // status.last_round == 1000
+    node.historical_box_store.insert(
+        (406, 999),
+        BTreeMap::from([(b"mybox".to_vec(), b"historical-value".to_vec())]),
+    );
     let server = TestServer::start(node).await;
 
     let resp = server
         .client
-        .get(server.url("/v2/applications/406/boxes?round=999"))
+        .get(server.url("/v2/applications/406/boxes?round=999&include=values"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["round"].as_u64().unwrap(), 999);
+    let boxes = body["boxes"].as_array().unwrap();
+    assert_eq!(boxes.len(), 1);
+
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let name = STANDARD.decode(boxes[0]["name"].as_str().unwrap()).unwrap();
+    assert_eq!(name, b"mybox");
+    let value = STANDARD
+        .decode(boxes[0]["value"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(value, b"historical-value");
+}
+
+/// A `round` strictly older than latest that the node cannot reconstruct
+/// (outside its retained delta-cache lookback window, or the round was
+/// never cached) still 400s, but for the window-boundary reason rather
+/// than a blanket "not supported" -- mirroring go-algorand's own
+/// `RoundOffsetError` for a round older than `accountUpdates.deltas`'
+/// bounded lookback (issue #570's acceptance criterion).
+#[tokio::test]
+async fn get_application_boxes_round_outside_lookback_window_returns_400() {
+    let node = MockNode::synced(); // status.last_round == 1000, no historical_box_store entry
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/406/boxes?round=1"))
         .header("X-Algo-API-Token", &server.api_token)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(
-        body["message"].as_str().unwrap(),
-        "historical round queries are not supported for application boxes"
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("lookback window") || message.contains("outside"),
+        "expected a window-boundary-specific message, got: {message}"
     );
 }
 

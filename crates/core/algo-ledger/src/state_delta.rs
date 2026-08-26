@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use algo_types::{Address, BlockHeader, Digest, Round, StateSchema};
 
@@ -89,6 +89,52 @@ pub struct KvValueDelta {
     #[serde(rename = "OldData", default, skip_serializing_if = "Vec::is_empty")]
     #[serde(with = "serde_bytes")]
     pub old_data: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// KvMods key-type note (issue #570)
+// ---------------------------------------------------------------------------
+//
+// go-algorand's `ledgercore.StateDelta.KvMods` is `map[string][]byte`, where
+// the key is the *raw* KV-store key (`"bx:" + big-endian(app_id) + box_name`,
+// see `apps.MakeBoxKey`) cast to a Go `string` without any UTF-8 validation —
+// box names are arbitrary bytes, not guaranteed valid UTF-8. Rust's `String`
+// cannot losslessly hold that, so `kv_mods` is keyed by `Vec<u8>` internally
+// (matching this crate's own existing convention for box keys, e.g.
+// `avm_context.rs`'s `available_boxes: HashMap<(u64, Vec<u8>), bool>` and
+// `sqlite.rs`'s `make_box_key`) — this is what the round-reconstruction logic
+// in `SqliteLedger` uses, and it stays byte-exact for every key.
+//
+// The wire encoding (JSON and msgpack, both driven through
+// `[de]serialize_kv_mods` below) renders each key via
+// `String::from_utf8_lossy`. This intentionally matches go's own *JSON*
+// behavior: `encoding/json` also cannot emit invalid UTF-8 inside a JSON
+// string and substitutes the Unicode replacement character (U+FFFD) for
+// invalid byte sequences when marshaling a Go string. For msgpack, go's
+// codec writes the raw string bytes verbatim (a msgpack "str" is not
+// required to be valid UTF-8), so a box name containing invalid UTF-8 would
+// make algod-rust's msgpack `kv_mods` output diverge from go's at the byte
+// level — a known, accepted limitation for that specific edge case (rare in
+// practice; box names are conventionally ASCII/UTF-8 identifiers). Exact
+// msgpack parity for non-UTF-8 box names, if ever needed, is out of scope
+// here and should be filed as its own follow-up.
+fn serialize_kv_mods<S: Serializer>(
+    map: &HashMap<Vec<u8>, KvValueDelta>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut m = serializer.serialize_map(Some(map.len()))?;
+    for (k, v) in map {
+        m.serialize_entry(&String::from_utf8_lossy(k), v)?;
+    }
+    m.end()
+}
+
+fn deserialize_kv_mods<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HashMap<Vec<u8>, KvValueDelta>, D::Error> {
+    let m: HashMap<String, KvValueDelta> = HashMap::deserialize(deserializer)?;
+    Ok(m.into_iter().map(|(k, v)| (k.into_bytes(), v)).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -643,9 +689,18 @@ pub struct StateDelta {
     #[serde(rename = "Accts", default)]
     pub accts: AccountDeltas,
 
-    /// Key-value (box) modifications, keyed by box key string.
-    #[serde(rename = "KvMods", default, skip_serializing_if = "HashMap::is_empty")]
-    pub kv_mods: HashMap<String, KvValueDelta>,
+    /// Key-value (box) modifications, keyed by the raw KV-store key bytes
+    /// (`"bx:" + big-endian(app_id) + box_name`). See the key-type note
+    /// above [`KvValueDelta`] (issue #570) for why this is `Vec<u8>`
+    /// internally but renders as a (possibly lossy) string on the wire.
+    #[serde(
+        rename = "KvMods",
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "serialize_kv_mods",
+        deserialize_with = "deserialize_kv_mods"
+    )]
+    pub kv_mods: HashMap<Vec<u8>, KvValueDelta>,
 
     /// Transaction IDs included in the block.
     #[serde(rename = "Txids", default, skip_serializing_if = "HashMap::is_empty")]
@@ -713,9 +768,16 @@ pub struct StateDeltaSubset {
     #[serde(rename = "Accts", default)]
     pub accts: AccountDeltas,
 
-    /// Key-value (box) modifications, keyed by box key string.
-    #[serde(rename = "KvMods", default, skip_serializing_if = "HashMap::is_empty")]
-    pub kv_mods: HashMap<String, KvValueDelta>,
+    /// Key-value (box) modifications, keyed by the raw KV-store key bytes.
+    /// See the key-type note above [`KvValueDelta`] (issue #570).
+    #[serde(
+        rename = "KvMods",
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "serialize_kv_mods",
+        deserialize_with = "deserialize_kv_mods"
+    )]
+    pub kv_mods: HashMap<Vec<u8>, KvValueDelta>,
 
     /// Transaction IDs included in the group.
     #[serde(rename = "Txids", default, skip_serializing_if = "HashMap::is_empty")]
