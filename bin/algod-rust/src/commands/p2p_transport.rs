@@ -15,21 +15,152 @@
 //! its pubsub/DHT stack into `algo-network`'s interfaces and node startup
 //! is this issue's job ("a later, separate sub-issue of the P2P epic
 //! (#544, see #542)").
+//!
+//! # Agreement traffic: gossipsub *and* the `/algorand-ws/2.2.0` stream (#560)
+//!
+//! Issue #560's investigation found that go-algorand v4.7.0-stable's own
+//! `gossipSubTags` map wires gossipsub up for the `TX` tag **only** — a
+//! real go-algorand P2P node never subscribes to (or publishes on) a
+//! gossipsub topic for proposals/votes/vote-bundles. Instead it opens one
+//! raw bidirectional libp2p stream per connected peer on the
+//! `/algorand-ws/2.2.0` protocol (`algo_p2p::wsproto`'s doc comment has the
+//! full go-source citation) and tunnels the same tag-prefixed message
+//! framing algo-network's own WS-gossip transport uses.
+//!
+//! This module now drives that stream in addition to gossipsub for AV/PP/VB
+//! (`Tag::AgreementVote`/`Tag::ProposalPayload`/`Tag::VoteBundle`):
+//! [`P2pTransport::start`] opens an outbound stream to every peer it dials
+//! and accepts inbound ones, and [`P2pTransport::publish`] fans a
+//! non-`TX` frame out over both gossipsub *and* every open stream. Against a
+//! real go-algorand peer, the gossipsub publish is a harmless no-op (go
+//! never subscribed) and the stream frame is what actually gets received;
+//! against another algod-rust `P2pTransport`, both paths deliver the same
+//! message (redundant but harmless — existing rust-to-rust tests below only
+//! ever consume one delivery per `recv`/`recv_timeout` call).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use algo_network::handler::{Multiplexer, TaggedMessageHandler, TaggedMessageValidatorHandler};
 use algo_network::{GossipNode, IncomingMessage, Peer, PeerOption, Router, Tag};
-use algo_p2p::{IdentityConfig, MessageValidationResult, P2pBehaviourEvent, P2pHost};
+use algo_p2p::{
+    build_headers, handshake_inbound, handshake_outbound, read_frame, write_frame, IdentityConfig,
+    MessageValidationResult, P2pBehaviourEvent, P2pHost, PeerMetaHeaders, ALGORAND_WS_PROTOCOL_V22,
+};
 use async_trait::async_trait;
+use libp2p::futures::{AsyncReadExt, StreamExt as _};
 use libp2p::multiaddr::Protocol;
-use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::{Stream as P2pRawStream, SwarmEvent};
 use libp2p::{gossipsub, kad, Multiaddr, PeerId};
 use tokio::sync::mpsc;
 
 use crate::config::P2pConfig;
+
+/// go's own `SupportedProtocolVersions`/`ProtocolVersion` for the
+/// `/algorand-ws/*` handshake (`algo_network::handshake::PROTOCOL_VERSION`
+/// — kept as a literal here rather than a cross-crate import since
+/// `algo-p2p` deliberately has no `algo-network` dependency; see
+/// `algo_p2p::wsproto`'s doc comment).
+const ALGORAND_WS_SUPPORTED_VERSIONS: &[&str] = &["2.2"];
+
+/// Registry of currently-established `/algorand-ws/2.2.0` streams, keyed by
+/// peer, used to fan agreement traffic out (see this module's doc comment).
+/// Each sender feeds a per-peer writer task a pre-framed (tag+payload)
+/// byte string, mirroring `algo_network::framing::encode_frame`'s output.
+type StreamPeers = Arc<Mutex<HashMap<PeerId, mpsc::UnboundedSender<Vec<u8>>>>>;
+
+/// Run the post-handshake read/write loop for one peer's `/algorand-ws`
+/// stream: registers a sender in `stream_peers` that
+/// [`P2pTransport::stream_broadcast`] fans frames out to, and dispatches
+/// every frame this peer sends into `mux` (the same [`Multiplexer`]
+/// gossipsub messages are dispatched to).
+fn spawn_ws_peer(
+    peer_id: PeerId,
+    stream: P2pRawStream,
+    mux: Arc<Multiplexer>,
+    stream_peers: StreamPeers,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    stream_peers
+        .lock()
+        .expect("stream_peers mutex poisoned")
+        .insert(peer_id, tx);
+
+    tokio::spawn(async move {
+        let (mut read_half, mut write_half) = stream.split();
+
+        let writer = async {
+            while let Some(frame) = rx.recv().await {
+                if write_frame(&mut write_half, &frame).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let reader = async {
+            loop {
+                let body = match read_frame(&mut read_half).await {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                if let Ok((tag, payload)) = algo_network::framing::decode_frame(&body) {
+                    let msg = IncomingMessage::new(
+                        tag,
+                        payload.to_vec(),
+                        peer_id.to_string(),
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                    );
+                    let _ = mux.handle(msg).await;
+                }
+            }
+        };
+        tokio::select! {
+            _ = writer => {}
+            _ = reader => {}
+        }
+        stream_peers
+            .lock()
+            .expect("stream_peers mutex poisoned")
+            .remove(&peer_id);
+    });
+}
+
+/// Complete the inbound (listener) side of the `/algorand-ws/2.2.0`
+/// handshake (go: the `incoming` branch of `wsStreamHandlerV22`) and, on
+/// success, start this peer's read/write loop.
+async fn handle_inbound_ws_stream(
+    peer_id: PeerId,
+    mut stream: P2pRawStream,
+    our_headers: PeerMetaHeaders,
+    mux: Arc<Multiplexer>,
+    stream_peers: StreamPeers,
+) {
+    match handshake_inbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS).await {
+        Ok(_meta) => spawn_ws_peer(peer_id, stream, mux, stream_peers),
+        Err(e) => {
+            tracing::debug!(%peer_id, error = %e, "P2P algorand-ws inbound handshake failed")
+        }
+    }
+}
+
+/// Complete the outbound (dialer) side of the `/algorand-ws/2.2.0`
+/// handshake (go: the `!incoming` branch of `wsStreamHandlerV22`) and, on
+/// success, start this peer's read/write loop.
+async fn handle_outbound_ws_stream(
+    peer_id: PeerId,
+    mut stream: P2pRawStream,
+    our_headers: PeerMetaHeaders,
+    mux: Arc<Multiplexer>,
+    stream_peers: StreamPeers,
+) {
+    match handshake_outbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS).await {
+        Ok(_meta) => spawn_ws_peer(peer_id, stream, mux, stream_peers),
+        Err(e) => {
+            tracing::debug!(%peer_id, error = %e, "P2P algorand-ws outbound handshake failed")
+        }
+    }
+}
 
 /// Map an `algo-network` protocol [`Tag`] to the gossipsub topic name it
 /// publishes/subscribes on, via `algo_p2p::pubsub`'s tag-code convention
@@ -229,6 +360,10 @@ pub struct P2pTransport {
     connected_peers: Arc<Mutex<Vec<PeerId>>>,
     multiplexer: Arc<Multiplexer>,
     cmd_tx: mpsc::UnboundedSender<P2pCommand>,
+    /// Established `/algorand-ws/2.2.0` stream peers — see this module's
+    /// doc comment on why AV/PP/VB traffic needs this in addition to
+    /// gossipsub.
+    stream_peers: StreamPeers,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -282,14 +417,51 @@ impl P2pTransport {
                 .map_err(|e| anyhow::anyhow!("failed to subscribe to {topic}: {e}"))?;
         }
 
+        // `/algorand-ws/2.2.0` stream setup (issue #560): register an
+        // acceptor for inbound streams now, before any peer can possibly
+        // dial in. `stream_control` is cloned into the background task
+        // below to open an outbound stream whenever *this* node dials out.
+        let mut stream_control = host.stream_control();
+        let mut incoming_ws_streams = stream_control
+            .accept(ALGORAND_WS_PROTOCOL_V22)
+            .map_err(|e| anyhow::anyhow!("failed to register algorand-ws stream acceptor: {e}"))?;
+        let our_ws_headers = build_headers(
+            &cfg.network_id,
+            "",
+            "algod-rust",
+            "",
+            ALGORAND_WS_SUPPORTED_VERSIONS,
+        );
+
         let listen_addrs: Arc<Mutex<Vec<Multiaddr>>> = Arc::new(Mutex::new(Vec::new()));
         let connected_peers: Arc<Mutex<Vec<PeerId>>> = Arc::new(Mutex::new(Vec::new()));
         let multiplexer = Arc::new(Multiplexer::new());
+        let stream_peers: StreamPeers = Arc::new(Mutex::new(HashMap::new()));
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<P2pCommand>();
+
+        // Accept-loop: every inbound `/algorand-ws/2.2.0` stream a peer
+        // opens to us gets handshaken and, on success, joins `stream_peers`.
+        {
+            let mux = Arc::clone(&multiplexer);
+            let sp = Arc::clone(&stream_peers);
+            let headers = our_ws_headers.clone();
+            tokio::spawn(async move {
+                while let Some((peer_id, stream)) = incoming_ws_streams.next().await {
+                    tokio::spawn(handle_inbound_ws_stream(
+                        peer_id,
+                        stream,
+                        headers.clone(),
+                        Arc::clone(&mux),
+                        Arc::clone(&sp),
+                    ));
+                }
+            });
+        }
 
         let la = Arc::clone(&listen_addrs);
         let cp = Arc::clone(&connected_peers);
         let mux = Arc::clone(&multiplexer);
+        let sp_for_task = Arc::clone(&stream_peers);
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -298,13 +470,40 @@ impl P2pTransport {
                             SwarmEvent::NewListenAddr { address, .. } => {
                                 la.lock().expect("listen_addrs mutex poisoned").push(address);
                             }
-                            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 cp.lock().expect("connected_peers mutex poisoned").push(peer_id);
+                                // Only the dialing side opens the
+                                // `/algorand-ws/2.2.0` stream — mirrors go's
+                                // asymmetric handshake (the `!incoming`
+                                // branch writes first) and avoids both
+                                // sides racing to open a duplicate stream
+                                // for the same connection.
+                                if endpoint.is_dialer() {
+                                    let mut control = stream_control.clone();
+                                    let mux = Arc::clone(&mux);
+                                    let sp = Arc::clone(&sp_for_task);
+                                    let headers = our_ws_headers.clone();
+                                    tokio::spawn(async move {
+                                        match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V22).await {
+                                            Ok(stream) => {
+                                                handle_outbound_ws_stream(peer_id, stream, headers, mux, sp).await;
+                                            }
+                                            Err(e) => tracing::debug!(
+                                                %peer_id, error = %e,
+                                                "failed to open P2P algorand-ws stream"
+                                            ),
+                                        }
+                                    });
+                                }
                             }
                             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                                 cp.lock()
                                     .expect("connected_peers mutex poisoned")
                                     .retain(|p| *p != peer_id);
+                                sp_for_task
+                                    .lock()
+                                    .expect("stream_peers mutex poisoned")
+                                    .remove(&peer_id);
                             }
                             SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(
                                 gossipsub::Event::Message {
@@ -361,6 +560,7 @@ impl P2pTransport {
             connected_peers,
             multiplexer,
             cmd_tx,
+            stream_peers,
             _task: task,
         })
     }
@@ -397,6 +597,19 @@ impl P2pTransport {
             .len()
     }
 
+    /// Number of peers with a currently-established `/algorand-ws/2.2.0`
+    /// stream (issue #560) — exercised by this module's own tests and by
+    /// the live go-algorand interop test
+    /// (`bin/algod-rust/tests/p2p_go_algorand_interop.rs`) to observe that
+    /// the handshake actually completed against a real peer, not just that
+    /// the raw libp2p connection came up.
+    pub fn stream_peer_count(&self) -> usize {
+        self.stream_peers
+            .lock()
+            .expect("stream_peers mutex poisoned")
+            .len()
+    }
+
     /// The [`Multiplexer`] inbound gossipsub messages (for topics this
     /// transport subscribes to — TX/AV/PP/VB) are dispatched to. Callers
     /// register handlers here the same way they register on
@@ -405,7 +618,11 @@ impl P2pTransport {
         &self.multiplexer
     }
 
-    /// Publish `data` on the gossipsub topic corresponding to `tag`.
+    /// Publish `data` on the gossipsub topic corresponding to `tag` and,
+    /// for AV/PP/VB, also fan it out over every established
+    /// `/algorand-ws/2.2.0` stream peer (see this module's doc comment on
+    /// why both paths matter: a real go-algorand peer never gossips
+    /// agreement traffic, only the stream carries it there).
     /// Fire-and-forget: the background task logs (rather than propagates)
     /// a publish failure, matching `GossipNode::broadcast`'s best-effort
     /// semantics for other transports. Returns an error only if `tag` has
@@ -414,9 +631,37 @@ impl P2pTransport {
     pub fn publish(&self, tag: Tag, data: Vec<u8>) -> Result<(), anyhow::Error> {
         let topic = tag_to_topic(tag)
             .ok_or_else(|| anyhow::anyhow!("no P2P gossipsub topic defined for tag {tag}"))?;
+
+        if matches!(
+            tag,
+            Tag::AgreementVote | Tag::ProposalPayload | Tag::VoteBundle
+        ) {
+            self.stream_broadcast(tag, &data);
+        }
+
         self.cmd_tx
             .send(P2pCommand::Publish(topic, data))
             .map_err(|_| anyhow::anyhow!("P2P transport task has stopped"))
+    }
+
+    /// Fan a tag+payload frame out to every currently-established
+    /// `/algorand-ws/2.2.0` stream peer. Best-effort: a peer whose writer
+    /// task has already exited (connection dropped) simply drops the send.
+    fn stream_broadcast(&self, tag: Tag, data: &[u8]) {
+        match algo_network::framing::encode_frame(&tag, data) {
+            Ok(frame) => {
+                let peers = self
+                    .stream_peers
+                    .lock()
+                    .expect("stream_peers mutex poisoned");
+                for sender in peers.values() {
+                    let _ = sender.send(frame.clone());
+                }
+            }
+            Err(e) => {
+                tracing::debug!(%tag, error = %e, "failed to encode P2P algorand-ws stream frame")
+            }
+        }
     }
 }
 
@@ -870,6 +1115,35 @@ mod tests {
         assert!(
             !received.data.is_empty(),
             "expected the encoded transaction group's bytes to arrive over P2P"
+        );
+    }
+
+    /// Issue #560: dialing another `P2pTransport` must, in addition to the
+    /// gossipsub mesh forming, also bring up an `/algorand-ws/2.2.0` stream
+    /// between the two peers — the transport go-algorand actually uses for
+    /// AV/PP/VB traffic (see this module's doc comment). Both sides should
+    /// see the other as a stream peer: the dialer opens the stream
+    /// (`endpoint.is_dialer()`), the listener accepts it.
+    #[tokio::test]
+    async fn connecting_peers_establish_an_algorand_ws_stream_in_both_directions() {
+        let (listener, dialer) = connected_pair().await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (listener.stream_peer_count() == 0 || dialer.stream_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(
+            listener.stream_peer_count(),
+            1,
+            "listener should have accepted exactly one inbound algorand-ws stream"
+        );
+        assert_eq!(
+            dialer.stream_peer_count(),
+            1,
+            "dialer should have opened exactly one outbound algorand-ws stream"
         );
     }
 

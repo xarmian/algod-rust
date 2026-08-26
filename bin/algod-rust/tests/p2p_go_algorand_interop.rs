@@ -104,7 +104,10 @@
 
 use std::time::Duration;
 
-use algo_p2p::{Capability, IdentityConfig, P2pHost};
+use algo_p2p::{
+    build_headers, handshake_outbound, Capability, IdentityConfig, P2pHost,
+    ALGORAND_WS_PROTOCOL_V22,
+};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId};
 
@@ -347,5 +350,113 @@ async fn provider_record_advertised_by_neighbor_propagates_to_queried_node() {
          directly) — got providers = {providers:?}. If this regresses, go-node-2's \
          provider-record advertisement is no longer propagating to go-node-1 within \
          {PROPAGATION_WAIT:?} — see this test's doc comment for the timing this pins."
+    );
+}
+
+/// Issue #560's actual remaining blocker, closed by this test: proves the
+/// `/algorand-ws/2.2.0` raw-libp2p-stream handshake (`algo_p2p::wsproto`)
+/// — go-algorand's real wire protocol for proposal/vote/bundle traffic in
+/// P2P mode, since go's own gossipsub wiring only ever carries the `TX`
+/// tag (see `wsproto`'s doc comment for the full go-source citation) —
+/// actually interoperates byte-for-byte with a real go-algorand node, not
+/// just with another `algo-p2p` host (unlike this crate's own
+/// `wsproto::tests`, which only ever exercise both sides of the handshake
+/// with the *same* Rust implementation).
+///
+/// This is the novel, highest-risk-of-a-wire-format-bug part of #560's
+/// fix: the length-prefixed msgpack `peerMetaHeaders` encoding
+/// (`network/p2pMetainfo.go`) has no existing algod-rust test coverage
+/// against a real peer before this. A successful [`handshake_outbound`]
+/// here means a real go-algorand node read our msgpack-encoded headers,
+/// matched a protocol version, and wrote back its own — round-tripping
+/// through go's actual `wsStreamHandlerV22`/`baseWsStreamHandler`, which
+/// (per that function's own logic) also means go now holds a live `wsPeer`
+/// for this connection in its peer table, precisely the missing piece
+/// `bin/algod-rust/src/commands/p2p_transport.rs`'s `P2pTransport` now
+/// uses to carry AV/PP/VB traffic to real go-algorand peers.
+#[tokio::test]
+#[ignore = "requires a live go-algorand v4.7.0-stable node in P2P mode — see ops/mixed-cluster-p2p/scripts/start.sh"]
+async fn algorand_ws_stream_handshake_round_trips_with_real_go_algorand_node() {
+    let Some(target) = go_node_multiaddr() else {
+        panic!(
+            "ALGOD_RUST_P2P_GO_MULTIADDR is not set or not a valid multiaddr — \
+             run ops/mixed-cluster-p2p/scripts/start.sh first and export its output \
+             (netroot/.p2p-multiaddr-1)"
+        );
+    };
+
+    let identity = IdentityConfig::default();
+    let mut host = P2pHost::new(&identity, P2PINTEROP_NETWORK_ID).expect("build P2P host");
+    let mut control = host.stream_control();
+
+    host.dial(target.clone())
+        .unwrap_or_else(|e| panic!("dial to {target} rejected before it even started: {e}"));
+
+    let peer_id = loop {
+        tokio::select! {
+            event = host.next_event() => {
+                match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => break peer_id,
+                    SwarmEvent::OutgoingConnectionError { error, .. } => {
+                        panic!("dial to real go-algorand P2P host at {target} failed: {error}");
+                    }
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(20)) => {
+                panic!("timed out after 20s waiting for ConnectionEstablished against {target}");
+            }
+        }
+    };
+
+    // Drive the swarm in the background so the outbound stream's protocol
+    // negotiation (multistream-select over the already-established
+    // connection) actually progresses while we await `open_stream` below.
+    tokio::spawn(async move {
+        loop {
+            host.next_event().await;
+        }
+    });
+
+    let stream = tokio::time::timeout(
+        Duration::from_secs(15),
+        control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V22),
+    )
+    .await
+    .expect("timed out opening the algorand-ws stream")
+    .unwrap_or_else(|e| {
+        panic!(
+            "failed to open /algorand-ws/2.2.0 stream to real go-algorand node {peer_id}: {e} \
+             (if this regresses, go stopped accepting this protocol ID, or multistream-select \
+             negotiation itself broke)"
+        )
+    });
+
+    let our_headers = build_headers(
+        P2PINTEROP_NETWORK_ID,
+        "",
+        "algod-rust-interop-test",
+        "",
+        &["2.2"],
+    );
+    let mut stream = stream;
+    let meta = tokio::time::timeout(
+        Duration::from_secs(15),
+        handshake_outbound(&mut stream, &our_headers, &["2.2"]),
+    )
+    .await
+    .expect("timed out waiting for go-algorand's peerMetaHeaders handshake response")
+    .unwrap_or_else(|e| {
+        panic!(
+            "algorand-ws handshake with real go-algorand node {peer_id} failed: {e} (if this \
+             regresses, algo_p2p::wsproto's msgpack peerMetaHeaders encoding or length-prefix \
+             framing stopped matching go's network/p2pMetainfo.go byte-for-byte)"
+        )
+    });
+
+    assert_eq!(
+        meta.version, "2.2",
+        "expected go-algorand to negotiate protocol version 2.2 (its own \
+         SupportedProtocolVersions), got {meta:?}"
     );
 }

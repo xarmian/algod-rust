@@ -81,14 +81,19 @@ pub const DHT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const IDENTIFY_PROTOCOL_VERSION: &str = "/algorand/id/1.0.0";
 
 /// This host's composed `NetworkBehaviour`: Kademlia DHT peer routing on
-/// top of the bare transport foundation from #538, plus `identify` so
+/// top of the bare transport foundation from #538, `identify` so
 /// `kad` can learn a connecting peer's real listen address (see this
-/// module's doc comment).
+/// module's doc comment), `gossipsub` for TX propagation (the only tag
+/// go-algorand itself gossips over pubsub in P2P mode — see
+/// `crate::wsproto`'s doc comment), and `stream` (`libp2p-stream`) for
+/// opening/accepting the raw `/algorand-ws/2.2.0` bidirectional streams
+/// go-algorand actually uses for proposal/vote/bundle traffic.
 #[derive(NetworkBehaviour)]
 pub struct P2pBehaviour {
     kad: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
     gossipsub: gossipsub::Behaviour,
+    stream: libp2p_stream::Behaviour,
 }
 
 /// Outcome a caller reports for a received gossipsub message, mirroring
@@ -168,10 +173,12 @@ impl P2pHost {
                     gossipsub_config,
                 )
                 .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
+                let stream = libp2p_stream::Behaviour::new();
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(P2pBehaviour {
                     kad,
                     identify,
                     gossipsub,
+                    stream,
                 })
             })
             .map_err(|e| P2pError::SwarmBuild(e.to_string()))?
@@ -208,6 +215,14 @@ impl P2pHost {
     /// `SwarmEvent::NewListenAddr` has been observed via [`P2pHost::next_event`]).
     pub fn listen_addrs(&self) -> Vec<Multiaddr> {
         self.swarm.listeners().cloned().collect()
+    }
+
+    /// A cheap-to-clone handle for opening outbound `/algorand-ws/*` streams
+    /// (or any other raw libp2p-stream protocol) and registering acceptors
+    /// for inbound ones. See `crate::wsproto` for the framing/handshake run
+    /// over the streams this produces.
+    pub fn stream_control(&self) -> libp2p_stream::Control {
+        self.swarm.behaviour().stream.new_control()
     }
 
     /// Dial a peer at the given multiaddr. This only initiates the dial;
