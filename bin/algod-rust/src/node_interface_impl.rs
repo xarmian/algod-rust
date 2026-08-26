@@ -3369,6 +3369,67 @@ mod tests {
         assert_eq!(status.confirmed_round, 1, "confirmed in round 1");
     }
 
+    /// Issue #581: the dev-mode block producer's `StateDelta` cache (what
+    /// `GET /v2/deltas/{round}` serves) must be populated from the same
+    /// apply pass as the committed block, not just `KvMods`. A plain
+    /// pay-only round has no box mutations at all, so `KvMods` is legitimately
+    /// empty — but `Accts` must contain balance records for both the sender
+    /// and the receiver, `Txids` must contain the payment's txid, and `Hdr`
+    /// must be populated, exactly as go-algorand's dev-mode node reports.
+    /// Before the fix, `produce_dev_block` cached
+    /// `StateDelta { kv_mods, ..Default::default() }`, so all of these were
+    /// left at their zero values regardless of round content.
+    #[tokio::test]
+    async fn dev_mode_produced_block_caches_populated_state_delta() {
+        use algo_types::{Round, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x33u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let receiver = Address([0x44u8; 32]);
+        let (adapter, ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+
+        let txn = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver,
+            amount: 1_000_000,
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            genesis_hash: gh,
+            ..Default::default()
+        };
+        let stx = sign_txn(&txn, &sender_key);
+
+        adapter
+            .broadcast_signed_tx_group(vec![stx])
+            .await
+            .expect("dev-mode broadcast should produce a block");
+
+        let delta = ledger
+            .lock()
+            .unwrap()
+            .get_cached_state_delta(1)
+            .expect("round 1's StateDelta must be cached");
+
+        let addrs: std::collections::HashSet<Address> =
+            delta.accts.accts.iter().map(|r| r.addr).collect();
+        assert!(
+            addrs.contains(&sender),
+            "cached delta's Accts must include the sender; got {addrs:?}",
+        );
+        assert!(
+            addrs.contains(&receiver),
+            "cached delta's Accts must include the receiver; got {addrs:?}",
+        );
+        assert!(
+            !delta.txids.is_empty(),
+            "cached delta's Txids must include the payment's txid",
+        );
+        assert!(delta.hdr.is_some(), "cached delta's Hdr must be populated",);
+    }
+
     /// Dev mode commits in Execute mode, so an app-create whose approval program
     /// rejects must fail the submission — not confirm an invalid app call — and
     /// must not wedge the pool (TASK-264 / Codex round 5).
