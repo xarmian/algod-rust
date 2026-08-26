@@ -731,7 +731,10 @@ async fn state_delta_accts_zero_fields_matches_go_for_plain_payment() {
         let mut pay = base_txn(&c, &base).await;
         pay.txn_type = TxnType::Pay;
         pay.receiver = receiver;
-        pay.amount = 1234;
+        // Must clear the minimum balance requirement (100_000 microAlgos)
+        // for a brand-new account, or go-algorand's TransactionPool rejects
+        // the payment outright with "balance ... below min ...".
+        pay.amount = 200_000;
         pay.note = unique_note(&format!("plain-payment-{label}")).into();
         let confirmed = submit_and_confirm(&c, &base, label, &mut pay, &sk, "plain payment").await;
         let round = confirmed["confirmed-round"].as_u64().unwrap();
