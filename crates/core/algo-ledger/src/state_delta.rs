@@ -796,14 +796,24 @@ pub struct AssetHoldingDelta {
 }
 
 /// Asset holding record matching Go's basics.AssetHolding serialization.
+///
+/// `basics.AssetHolding` declares go-codec short tags (`codec:"a"`,
+/// `codec:"f"`), and the `/v2/deltas/{round}` handler encodes the real
+/// `ledgercore.StateDelta` (and therefore the real `basics.AssetHolding`)
+/// directly via `codec.NewEncoderBytes(&output, handle).Encode(obj)` with no
+/// intermediate model conversion (`daemon/algod/api/server/v2/handlers.go`'s
+/// `GetLedgerStateDelta`/`utils.go`'s `encode`) -- so the wire form uses
+/// those short tags, not the full Go field names (issue #579, live-verified
+/// against a real go-algorand v4.7.0-stable node's `/v2/deltas/{round}`
+/// response).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AssetHoldingRecord {
-    /// Amount of the asset held.
-    #[serde(rename = "Amount", default, skip_serializing_if = "is_zero_u64")]
+    /// Amount of the asset held. Go codec tag: `"a"`.
+    #[serde(rename = "a", default, skip_serializing_if = "is_zero_u64")]
     pub amount: u64,
 
-    /// Whether the asset is frozen.
-    #[serde(rename = "Frozen", default, skip_serializing_if = "is_false")]
+    /// Whether the asset is frozen. Go codec tag: `"f"`.
+    #[serde(rename = "f", default, skip_serializing_if = "is_false")]
     pub frozen: bool,
 }
 
@@ -826,53 +836,51 @@ pub struct AssetParamsDelta {
 
 /// Asset params record for state delta serialization.
 ///
-/// Uses Go field names for the canonical encoding. We define a separate type
-/// here instead of reusing `algo_types::AssetParams` (which uses short msgpack
-/// tags like `"t"`, `"dc"` etc.) because go-algorand's ledgercore path
-/// serializes asset params with full Go field names.
+/// We define a separate type here instead of reusing `algo_types::AssetParams`
+/// only to keep this module's `*Record` types self-contained; the wire form
+/// is identical either way. go-algorand's `ledgercore.AssetParamsDelta.Params`
+/// is a `*basics.AssetParams` -- the real type, not a copy with different
+/// tags -- and the `/v2/deltas/{round}` handler encodes the real
+/// `ledgercore.StateDelta` directly with no intermediate model conversion
+/// (`daemon/algod/api/server/v2/handlers.go`'s `GetLedgerStateDelta`), so its
+/// wire form uses `basics.AssetParams`'s real go-codec short tags (issue
+/// #579, live-verified against a real go-algorand v4.7.0-stable node's
+/// `/v2/deltas/{round}` response) -- **not** the full Go field names this
+/// type previously hard-coded.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AssetParamsRecord {
-    #[serde(rename = "Total", default, skip_serializing_if = "is_zero_u64")]
+    /// Go codec tag: `"t"`.
+    #[serde(rename = "t", default, skip_serializing_if = "is_zero_u64")]
     pub total: u64,
-    #[serde(rename = "Decimals", default, skip_serializing_if = "is_zero_u32")]
+    /// Go codec tag: `"dc"`.
+    #[serde(rename = "dc", default, skip_serializing_if = "is_zero_u32")]
     pub decimals: u32,
-    #[serde(rename = "DefaultFrozen", default, skip_serializing_if = "is_false")]
+    /// Go codec tag: `"df"`.
+    #[serde(rename = "df", default, skip_serializing_if = "is_false")]
     pub default_frozen: bool,
-    #[serde(rename = "UnitName", default, skip_serializing_if = "String::is_empty")]
+    /// Go codec tag: `"un"`.
+    #[serde(rename = "un", default, skip_serializing_if = "String::is_empty")]
     pub unit_name: String,
-    #[serde(
-        rename = "AssetName",
-        default,
-        skip_serializing_if = "String::is_empty"
-    )]
+    /// Go codec tag: `"an"`.
+    #[serde(rename = "an", default, skip_serializing_if = "String::is_empty")]
     pub asset_name: String,
-    #[serde(rename = "URL", default, skip_serializing_if = "String::is_empty")]
+    /// Go codec tag: `"au"`.
+    #[serde(rename = "au", default, skip_serializing_if = "String::is_empty")]
     pub url: String,
-    #[serde(
-        rename = "MetadataHash",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Go codec tag: `"am"`.
+    #[serde(rename = "am", default, skip_serializing_if = "Option::is_none")]
     pub metadata_hash: Option<[u8; 32]>,
-    #[serde(
-        rename = "Manager",
-        default,
-        skip_serializing_if = "is_default_address"
-    )]
+    /// Go codec tag: `"m"`.
+    #[serde(rename = "m", default, skip_serializing_if = "is_default_address")]
     pub manager: Address,
-    #[serde(
-        rename = "Reserve",
-        default,
-        skip_serializing_if = "is_default_address"
-    )]
+    /// Go codec tag: `"r"`.
+    #[serde(rename = "r", default, skip_serializing_if = "is_default_address")]
     pub reserve: Address,
-    #[serde(rename = "Freeze", default, skip_serializing_if = "is_default_address")]
+    /// Go codec tag: `"f"`.
+    #[serde(rename = "f", default, skip_serializing_if = "is_default_address")]
     pub freeze: Address,
-    #[serde(
-        rename = "Clawback",
-        default,
-        skip_serializing_if = "is_default_address"
-    )]
+    /// Go codec tag: `"c"`.
+    #[serde(rename = "c", default, skip_serializing_if = "is_default_address")]
     pub clawback: Address,
 }
 
@@ -894,25 +902,36 @@ pub struct AppLocalStateDelta {
 }
 
 /// Application local state for state delta serialization.
+///
+/// `basics.AppLocalState` declares go-codec short tags (`codec:"hsch"` for
+/// `Schema`, `codec:"tkv"` for `KeyValue`), not the full field names (issue
+/// #579 -- same bug class as `AssetParamsRecord`/`TealValueRecord`, found by
+/// the same audit).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppLocalStateRecord {
-    #[serde(rename = "Schema", default)]
+    /// Go codec tag: `"hsch"`.
+    #[serde(rename = "hsch", default)]
     pub schema: StateSchema,
-    #[serde(rename = "KeyValue", default, skip_serializing_if = "Option::is_none")]
+    /// Go codec tag: `"tkv"`.
+    #[serde(rename = "tkv", default, skip_serializing_if = "Option::is_none")]
     pub key_value: Option<HashMap<String, TealValueRecord>>,
 }
 
 /// TEAL value for state delta serialization.
+///
+/// `basics.TealValue` declares go-codec short tags (`codec:"tt"`/`"tb"`/
+/// `"ui"`), not the full field names (issue #579, live-verified against a
+/// real go-algorand v4.7.0-stable node's `/v2/deltas/{round}` response).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TealValueRecord {
-    /// Type: 1 = bytes, 2 = uint.
-    #[serde(rename = "Type", default, skip_serializing_if = "is_zero_u64")]
+    /// Type: 1 = bytes, 2 = uint. Go codec tag: `"tt"`.
+    #[serde(rename = "tt", default, skip_serializing_if = "is_zero_u64")]
     pub value_type: u64,
-    /// Bytes value.
-    #[serde(rename = "Bytes", default, skip_serializing_if = "String::is_empty")]
+    /// Bytes value. Go codec tag: `"tb"`.
+    #[serde(rename = "tb", default, skip_serializing_if = "String::is_empty")]
     pub bytes: String,
-    /// Uint value.
-    #[serde(rename = "Uint", default, skip_serializing_if = "is_zero_u64")]
+    /// Uint value. Go codec tag: `"ui"`.
+    #[serde(rename = "ui", default, skip_serializing_if = "is_zero_u64")]
     pub uint: u64,
 }
 
@@ -934,38 +953,199 @@ pub struct AppParamsDelta {
 }
 
 /// Application parameters for state delta serialization.
+///
+/// `basics.AppParams` declares go-codec short tags (`codec:"approv"`,
+/// `codec:"clearp"`, `codec:"gs"`, `codec:"lsch"`/`"gsch"` via its embedded
+/// `StateSchemas`, `codec:"epp"`), not the full field names (issue #579,
+/// live-verified against a real go-algorand v4.7.0-stable node's
+/// `/v2/deltas/{round}` response). Note: go's `AppParams` also carries
+/// `Version` (`codec:"v"`) and `SizeSponsor` (`codec:"ss"`) fields this type
+/// doesn't yet track -- out of scope for this rename fix, filed separately.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppParamsRecord {
-    #[serde(
-        rename = "ApprovalProgram",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    /// Go codec tag: `"approv"`.
+    #[serde(rename = "approv", default, skip_serializing_if = "Vec::is_empty")]
     #[serde(with = "serde_bytes")]
     pub approval_program: Vec<u8>,
-    #[serde(
-        rename = "ClearStateProgram",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    /// Go codec tag: `"clearp"`.
+    #[serde(rename = "clearp", default, skip_serializing_if = "Vec::is_empty")]
     #[serde(with = "serde_bytes")]
     pub clear_state_program: Vec<u8>,
-    #[serde(
-        rename = "GlobalState",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Go codec tag: `"gs"`.
+    #[serde(rename = "gs", default, skip_serializing_if = "Option::is_none")]
     pub global_state: Option<HashMap<String, TealValueRecord>>,
-    #[serde(rename = "LocalStateSchema", default)]
+    /// Go codec tag: `"lsch"` (via embedded `basics.StateSchemas`).
+    #[serde(rename = "lsch", default)]
     pub local_state_schema: StateSchema,
-    #[serde(rename = "GlobalStateSchema", default)]
+    /// Go codec tag: `"gsch"` (via embedded `basics.StateSchemas`).
+    #[serde(rename = "gsch", default)]
     pub global_state_schema: StateSchema,
-    #[serde(
-        rename = "ExtraProgramPages",
-        default,
-        skip_serializing_if = "is_zero_u32"
-    )]
+    /// Go codec tag: `"epp"`.
+    #[serde(rename = "epp", default, skip_serializing_if = "is_zero_u32")]
     pub extra_program_pages: u32,
+}
+
+#[cfg(test)]
+mod issue_579_short_codec_tag_wire_format_tests {
+    use super::*;
+
+    /// Issue #579: `basics.AssetParams` declares go-codec short tags
+    /// (`codec:"t"`, `codec:"dc"`, ...), not the full Go field names this
+    /// type previously hard-coded. Live-verified against a real
+    /// go-algorand v4.7.0-stable node's `/v2/deltas/{round}` JSON response
+    /// for an asset-config transaction: the real wire form is
+    /// `{"t":...,"dc":...,"df":true,...}`, never `{"Total":...}`.
+    #[test]
+    fn asset_params_record_json_uses_go_short_codec_tags() {
+        let params = AssetParamsRecord {
+            total: 1_000_000,
+            decimals: 2,
+            default_frozen: true,
+            unit_name: "UNIT".to_string(),
+            asset_name: "Asset".to_string(),
+            url: "https://example.com".to_string(),
+            metadata_hash: Some([7u8; 32]),
+            manager: Address([1u8; 32]),
+            reserve: Address([2u8; 32]),
+            freeze: Address([3u8; 32]),
+            clawback: Address([4u8; 32]),
+        };
+        let json = serde_json::to_value(&params).expect("must serialize");
+        let obj = json.as_object().expect("encodes as a JSON object");
+
+        for short_tag in ["t", "dc", "df", "un", "an", "au", "am", "m", "r", "f", "c"] {
+            assert!(
+                obj.contains_key(short_tag),
+                "AssetParamsRecord JSON must use go's short codec tag {short_tag:?}: {obj:?}"
+            );
+        }
+        for full_name in [
+            "Total",
+            "Decimals",
+            "DefaultFrozen",
+            "UnitName",
+            "AssetName",
+            "URL",
+            "MetadataHash",
+            "Manager",
+            "Reserve",
+            "Freeze",
+            "Clawback",
+        ] {
+            assert!(
+                !obj.contains_key(full_name),
+                "AssetParamsRecord JSON must NOT use the full Go field name \
+                 {full_name:?} -- go-algorand's real wire form uses the \
+                 short codec tag instead: {obj:?}"
+            );
+        }
+
+        // Round-trip through the short tags.
+        let back: AssetParamsRecord = serde_json::from_value(json).expect("must deserialize");
+        assert_eq!(back, params);
+    }
+
+    /// Same bug class as `AssetParamsRecord`: `basics.AssetHolding` declares
+    /// `codec:"a"`/`codec:"f"`, not `Amount`/`Frozen`.
+    #[test]
+    fn asset_holding_record_json_uses_go_short_codec_tags() {
+        let holding = AssetHoldingRecord {
+            amount: 7,
+            frozen: true,
+        };
+        let json = serde_json::to_value(&holding).expect("must serialize");
+        assert_eq!(json["a"], serde_json::json!(7));
+        assert_eq!(json["f"], serde_json::json!(true));
+        assert!(json.get("Amount").is_none());
+        assert!(json.get("Frozen").is_none());
+    }
+
+    /// Same bug class: `basics.TealValue` declares `codec:"tt"`/`"tb"`/
+    /// `"ui"`, not `Type`/`Bytes`/`Uint`.
+    #[test]
+    fn teal_value_record_json_uses_go_short_codec_tags() {
+        let value = TealValueRecord {
+            value_type: 2,
+            bytes: String::new(),
+            uint: 42,
+        };
+        let json = serde_json::to_value(&value).expect("must serialize");
+        assert_eq!(json["tt"], serde_json::json!(2));
+        assert_eq!(json["ui"], serde_json::json!(42));
+        assert!(json.get("Type").is_none());
+        assert!(json.get("Uint").is_none());
+    }
+
+    /// Same bug class: `basics.AppLocalState` declares `codec:"hsch"`/
+    /// `"tkv"`, not `Schema`/`KeyValue`.
+    #[test]
+    fn app_local_state_record_json_uses_go_short_codec_tags() {
+        let mut kv = HashMap::new();
+        kv.insert(
+            "k".to_string(),
+            TealValueRecord {
+                value_type: 2,
+                bytes: String::new(),
+                uint: 1,
+            },
+        );
+        let record = AppLocalStateRecord {
+            schema: StateSchema {
+                num_uint: 1,
+                num_byte_slice: 0,
+            },
+            key_value: Some(kv),
+        };
+        let json = serde_json::to_value(&record).expect("must serialize");
+        assert!(json.get("hsch").is_some());
+        assert!(json.get("tkv").is_some());
+        assert!(json.get("Schema").is_none());
+        assert!(json.get("KeyValue").is_none());
+    }
+
+    /// Same bug class: `basics.AppParams` declares `codec:"approv"`/
+    /// `"clearp"`/`"gs"`/`"lsch"`/`"gsch"`/`"epp"`, not the full field
+    /// names.
+    #[test]
+    fn app_params_record_json_uses_go_short_codec_tags() {
+        let record = AppParamsRecord {
+            approval_program: vec![0x06, 0x81, 0x01],
+            clear_state_program: vec![0x06, 0x81, 0x01],
+            global_state: None,
+            local_state_schema: StateSchema {
+                num_uint: 1,
+                num_byte_slice: 2,
+            },
+            global_state_schema: StateSchema {
+                num_uint: 3,
+                num_byte_slice: 4,
+            },
+            extra_program_pages: 1,
+        };
+        let json = serde_json::to_value(&record).expect("must serialize");
+        let obj = json.as_object().expect("encodes as a JSON object");
+
+        for short_tag in ["approv", "clearp", "lsch", "gsch", "epp"] {
+            assert!(
+                obj.contains_key(short_tag),
+                "AppParamsRecord JSON must use go's short codec tag {short_tag:?}: {obj:?}"
+            );
+        }
+        for full_name in [
+            "ApprovalProgram",
+            "ClearStateProgram",
+            "GlobalState",
+            "LocalStateSchema",
+            "GlobalStateSchema",
+            "ExtraProgramPages",
+        ] {
+            assert!(
+                !obj.contains_key(full_name),
+                "AppParamsRecord JSON must NOT use the full Go field name \
+                 {full_name:?}: {obj:?}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
