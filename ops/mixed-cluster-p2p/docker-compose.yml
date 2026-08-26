@@ -58,7 +58,23 @@ services:
       retries: 30
     restart: unless-stopped
     networks:
-      - p2pinterop
+      p2pinterop:
+        # Static IP (see the `networks.p2pinterop.ipam` block below for why):
+        # go-algorand's own `network/p2p.addressFilter` (`network/p2p/p2p.go`)
+        # strips *every* candidate address — including this Docker bridge
+        # IP — whenever `NetAddress` binds the "unspecified" address
+        # (`0.0.0.0`/`::`, `manet.IsIPUnspecified`), which is what a plain
+        # `NetAddress=0.0.0.0:<port>` triggers. A DHT `Provide` call with
+        # zero advertisable addresses is silently skipped
+        # (`go-libp2p-kad-dht@v0.38.0`'s `ProtocolMessenger.PutProviderAddrs`:
+        # `"no known addresses for self, cannot put provider"`) — the
+        # provider record never leaves the advertising node's own local
+        # store, which is issue #566's root cause. Pinning `NetAddress` to
+        # this *specific* (non-unspecified) address instead keeps
+        # `needAddressFilter` false, so go-algorand's `addressFilter` is
+        # never installed and the real, routable-within-this-network
+        # address is advertised.
+        ipv4_address: 172.28.0.11
 
   # go-node-2 and go-node-3 are only started by start.sh once the previous
   # node's multiaddr is known (needed to set PEER_ADDRESS), so they have no
@@ -94,7 +110,8 @@ services:
       retries: 30
     restart: unless-stopped
     networks:
-      - p2pinterop
+      p2pinterop:
+        ipv4_address: 172.28.0.12
 
   go-node-3:
     image: algorand/algod:4.7.0-stable
@@ -125,8 +142,15 @@ services:
       retries: 30
     restart: unless-stopped
     networks:
-      - p2pinterop
+      p2pinterop:
+        ipv4_address: 172.28.0.13
 
 networks:
   p2pinterop:
     driver: bridge
+    ipam:
+      config:
+        # A fixed subnet lets each service pin a static `ipv4_address`
+        # (above) — see go-node-1's `networks.p2pinterop` comment for why a
+        # *specific* (non-unspecified) `NetAddress` matters for issue #566.
+        - subnet: 172.28.0.0/24

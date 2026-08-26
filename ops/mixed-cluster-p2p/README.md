@@ -1,4 +1,4 @@
-# P2P interop harness (issues #543, #560, #564)
+# P2P interop harness (issues #543, #560, #564, #566)
 
 Three real go-algorand v4.7.0-stable nodes, each started in plain P2P
 mode (`EnableP2P: true`, no WS-gossip listener — `config/localTemplate.go`'s
@@ -42,7 +42,45 @@ the wrong DHT key (raw namespace bytes instead of go's
 `nsToCid(ns).Hash()` SHA-256-multihash derivation) — fixed, and verified
 live that `find_peers_for_capability` now genuinely round-trips against
 a real go-algorand node. Multi-hop provider-record propagation across
-more than one node is tracked as its own follow-up issue.
+more than one node did not initially work in this harness — root-caused
+and fixed by issue #566, see below.
+
+## Issue #566 status
+
+With #563/#565's fixes applied, single-hop provider-record advertisement
+worked (a node reports *itself* as a "gossip" provider), but a provider
+record advertised by one go-algorand node never propagated to its
+neighbors' local provider stores — querying any node only ever returned
+that node itself, never its DHT neighbors, no matter how long the test
+waited. Root-caused live (with `BaseLoggerDebugLevel` raised to `5` to
+observe go's own DHT debug logs) to a **harness configuration** issue,
+not a wire-protocol or algod-rust bug: this harness originally bound each
+node's `NetAddress` to the *unspecified* address (`0.0.0.0:<port>`).
+go-algorand's own `network/p2p.addressFilter` (`network/p2p/p2p.go`)
+strips every candidate advertised address whenever `NetAddress` is
+unspecified (`manet.IsIPUnspecified`) — a real-deployment safeguard
+against advertising unroutable private addresses to a public DHT — which
+in this all-private-IP Docker network left **every** node with zero
+addresses to announce. `go-libp2p-kad-dht@v0.38.0`'s
+`ProtocolMessenger.PutProviderAddrs` correctly detects this and silently
+skips sending the `ADD_PROVIDER` RPC at all (`"no known addresses for
+self, cannot put provider"`, confirmed present in all three nodes' debug
+logs, once per every single `Provide` attempt) — so the record never left
+the advertising node's own local provider store, permanently, regardless
+of how long a test waited.
+
+Fixed entirely within this harness (no algod-rust production code
+change): `docker-compose.yml` pins each node to a **static**, non-zero
+docker-bridge IP (`networks.p2pinterop.ipam` + each service's
+`ipv4_address`), and `start.sh` binds `NetAddress` to that specific IP
+instead of `0.0.0.0`. A specific `NetAddress` keeps `needAddressFilter`
+false, so go-algorand never installs the stripping `addrFactory`, and
+each node's real (Docker-bridge-routable) address is advertised
+correctly — verified live: `bin/algod-rust/tests/p2p_go_algorand_interop.rs`'s
+`provider_record_advertised_by_neighbor_propagates_to_queried_node`
+queries **only** go-node-1 and correctly discovers go-node-2 as a
+"gossip" provider, proving genuine multi-hop DHT provider-record
+propagation between real go-algorand nodes.
 
 ## Usage
 

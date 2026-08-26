@@ -709,12 +709,14 @@ consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker
 ## cross-implementation transport interop. See
 ## docs/MIXED_CLUSTER_HARNESS.md's "P2P interop harness" section for
 ## current scope and what's left — building this harness's 3-node chain
-## found and fixed a DHT protocol-string bug (#560/#563) and a DHT
-## provider-record key-derivation bug (#564); `find_peers_for_capability`
+## found and fixed a DHT protocol-string bug (#560/#563), a DHT
+## provider-record key-derivation bug (#564), and a harness
+## NetAddress/addressFilter config bug that silently blocked multi-hop DHT
+## provider-record propagation between nodes (#566); `find_peers_for_capability`
 ## (provider records) now genuinely round-trips against a real
-## go-algorand node, but `find_closest_peers` structurally cannot (by
-## go's own design — see #564) and multi-hop provider-record propagation
-## is tracked as its own follow-up, not asserted by any test here yet.
+## go-algorand node, including surfacing a *neighboring* node's
+## capability, but `find_closest_peers` structurally cannot (by go's own
+## design — see #564).
 p2p-interop-up: ## Bring up the 3-node go-algorand P2P interop target
 	$(P2P_INTEROP_CLUSTER)/scripts/start.sh
 
@@ -727,6 +729,7 @@ p2p-interop-down: ## Tear down the P2P interop target (pass PURGE=1 to wipe netr
 
 p2p-interop-test: p2p-interop-up ## Up + run the live interop test + down
 	@ALGOD_RUST_P2P_GO_MULTIADDR="$$(cat $(P2P_INTEROP_CLUSTER)/netroot/.p2p-multiaddr-1)" \
+	ALGOD_RUST_P2P_GO_MULTIADDR_2="$$(cat $(P2P_INTEROP_CLUSTER)/netroot/.p2p-multiaddr-2)" \
 		cargo test --package algod-rust --test p2p_go_algorand_interop -- --ignored --nocapture; \
 	status=$$?; \
 	$(P2P_INTEROP_CLUSTER)/scripts/stop.sh; \
