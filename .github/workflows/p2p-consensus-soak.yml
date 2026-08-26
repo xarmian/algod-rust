@@ -31,17 +31,20 @@ name: Nightly P2P Consensus Soak
 #     gate, retried) -> `p2p-interop-consensus-test` (issue #589's
 #     30-round consensus round-trip smoke) -> `p2p-interop-down`.
 #   Tier 2 (nightly / dispatch with tier=full) —
-#     `p2p-interop-soak-test ROUNDS=<input, default 200>` (issue #594),
-#     uploading summary.json, soak.jsonl, analyze.summary.json and the
-#     per-node container logs.
+#     `p2p-interop-soak-test ROUNDS=<input, default 200>
+#     VERIFY_STAGE=1 RESTART_SCENARIOS=1` (issue #594 soak + issue #596's
+#     fork-detector / bidirectional cert cross-verify / restart-rejoin
+#     stages), uploading summary.json, soak.jsonl, analyze.summary.json,
+#     verify.log + verify-go-report-*.json, the restart/ sub-summary, and
+#     the per-node container logs.
 #
 # ## Not yet covered (see docs/P2P_SOAK_METHODOLOGY.md "Not yet covered")
 #
-# Unlike consensus-cluster.yml's Tier 2, this workflow does NOT run fork
-# detection, bidirectional cert cross-verify, restart/rejoin scenarios,
-# or negative conformance — those tools aren't wired to this harness's
-# container names/ports yet. Tracked as a follow-up issue (see the PR
-# that shipped this workflow for the issue number).
+# Unlike consensus-cluster.yml's Tier 2, this workflow does NOT run
+# negative conformance (malformed-message injection): `algo-agreement-fuzz`
+# speaks the WS-gossip wire framing, which has no equivalent yet over this
+# harness's libp2p `/algorand-ws/2.2.0` raw stream. Tracked as a
+# follow-up issue — see docs/P2P_SOAK_METHODOLOGY.md.
 #
 # ## Caching
 #
@@ -50,6 +53,12 @@ name: Nightly P2P Consensus Soak
 #     P2PINTEROP_SKIP_BUILD=1, so the release compile is paid once per
 #     Dockerfile/source change rather than on every `up` (twice per run,
 #     once per tier).
+#   * The Docker volume holding `tools/cert-authenticate`'s in-container
+#     go-algorand clone AND its built libsodium is tarred into
+#     actions/cache under its own key (`certauth-libsodium-p2p-*`, distinct
+#     from consensus-cluster.yml's `certauth-libsodium-*` — two nightly
+#     jobs writing the same cache key would race), same pattern as
+#     consensus-cluster.yml's own Tier 2.
 
 on:
   schedule:
@@ -85,15 +94,26 @@ env:
   GO_ALGORAND_REV: "v4.7.0-stable"
   # start.sh: reuse the image built by the buildx step below.
   P2PINTEROP_SKIP_BUILD: "1"
+  # Named volume run-in-docker.sh keeps its go-algorand clone + libsodium
+  # build in. MUST match run-in-docker.sh's own SRC_VOLUME default
+  # (tools/cert-authenticate/run-in-docker.sh) since verify-soak.sh
+  # invokes it without an explicit SRC_VOLUME override — same value
+  # consensus-cluster.yml uses. This is safe to share: each workflow run
+  # gets its own ephemeral runner/Docker daemon, so there is no
+  # cross-workflow collision on the volume itself; only the
+  # actions/cache KEY below needs to be distinct per workflow.
+  CERT_AUTH_VOLUME: algod-rust-goalgo-src
 
 jobs:
   p2p-consensus-soak:
     name: P2P mixed-cluster consensus soak (3 Go P2P + 1 Rust P2pOnly)
     runs-on: ubuntu-latest
     # Tier 1 is a few minutes (cluster boot + 30-round smoke); Tier 2's
-    # 200-round soak is the bulk of the rest. 90 min is a hard stop so a
+    # 200-round soak plus the #596 verify (incl. the libsodium build on a
+    # cache miss) and restart stages is the bulk of the rest. 120 min
+    # (bumped from 90 when #596 added those stages) is a hard stop so a
     # wedged cluster can't hold a runner all day.
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -163,16 +183,68 @@ jobs:
       - name: Tier 1 — cluster down
         run: make p2p-interop-down
 
-      # ── Tier 2 — full soak (#594) ─────────────────────────────────────
+      # ── Tier 2 prerequisites — go-algorand + libsodium caches ─────────
+      # Same rationale as consensus-cluster.yml's own copy of these
+      # steps: run-in-docker.sh needs a real go-algorand git checkout to
+      # clone from (a runner has no sibling ../go-algorand), and the
+      # expensive `make libsodium` autotools build is cached across
+      # nightly runs via the tarred Docker volume below.
+      - name: Clone pinned go-algorand
+        if: github.event.inputs.tier != 'smoke'
+        env:
+          GO_ALGORAND_DIR: ${{ runner.temp }}/go-algorand-src
+        run: |
+          set -euo pipefail
+          rm -rf "$GO_ALGORAND_DIR"
+          git clone --branch "$GO_ALGORAND_REV" \
+            https://github.com/algorand/go-algorand.git "$GO_ALGORAND_DIR"
+
+      - name: Restore cert-authenticate libsodium volume
+        id: certauth-vol
+        if: github.event.inputs.tier != 'smoke'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/certauth-volume
+          # Distinct key from consensus-cluster.yml's own
+          # (`certauth-libsodium-${GO_ALGORAND_REV}-...`) — a separate
+          # actions/cache entry per workflow, even though the underlying
+          # Docker volume NAME (CERT_AUTH_VOLUME above) is shared, since
+          # each is restored into its own ephemeral runner.
+          key: certauth-libsodium-p2p-${{ env.GO_ALGORAND_REV }}-${{ hashFiles('tools/cert-authenticate/run-in-docker.sh') }}
+
+      - name: Load cert-authenticate volume from cache
+        if: github.event.inputs.tier != 'smoke'
+        run: |
+          set -euo pipefail
+          docker volume create "$CERT_AUTH_VOLUME" >/dev/null
+          if [ -f "$RUNNER_TEMP/certauth-volume/work.tar" ]; then
+            echo "==> restoring cached go-algorand clone + libsodium build"
+            docker run --rm \
+              -v "$CERT_AUTH_VOLUME:/work" \
+              -v "$RUNNER_TEMP/certauth-volume:/backup:ro" \
+              alpine tar -xf /backup/work.tar -C /work
+          else
+            echo "==> no cached volume; run-in-docker.sh will run 'make libsodium' (3-5 min)"
+          fi
+
+      # ── Tier 2 — full soak + #596 verify/restart stages ───────────────
       #
       # OUT_DIR is read straight from the environment by
       # consensus-soak.sh, pinning the otherwise timestamped artifact
-      # directory to a path the upload step can name.
-      - name: Tier 2 — P2P consensus soak (#594)
+      # directory to a path the upload step can name. VERIFY_STAGE=1
+      # RESTART_SCENARIOS=1 turn on issue #596's fork-detector /
+      # bidirectional cert cross-verify / restart-rejoin stages on top of
+      # issue #594's soak — the P2P-harness analogue of
+      # consensus-cluster.yml's Tier 2 `RESTART_SCENARIOS=1` (this
+      # harness has no negative-conformance stage yet — see the header
+      # comment above).
+      - name: Tier 2 — P2P consensus soak + verify + restart (#594 + #596)
         if: github.event.inputs.tier != 'smoke'
         env:
           OUT_DIR: ${{ github.workspace }}/p2p-soak-artifacts
           ROUNDS: ${{ github.event.inputs.rounds || '200' }}
+          VERIFY_STAGE: "1"
+          RESTART_SCENARIOS: "1"
         run: make p2p-interop-soak-test
 
       # ── Diagnostics + artifacts ───────────────────────────────────────
@@ -193,11 +265,33 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           # summary.json, soak.jsonl, analyze.summary.json, analyze.log,
-          # and the per-node logs the analyzer reads.
+          # verify.log + verify-go-report-*.json (#596 cert authenticate),
+          # cert-crossverify JSONL, the restart/ sub-summary, and the
+          # per-node logs the analyzers read.
           name: p2p-consensus-soak-${{ github.run_id }}
           path: p2p-soak-artifacts/
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Export cert-authenticate volume for the cache
+        if: always() && github.event.inputs.tier != 'smoke' && steps.certauth-vol.outputs.cache-hit != 'true'
+        run: |
+          set +e
+          # Only cache a volume that actually holds a built libsodium —
+          # otherwise a job that failed before the verifier ran would
+          # poison this cache key with an empty tarball.
+          docker run --rm -v "$CERT_AUTH_VOLUME:/work:ro" alpine \
+            test -f /work/go-algorand/crypto/libs/linux/amd64/lib/libsodium.a
+          if [ $? -ne 0 ]; then
+            echo "==> volume has no libsodium build — not caching"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/certauth-volume"
+          docker run --rm \
+            -v "$CERT_AUTH_VOLUME:/work:ro" \
+            -v "$RUNNER_TEMP/certauth-volume:/backup" \
+            alpine tar -cf /backup/work.tar -C /work .
+          exit 0
 
       - name: Tear down (safety net)
         if: always()

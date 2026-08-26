@@ -88,29 +88,49 @@ which is exactly the class of change the WS-gossip harness's own
 against a real 4-node P2P cluster before this issue was considered
 done (see the PR description for the run's summary numbers).
 
-## Not yet covered (out of #594's scope)
+## Not yet covered
 
-Unlike `ops/mixed-cluster/scripts/consensus-conformance.sh` (the
-WS-gossip harness's `consensus-cluster-test` Tier 2), `ops/mixed-cluster-p2p/
-scripts/consensus-soak.sh` does **not** run:
+Issue #596 wired three of the four WS-gossip-only Tier 2 verifiers to
+this harness (all opt-in, off by default, same as
+`consensus-conformance.sh`'s own gating):
 
-- **Fork detection** (`algo-fork-detector`) or **bidirectional cert
+- ~~**Fork detection** (`algo-fork-detector`) or **bidirectional cert
   cross-verify** (`algo-cert-crossverify` + `tools/cert-authenticate`).
   Neither tool is wired to this harness's container names/ports/SQLite
-  extraction path yet.
-- **Restart/rejoin scenarios** (issue #471's analogue).
+  extraction path yet.~~ Done (#596) — `VERIFY_STAGE=1` (see
+  `ops/mixed-cluster-p2p/scripts/verify-soak.sh`, `make
+  p2p-interop-verify`). Both tools operate on exported ledger/block
+  facts over REST + SQLite, not on the gossip/P2P wire format, so
+  nothing about them was WS-gossip-specific — porting was
+  container-name/port plumbing only.
+- ~~**Restart/rejoin scenarios** (issue #471's analogue).~~ Done (#596)
+  — `RESTART_SCENARIOS=1` (see
+  `ops/mixed-cluster-p2p/scripts/restart-rejoin.sh`, `make
+  p2p-interop-restart`). Same reasoning: the restart/rejoin mechanics
+  (docker kill/restart, REST round polling, `algo-agreement`'s own log
+  lines) are transport-agnostic.
 - **Negative conformance** (issue #472's analogue — malformed-message
-  injection).
+  injection) is **still open**. The existing injector,
+  `crates/tools/algo-agreement-fuzz`, speaks go-algorand's WS-gossip
+  handshake/framing (`algo_network::connect` + `algo_network::framing`)
+  — this harness's Go nodes run `EnableP2P=true` with no WS-gossip
+  listener at all, and AV/PP/VB agreement traffic travels over a raw
+  `/algorand-ws/2.2.0` libp2p stream instead (issue #560). Building a
+  P2P-speaking injector is genuine new engineering (a libp2p client
+  capable of dialing, negotiating `/algorand-ws/2.2.0`, and sending one
+  malformed message), not a porting exercise, so #596 left it out and
+  filed it as #597.
 
-These are tracked as their own follow-up issue rather than silently
-dropped — see the PR that shipped this doc for the issue number. What
-IS covered: proposer-share assertion, vote-step coverage (soft + cert),
+What IS covered by the base soak (`p2p-interop-soak-test` with no extra
+flags): proposer-share assertion, vote-step coverage (soft + cert),
 block cadence bounds, node lockstep, zero Go-side agreement rejections,
 and Go's own `VoteAccepted` telemetry for the Rust account — the same
 five categories `docs/SOAK_METHODOLOGY.md`'s "Acceptance" section
 defines for the base soak (rounds reached, no lag violation, zero
 warnings, every block has ts+proposer), plus the opt-in issue #470-style
-participation assertions.
+participation assertions. `VERIFY_STAGE=1 RESTART_SCENARIOS=1` add
+issue #596's fork-freedom, bidirectional cert authentication, and
+restart/rejoin coverage on top of that.
 
 ## Running a soak
 
@@ -160,9 +180,12 @@ of minutes, far too expensive per PR) and its two-tier structure:
   `p2p-interop-consensus-test` (issue #589's 30-round smoke) ->
   `p2p-interop-down`.
 - **Tier 2** (nightly / dispatch with `tier=full`):
-  `p2p-interop-soak-test ROUNDS=<input, default 200>`, uploading
-  `summary.json`, `soak.jsonl`, `analyze.summary.json`, and the per-node
-  container logs as a workflow artifact.
+  `p2p-interop-soak-test ROUNDS=<input, default 200> VERIFY_STAGE=1
+  RESTART_SCENARIOS=1`, uploading `summary.json`, `soak.jsonl`,
+  `analyze.summary.json`, `verify.log` + `verify-go-report-*.json` (the
+  go-algorand cert verifier), the cert-crossverify JSONL, the
+  `restart/` sub-summary, and the per-node container logs as a workflow
+  artifact.
 
 Scheduled for `50 3 * * *` UTC — after `consensus-cluster.yml`'s
 `41 2` and `p2p-interop.yml`'s `5 3`, so the three nightly Docker-heavy
