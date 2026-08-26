@@ -1,0 +1,17 @@
+# Raise the MSVC-linked main-thread stack reservation on Windows.
+#
+# See issue #568 and bin/algod-rust/tests/windows_stack_size_test.rs for the
+# full investigation. Summary: algod-rust's dependency graph (tokio,
+# reqwest/hyper/rustls, libp2p) makes the generated state machine for
+# `async fn main()`'s subcommand dispatch large enough in **debug** builds
+# (which skip the MIR storage-coalescing optimization release builds get)
+# to overflow the MSVC linker's default 1 MiB (`/STACK:0x100000`) main-thread
+# stack reservation on Windows -- before a single line of `main()`'s body
+# executes. Spawning a bigger-stack thread from inside `main()` cannot fix
+# this, because the OS has already allocated the fixed-size main thread by
+# the time any user code runs; only the PE header's own stack reservation,
+# set at link time, controls that. This raises it to 8 MiB, comfortably
+# above the observed debug-build requirement, at no runtime cost (it is a
+# virtual-address-space reservation, not committed memory).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:8388608"]
