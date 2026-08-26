@@ -290,33 +290,6 @@ pub fn apply_block_capturing_apply_data<L: crate::store_trait::LedgerStore>(
     Ok(out)
 }
 
-/// Like [`apply_block_capturing_apply_data`], but also returns the box
-/// deltas recorded during the apply (issue #570) — non-empty only in
-/// `ApplyMode::Execute` (Replay mode never runs the AVM, so it can never
-/// observe box mutations; see [`apply_block_with_delta_mode`]'s doc
-/// comment). Used by the dev-mode block producer, which already runs
-/// Execute mode for real, so it can cache a `kv_mods`-populated delta and
-/// make historical box-list queries work for locally-produced blocks.
-pub fn apply_block_capturing_apply_data_with_kv_mods<L: crate::store_trait::LedgerStore>(
-    store: &mut L,
-    block: &Block,
-    mode: ApplyMode,
-) -> Result<(Vec<ApplyData>, KvModsMap), AlgoError> {
-    let mut out = Vec::with_capacity(block.payset.len());
-    let mut kv_mods = std::collections::HashMap::new();
-    apply_block_impl(
-        store,
-        block,
-        mode,
-        false,
-        None,
-        None,
-        Some(&mut out),
-        Some(&mut kv_mods),
-    )?;
-    Ok((out, kv_mods))
-}
-
 /// Build a `StateDelta` balance record from an account's post-state, matching
 /// the field mapping in [`apply_block_with_delta`] and the per-group capture in
 /// [`apply_block_impl`].
@@ -402,6 +375,40 @@ pub fn apply_block_with_delta_mode<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
 ) -> Result<crate::state_delta::StateDelta, AlgoError> {
+    let (delta, _apply_data) =
+        apply_block_with_delta_mode_and_apply_data(store, block, mode, false)?;
+    Ok(delta)
+}
+
+/// Like [`apply_block_with_delta_mode`], but also returns the per-transaction
+/// [`ApplyData`] captured during the same apply pass (payset order), so a
+/// caller that already needs `ApplyData` (e.g. the dev-mode block producer,
+/// issue #581) doesn't have to apply the block a second time to also get a
+/// fully-populated `StateDelta`.
+///
+/// The returned `StateDelta` has the same field coverage as
+/// [`apply_block_with_delta_mode`]: `Accts` (base account data only, no
+/// per-resource deltas), `Txids`, `Txleases`, `Hdr`, and `KvMods` (real box
+/// deltas under `Execute` mode) are populated; `Accts.AppResources`/
+/// `AssetResources`, `Creatables`, `Totals`, and `StateProofNext` stay at
+/// their zero values — computing those is tracked separately in #586, not
+/// something this function (or issue #581's dev-mode caching fix) is
+/// responsible for.
+pub fn apply_block_capturing_apply_data_with_delta<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+) -> Result<(Vec<ApplyData>, crate::state_delta::StateDelta), AlgoError> {
+    let (delta, apply_data) = apply_block_with_delta_mode_and_apply_data(store, block, mode, true)?;
+    Ok((apply_data, delta))
+}
+
+fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+    capture_apply_data: bool,
+) -> Result<(crate::state_delta::StateDelta, Vec<ApplyData>), AlgoError> {
     use std::collections::{HashMap, HashSet};
 
     use crate::state_delta::{
@@ -441,6 +448,7 @@ pub fn apply_block_with_delta_mode<L: crate::store_trait::LedgerStore>(
 
     // ── 3. Apply the block ────────────────────────────────────────
     let mut kv_mods: HashMap<Vec<u8>, crate::state_delta::KvValueDelta> = HashMap::new();
+    let mut apply_data: Vec<ApplyData> = Vec::new();
     apply_block_impl(
         store,
         block,
@@ -448,7 +456,7 @@ pub fn apply_block_with_delta_mode<L: crate::store_trait::LedgerStore>(
         false,
         None,
         None,
-        None,
+        capture_apply_data.then_some(&mut apply_data),
         Some(&mut kv_mods),
     )?;
 
@@ -587,7 +595,7 @@ pub fn apply_block_with_delta_mode<L: crate::store_trait::LedgerStore>(
         totals: AccountTotals::default(),
     };
 
-    Ok(delta)
+    Ok((delta, apply_data))
 }
 
 /// Collect all addresses referenced by a transaction (sender, receiver, etc.).
