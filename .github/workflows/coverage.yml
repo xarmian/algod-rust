@@ -2,10 +2,10 @@ name: Coverage
 
 # Workspace test coverage via cargo-llvm-cov (source-based LLVM instrumentation:
 # accurate region/branch data across unit, integration, and doc tests).
-# Runs on every PR and push to main; uploads LCOV to Codecov, which posts the
-# per-PR coverage-diff comment and enforces the patch/project thresholds
-# configured in codecov.yml. An HTML report is attached as a workflow artifact
-# so coverage is inspectable even without the Codecov UI.
+# Runs once per day (scheduled) and on manual dispatch; uploads LCOV to
+# Codecov, which enforces the project thresholds configured in codecov.yml.
+# An HTML report is attached as a workflow artifact so coverage is
+# inspectable even without the Codecov UI.
 #
 # Scope: default `cargo test --workspace` targets only. Docker-backed e2e
 # suites (localnet, mixed-cluster, relay) are feature/env-gated and stay out
@@ -14,9 +14,9 @@ name: Coverage
 # See docs/COVERAGE.md for local usage, thresholds, and best practices.
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  schedule:
+    # Daily at 03:17 UTC (off the hour to avoid GitHub's peak-load delays).
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 concurrency:
