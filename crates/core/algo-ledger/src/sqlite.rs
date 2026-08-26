@@ -3470,6 +3470,81 @@ impl SqliteLedger {
         Ok((online.max(0) as u64).saturating_add(offline.max(0) as u64))
     }
 
+    /// Compute the current `accounttotals` aggregate as
+    /// [`crate::state_delta::AccountTotals`] (issue #586), including this
+    /// block's not-yet-flushed `pending_totals_delta` and this round's
+    /// rewards-level bump.
+    ///
+    /// This is a read-only peek used by
+    /// [`crate::apply::apply_block_with_delta_mode`] to populate
+    /// `StateDelta::totals` *mid-block*, before `commit_block` has run
+    /// [`Self::flush_pending_account_totals_delta`] to persist the same
+    /// arithmetic into the row. Deliberately reimplements that function's
+    /// formula independently (see its doc comment for the derivation from
+    /// go's `roundCowState.CalculateTotals`/`AccountTotals.ApplyRewards`)
+    /// rather than sharing code with it, so a bug in this peek can never
+    /// perturb the tested persist path that `commit_block` depends on.
+    ///
+    /// Returns [`AccountTotals::default`] (all-zero) if the `accounttotals`
+    /// row hasn't been seeded yet (fresh/catchpoint-only ledger) — matching
+    /// [`Self::online_stake`]/[`Self::participating_money`]'s same
+    /// "unseeded ⇒ zero" convention, and if the query itself fails (should
+    /// not happen outside catastrophic DB corruption) — this is an
+    /// infallible accessor by design (mirroring `rewards_level()` and
+    /// friends), so a freak SQL error degrades to zero totals rather than
+    /// panicking or forcing a `Result` onto every caller.
+    pub fn account_totals(&self) -> crate::state_delta::AccountTotals {
+        use crate::state_delta::{AccountTotals, AlgoCount};
+        let row: Option<(i64, i64, i64, i64, i64, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT online, onlinerewardunits, offline, offlinerewardunits, \
+                 notparticipating, notparticipatingrewardunits, rewardslevel \
+                 FROM accounttotals WHERE id = ''",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .unwrap_or(None);
+        let Some((online, online_ru, offline, offline_ru, notpart, notpart_ru, row_level)) = row
+        else {
+            return AccountTotals::default();
+        };
+        let delta = self.pending_totals_delta;
+        let new_level = self.rewards_level;
+        let row_level_u = row_level.max(0) as u64;
+        let level_delta = new_level.saturating_sub(row_level_u) as i128;
+        let online_rewards_bump = online_ru as i128 * level_delta;
+        let offline_rewards_bump = offline_ru as i128 * level_delta;
+        let clamp =
+            |base: i64, d: i128| -> u64 { (base as i128 + d).clamp(0, i64::MAX as i128) as u64 };
+        AccountTotals {
+            online: AlgoCount {
+                money: clamp(online, online_rewards_bump + delta.online_money),
+                reward_units: clamp(online_ru, delta.online_reward_units),
+            },
+            offline: AlgoCount {
+                money: clamp(offline, offline_rewards_bump + delta.offline_money),
+                reward_units: clamp(offline_ru, delta.offline_reward_units),
+            },
+            not_participating: AlgoCount {
+                money: clamp(notpart, delta.not_participating_money),
+                reward_units: clamp(notpart_ru, delta.not_participating_reward_units),
+            },
+            rewards_level: new_level,
+        }
+    }
+
     /// Query the online supply for a specific round from the
     /// `onlineroundparamstail` table.
     ///
@@ -5195,6 +5270,10 @@ impl LedgerStore for SqliteLedger {
         self.txn_counter
     }
 
+    fn account_totals(&self) -> crate::state_delta::AccountTotals {
+        SqliteLedger::account_totals(self)
+    }
+
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round) {
@@ -6521,6 +6600,84 @@ mod tests {
         // The lookback-round accessor used by sortition and GetSupply must see
         // the true historical value at an old round, not the current aggregate.
         assert_eq!(ledger.online_circulation_at_round(1, 1).unwrap(), 1_000_000);
+    }
+
+    /// TDD regression for issue #586: `StateDelta::totals` must reflect the
+    /// real post-apply `AccountTotals` *immediately*, before `commit_block`
+    /// has run `flush_pending_account_totals_delta` to persist it into the
+    /// `accounttotals` row. `apply::apply_block_with_delta` calls
+    /// `SqliteLedger::account_totals()` mid-block (between `begin_block` and
+    /// `commit_block`), so it must peek `pending_totals_delta` + the current
+    /// `rewards_level` bump rather than reading the (still stale) row
+    /// directly -- exercising exactly the gap `online_stake()`/
+    /// `participating_money()` don't cover, since those are only ever
+    /// asserted post-`commit_block` elsewhere in this file (e.g.
+    /// `apply_block_proposer_payout_updates_accounttotals_and_supply` below).
+    #[test]
+    fn issue_586_account_totals_reflects_pending_delta_before_commit() {
+        use algo_types::{Block, SignedTransaction};
+
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.begin_block().unwrap();
+        ledger.set_account(
+            &sender,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(
+            &receiver,
+            AccountData {
+                micro_algos: 0,
+                status: AccountStatus::Online,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(&fee_sink, AccountData::default());
+        ledger
+            .put_account_totals_seed(5_000_000, 5, 0, 0, 0, 0)
+            .unwrap();
+        ledger.discard_pending_account_totals_delta();
+        ledger.commit_block().unwrap();
+
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "pay".into();
+        stx.txn.sender = sender;
+        stx.txn.receiver = receiver;
+        stx.txn.amount = 1_000_000;
+        stx.txn.fee = 1_000;
+
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stx],
+            ..Block::default()
+        };
+
+        ledger.begin_block().unwrap();
+        let delta = crate::apply::apply_block_with_delta(&mut ledger, &block).unwrap();
+
+        // Mid-block (before commit_block flushes the row): sender
+        // 5_000_000 -> 3_999_000, receiver 0 -> 1_000_000, both Online, fee
+        // absorbed by the (untracked-status) fee sink and excluded from
+        // "online". `account_totals()` must already reflect this via the
+        // pending delta, not the still-unflushed 5_000_000/0 seed row.
+        assert_eq!(delta.totals.online.money, 3_999_000 + 1_000_000);
+        assert_eq!(delta.totals.online.reward_units, 3 + 1);
+
+        ledger.commit_block().unwrap();
+        assert_eq!(
+            ledger.online_stake().unwrap(),
+            3_999_000 + 1_000_000,
+            "post-commit row must agree with the pre-commit peek"
+        );
     }
 
     /// Issue #523: a live mixed-cluster run (3 go-algorand relays + 1

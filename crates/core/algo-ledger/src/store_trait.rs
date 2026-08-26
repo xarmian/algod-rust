@@ -282,6 +282,23 @@ pub trait LedgerStore {
     /// for creatable ID generation in the next block.
     fn txn_counter(&self) -> u64;
 
+    /// Aggregate account totals (money/reward-units by participation
+    /// status, current rewards level), matching go-algorand's
+    /// `ledgercore.AccountTotals`. Used to populate `StateDelta::totals`
+    /// (issue #586) after a block apply.
+    ///
+    /// Default implementation returns the all-zero value — correct only
+    /// for a backend that genuinely tracks no totals at all. Both real
+    /// implementors (`SqliteLedger`, which maintains an incremental
+    /// `accounttotals` row per issue #523/#530, and `LedgerState`, which
+    /// scans its full in-memory account map) override this with a real
+    /// computation; this default exists purely so the method doesn't force
+    /// a third, hypothetical implementor to plumb totals tracking just to
+    /// compile.
+    fn account_totals(&self) -> crate::state_delta::AccountTotals {
+        crate::state_delta::AccountTotals::default()
+    }
+
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round);
