@@ -708,35 +708,40 @@ fn tempfile_dir() -> tempfile::TempDir {
 /// Issue #576 (follow-up to #573): live-verifies that fields *outside*
 /// `KvValueDelta` are never omitted either. `ledgercore.AccountBaseData`
 /// (the `Accts[]` entries under `StateDelta.Accts`) carries no `_struct
-/// codec:",omitempty,omitemptyarray"` marker, so a real node's response for
-/// a plain payment round -- where most `AccountBaseData` fields are zero --
-/// must still include every one of those fields, e.g. `"Status":0`,
-/// `"AuthAddr":"AAAA...Y5HFKQ"` (the all-zero address's checksum string, not
-/// omitted/null), `"TotalAppSchema":{}` (present as an empty object, not
-/// omitted). This is exactly the example quoted in issue #576 itself.
+/// codec:",omitempty,omitemptyarray"` marker, so a real node's response
+/// must still include every one of those fields even when zero, e.g.
+/// `"Status":0`, `"AuthAddr":"AAAA...Y5HFKQ"` (the all-zero address's
+/// checksum string, not omitted/null), `"TotalAppSchema":{}` (present as an
+/// empty object, not omitted). This is exactly the example quoted in issue
+/// #576 itself.
+///
+/// Deliberately checks an *app-creation* round rather than a plain payment:
+/// a plain-`Pay`-only round on algod-rust's own dev-mode block producer was
+/// found (while first writing this test) to cache an essentially-empty
+/// `StateDelta` (`"Accts":{"Accts":[],...}`) for its own round, a separate,
+/// pre-existing ledger/dev-mode-block-production bug unrelated to this
+/// issue's serialization-format scope -- filed as its own follow-up rather
+/// than fixed here. App-creation rounds are already proven to populate
+/// `Accts` correctly (this file's box create/put/delete tests depend on
+/// it), so this test piggybacks on that known-working path.
 #[tokio::test]
 #[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
-async fn state_delta_accts_zero_fields_matches_go_for_plain_payment() {
+async fn state_delta_accts_zero_fields_matches_go_for_app_creation() {
     let c = client();
     let sk = dev_signing_key();
 
-    // A second dev-mode account: the recipient. Any funded, distinct
-    // address works; genesis dev-mode accounts always exist, so pick the
-    // all-zero address's "next" byte pattern to guarantee it's a fresh
-    // account with zero `AccountBaseData` (no prior Status/AuthAddr/etc.)
-    // wherever it lands in Accts.
-    let receiver = algo_types::Address([0x07; 32]);
-
     for (base, label) in [(go_url(), "go"), (rust_url(), "rust")] {
-        let mut pay = base_txn(&c, &base).await;
-        pay.txn_type = TxnType::Pay;
-        pay.receiver = receiver;
-        // Must clear the minimum balance requirement (100_000 microAlgos)
-        // for a brand-new account, or go-algorand's TransactionPool rejects
-        // the payment outright with "balance ... below min ...".
-        pay.amount = 200_000;
-        pay.note = unique_note(&format!("plain-payment-{label}")).into();
-        let confirmed = submit_and_confirm(&c, &base, label, &mut pay, &sk, "plain payment").await;
+        let approval = algo_avm::assembler::assemble_string(APPROVAL_SOURCE)
+            .unwrap_or_else(|e| panic!("{label}: approval program failed to assemble: {e:?}"))
+            .program;
+
+        let mut create = base_txn(&c, &base).await;
+        create.txn_type = TxnType::Appl;
+        create.approval_program = Some(ByteBuf::from(approval));
+        create.clear_state_program = Some(ByteBuf::from(CLEAR_STATE_PROGRAM.to_vec()));
+        create.note = unique_note(&format!("acct-zero-fields-app-create-{label}")).into();
+        let confirmed =
+            submit_and_confirm(&c, &base, label, &mut create, &sk, "app creation").await;
         let round = confirmed["confirmed-round"].as_u64().unwrap();
 
         let (status, body) = get_json(&c, &base, &format!("/v2/deltas/{round}?format=json")).await;
@@ -750,28 +755,29 @@ async fn state_delta_accts_zero_fields_matches_go_for_plain_payment() {
             .unwrap_or_else(|| panic!("{label}: round {round} StateDelta.Accts.Accts must be a (possibly empty) array: {body}"));
         assert!(
             !accts.is_empty(),
-            "{label}: a plain payment round must touch at least the sender and receiver: {body}"
+            "{label}: an app-creation round must touch at least the creator account: {body}"
         );
 
-        // Find the freshly-touched receiver's BalanceRecord by its zero
-        // `Status`/`MicroAlgos`... wait, MicroAlgos is nonzero after the
-        // payment, so key on the fields that stay zero for a brand-new
-        // account with no app/asset history (Status, TotalAppSchema,
-        // TotalAppParams): the sender (a long-lived dev-mode account) won't
-        // match all of these simultaneously. Not matching by the `Addr`
-        // field's *string* value deliberately -- `ledgercore.AccountDeltas`'
-        // `Addr`/`AuthAddr` fields have their own separate, pre-existing
-        // wire-encoding bug (tracked in a dedicated follow-up issue filed
-        // alongside #576) unrelated to this test's omitempty concern.
-        let receiver_record = accts
+        // The creator's own `AccountBaseData` after just creating an app
+        // (no boxes, no assets, no incoming funds) has `TotalAppParams == 1`
+        // (nonzero, expected) but `TotalAssets`/`TotalAssetParams`/
+        // `TotalBoxes` all stay zero -- pin presence on those. Not matching
+        // by the `Addr` field's *string* value deliberately --
+        // `ledgercore.AccountDeltas`'s `Addr`/`AuthAddr` fields have their
+        // own separate, pre-existing wire-encoding bug (tracked in a
+        // dedicated follow-up issue filed alongside #576) unrelated to this
+        // test's omitempty concern.
+        let creator_record = accts
             .iter()
             .find(|r| {
-                r.get("Status") == Some(&serde_json::json!(0))
-                    && r.get("TotalAppSchema") == Some(&serde_json::json!({}))
-                    && r.get("TotalAppParams") == Some(&serde_json::json!(0))
+                r.get("TotalAppParams") == Some(&serde_json::json!(1))
+                    && r.get("TotalAssets") == Some(&serde_json::json!(0))
+                    && r.get("TotalBoxes") == Some(&serde_json::json!(0))
             })
             .unwrap_or_else(|| {
-                panic!("{label}: round {round} Accts must contain a fresh zero-history receiver: {accts:?}")
+                panic!(
+                    "{label}: round {round} Accts must contain the app-creating account: {accts:?}"
+                )
             });
 
         for key in [
@@ -793,23 +799,28 @@ async fn state_delta_accts_zero_fields_matches_go_for_plain_payment() {
             "LastHeartbeat",
         ] {
             assert!(
-                receiver_record.get(key).is_some(),
-                "{label}: round {round} receiver's AccountBaseData must always include {key} \
-                 (no omitempty on ledgercore.AccountBaseData), even when zero: {receiver_record}"
+                creator_record.get(key).is_some(),
+                "{label}: round {round} creator's AccountBaseData must always include {key} \
+                 (no omitempty on ledgercore.AccountBaseData), even when zero: {creator_record}"
             );
         }
         // Spot-check the exact zero-value wire forms the issue itself
-        // quotes: Status as a bare 0, AuthAddr as the real (non-omitted,
-        // non-null) checksum-address string, TotalAppSchema as `{}`.
+        // quotes: Status as a bare 0, TotalAssets/TotalBoxes as bare 0s
+        // (never omitted).
         assert_eq!(
-            receiver_record["Status"],
+            creator_record["Status"],
             serde_json::json!(0),
-            "{label}: fresh receiver's Status must be present as 0: {receiver_record}"
+            "{label}: app creator's Status must be present as 0: {creator_record}"
         );
         assert_eq!(
-            receiver_record["TotalAppSchema"],
-            serde_json::json!({}),
-            "{label}: fresh receiver's TotalAppSchema must be present as {{}}: {receiver_record}"
+            creator_record["TotalAssets"],
+            serde_json::json!(0),
+            "{label}: app creator's TotalAssets must be present as 0: {creator_record}"
+        );
+        assert_eq!(
+            creator_record["TotalBoxes"],
+            serde_json::json!(0),
+            "{label}: app creator's TotalBoxes must be present as 0: {creator_record}"
         );
     }
 }
