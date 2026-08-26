@@ -82,6 +82,35 @@ queries **only** go-node-1 and correctly discovers go-node-2 as a
 "gossip" provider, proving genuine multi-hop DHT provider-record
 propagation between real go-algorand nodes.
 
+## Issue #560 status: `/algorand-ws/2.2.0` agreement-traffic stream (PR #590)
+
+With #563/#565/#566's fixes applied, DHT discovery and capability
+advertisement both round-trip cleanly against real go-algorand nodes — but
+a full consensus round-trip still needed one more piece: go-algorand
+v4.7.0-stable's own `gossipSubTags` map (`network/p2pNetwork.go`) wires
+gossipsub up for the `TX` tag **only**. A real go-algorand P2P node never
+subscribes to or publishes on a gossipsub topic for proposals, votes, or
+vote bundles — that traffic travels over a separate raw bidirectional
+libp2p stream per connected peer, on the `/algorand-ws/2.2.0` protocol
+(`wsStreamHandlerV22`), tunneling the same tag-prefixed message framing
+the WS-gossip transport uses (a length-prefixed frame instead of relying
+on WebSocket message boundaries, and a msgpack-encoded handshake instead
+of an HTTP upgrade).
+
+`crates/node/algo-p2p/src/wsproto.rs` now implements this protocol, and
+`bin/algod-rust/src/commands/p2p_transport.rs`'s `P2pTransport` opens/
+accepts one such stream per peer, fanning AV/PP/VB traffic out over it in
+addition to gossipsub. Live-verified against this harness:
+`bin/algod-rust/tests/p2p_go_algorand_interop.rs`'s
+`algorand_ws_stream_handshake_round_trips_with_real_go_algorand_node`
+dials go-node-1, opens a `/algorand-ws/2.2.0` stream, and completes go's
+actual msgpack `peerMetaHeaders` handshake end-to-end.
+
+This harness still has **no stake-provisioned rust node** (all 100% stake
+sits on go-node-1, per `template.json`, and there is no `P2pOnly`
+`algod-rust participate` service here) — building that out to prove a
+full multi-round consensus round-trip is tracked as issue #589.
+
 ## Usage
 
 ```bash

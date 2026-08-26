@@ -282,34 +282,48 @@ issue #560's DHT-discovery investigation below.
 
 Issue #543's full headline scope — "a mixed P2P cluster (Rust +
 go-algorand NEW nodes) reaches and maintains consensus over a run of
-rounds" — is still not implemented, and issue #560's investigation found
-it is not achievable at all without new work beyond what #559 delivered:
+rounds" — is still not implemented, but the architectural blocker issue
+#560's investigation originally found is now closed (PR #590):
 go-algorand v4.7.0-stable's own `gossipSubTags` map
 (`network/p2pNetwork.go`) wires up gossipsub for the `TX` tag **only**.
 Agreement traffic (votes/proposals/bundles) travels over go's per-peer
 libp2p **stream** protocol instead
 (`wsStreamHandlerV1`/`wsStreamHandlerV22` — the same wire framing as its
 WS-gossip peers, tunneled through a libp2p stream rather than a raw
-WebSocket), which `algo_p2p::streams` has never implemented beyond a
-stub. algod-rust's own `AV`/`PP`/`VB` gossipsub topics (#559) are
-algod-rust-only forward-looking extensions of go's topic-naming
-convention — a real go-algorand P2P node does not subscribe to them and
-never will until/unless go-algorand itself starts gossiping agreement
-traffic. Porting go's per-peer stream wire protocol onto `algo-p2p` is
-tracked as its own follow-up issue.
+WebSocket) — `algo_p2p::wsproto` now implements this protocol
+(length-prefixed frame delimiting + msgpack `peerMetaHeaders` handshake,
+reusing `algo_network`'s existing tag+payload frame contents unchanged),
+and `bin/algod-rust/src/commands/p2p_transport.rs`'s `P2pTransport` opens/
+accepts one such stream per connected peer, fanning AV/PP/VB traffic out
+over it in addition to gossipsub. **Live-verified** against a real
+go-algorand node:
+`algorand_ws_stream_handshake_round_trips_with_real_go_algorand_node`
+(`bin/algod-rust/tests/p2p_go_algorand_interop.rs`) completes go's actual
+msgpack handshake end-to-end. algod-rust's own `AV`/`PP`/`VB` gossipsub
+topics (#559) remain algod-rust-only forward-looking extensions of go's
+topic-naming convention — a real go-algorand P2P node still never
+subscribes to them — but that no longer matters for interop now that the
+stream carries this traffic instead.
 
-DHT-based peer discovery against real go-algorand peers is partway
-investigated but not yet proven working: building the 3-node chain found
-and fixed a real bug (`algo_p2p::dht::dht_protocol_name` was missing the
-`/kad/1.0.0` suffix `go-libp2p-kad-dht` always appends — see
-`ops/mixed-cluster-p2p/README.md`'s "Issue #560 status" for the full
-citation and current state), after which a rust host's DHT query against
-a live go node reaches go's DHT handler for the first time (a real round
-trip, not an instant no-op) but does not yet reliably surface peers that
-node is directly connected to. This remaining gap, cross-implementation
-capability advertisement, and a soak/nightly variant all remain tracked
-as follow-up work — see the tracking issue this section's follow-up was
-filed under for the current status.
+DHT-based peer discovery and capability advertisement against real
+go-algorand peers are both now fully proven working (#563-#566):
+`algo_p2p::dht::dht_protocol_name` and
+`algo_p2p::capabilities::Capability::record_key` both had real
+protocol/key-derivation bugs, now fixed — see
+`ops/mixed-cluster-p2p/README.md`'s "Issue #560/#566 status" for the full
+citation. `get_closest_peers` was found structurally unable to surface a
+real go-algorand peer's address *by go's own design* (its peerstore is
+never populated via `FIND_NODE` responses); `find_peers_for_capability`
+(DHT provider records) is the correct mechanism and round-trips
+end-to-end, including multi-hop propagation between go-algorand nodes.
+
+What remains: `ops/mixed-cluster-p2p` still provisions **zero stake** to
+any rust node (all 100% of stake sits on go-node-1, and there is no
+`P2pOnly` `algod-rust participate` service in that harness at all) — so
+the actual multi-round consensus proof this section's headline goal
+describes still needs that harness built out, now unblocked by the fixes
+above. Tracked as #589 (a soak/nightly variant is also folded into that
+issue, gated on the consensus round-trip landing first).
 
 ### Why go-algorand's own `EnableP2P` config was reachable without a custom build
 
