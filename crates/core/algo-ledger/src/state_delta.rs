@@ -21,20 +21,162 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
-fn is_zero_i64(v: &i64) -> bool {
-    *v == 0
-}
-
 fn is_false(v: &bool) -> bool {
     !v
 }
 
-fn is_default_round(v: &Round) -> bool {
-    v.0 == 0
-}
-
 fn is_default_address(v: &Address) -> bool {
     v.0 == [0u8; 32]
+}
+
+// ---------------------------------------------------------------------------
+// Never-omit container helpers (issue #576)
+// ---------------------------------------------------------------------------
+//
+// go-algorand's go-codec (ugorji) `OmitEmpty` defaults to `false`; a Go
+// struct only gets field-omission behavior when it declares a `_struct
+// struct{} `codec:",omitempty,omitemptyarray"`` marker (see `AlgoCount`/
+// `AccountTotals` above, and `basics.AssetHolding`/`AssetParams`/
+// `AppLocalState`/`AppParams`/`TealValue`/`StateSchema`, which all declare
+// it). Most of the *other* types in this file (`ledgercore.AccountBaseData`,
+// `basics.VotingData`, `ledgercore.ModifiedCreatable`, `ledgercore.
+// StateDelta` itself, its `AccountDeltas`/resource-delta wrapper types, ...)
+// declare no such marker, so a real node's response always includes every
+// field -- using JSON `null`/msgpack nil for a nil Go map or slice rather
+// than omitting the key. These two helpers reproduce that "always present,
+// null when empty" wire form for `HashMap`/`Vec` fields on those types.
+fn serialize_map_or_null<K, V, S>(map: &HashMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    K: Serialize + Eq + std::hash::Hash,
+    V: Serialize,
+    S: Serializer,
+{
+    if map.is_empty() {
+        serializer.serialize_none()
+    } else {
+        map.serialize(serializer)
+    }
+}
+
+fn deserialize_map_or_null<'de, K, V, D>(deserializer: D) -> Result<HashMap<K, V>, D::Error>
+where
+    K: Deserialize<'de> + Eq + std::hash::Hash,
+    V: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    let opt = Option::<HashMap<K, V>>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+fn serialize_vec_or_null<T, S>(vec: &[T], serializer: S) -> Result<S::Ok, S::Error>
+where
+    T: Serialize,
+    S: Serializer,
+{
+    if vec.is_empty() {
+        serializer.serialize_none()
+    } else {
+        vec.serialize(serializer)
+    }
+}
+
+fn deserialize_vec_or_null<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    let opt = Option::<Vec<T>>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-size byte-array wire encoding (issue #576, following #573's
+// serialize_kv_bytes precedent)
+// ---------------------------------------------------------------------------
+//
+// go-codec treats a fixed-size `[N]byte` array exactly like `[]byte` for
+// encoding purposes (see go-codec's `encode.go`, the `rtelemIsByte`/
+// `seqTypeArray` branch) -- base64 for the JSON handle, raw bytes for the
+// msgpack handle. Unlike a `[]byte` slice, a Go array is never nil, so
+// (unlike `serialize_kv_bytes`) there is no empty/null case to special-case
+// here: the actual (possibly all-zero) bytes are always written.
+fn serialize_bytes_array<S: Serializer, const N: usize>(
+    bytes: &[u8; N],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if serializer.is_human_readable() {
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use base64::Engine as _;
+        serializer.serialize_str(&BASE64_STANDARD.encode(bytes))
+    } else {
+        serde_bytes::serialize(bytes.as_slice(), serializer)
+    }
+}
+
+// Deliberately does NOT branch on `deserializer.is_human_readable()` (unlike
+// `serialize_bytes_array` above, and unlike `deserialize_kv_bytes` below).
+// `VotingData` -- the only user of this function -- is `#[serde(flatten)]`ed
+// into `LedgercoreAccountData`, and serde's derive implements `flatten` on
+// the *deserialize* side by first buffering the remaining input into a
+// generic `serde::__private::de::Content` value, whose `Deserializer` impl
+// hard-codes `is_human_readable() == true` regardless of the real wire
+// format (a documented serde limitation: flatten does not propagate the
+// original format's human-readability). Branching on it here silently
+// mis-detected msgpack as JSON and tried to base64-decode raw msgpack bytes,
+// breaking every msgpack round-trip through a flattened `VotingData` --
+// caught by this file's own `debug_repro_*` bisection while chasing an
+// `Invalid symbol 0, offset 0` panic in `algo-rest-api`'s state-delta
+// integration tests, one layer removed from anything KvMods/KvValueDelta
+// exercises (neither is ever flattened). Using `deserialize_any` instead
+// asks "what shape is this value" (a `Content::Bytes`/`Content::Str` case
+// preserves the real original kind even though its `is_human_readable()`
+// lies), which sidesteps the bug entirely and works unflattened too.
+fn deserialize_bytes_array<'de, D: Deserializer<'de>, const N: usize>(
+    deserializer: D,
+) -> Result<[u8; N], D::Error> {
+    struct BytesArrayVisitor<const N: usize>;
+
+    fn bytes_to_array<E: serde::de::Error, const N: usize>(bytes: Vec<u8>) -> Result<[u8; N], E> {
+        let len = bytes.len();
+        bytes
+            .try_into()
+            .map_err(|_| E::custom(format!("expected {N} bytes, got {len}")))
+    }
+
+    impl<'de, const N: usize> serde::de::Visitor<'de> for BytesArrayVisitor<N> {
+        type Value = [u8; N];
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a base64 string or {N} raw bytes")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+            use base64::Engine as _;
+            bytes_to_array(BASE64_STANDARD.decode(v.as_bytes()).map_err(E::custom)?)
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+            bytes_to_array(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+            bytes_to_array(v)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut out = Vec::with_capacity(N);
+            while let Some(b) = seq.next_element::<u8>()? {
+                out.push(b);
+            }
+            bytes_to_array(out)
+        }
+    }
+
+    deserializer.deserialize_any(BytesArrayVisitor::<N>)
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +339,13 @@ fn serialize_kv_mods<S: Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeMap;
+    // Issue #576: `ledgercore.StateDelta` carries no `_struct codec:",
+    // omitempty,omitemptyarray"` marker, so a nil `KvMods` map (the common
+    // case -- untouched until `AddKvMod` is called) must still serialize the
+    // "KvMods" key, with JSON `null`/msgpack nil rather than `{}`.
+    if map.is_empty() {
+        return serializer.serialize_none();
+    }
     let human_readable = serializer.is_human_readable();
     let mut m = serializer.serialize_map(Some(map.len()))?;
     for (k, v) in map {
@@ -225,15 +374,20 @@ fn deserialize_kv_mods<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<HashMap<Vec<u8>, KvValueDelta>, D::Error> {
     if deserializer.is_human_readable() {
-        let m: HashMap<String, KvValueDelta> = HashMap::deserialize(deserializer)?;
-        Ok(m.into_iter().map(|(k, v)| (k.into_bytes(), v)).collect())
+        // Issue #576: an empty/untouched KvMods now round-trips through
+        // `null` rather than an omitted key or `{}`.
+        let m: Option<HashMap<String, KvValueDelta>> = Option::deserialize(deserializer)?;
+        Ok(m.unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k.into_bytes(), v))
+            .collect())
     } else {
         struct RawKeyMapVisitor;
         impl<'de> serde::de::Visitor<'de> for RawKeyMapVisitor {
             type Value = HashMap<Vec<u8>, KvValueDelta>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "a map of raw byte keys to KvValueDelta")
+                write!(f, "a map of raw byte keys to KvValueDelta, or nil")
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -246,8 +400,126 @@ fn deserialize_kv_mods<'de, D: Deserializer<'de>>(
                 }
                 Ok(out)
             }
+
+            // Issue #576: an empty/untouched KvMods serializes as msgpack
+            // nil, not an empty map -- accept both on the read side.
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(HashMap::new())
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(HashMap::new())
+            }
         }
-        deserializer.deserialize_map(RawKeyMapVisitor)
+        // `deserialize_any` (rather than `deserialize_map`) lets the wire
+        // format pick which `visit_*` method to call, so both a real map and
+        // a nil value are handled correctly.
+        deserializer.deserialize_any(RawKeyMapVisitor)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Txids key wire encoding (issue #576)
+// ---------------------------------------------------------------------------
+//
+// go-algorand's `ledgercore.StateDelta.Txids` is `map[transactions.Txid]
+// IncludedTransactions`, where `Txid` is `crypto.Digest` ([32]byte) -- unlike
+// `KvMods`'s genuinely-`string`-typed keys, this is a *non-string* Go map key
+// type. go-codec's `Canonical` map-key path (both `JSONStrictHandle` and
+// `CodecHandle` set `Canonical = true`) has no special case for an array-kind
+// key, so it falls to the generic "encode the key with the same handle used
+// for values" branch (`encode.go`'s `kMapCanonical` default case) -- meaning
+// a Txid key gets the exact same encoding a `[32]byte` *value* would: base64
+// for the JSON handle, raw bytes as a msgpack "bin" (not "str", since
+// `CodecHandle.WriteExt = true`) for the msgpack handle. A plain
+// `HashMap<Digest, _>` cannot represent this at all for JSON --
+// `serde_json` requires map keys to serialize as strings, and `Digest`
+// (a newtype `[u8; 32]`) does not, so populating `Txids` and serializing to
+// JSON previously panicked/errored with "key must be a string" the moment a
+// round had at least one transaction (i.e. virtually always) -- a
+// pre-existing bug this fix also resolves as a prerequisite for exercising
+// issue #576's "Txids is never omitted" behavior at all.
+fn serialize_txids<S: Serializer>(
+    map: &HashMap<Digest, IncludedTransactions>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    if map.is_empty() {
+        return serializer.serialize_none();
+    }
+    let human_readable = serializer.is_human_readable();
+    let mut m = serializer.serialize_map(Some(map.len()))?;
+    for (k, v) in map {
+        if human_readable {
+            use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+            use base64::Engine as _;
+            m.serialize_key(&BASE64_STANDARD.encode(k.0))?;
+        } else {
+            m.serialize_key(serde_bytes::Bytes::new(&k.0))?;
+        }
+        m.serialize_value(v)?;
+    }
+    m.end()
+}
+
+fn deserialize_txids<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HashMap<Digest, IncludedTransactions>, D::Error> {
+    fn digest_from_bytes<E: serde::de::Error>(bytes: Vec<u8>) -> Result<Digest, E> {
+        let len = bytes.len();
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| E::custom(format!("expected a 32-byte Txid key, got {len} bytes")))?;
+        Ok(Digest(arr))
+    }
+
+    if deserializer.is_human_readable() {
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use base64::Engine as _;
+        let m: Option<HashMap<String, IncludedTransactions>> = Option::deserialize(deserializer)?;
+        m.unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| {
+                let bytes = BASE64_STANDARD
+                    .decode(k.as_bytes())
+                    .map_err(serde::de::Error::custom)?;
+                Ok((digest_from_bytes(bytes)?, v))
+            })
+            .collect()
+    } else {
+        struct TxidKeyMapVisitor;
+        impl<'de> serde::de::Visitor<'de> for TxidKeyMapVisitor {
+            type Value = HashMap<Digest, IncludedTransactions>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "a map of 32-byte Txid keys to IncludedTransactions, or nil"
+                )
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut out = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((k, v)) =
+                    map.next_entry::<serde_bytes::ByteBuf, IncludedTransactions>()?
+                {
+                    out.insert(digest_from_bytes(k.into_vec())?, v);
+                }
+                Ok(out)
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(HashMap::new())
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(HashMap::new())
+            }
+        }
+        deserializer.deserialize_any(TxidKeyMapVisitor)
     }
 }
 
@@ -256,18 +528,18 @@ fn deserialize_kv_mods<'de, D: Deserializer<'de>>(
 // ---------------------------------------------------------------------------
 
 /// Metadata for a transaction included in a block.
+///
+/// go-algorand's `ledgercore.IncludedTransactions` carries no `_struct
+/// codec:",omitempty,omitemptyarray"` marker, so both fields are always
+/// present on the wire (issue #576) -- never skipped, even when zero.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IncludedTransactions {
     /// Last valid round for the transaction.
-    #[serde(
-        rename = "LastValid",
-        default,
-        skip_serializing_if = "is_default_round"
-    )]
+    #[serde(rename = "LastValid", default)]
     pub last_valid: Round,
 
     /// Intra-block index.
-    #[serde(rename = "Intra", default, skip_serializing_if = "is_zero_u64")]
+    #[serde(rename = "Intra", default)]
     pub intra: u64,
 }
 
@@ -276,26 +548,26 @@ pub struct IncludedTransactions {
 // ---------------------------------------------------------------------------
 
 /// Tracks creation/deletion of an asset or application.
+///
+/// go-algorand's `ledgercore.ModifiedCreatable` carries no `_struct
+/// codec:",omitempty,omitemptyarray"` marker, so every field is always
+/// present on the wire (issue #576) -- never skipped, even when zero.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModifiedCreatable {
     /// Creatable type: 0 = asset, 1 = app.
-    #[serde(rename = "Ctype", default, skip_serializing_if = "is_zero_u64")]
+    #[serde(rename = "Ctype", default)]
     pub ctype: u64,
 
     /// Whether this creatable was created (true) or deleted (false).
-    #[serde(rename = "Created", default, skip_serializing_if = "is_false")]
+    #[serde(rename = "Created", default)]
     pub created: bool,
 
     /// Creator address.
-    #[serde(
-        rename = "Creator",
-        default,
-        skip_serializing_if = "is_default_address"
-    )]
+    #[serde(rename = "Creator", default)]
     pub creator: Address,
 
     /// Number of deltas referencing this creatable.
-    #[serde(rename = "Ndeltas", default, skip_serializing_if = "is_zero_i64")]
+    #[serde(rename = "Ndeltas", default)]
     pub ndeltas: i64,
 }
 
@@ -320,53 +592,57 @@ pub struct Txlease {
 // ---------------------------------------------------------------------------
 
 /// Voting-related fields from basics.VotingData.
+///
+/// go-algorand's `basics.VotingData` carries no `_struct codec:",omitempty,
+/// omitemptyarray"` marker, so every field is always present on the wire
+/// (issue #576) -- never skipped, even when zero. The three byte-array
+/// fields additionally need `serialize_bytes_array`/`deserialize_bytes_array`
+/// (issue #576, following #573's `serialize_kv_bytes` precedent): go-codec's
+/// JSON handle base64-encodes fixed-size `[N]byte` arrays exactly like
+/// `[]byte` slices, which a plain `#[serde(with = "serde_bytes")]` field does
+/// not reproduce under `serde_json` (falls back to a JSON array of numbers).
+/// Unlike `KvValueDelta.Data`/`.OldData`, a Go array is never nil, so there
+/// is no empty/null case here -- the actual (possibly all-zero) bytes are
+/// always written, never `null`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VotingData {
     /// VoteID (one-time-signature verifier).
-    #[serde(rename = "VoteID", default, skip_serializing_if = "is_zero_bytes_32")]
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        rename = "VoteID",
+        default,
+        serialize_with = "serialize_bytes_array",
+        deserialize_with = "deserialize_bytes_array"
+    )]
     pub vote_id: [u8; 32],
 
     /// Selection public key.
     #[serde(
         rename = "SelectionID",
         default,
-        skip_serializing_if = "is_zero_bytes_32"
+        serialize_with = "serialize_bytes_array",
+        deserialize_with = "deserialize_bytes_array"
     )]
-    #[serde(with = "serde_bytes")]
     pub selection_id: [u8; 32],
 
     /// State proof public key (64 bytes).
     #[serde(
         rename = "StateProofID",
         default = "default_64_bytes",
-        skip_serializing_if = "is_zero_bytes_64"
+        serialize_with = "serialize_bytes_array",
+        deserialize_with = "deserialize_bytes_array"
     )]
-    #[serde(with = "serde_bytes")]
     pub state_proof_id: [u8; 64],
 
     /// First round votes are valid.
-    #[serde(
-        rename = "VoteFirstValid",
-        default,
-        skip_serializing_if = "is_default_round"
-    )]
+    #[serde(rename = "VoteFirstValid", default)]
     pub vote_first_valid: Round,
 
     /// Last round votes are valid.
-    #[serde(
-        rename = "VoteLastValid",
-        default,
-        skip_serializing_if = "is_default_round"
-    )]
+    #[serde(rename = "VoteLastValid", default)]
     pub vote_last_valid: Round,
 
     /// Key dilution for key registration.
-    #[serde(
-        rename = "VoteKeyDilution",
-        default,
-        skip_serializing_if = "is_zero_u64"
-    )]
+    #[serde(rename = "VoteKeyDilution", default)]
     pub vote_key_dilution: u64,
 }
 
@@ -387,14 +663,6 @@ fn default_64_bytes() -> [u8; 64] {
     [0u8; 64]
 }
 
-fn is_zero_bytes_32(v: &[u8; 32]) -> bool {
-    *v == [0u8; 32]
-}
-
-fn is_zero_bytes_64(v: &[u8; 64]) -> bool {
-    *v == [0u8; 64]
-}
-
 // ---------------------------------------------------------------------------
 // AccountBaseData (ledgercore/accountdata.go)
 // ---------------------------------------------------------------------------
@@ -403,42 +671,34 @@ fn is_zero_bytes_64(v: &[u8; 64]) -> bool {
 ///
 /// This is the ledgercore version, NOT basics.AccountData — it omits the
 /// per-resource maps and tracks aggregate counts instead.
+///
+/// go-algorand's `ledgercore.AccountBaseData` carries no `_struct
+/// codec:",omitempty,omitemptyarray"` marker, so every field is always
+/// present on the wire (issue #576) -- never skipped, even when zero.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountBaseData {
     /// Account status (0=Offline, 1=Online, 2=NotParticipating).
-    #[serde(rename = "Status", default, skip_serializing_if = "is_zero_u64")]
+    #[serde(rename = "Status", default)]
     pub status: u64,
 
     /// Account balance in MicroAlgos.
-    #[serde(rename = "MicroAlgos", default, skip_serializing_if = "is_zero_u64")]
+    #[serde(rename = "MicroAlgos", default)]
     pub micro_algos: u64,
 
     /// Rewards base for computing pending rewards.
-    #[serde(rename = "RewardsBase", default, skip_serializing_if = "is_zero_u64")]
+    #[serde(rename = "RewardsBase", default)]
     pub rewards_base: u64,
 
     /// Total rewards earned (MicroAlgos).
-    #[serde(
-        rename = "RewardedMicroAlgos",
-        default,
-        skip_serializing_if = "is_zero_u64"
-    )]
+    #[serde(rename = "RewardedMicroAlgos", default)]
     pub rewarded_micro_algos: u64,
 
     /// Spending key (authorized address).
-    #[serde(
-        rename = "AuthAddr",
-        default,
-        skip_serializing_if = "is_default_address"
-    )]
+    #[serde(rename = "AuthAddr", default)]
     pub auth_addr: Address,
 
     /// Whether the account is eligible for block incentives (v40+).
-    #[serde(
-        rename = "IncentiveEligible",
-        default,
-        skip_serializing_if = "is_false"
-    )]
+    #[serde(rename = "IncentiveEligible", default)]
     pub incentive_eligible: bool,
 
     /// Aggregate of all application schemas for min-balance calculation.
@@ -446,63 +706,39 @@ pub struct AccountBaseData {
     pub total_app_schema: StateSchema,
 
     /// Total extra app pages.
-    #[serde(
-        rename = "TotalExtraAppPages",
-        default,
-        skip_serializing_if = "is_zero_u32"
-    )]
+    #[serde(rename = "TotalExtraAppPages", default)]
     pub total_extra_app_pages: u32,
 
     /// Total number of created applications.
-    #[serde(
-        rename = "TotalAppParams",
-        default,
-        skip_serializing_if = "is_zero_u64"
-    )]
+    #[serde(rename = "TotalAppParams", default)]
     pub total_app_params: u64,
 
     /// Total number of opted-in app local states.
-    #[serde(
-        rename = "TotalAppLocalStates",
-        default,
-        skip_serializing_if = "is_zero_u64"
-    )]
+    #[serde(rename = "TotalAppLocalStates", default)]
     pub total_app_local_states: u64,
 
     /// Total number of created asset params.
-    #[serde(
-        rename = "TotalAssetParams",
-        default,
-        skip_serializing_if = "is_zero_u64"
-    )]
+    #[serde(rename = "TotalAssetParams", default)]
     pub total_asset_params: u64,
 
     /// Total number of opted-in assets.
-    #[serde(rename = "TotalAssets", default, skip_serializing_if = "is_zero_u64")]
+    #[serde(rename = "TotalAssets", default)]
     pub total_assets: u64,
 
     /// Total number of boxes.
-    #[serde(rename = "TotalBoxes", default, skip_serializing_if = "is_zero_u64")]
+    #[serde(rename = "TotalBoxes", default)]
     pub total_boxes: u64,
 
     /// Total byte size of all boxes.
-    #[serde(rename = "TotalBoxBytes", default, skip_serializing_if = "is_zero_u64")]
+    #[serde(rename = "TotalBoxBytes", default)]
     pub total_box_bytes: u64,
 
     /// Last round this account proposed a block.
-    #[serde(
-        rename = "LastProposed",
-        default,
-        skip_serializing_if = "is_default_round"
-    )]
+    #[serde(rename = "LastProposed", default)]
     pub last_proposed: Round,
 
     /// Last heartbeat round.
-    #[serde(
-        rename = "LastHeartbeat",
-        default,
-        skip_serializing_if = "is_default_round"
-    )]
+    #[serde(rename = "LastHeartbeat", default)]
     pub last_heartbeat: Round,
 }
 
@@ -543,14 +779,19 @@ pub struct BalanceRecord {
 // ---------------------------------------------------------------------------
 
 /// Delta for asset holdings.
+///
+/// go-algorand's `ledgercore.AssetHoldingDelta` carries no `_struct
+/// codec:",omitempty,omitemptyarray"` marker, so both fields are always
+/// present on the wire (issue #576) -- `Holding` as `null` when unset
+/// (mirroring Go's nil `*basics.AssetHolding`), `Deleted` even when `false`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AssetHoldingDelta {
     /// Updated holding (None if not changed or deleted).
-    #[serde(rename = "Holding", default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "Holding", default)]
     pub holding: Option<AssetHoldingRecord>,
 
     /// Whether the holding was deleted.
-    #[serde(rename = "Deleted", default, skip_serializing_if = "is_false")]
+    #[serde(rename = "Deleted", default)]
     pub deleted: bool,
 }
 
@@ -567,14 +808,19 @@ pub struct AssetHoldingRecord {
 }
 
 /// Delta for asset parameters.
+///
+/// go-algorand's `ledgercore.AssetParamsDelta` carries no `_struct
+/// codec:",omitempty,omitemptyarray"` marker, so both fields are always
+/// present on the wire (issue #576) -- `Params` as `null` when unset
+/// (mirroring Go's nil `*basics.AssetParams`), `Deleted` even when `false`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AssetParamsDelta {
     /// Updated asset params (None if not changed or deleted).
-    #[serde(rename = "Params", default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "Params", default)]
     pub params: Option<AssetParamsRecord>,
 
     /// Whether the asset was deleted.
-    #[serde(rename = "Deleted", default, skip_serializing_if = "is_false")]
+    #[serde(rename = "Deleted", default)]
     pub deleted: bool,
 }
 
@@ -631,18 +877,19 @@ pub struct AssetParamsRecord {
 }
 
 /// Delta for application local state.
+///
+/// go-algorand's `ledgercore.AppLocalStateDelta` carries no `_struct
+/// codec:",omitempty,omitemptyarray"` marker, so both fields are always
+/// present on the wire (issue #576) -- `LocalState` as `null` when unset
+/// (mirroring Go's nil `*basics.AppLocalState`), `Deleted` even when `false`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppLocalStateDelta {
     /// Updated local state (None if not changed or deleted).
-    #[serde(
-        rename = "LocalState",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "LocalState", default)]
     pub local_state: Option<AppLocalStateRecord>,
 
     /// Whether the local state was deleted.
-    #[serde(rename = "Deleted", default, skip_serializing_if = "is_false")]
+    #[serde(rename = "Deleted", default)]
     pub deleted: bool,
 }
 
@@ -670,14 +917,19 @@ pub struct TealValueRecord {
 }
 
 /// Delta for application parameters.
+///
+/// go-algorand's `ledgercore.AppParamsDelta` carries no `_struct
+/// codec:",omitempty,omitemptyarray"` marker, so both fields are always
+/// present on the wire (issue #576) -- `Params` as `null` when unset
+/// (mirroring Go's nil `*basics.AppParams`), `Deleted` even when `false`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppParamsDelta {
     /// Updated app params (None if not changed or deleted).
-    #[serde(rename = "Params", default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "Params", default)]
     pub params: Option<AppParamsRecord>,
 
     /// Whether the app was deleted.
-    #[serde(rename = "Deleted", default, skip_serializing_if = "is_false")]
+    #[serde(rename = "Deleted", default)]
     pub deleted: bool,
 }
 
@@ -767,17 +1019,32 @@ pub struct AssetResourceRecord {
 /// Collection of account changes from evaluating a block.
 ///
 /// Private cache fields from Go are omitted.
+///
+/// go-algorand's `ledgercore.AccountDeltas` carries no `_struct
+/// codec:",omitempty,omitemptyarray"` marker, so every field is always
+/// present on the wire (issue #576). The three fields differ in their
+/// empty-value wire form, matching how go-algorand allocates them:
+/// - `Accts` is unconditionally allocated (non-nil) by `MakeAccountDeltas`
+///   at the start of every round's state-delta construction
+///   (`PopulateStateDelta`), so it is always `[]` (never `null`) when empty
+///   -- a plain `Vec` with no `skip_serializing_if` reproduces that.
+/// - `AppResources`/`AssetResources` are left as Go nil slices until the
+///   first `UpsertAppResource`/`UpsertAssetResource` call, so for a round
+///   that never touches app/asset resources (the common case, e.g. a plain
+///   payment) they serialize as `null`, not `[]` -- `serialize_vec_or_null`/
+///   `deserialize_vec_or_null` reproduce that.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountDeltas {
     /// Balance records (address + account data).
-    #[serde(rename = "Accts", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "Accts", default)]
     pub accts: Vec<BalanceRecord>,
 
     /// Application resource changes.
     #[serde(
         rename = "AppResources",
         default,
-        skip_serializing_if = "Vec::is_empty"
+        serialize_with = "serialize_vec_or_null",
+        deserialize_with = "deserialize_vec_or_null"
     )]
     pub app_resources: Vec<AppResourceRecord>,
 
@@ -785,7 +1052,8 @@ pub struct AccountDeltas {
     #[serde(
         rename = "AssetResources",
         default,
-        skip_serializing_if = "Vec::is_empty"
+        serialize_with = "serialize_vec_or_null",
+        deserialize_with = "deserialize_vec_or_null"
     )]
     pub asset_resources: Vec<AssetResourceRecord>,
 }
@@ -797,6 +1065,13 @@ pub struct AccountDeltas {
 /// The complete set of state changes produced by evaluating a block.
 ///
 /// This mirrors go-algorand's `ledgercore.StateDelta`.
+///
+/// go-algorand's `ledgercore.StateDelta` carries no `_struct codec:",
+/// omitempty,omitemptyarray"` marker, so every field is always present on
+/// the wire (issue #576) -- never skipped. `KvMods`/`Txids`/`Creatables`
+/// (nil Go maps until first populated) and `Txleases`/`Hdr` (nil Go
+/// pointers/maps) serialize as `null` when empty/unset rather than an
+/// omitted key or `{}`/`[]`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StateDelta {
     /// Account deltas (balance + resource changes).
@@ -810,14 +1085,18 @@ pub struct StateDelta {
     #[serde(
         rename = "KvMods",
         default,
-        skip_serializing_if = "HashMap::is_empty",
         serialize_with = "serialize_kv_mods",
         deserialize_with = "deserialize_kv_mods"
     )]
     pub kv_mods: HashMap<Vec<u8>, KvValueDelta>,
 
     /// Transaction IDs included in the block.
-    #[serde(rename = "Txids", default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(
+        rename = "Txids",
+        default,
+        serialize_with = "serialize_txids",
+        deserialize_with = "deserialize_txids"
+    )]
     pub txids: HashMap<Digest, IncludedTransactions>,
 
     /// Transaction leases. Represented as a Vec of pairs since `Txlease`
@@ -827,31 +1106,28 @@ pub struct StateDelta {
     /// TODO: go-algorand's codec encodes this as a msgpack map, not an array
     /// of pairs. A custom serde implementation may be needed for byte-level
     /// msgpack conformance.
-    #[serde(rename = "Txleases", default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "Txleases", default)]
     pub txleases: Option<Vec<(Txlease, Round)>>,
 
     /// Created/deleted assets and applications.
     #[serde(
         rename = "Creatables",
         default,
-        skip_serializing_if = "HashMap::is_empty"
+        serialize_with = "serialize_map_or_null",
+        deserialize_with = "deserialize_map_or_null"
     )]
     pub creatables: HashMap<u64, ModifiedCreatable>,
 
     /// Block header (None when not set).
-    #[serde(rename = "Hdr", default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "Hdr", default)]
     pub hdr: Option<BlockHeader>,
 
     /// Next expected state proof round.
-    #[serde(
-        rename = "StateProofNext",
-        default,
-        skip_serializing_if = "is_default_round"
-    )]
+    #[serde(rename = "StateProofNext", default)]
     pub state_proof_next: Round,
 
     /// Previous block timestamp.
-    #[serde(rename = "PrevTimestamp", default, skip_serializing_if = "is_zero_i64")]
+    #[serde(rename = "PrevTimestamp", default)]
     pub prev_timestamp: i64,
 
     /// Aggregate account totals after applying this block.
@@ -876,6 +1152,14 @@ pub struct StateDelta {
 /// full [`StateDelta`] for these two endpoints would instead always emit a
 /// `Totals` key (its sub-fields have no `skip_serializing_if`), a byte-level
 /// conformance mismatch — see issue #191.
+///
+/// Unlike `ledgercore.StateDelta` (see [`StateDelta`]'s docs), go's
+/// `ledger/eval.StateDeltaSubset` **does** declare the `_struct codec:",
+/// omitempty,omitemptyarray"` marker (`ledger/eval/txntracer.go`), so this
+/// type's own `skip_serializing_if`s on `KvMods`/`Txids`/`Txleases`/
+/// `Creatables` are correct as-is (issue #576's audit): despite the
+/// near-identical field list, `StateDeltaSubset` and `StateDelta` are
+/// different Go types with opposite default-omission behavior.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StateDeltaSubset {
     /// Account deltas (balance + resource changes).
@@ -894,7 +1178,19 @@ pub struct StateDeltaSubset {
     pub kv_mods: HashMap<Vec<u8>, KvValueDelta>,
 
     /// Transaction IDs included in the group.
-    #[serde(rename = "Txids", default, skip_serializing_if = "HashMap::is_empty")]
+    ///
+    /// Uses the same `serialize_txids`/`deserialize_txids` helpers as
+    /// [`StateDelta::txids`] (see their doc comment) -- a plain
+    /// `HashMap<Digest, _>` cannot serialize to JSON at all (`Digest` is not
+    /// a string-serializable map key), a pre-existing bug independent of
+    /// this field's (correct, unchanged) `skip_serializing_if`.
+    #[serde(
+        rename = "Txids",
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "serialize_txids",
+        deserialize_with = "deserialize_txids"
+    )]
     pub txids: HashMap<Digest, IncludedTransactions>,
 
     /// Transaction leases. See [`StateDelta::txleases`] for representation
@@ -1178,5 +1474,469 @@ mod kv_value_delta_wire_format_tests {
             raw_key_bytes, key,
             "msgpack KvMods key must be the exact raw bytes, not a lossy-UTF8 substitution"
         );
+    }
+
+    /// Regression: `#[serde(flatten)]`'s *deserialize* side (used by
+    /// `LedgercoreAccountData` to compose `AccountBaseData` + `VotingData`)
+    /// buffers the remaining input into serde's generic `Content` type,
+    /// whose `Deserializer::is_human_readable()` always answers `true`
+    /// regardless of the real wire format -- so `deserialize_bytes_array`
+    /// branching on that flag (as it originally did, mirroring
+    /// `deserialize_kv_bytes`) mis-decoded raw msgpack bytes as base64 the
+    /// moment `VotingData` sat under a `flatten`. Pins the fix (dispatch via
+    /// `deserialize_any`'s visitor instead, which sees the value's real
+    /// shape) directly against the minimal case that first exposed it.
+    #[test]
+    fn voting_data_behind_flatten_round_trips_through_msgpack() {
+        #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+        struct Inner {
+            #[serde(
+                serialize_with = "serialize_bytes_array",
+                deserialize_with = "deserialize_bytes_array"
+            )]
+            id: [u8; 32],
+        }
+        #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+        struct Outer {
+            #[serde(flatten)]
+            inner: Inner,
+        }
+        let w = Outer::default();
+        let bytes = rmp_serde::to_vec_named(&w).expect("serialize");
+        let decoded: Outer = rmp_serde::from_slice(&bytes).expect("deserialize");
+        assert_eq!(decoded, w);
+    }
+
+    /// Same regression, exercised through the real (not minimal) types:
+    /// `AccountDeltas` -> `BalanceRecord` -> `LedgercoreAccountData`
+    /// (flattened `AccountBaseData` + `VotingData`), matching exactly what
+    /// `algo-rest-api`'s `mock_with_delta()` integration-test helper builds.
+    #[test]
+    fn account_deltas_default_voting_data_msgpack_roundtrip() {
+        let deltas = AccountDeltas {
+            accts: vec![BalanceRecord {
+                addr: Address([1u8; 32]),
+                account_data: LedgercoreAccountData::default(),
+            }],
+            app_resources: Vec::new(),
+            asset_resources: Vec::new(),
+        };
+        let bytes = rmp_serde::to_vec_named(&deltas).expect("serialize");
+        let decoded: AccountDeltas = rmp_serde::from_slice(&bytes).expect("deserialize");
+        assert_eq!(decoded, deltas);
+    }
+
+    /// Full end-to-end regression matching `algo-rest-api`'s
+    /// `mock_with_delta()` integration-test fixture exactly (the scenario
+    /// that first surfaced the flatten/msgpack bug above, via
+    /// `get_state_delta_msgpack_returns_200_with_txleases`).
+    #[test]
+    fn state_delta_mock_with_delta_shape_msgpack_roundtrip() {
+        let delta = StateDelta {
+            accts: AccountDeltas {
+                accts: vec![BalanceRecord {
+                    addr: Address([1u8; 32]),
+                    account_data: LedgercoreAccountData::default(),
+                }],
+                app_resources: Vec::new(),
+                asset_resources: Vec::new(),
+            },
+            kv_mods: HashMap::new(),
+            txids: HashMap::new(),
+            txleases: Some(vec![(
+                Txlease {
+                    sender: Address([2u8; 32]),
+                    lease: [3u8; 32],
+                },
+                Round(100),
+            )]),
+            creatables: HashMap::new(),
+            hdr: None,
+            state_proof_next: Round(0),
+            prev_timestamp: 0,
+            totals: AccountTotals::default(),
+        };
+        let bytes = rmp_serde::to_vec_named(&delta).expect("serialize");
+        let decoded: StateDelta = rmp_serde::from_slice(&bytes).expect("deserialize");
+        assert_eq!(decoded, delta);
+    }
+}
+
+#[cfg(test)]
+mod issue_576_never_omit_tests {
+    //! Issue #576: field-by-field audit of every `skip_serializing_if` in
+    //! this file against go-algorand's actual `_struct codec:",omitempty,
+    //! omitemptyarray"` marker presence/absence. Every type below carries no
+    //! such marker on the Go side (`ledger/ledgercore/statedelta.go`,
+    //! `ledger/ledgercore/accountdata.go`, `data/basics/userBalance.go`), so
+    //! a real node's JSON response always includes every one of these
+    //! fields -- these tests pin that a Rust-side zero/empty value still
+    //! produces the key, using `null` for a nil Go map/slice/pointer rather
+    //! than an omitted key or `{}`/`[]`.
+    use super::*;
+
+    fn obj(json: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
+        json.as_object().expect("must serialize as a JSON object")
+    }
+
+    #[test]
+    fn account_base_data_zero_value_serializes_every_field() {
+        let json = serde_json::to_value(AccountBaseData::default()).expect("serialize");
+        let obj = obj(&json);
+        for key in [
+            "Status",
+            "MicroAlgos",
+            "RewardsBase",
+            "RewardedMicroAlgos",
+            "AuthAddr",
+            "IncentiveEligible",
+            "TotalAppSchema",
+            "TotalExtraAppPages",
+            "TotalAppParams",
+            "TotalAppLocalStates",
+            "TotalAssetParams",
+            "TotalAssets",
+            "TotalBoxes",
+            "TotalBoxBytes",
+            "LastProposed",
+            "LastHeartbeat",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "AccountBaseData must always emit {key} (no omitempty on the Go side): {obj:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn voting_data_zero_value_serializes_every_field_and_base64_encodes_keys() {
+        let json = serde_json::to_value(VotingData::default()).expect("serialize");
+        let obj = obj(&json);
+        for key in [
+            "VoteID",
+            "SelectionID",
+            "StateProofID",
+            "VoteFirstValid",
+            "VoteLastValid",
+            "VoteKeyDilution",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "VotingData must always emit {key} (no omitempty on the Go side): {obj:?}"
+            );
+        }
+        // A Go [32]byte/[64]byte array is never nil -- even the all-zero
+        // VoteID/SelectionID/StateProofID must be a real base64 string, not
+        // null and not a JSON array of numbers.
+        assert_eq!(
+            obj["VoteID"],
+            serde_json::Value::String(
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 32])
+            ),
+            "a zero VoteID must still base64-encode its 32 zero bytes, not omit/null/array: {obj:?}"
+        );
+        assert_eq!(
+            obj["StateProofID"],
+            serde_json::Value::String(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                [0u8; 64]
+            )),
+            "a zero StateProofID must still base64-encode its 64 zero bytes: {obj:?}"
+        );
+
+        let round_tripped: VotingData = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped, VotingData::default());
+    }
+
+    #[test]
+    fn voting_data_nonzero_vote_id_round_trips_through_json_and_msgpack() {
+        let vd = VotingData {
+            vote_id: [0x11; 32],
+            selection_id: [0x22; 32],
+            state_proof_id: [0x33; 64],
+            vote_first_valid: Round(10),
+            vote_last_valid: Round(20),
+            vote_key_dilution: 30,
+        };
+        let json = serde_json::to_value(&vd).expect("serialize");
+        assert_eq!(
+            json["VoteID"],
+            serde_json::Value::String(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                [0x11u8; 32]
+            ))
+        );
+        let round_tripped: VotingData = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped, vd);
+
+        let bytes = rmp_serde::to_vec_named(&vd).expect("msgpack serialize");
+        let round_tripped_mp: VotingData = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped_mp, vd);
+    }
+
+    #[test]
+    fn modified_creatable_zero_value_serializes_every_field() {
+        let json = serde_json::to_value(ModifiedCreatable {
+            ctype: 0,
+            created: false,
+            creator: Address([0u8; 32]),
+            ndeltas: 0,
+        })
+        .expect("serialize");
+        let obj = obj(&json);
+        for key in ["Ctype", "Created", "Creator", "Ndeltas"] {
+            assert!(
+                obj.contains_key(key),
+                "ModifiedCreatable must always emit {key}: {obj:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn included_transactions_zero_value_serializes_every_field() {
+        let json = serde_json::to_value(IncludedTransactions {
+            last_valid: Round(0),
+            intra: 0,
+        })
+        .expect("serialize");
+        let obj = obj(&json);
+        assert!(obj.contains_key("LastValid"), "{obj:?}");
+        assert!(obj.contains_key("Intra"), "{obj:?}");
+    }
+
+    #[test]
+    fn resource_delta_wrappers_always_emit_both_fields_null_and_false() {
+        let json = serde_json::to_value(AssetHoldingDelta::default()).expect("serialize");
+        let holding_obj = obj(&json);
+        assert_eq!(
+            holding_obj["Holding"],
+            serde_json::Value::Null,
+            "{holding_obj:?}"
+        );
+        assert_eq!(
+            holding_obj["Deleted"],
+            serde_json::Value::Bool(false),
+            "{holding_obj:?}"
+        );
+
+        let json = serde_json::to_value(AssetParamsDelta::default()).expect("serialize");
+        let asset_params_obj = obj(&json);
+        assert_eq!(
+            asset_params_obj["Params"],
+            serde_json::Value::Null,
+            "{asset_params_obj:?}"
+        );
+        assert_eq!(
+            asset_params_obj["Deleted"],
+            serde_json::Value::Bool(false),
+            "{asset_params_obj:?}"
+        );
+
+        let json = serde_json::to_value(AppLocalStateDelta::default()).expect("serialize");
+        let local_state_obj = obj(&json);
+        assert_eq!(
+            local_state_obj["LocalState"],
+            serde_json::Value::Null,
+            "{local_state_obj:?}"
+        );
+        assert_eq!(
+            local_state_obj["Deleted"],
+            serde_json::Value::Bool(false),
+            "{local_state_obj:?}"
+        );
+
+        let json = serde_json::to_value(AppParamsDelta::default()).expect("serialize");
+        let app_params_obj = obj(&json);
+        assert_eq!(
+            app_params_obj["Params"],
+            serde_json::Value::Null,
+            "{app_params_obj:?}"
+        );
+        assert_eq!(
+            app_params_obj["Deleted"],
+            serde_json::Value::Bool(false),
+            "{app_params_obj:?}"
+        );
+    }
+
+    #[test]
+    fn account_deltas_accts_is_empty_array_but_resources_are_null_when_empty() {
+        // AccountDeltas.Accts is unconditionally allocated (non-nil) by
+        // go-algorand's MakeAccountDeltas at the start of every round's
+        // state-delta construction, so it must be `[]`, never `null`, when
+        // empty. AppResources/AssetResources are left nil until the first
+        // Upsert*Resource call, so they must be `null`, not `[]`.
+        let json = serde_json::to_value(AccountDeltas::default()).expect("serialize");
+        let obj = obj(&json);
+        assert_eq!(
+            obj["Accts"],
+            serde_json::Value::Array(vec![]),
+            "empty Accts must serialize as [] (always-allocated in go): {obj:?}"
+        );
+        assert_eq!(
+            obj["AppResources"],
+            serde_json::Value::Null,
+            "untouched AppResources must serialize as null (nil in go): {obj:?}"
+        );
+        assert_eq!(
+            obj["AssetResources"],
+            serde_json::Value::Null,
+            "untouched AssetResources must serialize as null (nil in go): {obj:?}"
+        );
+
+        let round_tripped: AccountDeltas = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped, AccountDeltas::default());
+    }
+
+    #[test]
+    fn account_deltas_populated_resources_round_trip_through_json_and_msgpack() {
+        let deltas = AccountDeltas {
+            accts: vec![],
+            app_resources: vec![AppResourceRecord {
+                aidx: 7,
+                addr: Address([0x01; 32]),
+                params: AppParamsDelta::default(),
+                state: AppLocalStateDelta::default(),
+            }],
+            asset_resources: vec![],
+        };
+        let json = serde_json::to_value(&deltas).expect("serialize");
+        let obj = obj(&json);
+        assert!(obj["AppResources"].is_array());
+        let round_tripped: AccountDeltas = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped, deltas);
+
+        let bytes = rmp_serde::to_vec_named(&deltas).expect("msgpack serialize");
+        let round_tripped_mp: AccountDeltas =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped_mp, deltas);
+    }
+
+    #[test]
+    fn state_delta_default_never_omits_a_field_and_uses_null_for_empty_maps() {
+        let json = serde_json::to_value(StateDelta::default()).expect("serialize");
+        let obj = obj(&json);
+        for key in [
+            "Accts",
+            "KvMods",
+            "Txids",
+            "Txleases",
+            "Creatables",
+            "Hdr",
+            "StateProofNext",
+            "PrevTimestamp",
+            "Totals",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "StateDelta must always emit {key} (no omitempty on ledgercore.StateDelta): {obj:?}"
+            );
+        }
+        assert_eq!(
+            obj["KvMods"],
+            serde_json::Value::Null,
+            "an untouched (nil in go) KvMods must serialize as null, not {{}}: {obj:?}"
+        );
+        assert_eq!(
+            obj["Txids"],
+            serde_json::Value::Null,
+            "an untouched (nil in go) Txids must serialize as null, not {{}}: {obj:?}"
+        );
+        assert_eq!(
+            obj["Creatables"],
+            serde_json::Value::Null,
+            "an untouched (nil in go) Creatables must serialize as null, not {{}}: {obj:?}"
+        );
+        assert_eq!(obj["Txleases"], serde_json::Value::Null, "{obj:?}");
+        assert_eq!(obj["Hdr"], serde_json::Value::Null, "{obj:?}");
+        assert_eq!(obj["StateProofNext"], serde_json::json!(0), "{obj:?}");
+        assert_eq!(obj["PrevTimestamp"], serde_json::json!(0), "{obj:?}");
+        // Accts is unconditionally allocated in go, so it's [] not null.
+        assert_eq!(obj["Accts"]["Accts"], serde_json::Value::Array(vec![]));
+
+        let round_tripped: StateDelta = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped, StateDelta::default());
+    }
+
+    #[test]
+    fn state_delta_populated_maps_round_trip_through_json_and_msgpack() {
+        let mut txids = HashMap::new();
+        txids.insert(
+            Digest([0x42; 32]),
+            IncludedTransactions {
+                last_valid: Round(100),
+                intra: 3,
+            },
+        );
+        let mut creatables = HashMap::new();
+        creatables.insert(
+            5,
+            ModifiedCreatable {
+                ctype: 1,
+                created: true,
+                creator: Address([0x09; 32]),
+                ndeltas: 1,
+            },
+        );
+        let delta = StateDelta {
+            txids,
+            creatables,
+            state_proof_next: Round(42),
+            prev_timestamp: 1_700_000_000,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&delta).expect("serialize");
+        let obj = obj(&json);
+        assert!(obj["Txids"].is_object());
+        assert!(obj["Creatables"].is_object());
+        let round_tripped: StateDelta = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped, delta);
+
+        let bytes = rmp_serde::to_vec_named(&delta).expect("msgpack serialize");
+        let round_tripped_mp: StateDelta = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped_mp, delta);
+    }
+
+    #[test]
+    fn state_delta_kv_mods_null_round_trips_through_msgpack() {
+        // Regression for the msgpack decode side of the KvMods null-when-
+        // empty fix: `deserialize_kv_mods`'s non-human-readable branch must
+        // accept a nil value (not just a real map), since a real node emits
+        // msgpack nil for an untouched KvMods.
+        let delta = StateDelta::default();
+        let bytes = rmp_serde::to_vec_named(&delta).expect("msgpack serialize");
+        let decoded: rmpv::Value =
+            rmpv::decode::read_value(&mut &bytes[..]).expect("decode as rmpv");
+        let kv_mods_val = decoded
+            .as_map()
+            .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("KvMods")))
+            .map(|(_, v)| v.clone())
+            .expect("StateDelta must always have a KvMods entry");
+        assert!(
+            kv_mods_val.is_nil(),
+            "an untouched KvMods must serialize as msgpack nil: {kv_mods_val:?}"
+        );
+
+        let round_tripped: StateDelta = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, delta);
+    }
+
+    #[test]
+    fn state_delta_subset_still_omits_empty_map_fields_unlike_state_delta() {
+        // Regression guard for the opposite finding of this issue's audit:
+        // `ledger/eval.StateDeltaSubset` (unlike `ledgercore.StateDelta`)
+        // *does* declare the omitempty marker, so its skip_serializing_ifs
+        // must remain unchanged -- an empty KvMods/Txids/Creatables/
+        // Txleases/Hdr must still be an *omitted key*, not null.
+        let subset = StateDeltaSubset::default();
+        let json = serde_json::to_value(&subset).expect("serialize");
+        let obj = obj(&json);
+        for key in ["KvMods", "Txids", "Txleases", "Creatables", "Hdr"] {
+            assert!(
+                !obj.contains_key(key),
+                "StateDeltaSubset must omit {key} when empty (go's marker is present): {obj:?}"
+            );
+        }
     }
 }

@@ -704,3 +704,109 @@ async fn algo_fixtures_can_capture_state_delta() {
 fn tempfile_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("create scratch dir for fixture capture")
 }
+
+/// Issue #576 (follow-up to #573): live-verifies that fields *outside*
+/// `KvValueDelta` are never omitted either. `ledgercore.AccountBaseData`
+/// (the `Accts[]` entries under `StateDelta.Accts`) carries no `_struct
+/// codec:",omitempty,omitemptyarray"` marker, so a real node's response for
+/// a plain payment round -- where most `AccountBaseData` fields are zero --
+/// must still include every one of those fields, e.g. `"Status":0`,
+/// `"AuthAddr":"AAAA...Y5HFKQ"` (the all-zero address's checksum string, not
+/// omitted/null), `"TotalAppSchema":{}` (present as an empty object, not
+/// omitted). This is exactly the example quoted in issue #576 itself.
+#[tokio::test]
+#[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
+async fn state_delta_accts_zero_fields_matches_go_for_plain_payment() {
+    let c = client();
+    let sk = dev_signing_key();
+
+    // A second dev-mode account: the recipient. Any funded, distinct
+    // address works; genesis dev-mode accounts always exist, so pick the
+    // all-zero address's "next" byte pattern to guarantee it's a fresh
+    // account with zero `AccountBaseData` (no prior Status/AuthAddr/etc.)
+    // wherever it lands in Accts.
+    let receiver = algo_types::Address([0x07; 32]);
+
+    for (base, label) in [(go_url(), "go"), (rust_url(), "rust")] {
+        let mut pay = base_txn(&c, &base).await;
+        pay.txn_type = TxnType::Pay;
+        pay.receiver = receiver;
+        pay.amount = 1234;
+        pay.note = unique_note(&format!("plain-payment-{label}")).into();
+        let confirmed = submit_and_confirm(&c, &base, label, &mut pay, &sk, "plain payment").await;
+        let round = confirmed["confirmed-round"].as_u64().unwrap();
+
+        let (status, body) = get_json(&c, &base, &format!("/v2/deltas/{round}?format=json")).await;
+        assert_eq!(
+            status, 200,
+            "{label}: GET /v2/deltas/{round} status: {body}"
+        );
+
+        let accts = body["Accts"]["Accts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label}: round {round} StateDelta.Accts.Accts must be a (possibly empty) array: {body}"));
+        assert!(
+            !accts.is_empty(),
+            "{label}: a plain payment round must touch at least the sender and receiver: {body}"
+        );
+
+        // Find the freshly-touched receiver's BalanceRecord by its zero
+        // `Status`/`MicroAlgos`... wait, MicroAlgos is nonzero after the
+        // payment, so key on the fields that stay zero for a brand-new
+        // account with no app/asset history (Status, TotalAppSchema,
+        // TotalAppParams): the sender (a long-lived dev-mode account) won't
+        // match all of these simultaneously. Not matching by the `Addr`
+        // field's *string* value deliberately -- `ledgercore.AccountDeltas`'
+        // `Addr`/`AuthAddr` fields have their own separate, pre-existing
+        // wire-encoding bug (tracked in a dedicated follow-up issue filed
+        // alongside #576) unrelated to this test's omitempty concern.
+        let receiver_record = accts
+            .iter()
+            .find(|r| {
+                r.get("Status") == Some(&serde_json::json!(0))
+                    && r.get("TotalAppSchema") == Some(&serde_json::json!({}))
+                    && r.get("TotalAppParams") == Some(&serde_json::json!(0))
+            })
+            .unwrap_or_else(|| {
+                panic!("{label}: round {round} Accts must contain a fresh zero-history receiver: {accts:?}")
+            });
+
+        for key in [
+            "Status",
+            "MicroAlgos",
+            "RewardsBase",
+            "RewardedMicroAlgos",
+            "AuthAddr",
+            "IncentiveEligible",
+            "TotalAppSchema",
+            "TotalExtraAppPages",
+            "TotalAppParams",
+            "TotalAppLocalStates",
+            "TotalAssetParams",
+            "TotalAssets",
+            "TotalBoxes",
+            "TotalBoxBytes",
+            "LastProposed",
+            "LastHeartbeat",
+        ] {
+            assert!(
+                receiver_record.get(key).is_some(),
+                "{label}: round {round} receiver's AccountBaseData must always include {key} \
+                 (no omitempty on ledgercore.AccountBaseData), even when zero: {receiver_record}"
+            );
+        }
+        // Spot-check the exact zero-value wire forms the issue itself
+        // quotes: Status as a bare 0, AuthAddr as the real (non-omitted,
+        // non-null) checksum-address string, TotalAppSchema as `{}`.
+        assert_eq!(
+            receiver_record["Status"],
+            serde_json::json!(0),
+            "{label}: fresh receiver's Status must be present as 0: {receiver_record}"
+        );
+        assert_eq!(
+            receiver_record["TotalAppSchema"],
+            serde_json::json!({}),
+            "{label}: fresh receiver's TotalAppSchema must be present as {{}}: {receiver_record}"
+        );
+    }
+}
