@@ -66,8 +66,8 @@ txn NumAppArgs
 int 2
 ==
 bz done
-txn ApplicationArgs 0
-txn ApplicationArgs 1
+txna ApplicationArgs 0
+txna ApplicationArgs 1
 box_put
 done:
 int 1
@@ -404,6 +404,23 @@ async fn deploy_and_populate(client: &reqwest::Client, base: &str, label: &str) 
 }
 
 // ---------------------------------------------------------------------------
+
+/// Fast, always-run (not `#[ignore]`d) regression test: pins that
+/// `APPROVAL_SOURCE` actually assembles. This is deliberately *not*
+/// gated behind the dual-node harness -- a TEAL syntax mistake here (e.g.
+/// using `txn` instead of `txna` for an array field, which this test
+/// caught live in CI before this test existed) should fail fast in
+/// default `cargo test --workspace`, not only when someone happens to run
+/// the ignored live suite.
+#[test]
+fn approval_program_assembles() {
+    let ops = algo_avm::assembler::assemble_string(APPROVAL_SOURCE)
+        .expect("APPROVAL_SOURCE must assemble cleanly");
+    assert!(
+        !ops.program.is_empty(),
+        "assembled program must not be empty"
+    );
+}
 
 #[tokio::test]
 #[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
