@@ -17,3 +17,7 @@ serde_bytes.workspace = true
 data-encoding.workspace = true
 sha2 = { workspace = true }
 arbitrary = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+rmp-serde.workspace = true
