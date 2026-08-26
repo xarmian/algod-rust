@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# consensus-soak.sh — issue #594 acceptance gate.
+# consensus-soak.sh — issue #594 acceptance gate, extended by issue #596.
 #
 # The P2P-transport analogue of
-# `ops/mixed-cluster/scripts/consensus-conformance.sh` (issue #470), but
-# scoped to what issue #594 actually asks for: a long soak with
-# machine-readable pass/fail, not the full fork-detector / bidirectional
-# cert-cross-verify / restart / negative-conformance suite that harness
-# also runs. Those verifiers (`algo-fork-detector`, `algo-cert-crossverify`,
-# `tools/cert-authenticate`) are not wired to this harness's container
-# names/ports yet — see docs/P2P_SOAK_METHODOLOGY.md's "Not yet covered"
-# section and the follow-up issue filed alongside #594 for that gap.
+# `ops/mixed-cluster/scripts/consensus-conformance.sh` (issue #470).
+# Issue #594 originally scoped this to just the soak + analyze stages;
+# issue #596 wires up three of the four verifiers the WS-gossip harness's
+# own Tier 2 also runs — fork detection, bidirectional cert cross-verify,
+# and restart/rejoin scenarios (all opt-in, off by default, identical
+# env-var gating to consensus-conformance.sh). Negative-conformance
+# (malformed-message injection) is NOT wired here — `algo-agreement-fuzz`
+# speaks the WS-gossip wire framing (`algo_network::connect`), which has
+# no equivalent over this harness's libp2p `/algorand-ws/2.2.0` raw
+# stream; see docs/P2P_SOAK_METHODOLOGY.md's "Not yet covered" section
+# for the follow-up tracking a P2P-speaking injector.
 #
 # One command that runs:
 #
-#   up  ->  soak (>= $ROUNDS rounds)  ->  analyze  ->  down
+#   up  ->  soak (>= $ROUNDS rounds)  ->  analyze
+#       ->  [opt-in] verify (forks, certs both directions)
+#       ->  [opt-in] restart/rejoin scenarios
+#       ->  down
 #
 # Verification covers:
 #
@@ -27,10 +33,20 @@
 #      REJECTION_PATTERN consensus-round-trip.sh already scans for).
 #   4. Machine-readable      — a single summary JSON is written and
 #      echoed, and the exit code is 0 only if every check passed.
+#   5. (opt-in) Fork-freedom + bidirectional cert authentication —
+#      VERIFY_STAGE=1: algo-fork-detector across the 3 Go REST nodes,
+#      plus algo-cert-crossverify (Go certs authenticate under Rust) and
+#      tools/cert-authenticate (the same certs authenticate under
+#      go-algorand's own verifier).
+#   6. (opt-in) Restart/rejoin — RESTART_SCENARIOS=1: graceful restart,
+#      SIGKILL, and a SIGKILL timed into a round the Rust node is
+#      proposing in, each asserting rejoin-within-budget, no stall, no
+#      fork, no equivocation.
 #
 # Usage:
 #   bash ops/mixed-cluster-p2p/scripts/consensus-soak.sh
 #   make p2p-interop-soak-test ROUNDS=200
+#   VERIFY_STAGE=1 RESTART_SCENARIOS=1 make p2p-interop-soak-test
 #
 # Env:
 #   ROUNDS                rounds to soak                    (default 200)
@@ -40,6 +56,18 @@
 #   RUST_STAKE_FRACTION   Rust share of ONLINE stake        (default 0.10)
 #   MAX_MEAN_BLOCK_TIME   cadence bound, seconds            (default 10)
 #   MAX_P95_BLOCK_TIME    cadence bound, seconds            (default 20)
+#   CERT_STRIDE           sample every Nth round for certs  (default 20)
+#   MIN_RUST_VOTE_ROUNDS  required certs carrying a Rust
+#                         vote                              (default 0,
+#                         see consensus-conformance.sh's own comment on
+#                         why — the same 30/30/30/10 stake split applies)
+#   VERIFY_STAGE           1 = run fork-detector + bidirectional cert
+#                         cross-verify after the soak        (default 0)
+#   RESTART_SCENARIOS     1 = also run the P2P restart/rejoin stage
+#                         after the soak (graceful restart, SIGKILL,
+#                         restart-as-proposer)                (default 0)
+#   RESTART_MODE          which restart scenarios to run:
+#                         graceful|kill|proposer|all       (default all)
 #   SKIP_START=1          use an already-running cluster
 #   KEEP_CLUSTER=1        leave the cluster up on exit
 #   OUT_DIR               artifact directory (default: a timestamped
@@ -60,6 +88,11 @@ PROPOSER_SIGMA="${PROPOSER_SIGMA:-3.0}"
 RUST_STAKE_FRACTION="${RUST_STAKE_FRACTION:-0.10}"
 MAX_MEAN_BLOCK_TIME="${MAX_MEAN_BLOCK_TIME:-10}"
 MAX_P95_BLOCK_TIME="${MAX_P95_BLOCK_TIME:-20}"
+CERT_STRIDE="${CERT_STRIDE:-20}"
+MIN_RUST_VOTE_ROUNDS="${MIN_RUST_VOTE_ROUNDS:-0}"
+VERIFY_STAGE="${VERIFY_STAGE:-0}"
+RESTART_SCENARIOS="${RESTART_SCENARIOS:-0}"
+RESTART_MODE="${RESTART_MODE:-all}"
 SKIP_START="${SKIP_START:-0}"
 KEEP_CLUSTER="${KEEP_CLUSTER:-0}"
 ALGOD_TOKEN="${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
@@ -279,6 +312,71 @@ for name, status, detail in rows:
 " "$OUT_DIR/analyze.summary.json")
 else
     record "analyze" fail "analyze.py produced no summary JSON"
+fi
+
+# -- 3b. (opt-in) fork detector + bidirectional cert cross-verify -------
+# Off by default: needs algo-fork-detector / algo-cert-crossverify built
+# and, when RUST_ACCOUNT-gated go-authentication runs, go-algorand's own
+# vendored libsodium build via tools/cert-authenticate/run-in-docker.sh
+# (issue #596; see verify-soak.sh's header for what each tool proves).
+if [ "$VERIFY_STAGE" = "1" ]; then
+    echo "==> verify-soak.sh (fork detector + cert cross-verify both directions)"
+    TOOLS_DIR="${TOOLS_DIR:-$REPO_ROOT/target/debug}"
+    verify_rc=0
+    "$HERE/verify-soak.sh" \
+        --stride "$CERT_STRIDE" \
+        --tools-dir "$TOOLS_DIR" \
+        --out-dir "$OUT_DIR" \
+        --rust-account "$RUST_ACCOUNT" \
+        --min-rust-vote-rounds "$MIN_RUST_VOTE_ROUNDS" \
+        > "$OUT_DIR/verify.log" 2>&1 || verify_rc=$?
+    tail -20 "$OUT_DIR/verify.log" || true
+
+    if grep -q "fork-detector exit: 0" "$OUT_DIR/verify.log"; then
+        record "fork_free" pass "algo-fork-detector reported no forks"
+    else
+        record "fork_free" fail "fork detector non-zero — see $OUT_DIR/verify.log"
+    fi
+    if grep -qE "cert-crossverify: .* failed=0 " "$OUT_DIR/verify.log"; then
+        record "certs_authenticate_rust" pass "every sampled Go cert authenticated under Rust"
+    else
+        record "certs_authenticate_rust" fail "Rust-side cert authentication failed — see $OUT_DIR/verify.log"
+    fi
+    if grep -qE "cert-authenticate \(go-algorand .*\): rounds=[0-9]+ ok=[0-9]+ failed=0 " "$OUT_DIR/verify.log"; then
+        record "certs_authenticate_go" pass "every sampled cert authenticated under go-algorand's verifier"
+    else
+        record "certs_authenticate_go" fail "go-algorand-side cert authentication failed or did not run — see $OUT_DIR/verify.log"
+    fi
+fi
+
+# -- 3c. (opt-in) restart / rejoin scenarios -----------------------------
+# Off by default: each scenario takes the Rust node down and waits for it
+# to catch back up, which adds minutes and is a *different* property from
+# the steady-state conformance the rest of this script asserts.
+if [ "$RESTART_SCENARIOS" = "1" ]; then
+    echo "==> restart / rejoin scenarios (issue #596, mode=$RESTART_MODE)"
+    restart_rc=0
+    MODE="$RESTART_MODE" \
+    OUT_DIR="$OUT_DIR/restart" \
+    TOOLS_DIR="${TOOLS_DIR:-$REPO_ROOT/target/debug}" \
+    LAG_TOLERANCE="$LAG_TOLERANCE" \
+        "$HERE/restart-rejoin.sh" > "$OUT_DIR/restart.log" 2>&1 || restart_rc=$?
+    tail -30 "$OUT_DIR/restart.log" || true
+    if [ -s "$OUT_DIR/restart/restart-summary.json" ]; then
+        while IFS=$'\t' read -r name status detail; do
+            [ -n "$name" ] && record "$name" "$status" "$detail"
+        done < <(python3 -c "
+import json, sys
+s = json.load(open(sys.argv[1]))
+for c in s['checks']:
+    status = c['status'] if c['status'] in ('pass', 'fail') else 'pass'
+    print('restart_{}_{}\t{}\t{}'.format(
+        c['scenario'].replace('-', '_'), c['name'], status, c['detail']))
+" "$OUT_DIR/restart/restart-summary.json")
+    else
+        record "restart_rejoin" fail \
+            "restart-rejoin.sh exited $restart_rc with no summary — see $OUT_DIR/restart.log"
+    fi
 fi
 
 # -- 4. Go-side telemetry: rejections + Rust vote acceptance ------------

@@ -30,6 +30,7 @@ P2P_INTEROP_CLUSTER := ops/mixed-cluster-p2p
 .PHONY: consensus-cluster-analyzer
 .PHONY: p2p-interop-up p2p-interop-down p2p-interop-test p2p-interop-status
 .PHONY: p2p-interop-consensus-test p2p-interop-soak p2p-interop-soak-test
+.PHONY: p2p-interop-verify p2p-interop-restart
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 .PHONY: consensus-analyzer-test consensus-negative-test
 
@@ -765,9 +766,34 @@ p2p-interop-consensus-test: ## Up + run the #589 consensus round-trip assertion 
 p2p-interop-soak: ## Run the #594 soak only (assumes an already-running cluster)
 	$(P2P_INTEROP_CLUSTER)/scripts/soak.sh --rounds $(or $(ROUNDS),200)
 
-p2p-interop-soak-test: ## Run the #594 soak suite (up + soak + analyze + down)
+## Issue #596 adds three OPT-IN stages to the same soak-suite invocation,
+## mirroring consensus-cluster-test's own RESTART_SCENARIOS=1 (fork
+## detector + bidirectional cert cross-verify is gated by VERIFY_STAGE=1
+## here rather than being unconditional, since this harness's nightly
+## Tier 1/Tier 2 split — see .github/workflows/p2p-consensus-soak.yml —
+## keeps the expensive libsodium-backed go-authenticate step out of every
+## soak run by default):
+##
+##   VERIFY_STAGE=1 RESTART_SCENARIOS=1 make p2p-interop-soak-test
+##
+## `p2p-interop-verify` / `p2p-interop-restart` below run each stage
+## standalone against an already-running cluster (SKIP_START-style usage
+## from consensus-cluster.yml's Tier 2 job).
+p2p-interop-soak-test: ## Run the #594 soak suite (up + soak + analyze + down); VERIFY_STAGE=1/RESTART_SCENARIOS=1 add #596's stages
+	cargo build -p algo-fork-detector -p algo-cert-crossverify
 	ROUNDS=$(or $(ROUNDS),200) \
+	VERIFY_STAGE=$(or $(VERIFY_STAGE),0) \
+	RESTART_SCENARIOS=$(or $(RESTART_SCENARIOS),0) \
+	RESTART_MODE=$(or $(RESTART_MODE),all) \
 		$(P2P_INTEROP_CLUSTER)/scripts/consensus-soak.sh
+
+p2p-interop-verify: ## Run the #596 fork-detector + bidirectional cert cross-verify stage against a RUNNING P2P cluster
+	cargo build -p algo-fork-detector -p algo-cert-crossverify
+	$(P2P_INTEROP_CLUSTER)/scripts/verify-soak.sh --stride $(or $(CERT_STRIDE),20)
+
+p2p-interop-restart: ## Run the #596 restart/rejoin scenarios against a RUNNING P2P cluster
+	cargo build -p algo-fork-detector
+	MODE=$(or $(RESTART_MODE),all) $(P2P_INTEROP_CLUSTER)/scripts/restart-rejoin.sh
 
 ## Deprecated aliases.
 ##
@@ -978,7 +1004,7 @@ help:
 	@echo "  Deprecated aliases: phase6-cluster-up/-status/-down,"
 	@echo "                      consensus-analyzer-test, consensus-negative-test"
 	@echo ""
-	@echo "P2P Mixed-Cluster Consensus (3 Go P2P + 1 Rust P2pOnly — #543/#560/#589/#594):"
+	@echo "P2P Mixed-Cluster Consensus (3 Go P2P + 1 Rust P2pOnly — #543/#560/#589/#594/#596):"
 	@echo "  make p2p-interop-up             Bring up the 4-node P2P consensus cluster"
 	@echo "  make p2p-interop-status         Per-node round snapshot (all 4 via REST)"
 	@echo "  make p2p-interop-down           Tear down (append PURGE=1 to wipe netroot/)"
@@ -986,6 +1012,9 @@ help:
 	@echo "  make p2p-interop-consensus-test #589 up + 30-round consensus round-trip + down"
 	@echo "  make p2p-interop-soak           #594 soak only (assumes a running cluster), ROUNDS=N"
 	@echo "  make p2p-interop-soak-test      #594 full suite (up + soak + analyze + down), ROUNDS=N"
+	@echo "                                  VERIFY_STAGE=1, RESTART_SCENARIOS=1 (#596)"
+	@echo "  make p2p-interop-verify         #596 fork detector + bidirectional cert cross-verify (running cluster)"
+	@echo "  make p2p-interop-restart        #596 restart/rejoin scenarios against a running cluster"
 	@echo "  Runbook: ops/mixed-cluster-p2p/README.md;"
 	@echo "  soak methodology: docs/P2P_SOAK_METHODOLOGY.md"
 	@echo ""
