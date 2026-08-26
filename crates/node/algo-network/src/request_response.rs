@@ -30,7 +30,14 @@ use crate::topics::{Topic, Topics, TopicsError};
 // ---------------------------------------------------------------------------
 
 /// Encode a `u64` as an unsigned variable-length integer (LEB128).
-pub(crate) fn encode_uvarint(mut value: u64) -> Vec<u8> {
+///
+/// Public so transports outside this crate that need to build a
+/// hand-rolled `TopicMsgResp` (mirroring [`crate::ws_peer`]'s own
+/// `ForwardingPolicy::Respond` handling) can encode the `RequestHash`
+/// topic value themselves — see `bin/algod-rust`'s P2P `/algorand-ws`
+/// stream reply path (issue #591), which cannot depend on `ws_peer`'s
+/// private read-loop internals.
+pub fn encode_uvarint(mut value: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(10);
     loop {
         let mut byte = (value & 0x7F) as u8;
