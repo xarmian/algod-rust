@@ -1,5 +1,6 @@
 # Issue #543 (single-node transport interop) + issue #560 (multi-node DHT
-# discovery interop).
+# discovery interop) + issue #589 (stake-provisioned Rust participant +
+# full multi-round consensus proof over P2P).
 #
 # Three go-algorand v4.7.0-stable nodes, each started with `EnableP2P: true`
 # (plain P2P, no WS-gossip listener — mirrors what algod-rust's own
@@ -11,20 +12,27 @@
 # `scripts/start.sh` and `bin/algod-rust/tests/p2p_go_algorand_interop.rs`'s
 # `discovers_third_go_algorand_peer_via_dht_routing_through_the_first`.
 #
-# This is a smaller, narrower sibling of `ops/mixed-cluster/` (which
-# proves WS-gossip consensus interop across 3 Go + 1 Rust nodes): this
-# harness proves P2P *transport + DHT-routing* interop with real
-# go-algorand nodes. A full consensus round-trip in `P2pOnly` mode against
-# real go-algorand peers additionally requires porting go's per-peer
-# libp2p-stream wire protocol for agreement traffic (go-algorand's own
-# gossipsub wiring covers only the TX tag — see
-# `docs/MIXED_CLUSTER_HARNESS.md`'s "P2P interop harness" section and
-# issue #560's follow-up for the tracked gap).
+# A fourth node, `rust-node-4`, is a real algod-rust `participate` process
+# run in `P2pOnly` mode (`--enable-p2p`, no `--enable-p2p-hybrid-mode`, no
+# WS-gossip listener at all — `crate::commands::p2p_transport::NetworkMode`).
+# `../template.json` gives it Wallet4's 10% online stake, the same split
+# `ops/mixed-cluster/template.json` uses for its WS-gossip Rust
+# participant, so this harness is a direct P2P-transport analogue of that
+# proven WS-gossip one (see `docs/PHASE6_VALIDATION.md`). It dials
+# go-node-1 as its sole `--p2p-bootstrap-peers` entry (no
+# `--p2p-listen-address` — outbound-only, exactly like
+# `ops/mixed-cluster/`'s `rust-node-4` service is outbound-only over
+# WS-gossip); AV/PP/VB agreement traffic then flows over the
+# `/algorand-ws/2.2.0` raw-stream protocol issue #560's investigation
+# found go-algorand actually uses for that traffic in P2P mode (go never
+# gossips it — see `crates/node/algo-p2p/src/wsproto.rs` and
+# `bin/algod-rust/src/commands/p2p_transport.rs`).
 #
 # Usage:
-#   ops/mixed-cluster-p2p/scripts/start.sh   # generate netroot + start,
-#                                             # prints each node's dialable
-#                                             # multiaddr
+#   ops/mixed-cluster-p2p/scripts/start.sh   # generate netroot + start all
+#                                             # 4 nodes, prints each go
+#                                             # node's dialable multiaddr
+#   ops/mixed-cluster-p2p/scripts/status.sh  # per-node round snapshot
 #   ops/mixed-cluster-p2p/scripts/stop.sh    # tear down + cleanup
 
 services:
@@ -144,6 +152,87 @@ services:
     networks:
       p2pinterop:
         ipv4_address: 172.28.0.13
+
+  # Issue #589: a stake-holding algod-rust `P2pOnly` participation node.
+  # Unlike the 3 go-algorand nodes above it needs no static IP or inbound
+  # listener — like `ops/mixed-cluster/`'s WS-gossip `rust-node-4`, it only
+  # ever dials out (to go-node-1's internal multiaddr, the sole
+  # `--p2p-bootstrap-peers` entry), so it never needs to be independently
+  # dialable and go-algorand's `addressFilter`/DHT-provider-record concerns
+  # (see go-node-1's comment above) do not apply to it.
+  #
+  # Flags worth explaining (see `../mixed-cluster/docker-compose.yml`'s
+  # `rust-node-4` for the WS-gossip analogues of most of these):
+  #   --enable-p2p              P2pOnly mode: only the libp2p transport is
+  #                              brought up, no WS-gossip listener at all.
+  #   --p2p-bootstrap-peers     go-node-1's *internal* docker-network
+  #                              multiaddr, set by start.sh once go-node-1's
+  #                              PeerId is known (mirrors GO_NODE_2/3's
+  #                              PEER_ADDRESS chaining above).
+  #   --partkey-dir              Wallet4's `.partkey`, written by
+  #                              `goal network create` under
+  #                              `netroot/Node4Rust/<genesis-id>/`.
+  #   --genesis-json/--genesis-hash   seed accountbase/accounttotals and
+  #                              validate incoming blocks; the hash is read
+  #                              off go-node-1's REST once healthy (shell
+  #                              cannot derive the canonical-msgpack digest
+  #                              offline).
+  rust-node-4:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: runtime
+    # Deterministic tag so CI can pre-build out of band, mirroring
+    # `../mixed-cluster/docker-compose.yml`'s `rust-node-4.image` pattern.
+    image: algod-rust-p2pinterop:local
+    container_name: p2pinterop-rust-node-4
+    depends_on:
+      go-node-1:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=${P2PINTEROP_RUST_LOG:-info,algod_rust=debug,algo_p2p=debug,algo_agreement=info}
+    # P2PINTEROP_GENESIS_ID / P2PINTEROP_GENESIS_HASH / P2PINTEROP_GO1_MULTIADDR
+    # are exported by start.sh. The `:-` defaults exist only so
+    # `docker compose down`/`config` work without them.
+    entrypoint:
+      - algod-rust
+      - participate
+      - --ledger-path=/app/ledger
+      - --partkey-path=/app/partkeys.sqlite
+      - --partkey-dir=/netroot/Node4Rust/${P2PINTEROP_GENESIS_ID:-p2pinterop-v1}
+      - --genesis-json=/netroot/genesis.json
+      - --genesis-path=/netroot/genesis.json
+      - --genesis-id=${P2PINTEROP_GENESIS_ID:-p2pinterop-v1}
+      - --genesis-hash=${P2PINTEROP_GENESIS_HASH:-}
+      - --network=p2pinterop
+      - --enable-p2p
+      - --p2p-bootstrap-peers=${P2PINTEROP_GO1_MULTIADDR:-}
+      - --rest-listen=0.0.0.0:8080
+      - --data-dir=/data
+    ports:
+      - "127.0.0.1:5004:8080"
+    volumes:
+      - rust-node-4-data:/app
+      - ./netroot:/netroot:ro
+      - ./netroot/rust-node-4-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - p2pinterop
+
+volumes:
+  rust-node-4-data:
 
 networks:
   p2pinterop:

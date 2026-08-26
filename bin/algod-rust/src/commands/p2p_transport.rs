@@ -105,9 +105,47 @@ fn spawn_ws_peer(
                     Err(_) => break,
                 };
                 if let Ok((tag, payload)) = algo_network::framing::decode_frame(&body) {
+                    // Decompress PP (proposal) payloads that carry the zstd
+                    // frame magic — go-algorand compresses *every* proposal
+                    // broadcast unconditionally once the wsnet protocol
+                    // version is 2.2 (`network/wsNetwork.go`:
+                    // "Compress proposals -- all proposals are compressed
+                    // as of wsnet 2.2", in `msgBroadcaster.preparePeerData`,
+                    // which runs before any per-peer feature negotiation),
+                    // and this stream is negotiated at exactly that version
+                    // (`ALGORAND_WS_SUPPORTED_VERSIONS = ["2.2"]` above).
+                    // Without this, every proposal a real go-algorand peer
+                    // sends over `/algorand-ws/2.2.0` arrives as raw zstd
+                    // bytes, fails `algo_agreement::demux`'s msgpack decode,
+                    // and the node can never validate/vote on a peer's
+                    // proposal — issue #478 fixed the identical gap for the
+                    // WS-gossip transport's `ws_peer.rs` read loop; this
+                    // stream (added by #560/#590) never got the same fix,
+                    // found live while proving out issue #589's
+                    // stake-holding P2P consensus participant.
+                    let payload = if tag == Tag::ProposalPayload
+                        && algo_network::compression::is_zstd_compressed(payload)
+                    {
+                        match algo_network::compression::zstd_decompress(
+                            payload,
+                            algo_network::compression::MAX_DECOMPRESSED_MESSAGE_SIZE,
+                        ) {
+                            Ok(decompressed) => decompressed,
+                            Err(e) => {
+                                tracing::warn!(
+                                    %peer_id,
+                                    error = %e,
+                                    "P2P algorand-ws stream: PP decompression failed"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        payload.to_vec()
+                    };
                     let msg = IncomingMessage::new(
                         tag,
-                        payload.to_vec(),
+                        payload,
                         peer_id.to_string(),
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
                     );

@@ -5,7 +5,10 @@
         "LastPartKeyRound": NUM_ROUNDS,
         "ConsensusProtocol": "future",
         "Wallets": [
-            { "Name": "Wallet1", "Stake": 100, "Online": true }
+            { "Name": "Wallet1", "Stake": 30, "Online": true },
+            { "Name": "Wallet2", "Stake": 30, "Online": true },
+            { "Name": "Wallet3", "Stake": 30, "Online": true },
+            { "Name": "Wallet4", "Stake": 10, "Online": true }
         ]
     },
     "Nodes": [
@@ -19,12 +22,23 @@
         {
             "Name": "Node2",
             "IsRelay": true,
-            "Wallets": []
+            "Wallets": [
+                { "Name": "Wallet2", "ParticipationOnly": false }
+            ]
         },
         {
             "Name": "Node3",
             "IsRelay": true,
-            "Wallets": []
+            "Wallets": [
+                { "Name": "Wallet3", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "Node4Rust",
+            "IsRelay": false,
+            "Wallets": [
+                { "Name": "Wallet4", "ParticipationOnly": false }
+            ]
         }
     ]
 }
