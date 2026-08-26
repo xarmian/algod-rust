@@ -715,47 +715,40 @@ fn tempfile_dir() -> tempfile::TempDir {
 /// empty object, not omitted). This is exactly the example quoted in issue
 /// #576 itself.
 ///
-/// Deliberately checks an *app-creation* round rather than a plain payment:
-/// a plain-`Pay`-only round on algod-rust's own dev-mode block producer was
-/// found (while first writing this test) to cache an essentially-empty
-/// `StateDelta` (`"Accts":{"Accts":[],...}`) for its own round, a separate,
-/// pre-existing ledger/dev-mode-block-production bug unrelated to this
-/// issue's serialization-format scope -- filed as its own follow-up rather
-/// than fixed here. App-creation rounds are already proven to populate
-/// `Accts` correctly (this file's box create/put/delete tests depend on
-/// it), so this test piggybacks on that known-working path.
+/// Deliberately reuses `deploy_and_mutate_box`'s box-*create* round rather
+/// than a plain payment or a bare app-creation round: both of those were
+/// found (while first writing this test) to make algod-rust's own dev-mode
+/// block producer cache an essentially-empty `StateDelta`
+/// (`"Accts":{"Accts":[],...}`) for the round -- a separate, pre-existing
+/// ledger/dev-mode-block-production bug unrelated to this issue's
+/// serialization-format scope, filed as its own follow-up (issue #581)
+/// rather than fixed here. The box-create round is the one round shape this
+/// file's own `state_delta_kv_mods_matches_go_for_box_create_put_delete`
+/// already proves reliably produces a populated delta on algod-rust's own
+/// chain, so this test piggybacks on that known-working path rather than
+/// risk tripping over yet another variant of the same round-population gap.
 #[tokio::test]
 #[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
-async fn state_delta_accts_zero_fields_matches_go_for_app_creation() {
+async fn state_delta_accts_zero_fields_matches_go_for_box_create_round() {
     let c = client();
-    let sk = dev_signing_key();
 
     for (base, label) in [(go_url(), "go"), (rust_url(), "rust")] {
-        let approval = algo_avm::assembler::assemble_string(APPROVAL_SOURCE)
-            .unwrap_or_else(|e| panic!("{label}: approval program failed to assemble: {e:?}"))
-            .program;
+        let (_app_id, create_round, _put_round, _del_round) =
+            deploy_and_mutate_box(&c, &base, label).await;
 
-        let mut create = base_txn(&c, &base).await;
-        create.txn_type = TxnType::Appl;
-        create.approval_program = Some(ByteBuf::from(approval));
-        create.clear_state_program = Some(ByteBuf::from(CLEAR_STATE_PROGRAM.to_vec()));
-        create.note = unique_note(&format!("acct-zero-fields-app-create-{label}")).into();
-        let confirmed =
-            submit_and_confirm(&c, &base, label, &mut create, &sk, "app creation").await;
-        let round = confirmed["confirmed-round"].as_u64().unwrap();
-
-        let (status, body) = get_json(&c, &base, &format!("/v2/deltas/{round}?format=json")).await;
+        let (status, body) =
+            get_json(&c, &base, &format!("/v2/deltas/{create_round}?format=json")).await;
         assert_eq!(
             status, 200,
-            "{label}: GET /v2/deltas/{round} status: {body}"
+            "{label}: GET /v2/deltas/{create_round} status: {body}"
         );
 
         let accts = body["Accts"]["Accts"]
             .as_array()
-            .unwrap_or_else(|| panic!("{label}: round {round} StateDelta.Accts.Accts must be a (possibly empty) array: {body}"));
+            .unwrap_or_else(|| panic!("{label}: round {create_round} StateDelta.Accts.Accts must be a (possibly empty) array: {body}"));
         assert!(
             !accts.is_empty(),
-            "{label}: an app-creation round must touch at least the creator account: {body}"
+            "{label}: the box-create round must touch at least the app account: {body}"
         );
 
         // Every `AccountBaseData` key must be present on *every* touched
@@ -792,7 +785,7 @@ async fn state_delta_accts_zero_fields_matches_go_for_app_creation() {
             for key in account_base_data_keys {
                 assert!(
                     record.get(key).is_some(),
-                    "{label}: round {round}'s every Accts[] entry must always include {key} \
+                    "{label}: round {create_round}'s every Accts[] entry must always include {key} \
                      (no omitempty on ledgercore.AccountBaseData), even when zero: {record}"
                 );
             }
@@ -805,7 +798,7 @@ async fn state_delta_accts_zero_fields_matches_go_for_app_creation() {
             accts
                 .iter()
                 .any(|r| r.get("TotalBoxes") == Some(&serde_json::json!(0))),
-            "{label}: round {round} must have at least one Accts[] entry with TotalBoxes present as 0: {accts:?}"
+            "{label}: round {create_round} must have at least one Accts[] entry with TotalBoxes present as 0: {accts:?}"
         );
     }
 }
