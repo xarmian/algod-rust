@@ -28,7 +28,8 @@ P2P_INTEROP_CLUSTER := ops/mixed-cluster-p2p
 .PHONY: consensus-cluster-up consensus-cluster-down consensus-cluster-status consensus-cluster-smoke
 .PHONY: consensus-cluster-test consensus-cluster-restart consensus-cluster-negative
 .PHONY: consensus-cluster-analyzer
-.PHONY: p2p-interop-up p2p-interop-down p2p-interop-test
+.PHONY: p2p-interop-up p2p-interop-down p2p-interop-test p2p-interop-status
+.PHONY: p2p-interop-consensus-test
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 .PHONY: consensus-analyzer-test consensus-negative-test
 
@@ -702,22 +703,24 @@ consensus-cluster-negative: ## Run the #472 negative conformance suite (up + inj
 consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
 	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py
 
-## ops/mixed-cluster-p2p harness (issues #543, #560, #564) — three real
-## go-algorand v4.7.0-stable nodes in plain P2P mode, chain-bootstrapped
+## ops/mixed-cluster-p2p harness (issues #543, #560, #564, #589) — three
+## real go-algorand v4.7.0-stable nodes in plain P2P mode, chain-bootstrapped
 ## to each other (1 <- 2 <- 3, no node told about a non-adjacent peer),
 ## dialed by algod-rust's `algo-p2p` libp2p transport to prove real
-## cross-implementation transport interop. See
+## cross-implementation transport interop, PLUS a 4th `rust-node-4` service
+## holding real online stake and running `algod-rust participate
+## --enable-p2p` as a genuine consensus participant (#589) — the P2P
+## analogue of `ops/mixed-cluster/`'s WS-gossip 3-Go+1-Rust proof. See
 ## docs/MIXED_CLUSTER_HARNESS.md's "P2P interop harness" section for
-## current scope and what's left — building this harness's 3-node chain
-## found and fixed a DHT protocol-string bug (#560/#563), a DHT
-## provider-record key-derivation bug (#564), and a harness
-## NetAddress/addressFilter config bug that silently blocked multi-hop DHT
-## provider-record propagation between nodes (#566); `find_peers_for_capability`
-## (provider records) now genuinely round-trips against a real
-## go-algorand node, including surfacing a *neighboring* node's
-## capability, but `find_closest_peers` structurally cannot (by go's own
-## design — see #564).
-p2p-interop-up: ## Bring up the 3-node go-algorand P2P interop target
+## history — building this harness's 3-node chain found and fixed a DHT
+## protocol-string bug (#560/#563), a DHT provider-record key-derivation
+## bug (#564), a harness NetAddress/addressFilter config bug that silently
+## blocked multi-hop DHT provider-record propagation between nodes (#566),
+## and the fact that go-algorand only gossips the TX tag over gossipsub in
+## P2P mode — AV/PP/VB agreement traffic travels over a raw
+## `/algorand-ws/2.2.0` libp2p stream instead (#560, now implemented in
+## `algo_p2p::wsproto` + `p2p_transport.rs`).
+p2p-interop-up: ## Bring up the 4-node P2P interop target (3 Go + 1 stake-holding Rust)
 	$(P2P_INTEROP_CLUSTER)/scripts/start.sh
 
 p2p-interop-down: ## Tear down the P2P interop target (pass PURGE=1 to wipe netroot/)
@@ -734,6 +737,20 @@ p2p-interop-test: p2p-interop-up ## Up + run the live interop test + down
 	status=$$?; \
 	$(P2P_INTEROP_CLUSTER)/scripts/stop.sh; \
 	exit $$status
+
+p2p-interop-status: ## Per-node round snapshot for the P2P interop cluster (all 4 via REST)
+	$(P2P_INTEROP_CLUSTER)/scripts/status.sh
+
+## Issue #589 — the P2P-transport analogue of `consensus-cluster-test`
+## (#469/#470): rust-node-4 in this harness now holds Wallet4's 10% online
+## stake and runs `algod-rust participate --enable-p2p` (P2pOnly mode, no
+## WS-gossip listener at all), dialing go-node-1 over
+## `--p2p-bootstrap-peers`. consensus-round-trip.sh asserts the 4-node
+## cluster reaches and maintains consensus over a run of rounds, mirroring
+## participation-smoke.sh's assertions (lockstep, Rust round progress, no
+## Go-side agreement rejections) but purely over the P2P transport.
+p2p-interop-consensus-test: ## Up + run the #589 consensus round-trip assertion + down
+	$(P2P_INTEROP_CLUSTER)/scripts/consensus-round-trip.sh
 
 ## Deprecated aliases.
 ##

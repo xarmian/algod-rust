@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Tear down the P2P interop harness (issue #543). By default this stops
-# the container and removes its volume but preserves the generated
-# netroot/ tree so a subsequent start.sh can reuse keys + genesis. Pass
-# --purge to wipe netroot/ as well (forces a clean bootstrap on next
-# start.sh).
+# Tear down the P2P interop + consensus harness (issues #543, #589). By
+# default this stops all four containers (`docker compose down -v`, which
+# also removes rust-node-4's named data volume) but preserves the
+# generated netroot/ tree so a subsequent start.sh can reuse keys +
+# genesis. Pass --purge to wipe netroot/ as well (forces a clean bootstrap
+# on next start.sh).
 
 set -euo pipefail
 
