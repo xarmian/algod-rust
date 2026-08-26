@@ -29,7 +29,7 @@ P2P_INTEROP_CLUSTER := ops/mixed-cluster-p2p
 .PHONY: consensus-cluster-test consensus-cluster-restart consensus-cluster-negative
 .PHONY: consensus-cluster-analyzer
 .PHONY: p2p-interop-up p2p-interop-down p2p-interop-test p2p-interop-status
-.PHONY: p2p-interop-consensus-test
+.PHONY: p2p-interop-consensus-test p2p-interop-soak p2p-interop-soak-test
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 .PHONY: consensus-analyzer-test consensus-negative-test
 
@@ -752,6 +752,23 @@ p2p-interop-status: ## Per-node round snapshot for the P2P interop cluster (all 
 p2p-interop-consensus-test: ## Up + run the #589 consensus round-trip assertion + down
 	$(P2P_INTEROP_CLUSTER)/scripts/consensus-round-trip.sh
 
+## Issue #594 — the P2P-transport analogue of `consensus-cluster-test`'s
+## soak stage: a long (>= 200 round) run against the running P2P cluster,
+## collecting per-round JSONL metrics (scripts/metrics.py) and analyzing
+## them (the shared ops/mixed-cluster/scripts/analyze.py verifier) for
+## proposer share, vote-step coverage, cadence and lockstep. Unlike
+## `consensus-cluster-test` this does NOT run the fork-detector / bidirectional
+## cert-cross-verify / restart / negative stages — those tools aren't wired to
+## this harness yet (see docs/P2P_SOAK_METHODOLOGY.md).
+##
+##   make p2p-interop-soak-test ROUNDS=200
+p2p-interop-soak: ## Run the #594 soak only (assumes an already-running cluster)
+	$(P2P_INTEROP_CLUSTER)/scripts/soak.sh --rounds $(or $(ROUNDS),200)
+
+p2p-interop-soak-test: ## Run the #594 soak suite (up + soak + analyze + down)
+	ROUNDS=$(or $(ROUNDS),200) \
+		$(P2P_INTEROP_CLUSTER)/scripts/consensus-soak.sh
+
 ## Deprecated aliases.
 ##
 ## `phase6-cluster-*` was the TASK-86 name for the same harness back when
@@ -960,6 +977,17 @@ help:
 	@echo "  Evidence map: docs/PHASE6_VALIDATION.md; runbook: ops/mixed-cluster/README.md"
 	@echo "  Deprecated aliases: phase6-cluster-up/-status/-down,"
 	@echo "                      consensus-analyzer-test, consensus-negative-test"
+	@echo ""
+	@echo "P2P Mixed-Cluster Consensus (3 Go P2P + 1 Rust P2pOnly — #543/#560/#589/#594):"
+	@echo "  make p2p-interop-up             Bring up the 4-node P2P consensus cluster"
+	@echo "  make p2p-interop-status         Per-node round snapshot (all 4 via REST)"
+	@echo "  make p2p-interop-down           Tear down (append PURGE=1 to wipe netroot/)"
+	@echo "  make p2p-interop-test           #543 single-Go-node transport interop test"
+	@echo "  make p2p-interop-consensus-test #589 up + 30-round consensus round-trip + down"
+	@echo "  make p2p-interop-soak           #594 soak only (assumes a running cluster), ROUNDS=N"
+	@echo "  make p2p-interop-soak-test      #594 full suite (up + soak + analyze + down), ROUNDS=N"
+	@echo "  Runbook: ops/mixed-cluster-p2p/README.md;"
+	@echo "  soak methodology: docs/P2P_SOAK_METHODOLOGY.md"
 	@echo ""
 	@echo "Benchmarks (fair comparison):"
 	@echo "  make bench-micro      Run Rust criterion microbenchmarks (fixture-based)"

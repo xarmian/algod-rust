@@ -1,0 +1,204 @@
+name: Nightly P2P Consensus Soak
+
+# Issue #594 — the P2P-transport analogue of consensus-cluster.yml's
+# nightly WS-gossip mixed-cluster soak, for ops/mixed-cluster-p2p/ (3
+# go-algorand v4.7.0-stable nodes in plain P2P mode, chain-bootstrapped
+# 1 <- 2 <- 3, + 1 `algod-rust participate --enable-p2p` P2pOnly
+# stake-holding node). Issue #591 (PR #593) fixed the P2P block/cert
+# catch-up fetch path and, with it, live-verified the 4-node cluster
+# sustaining 30+ rounds in lockstep over the libp2p transport alone
+# (`/algorand-ws/2.2.0` raw stream for AV/PP/VB, gossipsub for TX) — see
+# ops/mixed-cluster-p2p/scripts/consensus-round-trip.sh. This workflow
+# adds a nightly >= 200-round soak on top of that, mirroring
+# consensus-cluster.yml's tiered structure. See
+# docs/P2P_SOAK_METHODOLOGY.md for what's the same / different versus
+# the WS-gossip harness's own nightly job.
+#
+# ## Why this is NOT on the PR path
+#
+# Same reasoning as consensus-cluster.yml and p2p-interop.yml: a release
+# build of algod-rust in Docker, three `algorand/algod:4.7.0-stable`
+# pulls, a 4-node P2P-mode cluster boot (chain-bootstrapped, so each Go
+# node's start depends on scraping the previous one's PeerId), and a
+# multi-hundred-round soak at ~3-4.5s block time is tens of minutes —
+# far too much per PR. `schedule` + `workflow_dispatch` ONLY: no
+# `pull_request`, no `push`. Per-PR CI wall time is unchanged by this
+# file.
+#
+# ## Tiers
+#
+#   Tier 1 (always) — `p2p-interop-up` -> `p2p-interop-status` (lockstep
+#     gate, retried) -> `p2p-interop-consensus-test` (issue #589's
+#     30-round consensus round-trip smoke) -> `p2p-interop-down`.
+#   Tier 2 (nightly / dispatch with tier=full) —
+#     `p2p-interop-soak-test ROUNDS=<input, default 200>` (issue #594),
+#     uploading summary.json, soak.jsonl, analyze.summary.json and the
+#     per-node container logs.
+#
+# ## Not yet covered (see docs/P2P_SOAK_METHODOLOGY.md "Not yet covered")
+#
+# Unlike consensus-cluster.yml's Tier 2, this workflow does NOT run fork
+# detection, bidirectional cert cross-verify, restart/rejoin scenarios,
+# or negative conformance — those tools aren't wired to this harness's
+# container names/ports yet. Tracked as a follow-up issue (see the PR
+# that shipped this workflow for the issue number).
+#
+# ## Caching
+#
+#   * `algod-rust-p2pinterop:local` is pre-built here with a buildx
+#     `type=gha` layer cache and consumed by start.sh via
+#     P2PINTEROP_SKIP_BUILD=1, so the release compile is paid once per
+#     Dockerfile/source change rather than on every `up` (twice per run,
+#     once per tier).
+
+on:
+  schedule:
+    # 03:50 UTC daily — after consensus-cluster.yml's 02:41 and
+    # p2p-interop.yml's 03:05, so the three nightly Docker-heavy jobs
+    # don't contend for the same runner.
+    - cron: "50 3 * * *"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Which tier to run"
+        type: choice
+        options: [full, smoke]
+        default: full
+      rounds:
+        description: "Tier-2 soak length in rounds"
+        default: "200"
+        required: false
+
+concurrency:
+  # Never run two P2P clusters at once: they'd collide on host ports
+  # 5001-5004/5161-5163 if they ever land on the same runner.
+  group: p2p-consensus-soak
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Same pin as the rest of the repo (see CLAUDE.md, consensus-cluster.yml).
+  GO_ALGORAND_REV: "v4.7.0-stable"
+  # start.sh: reuse the image built by the buildx step below.
+  P2PINTEROP_SKIP_BUILD: "1"
+
+jobs:
+  p2p-consensus-soak:
+    name: P2P mixed-cluster consensus soak (3 Go P2P + 1 Rust P2pOnly)
+    runs-on: ubuntu-latest
+    # Tier 1 is a few minutes (cluster boot + 30-round smoke); Tier 2's
+    # 200-round soak is the bulk of the rest. 90 min is a hard stop so a
+    # wedged cluster can't hold a runner all day.
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: p2p-consensus-soak
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Pull algorand/algod:4.7.0-stable
+        run: docker pull algorand/algod:4.7.0-stable
+
+      # Deterministic tag declared by
+      # ops/mixed-cluster-p2p/docker-compose.yml's `rust-node-4.image`.
+      # With P2PINTEROP_SKIP_BUILD=1 start.sh runs
+      # `docker compose up -d rust-node-4` (no --build) and picks this up.
+      - name: Build algod-rust node image (layer-cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          tags: algod-rust-p2pinterop:local
+          load: true
+          cache-from: type=gha,scope=p2p-consensus-soak
+          cache-to: type=gha,mode=max,scope=p2p-consensus-soak
+
+      # ── Tier 1 — consensus round-trip smoke (#589) ───────────────────
+      #
+      # SKIP_START=1 / KEEP_CLUSTER=1 make the smoke run against the
+      # cluster `p2p-interop-up` just started rather than cycling it a
+      # second time; the explicit `-down` below is the up -> status ->
+      # smoke -> down sequence.
+      - name: Tier 1 — cluster up
+        run: make p2p-interop-up
+
+      # status.sh is a lockstep gate (fails when any node lags more than
+      # LAG_TOLERANCE=5 rounds behind the max), and `up` returns as soon
+      # as rust-node-4's container is started — before it has caught up
+      # on the handful of rounds the Go nodes produced while start.sh was
+      # scraping PeerIds and reading the genesis hash. Retry for up to
+      # 5 min so the gate measures steady-state lockstep, not boot
+      # ordering; the last invocation is the one that decides the step.
+      - name: Tier 1 — cluster status (lockstep gate)
+        run: |
+          for _ in $(seq 1 29); do
+            if make p2p-interop-status; then exit 0; fi
+            sleep 10
+          done
+          make p2p-interop-status
+
+      - name: Tier 1 — consensus round-trip smoke (#589)
+        env:
+          SKIP_START: "1"
+          KEEP_CLUSTER: "1"
+          ROUNDS: "30"
+        run: make p2p-interop-consensus-test
+
+      - name: Tier 1 — cluster down
+        run: make p2p-interop-down
+
+      # ── Tier 2 — full soak (#594) ─────────────────────────────────────
+      #
+      # OUT_DIR is read straight from the environment by
+      # consensus-soak.sh, pinning the otherwise timestamped artifact
+      # directory to a path the upload step can name.
+      - name: Tier 2 — P2P consensus soak (#594)
+        if: github.event.inputs.tier != 'smoke'
+        env:
+          OUT_DIR: ${{ github.workspace }}/p2p-soak-artifacts
+          ROUNDS: ${{ github.event.inputs.rounds || '200' }}
+        run: make p2p-interop-soak-test
+
+      # ── Diagnostics + artifacts ───────────────────────────────────────
+      - name: Collect container logs on failure
+        if: failure()
+        run: |
+          set +e
+          mkdir -p "$GITHUB_WORKSPACE/p2p-soak-artifacts/container-logs"
+          for c in p2pinterop-go-node-1 p2pinterop-go-node-2 p2pinterop-go-node-3 p2pinterop-rust-node-4; do
+            docker logs --tail 2000 "$c" \
+              > "$GITHUB_WORKSPACE/p2p-soak-artifacts/container-logs/$c.log" 2>&1
+          done
+          docker ps -a > "$GITHUB_WORKSPACE/p2p-soak-artifacts/container-logs/docker-ps.txt" 2>&1
+          exit 0
+
+      - name: Upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # summary.json, soak.jsonl, analyze.summary.json, analyze.log,
+          # and the per-node logs the analyzer reads.
+          name: p2p-consensus-soak-${{ github.run_id }}
+          path: p2p-soak-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Tear down (safety net)
+        if: always()
+        run: make p2p-interop-down PURGE=1 || true
