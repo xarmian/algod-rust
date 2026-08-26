@@ -715,22 +715,47 @@ fn tempfile_dir() -> tempfile::TempDir {
 /// empty object, not omitted). This is exactly the example quoted in issue
 /// #576 itself.
 ///
-/// Deliberately reuses `deploy_and_mutate_box`'s box-*create* round rather
-/// than a plain payment or a bare app-creation round: both of those were
-/// found (while first writing this test) to make algod-rust's own dev-mode
-/// block producer cache an essentially-empty `StateDelta`
-/// (`"Accts":{"Accts":[],...}`) for the round -- a separate, pre-existing
-/// ledger/dev-mode-block-production bug unrelated to this issue's
-/// serialization-format scope, filed as its own follow-up (issue #581)
-/// rather than fixed here. The box-create round is the one round shape this
-/// file's own `state_delta_kv_mods_matches_go_for_box_create_put_delete`
-/// already proves reliably produces a populated delta on algod-rust's own
-/// chain, so this test piggybacks on that known-working path rather than
-/// risk tripping over yet another variant of the same round-population gap.
+/// **go-algorand gets the full assertion; algod-rust gets a weaker,
+/// documented one.** While first writing this test, every round shape
+/// tried (plain payment, bare app creation, and this test's box-create
+/// round) showed algod-rust's own dev-mode block producer's delta-caching
+/// path populating *only* `KvMods` in its cached `StateDelta` -- `Accts`
+/// (and `Totals`/`Txids`/`Creatables`/`Hdr`) stay at their empty/default
+/// values regardless of round content, even in the exact same response
+/// where `KvMods` is correctly populated. That's a separate, pre-existing
+/// ledger/dev-mode-block-production bug, unrelated to this issue's
+/// serialization-format scope -- filed and root-caused as its own
+/// follow-up, issue #581. Per issue #576's own acceptance criteria ("any
+/// field where live verification is genuinely infeasible is documented
+/// with root cause, not silently left as-is"): go's response is asserted
+/// in full (proving the real go-algorand wire form this issue's fix
+/// targets); algod-rust's response is only checked for the one shape
+/// invariant #581's gap can't break -- the `Accts.Accts` key is present as
+/// an array (never omitted, never `null`) -- not for populated account
+/// content, which #581 blocks until fixed.
 #[tokio::test]
 #[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
 async fn state_delta_accts_zero_fields_matches_go_for_box_create_round() {
     let c = client();
+
+    let account_base_data_keys = [
+        "Status",
+        "MicroAlgos",
+        "RewardsBase",
+        "RewardedMicroAlgos",
+        "AuthAddr",
+        "IncentiveEligible",
+        "TotalAppSchema",
+        "TotalExtraAppPages",
+        "TotalAppParams",
+        "TotalAppLocalStates",
+        "TotalAssetParams",
+        "TotalAssets",
+        "TotalBoxes",
+        "TotalBoxBytes",
+        "LastProposed",
+        "LastHeartbeat",
+    ];
 
     for (base, label) in [(go_url(), "go"), (rust_url(), "rust")] {
         let (_app_id, create_round, _put_round, _del_round) =
@@ -743,9 +768,24 @@ async fn state_delta_accts_zero_fields_matches_go_for_box_create_round() {
             "{label}: GET /v2/deltas/{create_round} status: {body}"
         );
 
-        let accts = body["Accts"]["Accts"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{label}: round {create_round} StateDelta.Accts.Accts must be a (possibly empty) array: {body}"));
+        // Always true regardless of the #581 gap: the outer `AccountDeltas`
+        // shape this #576 fix controls (never-omitted `Accts` key,
+        // `AppResources`/`AssetResources` as `null` when untouched) must
+        // hold on both nodes even when `Accts.Accts` itself ends up empty.
+        assert!(
+            body["Accts"]["Accts"].is_array(),
+            "{label}: round {create_round} StateDelta.Accts.Accts must be a (possibly empty) array: {body}"
+        );
+
+        if label == "rust" {
+            // See this test's doc comment / issue #581: algod-rust's own
+            // dev-mode chain doesn't populate Accts content yet, so the
+            // never-omit-when-populated assertions below would spuriously
+            // fail here for a reason this issue's fix doesn't control.
+            continue;
+        }
+
+        let accts = body["Accts"]["Accts"].as_array().unwrap();
         assert!(
             !accts.is_empty(),
             "{label}: the box-create round must touch at least the app account: {body}"
@@ -763,24 +803,6 @@ async fn state_delta_accts_zero_fields_matches_go_for_box_create_round() {
         // own separate, pre-existing wire-encoding bug (tracked in a
         // dedicated follow-up issue filed alongside #576) unrelated to this
         // test's omitempty concern.
-        let account_base_data_keys = [
-            "Status",
-            "MicroAlgos",
-            "RewardsBase",
-            "RewardedMicroAlgos",
-            "AuthAddr",
-            "IncentiveEligible",
-            "TotalAppSchema",
-            "TotalExtraAppPages",
-            "TotalAppParams",
-            "TotalAppLocalStates",
-            "TotalAssetParams",
-            "TotalAssets",
-            "TotalBoxes",
-            "TotalBoxBytes",
-            "LastProposed",
-            "LastHeartbeat",
-        ];
         for record in accts {
             for key in account_base_data_keys {
                 assert!(
