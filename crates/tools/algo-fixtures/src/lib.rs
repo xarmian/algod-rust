@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use algo_error::Result;
-use algo_rest_client::BlockSource;
+use algo_rest_client::{AlgodClient, BlockSource};
 use algo_types::Round;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,56 @@ pub async fn capture_range(
         round = round.next();
     }
     Ok(paths)
+}
+
+/// Capture a single round's ledger state delta (`GET /v2/deltas/{round}`)
+/// to disk, in both formats go-algorand's endpoint supports (issue #573).
+///
+/// Writes three files:
+/// - `state_delta_{round}.json` — the JSON-format response body, pretty-printed
+/// - `state_delta_{round}.msgpack` — the raw msgpack-format response bytes
+/// - `state_delta_{round}.meta.json` — capture metadata
+///
+/// Unlike [`capture_block`], this always talks to a real `AlgodClient` (not
+/// the generic `BlockSource` trait) since `GET /v2/deltas/{round}` is a REST
+/// endpoint with no gossip-protocol equivalent.
+pub async fn capture_state_delta(
+    client: &AlgodClient,
+    round: Round,
+    dir: &Path,
+    source_url: &str,
+) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(dir).await?;
+
+    let base = dir.join(format!("state_delta_{}", round));
+
+    let json = client.get_state_delta_json(round.0).await?;
+    let json_path = base.with_extension("json");
+    let pretty = serde_json::to_string_pretty(&json).map_err(|e| algo_error::AlgoError::Codec {
+        source: Box::new(e),
+        context: format!("serializing state delta {round} to JSON"),
+    })?;
+    tokio::fs::write(&json_path, pretty).await?;
+
+    let raw = client.get_state_delta_msgpack_raw(round.0).await?;
+    let msgpack_path = base.with_extension("msgpack");
+    tokio::fs::write(&msgpack_path, &raw).await?;
+
+    let meta = FixtureMetadata {
+        round: round.0,
+        captured_at: Utc::now().to_rfc3339(),
+        source_url: source_url.to_string(),
+    };
+    let meta_path = base.with_extension("meta.json");
+    let meta_json =
+        serde_json::to_string_pretty(&meta).map_err(|e| algo_error::AlgoError::Codec {
+            source: Box::new(e),
+            context: "serializing state delta fixture metadata".into(),
+        })?;
+    tokio::fs::write(&meta_path, meta_json).await?;
+
+    info!(round = %round, path = %json_path.display(), "captured state delta fixture");
+    Ok(json_path)
 }
 
 /// Load a raw fixture from disk.

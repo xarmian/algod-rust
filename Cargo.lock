@@ -368,6 +368,7 @@ dependencies = [
  "algo-error",
  "algo-types",
  "algo-validate",
+ "base64",
  "criterion",
  "crossbeam-channel",
  "data-encoding",
