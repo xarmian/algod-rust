@@ -24,12 +24,28 @@ algo-codec.workspace = true
 algo-consensus-crypto.workspace = true
 algo-ledger.workspace = true
 algo-network.workspace = true
+algo-p2p.workspace = true
 algo-types.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
+# Same version/feature set as `bin/algod-rust` and `algo-p2p` itself (see
+# `algo-p2p/Cargo.toml`'s comment on why the exact version matters) — needed
+# here only for the plain `Multiaddr`/`PeerId`/`SwarmEvent` types this
+# crate's P2P injector uses to drive `algo_p2p::P2pHost` directly, mirroring
+# `bin/algod-rust/src/commands/p2p_transport.rs`.
+libp2p = { version = "0.54", features = [
+    "tcp",
+    "noise",
+    "yamux",
+    "tokio",
+    "kad",
+    "identify",
+    "gossipsub",
+    "macros",
+] }
 rand.workspace = true
 reqwest.workspace = true
 rmp-serde.workspace = true

@@ -72,6 +72,7 @@ use algo_consensus_crypto::vrf::VrfKeypair;
 use algo_types::{Address, ConsensusParams, Round};
 
 pub mod inject;
+pub mod inject_p2p;
 
 /// Go's `protocol.Vote` HashID — the correct domain-separation prefix for the
 /// message an agreement vote signs.

@@ -32,19 +32,21 @@ name: Nightly P2P Consensus Soak
 #     30-round consensus round-trip smoke) -> `p2p-interop-down`.
 #   Tier 2 (nightly / dispatch with tier=full) —
 #     `p2p-interop-soak-test ROUNDS=<input, default 200>
-#     VERIFY_STAGE=1 RESTART_SCENARIOS=1` (issue #594 soak + issue #596's
-#     fork-detector / bidirectional cert cross-verify / restart-rejoin
-#     stages), uploading summary.json, soak.jsonl, analyze.summary.json,
-#     verify.log + verify-go-report-*.json, the restart/ sub-summary, and
-#     the per-node container logs.
+#     VERIFY_STAGE=1 RESTART_SCENARIOS=1 NEGATIVE_CASES=1` (issue #594 soak
+#     + issue #596's fork-detector / bidirectional cert cross-verify /
+#     restart-rejoin stages + issue #597's negative-conformance stage),
+#     uploading summary.json, soak.jsonl, analyze.summary.json,
+#     verify.log + verify-go-report-*.json, the restart/ sub-summary, the
+#     negative/ sub-summary, and the per-node container logs.
 #
-# ## Not yet covered (see docs/P2P_SOAK_METHODOLOGY.md "Not yet covered")
+# ## Coverage (see docs/P2P_SOAK_METHODOLOGY.md "Not yet covered")
 #
-# Unlike consensus-cluster.yml's Tier 2, this workflow does NOT run
-# negative conformance (malformed-message injection): `algo-agreement-fuzz`
-# speaks the WS-gossip wire framing, which has no equivalent yet over this
-# harness's libp2p `/algorand-ws/2.2.0` raw stream. Tracked as a
-# follow-up issue — see docs/P2P_SOAK_METHODOLOGY.md.
+# As of issue #597 this workflow's Tier 2 now matches
+# consensus-cluster.yml's Tier 2 stage-for-stage: fork detection,
+# bidirectional cert cross-verify, restart/rejoin, AND negative
+# conformance (malformed-message injection over this harness's libp2p
+# `/algorand-ws/2.2.0` raw stream, via `algo-agreement-fuzz --transport
+# p2p`) all run nightly.
 #
 # ## Caching
 #
@@ -234,17 +236,18 @@ jobs:
       # directory to a path the upload step can name. VERIFY_STAGE=1
       # RESTART_SCENARIOS=1 turn on issue #596's fork-detector /
       # bidirectional cert cross-verify / restart-rejoin stages on top of
-      # issue #594's soak — the P2P-harness analogue of
-      # consensus-cluster.yml's Tier 2 `RESTART_SCENARIOS=1` (this
-      # harness has no negative-conformance stage yet — see the header
-      # comment above).
-      - name: Tier 2 — P2P consensus soak + verify + restart (#594 + #596)
+      # issue #594's soak, and NEGATIVE_CASES=1 turns on issue #597's
+      # malformed-message injection stage — the P2P-harness analogue of
+      # consensus-cluster.yml's Tier 2 `RESTART_SCENARIOS=1
+      # NEGATIVE_CASES=1`.
+      - name: Tier 2 — P2P consensus soak + verify + restart + negative (#594 + #596 + #597)
         if: github.event.inputs.tier != 'smoke'
         env:
           OUT_DIR: ${{ github.workspace }}/p2p-soak-artifacts
           ROUNDS: ${{ github.event.inputs.rounds || '200' }}
           VERIFY_STAGE: "1"
           RESTART_SCENARIOS: "1"
+          NEGATIVE_CASES: "1"
         run: make p2p-interop-soak-test
 
       # ── Diagnostics + artifacts ───────────────────────────────────────
@@ -266,8 +269,9 @@ jobs:
         with:
           # summary.json, soak.jsonl, analyze.summary.json, analyze.log,
           # verify.log + verify-go-report-*.json (#596 cert authenticate),
-          # cert-crossverify JSONL, the restart/ sub-summary, and the
-          # per-node logs the analyzers read.
+          # cert-crossverify JSONL, the restart/ sub-summary, the
+          # negative/ sub-summary (#597), and the per-node logs the
+          # analyzers read.
           name: p2p-consensus-soak-${{ github.run_id }}
           path: p2p-soak-artifacts/
           if-no-files-found: warn

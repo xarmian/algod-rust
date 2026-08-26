@@ -109,7 +109,7 @@ this harness (all opt-in, off by default, same as
   p2p-interop-restart`). Same reasoning: the restart/rejoin mechanics
   (docker kill/restart, REST round polling, `algo-agreement`'s own log
   lines) are transport-agnostic.
-- **Negative conformance** (issue #472's analogue — malformed-message
+- ~~**Negative conformance** (issue #472's analogue — malformed-message
   injection) is **still open**. The existing injector,
   `crates/tools/algo-agreement-fuzz`, speaks go-algorand's WS-gossip
   handshake/framing (`algo_network::connect` + `algo_network::framing`)
@@ -119,7 +119,22 @@ this harness (all opt-in, off by default, same as
   P2P-speaking injector is genuine new engineering (a libp2p client
   capable of dialing, negotiating `/algorand-ws/2.2.0`, and sending one
   malformed message), not a porting exercise, so #596 left it out and
-  filed it as #597.
+  filed it as #597.~~ Done (#597) — `NEGATIVE_CASES=1` (see
+  `ops/mixed-cluster-p2p/scripts/negative-conformance.sh`). `algo-agreement-fuzz`
+  gained a second connection backend
+  (`crates/tools/algo-agreement-fuzz/src/inject_p2p.rs`, `--transport p2p`)
+  that dials a peer, negotiates `/algorand-ws/2.2.0` via
+  `algo_p2p::{P2pHost, wsproto}`, and sends one tagged frame on the raw
+  stream — reusing the exact same fault-construction logic
+  (`build_vote`/`corrupt_proposal`/`baseline_and_faulted`) the WS-gossip
+  injector already had; only the transport layer is new. One deliberate
+  deviation from the WS-gossip script: it does not raise go-node-1's
+  `BaseLoggerDebugLevel` and restart it for the `malformed-proposal`
+  case, since a restart here would churn the node's ephemeral libp2p
+  PeerId (`P2PPersistPeerID` defaults to false) and fragment the
+  bootstrap-chained 3-node mesh — the `not-adopted` assertion (the
+  corrupted block is never committed) remains the decisive check for
+  that case regardless.
 
 What IS covered by the base soak (`p2p-interop-soak-test` with no extra
 flags): proposer-share assertion, vote-step coverage (soft + cert),
@@ -128,9 +143,10 @@ and Go's own `VoteAccepted` telemetry for the Rust account — the same
 five categories `docs/SOAK_METHODOLOGY.md`'s "Acceptance" section
 defines for the base soak (rounds reached, no lag violation, zero
 warnings, every block has ts+proposer), plus the opt-in issue #470-style
-participation assertions. `VERIFY_STAGE=1 RESTART_SCENARIOS=1` add
-issue #596's fork-freedom, bidirectional cert authentication, and
-restart/rejoin coverage on top of that.
+participation assertions. `VERIFY_STAGE=1 RESTART_SCENARIOS=1
+NEGATIVE_CASES=1` add issue #596's fork-freedom, bidirectional cert
+authentication, and restart/rejoin coverage, plus issue #597's
+negative-conformance coverage, on top of that.
 
 ## Running a soak
 

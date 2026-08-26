@@ -21,7 +21,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use algo_agreement::{Period, Seed, DOWN, PROPOSE};
-use algo_agreement_fuzz::inject::{inject_one, InjectorConfig};
+use algo_agreement_fuzz::inject::{inject_one, InjectionOutcome, InjectorConfig};
+use algo_agreement_fuzz::inject_p2p::{capture_proposal_p2p, inject_one_p2p, P2pInjectorConfig};
 use algo_agreement_fuzz::{
     baseline_and_faulted, bottom, committee_weight, corrupt_proposal, encode_compound_message,
     encode_vote, synthetic_proposal_value, OtsDomain, ParticipationSecrets, ProposalFault,
@@ -54,9 +55,25 @@ struct Cli {
     #[arg(long)]
     token: String,
 
-    /// `host:port` of the target Go node's gossip listener.
+    /// Which wire transport to inject the message over. `ws-gossip` speaks
+    /// go-algorand's WS-gossip handshake/framing (`--gossip`); `p2p` speaks
+    /// the raw `/algorand-ws/2.2.0` libp2p stream (`--p2p-multiaddr`) that a
+    /// go-algorand node started with `EnableP2P=true` uses instead — see
+    /// `ops/mixed-cluster-p2p/` (issue #597).
+    #[arg(long, default_value = "ws-gossip", value_parser = ["ws-gossip", "p2p"])]
+    transport: String,
+
+    /// `host:port` of the target Go node's WS-gossip listener.
+    /// (`--transport ws-gossip` only.)
     #[arg(long, default_value = "127.0.0.1:4161")]
     gossip: String,
+
+    /// The target Go node's dialable P2P multiaddr, including its trailing
+    /// `/p2p/<peer-id>` component (e.g. from
+    /// `ops/mixed-cluster-p2p/netroot/.p2p-multiaddr-1`).
+    /// (`--transport p2p` only.)
+    #[arg(long)]
+    p2p_multiaddr: Option<String>,
 
     /// Genesis ID of the network (e.g. `phase6net-v1`).
     #[arg(long)]
@@ -237,6 +254,76 @@ impl Algod {
 }
 
 // ---------------------------------------------------------------------------
+// Transport — ws-gossip or P2P (issue #597)
+// ---------------------------------------------------------------------------
+
+/// Which wire transport to inject the single malformed message over, plus
+/// its already-resolved connection config. See [`Cli::transport`]'s doc
+/// comment for the go-algorand-side rationale.
+enum Transport {
+    /// go-algorand's WS-gossip handshake/framing — [`algo_agreement_fuzz::inject`].
+    WsGossip(InjectorConfig),
+    /// The raw `/algorand-ws/2.2.0` libp2p stream — [`algo_agreement_fuzz::inject_p2p`].
+    P2p(P2pInjectorConfig),
+}
+
+impl Transport {
+    /// Resolve `--transport` (plus `--gossip`/`--p2p-multiaddr`) into a
+    /// concrete, ready-to-use config.
+    fn resolve(cli: &Cli, observe_secs: u64) -> Result<Self> {
+        match cli.transport.as_str() {
+            "p2p" => {
+                let addr = cli.p2p_multiaddr.as_deref().ok_or_else(|| {
+                    anyhow!("--transport p2p requires --p2p-multiaddr <multiaddr>")
+                })?;
+                let multiaddr: libp2p::Multiaddr = addr
+                    .parse()
+                    .with_context(|| format!("parsing --p2p-multiaddr {addr}"))?;
+                Ok(Transport::P2p(P2pInjectorConfig {
+                    observe: Duration::from_secs(observe_secs),
+                    ..P2pInjectorConfig::new(multiaddr, &cli.genesis_id)
+                }))
+            }
+            _ => Ok(Transport::WsGossip(InjectorConfig {
+                observe: Duration::from_secs(observe_secs),
+                ..InjectorConfig::new(&cli.gossip, &cli.genesis_id)
+            })),
+        }
+    }
+
+    /// Reconfigure the observe window on an already-resolved transport (used
+    /// where `run_malformed_proposal` needs a longer window for the initial
+    /// capture than for the later injection).
+    fn with_observe(&self, observe_secs: u64) -> Self {
+        let observe = Duration::from_secs(observe_secs);
+        match self {
+            Transport::WsGossip(cfg) => Transport::WsGossip(InjectorConfig {
+                observe,
+                ..cfg.clone()
+            }),
+            Transport::P2p(cfg) => Transport::P2p(P2pInjectorConfig {
+                observe,
+                ..cfg.clone()
+            }),
+        }
+    }
+
+    async fn inject_one(&self, tag: Tag, payload: Vec<u8>) -> Result<InjectionOutcome> {
+        match self {
+            Transport::WsGossip(cfg) => inject_one(cfg, tag, payload).await,
+            Transport::P2p(cfg) => inject_one_p2p(cfg, tag, payload).await,
+        }
+    }
+
+    async fn capture_proposal(&self) -> Result<Vec<u8>> {
+        match self {
+            Transport::WsGossip(cfg) => algo_agreement_fuzz::inject::capture_proposal(cfg).await,
+            Transport::P2p(cfg) => capture_proposal_p2p(cfg).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -275,8 +362,15 @@ async fn main() -> Result<()> {
         "loaded injected identity"
     );
 
+    // Resolving a transport only builds its config (dial/gossip target,
+    // timeouts) — it does not touch the network on its own, so this happens
+    // unconditionally even for `--dry-run` (mirrors `run_malformed_proposal`,
+    // which has always captured a real proposal off the wire regardless of
+    // `--dry-run`, since a proposal has to come from *somewhere* to corrupt).
+    let transport = Transport::resolve(&cli, cli.observe_secs)?;
+
     let report = match cli.case.as_str() {
-        "malformed-proposal" => run_malformed_proposal(&cli, &algod).await?,
+        "malformed-proposal" => run_malformed_proposal(&cli, &algod, &transport).await?,
         _ => {
             let fault = parse_vote_fault(&cli.case)?;
             run_vote_case(
@@ -290,6 +384,7 @@ async fn main() -> Result<()> {
                 total_money,
                 key_dilution,
                 fault,
+                &transport,
             )
             .await?
         }
@@ -351,6 +446,7 @@ async fn run_vote_case(
     total_money: u64,
     key_dilution: u64,
     fault: VoteFault,
+    transport: &Transport,
 ) -> Result<Report> {
     // Recovery steps are always propagated by Go's freshness rules
     // (`voteStepFresh`: `vote >= late` short-circuits) and are never emitted by
@@ -468,11 +564,9 @@ async fn run_vote_case(
         return Ok(report);
     }
 
-    let cfg = InjectorConfig {
-        observe: Duration::from_secs(cli.observe_secs),
-        ..InjectorConfig::new(&cli.gossip, &cli.genesis_id)
-    };
-    let outcome = inject_one(&cfg, Tag::AgreementVote, injected_bytes).await?;
+    let outcome = transport
+        .inject_one(Tag::AgreementVote, injected_bytes)
+        .await?;
     tracing::info!(?outcome, "injection complete");
     report.disconnected = Some(outcome.disconnected);
     report.elapsed_ms = Some(outcome.elapsed_ms);
@@ -486,16 +580,18 @@ async fn run_vote_case(
 /// Capturing rather than assembling is deliberate: the injector has no ledger,
 /// so the only way to obtain a payload that is valid in every respect *except*
 /// the injected fault is to take one an honest proposer just produced.
-async fn run_malformed_proposal(cli: &Cli, algod: &Algod) -> Result<Report> {
+async fn run_malformed_proposal(cli: &Cli, algod: &Algod, transport: &Transport) -> Result<Report> {
     use algo_agreement::codec;
 
     let fault = parse_proposal_fault(&cli.proposal_fault)?;
-    let cfg = InjectorConfig {
-        observe: Duration::from_secs(cli.capture_secs),
-        ..InjectorConfig::new(&cli.gossip, &cli.genesis_id)
-    };
+    let capture_transport = transport.with_observe(cli.capture_secs);
 
-    let captured = algo_agreement_fuzz::inject::capture_proposal(&cfg).await?;
+    let captured = capture_transport.capture_proposal().await?;
+    tracing::debug!(
+        len = captured.len(),
+        first_32_hex = %hex::encode(&captured[..captured.len().min(32)]),
+        "captured PP bytes before decode"
+    );
     let cm = codec::decode_compound_message(&captured)
         .map_err(|e| anyhow!("captured PP did not decode: {e}"))?;
     let round = cm.proposal.round();
@@ -544,12 +640,11 @@ async fn run_malformed_proposal(cli: &Cli, algod: &Algod) -> Result<Report> {
         return Ok(report);
     }
 
-    let inject_cfg = InjectorConfig {
-        observe: Duration::from_secs(cli.observe_secs),
-        ..InjectorConfig::new(&cli.gossip, &cli.genesis_id)
-    };
+    let inject_transport = transport.with_observe(cli.observe_secs);
     let injected_digest = injected_cm.proposal.block_digest();
-    let outcome = inject_one(&inject_cfg, Tag::ProposalPayload, injected_bytes).await?;
+    let outcome = inject_transport
+        .inject_one(Tag::ProposalPayload, injected_bytes)
+        .await?;
     tracing::info!(?outcome, "injection complete");
     report.disconnected = Some(outcome.disconnected);
     report.elapsed_ms = Some(outcome.elapsed_ms);
