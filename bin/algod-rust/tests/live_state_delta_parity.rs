@@ -704,3 +704,123 @@ async fn algo_fixtures_can_capture_state_delta() {
 fn tempfile_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("create scratch dir for fixture capture")
 }
+
+/// Issue #576 (follow-up to #573): live-verifies that fields *outside*
+/// `KvValueDelta` are never omitted either. `ledgercore.AccountBaseData`
+/// (the `Accts[]` entries under `StateDelta.Accts`) carries no `_struct
+/// codec:",omitempty,omitemptyarray"` marker, so a real node's response
+/// must still include every one of those fields even when zero, e.g.
+/// `"Status":0`, `"AuthAddr":"AAAA...Y5HFKQ"` (the all-zero address's
+/// checksum string, not omitted/null), `"TotalAppSchema":{}` (present as an
+/// empty object, not omitted). This is exactly the example quoted in issue
+/// #576 itself.
+///
+/// **go-algorand gets the full assertion; algod-rust gets a weaker,
+/// documented one.** While first writing this test, every round shape
+/// tried (plain payment, bare app creation, and this test's box-create
+/// round) showed algod-rust's own dev-mode block producer's delta-caching
+/// path populating *only* `KvMods` in its cached `StateDelta` -- `Accts`
+/// (and `Totals`/`Txids`/`Creatables`/`Hdr`) stay at their empty/default
+/// values regardless of round content, even in the exact same response
+/// where `KvMods` is correctly populated. That's a separate, pre-existing
+/// ledger/dev-mode-block-production bug, unrelated to this issue's
+/// serialization-format scope -- filed and root-caused as its own
+/// follow-up, issue #581. Per issue #576's own acceptance criteria ("any
+/// field where live verification is genuinely infeasible is documented
+/// with root cause, not silently left as-is"): go's response is asserted
+/// in full (proving the real go-algorand wire form this issue's fix
+/// targets); algod-rust's response is only checked for the one shape
+/// invariant #581's gap can't break -- the `Accts.Accts` key is present as
+/// an array (never omitted, never `null`) -- not for populated account
+/// content, which #581 blocks until fixed.
+#[tokio::test]
+#[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
+async fn state_delta_accts_zero_fields_matches_go_for_box_create_round() {
+    let c = client();
+
+    let account_base_data_keys = [
+        "Status",
+        "MicroAlgos",
+        "RewardsBase",
+        "RewardedMicroAlgos",
+        "AuthAddr",
+        "IncentiveEligible",
+        "TotalAppSchema",
+        "TotalExtraAppPages",
+        "TotalAppParams",
+        "TotalAppLocalStates",
+        "TotalAssetParams",
+        "TotalAssets",
+        "TotalBoxes",
+        "TotalBoxBytes",
+        "LastProposed",
+        "LastHeartbeat",
+    ];
+
+    for (base, label) in [(go_url(), "go"), (rust_url(), "rust")] {
+        let (_app_id, create_round, _put_round, _del_round) =
+            deploy_and_mutate_box(&c, &base, label).await;
+
+        let (status, body) =
+            get_json(&c, &base, &format!("/v2/deltas/{create_round}?format=json")).await;
+        assert_eq!(
+            status, 200,
+            "{label}: GET /v2/deltas/{create_round} status: {body}"
+        );
+
+        // Always true regardless of the #581 gap: the outer `AccountDeltas`
+        // shape this #576 fix controls (never-omitted `Accts` key,
+        // `AppResources`/`AssetResources` as `null` when untouched) must
+        // hold on both nodes even when `Accts.Accts` itself ends up empty.
+        assert!(
+            body["Accts"]["Accts"].is_array(),
+            "{label}: round {create_round} StateDelta.Accts.Accts must be a (possibly empty) array: {body}"
+        );
+
+        if label == "rust" {
+            // See this test's doc comment / issue #581: algod-rust's own
+            // dev-mode chain doesn't populate Accts content yet, so the
+            // never-omit-when-populated assertions below would spuriously
+            // fail here for a reason this issue's fix doesn't control.
+            continue;
+        }
+
+        let accts = body["Accts"]["Accts"].as_array().unwrap();
+        assert!(
+            !accts.is_empty(),
+            "{label}: the box-create round must touch at least the app account: {body}"
+        );
+
+        // Every `AccountBaseData` key must be present on *every* touched
+        // account, regardless of that account's specific field values --
+        // the dev account driving this suite accumulates state (app/asset
+        // counts, balances) across every other live test sharing this
+        // long-lived cluster, so pinning on a specific "fresh account" shape
+        // is brittle; presence-of-every-key is what issue #576 is actually
+        // about, and checking it across every entry is strictly stronger
+        // than checking one hand-picked entry. Not asserting on the `Addr`/
+        // `AuthAddr` fields' *string* value deliberately -- those have their
+        // own separate, pre-existing wire-encoding bug (tracked in a
+        // dedicated follow-up issue filed alongside #576) unrelated to this
+        // test's omitempty concern.
+        for record in accts {
+            for key in account_base_data_keys {
+                assert!(
+                    record.get(key).is_some(),
+                    "{label}: round {create_round}'s every Accts[] entry must always include {key} \
+                     (no omitempty on ledgercore.AccountBaseData), even when zero: {record}"
+                );
+            }
+        }
+
+        // Spot-check the exact zero-value wire form the issue itself
+        // quotes -- find some entry with a literal 0, proving it's a bare
+        // number and not e.g. a stringified/omitted placeholder.
+        assert!(
+            accts
+                .iter()
+                .any(|r| r.get("TotalBoxes") == Some(&serde_json::json!(0))),
+            "{label}: round {create_round} must have at least one Accts[] entry with TotalBoxes present as 0: {accts:?}"
+        );
+    }
+}

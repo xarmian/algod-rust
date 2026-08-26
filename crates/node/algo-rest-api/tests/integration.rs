@@ -6887,10 +6887,14 @@ async fn get_state_delta_json_returns_200() {
     assert_eq!(resp.headers()["content-type"], "application/json");
 
     let body: serde_json::Value = resp.json().await.unwrap();
-    // Txleases should be zeroed out (None) in JSON responses.
-    assert!(
-        body.get("Txleases").is_none(),
-        "Txleases should be absent in JSON: {body}"
+    // Txleases is zeroed out (None) in JSON responses (Txlease can't be a
+    // JSON map key), but issue #576 established that `ledgercore.StateDelta`
+    // carries no `_struct codec:",omitempty,omitemptyarray"` marker, so the
+    // key itself is never omitted -- it's `null`, not absent.
+    assert_eq!(
+        body.get("Txleases"),
+        Some(&serde_json::Value::Null),
+        "Txleases should be present as null (not absent) in JSON: {body}"
     );
     // Accts should be present.
     assert!(
