@@ -1,6 +1,6 @@
 # algod-rust
 
-Full Rust reimplementation of go-algorand — a production-grade Algorand node. Phases 0–6 are complete (conformance harness, block sync, AVM execution, ledger apply, validation, REST API, consensus participation). Phase 9/10 (go-algorand version-upgrade parity sweeps — most recently the `v4.6.0-stable` → `v4.7.0-stable` sweep plus a new libp2p P2P transport) is also complete. The reference pin is `v4.7.0-stable`. See `docs/PROJECT_SCOPE.md` for full scope, `docs/PHASE6_VALIDATION.md` for the Layer-9 consensus evidence map, and `docs/PHASE10_VALIDATION.md` for the version-upgrade/P2P-transport evidence map (which test/tool proves which criterion).
+Full Rust reimplementation of go-algorand — a production-grade Algorand node. Phases 0–6 are complete (conformance harness, block sync, AVM execution, ledger apply, validation, REST API, consensus participation). Phase 9/10 (go-algorand version-upgrade parity sweeps — most recently the `v4.6.0-stable` → `v4.7.0-stable` sweep plus a new libp2p P2P transport) are also complete. Phase 11 (the `v4.7.0-stable` → `v4.7.2-stable` sweep, a small bounds-check/security patch release) is in progress — see epic #621. The reference pin is `v4.7.2-stable`. See `docs/PROJECT_SCOPE.md` for full scope, `docs/PHASE6_VALIDATION.md` for the Layer-9 consensus evidence map, `docs/PHASE10_VALIDATION.md` for the v4.7.0-stable version-upgrade/P2P-transport evidence map, and `docs/PHASE11_PROPOSAL.md` for the in-progress v4.7.2-stable sweep (which test/tool proves which criterion).
 
 ## Shell Environment
 
@@ -8,7 +8,7 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
 
 ## Reference Implementation
 
-- **go-algorand source** is at `../go-algorand`, pinned to `v4.7.0-stable` (detached HEAD)
+- **go-algorand source** is at `../go-algorand`, pinned to `v4.7.2-stable` (detached HEAD)
 - Use this as the authoritative reference for AVM opcodes, consensus params, field indices, and protocol semantics
 - Key reference files:
   - `data/transactions/logic/opcodes.go` — opcode table, version gating

@@ -6,7 +6,7 @@ This is the P2P-transport sibling of `docs/SOAK_METHODOLOGY.md`
 (PLAN-32 / TASK-87). Issue #591 (PR #593) fixed the P2P block/cert
 catch-up fetch path and, with it, `ops/mixed-cluster-p2p/scripts/
 consensus-round-trip.sh` live-verified the 4-node P2P cluster (3
-go-algorand v4.7.0-stable nodes in plain P2P mode + 1 `algod-rust
+go-algorand v4.7.2-stable nodes in plain P2P mode + 1 `algod-rust
 participate --enable-p2p` stake-holding node) sustaining 30+ rounds in
 lockstep with zero agreement rejections — the same proof
 `participation-smoke.sh` gives the WS-gossip harness, but purely over

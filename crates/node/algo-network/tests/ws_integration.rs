@@ -1,6 +1,6 @@
 //! Integration tests for WebSocket peer connectivity against a real Go relay.
 //!
-//! These tests connect to a live `algorand/algod:4.7.0-stable` Docker container
+//! These tests connect to a live `algorand/algod:4.7.2-stable` Docker container
 //! configured as a relay node (with `GOSSIP_PORT=4161`).  They validate the
 //! full WebSocket handshake, Algorand header exchange, identity challenge
 //! protocol, message framing, and reconnection logic.
