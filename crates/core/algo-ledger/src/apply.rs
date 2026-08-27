@@ -4331,7 +4331,15 @@ mod tests {
     }
 
     #[test]
-    fn test_stpf_is_noop() {
+    fn test_stpf_no_longer_unconditionally_accepted() {
+        // Issue #626: a `stpf` transaction used to be an unconditional no-op
+        // that accepted *any* state proof (forged or otherwise) with zero
+        // cryptographic verification. It now goes through
+        // `apply_stateproof::apply_state_proof`, which requires the ledger
+        // to have a tracked `StateProofNext` round to check against -- a
+        // bare `stpf` txn with no such context (no previous block header at
+        // all) is correctly rejected, not silently accepted. See
+        // `apply_stateproof::tests` for full round-matching/crypto coverage.
         let sender = Address([1u8; 32]);
         let fee_sink = Address([3u8; 32]);
 
@@ -4342,8 +4350,12 @@ mod tests {
         stx.txn.sender = sender;
         stx.txn.fee = 0;
 
-        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
-        // Balance unchanged — stpf is a no-op.
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(
+            result.is_err(),
+            "a state proof txn with no ledger context must not be silently accepted"
+        );
+        // Balance unchanged: state proof txns carry no fee/reward regardless.
         assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
     }
 

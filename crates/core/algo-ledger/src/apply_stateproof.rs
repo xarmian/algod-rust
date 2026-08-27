@@ -429,9 +429,11 @@ mod tests {
     fn rejects_unsupported_state_proof_type() {
         let store = LedgerState::new();
         let ctx = ApplyContext::new_replay(0, Address::ZERO, 10);
-        let mut txn = Transaction::default();
-        txn.txn_type = "stpf".into();
-        txn.state_proof_type = 1;
+        let txn = Transaction {
+            txn_type: "stpf".into(),
+            state_proof_type: 1,
+            ..Default::default()
+        };
 
         let err = apply_state_proof(&store, &ctx, &txn).unwrap_err();
         assert!(
@@ -449,12 +451,14 @@ mod tests {
         );
         let ctx = ApplyContext::new_replay(0, Address::ZERO, 10);
 
-        let mut txn = Transaction::default();
-        txn.txn_type = "stpf".into();
-        txn.state_proof_message = Some(StateProofMessage {
-            last_attested_round: 600,
+        let txn = Transaction {
+            txn_type: "stpf".into(),
+            state_proof_message: Some(StateProofMessage {
+                last_attested_round: 600,
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
 
         let err = apply_state_proof(&store, &ctx, &txn).unwrap_err();
         assert!(
@@ -472,12 +476,14 @@ mod tests {
         put_header(&mut store, &header_at(9, CONSENSUS_V41, None));
         let ctx = ApplyContext::new_replay(0, Address::ZERO, 10);
 
-        let mut txn = Transaction::default();
-        txn.txn_type = "stpf".into();
-        txn.state_proof_message = Some(StateProofMessage {
-            last_attested_round: 256,
+        let txn = Transaction {
+            txn_type: "stpf".into(),
+            state_proof_message: Some(StateProofMessage {
+                last_attested_round: 256,
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
 
         let err = apply_state_proof(&store, &ctx, &txn).unwrap_err();
         assert!(
@@ -510,16 +516,18 @@ mod tests {
         let mut ctx = ApplyContext::new_replay(0, Address::ZERO, 256);
         ctx.validate = true;
 
-        let mut txn = Transaction::default();
-        txn.txn_type = "stpf".into();
-        txn.state_proof_message = Some(StateProofMessage {
-            last_attested_round: 256,
+        let txn = Transaction {
+            txn_type: "stpf".into(),
+            state_proof_message: Some(StateProofMessage {
+                last_attested_round: 256,
+                ..Default::default()
+            }),
+            state_proof: Some(StateProofBody {
+                signed_weight: 100, // far below the 1_000_000 required
+                ..Default::default()
+            }),
             ..Default::default()
-        });
-        txn.state_proof = Some(StateProofBody {
-            signed_weight: 100, // far below the 1_000_000 required
-            ..Default::default()
-        });
+        };
 
         let err = apply_state_proof(&store, &ctx, &txn).unwrap_err();
         assert!(
@@ -720,10 +728,12 @@ mod tests {
         let mut ctx = ApplyContext::new_replay(0, Address::ZERO, LAST_ATTESTED);
         ctx.validate = true;
 
-        let mut txn = Transaction::default();
-        txn.txn_type = "stpf".into();
-        txn.state_proof_message = Some(message);
-        txn.state_proof = Some(wire_proof);
+        let txn = Transaction {
+            txn_type: "stpf".into(),
+            state_proof_message: Some(message),
+            state_proof: Some(wire_proof),
+            ..Default::default()
+        };
 
         apply_state_proof(&store, &ctx, &txn)
             .expect("genuine state proof must be accepted end-to-end");

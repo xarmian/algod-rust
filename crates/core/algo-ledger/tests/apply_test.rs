@@ -214,11 +214,22 @@ fn test_payment_to_self_fee_deducted() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Fee pooling for stpf — fee=0 no error, balances unchanged
+// 6. stpf — no fee/reward side effects, regardless of accept/reject (#626)
 // ---------------------------------------------------------------------------
+//
+// Issue #626: `stpf` used to be an unconditional no-op that accepted *any*
+// state proof with zero cryptographic verification. It now runs through
+// `apply_stateproof::apply_state_proof` (round-matching + crypto
+// verification — see that module's own tests for full accept/reject
+// coverage) and correctly *rejects* a bare `stpf` txn with no ledger
+// context (no tracked `StateProofNext`, i.e. no previous block header at
+// all). What both these tests still confirm, since state-proof txns always
+// carry no fee: the sender/fee-sink balances are untouched either way — a
+// rejected `stpf` rolls back like any other rejected transaction, and its
+// `fee` field (0 or nonzero) has no bearing on that outcome.
 
 #[test]
-fn test_stpf_zero_fee_no_error() {
+fn test_stpf_zero_fee_no_balance_side_effects() {
     let sender = Address([1u8; 32]);
     let fee_sink = Address([3u8; 32]);
 
@@ -230,15 +241,20 @@ fn test_stpf_zero_fee_no_error() {
     stx.txn.sender = sender;
     stx.txn.fee = 0;
 
-    apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+    let result = apply_transaction(&mut state, &stx, &ctx, 0);
+    assert!(
+        result.is_err(),
+        "a state proof txn with no ledger context must not be silently accepted"
+    );
 
     assert_eq!(state.get_account(&sender).unwrap().micro_algos, 500_000);
     assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 0);
 }
 
 #[test]
-fn test_stpf_nonzero_fee_still_noop() {
-    // Even if fee is set, stpf branch doesn't debit it.
+fn test_stpf_nonzero_fee_no_balance_side_effects() {
+    // Even if fee is set, the (rejected) stpf branch never debits it —
+    // state-proof transactions carry no fee regardless of accept/reject.
     let sender = Address([1u8; 32]);
     let fee_sink = Address([3u8; 32]);
 
@@ -250,9 +266,12 @@ fn test_stpf_nonzero_fee_still_noop() {
     stx.txn.sender = sender;
     stx.txn.fee = 5_000;
 
-    apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+    let result = apply_transaction(&mut state, &stx, &ctx, 0);
+    assert!(
+        result.is_err(),
+        "a state proof txn with no ledger context must not be silently accepted"
+    );
 
-    // stpf is a complete no-op — fee field is ignored.
     assert_eq!(state.get_account(&sender).unwrap().micro_algos, 500_000);
     assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 0);
 }

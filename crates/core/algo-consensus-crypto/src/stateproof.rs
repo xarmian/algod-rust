@@ -614,12 +614,16 @@ mod tests {
 
     #[test]
     fn build_committable_signature_rejects_empty_falcon_sig() {
-        let mut sig_commit = SigSlotCommit::default();
         // Non-zero L makes the sigslotCommit non-"MsgIsZero" without a
         // signature present, matching the go invalid case (Merkle sig
         // present via nonzero fields, but Falcon signature bytes missing).
-        sig_commit.l = 5;
-        sig_commit.sig.vector_commitment_index = 1;
+        let sig_commit = SigSlotCommit {
+            l: 5,
+            sig: merklesig::Signature {
+                vector_commitment_index: 1,
+                ..Default::default()
+            },
+        };
         let err = build_committable_signature(&sig_commit).unwrap_err();
         assert_eq!(err, StateProofError::EmptyFalconSignature);
     }
