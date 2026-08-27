@@ -593,10 +593,19 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     // full `AssetResourceRecord` on go's wire response -- both `Params` and
     // (unexpectedly) `Holding`, even though neither value actually changed.
     // Every key in this set is force-emitted below regardless of the
-    // pre/post diff. Scoped to just the (creator, asset) key an existing-
-    // asset Acfg (reconfigure/destroy) resolves in the loop below --
-    // Axfer/Afrz-touched holdings keep the ordinary diff gate, since their
-    // matching go behavior hasn't been live-verified here.
+    // pre/post diff. Originally scoped to just the (creator, asset) key an
+    // existing-asset Acfg (reconfigure/destroy) resolves in the loop below
+    // (that key never itself goes through `set_asset_holding`/
+    // `remove_asset_holding` for a reconfigure, so it can't be discovered
+    // via `touches` -- go's own combined `UpsertAssetResource` call from
+    // `putAssetParams` is what forces the creator's holding onto the wire
+    // even though the holding itself wasn't `Put`). Issue #608 widened this
+    // to *also* be populated from `touches.asset_holdings` below (every key
+    // an actual `set_asset_holding`/`remove_asset_holding` call touched,
+    // top-level or inner, any txn type) -- live-verification confirmed
+    // go's `AssetFreeze`/`AssetTransfer` (`ledger/apply/asset.go`) call
+    // `PutAssetHolding` unconditionally too, so Axfer/Afrz-touched holdings
+    // need the same force-emit treatment as the Acfg case.
     let mut asset_holding_force_emit: HashSet<(Address, u64)> = HashSet::new();
     let mut asset_creators: HashMap<u64, Address> = HashMap::new();
     let mut asset_params_pre: HashMap<u64, Option<AssetParams>> = HashMap::new();
@@ -807,6 +816,46 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
         asset_holding_pre
             .entry((addr, aid))
             .or_insert_with(|| pre.clone());
+        // Issue #608 (widening #603's Acfg-only fix): `touches.asset_holdings`
+        // is populated by `RecordingStore` on every `set_asset_holding`/
+        // `remove_asset_holding` call made *anywhere* during this block's
+        // apply -- top-level or inner, and for every txn type (Acfg's own
+        // creator-holding writes, Axfer's opt-in/transfer/close-out, Afrz's
+        // freeze/unfreeze), not just Acfg. That's the exact same "was this
+        // resource `Put`" signal go-algorand's `roundCowState.putAssetHolding`
+        // (`ledger/eval/cow_creatables.go`) uses to force an entry into
+        // `AccountDeltas` -- go calls `PutAssetHolding` unconditionally
+        // whenever `takeOut`/`putIn`/`AssetFreeze` run (`ledger/apply/
+        // asset.go`), even when the resulting value is byte-identical to the
+        // value already there (e.g. a non-zero-amount self-transfer, or a
+        // re-freeze to the already-current flag). Force-emitting every
+        // touched key, not just the Acfg-derived ones, makes algod-rust
+        // match that unconditional-Put semantics for Axfer/Afrz too.
+        asset_holding_force_emit.insert((addr, aid));
+    }
+    // Issue #608 (the other half of go's combined-record semantics): go's
+    // `putAssetHolding` (`ledger/eval/cow_creatables.go`) doesn't just
+    // upsert the touched `Holding` -- it calls `lookupAssetParams(addr,
+    // aidx, cacheOnly=true)` first and bundles *that* onto the very same
+    // `AssetResourceRecord`. When the touched address is the asset's own
+    // creator (e.g. the creator self-transfers or freezes their own asset,
+    // live-verified: a value-identical self-transfer's wire record from a
+    // real go-algorand v4.7.0-stable node carries a full `Params` object,
+    // not null), go's response shows the asset's actual (round-unchanged)
+    // `Params` on that record too. Resolve and attach it here if no Acfg
+    // already did so above -- since nothing touched the params this round,
+    // the post-apply store read *is* the correct pre-image too (nothing to
+    // diff against a stale value).
+    for &(addr, aid) in touches.asset_holdings.keys() {
+        if asset_creators.contains_key(&aid) {
+            continue;
+        }
+        if let Some(rec) = store.get_asset_params(aid) {
+            if rec.creator == addr {
+                asset_creators.insert(aid, addr);
+                asset_params_pre.insert(aid, Some(rec.params));
+            }
+        }
     }
     for (&(addr, app_id), pre) in &touches.app_local_states {
         app_state_keys.insert((addr, app_id));

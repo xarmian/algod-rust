@@ -732,6 +732,23 @@ fn tempfile_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("create scratch dir for fixture capture")
 }
 
+/// Deterministic-per-`tag` fresh signing key, following the same
+/// nanos-seeded pattern already used inline by
+/// `state_delta_asset_resources_matches_go_for_optin_closeout` -- factored
+/// out here since issues #608's new tests below need several independent
+/// fresh accounts per node run (one per opt-in/close-out/clear-state actor).
+fn fresh_account(tag: &str) -> ed25519_dalek::SigningKey {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut seed = [0u8; 32];
+    let bytes = format!("{tag}-{nanos}").into_bytes();
+    let n = bytes.len().min(32);
+    seed[..n].copy_from_slice(&bytes[..n]);
+    ed25519_dalek::SigningKey::from_bytes(&seed)
+}
+
 /// Issue #576 (follow-up to #573): live-verifies that fields *outside*
 /// `KvValueDelta` are never omitted either. `ledgercore.AccountBaseData`
 /// (the `Accts[]` entries under `StateDelta.Accts`) carries no `_struct
@@ -1388,4 +1405,480 @@ async fn state_delta_app_resources_matches_go_for_create_update() {
         assert_eq!(creatable["Created"], serde_json::json!(true));
         assert_eq!(creatable["Ctype"], serde_json::json!(1), "1 = app");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #608: app opt-in/close-out/clear-state/destroy live verification,
+// and Axfer/Afrz Put-tracking (widening #603's Acfg-only
+// `asset_holding_force_emit` fix).
+// ---------------------------------------------------------------------------
+
+/// On-completion constants, matching `algo_ledger::apply`'s
+/// `ON_COMPLETION_*` values / go-algorand's `transactions.OnCompletion`.
+const OC_OPT_IN: u64 = 1;
+const OC_CLOSE_OUT: u64 = 2;
+const OC_CLEAR_STATE: u64 = 3;
+const OC_DELETE: u64 = 5;
+
+/// An `Appl`-call actor: signing key + its address, bundled together so
+/// `submit_appl_call` stays under clippy's `too_many_arguments` threshold.
+struct ApplActor<'a> {
+    sk: &'a ed25519_dalek::SigningKey,
+    addr: algo_types::Address,
+}
+
+/// Submits an `Appl` call from `actor` against `app_id` with the given
+/// `on_completion`, waits for confirmation, and returns the confirmed round.
+async fn submit_appl_call(
+    c: &reqwest::Client,
+    base: &str,
+    label: &str,
+    actor: &ApplActor<'_>,
+    app_id: u64,
+    on_completion: u64,
+    note_tag: &str,
+) -> u64 {
+    let mut txn = base_txn(c, base).await;
+    txn.sender = actor.addr;
+    txn.txn_type = TxnType::Appl;
+    txn.application_id = app_id;
+    txn.on_completion = on_completion;
+    txn.note = unique_note(&format!("{note_tag}-{label}")).into();
+    let confirmed = submit_and_confirm(c, base, label, &mut txn, actor.sk, note_tag).await;
+    confirmed["confirmed-round"].as_u64().unwrap()
+}
+
+fn app_resource_record<'a>(
+    body: &'a serde_json::Value,
+    app_id: u64,
+    addr: &str,
+) -> &'a serde_json::Value {
+    body["Accts"]["AppResources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| r["Aidx"].as_u64() == Some(app_id) && r["Addr"].as_str() == Some(addr))
+        .unwrap_or_else(|| {
+            panic!("missing AppResourceRecord for (app {app_id}, addr {addr}) in body: {body}")
+        })
+}
+
+/// Live dual-node verification for issue #608: an app opt-in / close-out /
+/// clear-state / destroy sequence, diffing `AppResources`/`Creatables`
+/// field-for-field against go-algorand at each round. #603's own app
+/// coverage (`state_delta_app_resources_matches_go_for_create_update`)
+/// stopped at create+update; this test covers the four states that were
+/// never live-verified.
+///
+/// Two independent accounts are used for close-out (`acct_b`) and
+/// clear-state (`acct_c`) since a single account can't demonstrate both
+/// terminal transitions.
+#[tokio::test]
+#[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
+async fn state_delta_app_resources_matches_go_for_optin_closeout_clearstate_destroy() {
+    let c = client();
+    let sk = dev_signing_key();
+
+    let approval = algo_avm::assembler::assemble_string("#pragma version 8\nint 1\nreturn\n")
+        .expect("approval must assemble")
+        .program;
+
+    // (optin_b, closeout_b, optin_c, clearstate_c, destroy) AppResourceRecord
+    // JSON entries per node, with `Aidx`/`Addr` stripped (per-node divergent)
+    // so the remaining shape can be compared directly between go and rust.
+    type PerNodeEntries = (
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+    );
+    let mut results: std::collections::HashMap<&str, PerNodeEntries> =
+        std::collections::HashMap::new();
+
+    for (base, label) in [(go_url(), "go"), (rust_url(), "rust")] {
+        // 1. Create the app.
+        let mut create = base_txn(&c, &base).await;
+        create.txn_type = TxnType::Appl;
+        create.approval_program = Some(ByteBuf::from(approval.clone()));
+        create.clear_state_program = Some(ByteBuf::from(CLEAR_STATE_PROGRAM.to_vec()));
+        create.note = unique_note(&format!("app608-create-{label}")).into();
+        let confirmed =
+            submit_and_confirm(&c, &base, label, &mut create, &sk, "app creation").await;
+        let app_id = confirmed["application-index"].as_u64().unwrap();
+
+        // 2. Fund and opt in `acct_b`, then close it out.
+        let b_sk = fresh_account(&format!("app608-b-{label}"));
+        let b_addr = algo_types::Address(b_sk.verifying_key().to_bytes());
+        let mut fund_b = base_txn(&c, &base).await;
+        fund_b.txn_type = TxnType::Pay;
+        fund_b.receiver = b_addr;
+        fund_b.amount = 1_000_000;
+        fund_b.note = unique_note(&format!("app608-fund-b-{label}")).into();
+        submit_and_confirm(&c, &base, label, &mut fund_b, &sk, "fund acct_b").await;
+
+        let actor_b = ApplActor {
+            sk: &b_sk,
+            addr: b_addr,
+        };
+        let optin_b_round = submit_appl_call(
+            &c,
+            &base,
+            label,
+            &actor_b,
+            app_id,
+            OC_OPT_IN,
+            "app608-optin-b",
+        )
+        .await;
+        let closeout_b_round = submit_appl_call(
+            &c,
+            &base,
+            label,
+            &actor_b,
+            app_id,
+            OC_CLOSE_OUT,
+            "app608-closeout-b",
+        )
+        .await;
+
+        // 3. Fund and opt in `acct_c`, then clear-state it.
+        let c_sk = fresh_account(&format!("app608-c-{label}"));
+        let c_addr = algo_types::Address(c_sk.verifying_key().to_bytes());
+        let mut fund_c = base_txn(&c, &base).await;
+        fund_c.txn_type = TxnType::Pay;
+        fund_c.receiver = c_addr;
+        fund_c.amount = 1_000_000;
+        fund_c.note = unique_note(&format!("app608-fund-c-{label}")).into();
+        submit_and_confirm(&c, &base, label, &mut fund_c, &sk, "fund acct_c").await;
+
+        let actor_c = ApplActor {
+            sk: &c_sk,
+            addr: c_addr,
+        };
+        let optin_c_round = submit_appl_call(
+            &c,
+            &base,
+            label,
+            &actor_c,
+            app_id,
+            OC_OPT_IN,
+            "app608-optin-c",
+        )
+        .await;
+        let clearstate_c_round = submit_appl_call(
+            &c,
+            &base,
+            label,
+            &actor_c,
+            app_id,
+            OC_CLEAR_STATE,
+            "app608-clearstate-c",
+        )
+        .await;
+
+        // 4. Destroy the app (creator).
+        let actor_dev = ApplActor {
+            sk: &sk,
+            addr: dev_address(),
+        };
+        let destroy_round = submit_appl_call(
+            &c,
+            &base,
+            label,
+            &actor_dev,
+            app_id,
+            OC_DELETE,
+            "app608-destroy",
+        )
+        .await;
+
+        let optin_b_body =
+            fetch_delta_expect_200(&c, &base, label, optin_b_round, "issue #608 opt-in").await;
+        let closeout_b_body =
+            fetch_delta_expect_200(&c, &base, label, closeout_b_round, "issue #608 close-out")
+                .await;
+        let optin_c_body =
+            fetch_delta_expect_200(&c, &base, label, optin_c_round, "issue #608 opt-in").await;
+        let clearstate_c_body = fetch_delta_expect_200(
+            &c,
+            &base,
+            label,
+            clearstate_c_round,
+            "issue #608 clear-state",
+        )
+        .await;
+        let destroy_body =
+            fetch_delta_expect_200(&c, &base, label, destroy_round, "issue #608 destroy").await;
+
+        let b_addr_str = b_addr.to_string();
+        let c_addr_str = c_addr.to_string();
+
+        // -- opt-in (b) --
+        let rec = app_resource_record(&optin_b_body, app_id, &b_addr_str);
+        assert_eq!(rec["State"]["Deleted"], serde_json::json!(false));
+        assert!(
+            rec["State"]["LocalState"].is_object(),
+            "{label}: opt-in round must carry a LocalState record: {rec}"
+        );
+
+        // -- close-out (b): local state removed --
+        let rec = app_resource_record(&closeout_b_body, app_id, &b_addr_str);
+        assert_eq!(
+            rec["State"]["Deleted"],
+            serde_json::json!(true),
+            "{label}: close-out must remove the account's local state: {rec}"
+        );
+        assert!(rec["State"]["LocalState"].is_null());
+
+        // -- opt-in (c) --
+        let rec = app_resource_record(&optin_c_body, app_id, &c_addr_str);
+        assert_eq!(rec["State"]["Deleted"], serde_json::json!(false));
+        assert!(rec["State"]["LocalState"].is_object());
+
+        // -- clear-state (c): local state removed --
+        let rec = app_resource_record(&clearstate_c_body, app_id, &c_addr_str);
+        assert_eq!(
+            rec["State"]["Deleted"],
+            serde_json::json!(true),
+            "{label}: clear-state must remove the account's local state: {rec}"
+        );
+        assert!(rec["State"]["LocalState"].is_null());
+
+        // -- destroy: app params removed, Creatables reflects it --
+        let dev_addr_str = dev_address().to_string();
+        let rec = app_resource_record(&destroy_body, app_id, &dev_addr_str);
+        assert_eq!(
+            rec["Params"]["Deleted"],
+            serde_json::json!(true),
+            "{label}: destroy must remove the app's params: {rec}"
+        );
+        assert!(rec["Params"]["Params"].is_null());
+        let creatable = &destroy_body["Creatables"][app_id.to_string()];
+        assert_eq!(
+            creatable["Created"],
+            serde_json::json!(false),
+            "{label}: destroy round Creatables entry: {creatable}"
+        );
+
+        let strip = |mut v: serde_json::Value| {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("Aidx");
+                obj.remove("Addr");
+            }
+            v
+        };
+        results.insert(
+            label,
+            (
+                strip(app_resource_record(&optin_b_body, app_id, &b_addr_str).clone()),
+                strip(app_resource_record(&closeout_b_body, app_id, &b_addr_str).clone()),
+                strip(app_resource_record(&optin_c_body, app_id, &c_addr_str).clone()),
+                strip(app_resource_record(&clearstate_c_body, app_id, &c_addr_str).clone()),
+                strip(app_resource_record(&destroy_body, app_id, &dev_addr_str).clone()),
+            ),
+        );
+    }
+
+    let (go_optin_b, go_closeout_b, go_optin_c, go_clearstate_c, go_destroy) = &results["go"];
+    let (rust_optin_b, rust_closeout_b, rust_optin_c, rust_clearstate_c, rust_destroy) =
+        &results["rust"];
+    assert_eq!(
+        go_optin_b, rust_optin_b,
+        "opt-in (b) AppResourceRecord (Aidx/Addr stripped) must match between go and rust"
+    );
+    assert_eq!(
+        go_closeout_b, rust_closeout_b,
+        "close-out (b) AppResourceRecord (Aidx/Addr stripped) must match between go and rust"
+    );
+    assert_eq!(
+        go_optin_c, rust_optin_c,
+        "opt-in (c) AppResourceRecord (Aidx/Addr stripped) must match between go and rust"
+    );
+    assert_eq!(
+        go_clearstate_c, rust_clearstate_c,
+        "clear-state (c) AppResourceRecord (Aidx/Addr stripped) must match between go and rust"
+    );
+    assert_eq!(
+        go_destroy, rust_destroy,
+        "destroy AppResourceRecord (Aidx/Addr stripped) must match between go and rust"
+    );
+}
+
+/// Live dual-node verification for issue #608's second concern: does
+/// go-algorand's `AccountDeltas` "was this resource `Put`"-tracking (see
+/// `apply.rs`'s `asset_holding_force_emit` doc comment, issue #603) also
+/// apply to Axfer/Afrz-touched holdings, not just Acfg's?
+///
+/// Two value-identical scenarios, each producing no *net* change to the
+/// holding's value while still calling go's `PutAssetHolding` (per
+/// `ledger/apply/asset.go`'s `takeOut`/`putIn`/`AssetFreeze`, which call it
+/// unconditionally, not gated on whether the value actually changed):
+///
+/// 1. **Value-identical Axfer**: the dev account (already opted in, holding
+///    the full non-zero supply) self-transfers a non-zero amount to itself.
+///    `takeOut` then `putIn` both run and both call `PutAssetHolding`, but
+///    the net amount is unchanged (X subtracted, X added back).
+/// 2. **Value-identical Afrz**: freeze the dev account's own holding to
+///    `true`, then freeze it to `true` again (no-op from the caller's
+///    perspective, but go's `AssetFreeze` calls `PutAssetHolding`
+///    unconditionally every time).
+///
+/// If go's response still carries the holding record in both cases (the
+/// expected finding, given `PutAssetHolding`'s unconditional call sites),
+/// this proves `apply.rs`'s widened `asset_holding_force_emit` (populated
+/// from `RecordingStore`'s `touches.asset_holdings` for *every* touched key,
+/// not just Acfg-derived ones) is required and correct.
+#[tokio::test]
+#[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
+async fn state_delta_asset_holding_force_emit_matches_go_for_value_identical_axfer_and_afrz() {
+    let c = client();
+    let dev_addr = dev_address();
+    let dev_addr_str = dev_addr.to_string();
+
+    type PerNodeEntries = (serde_json::Value, serde_json::Value);
+    let mut results: std::collections::HashMap<&str, PerNodeEntries> =
+        std::collections::HashMap::new();
+
+    for (base, label) in [(go_url(), "go"), (rust_url(), "rust")] {
+        let sk = dev_signing_key();
+
+        // Create the asset (dev holds full supply, is its own freeze addr).
+        let mut create = base_txn(&c, &base).await;
+        create.txn_type = TxnType::Acfg;
+        create.asset_params = Some(AssetParams {
+            total: ASSET_TOTAL,
+            unit_name: ASSET_UNIT_NAME.to_string(),
+            asset_name: ASSET_NAME.to_string(),
+            manager: Some(dev_addr),
+            reserve: Some(dev_addr),
+            freeze: Some(dev_addr),
+            clawback: Some(dev_addr),
+            ..Default::default()
+        });
+        create.note = unique_note(&format!("axferafrz608-create-{label}")).into();
+        let confirmed =
+            submit_and_confirm(&c, &base, label, &mut create, &sk, "asset create").await;
+        let asset_id = confirmed["asset-index"].as_u64().unwrap();
+
+        // 1. Value-identical Axfer: self-transfer a non-zero amount.
+        let mut selfxfer = base_txn(&c, &base).await;
+        selfxfer.txn_type = TxnType::Axfer;
+        selfxfer.xaid = asset_id;
+        selfxfer.asset_receiver = Some(dev_addr);
+        selfxfer.asset_amount = 1_000;
+        selfxfer.note = unique_note(&format!("axferafrz608-selfxfer-{label}")).into();
+        let confirmed =
+            submit_and_confirm(&c, &base, label, &mut selfxfer, &sk, "self-transfer").await;
+        let selfxfer_round = confirmed["confirmed-round"].as_u64().unwrap();
+
+        // 2a. First freeze: true -> true (already unfrozen -> now frozen;
+        // establishes a known Frozen=true baseline).
+        let mut freeze1 = base_txn(&c, &base).await;
+        freeze1.txn_type = TxnType::Afrz;
+        freeze1.freeze_asset = asset_id;
+        freeze1.freeze_account = Some(dev_addr);
+        freeze1.asset_frozen = true;
+        freeze1.note = unique_note(&format!("axferafrz608-freeze1-{label}")).into();
+        submit_and_confirm(&c, &base, label, &mut freeze1, &sk, "freeze (baseline)").await;
+
+        // 2b. Second freeze: true -> true again -- value-identical from the
+        // holding's perspective, but go's AssetFreeze still calls
+        // PutAssetHolding unconditionally.
+        let mut freeze2 = base_txn(&c, &base).await;
+        freeze2.txn_type = TxnType::Afrz;
+        freeze2.freeze_asset = asset_id;
+        freeze2.freeze_account = Some(dev_addr);
+        freeze2.asset_frozen = true;
+        freeze2.note = unique_note(&format!("axferafrz608-freeze2-{label}")).into();
+        let confirmed = submit_and_confirm(
+            &c,
+            &base,
+            label,
+            &mut freeze2,
+            &sk,
+            "freeze (value-identical)",
+        )
+        .await;
+        let freeze2_round = confirmed["confirmed-round"].as_u64().unwrap();
+
+        let selfxfer_body = fetch_delta_expect_200(
+            &c,
+            &base,
+            label,
+            selfxfer_round,
+            "issue #608 value-identical axfer",
+        )
+        .await;
+        let freeze2_body = fetch_delta_expect_200(
+            &c,
+            &base,
+            label,
+            freeze2_round,
+            "issue #608 value-identical afrz",
+        )
+        .await;
+
+        // Self-transfer round: go's response still carries the holding
+        // record for the dev account, with its (unchanged) amount.
+        let rec = asset_resources(&selfxfer_body)
+            .into_iter()
+            .find(|r| {
+                r["Aidx"].as_u64() == Some(asset_id) && r["Addr"].as_str() == Some(&dev_addr_str)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: value-identical self-transfer round missing AssetResourceRecord for \
+                     (asset {asset_id}, addr {dev_addr_str}): {selfxfer_body}"
+                )
+            });
+        assert_eq!(rec["Holding"]["Deleted"], serde_json::json!(false));
+        assert_eq!(
+            rec["Holding"]["Holding"]["a"].as_u64(),
+            Some(ASSET_TOTAL),
+            "{label}: self-transfer round's holding amount must be unchanged \
+             (net zero) but still present: {rec}"
+        );
+
+        // Second-freeze round: go's response still carries the holding
+        // record even though Frozen stays `true` across both freeze calls.
+        let frec = asset_resources(&freeze2_body)
+            .into_iter()
+            .find(|r| {
+                r["Aidx"].as_u64() == Some(asset_id) && r["Addr"].as_str() == Some(&dev_addr_str)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: value-identical re-freeze round missing AssetResourceRecord for \
+                     (asset {asset_id}, addr {dev_addr_str}): {freeze2_body}"
+                )
+            });
+        assert_eq!(frec["Holding"]["Deleted"], serde_json::json!(false));
+        assert_eq!(
+            frec["Holding"]["Holding"]["f"],
+            serde_json::json!(true),
+            "{label}: re-freeze round's holding must still show Frozen=true \
+             (unchanged from before) but still present: {frec}"
+        );
+
+        let strip = |mut v: serde_json::Value| {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("Aidx");
+                obj.remove("Addr");
+            }
+            v
+        };
+        results.insert(label, (strip(rec), strip(frec)));
+    }
+
+    let (go_xfer, go_freeze) = &results["go"];
+    let (rust_xfer, rust_freeze) = &results["rust"];
+    assert_eq!(
+        go_xfer, rust_xfer,
+        "value-identical self-transfer AssetResourceRecord must match between go and rust"
+    );
+    assert_eq!(
+        go_freeze, rust_freeze,
+        "value-identical re-freeze AssetResourceRecord must match between go and rust"
+    );
 }
