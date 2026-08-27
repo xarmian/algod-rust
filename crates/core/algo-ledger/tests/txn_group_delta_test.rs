@@ -142,30 +142,28 @@ fn captures_per_group_deltas_indexed_by_txn_and_group_id() {
 }
 
 /// Blocks whose payset contains a transaction type the diff-based delta cannot
-/// fully reconstruct (anything beyond pay/keyreg) are left unretained, so the
-/// endpoints report the delta as unavailable rather than serving a partial one
-/// (consistent with the per-round delta cache's completeness gate).
+/// fully reconstruct are left unretained, so the endpoints report the delta
+/// as unavailable rather than serving a partial one (consistent with the
+/// per-round delta cache's completeness gate).
 #[test]
 fn incomplete_block_is_not_captured() {
     let creator = Address([1u8; 32]);
     let fee_sink = Address([3u8; 32]);
     let balances = [(creator, 5_000_000), (fee_sink, 0)];
 
-    // An app-call create -- issue #603 widened `block_state_delta_is_complete`
-    // to admit Acfg/Axfer/Afrz (their top-level resource-key collection is
-    // complete, #586), but `Appl` stays excluded: its resource-key
-    // collection doesn't recurse into inner transactions yet (issue #604),
-    // so an Appl-containing block is still delta-incomplete.
-    let mut appl = SignedTransaction::default();
-    appl.txn.txn_type = "appl".into();
-    appl.txn.sender = creator;
-    appl.txn.fee = 1000;
-    appl.txn.last_valid = Round(1000);
-    appl.txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]));
-    appl.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]));
+    // A state-proof transaction -- `state_proof_next` is still `TODO(#586)`
+    // stubbed in the delta builder regardless of payset content, so `Stpf`
+    // stays excluded from `block_state_delta_is_complete` (unlike `Appl`,
+    // which issue #609 widened the gate to admit once #604's inner-
+    // transaction resource-collection gap was fixed).
+    let mut stpf = SignedTransaction::default();
+    stpf.txn.txn_type = "stpf".into();
+    stpf.txn.sender = creator;
+    stpf.txn.fee = 0;
+    stpf.txn.last_valid = Round(1000);
 
     let mut state = make_state(&balances, fee_sink);
-    let block = minimal_block(fee_sink, 1, vec![appl]);
+    let block = minimal_block(fee_sink, 1, vec![stpf]);
 
     let mut tracer = TxnGroupDeltaTracer::new(8);
     apply_block_capturing_group_deltas(&mut state, &block, &mut tracer).unwrap();

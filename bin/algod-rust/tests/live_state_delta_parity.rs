@@ -85,6 +85,42 @@
 //! for why), so that test still live-verifies full field-for-field parity
 //! for an app create + update (no inner transactions), including issue
 //! #606's `AppParamsRecord.v` live-verification.
+//!
+//! # Issue #609 addendum
+//!
+//! Issue #604 fixed `apply_block_with_delta_mode_and_apply_data`'s
+//! inner-transaction resource-collection gap (a `RecordingStore` wrapper
+//! that records every mutation's pre-image as it happens, at any call
+//! depth, so resource keys don't need to be known before the block is
+//! applied). Issue #609 then fixed the sync path's *other* consumer gated
+//! on the same predicate -- `apply.rs`'s `Execute`-mode per-group delta
+//! capture used by `TxnGroupDeltaTracer` -- with an equivalent group-scoped
+//! `RecordingStore` wrap, and fixed `apply_block_caching_delta`'s
+//! "complete" branch to select `ApplyMode::Execute` (not the hard-coded
+//! `Replay` it used before) whenever the block contains an `appl` call.
+//! With both fixed, `sqlite::block_state_delta_is_complete` now admits
+//! `Appl` blocks.
+//!
+//! `crates/core/algo-ledger/src/sqlite.rs`'s
+//! `apply_block_caching_delta_caches_full_delta_for_appl_with_inner_acfg`
+//! and `group_delta_tracer_captures_inner_txn_only_touched_account_for_appl`
+//! pin the target end-to-end behavior (a normally-synced Appl block with an
+//! inner transaction gets a complete, correctly-attributed `StateDelta`,
+//! for both the per-round cache and the per-group tracer) as fast, always-
+//! run unit tests -- satisfying the "or a fast in-process test if that's
+//! sufficient to pin the gate behavior" alternative issue #609 itself
+//! offered, since this file's own dual-node harness cannot exercise the
+//! *sync* path at all: the algod-rust node it boots always runs `--dev`
+//! (see the paragraph above), whose self-produced-block path calls
+//! `SqliteLedger::cache_state_delta` directly and never consults
+//! `block_state_delta_is_complete`/`apply_block_caching_delta` in the first
+//! place, regardless of what the gate admits. Extending this specific
+//! two-node REST harness with a genuine live sync-path comparison would
+//! need a third algod-rust process actually following the go node over the
+//! wire (or a `sync`-and-serve CLI mode neither `sync` nor `node start`
+//! currently offer) -- tracked in issue #612, not attempted here to avoid
+//! silently understating what this file's existing two `--dev` nodes can
+//! prove.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
