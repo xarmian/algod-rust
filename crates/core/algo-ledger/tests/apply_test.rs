@@ -214,11 +214,18 @@ fn test_payment_to_self_fee_deducted() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Fee pooling for stpf — fee=0 no error, balances unchanged
+// 6. stpf never debits fees, whether accepted or rejected (issue #626:
+//    stpf is no longer a structural no-op -- it now enforces the round
+//    window and, when validating, full cryptographic verification -- but
+//    on EITHER path (reject or, in principle, accept) it never touches
+//    balances/fees, matching go-algorand's fee-exempt StateProof handling).
+//    A fresh ledger has no tracked `StateProofNext` (reads back as `0`),
+//    so both of these are rejected before any state-changing logic runs;
+//    that's the whole point of the assertion below.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_stpf_zero_fee_no_error() {
+fn test_stpf_zero_fee_rejected_untracked_round() {
     let sender = Address([1u8; 32]);
     let fee_sink = Address([3u8; 32]);
 
@@ -230,15 +237,20 @@ fn test_stpf_zero_fee_no_error() {
     stx.txn.sender = sender;
     stx.txn.fee = 0;
 
-    apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+    let result = apply_transaction(&mut state, &stx, &ctx, 0);
+    assert!(
+        result.is_err(),
+        "stpf with untracked StateProofNext must be rejected"
+    );
 
     assert_eq!(state.get_account(&sender).unwrap().micro_algos, 500_000);
     assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 0);
 }
 
 #[test]
-fn test_stpf_nonzero_fee_still_noop() {
-    // Even if fee is set, stpf branch doesn't debit it.
+fn test_stpf_nonzero_fee_rejected_untracked_round() {
+    // Even if fee is set, the stpf branch never debits it — whether the
+    // proof is accepted or (as here) rejected for a round mismatch.
     let sender = Address([1u8; 32]);
     let fee_sink = Address([3u8; 32]);
 
@@ -250,9 +262,12 @@ fn test_stpf_nonzero_fee_still_noop() {
     stx.txn.sender = sender;
     stx.txn.fee = 5_000;
 
-    apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+    let result = apply_transaction(&mut state, &stx, &ctx, 0);
+    assert!(
+        result.is_err(),
+        "stpf with untracked StateProofNext must be rejected"
+    );
 
-    // stpf is a complete no-op — fee field is ignored.
     assert_eq!(state.get_account(&sender).unwrap().micro_algos, 500_000);
     assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 0);
 }

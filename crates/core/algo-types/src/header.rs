@@ -264,7 +264,55 @@ impl Default for BlockHeader {
 /// Type alias for decoder methods to avoid shadowing serde's Result usage.
 type DecodeResult<T> = algo_error::Result<T>;
 
+/// The `StateProofBasic` (`protocol.StateProofType == 0`) entry of a block
+/// header's `StateProofTracking` map — `data/bookkeeping/block.go`'s
+/// `StateProofTrackingData`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StateProofTrackingBasic {
+    /// `StateProofVotersCommitment` (`codec:"v"`) — vector-commitment root
+    /// over the online accounts that sign the *next* state proof interval.
+    /// Zero except on blocks at a multiple of `StateProofInterval`.
+    pub voters_commitment: Vec<u8>,
+    /// `StateProofOnlineTotalWeight` (`codec:"t"`) — total online stake as
+    /// of this voters block.
+    pub online_total_weight: u64,
+    /// `StateProofNextRound` (`codec:"n"`) — the next round for which a
+    /// `StateProof` transaction will be accepted.
+    pub next_round: u64,
+}
+
 impl BlockHeader {
+    /// Extract the `StateProofBasic` tracking entry, if present.
+    ///
+    /// `state_proof_tracking` is kept as an opaque `rmpv::Value` (it is
+    /// `map[protocol.StateProofType]StateProofTrackingData`, and algod-rust
+    /// only ever needs the `StateProofBasic` — key `0` — entry), so this
+    /// walks the generic map/int representation rather than requiring a
+    /// dedicated typed decoder for the whole field.
+    pub fn state_proof_tracking_basic(&self) -> Option<StateProofTrackingBasic> {
+        let outer = self.state_proof_tracking.as_ref()?.as_map()?;
+        let inner = outer.iter().find_map(|(k, v)| {
+            if k.as_u64() == Some(0) {
+                v.as_map()
+            } else {
+                None
+            }
+        })?;
+
+        let mut result = StateProofTrackingBasic::default();
+        for (k, v) in inner {
+            match k.as_str() {
+                Some("v") => {
+                    result.voters_commitment = v.as_slice().map(|s| s.to_vec()).unwrap_or_default()
+                }
+                Some("t") => result.online_total_weight = v.as_u64().unwrap_or(0),
+                Some("n") => result.next_round = v.as_u64().unwrap_or(0),
+                _ => {}
+            }
+        }
+        Some(result)
+    }
+
     /// Decode a BlockHeader from a msgpack map using raw rmp.
     ///
     /// Uses two-level key dispatch: (key_len, first_byte) for fast routing.

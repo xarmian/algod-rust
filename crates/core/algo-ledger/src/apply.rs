@@ -1174,12 +1174,20 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
             Some(txleases)
         },
         creatables,
+        // Closes TODO(#586): every block header already carries the current
+        // `StateProofNext` round as consensus-agreed data (it's the block
+        // proposer's own computed value, hashed into the header and
+        // validated like any other header field) -- no separate tracker is
+        // needed to reproduce it, just read `hdr.state_proof_tracking_basic()`
+        // (`data/bookkeeping/block.go: StateProofTrackingData.StateProofNextRound`,
+        // codec tag "n"). Falls back to `Round(0)` (never accept a state
+        // proof) if the block carries no tracking data at all, matching
+        // go's pre-bootstrap initial state.
+        state_proof_next: hdr
+            .state_proof_tracking_basic()
+            .map(|t| Round(t.next_round))
+            .unwrap_or(Round(0)),
         hdr: Some(hdr),
-        // TODO(#586): Set StateProofNext when block contains a valid state
-        // proof txn. Out of scope here -- app/asset resources, creatables,
-        // and totals (the fields this issue's acceptance criteria named)
-        // are now real; state proof tracking is a distinct, still-open gap.
-        state_proof_next: Round(0),
         prev_timestamp,
         totals: store.account_totals(),
     };
@@ -2262,9 +2270,21 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
 ) -> Result<ApplyData, AlgoError> {
     let txn = &stx.txn;
 
-    // State proof transactions are protocol-injected and skip all processing
-    // (no rewards, no fees, no state changes).
+    // State proof transactions are protocol-injected: no rewards, no fees,
+    // no account/app/asset state changes. They are NOT, however, a no-op —
+    // `apply_state_proof` enforces the round window and (when validating)
+    // performs full cryptographic verification of the state proof itself
+    // (crypto/stateproof.Verifier.Verify via ledger/apply/stateproof.go:
+    // apply.StateProof). A forged, malformed, or out-of-window state proof
+    // is rejected here rather than silently accepted (issue #626).
     if txn.txn_type == "stpf" {
+        crate::state_proof_apply::apply_state_proof(
+            &*store,
+            txn,
+            ctx.round,
+            &ctx.consensus,
+            ctx.validate,
+        )?;
         return Ok(ApplyData::default());
     }
 
@@ -4319,8 +4339,14 @@ mod tests {
         assert_eq!(state.get_account(&sender).unwrap().auth_addr, None);
     }
 
+    /// Before issue #626's fix, *any* `stpf` transaction applied as a
+    /// structural no-op with zero verification -- this pinned that (wrong)
+    /// behavior. It's superseded by
+    /// `test_stpf_rejected_when_state_proof_next_not_tracked` below, which
+    /// pins the correct behavior: a `stpf` txn is rejected unless the
+    /// ledger's tracked `StateProofNext` round actually matches it.
     #[test]
-    fn test_stpf_is_noop() {
+    fn test_stpf_without_message_is_rejected() {
         let sender = Address([1u8; 32]);
         let fee_sink = Address([3u8; 32]);
 
@@ -4331,9 +4357,64 @@ mod tests {
         stx.txn.sender = sender;
         stx.txn.fee = 0;
 
-        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
-        // Balance unchanged — stpf is a no-op.
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(
+            result.is_err(),
+            "stpf with no StateProof message must be rejected, not silently no-op'd"
+        );
         assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
+    }
+
+    /// A fresh ledger has never bootstrapped state proofs (no prior block
+    /// carried `StateProofTracking`), so `StateProofNext` reads back as `0`
+    /// -- and go-algorand's own round check (`ledger/apply/stateproof.go`)
+    /// explicitly treats `nextStateProofRnd == 0` as "never accept". A
+    /// well-formed-looking `stpf` transaction must still be rejected here,
+    /// not applied blindly (issue #626).
+    #[test]
+    fn test_stpf_rejected_when_state_proof_next_not_tracked() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "stpf".into();
+        stx.txn.sender = sender;
+        stx.txn.fee = 0;
+        stx.txn.state_proof_message = Some(algo_types::StateProofMessage {
+            last_attested_round: 256,
+            ..Default::default()
+        });
+
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(
+            result.is_err(),
+            "expected stpf with untracked StateProofNext to be rejected"
+        );
+        assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
+    }
+
+    /// Wrong `StateProofType` (only `StateProofBasic == 0` is supported) is
+    /// rejected regardless of round tracking.
+    #[test]
+    fn test_stpf_rejects_unsupported_state_proof_type() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "stpf".into();
+        stx.txn.sender = sender;
+        stx.txn.fee = 0;
+        stx.txn.state_proof_type = 1; // anything other than StateProofBasic (0)
+
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(
+            result.is_err(),
+            "expected unsupported state proof type to be rejected"
+        );
     }
 
     #[test]

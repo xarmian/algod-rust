@@ -82,6 +82,12 @@ extern "C" {
         data: *const c_void,
         data_len: usize,
     ) -> c_int;
+
+    fn falcon_det1024_convert_compressed_to_ct(
+        sig_ct: *mut c_void,
+        sig_compressed: *const c_void,
+        sig_compressed_len: usize,
+    ) -> c_int;
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +196,41 @@ pub fn falcon_sign(privkey: &[u8], data: &[u8]) -> Result<Vec<u8>, FalconError> 
     Ok(sig)
 }
 
+/// Convert a compressed-format deterministic Falcon-1024 signature to the
+/// fixed-width "CT" (constant-time-decodable) representation.
+///
+/// This is the byte sequence go-algorand's `crypto.FalconSignature.
+/// GetFixedLengthHashableRepresentation` (`crypto/falconWrapper.go:117`,
+/// backed by `github.com/algorand/falcon`'s `CompressedSignature.ConvertToCT`)
+/// produces before hashing a state-proof signature reveal into the SNARK-
+/// friendly commitment tree (`crypto/stateproof/committableSignatureSlot.go`).
+/// The compressed wire encoding is variable-length, which is unsuitable for a
+/// fixed-length hash-tree leaf, so it is expanded to a canonical fixed-size
+/// form first (`falcon_det1024_convert_compressed_to_ct`,
+/// `falcon-c/deterministic.h:105-114`).
+pub fn falcon_convert_compressed_to_ct(
+    sig_compressed: &[u8],
+) -> Result<[u8; FALCON_DET1024_SIG_CT_SIZE], FalconError> {
+    if sig_compressed.len() < 2 || sig_compressed.len() > FALCON_DET1024_SIG_COMPRESSED_MAXSIZE {
+        return Err(FalconError::InvalidSignatureSize(sig_compressed.len()));
+    }
+
+    let mut sig_ct = [0u8; FALCON_DET1024_SIG_CT_SIZE];
+    let rc = unsafe {
+        falcon_det1024_convert_compressed_to_ct(
+            sig_ct.as_mut_ptr() as *mut c_void,
+            sig_compressed.as_ptr() as *const c_void,
+            sig_compressed.len(),
+        )
+    };
+
+    if rc != 0 {
+        return Err(FalconError::ConvertToCtFailed(rc));
+    }
+
+    Ok(sig_ct)
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -207,6 +248,8 @@ pub enum FalconError {
     KeygenFailed(c_int),
     /// Signing returned a non-zero error code.
     SignFailed(c_int),
+    /// Compressed-to-CT conversion returned a non-zero error code.
+    ConvertToCtFailed(c_int),
 }
 
 impl std::fmt::Display for FalconError {
@@ -238,6 +281,13 @@ impl std::fmt::Display for FalconError {
             }
             FalconError::SignFailed(rc) => {
                 write!(f, "falcon sign failed with error code {}", rc)
+            }
+            FalconError::ConvertToCtFailed(rc) => {
+                write!(
+                    f,
+                    "falcon compressed-to-CT conversion failed with error code {}",
+                    rc
+                )
             }
         }
     }
@@ -367,6 +417,26 @@ mod tests {
 
         let result = falcon_verify(&pubkey, &sig, &msg).expect("verify should not error");
         assert!(result, "go-algorand test vector should verify");
+    }
+
+    #[test]
+    fn test_convert_compressed_to_ct_roundtrip() {
+        let seed = [3u8; FALCON_SEED_SIZE];
+        let (_pubkey, privkey) = falcon_keygen(&seed).expect("keygen should succeed");
+
+        let msg = b"convert to ct";
+        let sig = falcon_sign(&privkey, msg).expect("sign should succeed");
+
+        let sig_ct = falcon_convert_compressed_to_ct(&sig).expect("conversion should succeed");
+        assert_eq!(sig_ct.len(), FALCON_DET1024_SIG_CT_SIZE);
+        // Salt version byte (index 1) must survive the conversion unchanged.
+        assert_eq!(sig_ct[1], sig[1]);
+    }
+
+    #[test]
+    fn test_convert_compressed_to_ct_rejects_short_signature() {
+        let err = falcon_convert_compressed_to_ct(&[0xBA]).unwrap_err();
+        assert!(matches!(err, FalconError::InvalidSignatureSize(1)));
     }
 
     fn hex_decode(s: &str) -> Vec<u8> {

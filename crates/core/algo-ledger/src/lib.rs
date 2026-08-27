@@ -25,6 +25,7 @@ pub mod simulation;
 pub mod sqlite;
 pub mod state;
 pub mod state_delta;
+pub mod state_proof_apply;
 pub mod store_trait;
 pub mod sync;
 pub mod trie_hash;

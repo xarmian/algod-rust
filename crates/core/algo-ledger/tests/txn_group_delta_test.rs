@@ -23,6 +23,26 @@ fn make_state(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
     state
 }
 
+/// Insert a fake round-0 block header into `state` carrying
+/// `StateProofTracking[StateProofBasic].StateProofNextRound = next_round`,
+/// so `apply_state_proof`'s round-window check (reading the *previous*
+/// block's tracked `StateProofNext`) sees `next_round` when applying a
+/// `stpf` transaction at round 1.
+fn seed_state_proof_next(state: &mut LedgerState, next_round: u64) {
+    let tracking = rmpv::Value::Map(vec![(
+        rmpv::Value::from(0u64),
+        rmpv::Value::Map(vec![(rmpv::Value::from("n"), rmpv::Value::from(next_round))]),
+    )]);
+    let header = algo_types::BlockHeader {
+        state_proof_tracking: Some(tracking),
+        ..Default::default()
+    };
+    let encoded = algo_codec::canonical_encode_block_header(&header);
+    state
+        .put_block(0, "future", &encoded, &encoded)
+        .expect("seed block header");
+}
+
 fn pay_txn(sender: Address, receiver: Address, amount: u64, group: [u8; 32]) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
     stx.txn.txn_type = "pay".into();
@@ -151,18 +171,29 @@ fn incomplete_block_is_not_captured() {
     let fee_sink = Address([3u8; 32]);
     let balances = [(creator, 5_000_000), (fee_sink, 0)];
 
-    // A state-proof transaction -- `state_proof_next` is still `TODO(#586)`
-    // stubbed in the delta builder regardless of payset content, so `Stpf`
-    // stays excluded from `block_state_delta_is_complete` (unlike `Appl`,
-    // which issue #609 widened the gate to admit once #604's inner-
-    // transaction resource-collection gap was fixed).
+    // A state-proof transaction -- `Stpf` stays excluded from
+    // `block_state_delta_is_complete` regardless of payset content (unlike
+    // `Appl`, which issue #609 widened the gate to admit once #604's
+    // inner-transaction resource-collection gap was fixed); see
+    // `block_state_delta_is_complete` in `sqlite.rs`. That's independent of
+    // issue #626's fix, which made `stpf` application itself perform real
+    // round + cryptographic checks instead of a blind no-op -- so this test
+    // seeds a round-0 header carrying `StateProofNext = 1000` (matching
+    // the txn's `LastAttestedRound`) purely so the transaction *applies*
+    // (with `validate: false`, matching replay mode, so no crypto proof is
+    // needed) and the block reaches the completeness check at all.
     let mut stpf = SignedTransaction::default();
     stpf.txn.txn_type = "stpf".into();
     stpf.txn.sender = creator;
     stpf.txn.fee = 0;
     stpf.txn.last_valid = Round(1000);
+    stpf.txn.state_proof_message = Some(algo_types::StateProofMessage {
+        last_attested_round: 1000,
+        ..Default::default()
+    });
 
     let mut state = make_state(&balances, fee_sink);
+    seed_state_proof_next(&mut state, 1000);
     let block = minimal_block(fee_sink, 1, vec![stpf]);
 
     let mut tracer = TxnGroupDeltaTracer::new(8);
