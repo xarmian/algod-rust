@@ -1,6 +1,6 @@
 # P2P interop harness (issues #543, #560, #564, #566)
 
-Three real go-algorand v4.7.0-stable nodes, each started in plain P2P
+Three real go-algorand v4.7.2-stable nodes, each started in plain P2P
 mode (`EnableP2P: true`, no WS-gossip listener — `config/localTemplate.go`'s
 `IsP2PListenServer`), chain-bootstrapped to each other (1 <- 2 <- 3 —
 go-node-2 is only ever told go-node-1's multiaddr; go-node-3 is only ever
@@ -87,7 +87,7 @@ propagation between real go-algorand nodes.
 With #563/#565/#566's fixes applied, DHT discovery and capability
 advertisement both round-trip cleanly against real go-algorand nodes — but
 a full consensus round-trip still needed one more piece: go-algorand
-v4.7.0-stable's own `gossipSubTags` map (`network/p2pNetwork.go`) wires
+v4.7.2-stable's own `gossipSubTags` map (`network/p2pNetwork.go`) wires
 gossipsub up for the `TX` tag **only**. A real go-algorand P2P node never
 subscribes to or publishes on a gossipsub topic for proposals, votes, or
 vote bundles — that traffic travels over a separate raw bidirectional

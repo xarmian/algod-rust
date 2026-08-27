@@ -1,13 +1,13 @@
 name: Nightly Consensus Cluster
 
 # Issue #488 — run the Epic 42 mixed-cluster consensus harness
-# (ops/mixed-cluster/, 3 go-algorand v4.7.0-stable relays + 1
+# (ops/mixed-cluster/, 3 go-algorand v4.7.2-stable relays + 1
 # `algod-rust participate` node, 30/30/30/10 ONLINE stake) in CI.
 #
 # ## Why this is NOT on the PR path
 #
 # One run means: a release build of algod-rust in Docker, an
-# `algorand/algod:4.7.0-stable` pull, a 4-node BFT cluster boot, a
+# `algorand/algod:4.7.2-stable` pull, a 4-node BFT cluster boot, a
 # multi-hundred-round soak at ~3 s block time, restart/rejoin scenarios,
 # a malformed-message injection suite, and (for `certs_authenticate_go`)
 # building go-algorand's vendored libsodium fork inside
@@ -73,7 +73,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   # Same pin as the rest of the repo (see CLAUDE.md, algokey-e2e.yml).
-  GO_ALGORAND_REV: "v4.7.0-stable"
+  GO_ALGORAND_REV: "v4.7.2-stable"
   # start.sh: reuse the image built by the buildx step below.
   PHASE6_SKIP_BUILD: "1"
   # Named volume run-in-docker.sh keeps its go-algorand clone + libsodium
@@ -108,8 +108,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Pull algorand/algod:4.7.0-stable
-        run: docker pull algorand/algod:4.7.0-stable
+      - name: Pull algorand/algod:4.7.2-stable
+        run: docker pull algorand/algod:4.7.2-stable
 
       # Deterministic tag declared by ops/mixed-cluster/docker-compose.yml's
       # `rust-node-4.image`. With PHASE6_SKIP_BUILD=1 start.sh runs

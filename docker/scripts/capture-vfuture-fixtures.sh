@@ -113,7 +113,7 @@ echo "==> Writing capture metadata..."
 cat >"$OUT_DIR/README.md" <<EOF
 # vFuture golden fixtures (issue #548)
 
-Captured from a real \`algorand/algod:4.7.0-stable\` node running under the
+Captured from a real \`algorand/algod:4.7.2-stable\` node running under the
 \`future\` consensus protocol (\`docker/docker-compose.vfuture.yml\`), with
 \`MaxTxnBytesPerBlock\` shrunk via \`docker/config/vfuture-consensus.json\`
 (see \`tools/vfuture-consensus-override/\`) so a small burst of payment

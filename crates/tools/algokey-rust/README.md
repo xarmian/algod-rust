@@ -1,7 +1,7 @@
 # algokey-rust
 
 A Rust reimplementation of go-algorand's `algokey` CLI, pinned to and
-byte-compatible with **`v4.7.0-stable`** of the reference implementation
+byte-compatible with **`v4.7.2-stable`** of the reference implementation
 at `../go-algorand`.
 
 `algokey-rust` is a drop-in for the Go binary: every subcommand
@@ -100,7 +100,7 @@ and reuses it across binaries — re-runs are fast.
 
 ## Pinned Go version
 
-The repo references `go-algorand@v4.7.0-stable`. To bump:
+The repo references `go-algorand@v4.7.2-stable`. To bump:
 
 1. Update the `../go-algorand` checkout: `cd ../go-algorand && git
    checkout v<new>-stable`

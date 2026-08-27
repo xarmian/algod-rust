@@ -333,7 +333,7 @@ The inverse **Rust → Go** direction shipped with issue #470. Pass
 2. hands the raw `(block, cert)` bytes plus the ledger facts read from
    the **Rust** ledger to `tools/cert-authenticate`, which
    re-authenticates each certificate with go-algorand
-   v4.7.0-stable's own `agreement.Certificate.Authenticate` inside a
+   v4.7.2-stable's own `agreement.Certificate.Authenticate` inside a
    `golang:1.25-bookworm` container (it builds the vendored libsodium
    fork there — see `tools/cert-authenticate/run-in-docker.sh`).
 

@@ -9,7 +9,7 @@
 #   cd ../go-algorand && go build -o /tmp/algokey-go ./cmd/algokey
 #   ALGOKEY=/tmp/algokey-go bash scripts/capture-algokey-fixtures.sh
 #
-# Requires go-algorand pinned to v4.7.0-stable (the version this repo
+# Requires go-algorand pinned to v4.7.2-stable (the version this repo
 # tracks). The script regenerates every file under
 # crates/tools/algokey-rust/tests/fixtures/algokey/ from scratch.
 #
@@ -77,7 +77,7 @@ done <<<"$FIXTURES"
 cat >"$FIX_DIR/README.md" <<EOF
 # algokey Phase A fixtures
 
-Captured from \`../go-algorand\` pinned to \`v4.7.0-stable\` via
+Captured from \`../go-algorand\` pinned to \`v4.7.2-stable\` via
 \`scripts/capture-algokey-fixtures.sh\`.
 
 - \`import/case_NN.stdout\` — output of \`algokey import -m "<mnemonic>"\`

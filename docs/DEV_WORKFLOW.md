@@ -237,11 +237,11 @@ writes a report to `./reports/conformance.json`.
 
 ## go-algorand Reference Source
 
-The go-algorand source is available at `../go-algorand`, pinned to `v4.7.0-stable`:
+The go-algorand source is available at `../go-algorand`, pinned to `v4.7.2-stable`:
 
 ```bash
 cd ../go-algorand
-git log --oneline -1   # should show v4.7.0-stable tag
+git log --oneline -1   # should show v4.7.2-stable tag
 ```
 
 Use this as the authoritative reference when implementing AVM opcodes, consensus
@@ -263,7 +263,7 @@ go-algorand 4.6.0 consensus versions → AVM versions:
 
 ## Docker Image
 
-- Image: `algorand/algod:4.7.0-stable` (no `v` prefix)
+- Image: `algorand/algod:4.7.2-stable` (no `v` prefix)
 - Token: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` (64 `a`s, devnet convention)
 - Port: 4001 (host) -> 8080 (container)
 
@@ -414,7 +414,7 @@ cd tools/avm-opcode-capture
 go run .
 ```
 
-The tool enforces the go-algorand pin (`v4.7.0-stable`) at runtime; override
+The tool enforces the go-algorand pin (`v4.7.2-stable`) at runtime; override
 with `--allow-unpinned` only for an intentional capture against a different
 checkout. Do not edit `vectors.jsonl` by hand — it is a build artifact.
 
@@ -484,7 +484,7 @@ laptop. Output is deterministic (fixed RNG seed + stable iteration order);
 two runs against the same go-algorand pin produce byte-identical fixtures.
 
 The tool refuses to run unless `../go-algorand` is checked out at exactly
-the tag tracked in `CLAUDE.md` (currently `v4.7.0-stable`) with a clean
+the tag tracked in `CLAUDE.md` (currently `v4.7.2-stable`) with a clean
 `crypto/` and `protocol/` tree. This prevents a developer's local branch
 state from silently changing the golden corpus. If you are intentionally
 regenerating against a different pin (e.g. preparing a go-algorand bump),
@@ -631,7 +631,7 @@ go run .
 ```
 
 Runtime: ~40 s end-to-end on a modern laptop. The regeneration
-enforces the same `v4.7.0-stable` pin + clean `agreement/` tree the
+enforces the same `v4.7.2-stable` pin + clean `agreement/` tree the
 VRF tool does. Pass `--allow-unpinned` for intentional
 regeneration against a different go-algorand tag (the output will
 then be out-of-sync with the rest of the workspace until the pin
@@ -693,7 +693,7 @@ go run .
 Runtime: a few seconds (pure call-graph through go-algorand's
 `agreement.ParamsRound` / `agreement.BalanceRound` + the replicated
 `seedRound` formula; no I/O or crypto). The tool enforces the same
-`v4.7.0-stable` pin + clean tree the other captures do, filtering
+`v4.7.2-stable` pin + clean tree the other captures do, filtering
 `_test.go` files out of the dirty-tree scan so pre-existing
 untracked anchors (`agreement/golden_vectors_test.go`) don't block
 regeneration. Pass `--allow-unpinned` for an intentional capture
@@ -1082,7 +1082,7 @@ mkdir -p "$FIXDIR"
 
 The `algokey-rust` tool ships with an end-to-end test suite that drives
 a live `algod-go` localnet and cross-checks every artifact against the
-pinned `go-algorand@v4.7.0-stable` `algokey` binary.
+pinned `go-algorand@v4.7.2-stable` `algokey` binary.
 
 ```bash
 # One-command run (brings up localnet, runs all e2e binaries, tears down):
@@ -1104,7 +1104,7 @@ dependencies. Unrelated commits skip it.
 schema-level interop between `algo-kmd` and go-algorand's actual kmd
 driver. The test is **gated** — it runs only when `MIXED_CLUSTER=1` is
 set, because it needs the `go` toolchain and the `../go-algorand`
-source tree pinned to `v4.7.0-stable`.
+source tree pinned to `v4.7.2-stable`.
 
 ```bash
 # Default run: gated tests skip cleanly, no `go` needed.
