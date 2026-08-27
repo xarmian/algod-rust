@@ -2106,13 +2106,28 @@ async fn state_delta_appl_inner_txn_matches_go_through_real_sync_path() {
     )
     .await;
 
-    // 5a. The app-call AppResourceRecord (attributed to the dev account,
-    // the outer call's sender) must match field-for-field.
-    let go_app_rec = app_resource_record(&go_body, app_id, &dev_addr_str);
-    let sync_app_rec = app_resource_record(&sync_body, app_id, &dev_addr_str);
+    // 5a. If either side reports an AppResourceRecord for the calling
+    // account (a bare NoOp call with no local-state schema isn't
+    // guaranteed to touch/`Put` one -- unlike
+    // `state_delta_app_resources_matches_go_for_create_update`'s create/
+    // update calls, which do -- so presence itself isn't asserted here),
+    // it must match field-for-field between go and the syncing rust node.
+    let find_app_rec = |body: &serde_json::Value| -> Option<serde_json::Value> {
+        body["Accts"]["AppResources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| {
+                r["Aidx"].as_u64() == Some(app_id) && r["Addr"].as_str() == Some(&dev_addr_str)
+            })
+            .cloned()
+    };
+    let go_app_rec = find_app_rec(&go_body);
+    let sync_app_rec = find_app_rec(&sync_body);
     assert_eq!(
         go_app_rec, sync_app_rec,
-        "AppResourceRecord for the calling app must match between go and the syncing rust node"
+        "AppResourceRecord presence/content for the calling app must match between go and the \
+         syncing rust node (go: {go_app_rec:?}, sync: {sync_app_rec:?})"
     );
 
     // 5b. The inner acfg's AssetResourceRecord -- attributed to the APP
