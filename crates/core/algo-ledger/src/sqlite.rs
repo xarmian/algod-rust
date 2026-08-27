@@ -2026,14 +2026,24 @@ impl AccountTotalsDelta {
 /// transactions, so top-level-only resource-key collection is already
 /// complete for them.
 ///
-/// `Appl` stays excluded: an approval program's `itxn_submit` can create/
-/// update/destroy assets and apps, transfer assets, and opt other accounts'
-/// apps in/out via *inner* transactions, but `apply.rs`'s resource-key
-/// collection only walks `block.payset` (top-level transactions), never
-/// inner transactions embedded in an `appl` call's `EvalDelta` — a real gap,
-/// not just an unexercised one (see issue #604). Admitting `Appl` blocks
-/// here before #604 is resolved would cache-and-serve a `StateDelta` that
-/// silently omits inner-txn-only resource/creatable entries.
+/// `Appl` was excluded until issue #609: an approval program's `itxn_submit`
+/// can create/update/destroy assets and apps, transfer assets, and opt other
+/// accounts' apps in/out via *inner* transactions, and `apply.rs`'s
+/// resource-key collection originally only walked `block.payset` (top-level
+/// transactions), never inner transactions embedded in an `appl` call's
+/// `EvalDelta` — a real gap, not just an unexercised one (issue #604).
+/// Issue #604 closed that gap for [`crate::apply::apply_block_with_delta_mode`]
+/// (this gate's own consumer, via `apply_block_caching_delta` below) using a
+/// [`crate::recording_store::RecordingStore`] wrapper that records every
+/// account/resource mutation's pre-image as it happens, at any call depth —
+/// so resource-key collection no longer needs to know the keys up front.
+/// Issue #609 then fixed the *other* caller gated on this same predicate
+/// (`apply.rs`'s `Execute`-mode per-group delta capture, used by
+/// `TxnGroupDeltaTracer`) with an equivalent group-scoped `RecordingStore`
+/// wrap, and fixed `apply_block_caching_delta`'s "complete" branch to select
+/// `ApplyMode::Execute` (not the hard-coded `Replay` it used before) for a
+/// block containing an `appl` call — see [`block_has_app_call`]. With both
+/// gaps closed, `Appl` is now admitted here too.
 ///
 /// `Hb` (heartbeat) is intentionally excluded: `apply::apply_heartbeat`
 /// mutates the heartbeat **target**'s `last_heartbeat`, but the target
@@ -2043,13 +2053,18 @@ impl AccountTotalsDelta {
 /// still `TODO(#586)`-stubbed regardless of payset content.
 ///
 /// See `apply_block_caching_delta` for the rest of the contract, including
-/// the per-field gaps that remain even on cached rounds (#190, #604).
+/// the per-field gaps that remain even on cached rounds (#190).
 pub(crate) fn block_state_delta_is_complete(block: &algo_types::Block) -> bool {
     use algo_types::TxnType;
     block.payset.iter().all(|stx| {
         matches!(
             stx.txn.txn_type,
-            TxnType::Pay | TxnType::Keyreg | TxnType::Acfg | TxnType::Axfer | TxnType::Afrz
+            TxnType::Pay
+                | TxnType::Keyreg
+                | TxnType::Acfg
+                | TxnType::Axfer
+                | TxnType::Afrz
+                | TxnType::Appl
         )
     })
 }
@@ -2838,20 +2853,25 @@ impl SqliteLedger {
     ///
     /// The cache is populated only when [`block_state_delta_is_complete`]
     /// reports the block's payset is fully covered by the current
-    /// [`crate::apply::apply_block_with_delta`] builder — practically that
-    /// means a payset of only `Pay` / `Keyreg` / `Hb` transactions. Blocks
-    /// that contain `Acfg` / `Axfer` / `Afrz` / `Appl` / `Stpf` transactions
-    /// (or any unrecognized type) skip the delta build entirely — the REST
-    /// endpoint returns `NotFound` for those rounds, which is strictly
-    /// preferable to serving a known-incomplete `StateDelta` (app / asset /
-    /// kv deltas, `creatables`, and `state_proof_next` are all still
-    /// `TODO(#190)`-stubbed in the builder). Of those uncached blocks, one
-    /// containing an `appl` call still runs [`crate::apply::ApplyMode::Execute`]
-    /// (real AVM execution) rather than the cheaper bare
-    /// [`crate::apply::apply_block`] Replay path — see [`block_has_app_call`]
-    /// (issue #574) for why: box mutations only happen inside AVM
-    /// execution, and go-algorand's own `EvalDelta`/`ApplyData` carries no
-    /// box-content field for `Replay` to fall back on.
+    /// [`crate::apply::apply_block_with_delta_mode`] builder — practically
+    /// that means a payset of only `Pay` / `Keyreg` / `Acfg` / `Axfer` /
+    /// `Afrz` / `Appl` transactions (issue #609 widened this to admit
+    /// `Appl` once #604's `RecordingStore`-based inner-transaction fix
+    /// landed). Blocks that contain `Stpf` / `Hb` transactions (or any
+    /// unrecognized type) skip the delta build entirely — the REST endpoint
+    /// returns `NotFound` for those rounds, which is strictly preferable to
+    /// serving a known-incomplete `StateDelta` (`state_proof_next` is still
+    /// `TODO(#190)`-stubbed in the builder, and `Hb`'s target address isn't
+    /// covered by the diff's address set). This "complete" branch selects
+    /// [`crate::apply::ApplyMode::Execute`] (real AVM execution) instead of
+    /// the cheaper `Replay` mode whenever the block contains an `appl` call
+    /// — see [`block_has_app_call`] (issue #574) for why: box mutations
+    /// only happen inside AVM execution, and go-algorand's own
+    /// `EvalDelta`/`ApplyData` carries no box-content field for `Replay` to
+    /// fall back on. Of the uncached ("incomplete") blocks, one containing
+    /// an `appl` call similarly still runs `ApplyMode::Execute` rather than
+    /// the cheaper bare [`crate::apply::apply_block`] Replay path, for the
+    /// same box-correctness reason.
     ///
     /// **Known limitation even on cached rounds** (#190): a few
     /// `StateDelta` fields are still unconditionally defaulted by
@@ -2963,7 +2983,21 @@ impl SqliteLedger {
 
                 self.group_delta_tracer = Some(tracer);
             }
-            let delta = crate::apply::apply_block_with_delta(self, block)?;
+            // Issue #609: this branch used to hard-code `ApplyMode::Replay`
+            // via `apply_block_with_delta` (never runs the AVM), which was
+            // safe only while `Appl` was excluded from
+            // `block_state_delta_is_complete` above. Now that `Appl` is
+            // admitted, mirror the "incomplete" branch's own
+            // `block_has_app_call` check below so a real `appl` call still
+            // runs through the AVM for real — otherwise box mutations
+            // (issue #574) would silently regress for exactly the blocks
+            // this widening was meant to newly support.
+            let mode = if block_has_app_call(block) {
+                crate::apply::ApplyMode::Execute
+            } else {
+                crate::apply::ApplyMode::Replay
+            };
+            let delta = crate::apply::apply_block_with_delta_mode(self, block, mode)?;
             self.cache_state_delta(round, delta);
             Ok(())
         } else {
@@ -7881,6 +7915,323 @@ mod tests {
         );
     }
 
+    /// TDD regression for issue #609: the *real* default sync path
+    /// (`apply_block_caching_delta`) must now cache a full `StateDelta` --
+    /// not just kv_mods, but `AccountDeltas.asset_resources` and
+    /// `StateDelta.creatables` too -- for a normally-synced `Appl` block
+    /// whose approval program issues an inner `acfg` (asset create) via
+    /// `itxn_submit`.
+    ///
+    /// Before this fix, `block_state_delta_is_complete` excluded any block
+    /// containing an `Appl` transaction (issue #604's still-open inner-txn
+    /// resource-collection gap), so this round would never be cached at
+    /// all -- `get_cached_state_delta` would return `None` and
+    /// `GET /v2/deltas/{round}` would report `NotFound`, even though #604
+    /// had already fixed `apply_block_with_delta_mode_and_apply_data`
+    /// itself to correctly attribute the inner-created asset. Confirms both
+    /// halves of #609's fix: the gate now admits `Appl`, and the
+    /// "complete" branch runs `ApplyMode::Execute` (not the hard-coded
+    /// `Replay` it used before) so the inner `itxn_submit` actually runs.
+    #[test]
+    fn apply_block_caching_delta_caches_full_delta_for_appl_with_inner_acfg() {
+        use algo_types::{AppParams, Block, SignedTransaction, StateSchema, Transaction};
+
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let app_id = 970u64;
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_account(
+            &creator,
+            AccountData {
+                micro_algos: 50_000_000,
+                total_created_apps: 1,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(&fee_sink, AccountData::default());
+
+        // Approval program: on create (ApplicationID == 0) just approve; on
+        // any later call, itxn_submit an inner acfg (asset create) and
+        // approve. Same shape as `apply.rs`'s
+        // `issue_604_inner_acfg_create_populates_asset_resources_and_creatables`.
+        let approval_src = "#pragma version 6\n\
+            txn ApplicationID\n\
+            bz approve\n\
+            itxn_begin\n\
+            int acfg\n\
+            itxn_field TypeEnum\n\
+            int 1000000\n\
+            itxn_field ConfigAssetTotal\n\
+            int 0\n\
+            itxn_field ConfigAssetDecimals\n\
+            byte \"UNIT\"\n\
+            itxn_field ConfigAssetUnitName\n\
+            byte \"Asset\"\n\
+            itxn_field ConfigAssetName\n\
+            itxn_submit\n\
+            approve:\n\
+            int 1\n\
+            return\n";
+        let approval = algo_avm::assembler::assemble_string(approval_src)
+            .expect("approval program must assemble")
+            .program;
+        ledger.set_app_params(
+            app_id,
+            AppParams {
+                creator,
+                approval_program: approval,
+                clear_state_program: vec![0x08, 0x81, 0x01], // v8, pushint 1
+                global_state: BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                extra_program_pages: 0,
+                ..Default::default()
+            },
+        );
+
+        // Fund the app account so its inner acfg can cover the asset's MBR.
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+        ledger.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 3_000_000,
+                ..Default::default()
+            },
+        );
+
+        let stx = SignedTransaction {
+            txn: Transaction {
+                txn_type: "appl".into(),
+                sender: creator,
+                fee: 3_000,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                application_id: app_id,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stx],
+            ..Block::default()
+        };
+
+        // Precondition: the widened gate must admit this payset.
+        assert!(
+            block_state_delta_is_complete(&block),
+            "Appl block must pass the widened #609 gate"
+        );
+
+        // This is exactly what `commands/sync.rs`'s default (non-
+        // `--avm-execute`) branch calls per received block.
+        ledger.begin_block().unwrap();
+        ledger.apply_block_caching_delta(&block).unwrap();
+        ledger.commit_block().unwrap();
+
+        let delta = ledger.get_cached_state_delta(1).unwrap_or_else(|| {
+            panic!(
+                "round 1 must now be cached (Appl is admitted by the widened gate); \
+                 GET /v2/deltas/1 would incorrectly report NotFound otherwise"
+            )
+        });
+
+        // Confirm the mutation itself really happened.
+        let created_asset_id = *ledger
+            .created_assets_for_addr(&app_addr)
+            .first()
+            .map(|(id, _)| id)
+            .expect("inner acfg must have created an asset owned by the app account");
+
+        assert_eq!(
+            delta.creatables.len(),
+            1,
+            "expected exactly one ModifiedCreatable for the inner-created asset: {:?}",
+            delta.creatables
+        );
+        let creatable = delta
+            .creatables
+            .get(&created_asset_id)
+            .expect("creatable entry for the inner-created asset id");
+        assert!(creatable.created);
+        assert_eq!(creatable.creator, app_addr);
+
+        assert_eq!(
+            delta.accts.asset_resources.len(),
+            1,
+            "expected exactly one AssetResourceRecord for the inner-created asset: {:?}",
+            delta.accts.asset_resources
+        );
+        let rec = &delta.accts.asset_resources[0];
+        assert_eq!(rec.aidx, created_asset_id);
+        assert_eq!(
+            rec.addr, app_addr,
+            "the app account (not the outer call's sender) is the inner acfg's creator"
+        );
+
+        // Account-level diff must also include the app account (issue
+        // #190/#604's account-gap, closed the same way for this "complete"
+        // branch's `apply_block_with_delta_mode` call).
+        assert!(
+            delta.accts.accts.iter().any(|r| r.addr == app_addr),
+            "expected the app account (inner-txn-only touched) in the accts diff: {:?}",
+            delta.accts.accts
+        );
+    }
+
+    /// TDD regression for issue #609's other gap: the per-group delta
+    /// tracer (`TxnGroupDeltaTracer`, opt-in via `enable_group_delta_tracer`)
+    /// is gated on the same `block_state_delta_is_complete` predicate as
+    /// `apply_block_caching_delta`, but its own account-address collection
+    /// (`apply::collect_txn_addresses`) never recursed into inner
+    /// transactions. An account only ever touched by an `appl` call's
+    /// `itxn_submit` (never named in the outer transaction's own fields)
+    /// must still appear in the group's recorded `accts` diff, not be
+    /// silently dropped.
+    #[test]
+    fn group_delta_tracer_captures_inner_txn_only_touched_account_for_appl() {
+        use algo_types::{AppParams, Block, SignedTransaction, StateSchema, Transaction};
+
+        let creator = Address([1u8; 32]);
+        let sender = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        // Only ever touched by the approval program's inner payment --
+        // never the outer txn's sender/receiver/accounts-array.
+        let inner_receiver = Address([9u8; 32]);
+        let app_id = 971u64;
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_account(
+            &creator,
+            AccountData {
+                micro_algos: 50_000_000,
+                total_created_apps: 1,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(
+            &sender,
+            AccountData {
+                micro_algos: 50_000_000,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(&fee_sink, AccountData::default());
+
+        let receiver_hex: String = inner_receiver
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let approval_src = format!(
+            "#pragma version 8\n\
+             itxn_begin\n\
+             int pay\n\
+             itxn_field TypeEnum\n\
+             byte 0x{receiver_hex}\n\
+             itxn_field Receiver\n\
+             int 100000\n\
+             itxn_field Amount\n\
+             itxn_submit\n\
+             int 1\n\
+             return\n"
+        );
+        let approval = algo_avm::assembler::assemble_string(&approval_src)
+            .expect("approval program must assemble")
+            .program;
+        ledger.set_app_params(
+            app_id,
+            AppParams {
+                creator,
+                approval_program: approval,
+                clear_state_program: vec![0x08, 0x81, 0x01],
+                global_state: BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 0,
+                },
+                extra_program_pages: 0,
+                ..Default::default()
+            },
+        );
+
+        // Fund the app account so the inner payment has funds to send.
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+        ledger.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 5_000_000,
+                ..Default::default()
+            },
+        );
+
+        ledger.enable_group_delta_tracer(8);
+
+        let stx = SignedTransaction {
+            txn: Transaction {
+                txn_type: "appl".into(),
+                sender,
+                fee: 2_000,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                application_id: app_id,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tid = algo_codec::compute_txn_id(&stx.txn);
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stx],
+            ..Block::default()
+        };
+
+        ledger.begin_block().unwrap();
+        ledger.apply_block_caching_delta(&block).unwrap();
+        ledger.commit_block().unwrap();
+
+        // Confirm the inner payment really happened.
+        assert_eq!(
+            ledger
+                .get_account(&inner_receiver)
+                .map(|a| a.micro_algos)
+                .unwrap_or(0),
+            100_000,
+            "inner itxn_submit payment must have landed"
+        );
+
+        let group_delta = ledger.txn_group_delta_for_id(&tid).unwrap_or_else(|| {
+            panic!(
+                "group delta must be retained for this Appl round now that the \
+                 widened gate admits it"
+            )
+        });
+        assert!(
+            group_delta
+                .accts
+                .accts
+                .iter()
+                .any(|r| r.addr == inner_receiver),
+            "group delta must include the inner-txn-only touched receiver account: {:?}",
+            group_delta.accts.accts
+        );
+    }
+
     /// TDD regression for issue #570's box-list `round` reconstruction:
     /// across a box created, mutated, and deleted at three different
     /// rounds, `reconstruct_box_state_at_round` must recover the exact
@@ -8100,14 +8451,16 @@ mod tests {
         assert_eq!(root_after_commit, root_after_rollback);
     }
 
-    /// PLAN-36 TASK-128 / issue #603: the payset-completeness gate that
-    /// controls whether `apply_block_caching_delta` caches a delta.
-    /// Pay / Keyreg / Acfg / Axfer / Afrz blocks (including the
-    /// empty-payset case) pass; `Appl` / Stpf / Hb, or an `Unknown(_)`
+    /// PLAN-36 TASK-128 / issue #603 / issue #609: the payset-completeness
+    /// gate that controls whether `apply_block_caching_delta` caches a
+    /// delta. Pay / Keyreg / Acfg / Axfer / Afrz / Appl blocks (including
+    /// the empty-payset case) pass; `Stpf` / `Hb`, or an `Unknown(_)`
     /// fallback — fails the gate so the REST endpoint stays at
-    /// `NotFound` rather than serving a known-incomplete delta. `Appl` is
-    /// excluded because its resource-key collection doesn't yet recurse
-    /// into inner transactions (issue #604). `Hb` is excluded because the
+    /// `NotFound` rather than serving a known-incomplete delta. `Appl` was
+    /// excluded until issue #609 because its resource-key collection didn't
+    /// recurse into inner transactions (issue #604); now that #604's
+    /// `RecordingStore`-based fix covers both `apply_block_with_delta_mode`
+    /// callers, `Appl` is admitted too. `Hb` is excluded because the
     /// heartbeat target address isn't included in the diff's address set
     /// (see `block_state_delta_is_complete`).
     #[test]
@@ -8154,14 +8507,27 @@ mod tests {
             TxnType::Axfer,
             TxnType::Afrz,
         ])));
-        // Any other transaction type fails the gate. `Appl` is excluded
-        // because its resource-key collection doesn't recurse into inner
-        // transactions (issue #604). `Hb` is excluded because
-        // `apply::collect_txn_addresses` does not include the heartbeat
-        // target — the resulting `accts` diff would be incomplete for
-        // off-payset targets.
-        for unsupported in [
+        // Issue #609: `Appl` is now admitted -- #604 fixed the resource-key
+        // collection gap (inner transactions recursed into via
+        // `RecordingStore`'s `touches`), and `apply_block_caching_delta`'s
+        // "complete" branch now selects `ApplyMode::Execute` for a block
+        // containing an `appl` call, so kv_mods/app_resources/
+        // asset_resources/creatables are all correctly populated for a
+        // normally-synced Appl block too.
+        assert!(block_state_delta_is_complete(&block_with_types(&[
+            TxnType::Appl
+        ])));
+        assert!(block_state_delta_is_complete(&block_with_types(&[
+            TxnType::Pay,
             TxnType::Appl,
+            TxnType::Acfg,
+        ])));
+
+        // Any other transaction type still fails the gate. `Hb` is excluded
+        // because `apply::collect_txn_addresses` does not include the
+        // heartbeat target — the resulting `accts` diff would be incomplete
+        // for off-payset targets.
+        for unsupported in [
             TxnType::Stpf,
             TxnType::Hb,
             TxnType::Unknown(String::new()),

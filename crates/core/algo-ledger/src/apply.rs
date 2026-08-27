@@ -1208,10 +1208,14 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
 /// rather than by extending this function -- see that function's step 2b
 /// doc comment. The other caller (this function's use inside `Execute`
 /// mode's per-group delta capture, gated by
-/// `sqlite::block_state_delta_is_complete`, which currently excludes any
-/// block containing an `Appl` transaction) still has the gap unaddressed;
-/// that capture path needs its own equivalent fix before its gate can be
-/// widened to admit `Appl` blocks.
+/// `sqlite::block_state_delta_is_complete`) had the same gap until issue
+/// #609, which closed it the same way: a group-scoped
+/// [`crate::recording_store::RecordingStore`] wraps `store` for the
+/// duration of each group's apply (see the `capture_group_deltas` branch
+/// below), and any address only ever touched by that group's inner
+/// transactions is merged into the group's pre-image map from the
+/// wrapper's `touches.accounts`, using each address's actual first-touch
+/// pre-mutation value.
 fn collect_txn_addresses(
     txn: &algo_types::Transaction,
     addrs: &mut std::collections::HashSet<Address>,
@@ -1249,6 +1253,65 @@ fn collect_txn_addresses(
             addrs.insert(*a);
         }
     }
+}
+
+/// Apply one atomic transaction group's transactions against `store`, in
+/// payset order, threading a shared [`GroupBudget`] for pooled Execute-mode
+/// AVM budget accounting (matches go-algorand's per-group `feeCredit`
+/// pooling).
+///
+/// Factored out of `apply_block_impl`'s `Execute` arm (issue #609) so the
+/// exact same per-transaction dispatch logic can run against either the
+/// real ledger store or a group-scoped [`crate::recording_store::RecordingStore`]
+/// wrapper, without duplicating it -- the caller picks which by choosing
+/// what `S` is instantiated with at the call site.
+#[allow(clippy::too_many_arguments)]
+fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
+    store: &mut S,
+    group: &[&SignedTransaction],
+    ctx: &ApplyContext,
+    group_budget: &mut GroupBudget,
+    mut tracer: Option<&mut dyn EvalTracer>,
+    mut apply_data_out: Option<&mut Vec<ApplyData>>,
+    global_txn_idx: &mut usize,
+) -> Result<(), AlgoError> {
+    for (gi_idx, stx) in group.iter().enumerate() {
+        ctx.txn_index.set(*global_txn_idx);
+        let gi = GroupInfo {
+            txns: group,
+            index: gi_idx,
+        };
+        if stx.txn.txn_type == "appl" {
+            // Fresh per-call re-borrow via explicit `match`-bound reborrow.
+            // The inner `&mut dyn EvalTracer` lives only for the duration
+            // of this synchronous call; matching binds a fresh borrow with
+            // a local lifetime that the borrow checker can prove doesn't
+            // outlive the call.
+            let tracer_ref: Option<&mut dyn EvalTracer> = match tracer {
+                Some(ref mut t) => Some(&mut **t),
+                None => None,
+            };
+            let ad = apply_transaction_with_budget(
+                store,
+                stx,
+                ctx,
+                0,
+                Some(&mut *group_budget),
+                Some(&gi),
+                tracer_ref,
+            )?;
+            if let Some(out) = apply_data_out.as_deref_mut() {
+                out.push(ad);
+            }
+        } else {
+            let ad = apply_transaction(store, stx, ctx, 0)?;
+            if let Some(out) = apply_data_out.as_deref_mut() {
+                out.push(ad);
+            }
+        }
+        *global_txn_idx += 1;
+    }
+    Ok(())
 }
 
 /// Apply a full block to the ledger state (internal implementation).
@@ -1429,57 +1492,72 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                         None
                     };
 
-                    for (gi_idx, stx) in group.iter().enumerate() {
-                        ctx.txn_index.set(global_txn_idx);
-                        let gi = GroupInfo {
-                            txns: group,
-                            index: gi_idx,
-                        };
-                        if stx.txn.txn_type == "appl" {
-                            // Fresh per-call re-borrow via explicit
-                            // `match`-bound reborrow. The inner
-                            // `&mut dyn EvalTracer` lives only for the
-                            // duration of this synchronous call;
-                            // matching binds a fresh borrow with a
-                            // local lifetime that the borrow checker
-                            // can prove doesn't outlive the call.
-                            let tracer_ref: Option<&mut dyn EvalTracer> = match tracer {
-                                Some(ref mut t) => Some(&mut **t),
-                                None => None,
-                            };
-                            match apply_transaction_with_budget(
-                                store,
-                                stx,
-                                &ctx,
-                                0,
-                                Some(&mut group_budget),
-                                Some(&gi),
-                                tracer_ref,
-                            ) {
-                                Ok(ad) => {
-                                    if let Some(out) = apply_data_out.as_deref_mut() {
-                                        out.push(ad);
-                                    }
-                                }
-                                Err(e) => break 'block Err(e),
-                            }
-                        } else {
-                            match apply_transaction(store, stx, &ctx, 0) {
-                                Ok(ad) => {
-                                    if let Some(out) = apply_data_out.as_deref_mut() {
-                                        out.push(ad);
-                                    }
-                                }
-                                Err(e) => break 'block Err(e),
-                            }
+                    // Issue #609: run this group's transactions through a
+                    // group-scoped `RecordingStore` whenever the group's
+                    // delta is actually being captured, so that an account
+                    // only ever touched by one of this group's *inner*
+                    // transactions (an `appl` call's `itxn_submit`, at any
+                    // nesting depth) is still picked up by the diff below --
+                    // `collect_txn_addresses` above only sees each
+                    // top-level transaction's own fields, the same
+                    // long-standing gap issue #604 fixed for the per-round
+                    // delta cache's own resource-key collection. Scoped
+                    // fresh per group (not once for the whole block) so
+                    // that an address touched again in a later group still
+                    // gets that later group's own correct first-touch
+                    // pre-value, not an earlier group's.
+                    let mut inner_touched_accounts: Option<
+                        std::collections::HashMap<Address, Option<algo_types::AccountData>>,
+                    > = None;
+                    // Fresh per-iteration reborrow via explicit `match`, same
+                    // rationale as `apply_group_transactions`'s own per-call
+                    // reborrow: a plain `.as_deref_mut()` here makes rustc
+                    // unify the reborrow's lifetime with `tracer`'s own `'1`
+                    // input lifetime across loop iterations (E0499), since
+                    // it's threaded through a second, generic function call
+                    // boundary. The explicit reborrow binds a lifetime local
+                    // to this `match`, which the borrow checker can prove
+                    // ends when the call returns.
+                    let tracer_reborrow: Option<&mut dyn EvalTracer> = match tracer {
+                        Some(ref mut t) => Some(&mut **t),
+                        None => None,
+                    };
+                    if capture_group_deltas {
+                        let mut recording_store =
+                            crate::recording_store::RecordingStore::new(store);
+                        if let Err(e) = apply_group_transactions(
+                            &mut recording_store,
+                            group,
+                            &ctx,
+                            &mut group_budget,
+                            tracer_reborrow,
+                            apply_data_out.as_deref_mut(),
+                            &mut global_txn_idx,
+                        ) {
+                            break 'block Err(e);
                         }
-                        global_txn_idx += 1;
+                        inner_touched_accounts = Some(recording_store.touches.accounts);
+                    } else if let Err(e) = apply_group_transactions(
+                        store,
+                        group,
+                        &ctx,
+                        &mut group_budget,
+                        tracer_reborrow,
+                        apply_data_out.as_deref_mut(),
+                        &mut global_txn_idx,
+                    ) {
+                        break 'block Err(e);
                     }
 
                     // Build and record this group's state delta (account diff +
                     // txids + txleases, matching the per-round delta's scope).
-                    if let (Some(t), Some(pre)) = (group_deltas.as_deref_mut(), group_pre) {
+                    if let (Some(t), Some(mut pre)) = (group_deltas.as_deref_mut(), group_pre) {
                         use crate::state_delta::{IncludedTransactions, StateDelta, Txlease};
+                        if let Some(extra) = inner_touched_accounts {
+                            for (addr, pre_val) in extra {
+                                pre.entry(addr).or_insert(pre_val);
+                            }
+                        }
                         let mut delta = StateDelta::default();
                         for (addr, pre_ad) in &pre {
                             let post = store.get_account(addr);
