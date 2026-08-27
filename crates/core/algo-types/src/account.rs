@@ -114,7 +114,7 @@ pub struct AppLocalState {
     pub key_value: BTreeMap<Vec<u8>, TealValue>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AppParams {
     pub creator: Address,
     pub approval_program: Vec<u8>,
@@ -123,4 +123,12 @@ pub struct AppParams {
     pub local_state_schema: StateSchema,
     pub global_state_schema: StateSchema,
     pub extra_program_pages: u32,
+    /// Go codec `"v"`. Starts at 0 on create; increments on
+    /// `UpdateApplication` when the `EnableAppVersioning` consensus
+    /// param is set (go-algorand `ledger/apply/application.go`).
+    pub version: u64,
+    /// Go codec `"ss"`. The account responsible for the MBR of extra
+    /// program pages / global schema, when that differs from the
+    /// creator. Zero address means "no sponsor" (creator pays).
+    pub size_sponsor: Address,
 }

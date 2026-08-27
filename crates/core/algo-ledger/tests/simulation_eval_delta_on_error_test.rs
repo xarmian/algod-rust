@@ -47,6 +47,8 @@ fn register_app(state: &mut LedgerState, creator: Address, app_id: u64, approval
         local_state_schema: StateSchema::default(),
         global_state_schema: StateSchema::default(),
         extra_program_pages: 0,
+
+        ..Default::default()
     };
     state.set_app_params(app_id, app_params);
     let mut acct = state.get_account(&creator).cloned().unwrap_or_default();

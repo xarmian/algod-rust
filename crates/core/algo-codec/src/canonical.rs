@@ -1798,10 +1798,8 @@ pub fn canonical_encode_app_local_state(als: &AppLocalState) -> Vec<u8> {
 ///   LocalStateSchema → `"lsch"`, GlobalStateSchema → `"gsch"`,
 ///   Version → `"v"`, SizeSponsor → `"ss"`
 ///
-/// Note: The Rust `AppParams` struct does not yet have `version` or
-/// `size_sponsor` fields. When those are added, encoding should be updated.
-/// The `creator` field in the Rust struct is not part of Go's AppParams codec
-/// and is not encoded here.
+/// The `creator` field in the Rust struct is not part of Go's AppParams
+/// codec and is not encoded here.
 pub fn canonical_encode_app_params(ap: &AppParams) -> Vec<u8> {
     let mut m = CanonicalMap::new();
     m.add_bytes("approv", &ap.approval_program);
@@ -1816,8 +1814,8 @@ pub fn canonical_encode_app_params(ap: &AppParams) -> Vec<u8> {
         "lsch",
         canonical_encode_state_schema(&ap.local_state_schema),
     );
-    // TODO: encode "ss" (SizeSponsor) when added to Rust AppParams
-    // TODO: encode "v" (Version) when added to Rust AppParams
+    m.add_u64("v", ap.version);
+    m.add_address("ss", &ap.size_sponsor);
     m.encode()
 }
 
@@ -2495,6 +2493,8 @@ mod tests {
             },
             extra_program_pages: 0,
             creator: Address([0u8; 32]),
+
+            ..Default::default()
         };
         let bytes = canonical_encode_app_params(&params);
         let keys = extract_map_keys(&bytes);
@@ -2522,6 +2522,43 @@ mod tests {
         assert!(
             !keys.contains(&"clear-state-program".to_string()),
             "app params should NOT have serde 'clear-state-program' tag"
+        );
+        // Zero version / zero-address size_sponsor are both omitempty in go's
+        // basics.AppParams (issue #602) -- neither tag appears when unset.
+        assert!(
+            !keys.contains(&"v".to_string()),
+            "app params should omit 'v' (version) when zero, got: {:?}",
+            keys
+        );
+        assert!(
+            !keys.contains(&"ss".to_string()),
+            "app params should omit 'ss' (size_sponsor) when the zero address, got: {:?}",
+            keys
+        );
+    }
+
+    /// Issue #602: non-zero `version`/`size_sponsor` are encoded under go's
+    /// short codec tags `"v"`/`"ss"` once `algo_types::AppParams` tracks
+    /// them for real.
+    #[test]
+    fn canonical_encode_app_params_version_and_size_sponsor_when_nonzero() {
+        let params = AppParams {
+            version: 3,
+            size_sponsor: Address([7u8; 32]),
+            ..Default::default()
+        };
+        let bytes = canonical_encode_app_params(&params);
+        let keys = extract_map_keys(&bytes);
+
+        assert!(
+            keys.contains(&"v".to_string()),
+            "app params should have 'v' (version) tag when non-zero, got: {:?}",
+            keys
+        );
+        assert!(
+            keys.contains(&"ss".to_string()),
+            "app params should have 'ss' (size_sponsor) tag when non-zero, got: {:?}",
+            keys
         );
     }
 

@@ -169,6 +169,8 @@ fn seed_app(store: &mut LedgerState) {
                 num_byte_slice: 4,
             },
             extra_program_pages: 0,
+
+            ..Default::default()
         },
     );
 }

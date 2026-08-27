@@ -1804,7 +1804,13 @@ fn execute_inner_appl<L: LedgerStore>(
 
     // Apply on-completion side effects via the shared helper.
     // ON_COMPLETION_OPT_IN is a no-op (handled by apply_appl_opt_in_pre_program above).
-    apply_appl_on_completion(store, &stxn.txn, effective_app_id, ApplErrorContext::Inner)?;
+    apply_appl_on_completion(
+        store,
+        &stxn.txn,
+        effective_app_id,
+        ApplErrorContext::Inner,
+        &consensus,
+    )?;
 
     // Propagate fee_credit and txn_counter back to the parent (H5/H6).
     ad.fee_credit = child_fee_credit;
@@ -4281,6 +4287,8 @@ mod tests {
                     num_byte_slice: 0,
                 },
                 extra_program_pages: 0,
+
+                ..Default::default()
             },
         );
 
@@ -4473,6 +4481,8 @@ mod tests {
                     num_byte_slice: 2,
                 },
                 extra_program_pages: 1,
+
+                ..Default::default()
             },
         );
 
@@ -4960,6 +4970,8 @@ mod tests {
                     num_byte_slice: 4,
                 },
                 extra_program_pages: 0,
+
+                ..Default::default()
             },
         );
     }
@@ -5389,6 +5401,8 @@ mod tests {
                     num_byte_slice: 4,
                 },
                 extra_program_pages: 0,
+
+                ..Default::default()
             },
         );
         store.set_account(
@@ -6577,6 +6591,8 @@ mod tests {
                     num_byte_slice: 4,
                 },
                 extra_program_pages: 0,
+
+                ..Default::default()
             },
         );
 
@@ -7074,6 +7090,8 @@ mod tests {
                 local_state_schema: StateSchema::default(),
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
+
+                ..Default::default()
             },
         );
 
@@ -7168,6 +7186,8 @@ mod tests {
                 local_state_schema: StateSchema::default(),
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
+
+                ..Default::default()
             },
         );
 
@@ -7290,6 +7310,8 @@ mod tests {
                     num_byte_slice: 3,
                 },
                 extra_program_pages: 2,
+
+                ..Default::default()
             },
         );
 
@@ -7367,6 +7389,8 @@ mod tests {
                 },
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
+
+                ..Default::default()
             },
         );
 
@@ -7429,6 +7453,8 @@ mod tests {
                 },
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
+
+                ..Default::default()
             },
         );
 
@@ -7502,6 +7528,8 @@ mod tests {
                 },
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
+
+                ..Default::default()
             },
         );
 
@@ -7596,6 +7624,8 @@ mod tests {
                 global_state_schema: StateSchema::default(),
                 local_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
+
+                ..Default::default()
             },
         );
 

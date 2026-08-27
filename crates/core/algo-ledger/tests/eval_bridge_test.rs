@@ -145,6 +145,8 @@ fn create_app(
                 num_byte_slice: 4,
             },
             extra_program_pages: 0,
+
+            ..Default::default()
         },
     );
 

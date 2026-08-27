@@ -180,6 +180,8 @@ fn fixtures() -> Vec<Fixture> {
                             num_byte_slice: 1,
                         },
                         extra_program_pages: 1,
+
+                        ..Default::default()
                     },
                 )]),
                 ..Default::default()
@@ -289,6 +291,8 @@ fn standalone_application_json_matches_go() {
             num_byte_slice: 1,
         },
         extra_program_pages: 1,
+
+        ..Default::default()
     };
     let got =
         serde_json::to_value(app_params_to_api(8, &creator.to_algorand_string(), &params)).unwrap();
