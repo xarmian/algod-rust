@@ -364,15 +364,10 @@ fn asset_holding_record(h: &AssetHolding) -> crate::state_delta::AssetHoldingRec
 /// Convert the ledger's `AppParams` into the `StateDelta` wire record
 /// (`crate::state_delta::AppParamsRecord`, go's `basics.AppParams`).
 ///
-/// `version`/`size_sponsor` are always zero here: `algo_types::AppParams`
-/// (the ledger's own app-params type) doesn't track either field at all —
-/// this repo has no source of truth to populate them from yet. Issue #583
-/// landed the wire-format fields themselves (with their correct short
-/// codec tags), and issue #586's investigation confirmed the gap is
-/// exactly this — `AppParams` never carrying the values in the first
-/// place — rather than a further conversion bug here. Left as a
-/// documented, re-confirmed gap; threading real values through requires
-/// extending `algo_types::AppParams` first (tracked as a follow-up).
+/// Issue #602: `algo_types::AppParams` now tracks real `version`/
+/// `size_sponsor` values (set at app-create/update apply time in
+/// `create_application`/`apply_appl_on_completion`), so both are threaded
+/// through here instead of being hard-coded to zero.
 fn app_params_record(p: &AppParams) -> crate::state_delta::AppParamsRecord {
     crate::state_delta::AppParamsRecord {
         approval_program: p.approval_program.clone(),
@@ -381,8 +376,8 @@ fn app_params_record(p: &AppParams) -> crate::state_delta::AppParamsRecord {
         local_state_schema: p.local_state_schema.clone(),
         global_state_schema: p.global_state_schema.clone(),
         extra_program_pages: p.extra_program_pages,
-        version: 0,
-        size_sponsor: Address::ZERO,
+        version: p.version,
+        size_sponsor: p.size_sponsor,
     }
 }
 
@@ -3013,6 +3008,8 @@ pub(crate) fn create_application<L: crate::store_trait::LedgerStore>(
             local_state_schema: local_schema,
             global_state_schema: global_schema.clone(),
             extra_program_pages: extra_pages,
+
+            ..Default::default()
         },
     );
 
@@ -3080,6 +3077,7 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
     txn: &algo_types::Transaction,
     app_id: u64,
     err_ctx: ApplErrorContext,
+    consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
     match txn.on_completion {
         ON_COMPLETION_NOOP => {
@@ -3172,6 +3170,11 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
                 }
                 if let Some(ref clear) = txn.clear_state_program {
                     app.clear_state_program = clear.to_vec();
+                }
+                // go-algorand `ledger/apply/application.go`'s `updateApplication`:
+                // `if proto.EnableAppVersioning { params.Version++ }`.
+                if consensus.enable_app_versioning {
+                    app.version += 1;
                 }
                 store.set_app_params(app_id, app);
             }
@@ -3516,7 +3519,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
 
     // Apply remaining on-completion side effects via the shared helper.
     // ON_COMPLETION_OPT_IN is a no-op in the shared helper (handled above).
-    apply_appl_on_completion(store, txn, app_id, ApplErrorContext::Outer)?;
+    apply_appl_on_completion(store, txn, app_id, ApplErrorContext::Outer, &ctx.consensus)?;
 
     Ok(captured_eval_delta)
 }
@@ -3912,6 +3915,21 @@ mod tests {
         stx.txn.amount = amount;
         stx.txn.fee = fee;
         stx
+    }
+
+    /// Issue #602: `app_params_record` must thread real `version`/
+    /// `size_sponsor` values through instead of hard-coding zero.
+    #[test]
+    fn test_app_params_record_threads_version_and_size_sponsor() {
+        let p = AppParams {
+            creator: Address([1u8; 32]),
+            version: 4,
+            size_sponsor: Address([9u8; 32]),
+            ..Default::default()
+        };
+        let record = app_params_record(&p);
+        assert_eq!(record.version, 4);
+        assert_eq!(record.size_sponsor, Address([9u8; 32]));
     }
 
     #[test]

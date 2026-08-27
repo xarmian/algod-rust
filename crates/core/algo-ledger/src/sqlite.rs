@@ -941,6 +941,8 @@ pub fn build_app_resource_data(
         rd.global_state_schema_num_uint = p.global_state_schema.num_uint;
         rd.global_state_schema_num_byte_slice = p.global_state_schema.num_byte_slice;
         rd.extra_program_pages = p.extra_program_pages;
+        rd.version = p.version;
+        rd.size_sponsor = p.size_sponsor.0;
     }
 
     rd
@@ -968,13 +970,14 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
         local_state_schema: StateSchema::default(),
         global_state_schema: StateSchema::default(),
         extra_program_pages: 0,
+        ..Default::default()
     };
 
     // Canonical Go layout only (TASK-196 removed legacy tolerance):
     //   q = approval, r = clear_state, s = global_state,
     //   t = local_state_schema.num_uint, u = local_state_schema.num_byte_slice,
     //   v = global_state_schema.num_uint, w = global_state_schema.num_byte_slice,
-    //   x = extra_program_pages.
+    //   x = extra_program_pages, A = version, B = size_sponsor.
     for (k, v) in &map {
         match k.as_str().unwrap_or("") {
             "q" => {
@@ -997,6 +1000,16 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
                 p.extra_program_pages = u32::try_from(raw).map_err(|_| AlgoError::Ledger {
                     message: format!("extra_program_pages {raw} exceeds u32::MAX"),
                 })?;
+            }
+            "A" => p.version = v.as_u64().unwrap_or(0),
+            "B" => {
+                if let Some(b) = v.as_slice() {
+                    if b.len() == 32 {
+                        let mut addr = [0u8; 32];
+                        addr.copy_from_slice(b);
+                        p.size_sponsor = Address(addr);
+                    }
+                }
             }
             _ => {}
         }
@@ -1227,6 +1240,7 @@ fn merge_app_local_state_into_params(existing_blob: &[u8], new_local: &AppLocalS
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
+            ..Default::default()
         });
     let update_round = extract_update_round(existing_blob);
     let rd = build_app_resource_data(Some(new_local), Some(&existing_params), update_round);
@@ -6058,6 +6072,7 @@ mod tests {
                 num_byte_slice: 13,
             },
             extra_program_pages: 2,
+            ..Default::default()
         };
         let actual = encode_app_params_with_round(&p, 99);
 
@@ -6091,6 +6106,7 @@ mod tests {
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
+            ..Default::default()
         };
         let bytes = encode_app_params_with_round(&p, 0);
         let val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..]).expect("decode");
@@ -6123,6 +6139,8 @@ mod tests {
                 num_byte_slice: 4,
             },
             extra_program_pages: 1,
+            version: 5,
+            size_sponsor: Address([3u8; 32]),
         };
         let bytes = encode_app_params_with_round(&p, 0);
         let decoded = decode_app_params(&bytes, p.creator).expect("decode");
@@ -6145,6 +6163,10 @@ mod tests {
             p.global_state_schema.num_byte_slice
         );
         assert_eq!(decoded.extra_program_pages, p.extra_program_pages);
+        // Issue #602: version/size_sponsor (trackerdb codec "A"/"B") must
+        // survive the encode/decode round trip.
+        assert_eq!(decoded.version, p.version);
+        assert_eq!(decoded.size_sponsor, p.size_sponsor);
     }
 
     #[test]
@@ -6213,6 +6235,7 @@ mod tests {
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
+            ..Default::default()
         };
         let rd = build_app_resource_data(Some(&local), Some(&params), 0);
         let bytes = algo_codec::canonical_encode_resources_data(&rd);
@@ -6426,6 +6449,7 @@ mod tests {
                 num_byte_slice: 2,
             },
             extra_program_pages: 1,
+            ..Default::default()
         };
 
         ledger.set_app_params(20, params.clone());
@@ -7328,6 +7352,7 @@ mod tests {
                 num_byte_slice: 0,
             },
             extra_program_pages: 0,
+            ..Default::default()
         };
 
         let local = AppLocalState {
@@ -7386,6 +7411,7 @@ mod tests {
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
+            ..Default::default()
         };
 
         // Local state first, then params.
@@ -7790,6 +7816,7 @@ mod tests {
                     num_byte_slice: 0,
                 },
                 extra_program_pages: 0,
+                ..Default::default()
             },
         );
 
@@ -7882,6 +7909,7 @@ mod tests {
                     num_byte_slice: 0,
                 },
                 extra_program_pages: 0,
+                ..Default::default()
             },
         );
 
@@ -7923,6 +7951,7 @@ mod tests {
                     num_byte_slice: 0,
                 },
                 extra_program_pages: 0,
+                ..Default::default()
             },
         );
         apply_execute_round(&mut ledger, 2, fee_sink, appl_txn(1_001));
@@ -7944,6 +7973,7 @@ mod tests {
                     num_byte_slice: 0,
                 },
                 extra_program_pages: 0,
+                ..Default::default()
             },
         );
         apply_execute_round(&mut ledger, 3, fee_sink, appl_txn(1_002));

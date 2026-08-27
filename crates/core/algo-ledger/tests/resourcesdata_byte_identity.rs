@@ -260,6 +260,7 @@ fn rebuild_app_params(f: &RowFields) -> AppParams {
             num_byte_slice: f.global_state_schema_nbs,
         },
         extra_program_pages: f.extra_program_pages,
+        ..Default::default()
     }
 }
 

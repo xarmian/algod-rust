@@ -444,6 +444,18 @@ fn appl_optin_txn(sender: Address, fee: u64, app_id: u64) -> SignedTransaction {
     stx
 }
 
+fn appl_update_txn(sender: Address, fee: u64, app_id: u64) -> SignedTransaction {
+    let mut stx = SignedTransaction::default();
+    stx.txn.txn_type = "appl".into();
+    stx.txn.sender = sender;
+    stx.txn.fee = fee;
+    stx.txn.application_id = app_id;
+    stx.txn.on_completion = 4; // ON_COMPLETION_UPDATE
+    stx.txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x02]));
+    stx.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x02]));
+    stx
+}
+
 // ---------------------------------------------------------------------------
 // 9. Asset full lifecycle (multi-block)
 // ---------------------------------------------------------------------------
@@ -655,6 +667,42 @@ fn test_appl_create_and_optin() {
     assert_eq!(local.schema.num_uint, 2);
     assert_eq!(local.schema.num_byte_slice, 1);
     assert_eq!(state.get_account(&user).unwrap().total_apps_opted_in, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 12. App update increments AppParams::version (issue #602)
+//
+// go-algorand starts `AppParams.Version` at 0 on create and increments it
+// on every `UpdateApplication` completion, gated on the `EnableAppVersioning`
+// consensus param (`ledger/apply/application.go`'s `createApplication`/
+// `updateApplication`). `EnableAppVersioning` has been true since V41, which
+// is `ApplyContext::new_replay`'s default consensus version here.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_appl_update_increments_version() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+
+    let app_id = 300u64;
+
+    // Create the app — version starts at 0.
+    let stx = appl_create_txn(creator, 1_000, app_id, 0);
+    apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+    assert_eq!(state.get_app_params(app_id).unwrap().version, 0);
+
+    // First update — version increments to 1.
+    let update1 = appl_update_txn(creator, 1_000, app_id);
+    apply_transaction(&mut state, &update1, &ctx, 0).unwrap();
+    assert_eq!(state.get_app_params(app_id).unwrap().version, 1);
+
+    // Second update — version increments to 2.
+    let update2 = appl_update_txn(creator, 1_000, app_id);
+    apply_transaction(&mut state, &update2, &ctx, 0).unwrap();
+    assert_eq!(state.get_app_params(app_id).unwrap().version, 2);
 }
 
 // ---------------------------------------------------------------------------
