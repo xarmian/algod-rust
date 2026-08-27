@@ -2014,7 +2014,15 @@ async fn state_delta_appl_inner_txn_matches_go_through_real_sync_path() {
     let go = go_url();
     let dev_addr_str = dev_address().to_string();
 
-    let approval_src = "#pragma version 6\n\
+    // Version 8, matching `CLEAR_STATE_PROGRAM` (also v8) -- go-algorand
+    // rejects a create txn whose approval/clear-state versions mismatch
+    // ("program version mismatch"), unlike the in-process unit tests this
+    // program shape is adapted from (`apply.rs`'s
+    // `issue_604_inner_acfg_create_populates_asset_resources_and_creatables`,
+    // `sqlite.rs`'s `apply_block_caching_delta_caches_full_delta_for_appl_with_inner_acfg`),
+    // which apply hand-built blocks directly and never go through go's txn
+    // validity check.
+    let approval_src = "#pragma version 8\n\
         txn ApplicationID\n\
         bz approve\n\
         itxn_begin\n\
