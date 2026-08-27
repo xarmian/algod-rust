@@ -444,7 +444,12 @@ impl Verifier {
         verify_state_proof_trees_depth(s)?;
 
         let nr = s.positions_to_reveal.len() as u64;
-        verify_weights(s.signed_weight, self.ln_proven_weight, nr, self.strength_target)?;
+        verify_weights(
+            s.signed_weight,
+            self.ln_proven_weight,
+            nr,
+            self.strength_target,
+        )?;
 
         let version = s.merkle_signature_salt_version;
         for reveal in s.reveals.values() {
@@ -548,7 +553,10 @@ mod tests {
 
     #[test]
     fn ln_int_approximation_rejects_zero() {
-        assert_eq!(ln_int_approximation(0), Err(StateProofError::IllegalLnInput));
+        assert_eq!(
+            ln_int_approximation(0),
+            Err(StateProofError::IllegalLnInput)
+        );
     }
 
     #[test]
@@ -599,8 +607,7 @@ mod tests {
     fn build_committable_signature_rejects_deep_proof() {
         let mut sig_commit = SigSlotCommit::default();
         sig_commit.sig.signature = vec![1, 2, 3]; // non-empty falcon sig
-        sig_commit.sig.proof.proof.tree_depth =
-            (merklearray::MAX_ENCODED_TREE_DEPTH + 1) as u8;
+        sig_commit.sig.proof.proof.tree_depth = (merklearray::MAX_ENCODED_TREE_DEPTH + 1) as u8;
         let err = build_committable_signature(&sig_commit).unwrap_err();
         assert_eq!(err, StateProofError::ProofTreeDepthTooLarge);
     }
@@ -667,10 +674,7 @@ mod tests {
     /// a real per-participant ephemeral-key vector-commitment tree (the
     /// merkle-signature-scheme commitment), and real outer sig/participant
     /// vector-commitment trees.
-    fn build_genuine_state_proof(
-        round: u64,
-        msg: MessageHash,
-    ) -> (Verifier, StateProof, u64) {
+    fn build_genuine_state_proof(round: u64, msg: MessageHash) -> (Verifier, StateProof, u64) {
         let weight = 1000u64;
 
         // Per-participant merkle-signature-scheme keys, valid at `round`.

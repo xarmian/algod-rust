@@ -545,7 +545,9 @@ impl Signature {
         let sig_bytes = algo_falcon::falcon_convert_compressed_to_ct(&self.signature)
             .map_err(|e| MerkleSignatureError::FalconError(e.to_string()))?;
 
-        let verifier_bytes = self.verifying_key.get_fixed_length_hashable_representation();
+        let verifier_bytes = self
+            .verifying_key
+            .get_fixed_length_hashable_representation();
 
         let idx_bytes = self.vector_commitment_index.to_le_bytes();
 

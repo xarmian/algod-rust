@@ -33,9 +33,8 @@ use algo_error::AlgoError;
 use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{
     FalconVerifier as WireFalconVerifier, MerkleProof as WireMerkleProof,
-    MerkleSignature as WireMerkleSignature, Participant as WireParticipant,
-    Reveal as WireReveal, SigSlotCommit as WireSigSlotCommit, StateProofBody, StateProofMessage,
-    Transaction,
+    MerkleSignature as WireMerkleSignature, Participant as WireParticipant, Reveal as WireReveal,
+    SigSlotCommit as WireSigSlotCommit, StateProofBody, StateProofMessage, Transaction,
 };
 use sha2::{Digest, Sha256};
 
@@ -109,13 +108,15 @@ pub fn apply_state_proof<L: LedgerStore>(
     }
 
     if ctx.validate {
-        let last_round_hdr = store.get_block_header(last_round_in_interval)?.ok_or_else(|| {
-            ledger_err(format!(
-                "applyStateProof: no header for last attested round {last_round_in_interval}"
-            ))
-        })?;
-        let params = consensus_params_for_version(&last_round_hdr.current_protocol)
+        let last_round_hdr = store
+            .get_block_header(last_round_in_interval)?
             .ok_or_else(|| {
+                ledger_err(format!(
+                    "applyStateProof: no header for last attested round {last_round_in_interval}"
+                ))
+            })?;
+        let params =
+            consensus_params_for_version(&last_round_hdr.current_protocol).ok_or_else(|| {
                 ledger_err(format!(
                     "applyStateProof: unknown protocol '{}'",
                     last_round_hdr.current_protocol
@@ -144,9 +145,8 @@ pub fn apply_state_proof<L: LedgerStore>(
 
         let voters_commitment =
             crate::block_header::state_proof_voters_commitment(&voters_hdr.state_proof_tracking);
-        let online_total_weight = crate::block_header::state_proof_online_total_weight(
-            &voters_hdr.state_proof_tracking,
-        );
+        let online_total_weight =
+            crate::block_header::state_proof_online_total_weight(&voters_hdr.state_proof_tracking);
 
         let acceptable_weight = calculate_acceptable_state_proof_weight(
             online_total_weight,
@@ -176,12 +176,15 @@ pub fn apply_state_proof<L: LedgerStore>(
             ledger_err("applyStateProof: overflow computing provenWeight".to_string())
         })?;
 
-        let verifier =
-            crypto_sp::Verifier::new(voters_commitment, proven_weight, params.state_proof_strength_target)
-                .map_err(|e| ledger_err(format!("applyStateProof: {e}")))?;
+        let verifier = crypto_sp::Verifier::new(
+            voters_commitment,
+            proven_weight,
+            params.state_proof_strength_target,
+        )
+        .map_err(|e| ledger_err(format!("applyStateProof: {e}")))?;
 
-        let crypto_proof = convert_state_proof(body)
-            .map_err(|e| ledger_err(format!("applyStateProof: {e}")))?;
+        let crypto_proof =
+            convert_state_proof(body).map_err(|e| ledger_err(format!("applyStateProof: {e}")))?;
         let msg_hash = state_proof_message_hash(message);
 
         verifier
@@ -227,8 +230,7 @@ fn calculate_acceptable_state_proof_weight(
         return total;
     }
 
-    let Some(proven_weight) =
-        muldiv_u64_u32(total, proto.state_proof_weight_threshold, 1u64 << 32)
+    let Some(proven_weight) = muldiv_u64_u32(total, proto.state_proof_weight_threshold, 1u64 << 32)
     else {
         return 0;
     };
@@ -390,7 +392,11 @@ mod tests {
     /// map key `0` (`protocol.StateProofBasic`), matching the wire shape
     /// `block_header::state_proof_next_round`/`state_proof_voters_commitment`/
     /// `state_proof_online_total_weight` read back out.
-    fn tracking_value(next: u64, voters_commitment: &[u8], total_weight: u64) -> Option<rmpv::Value> {
+    fn tracking_value(
+        next: u64,
+        voters_commitment: &[u8],
+        total_weight: u64,
+    ) -> Option<rmpv::Value> {
         let mut fields = Vec::new();
         if next != 0 {
             fields.push((rmpv::Value::from("n"), rmpv::Value::from(next)));
@@ -437,7 +443,10 @@ mod tests {
     #[test]
     fn rejects_round_mismatch() {
         let mut store = LedgerState::new();
-        put_header(&mut store, &header_at(9, CONSENSUS_V41, tracking_value(500, &[], 0)));
+        put_header(
+            &mut store,
+            &header_at(9, CONSENSUS_V41, tracking_value(500, &[], 0)),
+        );
         let ctx = ApplyContext::new_replay(0, Address::ZERO, 10);
 
         let mut txn = Transaction::default();
@@ -564,7 +573,10 @@ mod tests {
             fn length(&self) -> u64 {
                 self.0.len() as u64
             }
-            fn marshal(&self, pos: u64) -> Result<Box<dyn merklearray::Hashable>, merklearray::MerkleError> {
+            fn marshal(
+                &self,
+                pos: u64,
+            ) -> Result<Box<dyn merklearray::Hashable>, merklearray::MerkleError> {
                 // Re-derive via the crate-internal builder is not accessible
                 // here (private); build the leaf inline using the same
                 // format `build_committable_signature` produces for a
@@ -598,7 +610,10 @@ mod tests {
             fn length(&self) -> u64 {
                 self.0.len() as u64
             }
-            fn marshal(&self, pos: u64) -> Result<Box<dyn merklearray::Hashable>, merklearray::MerkleError> {
+            fn marshal(
+                &self,
+                pos: u64,
+            ) -> Result<Box<dyn merklearray::Hashable>, merklearray::MerkleError> {
                 let p = &self.0[pos as usize];
                 struct Leaf {
                     weight: u64,
@@ -627,9 +642,11 @@ mod tests {
         // Participant-commitment tree first: `voters_commitment` (its root)
         // is part of the message the participant signs over, so it must be
         // known before signing happens.
-        let part_tree =
-            merklearray::build_vector_commitment_tree(&PartArray(vec![participant.clone()]), factory)
-                .unwrap();
+        let part_tree = merklearray::build_vector_commitment_tree(
+            &PartArray(vec![participant.clone()]),
+            factory,
+        )
+        .unwrap();
         let part_commit = part_tree.root();
 
         let message = algo_types::StateProofMessage {
@@ -740,13 +757,17 @@ mod tests {
         }
     }
 
-    fn wire_falcon_verifier(v: &algo_consensus_crypto::merklesig::FalconVerifier) -> WireFalconVerifier {
+    fn wire_falcon_verifier(
+        v: &algo_consensus_crypto::merklesig::FalconVerifier,
+    ) -> WireFalconVerifier {
         WireFalconVerifier {
             public_key: ByteBuf::from(v.k.to_vec()),
         }
     }
 
-    fn wire_merkle_signature(s: &algo_consensus_crypto::merklesig::Signature) -> WireMerkleSignature {
+    fn wire_merkle_signature(
+        s: &algo_consensus_crypto::merklesig::Signature,
+    ) -> WireMerkleSignature {
         WireMerkleSignature {
             signature: ByteBuf::from(s.signature.clone()),
             vector_commitment_index: s.vector_commitment_index,
