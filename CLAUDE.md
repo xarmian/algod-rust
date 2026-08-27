@@ -1,6 +1,6 @@
 # algod-rust
 
-Full Rust reimplementation of go-algorand — a production-grade Algorand node. Phases 0–5 are complete (conformance harness, block sync, AVM execution, ledger apply, validation, REST API). Currently in Phase 6 (consensus participation). See `docs/PROJECT_SCOPE.md` for full scope, `docs/PHASE6_PROPOSAL.md` for the current phase, and `docs/PHASE6_VALIDATION.md` for the Layer-9 evidence map (which test/tool proves which criterion).
+Full Rust reimplementation of go-algorand — a production-grade Algorand node. Phases 0–6 are complete (conformance harness, block sync, AVM execution, ledger apply, validation, REST API, consensus participation). Phase 9/10 (go-algorand version-upgrade parity sweeps — most recently the `v4.6.0-stable` → `v4.7.0-stable` sweep plus a new libp2p P2P transport) is also complete. The reference pin is `v4.7.0-stable`. See `docs/PROJECT_SCOPE.md` for full scope, `docs/PHASE6_VALIDATION.md` for the Layer-9 consensus evidence map, and `docs/PHASE10_VALIDATION.md` for the version-upgrade/P2P-transport evidence map (which test/tool proves which criterion).
 
 ## Shell Environment
 
