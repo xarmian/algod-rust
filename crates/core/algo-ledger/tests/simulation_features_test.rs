@@ -736,3 +736,73 @@ fn no_unnamed_resources_reported_when_flag_off() {
     assert!(result.txn_groups[0].unnamed_resources_accessed.is_none());
     assert!(!result.eval_overrides.allow_unnamed_resources);
 }
+
+// ---------------------------------------------------------------------------
+// CheckTxnGroup screen (issue #628)
+//
+// go-algorand's `Simulator.check()` (ledger/simulation/simulator.go:179)
+// always calls `verify.TxnGroupWithTracer`, which always runs
+// `transactions.CheckTxnGroup` — independent of `AllowEmptySignatures`, which
+// only relaxes signature verification, not this structural screen. A
+// malformed group (unknown txn type, box index exceeding foreign apps, etc.)
+// must be rejected during simulate's check phase exactly like real block
+// validation, not silently accepted or left to fail later during AVM eval.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn simulate_rejects_unknown_txn_type() {
+    let sender = Address([0xAA; 32]);
+    let mut state = setup_state(sender);
+
+    let mut bogus = make_pay_txn(sender);
+    bogus.txn.txn_type = "bogus".into();
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![bogus]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+
+    let err = simulate(&mut state, request).expect_err("unknown txn type must be rejected");
+    match err {
+        SimulatorError::InvalidRequest(e) => {
+            assert!(
+                e.message.contains("unknown"),
+                "expected an unknown-type rejection, got: {}",
+                e.message
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+}
+
+#[test]
+fn simulate_rejects_box_index_exceeding_foreign_apps() {
+    let sender = Address([0xAA; 32]);
+    let mut state = setup_state(sender);
+    register_app(&mut state, sender, 100, vec![0x06, 0x81, 0x01, 0x43]);
+
+    let mut appl = make_appl_txn(sender, 100);
+    appl.txn.boxes = Some(vec![algo_types::BoxRef {
+        index: 1, // no foreign_apps present, so index 1 is out of range
+        name: None,
+    }]);
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![appl]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+
+    let err = simulate(&mut state, request).expect_err("out-of-range box index must be rejected");
+    match err {
+        SimulatorError::InvalidRequest(e) => {
+            assert!(
+                e.message.contains("box"),
+                "expected a box-index rejection, got: {}",
+                e.message
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+}
