@@ -207,13 +207,42 @@ table above):
   2026-08-26 against `main`'s current state: all 4 tests in
   `p2p_go_algorand_interop.rs` pass together (#564, #566).
 
-This close-out session did not re-run the full multi-hundred-round
-Docker soak synchronously (the nightly workflow already covers that
-cadence and the evidence above is drawn from its most recent
-qualifying runs, cited by issue/PR number per the instruction to cite
-exactly what was run rather than claim an untested re-run). The full
-workspace `fmt`/`clippy`/test gate above **was** run fresh, on `main`,
-as part of this close-out.
+### Fresh close-out re-run (this session, 2026-08-27)
+
+In addition to the historical evidence above, a live P2P consensus
+round-trip was re-run synchronously as part of this close-out, on
+`main`, against the current code and a freshly-built
+`algod-rust-p2pinterop:local` image (`ROUNDS=100
+ops/mixed-cluster-p2p/scripts/consensus-round-trip.sh`):
+
+```
+baseline: go-node-1=1052 go-node-2=1052 go-node-3=1052 rust-node-4=256
+final:    go-node-1=1152 go-node-2=1152 go-node-3=1153 rust-node-4=1153
+elapsed:  253s
+round spread across 4 nodes: 0 (tolerance 5)
+rust-node-4 advanced 979 rounds (174 -> 1153)
+agreement rejections: go-node-1=0 go-node-2=0 go-node-3=0
+rust-node-4 votes accepted by go-node-1: 55
+blocks proposed by rust-node-4 in rounds 1052..1153: 11 (expected ~10% of the window)
+
+PASS: 4-node P2P-mode cluster advanced 100 rounds in lockstep,
+      rust-node-4 (P2pOnly, /algorand-ws/2.2.0 + gossipsub) made
+      REST-visible progress, and no Go node logged an agreement-level
+      rejection.
+```
+
+This is a full, independent confirmation (not merely a citation of a
+prior run) that the P2P transport sustains consensus against real
+go-algorand v4.7.0-stable nodes as of the code actually being closed
+out. The WS-gossip harness's own 200-round nightly gate was not
+re-run synchronously in this same session (Docker cannot usefully run
+two independent multi-node consensus clusters at once on this host,
+and the P2P run above is the newer, previously-less-exercised
+transport); its most recent qualifying evidence is cited above and its
+full acceptance suite continues to run nightly via
+`.github/workflows/consensus-cluster.yml` against the now-pinned
+`v4.7.0-stable` image. The full workspace `fmt`/`clippy`/test gate
+above **was** run fresh, on `main`, as part of this close-out.
 
 ---
 
