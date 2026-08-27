@@ -35,8 +35,8 @@ use algo_error::AlgoError;
 use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{Address, Round, SignedTransaction};
 use algo_validate::{
-    is_free_heartbeat, validate_transaction_wellformed, verify_transaction_signature,
-    verify_transaction_signature_with_tracer, SpecialAddresses,
+    check_txn_group, is_free_heartbeat, validate_transaction_wellformed,
+    verify_transaction_signature, verify_transaction_signature_with_tracer, SpecialAddresses,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -736,6 +736,19 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 }
             }
         }
+
+        // Group-level structural screen (go-algorand: `Simulator.check()`
+        // calls `verify.TxnGroupWithTracer` unconditionally — `checks.go`'s
+        // `CheckTxnGroup` runs independent of `AllowEmptySignatures`, which
+        // only relaxes signature verification, not this screen). A group
+        // with an unknown txn type, an out-of-range box index, etc. must be
+        // rejected here, not silently accepted or left to fail later during
+        // AVM evaluation.
+        check_txn_group(&verify_group).map_err(|e| {
+            SimulatorError::InvalidRequest(InvalidRequestError {
+                message: e.to_string(),
+            })
+        })?;
 
         // Group-level fee validation (matches go-algorand's verify.TxnGroup,
         // txn.go): the submitted group is a single fee pool — total fees must

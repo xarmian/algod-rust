@@ -670,6 +670,63 @@ fn test_appl_create_and_optin() {
 }
 
 // ---------------------------------------------------------------------------
+// 11b. sync/replay applies an out-of-range box index without erroring
+// (issue #628)
+//
+// go-algorand's `Eval(ctx, l, blk, validate, ...)` only re-runs the
+// group-level `CheckTxnGroup` screen (which would reject an out-of-range box
+// index) when `validate=true` — the `Validate()` call path used for
+// agreement/relay block validation. `AddBlock` and the tracker/catchup-replay
+// path (`validate=false`, matching this repo's `apply_block` +
+// `ApplyContext::new_replay`) never re-verify it, per the doc comment at
+// go-algorand's `ledger/eval/eval.go:2096-2100`; Go's own
+// `resources.go:376-377` (`fillApplicationCallForeign`) silently skips an
+// out-of-range box index reached this way. This test pins that
+// already-correct algod-rust behavior: `apply_block` on a replay-mode
+// context must NOT error on a box ref that `check_txn_group` would have
+// rejected, since sync/replay never runs that screen (see the comment at
+// `avm_context.rs`'s `ensure_boxes_initialized`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sync_replay_apply_block_skips_out_of_range_box_index_without_error() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+    let app_id = 400u64;
+
+    // v8 program that calls box_len on an empty-name box ref, then approves.
+    // Exercises the box-ref resolution path (`ensure_boxes_initialized`)
+    // that walks every box ref in the group, including the bogus one below.
+    let box_touching_program = vec![0x08, 0x80, 0x00, 0xbd, 0x48, 0x48, 0x81, 0x01, 0x43];
+
+    let mut create = appl_create_txn(creator, 1_000, app_id, 0);
+    create.txn.approval_program = Some(serde_bytes::ByteBuf::from(box_touching_program));
+    create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]));
+
+    let create_block = minimal_block(fee_sink, 1, vec![create]);
+    apply_block(&mut state, &create_block).expect("app creation must apply cleanly");
+
+    // Call the app with a box ref whose index (1) exceeds `foreign_apps`
+    // (empty) — exactly the case `check_txn_group`'s
+    // `check_application_call_boxes` would reject. This block is applied
+    // directly via `apply_block`, bypassing `validate_block`/
+    // `check_txn_group`, matching how sync/replay/catchpoint-restore invoke
+    // it on an already-trusted chain.
+    let mut call = appl_optin_txn(creator, 1_000, app_id);
+    call.txn.on_completion = 0; // NoOp, not opt-in — no local state needed
+    call.txn.boxes = Some(vec![algo_types::BoxRef {
+        index: 1,
+        name: None,
+    }]);
+
+    let call_block = minimal_block(fee_sink, 2, vec![call]);
+    apply_block(&mut state, &call_block)
+        .expect("sync/replay must silently skip an out-of-range box index, matching go-algorand's own trust model, not error");
+}
+
+// ---------------------------------------------------------------------------
 // 12. App update increments AppParams::version (issue #602)
 //
 // go-algorand starts `AppParams.Version` at 0 on create and increments it
