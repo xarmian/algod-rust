@@ -396,7 +396,7 @@ The `v4.6.0-stable → v4.7.0-stable` sweep additionally closes algod-rust's pre
 
 The `v4.7.0-stable → v4.7.2-stable` sweep is a small, security/bounds-check-focused patch release with no consensus version bump: a new group-level pre-signature-verification transaction screen, codec-level required-field decode enforcement, a defense-in-depth state-proof TreeDepth guard, and a msgpack decode nesting-depth cap. Complete — see `docs/PHASE11_VALIDATION.md` for the evidence map.
 
-The `v4.7.2-stable → v4.7.3-stable` sweep is a small, security/robustness-focused patch release with no consensus version bump: a tightened anti-zip-bomb gossip decompression bound, and a Go-specific panic-recovery hardening pass whose Rust-equivalent parity work is an audit-and-fix pass over algod-rust's own block-evaluation pipeline. See `docs/PHASE12_PROPOSAL.md`.
+The `v4.7.2-stable → v4.7.3-stable` sweep is a small, security/robustness-focused patch release with no consensus version bump: a tightened anti-zip-bomb gossip decompression bound, and a Go-specific panic-recovery hardening pass whose Rust-equivalent parity work is an audit-and-fix pass over algod-rust's own block-evaluation pipeline. Complete — see `docs/PHASE12_VALIDATION.md` for the evidence map.
 
 ---
 
