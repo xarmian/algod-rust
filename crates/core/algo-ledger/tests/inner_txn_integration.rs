@@ -116,7 +116,7 @@ fn seed_app_with_programs(
             ..Default::default()
         },
     );
-    let acct = store.get_or_default_account(&creator);
+    let acct = store.get_or_default_account_mut(&creator);
     acct.total_created_apps += 1;
 }
 
@@ -133,7 +133,7 @@ fn seed_app_approve(store: &mut LedgerState, app_id: u64, creator: Address) {
 
 /// Fund an account with the given microAlgos balance.
 fn fund_account(store: &mut LedgerState, addr: Address, micro_algos: u64) {
-    let acct = store.get_or_default_account(&addr);
+    let acct = store.get_or_default_account_mut(&addr);
     acct.micro_algos = micro_algos;
 }
 
@@ -1200,7 +1200,7 @@ fn sender_auth_rekeyed_account_succeeds() {
     fund_account(&mut store, app_addr, 10_000_000);
 
     // Create the rekeyed account with auth_addr = app address
-    let rekeyed_acct = store.get_or_default_account(&Address(rekeyed_account));
+    let rekeyed_acct = store.get_or_default_account_mut(&Address(rekeyed_account));
     rekeyed_acct.micro_algos = 5_000_000;
     rekeyed_acct.auth_addr = Some(app_addr);
 
@@ -1243,7 +1243,7 @@ fn sender_auth_unauthorized_fails() {
     fund_account(&mut store, app_addr, 10_000_000);
 
     // Create unauthorized account (no rekey to app)
-    let unauth_acct = store.get_or_default_account(&Address(unauthorized));
+    let unauth_acct = store.get_or_default_account_mut(&Address(unauthorized));
     unauth_acct.micro_algos = 5_000_000;
     // auth_addr is None (defaults to self, not app address)
 
