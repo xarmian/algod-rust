@@ -1109,39 +1109,32 @@ impl MultisigSig {
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
         let len = rmp_decode::read_map_len(rd)?;
         let mut s = Self::default();
-        let mut has_version = false;
-        let mut has_threshold = false;
-        let mut has_subsig = false;
         for _ in 0..len {
             match rmp_decode::read_key_bytes(rd)? {
-                b"v" => {
-                    s.version = rmp_decode::read_u8_val(rd)?;
-                    has_version = true;
-                }
-                b"thr" => {
-                    s.threshold = rmp_decode::read_u8_val(rd)?;
-                    has_threshold = true;
-                }
+                b"v" => s.version = rmp_decode::read_u8_val(rd)?,
+                b"thr" => s.threshold = rmp_decode::read_u8_val(rd)?,
                 b"subsig" => {
-                    s.subsigs = rmp_decode::read_vec(rd, MultisigSubsig::decode_from_reader)?;
-                    has_subsig = true;
+                    s.subsigs = rmp_decode::read_vec(rd, MultisigSubsig::decode_from_reader)?
                 }
                 _ => rmp_decode::skip_value(rd)?,
             }
         }
-        if !has_version {
+        // go-algorand v4.7.2-stable marks Version/Threshold/Subsigs `codec:",required"`:
+        // the generated decoder rejects the field's zero value regardless of key presence
+        // on the wire, so check the decoded value rather than an on-key-seen flag.
+        if s.version == 0 {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'v'".into(),
                 context: "rmp_decode".into(),
             });
         }
-        if !has_threshold {
+        if s.threshold == 0 {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'thr'".into(),
                 context: "rmp_decode".into(),
             });
         }
-        if !has_subsig {
+        if s.subsigs.is_empty() {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'subsig'".into(),
                 context: "rmp_decode".into(),
@@ -1386,6 +1379,18 @@ impl Participant {
                 _ => rmp_decode::skip_value(rd)?,
             }
         }
+        // go-algorand v4.7.2-stable marks `basics.Participant.PK` `codec:",required"`: the
+        // generated decoder rejects `PK.MsgIsZero()` regardless of key presence on the wire,
+        // so also reject an explicit-but-all-zero verifier, not just an absent "p" key.
+        if s.pk
+            .as_ref()
+            .map_or(true, |pk| *pk == MerkleSignatureVerifier::default())
+        {
+            return Err(algo_error::AlgoError::Codec {
+                source: "missing required field 'p'".into(),
+                context: "rmp_decode".into(),
+            });
+        }
         Ok(s)
     }
 
@@ -1407,6 +1412,15 @@ impl Reveal {
                 b"p" => s.part = rmp_decode::read_optional(rd, Participant::decode_from_reader)?,
                 _ => rmp_decode::skip_value(rd)?,
             }
+        }
+        // go-algorand v4.7.2-stable marks `stateproof.Reveal.Part` `codec:",required"`. The
+        // "PK present but zero" sub-case is already caught above by Participant's own
+        // required-PK check, propagated through the `?` on the `read_optional` call.
+        if s.part.is_none() {
+            return Err(algo_error::AlgoError::Codec {
+                source: "missing required field 'p'".into(),
+                context: "rmp_decode".into(),
+            });
         }
         Ok(s)
     }
@@ -1608,8 +1622,6 @@ impl Transaction {
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
         let len = rmp_decode::read_map_len(rd)?;
         let mut t = Self::default();
-        let mut has_type = false;
-        let mut has_snd = false;
         for _ in 0..len {
             let key = rmp_decode::read_key_bytes(rd)?;
             match (key.len(), key.first().copied().unwrap_or(0)) {
@@ -1637,10 +1649,7 @@ impl Transaction {
                 (3, b'g') if key == b"gen" => t.genesis_id = rmp_decode::read_string(rd)?,
                 (3, b'g') if key == b"grp" => t.group = rmp_decode::read_fixed_bytes::<32>(rd)?,
                 (3, b'r') if key == b"rcv" => t.receiver = rmp_decode::read_address(rd)?,
-                (3, b's') if key == b"snd" => {
-                    t.sender = rmp_decode::read_address(rd)?;
-                    has_snd = true;
-                }
+                (3, b's') if key == b"snd" => t.sender = rmp_decode::read_address(rd)?,
                 // ── 4-byte keys ──────────────────────────────────
                 (4, b'a') => match key {
                     b"aamt" => t.asset_amount = rmp_decode::read_u64(rd)?,
@@ -1699,8 +1708,7 @@ impl Transaction {
                 (4, b'f') if key == b"faid" => t.freeze_asset = rmp_decode::read_u64(rd)?,
                 (4, b'n') if key == b"note" => t.note = rmp_decode::read_bytes_as_bytebuf(rd)?,
                 (4, b't') if key == b"type" => {
-                    t.txn_type = TxnType::from(rmp_decode::read_string(rd)?);
-                    has_type = true;
+                    t.txn_type = TxnType::from(rmp_decode::read_string(rd)?)
                 }
                 (4, b'x') if key == b"xaid" => t.xaid = rmp_decode::read_u64(rd)?,
                 // ── 5-byte keys ──────────────────────────────────
@@ -1743,14 +1751,18 @@ impl Transaction {
                 _ => rmp_decode::skip_value(rd)?,
             }
         }
-        // The serde path requires `type` and `snd` (no #[serde(default)]), so validate here.
-        if !has_type {
+        // go-algorand v4.7.2-stable marks `type`/`snd` `codec:",required"`: the generated
+        // decoder rejects the field's zero value regardless of whether the key was present
+        // on the wire (`Type.MsgIsZero()` / `Sender.MsgIsZero()`), not merely its absence.
+        // A value check (rather than an on-key-seen presence flag) catches an explicit
+        // zero-valued "type"/"snd" too, not just an omitted key.
+        if t.txn_type.is_empty() {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'type'".into(),
                 context: "rmp_decode".into(),
             });
         }
-        if !has_snd {
+        if t.sender.is_zero() {
             return Err(algo_error::AlgoError::Codec {
                 source: "missing required field 'snd'".into(),
                 context: "rmp_decode".into(),
@@ -1830,5 +1842,242 @@ impl SignedTransaction {
     pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
         let mut rd = data;
         Self::decode_from_reader(&mut rd)
+    }
+}
+
+// ── go-algorand v4.7.2-stable required-field decode-rejection tests ────
+//
+// go-algorand's `codec:",required"` struct tags reject a decode when the
+// field's *decoded value* is zero, regardless of whether the msgpack key
+// was present on the wire (the generated code checks `Field.MsgIsZero()`
+// unconditionally after the decode loop). These tests build minimal
+// hand-rolled msgpack maps — both with the required key omitted and with
+// it explicitly present-but-zero-valued — covering both of the two ways
+// go-algorand's real decoder rejects a malformed encoding.
+#[cfg(test)]
+mod required_field_decode_tests {
+    use super::*;
+
+    fn write_map_len(buf: &mut Vec<u8>, len: u32) {
+        rmp::encode::write_map_len(buf, len).unwrap();
+    }
+
+    fn write_str_kv(buf: &mut Vec<u8>, key: &str, val: &str) {
+        rmp::encode::write_str(buf, key).unwrap();
+        rmp::encode::write_str(buf, val).unwrap();
+    }
+
+    fn write_bin_kv(buf: &mut Vec<u8>, key: &str, val: &[u8]) {
+        rmp::encode::write_str(buf, key).unwrap();
+        rmp::encode::write_bin(buf, val).unwrap();
+    }
+
+    fn write_uint_kv(buf: &mut Vec<u8>, key: &str, val: u64) {
+        rmp::encode::write_str(buf, key).unwrap();
+        rmp::encode::write_uint(buf, val).unwrap();
+    }
+
+    /// `AlgoError::Codec`'s `Display` only renders `context` ("rmp_decode");
+    /// the descriptive "missing required field '...'" text lives in `source`.
+    fn err_message(err: &algo_error::AlgoError) -> String {
+        std::error::Error::source(err)
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
+
+    // ── Transaction.Type / Header.Sender (Transaction::decode_from_reader) ──
+
+    #[test]
+    fn transaction_type_omitted_is_rejected() {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 1);
+        write_bin_kv(&mut buf, "snd", &[7u8; 32]);
+        let mut rd: &[u8] = &buf;
+        let err = Transaction::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("type"), "got: {err}");
+    }
+
+    #[test]
+    fn transaction_type_explicit_empty_string_is_rejected() {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 2);
+        write_str_kv(&mut buf, "type", "");
+        write_bin_kv(&mut buf, "snd", &[7u8; 32]);
+        let mut rd: &[u8] = &buf;
+        let err = Transaction::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("type"), "got: {err}");
+    }
+
+    #[test]
+    fn transaction_sender_omitted_is_rejected() {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 1);
+        write_str_kv(&mut buf, "type", "pay");
+        let mut rd: &[u8] = &buf;
+        let err = Transaction::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("snd"), "got: {err}");
+    }
+
+    #[test]
+    fn transaction_sender_explicit_zero_is_rejected() {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 2);
+        write_str_kv(&mut buf, "type", "pay");
+        write_bin_kv(&mut buf, "snd", &[0u8; 32]);
+        let mut rd: &[u8] = &buf;
+        let err = Transaction::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("snd"), "got: {err}");
+    }
+
+    #[test]
+    fn transaction_with_type_and_sender_present_decodes_successfully() {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 2);
+        write_str_kv(&mut buf, "type", "pay");
+        write_bin_kv(&mut buf, "snd", &[7u8; 32]);
+        let mut rd: &[u8] = &buf;
+        let t = Transaction::decode_from_reader(&mut rd).unwrap();
+        assert_eq!(t.txn_type, TxnType::Pay);
+        assert_eq!(t.sender, Address([7u8; 32]));
+    }
+
+    // ── MultisigSig.{Version,Threshold,Subsigs} (MultisigSig::decode_from_reader) ──
+
+    fn encode_multisig(version: Option<u8>, threshold: Option<u8>, with_subsig: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let n = version.is_some() as u32 + threshold.is_some() as u32 + with_subsig as u32;
+        write_map_len(&mut buf, n);
+        if let Some(v) = version {
+            write_uint_kv(&mut buf, "v", v as u64);
+        }
+        if let Some(t) = threshold {
+            write_uint_kv(&mut buf, "thr", t as u64);
+        }
+        if with_subsig {
+            rmp::encode::write_str(&mut buf, "subsig").unwrap();
+            rmp::encode::write_array_len(&mut buf, 1).unwrap();
+            // One MultisigSubsig: {"pk": <32 bytes>}.
+            write_map_len(&mut buf, 1);
+            write_bin_kv(&mut buf, "pk", &[9u8; 32]);
+        }
+        buf
+    }
+
+    #[test]
+    fn multisig_version_omitted_is_rejected() {
+        let buf = encode_multisig(None, Some(1), true);
+        let mut rd: &[u8] = &buf;
+        let err = MultisigSig::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("'v'"), "got: {err}");
+    }
+
+    #[test]
+    fn multisig_version_explicit_zero_is_rejected() {
+        let buf = encode_multisig(Some(0), Some(1), true);
+        let mut rd: &[u8] = &buf;
+        let err = MultisigSig::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("'v'"), "got: {err}");
+    }
+
+    #[test]
+    fn multisig_threshold_omitted_is_rejected() {
+        let buf = encode_multisig(Some(1), None, true);
+        let mut rd: &[u8] = &buf;
+        let err = MultisigSig::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("'thr'"), "got: {err}");
+    }
+
+    #[test]
+    fn multisig_subsig_omitted_is_rejected() {
+        let buf = encode_multisig(Some(1), Some(1), false);
+        let mut rd: &[u8] = &buf;
+        let err = MultisigSig::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("'subsig'"), "got: {err}");
+    }
+
+    #[test]
+    fn multisig_with_all_required_fields_decodes_successfully() {
+        let buf = encode_multisig(Some(1), Some(1), true);
+        let mut rd: &[u8] = &buf;
+        let s = MultisigSig::decode_from_reader(&mut rd).unwrap();
+        assert_eq!(s.version, 1);
+        assert_eq!(s.threshold, 1);
+        assert_eq!(s.subsigs.len(), 1);
+    }
+
+    // ── stateproof.Reveal.Part / basics.Participant.PK ──
+
+    fn encode_verifier() -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 1);
+        write_bin_kv(&mut buf, "cmt", &[3u8; 64]);
+        buf
+    }
+
+    #[test]
+    fn participant_pk_omitted_is_rejected() {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 1);
+        write_uint_kv(&mut buf, "w", 5);
+        let mut rd: &[u8] = &buf;
+        let err = Participant::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("'p'"), "got: {err}");
+    }
+
+    #[test]
+    fn participant_pk_explicit_zero_verifier_is_rejected() {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 1);
+        rmp::encode::write_str(&mut buf, "p").unwrap();
+        write_map_len(&mut buf, 0); // empty verifier map -> all-zero Verifier
+        let mut rd: &[u8] = &buf;
+        let err = Participant::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("'p'"), "got: {err}");
+    }
+
+    #[test]
+    fn participant_with_pk_decodes_successfully() {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 1);
+        rmp::encode::write_str(&mut buf, "p").unwrap();
+        buf.extend(encode_verifier());
+        let mut rd: &[u8] = &buf;
+        let p = Participant::decode_from_reader(&mut rd).unwrap();
+        assert!(p.pk.is_some());
+    }
+
+    #[test]
+    fn reveal_part_omitted_is_rejected() {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 0);
+        let mut rd: &[u8] = &buf;
+        let err = Reveal::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("'p'"), "got: {err}");
+    }
+
+    #[test]
+    fn reveal_part_with_zero_pk_is_rejected() {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 1);
+        rmp::encode::write_str(&mut buf, "p").unwrap();
+        // Participant map with pk omitted -> Participant::decode_from_reader itself errors.
+        write_map_len(&mut buf, 1);
+        write_uint_kv(&mut buf, "w", 1);
+        let mut rd: &[u8] = &buf;
+        let err = Reveal::decode_from_reader(&mut rd).unwrap_err();
+        assert!(err_message(&err).contains("'p'"), "got: {err}");
+    }
+
+    #[test]
+    fn reveal_with_part_decodes_successfully() {
+        let mut buf = Vec::new();
+        write_map_len(&mut buf, 1);
+        rmp::encode::write_str(&mut buf, "p").unwrap();
+        write_map_len(&mut buf, 1);
+        rmp::encode::write_str(&mut buf, "p").unwrap();
+        buf.extend(encode_verifier());
+        let mut rd: &[u8] = &buf;
+        let r = Reveal::decode_from_reader(&mut rd).unwrap();
+        assert!(r.part.is_some());
     }
 }
