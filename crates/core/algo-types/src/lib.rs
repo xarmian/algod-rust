@@ -24,6 +24,7 @@ pub use consensus::{
 pub use digest::Digest;
 pub use header::BlockHeader;
 pub use networks::{resolve_genesis_hash, Network, ResolveGenesisError, UnknownNetwork};
+pub use rmp_decode::check_msgpack_depth;
 pub use round::Round;
 pub use transaction::{
     AssetParams, BoxRef, FalconVerifier, HashFactory, HeartbeatProof, HeartbeatTxnFields,

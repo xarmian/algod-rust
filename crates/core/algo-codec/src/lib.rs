@@ -23,12 +23,15 @@ pub use digest::{
 };
 
 use algo_error::{AlgoError, Result};
-use algo_types::{Block, BlockResponse, LogicSig, MultisigSig, SignedTransaction};
+use algo_types::{
+    check_msgpack_depth, Block, BlockResponse, LogicSig, MultisigSig, SignedTransaction,
+};
 
 /// Decode a single msgpack-encoded `LogicSig`, as produced by `goal clerk
 /// compile -s` (a `protocol.Encode(&LogicSig)` blob). Mirrors `lsigFromArgs`'s
 /// `protocol.Decode(lsigBytes, lsig)` (`cmd/goal/clerk.go:753`).
 pub fn decode_logicsig(bytes: &[u8]) -> Result<LogicSig> {
+    check_msgpack_depth(bytes)?;
     rmp_serde::from_slice(bytes).map_err(|e| AlgoError::Codec {
         source: Box::new(e),
         context: "failed to decode LogicSig from msgpack".into(),
@@ -39,6 +42,7 @@ pub fn decode_logicsig(bytes: &[u8]) -> Result<LogicSig> {
 /// `multisig/sign` and `multisig/signprogram` endpoints (a `protocol.Encode`d
 /// `crypto.MultisigSig` blob). Mirrors `protocol.Decode(blob, &msig)`.
 pub fn decode_multisig(bytes: &[u8]) -> Result<MultisigSig> {
+    check_msgpack_depth(bytes)?;
     rmp_serde::from_slice(bytes).map_err(|e| AlgoError::Codec {
         source: Box::new(e),
         context: "failed to decode MultisigSig from msgpack".into(),
@@ -56,6 +60,7 @@ pub fn decode_multisig(bytes: &[u8]) -> Result<MultisigSig> {
 pub fn decode_signed_txn_stream(mut bytes: &[u8]) -> Result<Vec<SignedTransaction>> {
     let mut out = Vec::new();
     while !bytes.is_empty() {
+        check_msgpack_depth(bytes)?;
         let mut cursor = std::io::Cursor::new(bytes);
         let mut de = rmp_serde::Deserializer::new(&mut cursor);
         let stxn: SignedTransaction =
@@ -73,6 +78,7 @@ pub fn decode_signed_txn_stream(mut bytes: &[u8]) -> Result<Vec<SignedTransactio
 
 /// Decode a block response from msgpack bytes (as returned by the REST API).
 pub fn decode_block_response(bytes: &[u8]) -> Result<BlockResponse> {
+    check_msgpack_depth(bytes)?;
     rmp_serde::from_slice(bytes).map_err(|e| AlgoError::Codec {
         source: Box::new(e),
         context: "failed to decode block response from msgpack".into(),
@@ -81,6 +87,7 @@ pub fn decode_block_response(bytes: &[u8]) -> Result<BlockResponse> {
 
 /// Decode a raw block from msgpack bytes.
 pub fn decode_block(bytes: &[u8]) -> Result<Block> {
+    check_msgpack_depth(bytes)?;
     rmp_serde::from_slice(bytes).map_err(|e| AlgoError::Codec {
         source: Box::new(e),
         context: "failed to decode block from msgpack".into(),
@@ -117,6 +124,7 @@ pub fn encode_block(block: &Block) -> Result<Vec<u8>> {
 
 /// Decode msgpack bytes into a generic Value for debugging and comparison.
 pub fn decode_raw(bytes: &[u8]) -> Result<rmpv::Value> {
+    check_msgpack_depth(bytes)?;
     rmpv::decode::read_value(&mut &bytes[..]).map_err(|e| AlgoError::Codec {
         source: Box::new(e),
         context: "failed to decode msgpack value".into(),
@@ -134,6 +142,8 @@ pub fn decode_raw(bytes: &[u8]) -> Result<rmpv::Value> {
 /// Returns an empty Vec if the block has no `txns` field.
 pub fn extract_raw_payset_blobs(response_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     use std::io::Cursor;
+
+    check_msgpack_depth(response_bytes)?;
 
     let mut cursor = Cursor::new(response_bytes);
 
@@ -191,6 +201,7 @@ pub fn extract_raw_payset_blobs(response_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
 ///
 /// Returns an empty Vec if the block has no `txns` field.
 pub fn extract_raw_payset_blobs_from_block(block_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    check_msgpack_depth(block_bytes)?;
     extract_txns_from_block_map(block_bytes, block_bytes)
 }
 
@@ -377,5 +388,69 @@ mod tests {
     fn extract_from_block_invalid_bytes() {
         let result = extract_raw_payset_blobs_from_block(b"not-valid-msgpack");
         assert!(result.is_err());
+    }
+
+    // ── go-algorand v4.7.2-stable msgpack decode nesting depth cap ─────
+    //
+    // `algo_types::check_msgpack_depth` is unit-tested directly in
+    // algo-types; these tests confirm it's actually wired into every
+    // decode entry point here, using the same 255-level bound.
+
+    /// 255 nested fixarray(1) wrappers around a scalar: nests to exactly
+    /// the allowed depth (256, counting the leaf) so this must decode as
+    /// "structurally too deep" once wrapped in a real payload — used as a
+    /// generic "too deep" input across every entry point below.
+    fn too_deep_payload() -> Vec<u8> {
+        let mut buf = vec![0x91u8; 300];
+        buf.push(0x00);
+        buf
+    }
+
+    #[test]
+    fn decode_logicsig_rejects_too_deep_payload() {
+        assert!(decode_logicsig(&too_deep_payload()).is_err());
+    }
+
+    #[test]
+    fn decode_multisig_rejects_too_deep_payload() {
+        assert!(decode_multisig(&too_deep_payload()).is_err());
+    }
+
+    #[test]
+    fn decode_signed_txn_stream_rejects_too_deep_payload() {
+        assert!(decode_signed_txn_stream(&too_deep_payload()).is_err());
+    }
+
+    #[test]
+    fn decode_block_response_rejects_too_deep_payload() {
+        assert!(decode_block_response(&too_deep_payload()).is_err());
+    }
+
+    #[test]
+    fn decode_block_rejects_too_deep_payload() {
+        assert!(decode_block(&too_deep_payload()).is_err());
+    }
+
+    #[test]
+    fn decode_raw_rejects_too_deep_payload() {
+        assert!(decode_raw(&too_deep_payload()).is_err());
+    }
+
+    #[test]
+    fn extract_raw_payset_blobs_from_block_rejects_too_deep_payload() {
+        assert!(extract_raw_payset_blobs_from_block(&too_deep_payload()).is_err());
+    }
+
+    #[test]
+    fn extract_raw_payset_blobs_rejects_too_deep_payload() {
+        assert!(extract_raw_payset_blobs(&too_deep_payload()).is_err());
+    }
+
+    #[test]
+    fn decode_block_response_still_accepts_a_normal_fixture() {
+        // Guard against over-rejection: real fixtures nest nowhere near
+        // 255 levels deep and must keep decoding successfully.
+        let bytes = include_bytes!("../tests/fixtures/block_1.msgpack");
+        assert!(decode_block_response(bytes).is_ok());
     }
 }

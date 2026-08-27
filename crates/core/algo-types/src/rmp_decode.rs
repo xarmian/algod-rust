@@ -73,127 +73,168 @@ pub fn read_key_bytes<'a>(rd: &mut &'a [u8]) -> Result<&'a [u8]> {
 
 // ── Skip value ─────────────────────────────────────────────────
 
-/// Skip any msgpack value (handles all types recursively).
+/// Matches go-algorand v4.7.2-stable's `msgp.DefaultUnmarshalState.AllowableDepth`
+/// (`protocol/codec.go`), an anti-DoS bound on decode nesting depth.
+pub(crate) const MAX_MSGPACK_DECODE_DEPTH: usize = 255;
+
+/// Reject `bytes` if its (first) msgpack value nests containers deeper
+/// than [`MAX_MSGPACK_DECODE_DEPTH`] levels, without otherwise decoding
+/// or validating it.
 ///
-/// Uses direct byte dispatch to avoid Marker enum construction overhead.
+/// Exposed for decoders that don't go through this module's own
+/// `decode_from_reader` family — namely `algo-codec`'s `rmp_serde`/`rmpv`
+/// entry points, whose decoders have no depth cap of their own. Run this
+/// as a pre-scan before handing the bytes to them.
+pub fn check_msgpack_depth(bytes: &[u8]) -> Result<()> {
+    let mut rd = bytes;
+    skip_value(&mut rd)
+}
+
+/// Skip any msgpack value (handles all types, including arbitrarily
+/// nested containers).
+///
+/// Iterative, not recursive: `remaining` holds, for each currently open
+/// container, how many more values inside it still need skipping, so
+/// nesting depth is `remaining.len()`. This is deliberate — a naive
+/// recursive skip lets a maliciously deep/nested payload (this function
+/// is reached for every *unrecognized* field a decoder skips, so an
+/// attacker controls its shape freely) overflow the Rust call stack,
+/// which aborts the process rather than returning an error. Bounding
+/// `remaining.len()` at [`MAX_MSGPACK_DECODE_DEPTH`] mirrors go-algorand's
+/// own bound and rejects the same maliciously deep payloads with a
+/// catchable error instead.
 #[inline]
 pub fn skip_value(rd: &mut &[u8]) -> Result<()> {
-    if rd.is_empty() {
-        return Err(codec_err("skip_value: unexpected EOF"));
+    let mut remaining: Vec<u32> = vec![1];
+    while let Some(count) = remaining.last_mut() {
+        if *count == 0 {
+            remaining.pop();
+            continue;
+        }
+        *count -= 1;
+        if remaining.len() > MAX_MSGPACK_DECODE_DEPTH {
+            return Err(codec_err(format!(
+                "skip_value: nesting depth exceeds {MAX_MSGPACK_DECODE_DEPTH}"
+            )));
+        }
+        if rd.is_empty() {
+            return Err(codec_err("skip_value: unexpected EOF"));
+        }
+        let b = rd[0];
+        *rd = &rd[1..];
+        match b {
+            // positive fixint (0x00..=0x7f) — no data bytes
+            0x00..=0x7f => {}
+            // fixmap (0x80..=0x8f) — len 0..15 key-value pairs
+            0x80..=0x8f => remaining.push(((b & 0x0f) as u32) * 2),
+            // fixarray (0x90..=0x9f) — len 0..15 elements
+            0x90..=0x9f => remaining.push((b & 0x0f) as u32),
+            // fixstr (0xa0..=0xbf) — len 0..31
+            0xa0..=0xbf => skip_bytes(rd, (b & 0x1f) as usize)?,
+            // nil, false, true
+            0xc0 | 0xc2 | 0xc3 => {}
+            // reserved
+            0xc1 => return Err(codec_err("skip_value: reserved marker 0xc1")),
+            // bin8
+            0xc4 => {
+                let len = read_data_u8(rd)? as usize;
+                skip_bytes(rd, len)?;
+            }
+            // bin16
+            0xc5 => {
+                let len = read_data_u16(rd)? as usize;
+                skip_bytes(rd, len)?;
+            }
+            // bin32
+            0xc6 => {
+                let len = read_data_u32_raw(rd)? as usize;
+                skip_bytes(rd, len)?;
+            }
+            // ext8
+            0xc7 => {
+                let len = read_data_u8(rd)? as usize;
+                skip_bytes(rd, 1 + len)?;
+            }
+            // ext16
+            0xc8 => {
+                let len = read_data_u16(rd)? as usize;
+                skip_bytes(rd, 1 + len)?;
+            }
+            // ext32
+            0xc9 => {
+                let len = read_data_u32_raw(rd)? as usize;
+                skip_bytes(rd, 1 + len)?;
+            }
+            // f32
+            0xca => skip_bytes(rd, 4)?,
+            // f64
+            0xcb => skip_bytes(rd, 8)?,
+            // u8
+            0xcc => skip_bytes(rd, 1)?,
+            // u16
+            0xcd => skip_bytes(rd, 2)?,
+            // u32
+            0xce => skip_bytes(rd, 4)?,
+            // u64
+            0xcf => skip_bytes(rd, 8)?,
+            // i8
+            0xd0 => skip_bytes(rd, 1)?,
+            // i16
+            0xd1 => skip_bytes(rd, 2)?,
+            // i32
+            0xd2 => skip_bytes(rd, 4)?,
+            // i64
+            0xd3 => skip_bytes(rd, 8)?,
+            // fixext1
+            0xd4 => skip_bytes(rd, 2)?,
+            // fixext2
+            0xd5 => skip_bytes(rd, 3)?,
+            // fixext4
+            0xd6 => skip_bytes(rd, 5)?,
+            // fixext8
+            0xd7 => skip_bytes(rd, 9)?,
+            // fixext16
+            0xd8 => skip_bytes(rd, 17)?,
+            // str8
+            0xd9 => {
+                let len = read_data_u8(rd)? as usize;
+                skip_bytes(rd, len)?;
+            }
+            // str16
+            0xda => {
+                let len = read_data_u16(rd)? as usize;
+                skip_bytes(rd, len)?;
+            }
+            // str32
+            0xdb => {
+                let len = read_data_u32_raw(rd)? as usize;
+                skip_bytes(rd, len)?;
+            }
+            // array16
+            0xdc => {
+                let len = read_data_u16(rd)? as u32;
+                remaining.push(len);
+            }
+            // array32
+            0xdd => {
+                let len = read_data_u32_raw(rd)?;
+                remaining.push(len);
+            }
+            // map16
+            0xde => {
+                let len = read_data_u16(rd)? as u32;
+                remaining.push(len * 2);
+            }
+            // map32
+            0xdf => {
+                let len = read_data_u32_raw(rd)?;
+                remaining.push(len * 2);
+            }
+            // negative fixint (0xe0..=0xff) — no data bytes
+            0xe0..=0xff => {}
+        }
     }
-    let b = rd[0];
-    *rd = &rd[1..];
-    match b {
-        // positive fixint (0x00..=0x7f) — no data bytes
-        0x00..=0x7f => Ok(()),
-        // fixmap (0x80..=0x8f) — len 0..15 key-value pairs
-        0x80..=0x8f => skip_n_values(rd, ((b & 0x0f) as u32) * 2),
-        // fixarray (0x90..=0x9f) — len 0..15 elements
-        0x90..=0x9f => skip_n_values(rd, (b & 0x0f) as u32),
-        // fixstr (0xa0..=0xbf) — len 0..31
-        0xa0..=0xbf => skip_bytes(rd, (b & 0x1f) as usize),
-        // nil, false, true
-        0xc0 | 0xc2 | 0xc3 => Ok(()),
-        // reserved
-        0xc1 => Err(codec_err("skip_value: reserved marker 0xc1")),
-        // bin8
-        0xc4 => {
-            let len = read_data_u8(rd)? as usize;
-            skip_bytes(rd, len)
-        }
-        // bin16
-        0xc5 => {
-            let len = read_data_u16(rd)? as usize;
-            skip_bytes(rd, len)
-        }
-        // bin32
-        0xc6 => {
-            let len = read_data_u32_raw(rd)? as usize;
-            skip_bytes(rd, len)
-        }
-        // ext8
-        0xc7 => {
-            let len = read_data_u8(rd)? as usize;
-            skip_bytes(rd, 1 + len)
-        }
-        // ext16
-        0xc8 => {
-            let len = read_data_u16(rd)? as usize;
-            skip_bytes(rd, 1 + len)
-        }
-        // ext32
-        0xc9 => {
-            let len = read_data_u32_raw(rd)? as usize;
-            skip_bytes(rd, 1 + len)
-        }
-        // f32
-        0xca => skip_bytes(rd, 4),
-        // f64
-        0xcb => skip_bytes(rd, 8),
-        // u8
-        0xcc => skip_bytes(rd, 1),
-        // u16
-        0xcd => skip_bytes(rd, 2),
-        // u32
-        0xce => skip_bytes(rd, 4),
-        // u64
-        0xcf => skip_bytes(rd, 8),
-        // i8
-        0xd0 => skip_bytes(rd, 1),
-        // i16
-        0xd1 => skip_bytes(rd, 2),
-        // i32
-        0xd2 => skip_bytes(rd, 4),
-        // i64
-        0xd3 => skip_bytes(rd, 8),
-        // fixext1
-        0xd4 => skip_bytes(rd, 2),
-        // fixext2
-        0xd5 => skip_bytes(rd, 3),
-        // fixext4
-        0xd6 => skip_bytes(rd, 5),
-        // fixext8
-        0xd7 => skip_bytes(rd, 9),
-        // fixext16
-        0xd8 => skip_bytes(rd, 17),
-        // str8
-        0xd9 => {
-            let len = read_data_u8(rd)? as usize;
-            skip_bytes(rd, len)
-        }
-        // str16
-        0xda => {
-            let len = read_data_u16(rd)? as usize;
-            skip_bytes(rd, len)
-        }
-        // str32
-        0xdb => {
-            let len = read_data_u32_raw(rd)? as usize;
-            skip_bytes(rd, len)
-        }
-        // array16
-        0xdc => {
-            let len = read_data_u16(rd)? as u32;
-            skip_n_values(rd, len)
-        }
-        // array32
-        0xdd => {
-            let len = read_data_u32_raw(rd)?;
-            skip_n_values(rd, len)
-        }
-        // map16
-        0xde => {
-            let len = read_data_u16(rd)? as u32;
-            skip_n_values(rd, len * 2)
-        }
-        // map32
-        0xdf => {
-            let len = read_data_u32_raw(rd)?;
-            skip_n_values(rd, len * 2)
-        }
-        // negative fixint (0xe0..=0xff) — no data bytes
-        0xe0..=0xff => Ok(()),
-    }
+    Ok(())
 }
 
 /// Skip exactly `n` bytes from the reader.
@@ -206,15 +247,6 @@ fn skip_bytes(rd: &mut &[u8], n: usize) -> Result<()> {
         )));
     }
     *rd = &rd[n..];
-    Ok(())
-}
-
-/// Skip `n` msgpack values from the reader.
-#[inline]
-fn skip_n_values(rd: &mut &[u8], n: u32) -> Result<()> {
-    for _ in 0..n {
-        skip_value(rd)?;
-    }
     Ok(())
 }
 
@@ -887,5 +919,84 @@ mod tests {
         let mut rd = &data[..];
         let result: Option<Vec<u64>> = read_optional_vec(&mut rd, read_u64).unwrap();
         assert_eq!(result, Some(vec![1, 2]));
+    }
+
+    // ── go-algorand v4.7.2-stable msgpack decode nesting depth cap ─────
+    //
+    // Builds `wrappers` nested fixarray(1) markers (0x91) around a single
+    // scalar leaf (fixint 0). The leaf value sits at nesting depth
+    // `wrappers + 1`, so `wrappers = MAX_MSGPACK_DECODE_DEPTH - 1` is the
+    // deepest payload that still stays within the 255-level bound, and
+    // `wrappers = MAX_MSGPACK_DECODE_DEPTH` is the shallowest one that
+    // exceeds it.
+    fn nested_fixarray_payload(wrappers: usize) -> Vec<u8> {
+        let mut buf = vec![0x91u8; wrappers];
+        buf.push(0x00); // fixint 0 leaf
+        buf
+    }
+
+    #[test]
+    fn skip_value_accepts_payload_at_max_depth() {
+        let data = nested_fixarray_payload(MAX_MSGPACK_DECODE_DEPTH - 1);
+        let mut rd = &data[..];
+        skip_value(&mut rd).unwrap();
+        assert!(rd.is_empty());
+    }
+
+    #[test]
+    fn skip_value_rejects_payload_exceeding_max_depth() {
+        let data = nested_fixarray_payload(MAX_MSGPACK_DECODE_DEPTH);
+        let mut rd = &data[..];
+        let err = skip_value(&mut rd).unwrap_err();
+        let msg = std::error::Error::source(&err)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(msg.to_lowercase().contains("depth"), "got: {msg}");
+    }
+
+    #[test]
+    fn skip_value_does_not_stack_overflow_on_very_deep_payload() {
+        // Two orders of magnitude past the bound — would overflow a naive
+        // recursive skip; the iterative implementation must still return a
+        // clean error rather than crash the test process.
+        let data = nested_fixarray_payload(50_000);
+        let mut rd = &data[..];
+        assert!(skip_value(&mut rd).is_err());
+    }
+
+    #[test]
+    fn check_msgpack_depth_matches_skip_value_at_the_boundary() {
+        assert!(
+            check_msgpack_depth(&nested_fixarray_payload(MAX_MSGPACK_DECODE_DEPTH - 1)).is_ok()
+        );
+        assert!(check_msgpack_depth(&nested_fixarray_payload(MAX_MSGPACK_DECODE_DEPTH)).is_err());
+    }
+
+    #[test]
+    fn skip_value_via_unknown_field_rejects_deep_nesting() {
+        // Integration check: an unrecognized Transaction field (the fast
+        // decoder's `_ => skip_value(rd)?` arm) whose value is a
+        // maliciously deep structure must be rejected, not just a
+        // top-level payload passed straight to skip_value/check_msgpack_depth.
+        use crate::Transaction;
+
+        let mut buf = Vec::new();
+        rmp::encode::write_map_len(&mut buf, 3).unwrap();
+        rmp::encode::write_str(&mut buf, "type").unwrap();
+        rmp::encode::write_str(&mut buf, "pay").unwrap();
+        rmp::encode::write_str(&mut buf, "snd").unwrap();
+        rmp::encode::write_bin(&mut buf, &[7u8; 32]).unwrap();
+        rmp::encode::write_str(&mut buf, "zzz_unknown_field").unwrap();
+        buf.extend(nested_fixarray_payload(MAX_MSGPACK_DECODE_DEPTH));
+
+        let mut rd = &buf[..];
+        let err = Transaction::decode_from_reader(&mut rd).unwrap_err();
+        assert!(
+            format!("{err}").to_lowercase().contains("depth")
+                || std::error::Error::source(&err)
+                    .map(|s| s.to_string().to_lowercase().contains("depth"))
+                    .unwrap_or(false),
+            "got: {err}"
+        );
     }
 }
