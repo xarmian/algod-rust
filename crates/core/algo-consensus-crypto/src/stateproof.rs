@@ -760,24 +760,39 @@ mod tests {
 
     #[test]
     fn genuine_state_proof_rejects_forged_falcon_signature() {
-        let msg = [7u8; 32];
-        let (verifier, mut state_proof, round) = build_genuine_state_proof(0, msg);
-        // Corrupt a byte in the body of the Falcon signature (not the header,
-        // which would instead fail the earlier compressed->CT conversion
-        // step in `build_committable_signature` — go's `buildCommittableSignature`
-        // runs before the per-reveal `VerifyBytes` call too, so a corrupted
-        // header surfaces as a *different* error there as well).
-        let reveal = state_proof.reveals.get_mut(&0).unwrap();
-        let sig_bytes = &mut reveal.sig_slot.sig.signature;
-        let mid = sig_bytes.len() / 2;
-        sig_bytes[mid] ^= 0xff;
-        let err = verifier
-            .verify(round, msg, &state_proof)
-            .expect_err("must reject forged Falcon signature");
-        assert!(matches!(
-            err,
-            StateProofError::SignatureVerificationFailed { .. }
-        ));
+        // Falcon-1024's compressed signature encoding is variable-length
+        // (compression is data-dependent), so a fixed `mid = len/2` byte
+        // flip lands in a different part of the encoding on every run
+        // (`build_genuine_state_proof` draws fresh, unseeded keys/signatures
+        // each call). Confirmed by looping 300 iterations: the corrupted
+        // byte sometimes breaks the compressed->CT conversion itself
+        // (`build_committable_signature`'s `get_fixed_length_hashable_representation`
+        // call, surfacing as `StateProofError::Internal` — go's own
+        // `buildCommittableSignature` runs this same conversion before the
+        // per-reveal `VerifyBytes` call, so this is the equivalent failure
+        // mode there too), and sometimes reaches the deeper per-reveal
+        // Falcon check (`SignatureVerificationFailed`). Both are a correct
+        // rejection of the forged signature — assert on that outcome, not a
+        // specific error variant that isn't actually deterministic here.
+        for _ in 0..150 {
+            let msg = [7u8; 32];
+            let (verifier, mut state_proof, round) = build_genuine_state_proof(0, msg);
+            let reveal = state_proof.reveals.get_mut(&0).unwrap();
+            let sig_bytes = &mut reveal.sig_slot.sig.signature;
+            let mid = sig_bytes.len() / 2;
+            sig_bytes[mid] ^= 0xff;
+            let err = verifier
+                .verify(round, msg, &state_proof)
+                .expect_err("must reject forged Falcon signature");
+            assert!(
+                matches!(
+                    err,
+                    StateProofError::SignatureVerificationFailed { .. }
+                        | StateProofError::Internal(_)
+                ),
+                "unexpected rejection variant for a forged signature: {err:?}"
+            );
+        }
     }
 
     #[test]
