@@ -11,9 +11,14 @@ use thiserror::Error;
 /// Also defined in go-algorand as `zstdCompressionMagic`.
 pub const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
-/// Maximum decompressed message size (20 MiB).
-/// Protects against zip bombs. Matches go-algorand `MaxDecompressedMessageSize`.
-pub const MAX_DECOMPRESSED_MESSAGE_SIZE: usize = 20 * 1024 * 1024;
+/// Maximum decompressed message size. Protects against zip bombs. Matches
+/// go-algorand v4.7.3-stable's `MaxDecompressedMessageSize`
+/// (`network/msgCompressor.go`), which is `protocol.ProposalPayloadTagMaxSize`
+/// (`protocol/tags.go`: `const ProposalPayloadTagMaxSize = 0x501e3a`) — the
+/// actual maximum size a legitimate compressed gossip message (a proposal
+/// payload) can decompress to, tightened from a flat 20 MiB "some large
+/// enough value" in earlier go-algorand versions.
+pub const MAX_DECOMPRESSED_MESSAGE_SIZE: usize = 0x501e3a;
 
 /// Compression level matching go-algorand's `zstd.BestSpeed` (level 1).
 const ZSTD_COMPRESSION_LEVEL: i32 = 1;
@@ -132,9 +137,27 @@ mod tests {
 
     #[test]
     fn max_decompressed_message_size_matches_go() {
-        // go-algorand: MaxDecompressedMessageSize = 20 * 1024 * 1024
-        assert_eq!(MAX_DECOMPRESSED_MESSAGE_SIZE, 20 * 1024 * 1024);
-        assert_eq!(MAX_DECOMPRESSED_MESSAGE_SIZE, 20_971_520);
+        // go-algorand v4.7.3-stable: MaxDecompressedMessageSize =
+        // protocol.ProposalPayloadTagMaxSize (protocol/tags.go: `const
+        // ProposalPayloadTagMaxSize = 0x501e3a`), tightened from a flat
+        // 20 MiB "some large enough value" to the actual maximum size a
+        // legitimate compressed gossip message (a proposal payload) can
+        // decompress to.
+        assert_eq!(MAX_DECOMPRESSED_MESSAGE_SIZE, 0x501e3a);
+        assert_eq!(MAX_DECOMPRESSED_MESSAGE_SIZE, 5_250_618);
+    }
+
+    #[test]
+    fn decompress_between_old_and_new_bound_now_rejected() {
+        // A payload between the old 20 MiB bound and the new ~5 MiB bound
+        // must now be rejected as too large, where it previously succeeded.
+        let original = vec![0u8; 6 * 1024 * 1024]; // 6 MiB: below old bound, above new bound
+        let compressed = zstd_compress(&original).expect("compress");
+        let result = zstd_decompress(&compressed, MAX_DECOMPRESSED_MESSAGE_SIZE);
+        assert!(matches!(
+            result,
+            Err(CompressionError::DecompressedTooLarge { max_size }) if max_size == MAX_DECOMPRESSED_MESSAGE_SIZE
+        ));
     }
 
     #[test]
