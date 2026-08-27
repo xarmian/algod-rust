@@ -19,6 +19,7 @@ pub mod merkle_page;
 pub mod merkle_trie;
 pub mod params;
 pub mod participation;
+pub(crate) mod recording_store;
 pub mod rewards;
 pub mod simulation;
 pub mod sqlite;
