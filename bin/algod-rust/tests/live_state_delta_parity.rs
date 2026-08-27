@@ -59,11 +59,38 @@
 //! make validate-api-down
 //! ```
 
+//! # Issue #603 / #606 additions
+//!
+//! Issue #603 split out #586's own unmet acceptance criterion (a live
+//! dual-node comparison for `AccountDeltas::app_resources`/
+//! `asset_resources`/`StateDelta::creatables`/`totals`, populated by #586
+//! but never verified against a real go-algorand node) and the
+//! `block_state_delta_is_complete` cache gate that controls whether the
+//! *sync* path (`bin/algod-rust/src/commands/sync.rs`) caches a delta for
+//! `GET /v2/deltas/{round}` to later serve. The tests below
+//! (`state_delta_asset_resources_matches_go_for_*`) cover the Acfg (asset
+//! create/reconfigure/destroy) and Axfer (opt-in/close-out) lifecycle #603
+//! widened that gate to admit, live-diffing `AssetResources`/`Creatables`
+//! field-for-field against go -- live-verification found and fixed two
+//! real gaps along the way (see `apply.rs`'s `asset_holding_force_emit`
+//! doc comment): a destroy Acfg wasn't attributing the creator's holding
+//! removal, and neither loop matched go's "was this resource `Put`
+//! during the round" emission semantics (value-diffed instead, so a
+//! value-identical reconfigure produced an empty record). `Appl` stays
+//! excluded from that *sync-path* gate (issue #604 -- inner-transaction
+//! resource attribution is still a real gap there), but this harness's
+//! algod-rust node runs in `--dev` mode, whose self-produced-block path
+//! bypasses the gate entirely (see
+//! `state_delta_app_resources_matches_go_for_create_update`'s doc comment
+//! for why), so that test still live-verifies full field-for-field parity
+//! for an app create + update (no inner transactions), including issue
+//! #606's `AppParamsRecord.v` live-verification.
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use algo_codec::{canonical_encode_transaction, compute_txn_id};
 use algo_rest_client::AlgodClient;
-use algo_types::{BoxRef, Round, SignedTransaction, TxnType};
+use algo_types::{AssetParams, BoxRef, Round, SignedTransaction, TxnType};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use ed25519_dalek::Signer;
@@ -822,5 +849,543 @@ async fn state_delta_accts_zero_fields_matches_go_for_box_create_round() {
                 .any(|r| r.get("TotalBoxes") == Some(&serde_json::json!(0))),
             "{label}: round {create_round} must have at least one Accts[] entry with TotalBoxes present as 0: {accts:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #603: Acfg/Axfer AssetResources/Creatables live verification + the
+// widened `block_state_delta_is_complete` cache gate.
+// ---------------------------------------------------------------------------
+
+const ASSET_TOTAL: u64 = 1_000_000;
+const ASSET_UNIT_NAME: &str = "TSTU";
+const ASSET_NAME: &str = "TestAsset603";
+const ASSET_URL: &str = "https://example.com/asset603";
+
+/// Deploys an asset on `base` (dev account holds every role), reconfigures
+/// it (manager re-affirms itself, a pure `AssetParamsDelta` change that
+/// must not touch the holding), then destroys it (empty `AssetParams`
+/// signals destroy per `apply_acfg`/go's `AssetConfigTxnFields` -- the
+/// creator still holds the full supply, so destroy is legal). Returns
+/// `(asset_id, create_round, update_round, destroy_round)`.
+async fn deploy_and_mutate_asset(
+    client: &reqwest::Client,
+    base: &str,
+    label: &str,
+) -> (u64, u64, u64, u64) {
+    let sk = dev_signing_key();
+    let addr = dev_address();
+
+    // 1. Create.
+    let mut create = base_txn(client, base).await;
+    create.txn_type = TxnType::Acfg;
+    create.asset_params = Some(AssetParams {
+        total: ASSET_TOTAL,
+        decimals: 2,
+        default_frozen: false,
+        unit_name: ASSET_UNIT_NAME.to_string(),
+        asset_name: ASSET_NAME.to_string(),
+        url: ASSET_URL.to_string(),
+        manager: Some(addr),
+        reserve: Some(addr),
+        freeze: Some(addr),
+        clawback: Some(addr),
+        ..Default::default()
+    });
+    create.note = unique_note(&format!("asset-create-{label}")).into();
+    let confirmed =
+        submit_and_confirm(client, base, label, &mut create, &sk, "asset creation").await;
+    let asset_id = confirmed["asset-index"].as_u64().unwrap_or_else(|| {
+        panic!("{label}: confirmed asset creation must report asset-index: {confirmed}")
+    });
+    let create_round = confirmed["confirmed-round"].as_u64().unwrap();
+
+    // 2. Reconfigure (manager re-affirms every role -- a real params change
+    // that must not touch the holding).
+    let mut reconfig = base_txn(client, base).await;
+    reconfig.txn_type = TxnType::Acfg;
+    reconfig.config_asset = asset_id;
+    reconfig.asset_params = Some(AssetParams {
+        manager: Some(addr),
+        reserve: Some(addr),
+        freeze: Some(addr),
+        clawback: Some(addr),
+        ..Default::default()
+    });
+    reconfig.note = unique_note(&format!("asset-reconfig-{label}")).into();
+    let confirmed =
+        submit_and_confirm(client, base, label, &mut reconfig, &sk, "asset reconfigure").await;
+    let update_round = confirmed["confirmed-round"].as_u64().unwrap();
+
+    // 3. Destroy.
+    let mut destroy = base_txn(client, base).await;
+    destroy.txn_type = TxnType::Acfg;
+    destroy.config_asset = asset_id;
+    destroy.note = unique_note(&format!("asset-destroy-{label}")).into();
+    let confirmed =
+        submit_and_confirm(client, base, label, &mut destroy, &sk, "asset destroy").await;
+    let destroy_round = confirmed["confirmed-round"].as_u64().unwrap();
+
+    (asset_id, create_round, update_round, destroy_round)
+}
+
+/// `GET /v2/deltas/{round}?format=json`, asserting the request succeeds
+/// (used by rounds this widened gate is now expected to serve).
+async fn fetch_delta_expect_200(
+    c: &reqwest::Client,
+    base: &str,
+    label: &str,
+    round: u64,
+    context: &str,
+) -> serde_json::Value {
+    let (status, body) = get_json(c, base, &format!("/v2/deltas/{round}?format=json")).await;
+    assert_eq!(
+        status, 200,
+        "{label}: round {round} GET /v2/deltas must succeed ({context}): {body}"
+    );
+    body
+}
+
+fn asset_resources(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    body["Accts"]["AssetResources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Live dual-node verification for issue #603's Acfg (asset create /
+/// reconfigure / destroy) coverage: proves `block_state_delta_is_complete`'s
+/// widened gate actually serves a cached delta (`200`, not `404`) for these
+/// rounds, and that the delta's `AssetResources`/`Creatables` content
+/// matches go-algorand field-for-field.
+#[tokio::test]
+#[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
+async fn state_delta_asset_resources_matches_go_for_create_update_destroy() {
+    let c = client();
+    let addr_str = dev_address().to_string();
+
+    // (create, update, destroy) AssetResources[0] JSON entries per node,
+    // with the per-node-divergent `Aidx` stripped so the remaining shape
+    // can be compared directly between go and rust.
+    type PerNodeEntries = (serde_json::Value, serde_json::Value, serde_json::Value);
+    let mut results: std::collections::HashMap<&str, PerNodeEntries> =
+        std::collections::HashMap::new();
+
+    for (base, label) in [(go_url(), "go"), (rust_url(), "rust")] {
+        let (asset_id, create_round, update_round, destroy_round) =
+            deploy_and_mutate_asset(&c, &base, label).await;
+
+        let create_body =
+            fetch_delta_expect_200(&c, &base, label, create_round, "issue #603").await;
+        let update_body =
+            fetch_delta_expect_200(&c, &base, label, update_round, "issue #603").await;
+        let destroy_body =
+            fetch_delta_expect_200(&c, &base, label, destroy_round, "issue #603").await;
+
+        // -- create round --
+        let recs = asset_resources(&create_body);
+        assert_eq!(
+            recs.len(),
+            1,
+            "{label}: create round expected exactly one AssetResourceRecord: {recs:?}"
+        );
+        let rec = &recs[0];
+        assert_eq!(rec["Aidx"].as_u64(), Some(asset_id));
+        assert_eq!(rec["Addr"].as_str(), Some(addr_str.as_str()));
+        assert_eq!(rec["Params"]["Deleted"], serde_json::json!(false));
+        let params = &rec["Params"]["Params"];
+        assert_eq!(params["t"].as_u64(), Some(ASSET_TOTAL), "{label}: total");
+        assert_eq!(params["dc"].as_u64(), Some(2), "{label}: decimals");
+        assert_eq!(params["un"].as_str(), Some(ASSET_UNIT_NAME));
+        assert_eq!(params["an"].as_str(), Some(ASSET_NAME));
+        assert_eq!(params["au"].as_str(), Some(ASSET_URL));
+        assert_eq!(params["m"].as_str(), Some(addr_str.as_str()));
+        assert_eq!(rec["Holding"]["Deleted"], serde_json::json!(false));
+        assert_eq!(
+            rec["Holding"]["Holding"]["a"].as_u64(),
+            Some(ASSET_TOTAL),
+            "{label}: creator's initial holding must equal the total supply: {rec}"
+        );
+        let creatable = &create_body["Creatables"][asset_id.to_string()];
+        assert_eq!(
+            creatable["Created"],
+            serde_json::json!(true),
+            "{label}: create round Creatables entry: {creatable}"
+        );
+        assert_eq!(
+            creatable["Ctype"],
+            serde_json::json!(0),
+            "{label}: 0 = asset"
+        );
+
+        // -- update (reconfigure) round --
+        let recs = asset_resources(&update_body);
+        assert_eq!(
+            recs.len(),
+            1,
+            "{label}: update round expected exactly one AssetResourceRecord: {recs:?}"
+        );
+        let rec = &recs[0];
+        assert_eq!(rec["Params"]["Deleted"], serde_json::json!(false));
+        assert!(
+            rec["Params"]["Params"].is_object(),
+            "{label}: reconfigure must carry a Params delta: {rec}"
+        );
+        // Live-verification finding (issue #603): go-algorand's
+        // `AccountDeltas` are "was this resource `Put` during the round"
+        // -tracked, not before/after diffed -- a reconfigure that
+        // re-affirms identical role addresses (this test's) still carries
+        // the creator's *unchanged* holding on the wire, not a null/absent
+        // one.
+        assert_eq!(rec["Holding"]["Deleted"], serde_json::json!(false));
+        assert_eq!(
+            rec["Holding"]["Holding"]["a"].as_u64(),
+            Some(ASSET_TOTAL),
+            "{label}: a reconfigure round still carries the creator's (unchanged) \
+             holding on go's wire response: {rec}"
+        );
+
+        // -- destroy round --
+        let recs = asset_resources(&destroy_body);
+        assert_eq!(
+            recs.len(),
+            1,
+            "{label}: destroy round expected exactly one AssetResourceRecord: {recs:?}"
+        );
+        let rec = &recs[0];
+        assert_eq!(rec["Params"]["Deleted"], serde_json::json!(true));
+        assert!(rec["Params"]["Params"].is_null());
+        assert_eq!(
+            rec["Holding"]["Deleted"],
+            serde_json::json!(true),
+            "{label}: creator's holding must be removed on destroy: {rec}"
+        );
+        assert!(rec["Holding"]["Holding"].is_null());
+        let creatable = &destroy_body["Creatables"][asset_id.to_string()];
+        assert_eq!(
+            creatable["Created"],
+            serde_json::json!(false),
+            "{label}: destroy round Creatables entry: {creatable}"
+        );
+
+        let strip_aidx = |mut v: serde_json::Value| {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("Aidx");
+            }
+            v
+        };
+        results.insert(
+            label,
+            (
+                strip_aidx(recs_first(&create_body)),
+                strip_aidx(recs_first(&update_body)),
+                strip_aidx(recs_first(&destroy_body)),
+            ),
+        );
+    }
+
+    // Cross-node comparison: with `Aidx` stripped (per-node divergent asset
+    // id), the remaining shape -- Addr (same dev account on both nodes),
+    // Params, Holding -- must be identical between go and rust.
+    let (go_create, go_update, go_destroy) = &results["go"];
+    let (rust_create, rust_update, rust_destroy) = &results["rust"];
+    assert_eq!(
+        go_create, rust_create,
+        "create round AssetResourceRecord must match between go and rust"
+    );
+    assert_eq!(
+        go_update, rust_update,
+        "update round AssetResourceRecord must match between go and rust"
+    );
+    assert_eq!(
+        go_destroy, rust_destroy,
+        "destroy round AssetResourceRecord must match between go and rust"
+    );
+}
+
+fn recs_first(body: &serde_json::Value) -> serde_json::Value {
+    asset_resources(body)
+        .into_iter()
+        .next()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Live dual-node verification for issue #603's Axfer opt-in/close-out
+/// coverage: a second account opts into the asset (zero-amount self
+/// transfer), then closes out (reclaiming its holding to the creator via
+/// `AssetCloseTo`). Both rounds are `Axfer`-only, so `#603`'s widened gate
+/// must serve them.
+#[tokio::test]
+#[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
+async fn state_delta_asset_resources_matches_go_for_optin_closeout() {
+    let c = client();
+    let dev_addr = dev_address();
+
+    type PerNodeEntries = (serde_json::Value, serde_json::Value);
+    let mut results: std::collections::HashMap<&str, PerNodeEntries> =
+        std::collections::HashMap::new();
+
+    for (base, label) in [(go_url(), "go"), (rust_url(), "rust")] {
+        // Fresh account for this run so opt-in always starts from a clean
+        // (not-yet-opted-in) state, deterministic per (label, run) via the
+        // note-based uniqueness already used for other txns in this suite.
+        let opt_sk = ed25519_dalek::SigningKey::from_bytes(&{
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let mut seed = [0u8; 32];
+            let bytes = format!("{label}-{nanos}").into_bytes();
+            let n = bytes.len().min(32);
+            seed[..n].copy_from_slice(&bytes[..n]);
+            seed
+        });
+        let opt_addr = algo_types::Address(opt_sk.verifying_key().to_bytes());
+
+        // Create the asset (dev account holds full supply + clawback so it
+        // can fund/close out the opt-in account).
+        let mut create = base_txn(&c, &base).await;
+        create.txn_type = TxnType::Acfg;
+        create.asset_params = Some(AssetParams {
+            total: ASSET_TOTAL,
+            unit_name: ASSET_UNIT_NAME.to_string(),
+            asset_name: ASSET_NAME.to_string(),
+            manager: Some(dev_addr),
+            reserve: Some(dev_addr),
+            freeze: Some(dev_addr),
+            clawback: Some(dev_addr),
+            ..Default::default()
+        });
+        create.note = unique_note(&format!("asset-optin-create-{label}")).into();
+        let confirmed = submit_and_confirm(
+            &c,
+            &base,
+            label,
+            &mut create,
+            &dev_signing_key(),
+            "asset create",
+        )
+        .await;
+        let asset_id = confirmed["asset-index"].as_u64().unwrap();
+
+        // Fund the opt-in account with algos to cover its min balance.
+        let mut fund = base_txn(&c, &base).await;
+        fund.txn_type = TxnType::Pay;
+        fund.receiver = opt_addr;
+        fund.amount = 1_000_000;
+        fund.note = unique_note(&format!("asset-optin-fund-{label}")).into();
+        submit_and_confirm(
+            &c,
+            &base,
+            label,
+            &mut fund,
+            &dev_signing_key(),
+            "fund opt-in acct",
+        )
+        .await;
+
+        // Opt in (zero-amount self transfer).
+        let mut optin = base_txn(&c, &base).await;
+        optin.sender = opt_addr;
+        optin.txn_type = TxnType::Axfer;
+        optin.xaid = asset_id;
+        optin.asset_receiver = Some(opt_addr);
+        optin.amount = 0;
+        optin.note = unique_note(&format!("asset-optin-{label}")).into();
+        let confirmed =
+            submit_and_confirm(&c, &base, label, &mut optin, &opt_sk, "asset opt-in").await;
+        let optin_round = confirmed["confirmed-round"].as_u64().unwrap();
+
+        // Close out back to the dev/creator account.
+        let mut closeout = base_txn(&c, &base).await;
+        closeout.sender = opt_addr;
+        closeout.txn_type = TxnType::Axfer;
+        closeout.xaid = asset_id;
+        closeout.asset_receiver = Some(dev_addr);
+        closeout.asset_close_to = Some(dev_addr);
+        closeout.amount = 0;
+        closeout.note = unique_note(&format!("asset-closeout-{label}")).into();
+        let confirmed =
+            submit_and_confirm(&c, &base, label, &mut closeout, &opt_sk, "asset close-out").await;
+        let closeout_round = confirmed["confirmed-round"].as_u64().unwrap();
+
+        let (status, optin_body) =
+            get_json(&c, &base, &format!("/v2/deltas/{optin_round}?format=json")).await;
+        assert_eq!(
+            status, 200,
+            "{label}: opt-in round GET /v2/deltas: {optin_body}"
+        );
+        let (status, closeout_body) = get_json(
+            &c,
+            &base,
+            &format!("/v2/deltas/{closeout_round}?format=json"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "{label}: close-out round GET /v2/deltas: {closeout_body}"
+        );
+
+        // Opt-in round: the opted-in account's holding must appear with
+        // amount 0, not frozen, not deleted.
+        let recs = asset_resources(&optin_body);
+        let opt_rec = recs
+            .iter()
+            .find(|r| r["Aidx"].as_u64() == Some(asset_id))
+            .unwrap_or_else(|| {
+                panic!("{label}: opt-in round missing AssetResourceRecord for {asset_id}: {recs:?}")
+            });
+        assert_eq!(opt_rec["Holding"]["Deleted"], serde_json::json!(false));
+        // `AssetHoldingRecord.a`'s wire tag has `skip_serializing_if =
+        // "is_zero_u64"` (matching go's own short-codec `omitempty`), so a
+        // fresh opt-in's zero balance is an *absent* key, not a literal 0.
+        assert!(
+            opt_rec["Holding"]["Holding"].get("a").is_none(),
+            "{label}: fresh opt-in holding must omit `a` at amount 0: {opt_rec}"
+        );
+
+        // Close-out round: the account's holding is removed (go-algorand
+        // deletes a zero-balance closed-out holding).
+        let recs = asset_resources(&closeout_body);
+        let close_rec = recs
+            .iter()
+            .find(|r| r["Aidx"].as_u64() == Some(asset_id))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: close-out round missing AssetResourceRecord for {asset_id}: {recs:?}"
+                )
+            });
+        assert_eq!(
+            close_rec["Holding"]["Deleted"],
+            serde_json::json!(true),
+            "{label}: close-out must remove the closing account's holding: {close_rec}"
+        );
+
+        let strip = |mut v: serde_json::Value| {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("Aidx");
+                obj.remove("Addr");
+            }
+            v
+        };
+        results.insert(label, (strip(opt_rec.clone()), strip(close_rec.clone())));
+    }
+
+    let (go_optin, go_closeout) = &results["go"];
+    let (rust_optin, rust_closeout) = &results["rust"];
+    assert_eq!(
+        go_optin, rust_optin,
+        "opt-in round AssetResourceRecord (Aidx/Addr stripped) must match between go and rust"
+    );
+    assert_eq!(
+        go_closeout, rust_closeout,
+        "close-out round AssetResourceRecord (Aidx/Addr stripped) must match between go and rust"
+    );
+}
+
+/// Live dual-node verification of `AppResources`/`Creatables` for an app
+/// create + update (no inner transactions), including issue #606's
+/// `AppParamsRecord.v` field (`0`, omitted, on create; `1` on update).
+///
+/// **Why this doesn't exercise `block_state_delta_is_complete`'s `Appl`
+/// exclusion (issue #604), and isn't expected to:** this harness's
+/// algod-rust node runs in `--dev` mode (see `docker/docker-compose.
+/// validate-api.yml` / `Makefile`'s `validate-api-up`), and
+/// `bin/algod-rust/src/dev_producer.rs`'s self-produced-block path calls
+/// `SqliteLedger::cache_state_delta` directly with the `StateDelta` it just
+/// computed via a real `ApplyMode::Execute` run -- it never calls
+/// `apply_block_caching_delta` (and therefore never consults
+/// `block_state_delta_is_complete`) at all. That gate only protects the
+/// *sync* path (`bin/algod-rust/src/commands/sync.rs`, replaying blocks
+/// received from peers), which this live harness doesn't exercise; the
+/// gate's `Appl`-excluding logic itself is unit-tested directly in
+/// `algo_ledger::sqlite::tests::test_block_state_delta_is_complete_gate`.
+/// Since #586 already made top-level Appl resource-key collection correct
+/// (only *inner*-transaction resources are the #604 gap, and this test's
+/// create/update have none), algod-rust's dev-mode response for these
+/// rounds is expected to be fully correct and is compared field-for-field
+/// against go's, just like the Acfg/Axfer tests above.
+#[tokio::test]
+#[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
+async fn state_delta_app_resources_matches_go_for_create_update() {
+    let c = client();
+    let sk = dev_signing_key();
+
+    let approval_v1 = algo_avm::assembler::assemble_string("#pragma version 8\nint 1\nreturn\n")
+        .expect("approval v1 must assemble")
+        .program;
+    let approval_v2 =
+        algo_avm::assembler::assemble_string("#pragma version 8\nint 1\nint 1\n==\nreturn\n")
+            .expect("approval v2 must assemble")
+            .program;
+
+    for (base, label) in [(go_url(), "go"), (rust_url(), "rust")] {
+        let mut create = base_txn(&c, &base).await;
+        create.txn_type = TxnType::Appl;
+        create.approval_program = Some(ByteBuf::from(approval_v1.clone()));
+        create.clear_state_program = Some(ByteBuf::from(CLEAR_STATE_PROGRAM.to_vec()));
+        create.note = unique_note(&format!("app-resource-create-{label}")).into();
+        let confirmed =
+            submit_and_confirm(&c, &base, label, &mut create, &sk, "app creation").await;
+        let app_id = confirmed["application-index"].as_u64().unwrap();
+        let create_round = confirmed["confirmed-round"].as_u64().unwrap();
+
+        let mut update = base_txn(&c, &base).await;
+        update.txn_type = TxnType::Appl;
+        update.application_id = app_id;
+        update.on_completion = 4; // UpdateApplication
+        update.approval_program = Some(ByteBuf::from(approval_v2.clone()));
+        update.clear_state_program = Some(ByteBuf::from(CLEAR_STATE_PROGRAM.to_vec()));
+        update.note = unique_note(&format!("app-resource-update-{label}")).into();
+        let confirmed = submit_and_confirm(&c, &base, label, &mut update, &sk, "app update").await;
+        let update_round = confirmed["confirmed-round"].as_u64().unwrap();
+
+        let create_body =
+            fetch_delta_expect_200(&c, &base, label, create_round, "dev-mode always caches").await;
+        let update_body =
+            fetch_delta_expect_200(&c, &base, label, update_round, "dev-mode always caches").await;
+
+        let create_recs = create_body["Accts"]["AppResources"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let rec = create_recs
+            .iter()
+            .find(|r| r["Aidx"].as_u64() == Some(app_id))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: create round missing AppResourceRecord for {app_id}: {create_recs:?}"
+                )
+            });
+        assert_eq!(rec["Params"]["Deleted"], serde_json::json!(false));
+        // Issue #606: version omitted (0) on create -- `AppParamsRecord`'s
+        // `v` field has `skip_serializing_if = "is_zero_u64"`.
+        assert!(
+            rec["Params"]["Params"].get("v").is_none(),
+            "{label}: create round AppParamsRecord.v must be omitted at 0: {rec}"
+        );
+
+        let update_recs = update_body["Accts"]["AppResources"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let rec = update_recs
+            .iter()
+            .find(|r| r["Aidx"].as_u64() == Some(app_id))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: update round missing AppResourceRecord for {app_id}: {update_recs:?}"
+                )
+            });
+        assert_eq!(rec["Params"]["Deleted"], serde_json::json!(false));
+        assert_eq!(
+            rec["Params"]["Params"]["v"].as_u64(),
+            Some(1),
+            "{label}: update round AppParamsRecord.v must be 1 (issue #606): {rec}"
+        );
+
+        let creatable = &create_body["Creatables"][app_id.to_string()];
+        assert_eq!(creatable["Created"], serde_json::json!(true));
+        assert_eq!(creatable["Ctype"], serde_json::json!(1), "1 = app");
     }
 }

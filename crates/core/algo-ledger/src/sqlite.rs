@@ -2006,33 +2006,52 @@ impl AccountTotalsDelta {
 
 /// Whether the current `apply_block_with_delta` builder produces a
 /// `StateDelta` that is safe to cache and return through the REST
-/// `GET /v2/deltas/:round` endpoint for `block`.
+/// `GET /v2/deltas/:round` endpoint for `block`. Consulted only by
+/// `apply_block_caching_delta`, i.e. the *sync* path
+/// (`bin/algod-rust/src/commands/sync.rs`) that replays blocks received
+/// from peers. The `--dev`-mode self-produced-block path
+/// (`bin/algod-rust/src/dev_producer.rs`) always runs `ApplyMode::Execute`
+/// to build the block in the first place, so it calls
+/// `SqliteLedger::cache_state_delta` directly with the real delta it
+/// already has in hand and never consults this gate at all.
 ///
-/// Today the builder only populates `accts` / `txids` / `txleases` / `hdr`
-/// completely. The `app_resources` / `asset_resources` / `kv_mods` /
-/// `creatables` / `state_proof_next` fields are still `TODO(#190)`-stubbed,
-/// so a block whose payset touches those code paths would yield a
-/// silently-incomplete response. We refuse to cache such blocks (returning
-/// `NotFound` is preferable to a partial 200 a client cannot detect).
+/// `Pay` and `Keyreg` payloads touch only the account-base fields of the
+/// accounts already collected by `apply::collect_txn_addresses`, so they
+/// were always admitted. Issue #586 then made `app_resources` /
+/// `asset_resources` / `creatables` / `totals` real (previously
+/// `TODO(#190)`-stubbed) for `Acfg` / `Axfer` / `Afrz` / `Appl`'s
+/// **top-level** transaction fields (`apply.rs`'s step "2b"/"3b" resource-key
+/// collection) — issue #603 widens this gate to admit `Acfg` / `Axfer` /
+/// `Afrz` accordingly, since none of those three types can spawn inner
+/// transactions, so top-level-only resource-key collection is already
+/// complete for them.
 ///
-/// Only `Pay` and `Keyreg` payloads are admitted — they touch only the
-/// account-base fields of the accounts already collected by
-/// `apply::collect_txn_addresses`. `Hb` (heartbeat) is intentionally
-/// excluded: `apply::apply_heartbeat` mutates the heartbeat **target**'s
-/// `last_heartbeat`, but the target address isn't currently included in
-/// the diff's address set, so a heartbeat for an off-payset target would
-/// produce an incomplete `accts` delta. `Acfg` / `Axfer` / `Afrz` /
-/// `Appl` / `Stpf` / `Unknown(_)` are excluded for the same builder-gap
-/// reasons documented above.
+/// `Appl` stays excluded: an approval program's `itxn_submit` can create/
+/// update/destroy assets and apps, transfer assets, and opt other accounts'
+/// apps in/out via *inner* transactions, but `apply.rs`'s resource-key
+/// collection only walks `block.payset` (top-level transactions), never
+/// inner transactions embedded in an `appl` call's `EvalDelta` — a real gap,
+/// not just an unexercised one (see issue #604). Admitting `Appl` blocks
+/// here before #604 is resolved would cache-and-serve a `StateDelta` that
+/// silently omits inner-txn-only resource/creatable entries.
+///
+/// `Hb` (heartbeat) is intentionally excluded: `apply::apply_heartbeat`
+/// mutates the heartbeat **target**'s `last_heartbeat`, but the target
+/// address isn't currently included in the diff's address set, so a
+/// heartbeat for an off-payset target would produce an incomplete `accts`
+/// delta. `Stpf` / `Unknown(_)` remain excluded — `state_proof_next` is
+/// still `TODO(#586)`-stubbed regardless of payset content.
 ///
 /// See `apply_block_caching_delta` for the rest of the contract, including
-/// the per-field gaps that remain even on cached rounds (#190).
+/// the per-field gaps that remain even on cached rounds (#190, #604).
 pub(crate) fn block_state_delta_is_complete(block: &algo_types::Block) -> bool {
     use algo_types::TxnType;
-    block
-        .payset
-        .iter()
-        .all(|stx| matches!(stx.txn.txn_type, TxnType::Pay | TxnType::Keyreg))
+    block.payset.iter().all(|stx| {
+        matches!(
+            stx.txn.txn_type,
+            TxnType::Pay | TxnType::Keyreg | TxnType::Acfg | TxnType::Axfer | TxnType::Afrz
+        )
+    })
 }
 
 /// Whether `block` contains any `appl` transaction (issue #574).
@@ -8081,14 +8100,16 @@ mod tests {
         assert_eq!(root_after_commit, root_after_rollback);
     }
 
-    /// PLAN-36 TASK-128: the payset-completeness gate that controls
-    /// whether `apply_block_caching_delta` caches a delta. Pay / Keyreg
-    /// blocks (including the empty-payset case) pass; anything else —
-    /// Acfg / Axfer / Afrz / Appl / Stpf / Hb, or an `Unknown(_)`
+    /// PLAN-36 TASK-128 / issue #603: the payset-completeness gate that
+    /// controls whether `apply_block_caching_delta` caches a delta.
+    /// Pay / Keyreg / Acfg / Axfer / Afrz blocks (including the
+    /// empty-payset case) pass; `Appl` / Stpf / Hb, or an `Unknown(_)`
     /// fallback — fails the gate so the REST endpoint stays at
-    /// `NotFound` rather than serving a known-incomplete delta. `Hb` is
-    /// excluded because the heartbeat target address isn't included in
-    /// the diff's address set (see `block_state_delta_is_complete`).
+    /// `NotFound` rather than serving a known-incomplete delta. `Appl` is
+    /// excluded because its resource-key collection doesn't yet recurse
+    /// into inner transactions (issue #604). `Hb` is excluded because the
+    /// heartbeat target address isn't included in the diff's address set
+    /// (see `block_state_delta_is_complete`).
     #[test]
     fn test_block_state_delta_is_complete_gate() {
         use algo_types::{Block, SignedTransaction, Transaction, TxnType};
@@ -8111,7 +8132,9 @@ mod tests {
 
         // Empty payset is trivially "delta-complete".
         assert!(block_state_delta_is_complete(&block_with_types(&[])));
-        // Pure Pay / Keyreg payloads pass.
+        // Pure Pay / Keyreg / Acfg / Axfer / Afrz payloads pass (issue
+        // #603 widened the gate to admit the latter three now that #586
+        // makes their top-level resource-key collection complete).
         assert!(block_state_delta_is_complete(&block_with_types(&[
             TxnType::Pay
         ])));
@@ -8119,14 +8142,25 @@ mod tests {
             TxnType::Pay,
             TxnType::Keyreg,
         ])));
-        // Any other transaction type fails the gate. `Hb` is excluded
-        // because `apply::collect_txn_addresses` does not include the
-        // heartbeat target — the resulting `accts` diff would be
-        // incomplete for off-payset targets.
-        for unsupported in [
+        assert!(block_state_delta_is_complete(&block_with_types(&[
             TxnType::Acfg,
             TxnType::Axfer,
             TxnType::Afrz,
+        ])));
+        assert!(block_state_delta_is_complete(&block_with_types(&[
+            TxnType::Pay,
+            TxnType::Keyreg,
+            TxnType::Acfg,
+            TxnType::Axfer,
+            TxnType::Afrz,
+        ])));
+        // Any other transaction type fails the gate. `Appl` is excluded
+        // because its resource-key collection doesn't recurse into inner
+        // transactions (issue #604). `Hb` is excluded because
+        // `apply::collect_txn_addresses` does not include the heartbeat
+        // target — the resulting `accts` diff would be incomplete for
+        // off-payset targets.
+        for unsupported in [
             TxnType::Appl,
             TxnType::Stpf,
             TxnType::Hb,
