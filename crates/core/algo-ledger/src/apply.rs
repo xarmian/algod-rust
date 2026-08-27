@@ -539,7 +539,7 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     addrs.insert(block.rewards_pool);
 
     // ── 2. Snapshot pre-state for all collected addresses ──────────
-    let addr_list: Vec<Address> = addrs.iter().copied().collect();
+    let mut addr_list: Vec<Address> = addrs.iter().copied().collect();
     let mut pre_accounts: HashMap<Address, Option<algo_types::AccountData>> = HashMap::new();
     for addr in &addr_list {
         pre_accounts.insert(*addr, store.get_account(addr));
@@ -553,12 +553,14 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     //
     // Mirrors go-algorand's `roundCowState` resource tracking
     // (`ledger/eval/cow.go`'s `Put`/`putAsset`), but scoped to what the
-    // payset's *top-level* transaction fields name directly — like
-    // `collect_txn_addresses` above, this does not recurse into inner
-    // transactions (an app call's inner `acfg`/`axfer`/`appl` can touch
-    // resources this pass never sees), a pre-existing, explicitly
-    // documented gap this function shares with the account-delta collector
-    // it was modeled on.
+    // payset's *top-level* transaction fields name directly. This pass
+    // alone does not recurse into inner transactions (an app call's inner
+    // `acfg`/`axfer`/`afrz`/`appl` can touch resources it never names) --
+    // step 3c below closes that gap (and `collect_txn_addresses`'s
+    // matching account-address gap) using a different mechanism, since
+    // the resource keys an inner transaction touches aren't knowable
+    // until after the block has actually been applied (issue #604; see
+    // `recording_store`'s module doc comment for why).
     //
     // - Acfg (update/destroy, `config_asset != 0`): the asset's params
     //   delta is attributed to the *creator* address (go keys
@@ -693,8 +695,18 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     // caller itself wants ApplyData back (`capture_apply_data`); the return
     // value below still honors that flag.
     let mut apply_data: Vec<ApplyData> = Vec::new();
+    // Issue #604: wrap `store` for the duration of the real apply so that
+    // every account/resource mutation -- top-level *or* inner-transaction,
+    // at any nesting depth -- has its pre-mutation value recorded as it
+    // happens. This is what lets step 3c below attribute resource deltas
+    // for resources only ever touched by an `itxn_submit`-driven inner
+    // transaction, which the top-level-only scan in step 2b can't see and
+    // which (for a freshly-executed, not-yet-recorded block) can't be
+    // discovered before the apply either. See `recording_store`'s module
+    // doc comment for why a pre-apply snapshot alone doesn't work here.
+    let mut recording_store = crate::recording_store::RecordingStore::new(store);
     apply_block_impl(
-        store,
+        &mut recording_store,
         block,
         mode,
         false,
@@ -703,6 +715,7 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
         Some(&mut apply_data),
         Some(&mut kv_mods),
     )?;
+    let touches = recording_store.touches;
 
     // ── 3b. Resolve create-time resource keys now that new ids exist ───
     for (stx, ad) in block.payset.iter().zip(apply_data.iter()) {
@@ -731,6 +744,86 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     }
     for &(addr, aid) in &app_state_keys {
         app_state_pre.entry((addr, aid)).or_insert(None);
+    }
+
+    // ── 3c. Merge in resources/accounts only ever touched by an inner
+    // transaction (issue #604) ──────────────────────────────────────────
+    //
+    // `touches` (populated by the `RecordingStore` wrapper around step 3)
+    // captured the pre-mutation value of every account/asset/app resource
+    // actually written this round, including ones only reachable via
+    // `itxn_submit` at any nesting depth -- something the top-level-only
+    // scan in step 2b (and `collect_txn_addresses`'s own long-standing
+    // TODO(#190) gap, in step 1) can't see. Keys step 1/2b/3b already
+    // resolved are left untouched here (their pre-image was captured
+    // correctly, before the block applied, which is strictly more
+    // reliable than a post-apply store read for a key that step 2b/3b
+    // themselves mutated); this only *adds* newly-discovered
+    // inner-transaction-only keys, using each one's actual first-touch
+    // pre-mutation value (not a post-apply read, which would silently
+    // read the *post* value for a key mutated earlier in the same round).
+    for (&aid, pre) in &touches.asset_params {
+        if asset_params_pre.contains_key(&aid) {
+            continue;
+        }
+        let creator = match pre {
+            Some(rec) => rec.creator,
+            None => match store.get_asset_params(aid) {
+                Some(rec) => rec.creator,
+                // Created and destroyed within the same round, leaving no
+                // surviving params record to resolve a creator from --
+                // nothing stable to attribute a delta to.
+                None => continue,
+            },
+        };
+        asset_creators.insert(aid, creator);
+        asset_params_pre.insert(aid, pre.as_ref().map(|rec| rec.params.clone()));
+        if let Some(pre_rec) = pre {
+            // Existing asset touched (reconfigure/destroy semantics) --
+            // mirror issue #603's force-emit of the creator's holding
+            // record for a top-level Acfg on an existing asset (go's
+            // `AccountDeltas` are "was this resource `Put`"-tracked, not
+            // value-diffed).
+            asset_holding_keys.insert((pre_rec.creator, aid));
+            asset_holding_force_emit.insert((pre_rec.creator, aid));
+        }
+    }
+    for (&app_id, pre) in &touches.app_params {
+        if app_params_pre.contains_key(&app_id) {
+            continue;
+        }
+        let creator = match pre {
+            Some(p) => p.creator,
+            None => match store.get_app_params(app_id) {
+                Some(p) => p.creator,
+                None => continue,
+            },
+        };
+        app_creators.insert(app_id, creator);
+        app_params_pre.insert(app_id, pre.clone());
+    }
+    for (&(addr, aid), pre) in &touches.asset_holdings {
+        asset_holding_keys.insert((addr, aid));
+        asset_holding_pre
+            .entry((addr, aid))
+            .or_insert_with(|| pre.clone());
+    }
+    for (&(addr, app_id), pre) in &touches.app_local_states {
+        app_state_keys.insert((addr, app_id));
+        app_state_pre
+            .entry((addr, app_id))
+            .or_insert_with(|| pre.clone());
+    }
+    // Same first-touch-wins merge for accounts (issue #190's gap, folded
+    // into #604's fix since it needs the identical mechanism): an account
+    // only ever referenced by an inner transaction (e.g. an inner `axfer`
+    // receiver never named in the outer txn's own fields or `Accounts`
+    // array) was never added to `addr_list`/`pre_accounts` in step 1/2.
+    for (&addr, pre) in &touches.accounts {
+        if let std::collections::hash_map::Entry::Vacant(e) = pre_accounts.entry(addr) {
+            e.insert(pre.clone());
+            addr_list.push(addr);
+        }
     }
 
     // ── 4. Build the StateDelta by diffing pre vs post state ──────
@@ -1057,8 +1150,19 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
 
 /// Collect all addresses referenced by a transaction (sender, receiver, etc.).
 ///
-/// TODO(#190): Recurse into inner transactions so that accounts only
-/// referenced by inner app calls are included in the pre-state snapshot.
+/// Deliberately does not recurse into inner transactions -- an address only
+/// referenced by an inner app call isn't knowable from the top-level
+/// transaction fields alone (issue #190/#604). For
+/// [`apply_block_with_delta_mode_and_apply_data`], that gap is closed by a
+/// different mechanism (step 3c's `RecordingStore`-captured `touches`,
+/// which sees every address actually mutated regardless of nesting depth)
+/// rather than by extending this function -- see that function's step 2b
+/// doc comment. The other caller (this function's use inside `Execute`
+/// mode's per-group delta capture, gated by
+/// `sqlite::block_state_delta_is_complete`, which currently excludes any
+/// block containing an `Appl` transaction) still has the gap unaddressed;
+/// that capture path needs its own equivalent fix before its gate can be
+/// widened to admit `Appl` blocks.
 fn collect_txn_addresses(
     txn: &algo_types::Transaction,
     addrs: &mut std::collections::HashSet<Address>,
@@ -8279,6 +8383,337 @@ mod tests {
         assert_eq!(
             delta.totals.online.reward_units,
             (3_999_000 / crate::rewards::REWARD_UNITS) + (1_000_000 / crate::rewards::REWARD_UNITS)
+        );
+    }
+
+    // ── Issue #604: inner-transaction-touched resources ───────────────────
+
+    /// TDD regression for issue #604: an `Appl` call whose approval program
+    /// issues an inner `acfg` (asset create) via `itxn_submit` must produce
+    /// a real `AssetResourceRecord` (the app account's params + holding, as
+    /// creator) and a `ModifiedCreatable` entry -- not just apply the
+    /// mutation to the ledger while silently omitting it from the
+    /// `StateDelta`. Before this fix, step 2b's resource-key collection
+    /// only walked the block's top-level `Acfg`/`Axfer`/`Afrz`/`Appl`
+    /// fields, never an app call's inner transactions, so this asset
+    /// simply never appeared in `delta.accts.asset_resources`/
+    /// `delta.creatables` even though `store.get_asset_params` shows it was
+    /// really created.
+    ///
+    /// Uses `ApplyMode::Execute` on a freshly-built (unexecuted) block, per
+    /// the issue's own TDD instructions -- this is deliberately the harder
+    /// case where no recorded `EvalDelta` exists before the apply to walk
+    /// (see `recording_store`'s module doc comment for why that matters).
+    #[test]
+    fn issue_604_inner_acfg_create_populates_asset_resources_and_creatables() {
+        // Scoped locally (not at module level) -- `LedgerState` has its own
+        // inherent `get_or_default_account` with a different signature than
+        // the trait's; see this module's top-of-file NOTE for why the
+        // trait isn't brought into scope via a blanket `use`.
+        use crate::store_trait::LedgerStore;
+
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        // Approval program: on create (ApplicationID == 0), just approve.
+        // On any later call, issue an inner acfg (asset create) and
+        // approve. The same program runs for both create and call, exactly
+        // like a real deployed app.
+        let approval_src = "#pragma version 6\n\
+            txn ApplicationID\n\
+            bz approve\n\
+            itxn_begin\n\
+            int acfg\n\
+            itxn_field TypeEnum\n\
+            int 1000000\n\
+            itxn_field ConfigAssetTotal\n\
+            int 0\n\
+            itxn_field ConfigAssetDecimals\n\
+            byte \"UNIT\"\n\
+            itxn_field ConfigAssetUnitName\n\
+            byte \"Asset\"\n\
+            itxn_field ConfigAssetName\n\
+            itxn_submit\n\
+            approve:\n\
+            int 1\n\
+            return\n";
+        let approval = algo_avm::assembler::assemble_string(approval_src)
+            .expect("approval program must assemble")
+            .program;
+        let clear = algo_avm::assembler::assemble_string("#pragma version 6\nint 1\nreturn\n")
+            .expect("clear program must assemble")
+            .program;
+
+        // Round 1: create the app (no itxn -- ApplicationID == 0 on create).
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        assert_eq!(delta1.creatables.len(), 1, "app create must be a creatable");
+        let (&app_id, app_creatable) = delta1.creatables.iter().next().unwrap();
+        assert_eq!(app_creatable.ctype, 1, "1 = app");
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+
+        // Round 2: fund the app account so its inner acfg can cover the
+        // asset's minimum-balance requirement.
+        let fund = pay_txn(creator, app_addr, 3_000_000, 1_000);
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![fund],
+            ..Block::default()
+        };
+        apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute).unwrap();
+
+        // Round 3: call the app -- its approval program itxn_submits an
+        // inner acfg asset create. Outer fee covers the inner txn's fee via
+        // fee pooling.
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 3_000;
+        call.txn.application_id = app_id;
+        let block3 = Block {
+            round: Round(3),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![call],
+            ..Block::default()
+        };
+        let delta3 = apply_block_with_delta_mode(&mut state, &block3, ApplyMode::Execute).unwrap();
+
+        // Confirm the mutation itself really happened (the AVM execution
+        // side was never in question -- only its *attribution* into the
+        // StateDelta is what issue #604 is about).
+        let created_asset_id = *state
+            .created_assets_for_addr(&app_addr)
+            .first()
+            .map(|(id, _)| id)
+            .expect("inner acfg must have created an asset owned by the app account");
+
+        assert_eq!(
+            delta3.accts.asset_resources.len(),
+            1,
+            "expected exactly one AssetResourceRecord for the inner-created asset: {:?}",
+            delta3.accts.asset_resources
+        );
+        let rec = &delta3.accts.asset_resources[0];
+        assert_eq!(rec.aidx, created_asset_id);
+        assert_eq!(
+            rec.addr, app_addr,
+            "the app account (not the outer call's sender) is the inner acfg's creator"
+        );
+        assert!(!rec.params.deleted);
+        let params = rec.params.params.as_ref().expect("params delta present");
+        assert_eq!(params.total, 1_000_000);
+        assert_eq!(params.unit_name, "UNIT");
+        assert!(!rec.holding.deleted);
+        let holding = rec.holding.holding.as_ref().expect("holding delta present");
+        assert_eq!(
+            holding.amount, 1_000_000,
+            "the app account gets the full supply on create"
+        );
+
+        assert_eq!(
+            delta3.creatables.len(),
+            1,
+            "expected exactly one ModifiedCreatable for the inner-created asset: {:?}",
+            delta3.creatables
+        );
+        let creatable = delta3
+            .creatables
+            .get(&created_asset_id)
+            .expect("creatable entry for the inner-created asset id");
+        assert_eq!(creatable.ctype, 0, "0 = asset");
+        assert!(creatable.created);
+        assert_eq!(creatable.creator, app_addr);
+    }
+
+    /// TDD regression for issue #604, the harder half: an inner `acfg` that
+    /// *reconfigures* an asset that already existed **before** this round
+    /// (created by an ordinary top-level Acfg, not by the app). Unlike a
+    /// create, this has a real pre-image to get right -- the fix must
+    /// attribute the delta to the asset's original creator (not the app
+    /// account that reconfigured it, matching go-algorand's
+    /// creator-keyed `AssetParamsDelta`) and force-emit the creator's
+    /// holding record alongside it (issue #603's "was this resource `Put`"
+    /// semantics), using the value captured at the actual moment of
+    /// mutation -- not a value read from the store after the whole block
+    /// already applied, which would silently look like a no-op change.
+    ///
+    /// Reconfigure only lets an Acfg change the manager/reserve/freeze/
+    /// clawback addresses (`apply_acfg`'s `Reconfigure` branch, matching
+    /// go-algorand -- `unit_name`/`asset_name`/`total`/etc. are immutable
+    /// after creation), so the inner acfg here reassigns the manager to a
+    /// new address to produce a real, observable change.
+    #[test]
+    fn issue_604_inner_acfg_reconfigure_of_preexisting_asset_populates_asset_resources() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let new_manager = Address([7u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        // Approval program: on create, just approve. On any later call,
+        // reconfigure the asset named by ApplicationArgs[0] (an 8-byte
+        // big-endian asset id), reassigning its manager to the 32-byte
+        // address in ApplicationArgs[1], then approve.
+        let approval_src = "#pragma version 6\n\
+            txn ApplicationID\n\
+            bz approve\n\
+            itxn_begin\n\
+            int acfg\n\
+            itxn_field TypeEnum\n\
+            txna ApplicationArgs 0\n\
+            btoi\n\
+            itxn_field ConfigAsset\n\
+            txna ApplicationArgs 1\n\
+            itxn_field ConfigAssetManager\n\
+            itxn_submit\n\
+            approve:\n\
+            int 1\n\
+            return\n";
+        let approval = algo_avm::assembler::assemble_string(approval_src)
+            .expect("approval program must assemble")
+            .program;
+        let clear = algo_avm::assembler::assemble_string("#pragma version 6\nint 1\nreturn\n")
+            .expect("clear program must assemble")
+            .program;
+
+        // Round 1: create the app.
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let (&app_id, _) = delta1.creatables.iter().next().unwrap();
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+
+        // Round 2: fund the app account (it must cover the inner acfg's
+        // own fee via fee pooling in round 3) and have the creator create
+        // a *separate*, pre-existing asset with the app account as
+        // manager (so the app is authorized to reconfigure it later) --
+        // an ordinary top-level Acfg, already correctly handled before
+        // this fix.
+        let fund = pay_txn(creator, app_addr, 3_000_000, 1_000);
+        let mut asset_create = SignedTransaction::default();
+        asset_create.txn.txn_type = "acfg".into();
+        asset_create.txn.sender = creator;
+        asset_create.txn.fee = 1_000;
+        asset_create.txn.asset_params = Some(algo_types::AssetParams {
+            total: 500_000,
+            unit_name: "OLD".to_string(),
+            asset_name: "Asset2".to_string(),
+            manager: Some(app_addr),
+            ..Default::default()
+        });
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![fund, asset_create],
+            ..Block::default()
+        };
+        let delta2 = apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute).unwrap();
+        let (&asset_id, _) = delta2.creatables.iter().next().unwrap();
+
+        // Round 3: call the app, passing the asset id as an app arg. Its
+        // approval program itxn_submits an inner acfg reconfigure. Outer
+        // fee covers the inner txn's fee via fee pooling.
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 3_000;
+        call.txn.application_id = app_id;
+        call.txn.app_arguments = Some(vec![
+            Some(serde_bytes::ByteBuf::from(asset_id.to_be_bytes().to_vec())),
+            Some(serde_bytes::ByteBuf::from(new_manager.0.to_vec())),
+        ]);
+        let block3 = Block {
+            round: Round(3),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![call],
+            ..Block::default()
+        };
+        let delta3 = apply_block_with_delta_mode(&mut state, &block3, ApplyMode::Execute).unwrap();
+
+        assert_eq!(
+            delta3.accts.asset_resources.len(),
+            1,
+            "expected exactly one AssetResourceRecord for the inner-reconfigured asset: {:?}",
+            delta3.accts.asset_resources
+        );
+        let rec = &delta3.accts.asset_resources[0];
+        assert_eq!(rec.aidx, asset_id);
+        assert_eq!(
+            rec.addr, creator,
+            "the asset's original creator (not the reconfiguring app account) owns the params delta"
+        );
+        assert!(!rec.params.deleted);
+        let params = rec.params.params.as_ref().expect("params delta present");
+        assert_eq!(
+            params.manager, new_manager,
+            "the inner acfg's manager reassignment must have applied"
+        );
+        assert_eq!(
+            params.unit_name, "OLD",
+            "unit_name is immutable after creation -- reconfigure must not have touched it"
+        );
+        // Issue #603 force-emit semantics: the creator's holding record is
+        // present even though its value (the original supply) is
+        // unchanged by a reconfigure.
+        assert!(!rec.holding.deleted);
+        let holding = rec.holding.holding.as_ref().expect(
+            "creator's holding must be force-emitted for an existing-asset Acfg, even via an inner txn",
+        );
+        assert_eq!(
+            holding.amount, 500_000,
+            "creator's original supply is unchanged"
+        );
+
+        assert!(
+            delta3.creatables.is_empty(),
+            "a pure reconfigure is not a create/destroy transition -- no Creatables entry: {:?}",
+            delta3.creatables
         );
     }
 }
