@@ -1,6 +1,7 @@
 pub mod agreement_bridge;
 pub mod agreement_key_manager;
 pub mod apply;
+pub mod apply_stateproof;
 pub mod avm_context;
 pub mod block_entry;
 pub mod block_header;
