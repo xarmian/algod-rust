@@ -16,6 +16,7 @@ pub mod multisig;
 pub mod onetimesig;
 pub mod passphrase;
 pub mod sortition;
+pub mod stateproof;
 pub mod sumhash;
 pub mod vrf;
 

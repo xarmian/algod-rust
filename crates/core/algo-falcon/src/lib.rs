@@ -82,6 +82,14 @@ extern "C" {
         data: *const c_void,
         data_len: usize,
     ) -> c_int;
+
+    fn falcon_det1024_convert_compressed_to_ct(
+        sig_ct: *mut c_void,
+        sig_compressed: *const c_void,
+        sig_compressed_len: usize,
+    ) -> c_int;
+
+    fn falcon_det1024_get_salt_version(sig: *const c_void) -> c_int;
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +198,54 @@ pub fn falcon_sign(privkey: &[u8], data: &[u8]) -> Result<Vec<u8>, FalconError> 
     Ok(sig)
 }
 
+/// Convert a compressed-format deterministic Falcon-1024 signature to the
+/// fixed-width "CT" (constant-time-decodable) representation.
+///
+/// This is the byte sequence go-algorand's `crypto.FalconSignature.
+/// GetFixedLengthHashableRepresentation` (`crypto/falconWrapper.go:117`) feeds
+/// into `merklesig::Signature`'s hashable representation for state-proof
+/// commitments — the compressed wire encoding is variable-length, which is
+/// unsuitable for a fixed-length hash-tree leaf, so it is expanded to a
+/// canonical fixed-size form first (`falcon_det1024_convert_compressed_to_ct`,
+/// `falcon-c/deterministic.h:105-114`).
+pub fn falcon_convert_compressed_to_ct(
+    sig_compressed: &[u8],
+) -> Result<[u8; FALCON_DET1024_SIG_CT_SIZE], FalconError> {
+    if sig_compressed.len() < 2 || sig_compressed.len() > FALCON_DET1024_SIG_COMPRESSED_MAXSIZE {
+        return Err(FalconError::InvalidSignatureSize(sig_compressed.len()));
+    }
+
+    let mut sig_ct = [0u8; FALCON_DET1024_SIG_CT_SIZE];
+    let rc = unsafe {
+        falcon_det1024_convert_compressed_to_ct(
+            sig_ct.as_mut_ptr() as *mut c_void,
+            sig_compressed.as_ptr() as *const c_void,
+            sig_compressed.len(),
+        )
+    };
+
+    if rc != 0 {
+        return Err(FalconError::ConvertToCtFailed(rc));
+    }
+
+    Ok(sig_ct)
+}
+
+/// Return the salt version embedded in a Falcon signature (compressed or CT
+/// form), matching go-algorand's `crypto.FalconSignature.IsSaltVersionEqual`
+/// (`crypto/falconWrapper.go:127`), which compares this value against an
+/// expected version.
+pub fn falcon_salt_version(sig: &[u8]) -> Result<u8, FalconError> {
+    if sig.is_empty() {
+        return Err(FalconError::InvalidSignatureSize(0));
+    }
+    let rc = unsafe { falcon_det1024_get_salt_version(sig.as_ptr() as *const c_void) };
+    if rc < 0 {
+        return Err(FalconError::SaltVersionFailed(rc));
+    }
+    Ok(rc as u8)
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -207,6 +263,10 @@ pub enum FalconError {
     KeygenFailed(c_int),
     /// Signing returned a non-zero error code.
     SignFailed(c_int),
+    /// Compressed-to-CT conversion returned a non-zero error code.
+    ConvertToCtFailed(c_int),
+    /// Salt-version extraction returned a negative error code.
+    SaltVersionFailed(c_int),
 }
 
 impl std::fmt::Display for FalconError {
@@ -238,6 +298,16 @@ impl std::fmt::Display for FalconError {
             }
             FalconError::SignFailed(rc) => {
                 write!(f, "falcon sign failed with error code {}", rc)
+            }
+            FalconError::ConvertToCtFailed(rc) => {
+                write!(
+                    f,
+                    "falcon compressed-to-CT conversion failed with error code {}",
+                    rc
+                )
+            }
+            FalconError::SaltVersionFailed(rc) => {
+                write!(f, "falcon salt version extraction failed with code {}", rc)
             }
         }
     }

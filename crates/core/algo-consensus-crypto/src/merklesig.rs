@@ -509,6 +509,63 @@ impl Signature {
             && self.verifying_key.is_zero()
     }
 
+    /// Validate that this signature's embedded Falcon salt version matches
+    /// the expected version.
+    ///
+    /// Matches Go's `Signature.ValidateSaltVersion`
+    /// (`crypto/merklesignature/merkleSignatureScheme.go:249`), which compares
+    /// `s.Signature.IsSaltVersionEqual(version)` — itself
+    /// `crypto.FalconSignature.IsSaltVersionEqual`
+    /// (`crypto/falconWrapper.go:127`), a thin wrapper over the C library's
+    /// `falcon_det1024_get_salt_version`.
+    pub fn validate_salt_version(&self, version: u8) -> Result<(), MerkleSignatureError> {
+        let actual = algo_falcon::falcon_salt_version(&self.signature)
+            .map_err(|e| MerkleSignatureError::FalconError(e.to_string()))?;
+        if actual != version {
+            return Err(MerkleSignatureError::SaltVersionMismatch);
+        }
+        Ok(())
+    }
+
+    /// Return the fixed-length byte representation used as a state-proof
+    /// signature-commitment merkle leaf.
+    ///
+    /// Matches Go's `Signature.GetFixedLengthHashableRepresentation`
+    /// (`crypto/merklesignature/merkleSignatureScheme.go:298`):
+    /// `schemeType (2B LE) || sigBytes || verifierBytes || vectorCommitmentIndex (8B LE) || proofBytes`,
+    /// where `sigBytes` is the Falcon signature expanded to its fixed-width
+    /// "CT" form (`crypto.FalconSignature.GetFixedLengthHashableRepresentation`,
+    /// `crypto/falconWrapper.go:117`) and `proofBytes` is
+    /// `SingleLeafProof.GetFixedLengthHashableRepresentation`.
+    pub fn get_fixed_length_hashable_representation(
+        &self,
+    ) -> Result<Vec<u8>, MerkleSignatureError> {
+        let scheme_bytes = CRYPTO_PRIMITIVES_ID.to_le_bytes();
+
+        let sig_bytes = algo_falcon::falcon_convert_compressed_to_ct(&self.signature)
+            .map_err(|e| MerkleSignatureError::FalconError(e.to_string()))?;
+
+        let verifier_bytes = self.verifying_key.get_fixed_length_hashable_representation();
+
+        let idx_bytes = self.vector_commitment_index.to_le_bytes();
+
+        let proof_bytes = self.proof.get_fixed_length_hashable_representation();
+
+        let mut out = Vec::with_capacity(
+            scheme_bytes.len()
+                + sig_bytes.len()
+                + verifier_bytes.len()
+                + idx_bytes.len()
+                + proof_bytes.len(),
+        );
+        out.extend_from_slice(&scheme_bytes);
+        out.extend_from_slice(&sig_bytes);
+        out.extend_from_slice(verifier_bytes);
+        out.extend_from_slice(&idx_bytes);
+        out.extend_from_slice(&proof_bytes);
+        Ok(out)
+    }
+
     /// Encode to canonical msgpack.
     ///
     /// Go field order (alphabetical, omitempty): `"idx"`, `"prf"`, `"sig"`, `"vkey"`.
@@ -774,6 +831,8 @@ pub enum MerkleSignatureError {
     TreeError(merklearray::MerkleError),
     /// Invalid round.
     InvalidRound(String),
+    /// Signature's embedded salt version does not match the expected value.
+    SaltVersionMismatch,
 }
 
 impl std::fmt::Display for MerkleSignatureError {
@@ -788,6 +847,7 @@ impl std::fmt::Display for MerkleSignatureError {
             Self::FalconError(msg) => write!(f, "falcon error: {msg}"),
             Self::TreeError(e) => write!(f, "merkle tree error: {e}"),
             Self::InvalidRound(msg) => write!(f, "invalid round: {msg}"),
+            Self::SaltVersionMismatch => write!(f, "signature salt version mismatch"),
         }
     }
 }
