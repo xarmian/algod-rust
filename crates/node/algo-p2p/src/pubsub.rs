@@ -6,7 +6,7 @@
 //! require a single x86-64 CMPQ instruction"), so the same fixed-width shape
 //! is reused here.
 //!
-//! As of `v4.7.2-stable`, go-algorand's `gossipSubTags` map
+//! As of `v4.7.3-stable`, go-algorand's `gossipSubTags` map
 //! (`network/p2pNetwork.go`) wires up gossipsub for exactly one tag —
 //! `protocol.TxnTag` → [`TX_TOPIC`] (`"algotx01"`, byte-for-byte identical to
 //! go's `p2p.TXTopicName`, for real interop with a go-algorand P2P peer on
@@ -24,27 +24,27 @@ use libp2p::gossipsub::IdentTopic;
 /// GossipSub topic name for transactions (`TX`).
 ///
 /// Byte-for-byte identical to go-algorand's `network/p2p.TXTopicName` — this
-/// is the one topic go-algorand v4.7.2-stable itself gossips over pubsub, so
+/// is the one topic go-algorand v4.7.3-stable itself gossips over pubsub, so
 /// this exact string is required for wire-level interop with a real
 /// go-algorand P2P peer.
 pub const TX_TOPIC: &str = "algotx01";
 
 /// GossipSub topic name for agreement votes (`AV`).
 ///
-/// Not wired up by go-algorand v4.7.2-stable's own `gossipSubTags` (votes
+/// Not wired up by go-algorand v4.7.3-stable's own `gossipSubTags` (votes
 /// still travel over the per-peer stream protocol there) — see this
 /// module's doc comment.
 pub const AGREEMENT_VOTE_TOPIC: &str = "algoav01";
 
 /// GossipSub topic name for block proposal payloads (`PP`).
 ///
-/// Not wired up by go-algorand v4.7.2-stable's own `gossipSubTags` — see
+/// Not wired up by go-algorand v4.7.3-stable's own `gossipSubTags` — see
 /// this module's doc comment.
 pub const PROPOSAL_PAYLOAD_TOPIC: &str = "algopp01";
 
 /// GossipSub topic name for certified vote bundles (`VB`).
 ///
-/// Not wired up by go-algorand v4.7.2-stable's own `gossipSubTags` — see
+/// Not wired up by go-algorand v4.7.3-stable's own `gossipSubTags` — see
 /// this module's doc comment.
 pub const VOTE_BUNDLE_TOPIC: &str = "algovb01";
 

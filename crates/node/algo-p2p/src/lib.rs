@@ -17,7 +17,7 @@
 //! separate sub-issue of the P2P epic (#544, see #542) and is deliberately
 //! out of scope for this crate so far.
 //!
-//! Reference: `../go-algorand/network/p2p/` at `v4.7.2-stable`
+//! Reference: `../go-algorand/network/p2p/` at `v4.7.3-stable`
 //! (`p2p.go`, `peerID.go`, `streams.go`, `http.go`, `dht/dht.go`,
 //! `dnsaddr/resolve.go`, `peerstore/peerstore.go`, `pubsub.go`,
 //! `capabilities.go`).

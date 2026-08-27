@@ -1,6 +1,6 @@
 # algod-rust
 
-Full Rust reimplementation of go-algorand — a production-grade Algorand node. Phases 0–6 are complete (conformance harness, block sync, AVM execution, ledger apply, validation, REST API, consensus participation). Phases 9–11 (go-algorand version-upgrade parity sweeps — `v4.6.0-stable` → `v4.7.0-stable` plus a new libp2p P2P transport, then `v4.7.0-stable` → `v4.7.2-stable`, a small bounds-check/security patch release) are also complete — see epic #621. The reference pin is `v4.7.2-stable`. See `docs/PROJECT_SCOPE.md` for full scope, `docs/PHASE6_VALIDATION.md` for the Layer-9 consensus evidence map, `docs/PHASE10_VALIDATION.md` for the v4.7.0-stable version-upgrade/P2P-transport evidence map, and `docs/PHASE11_VALIDATION.md` for the v4.7.2-stable sweep evidence map (which test/tool proves which criterion). Issue #628 (ledger box-ref index resolution on sync/replay/simulate paths, surfaced during Phase 11's review) remains open as a follow-up, structurally independent of the v4.7.2-stable delta itself.
+Full Rust reimplementation of go-algorand — a production-grade Algorand node. Phases 0–6 are complete (conformance harness, block sync, AVM execution, ledger apply, validation, REST API, consensus participation). Phases 9–11 (go-algorand version-upgrade parity sweeps — `v4.6.0-stable` → `v4.7.0-stable` plus a new libp2p P2P transport, then `v4.7.0-stable` → `v4.7.2-stable`, a small bounds-check/security patch release) are also complete. Phase 12 (the `v4.7.2-stable` → `v4.7.3-stable` sweep, a small security/robustness patch release) is in progress — see epic #643. The reference pin is `v4.7.3-stable`. See `docs/PROJECT_SCOPE.md` for full scope, `docs/PHASE6_VALIDATION.md` for the Layer-9 consensus evidence map, `docs/PHASE10_VALIDATION.md` for the v4.7.0-stable version-upgrade/P2P-transport evidence map, `docs/PHASE11_VALIDATION.md` for the v4.7.2-stable sweep evidence map, and `docs/PHASE12_PROPOSAL.md` for the in-progress v4.7.3-stable sweep (which test/tool proves which criterion).
 
 ## Shell Environment
 
@@ -8,7 +8,7 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
 
 ## Reference Implementation
 
-- **go-algorand source** is at `../go-algorand`, pinned to `v4.7.2-stable` (detached HEAD)
+- **go-algorand source** is at `../go-algorand`, pinned to `v4.7.3-stable` (detached HEAD)
 - Use this as the authoritative reference for AVM opcodes, consensus params, field indices, and protocol semantics
 - Key reference files:
   - `data/transactions/logic/opcodes.go` — opcode table, version gating

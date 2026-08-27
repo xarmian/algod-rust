@@ -28,7 +28,7 @@
 
 services:
   go-node-1:
-    image: algorand/algod:4.7.2-stable
+    image: algorand/algod:4.7.3-stable
     container_name: phase7-go-node-1
     environment:
       - ALGORAND_DATA=/algod/data
@@ -60,7 +60,7 @@ services:
       - phase7net
 
   go-node-2:
-    image: algorand/algod:4.7.2-stable
+    image: algorand/algod:4.7.3-stable
     container_name: phase7-go-node-2
     environment:
       - ALGORAND_DATA=/algod/data
@@ -88,7 +88,7 @@ services:
       - phase7net
 
   go-node-3:
-    image: algorand/algod:4.7.2-stable
+    image: algorand/algod:4.7.3-stable
     container_name: phase7-go-node-3
     environment:
       - ALGORAND_DATA=/algod/data

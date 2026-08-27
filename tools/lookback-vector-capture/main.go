@@ -73,7 +73,7 @@ import (
 // are guaranteed byte-identical output regardless of what branch or
 // dirty state happens to be checked out in their local go-algorand
 // clone.
-const expectedGoAlgorandPin = "v4.7.2-stable"
+const expectedGoAlgorandPin = "v4.7.3-stable"
 
 // allVersions returns every non-deprecated consensus version in order.
 // V7 is included (beyond the task's V18..V41 range) because the V7→V8
