@@ -581,6 +581,21 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     //   pre-image (Update/Delete) or, for a create, from `ApplyData::
     //   application_id` post-apply.
     let mut asset_holding_keys: HashSet<(Address, u64)> = HashSet::new();
+    // Issue #603 (live-verification against a real go-algorand
+    // v4.7.0-stable node found this): go-algorand's `AccountDeltas` entries
+    // are "was this resource `Put` during the round"-tracked
+    // (`ledger/eval/cow.go`), not before/after diffed the way this
+    // function's own `pre != post` gating works elsewhere. Concretely, a
+    // *reconfigure* Acfg that re-affirms identical manager/reserve/freeze/
+    // clawback values (a legal, real no-op reconfigure) still produces a
+    // full `AssetResourceRecord` on go's wire response -- both `Params` and
+    // (unexpectedly) `Holding`, even though neither value actually changed.
+    // Every key in this set is force-emitted below regardless of the
+    // pre/post diff. Scoped to just the (creator, asset) key an existing-
+    // asset Acfg (reconfigure/destroy) resolves in the loop below --
+    // Axfer/Afrz-touched holdings keep the ordinary diff gate, since their
+    // matching go behavior hasn't been live-verified here.
+    let mut asset_holding_force_emit: HashSet<(Address, u64)> = HashSet::new();
     let mut asset_creators: HashMap<u64, Address> = HashMap::new();
     let mut asset_params_pre: HashMap<u64, Option<AssetParams>> = HashMap::new();
     let mut asset_ids_resolved: HashSet<u64> = HashSet::new();
@@ -597,6 +612,15 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
                     if let Some(rec) = store.get_asset_params(txn.config_asset) {
                         asset_creators.insert(txn.config_asset, rec.creator);
                         asset_params_pre.insert(txn.config_asset, Some(rec.params));
+                        // A destroy Acfg removes the creator's holding too
+                        // (`apply_acfg`'s destroy branch calls
+                        // `remove_asset_holding`); a reconfigure never
+                        // changes it. Either way, track it as force-emit
+                        // (see `asset_holding_force_emit`'s doc comment) so
+                        // it always appears in the resulting
+                        // `AssetResourceRecord`, matching go.
+                        asset_holding_keys.insert((rec.creator, txn.config_asset));
+                        asset_holding_force_emit.insert((rec.creator, txn.config_asset));
                     } else {
                         asset_params_pre.insert(txn.config_asset, None);
                     }
@@ -765,57 +789,65 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
         let pre = asset_params_pre.get(&aid).cloned().flatten();
         let post_rec = store.get_asset_params(aid);
         let post = post_rec.as_ref().map(|r| r.params.clone());
-        if pre != post {
-            let delta = match &post {
-                Some(p) => AssetParamsDelta {
-                    params: Some(asset_params_record(p)),
-                    deleted: false,
-                },
-                None => AssetParamsDelta {
-                    params: None,
-                    deleted: true,
-                },
-            };
-            asset_records
-                .entry((creator, aid))
-                .or_insert_with(|| AssetResourceRecord {
-                    aidx: aid,
-                    addr: creator,
-                    params: AssetParamsDelta::default(),
-                    holding: AssetHoldingDelta::default(),
-                })
-                .params = delta;
-            match (pre.is_some(), post.is_some()) {
-                (false, true) => {
-                    creatables.insert(
-                        aid,
-                        ModifiedCreatable {
-                            ctype: 0,
-                            created: true,
-                            creator,
-                            ndeltas: 1,
-                        },
-                    );
-                }
-                (true, false) => {
-                    creatables.insert(
-                        aid,
-                        ModifiedCreatable {
-                            ctype: 0,
-                            created: false,
-                            creator,
-                            ndeltas: 1,
-                        },
-                    );
-                }
-                _ => {}
+        // `asset_creators` is populated solely by processing an Acfg (see
+        // step 2b/3b above) -- create, reconfigure, or destroy. Emit
+        // unconditionally, not gated on `pre != post`: go-algorand's own
+        // `/v2/deltas` response always carries an `AssetResourceRecord.Params`
+        // entry for any Acfg that touches an existing asset, even a
+        // no-op reconfigure that re-affirms identical values (issue #603,
+        // live-verified against a real go-algorand v4.7.0-stable node).
+        let delta = match &post {
+            Some(p) => AssetParamsDelta {
+                params: Some(asset_params_record(p)),
+                deleted: false,
+            },
+            None => AssetParamsDelta {
+                params: None,
+                deleted: true,
+            },
+        };
+        asset_records
+            .entry((creator, aid))
+            .or_insert_with(|| AssetResourceRecord {
+                aidx: aid,
+                addr: creator,
+                params: AssetParamsDelta::default(),
+                holding: AssetHoldingDelta::default(),
+            })
+            .params = delta;
+        match (pre.is_some(), post.is_some()) {
+            (false, true) => {
+                creatables.insert(
+                    aid,
+                    ModifiedCreatable {
+                        ctype: 0,
+                        created: true,
+                        creator,
+                        ndeltas: 1,
+                    },
+                );
             }
+            (true, false) => {
+                creatables.insert(
+                    aid,
+                    ModifiedCreatable {
+                        ctype: 0,
+                        created: false,
+                        creator,
+                        ndeltas: 1,
+                    },
+                );
+            }
+            _ => {}
         }
     }
     for &(addr, aid) in &asset_holding_keys {
         let pre = asset_holding_pre.get(&(addr, aid)).cloned().flatten();
         let post = store.get_asset_holding(&addr, aid);
-        if pre != post {
+        // See `asset_holding_force_emit`'s doc comment: an existing-asset
+        // Acfg (reconfigure/destroy) always emits the creator's holding on
+        // go's wire response too, even when its value is unchanged.
+        if pre != post || asset_holding_force_emit.contains(&(addr, aid)) {
             let delta = match &post {
                 Some(h) => AssetHoldingDelta {
                     holding: Some(asset_holding_record(h)),
@@ -7963,6 +7995,191 @@ mod tests {
         assert_eq!(creatable.ctype, 0, "0 = asset");
         assert!(creatable.created);
         assert_eq!(creatable.creator, creator);
+    }
+
+    /// TDD regression for issue #603 (found via live dual-node verification
+    /// against a real go-algorand v4.7.0-stable node): an asset *destroy*
+    /// Acfg must attribute the creator's holding removal too, not just the
+    /// params removal. Before this fix, step 2b's `Acfg` match arm only
+    /// tracked `asset_creators`/`asset_params_pre` for a non-create Acfg,
+    /// never adding the creator to `asset_holding_keys` -- so even though
+    /// `apply_acfg`'s destroy branch calls `store.remove_asset_holding`, the
+    /// resulting `StateDelta.accts.asset_resources` entry for the destroy
+    /// round only carried `Params: {Deleted: true}`, silently omitting
+    /// `Holding: {Deleted: true}` even though the creator's holding really
+    /// was removed by this round.
+    #[test]
+    fn issue_603_asset_destroy_populates_holding_removal() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(creator, 10_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        // Round 1: create the asset (manager = creator, so destroy is
+        // authorized).
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "acfg".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.asset_params = Some(algo_types::AssetParams {
+            total: 1_000_000,
+            unit_name: "UNIT".to_string(),
+            asset_name: "Asset".to_string(),
+            manager: Some(creator),
+            ..Default::default()
+        });
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        apply_block_with_delta(&mut state, &block1).unwrap();
+
+        // Round 2: destroy it (empty `AssetParams` signals destroy).
+        let mut destroy = SignedTransaction::default();
+        destroy.txn.txn_type = "acfg".into();
+        destroy.txn.sender = creator;
+        destroy.txn.fee = 1_000;
+        destroy.txn.config_asset = 1;
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![destroy],
+            ..Block::default()
+        };
+        let delta = apply_block_with_delta(&mut state, &block2).unwrap();
+
+        assert_eq!(
+            delta.accts.asset_resources.len(),
+            1,
+            "expected exactly one AssetResourceRecord for the destroy round: {:?}",
+            delta.accts.asset_resources
+        );
+        let rec = &delta.accts.asset_resources[0];
+        assert_eq!(rec.aidx, 1);
+        assert_eq!(rec.addr, creator);
+        assert!(rec.params.deleted, "params must be marked deleted");
+        assert!(rec.params.params.is_none());
+        assert!(
+            rec.holding.deleted,
+            "creator's holding removal must be attributed to the destroy round \
+             (apply_acfg calls remove_asset_holding on destroy): {rec:?}"
+        );
+        assert!(rec.holding.holding.is_none());
+
+        let creatable = delta.creatables.get(&1).expect("creatable entry for id 1");
+        assert_eq!(creatable.ctype, 0, "0 = asset");
+        assert!(!creatable.created, "destroy => created=false");
+        assert_eq!(creatable.creator, creator);
+    }
+
+    /// TDD regression for issue #603 (also found via live dual-node
+    /// verification): a *reconfigure* Acfg that re-affirms identical
+    /// manager/reserve/freeze/clawback values -- a legal, real no-op
+    /// reconfigure -- must still produce a full `AssetResourceRecord`
+    /// (both `Params` and `Holding`) in the round's `StateDelta`. Before
+    /// this fix, both loops in step 4b only emitted a record when
+    /// `pre != post`, so a value-identical reconfigure round produced an
+    /// *empty* `asset_resources` -- go-algorand's real `/v2/deltas`
+    /// response always includes the record regardless (its `AccountDeltas`
+    /// tracks "was this resource `Put` during the round", not a value
+    /// diff).
+    #[test]
+    fn issue_603_asset_reconfigure_with_unchanged_values_still_emits_record() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(creator, 10_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "acfg".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.asset_params = Some(algo_types::AssetParams {
+            total: 1_000_000,
+            unit_name: "UNIT".to_string(),
+            asset_name: "Asset".to_string(),
+            manager: Some(creator),
+            reserve: Some(creator),
+            freeze: Some(creator),
+            clawback: Some(creator),
+            ..Default::default()
+        });
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        apply_block_with_delta(&mut state, &block1).unwrap();
+
+        // Reconfigure with the exact same role addresses -- a real,
+        // legal no-op reconfigure.
+        let mut reconfig = SignedTransaction::default();
+        reconfig.txn.txn_type = "acfg".into();
+        reconfig.txn.sender = creator;
+        reconfig.txn.fee = 1_000;
+        reconfig.txn.config_asset = 1;
+        reconfig.txn.asset_params = Some(algo_types::AssetParams {
+            manager: Some(creator),
+            reserve: Some(creator),
+            freeze: Some(creator),
+            clawback: Some(creator),
+            ..Default::default()
+        });
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![reconfig],
+            ..Block::default()
+        };
+        let delta = apply_block_with_delta(&mut state, &block2).unwrap();
+
+        assert_eq!(
+            delta.accts.asset_resources.len(),
+            1,
+            "a value-identical reconfigure must still emit an AssetResourceRecord \
+             (go tracks Put, not value diffs): {:?}",
+            delta.accts.asset_resources
+        );
+        let rec = &delta.accts.asset_resources[0];
+        assert_eq!(rec.aidx, 1);
+        assert_eq!(rec.addr, creator);
+        assert!(!rec.params.deleted);
+        assert!(
+            rec.params.params.is_some(),
+            "Params must be present: {rec:?}"
+        );
+        assert!(!rec.holding.deleted);
+        let holding = rec
+            .holding
+            .holding
+            .as_ref()
+            .expect("Holding must be present even though its value is unchanged");
+        assert_eq!(holding.amount, 1_000_000);
+
+        // A pure reconfigure is not a create/destroy transition -- no
+        // Creatables entry.
+        assert!(delta.creatables.is_empty());
     }
 
     /// TDD regression for issue #586: an app-create transaction must produce

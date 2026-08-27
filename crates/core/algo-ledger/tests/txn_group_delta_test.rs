@@ -151,20 +151,21 @@ fn incomplete_block_is_not_captured() {
     let fee_sink = Address([3u8; 32]);
     let balances = [(creator, 5_000_000), (fee_sink, 0)];
 
-    // An asset-config create — not pay/keyreg, so the block is delta-incomplete.
-    let mut acfg = SignedTransaction::default();
-    acfg.txn.txn_type = "acfg".into();
-    acfg.txn.sender = creator;
-    acfg.txn.fee = 1000;
-    acfg.txn.last_valid = Round(1000);
-    acfg.txn.config_asset = 0; // create
-    acfg.txn.asset_params = Some(algo_types::AssetParams {
-        total: 1_000_000,
-        ..Default::default()
-    });
+    // An app-call create -- issue #603 widened `block_state_delta_is_complete`
+    // to admit Acfg/Axfer/Afrz (their top-level resource-key collection is
+    // complete, #586), but `Appl` stays excluded: its resource-key
+    // collection doesn't recurse into inner transactions yet (issue #604),
+    // so an Appl-containing block is still delta-incomplete.
+    let mut appl = SignedTransaction::default();
+    appl.txn.txn_type = "appl".into();
+    appl.txn.sender = creator;
+    appl.txn.fee = 1000;
+    appl.txn.last_valid = Round(1000);
+    appl.txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]));
+    appl.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]));
 
     let mut state = make_state(&balances, fee_sink);
-    let block = minimal_block(fee_sink, 1, vec![acfg]);
+    let block = minimal_block(fee_sink, 1, vec![appl]);
 
     let mut tracer = TxnGroupDeltaTracer::new(8);
     apply_block_capturing_group_deltas(&mut state, &block, &mut tracer).unwrap();
