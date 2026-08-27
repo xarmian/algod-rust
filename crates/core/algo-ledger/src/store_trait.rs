@@ -437,4 +437,49 @@ pub trait LedgerStore {
         let _ = round;
         Ok(())
     }
+
+    // ---- State-proof verification-context tracker ----
+    //
+    // Mirrors go-algorand's `spVerificationTracker`/`StateProofVerificationContext`
+    // persistence (`ledger/spverificationtracker.go`, the `stateproofverification`
+    // DB table): a cache of the data needed to verify a future `StateProofTx`
+    // (voters commitment, online total weight, protocol version), keyed by the
+    // last-attested round the eventual proof will cover, populated when the
+    // relevant "voters round" block is applied and independent of whether that
+    // block's own header is still retained. See `apply_stateproof.rs`'s
+    // `resolve_verification_context`.
+
+    /// Store a state-proof verification-context blob, keyed by the round the
+    /// eventual state proof will attest to (`last_attested_round`).
+    fn put_state_proof_verification_context(
+        &mut self,
+        last_attested_round: u64,
+        data: &[u8],
+    ) -> Result<(), AlgoError> {
+        let _ = (last_attested_round, data);
+        Ok(())
+    }
+
+    /// Retrieve a state-proof verification-context blob by its
+    /// `last_attested_round` key.
+    fn get_state_proof_verification_context(
+        &self,
+        last_attested_round: u64,
+    ) -> Result<Option<Vec<u8>>, AlgoError> {
+        let _ = last_attested_round;
+        Ok(None)
+    }
+
+    /// Delete verification-context entries whose `last_attested_round` is
+    /// strictly less than `before_round` (matches go's
+    /// `DeleteOldSPContexts`: entries are only needed until a state proof
+    /// covering that round has actually been applied and `StateProofNext`
+    /// has advanced past it).
+    fn delete_state_proof_verification_contexts_before(
+        &mut self,
+        before_round: u64,
+    ) -> Result<(), AlgoError> {
+        let _ = before_round;
+        Ok(())
+    }
 }

@@ -5735,6 +5735,55 @@ impl LedgerStore for SqliteLedger {
             })?;
         Ok(())
     }
+
+    // ---- State-proof verification-context tracker ----
+
+    fn put_state_proof_verification_context(
+        &mut self,
+        last_attested_round: u64,
+        data: &[u8],
+    ) -> Result<(), AlgoError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO stateproofverification (lastattestedround, verificationcontext) VALUES (?1, ?2)",
+                params![last_attested_round as i64, data],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("put_state_proof_verification_context error: {e}"),
+            })?;
+        Ok(())
+    }
+
+    fn get_state_proof_verification_context(
+        &self,
+        last_attested_round: u64,
+    ) -> Result<Option<Vec<u8>>, AlgoError> {
+        self.conn
+            .query_row(
+                "SELECT verificationcontext FROM stateproofverification WHERE lastattestedround = ?1",
+                params![last_attested_round as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("get_state_proof_verification_context error: {e}"),
+            })
+    }
+
+    fn delete_state_proof_verification_contexts_before(
+        &mut self,
+        before_round: u64,
+    ) -> Result<(), AlgoError> {
+        self.conn
+            .execute(
+                "DELETE FROM stateproofverification WHERE lastattestedround < ?1",
+                params![before_round as i64],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("delete_state_proof_verification_contexts_before error: {e}"),
+            })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

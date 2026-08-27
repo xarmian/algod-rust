@@ -160,6 +160,62 @@ fn test_apply_block_updates_rewards_state() {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. apply_block populates the state-proof verification-context tracker on
+// a "voters round" block (issue #632)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_apply_block_records_state_proof_verification_context_on_voters_round() {
+    let fee_sink = Address([3u8; 32]);
+    let mut state = make_state(&[(fee_sink, 0)], fee_sink);
+    // v41's StateProofInterval is 256; round 256 is a "voters round"
+    // (round % interval == 0). Jump straight there rather than replaying
+    // 256 blocks -- apply_block only requires round == current_round + 1.
+    state.current_round = Round(255);
+
+    let voters_commitment = vec![9u8; 64];
+    let tracking = Some(rmpv::Value::Map(vec![(
+        rmpv::Value::from(0u64),
+        rmpv::Value::Map(vec![
+            (
+                rmpv::Value::from("v"),
+                rmpv::Value::Binary(voters_commitment.clone()),
+            ),
+            (rmpv::Value::from("t"), rmpv::Value::from(555u64)),
+        ]),
+    )]));
+
+    let mut block = minimal_block(fee_sink, 256, vec![]);
+    block.state_proof_tracking = tracking;
+
+    apply_block(&mut state, &block).unwrap();
+
+    // The tracker must now hold an entry keyed by 256 + 256 = 512 (the
+    // interval this voters-round block seeds), independent of the block
+    // header still being retained.
+    let stored = algo_ledger::LedgerStore::get_state_proof_verification_context(&state, 512)
+        .unwrap()
+        .expect("voters-round block must record a tracker entry");
+    // Sanity: the raw blob at least contains the voters commitment bytes
+    // (exact decoding is covered by apply_stateproof.rs's own unit tests).
+    assert!(
+        stored
+            .windows(voters_commitment.len())
+            .any(|w| w == voters_commitment.as_slice()),
+        "tracker blob must contain the voters commitment"
+    );
+
+    // A non-voters-round block (257) must not record an entry.
+    let block2 = minimal_block(fee_sink, 257, vec![]);
+    apply_block(&mut state, &block2).unwrap();
+    assert!(
+        algo_ledger::LedgerStore::get_state_proof_verification_context(&state, 257 + 256)
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 4. Close-remainder with sender == close_to
 // ---------------------------------------------------------------------------
 
