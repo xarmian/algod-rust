@@ -49,3 +49,7 @@ docker/localnet-rust/data/algod.admin.token text eol=lf
 # format-parity fixture into a corrupt database.
 crates/**/fixtures/**/*.partkey binary
 crates/**/fixtures/**/*.sqlite binary
+
+# Raw captured canonical-msgpack block data (issue #632's genuine
+# state-proof fixture) -- binary for the same reason as above.
+crates/**/fixtures/**/*.bin binary

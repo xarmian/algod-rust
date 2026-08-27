@@ -1,0 +1,16 @@
+{
+  "type": "genuine_state_proof_chain_segment",
+  "source": "ops/mixed-cluster (issue #632) -- 4-node cluster, 3x go-algorand v4.7.2-stable relay+propose (30% stake each) + 1x algod-rust participate (10% stake), all online, real gossip/agreement",
+  "source_go_algorand_version": "4.7.2 (b247a77a, rel/stable)",
+  "genesis_id": "phase6net-v1",
+  "genesis_hash_b64": "iEcro0niH11qvmgyqojcaolH0XeT6MxI140oRZ5rz+A=",
+  "captured_at_utc": "2026-08-28T00:04:00Z",
+  "captured_from": "ops/mixed-cluster/netroot/Node1/phase6net-v1/ledger.block.sqlite (blkdata column, raw canonical block msgpack -- go's protocol.Decode(buf, &blk) format, no wrapper)",
+  "files": {
+    "block_256_voters.bin": "round 256 -- the 'voters round' block whose StateProofTracking (VotersCommitment/StateProofOnlineTotalWeight) is the verification context for the state proof attesting to round 512",
+    "block_660_prev.bin": "round 660 -- the block immediately preceding the stpf-carrying block (661); its StateProofTracking.NextRound=512 is what the round-matching check expects",
+    "block_661_stpf.bin": "round 661 -- the first on-chain block carrying the certifying StateProofTx (payset[0]), a REAL, honestly-produced state proof: StateProofType=0 (Basic), Message{FirstAttestedRound=257, LastAttestedRound=512}, StateProof{SignedWeight=9000045000000000, 3 reveals}"
+  },
+  "how_produced": "This is not synthetic/hand-constructed data. The cluster was started (docker compose, real gossip network) and its 3 go-algorand nodes, holding real online stake with registered state-proof participation keys, autonomously produced and signed this proof over real wall-clock time as part of normal go-algorand consensus operation -- exactly what a real MainNet/TestNet node does. Verified end-to-end through algod-rust's own apply_state_proof (crates/core/algo-ledger/src/apply_stateproof.rs) using this repo's own decode_block, confirming acceptance and correct StateProofNext advancement (see apply_stateproof.rs's accepts_genuine_captured_state_proof_from_live_cluster test).",
+  "notes": "Closes the two remaining #632 acceptance criteria: a genuine go-algorand-produced state proof captured as a golden fixture and verified through apply_state_proof, and live mixed-cluster acceptance (the cluster's own algod-rust participant, rust-node-4, independently synced and accepted this exact block over the real gossip network as part of normal cluster operation -- see ops/mixed-cluster status output at the time of capture)."
+}
