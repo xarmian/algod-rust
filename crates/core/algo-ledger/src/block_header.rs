@@ -233,7 +233,7 @@ fn saturating_mul_micros(a: u128, b: u128) -> u128 {
 /// field under map key `0`) out of an encoded `"spt"` value, defaulting to 0
 /// when absent — mirroring go's zero-value map lookup at
 /// `ledger/eval/eval.go:770`.
-fn state_proof_next_round(tracking: &Option<rmpv::Value>) -> u64 {
+pub(crate) fn state_proof_next_round(tracking: &Option<rmpv::Value>) -> u64 {
     let Some(rmpv::Value::Map(types)) = tracking.as_ref() else {
         return 0;
     };
@@ -247,6 +247,49 @@ fn state_proof_next_round(tracking: &Option<rmpv::Value>) -> u64 {
     fields
         .iter()
         .find(|(k, _)| k.as_str() == Some("n"))
+        .and_then(|(_, v)| v.as_u64())
+        .unwrap_or(0)
+}
+
+/// Read `StateProofTracking[StateProofBasic].VotersCommitment` (the `"v"`
+/// field under map key `0`) out of an encoded `"spt"` value, defaulting to
+/// empty when absent.
+pub(crate) fn state_proof_voters_commitment(tracking: &Option<rmpv::Value>) -> Vec<u8> {
+    let Some(rmpv::Value::Map(types)) = tracking.as_ref() else {
+        return Vec::new();
+    };
+    let basic = types
+        .iter()
+        .find(|(k, _)| k.as_u64() == Some(STATE_PROOF_BASIC))
+        .map(|(_, v)| v);
+    let Some(rmpv::Value::Map(fields)) = basic else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("v"))
+        .and_then(|(_, v)| v.as_slice())
+        .map(|b| b.to_vec())
+        .unwrap_or_default()
+}
+
+/// Read `StateProofTracking[StateProofBasic].StateProofOnlineTotalWeight`
+/// (the `"t"` field under map key `0`) out of an encoded `"spt"` value,
+/// defaulting to 0 when absent.
+pub(crate) fn state_proof_online_total_weight(tracking: &Option<rmpv::Value>) -> u64 {
+    let Some(rmpv::Value::Map(types)) = tracking.as_ref() else {
+        return 0;
+    };
+    let basic = types
+        .iter()
+        .find(|(k, _)| k.as_u64() == Some(STATE_PROOF_BASIC))
+        .map(|(_, v)| v);
+    let Some(rmpv::Value::Map(fields)) = basic else {
+        return 0;
+    };
+    fields
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("t"))
         .and_then(|(_, v)| v.as_u64())
         .unwrap_or(0)
 }

@@ -1175,11 +1175,18 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
         },
         creatables,
         hdr: Some(hdr),
-        // TODO(#586): Set StateProofNext when block contains a valid state
-        // proof txn. Out of scope here -- app/asset resources, creatables,
-        // and totals (the fields this issue's acceptance criteria named)
-        // are now real; state proof tracking is a distinct, still-open gap.
-        state_proof_next: Round(0),
+        // Closes #586: mirrors go's `endOfBlock` (`ledger/eval/eval.go:1391-1400`),
+        // which reads the cow's (post-`apply.StateProof`) `StateProofNextRound`
+        // back into the header's `StateProofTracking[StateProofBasic].NextRound`.
+        // For any block received from the wire (the state proof security-relevant
+        // path this issue is about), `block.state_proof_tracking` already carries
+        // that real value from go-algorand's own block production -- so reading
+        // it back out of the header we just built is exactly the cow readback,
+        // without needing a separate per-round mutable tracking field threaded
+        // through `apply_transaction_inner`.
+        state_proof_next: Round(crate::block_header::state_proof_next_round(
+            &block.state_proof_tracking,
+        )),
         prev_timestamp,
         totals: store.account_totals(),
     };
@@ -2262,10 +2269,14 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
 ) -> Result<ApplyData, AlgoError> {
     let txn = &stx.txn;
 
-    // State proof transactions are protocol-injected and skip all processing
-    // (no rewards, no fees, no state changes).
+    // State proof transactions are protocol-injected: no rewards, no fees,
+    // no ledger state changes beyond the round-matching/crypto checks in
+    // `apply_stateproof::apply_state_proof` (go's `apply.StateProof`,
+    // `ledger/apply/stateproof.go:38`). See issue #626 -- this used to be an
+    // unconditional no-op that accepted any state proof with zero
+    // cryptographic verification.
     if txn.txn_type == "stpf" {
-        return Ok(ApplyData::default());
+        return crate::apply_stateproof::apply_state_proof(store, ctx, txn);
     }
 
     // Convert lease bytes to [u8; 32] for lease table operations.
@@ -4320,7 +4331,15 @@ mod tests {
     }
 
     #[test]
-    fn test_stpf_is_noop() {
+    fn test_stpf_no_longer_unconditionally_accepted() {
+        // Issue #626: a `stpf` transaction used to be an unconditional no-op
+        // that accepted *any* state proof (forged or otherwise) with zero
+        // cryptographic verification. It now goes through
+        // `apply_stateproof::apply_state_proof`, which requires the ledger
+        // to have a tracked `StateProofNext` round to check against -- a
+        // bare `stpf` txn with no such context (no previous block header at
+        // all) is correctly rejected, not silently accepted. See
+        // `apply_stateproof::tests` for full round-matching/crypto coverage.
         let sender = Address([1u8; 32]);
         let fee_sink = Address([3u8; 32]);
 
@@ -4331,8 +4350,12 @@ mod tests {
         stx.txn.sender = sender;
         stx.txn.fee = 0;
 
-        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
-        // Balance unchanged — stpf is a no-op.
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(
+            result.is_err(),
+            "a state proof txn with no ledger context must not be silently accepted"
+        );
+        // Balance unchanged: state proof txns carry no fee/reward regardless.
         assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
     }
 

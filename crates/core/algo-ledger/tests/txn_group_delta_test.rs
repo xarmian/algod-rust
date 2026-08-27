@@ -151,18 +151,49 @@ fn incomplete_block_is_not_captured() {
     let fee_sink = Address([3u8; 32]);
     let balances = [(creator, 5_000_000), (fee_sink, 0)];
 
-    // A state-proof transaction -- `state_proof_next` is still `TODO(#586)`
-    // stubbed in the delta builder regardless of payset content, so `Stpf`
-    // stays excluded from `block_state_delta_is_complete` (unlike `Appl`,
-    // which issue #609 widened the gate to admit once #604's inner-
+    // A state-proof transaction -- `Stpf` stays excluded from
+    // `block_state_delta_is_complete` regardless of payset content (unlike
+    // `Appl`, which issue #609 widened the gate to admit once #604's inner-
     // transaction resource-collection gap was fixed).
+    //
+    // Issue #626 replaced the unconditional stpf no-op with real
+    // round-matching + crypto verification (see
+    // `algo_ledger::apply_stateproof` for that coverage) -- so this txn now
+    // needs a ledger that actually tracks a matching `StateProofNext` round
+    // to be *applied* at all (this test uses `apply_block_capturing_group_deltas`,
+    // which runs in Replay mode / `validate=false`, so only round-matching
+    // is exercised here, not the crypto path).
+    let last_attested_round = 100u64;
     let mut stpf = SignedTransaction::default();
     stpf.txn.txn_type = "stpf".into();
     stpf.txn.sender = creator;
     stpf.txn.fee = 0;
     stpf.txn.last_valid = Round(1000);
+    stpf.txn.state_proof_message = Some(algo_types::StateProofMessage {
+        last_attested_round,
+        ..Default::default()
+    });
 
     let mut state = make_state(&balances, fee_sink);
+    // Previous round's header carries the tracked StateProofNext this stpf
+    // txn is for.
+    let prev_hdr = algo_types::BlockHeader {
+        round: Round(0),
+        current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+        state_proof_tracking: Some(rmpv::Value::Map(vec![(
+            rmpv::Value::from(0u64),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::from("n"),
+                rmpv::Value::from(last_attested_round),
+            )]),
+        )])),
+        ..Default::default()
+    };
+    let hdr_bytes = algo_codec::canonical_encode_block_header(&prev_hdr);
+    state
+        .put_block(0, &prev_hdr.current_protocol, &hdr_bytes, &[])
+        .unwrap();
+
     let block = minimal_block(fee_sink, 1, vec![stpf]);
 
     let mut tracer = TxnGroupDeltaTracer::new(8);

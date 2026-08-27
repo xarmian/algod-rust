@@ -342,6 +342,14 @@ pub struct ConsensusParams {
     /// Whether the light block header includes the block hash instead of the seed
     /// (Go: `StateProofBlockHashInLightHeader`, v39+).
     pub state_proof_block_hash_in_light_header: bool,
+    /// Fraction (numerator over `1<<32`) of top-voters weight that must sign
+    /// for a proof to be considered acceptable (Go: `StateProofWeightThreshold`,
+    /// v34+).
+    pub state_proof_weight_threshold: u32,
+    /// Security parameter `k+q` (pre-quantum) or `k+2q` (post-quantum) used by
+    /// `crypto/stateproof`'s reveal-count bound (Go: `StateProofStrengthTarget`,
+    /// v34+).
+    pub state_proof_strength_target: u64,
 
     // ── Clear state isolation ───────────────────────────────────
     /// Greater isolation for clear state programs (Go: `IsolateClearState`, v31+).
@@ -565,6 +573,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         state_proof_interval: 0,
         state_proof_voters_lookback: 0,
         state_proof_block_hash_in_light_header: false,
+        state_proof_weight_threshold: 0,
+        state_proof_strength_target: 0,
         isolate_clear_state: false,
         max_asset_url_bytes: 0,
         max_asset_name_bytes: 0,
@@ -884,6 +894,10 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v34.enable_sha256_txn_commitment_header = true;
     v34.state_proof_interval = 256;
     v34.state_proof_voters_lookback = 16;
+    // Go: v34.StateProofWeightThreshold = (1 << 32) * 30 / 100 (config/consensus.go:1307).
+    v34.state_proof_weight_threshold = (((1u64 << 32) * 30) / 100) as u32;
+    // Go: v34.StateProofStrengthTarget = 256 (config/consensus.go:1308).
+    v34.state_proof_strength_target = 256;
     v34.agreement_filter_timeout_period0 = Duration::from_millis(3400);
     if version == CONSENSUS_V34 {
         return Some(v34);
