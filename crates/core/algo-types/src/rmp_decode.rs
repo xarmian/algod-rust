@@ -851,6 +851,41 @@ mod tests {
         assert!(rd.is_empty());
     }
 
+    /// Issue #642: a u64/i64 marker followed by fewer than 8 data bytes (a
+    /// truncated wire message, exactly the kind of malformed input an
+    /// attacker controls) must return `Err`, not panic via out-of-bounds
+    /// slice indexing in `read_data_u64_raw`/`read_data_i64_raw`. Audited
+    /// during the panic-hardening pass and confirmed already correctly
+    /// guarded (`if rd.len() < 8 { return Err(...) }` precedes the slice
+    /// index in both); this test pins that guard against regression.
+    #[test]
+    fn read_u64_truncated_after_marker_does_not_panic() {
+        for len in 0..8 {
+            let mut data = vec![0xcfu8];
+            data.extend(std::iter::repeat(0u8).take(len));
+            let mut rd = &data[..];
+            let result = read_u64(&mut rd);
+            assert!(
+                result.is_err(),
+                "u64 marker + {len} data bytes must be rejected, not accepted or panic"
+            );
+        }
+    }
+
+    #[test]
+    fn read_i64_truncated_after_marker_does_not_panic() {
+        for len in 0..8 {
+            let mut data = vec![0xd3u8];
+            data.extend(std::iter::repeat(0u8).take(len));
+            let mut rd = &data[..];
+            let result = read_i64(&mut rd);
+            assert!(
+                result.is_err(),
+                "i64 marker + {len} data bytes must be rejected, not accepted or panic"
+            );
+        }
+    }
+
     #[test]
     fn test_skip_bin8() {
         // bin8 with 4 bytes
