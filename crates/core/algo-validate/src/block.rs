@@ -283,6 +283,16 @@ pub fn validate_block(
         let group_txns: Vec<SignedTransaction> =
             group.iter().map(|&(_, stx)| stx.clone()).collect();
 
+        // Group-level structural screen (Go: `verify/txn.go`'s
+        // `txnGroupBatchPrep` calling `CheckTxnGroup` before any per-txn
+        // signature prep). Runs ahead of the per-member loop below, exactly
+        // like Go's real ordering.
+        if let Err(e) = crate::checks::check_txn_group(&group_txns) {
+            errors.push(BlockValidationError::GroupValidationFailed {
+                error: e.to_string(),
+            });
+        }
+
         for (intra_group_idx, &(idx, stx)) in group.iter().enumerate() {
             // State proof transactions (`stpf`) are special protocol-level
             // transactions injected by consensus. They legitimately have fee=0
@@ -615,7 +625,9 @@ pub fn contents_match_header(
 /// `TxGroup` contains the individual transaction hashes (each unique), so a
 /// collision would require breaking SHA-512/256. Merging adjacent runs with
 /// the same hash is therefore correct.
-fn detect_validation_groups(payset: &[SignedTransaction]) -> Vec<Vec<(usize, &SignedTransaction)>> {
+pub(crate) fn detect_validation_groups(
+    payset: &[SignedTransaction],
+) -> Vec<Vec<(usize, &SignedTransaction)>> {
     let mut groups: Vec<Vec<(usize, &SignedTransaction)>> = Vec::new();
     let mut i = 0;
     while i < payset.len() {

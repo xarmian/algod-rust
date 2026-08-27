@@ -595,11 +595,27 @@ impl Demux {
         consensus_version: &ConsensusVersionView,
     ) -> Option<ExternalEvent> {
         match codec::decode_compound_message(&msg.data) {
-            Ok(compound) => Some(setup_compound_message_from_network(
-                compound,
-                msg.handle,
-                consensus_version,
-            )),
+            Ok(compound) => {
+                // Group-level structural screen (Go: `agreement/message.go`'s
+                // `proposalCarriesInvalidTxn`, called from `demux.go`'s
+                // `tokenizeMessages`). A proposal whose payset fails this
+                // screen is silently dropped — logged, but the peer is NOT
+                // disconnected, unlike a raw decode failure below.
+                if let Err(e) = algo_validate::check_payset(&compound.proposal.block.payset) {
+                    warn!(
+                        len = msg.data.len(),
+                        prefix = %hex_prefix(&msg.data, 96),
+                        "dropping proposal with a malformed transaction payload: {}",
+                        e
+                    );
+                    return None;
+                }
+                Some(setup_compound_message_from_network(
+                    compound,
+                    msg.handle,
+                    consensus_version,
+                ))
+            }
             Err(e) => {
                 warn!(
                     len = msg.data.len(),

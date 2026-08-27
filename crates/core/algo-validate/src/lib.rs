@@ -1,4 +1,5 @@
 pub mod block;
+pub mod checks;
 pub mod merkle;
 pub mod rules;
 pub mod signature;
@@ -6,6 +7,7 @@ pub mod signature;
 pub use block::{
     contents_match_header, validate_block, BlockValidationError, BlockValidationResult,
 };
+pub use checks::{check_payset, check_txn_group};
 pub use rules::{
     compute_group_id, consensus_params_for_version, has_heartbeat, is_free_heartbeat,
     max_txn_bytes_per_block, validate_genesis_consistency, validate_group_fees,
