@@ -114,13 +114,34 @@
 //! (see the paragraph above), whose self-produced-block path calls
 //! `SqliteLedger::cache_state_delta` directly and never consults
 //! `block_state_delta_is_complete`/`apply_block_caching_delta` in the first
-//! place, regardless of what the gate admits. Extending this specific
-//! two-node REST harness with a genuine live sync-path comparison would
-//! need a third algod-rust process actually following the go node over the
-//! wire (or a `sync`-and-serve CLI mode neither `sync` nor `node start`
-//! currently offer) -- tracked in issue #612, not attempted here to avoid
-//! silently understating what this file's existing two `--dev` nodes can
-//! prove.
+//! place, regardless of what the gate admits.
+//!
+//! # Issue #612: the genuine sync-path live test
+//!
+//! #612 added exactly the third process the paragraph above called for:
+//! `algod-rust node start --follow <peer-url>` (see
+//! `bin/algod-rust/src/commands/node.rs::run_follow_loop`) fetches new
+//! blocks one round at a time from a REST peer and applies each one via
+//! `SqliteLedger::apply_block_caching_delta` -- the exact call
+//! `commands/sync.rs` makes per received block -- while continuing to
+//! serve its own REST API, so `GET /v2/deltas/{round}` can be queried
+//! against a block that was genuinely synced, not dev-mode-produced.
+//! `Makefile`'s `validate-api-up` now boots this node on `:4003`, following
+//! `algod-go-shared` (`:4001`) directly.
+//!
+//! `state_delta_appl_inner_txn_matches_go_through_real_sync_path` below
+//! submits an itxn-issuing app call to go ALONE (unlike every other test in
+//! this file, which submits independently to both `--dev` nodes), waits
+//! for the `:4003` follow node to sync that round over its own independent
+//! REST poll of go, and then diffs `GET /v2/deltas/{round}` between go and
+//! the syncing node for that *same* round of the *same* chain -- a full,
+//! unstripped comparison (not the per-side key-stripped comparison the
+//! rest of this file needs for two independently-advancing chains, per the
+//! header note above), since both sides now describe literally the same
+//! block. This is the live proof that #609/#613's sync-path fix
+//! (`apply_block_caching_delta` routing `Appl` blocks through
+//! `ApplyMode::Execute`) works end-to-end against a real peer, closing the
+//! gap this file's module doc used to describe as open.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1916,5 +1937,260 @@ async fn state_delta_asset_holding_force_emit_matches_go_for_value_identical_axf
     assert_eq!(
         go_freeze, rust_freeze,
         "value-identical re-freeze AssetResourceRecord must match between go and rust"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #612: genuine sync-path live verification (algod-rust `--follow`,
+// syncing from go-algorand, vs the `--dev` nodes every other test above
+// uses). See the module docs' "Issue #612" section for why this needed a
+// third harness node.
+// ---------------------------------------------------------------------------
+
+fn sync_url() -> String {
+    std::env::var("ALGOD_RUST_SYNC_URL").unwrap_or_else(|_| "http://127.0.0.1:4003".to_string())
+}
+
+/// Polls the `--follow` node's `/v2/status` until its `last-round` reaches
+/// at least `round`, bounded by `deadline`. This is the live proof that
+/// the node is actually syncing new blocks from its peer over its own
+/// independent REST poll loop (`commands/node.rs::run_follow_loop`) --
+/// before #609/#613's fix, the round could show up as synced yet still
+/// 404 on `/v2/deltas/{round}` (the old gate excluded `Appl` blocks from
+/// the delta cache); after #604, a stale `Replay`-mode apply of an `Appl`
+/// block could diverge from go entirely. This helper only waits for the
+/// round to be *seen*; the delta comparison below is what actually
+/// exercises those fixed paths.
+async fn wait_for_sync_round(c: &reqwest::Client, round: u64, deadline: std::time::Instant) {
+    loop {
+        let (status, body) = get_json(c, &sync_url(), "/v2/status").await;
+        if status == 200 {
+            if let Some(last) = body["last-round"].as_u64() {
+                if last >= round {
+                    return;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "algod-rust --follow node (issue #612) did not sync round {round} before \
+                 deadline (last status {status}, body {body}) -- is `node start --follow` \
+                 running on {}? (see Makefile's validate-api-up)",
+                sync_url()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Live sync-path verification for issue #612.
+///
+/// Unlike every other test in this file (each of which submits
+/// independently to `go_url()` and `rust_url()` -- two `--dev` nodes each
+/// building their own chain from the shared genesis, requiring the
+/// per-side key-stripped comparison this file's module docs explain), this
+/// test submits ONLY to `go_url()`. It then waits for a third algod-rust
+/// process -- started with `node start --follow http://localhost:4001`
+/// (see `Makefile`'s `validate-api-up`,
+/// `commands/node.rs::run_follow_loop`) -- to genuinely sync that same
+/// block over its own REST poll of go, through the real sync-path call
+/// (`SqliteLedger::apply_block_caching_delta`, the exact function
+/// `commands/sync.rs` calls per received block; `--dev` mode never calls
+/// it at all). Both nodes then serve `GET /v2/deltas/{round}` for the
+/// *same* round of the *same* chain, so this is a strict, unstripped
+/// comparison, not the per-side one the rest of this file needs.
+///
+/// Deploys the same itxn-issuing app as `algo_ledger::apply`'s
+/// `issue_604_inner_acfg_create_populates_asset_resources_and_creatables` /
+/// `sqlite::apply_block_caching_delta_caches_full_delta_for_appl_with_inner_acfg`:
+/// approve on create, `itxn_submit` an inner `acfg` (asset create) on any
+/// later call -- so the round under comparison is exactly the shape
+/// #609/#613 fixed sync-path attribution for.
+#[tokio::test]
+#[ignore = "requires `make validate-api-up` (needs the --follow node on :4003); see module docs"]
+async fn state_delta_appl_inner_txn_matches_go_through_real_sync_path() {
+    let c = client();
+    let sk = dev_signing_key();
+    let go = go_url();
+    let dev_addr_str = dev_address().to_string();
+
+    // Version 8, matching `CLEAR_STATE_PROGRAM` (also v8) -- go-algorand
+    // rejects a create txn whose approval/clear-state versions mismatch
+    // ("program version mismatch"), unlike the in-process unit tests this
+    // program shape is adapted from (`apply.rs`'s
+    // `issue_604_inner_acfg_create_populates_asset_resources_and_creatables`,
+    // `sqlite.rs`'s `apply_block_caching_delta_caches_full_delta_for_appl_with_inner_acfg`),
+    // which apply hand-built blocks directly and never go through go's txn
+    // validity check.
+    let approval_src = "#pragma version 8\n\
+        txn ApplicationID\n\
+        bz approve\n\
+        itxn_begin\n\
+        int acfg\n\
+        itxn_field TypeEnum\n\
+        int 1000000\n\
+        itxn_field ConfigAssetTotal\n\
+        int 0\n\
+        itxn_field ConfigAssetDecimals\n\
+        byte \"UNIT\"\n\
+        itxn_field ConfigAssetUnitName\n\
+        byte \"Asset\"\n\
+        itxn_field ConfigAssetName\n\
+        itxn_submit\n\
+        approve:\n\
+        int 1\n\
+        return\n";
+    let approval = algo_avm::assembler::assemble_string(approval_src)
+        .expect("approval program must assemble")
+        .program;
+
+    // 1. Create the app on go ONLY -- the syncing node has no submit
+    // capability of its own; it only ever consumes go's blocks.
+    let mut create = base_txn(&c, &go).await;
+    create.txn_type = TxnType::Appl;
+    create.approval_program = Some(ByteBuf::from(approval));
+    create.clear_state_program = Some(ByteBuf::from(CLEAR_STATE_PROGRAM.to_vec()));
+    create.note = unique_note("issue612-appl-create").into();
+    let confirmed = submit_and_confirm(&c, &go, "go", &mut create, &sk, "app creation").await;
+    let app_id = confirmed["application-index"].as_u64().unwrap_or_else(|| {
+        panic!("go: confirmed app creation must report application-index: {confirmed}")
+    });
+
+    // 2. Fund the app account so its inner acfg can cover the asset's MBR.
+    let app_addr = algo_types::Address(algo_ledger::avm_context::app_address(app_id));
+    let mut fund = base_txn(&c, &go).await;
+    fund.txn_type = TxnType::Pay;
+    fund.receiver = app_addr;
+    fund.amount = 1_000_000;
+    fund.note = unique_note("issue612-appl-fund").into();
+    submit_and_confirm(&c, &go, "go", &mut fund, &sk, "app funding").await;
+
+    // 3. Call the app -- its approval program itxn_submits an inner acfg.
+    let mut call = base_txn(&c, &go).await;
+    call.txn_type = TxnType::Appl;
+    call.application_id = app_id;
+    call.note = unique_note("issue612-appl-call").into();
+    let confirmed =
+        submit_and_confirm(&c, &go, "go", &mut call, &sk, "app call (inner acfg)").await;
+    let call_round = confirmed["confirmed-round"].as_u64().unwrap();
+    let inner_txns = confirmed["inner-txns"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        inner_txns.len(),
+        1,
+        "go: app call must report exactly one inner txn: {confirmed}"
+    );
+    let created_asset_id = inner_txns[0]["asset-index"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("go: inner acfg must report asset-index: {confirmed}"));
+
+    // 4. Wait for the syncing --follow node to genuinely apply this round
+    //    over its own independent REST poll of go.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    wait_for_sync_round(&c, call_round, deadline).await;
+
+    // 5. Compare GET /v2/deltas/{call_round} between go and the syncing
+    //    rust node for the SAME round of the SAME chain -- a full-body
+    //    comparison is meaningful here (unlike the rest of this file)
+    //    because both nodes now describe literally the same block, same
+    //    app id, same inner-created asset id.
+    let go_body = fetch_delta_expect_200(&c, &go, "go", call_round, "issue #612 sync path").await;
+    let sync_body = fetch_delta_expect_200(
+        &c,
+        &sync_url(),
+        "rust-sync",
+        call_round,
+        "issue #612 sync path",
+    )
+    .await;
+
+    // 5a. If either side reports an AppResourceRecord for the calling
+    // account (a bare NoOp call with no local-state schema isn't
+    // guaranteed to touch/`Put` one -- unlike
+    // `state_delta_app_resources_matches_go_for_create_update`'s create/
+    // update calls, which do -- so presence itself isn't asserted here),
+    // it must match field-for-field between go and the syncing rust node.
+    let find_app_rec = |body: &serde_json::Value| -> Option<serde_json::Value> {
+        body["Accts"]["AppResources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| {
+                r["Aidx"].as_u64() == Some(app_id) && r["Addr"].as_str() == Some(&dev_addr_str)
+            })
+            .cloned()
+    };
+    let go_app_rec = find_app_rec(&go_body);
+    let sync_app_rec = find_app_rec(&sync_body);
+    assert_eq!(
+        go_app_rec, sync_app_rec,
+        "AppResourceRecord presence/content for the calling app must match between go and the \
+         syncing rust node (go: {go_app_rec:?}, sync: {sync_app_rec:?})"
+    );
+
+    // 5b. The inner acfg's AssetResourceRecord -- attributed to the APP
+    // account (the inner txn's implicit sender), not the outer call's
+    // sender; this is exactly the attribution issue #604/#609 fixed. Must
+    // match field-for-field, including the app address as Addr.
+    let app_addr_str = app_addr.to_string();
+    let go_asset_rec = asset_resources(&go_body)
+        .into_iter()
+        .find(|r| r["Aidx"].as_u64() == Some(created_asset_id))
+        .unwrap_or_else(|| {
+            panic!("go: missing AssetResourceRecord for inner-created asset {created_asset_id}: {go_body}")
+        });
+    let sync_asset_rec = asset_resources(&sync_body)
+        .into_iter()
+        .find(|r| r["Aidx"].as_u64() == Some(created_asset_id))
+        .unwrap_or_else(|| {
+            panic!(
+                "rust-sync: missing AssetResourceRecord for inner-created asset \
+                 {created_asset_id} -- this is exactly the sync-path gap #609/#613 fixed: {sync_body}"
+            )
+        });
+    assert_eq!(
+        go_asset_rec["Addr"].as_str(),
+        Some(app_addr_str.as_str()),
+        "go: inner acfg's AssetResourceRecord must be attributed to the app account: {go_asset_rec}"
+    );
+    assert_eq!(
+        go_asset_rec, sync_asset_rec,
+        "inner-created asset's AssetResourceRecord must match between go and the syncing rust node"
+    );
+
+    // 5c. Both Creatables entries (the app itself and the inner-created
+    // asset) must match on `Created`/`Ctype`/`Creator` -- the fields every
+    // other test in this file checks (see e.g.
+    // `state_delta_asset_resources_matches_go_for_create_update_destroy`).
+    // `Ndeltas` is deliberately excluded: it's go's own tracker-internal
+    // "how many in-flight rounds' deltas still reference this creatable"
+    // counter (see `ledgercore.ModifiedCreatable`), not part of the
+    // creatable's logical content -- algod-rust always emits `1` for a
+    // freshly-created creatable (`apply.rs`), while go's value here
+    // depends on unrelated tracker cache state built up by every earlier
+    // test/round in this long-lived harness process, so comparing it is
+    // comparing implementation bookkeeping, not parity.
+    let creatable_content = |v: &serde_json::Value| -> serde_json::Value {
+        serde_json::json!({
+            "Created": v["Created"],
+            "Ctype": v["Ctype"],
+            "Creator": v["Creator"],
+        })
+    };
+    let go_app_creatable = &go_body["Creatables"][app_id.to_string()];
+    let sync_app_creatable = &sync_body["Creatables"][app_id.to_string()];
+    assert_eq!(
+        creatable_content(go_app_creatable),
+        creatable_content(sync_app_creatable),
+        "app Creatables entry must match between go and the syncing rust node"
+    );
+    let go_asset_creatable = &go_body["Creatables"][created_asset_id.to_string()];
+    let sync_asset_creatable = &sync_body["Creatables"][created_asset_id.to_string()];
+    assert_eq!(
+        creatable_content(go_asset_creatable),
+        creatable_content(sync_asset_creatable),
+        "inner-created asset's Creatables entry must match between go and the syncing rust node"
     );
 }
