@@ -6,25 +6,34 @@
 //! actual cryptographic verification (`crypto/stateproof.Verifier.Verify`)
 //! is ported separately in `algo_consensus_crypto::stateproof`.
 //!
-//! # Scope note (issue #626)
+//! # Verification-context tracker (issue #632)
 //!
-//! go's `apply.StateProof` resolves the verification context (participant
-//! commitment + proven weight for the relevant voting round) two ways,
-//! selected by `StateProofUseTrackerVerification` (v38+, `config/consensus.go:521`):
-//! a dedicated state-proof-verification tracker, or (the pre-v38 fallback,
-//! `gatherVerificationContextUsingBlockHeaders`, `ledger/apply/stateproof.go:78`)
-//! reading `StateProofTracking` straight out of the two relevant block
-//! headers. algod-rust has no tracker subsystem, so this module always uses
-//! the block-header path — the same underlying data (`VotersCommitment`,
-//! `StateProofOnlineTotalWeight`), just read directly rather than cached in a
-//! dedicated store. For any block received from the network (the security-
-//! relevant case this issue is about — a forged proof in an untrusted block),
-//! those header fields are real values written by go-algorand's own block
-//! production, decoded from the wire byte-for-byte, so this does not weaken
-//! verification; it only means algod-rust cannot yet independently rebuild
-//! `VotersCommitment` when *producing* its own state-proof-carrying blocks
-//! from scratch (a separate, already-tracked gap — see `next_state_proof_tracking`
-//! in `block_header.rs`).
+//! go's `apply.StateProof` resolves the verification context (voters
+//! commitment + online total weight + protocol version for the relevant
+//! voting round) two ways, selected by `StateProofUseTrackerVerification`
+//! (true from v38, `config/consensus.go:1364` — i.e. true for every
+//! consensus version this repo currently targets, including V41):
+//!
+//! - **Tracker path** (`ledger/spverificationtracker.go`'s
+//!   `LookupVerificationContext`): a dedicated cache populated when each
+//!   "voters round" block (`round % StateProofInterval == 0`) is applied,
+//!   independent of whether that block's own header is still retained —
+//!   this is real go-algorand's actual behavior at the versions this repo
+//!   targets, not a fallback.
+//! - **Header path** (pre-v38 fallback,
+//!   `gatherVerificationContextUsingBlockHeaders`,
+//!   `ledger/apply/stateproof.go:78`): reads `StateProofTracking` straight
+//!   out of the two relevant block headers.
+//!
+//! `resolve_verification_context` below mirrors this: it prefers a tracker
+//! entry (populated by `record_state_proof_verification_context`, called
+//! from `apply::apply_block_impl` on every "voters round" block, mirroring
+//! go's `spVerificationTracker.newBlock`/`appendCommitContext`) and falls
+//! back to the header-derived path when no tracker entry exists — covering
+//! both pre-v38 protocols and any round the tracker hasn't (yet) recorded
+//! (e.g. a chain replayed from genesis before this tracker existed). Old
+//! entries are pruned via `prune_state_proof_verification_contexts`,
+//! mirroring go's `DeleteOldSPContexts`.
 
 use std::collections::BTreeMap;
 
@@ -61,7 +70,7 @@ fn ledger_err(message: impl Into<String>) -> AlgoError {
 /// 1. Reject unsupported `StateProofType`.
 /// 2. Enforce that the proof is for exactly the round the ledger's tracked
 ///    `StateProofNext` expects (read from the previous block header's
-///    `StateProofTracking`, see the module doc's scope note).
+///    `StateProofTracking`).
 /// 3. When `ctx.validate` (mirrors go's `eval.validate` — false only for
 ///    trusted replay of already-accepted blocks), resolve the verification
 ///    context and run the full cryptographic verification.
@@ -108,45 +117,13 @@ pub fn apply_state_proof<L: LedgerStore>(
     }
 
     if ctx.validate {
-        // Matches go's `gatherVerificationContextUsingBlockHeaders`
-        // (`ledger/apply/stateproof.go:77`): `lastRoundHdr.CurrentProtocol`
-        // is used *only* to locate `votersRnd`'s offset. Every downstream
-        // security parameter (interval-multiple check, WeightThreshold,
-        // StrengthTarget) is then read from `votersHdr.CurrentProtocol` via
-        // `MakeStateProofVerificationContext`'s `Version` field
-        // (`ledger/ledgercore/stateproofverification.go:49`), consumed by
-        // `verify.ValidateStateProof` (`stateproof/verify/stateproof.go:144`)
-        // — NOT from `lastRoundHdr` again. Using the wrong header here would
-        // silently verify against the wrong version's security thresholds
-        // if a future protocol upgrade ever changes them mid-interval.
-        let last_round_hdr = store
-            .get_block_header(last_round_in_interval)?
-            .ok_or_else(|| {
-                ledger_err(format!(
-                    "applyStateProof: no header for last attested round {last_round_in_interval}"
-                ))
-            })?;
-        let gather_params = consensus_params_for_version(&last_round_hdr.current_protocol)
-            .ok_or_else(|| {
-                ledger_err(format!(
-                    "applyStateProof: unknown protocol '{}'",
-                    last_round_hdr.current_protocol
-                ))
-            })?;
-
-        let voters_round =
-            last_round_in_interval.saturating_sub(gather_params.state_proof_interval);
-        let voters_hdr = store.get_block_header(voters_round)?.ok_or_else(|| {
-            ledger_err(format!(
-                "applyStateProof: no header for voters round {voters_round}"
-            ))
-        })?;
+        let verification_context = resolve_verification_context(store, last_round_in_interval)?;
 
         let params =
-            consensus_params_for_version(&voters_hdr.current_protocol).ok_or_else(|| {
+            consensus_params_for_version(&verification_context.version).ok_or_else(|| {
                 ledger_err(format!(
                     "applyStateProof: unknown protocol '{}'",
-                    voters_hdr.current_protocol
+                    verification_context.version
                 ))
             })?;
 
@@ -163,10 +140,7 @@ pub fn apply_state_proof<L: LedgerStore>(
             )));
         }
 
-        let voters_commitment =
-            crate::block_header::state_proof_voters_commitment(&voters_hdr.state_proof_tracking);
-        let online_total_weight =
-            crate::block_header::state_proof_online_total_weight(&voters_hdr.state_proof_tracking);
+        let online_total_weight = verification_context.online_total_weight;
 
         let acceptable_weight = calculate_acceptable_state_proof_weight(
             online_total_weight,
@@ -197,7 +171,7 @@ pub fn apply_state_proof<L: LedgerStore>(
         })?;
 
         let verifier = crypto_sp::Verifier::new(
-            voters_commitment,
+            verification_context.voters_commitment,
             proven_weight,
             params.state_proof_strength_target,
         )
@@ -213,6 +187,176 @@ pub fn apply_state_proof<L: LedgerStore>(
     }
 
     Ok(ApplyData::default())
+}
+
+// ── Verification-context tracker ────────────────────────────────────────
+
+/// The data needed to verify a state proof for one round interval: voters
+/// commitment, online total weight, and the protocol version whose security
+/// parameters (`StateProofWeightThreshold`, `StateProofStrengthTarget`,
+/// `StateProofInterval`) govern that interval. Matches go's
+/// `ledgercore.StateProofVerificationContext` (minus the redundant
+/// `LastAttestedRound` field, which is the tracker's lookup key here).
+#[derive(Debug)]
+struct VerificationContext {
+    voters_commitment: Vec<u8>,
+    online_total_weight: u64,
+    version: String,
+}
+
+/// Resolve the verification context for a state proof attesting to
+/// `last_round_in_interval`, preferring the tracker (real go-algorand
+/// behavior at v38+) and falling back to reading it directly out of the
+/// two relevant block headers (pre-v38, or a round the tracker hasn't
+/// recorded — e.g. a chain replayed before this tracker existed). See the
+/// module doc for the full picture.
+fn resolve_verification_context<L: LedgerStore>(
+    store: &L,
+    last_round_in_interval: u64,
+) -> Result<VerificationContext, AlgoError> {
+    if let Some(bytes) = store.get_state_proof_verification_context(last_round_in_interval)? {
+        return decode_verification_context(&bytes).map_err(|e| {
+            ledger_err(format!(
+                "applyStateProof: corrupt tracked verification context for round \
+                 {last_round_in_interval}: {e}"
+            ))
+        });
+    }
+
+    // Matches go's `gatherVerificationContextUsingBlockHeaders`
+    // (`ledger/apply/stateproof.go:77`): `lastRoundHdr.CurrentProtocol` is
+    // used *only* to locate `votersRnd`'s offset. Every downstream security
+    // parameter is then read from `votersHdr.CurrentProtocol` via
+    // `MakeStateProofVerificationContext`'s `Version` field
+    // (`ledger/ledgercore/stateproofverification.go:49`) — NOT from
+    // `lastRoundHdr` again. Using the wrong header here would silently
+    // verify against the wrong version's security thresholds if a future
+    // protocol upgrade ever changes them mid-interval.
+    let last_round_hdr = store
+        .get_block_header(last_round_in_interval)?
+        .ok_or_else(|| {
+            ledger_err(format!(
+                "applyStateProof: no header for last attested round {last_round_in_interval}"
+            ))
+        })?;
+    let gather_params =
+        consensus_params_for_version(&last_round_hdr.current_protocol).ok_or_else(|| {
+            ledger_err(format!(
+                "applyStateProof: unknown protocol '{}'",
+                last_round_hdr.current_protocol
+            ))
+        })?;
+
+    let voters_round = last_round_in_interval.saturating_sub(gather_params.state_proof_interval);
+    let voters_hdr = store.get_block_header(voters_round)?.ok_or_else(|| {
+        ledger_err(format!(
+            "applyStateProof: no header for voters round {voters_round}"
+        ))
+    })?;
+
+    Ok(VerificationContext {
+        voters_commitment: crate::block_header::state_proof_voters_commitment(
+            &voters_hdr.state_proof_tracking,
+        ),
+        online_total_weight: crate::block_header::state_proof_online_total_weight(
+            &voters_hdr.state_proof_tracking,
+        ),
+        version: voters_hdr.current_protocol,
+    })
+}
+
+/// Record a verification context for the block just applied, if it's a
+/// "voters round" (`round % StateProofInterval == 0`) — mirrors go's
+/// `spVerificationTracker.newBlock`/`appendCommitContext`
+/// (`ledger/spverificationtracker.go:88-102`): every such block seeds the
+/// verification context for the state proof interval starting after it,
+/// i.e. for `last_attested_round = round + StateProofInterval`.
+///
+/// Called from `apply::apply_block_impl` on every applied block (own
+/// production or replay/sync), independent of whether that block will ever
+/// itself carry a `StateProofTx` — the tracker records *voters* data, not
+/// proof data.
+pub(crate) fn record_state_proof_verification_context<L: LedgerStore>(
+    store: &mut L,
+    round: u64,
+    current_protocol: &str,
+    state_proof_tracking: &Option<rmpv::Value>,
+    state_proof_interval: u64,
+) -> Result<(), AlgoError> {
+    if state_proof_interval == 0 || round % state_proof_interval != 0 {
+        return Ok(());
+    }
+    let last_attested_round = round + state_proof_interval;
+    let ctx = VerificationContext {
+        voters_commitment: crate::block_header::state_proof_voters_commitment(state_proof_tracking),
+        online_total_weight: crate::block_header::state_proof_online_total_weight(
+            state_proof_tracking,
+        ),
+        version: current_protocol.to_string(),
+    };
+    store.put_state_proof_verification_context(
+        last_attested_round,
+        &encode_verification_context(&ctx),
+    )
+}
+
+/// Prune verification-context entries that are no longer needed because a
+/// state proof for that round has already been applied and `StateProofNext`
+/// has advanced past it — mirrors go's `DeleteOldSPContexts`
+/// (`ledger/spverificationtracker.go:136-138`, keyed by
+/// `pendingDeleteContexts`' `stateProofNextRound`, i.e. the block's own
+/// post-apply `StateProofNext`).
+pub(crate) fn prune_state_proof_verification_contexts<L: LedgerStore>(
+    store: &mut L,
+    new_state_proof_next: u64,
+) -> Result<(), AlgoError> {
+    if new_state_proof_next == 0 {
+        return Ok(());
+    }
+    store.delete_state_proof_verification_contexts_before(new_state_proof_next)
+}
+
+/// Encode a [`VerificationContext`] to a plain binary blob for the
+/// verification-context tracker's local store. Internal, node-private
+/// format — this data never crosses the wire or affects consensus (it's a
+/// pure verification-context cache), so byte-level parity with go's own DB
+/// blob encoding isn't required, only matching read/write/lookup behavior.
+fn encode_verification_context(ctx: &VerificationContext) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 4 + ctx.voters_commitment.len() + 4 + ctx.version.len());
+    out.extend_from_slice(&ctx.online_total_weight.to_le_bytes());
+    out.extend_from_slice(&(ctx.voters_commitment.len() as u32).to_le_bytes());
+    out.extend_from_slice(&ctx.voters_commitment);
+    out.extend_from_slice(&(ctx.version.len() as u32).to_le_bytes());
+    out.extend_from_slice(ctx.version.as_bytes());
+    out
+}
+
+fn decode_verification_context(bytes: &[u8]) -> Result<VerificationContext, String> {
+    let mut pos = 0usize;
+    let take = |pos: &mut usize, n: usize, bytes: &[u8]| -> Result<Vec<u8>, String> {
+        let end = pos.checked_add(n).ok_or("length overflow")?;
+        let slice = bytes.get(*pos..end).ok_or("truncated")?.to_vec();
+        *pos = end;
+        Ok(slice)
+    };
+
+    let weight_bytes = take(&mut pos, 8, bytes)?;
+    let online_total_weight = u64::from_le_bytes(weight_bytes.try_into().unwrap());
+
+    let commit_len_bytes = take(&mut pos, 4, bytes)?;
+    let commit_len = u32::from_le_bytes(commit_len_bytes.try_into().unwrap()) as usize;
+    let voters_commitment = take(&mut pos, commit_len, bytes)?;
+
+    let ver_len_bytes = take(&mut pos, 4, bytes)?;
+    let ver_len = u32::from_le_bytes(ver_len_bytes.try_into().unwrap()) as usize;
+    let ver_bytes = take(&mut pos, ver_len, bytes)?;
+    let version = String::from_utf8(ver_bytes).map_err(|e| e.to_string())?;
+
+    Ok(VerificationContext {
+        voters_commitment,
+        online_total_weight,
+        version,
+    })
 }
 
 /// `a*b/d`, computed in 128-bit precision (`a`, `d`: u64; `b`: u32), matching
@@ -554,6 +698,120 @@ mod tests {
             format!("{err}").contains("insufficient weight"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Issue #632: the verification-context tracker must survive the
+    /// voters-round block header being pruned/unavailable — the whole point
+    /// of a dedicated tracker (`ledger/spverificationtracker.go`) rather than
+    /// go's pre-v38 `gatherVerificationContextUsingBlockHeaders` fallback.
+    /// Without a tracker entry, deleting the voters header (round 0) makes
+    /// `resolve_verification_context` fail; with one recorded (as
+    /// `apply::apply_block_impl` would on every applied "voters round"
+    /// block), it must still succeed.
+    #[test]
+    fn tracker_survives_voters_header_pruning() {
+        const LAST_ATTESTED: u64 = 256;
+        const VOTERS_ROUND: u64 = 0;
+
+        let mut store = LedgerState::new();
+        put_header(
+            &mut store,
+            &header_at(255, CONSENSUS_V41, tracking_value(LAST_ATTESTED, &[], 0)),
+        );
+        put_header(&mut store, &header_at(LAST_ATTESTED, CONSENSUS_V41, None));
+        let voters_commitment = vec![7u8; 64];
+        put_header(
+            &mut store,
+            &header_at(
+                VOTERS_ROUND,
+                CONSENSUS_V41,
+                tracking_value(0, &voters_commitment, 42),
+            ),
+        );
+
+        // Baseline: with the voters header present, resolution succeeds via
+        // the header-derived fallback.
+        let ctx_before =
+            resolve_verification_context(&store, LAST_ATTESTED).expect("header path must work");
+        assert_eq!(ctx_before.voters_commitment, voters_commitment);
+        assert_eq!(ctx_before.online_total_weight, 42);
+
+        // Prune the voters header (round 0) -- simulates it having fallen
+        // out of retention. The header-derived path can no longer resolve
+        // this round.
+        store.forget_before(1).unwrap();
+        assert!(store.get_block_header(VOTERS_ROUND).unwrap().is_none());
+        let err = resolve_verification_context(&store, LAST_ATTESTED).unwrap_err();
+        assert!(
+            format!("{err}").contains("no header for voters round"),
+            "expected the header-path failure without a tracker entry, got: {err}"
+        );
+
+        // Record the tracker entry for that voters-round block (as
+        // `apply_block_impl` would have when round 0 was originally
+        // applied), then confirm resolution succeeds even with the header
+        // still gone.
+        record_state_proof_verification_context(
+            &mut store,
+            VOTERS_ROUND,
+            CONSENSUS_V41,
+            &tracking_value(0, &voters_commitment, 42),
+            algo_types::consensus::consensus_params_for_version(CONSENSUS_V41)
+                .unwrap()
+                .state_proof_interval,
+        )
+        .unwrap();
+
+        let ctx_after = resolve_verification_context(&store, LAST_ATTESTED)
+            .expect("tracker path must succeed without the header");
+        assert_eq!(ctx_after.voters_commitment, voters_commitment);
+        assert_eq!(ctx_after.online_total_weight, 42);
+        assert_eq!(ctx_after.version, CONSENSUS_V41);
+    }
+
+    #[test]
+    fn tracker_prunes_entries_before_new_state_proof_next() {
+        let mut store = LedgerState::new();
+        let ctx = VerificationContext {
+            voters_commitment: vec![1, 2, 3],
+            online_total_weight: 10,
+            version: CONSENSUS_V41.to_string(),
+        };
+        store
+            .put_state_proof_verification_context(256, &encode_verification_context(&ctx))
+            .unwrap();
+        store
+            .put_state_proof_verification_context(512, &encode_verification_context(&ctx))
+            .unwrap();
+
+        prune_state_proof_verification_contexts(&mut store, 512).unwrap();
+
+        assert!(store
+            .get_state_proof_verification_context(256)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_state_proof_verification_context(512)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn record_state_proof_verification_context_ignores_non_voters_rounds() {
+        let mut store = LedgerState::new();
+        record_state_proof_verification_context(
+            &mut store,
+            5, // not a multiple of any real StateProofInterval
+            CONSENSUS_V41,
+            &tracking_value(0, &[9u8; 32], 100),
+            256,
+        )
+        .unwrap();
+        // 5 + 256 = 261 -- must not have been recorded.
+        assert!(store
+            .get_state_proof_verification_context(261)
+            .unwrap()
+            .is_none());
     }
 
     /// Genuine, end-to-end accept case: real Falcon-1024 keys/signatures and

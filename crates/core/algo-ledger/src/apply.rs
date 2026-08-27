@@ -1698,6 +1698,32 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
         tracing::warn!("put_txtail failed for round {}: {e}", block.round.0);
     }
 
+    // State-proof verification-context tracker (issue #632): mirrors go's
+    // `spVerificationTracker.newBlock` — record this block's own voters
+    // data if it's a "voters round", and prune contexts a proof already
+    // covered. Auxiliary tracker writes, same failure policy as above.
+    if let Err(e) = crate::apply_stateproof::record_state_proof_verification_context(
+        store,
+        block.round.0,
+        &block.current_protocol,
+        &block.state_proof_tracking,
+        consensus.state_proof_interval,
+    ) {
+        tracing::warn!(
+            "record_state_proof_verification_context failed for round {}: {e}",
+            block.round.0
+        );
+    }
+    let state_proof_next = crate::block_header::state_proof_next_round(&block.state_proof_tracking);
+    if let Err(e) =
+        crate::apply_stateproof::prune_state_proof_verification_contexts(store, state_proof_next)
+    {
+        tracing::warn!(
+            "prune_state_proof_verification_contexts failed for round {}: {e}",
+            block.round.0
+        );
+    }
+
     // Issue #570: hand the accumulated box deltas back to the caller.
     if let (Some(out), Some(recorder)) = (kv_mods_out, kv_mods_recorder) {
         *out = Rc::try_unwrap(recorder)

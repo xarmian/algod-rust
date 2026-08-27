@@ -455,4 +455,31 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
     fn forget_before(&mut self, round: u64) -> Result<(), AlgoError> {
         self.inner.forget_before(round)
     }
+
+    // ---- State-proof verification-context tracker ----
+
+    fn put_state_proof_verification_context(
+        &mut self,
+        last_attested_round: u64,
+        data: &[u8],
+    ) -> Result<(), AlgoError> {
+        self.inner
+            .put_state_proof_verification_context(last_attested_round, data)
+    }
+
+    fn get_state_proof_verification_context(
+        &self,
+        last_attested_round: u64,
+    ) -> Result<Option<Vec<u8>>, AlgoError> {
+        self.inner
+            .get_state_proof_verification_context(last_attested_round)
+    }
+
+    fn delete_state_proof_verification_contexts_before(
+        &mut self,
+        before_round: u64,
+    ) -> Result<(), AlgoError> {
+        self.inner
+            .delete_state_proof_verification_contexts_before(before_round)
+    }
 }

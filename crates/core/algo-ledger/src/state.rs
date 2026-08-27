@@ -109,6 +109,7 @@ pub struct LedgerState {
     // Block and txtail storage (in-memory backend for LedgerStore trait)
     block_store: HashMap<u64, BlockEntry>,
     txtail_store: HashMap<u64, Vec<u8>>,
+    state_proof_verification_store: HashMap<u64, Vec<u8>>,
 }
 
 impl LedgerState {
@@ -138,6 +139,7 @@ impl LedgerState {
             pre_mutations: Vec::new(),
             block_store: HashMap::new(),
             txtail_store: HashMap::new(),
+            state_proof_verification_store: HashMap::new(),
         }
     }
 
@@ -1563,6 +1565,37 @@ impl crate::store_trait::LedgerStore for LedgerState {
     fn forget_before(&mut self, round: u64) -> Result<(), algo_error::AlgoError> {
         self.block_store.retain(|&r, _| r >= round);
         self.txtail_store.retain(|&r, _| r >= round);
+        Ok(())
+    }
+
+    // ---- State-proof verification-context tracker ----
+
+    fn put_state_proof_verification_context(
+        &mut self,
+        last_attested_round: u64,
+        data: &[u8],
+    ) -> Result<(), algo_error::AlgoError> {
+        self.state_proof_verification_store
+            .insert(last_attested_round, data.to_vec());
+        Ok(())
+    }
+
+    fn get_state_proof_verification_context(
+        &self,
+        last_attested_round: u64,
+    ) -> Result<Option<Vec<u8>>, algo_error::AlgoError> {
+        Ok(self
+            .state_proof_verification_store
+            .get(&last_attested_round)
+            .cloned())
+    }
+
+    fn delete_state_proof_verification_contexts_before(
+        &mut self,
+        before_round: u64,
+    ) -> Result<(), algo_error::AlgoError> {
+        self.state_proof_verification_store
+            .retain(|&r, _| r >= before_round);
         Ok(())
     }
 }
