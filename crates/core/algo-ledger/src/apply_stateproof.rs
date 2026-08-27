@@ -276,7 +276,7 @@ fn resolve_verification_context<L: LedgerStore>(
 /// production or replay/sync), independent of whether that block will ever
 /// itself carry a `StateProofTx` — the tracker records *voters* data, not
 /// proof data.
-pub(crate) fn record_state_proof_verification_context<L: LedgerStore>(
+pub fn record_state_proof_verification_context<L: LedgerStore>(
     store: &mut L,
     round: u64,
     current_protocol: &str,
