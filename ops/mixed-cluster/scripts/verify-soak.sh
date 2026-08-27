@@ -23,7 +23,7 @@
 #      direction. `algo-cert-crossverify --export-go-input` dumps the
 #      raw (block, cert) bytes plus the ledger facts Go's verifier
 #      needs, and the Go helper re-authenticates each certificate with
-#      go-algorand v4.7.2-stable's own
+#      go-algorand v4.7.3-stable's own
 #      `agreement.Certificate.Authenticate`. Combined with step 2, every
 #      sampled certificate is proven to authenticate under BOTH
 #      implementations. Enabled by passing `--rust-account`.

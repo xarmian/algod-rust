@@ -1,7 +1,7 @@
 # 3 Go + 3 Rust Mixed-Cluster Harness (Phase 7, issue #496)
 
 A 6-node docker-compose harness — sibling of [`../mixed-cluster/`](../mixed-cluster/README.md)
-— that runs 3 go-algorand v4.7.2-stable nodes + 3 algod-rust nodes on a
+— that runs 3 go-algorand v4.7.3-stable nodes + 3 algod-rust nodes on a
 private network with a **50/50** online-stake split. It exists to answer
 the one question `../mixed-cluster/`'s 30/30/30/10 topology structurally
 cannot: **do Rust votes ever appear *inside* a Go-produced, Go-verified
@@ -79,7 +79,7 @@ own algod v2 REST API.
 ### Why 50/50 makes Rust votes quorum-necessary
 
 `agreement.makeBundle` (`../../go-algorand/agreement/bundle.go` @
-v4.7.2-stable) stops packing votes into a certificate the instant
+v4.7.3-stable) stops packing votes into a certificate the instant
 running weight clears the step's quorum. For the `future` consensus
 protocol this harness uses (`../../go-algorand/config/consensus.go`),
 `CertCommitteeSize = 1500` and the quorum threshold is `1112` (74.1%).
@@ -156,7 +156,7 @@ measured: 220 consecutive rounds fork-free (`algo-fork-detector`:
 rejections, and both cert-verification directions passing — 16 sampled
 certificates all authenticate under both implementations, 12 of which
 carry a Rust participant's vote (`algo-cert-crossverify` Go→Rust,
-`tools/cert-authenticate` against a real go-algorand v4.7.2-stable
+`tools/cert-authenticate` against a real go-algorand v4.7.3-stable
 build Rust→Go). See `docs/PHASE6_VALIDATION.md`'s Phase 7 addendum for
 the full writeup, exact commands, and root-cause notes on this
 topology's round-time characteristics.

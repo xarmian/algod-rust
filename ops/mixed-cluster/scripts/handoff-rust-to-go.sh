@@ -38,7 +38,7 @@ set -euo pipefail
 HANDOFF_ROUNDS="${HANDOFF_ROUNDS:-20}"
 GO_NODE_REST="${GO_NODE_REST:-http://localhost:4001}"
 GO_NODE_TOKEN="${GO_NODE_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
-ALGOD_IMG="${ALGOD_IMG:-algorand/algod:4.7.2-stable}"
+ALGOD_IMG="${ALGOD_IMG:-algorand/algod:4.7.3-stable}"
 KEEP_HANDOFF="${KEEP_HANDOFF:-0}"
 SKIP_CLUSTER_START="${SKIP_CLUSTER_START:-0}"
 
@@ -182,7 +182,7 @@ echo "$GO_NODE_TOKEN" > "$GO_DATA_DIR/algod.admin.token"
 
 # Drop the Rust-produced ledger files into the location go-algorand
 # expects: `<datadir>/<genesisID>/ledger.{tracker,block}.sqlite`.
-# Reference: ../go-algorand/ledger/ledger.go:325,331 (v4.7.2-stable).
+# Reference: ../go-algorand/ledger/ledger.go:325,331 (v4.7.3-stable).
 cp "${LEDGER_PREFIX}.tracker.sqlite" "$GO_DATA_DIR/$GENESIS_ID/ledger.tracker.sqlite"
 cp "${LEDGER_PREFIX}.block.sqlite"   "$GO_DATA_DIR/$GENESIS_ID/ledger.block.sqlite"
 

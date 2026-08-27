@@ -4,7 +4,7 @@
 //!
 //! # Why this module exists
 //!
-//! Issue #540's investigation found that go-algorand v4.7.2-stable's own
+//! Issue #540's investigation found that go-algorand v4.7.3-stable's own
 //! `gossipSubTags` map wires gossipsub up for the `TX` tag **only** —
 //! proposals, votes, and vote bundles are never published on gossipsub in
 //! P2P mode. Instead (`../go-algorand/network/p2p/streams.go` +

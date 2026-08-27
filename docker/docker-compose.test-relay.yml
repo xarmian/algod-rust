@@ -21,7 +21,7 @@
 
 services:
   algod-relay:
-    image: algorand/algod:4.7.2-stable
+    image: algorand/algod:4.7.3-stable
     container_name: algod-relay
     environment:
       - DEV_MODE=1

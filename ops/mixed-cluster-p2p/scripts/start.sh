@@ -55,7 +55,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 
 NETROOT="$ROOT/netroot"
 TEMPLATE="$ROOT/template.json"
-ALGOD_IMG="algorand/algod:4.7.2-stable"
+ALGOD_IMG="algorand/algod:4.7.3-stable"
 NUM_ROUNDS="${NUM_ROUNDS:-30000}"
 ALGOD_TOKEN="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 

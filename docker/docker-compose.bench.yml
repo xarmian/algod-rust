@@ -9,7 +9,7 @@
 
 services:
   algod-bench:
-    image: algorand/algod:4.7.2-stable
+    image: algorand/algod:4.7.3-stable
     container_name: algod-bench
     environment:
       - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
