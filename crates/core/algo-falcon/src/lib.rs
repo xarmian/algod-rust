@@ -236,8 +236,15 @@ pub fn falcon_convert_compressed_to_ct(
 /// (`crypto/falconWrapper.go:127`), which compares this value against an
 /// expected version.
 pub fn falcon_salt_version(sig: &[u8]) -> Result<u8, FalconError> {
-    if sig.is_empty() {
-        return Err(FalconError::InvalidSignatureSize(0));
+    // The C implementation (`falcon_det1024_get_salt_version`,
+    // `falcon-c/deterministic.c:167`) unconditionally reads `sig[1]` with no
+    // length check of its own -- it trusts the caller to have validated the
+    // buffer first. `sig` here is attacker-controlled (decoded straight off
+    // an untrusted block's wire bytes), so this bound must actually be
+    // enforced on the Rust side or a `sig.len() == 1` input is an
+    // out-of-bounds read. Match `falcon_verify`'s existing minimum.
+    if sig.len() < 2 || sig.len() > FALCON_DET1024_SIG_COMPRESSED_MAXSIZE {
+        return Err(FalconError::InvalidSignatureSize(sig.len()));
     }
     let rc = unsafe { falcon_det1024_get_salt_version(sig.as_ptr() as *const c_void) };
     if rc < 0 {
