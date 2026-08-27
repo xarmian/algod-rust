@@ -1225,6 +1225,67 @@ mod tests {
     }
 
     #[test]
+    fn demux_raw_proposal_with_malformed_payset_is_dropped_not_disconnected() {
+        // go-algorand v4.7.2-stable: `agreement/message.go`'s
+        // `proposalCarriesInvalidTxn`, called from `demux.go`'s
+        // `tokenizeMessages`. A proposal that decodes fine but whose block
+        // payset fails the group-level `CheckPayset` screen is silently
+        // dropped — logged, but NOT a disconnect-worthy malformed message
+        // like an actual decode failure is.
+        use crate::stubs::StubNetwork;
+        use algo_types::{SignedTransaction, Transaction, TxnType};
+
+        let (mut demux, _av_tx, pp_tx, _vb_tx, _vv_tx, _vp_tx, _vb_res_tx, _lr_tx, quit_tx) =
+            make_test_demux();
+
+        let stub = Arc::new(StubNetwork::new());
+        demux.set_network(stub.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
+
+        // A payset containing a transaction of an unrecognized type — one of
+        // the five checkTxnGroup rejection cases.
+        let bogus_txn = SignedTransaction {
+            txn: Transaction {
+                txn_type: TxnType::from("bogus"),
+                sender: Address([1u8; 32]),
+                ..Transaction::default()
+            },
+            ..SignedTransaction::default()
+        };
+        let compound = CompoundMessage {
+            vote: UnauthenticatedVote::default(),
+            proposal: crate::proposal::UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(1),
+                    payset: vec![bogus_txn],
+                    ..algo_types::Block::default()
+                },
+                seed_proof: [0u8; crate::VRF_PROOF_SIZE],
+                original_period: crate::step::Period(0),
+                original_proposer: Address([0u8; 32]),
+            },
+        };
+        let encoded = codec::encode_compound_message(&compound);
+        pp_tx
+            .send(Message {
+                data: encoded,
+                handle: None,
+            })
+            .unwrap();
+        // Quit so `next()` returns after retrying past the dropped message,
+        // rather than blocking forever waiting for a next event.
+        quit_tx.send(()).unwrap();
+
+        let signals = default_signals();
+        let result = demux.next(&signals, None);
+
+        assert!(result.is_none(), "dropped proposal yields no event");
+        assert!(
+            stub.disconnected.lock().unwrap().is_empty(),
+            "a malformed-payset proposal must be dropped, not disconnect the peer"
+        );
+    }
+
+    #[test]
     fn demux_garbage_data_does_not_crash() {
         let (mut demux, av_tx, _pp_tx, _vb_tx, _vv_tx, _vp_tx, _vb_res_tx, _lr_tx, quit_tx) =
             make_test_demux();
