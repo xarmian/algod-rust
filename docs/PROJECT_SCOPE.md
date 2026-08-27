@@ -394,7 +394,7 @@ Ongoing maintenance phase, run whenever the pinned go-algorand reference version
 
 The `v4.6.0-stable → v4.7.0-stable` sweep additionally closes algod-rust's previously-deliberately-scoped-out libp2p P2P transport gap (see Phase 5's WS-gossip-only delivery above): a full `rust-libp2p`-based host, Kademlia DHT peer discovery, gossipsub block/vote/tx propagation, and capability advertisement, offered alongside the existing WS-gossip network in a configurable hybrid mode.
 
-The `v4.7.0-stable → v4.7.2-stable` sweep is a small, security/bounds-check-focused patch release with no consensus version bump: a new group-level pre-signature-verification transaction screen, codec-level required-field decode enforcement, a defense-in-depth state-proof TreeDepth guard, and a msgpack decode nesting-depth cap.
+The `v4.7.0-stable → v4.7.2-stable` sweep is a small, security/bounds-check-focused patch release with no consensus version bump: a new group-level pre-signature-verification transaction screen, codec-level required-field decode enforcement, a defense-in-depth state-proof TreeDepth guard, and a msgpack decode nesting-depth cap. Complete — see `docs/PHASE11_VALIDATION.md` for the evidence map.
 
 ---
 
