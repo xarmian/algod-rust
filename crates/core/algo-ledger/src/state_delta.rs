@@ -29,6 +29,22 @@ fn is_default_address(v: &Address) -> bool {
     v.0 == [0u8; 32]
 }
 
+/// Issue #608 (live-verification found this): go-algorand's
+/// `basics.AppLocalState`/`basics.StateSchemas` (the latter embedded into
+/// `basics.AppParams`) each declare their own `_struct codec:",omitempty,
+/// omitemptyarray"` marker, so a zero-value `StateSchema` field (`hsch` on
+/// `AppLocalState`; `lsch`/`gsch` on `AppParams`, via the embedded struct)
+/// is omitted from the wire *entirely*, not just serialized as `{}` --
+/// unlike the "never omit" container types documented above this helper,
+/// which declare no such marker. A real go node's opt-in-round response for
+/// an app with no declared local/global schema shows no `"hsch"` key at
+/// all; algod-rust previously always emitted `"hsch": {}` (its two
+/// subfields already individually omit at zero, but the containing key
+/// itself did not).
+fn is_default_state_schema(v: &StateSchema) -> bool {
+    *v == StateSchema::default()
+}
+
 // ---------------------------------------------------------------------------
 // Never-omit container helpers (issue #576)
 // ---------------------------------------------------------------------------
@@ -909,8 +925,13 @@ pub struct AppLocalStateDelta {
 /// the same audit).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppLocalStateRecord {
-    /// Go codec tag: `"hsch"`.
-    #[serde(rename = "hsch", default)]
+    /// Go codec tag: `"hsch"`. Omitted entirely (not `{}`) when zero --
+    /// see `is_default_state_schema`'s doc comment (issue #608).
+    #[serde(
+        rename = "hsch",
+        default,
+        skip_serializing_if = "is_default_state_schema"
+    )]
     pub schema: StateSchema,
     /// Go codec tag: `"tkv"`.
     #[serde(rename = "tkv", default, skip_serializing_if = "Option::is_none")]
@@ -985,11 +1006,22 @@ pub struct AppParamsRecord {
     /// Go codec tag: `"gs"`.
     #[serde(rename = "gs", default, skip_serializing_if = "Option::is_none")]
     pub global_state: Option<HashMap<String, TealValueRecord>>,
-    /// Go codec tag: `"lsch"` (via embedded `basics.StateSchemas`).
-    #[serde(rename = "lsch", default)]
+    /// Go codec tag: `"lsch"` (via embedded `basics.StateSchemas`). Omitted
+    /// entirely (not `{}`) when zero -- see `is_default_state_schema`'s doc
+    /// comment (issue #608).
+    #[serde(
+        rename = "lsch",
+        default,
+        skip_serializing_if = "is_default_state_schema"
+    )]
     pub local_state_schema: StateSchema,
-    /// Go codec tag: `"gsch"` (via embedded `basics.StateSchemas`).
-    #[serde(rename = "gsch", default)]
+    /// Go codec tag: `"gsch"` (via embedded `basics.StateSchemas`). Omitted
+    /// entirely (not `{}`) when zero -- same rationale as `lsch` above.
+    #[serde(
+        rename = "gsch",
+        default,
+        skip_serializing_if = "is_default_state_schema"
+    )]
     pub global_state_schema: StateSchema,
     /// Go codec tag: `"epp"`.
     #[serde(rename = "epp", default, skip_serializing_if = "is_zero_u32")]
@@ -1218,6 +1250,59 @@ mod issue_579_short_codec_tag_wire_format_tests {
         let obj = json.as_object().expect("encodes as a JSON object");
         assert!(!obj.contains_key("v"), "obj: {obj:?}");
         assert!(!obj.contains_key("ss"), "obj: {obj:?}");
+    }
+
+    /// Issue #608 (live-verified against a real go-algorand v4.7.0-stable
+    /// node): an opt-in round for an app with no declared local schema
+    /// produced `"LocalState": {}` from algod-rust's `/v2/deltas/{round}`
+    /// but `"LocalState": {}` with no `hsch` key at all from go -- go's
+    /// `basics.AppLocalState` declares `_struct codec:",omitempty,
+    /// omitemptyarray"`, so a zero-value `Schema` field is omitted
+    /// entirely, not serialized as `"hsch": {}`. Confirms
+    /// `is_default_state_schema`'s skip_serializing_if fixes this.
+    #[test]
+    fn app_local_state_record_omits_zero_schema() {
+        let record = AppLocalStateRecord {
+            schema: StateSchema::default(),
+            key_value: None,
+        };
+        let json = serde_json::to_value(&record).expect("must serialize");
+        let obj = json.as_object().expect("encodes as a JSON object");
+        assert!(
+            !obj.contains_key("hsch"),
+            "zero-value schema must be omitted entirely, not serialized as {{}}: {obj:?}"
+        );
+
+        let back: AppLocalStateRecord = serde_json::from_value(json).expect("must deserialize");
+        assert_eq!(back, record);
+    }
+
+    /// Same bug class as `app_local_state_record_omits_zero_schema`, for
+    /// `AppParamsRecord`'s `lsch`/`gsch` (go's embedded `StateSchemas`
+    /// carries the identical `_struct codec:",omitempty,omitemptyarray"`
+    /// marker). Not directly live-verified (this repo's live app
+    /// create/update harness never populates a non-default schema), but the
+    /// same go source construct as the live-verified `hsch` case above, so
+    /// fixed the same way rather than leaving an inconsistent gap.
+    #[test]
+    fn app_params_record_omits_zero_schema() {
+        let record = AppParamsRecord {
+            approval_program: Vec::new(),
+            clear_state_program: Vec::new(),
+            global_state: None,
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+            version: 0,
+            size_sponsor: Address([0u8; 32]),
+        };
+        let json = serde_json::to_value(&record).expect("must serialize");
+        let obj = json.as_object().expect("encodes as a JSON object");
+        assert!(!obj.contains_key("lsch"), "obj: {obj:?}");
+        assert!(!obj.contains_key("gsch"), "obj: {obj:?}");
+
+        let back: AppParamsRecord = serde_json::from_value(json).expect("must deserialize");
+        assert_eq!(back, record);
     }
 }
 
