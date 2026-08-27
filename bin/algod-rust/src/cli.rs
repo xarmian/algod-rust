@@ -672,6 +672,20 @@ pub enum NodeCommands {
         /// `"devmode": true`.
         #[arg(long)]
         dev: bool,
+
+        /// Follow (sync from) a remote algod REST peer: fetch each new block
+        /// over `/v2/blocks/{round}` and apply it through the same real
+        /// sync-path code (`SqliteLedger::apply_block_caching_delta`) that
+        /// `algod-rust sync` uses, while this process keeps serving its own
+        /// REST API — so `GET /v2/deltas/{round}` can be queried against a
+        /// genuinely synced (not dev-mode-produced) block. Mutually
+        /// exclusive with `--dev` (issue #612).
+        #[arg(long)]
+        follow: Option<String>,
+
+        /// API token for the `--follow` peer's REST endpoint.
+        #[arg(long, default_value = DEFAULT_TOKEN)]
+        follow_token: String,
     },
 }
 

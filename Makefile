@@ -167,6 +167,19 @@ algokey-e2e:
 VALIDATE_API_RUST_DATA := .validate-api-rust-data
 VALIDATE_API_RUST_PID := .validate-api-rust.pid
 
+## Issue #612: a THIRD native algod-rust process that actually *syncs* from
+## algod-go-shared (port 4001) over REST via `node start --follow` (see
+## `bin/algod-rust/src/commands/node.rs`), instead of self-producing blocks
+## like the `--dev` process on :4002 does. This is what lets
+## `live_state_delta_parity.rs` diff `GET /v2/deltas/{round}` against a
+## block that genuinely went through `SqliteLedger::apply_block_caching_delta`
+## (the real sync path `commands/sync.rs` uses) rather than dev-mode's
+## `cache_state_delta`-direct shortcut. Uses the same shared genesis as the
+## other two nodes/services (see this file's own header comment) so its
+## ledger state lines up with algod-go-shared's from round 0.
+VALIDATE_API_RUST_SYNC_DATA := .validate-api-rust-sync-data
+VALIDATE_API_RUST_SYNC_PID := .validate-api-rust-sync.pid
+
 validate-api-up:
 	$(COMPOSE_VALIDATE_API) up -d
 	@echo "Waiting for algod-go-shared to be healthy..."
@@ -197,7 +210,20 @@ validate-api-up:
 		http://localhost:4002/v2/status >/dev/null 2>&1; do \
 		sleep 1; \
 	done
-	@echo "Both nodes healthy — go on http://localhost:4001, rust on http://localhost:4002"
+	@echo "==> Starting algod-rust (--follow, issue #612 sync-path harness) natively on :4003..."
+	@rm -rf $(VALIDATE_API_RUST_SYNC_DATA)
+	@mkdir -p $(VALIDATE_API_RUST_SYNC_DATA)
+	@cp -r docker/localnet-rust/data/. $(VALIDATE_API_RUST_SYNC_DATA)/
+	@printf '%s' "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" > $(VALIDATE_API_RUST_SYNC_DATA)/algod.admin.token
+	@./target/release/algod-rust node start -d $(VALIDATE_API_RUST_SYNC_DATA) \
+		--follow http://localhost:4001 --follow-token $(ALGOD_TOKEN) -l 0.0.0.0:4003 \
+		>$(VALIDATE_API_RUST_SYNC_DATA).log 2>&1 & echo $$! > $(VALIDATE_API_RUST_SYNC_PID)
+	@echo "Waiting for algod-rust (sync) to be healthy..."
+	@until curl -sf -H "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+		http://localhost:4003/v2/status >/dev/null 2>&1; do \
+		sleep 1; \
+	done
+	@echo "All three nodes healthy — go on http://localhost:4001, rust (--dev) on http://localhost:4002, rust (--follow, syncing from go) on http://localhost:4003"
 
 validate-api-down:
 	$(COMPOSE_VALIDATE_API) down -v
@@ -205,12 +231,19 @@ validate-api-down:
 		kill $$(cat $(VALIDATE_API_RUST_PID)) 2>/dev/null || true; \
 		rm -f $(VALIDATE_API_RUST_PID); \
 	fi
+	@if [ -f $(VALIDATE_API_RUST_SYNC_PID) ]; then \
+		kill $$(cat $(VALIDATE_API_RUST_SYNC_PID)) 2>/dev/null || true; \
+		rm -f $(VALIDATE_API_RUST_SYNC_PID); \
+	fi
 	@rm -rf $(VALIDATE_API_RUST_DATA) $(VALIDATE_API_RUST_DATA).log
+	@rm -rf $(VALIDATE_API_RUST_SYNC_DATA) $(VALIDATE_API_RUST_SYNC_DATA).log
 
 validate-api-status:
 	@echo "== go ==" && curl -s http://localhost:4001/v2/status \
 		-H "X-Algo-API-Token: $(ALGOD_TOKEN)" | python3 -m json.tool
-	@echo "== rust ==" && curl -s http://localhost:4002/v2/status \
+	@echo "== rust (--dev) ==" && curl -s http://localhost:4002/v2/status \
+		-H "X-Algo-API-Token: $(ALGOD_TOKEN)" | python3 -m json.tool
+	@echo "== rust (--follow) ==" && curl -s http://localhost:4003/v2/status \
 		-H "X-Algo-API-Token: $(ALGOD_TOKEN)" | python3 -m json.tool
 
 validate-api-logs:
