@@ -108,6 +108,17 @@ pub fn apply_state_proof<L: LedgerStore>(
     }
 
     if ctx.validate {
+        // Matches go's `gatherVerificationContextUsingBlockHeaders`
+        // (`ledger/apply/stateproof.go:77`): `lastRoundHdr.CurrentProtocol`
+        // is used *only* to locate `votersRnd`'s offset. Every downstream
+        // security parameter (interval-multiple check, WeightThreshold,
+        // StrengthTarget) is then read from `votersHdr.CurrentProtocol` via
+        // `MakeStateProofVerificationContext`'s `Version` field
+        // (`ledger/ledgercore/stateproofverification.go:49`), consumed by
+        // `verify.ValidateStateProof` (`stateproof/verify/stateproof.go:144`)
+        // — NOT from `lastRoundHdr` again. Using the wrong header here would
+        // silently verify against the wrong version's security thresholds
+        // if a future protocol upgrade ever changes them mid-interval.
         let last_round_hdr = store
             .get_block_header(last_round_in_interval)?
             .ok_or_else(|| {
@@ -115,11 +126,27 @@ pub fn apply_state_proof<L: LedgerStore>(
                     "applyStateProof: no header for last attested round {last_round_in_interval}"
                 ))
             })?;
-        let params =
-            consensus_params_for_version(&last_round_hdr.current_protocol).ok_or_else(|| {
+        let gather_params = consensus_params_for_version(&last_round_hdr.current_protocol)
+            .ok_or_else(|| {
                 ledger_err(format!(
                     "applyStateProof: unknown protocol '{}'",
                     last_round_hdr.current_protocol
+                ))
+            })?;
+
+        let voters_round =
+            last_round_in_interval.saturating_sub(gather_params.state_proof_interval);
+        let voters_hdr = store.get_block_header(voters_round)?.ok_or_else(|| {
+            ledger_err(format!(
+                "applyStateProof: no header for voters round {voters_round}"
+            ))
+        })?;
+
+        let params =
+            consensus_params_for_version(&voters_hdr.current_protocol).ok_or_else(|| {
+                ledger_err(format!(
+                    "applyStateProof: unknown protocol '{}'",
+                    voters_hdr.current_protocol
                 ))
             })?;
 
@@ -135,13 +162,6 @@ pub fn apply_state_proof<L: LedgerStore>(
                 params.state_proof_interval
             )));
         }
-
-        let voters_round = last_round_in_interval.saturating_sub(params.state_proof_interval);
-        let voters_hdr = store.get_block_header(voters_round)?.ok_or_else(|| {
-            ledger_err(format!(
-                "applyStateProof: no header for voters round {voters_round}"
-            ))
-        })?;
 
         let voters_commitment =
             crate::block_header::state_proof_voters_commitment(&voters_hdr.state_proof_tracking);
