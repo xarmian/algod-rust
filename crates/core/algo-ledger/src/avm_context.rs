@@ -4287,7 +4287,6 @@ mod tests {
                     num_byte_slice: 0,
                 },
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -4481,7 +4480,6 @@ mod tests {
                     num_byte_slice: 2,
                 },
                 extra_program_pages: 1,
-
                 ..Default::default()
             },
         );
@@ -4970,7 +4968,6 @@ mod tests {
                     num_byte_slice: 4,
                 },
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -5401,7 +5398,6 @@ mod tests {
                     num_byte_slice: 4,
                 },
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -6591,7 +6587,6 @@ mod tests {
                     num_byte_slice: 4,
                 },
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -7090,7 +7085,6 @@ mod tests {
                 local_state_schema: StateSchema::default(),
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -7186,7 +7180,6 @@ mod tests {
                 local_state_schema: StateSchema::default(),
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -7310,7 +7303,6 @@ mod tests {
                     num_byte_slice: 3,
                 },
                 extra_program_pages: 2,
-
                 ..Default::default()
             },
         );
@@ -7389,7 +7381,6 @@ mod tests {
                 },
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -7453,7 +7444,6 @@ mod tests {
                 },
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -7528,7 +7518,6 @@ mod tests {
                 },
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -7624,7 +7613,6 @@ mod tests {
                 global_state_schema: StateSchema::default(),
                 local_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );

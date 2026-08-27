@@ -53,7 +53,6 @@ fn setup_state(sender: Address, app_id: u64, approval_program: Vec<u8>) -> Ledge
         local_state_schema: StateSchema::default(),
         global_state_schema: StateSchema::default(),
         extra_program_pages: 0,
-
         ..Default::default()
     };
     state.set_app_params(app_id, app_params);
@@ -737,7 +736,6 @@ fn simulation_trace_inner_txn_spawned_inners() {
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
-
             ..Default::default()
         },
     );
@@ -751,7 +749,6 @@ fn simulation_trace_inner_txn_spawned_inners() {
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
-
             ..Default::default()
         },
     );
@@ -896,7 +893,6 @@ fn simulation_app_budget_added_includes_inner_app_calls() {
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
-
             ..Default::default()
         },
     );
@@ -910,7 +906,6 @@ fn simulation_app_budget_added_includes_inner_app_calls() {
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
-
             ..Default::default()
         },
     );
@@ -1113,7 +1108,6 @@ fn simulation_logicsig_budget_set_for_txn_after_execution_failure() {
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
-
             ..Default::default()
         },
     );

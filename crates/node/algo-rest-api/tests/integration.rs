@@ -2730,7 +2730,6 @@ async fn account_info_exclude_none_returns_full_info() {
                 local_state_schema: Default::default(),
                 global_state_schema: Default::default(),
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         )]),
@@ -2806,7 +2805,6 @@ fn lookup_with_one_of_each_resource() -> AccountLookup {
                 local_state_schema: Default::default(),
                 global_state_schema: Default::default(),
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         )]),
@@ -3353,7 +3351,6 @@ async fn account_info_returns_populated_created_apps() {
                 num_byte_slice: 0,
             },
             extra_program_pages: 0,
-
             ..Default::default()
         },
     );
@@ -3718,7 +3715,6 @@ async fn get_application_returns_200_with_correct_json() {
                 num_byte_slice: 2,
             },
             extra_program_pages: 0,
-
             ..Default::default()
         }),
         creator,
@@ -5217,7 +5213,6 @@ async fn account_app_msgpack_uses_protocol_codec_tags() {
             },
             extra_program_pages: 0,
             creator: Address([0u8; 32]),
-
             ..Default::default()
         }),
         last_round: 1000,

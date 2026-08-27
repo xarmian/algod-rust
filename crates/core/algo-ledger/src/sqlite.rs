@@ -1240,7 +1240,6 @@ fn merge_app_local_state_into_params(existing_blob: &[u8], new_local: &AppLocalS
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
-
             ..Default::default()
         });
     let update_round = extract_update_round(existing_blob);
@@ -6073,7 +6072,6 @@ mod tests {
                 num_byte_slice: 13,
             },
             extra_program_pages: 2,
-
             ..Default::default()
         };
         let actual = encode_app_params_with_round(&p, 99);
@@ -6108,7 +6106,6 @@ mod tests {
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
-
             ..Default::default()
         };
         let bytes = encode_app_params_with_round(&p, 0);
@@ -6238,7 +6235,6 @@ mod tests {
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
-
             ..Default::default()
         };
         let rd = build_app_resource_data(Some(&local), Some(&params), 0);
@@ -6453,7 +6449,6 @@ mod tests {
                 num_byte_slice: 2,
             },
             extra_program_pages: 1,
-
             ..Default::default()
         };
 
@@ -7357,7 +7352,6 @@ mod tests {
                 num_byte_slice: 0,
             },
             extra_program_pages: 0,
-
             ..Default::default()
         };
 
@@ -7417,7 +7411,6 @@ mod tests {
             local_state_schema: StateSchema::default(),
             global_state_schema: StateSchema::default(),
             extra_program_pages: 0,
-
             ..Default::default()
         };
 
@@ -7823,7 +7816,6 @@ mod tests {
                     num_byte_slice: 0,
                 },
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -7917,7 +7909,6 @@ mod tests {
                     num_byte_slice: 0,
                 },
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -7960,7 +7951,6 @@ mod tests {
                     num_byte_slice: 0,
                 },
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );
@@ -7983,7 +7973,6 @@ mod tests {
                     num_byte_slice: 0,
                 },
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );

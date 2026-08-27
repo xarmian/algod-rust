@@ -180,7 +180,6 @@ fn fixtures() -> Vec<Fixture> {
                             num_byte_slice: 1,
                         },
                         extra_program_pages: 1,
-
                         ..Default::default()
                     },
                 )]),
@@ -291,7 +290,6 @@ fn standalone_application_json_matches_go() {
             num_byte_slice: 1,
         },
         extra_program_pages: 1,
-
         ..Default::default()
     };
     let got =

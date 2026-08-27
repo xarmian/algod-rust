@@ -288,7 +288,6 @@ pub fn apply_eval_delta<L: crate::store_trait::LedgerStore>(
                 local_state_schema: StateSchema::default(),
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
-
                 ..Default::default()
             });
 
@@ -989,7 +988,6 @@ mod tests {
                 local_state_schema: StateSchema::default(),
                 global_state_schema: StateSchema::default(),
                 extra_program_pages: 0,
-
                 ..Default::default()
             },
         );

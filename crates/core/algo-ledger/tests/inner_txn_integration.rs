@@ -113,7 +113,6 @@ fn seed_app_with_programs(
                 num_byte_slice: 4,
             },
             extra_program_pages: 0,
-
             ..Default::default()
         },
     );
