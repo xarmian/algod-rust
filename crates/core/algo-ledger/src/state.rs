@@ -152,7 +152,7 @@ impl LedgerState {
     }
 
     /// Get a mutable reference to the account, inserting a default if missing.
-    pub fn get_or_default_account(&mut self, addr: &Address) -> &mut AccountData {
+    pub fn get_or_default_account_mut(&mut self, addr: &Address) -> &mut AccountData {
         self.accounts.entry(*addr).or_default()
     }
 
@@ -1653,16 +1653,55 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_default_account() {
+    fn test_get_or_default_account_mut() {
         let mut state = LedgerState::new();
         let addr = Address([1u8; 32]);
 
         assert!(state.get_account(&addr).is_none());
 
-        let account = state.get_or_default_account(&addr);
+        let account = state.get_or_default_account_mut(&addr);
         account.micro_algos = 500_000;
 
         assert_eq!(state.get_account(&addr).unwrap().micro_algos, 500_000);
+    }
+
+    /// Issue #637: `LedgerState::get_or_default_account_mut` (inherent,
+    /// `&mut self -> &mut AccountData`) used to be named identically to
+    /// `LedgerStore::get_or_default_account` (trait default, `&self ->
+    /// AccountData`, owned copy-in/copy-out per the trait's whole design).
+    /// Importing the trait in the same scope as calling the (then
+    /// same-named) inherent method could silently resolve to the trait's
+    /// owned-copy version instead — Rust's autoref method resolution tries
+    /// `&T` before `&mut T`, so once both were visible the immutable trait
+    /// method won even though inherent methods are supposed to take
+    /// priority (that priority only applies within the same autoref step).
+    /// Any mutation through the result would then be silently discarded
+    /// instead of persisted. Renaming eliminates the collision outright;
+    /// this test proves both APIs are reachable, unambiguous, and do what
+    /// their names say with `LedgerStore` imported in the same scope.
+    #[test]
+    fn get_or_default_account_mut_unambiguous_with_ledger_store_trait_in_scope() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+        let addr = Address([3u8; 32]);
+
+        // The inherent, mutable-handle API: a mutation through it must
+        // persist into the ledger.
+        state.get_or_default_account_mut(&addr).micro_algos = 777_000;
+        assert_eq!(state.get_account(&addr).unwrap().micro_algos, 777_000);
+
+        // The trait's owned-copy API, called explicitly (via the trait
+        // method, not the inherent one) -- must NOT silently pick up the
+        // inherent method's identity, and must return an independent copy:
+        // mutating it must NOT affect the stored account.
+        let mut snapshot = LedgerStore::get_or_default_account(&state, &addr);
+        snapshot.micro_algos = 1;
+        assert_eq!(
+            state.get_account(&addr).unwrap().micro_algos,
+            777_000,
+            "mutating the trait method's owned copy must not affect stored state"
+        );
     }
 
     #[test]
@@ -1685,12 +1724,12 @@ mod tests {
     fn test_snapshot_restore_accounts() {
         let mut state = LedgerState::new();
         let addr = Address([1u8; 32]);
-        state.get_or_default_account(&addr).micro_algos = 1_000_000;
+        state.get_or_default_account_mut(&addr).micro_algos = 1_000_000;
 
         let snap = state.snapshot(&[addr]);
 
         // Mutate after snapshot.
-        state.get_or_default_account(&addr).micro_algos = 500_000;
+        state.get_or_default_account_mut(&addr).micro_algos = 500_000;
         assert_eq!(state.get_account(&addr).unwrap().micro_algos, 500_000);
 
         // Restore.
@@ -1707,7 +1746,7 @@ mod tests {
         let snap = state.snapshot(&[addr]);
 
         // Create the account.
-        state.get_or_default_account(&addr).micro_algos = 100;
+        state.get_or_default_account_mut(&addr).micro_algos = 100;
 
         // Restore should remove it.
         state.restore_snapshot(snap);
@@ -1925,17 +1964,17 @@ mod tests {
         assert_eq!(state.get_asset_holding(&addr1, 99).unwrap().amount, 50);
 
         // Account counters should be decremented.
-        let acct1 = state.get_or_default_account(&addr1);
+        let acct1 = state.get_or_default_account_mut(&addr1);
         assert_eq!(
             acct1.total_assets_opted_in, 1,
             "addr1 had 2 assets, removed 1 => 1 remaining"
         );
-        let acct2 = state.get_or_default_account(&addr2);
+        let acct2 = state.get_or_default_account_mut(&addr2);
         assert_eq!(
             acct2.total_assets_opted_in, 0,
             "addr2 had 1 asset, removed 1 => 0 remaining"
         );
-        let acct3 = state.get_or_default_account(&addr3);
+        let acct3 = state.get_or_default_account_mut(&addr3);
         assert_eq!(
             acct3.total_assets_opted_in, 0,
             "addr3 had 1 asset, removed 1 => 0 remaining"
@@ -2014,7 +2053,7 @@ mod tests {
         assert!(state.get_app_local_state(&addr1, 99).is_some());
 
         // Account counters should be updated.
-        let acct1 = state.get_or_default_account(&addr1);
+        let acct1 = state.get_or_default_account_mut(&addr1);
         assert_eq!(
             acct1.total_apps_opted_in, 1,
             "addr1 had 2 apps opted in, removed 1 => 1 remaining"
@@ -2025,7 +2064,7 @@ mod tests {
         );
         assert_eq!(acct1.total_app_schema.num_byte_slice, 0);
 
-        let acct2 = state.get_or_default_account(&addr2);
+        let acct2 = state.get_or_default_account_mut(&addr2);
         assert_eq!(
             acct2.total_apps_opted_in, 0,
             "addr2 had 1 app opted in, removed 1 => 0 remaining"
@@ -2168,7 +2207,7 @@ mod tests {
 
         let mut state = LedgerState::new();
         let addr = Address([1u8; 32]);
-        state.get_or_default_account(&addr).micro_algos = 1_000_000;
+        state.get_or_default_account_mut(&addr).micro_algos = 1_000_000;
 
         // Snapshot with app_id 100 (no boxes yet).
         let snap = state.snapshot_with_ids(&[addr], &[], &[100]);
@@ -2191,7 +2230,7 @@ mod tests {
 
         let mut state = LedgerState::new();
         let addr = Address([1u8; 32]);
-        state.get_or_default_account(&addr).micro_algos = 1_000_000;
+        state.get_or_default_account_mut(&addr).micro_algos = 1_000_000;
         state.set_box(100, b"mybox", b"original".to_vec());
 
         // Snapshot with app_id 100.
@@ -2216,7 +2255,7 @@ mod tests {
 
         let mut state = LedgerState::new();
         let addr = Address([1u8; 32]);
-        state.get_or_default_account(&addr).micro_algos = 1_000_000;
+        state.get_or_default_account_mut(&addr).micro_algos = 1_000_000;
         state.set_box(100, b"mybox", b"data".to_vec());
 
         // Snapshot with app_id 100.
@@ -2241,7 +2280,7 @@ mod tests {
 
         let mut state = LedgerState::new();
         let addr = Address([1u8; 32]);
-        state.get_or_default_account(&addr).micro_algos = 1_000_000;
+        state.get_or_default_account_mut(&addr).micro_algos = 1_000_000;
         state.set_box(100, b"box100", b"data100".to_vec());
         state.set_box(200, b"box200", b"data200".to_vec());
 

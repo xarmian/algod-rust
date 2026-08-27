@@ -22,12 +22,6 @@ use crate::eval_compare::{
 use crate::eval_delta::{apply_eval_delta, parse_eval_delta};
 use crate::rewards::apply_rewards;
 
-// NOTE: LedgerStore is referenced via full path `crate::store_trait::LedgerStore`
-// in function bounds rather than imported at module level. This prevents
-// `use super::*` in the test module from bringing the trait into scope,
-// which would shadow LedgerState's inherent `get_or_default_account(&mut self)
-// -> &mut AccountData` with the trait's `get_or_default_account(&self) -> AccountData`.
-
 /// Box-modification deltas accumulated during a block apply, keyed by the
 /// raw KV-store key bytes (`make_box_key`). See [`apply_block_with_delta_mode`]
 /// and [`crate::state_delta::StateDelta::kv_mods`] (issue #570).
@@ -4201,7 +4195,7 @@ mod tests {
         let mut state = LedgerState::new();
         state.fee_sink = fee_sink;
         for (addr, balance) in balances {
-            let account = state.get_or_default_account(addr);
+            let account = state.get_or_default_account_mut(addr);
             account.micro_algos = *balance;
         }
         state
@@ -4305,7 +4299,9 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-        state.get_or_default_account(&sender).total_assets_opted_in = 1;
+        state
+            .get_or_default_account_mut(&sender)
+            .total_assets_opted_in = 1;
 
         let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = pay_txn(sender, receiver, 0, 1_000);
@@ -4521,7 +4517,9 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 100)], fee_sink);
-        state.get_or_default_account(&sender).total_assets_opted_in = 1;
+        state
+            .get_or_default_account_mut(&sender)
+            .total_assets_opted_in = 1;
 
         let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = pay_txn(sender, receiver, 0, 1_000);
@@ -4706,7 +4704,9 @@ mod tests {
                 frozen: false,
             },
         );
-        state.get_or_default_account(&other).total_assets_opted_in += 1;
+        state
+            .get_or_default_account_mut(&other)
+            .total_assets_opted_in += 1;
 
         // Manually move 100 units from creator to other.
         state.asset_holdings.get_mut(&(sender, 42)).unwrap().amount = 900;
@@ -5086,7 +5086,9 @@ mod tests {
                 frozen: false,
             },
         );
-        state.get_or_default_account(&user).total_assets_opted_in += 1;
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
 
         // Transfer 300 from creator to user.
         let mut stx = SignedTransaction::default();
@@ -5130,7 +5132,9 @@ mod tests {
                 frozen: false,
             },
         );
-        state.get_or_default_account(&user).total_assets_opted_in += 1;
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
 
         // Try to transfer more than creator holds.
         let mut stx = SignedTransaction::default();
@@ -5213,7 +5217,9 @@ mod tests {
                 frozen: false,
             },
         );
-        state.get_or_default_account(&user).total_assets_opted_in += 1;
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
         // Adjust creator holding.
         state.asset_holdings.get_mut(&(creator, 42)).unwrap().amount = 500;
 
@@ -5267,7 +5273,9 @@ mod tests {
                 frozen: false,
             },
         );
-        state.get_or_default_account(&user).total_assets_opted_in += 1;
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
 
         // Attacker tries clawback.
         let mut stx = SignedTransaction::default();
@@ -5317,7 +5325,9 @@ mod tests {
                 frozen: false,
             },
         );
-        state.get_or_default_account(&user).total_assets_opted_in += 1;
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
 
         // Opt-in close_target.
         state.asset_holdings.insert(
@@ -5328,7 +5338,7 @@ mod tests {
             },
         );
         state
-            .get_or_default_account(&close_target)
+            .get_or_default_account_mut(&close_target)
             .total_assets_opted_in += 1;
 
         // Close asset holding: transfer 100 to creator, close remainder to close_target.
@@ -5384,7 +5394,9 @@ mod tests {
                 frozen: true,
             },
         );
-        state.get_or_default_account(&user).total_assets_opted_in += 1;
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
 
         // User tries to transfer from frozen holding.
         let mut stx = SignedTransaction::default();
@@ -5432,7 +5444,9 @@ mod tests {
                 frozen: false,
             },
         );
-        state.get_or_default_account(&user).total_assets_opted_in += 1;
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
 
         // Freeze user's holding.
         let mut stx = SignedTransaction::default();
@@ -5476,7 +5490,9 @@ mod tests {
                 frozen: true,
             },
         );
-        state.get_or_default_account(&user).total_assets_opted_in += 1;
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
 
         // Unfreeze.
         let mut stx = SignedTransaction::default();
@@ -5526,7 +5542,9 @@ mod tests {
                 frozen: false,
             },
         );
-        state.get_or_default_account(&user).total_assets_opted_in += 1;
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
 
         // Attacker tries to freeze.
         let mut stx = SignedTransaction::default();
@@ -5652,7 +5670,7 @@ mod tests {
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
         // Set account to Online with keys first.
         {
-            let acct = state.get_or_default_account(&sender);
+            let acct = state.get_or_default_account_mut(&sender);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.selection_id = Some([2u8; 32]);
@@ -5701,7 +5719,7 @@ mod tests {
 
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
         // Set account to NotParticipating.
-        state.get_or_default_account(&sender).status = AccountStatus::NotParticipating;
+        state.get_or_default_account_mut(&sender).status = AccountStatus::NotParticipating;
 
         let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
@@ -5773,7 +5791,7 @@ mod tests {
 
         // Set account Online with rewards_base=0.
         {
-            let acct = state.get_or_default_account(&sender);
+            let acct = state.get_or_default_account_mut(&sender);
             acct.status = AccountStatus::Online;
             acct.rewards_base = 0;
         }
@@ -6141,7 +6159,7 @@ mod tests {
         // and IncentiveEligible cleared (mirrors `suspend_absent_accounts`'s
         // effect from a prior round).
         {
-            let acct = state.get_or_default_account(&proposer);
+            let acct = state.get_or_default_account_mut(&proposer);
             acct.status = AccountStatus::Offline;
             acct.vote_id = Some([7u8; 32]);
             acct.selection_id = Some([8u8; 32]);
@@ -6197,7 +6215,7 @@ mod tests {
         );
 
         let before = {
-            let acct = state.get_or_default_account(&proposer);
+            let acct = state.get_or_default_account_mut(&proposer);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([7u8; 32]);
             acct.selection_id = Some([8u8; 32]);
@@ -6431,7 +6449,7 @@ mod tests {
 
         // Set target account to Online with matching voting keys.
         {
-            let acct = state.get_or_default_account(&target);
+            let acct = state.get_or_default_account_mut(&target);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(vote_id);
             acct.vote_key_dilution = 10;
@@ -6491,7 +6509,7 @@ mod tests {
 
         // Set target account with one vote_id.
         {
-            let acct = state.get_or_default_account(&target);
+            let acct = state.get_or_default_account_mut(&target);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(account_vote_id);
             acct.vote_key_dilution = 10;
@@ -6526,7 +6544,7 @@ mod tests {
 
         // Set target account with key_dilution=10.
         {
-            let acct = state.get_or_default_account(&target);
+            let acct = state.get_or_default_account_mut(&target);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(vote_id);
             acct.vote_key_dilution = 10;
@@ -6631,7 +6649,7 @@ mod tests {
         // Set up the expired account as Online with voting keys.
         // vote_last_valid = 0 so it is less than block round (1), i.e. truly expired.
         {
-            let acct = state.get_or_default_account(&expired_addr);
+            let acct = state.get_or_default_account_mut(&expired_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.selection_id = Some([2u8; 32]);
@@ -6678,7 +6696,7 @@ mod tests {
         let selection_id = [43u8; 32];
         let state_proof_id = [44u8; 64];
         {
-            let acct = state.get_or_default_account(&absent_addr);
+            let acct = state.get_or_default_account_mut(&absent_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(vote_id);
             acct.selection_id = Some(selection_id);
@@ -6722,7 +6740,7 @@ mod tests {
             make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&expired_addr);
+            let acct = state.get_or_default_account_mut(&expired_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
         }
@@ -6776,7 +6794,7 @@ mod tests {
             make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&absent_addr);
+            let acct = state.get_or_default_account_mut(&absent_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.incentive_eligible = true;
@@ -6810,7 +6828,7 @@ mod tests {
             make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&absent_addr);
+            let acct = state.get_or_default_account_mut(&absent_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.incentive_eligible = true;
@@ -6880,7 +6898,7 @@ mod tests {
         // Set up expired account as Online with voting keys.
         // vote_last_valid = 0 so it is less than block round (1), i.e. truly expired.
         {
-            let acct = state.get_or_default_account(&expired_addr);
+            let acct = state.get_or_default_account_mut(&expired_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.selection_id = Some([2u8; 32]);
@@ -6894,7 +6912,7 @@ mod tests {
         // Set up absent account as Online with voting keys.
         let absent_vote_id = [42u8; 32];
         {
-            let acct = state.get_or_default_account(&absent_addr);
+            let acct = state.get_or_default_account_mut(&absent_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(absent_vote_id);
             acct.selection_id = Some([43u8; 32]);
@@ -6946,7 +6964,7 @@ mod tests {
         // Create 33 expired addresses (max is 32 for V41).
         let expired: Vec<Address> = (0..33u8).map(|i| Address([100 + i; 32])).collect();
         for addr in &expired {
-            let acct = state.get_or_default_account(addr);
+            let acct = state.get_or_default_account_mut(addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
         }
@@ -6977,7 +6995,7 @@ mod tests {
         // Create exactly 32 expired addresses (max is 32 for V41).
         let expired: Vec<Address> = (0..32u8).map(|i| Address([100 + i; 32])).collect();
         for addr in &expired {
-            let acct = state.get_or_default_account(addr);
+            let acct = state.get_or_default_account_mut(addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.micro_algos = 1_000_000;
@@ -7020,7 +7038,7 @@ mod tests {
 
         // Set target account to Online with matching voting keys.
         {
-            let acct = state.get_or_default_account(&target);
+            let acct = state.get_or_default_account_mut(&target);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(vote_id);
             acct.vote_key_dilution = 10;
@@ -7059,7 +7077,7 @@ mod tests {
 
         // Set target account to Online with matching voting keys.
         {
-            let acct = state.get_or_default_account(&target);
+            let acct = state.get_or_default_account_mut(&target);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(vote_id);
             acct.vote_key_dilution = 10;
@@ -7089,7 +7107,7 @@ mod tests {
 
         // Set target account to Online.
         {
-            let acct = state.get_or_default_account(&target);
+            let acct = state.get_or_default_account_mut(&target);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(vote_id);
             acct.vote_key_dilution = 10;
@@ -7139,7 +7157,7 @@ mod tests {
         // Create 33 absent addresses (max is 32 for V41).
         let absent: Vec<Address> = (0..33u8).map(|i| Address([100 + i; 32])).collect();
         for addr in &absent {
-            let acct = state.get_or_default_account(addr);
+            let acct = state.get_or_default_account_mut(addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.incentive_eligible = true;
@@ -7172,7 +7190,7 @@ mod tests {
         // Create exactly 32 absent addresses (max is 32 for V41).
         let absent: Vec<Address> = (0..32u8).map(|i| Address([100 + i; 32])).collect();
         for addr in &absent {
-            let acct = state.get_or_default_account(addr);
+            let acct = state.get_or_default_account_mut(addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.incentive_eligible = true;
@@ -7210,7 +7228,7 @@ mod tests {
 
         // Set up expired account as Online with expired keys.
         {
-            let acct = state.get_or_default_account(&expired_addr);
+            let acct = state.get_or_default_account_mut(&expired_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.selection_id = Some([2u8; 32]);
@@ -7221,7 +7239,7 @@ mod tests {
 
         let absent: Vec<Address> = (0..33u8).map(|i| Address([200 + i; 32])).collect();
         for addr in &absent {
-            let acct = state.get_or_default_account(addr);
+            let acct = state.get_or_default_account_mut(addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.incentive_eligible = true;
@@ -7318,7 +7336,7 @@ mod tests {
 
         // Set target account as Online, IncentiveEligible, with voting keys.
         {
-            let acct = state.get_or_default_account(&target);
+            let acct = state.get_or_default_account_mut(&target);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(vote_id);
             acct.vote_key_dilution = 10;
@@ -7372,7 +7390,7 @@ mod tests {
         );
 
         {
-            let acct = state.get_or_default_account(&target);
+            let acct = state.get_or_default_account_mut(&target);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(vote_id);
             acct.vote_key_dilution = 10;
@@ -7419,7 +7437,7 @@ mod tests {
         );
 
         {
-            let acct = state.get_or_default_account(&target);
+            let acct = state.get_or_default_account_mut(&target);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(vote_id);
             acct.vote_key_dilution = 10;
@@ -7465,7 +7483,7 @@ mod tests {
         );
 
         {
-            let acct = state.get_or_default_account(&target);
+            let acct = state.get_or_default_account_mut(&target);
             acct.status = AccountStatus::Offline; // Offline.
             acct.vote_id = Some(vote_id);
             acct.vote_key_dilution = 10;
@@ -7577,7 +7595,7 @@ mod tests {
 
         // Set target as suspended: Offline but with voting keys intact.
         {
-            let acct = state.get_or_default_account(&target);
+            let acct = state.get_or_default_account_mut(&target);
             acct.status = AccountStatus::Offline;
             acct.vote_id = Some(vote_id);
             acct.selection_id = Some([2u8; 32]);
@@ -7630,14 +7648,14 @@ mod tests {
 
         // Set up both accounts as Online with voting keys.
         {
-            let acct = state.get_or_default_account(&target1);
+            let acct = state.get_or_default_account_mut(&target1);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(vote_id1);
             acct.vote_key_dilution = 10;
             acct.last_heartbeat = 0;
         }
         {
-            let acct = state.get_or_default_account(&target2);
+            let acct = state.get_or_default_account_mut(&target2);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some(vote_id2);
             acct.vote_key_dilution = 20;
@@ -7780,7 +7798,7 @@ mod tests {
             make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&expired_addr);
+            let acct = state.get_or_default_account_mut(&expired_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.selection_id = Some([2u8; 32]);
@@ -7815,7 +7833,7 @@ mod tests {
             make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&expired_addr);
+            let acct = state.get_or_default_account_mut(&expired_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.selection_id = Some([2u8; 32]);
@@ -7849,7 +7867,7 @@ mod tests {
             make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&expired_addr);
+            let acct = state.get_or_default_account_mut(&expired_addr);
             acct.status = AccountStatus::Online;
             // No vote_id set (None) -> should be rejected
             acct.vote_last_valid = 0;
@@ -7881,7 +7899,7 @@ mod tests {
             make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&expired_addr);
+            let acct = state.get_or_default_account_mut(&expired_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.vote_last_valid = 0;
@@ -7914,7 +7932,7 @@ mod tests {
             make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&expired_addr);
+            let acct = state.get_or_default_account_mut(&expired_addr);
             acct.status = AccountStatus::Online;
             acct.vote_id = Some([1u8; 32]);
             acct.vote_last_valid = 0;
@@ -7941,7 +7959,7 @@ mod tests {
             make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&absent_addr);
+            let acct = state.get_or_default_account_mut(&absent_addr);
             acct.status = AccountStatus::Offline; // Not Online!
             acct.incentive_eligible = true;
         }
@@ -7973,7 +7991,7 @@ mod tests {
             make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&absent_addr);
+            let acct = state.get_or_default_account_mut(&absent_addr);
             acct.status = AccountStatus::Offline;
             acct.incentive_eligible = true;
         }
@@ -7997,7 +8015,7 @@ mod tests {
         let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&absent_addr);
+            let acct = state.get_or_default_account_mut(&absent_addr);
             acct.status = AccountStatus::Online;
             acct.incentive_eligible = true;
             acct.micro_algos = 0; // Zero balance!
@@ -8029,7 +8047,7 @@ mod tests {
             make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&absent_addr);
+            let acct = state.get_or_default_account_mut(&absent_addr);
             acct.status = AccountStatus::Online;
             acct.incentive_eligible = false; // Not incentive eligible!
         }
@@ -8060,7 +8078,7 @@ mod tests {
             make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&absent_addr);
+            let acct = state.get_or_default_account_mut(&absent_addr);
             acct.status = AccountStatus::Online;
             acct.incentive_eligible = true;
         }
@@ -8092,7 +8110,7 @@ mod tests {
             make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
         {
-            let acct = state.get_or_default_account(&absent_addr);
+            let acct = state.get_or_default_account_mut(&absent_addr);
             acct.status = AccountStatus::Online;
             acct.incentive_eligible = true;
         }
@@ -8537,8 +8555,8 @@ mod tests {
             fee_sink,
         );
         state.rewards_pool = rewards_pool;
-        state.get_or_default_account(&sender).status = AccountStatus::Online;
-        state.get_or_default_account(&receiver).status = AccountStatus::Online;
+        state.get_or_default_account_mut(&sender).status = AccountStatus::Online;
+        state.get_or_default_account_mut(&receiver).status = AccountStatus::Online;
 
         let stx = pay_txn(sender, receiver, 1_000_000, 1_000);
         let block = Block {

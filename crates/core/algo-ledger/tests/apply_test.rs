@@ -11,7 +11,7 @@ fn make_state(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
     let mut state = LedgerState::new();
     state.fee_sink = fee_sink;
     for (addr, bal) in balances {
-        let acct = state.get_or_default_account(addr);
+        let acct = state.get_or_default_account_mut(addr);
         acct.micro_algos = *bal;
     }
     state
@@ -83,8 +83,8 @@ fn test_reward_dedup_sender_eq_receiver() {
     );
     state.rewards_pool = rewards_pool;
     // Set rewards_base so there are pending rewards.
-    state.get_or_default_account(&addr).rewards_base = 0;
-    state.get_or_default_account(&addr).status = AccountStatus::Online;
+    state.get_or_default_account_mut(&addr).rewards_base = 0;
+    state.get_or_default_account_mut(&addr).status = AccountStatus::Online;
 
     let ctx = ApplyContext::new_replay(10, fee_sink, 1);
 
@@ -369,7 +369,7 @@ fn test_rekey_clear_on_non_pay() {
     let fee_sink = Address([3u8; 32]);
 
     let mut state = make_state(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-    state.get_or_default_account(&sender).auth_addr = Some(auth);
+    state.get_or_default_account_mut(&sender).auth_addr = Some(auth);
 
     let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
@@ -397,7 +397,9 @@ fn test_close_with_opted_in_apps_fails() {
     let fee_sink = Address([3u8; 32]);
 
     let mut state = make_state(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-    state.get_or_default_account(&sender).total_apps_opted_in = 2;
+    state
+        .get_or_default_account_mut(&sender)
+        .total_apps_opted_in = 2;
 
     let ctx = ApplyContext::new_replay(0, fee_sink, 1);
     let mut stx = pay_txn(sender, receiver, 0, 1_000);
@@ -1153,8 +1155,8 @@ fn test_rewards_recalculation_rate_drops_to_zero() {
     // Set initial rewards state: rate=100, level=10, base=10 for both accounts.
     state.rewards_level = 10;
     state.rewards_rate = 100;
-    state.get_or_default_account(&sender).rewards_base = 10;
-    state.get_or_default_account(&receiver).rewards_base = 10;
+    state.get_or_default_account_mut(&sender).rewards_base = 10;
+    state.get_or_default_account_mut(&receiver).rewards_base = 10;
 
     // Block 1: rewards_level rises to 20 (rate still 100).
     let mut block1 = minimal_block(fee_sink, 1, vec![]);
@@ -1398,8 +1400,8 @@ fn test_asset_close_out_with_rewards() {
     state.rewards_pool = rewards_pool;
 
     // Set up holder with pending rewards: base=0, current level will be 10.
-    state.get_or_default_account(&holder).rewards_base = 0;
-    state.get_or_default_account(&holder).status = AccountStatus::Online;
+    state.get_or_default_account_mut(&holder).rewards_base = 0;
+    state.get_or_default_account_mut(&holder).status = AccountStatus::Online;
 
     let ctx_no_rewards = ApplyContext::new_replay(0, fee_sink, 1);
 
@@ -1426,7 +1428,7 @@ fn test_asset_close_out_with_rewards() {
     assert_eq!(state.get_asset_holding(&holder, 42).unwrap().amount, 500,);
 
     // Reset holder rewards_base to 0 so there are pending rewards at level 10.
-    state.get_or_default_account(&holder).rewards_base = 0;
+    state.get_or_default_account_mut(&holder).rewards_base = 0;
     let holder_balance_before = state.get_account(&holder).unwrap().micro_algos;
     // holder_balance_before = 9_999_000
 
