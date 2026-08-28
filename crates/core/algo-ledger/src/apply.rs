@@ -4093,15 +4093,36 @@ pub fn apply_heartbeat<L: crate::store_trait::LedgerStore>(
     }
     let account = account.unwrap();
 
-    // Cheap/free heartbeat validation.
-    // Go: if header.Fee.Raw < proto.MinTxnFee && header.Group.IsZero()
-    // A heartbeat with fee below MinTxnFee in a singleton group is only
-    // allowed if the target account is online, incentive-eligible, and
-    // currently challenged (the "risky" challenge period).
+    // Cheap/free/discounted heartbeat validation.
+    //
+    // `kind` mirrors go's `Heartbeat()` local variable (`ledger/apply/heartbeat.go`):
+    // how (if at all) this heartbeat is claiming the challenge fee discount.
+    // `None` means no discount is being claimed, so no eligibility
+    // verification is needed here (well-formedness/fee checks upstream
+    // already require the full, undiscounted fee in that case).
+    //
+    // Post-v42 (`TxnSizePricingEnabled`): the discount is claimed explicitly
+    // via `hb_challenge_discount`, regardless of grouping. Pre-v42: it is
+    // inferred from an underpaying singleton heartbeat (Go:
+    // `header.Fee.Raw < proto.MinTxnFee && header.Group.IsZero()`).
+    //
+    // Either way, claiming the discount (via either convention) is only a
+    // *request* -- it is granted only if the target account is actually
+    // online, incentive-eligible, and currently challenged (the "risky"
+    // challenge period).
     let is_singleton = txn.group == [0u8; 32];
-    if txn.fee < consensus.min_txn_fee && is_singleton {
-        let kind = if txn.fee > 0 { "cheap" } else { "free" };
-
+    let kind: Option<&'static str> = if consensus.txn_size_pricing_enabled() {
+        if hb.hb_challenge_discount {
+            Some("discounted")
+        } else {
+            None
+        }
+    } else if txn.fee < consensus.min_txn_fee && is_singleton {
+        Some(if txn.fee > 0 { "cheap" } else { "free" })
+    } else {
+        None
+    };
+    if let Some(kind) = kind {
         if account.status != AccountStatus::Online {
             return Err(AlgoError::Ledger {
                 message: format!(
@@ -6450,6 +6471,7 @@ mod tests {
             seed: *seed,
             vote_id,
             key_dilution,
+            hb_challenge_discount: false,
         });
         stx
     }
@@ -7615,6 +7637,172 @@ mod tests {
             "expected 'not allowed for Offline' in error: {}",
             err_msg
         );
+    }
+
+    /// Helper: create an ApplyContext with V42 consensus parameters (size
+    /// pricing / explicit `HbChallengeDiscount` enabled). V42 inherits V41's
+    /// payout-challenge parameters unchanged, so the same round/window math
+    /// used by the V41 challenge tests above applies here too.
+    fn make_v42_apply_context(fee_sink: Address, round: u64) -> ApplyContext {
+        use algo_types::consensus::consensus_params_for_version;
+        let consensus =
+            consensus_params_for_version(algo_types::consensus::CONSENSUS_V42).expect("V42 params");
+        assert!(consensus.txn_size_pricing_enabled());
+        ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round,
+            mode: ApplyMode::Replay,
+            validate: false,
+            latest_timestamp: 0,
+            genesis_hash: [0u8; 32],
+            txn_counter: Cell::new(0),
+            fee_credit: Cell::new(0),
+            fee_residue: Cell::new(0),
+            txn_index: Cell::new(0),
+            consensus,
+            avm_overrides: Default::default(),
+            failed_eval_delta: Cell::new(None),
+            kv_mods_recorder: None,
+        }
+    }
+
+    #[test]
+    fn test_discounted_heartbeat_post_v42_challenged_account_succeeds() {
+        // Post-v42 mirror of test_cheap_heartbeat_challenged_account_succeeds:
+        // the explicit `hb_challenge_discount` flag (not fee underpayment)
+        // claims the discount, and a genuinely challenged/eligible account is
+        // still granted it.
+        let seed = [0xF8; 32];
+        let target = Address([0xFF; 32]); // First 5 bits match seed.
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 5_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        {
+            let acct = state.get_or_default_account_mut(&target);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+            acct.incentive_eligible = true;
+            acct.last_heartbeat = 0;
+            acct.last_proposed = 0;
+        }
+
+        let round = 2150; // within the V41/V42-shared risky window.
+        {
+            use crate::store_trait::LedgerStore;
+            let hdr = make_challenge_header_data(&seed, algo_types::consensus::CONSENSUS_V42);
+            state
+                .put_block(2000, algo_types::consensus::CONSENSUS_V42, &hdr, &[])
+                .unwrap();
+        }
+        store_block_header_with_seed(&mut state, 1, &HB_TEST_SEED);
+
+        let ctx = make_v42_apply_context(fee_sink, round);
+        // Full fee paid (not underpaying) -- the flag alone claims the discount.
+        let mut stx = heartbeat_txn(sender, target, vote_id, 10, ctx.consensus.min_txn_fee);
+        stx.txn.heartbeat.as_mut().unwrap().hb_challenge_discount = true;
+
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        let acct = state.get_account(&target).unwrap();
+        assert_eq!(acct.last_heartbeat, round);
+    }
+
+    #[test]
+    fn test_discounted_heartbeat_post_v42_not_incentive_eligible_rejected() {
+        // Post-v42 mirror of test_cheap_heartbeat_non_incentive_eligible_rejected:
+        // the explicit flag is a request, not an assertion -- apply must
+        // still independently verify eligibility.
+        let seed = [0xF8; 32];
+        let target = Address([0xFF; 32]); // Matches seed.
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 5_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        {
+            let acct = state.get_or_default_account_mut(&target);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+            acct.incentive_eligible = false; // NOT incentive eligible.
+            acct.last_heartbeat = 0;
+        }
+
+        let round = 2150;
+        {
+            use crate::store_trait::LedgerStore;
+            let hdr = make_challenge_header_data(&seed, algo_types::consensus::CONSENSUS_V42);
+            state
+                .put_block(2000, algo_types::consensus::CONSENSUS_V42, &hdr, &[])
+                .unwrap();
+        }
+
+        let ctx = make_v42_apply_context(fee_sink, round);
+        let mut stx = heartbeat_txn(sender, target, vote_id, 10, ctx.consensus.min_txn_fee);
+        stx.txn.heartbeat.as_mut().unwrap().hb_challenge_discount = true;
+
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not IncentiveEligible"),
+            "expected 'not IncentiveEligible' in error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_post_v42_without_discount_flag_skips_eligibility_gate() {
+        // Post-v42, a heartbeat that does NOT set hb_challenge_discount makes
+        // no discount claim, so apply_heartbeat must not require online/
+        // eligible/challenged status for it -- even though (pre-v42) an
+        // underpaying singleton heartbeat would have implied exactly that.
+        // (In a full pipeline this txn would be rejected upstream by the fee
+        // check for underpaying without the flag; this test isolates
+        // apply_heartbeat's own eligibility gate.)
+        let target = Address([0x00; 32]); // Would NOT match any challenge seed.
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 5_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        {
+            let acct = state.get_or_default_account_mut(&target);
+            acct.status = AccountStatus::Offline; // Would fail the eligibility gate.
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+            acct.incentive_eligible = false;
+            acct.last_heartbeat = 0;
+        }
+
+        let round = 2150;
+        store_block_header_with_seed(&mut state, 1, &HB_TEST_SEED);
+
+        let ctx = make_v42_apply_context(fee_sink, round);
+        // No discount flag set, full fee paid -- kind is None, so the
+        // online/eligible/challenged gate must not run at all.
+        let stx = heartbeat_txn(sender, target, vote_id, 10, ctx.consensus.min_txn_fee);
+
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        let acct = state.get_account(&target).unwrap();
+        assert_eq!(acct.last_heartbeat, round);
     }
 
     #[test]

@@ -785,6 +785,18 @@ pub struct HeartbeatTxnFields {
     /// Key dilution.
     #[serde(rename = "kd", default, skip_serializing_if = "is_zero_u64")]
     pub key_dilution: u64,
+
+    /// Requests the challenge fee discount: when set, the required fee is
+    /// reduced by one min fee. It is optional even for a challenged account
+    /// (an account willing to pay the normal fee can leave it off), so it is
+    /// a request, not an assertion — apply verifies the account is actually
+    /// under challenge before granting it. Only meaningful once transaction
+    /// size pricing is enabled (`ConsensusParams::txn_size_pricing_enabled`);
+    /// before then, the discount is inferred from an underpaid singleton
+    /// heartbeat instead, and this field must not be set (Go:
+    /// `HeartbeatTxnFields.HbChallengeDiscount`, `data/transactions/heartbeat.go`, v42+).
+    #[serde(rename = "c", default, skip_serializing_if = "is_false")]
+    pub hb_challenge_discount: bool,
 }
 
 // ── State Proof types ──────────────────────────────────────────
@@ -1233,6 +1245,7 @@ impl HeartbeatTxnFields {
                 b"sd" => s.seed = rmp_decode::read_fixed_bytes::<32>(rd)?,
                 b"vid" => s.vote_id = rmp_decode::read_fixed_bytes::<32>(rd)?,
                 b"kd" => s.key_dilution = rmp_decode::read_u64(rd)?,
+                b"c" => s.hb_challenge_discount = rmp_decode::read_bool(rd)?,
                 _ => rmp_decode::skip_value(rd)?,
             }
         }

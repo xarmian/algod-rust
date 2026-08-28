@@ -117,41 +117,78 @@ pub fn validate_transaction_wellformed(
     }
 
     // ── Heartbeat-specific checks (Go: HeartbeatTxnFields.wellFormed) ──
-    // Ungrouped heartbeat transactions with fee < MinTxnFee are "free"
-    // heartbeats. Go exempts them from the fee check entirely but
-    // requires they have no note, no lease, and no rekey-to.
-    let is_free_heartbeat = txn.txn_type == "hb"
-        && txn.group == [0u8; 32]
-        && txn.fee < params.min_txn_fee
-        && params.enable_heartbeat;
-
-    if is_free_heartbeat {
-        if !txn.note.is_empty() {
-            let kind = if txn.fee > 0 { "cheap" } else { "free" };
-            return Err(AlgoError::Validation {
-                message: format!("tx.Note is set in {kind} heartbeat"),
-            });
-        }
-        if txn.lease != [0u8; 32] {
-            let kind = if txn.fee > 0 { "cheap" } else { "free" };
-            return Err(AlgoError::Validation {
-                message: format!("tx.Lease is set in {kind} heartbeat"),
-            });
-        }
-        if txn.rekey_to.as_ref().is_some_and(|a| !a.is_zero()) {
-            let kind = if txn.fee > 0 { "cheap" } else { "free" };
-            return Err(AlgoError::Validation {
-                message: format!("tx.RekeyTo is set in {kind} heartbeat"),
-            });
-        }
-    }
-
-    // Heartbeat well-formedness: proof, seed, vote_id, key_dilution must be
-    // non-empty. Cryptographic verification of the three-level ed25519
-    // ephemeral key tree is done separately via `verify_heartbeat_proof()`
-    // in signature.rs (called from `stxnCoreChecks` equivalent).
     if txn.txn_type == "hb" {
         if let Some(ref hb) = txn.heartbeat {
+            // `kind` mirrors go's local `kind` variable: how (if at all) this
+            // heartbeat is claiming the challenge fee discount -- used only to
+            // decide whether the "must be very simple" restrictions below
+            // apply. `None` means no discount is being claimed, so no
+            // restriction applies.
+            //
+            // Post-v42 (`txn_size_pricing_enabled`): the discount is claimed
+            // explicitly via `hb_challenge_discount`, regardless of grouping.
+            // Pre-v42: `hb_challenge_discount` has no meaning and must not be
+            // set (hard rejection, matching go's "set before it is allowed"),
+            // and the discount is instead inferred from an underpaying
+            // singleton heartbeat, exactly as before this field existed.
+            let kind: Option<&'static str> = if params.txn_size_pricing_enabled() {
+                if hb.hb_challenge_discount {
+                    Some("discounted")
+                } else {
+                    None
+                }
+            } else {
+                if hb.hb_challenge_discount {
+                    return Err(AlgoError::Validation {
+                        message: "tx.HbChallengeDiscount set before it is allowed".to_string(),
+                    });
+                }
+                if params.enable_heartbeat && txn.group == [0u8; 32] {
+                    // Fee a normal (non-discounted) heartbeat owes, computed
+                    // the same way as a top-level group of one: no cost
+                    // multiplier, no prior residue (go: `header.FeeContribution
+                    // (proto) + 1e6` -> `MinFee().FeeForUsage(factor, 1e6, 0)`).
+                    // Deliberately NOT `fee::required_fee_for_txn`, which
+                    // already applies the singleton discount this inference
+                    // exists to detect in the first place.
+                    let undiscounted_factor = crate::fee::ONE_MICROS.saturating_add(
+                        crate::fee::header_fee_contribution(txn.note.len(), params),
+                    );
+                    let (required_fee, _overflow) =
+                        crate::fee::required_fee_for_usage(undiscounted_factor, params);
+                    if txn.fee < required_fee {
+                        Some(if txn.fee > 0 { "cheap" } else { "free" })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(kind) = kind {
+                if !txn.note.is_empty() {
+                    return Err(AlgoError::Validation {
+                        message: format!("tx.Note is set in {kind} heartbeat"),
+                    });
+                }
+                if txn.lease != [0u8; 32] {
+                    return Err(AlgoError::Validation {
+                        message: format!("tx.Lease is set in {kind} heartbeat"),
+                    });
+                }
+                if txn.rekey_to.as_ref().is_some_and(|a| !a.is_zero()) {
+                    return Err(AlgoError::Validation {
+                        message: format!("tx.RekeyTo is set in {kind} heartbeat"),
+                    });
+                }
+            }
+
+            // Heartbeat well-formedness: proof, seed, vote_id, key_dilution
+            // must be non-empty. Cryptographic verification of the
+            // three-level ed25519 ephemeral key tree is done separately via
+            // `verify_heartbeat_proof()` in signature.rs (called from
+            // `stxnCoreChecks` equivalent).
             if hb.proof.is_none()
                 || hb
                     .proof
@@ -191,15 +228,22 @@ pub fn validate_transaction_wellformed(
     }
 
     // ── Fee check ─────────────────────────────────────────────────
-    // State proof txns are always fee-exempt.
-    // Free heartbeats (checked above) are also fee-exempt.
     // When `allow_fee_pooling` is true (caller signals txn is in a group),
     // the per-txn minimum is skipped — group-level validation handles it.
     // Ungrouped txns must always individually meet the minimum, regardless
     // of whether the protocol version enables fee pooling (Go checks this
     // in TxnGroup for both pooled and non-pooled modes).
-    let is_stpf = txn.txn_type == "stpf";
-    if !is_stpf && !is_free_heartbeat && !allow_fee_pooling {
+    //
+    // No separate exemption is needed here for state proofs or free/cheap/
+    // discounted heartbeats: `fee::required_fee_for_txn` (via `txn_fee_factor`)
+    // already computes a required fee of `0` for those cases (state proofs
+    // unconditionally; heartbeats via the same discount rules enforced above),
+    // so the generic comparison below naturally passes them. Special-casing
+    // heartbeats here as well (as prior code did, via an `is_free_heartbeat`-
+    // style flag keyed only on "fee < min_txn_fee && ungrouped") would
+    // incorrectly exempt a post-v42 heartbeat that merely underpays *without*
+    // requesting the explicit discount from ever having its fee checked.
+    if !allow_fee_pooling {
         // Usage-based required fee (Go: `ledger/eval.CheckGroupFees`, applied
         // here to a singleton "group" of one). For an ordinary transaction
         // with no oversized/billable features this is exactly
@@ -532,13 +576,26 @@ pub fn has_heartbeat(version: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Returns `true` if the given transaction is a free/cheap heartbeat that
-/// is exempt from fee checks (ungrouped `hb` with fee < min, v40+).
+/// Returns `true` if the given transaction is a free/cheap/discounted
+/// heartbeat that is exempt from fee checks (v40+).
+///
+/// Mirrors the same version-gated discount rule as `txn_fee_factor`'s
+/// heartbeat branch and `validate_transaction_wellformed`'s `kind`
+/// derivation: post-v42 (`txn_size_pricing_enabled`) the discount is claimed
+/// explicitly via `hb_challenge_discount` (grouping no longer matters);
+/// pre-v42 it is inferred from an underpaying ungrouped (singleton)
+/// heartbeat.
 pub fn is_free_heartbeat(txn: &Transaction, params: &ConsensusParams) -> bool {
-    txn.txn_type == "hb"
-        && txn.group == [0u8; 32]
-        && txn.fee < params.min_txn_fee
-        && params.enable_heartbeat
+    if txn.txn_type != "hb" || !params.enable_heartbeat {
+        return false;
+    }
+    if params.txn_size_pricing_enabled() {
+        txn.heartbeat
+            .as_ref()
+            .is_some_and(|hb| hb.hb_challenge_discount)
+    } else {
+        txn.group == [0u8; 32] && txn.fee < params.min_txn_fee
+    }
 }
 
 /// Compute the group ID for a set of transactions.
@@ -1042,24 +1099,34 @@ mod tests {
                 seed: [0x11; 32],
                 vote_id: [0x22; 32],
                 key_dilution: 10000,
+                hb_challenge_discount: false,
             }),
             ..Default::default()
         }
     }
 
+    /// V41 (pre-v42, size pricing disabled) consensus params — the regime
+    /// under which the discount is inferred from fee underpayment rather
+    /// than claimed via the explicit `hb_challenge_discount` flag.
+    fn v41_params() -> ConsensusParams {
+        consensus_params_for_version(algo_types::consensus::CONSENSUS_V41).unwrap()
+    }
+
     #[test]
     fn test_free_heartbeat_ungrouped_passes() {
-        // Ungrouped heartbeat with fee=0 should pass (fee-exempt in v40+).
+        // Pre-v42: an ungrouped heartbeat with fee=0 should pass (inferred
+        // discount).
         let txn = make_heartbeat_txn(0);
-        let params = ConsensusParams::default(); // enable_heartbeat=true
+        let params = v41_params();
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
     }
 
     #[test]
     fn test_cheap_heartbeat_ungrouped_passes() {
-        // Ungrouped heartbeat with fee < min (but > 0) should also pass.
+        // Pre-v42: an ungrouped heartbeat with fee < min (but > 0) should
+        // also pass (inferred discount).
         let txn = make_heartbeat_txn(500);
-        let params = ConsensusParams::default();
+        let params = v41_params();
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
     }
 
@@ -1067,7 +1134,7 @@ mod tests {
     fn test_free_heartbeat_with_note_rejected() {
         let mut txn = make_heartbeat_txn(0);
         txn.note = ByteBuf::from(vec![0x42; 10]);
-        let params = ConsensusParams::default();
+        let params = v41_params();
         let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1080,7 +1147,7 @@ mod tests {
     fn test_cheap_heartbeat_with_lease_rejected() {
         let mut txn = make_heartbeat_txn(500);
         txn.lease = [0x42; 32];
-        let params = ConsensusParams::default();
+        let params = v41_params();
         let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1093,7 +1160,7 @@ mod tests {
     fn test_free_heartbeat_with_rekey_rejected() {
         let mut txn = make_heartbeat_txn(0);
         txn.rekey_to = Some(Address([0x99; 32]));
-        let params = ConsensusParams::default();
+        let params = v41_params();
         let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1104,7 +1171,74 @@ mod tests {
 
     #[test]
     fn test_heartbeat_with_full_fee_allows_note() {
-        // Heartbeat with fee >= min should allow note (not "free").
+        // Pre-v42: heartbeat with fee >= min should allow note (not "free").
+        let mut txn = make_heartbeat_txn(MIN_TXN_FEE);
+        txn.note = ByteBuf::from(vec![0x42; 10]);
+        let params = v41_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_heartbeat_discount_flag_rejected_pre_v42() {
+        // Pre-v42, HbChallengeDiscount has no meaning and must be rejected
+        // outright, even on a well-formed, fully-paid heartbeat.
+        let mut txn = make_heartbeat_txn(MIN_TXN_FEE);
+        txn.heartbeat.as_mut().unwrap().hb_challenge_discount = true;
+        let params = v41_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tx.HbChallengeDiscount set before it is allowed"),
+            "expected pre-v42 discount-flag rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_discounted_post_v42_zero_fee_passes() {
+        // Post-v42 (default params): the explicit flag -- not fee
+        // underpayment -- is what claims the discount.
+        let txn = make_heartbeat_txn(0);
+        let mut txn = txn;
+        txn.heartbeat.as_mut().unwrap().hb_challenge_discount = true;
+        let params = ConsensusParams::default();
+        assert!(params.txn_size_pricing_enabled());
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_heartbeat_discounted_post_v42_with_note_rejected() {
+        // Post-v42: a discounted heartbeat must still be "very simple".
+        let mut txn = make_heartbeat_txn(0);
+        txn.heartbeat.as_mut().unwrap().hb_challenge_discount = true;
+        txn.note = ByteBuf::from(vec![0x42; 10]);
+        let params = ConsensusParams::default();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Note is set in discounted heartbeat"),
+            "expected note rejection in discounted heartbeat, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_underpaying_without_discount_flag_rejected_post_v42() {
+        // Regression: post-v42, an ungrouped heartbeat that underpays
+        // WITHOUT setting the explicit discount flag must be rejected for
+        // insufficient fee -- it must not be silently exempted the way the
+        // old (version-unaware) fee-underpayment inference would have done.
+        let txn = make_heartbeat_txn(0); // hb_challenge_discount defaults to false
+        let params = ConsensusParams::default();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("fee") && err.to_string().contains("below minimum"),
+            "expected fee-too-low rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_with_full_fee_allows_note_post_v42() {
+        // Post-v42, without the discount flag, a fully-paid heartbeat is not
+        // "kind"-restricted and may carry a note.
         let mut txn = make_heartbeat_txn(MIN_TXN_FEE);
         txn.note = ByteBuf::from(vec![0x42; 10]);
         let params = ConsensusParams::default();
@@ -1139,8 +1273,8 @@ mod tests {
     }
 
     #[test]
-    fn test_is_free_heartbeat_helper() {
-        let params = ConsensusParams::default();
+    fn test_is_free_heartbeat_helper_pre_v42() {
+        let params = v41_params();
         let txn = make_heartbeat_txn(0);
         assert!(is_free_heartbeat(&txn, &params));
 
@@ -1155,6 +1289,33 @@ mod tests {
         params_no_hb.enable_heartbeat = false;
         let txn2 = make_heartbeat_txn(0);
         assert!(!is_free_heartbeat(&txn2, &params_no_hb));
+    }
+
+    #[test]
+    fn test_is_free_heartbeat_helper_post_v42() {
+        // Post-v42: the explicit flag (not fee/grouping) decides.
+        let params = ConsensusParams::default();
+        assert!(params.txn_size_pricing_enabled());
+
+        // Underpaying but no flag: NOT free (the bug this issue fixes).
+        let txn_underpaying_no_flag = make_heartbeat_txn(0);
+        assert!(!is_free_heartbeat(&txn_underpaying_no_flag, &params));
+
+        // Flag set, full fee paid, ungrouped: still free (a request, not tied
+        // to underpayment).
+        let mut txn_flag = make_heartbeat_txn(MIN_TXN_FEE);
+        txn_flag.heartbeat.as_mut().unwrap().hb_challenge_discount = true;
+        assert!(is_free_heartbeat(&txn_flag, &params));
+
+        // Flag set even while grouped: still free post-v42 (unlike pre-v42).
+        let mut txn_flag_grouped = make_heartbeat_txn(MIN_TXN_FEE);
+        txn_flag_grouped.group = [0xFF; 32];
+        txn_flag_grouped
+            .heartbeat
+            .as_mut()
+            .unwrap()
+            .hb_challenge_discount = true;
+        assert!(is_free_heartbeat(&txn_flag_grouped, &params));
     }
 
     // ── Version-aware consensus params tests ─────────────────────
