@@ -45,10 +45,11 @@ Headline items, by consensus risk:
 
 ## Stage 6 — Sub-issues (dependency order)
 
-- [ ] #658 — consensus v42 parameter sweep (**foundation**)
-- [ ] #663 — Falcon-1024 seed size + sign-message convention fix
-- [ ] #669 — sha512/sumhash512 opcode cost formula bugfix
-- [ ] #670 — gload/gloads nil-pastScratch fix
+- [x] #658 — consensus v42 parameter sweep (**foundation**) — merged, PR #682
+- [x] #663 — Falcon-1024 seed size + sign-message convention fix — merged, PR #683
+- [x] #669 — sha512/sumhash512 opcode cost formula bugfix — merged, PR #684
+- [x] #670 — gload/gloads nil-pastScratch fix — merged, PR #685
+- [ ] #686 — gload/gloads must return sibling's real scratch value, not a zero placeholder (found during #670; depends on #670)
 - [ ] #672 — assembler match-opcode type tracking + deadcode disassembly fix
 - [ ] #666 — byte-constant size-limit enforcement + falcon_verify audit
 - [ ] #665 — poseidon2 opcode
