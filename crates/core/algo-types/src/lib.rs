@@ -19,7 +19,7 @@ pub use address::Address;
 pub use block::{Block, BlockResponse};
 pub use consensus::{
     consensus_params_for_version, ConsensusParams, CONSENSUS_CURRENT_VERSION, CONSENSUS_FUTURE,
-    CONSENSUS_V41, KNOWN_PROTOCOL_VERSIONS,
+    CONSENSUS_V41, CONSENSUS_V42, KNOWN_PROTOCOL_VERSIONS,
 };
 pub use digest::Digest;
 pub use header::BlockHeader;

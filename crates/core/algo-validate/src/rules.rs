@@ -1290,8 +1290,15 @@ mod tests {
     }
 
     #[test]
+    fn test_protocol_version_index_v42() {
+        assert_eq!(protocol_version_index(
+            "https://github.com/algorandfoundation/specs/tree/268b63433a907455d439995bf916f6b296018f4f"
+        ), Some(35));
+    }
+
+    #[test]
     fn test_protocol_version_index_future() {
-        assert_eq!(protocol_version_index("future"), Some(35));
+        assert_eq!(protocol_version_index("future"), Some(36));
     }
 
     #[test]

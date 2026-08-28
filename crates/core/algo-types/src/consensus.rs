@@ -83,6 +83,8 @@ pub const CONSENSUS_V40: &str =
     "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9";
 pub const CONSENSUS_V41: &str =
     "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed";
+pub const CONSENSUS_V42: &str =
+    "https://github.com/algorandfoundation/specs/tree/268b63433a907455d439995bf916f6b296018f4f";
 pub const CONSENSUS_FUTURE: &str = "future";
 pub const CONSENSUS_ALPHA1: &str = "alpha1";
 pub const CONSENSUS_ALPHA2: &str = "alpha2";
@@ -91,7 +93,7 @@ pub const CONSENSUS_ALPHA4: &str = "alpha4";
 pub const CONSENSUS_ALPHA5: &str = "alpha5";
 
 /// The current (latest release) consensus version.
-pub const CONSENSUS_CURRENT_VERSION: &str = CONSENSUS_V41;
+pub const CONSENSUS_CURRENT_VERSION: &str = CONSENSUS_V42;
 
 /// All protocol version strings recognised by go-algorand v4.6.0-stable.
 pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
@@ -132,6 +134,7 @@ pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
     CONSENSUS_V39,
     CONSENSUS_V40,
     CONSENSUS_V41,
+    CONSENSUS_V42,
     // Special versions
     CONSENSUS_FUTURE,
     CONSENSUS_ALPHA1,
@@ -177,6 +180,25 @@ pub struct ConsensusParams {
     pub max_tx_group_size: usize,
     /// Max block payload bytes (Go: `MaxTxnBytesPerBlock`).
     pub max_txn_bytes_per_block: u64,
+    /// Absolute hard cap on note field size in bytes, beyond which a
+    /// transaction is not well-formed regardless of size-pricing fee paid
+    /// (Go: `MaxAbsoluteTxnNoteBytes`, v42+). `MaxTxnNoteBytes` remains the
+    /// free/soft cap; bytes between the soft and absolute cap are billable
+    /// via `PerByteTxnSurcharge`.
+    pub max_absolute_txn_note_bytes: usize,
+    /// Absolute hard cap on extra app program pages, beyond which an app
+    /// create/update is not well-formed regardless of size-pricing fee paid
+    /// (Go: `MaxAbsoluteExtraProgramPages`, v42+).
+    pub max_absolute_extra_program_pages: u32,
+    /// Absolute hard cap on the summed length of ApplicationArgs, beyond
+    /// which an app call is not well-formed regardless of size-pricing fee
+    /// paid (Go: `MaxAbsoluteTotalArgLen`, v42+).
+    pub max_absolute_total_arg_len: usize,
+    /// Per-byte fee surcharge (fixed-point `basics.Micros`, 1_000_000 == one
+    /// `MinTxnFee`) charged for txn/app-call/logicsig bytes beyond the old
+    /// free/soft caps but within the new `MaxAbsolute*` hard caps (Go:
+    /// `PerByteTxnSurcharge`, v42+). Zero means size pricing is disabled.
+    pub per_byte_txn_surcharge: u64,
 
     // ── Feature flags ───────────────────────────────────────────
     /// Sum of fees in a group must exceed one MinTxnFee per txn (Go: `EnableFeePooling`, v28+).
@@ -191,13 +213,29 @@ pub struct ConsensusParams {
     pub support_rekeying: bool,
     /// Heartbeat transactions enabled (Go: `Heartbeat`, v40+).
     pub enable_heartbeat: bool,
-    /// AuthAddr must differ from Sender (Go: `EnforceAuthAddrSenderDiff`, future only).
+    /// AuthAddr must differ from Sender (Go: `EnforceAuthAddrSenderDiff`, v42+).
     pub enforce_auth_addr_sender_diff: bool,
     /// Enables header values (`Load`/`CongestionTax`) that track how full recent
     /// blocks are, and derive a congestion-tax fee adjustment from it (Go:
-    /// `LoadTracking`, future only — go-algorand v4.7.0-beta,
-    /// `config/consensus.go`, PR #6548).
+    /// `LoadTracking`, v42+ — go-algorand v4.7.0-beta introduced it future-only,
+    /// `config/consensus.go`, PR #6548; moved onto the real v42 release by
+    /// commit `88fe542f3`).
     pub load_tracking: bool,
+    /// Apps may update their approval/clear programs to larger page-extended
+    /// sizes without extra restriction (Go: `AppSizeUpdates`, v42+).
+    pub app_size_updates: bool,
+    /// Applications may be referenced by local-state ops (`app_local_get`,
+    /// etc.) using foreign-app index 0 to mean "this app", matching the
+    /// existing global-state convention (Go: `AllowZeroLocalAppRef`, v42+).
+    pub allow_zero_local_app_ref: bool,
+    /// Enables native Falcon-1024 transaction authorization for the `f1` PQ
+    /// scheme (Go: `EnablePQSchemeFalcon1024`, v42+). Full PQ wire-type
+    /// plumbing (`PQSchemeEnabled`/`PQSchemeFeeContribution`) is tracked by a
+    /// companion PQ-signatures issue; this flag is the consensus gate only.
+    pub enable_pq_scheme_falcon1024: bool,
+    /// Enables the AVM `select` opcode variant operating on 128-bit values
+    /// (Go: `EnableSelectF128`, v42+).
+    pub enable_select_f128: bool,
     /// LogicSig sizes pooled across a group (Go: `EnableLogicSigSizePooling`, v40+).
     pub enable_logicsig_size_pooling: bool,
     /// LogicSig costs pooled across a group (Go: `EnableLogicSigCostPooling`, v39+).
@@ -482,9 +520,9 @@ pub const PAYSET_COMMIT_FLAT: u8 = 1;
 pub const PAYSET_COMMIT_MERKLE: u8 = 2;
 
 impl Default for ConsensusParams {
-    /// Default returns V41 (current consensus) parameters.
+    /// Default returns V42 (current consensus) parameters.
     fn default() -> Self {
-        consensus_params_for_version(CONSENSUS_V41).expect("V41 must be a known protocol version")
+        consensus_params_for_version(CONSENSUS_V42).expect("V42 must be a known protocol version")
     }
 }
 
@@ -511,6 +549,10 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         max_txn_note_bytes: 1_024,
         max_tx_group_size: 1,
         max_txn_bytes_per_block: 1_000_000,
+        max_absolute_txn_note_bytes: 0,
+        max_absolute_extra_program_pages: 0,
+        max_absolute_total_arg_len: 0,
+        per_byte_txn_surcharge: 0,
         enable_fee_pooling: false,
         support_tx_groups: false,
         support_transaction_leases: false,
@@ -519,6 +561,10 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         enable_heartbeat: false,
         enforce_auth_addr_sender_diff: false,
         load_tracking: false,
+        app_size_updates: false,
+        allow_zero_local_app_ref: false,
+        enable_pq_scheme_falcon1024: false,
+        enable_select_f128: false,
         enable_logicsig_size_pooling: false,
         enable_logicsig_cost_pooling: false,
         enable_app_cost_pooling: false,
@@ -984,12 +1030,32 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         return Some(v41);
     }
 
+    // ── v42 ─────────────────────────────────────────────────────
+    // go: config/consensus.go, commit 88fe542f3 ("Consensus: Upgrade to
+    // consensus version v42 (#6677)"). v42 := v41 with ApprovedUpgrades
+    // reset and the fields below overridden.
+    let mut v42 = v41.clone();
+    v42.logic_sig_version = 13;
+    v42.app_size_updates = true;
+    v42.allow_zero_local_app_ref = true;
+    v42.enforce_auth_addr_sender_diff = true;
+    v42.enable_pq_scheme_falcon1024 = true;
+    v42.load_tracking = true;
+    v42.max_absolute_txn_note_bytes = 4_096; // same as largest AVM value
+    v42.max_absolute_extra_program_pages = 7; // Allow larger programs with extra fees
+    v42.max_absolute_total_arg_len = 16_384; // We _could_ make this as high as 16*4k
+    v42.per_byte_txn_surcharge = 100; // Each charged byte adds 0.000100 of min fee
+    v42.enable_select_f128 = true;
+    if version == CONSENSUS_V42 {
+        return Some(v42);
+    }
+
     // ── future ──────────────────────────────────────────────────
-    let v41_base = consensus_params_for_version(CONSENSUS_V41).expect("V41 must be constructible");
-    let mut v_future = v41_base.clone();
-    v_future.logic_sig_version = 13;
-    v_future.enforce_auth_addr_sender_diff = true;
-    v_future.load_tracking = true;
+    // go: vFuture := v42; vFuture.LogicSigVersion = 14 (commit 88fe542f3
+    // moved vFuture's onward from v41 to v42 and bumped LogicSigVersion
+    // again for the next in-development AVM version).
+    let mut v_future = v42.clone();
+    v_future.logic_sig_version = 14;
     if version == CONSENSUS_FUTURE {
         return Some(v_future);
     }
@@ -1181,32 +1247,104 @@ mod tests {
     }
 
     #[test]
-    fn test_default_is_v41() {
+    fn test_default_is_v42() {
         let def = ConsensusParams::default();
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert_eq!(def.logic_sig_version, v42.logic_sig_version);
+        assert_eq!(def.min_balance, v42.min_balance);
+        assert_eq!(def.enable_heartbeat, v42.enable_heartbeat);
+        assert_eq!(def.max_txn_bytes_per_block, v42.max_txn_bytes_per_block);
+        assert!(def.app_size_updates);
+        assert!(def.enable_pq_scheme_falcon1024);
+    }
+
+    #[test]
+    fn test_consensus_v42_params() {
+        // go: config/consensus.go, commit 88fe542f3 ("Consensus: Upgrade to
+        // consensus version v42 (#6677)") — v42 inherits v41 and overrides
+        // exactly these fields.
         let v41 = consensus_params_for_version(CONSENSUS_V41).unwrap();
-        assert_eq!(def.logic_sig_version, v41.logic_sig_version);
-        assert_eq!(def.min_balance, v41.min_balance);
-        assert_eq!(def.enable_heartbeat, v41.enable_heartbeat);
-        assert_eq!(def.max_txn_bytes_per_block, v41.max_txn_bytes_per_block);
+        let p = consensus_params_for_version(CONSENSUS_V42).unwrap();
+
+        assert_eq!(p.logic_sig_version, 13);
+        assert_eq!(p.max_absolute_txn_note_bytes, 4_096);
+        assert_eq!(p.max_absolute_extra_program_pages, 7);
+        assert_eq!(p.max_absolute_total_arg_len, 16_384);
+        assert_eq!(p.per_byte_txn_surcharge, 100);
+        assert!(p.app_size_updates);
+        assert!(p.allow_zero_local_app_ref);
+        assert!(p.enforce_auth_addr_sender_diff);
+        assert!(p.enable_pq_scheme_falcon1024);
+        assert!(p.load_tracking);
+        assert!(p.enable_select_f128);
+
+        // Everything else is inherited unchanged from v41.
+        assert_eq!(p.min_balance, v41.min_balance);
+        assert_eq!(p.min_txn_fee, v41.min_txn_fee);
+        assert_eq!(p.max_txn_bytes_per_block, v41.max_txn_bytes_per_block);
+        assert_eq!(p.max_app_access, v41.max_app_access);
+        assert_eq!(p.bytes_per_box_reference, v41.bytes_per_box_reference);
+        assert_eq!(p.max_txn_note_bytes, v41.max_txn_note_bytes);
+        assert_eq!(p.max_app_total_arg_len, v41.max_app_total_arg_len);
+        assert_eq!(
+            p.max_extra_app_program_pages,
+            v41.max_extra_app_program_pages
+        );
+
+        // v41 (and earlier released versions) never had these fields set.
+        assert!(!v41.app_size_updates);
+        assert!(!v41.allow_zero_local_app_ref);
+        assert!(!v41.enforce_auth_addr_sender_diff);
+        assert!(!v41.enable_pq_scheme_falcon1024);
+        assert!(!v41.load_tracking);
+        assert!(!v41.enable_select_f128);
+        assert_eq!(v41.max_absolute_txn_note_bytes, 0);
+        assert_eq!(v41.max_absolute_extra_program_pages, 0);
+        assert_eq!(v41.max_absolute_total_arg_len, 0);
+        assert_eq!(v41.per_byte_txn_surcharge, 0);
+    }
+
+    #[test]
+    fn test_consensus_v42_spec_url() {
+        assert_eq!(
+            CONSENSUS_V42,
+            "https://github.com/algorandfoundation/specs/tree/268b63433a907455d439995bf916f6b296018f4f"
+        );
     }
 
     #[test]
     fn test_future_version() {
+        // go: vFuture := v42 (commit 88fe542f3) — future now inherits v42's
+        // fields (previously only enforce_auth_addr_sender_diff/load_tracking
+        // were future-only overrides bolted onto v41) and bumps
+        // LogicSigVersion once more for the next in-development AVM version.
         let p = consensus_params_for_version(CONSENSUS_FUTURE).unwrap();
-        assert_eq!(p.logic_sig_version, 13);
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert_eq!(p.logic_sig_version, 14);
         assert!(p.enforce_auth_addr_sender_diff);
         assert!(p.load_tracking);
+        assert!(p.app_size_updates);
+        assert!(p.allow_zero_local_app_ref);
+        assert!(p.enable_pq_scheme_falcon1024);
+        assert!(p.enable_select_f128);
+        assert_eq!(
+            p.max_absolute_txn_note_bytes,
+            v42.max_absolute_txn_note_bytes
+        );
+        assert_eq!(p.per_byte_txn_surcharge, v42.per_byte_txn_surcharge);
     }
 
     #[test]
-    fn test_load_tracking_not_on_mainnet_versions() {
-        // LoadTracking is future-only per go-algorand config/consensus.go
-        // (v4.7.0-beta, PR #6548) — must stay off on every released MainNet/
-        // TestNet protocol version.
+    fn test_load_tracking_not_on_pre_v42_versions() {
+        // LoadTracking was future-only per go-algorand config/consensus.go
+        // (v4.7.0-beta, PR #6548) until commit 88fe542f3 moved it onto the
+        // real v42 release — must stay off on every version before v42.
         for v in [CONSENSUS_V38, CONSENSUS_V39, CONSENSUS_V40, CONSENSUS_V41] {
             let p = consensus_params_for_version(v).unwrap();
             assert!(!p.load_tracking, "{v} must not have load_tracking set");
         }
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert!(v42.load_tracking, "v42 must have load_tracking set");
     }
 
     #[test]

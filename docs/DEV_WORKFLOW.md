@@ -254,12 +254,13 @@ params, field indices, and protocol semantics. Key files:
 | `data/transactions/logic/resources.go` | Reference resolution, resource tracking |
 | `data/transactions/logic/fields.go` | TxnField, GlobalField, AssetHoldingField enums |
 | `config/consensus.go` | Consensus params per protocol version |
-| `protocol/consensus.go` | Version constants (`ConsensusCurrentVersion = V41`) |
+| `protocol/consensus.go` | Version constants (`ConsensusCurrentVersion = V42`) |
 
-go-algorand 4.6.0 consensus versions → AVM versions:
+go-algorand 5.0.0 consensus versions → AVM versions:
 - V39 → AVM 10
 - V40 → AVM 11 (mimc opcode, consensus incentives)
-- V41 → AVM 12 (falcon_verify, app versioning) — **this is ConsensusCurrentVersion**
+- V41 → AVM 12 (falcon_verify, app versioning)
+- V42 → AVM 13 (app size updates, PQ Falcon-1024 gate, big-txn size pricing) — **this is ConsensusCurrentVersion**
 
 ## Docker Image
 
