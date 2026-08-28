@@ -50,24 +50,31 @@ Headline items, by consensus risk:
 - [x] #669 — sha512/sumhash512 opcode cost formula bugfix — merged, PR #684
 - [x] #670 — gload/gloads nil-pastScratch fix — merged, PR #685
 - [ ] #686 — gload/gloads must return sibling's real scratch value, not a zero placeholder (found during #670; depends on #670)
-- [ ] #672 — assembler match-opcode type tracking + deadcode disassembly fix
-- [ ] #666 — byte-constant size-limit enforcement + falcon_verify audit
-- [ ] #665 — poseidon2 opcode
-- [ ] #661 — variable-length (varint) branch encoding
-- [ ] #664 — auto-salt TEAL v13 programs
-- [ ] #659 — app_params_set + multi-byte opcode dispatch + ForeignBoxReads/FamilyBoxAccess fields
-- [ ] #662 — nine app_box_* foreign-box opcodes (depends on #659)
-- [ ] #667 — SelectF128 sortition port (**highest risk**)
-- [ ] #675 — application-update LocalStateSchema immutability check
-- [ ] #657 — big-transaction size pricing
-- [ ] #677 — AVM inner-txn fee-residue threading + fee-shortfall message (depends on #657)
-- [ ] #668 — heartbeat explicit HbChallengeDiscount field (depends on #657)
-- [ ] #660 — post-quantum Falcon-1024 account signatures (depends on #663)
-- [ ] #671 — simulate API fee-usage reporting (depends on #657, #677)
-- [x] #674 — remove dryrun REST endpoint
-- [ ] #673 — GET /v2/node/peers + POST /v2/node/shutdown canonical route
+- [x] #672 — assembler match-opcode type tracking + deadcode disassembly fix — merged, PR #687
+- [x] #666 — byte-constant size-limit enforcement + falcon_verify audit — merged, PR #688
+- [x] #665 — poseidon2 opcode — merged, PR #689
+- [x] #661 — variable-length (varint) branch encoding — merged, PR #690
+- [x] #664 — auto-salt TEAL v13 programs — merged, PR #692
+- [x] #694 — fix flaky varint-branch test broken by auto-salt (found during #659) — merged, PR #696
+- [x] #659 — app_params_set + multi-byte opcode dispatch + ForeignBoxReads/FamilyBoxAccess fields — merged, PR #695
+- [x] #662 — nine app_box_* foreign-box opcodes (depends on #659) — merged, PR #697
+- [x] #667 — SelectF128 sortition port (**highest risk**) — merged, PR #699
+- [x] #675 — application-update LocalStateSchema immutability check — merged, PR #700
+- [x] #657 — big-transaction size pricing — merged, PR #702
+- [x] #677 — AVM inner-txn fee-residue threading + fee-shortfall message (depends on #657) — merged, PR #704
+- [x] #668 — heartbeat explicit HbChallengeDiscount field (depends on #657) — merged, PR #705
+- [x] #660 — post-quantum Falcon-1024 account signatures (depends on #663) — merged, PR #706
+- [x] #671 — simulate API fee-usage reporting (depends on #657, #677) — merged, PR #708
+- [x] #674 — remove dryrun REST endpoint — merged, PR #709
+- [ ] #673 — GET /v2/node/peers + POST /v2/node/shutdown canonical route (in progress)
 - [ ] #676 — FNet consensus version table entries
 - [ ] #681 — algod-rust block production never proposes/votes for protocol upgrades (found during Stage 5's pin sweep — see PR #680; the first pin bump in this repo's history where `ConsensusCurrentVersion` itself advances, surfacing a previously-unreachable gap)
+- [ ] #691 — live byte-for-byte assembler verification + mixed-cluster check for #661 (deferred, needs go-algorand build toolchain)
+- [ ] #693 — assembler warnings channel (deferred from #664; upstream's two `shouldAutoSalt` diagnostics have no algod-rust warnings mechanism to attach to yet)
+- [ ] #698 — machine.rs cost-charging gap for multi-byte opcodes (found during #662, currently harmless)
+- [ ] #701 — remaining ApplicationCallTxnFields.wellFormed sub-checks (found during #675; OnCompletion validity, RejectVersion, program/arg/reference-count bounds, etc.)
+- [ ] #703 — live fixture/oracle parity tests for big-transaction size-pricing boundaries (found during #657, needs go-algorand build toolchain)
+- [ ] #707 — upgrade #660's hand-computed msgpack byte-oracle test to a live go-algorand-captured fixture
 
 ## Epic-level acceptance criteria
 
