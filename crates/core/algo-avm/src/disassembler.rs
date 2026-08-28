@@ -115,6 +115,16 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
                     line.push_str(&format!(" {}", target));
                 }
             }
+            Immediates::BranchVarint(offset, varint_len) => {
+                // bnz/bz/b/callsub at LogicSigVersion >= 13 — use label.
+                let target = bytecode::varint_branch_target(instr.offset, *varint_len, *offset);
+                let target = if target >= 0 { target as usize } else { 0 };
+                if let Some(label) = labels.get(&target) {
+                    line.push_str(&format!(" {}", label));
+                } else {
+                    line.push_str(&format!(" {}", target));
+                }
+            }
             Immediates::Varuint(val) => {
                 line.push_str(&format!(" {}", val));
             }
@@ -227,6 +237,7 @@ fn instruction_size(instr: &Instruction) -> usize {
                     .sum::<usize>()
         }
         Immediates::Labels(offsets) => 1 + 1 + offsets.len() * 2,
+        Immediates::BranchVarint(_, len) => 1 + len,
     }
 }
 
@@ -260,6 +271,15 @@ fn collect_labels(program: &Program) -> HashMap<usize, String> {
                 let end_of_instr = compute_labels_end(instr, offsets.len());
                 for offset in offsets {
                     let target = (end_of_instr as isize + *offset as isize) as usize;
+                    if seen.insert(target) {
+                        targets.push(target);
+                    }
+                }
+            }
+            Immediates::BranchVarint(offset, varint_len) => {
+                let target = bytecode::varint_branch_target(instr.offset, *varint_len, *offset);
+                if target >= 0 {
+                    let target = target as usize;
                     if seen.insert(target) {
                         targets.push(target);
                     }

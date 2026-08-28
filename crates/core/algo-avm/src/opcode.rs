@@ -69,6 +69,31 @@ pub enum ImmKind {
     PushBytess,
     /// switch/match: uint8 count, then count int16 offsets.
     Labels,
+    /// Varint-encoded (zigzag + ULEB128) branch offset — used instead of
+    /// `Int16` for `bnz`/`bz`/`b`/`callsub` at `LogicSigVersion >=
+    /// VARINT_BRANCH_VERSION` (go-algorand PR #6600, `varintBranchVersion`).
+    /// Not used as a static table entry (those four opcodes keep `Int16` in
+    /// `OPCODE_TABLE` for the legacy encoding); the effective kind is
+    /// resolved per-program-version by [`is_varint_branch_opcode`] at parse
+    /// and assembly time.
+    BranchVarint,
+}
+
+/// The AVM version at which `bnz`/`bz`/`b`/`callsub` switch from a fixed
+/// 2-byte big-endian `int16` branch offset to a variable-length
+/// (zigzag+ULEB128) `binary.Varint`-encoded offset.
+///
+/// Matches go-algorand's `varintBranchVersion` constant
+/// (`data/transactions/logic/opcodes.go`). `switch`/`match` (0x8d/0x8e) are
+/// unaffected at any version — they keep their fixed 2-byte-per-target
+/// encoding.
+pub const VARINT_BRANCH_VERSION: u8 = 13;
+
+/// Returns `true` for the four opcodes whose branch-offset encoding is
+/// version-gated by [`VARINT_BRANCH_VERSION`]: `bnz` (0x40), `bz` (0x41),
+/// `b` (0x42), `callsub` (0x88). `switch`/`match` are deliberately excluded.
+pub fn is_varint_branch_opcode(byte: u8) -> bool {
+    matches!(byte, 0x40 | 0x41 | 0x42 | 0x88)
 }
 
 /// Static metadata for a single opcode.

@@ -453,6 +453,47 @@ impl AvmMachine {
         })
     }
 
+    /// Resolve a branch target from an instruction index + varint-encoded
+    /// (zigzag+ULEB128) offset -- `bnz`/`bz`/`b`/`callsub` at
+    /// `LogicSigVersion >= opcode::VARINT_BRANCH_VERSION`.
+    ///
+    /// Sign-dependent base point (see [`crate::bytecode::varint_branch_target`]):
+    /// a negative offset back-jumps from the start of the instruction; a
+    /// non-negative offset forward-jumps from the end of the instruction
+    /// (opcode byte + `varint_len` encoded bytes).
+    pub fn get_varint_branch_target(
+        &self,
+        from_instruction: usize,
+        offset: i64,
+        varint_len: usize,
+    ) -> Result<usize, AlgoError> {
+        let instr = &self.program.instructions[from_instruction];
+        let target = crate::bytecode::varint_branch_target(instr.offset, varint_len, offset);
+
+        if target < 0 || target > self.end_of_program_offset as i128 {
+            return Err(AlgoError::Avm {
+                message: format!("branch target {target} outside of program"),
+            });
+        }
+        let target_offset = target as usize;
+
+        // Check if target is an instruction boundary.
+        if let Some(&idx) = self.offset_to_index.get(&target_offset) {
+            return Ok(idx);
+        }
+
+        // Allow branching to end-of-program (triggers implicit termination).
+        if target_offset == self.end_of_program_offset {
+            return Ok(self.program.instructions.len());
+        }
+
+        Err(AlgoError::Avm {
+            message: format!(
+                "branch target byte offset {target_offset} does not match any instruction"
+            ),
+        })
+    }
+
     /// Push a frame onto the call stack.
     pub fn push_call_frame(&mut self, frame: CallFrame) -> Result<(), AlgoError> {
         if self.call_stack.len() >= MAX_CALL_STACK_DEPTH {

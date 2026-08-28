@@ -59,7 +59,7 @@ pub struct SourceLocation {
 
 #[derive(Debug, Clone)]
 struct LabelReference {
-    /// Position within `pending` where the 2-byte offset should be written.
+    /// Position within `pending` where the offset should be written.
     position: usize,
     /// The label name.
     label: String,
@@ -67,6 +67,12 @@ struct LabelReference {
     line: usize,
     /// End of the full instruction containing this label ref (for offset computation).
     offset_position: usize,
+    /// `true` for a varint-encoded branch (`bnz`/`bz`/`b`/`callsub` at
+    /// LogicSigVersion >= `opcode::VARINT_BRANCH_VERSION`); `false` for the
+    /// legacy fixed 2-byte encoding (also used by `switch`/`match`, which
+    /// are never varint-encoded at any version). Mirrors go-algorand's
+    /// `labelReference.varint` (`assembler.go`).
+    varint: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +268,112 @@ impl OpStream {
 
     // ---------- label resolution ----------
 
+    /// Shrink varint-encoded branch placeholders to their minimum needed
+    /// size, via the same fixed-point iteration as go-algorand's
+    /// `findBranchSizes`: shrinking one branch changes the byte distance
+    /// (and therefore the encoded width) of any other branch whose jump
+    /// spans it, so this repeats until no further branch can shrink.
+    /// Distances only ever shrink (never grow) as bytes are removed, so
+    /// this always terminates. Offset bytes stay zero-filled throughout --
+    /// `resolve_labels` writes the actual encoded values afterward, once
+    /// every placeholder's final width is stable.
+    fn find_branch_sizes(&mut self) {
+        loop {
+            let mut edits: Vec<(usize, usize, usize)> = Vec::new(); // (position, old_len, needed_len)
+            for lr in &self.label_references {
+                if !lr.varint {
+                    continue; // switch/match references stay fixed 2-byte
+                }
+                let dest = match self.labels.get(&lr.label) {
+                    Some(&d) => d,
+                    None => continue, // undefined labels are reported by resolve_labels
+                };
+                let opcode_pos = lr.position - 1;
+                if dest == opcode_pos {
+                    continue; // will be rejected by resolve_labels
+                }
+                let jump: i64 = if dest < opcode_pos {
+                    // Back-jump from instruction start: no instr-size dependency.
+                    dest as i64 - opcode_pos as i64
+                } else {
+                    dest as i64 - lr.offset_position as i64
+                };
+                let needed = zigzag_varint_len(jump);
+                let old_len = lr.offset_position - lr.position;
+                if needed < old_len {
+                    edits.push((lr.position, old_len, needed));
+                }
+            }
+            if edits.is_empty() {
+                break;
+            }
+            // Apply from the highest position down, so each edit's own
+            // (still-unprocessed) lower-numbered siblings keep their
+            // originally-collected positions valid.
+            edits.sort_by_key(|e| e.0);
+            for &(position, old_len, needed) in edits.iter().rev() {
+                let delta = needed as isize - old_len as isize;
+                replace_bytes(&mut self.pending, position, old_len, &vec![0u8; needed]);
+                // NOTE: deliberately *not* `adjust_positions_after` (which
+                // shifts a tracked position only when it is strictly greater
+                // than the edit's own start). That boundary is wrong here:
+                // a varint branch's own `offset_position` sits exactly at
+                // `position + old_len` (the end of its own placeholder), as
+                // does any label defined immediately after the branch (a
+                // very common case -- see e.g. `b end\nend:\n...`). Both
+                // must shift once this edit shrinks the placeholder, so the
+                // boundary has to be the *end* of the edited region.
+                self.shift_positions_at_or_after(position + old_len, delta);
+            }
+        }
+    }
+
+    /// Shift every tracked byte position that is `>= boundary` by `delta`,
+    /// leaving positions `< boundary` untouched. Used by `find_branch_sizes`
+    /// after replacing `[position, position+old_len)` with a shorter
+    /// zero-filled placeholder (`boundary = position + old_len`, i.e. the
+    /// end of the edited region) -- matches go-algorand's `applyEdits`
+    /// `cumDelta` semantics for a single edit. This differs from
+    /// `adjust_positions_after` (used by constant optimization), whose
+    /// simpler `position`-only boundary is correct only when no tracked
+    /// position ever sits exactly at the end of the edited region; a varint
+    /// branch's own `offset_position` (and any label right after it)
+    /// routinely does.
+    fn shift_positions_at_or_after(&mut self, boundary: usize, delta: isize) {
+        for r in &mut self.intc_refs {
+            if r.position >= boundary {
+                r.position = (r.position as isize + delta) as usize;
+            }
+        }
+        for r in &mut self.bytec_refs {
+            if r.position >= boundary {
+                r.position = (r.position as isize + delta) as usize;
+            }
+        }
+        for pos in self.labels.values_mut() {
+            if *pos >= boundary {
+                *pos = (*pos as isize + delta) as usize;
+            }
+        }
+        for lr in &mut self.label_references {
+            if lr.position >= boundary {
+                lr.position = (lr.position as isize + delta) as usize;
+            }
+            if lr.offset_position >= boundary {
+                lr.offset_position = (lr.offset_position as isize + delta) as usize;
+            }
+        }
+        let mut new_map = HashMap::new();
+        for (&pos, &loc) in &self.offset_to_source {
+            if pos >= boundary {
+                new_map.insert((pos as isize + delta) as usize, loc);
+            } else {
+                new_map.insert(pos, loc);
+            }
+        }
+        self.offset_to_source = new_map;
+    }
+
     fn resolve_labels(&mut self) {
         let raw = &mut self.pending;
         let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -291,6 +403,62 @@ impl OpStream {
                         lr.label,
                     ),
                 });
+                continue;
+            }
+
+            if lr.varint {
+                let opcode_pos = lr.position - 1;
+                if dest == opcode_pos {
+                    // Jumping to the start of the same instruction would be
+                    // ambiguous under the sign-based back/forward dispatch
+                    // (a zero offset means "forward"), so it is disallowed
+                    // at assembly time -- matches go-algorand's resolveLabels.
+                    self.errors.push(AssemblyError {
+                        line: lr.line,
+                        col: 0,
+                        message: format!("branch to start of same instruction: {:?} ", lr.label),
+                    });
+                    continue;
+                }
+                // Back-jumps use the start of the instruction as the
+                // reference point, which avoids any dependency on this
+                // instruction's own (possibly still-shrinking) size.
+                let jump: i64 = if dest < opcode_pos {
+                    dest as i64 - opcode_pos as i64
+                } else {
+                    dest as i64 - lr.offset_position as i64
+                };
+
+                let placeholder_size = lr.offset_position - lr.position;
+                let limit: i64 = 1i64 << (7 * placeholder_size - 1);
+                if jump < -limit || jump >= limit {
+                    self.errors.push(AssemblyError {
+                        line: lr.line,
+                        col: 0,
+                        message: format!("label {:?} is too far away", lr.label),
+                    });
+                    continue;
+                }
+
+                let encoded = zigzag_varint_encode(jump);
+                if encoded.len() != placeholder_size {
+                    // find_branch_sizes guarantees the placeholder has
+                    // already shrunk to exactly this jump's minimal width;
+                    // a mismatch here would be an assembler bug, not a
+                    // program error, but avoid panicking on the (untrusted
+                    // by construction, but let's not trust ourselves either)
+                    // program text either way.
+                    self.errors.push(AssemblyError {
+                        line: lr.line,
+                        col: 0,
+                        message: format!(
+                            "internal error: branch varint size mismatch for label {:?}",
+                            lr.label
+                        ),
+                    });
+                    continue;
+                }
+                raw[lr.position..lr.position + encoded.len()].copy_from_slice(&encoded);
                 continue;
             }
 
@@ -714,7 +882,9 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
         }
     }
 
-    // Resolve labels
+    // Shrink varint-encoded branches to their minimal width, then resolve
+    // all label references (fixed-width and varint) to their final bytes.
+    ops.find_branch_sizes();
     ops.resolve_labels();
 
     if !ops.errors.is_empty() {
@@ -1138,7 +1308,17 @@ fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
             }
         }
         ImmKind::Int16 => {
-            // Branch instruction
+            // Branch instruction: bnz/bz/b/callsub. At LogicSigVersion >=
+            // VARINT_BRANCH_VERSION these switch to a varint-encoded offset
+            // (go-algorand PR #6600); below that they keep the legacy fixed
+            // 2-byte big-endian encoding assembled below.
+            if ops.version >= opcode::VARINT_BRANCH_VERSION
+                && opcode::is_varint_branch_opcode(spec.opcode)
+            {
+                asm_branch_varint(ops, spec.opcode, mnemonic, args);
+                return;
+            }
+
             if args.len() != 1 {
                 ops.record_error(
                     ops.source_line,
@@ -1158,6 +1338,7 @@ fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
                 label,
                 line: ops.source_line,
                 offset_position: end_of_instruction,
+                varint: false,
             });
         }
         ImmKind::Varuint => {
@@ -1240,6 +1421,7 @@ fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
                     label,
                     line: ops.source_line,
                     offset_position: op_end_pos,
+                    varint: false,
                 });
             }
         }
@@ -1253,6 +1435,20 @@ fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
                     Err(e) => ops.record_error(ops.source_line, 0, format!("{mnemonic}: {e}")),
                 }
             }
+        }
+        ImmKind::BranchVarint => {
+            // Never a static table entry (see opcode::ImmKind::BranchVarint's
+            // doc comment) -- the ImmKind::Int16 arm above dispatches to
+            // asm_branch_varint directly once ops.version >=
+            // VARINT_BRANCH_VERSION, without ever assigning this kind to
+            // spec.imm. Unreachable in practice; handled defensively rather
+            // than via a wildcard so a future real table entry using this
+            // kind doesn't silently fall through unassembled.
+            ops.record_error(
+                ops.source_line,
+                0,
+                format!("{mnemonic}: unexpected BranchVarint immediate kind"),
+            );
         }
         ImmKind::PushBytess => {
             // pushbytess
@@ -1292,6 +1488,43 @@ fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
             }
         }
     }
+}
+
+/// Number of placeholder bytes initially reserved for a varint-encoded
+/// branch offset. `find_branch_sizes` shrinks these down to the minimum
+/// needed size once all label positions are known. 3 bytes covers offsets
+/// up to +/-2^20, far beyond any program's max size -- matches
+/// go-algorand's `varintBranchInitialSize`.
+const VARINT_BRANCH_INITIAL_SIZE: usize = 3;
+
+/// Assemble a varint-encoded branch (`bnz`/`bz`/`b`/`callsub` at
+/// LogicSigVersion >= `opcode::VARINT_BRANCH_VERSION`). Reserves
+/// `VARINT_BRANCH_INITIAL_SIZE` zero-filled placeholder bytes; the actual
+/// minimal-width varint offset is written later by `find_branch_sizes` +
+/// `resolve_labels`, once every label's final position is known.
+fn asm_branch_varint(ops: &mut OpStream, opcode_byte: u8, mnemonic: &str, args: &[&str]) {
+    if args.len() != 1 {
+        ops.record_error(
+            ops.source_line,
+            0,
+            format!("{} expects 1 immediate argument", mnemonic),
+        );
+        return;
+    }
+    let label = args[0].to_string();
+    ops.pending.push(opcode_byte);
+    let offset_pos = ops.pending.len();
+    for _ in 0..VARINT_BRANCH_INITIAL_SIZE {
+        ops.pending.push(0); // placeholder
+    }
+    let end_of_instruction = ops.pending.len();
+    ops.label_references.push(LabelReference {
+        position: offset_pos,
+        label,
+        line: ops.source_line,
+        offset_position: end_of_instruction,
+        varint: true,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1689,7 +1922,6 @@ pub fn write_varuint_to_vec(buf: &mut Vec<u8>, mut val: u64) {
 }
 
 /// Returns the number of bytes needed to encode a varuint.
-#[allow(dead_code)]
 fn varuint_len(mut val: u64) -> usize {
     let mut len = 0;
     loop {
@@ -1700,6 +1932,33 @@ fn varuint_len(mut val: u64) -> usize {
         }
     }
     len
+}
+
+/// Zigzag-encode a signed value to the unsigned form Go's
+/// `encoding/binary.PutVarint` feeds to `PutUvarint`:
+/// `ux := uint64(x) << 1; if x < 0 { ux = ^ux }`. All-unsigned arithmetic
+/// (via `wrapping_shl`) so this never overflow-panics, even for
+/// `i64::MIN`/`i64::MAX`.
+fn zigzag_encode(v: i64) -> u64 {
+    let ux = (v as u64).wrapping_shl(1);
+    if v < 0 {
+        !ux
+    } else {
+        ux
+    }
+}
+
+/// Number of bytes `v` would occupy as a zigzag+ULEB128 branch offset --
+/// matches Go's `binary.PutVarint`'s output length without allocating.
+fn zigzag_varint_len(v: i64) -> usize {
+    varuint_len(zigzag_encode(v))
+}
+
+/// Encode `v` as a zigzag+ULEB128 varint (Go's `binary.PutVarint`).
+fn zigzag_varint_encode(v: i64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_varuint_to_vec(&mut buf, zigzag_encode(v));
+    buf
 }
 
 /// Replace `original_len` bytes starting at `index` in `s` with `new_bytes`.

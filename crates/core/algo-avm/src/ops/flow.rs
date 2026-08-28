@@ -346,15 +346,22 @@ fn resolve_label(
     })
 }
 
-/// Helper: resolve Int16 branch offset and set PC.
+/// Helper: resolve a branch offset (`Int16` below LogicSigVersion 13,
+/// `BranchVarint` at 13+ -- see `bytecode::parse`'s version gate) and set PC.
 fn branch(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(), AlgoError> {
-    if let Immediates::Int16(offset) = instruction.immediates {
-        let target = machine.get_branch_target(machine.pc, offset)?;
-        machine.pc = target;
-        Ok(())
-    } else {
-        Err(AlgoError::Avm {
-            message: "branch: expected Int16 immediate".to_string(),
-        })
+    match instruction.immediates {
+        Immediates::Int16(offset) => {
+            let target = machine.get_branch_target(machine.pc, offset)?;
+            machine.pc = target;
+            Ok(())
+        }
+        Immediates::BranchVarint(offset, varint_len) => {
+            let target = machine.get_varint_branch_target(machine.pc, offset, varint_len)?;
+            machine.pc = target;
+            Ok(())
+        }
+        _ => Err(AlgoError::Avm {
+            message: "branch: expected Int16 or BranchVarint immediate".to_string(),
+        }),
     }
 }
