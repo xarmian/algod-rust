@@ -1,7 +1,7 @@
 name: Nightly Consensus Cluster
 
 # Issue #488 — run the Epic 42 mixed-cluster consensus harness
-# (ops/mixed-cluster/, 3 go-algorand v4.7.3-stable relays + 1
+# (ops/mixed-cluster/, 3 go-algorand v4.7.4-stable relays + 1
 # `algod-rust participate` node, 30/30/30/10 ONLINE stake) in CI.
 #
 # ## Why this is NOT on the PR path
@@ -73,7 +73,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   # Same pin as the rest of the repo (see CLAUDE.md, algokey-e2e.yml).
-  GO_ALGORAND_REV: "v4.7.3-stable"
+  GO_ALGORAND_REV: "v4.7.4-stable"
   # start.sh: reuse the image built by the buildx step below.
   PHASE6_SKIP_BUILD: "1"
   # Named volume run-in-docker.sh keeps its go-algorand clone + libsodium

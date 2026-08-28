@@ -82,7 +82,7 @@ import (
 // to run unless `../../../go-algorand` resolves to exactly this tag (or
 // --allow-unpinned is set), so two developers regenerating the corpus get
 // byte-identical output regardless of local go-algorand state.
-const expectedGoAlgorandPin = "v4.7.3-stable"
+const expectedGoAlgorandPin = "v4.7.4-stable"
 
 // protoVersion is the consensus version every fixture is evaluated under.
 // V41 is ConsensusCurrentVersion at the pin; its string value is recorded in
