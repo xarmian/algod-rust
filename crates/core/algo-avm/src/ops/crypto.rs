@@ -1172,22 +1172,29 @@ pub fn op_poseidon2(machine: &mut AvmMachine, instruction: &Instruction) -> Resu
 ///
 /// Round keys are derived from the seed string gnark-crypto uses for these
 /// parameters: `Parameters.String()` for `NewParameters(2, 6, 50)` on BN254,
-/// i.e. `"Poseidon2-BN254[t=2,rF=6,rP=50,d=5]"`.
+/// i.e. `"Poseidon2-BN254[t=2,rF=6,rP=50,d=5]"`. Derivation (56 chained
+/// Keccak-256 calls) is pure and seed-only, so it is computed once and
+/// cached rather than repeated on every opcode invocation.
 fn poseidon2_bn254(data: &[u8]) -> Result<Vec<u8>, AlgoError> {
     type Fr = ark_bn254::Fr;
-    let round_keys = poseidon2_round_keys::<Fr>("Poseidon2-BN254[t=2,rF=6,rP=50,d=5]");
-    poseidon2_merkle_damgard::<Fr>(data, &round_keys)
+    static ROUND_KEYS: std::sync::OnceLock<Vec<Vec<Fr>>> = std::sync::OnceLock::new();
+    let round_keys = ROUND_KEYS
+        .get_or_init(|| poseidon2_round_keys::<Fr>("Poseidon2-BN254[t=2,rF=6,rP=50,d=5]"));
+    poseidon2_merkle_damgard::<Fr>(data, round_keys)
 }
 
 /// Poseidon2 hash over the BLS12-381 scalar field (Fr), Merkle-Damgard mode,
 /// width=2, full rounds=6, partial rounds=50.
 ///
 /// Seed string: `"Poseidon2-BLS12_381[t=2,rF=6,rP=50,d=5]"` (gnark-crypto's
-/// `Parameters.String()` for `NewParameters(2, 6, 50)` on BLS12-381).
+/// `Parameters.String()` for `NewParameters(2, 6, 50)` on BLS12-381). As with
+/// [`poseidon2_bn254`], the derived round keys are cached after first use.
 fn poseidon2_bls12_381(data: &[u8]) -> Result<Vec<u8>, AlgoError> {
     type Fr = ark_bls12_381::Fr;
-    let round_keys = poseidon2_round_keys::<Fr>("Poseidon2-BLS12_381[t=2,rF=6,rP=50,d=5]");
-    poseidon2_merkle_damgard::<Fr>(data, &round_keys)
+    static ROUND_KEYS: std::sync::OnceLock<Vec<Vec<Fr>>> = std::sync::OnceLock::new();
+    let round_keys = ROUND_KEYS
+        .get_or_init(|| poseidon2_round_keys::<Fr>("Poseidon2-BLS12_381[t=2,rF=6,rP=50,d=5]"));
+    poseidon2_merkle_damgard::<Fr>(data, round_keys)
 }
 
 /// Sequentially compress 32-byte big-endian field-element chunks with the
