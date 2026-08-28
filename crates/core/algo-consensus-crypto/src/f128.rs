@@ -285,6 +285,10 @@ fn sub64(x: u64, y: u64, borrow: u64) -> (u64, u64) {
 /// Go call sites' own invariants, not via input validation.
 #[inline]
 fn div64(hi: u64, lo: u64, y: u64) -> (u64, u64) {
+    debug_assert!(
+        y != 0 && hi < y,
+        "div64 precondition violated (y != 0, hi < y)"
+    );
     let num = ((hi as u128) << 64) | (lo as u128);
     let den = y as u128;
     ((num / den) as u64, (num % den) as u64)
@@ -481,9 +485,21 @@ pub(crate) fn f128_from_digest_ratio(d: &[u8; 32]) -> F128 {
     // hypothetical future signature change (e.g. to `&[u8]`) diagnosable
     // rather than an opaque panic on this consensus-critical path.
     let w3 = u64::from_be_bytes(d[0..8].try_into().expect("8-byte slice of a 32-byte array"));
-    let w2 = u64::from_be_bytes(d[8..16].try_into().expect("8-byte slice of a 32-byte array"));
-    let w1 = u64::from_be_bytes(d[16..24].try_into().expect("8-byte slice of a 32-byte array"));
-    let w0 = u64::from_be_bytes(d[24..32].try_into().expect("8-byte slice of a 32-byte array"));
+    let w2 = u64::from_be_bytes(
+        d[8..16]
+            .try_into()
+            .expect("8-byte slice of a 32-byte array"),
+    );
+    let w1 = u64::from_be_bytes(
+        d[16..24]
+            .try_into()
+            .expect("8-byte slice of a 32-byte array"),
+    );
+    let w0 = u64::from_be_bytes(
+        d[24..32]
+            .try_into()
+            .expect("8-byte slice of a 32-byte array"),
+    );
 
     let leading: u32 = if w3 != 0 {
         w3.leading_zeros()
