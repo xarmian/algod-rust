@@ -2098,6 +2098,35 @@ pub struct CatchpointAbortResponse {
     pub catchup_message: String,
 }
 
+/// Response for `GET /v2/node/peers` — matches go-algorand's
+/// `model.GetPeersResponse`.
+///
+/// The top-level JSON key is capitalized `"Peers"` — unusual against the
+/// rest of the API's lowercase-hyphenated convention, but that's exactly
+/// what go-algorand's OAS3 schema specifies (`algod.oas3.yml` line ~557,
+/// `GetPeersResponse.content.application/json.schema.properties.Peers`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetPeersResponse {
+    /// The connected peers.
+    #[serde(rename = "Peers")]
+    pub peers: Vec<PeerStatus>,
+}
+
+/// The status of a single connected peer — matches go-algorand's
+/// `model.PeerStatus`. All three fields are required.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerStatus {
+    /// `"inbound"` or `"outbound"`.
+    #[serde(rename = "connection-type")]
+    pub connection_type: String,
+    /// The peer's network address.
+    #[serde(rename = "network-address")]
+    pub network_address: String,
+    /// `"p2p"` or `"ws"`.
+    #[serde(rename = "network-type")]
+    pub network_type: String,
+}
+
 /// Response for `GET /v2/ledger/sync` — matches go-algorand's
 /// `model.GetSyncRoundResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

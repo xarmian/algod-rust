@@ -1026,6 +1026,51 @@ pub trait NodeInterface: Send + Sync + 'static {
     fn latest_round_for_catchup(&self) -> u64 {
         0
     }
+
+    /// Returns the node's currently connected peers, split into inbound
+    /// (accepted) and outbound (dialed) lists.
+    ///
+    /// Mirrors go-algorand's `Node.GetPeers() (inboundPeers []network.Peer,
+    /// outboundPeers []network.Peer, err error)` (`handlers.go:156`), which
+    /// backs `GET /v2/node/peers`. Only the address and transport type are
+    /// exposed here — matching go's `network.PeerConnectionInfo`, which the
+    /// handler type-asserts each `network.Peer` against — since that's all
+    /// `PeerStatus` in the API response carries.
+    ///
+    /// Default stub: [`NodeError::NotImplemented`]. A full node backed by
+    /// the network layer (`algo-network`'s `GossipNode::get_peers`)
+    /// overrides this.
+    async fn get_peers(&self) -> Result<(Vec<PeerInfo>, Vec<PeerInfo>), NodeError> {
+        Err(NodeError::NotImplemented("get_peers"))
+    }
+}
+
+/// Network transport type for a connected peer.
+///
+/// Mirrors go-algorand's `network.PeerNetworkType` (`Websocket` / `LibP2P`),
+/// as reported via `network.PeerConnectionInfo.GetNetworkType()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerNetworkType {
+    /// Gossip over the legacy WebSocket transport.
+    Ws,
+    /// Gossip over the libp2p transport.
+    P2p,
+}
+
+/// A single connected peer, as reported by the network layer.
+///
+/// Mirrors the fields go-algorand's `convertPeers` reads off
+/// `network.PeerConnectionInfo` (`GetAddress()` / `GetNetworkType()`) before
+/// mapping them onto `model.PeerStatus`. Connection direction (inbound vs.
+/// outbound) is not carried here — it's implied by which of
+/// [`NodeInterface::get_peers`]'s two returned lists a `PeerInfo` came from,
+/// matching go's own `GetPeers` signature.
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    /// The peer's network address (e.g. `"1.2.3.4:4160"`).
+    pub network_address: String,
+    /// The transport this peer is connected over.
+    pub network_type: PeerNetworkType,
 }
 
 /// Result of a catchup start operation.

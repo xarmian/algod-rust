@@ -3364,7 +3364,15 @@ pub async fn run(
             .with_pool(pool.clone())
             .with_broadcaster(broadcaster.clone())
             .with_shutdown_token(shutdown_token.clone())
-            .with_participation_metrics(participation_metrics.clone());
+            .with_participation_metrics(participation_metrics.clone())
+            // `GET /v2/node/peers` (issue #673): the WS gossip network is
+            // always constructed (even in P2P-only mode it just reports no
+            // connections — the "no leak" guarantee above), so it's always
+            // safe to attach here.
+            .with_ws_network(gossip_node.clone() as Arc<dyn algo_network::GossipNode>);
+        if let Some(p2p) = &p2p_transport {
+            adapter = adapter.with_p2p_network(p2p.clone() as Arc<dyn algo_network::GossipNode>);
+        }
         if let Some(capacity) = cfg.async_backlog_size {
             adapter = adapter.with_async_backlog_capacity(capacity);
         }

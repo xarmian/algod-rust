@@ -39,6 +39,7 @@ use algo_ledger::simulation::{
 };
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta, StateDeltaSubset};
+use algo_network::gossip_node::{GossipNode, PeerOption};
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, LocalTxError};
 use algo_pool::TransactionPool;
 use algo_rest_api::models::{
@@ -52,7 +53,7 @@ use algo_rest_api::models::{
 use algo_rest_api::node::{
     AccountLookup, AppResourceLookup, AppResourceWithIDs, ApplicationLookup, AssetLookup,
     AssetResourceLookup, AssetResourceWithIDs, BuildVersion, NodeError, NodeInterface, NodeStatus,
-    ProtocolSwitchInfo, SupplyInfo, TxnGroupDeltaWithIds, TxnWithStatus,
+    PeerInfo, PeerNetworkType, ProtocolSwitchInfo, SupplyInfo, TxnGroupDeltaWithIds, TxnWithStatus,
 };
 use algo_types::consensus::consensus_params_for_version;
 use algo_types::{
@@ -222,6 +223,16 @@ pub struct AlgodNodeInterface {
     /// read-only inspection), which is what makes `/metrics` and
     /// `/v2/participation/status` answer 404 on a non-participating node.
     participation_metrics: Option<Arc<ParticipationMetrics>>,
+    /// The WebSocket gossip network, if this node has one active
+    /// (`NetworkMode::WsOnly`/`Hybrid`). Backs `GET /v2/node/peers`'
+    /// `"ws"`-typed entries via [`GossipNode::get_peers`]. `None` for
+    /// read-only/test contexts and `NetworkMode::P2pOnly` nodes.
+    ws_network: Option<Arc<dyn GossipNode>>,
+    /// The libp2p gossip transport, if this node has one active
+    /// (`NetworkMode::P2pOnly`/`Hybrid`). Backs `GET /v2/node/peers`'
+    /// `"p2p"`-typed entries. `None` for read-only/test contexts and
+    /// `NetworkMode::WsOnly` nodes.
+    p2p_network: Option<Arc<dyn GossipNode>>,
 }
 
 impl AlgodNodeInterface {
@@ -249,6 +260,8 @@ impl AlgodNodeInterface {
             timestamp_offset: Arc::new(Mutex::new(None)),
             debug_settings_prof: Arc::new(Mutex::new((0, 0))),
             participation_metrics: None,
+            ws_network: None,
+            p2p_network: None,
         }
     }
 
@@ -321,6 +334,28 @@ impl AlgodNodeInterface {
     #[must_use]
     pub fn with_broadcaster(mut self, broadcaster: Arc<LocalTxBroadcaster>) -> Self {
         self.broadcaster = Some(broadcaster);
+        self
+    }
+
+    /// Attach the WebSocket gossip network so `GET /v2/node/peers` reports
+    /// real `"ws"`-typed connected peers via `GossipNode::get_peers`.
+    /// Builder-style, matching [`Self::with_pool`]. Without this (and
+    /// without [`Self::with_p2p_network`]), `get_peers` reports
+    /// [`NodeError::NotImplemented`] — issue #673 (this repo's network
+    /// layer genuinely can enumerate connections; only read-only/test
+    /// contexts that never construct a gossip network lack the data).
+    #[must_use]
+    pub fn with_ws_network(mut self, network: Arc<dyn GossipNode>) -> Self {
+        self.ws_network = Some(network);
+        self
+    }
+
+    /// Attach the libp2p gossip transport so `GET /v2/node/peers` reports
+    /// real `"p2p"`-typed connected peers. Builder-style, matching
+    /// [`Self::with_ws_network`].
+    #[must_use]
+    pub fn with_p2p_network(mut self, network: Arc<dyn GossipNode>) -> Self {
+        self.p2p_network = Some(network);
         self
     }
 
@@ -1903,6 +1938,49 @@ impl NodeInterface for AlgodNodeInterface {
     /// is wired later.) Falls back to 0 on a poisoned lock.
     fn latest_round_for_catchup(&self) -> u64 {
         self.ledger.lock().map(|l| l.current_round().0).unwrap_or(0)
+    }
+
+    /// Connected peers, backing `GET /v2/node/peers` (issue #673). Queries
+    /// whichever of the ws/p2p gossip networks are attached (see
+    /// [`Self::with_ws_network`] / [`Self::with_p2p_network`]) for their
+    /// inbound and outbound peer sets via `GossipNode::get_peers`, tagging
+    /// each with the transport it came from. `NotImplemented` only when
+    /// neither network is attached (read-only/test contexts that never
+    /// construct a gossip network) — a real `serve`/`participate` node
+    /// always has at least one attached, matching go-algorand's `Node`,
+    /// which always has a live `GossipNode`.
+    async fn get_peers(&self) -> Result<(Vec<PeerInfo>, Vec<PeerInfo>), NodeError> {
+        if self.ws_network.is_none() && self.p2p_network.is_none() {
+            return Err(NodeError::NotImplemented("get_peers"));
+        }
+
+        let mut inbound = Vec::new();
+        let mut outbound = Vec::new();
+        for (network, network_type) in [
+            (&self.ws_network, PeerNetworkType::Ws),
+            (&self.p2p_network, PeerNetworkType::P2p),
+        ] {
+            let Some(network) = network else { continue };
+            inbound.extend(
+                network
+                    .get_peers(&[PeerOption::PeersConnectedIn])
+                    .into_iter()
+                    .map(|p| PeerInfo {
+                        network_address: p.get_address().to_string(),
+                        network_type,
+                    }),
+            );
+            outbound.extend(
+                network
+                    .get_peers(&[PeerOption::PeersConnectedOut])
+                    .into_iter()
+                    .map(|p| PeerInfo {
+                        network_address: p.get_address().to_string(),
+                        network_type,
+                    }),
+            );
+        }
+        Ok((inbound, outbound))
     }
 }
 
@@ -5658,5 +5736,157 @@ mod tests {
         let (adapter, _ledger, _gh) = seed_dev_adapter(sender, 10_000_000);
         // Genesis committed at round 0.
         assert_eq!(adapter.latest_round_for_catchup(), 0);
+    }
+
+    // ── get_peers (issue #673) ───────────────────────────────────────
+
+    /// Minimal `GossipNode` test double returning a fixed inbound/outbound
+    /// address list, ignoring every method `get_peers` doesn't exercise.
+    struct MockGossipNode {
+        inbound: Vec<&'static str>,
+        outbound: Vec<&'static str>,
+    }
+
+    struct MockPeer {
+        addr: String,
+    }
+
+    impl algo_network::gossip_node::Peer for MockPeer {
+        fn get_address(&self) -> &str {
+            &self.addr
+        }
+        fn get_connection_latency(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn routing_addr(&self) -> &[u8] {
+            &[]
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl algo_network::gossip_node::GossipNode for MockGossipNode {
+        fn address(&self) -> (String, bool) {
+            (String::new(), false)
+        }
+        async fn broadcast(
+            &self,
+            _tag: algo_network::Tag,
+            _data: Vec<u8>,
+            _wait: bool,
+            _except: Option<Arc<dyn algo_network::gossip_node::Peer>>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn relay(
+            &self,
+            _tag: algo_network::Tag,
+            _data: Vec<u8>,
+            _wait: bool,
+            _except: Option<Arc<dyn algo_network::gossip_node::Peer>>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn disconnect(&self, _peer: Arc<dyn algo_network::gossip_node::Peer>) {}
+        fn disconnect_peers(&self) {}
+        async fn request_connect_outgoing(&self, _replace: bool) {}
+        fn get_peers(
+            &self,
+            options: &[algo_network::gossip_node::PeerOption],
+        ) -> Vec<Arc<dyn algo_network::gossip_node::Peer>> {
+            let addrs: &[&str] = if options == [PeerOption::PeersConnectedIn] {
+                &self.inbound
+            } else if options == [PeerOption::PeersConnectedOut] {
+                &self.outbound
+            } else {
+                &[]
+            };
+            addrs
+                .iter()
+                .map(|a| {
+                    Arc::new(MockPeer {
+                        addr: (*a).to_string(),
+                    }) as Arc<dyn algo_network::gossip_node::Peer>
+                })
+                .collect()
+        }
+        async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn stop(&self) {}
+        fn register_handlers(&self, _dispatch: Vec<algo_network::handler::TaggedMessageHandler>) {}
+        fn clear_handlers(&self) {}
+        fn register_validator_handlers(
+            &self,
+            _dispatch: Vec<algo_network::handler::TaggedMessageValidatorHandler>,
+        ) {
+        }
+        fn clear_validator_handlers(&self) {}
+        fn on_network_advance(&self) {}
+        fn get_genesis_id(&self) -> &str {
+            ""
+        }
+        fn register_http_handler(&self, _path: &str, _handler: algo_network::gossip_node::Router) {}
+    }
+
+    /// Without any network attached, `get_peers` reports `NotImplemented`
+    /// rather than silently returning an empty list (issue #673's explicit
+    /// requirement: this repo's network layer genuinely can enumerate
+    /// connections, so a bare adapter must not pretend "zero peers").
+    #[tokio::test]
+    async fn get_peers_without_network_is_not_implemented() {
+        let adapter = make_adapter();
+        let err = adapter.get_peers().await.unwrap_err();
+        assert!(matches!(err, NodeError::NotImplemented("get_peers")));
+    }
+
+    /// With only a WS network attached, `get_peers` reports its inbound and
+    /// outbound peers tagged `Ws`, and no P2p-tagged entries.
+    #[tokio::test]
+    async fn get_peers_ws_only_tags_ws_and_splits_direction() {
+        let ws = Arc::new(MockGossipNode {
+            inbound: vec!["10.0.0.2:4160"],
+            outbound: vec!["10.0.0.1:4160", "10.0.0.3:4160"],
+        });
+        let adapter =
+            make_adapter().with_ws_network(ws as Arc<dyn algo_network::gossip_node::GossipNode>);
+
+        let (inbound, outbound) = adapter.get_peers().await.expect("peers ok");
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].network_address, "10.0.0.2:4160");
+        assert_eq!(inbound[0].network_type, PeerNetworkType::Ws);
+        assert_eq!(outbound.len(), 2);
+        assert!(outbound
+            .iter()
+            .all(|p| p.network_type == PeerNetworkType::Ws));
+    }
+
+    /// With both ws and p2p networks attached, peers from each are tagged
+    /// with their own transport and combined.
+    #[tokio::test]
+    async fn get_peers_combines_ws_and_p2p_with_correct_tags() {
+        let ws = Arc::new(MockGossipNode {
+            inbound: vec!["10.0.0.2:4160"],
+            outbound: vec![],
+        });
+        let p2p = Arc::new(MockGossipNode {
+            inbound: vec!["10.0.0.9:4166"],
+            outbound: vec![],
+        });
+        let adapter = make_adapter()
+            .with_ws_network(ws as Arc<dyn algo_network::gossip_node::GossipNode>)
+            .with_p2p_network(p2p as Arc<dyn algo_network::gossip_node::GossipNode>);
+
+        let (inbound, _outbound) = adapter.get_peers().await.expect("peers ok");
+        assert_eq!(inbound.len(), 2);
+        let ws_entry = inbound
+            .iter()
+            .find(|p| p.network_address == "10.0.0.2:4160")
+            .expect("ws peer present");
+        assert_eq!(ws_entry.network_type, PeerNetworkType::Ws);
+        let p2p_entry = inbound
+            .iter()
+            .find(|p| p.network_address == "10.0.0.9:4166")
+            .expect("p2p peer present");
+        assert_eq!(p2p_entry.network_type, PeerNetworkType::P2p);
     }
 }
