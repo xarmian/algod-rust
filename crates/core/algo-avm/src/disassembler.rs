@@ -267,6 +267,24 @@ fn collect_labels(program: &Program) -> HashMap<usize, String> {
             }
             _ => {}
         }
+
+        // A `proto` marks a subroutine entry point. go-algorand's
+        // disassembler always synthesizes a label immediately before a
+        // `proto` that isn't already a recorded branch target (e.g. a
+        // subroutine reached only by `b`, skipping over it, rather than by
+        // `callsub`) — see assembler.go's `disassembleInstrumented`, fixed by
+        // go-algorand PR #6594. Without this, a dead subroutine's `proto`
+        // would disassemble with no preceding label, which go-algorand's
+        // stricter assembler (a `typeProto` "unreachable from previous PC"
+        // check that algod-rust does not yet implement) rejects on
+        // reassembly. Mirror the label regardless, so disassembly text
+        // matches go-algorand's and a future stricter check doesn't
+        // reintroduce this exact bug.
+        if opcode::lookup(instr.opcode).map(|s| s.name) == Some("proto")
+            && seen.insert(instr.offset)
+        {
+            targets.push(instr.offset);
+        }
     }
 
     // Sort targets and assign label names
@@ -440,5 +458,44 @@ mod tests {
     #[test]
     fn test_empty_program() {
         assert!(disassemble(&[]).is_err());
+    }
+
+    /// Port of go-algorand's `TestDisassembleDeadSubroutine`
+    /// (data/transactions/logic/assembler_test.go, added by PR #6594,
+    /// commit 03a79c91d): a subroutine that is skipped over by `b` (not
+    /// reached via `callsub`) and thus never a recorded branch target must
+    /// still get a label synthesized immediately before its `proto` opcode
+    /// during disassembly, so that reassembling the disassembly round-trips
+    /// to identical bytecode. `frame_dig`/`proto`/`retsub` are available
+    /// from AVM version 8 (fpVersion) onward, up through this crate's
+    /// `MAX_AVM_VERSION`.
+    #[test]
+    fn test_roundtrip_dead_subroutine() {
+        for v in 8..=crate::opcode::MAX_AVM_VERSION {
+            let source = format!(
+                "#pragma version {v}\nb main\n\ndead_sub:\nproto 2 1\nframe_dig -2\nframe_dig -1\n+\nretsub\n\nmain:\nint 1\n"
+            );
+            let ops = assemble_string(&source)
+                .unwrap_or_else(|e| panic!("v={v}: failed to assemble source: {e:?}"));
+            let text = disassemble(&ops.program)
+                .unwrap_or_else(|e| panic!("v={v}: failed to disassemble: {e}"));
+            // The disassembly must contain a label immediately before the
+            // dead subroutine's `proto`, matching go-algorand's
+            // disassembleInstrumented (PR #6594) — not just an incidentally
+            // round-tripping bytecode.
+            assert!(
+                text.contains(":\nproto 2 1\n"),
+                "v={v}: expected a label immediately before the dead subroutine's proto\ndisassembly:\n{text}"
+            );
+            let ops2 = assemble_string(&text).unwrap_or_else(|e| {
+                panic!(
+                    "v={v}: disassembly of program with dead subroutine could not be reassembled: {e:?}\n{text}"
+                )
+            });
+            assert_eq!(
+                ops.program, ops2.program,
+                "v={v}: round-trip bytecode mismatch\ndisassembly:\n{text}"
+            );
+        }
     }
 }
