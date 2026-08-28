@@ -66,6 +66,7 @@ Headline items, by consensus risk:
 - [ ] #674 — remove dryrun REST endpoint
 - [ ] #673 — GET /v2/node/peers + POST /v2/node/shutdown canonical route
 - [ ] #676 — FNet consensus version table entries
+- [ ] #681 — algod-rust block production never proposes/votes for protocol upgrades (found during Stage 5's pin sweep — see PR #680; the first pin bump in this repo's history where `ConsensusCurrentVersion` itself advances, surfacing a previously-unreachable gap)
 
 ## Epic-level acceptance criteria
 
