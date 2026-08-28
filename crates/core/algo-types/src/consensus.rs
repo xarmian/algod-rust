@@ -160,6 +160,13 @@ pub struct ConsensusParams {
     pub logic_sig_version: u64,
     /// Max LogicSig program+args size in bytes (Go: `LogicSigMaxSize`).
     pub logic_sig_max_size: u64,
+    /// Absolute hard cap on a single LogicSig program's byte length,
+    /// independent of group pooling (Go: `MaxAbsoluteLogicSigProgramSize`,
+    /// set to `LogicSigMaxSize` at v18, raised to 16000 at v40 alongside
+    /// `EnableLogicSigSizePooling`). A LogicSig program longer than this is
+    /// never well-formed, no matter how much of the group's pooled allowance
+    /// is unused. Zero means LogicSigs are not yet supported.
+    pub max_absolute_logic_sig_program_size: u64,
     /// Max LogicSig opcode cost budget (Go: `LogicSigMaxCost`).
     pub logic_sig_max_cost: u64,
     /// Per-app-call opcode budget (Go: `MaxAppProgramCost`).
@@ -547,6 +554,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     let v7 = ConsensusParams {
         logic_sig_version: 0,
         logic_sig_max_size: 0,
+        max_absolute_logic_sig_program_size: 0,
         logic_sig_max_cost: 0,
         max_app_program_cost: 0,
         min_balance: 10_000,
@@ -776,6 +784,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v18.asset = true;
     v18.logic_sig_version = 1;
     v18.logic_sig_max_size = 1000;
+    v18.max_absolute_logic_sig_program_size = 1000;
     v18.logic_sig_max_cost = 20_000;
     v18.max_assets_per_account = 1000;
     v18.support_tx_groups = true;
@@ -1006,6 +1015,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     let mut v40 = v39.clone();
     v40.logic_sig_version = 11;
     v40.enable_logicsig_size_pooling = true;
+    v40.max_absolute_logic_sig_program_size = 16_000;
     v40.enable_heartbeat = true;
     v40.payouts_enabled = true;
     v40.payouts_percent = 50;

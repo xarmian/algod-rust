@@ -357,6 +357,24 @@ pub fn verify_logicsig_with_tracer(
         });
     }
 
+    // Absolute per-LogicSig program cap (Go: `logicSigSanityCheckBatchPrep`,
+    // `data/transactions/verify/txn.go`, v5.0.0-stable): independent of group
+    // pooling, a single LogicSig program longer than
+    // `MaxAbsoluteLogicSigProgramSize` is never well-formed, no matter how
+    // much of the group's pooled allowance is unused. Zero means LogicSigs
+    // are not yet supported by this protocol version (pre-v18), in which case
+    // this check is a no-op and the version gate elsewhere is authoritative.
+    if consensus.max_absolute_logic_sig_program_size > 0
+        && lsig.logic.len() as u64 > consensus.max_absolute_logic_sig_program_size
+    {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "LogicSig.Logic too long. max size is {} bytes",
+                consensus.max_absolute_logic_sig_program_size
+            ),
+        });
+    }
+
     // Count how many of sig/msig/lmsig are set — must be 0 or 1 (matches Go).
     let has_sig = lsig.sig != [0u8; 64];
     let has_msig = lsig.msig.is_some();
@@ -733,6 +751,99 @@ pub fn verify_group_logicsig_size(
             ),
         });
     }
+    Ok(())
+}
+
+/// Group-level LogicSig size check (Go: `verify.logicSigGroupSizeCheck`,
+/// `data/transactions/verify/txn.go`, v5.0.0-stable). Replaces
+/// [`verify_group_logicsig_size`]'s flat total-byte pool (which unconditionally
+/// pools *both* program and arg bytes) with version-aware behavior:
+///
+/// - A LogicSig with no program but non-empty other fields (msig/args/lmsig)
+///   is rejected once `TxnSizePricingEnabled()` (v42+, `per_byte_txn_surcharge
+///   != 0`) — an "orphan" LogicSig can no longer carry unpriced content.
+/// - Before size pricing, the *entire* pooled size (program + args) must fit
+///   `len(group) * LogicSigMaxSize` — this is the same check
+///   [`verify_group_logicsig_size`] performs, now folded in here.
+/// - Once size pricing is enabled, program bytes are billed via
+///   [`crate::fee::logic_sig_program_fee_contribution`] instead of pool-capped,
+///   so only LogicSig *args* remain subject to the pool.
+///
+/// Should be called once per transaction group, unconditionally (matching
+/// upstream, which no longer gates this behind a boolean feature flag).
+pub fn logic_sig_group_size_check(
+    group: &[SignedTransaction],
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    let mut lsig_pooled_size: u64 = 0;
+    let mut lsig_args_size: u64 = 0;
+    let mut lsig_args_need_size_pooling = false;
+
+    let reject_orphan_lsig_content = consensus.per_byte_txn_surcharge != 0;
+    let pool_orphan_lsig_args =
+        consensus.max_absolute_logic_sig_program_size > consensus.logic_sig_max_size;
+
+    for stx in group {
+        let lsig = stx.lsig.as_ref();
+        let has_program = lsig.is_some_and(|l| !l.logic.is_empty());
+        let is_blank = match lsig {
+            None => true,
+            Some(l) => {
+                l.logic.is_empty()
+                    && l.sig == [0u8; 64]
+                    && l.msig.is_none()
+                    && l.args.is_none()
+                    && l.lmsig.is_none()
+            }
+        };
+
+        if !has_program {
+            if !is_blank && reject_orphan_lsig_content {
+                return Err(AlgoError::Validation {
+                    message: "LogicSig fields without LogicSig program".into(),
+                });
+            }
+            if !pool_orphan_lsig_args {
+                continue;
+            }
+        }
+
+        let logic_len = lsig.map(|l| l.logic.len() as u64).unwrap_or(0);
+        let args_len: u64 = lsig
+            .and_then(|l| l.args.as_ref())
+            .map(|args| args.iter().map(|a| a.len() as u64).sum())
+            .unwrap_or(0);
+
+        lsig_pooled_size += logic_len + args_len;
+        lsig_args_size += args_len;
+        if args_len > consensus.logic_sig_max_size {
+            lsig_args_need_size_pooling = true;
+        }
+    }
+
+    let lsig_available_pool = group.len() as u64 * consensus.logic_sig_max_size;
+
+    // Protocols without per-byte surcharge cannot pay for LogicSig bytes above
+    // the group pool: keep those protocols on the legacy total LogicSig size check.
+    if !reject_orphan_lsig_content && lsig_pooled_size > lsig_available_pool {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "txgroup had {lsig_pooled_size} bytes of LogicSigs, more than the available pool of {lsig_available_pool} bytes"
+            ),
+        });
+    }
+    // LogicSig args are unpriced. Each LogicSig may carry up to LogicSigMaxSize
+    // without pooling; larger args are allowed only when the group's pool
+    // covers the group's total args.
+    if lsig_args_need_size_pooling && lsig_args_size > lsig_available_pool {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "txgroup had {lsig_args_size} bytes of LogicSig args, more than the available size pool of {lsig_available_pool} bytes (per-LogicSig allowance is {})",
+                consensus.logic_sig_max_size
+            ),
+        });
+    }
+
     Ok(())
 }
 
