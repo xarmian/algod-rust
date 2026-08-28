@@ -4,8 +4,8 @@
 //! across `available_parallelism() * 2` worker threads (matching Go's
 //! `runtime.NumCPU() * 2`) and aborts the remaining workers on first error.
 //!
-//! Each worker draws a fresh 48-byte Falcon seed from `rng` (`OsRng` in the
-//! public entry point) and calls [`algo_falcon::falcon_keygen`].
+//! Each worker draws a fresh [`FALCON_SEED_SIZE`]-byte Falcon seed from `rng`
+//! (`OsRng` in the public entry point) and calls [`algo_falcon::falcon_keygen`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -22,8 +22,9 @@ pub fn keys_builder(num_keys: u64) -> Result<Vec<FalconSigner>, MssError> {
     keys_builder_with_seed_provider(num_keys, &OsRngSeedProvider)
 }
 
-/// Generate `num_keys` Falcon ephemeral signers, drawing each 48-byte seed
-/// from the supplied seed provider. Production code uses [`keys_builder`];
+/// Generate `num_keys` Falcon ephemeral signers, drawing each
+/// [`FALCON_SEED_SIZE`]-byte seed from the supplied seed provider. Production
+/// code uses [`keys_builder`];
 /// this entry point exists so tests (and any deterministic capture tool)
 /// can plumb in a reproducible seed table.
 pub fn keys_builder_with_seed_provider(
@@ -194,9 +195,9 @@ impl SeedProvider for OsRngSeedProvider {
 
 use sha2::{Digest, Sha512};
 
-/// Deterministic seed provider: hashes `(domain_seed || index)` into 48 bytes.
-/// Used to prove that key generation is reproducible regardless of how the
-/// work is split across worker threads.
+/// Deterministic seed provider: hashes `(domain_seed || index)` into
+/// [`FALCON_SEED_SIZE`] bytes. Used to prove that key generation is
+/// reproducible regardless of how the work is split across worker threads.
 pub struct DeterministicSeedProvider {
     pub domain_seed: u64,
 }
