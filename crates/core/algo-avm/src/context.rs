@@ -226,6 +226,29 @@ pub trait AvmContext {
         })
     }
 
+    /// Set the `ForeignBoxReads` flag on `app_id`'s params
+    /// (`app_params_set AppForeignBoxReads`). When enabled, any app may read
+    /// (but not write) this app's boxes. Matches go-algorand's
+    /// `LedgerForLogic.SetForeignBoxReads` (`data/transactions/logic/eval.go`).
+    fn set_foreign_box_reads(&mut self, app_id: u64, enable: bool) -> Result<(), AlgoError> {
+        let _ = (app_id, enable);
+        Err(AlgoError::Avm {
+            message: "context unavailable: set_foreign_box_reads".into(),
+        })
+    }
+
+    /// Set the `FamilyBoxAccess` flag on `app_id`'s params
+    /// (`app_params_set AppFamilyBoxAccess`). When enabled, any app (existing
+    /// or future) with the same creator may read and write this app's boxes.
+    /// Matches go-algorand's `LedgerForLogic.SetFamilyBoxAccess`
+    /// (`data/transactions/logic/eval.go`).
+    fn set_family_box_access(&mut self, app_id: u64, enable: bool) -> Result<(), AlgoError> {
+        let _ = (app_id, enable);
+        Err(AlgoError::Avm {
+            message: "context unavailable: set_family_box_access".into(),
+        })
+    }
+
     // ---- Logging ----
 
     /// Append a log message.

@@ -201,6 +201,7 @@ mod tests {
     fn dummy_instr() -> Instruction {
         Instruction {
             opcode: 0x00,
+            sub_opcode: None,
             immediates: crate::bytecode::Immediates::None,
             offset: 0,
         }

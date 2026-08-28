@@ -1034,8 +1034,9 @@ pub mod resource_flags {
 /// - **App params** (`q`..`x`): `approval_program`/`clear_state_program`/
 ///   `global_state` (raw msgpack map) / four flat schema fields /
 ///   `extra_program_pages`.
-/// - **Flags + metadata** (`y`,`z`,`A`,`B`): `resource_flags`/
-///   `update_round`/`version`/`size_sponsor`.
+/// - **Flags + metadata** (`y`,`z`,`A`,`B`,`C`,`D`): `resource_flags`/
+///   `update_round`/`version`/`size_sponsor`/`foreign_box_reads`/
+///   `family_box_access`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResourcesData {
     // Asset params (a-k).
@@ -1083,6 +1084,12 @@ pub struct ResourcesData {
     pub update_round: u64,
     pub version: u64,
     pub size_sponsor: [u8; 32],
+    /// AppParams.ForeignBoxReads. Codec `"C"` (trackerdb) /
+    /// `"fbr"` (basics.AppParams). Issue #659.
+    pub foreign_box_reads: bool,
+    /// AppParams.FamilyBoxAccess. Codec `"D"` (trackerdb) /
+    /// `"fba"` (basics.AppParams). Issue #659.
+    pub family_box_access: bool,
 }
 
 /// Canonically encode the Go `trackerdb.ResourcesData` struct.
@@ -1151,6 +1158,8 @@ pub fn canonical_encode_resources_data(d: &ResourcesData) -> Vec<u8> {
     m.add_u64("z", d.update_round);
     m.add_u64("A", d.version);
     m.add_bytes("B", &d.size_sponsor);
+    m.add_bool("C", d.foreign_box_reads);
+    m.add_bool("D", d.family_box_access);
 
     m.encode()
 }
@@ -1796,7 +1805,8 @@ pub fn canonical_encode_app_local_state(als: &AppLocalState) -> Vec<u8> {
 ///   ApprovalProgram → `"approv"`, ClearStateProgram → `"clearp"`,
 ///   GlobalState → `"gs"`, ExtraProgramPages → `"epp"`,
 ///   LocalStateSchema → `"lsch"`, GlobalStateSchema → `"gsch"`,
-///   Version → `"v"`, SizeSponsor → `"ss"`
+///   Version → `"v"`, SizeSponsor → `"ss"`, ForeignBoxReads → `"fbr"`,
+///   FamilyBoxAccess → `"fba"`
 ///
 /// The `creator` field in the Rust struct is not part of Go's AppParams
 /// codec and is not encoded here.
@@ -1816,6 +1826,8 @@ pub fn canonical_encode_app_params(ap: &AppParams) -> Vec<u8> {
     );
     m.add_u64("v", ap.version);
     m.add_address("ss", &ap.size_sponsor);
+    m.add_bool("fbr", ap.foreign_box_reads);
+    m.add_bool("fba", ap.family_box_access);
     m.encode()
 }
 

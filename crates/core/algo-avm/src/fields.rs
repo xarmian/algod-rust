@@ -197,7 +197,10 @@ field_enum! {
 // ---------------------------------------------------------------------------
 
 field_enum! {
-    /// Fields available via the `app_params_get` opcode.
+    /// Fields available via the `app_params_get` opcode. A subset
+    /// (currently `AppForeignBoxReads`/`AppFamilyBoxAccess`) is also
+    /// settable via the `app_params_set` opcode -- see
+    /// [`AppParamsField::set_version`].
     pub enum AppParamsField {
         AppApprovalProgram = 0,
         AppClearStateProgram = 1,
@@ -208,6 +211,76 @@ field_enum! {
         AppExtraProgramPages = 6,
         AppCreator = 7,
         AppAddress = 8,
+        /// AppParams.Version. AVM v12+.
+        AppVersion = 9,
+        /// AppParams.SizeSponsor. AVM v13+.
+        AppSizeSponsor = 10,
+        /// AppParams.ForeignBoxReads. AVM v13+ (`foreignBoxVersion`).
+        /// Settable via `app_params_set`.
+        AppForeignBoxReads = 11,
+        /// AppParams.FamilyBoxAccess. AVM v13+ (`foreignBoxVersion`).
+        /// Settable via `app_params_set`.
+        AppFamilyBoxAccess = 12,
+    }
+}
+
+impl std::fmt::Display for AppParamsField {
+    /// Matches go-algorand's generated stringer output exactly (the field's
+    /// own enum-variant name), used in the `app_params_set` "immutable
+    /// field" error text.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::AppApprovalProgram => "AppApprovalProgram",
+            Self::AppClearStateProgram => "AppClearStateProgram",
+            Self::AppGlobalNumUint => "AppGlobalNumUint",
+            Self::AppGlobalNumByteSlice => "AppGlobalNumByteSlice",
+            Self::AppLocalNumUint => "AppLocalNumUint",
+            Self::AppLocalNumByteSlice => "AppLocalNumByteSlice",
+            Self::AppExtraProgramPages => "AppExtraProgramPages",
+            Self::AppCreator => "AppCreator",
+            Self::AppAddress => "AppAddress",
+            Self::AppVersion => "AppVersion",
+            Self::AppSizeSponsor => "AppSizeSponsor",
+            Self::AppForeignBoxReads => "AppForeignBoxReads",
+            Self::AppFamilyBoxAccess => "AppFamilyBoxAccess",
+        };
+        write!(f, "{}", name)
+    }
+}
+
+impl AppParamsField {
+    /// The AVM version in which this field became readable via
+    /// `app_params_get`. Matches go-algorand's `appParamsFieldSpecs[].version`
+    /// (`data/transactions/logic/fields.go`).
+    pub fn version(&self) -> u8 {
+        match self {
+            Self::AppApprovalProgram
+            | Self::AppClearStateProgram
+            | Self::AppGlobalNumUint
+            | Self::AppGlobalNumByteSlice
+            | Self::AppLocalNumUint
+            | Self::AppLocalNumByteSlice
+            | Self::AppExtraProgramPages
+            | Self::AppCreator
+            | Self::AppAddress => 5,
+            Self::AppVersion => 12,
+            Self::AppSizeSponsor => 13,
+            Self::AppForeignBoxReads | Self::AppFamilyBoxAccess => {
+                crate::opcode::FOREIGN_BOX_VERSION
+            }
+        }
+    }
+
+    /// The AVM version in which this field became settable via
+    /// `app_params_set`. `0` means the field can never be set this way.
+    /// Matches go-algorand's `appParamsFieldSpecs[].setVersion`.
+    pub fn set_version(&self) -> u8 {
+        match self {
+            Self::AppForeignBoxReads | Self::AppFamilyBoxAccess => {
+                crate::opcode::FOREIGN_BOX_VERSION
+            }
+            _ => 0,
+        }
     }
 }
 
@@ -842,6 +915,10 @@ pub fn app_params_field_by_name(name: &str) -> Option<u8> {
         "AppExtraProgramPages" => Some(6),
         "AppCreator" => Some(7),
         "AppAddress" => Some(8),
+        "AppVersion" => Some(9),
+        "AppSizeSponsor" => Some(10),
+        "AppForeignBoxReads" => Some(11),
+        "AppFamilyBoxAccess" => Some(12),
         _ => None,
     }
 }
@@ -857,6 +934,10 @@ pub fn app_params_field_name(index: u8) -> Option<&'static str> {
         6 => Some("AppExtraProgramPages"),
         7 => Some("AppCreator"),
         8 => Some("AppAddress"),
+        9 => Some("AppVersion"),
+        10 => Some("AppSizeSponsor"),
+        11 => Some("AppForeignBoxReads"),
+        12 => Some("AppFamilyBoxAccess"),
         _ => None,
     }
 }
@@ -1103,7 +1184,7 @@ pub fn field_name_for_opcode(mnemonic: &str, imm_index: usize, value: u8) -> Opt
 
         ("asset_holding_get", 0) => asset_holding_field_name(value),
         ("asset_params_get", 0) => asset_params_field_name(value),
-        ("app_params_get", 0) => app_params_field_name(value),
+        ("app_params_get", 0) | ("app_params_set", 0) => app_params_field_name(value),
         ("acct_params_get", 0) => acct_params_field_name(value),
         ("voter_params_get", 0) => voter_params_field_name(value),
 
@@ -1203,7 +1284,88 @@ mod tests {
             AppParamsField::from_u8(8).unwrap(),
             AppParamsField::AppAddress,
         );
-        assert!(AppParamsField::from_u8(9).is_err());
+        // Issue #659: AppVersion(9)/AppSizeSponsor(10) were previously
+        // missing entirely (a pre-existing gap uncovered while adding the
+        // new fields below at their go-algorand-correct indices 11/12),
+        // and AppForeignBoxReads(11)/AppFamilyBoxAccess(12) are new in
+        // v5.0.0-stable. All four must now round-trip.
+        assert_eq!(
+            AppParamsField::from_u8(9).unwrap(),
+            AppParamsField::AppVersion,
+        );
+        assert_eq!(
+            AppParamsField::from_u8(10).unwrap(),
+            AppParamsField::AppSizeSponsor,
+        );
+        assert_eq!(
+            AppParamsField::from_u8(11).unwrap(),
+            AppParamsField::AppForeignBoxReads,
+        );
+        assert_eq!(
+            AppParamsField::from_u8(12).unwrap(),
+            AppParamsField::AppFamilyBoxAccess,
+        );
+        assert!(AppParamsField::from_u8(13).is_err());
+    }
+
+    #[test]
+    fn app_params_field_get_version_matches_go_algorand() {
+        // go-algorand data/transactions/logic/fields.go appParamsFieldSpecs.
+        assert_eq!(AppParamsField::AppApprovalProgram.version(), 5);
+        assert_eq!(AppParamsField::AppAddress.version(), 5);
+        assert_eq!(AppParamsField::AppVersion.version(), 12);
+        assert_eq!(AppParamsField::AppSizeSponsor.version(), 13);
+        assert_eq!(AppParamsField::AppForeignBoxReads.version(), 13);
+        assert_eq!(AppParamsField::AppFamilyBoxAccess.version(), 13);
+    }
+
+    #[test]
+    fn app_params_field_set_version_only_new_fields_settable() {
+        // Only AppForeignBoxReads/AppFamilyBoxAccess are settable via
+        // app_params_set; every other field's setVersion is 0 ("never
+        // settable this way"), matching go-algorand's appParamsFieldSpecs.
+        for f in [
+            AppParamsField::AppApprovalProgram,
+            AppParamsField::AppClearStateProgram,
+            AppParamsField::AppGlobalNumUint,
+            AppParamsField::AppGlobalNumByteSlice,
+            AppParamsField::AppLocalNumUint,
+            AppParamsField::AppLocalNumByteSlice,
+            AppParamsField::AppExtraProgramPages,
+            AppParamsField::AppCreator,
+            AppParamsField::AppAddress,
+            AppParamsField::AppVersion,
+            AppParamsField::AppSizeSponsor,
+        ] {
+            assert_eq!(f.set_version(), 0, "{f} should not be settable");
+        }
+        assert_eq!(AppParamsField::AppForeignBoxReads.set_version(), 13);
+        assert_eq!(AppParamsField::AppFamilyBoxAccess.set_version(), 13);
+    }
+
+    #[test]
+    fn app_params_field_display_matches_go_stringer() {
+        assert_eq!(
+            AppParamsField::AppForeignBoxReads.to_string(),
+            "AppForeignBoxReads"
+        );
+        assert_eq!(
+            AppParamsField::AppFamilyBoxAccess.to_string(),
+            "AppFamilyBoxAccess"
+        );
+    }
+
+    #[test]
+    fn app_params_field_name_and_by_name_round_trip_new_fields() {
+        for (idx, name) in [
+            (9u8, "AppVersion"),
+            (10, "AppSizeSponsor"),
+            (11, "AppForeignBoxReads"),
+            (12, "AppFamilyBoxAccess"),
+        ] {
+            assert_eq!(app_params_field_name(idx), Some(name));
+            assert_eq!(app_params_field_by_name(name), Some(idx));
+        }
     }
 
     #[test]

@@ -131,4 +131,13 @@ pub struct AppParams {
     /// program pages / global schema, when that differs from the
     /// creator. Zero address means "no sponsor" (creator pays).
     pub size_sponsor: Address,
+    /// Go codec `"fbr"`. When `true`, any app may read (but not write)
+    /// this app's boxes. Settable via the `app_params_set` opcode
+    /// (`AppForeignBoxReads`, `foreignBoxVersion`/v5.0.0-stable).
+    pub foreign_box_reads: bool,
+    /// Go codec `"fba"`. When `true`, any app (existing or future) with
+    /// the same creator as this app may read *and* write this app's
+    /// boxes. Settable via the `app_params_set` opcode
+    /// (`AppFamilyBoxAccess`, `foreignBoxVersion`/v5.0.0-stable).
+    pub family_box_access: bool,
 }

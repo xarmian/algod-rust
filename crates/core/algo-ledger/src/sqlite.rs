@@ -943,6 +943,8 @@ pub fn build_app_resource_data(
         rd.extra_program_pages = p.extra_program_pages;
         rd.version = p.version;
         rd.size_sponsor = p.size_sponsor.0;
+        rd.foreign_box_reads = p.foreign_box_reads;
+        rd.family_box_access = p.family_box_access;
     }
 
     rd
@@ -977,7 +979,8 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
     //   q = approval, r = clear_state, s = global_state,
     //   t = local_state_schema.num_uint, u = local_state_schema.num_byte_slice,
     //   v = global_state_schema.num_uint, w = global_state_schema.num_byte_slice,
-    //   x = extra_program_pages, A = version, B = size_sponsor.
+    //   x = extra_program_pages, A = version, B = size_sponsor,
+    //   C = foreign_box_reads, D = family_box_access.
     for (k, v) in &map {
         match k.as_str().unwrap_or("") {
             "q" => {
@@ -1011,6 +1014,8 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
                     }
                 }
             }
+            "C" => p.foreign_box_reads = v.as_bool().unwrap_or(false),
+            "D" => p.family_box_access = v.as_bool().unwrap_or(false),
             _ => {}
         }
     }
@@ -6243,6 +6248,8 @@ mod tests {
             extra_program_pages: 1,
             version: 5,
             size_sponsor: Address([3u8; 32]),
+            foreign_box_reads: true,
+            family_box_access: true,
         };
         let bytes = encode_app_params_with_round(&p, 0);
         let decoded = decode_app_params(&bytes, p.creator).expect("decode");
@@ -6269,6 +6276,29 @@ mod tests {
         // survive the encode/decode round trip.
         assert_eq!(decoded.version, p.version);
         assert_eq!(decoded.size_sponsor, p.size_sponsor);
+        // Issue #659: foreign_box_reads/family_box_access (trackerdb codec
+        // "C"/"D") must survive the same round trip.
+        assert_eq!(decoded.foreign_box_reads, p.foreign_box_reads);
+        assert_eq!(decoded.family_box_access, p.family_box_access);
+    }
+
+    /// `false` (the default/omitted) values for `foreign_box_reads`/
+    /// `family_box_access` must also round-trip correctly -- i.e. the new
+    /// fields don't accidentally default to `true` on decode when absent
+    /// from the encoded bytes (bool `omitempty` semantics).
+    #[test]
+    fn encode_app_params_round_trip_foreign_box_fields_default_false() {
+        let p = AppParams {
+            creator: Address([1u8; 32]),
+            approval_program: vec![0x01],
+            ..Default::default()
+        };
+        assert!(!p.foreign_box_reads);
+        assert!(!p.family_box_access);
+        let bytes = encode_app_params_with_round(&p, 0);
+        let decoded = decode_app_params(&bytes, p.creator).expect("decode");
+        assert!(!decoded.foreign_box_reads);
+        assert!(!decoded.family_box_access);
     }
 
     #[test]

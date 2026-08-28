@@ -96,6 +96,26 @@ pub fn is_varint_branch_opcode(byte: u8) -> bool {
     matches!(byte, 0x40 | 0x41 | 0x42 | 0x88)
 }
 
+/// Maximum number of sub-opcodes a single "prefix" opcode family may
+/// register. go-algorand's `OpSpec.SubOps` is a dynamically-grown slice
+/// (`addToSubOps`, `opcodes.go:929-938`); Rust's `static` tables need a
+/// fixed bound, so this is sized generously above any currently-planned
+/// family (the `app_box_*` family sharing prefix byte `0xd4` uses 9).
+/// Index 0 is always unused/`None`, mirroring go's documented "index 0 is
+/// always a zero-value OpSpec sentinel" convention for `SubOps`.
+pub const MAX_SUB_OPCODES: usize = 32;
+
+/// Sub-opcode table for a multi-byte "prefix" opcode family. Indexed by the
+/// second byte of the instruction (the sub-opcode).
+pub type SubOpTable = [Option<OpSpec>; MAX_SUB_OPCODES];
+
+/// The AVM version at which the multi-byte "prefix opcode" dispatch
+/// mechanism and its first consumers (`app_params_set`, and the
+/// `app_box_*` family) were introduced.
+///
+/// Matches go-algorand's `foreignBoxVersion = 13` (`opcodes.go:83`).
+pub const FOREIGN_BOX_VERSION: u8 = 13;
+
 /// Static metadata for a single opcode.
 #[derive(Debug, Clone)]
 pub struct OpSpec {
@@ -115,6 +135,15 @@ pub struct OpSpec {
     pub mode: Mode,
     /// Immediate argument encoding.
     pub imm: ImmKind,
+    /// Nonzero when this `OpSpec` is itself a sub-opcode entry inside a
+    /// prefix family (mirrors go's `OpDetails.SubOpcode`, `opcodes.go:162`).
+    /// `0` for ordinary single-byte opcodes and for the prefix entry itself.
+    pub sub_opcode: u8,
+    /// Set on the *prefix* entry (e.g. `0xd4`) to mark this opcode byte as
+    /// the shared first byte of a multi-byte opcode family (mirrors go's
+    /// `OpSpec.SubOps`, `opcodes.go:164-166`). `None` for ordinary,
+    /// single-byte opcodes.
+    pub sub_ops: Option<&'static SubOpTable>,
 }
 
 /// Lookup table indexed by opcode byte. `None` means the byte is unused/invalid.
@@ -135,6 +164,12 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
                 stack_pushes: $pushes,
                 mode: $mode,
                 imm: $imm,
+                sub_opcode: 0,
+                // `Option::None` spelled out: this macro body expands in a
+                // scope with `use ImmKind::*;` (for the bare `None` immediate
+                // kind used by many opcodes above), which would otherwise
+                // shadow the prelude's `Option::None` with `ImmKind::None`.
+                sub_ops: Option::None,
             });
         };
     }
@@ -370,6 +405,21 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
         Uint8
     );
     op!(0x75, "online_stake", 11, Static(1), 0, 1, Application, None);
+    // `app_params_set` (v5.0.0 / foreignBoxVersion=13): pops a uint64,
+    // sets a settable `AppParamsField` on the *current* app. Not itself a
+    // multi-byte/prefix opcode -- go-algorand's `opcodes.go:691`:
+    //   {0x76, "app_params_set", opAppParamsSet, proto("i:"), foreignBoxVersion,
+    //    field("f", &AppParamsSettableFields).only(ModeApp).assembler(asmAppParamsSet)}
+    op!(
+        0x76,
+        "app_params_set",
+        FOREIGN_BOX_VERSION,
+        Static(1),
+        1,
+        0,
+        Application,
+        Uint8
+    );
 
     // ---- Min balance ----
     op!(0x78, "min_balance", 3, Static(1), 1, 1, Application, None);
@@ -503,6 +553,55 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
 /// Look up an opcode spec by its byte value. Returns `None` for undefined opcodes.
 pub fn lookup(byte: u8) -> Option<&'static OpSpec> {
     OPCODE_TABLE[byte as usize].as_ref()
+}
+
+/// Resolve the [`OpSpec`] for the instruction starting at `code[pc]`,
+/// including multi-byte "prefix opcode" dispatch: if the byte at `code[pc]`
+/// names a prefix entry (`sub_ops.is_some()`), the following byte selects
+/// the sub-opcode.
+///
+/// Mirrors go-algorand's `EvalContext.GetOpSpec` / `getOpSpecError`
+/// (`data/transactions/logic/eval.go:797-822`), including its exact error
+/// text: `"illegal opcode 0x%02x"`, `"prefix opcode 0x%02x missing
+/// sub-opcode"`, `"prefix opcode 0x%02x with improper sub-opcode 0x%02x"`.
+///
+/// Returns `(spec, header_len)` on success, where `header_len` is `1` for
+/// an ordinary opcode or `2` for a resolved sub-opcode (prefix byte +
+/// sub-opcode byte) -- the number of bytes the caller must advance past
+/// before parsing any immediates.
+pub fn resolve(code: &[u8], pc: usize) -> Result<(&'static OpSpec, usize), String> {
+    resolve_in(&OPCODE_TABLE, code, pc)
+}
+
+/// Same as [`resolve`], but against an explicit table. Exists so tests can
+/// exercise the prefix/sub-opcode resolution logic against a small,
+/// purpose-built table without needing a real multi-byte opcode family
+/// registered in the production [`OPCODE_TABLE`].
+fn resolve_in<'a>(
+    table: &'a [Option<OpSpec>; 256],
+    code: &[u8],
+    pc: usize,
+) -> Result<(&'a OpSpec, usize), String> {
+    let byte = code[pc];
+    let spec = table[byte as usize]
+        .as_ref()
+        .ok_or_else(|| format!("illegal opcode 0x{byte:02x}"))?;
+
+    match spec.sub_ops {
+        None => Ok((spec, 1)),
+        Some(sub_ops) => {
+            if pc + 1 >= code.len() {
+                return Err(format!("prefix opcode 0x{byte:02x} missing sub-opcode"));
+            }
+            let sub = code[pc + 1];
+            match sub_ops.get(sub as usize).and_then(|o| o.as_ref()) {
+                Some(sub_spec) => Ok((sub_spec, 2)),
+                None => Err(format!(
+                    "prefix opcode 0x{byte:02x} with improper sub-opcode 0x{sub:02x}"
+                )),
+            }
+        }
+    }
 }
 
 /// Look up an opcode spec by mnemonic name. Linear scan — use for debugging/tests only.
@@ -667,5 +766,166 @@ mod tests {
         let count = defined_opcode_count();
         let all = all_opcodes();
         assert_eq!(count, all.len());
+    }
+
+    #[test]
+    fn test_app_params_set_opcode() {
+        let spec = lookup(0x76).unwrap();
+        assert_eq!(spec.name, "app_params_set");
+        assert_eq!(spec.version, FOREIGN_BOX_VERSION);
+        assert_eq!(spec.mode, Mode::Application);
+        assert_eq!(spec.imm, ImmKind::Uint8);
+        assert_eq!(spec.sub_opcode, 0);
+        assert!(spec.sub_ops.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-byte "prefix opcode" dispatch (go-algorand opcodes.go SubOpcode/
+    // SubOps/subOp/GetOpSpec/getOpSpecError, v5.0.0-stable). No production
+    // opcode registers `sub_ops` yet (the first consumer, the `app_box_*`
+    // family at prefix byte 0xd4, lands in the companion box-opcodes issue),
+    // so these tests build a small private table to exercise the generic
+    // resolution logic in isolation.
+    // -----------------------------------------------------------------------
+
+    fn test_sub_op_table() -> SubOpTable {
+        const EMPTY: Option<OpSpec> = None;
+        let mut subs: SubOpTable = [EMPTY; MAX_SUB_OPCODES];
+        subs[1] = Some(OpSpec {
+            opcode: 0xf0,
+            name: "test_sub_one",
+            version: 13,
+            cost: CostKind::Static(1),
+            stack_pops: 0,
+            stack_pushes: 0,
+            mode: Mode::Any,
+            imm: ImmKind::None,
+            sub_opcode: 1,
+            sub_ops: None,
+        });
+        // A sub-opcode gated to a version higher than the family's own
+        // introduction, to exercise per-sub-opcode version gating
+        // independent of the prefix byte's own version.
+        subs[2] = Some(OpSpec {
+            opcode: 0xf0,
+            name: "test_sub_two",
+            version: 20,
+            cost: CostKind::Static(1),
+            stack_pops: 0,
+            stack_pushes: 0,
+            mode: Mode::Any,
+            imm: ImmKind::None,
+            sub_opcode: 2,
+            sub_ops: None,
+        });
+        subs
+    }
+
+    fn test_table_with_prefix() -> [Option<OpSpec>; 256] {
+        const EMPTY: Option<OpSpec> = None;
+        let mut table: [Option<OpSpec>; 256] = [EMPTY; 256];
+        // Leak the sub-op table to get a `'static` reference for the test
+        // table's prefix entry (mirrors how the real OPCODE_TABLE's prefix
+        // entries reference a named `static SubOpTable`).
+        let subs: &'static SubOpTable = Box::leak(Box::new(test_sub_op_table()));
+        table[0xf0] = Some(OpSpec {
+            opcode: 0xf0,
+            name: "test_prefix",
+            version: 13,
+            cost: CostKind::Static(1),
+            stack_pops: 0,
+            stack_pushes: 0,
+            mode: Mode::Any,
+            imm: ImmKind::None,
+            sub_opcode: 0,
+            sub_ops: Some(subs),
+        });
+        table[0x01] = Some(OpSpec {
+            opcode: 0x01,
+            name: "ordinary",
+            version: 1,
+            cost: CostKind::Static(1),
+            stack_pops: 0,
+            stack_pushes: 0,
+            mode: Mode::Any,
+            imm: ImmKind::None,
+            sub_opcode: 0,
+            sub_ops: None,
+        });
+        table
+    }
+
+    #[test]
+    fn test_resolve_ordinary_opcode_is_unaffected() {
+        let table = test_table_with_prefix();
+        let (spec, len) = resolve_in(&table, &[0x01], 0).unwrap();
+        assert_eq!(spec.name, "ordinary");
+        assert_eq!(len, 1);
+    }
+
+    #[test]
+    fn test_resolve_prefix_with_valid_sub_opcode() {
+        let table = test_table_with_prefix();
+        let (spec, len) = resolve_in(&table, &[0xf0, 0x01], 0).unwrap();
+        assert_eq!(spec.name, "test_sub_one");
+        assert_eq!(spec.opcode, 0xf0);
+        assert_eq!(spec.sub_opcode, 1);
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn test_resolve_prefix_missing_sub_opcode_byte() {
+        let table = test_table_with_prefix();
+        // Program ends right after the prefix byte -- no second byte.
+        let err = resolve_in(&table, &[0xf0], 0).unwrap_err();
+        assert_eq!(err, "prefix opcode 0xf0 missing sub-opcode");
+    }
+
+    #[test]
+    fn test_resolve_prefix_improper_sub_opcode() {
+        let table = test_table_with_prefix();
+        // 0x09 is within MAX_SUB_OPCODES bounds but not registered.
+        let err = resolve_in(&table, &[0xf0, 0x09], 0).unwrap_err();
+        assert_eq!(err, "prefix opcode 0xf0 with improper sub-opcode 0x09");
+    }
+
+    #[test]
+    fn test_resolve_prefix_sub_opcode_out_of_table_bounds() {
+        let table = test_table_with_prefix();
+        // 0xff is beyond MAX_SUB_OPCODES -- must still be "improper", not panic.
+        let err = resolve_in(&table, &[0xf0, 0xff], 0).unwrap_err();
+        assert_eq!(err, "prefix opcode 0xf0 with improper sub-opcode 0xff");
+    }
+
+    #[test]
+    fn test_resolve_illegal_opcode() {
+        let table = test_table_with_prefix();
+        let err = resolve_in(&table, &[0x99], 0).unwrap_err();
+        assert_eq!(err, "illegal opcode 0x99");
+    }
+
+    #[test]
+    fn test_resolve_prefix_sub_opcode_carries_independent_version() {
+        // The sub-opcode's own `version` (not the prefix's) is what a
+        // caller must check for version gating -- go-algorand's per-version
+        // table cloning means an individual sub-opcode can be introduced
+        // later than the family itself.
+        let table = test_table_with_prefix();
+        let (spec, _) = resolve_in(&table, &[0xf0, 0x02], 0).unwrap();
+        assert_eq!(spec.version, 20);
+    }
+
+    #[test]
+    fn test_resolve_against_real_table_no_registered_prefixes_yet() {
+        // Sanity check against the *production* OPCODE_TABLE: as of this
+        // issue, no real opcode registers `sub_ops` (the app_box_* family
+        // lands in the companion issue), so `resolve()` must behave
+        // identically to plain `lookup()` for every currently-defined byte.
+        for (byte, _) in all_opcodes() {
+            let (spec, len) = resolve(&[byte], 0).unwrap();
+            assert_eq!(spec.opcode, byte);
+            assert_eq!(len, 1);
+            assert!(spec.sub_ops.is_none());
+        }
     }
 }

@@ -1790,7 +1790,7 @@ fn resolve_field_immediate_at(
 
         ("asset_holding_get", 0) => fields::asset_holding_field_by_name(arg),
         ("asset_params_get", 0) => fields::asset_params_field_by_name(arg),
-        ("app_params_get", 0) => fields::app_params_field_by_name(arg),
+        ("app_params_get", 0) | ("app_params_set", 0) => fields::app_params_field_by_name(arg),
         ("acct_params_get", 0) => fields::acct_params_field_by_name(arg),
         ("voter_params_get", 0) => fields::voter_params_field_by_name(arg),
 
@@ -2243,6 +2243,28 @@ mod tests {
         assert_eq!(ops.program[2], 1); // count=1
         assert_eq!(ops.program[3], 1); // value=1
         assert_eq!(ops.program[4], 0x22); // intc_0
+    }
+
+    /// `app_params_set` is App-mode only, but the assembler doesn't enforce
+    /// mode at assembly time (that's the validator's job) -- this pins that
+    /// the named-field immediate resolves to the correct byte (`fields::
+    /// app_params_field_by_name`, `AppForeignBoxReads` = 11) end-to-end
+    /// through `assemble_string`, matching go-algorand's `asmAppParamsSet`.
+    #[test]
+    fn test_app_params_set_foreign_box_reads_assembles() {
+        let source = "#pragma version 13\nint 1\napp_params_set AppForeignBoxReads\n";
+        let ops = assemble_string(source).unwrap();
+        assert_eq!(ops.version, 13);
+        // pushint 1 (single reference -> pushint, no intcblock), then
+        // app_params_set with immediate byte 11 (AppForeignBoxReads).
+        assert_eq!(&ops.program[..], &[13, 0x81, 0x01, 0x76, 0x0b]);
+    }
+
+    #[test]
+    fn test_app_params_set_family_box_access_assembles() {
+        let source = "#pragma version 13\nint 0\napp_params_set AppFamilyBoxAccess\n";
+        let ops = assemble_string(source).unwrap();
+        assert_eq!(&ops.program[..], &[13, 0x81, 0x00, 0x76, 0x0c]);
     }
 
     #[test]

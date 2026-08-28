@@ -2469,6 +2469,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     7 => TealValue::Bytes(p.creator.0.to_vec()),
                     // AppAddress
                     8 => TealValue::Bytes(app_address(app_id).to_vec()),
+                    // AppVersion
+                    9 => TealValue::Uint(p.version),
+                    // AppSizeSponsor
+                    10 => TealValue::Bytes(p.size_sponsor.0.to_vec()),
+                    // AppForeignBoxReads
+                    11 => TealValue::Uint(p.foreign_box_reads as u64),
+                    // AppFamilyBoxAccess
+                    12 => TealValue::Uint(p.family_box_access as u64),
                     _ => {
                         return Err(AlgoError::Avm {
                             message: format!("unknown AppParamsField index: {field}"),
@@ -2479,6 +2487,39 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             }
             None => Ok((TealValue::Uint(0), false)),
         }
+    }
+
+    /// `app_params_set AppForeignBoxReads`: read-modify-write the current
+    /// app's `AppParams.foreign_box_reads` flag. Mirrors go-algorand's
+    /// `roundCowState.SetForeignBoxReads` / `appParamsSetter`
+    /// (`ledger/eval/cow_creatables.go`), minus the explicit creator-address
+    /// lookup that go's account-scoped storage requires -- algod-rust's
+    /// `AppStore` addresses app params directly by `app_id`.
+    fn set_foreign_box_reads(&mut self, app_id: u64, enable: bool) -> Result<(), AlgoError> {
+        let mut p = self
+            .store
+            .get_app_params(app_id)
+            .ok_or_else(|| AlgoError::Avm {
+                message: format!("app {app_id} does not exist"),
+            })?;
+        p.foreign_box_reads = enable;
+        self.store.set_app_params(app_id, p);
+        Ok(())
+    }
+
+    /// `app_params_set AppFamilyBoxAccess`: read-modify-write the current
+    /// app's `AppParams.family_box_access` flag. See
+    /// [`Self::set_foreign_box_reads`] for the go-algorand mirror.
+    fn set_family_box_access(&mut self, app_id: u64, enable: bool) -> Result<(), AlgoError> {
+        let mut p = self
+            .store
+            .get_app_params(app_id)
+            .ok_or_else(|| AlgoError::Avm {
+                message: format!("app {app_id} does not exist"),
+            })?;
+        p.family_box_access = enable;
+        self.store.set_app_params(app_id, p);
+        Ok(())
     }
 
     fn acct_params_get(
@@ -4591,6 +4632,90 @@ mod tests {
         let (val, exists) = ctx.app_params_get(999, 0).unwrap();
         assert!(!exists);
         assert_eq!(val, TealValue::Uint(0));
+    }
+
+    /// Issue #659: `AppVersion`(9)/`AppSizeSponsor`(10)/`AppForeignBoxReads`(11)/
+    /// `AppFamilyBoxAccess`(12) must be readable via `app_params_get`,
+    /// matching go-algorand's field indices exactly.
+    #[test]
+    fn app_params_get_version_size_sponsor_and_foreign_box_fields() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.app_params.insert(
+            42,
+            AppParams {
+                creator: Address([1u8; 32]),
+                version: 3,
+                size_sponsor: Address([9u8; 32]),
+                foreign_box_reads: true,
+                family_box_access: false,
+                ..Default::default()
+            },
+        );
+        let ctx = make_context(&mut store, vec![txn]);
+
+        let (val, exists) = ctx.app_params_get(42, 9).unwrap(); // AppVersion
+        assert!(exists);
+        assert_eq!(val, TealValue::Uint(3));
+
+        let (val, _) = ctx.app_params_get(42, 10).unwrap(); // AppSizeSponsor
+        assert_eq!(val, TealValue::Bytes([9u8; 32].to_vec()));
+
+        let (val, _) = ctx.app_params_get(42, 11).unwrap(); // AppForeignBoxReads
+        assert_eq!(val, TealValue::Uint(1));
+
+        let (val, _) = ctx.app_params_get(42, 12).unwrap(); // AppFamilyBoxAccess
+        assert_eq!(val, TealValue::Uint(0));
+    }
+
+    /// `app_params_set AppForeignBoxReads`/`AppFamilyBoxAccess` must
+    /// actually persist through the real `LedgerStore` (not just a mock),
+    /// closing the "round-trips correctly through state" acceptance
+    /// criterion end-to-end (write via `set_*`, read back via
+    /// `store.get_app_params` directly, independent of `app_params_get`).
+    #[test]
+    fn app_params_set_foreign_box_reads_and_family_box_access_persist_through_store() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.app_params.insert(
+            42,
+            AppParams {
+                creator: Address([1u8; 32]),
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        let p = ctx.store.get_app_params(42).unwrap();
+        assert!(!p.foreign_box_reads);
+        assert!(!p.family_box_access);
+
+        ctx.set_foreign_box_reads(42, true).unwrap();
+        let p = ctx.store.get_app_params(42).unwrap();
+        assert!(p.foreign_box_reads);
+        assert!(!p.family_box_access);
+
+        ctx.set_family_box_access(42, true).unwrap();
+        let p = ctx.store.get_app_params(42).unwrap();
+        assert!(p.foreign_box_reads);
+        assert!(p.family_box_access);
+
+        ctx.set_foreign_box_reads(42, false).unwrap();
+        let p = ctx.store.get_app_params(42).unwrap();
+        assert!(!p.foreign_box_reads);
+        assert!(p.family_box_access);
+    }
+
+    /// Setting a flag on a nonexistent app must error, not silently no-op or
+    /// panic (mirrors go's `appParamsSetter`'s `"app %d does not exist"`).
+    #[test]
+    fn app_params_set_on_missing_app_errors() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        assert!(ctx.set_foreign_box_reads(999, true).is_err());
+        assert!(ctx.set_family_box_access(999, true).is_err());
     }
 
     // ---- acct_params_get tests ----

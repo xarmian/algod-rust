@@ -580,6 +580,10 @@ pub struct CatchpointResourcesData {
     pub version: u64,
     /// Size sponsor address (32 bytes). Codec: "B"
     pub size_sponsor: [u8; 32],
+    /// ForeignBoxReads flag. Codec: "C". Issue #659.
+    pub foreign_box_reads: bool,
+    /// FamilyBoxAccess flag. Codec: "D". Issue #659.
+    pub family_box_access: bool,
 }
 
 /// Decoded form of Go's `BaseOnlineAccountData` from `trackerdb/data.go`.

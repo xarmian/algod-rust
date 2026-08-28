@@ -19,8 +19,13 @@ pub struct Program {
 /// A single parsed instruction.
 #[derive(Debug, Clone)]
 pub struct Instruction {
-    /// The opcode byte.
+    /// The opcode byte (the *prefix* byte, for a multi-byte instruction).
     pub opcode: u8,
+    /// The second byte of a multi-byte "prefix opcode" instruction (e.g. the
+    /// `app_box_*` family sharing prefix byte `0xd4`), or `None` for an
+    /// ordinary single-byte opcode. Mirrors go-algorand's
+    /// `OpDetails.SubOpcode` (`opcodes.go:162`) once resolved.
+    pub sub_opcode: Option<u8>,
     /// Byte offset of this instruction within the program (after the version byte).
     pub offset: usize,
     /// Parsed immediate arguments.
@@ -194,11 +199,23 @@ pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
     while pc < code.len() {
         let offset = pc;
         let op_byte = code[pc];
-        pc += 1;
 
-        let spec = opcode::lookup(op_byte).ok_or_else(|| AlgoError::Avm {
-            message: format!("unknown opcode 0x{op_byte:02x} at offset {offset}"),
+        // `opcode::resolve` handles both ordinary single-byte opcodes and
+        // multi-byte "prefix opcode" families (go-algorand's SubOpcode/
+        // SubOps mechanism): `header_len` is 1 for the former, 2 (prefix +
+        // sub-opcode byte) for the latter. No production opcode registers
+        // `sub_ops` yet, so this is currently always 1 in practice, but the
+        // decoder is wired end-to-end so a future prefix family (e.g. the
+        // `app_box_*` opcodes at 0xd4) needs no further changes here.
+        let (spec, header_len) = opcode::resolve(code, pc).map_err(|message| AlgoError::Avm {
+            message: format!("{message} at offset {offset}"),
         })?;
+        let sub_opcode = if header_len > 1 {
+            Some(code[pc + 1])
+        } else {
+            None
+        };
+        pc += header_len;
 
         if spec.version > version {
             return Err(AlgoError::Avm {
@@ -258,6 +275,7 @@ pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
 
         instructions.push(Instruction {
             opcode: op_byte,
+            sub_opcode,
             offset,
             immediates,
         });

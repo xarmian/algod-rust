@@ -260,12 +260,65 @@ pub fn op_app_params_get(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field_byte = get_uint8(instruction)?;
-    let _field = AppParamsField::from_u8(field_byte)?;
+
+    // Matches go-algorand's opAppParamsGet exactly (eval.go):
+    //   fs, ok := appParamsFieldSpecByField(paramField)
+    //   if !ok || fs.version > cx.version { error }
+    // Below foreignBoxVersion this is a no-op for every currently-defined
+    // field (all have version <= 5, the opcode's own gate), but AppVersion
+    // (v12)/AppSizeSponsor/AppForeignBoxReads/AppFamilyBoxAccess (v13) now
+    // need it to reject reads from a lower-versioned program.
+    let field = AppParamsField::from_u8(field_byte)?;
+    if field.version() > machine.version {
+        return Err(AlgoError::Avm {
+            message: format!("invalid app_params_get field {field_byte}"),
+        });
+    }
+
     let app_id_raw = machine.pop_uint()?;
     let app_id = ctx.resolve_app(app_id_raw)?;
     let (value, exists) = ctx.app_params_get(app_id, field_byte)?;
     machine.push(teal_to_avm(value))?;
     machine.push(AvmValue::Uint64(if exists { 1 } else { 0 }))
+}
+
+/// `app_params_set f` (0x76): 1 immediate (settable field). Pop a uint64
+/// and set field `f` on the CURRENT app (`ctx.current_app_id()`).
+///
+/// Matches go-algorand's `opAppParamsSet` exactly (eval.go):
+///   fs, ok := appParamsFieldSpecByField(paramField)
+///   if !ok || fs.setVersion == 0 || fs.setVersion > cx.version { error }
+///   ... dispatch on fs.field, else "immutable app_params_set field %s"
+pub fn op_app_params_set(
+    machine: &mut AvmMachine,
+    instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let field_byte = get_uint8(instruction)?;
+    let field = match AppParamsField::from_u8(field_byte) {
+        Ok(f) if f.set_version() != 0 && f.set_version() <= machine.version => f,
+        _ => {
+            return Err(AlgoError::Avm {
+                message: format!("invalid app_params_set field {field_byte}"),
+            });
+        }
+    };
+
+    let arg = machine.pop_uint()?;
+    let app_id = ctx.current_app_id();
+    match field {
+        AppParamsField::AppForeignBoxReads => ctx.set_foreign_box_reads(app_id, arg != 0),
+        AppParamsField::AppFamilyBoxAccess => ctx.set_family_box_access(app_id, arg != 0),
+        // Unreachable with the current field table: every other field has
+        // `set_version() == 0`, which is already rejected above as
+        // "invalid app_params_set field N" before reaching this match.
+        // Kept as defensive coverage (mirrors go-algorand's own switch
+        // default), matching go's text for a field whose `setVersion` is
+        // someday made nonzero without a dispatch arm added here.
+        _ => Err(AlgoError::Avm {
+            message: format!("immutable app_params_set field {field}"),
+        }),
+    }
 }
 
 /// `acct_params_get` (0x73): 1 immediate (field). Pop account.
@@ -597,6 +650,10 @@ mod tests {
         group_index_val: usize,
         /// Box storage: (name) -> contents
         boxes: HashMap<Vec<u8>, Vec<u8>>,
+        /// Recorded `set_foreign_box_reads` calls: app_id -> enable.
+        foreign_box_reads: HashMap<u64, bool>,
+        /// Recorded `set_family_box_access` calls: app_id -> enable.
+        family_box_access: HashMap<u64, bool>,
     }
 
     impl TestStateContext {
@@ -621,6 +678,8 @@ mod tests {
                 group_size_val: 1,
                 group_index_val: 0,
                 boxes: HashMap::new(),
+                foreign_box_reads: HashMap::new(),
+                family_box_access: HashMap::new(),
             }
         }
     }
@@ -835,6 +894,16 @@ mod tests {
         }
         fn current_app_id(&self) -> u64 {
             self.app_id
+        }
+
+        fn set_foreign_box_reads(&mut self, app_id: u64, enable: bool) -> Result<(), AlgoError> {
+            self.foreign_box_reads.insert(app_id, enable);
+            Ok(())
+        }
+
+        fn set_family_box_access(&mut self, app_id: u64, enable: bool) -> Result<(), AlgoError> {
+            self.family_box_access.insert(app_id, enable);
+            Ok(())
         }
 
         fn box_get(&mut self, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
@@ -1404,6 +1473,144 @@ mod tests {
         assert_eq!(m.stack.len(), 2);
         assert_eq!(m.stack[0], AvmValue::Bytes(vec![0xAA; 32]));
         assert_eq!(m.stack[1], AvmValue::Uint64(1));
+    }
+
+    /// v13 program reading `AppForeignBoxReads`/`AppFamilyBoxAccess` (fields
+    /// 11/12, `foreignBoxVersion`) via `app_params_get` -- new in v5.0.0.
+    #[test]
+    fn test_app_params_get_foreign_box_fields() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.app_params.insert((50, 11), (TealValue::Uint(1), true)); // AppForeignBoxReads
+        ctx.app_params.insert((50, 12), (TealValue::Uint(0), true)); // AppFamilyBoxAccess
+                                                                     // pushint 50, app_params_get AppForeignBoxReads
+        let code = vec![0x81, 50, 0x72, 0x0b];
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack[0], AvmValue::Uint64(1));
+        assert_eq!(m.stack[1], AvmValue::Uint64(1));
+    }
+
+    /// Below `foreignBoxVersion` (13), `app_params_get AppForeignBoxReads`
+    /// must be rejected even though the opcode itself only requires v5 --
+    /// go-algorand gates per-field, not just per-opcode
+    /// (`appParamsFieldSpecs[AppForeignBoxReads].version == foreignBoxVersion`).
+    #[test]
+    fn test_app_params_get_foreign_box_field_rejected_below_v13() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.app_params.insert((50, 11), (TealValue::Uint(1), true));
+        let code = vec![0x81, 50, 0x72, 0x0b];
+        let raw = prog(12, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 1).unwrap(); // pushint 50
+        let err = m.step(&mut ctx).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid app_params_get field 11"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `AppVersion` (field 9) requires v12; a v11 program must reject it.
+    #[test]
+    fn test_app_params_get_app_version_field_rejected_below_v12() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.app_params.insert((50, 9), (TealValue::Uint(3), true));
+        let code = vec![0x81, 50, 0x72, 0x09];
+        let raw = prog(11, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 1).unwrap();
+        let err = m.step(&mut ctx).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid app_params_get field 9"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_app_params_set_foreign_box_reads() {
+        let mut ctx = TestStateContext::new(50);
+        // pushint 1, app_params_set AppForeignBoxReads (field 11)
+        let code = vec![0x81, 0x01, 0x76, 0x0b];
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert!(m.stack.is_empty(), "app_params_set pushes nothing");
+        assert_eq!(ctx.foreign_box_reads.get(&50), Some(&true));
+    }
+
+    #[test]
+    fn test_app_params_set_family_box_access() {
+        let mut ctx = TestStateContext::new(50);
+        // pushint 0, app_params_set AppFamilyBoxAccess (field 12)
+        let code = vec![0x81, 0x00, 0x76, 0x0c];
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(ctx.family_box_access.get(&50), Some(&false));
+    }
+
+    /// `app_params_set` on a field whose `setVersion` is 0 (i.e. every
+    /// field except `AppForeignBoxReads`/`AppFamilyBoxAccess`, e.g.
+    /// `AppCreator`, field 7) must be rejected with the numeric-field
+    /// "invalid" error -- matches go-algorand's `opAppParamsSet` exactly:
+    /// the `fs.setVersion == 0` check happens *before* the field-dispatch
+    /// switch, so a getVersion-only field never reaches the switch's
+    /// `default: "immutable app_params_set field %s"` arm. That arm is
+    /// unreachable with go-algorand's current field table (kept only as
+    /// defensive coverage for a future field with a nonzero `setVersion`
+    /// that the switch hasn't been taught to handle yet) -- see
+    /// `crate::ops::state::op_app_params_set`'s own match for the mirror.
+    #[test]
+    fn test_app_params_set_non_settable_field_rejected() {
+        let mut ctx = TestStateContext::new(50);
+        // pushint 1, app_params_set AppCreator (field 7)
+        let code = vec![0x81, 0x01, 0x76, 0x07];
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 1).unwrap(); // pushint 1
+        let err = m.step(&mut ctx).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid app_params_set field 7"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An unknown field index must be rejected with the numeric-field error
+    /// text (go: "invalid app_params_set field %d").
+    #[test]
+    fn test_app_params_set_unknown_field_rejected() {
+        let mut ctx = TestStateContext::new(50);
+        let code = vec![0x81, 0x01, 0x76, 0x63]; // field 99: unknown
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 1).unwrap();
+        let err = m.step(&mut ctx).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid app_params_set field 99"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `app_params_set` is version-gated by the *program's* AVM version
+    /// against the whole opcode's own version (`foreignBoxVersion` = 13),
+    /// so the opcode byte itself is already rejected by the decoder at
+    /// v12 -- this pins that at the bytecode-parse layer.
+    #[test]
+    fn test_app_params_set_opcode_rejected_below_v13() {
+        let code = vec![0x81, 0x01, 0x76, 0x0b];
+        let raw = prog(12, &code);
+        let err = bytecode::parse(&raw).unwrap_err();
+        assert!(
+            err.to_string().contains("app_params_set"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
