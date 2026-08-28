@@ -1354,6 +1354,7 @@ fn resolve_field_immediate_at(
         ("vrf_verify", 0) => fields::vrf_standard_by_name(arg),
         ("block", 0) => fields::block_field_by_name(arg),
         ("mimc", 0) => fields::mimc_config_by_name(arg),
+        ("poseidon2", 0) => fields::poseidon2_config_by_name(arg),
 
         _ => None,
     }

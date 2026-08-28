@@ -459,6 +459,22 @@ field_enum! {
 }
 
 // ---------------------------------------------------------------------------
+// Poseidon2Config — `poseidon2` opcode (0xe7)
+// ---------------------------------------------------------------------------
+
+field_enum! {
+    /// Poseidon2 hash configuration for the `poseidon2` opcode.
+    pub enum Poseidon2Config {
+        /// Poseidon2 Merkle-Damgard configuration for BN254 with width = 2,
+        /// full rounds = 6, partial rounds = 50.
+        BN254t2 = 0,
+        /// Poseidon2 Merkle-Damgard configuration for BLS12-381 with width = 2,
+        /// full rounds = 6, partial rounds = 50.
+        BLS12_381t2 = 1,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Base64Encoding — `base64_decode` opcode (0x5e)
 // ---------------------------------------------------------------------------
 
@@ -1044,6 +1060,23 @@ pub fn mimc_config_name(index: u8) -> Option<&'static str> {
     }
 }
 
+/// Look up a Poseidon2Config by name.
+pub fn poseidon2_config_by_name(name: &str) -> Option<u8> {
+    match name {
+        "BN254t2" => Some(0),
+        "BLS12_381t2" => Some(1),
+        _ => None,
+    }
+}
+
+pub fn poseidon2_config_name(index: u8) -> Option<&'static str> {
+    match index {
+        0 => Some("BN254t2"),
+        1 => Some("BLS12_381t2"),
+        _ => None,
+    }
+}
+
 /// Given an opcode name and an immediate index, resolve the field name for a byte value.
 /// Returns the field name string if applicable, or None if the opcode doesn't use named fields.
 pub fn field_name_for_opcode(mnemonic: &str, imm_index: usize, value: u8) -> Option<&'static str> {
@@ -1090,6 +1123,7 @@ pub fn field_name_for_opcode(mnemonic: &str, imm_index: usize, value: u8) -> Opt
         ("vrf_verify", 0) => vrf_standard_name(value),
         ("block", 0) => block_field_name(value),
         ("mimc", 0) => mimc_config_name(value),
+        ("poseidon2", 0) => poseidon2_config_name(value),
 
         _ => None,
     }
@@ -1227,6 +1261,25 @@ mod tests {
         assert_eq!(MimcConfig::from_u8(0).unwrap(), MimcConfig::BN254Mp110);
         assert_eq!(MimcConfig::from_u8(1).unwrap(), MimcConfig::BLS12_381Mp111,);
         assert!(MimcConfig::from_u8(2).is_err());
+    }
+
+    #[test]
+    fn poseidon2_config_round_trip() {
+        assert_eq!(
+            Poseidon2Config::from_u8(0).unwrap(),
+            Poseidon2Config::BN254t2
+        );
+        assert_eq!(
+            Poseidon2Config::from_u8(1).unwrap(),
+            Poseidon2Config::BLS12_381t2,
+        );
+        assert!(Poseidon2Config::from_u8(2).is_err());
+        assert_eq!(poseidon2_config_by_name("BN254t2"), Some(0));
+        assert_eq!(poseidon2_config_by_name("BLS12_381t2"), Some(1));
+        assert_eq!(poseidon2_config_by_name("bogus"), None);
+        assert_eq!(poseidon2_config_name(0), Some("BN254t2"));
+        assert_eq!(poseidon2_config_name(1), Some("BLS12_381t2"));
+        assert_eq!(poseidon2_config_name(2), None);
     }
 
     #[test]

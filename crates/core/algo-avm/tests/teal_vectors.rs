@@ -2017,6 +2017,12 @@ fn version_gate_falcon_requires_v12() {
 }
 
 #[test]
+fn version_gate_poseidon2_requires_v13() {
+    // poseidon2 (0xe7) requires v13
+    expect_parse_fail(12, &[0x80, 0x00, 0xe7, 0x00]);
+}
+
+#[test]
 fn version_gate_unknown_opcode() {
     // 0x99 is not defined at all
     let raw = prog(10, &[0x99]);

@@ -1127,6 +1127,198 @@ fn mimc_miyaguchi_preneel<F: ark_ff::Field>(data: &[F], constants: &[F]) -> F {
     h
 }
 
+// ---------------------------------------------------------------------------
+// Poseidon2 hash (0xe7, v13+)
+// ---------------------------------------------------------------------------
+
+/// `poseidon2` (0xe7, v13+): pop bytes, push 32-byte Poseidon2 hash.
+///
+/// Matches gnark-crypto's Poseidon2 implementation (Merkle-Damgard mode over
+/// a width=2 permutation with 6 full rounds and 50 partial rounds):
+/// - BN254t2: BN254 scalar field
+/// - BLS12_381t2: BLS12-381 scalar field
+///
+/// The input must be non-empty and a multiple of 32 bytes. Each 32-byte
+/// big-endian chunk must be a valid field element (< modulus) — Poseidon2
+/// hashes field elements, not arbitrary byte strings.
+pub fn op_poseidon2(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(), AlgoError> {
+    let config = get_uint8(instruction)?;
+
+    let data = machine.pop_bytes()?;
+    if data.is_empty() {
+        return Err(avm_err("the input data cannot be empty"));
+    }
+    if data.len() % 32 != 0 {
+        return Err(avm_err("the input data must be a multiple of 32 bytes"));
+    }
+
+    // Charge dynamic cost: baseCost + chunkCost * (len / chunkSize)
+    // Both configs: base=7, chunkCost=350, chunkSize=32
+    let num_chunks = data.len() / 32;
+    let cost = 7u64 + 350 * num_chunks as u64;
+    machine.charge_cost(cost)?;
+
+    let result = match config {
+        0 => poseidon2_bn254(&data)?,
+        1 => poseidon2_bls12_381(&data)?,
+        _ => return Err(avm_err(format!("invalid poseidon2 config {config}"))),
+    };
+
+    machine.push(AvmValue::Bytes(result))
+}
+
+/// Poseidon2 hash over the BN254 scalar field (Fr), Merkle-Damgard mode,
+/// width=2, full rounds=6, partial rounds=50.
+///
+/// Round keys are derived from the seed string gnark-crypto uses for these
+/// parameters: `Parameters.String()` for `NewParameters(2, 6, 50)` on BN254,
+/// i.e. `"Poseidon2-BN254[t=2,rF=6,rP=50,d=5]"`. Derivation (56 chained
+/// Keccak-256 calls) is pure and seed-only, so it is computed once and
+/// cached rather than repeated on every opcode invocation.
+fn poseidon2_bn254(data: &[u8]) -> Result<Vec<u8>, AlgoError> {
+    type Fr = ark_bn254::Fr;
+    static ROUND_KEYS: std::sync::OnceLock<Vec<Vec<Fr>>> = std::sync::OnceLock::new();
+    let round_keys = ROUND_KEYS
+        .get_or_init(|| poseidon2_round_keys::<Fr>("Poseidon2-BN254[t=2,rF=6,rP=50,d=5]"));
+    poseidon2_merkle_damgard::<Fr>(data, round_keys)
+}
+
+/// Poseidon2 hash over the BLS12-381 scalar field (Fr), Merkle-Damgard mode,
+/// width=2, full rounds=6, partial rounds=50.
+///
+/// Seed string: `"Poseidon2-BLS12_381[t=2,rF=6,rP=50,d=5]"` (gnark-crypto's
+/// `Parameters.String()` for `NewParameters(2, 6, 50)` on BLS12-381). As with
+/// [`poseidon2_bn254`], the derived round keys are cached after first use.
+fn poseidon2_bls12_381(data: &[u8]) -> Result<Vec<u8>, AlgoError> {
+    type Fr = ark_bls12_381::Fr;
+    static ROUND_KEYS: std::sync::OnceLock<Vec<Vec<Fr>>> = std::sync::OnceLock::new();
+    let round_keys = ROUND_KEYS
+        .get_or_init(|| poseidon2_round_keys::<Fr>("Poseidon2-BLS12_381[t=2,rF=6,rP=50,d=5]"));
+    poseidon2_merkle_damgard::<Fr>(data, round_keys)
+}
+
+/// Sequentially compress 32-byte big-endian field-element chunks with the
+/// Poseidon2 2-to-1 compression function in Merkle-Damgard mode, starting
+/// from a zero initial state.
+///
+/// Matches gnark-crypto's `hash.NewMerkleDamgardHasher` driving
+/// `Permutation.Compress(state, chunk)`, where
+/// `Compress(left, right) = right_before_permutation + Permutation([left, right])[1]`.
+fn poseidon2_merkle_damgard<F: ark_ff::PrimeField>(
+    data: &[u8],
+    round_keys: &[Vec<F>],
+) -> Result<Vec<u8>, AlgoError> {
+    use ark_ff::BigInteger;
+
+    let elements = parse_field_elements::<F>(data)?;
+
+    let mut state = F::zero();
+    for right in elements {
+        let mut buf = [state, right];
+        poseidon2_permutation(&mut buf, round_keys);
+        state = right + buf[1];
+    }
+
+    let bytes = state.into_bigint().to_bytes_be();
+    let mut out = vec![0u8; 32];
+    let start = 32usize.saturating_sub(bytes.len());
+    out[start..].copy_from_slice(&bytes[..bytes.len().min(32)]);
+    Ok(out)
+}
+
+/// The Poseidon2 permutation for width=2, following gnark-crypto's
+/// `Permutation.Permutation`: an external linear layer, then
+/// `NbFullRounds/2` full rounds (S-box on both lanes), `NbPartialRounds`
+/// partial rounds (S-box on lane 0 only), then `NbFullRounds/2` more full
+/// rounds.
+fn poseidon2_permutation<F: ark_ff::Field>(state: &mut [F; 2], round_keys: &[Vec<F>]) {
+    const RF: usize = 6;
+    const RP: usize = 50;
+    let half = RF / 2;
+
+    poseidon2_mat_mul_external(state);
+
+    for keys in round_keys.iter().take(half) {
+        state[0] += keys[0];
+        state[1] += keys[1];
+        state[0] = poseidon2_sbox(state[0]);
+        state[1] = poseidon2_sbox(state[1]);
+        poseidon2_mat_mul_external(state);
+    }
+
+    for keys in round_keys.iter().skip(half).take(RP) {
+        state[0] += keys[0];
+        state[0] = poseidon2_sbox(state[0]);
+        poseidon2_mat_mul_internal(state);
+    }
+
+    for keys in round_keys.iter().skip(half + RP).take(half) {
+        state[0] += keys[0];
+        state[1] += keys[1];
+        state[0] = poseidon2_sbox(state[0]);
+        state[1] = poseidon2_sbox(state[1]);
+        poseidon2_mat_mul_external(state);
+    }
+}
+
+/// x^5 S-box, matching gnark-crypto's `sBox` (x^2, then x^4, then x^5 = x^4 * x).
+fn poseidon2_sbox<F: ark_ff::Field>(x: F) -> F {
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    x4 * x
+}
+
+/// External linear layer for width=2: circulant matrix `[[2,1],[1,2]]`,
+/// i.e. `[a, b] -> [2a+b, a+2b]`.
+fn poseidon2_mat_mul_external<F: ark_ff::Field>(state: &mut [F; 2]) {
+    let tmp = state[0] + state[1];
+    state[0] = tmp + state[0];
+    state[1] = tmp + state[1];
+}
+
+/// Internal linear layer for width=2: matrix `[[2,1],[1,3]]`, i.e.
+/// `[a, b] -> [2a+b, a+3b]`.
+fn poseidon2_mat_mul_internal<F: ark_ff::Field>(state: &mut [F; 2]) {
+    let sum = state[0] + state[1];
+    let new0 = state[0] + sum;
+    let new1 = state[1] + state[1] + sum;
+    state[0] = new0;
+    state[1] = new1;
+}
+
+/// Derive Poseidon2 round keys from a parameter seed string using
+/// chained Keccak-256, matching gnark-crypto's `Parameters.initRC`.
+///
+/// Round key widths: the first and last `NbFullRounds/2` rounds each use a
+/// full-width (2-element) key; the `NbPartialRounds` rounds in between each
+/// use a single-element key (added only to lane 0).
+fn poseidon2_round_keys<F: ark_ff::PrimeField>(seed: &str) -> Vec<Vec<F>> {
+    use sha3::{Digest, Keccak256};
+    const RF: usize = 6;
+    const RP: usize = 50;
+    const WIDTH: usize = 2;
+    let half = RF / 2;
+
+    let mut hasher = Keccak256::new();
+    hasher.update(seed.as_bytes());
+    let mut rnd = hasher.finalize_reset().to_vec();
+    hasher.update(&rnd);
+
+    let mut round_keys = Vec::with_capacity(RF + RP);
+    for i in 0..(RF + RP) {
+        let width = if i < half || i >= half + RP { WIDTH } else { 1 };
+        let mut keys = Vec::with_capacity(width);
+        for _ in 0..width {
+            rnd = hasher.finalize_reset().to_vec();
+            let bi = num_bigint::BigUint::from_bytes_be(&rnd);
+            keys.push(F::from(bi));
+            hasher.update(&rnd);
+        }
+        round_keys.push(keys);
+    }
+    round_keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3319,5 +3511,179 @@ mod tests {
         let result =
             mimc_bn254_direct("30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000002");
         assert!(result.is_err(), "should reject element >= BN254 Fr modulus");
+    }
+
+    // -----------------------------------------------------------------------
+    // Poseidon2 tests (using go-algorand's TestPoseidon2 vectors, gnark-crypto)
+    // -----------------------------------------------------------------------
+
+    /// Helper: compute Poseidon2 hash directly (for unit testing, not through the VM).
+    fn poseidon2_bn254_direct(input_hex: &str) -> Result<Vec<u8>, AlgoError> {
+        let data = super::super::hex_decode(input_hex);
+        super::poseidon2_bn254(&data)
+    }
+
+    fn poseidon2_bls12_direct(input_hex: &str) -> Result<Vec<u8>, AlgoError> {
+        let data = super::super::hex_decode(input_hex);
+        super::poseidon2_bls12_381(&data)
+    }
+
+    #[test]
+    fn test_poseidon2_bn254_single_chunk() {
+        // From go-algorand TestPoseidon2: preImageTestVectors[1] = 32-byte input (< modulus)
+        // circuitHashTestVectors["BN254t2"][1]
+        let result = poseidon2_bn254_direct(
+            "23a950068dd3d1e21cee48e7919be7ae32cdef70311fc486336ea9d4b5042535",
+        )
+        .unwrap();
+        let result_int = num_bigint::BigUint::from_bytes_be(&result);
+        assert_eq!(
+            result_int.to_string(),
+            "9508867777362231262564394485161648897131889139474639535709054689562539246209",
+            "BN254 Poseidon2 single-chunk hash mismatch"
+        );
+    }
+
+    #[test]
+    fn test_poseidon2_bn254_three_chunks() {
+        // From go-algorand TestPoseidon2: preImageTestVectors[4] = 96-byte input (3 chunks)
+        // circuitHashTestVectors["BN254t2"][4]
+        let result = poseidon2_bn254_direct(
+            "183de351a72141d79c51a27d10405549c98302cb2536c5968deeb3cba635121723a950068dd3d1e21cee48e7919be7ae32cdef70311fc486336ea9d4b504253530644e72e131a029b85045b68181585d2833e84879b9709143e1f593ef676981",
+        ).unwrap();
+        let result_int = num_bigint::BigUint::from_bytes_be(&result);
+        assert_eq!(
+            result_int.to_string(),
+            "6791735139456093729163685856803485582211494197517701835714118539027901440151",
+            "BN254 Poseidon2 three-chunk hash mismatch"
+        );
+    }
+
+    #[test]
+    fn test_poseidon2_bn254_exceeds_modulus() {
+        // From go-algorand TestPoseidon2: 32 bytes >= BLS12-381 Fr modulus (also > BN254 Fr modulus)
+        let result = poseidon2_bn254_direct(
+            "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000002",
+        );
+        assert!(result.is_err(), "should reject element >= BN254 Fr modulus");
+    }
+
+    #[test]
+    fn test_poseidon2_bn254_empty_input() {
+        // The opcode handler checks for empty before calling poseidon2_bn254.
+        // poseidon2_bn254 itself returns h=0 for empty input (which is valid),
+        // but the opcode rejects it.
+        let _result = super::poseidon2_bn254(&[]);
+    }
+
+    #[test]
+    fn test_poseidon2_bls12_single_chunk() {
+        // From go-algorand TestPoseidon2: BLS12_381t2 config, preImageTestVectors[1]
+        // circuitHashTestVectors["BLS12_381t2"][1]
+        let result = poseidon2_bls12_direct(
+            "23a950068dd3d1e21cee48e7919be7ae32cdef70311fc486336ea9d4b5042535",
+        )
+        .unwrap();
+        let result_int = num_bigint::BigUint::from_bytes_be(&result);
+        assert_eq!(
+            result_int.to_string(),
+            "34960972753749415790402211978912014226528569245540044525901549350192685584856",
+            "BLS12-381 Poseidon2 single-chunk hash mismatch"
+        );
+    }
+
+    #[test]
+    fn test_poseidon2_bls12_three_chunks() {
+        // From go-algorand TestPoseidon2: BLS12_381t2 config, preImageTestVectors[4]
+        // circuitHashTestVectors["BLS12_381t2"][4]
+        let result = poseidon2_bls12_direct(
+            "183de351a72141d79c51a27d10405549c98302cb2536c5968deeb3cba635121723a950068dd3d1e21cee48e7919be7ae32cdef70311fc486336ea9d4b504253530644e72e131a029b85045b68181585d2833e84879b9709143e1f593ef676981",
+        ).unwrap();
+        let result_int = num_bigint::BigUint::from_bytes_be(&result);
+        assert_eq!(
+            result_int.to_string(),
+            "42428992405405528150674275794637337448740652553021708843638392031995718438793",
+            "BLS12-381 Poseidon2 three-chunk hash mismatch"
+        );
+    }
+
+    #[test]
+    fn test_poseidon2_bls12_exceeds_modulus() {
+        // From go-algorand TestPoseidon2: 32 bytes >= BLS12-381 Fr modulus
+        let result = poseidon2_bls12_direct(
+            "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000002",
+        );
+        assert!(
+            result.is_err(),
+            "should reject element >= BLS12-381 Fr modulus"
+        );
+    }
+
+    #[test]
+    fn test_op_poseidon2_via_vm_bn254() {
+        // Full opcode dispatch: pushbytes <32-byte input>; poseidon2 BN254t2; pushbytes <expected>; ==
+        let mut code = Vec::new();
+        pushbytes(
+            &mut code,
+            &super::super::hex_decode(
+                "23a950068dd3d1e21cee48e7919be7ae32cdef70311fc486336ea9d4b5042535",
+            ),
+        );
+        code.push(0xe7); // poseidon2
+        code.push(0x00); // BN254t2
+        let expected = num_bigint::BigUint::parse_bytes(
+            b"9508867777362231262564394485161648897131889139474639535709054689562539246209",
+            10,
+        )
+        .unwrap()
+        .to_bytes_be();
+        let mut expected32 = vec![0u8; 32];
+        let start = 32 - expected.len();
+        expected32[start..].copy_from_slice(&expected);
+        pushbytes(&mut code, &expected32);
+        code.push(0x12); // ==
+        code.push(0x43); // return
+
+        let machine = run_prog(13, &code).expect("poseidon2 opcode should run");
+        assert!(machine.pass);
+    }
+
+    #[test]
+    fn test_op_poseidon2_rejects_empty_input() {
+        let mut code = Vec::new();
+        pushbytes(&mut code, &[]);
+        code.push(0xe7); // poseidon2
+        code.push(0x00); // BN254t2
+        let program = parse(&prog(13, &code)).unwrap();
+        let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
+        let result = machine.run(&mut NullContext);
+        assert!(result.is_err(), "poseidon2 should reject empty input");
+    }
+
+    #[test]
+    fn test_op_poseidon2_rejects_non_multiple_of_32() {
+        let mut code = Vec::new();
+        pushbytes(&mut code, &[0xde, 0xad, 0xf0, 0x0d]);
+        code.push(0xe7); // poseidon2
+        code.push(0x00); // BN254t2
+        let program = parse(&prog(13, &code)).unwrap();
+        let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
+        let result = machine.run(&mut NullContext);
+        assert!(
+            result.is_err(),
+            "poseidon2 should reject input not a multiple of 32 bytes"
+        );
+    }
+
+    #[test]
+    fn test_op_poseidon2_rejects_invalid_config() {
+        let mut code = Vec::new();
+        pushbytes(&mut code, &[0u8; 32]);
+        code.push(0xe7); // poseidon2
+        code.push(0x02); // invalid config
+        let program = parse(&prog(13, &code)).unwrap();
+        let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
+        let result = machine.run(&mut NullContext);
+        assert!(result.is_err(), "poseidon2 should reject invalid config");
     }
 }
