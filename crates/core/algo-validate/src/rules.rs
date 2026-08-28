@@ -199,13 +199,29 @@ pub fn validate_transaction_wellformed(
     // of whether the protocol version enables fee pooling (Go checks this
     // in TxnGroup for both pooled and non-pooled modes).
     let is_stpf = txn.txn_type == "stpf";
-    if !is_stpf && !is_free_heartbeat && !allow_fee_pooling && txn.fee < params.min_txn_fee {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "transaction fee {} is below minimum {}",
-                txn.fee, params.min_txn_fee
-            ),
-        });
+    if !is_stpf && !is_free_heartbeat && !allow_fee_pooling {
+        // Usage-based required fee (Go: `ledger/eval.CheckGroupFees`, applied
+        // here to a singleton "group" of one). For an ordinary transaction
+        // with no oversized/billable features this is exactly
+        // `params.min_txn_fee`, so the check and its wording are unchanged
+        // from the flat comparison for every transaction that isn't using
+        // v42+ size pricing. A transaction with billable oversized fields
+        // (large note/app-args/app-programs) requires more than the flat
+        // minimum, mirroring go's `feeFactor`/`FeeForUsage`.
+        let (required_fee, overflow) = crate::fee::required_fee_for_txn(txn, params);
+        if overflow {
+            return Err(AlgoError::Validation {
+                message: "transaction required fee overflow".to_string(),
+            });
+        }
+        if txn.fee < required_fee {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "transaction fee {} is below minimum {}",
+                    txn.fee, required_fee
+                ),
+            });
+        }
     }
 
     // Last valid must be >= first valid.
@@ -229,13 +245,18 @@ pub fn validate_transaction_wellformed(
         });
     }
 
-    // Note must not exceed max_txn_note_bytes.
-    if txn.note.len() > params.max_txn_note_bytes {
+    // Note must not exceed the hard MaxAbsoluteTxnNoteBytes cap (Go:
+    // `len(tx.Note) > proto.MaxAbsoluteTxnNoteBytes`, unconditional at every
+    // protocol version). Bytes between the old free/soft cap
+    // (max_txn_note_bytes) and this hard cap are well-formed but billable via
+    // `fee::header_fee_contribution` (v42+ size pricing).
+    let max_note_bytes = crate::fee::effective_max_note_bytes(params);
+    if txn.note.len() > max_note_bytes {
         return Err(AlgoError::Validation {
             message: format!(
-                "note size {} exceeds maximum {}",
+                "transaction note too big: {} > {}",
                 txn.note.len(),
-                params.max_txn_note_bytes
+                max_note_bytes
             ),
         });
     }
@@ -386,6 +407,31 @@ fn validate_application_call_wellformed(
                 });
             }
         }
+    }
+
+    // Total ApplicationArgs byte length must not exceed the hard
+    // MaxAbsoluteTotalArgLen cap (Go: `argSum > proto.MaxAbsoluteTotalArgLen`,
+    // `data/transactions/application.go`, unconditional at every protocol
+    // version). Bytes between the old free/soft cap (max_app_total_arg_len)
+    // and this hard cap are well-formed but billable via
+    // `fee::app_call_fee_contribution` (v42+ size pricing).
+    let total_arg_bytes: usize = txn
+        .app_arguments
+        .as_ref()
+        .map(|args| {
+            args.iter()
+                .map(|a| a.as_ref().map(|b| b.len()).unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0);
+    let max_total_arg_len = crate::fee::effective_max_total_arg_len(params);
+    if total_arg_bytes > max_total_arg_len {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "tx.ApplicationArgs total length is too long. {} > {}",
+                total_arg_bytes, max_total_arg_len
+            ),
+        });
     }
 
     // MaxLocalSchemaEntries / MaxGlobalSchemaEntries: unconditional size caps,
@@ -644,8 +690,8 @@ pub fn validate_group_fees_with_params(
 ) -> Result<(), crate::block::BlockValidationError> {
     use std::collections::HashMap;
 
-    // Collect (total_fee, min_fee_count) by group ID.
-    let mut groups: HashMap<&[u8], (u64, u64)> = HashMap::new();
+    // Collect the group's members by group ID (preserving encounter order).
+    let mut groups: HashMap<&[u8], Vec<&SignedTransaction>> = HashMap::new();
     let mut order: Vec<&[u8]> = Vec::new();
 
     for stx in txns {
@@ -655,27 +701,24 @@ pub fn validate_group_fees_with_params(
         let grp: &[u8] = stx.txn.group.as_ref();
         let entry = groups.entry(grp).or_insert_with(|| {
             order.push(grp);
-            (0u64, 0u64)
+            Vec::new()
         });
-        entry.0 = entry.0.saturating_add(stx.txn.fee);
-
-        // State proofs are always fee-exempt (don't increment min_fee_count).
-        if stx.txn.txn_type == "stpf" {
-            continue;
-        }
-        // Ungrouped heartbeat txns are fee-exempt (v40+). Within a group,
-        // heartbeats are NOT exempt per Go's verify/txn.go — the exemption
-        // only applies when `Group.IsZero()`. Since we're inside the grouped
-        // branch here (grp is non-empty), heartbeats in groups count normally.
-        // (This matches Go: `stxn.Txn.Type == protocol.HeartbeatTx && stxn.Txn.Group.IsZero()`)
-
-        entry.1 += 1;
+        entry.push(stx);
     }
 
+    // Usage-based group fee check (Go: `transactions.SummarizeFees` +
+    // `ledger/eval.CheckGroupFees`): required fee is `FeeForUsage(min_txn_fee,
+    // usage, 1e6, 0)` where `usage` sums each member's `feeFactor` (1e6 per
+    // ordinary transaction, 0 for state proofs, more for a transaction with
+    // billable oversized fields, v42+) plus the group's pooled LogicSig
+    // program-byte surcharge. For a group with no size-pricing/state-proof/
+    // heartbeat-discount members this reduces to exactly `len(group) *
+    // min_txn_fee`, matching the previous flat count-based check.
     for grp_key in &order {
-        let (total_fee, min_fee_count) = groups[grp_key];
-        let required_fee = min_fee_count * params.min_txn_fee;
-        if total_fee < required_fee {
+        let members = &groups[grp_key];
+        let (usage, total_fee) = crate::fee::summarize_fees(members, params);
+        let (required_fee, overflow) = crate::fee::required_fee_for_usage(usage, params);
+        if overflow || total_fee < required_fee {
             return Err(crate::block::BlockValidationError::GroupFeePoolingFailed {
                 group_id: hex::encode(grp_key),
                 total_fee,
@@ -805,11 +848,18 @@ mod tests {
 
     #[test]
     fn test_note_too_large_fails() {
+        // `validate_transaction_rules` uses ConsensusParams::default() (v42),
+        // which has MaxAbsoluteTxnNoteBytes = 4096 (size-pricing enabled).
+        // Since v42, a 1025-byte note is well-formed on its own -- the flat
+        // MAX_NOTE_SIZE (1024) is no longer a hard reject -- so it fails on
+        // the *fee* check instead (a 1025-byte note requires more than
+        // MIN_TXN_FEE). See `test_note_over_hard_cap_v42_is_rejected` for the
+        // true structural hard-cap rejection.
         let mut txn = make_valid_txn();
         txn.note = ByteBuf::from(vec![0u8; MAX_NOTE_SIZE + 1]);
         let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("note size"), "unexpected error: {msg}");
+        assert!(msg.contains("below minimum"), "unexpected error: {msg}");
     }
 
     #[test]
@@ -817,6 +867,82 @@ mod tests {
         let mut txn = make_valid_txn();
         txn.note = ByteBuf::from(vec![0u8; MAX_NOTE_SIZE]);
         assert!(validate_transaction_rules(&txn, false).is_ok());
+    }
+
+    // ── Big-transaction size pricing (issue #657) ────────────────
+
+    #[test]
+    fn test_note_over_soft_cap_pre_v42_is_hard_rejected() {
+        // Pre-v42, MaxAbsoluteTxnNoteBytes == MaxTxnNoteBytes (both 1024): no
+        // size pricing exists yet, so any note beyond the free cap is
+        // unconditionally not well-formed, regardless of fee paid.
+        let params = consensus_params_for_version(algo_types::consensus::CONSENSUS_V41).unwrap();
+        let mut txn = make_valid_txn();
+        txn.note = ByteBuf::from(vec![0u8; MAX_NOTE_SIZE + 1]);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("note too big"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_note_over_soft_cap_v42_is_well_formed_but_needs_higher_fee() {
+        // v42+: a note beyond the old free cap but within
+        // MaxAbsoluteTxnNoteBytes (4096) is well-formed on its own, but the
+        // flat MIN_TXN_FEE is no longer sufficient to cover it.
+        let params = ConsensusParams::default(); // v42
+        let mut txn = make_valid_txn();
+        txn.note = ByteBuf::from(vec![0u8; MAX_NOTE_SIZE + 1]);
+
+        let (required, overflow) = crate::fee::required_fee_for_txn(&txn, &params);
+        assert!(!overflow);
+        assert!(
+            required > params.min_txn_fee,
+            "oversized note should require more than the flat minimum fee"
+        );
+
+        // Paying only the flat minimum is not enough once the fee check
+        // accounts for the note surcharge (the fee check runs before the
+        // note-size structural check, so this is the error we observe).
+        txn.fee = MIN_TXN_FEE;
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(err.to_string().contains("below minimum"));
+
+        // Paying the exact required fee passes -- the oversized note is
+        // well-formed on its own, it's simply billable.
+        txn.fee = required;
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_note_over_hard_cap_v42_is_rejected() {
+        let params = ConsensusParams::default(); // v42, MaxAbsoluteTxnNoteBytes = 4096
+        let mut txn = make_valid_txn();
+        txn.note = ByteBuf::from(vec![0u8; params.max_absolute_txn_note_bytes + 1]);
+        // Overpay generously so the fee check can't mask the structural
+        // hard-cap rejection we're testing for.
+        txn.fee = u64::MAX / 2;
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(err.to_string().contains("note too big"));
+    }
+
+    #[test]
+    fn test_app_args_over_hard_cap_v42_is_rejected() {
+        let params = ConsensusParams::default(); // v42, MaxAbsoluteTotalArgLen = 16384
+        let mut txn = make_valid_txn();
+        txn.txn_type = "appl".into();
+        txn.app_arguments = Some(vec![Some(ByteBuf::from(vec![
+            0u8;
+            params.max_absolute_total_arg_len
+                + 1
+        ]))]);
+        // Overpay generously so the fee check can't mask the structural
+        // hard-cap rejection we're testing for.
+        txn.fee = u64::MAX / 2;
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("ApplicationArgs total length"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

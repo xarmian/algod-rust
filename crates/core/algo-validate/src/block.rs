@@ -31,7 +31,7 @@ use crate::rules::{
     SpecialAddresses, MAX_TIMESTAMP_INCREMENT,
 };
 use crate::signature::{
-    verify_auth_addr_sender_diff, verify_group_logicsig_size, verify_heartbeat_proof,
+    logic_sig_group_size_check, verify_auth_addr_sender_diff, verify_heartbeat_proof,
     verify_transaction_signature,
 };
 
@@ -382,13 +382,16 @@ pub fn validate_block(
             total_txn_bytes += encoded.len();
         }
 
-        // Group-level LogicSig size pooling check (Go: EnableLogicSigSizePooling, v40+).
-        if params.enable_logicsig_size_pooling {
-            if let Err(e) = verify_group_logicsig_size(&group_txns, &params) {
-                errors.push(BlockValidationError::GroupValidationFailed {
-                    error: e.to_string(),
-                });
-            }
+        // Group-level LogicSig size check (Go: `verify.logicSigGroupSizeCheck`,
+        // `data/transactions/verify/txn.go`, v5.0.0-stable). Called
+        // unconditionally, matching upstream: pre-v18 (LogicSigMaxSize == 0)
+        // and pre-v40 (no pooling) protocols simply have an available pool of
+        // `0` or `len(group) * LogicSigMaxSize` respectively, which the
+        // function's own arithmetic already accounts for.
+        if let Err(e) = logic_sig_group_size_check(&group_txns, &params) {
+            errors.push(BlockValidationError::GroupValidationFailed {
+                error: e.to_string(),
+            });
         }
     }
 
