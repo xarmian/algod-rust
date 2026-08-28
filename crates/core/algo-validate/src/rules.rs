@@ -1214,7 +1214,8 @@ mod tests {
         let params = ConsensusParams::default();
         let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
         assert!(
-            err.to_string().contains("Note is set in discounted heartbeat"),
+            err.to_string()
+                .contains("Note is set in discounted heartbeat"),
             "expected note rejection in discounted heartbeat, got: {err}"
         );
     }
@@ -1309,7 +1310,11 @@ mod tests {
         // Flag set even while grouped: still free post-v42 (unlike pre-v42).
         let mut txn_flag_grouped = make_heartbeat_txn(MIN_TXN_FEE);
         txn_flag_grouped.group = [0xFF; 32];
-        txn_flag_grouped.heartbeat.as_mut().unwrap().hb_challenge_discount = true;
+        txn_flag_grouped
+            .heartbeat
+            .as_mut()
+            .unwrap()
+            .hb_challenge_discount = true;
         assert!(is_free_heartbeat(&txn_flag_grouped, &params));
     }
 
