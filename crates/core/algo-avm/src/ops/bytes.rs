@@ -471,6 +471,7 @@ mod tests {
     fn dummy_instr(opcode: u8, immediates: Immediates) -> Instruction {
         Instruction {
             opcode,
+            sub_opcode: None,
             offset: 0,
             immediates,
         }

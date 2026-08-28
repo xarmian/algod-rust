@@ -803,7 +803,7 @@ pub fn decode_base_account_data(raw: &[u8]) -> Result<CatchpointBaseAccountData,
 ///   t=LocalStateSchemaNumUint, u=LocalStateSchemaNumByteSlice,
 ///   v=GlobalStateSchemaNumUint, w=GlobalStateSchemaNumByteSlice,
 ///   x=ExtraProgramPages, y=ResourceFlags, z=UpdateRound,
-///   A=Version, B=SizeSponsor
+///   A=Version, B=SizeSponsor, C=ForeignBoxReads, D=FamilyBoxAccess
 ///
 /// Array order (from Go struct declaration):
 ///   Total, Decimals, DefaultFrozen, UnitName, AssetName, URL, MetadataHash,
@@ -812,7 +812,8 @@ pub fn decode_base_account_data(raw: &[u8]) -> Result<CatchpointBaseAccountData,
 ///   ApprovalProgram, ClearStateProgram, GlobalState,
 ///   LocalStateSchemaNumUint, LocalStateSchemaNumByteSlice,
 ///   GlobalStateSchemaNumUint, GlobalStateSchemaNumByteSlice,
-///   ExtraProgramPages, ResourceFlags, UpdateRound, Version, SizeSponsor
+///   ExtraProgramPages, ResourceFlags, UpdateRound, Version, SizeSponsor,
+///   ForeignBoxReads, FamilyBoxAccess
 pub fn decode_resources_data(raw: &[u8]) -> Result<CatchpointResourcesData, CatchpointError> {
     if raw.is_empty() {
         return Ok(CatchpointResourcesData::default());
@@ -854,6 +855,8 @@ pub fn decode_resources_data(raw: &[u8]) -> Result<CatchpointResourcesData, Catc
                     "z" => result.update_round = read_u64(&mut rd)?,
                     "A" => result.version = read_u64(&mut rd)?,
                     "B" => result.size_sponsor = read_bytes_fixed::<32>(&mut rd)?,
+                    "C" => result.foreign_box_reads = read_bool(&mut rd)?,
+                    "D" => result.family_box_access = read_bool(&mut rd)?,
                     _ => skip_value(&mut rd)?,
                 }
             }
@@ -942,6 +945,8 @@ pub fn decode_resources_data(raw: &[u8]) -> Result<CatchpointResourcesData, Catc
             next_field!(result.update_round, u64);
             next_field!(result.version, u64);
             next_field!(result.size_sponsor, bytes32);
+            next_field!(result.foreign_box_reads, bool);
+            next_field!(result.family_box_access, bool);
             _ = idx;
         }
     }

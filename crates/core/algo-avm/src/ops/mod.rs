@@ -248,6 +248,9 @@ pub fn dispatch(
         0x74 => state::op_voter_params_get(machine, instruction, ctx),
         0x75 => state::op_online_stake(machine, instruction, ctx),
 
+        // ---- App params set (foreignBoxVersion / v5.0.0-stable) ----
+        0x76 => state::op_app_params_set(machine, instruction, ctx),
+
         // ---- Min balance ----
         0x78 => state::op_min_balance(machine, instruction, ctx),
 

@@ -24,6 +24,7 @@ fn new_machine(budget: i64) -> AvmMachine {
 fn fake_instr() -> Instruction {
     Instruction {
         opcode: 0x87,
+        sub_opcode: None,
         offset: 0,
         immediates: Immediates::None,
     }

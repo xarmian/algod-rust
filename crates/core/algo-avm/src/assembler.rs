@@ -1790,7 +1790,7 @@ fn resolve_field_immediate_at(
 
         ("asset_holding_get", 0) => fields::asset_holding_field_by_name(arg),
         ("asset_params_get", 0) => fields::asset_params_field_by_name(arg),
-        ("app_params_get", 0) => fields::app_params_field_by_name(arg),
+        ("app_params_get", 0) | ("app_params_set", 0) => fields::app_params_field_by_name(arg),
         ("acct_params_get", 0) => fields::acct_params_field_by_name(arg),
         ("voter_params_get", 0) => fields::voter_params_field_by_name(arg),
 

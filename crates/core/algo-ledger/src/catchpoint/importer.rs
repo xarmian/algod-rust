@@ -840,6 +840,8 @@ fn is_empty_app_fields(rd: &super::types::CatchpointResourcesData) -> bool {
         && rd.extra_program_pages == 0
         && rd.version == 0
         && rd.size_sponsor == [0u8; 32]
+        && !rd.foreign_box_reads
+        && !rd.family_box_access
 }
 
 /// Check if a rusqlite error is a UNIQUE constraint violation.

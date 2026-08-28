@@ -372,6 +372,8 @@ fn app_params_record(p: &AppParams) -> crate::state_delta::AppParamsRecord {
         extra_program_pages: p.extra_program_pages,
         version: p.version,
         size_sponsor: p.size_sponsor,
+        foreign_box_reads: p.foreign_box_reads,
+        family_box_access: p.family_box_access,
     }
 }
 

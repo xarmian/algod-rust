@@ -349,6 +349,7 @@ mod tests {
     fn dummy_instruction() -> Instruction {
         Instruction {
             opcode: 0x00,
+            sub_opcode: None,
             offset: 0,
             immediates: Immediates::None,
         }

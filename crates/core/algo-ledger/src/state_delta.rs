@@ -1033,6 +1033,14 @@ pub struct AppParamsRecord {
     /// program pages / global schema via a sponsoring account.
     #[serde(rename = "ss", default, skip_serializing_if = "is_default_address")]
     pub size_sponsor: Address,
+    /// Go codec tag: `"fbr"`. Same not-yet-populated caveat as
+    /// `version`/`size_sponsor` above (issue #659) -- `app_resources` isn't
+    /// constructed from real apply-time state yet.
+    #[serde(rename = "fbr", default, skip_serializing_if = "is_false")]
+    pub foreign_box_reads: bool,
+    /// Go codec tag: `"fba"`. Same caveat as `foreign_box_reads` above.
+    #[serde(rename = "fba", default, skip_serializing_if = "is_false")]
+    pub family_box_access: bool,
 }
 
 #[cfg(test)]
@@ -1173,6 +1181,8 @@ mod issue_579_short_codec_tag_wire_format_tests {
             extra_program_pages: 1,
             version: 0,
             size_sponsor: Address([0u8; 32]),
+            foreign_box_reads: false,
+            family_box_access: false,
         };
         let json = serde_json::to_value(&record).expect("must serialize");
         let obj = json.as_object().expect("encodes as a JSON object");
@@ -1218,6 +1228,8 @@ mod issue_579_short_codec_tag_wire_format_tests {
             extra_program_pages: 0,
             version: 7,
             size_sponsor: Address([9u8; 32]),
+            foreign_box_reads: false,
+            family_box_access: false,
         };
         let json = serde_json::to_value(&record).expect("must serialize");
         let obj = json.as_object().expect("encodes as a JSON object");
@@ -1229,6 +1241,47 @@ mod issue_579_short_codec_tag_wire_format_tests {
 
         let back: AppParamsRecord = serde_json::from_value(json).expect("must deserialize");
         assert_eq!(back, record);
+    }
+
+    /// Issue #659: `AppParams` also declares `ForeignBoxReads`
+    /// (`codec:"fbr"`) and `FamilyBoxAccess` (`codec:"fba"`) -- same
+    /// short-tag and `omitempty`-when-zero contract as `Version`/
+    /// `SizeSponsor` above.
+    #[test]
+    fn app_params_record_json_uses_go_short_codec_tags_for_foreign_box_fields() {
+        let record = AppParamsRecord {
+            approval_program: vec![0x06, 0x81, 0x01],
+            clear_state_program: vec![0x06, 0x81, 0x01],
+            global_state: None,
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+            version: 0,
+            size_sponsor: Address([0u8; 32]),
+            foreign_box_reads: true,
+            family_box_access: true,
+        };
+        let json = serde_json::to_value(&record).expect("must serialize");
+        let obj = json.as_object().expect("encodes as a JSON object");
+
+        assert_eq!(obj["fbr"], serde_json::json!(true), "obj: {obj:?}");
+        assert_eq!(obj["fba"], serde_json::json!(true), "obj: {obj:?}");
+        assert!(obj.get("ForeignBoxReads").is_none(), "obj: {obj:?}");
+        assert!(obj.get("FamilyBoxAccess").is_none(), "obj: {obj:?}");
+
+        let back: AppParamsRecord = serde_json::from_value(json).expect("must deserialize");
+        assert_eq!(back, record);
+
+        // `false` (the default) must be omitted entirely, like `v`/`ss`.
+        let default_record = AppParamsRecord {
+            foreign_box_reads: false,
+            family_box_access: false,
+            ..record
+        };
+        let json = serde_json::to_value(&default_record).expect("must serialize");
+        let obj = json.as_object().expect("encodes as a JSON object");
+        assert!(!obj.contains_key("fbr"), "obj: {obj:?}");
+        assert!(!obj.contains_key("fba"), "obj: {obj:?}");
     }
 
     /// `Version`/`SizeSponsor` zero-valued must be omitted entirely (go's
@@ -1245,11 +1298,15 @@ mod issue_579_short_codec_tag_wire_format_tests {
             extra_program_pages: 0,
             version: 0,
             size_sponsor: Address([0u8; 32]),
+            foreign_box_reads: false,
+            family_box_access: false,
         };
         let json = serde_json::to_value(&record).expect("must serialize");
         let obj = json.as_object().expect("encodes as a JSON object");
         assert!(!obj.contains_key("v"), "obj: {obj:?}");
         assert!(!obj.contains_key("ss"), "obj: {obj:?}");
+        assert!(!obj.contains_key("fbr"), "obj: {obj:?}");
+        assert!(!obj.contains_key("fba"), "obj: {obj:?}");
     }
 
     /// Issue #608 (live-verified against a real go-algorand v4.7.0-stable
@@ -1295,6 +1352,8 @@ mod issue_579_short_codec_tag_wire_format_tests {
             extra_program_pages: 0,
             version: 0,
             size_sponsor: Address([0u8; 32]),
+            foreign_box_reads: false,
+            family_box_access: false,
         };
         let json = serde_json::to_value(&record).expect("must serialize");
         let obj = json.as_object().expect("encodes as a JSON object");

@@ -2469,6 +2469,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     7 => TealValue::Bytes(p.creator.0.to_vec()),
                     // AppAddress
                     8 => TealValue::Bytes(app_address(app_id).to_vec()),
+                    // AppVersion
+                    9 => TealValue::Uint(p.version),
+                    // AppSizeSponsor
+                    10 => TealValue::Bytes(p.size_sponsor.0.to_vec()),
+                    // AppForeignBoxReads
+                    11 => TealValue::Uint(p.foreign_box_reads as u64),
+                    // AppFamilyBoxAccess
+                    12 => TealValue::Uint(p.family_box_access as u64),
                     _ => {
                         return Err(AlgoError::Avm {
                             message: format!("unknown AppParamsField index: {field}"),
@@ -2479,6 +2487,39 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             }
             None => Ok((TealValue::Uint(0), false)),
         }
+    }
+
+    /// `app_params_set AppForeignBoxReads`: read-modify-write the current
+    /// app's `AppParams.foreign_box_reads` flag. Mirrors go-algorand's
+    /// `roundCowState.SetForeignBoxReads` / `appParamsSetter`
+    /// (`ledger/eval/cow_creatables.go`), minus the explicit creator-address
+    /// lookup that go's account-scoped storage requires -- algod-rust's
+    /// `AppStore` addresses app params directly by `app_id`.
+    fn set_foreign_box_reads(&mut self, app_id: u64, enable: bool) -> Result<(), AlgoError> {
+        let mut p = self
+            .store
+            .get_app_params(app_id)
+            .ok_or_else(|| AlgoError::Avm {
+                message: format!("app {app_id} does not exist"),
+            })?;
+        p.foreign_box_reads = enable;
+        self.store.set_app_params(app_id, p);
+        Ok(())
+    }
+
+    /// `app_params_set AppFamilyBoxAccess`: read-modify-write the current
+    /// app's `AppParams.family_box_access` flag. See
+    /// [`Self::set_foreign_box_reads`] for the go-algorand mirror.
+    fn set_family_box_access(&mut self, app_id: u64, enable: bool) -> Result<(), AlgoError> {
+        let mut p = self
+            .store
+            .get_app_params(app_id)
+            .ok_or_else(|| AlgoError::Avm {
+                message: format!("app {app_id} does not exist"),
+            })?;
+        p.family_box_access = enable;
+        self.store.set_app_params(app_id, p);
+        Ok(())
     }
 
     fn acct_params_get(
