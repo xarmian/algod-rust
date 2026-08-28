@@ -4634,6 +4634,90 @@ mod tests {
         assert_eq!(val, TealValue::Uint(0));
     }
 
+    /// Issue #659: `AppVersion`(9)/`AppSizeSponsor`(10)/`AppForeignBoxReads`(11)/
+    /// `AppFamilyBoxAccess`(12) must be readable via `app_params_get`,
+    /// matching go-algorand's field indices exactly.
+    #[test]
+    fn app_params_get_version_size_sponsor_and_foreign_box_fields() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.app_params.insert(
+            42,
+            AppParams {
+                creator: Address([1u8; 32]),
+                version: 3,
+                size_sponsor: Address([9u8; 32]),
+                foreign_box_reads: true,
+                family_box_access: false,
+                ..Default::default()
+            },
+        );
+        let ctx = make_context(&mut store, vec![txn]);
+
+        let (val, exists) = ctx.app_params_get(42, 9).unwrap(); // AppVersion
+        assert!(exists);
+        assert_eq!(val, TealValue::Uint(3));
+
+        let (val, _) = ctx.app_params_get(42, 10).unwrap(); // AppSizeSponsor
+        assert_eq!(val, TealValue::Bytes([9u8; 32].to_vec()));
+
+        let (val, _) = ctx.app_params_get(42, 11).unwrap(); // AppForeignBoxReads
+        assert_eq!(val, TealValue::Uint(1));
+
+        let (val, _) = ctx.app_params_get(42, 12).unwrap(); // AppFamilyBoxAccess
+        assert_eq!(val, TealValue::Uint(0));
+    }
+
+    /// `app_params_set AppForeignBoxReads`/`AppFamilyBoxAccess` must
+    /// actually persist through the real `LedgerStore` (not just a mock),
+    /// closing the "round-trips correctly through state" acceptance
+    /// criterion end-to-end (write via `set_*`, read back via
+    /// `store.get_app_params` directly, independent of `app_params_get`).
+    #[test]
+    fn app_params_set_foreign_box_reads_and_family_box_access_persist_through_store() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.app_params.insert(
+            42,
+            AppParams {
+                creator: Address([1u8; 32]),
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        let p = ctx.store.get_app_params(42).unwrap();
+        assert!(!p.foreign_box_reads);
+        assert!(!p.family_box_access);
+
+        ctx.set_foreign_box_reads(42, true).unwrap();
+        let p = ctx.store.get_app_params(42).unwrap();
+        assert!(p.foreign_box_reads);
+        assert!(!p.family_box_access);
+
+        ctx.set_family_box_access(42, true).unwrap();
+        let p = ctx.store.get_app_params(42).unwrap();
+        assert!(p.foreign_box_reads);
+        assert!(p.family_box_access);
+
+        ctx.set_foreign_box_reads(42, false).unwrap();
+        let p = ctx.store.get_app_params(42).unwrap();
+        assert!(!p.foreign_box_reads);
+        assert!(p.family_box_access);
+    }
+
+    /// Setting a flag on a nonexistent app must error, not silently no-op or
+    /// panic (mirrors go's `appParamsSetter`'s `"app %d does not exist"`).
+    #[test]
+    fn app_params_set_on_missing_app_errors() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        assert!(ctx.set_foreign_box_reads(999, true).is_err());
+        assert!(ctx.set_family_box_access(999, true).is_err());
+    }
+
     // ---- acct_params_get tests ----
 
     #[test]
