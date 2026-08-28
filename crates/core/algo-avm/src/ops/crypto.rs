@@ -61,8 +61,13 @@ pub fn op_sha3_256(machine: &mut AvmMachine, _instruction: &Instruction) -> Resu
 /// hash used in State Proofs. Matches go-algorand's `opSumhash512` which calls
 /// `sumhash.New512(nil)` with no salt.
 ///
-/// Dynamic cost: `150 + 7 * DivCeil(len, 4)`, matching go-algorand
-/// `data/transactions/logic/opcodes.go:657` — `costByLength(150, 7, 4, 0)`.
+/// Dynamic cost: `150 + 4 * DivCeil(len, 7)`, matching go-algorand
+/// `data/transactions/logic/opcodes.go:704` — `costByLength(150, 4, 7, 0)`.
+/// go-algorand originally shipped this opcode with the `chunkCost`/`chunkSize`
+/// arguments reversed (`costByLength(150, 7, 4, 0)`); PR #6695 "AVM: Fix
+/// reversed costs arguments" (commit `e4b8e0eac`, first released in
+/// v5.0.0-beta) corrected it unconditionally for every `LogicSigVersion`
+/// that carries this opcode, not just v5+ programs going forward.
 ///
 /// Reference: go-algorand `data/transactions/logic/crypto.go:120`
 /// (`opSumhash512`).
@@ -71,8 +76,8 @@ pub fn op_sumhash512(
     _instruction: &Instruction,
 ) -> Result<(), AlgoError> {
     let data = machine.pop_bytes()?;
-    // Dynamic cost: baseCost=150, chunkCost=7, chunkSize=4, depth=0.
-    let cost = 150u64 + 7u64 * (data.len() as u64).div_ceil(4);
+    // Dynamic cost: baseCost=150, chunkCost=4, chunkSize=7, depth=0.
+    let cost = 150u64 + 4u64 * (data.len() as u64).div_ceil(7);
     machine.charge_cost(cost)?;
     let hash = algo_consensus_crypto::sumhash::sumhash512(&data);
     machine.push(AvmValue::Bytes(hash.to_vec()))
@@ -80,14 +85,19 @@ pub fn op_sumhash512(
 
 /// `sha512` (0x87): pop bytes, push SHA-512 hash (64 bytes). AVM v13+.
 ///
-/// Dynamic cost: `15 + 32 * DivCeil(len, 2)`, matching go-algorand
-/// `data/transactions/logic/opcodes.go:658` — `costByLength(15, 32, 2, 0)`.
+/// Dynamic cost: `15 + 2 * DivCeil(len, 32)`, matching go-algorand
+/// `data/transactions/logic/opcodes.go:705` — `costByLength(15, 2, 32, 0)`.
+/// go-algorand originally shipped this opcode with the `chunkCost`/`chunkSize`
+/// arguments reversed (`costByLength(15, 32, 2, 0)`); PR #6695 "AVM: Fix
+/// reversed costs arguments" (commit `e4b8e0eac`, first released in
+/// v5.0.0-beta) corrected it unconditionally for every `LogicSigVersion`
+/// that carries this opcode, not just v13+ programs going forward.
 ///
 /// Reference: go-algorand `data/transactions/logic/crypto.go:128` (`opSHA512`).
 pub fn op_sha512(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let data = machine.pop_bytes()?;
-    // Dynamic cost: baseCost=15, chunkCost=32, chunkSize=2, depth=0.
-    let cost = 15u64 + 32u64 * (data.len() as u64).div_ceil(2);
+    // Dynamic cost: baseCost=15, chunkCost=2, chunkSize=32, depth=0.
+    let cost = 15u64 + 2u64 * (data.len() as u64).div_ceil(32);
     machine.charge_cost(cost)?;
     let hash = Sha512::digest(&data);
     machine.push(AvmValue::Bytes(hash.to_vec()))
