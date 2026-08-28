@@ -10,8 +10,11 @@
 
 use std::collections::HashMap;
 
+use curve25519_dalek::edwards::CompressedEdwardsY;
+use sha2::{Digest, Sha512_256};
+
 use crate::fields;
-use crate::opcode::{self, ImmKind, MAX_AVM_VERSION};
+use crate::opcode::{self, ImmKind, Mode, MAX_AVM_VERSION};
 
 /// The first AVM version where constant optimization is enabled.
 const OPTIMIZE_CONSTANTS_ENABLED_VERSION: u8 = 4;
@@ -21,6 +24,69 @@ const ASSEMBLER_DEFAULT_VERSION: u8 = 1;
 
 /// AVM version where back-branches were introduced.
 const BACK_BRANCH_ENABLED_VERSION: u8 = 4;
+
+/// First AVM version at which stateless (non-app) programs are
+/// automatically salted so their program hash cannot be a valid
+/// Edwards25519 curve point (and thus cannot collide with a spendable
+/// on-curve ed25519 address). Matches go-algorand's
+/// `LogicSigOffCurveVersion` (`data/transactions/logic/opcodes.go`).
+const LOGIC_SIG_OFF_CURVE_VERSION: u8 = 13;
+
+/// Number of salt candidates tried by the auto-salt search — chosen so the
+/// salt value always fits a single-byte varint. Matches go-algorand's
+/// `assemblerSaltSearchLimit` (`assembler.go`).
+const ASSEMBLER_SALT_SEARCH_LIMIT: u64 = 128;
+
+/// Domain-separation prefix used when hashing program bytes into a LogicSig
+/// address. Matches go-algorand's `protocol.Program` `HashID`.
+const PROGRAM_HASH_PREFIX: &[u8] = b"Program";
+
+/// State of the `#pragma autosalt` directive for the program being
+/// assembled. Mirrors go-algorand's `autoSaltMode` (`assembler.go`):
+/// `Unset` applies the version-gated default
+/// ([`default_auto_salt_applies`]), while `On`/`Off` come from an explicit
+/// `#pragma autosalt true|false` and override that default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoSaltMode {
+    Unset,
+    On,
+    Off,
+}
+
+/// Reports whether `program`'s hash decodes as a valid Edwards25519 curve
+/// point. If it does, those bytes could also be a valid ed25519 public key,
+/// so a LogicSig using this program as a contract-account address could in
+/// principle collide with a spendable on-curve address. Matches
+/// go-algorand's `ProgramHashIsEdwards25519Point` (`program.go`), which
+/// hashes `"Program" || program` (SHA-512/256) and decodes it the same way
+/// `filippo.io/edwards25519`'s `Point.SetBytes` does — accepting some
+/// non-canonical point encodings and not checking prime-order-subgroup
+/// membership. `curve25519-dalek`'s `CompressedEdwardsY::decompress` follows
+/// the same reference algorithm, so it matches that acceptance behavior.
+pub(crate) fn program_hash_is_edwards25519_point(program: &[u8]) -> bool {
+    let mut hasher = Sha512_256::new();
+    hasher.update(PROGRAM_HASH_PREFIX);
+    hasher.update(program);
+    let hash: [u8; 32] = hasher.finalize().into();
+    CompressedEdwardsY(hash).decompress().is_some()
+}
+
+/// Reports whether the version-gated auto-salt default applies: `program`
+/// is assembled at `LOGIC_SIG_OFF_CURVE_VERSION` or later, contains no
+/// application-only opcodes, and its hash is currently on-curve. Matches
+/// go-algorand's `defaultAutoSaltApplies` (`assembler.go`); also used by the
+/// disassembler to decide whether to emit `#pragma autosalt false` so a
+/// round-tripped legacy/pre-salted program doesn't get re-salted (which
+/// would change its hash) on reassembly.
+pub(crate) fn default_auto_salt_applies(
+    version: u8,
+    has_stateful_ops: bool,
+    program: &[u8],
+) -> bool {
+    version >= LOGIC_SIG_OFF_CURVE_VERSION
+        && !has_stateful_ops
+        && program_hash_is_edwards25519_point(program)
+}
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -120,6 +186,14 @@ pub struct OpStream {
     has_pseudo_byte: bool,
 
     source_line: usize,
+
+    /// Set once any assembled opcode is `Mode::Application`-only. Mirrors
+    /// go-algorand's `OpStream.HasStatefulOps`; gates auto-salt (which only
+    /// ever applies to stateless/LogicSig programs).
+    has_stateful_ops: bool,
+    /// State of the `#pragma autosalt` directive (defaults to the
+    /// version-gated behavior until overridden).
+    auto_salt: AutoSaltMode,
 }
 
 impl OpStream {
@@ -141,6 +215,8 @@ impl OpStream {
             cnt_bytec_block: 0,
             has_pseudo_byte: false,
             source_line: 0,
+            has_stateful_ops: false,
+            auto_salt: AutoSaltMode::Unset,
         }
     }
 
@@ -693,7 +769,18 @@ impl OpStream {
 
     // ---------- prepend constant blocks ----------
 
-    fn prepend_cblocks(&mut self) -> Vec<u8> {
+    /// Builds the completed program: version byte, then any automatic
+    /// intcblock/bytecblock, then the pending instruction bytes. Returns the
+    /// program bytes and the prefix length (version byte + cblocks).
+    ///
+    /// Pure (does not mutate `self`) so the auto-salt search
+    /// ([`Self::finalize_with_auto_intc_salt`]) can call it repeatedly
+    /// against different trial `intc` values without side effects; the
+    /// offset-to-source fixup that go-algorand's `prependCBlocks` callers
+    /// apply once, after the final prefix length is known, lives in
+    /// [`Self::adjust_offset_to_source`]. Matches go-algorand's
+    /// `prependCBlocks` (`assembler.go`).
+    fn prepend_cblocks(&self) -> (Vec<u8>, usize) {
         let mut pre = Vec::new();
         // Version byte
         pre.push(self.version);
@@ -717,19 +804,98 @@ impl OpStream {
         let pbl = pre.len();
         let mut out = pre;
         out.extend_from_slice(&self.pending);
+        (out, pbl)
+    }
 
-        // Fixup offset-to-source mapping: shift all offsets by pbl (which
-        // includes the version byte). Matches go-algorand's unconditional shift.
-        {
-            let shift = pbl;
-            let mut new_map = HashMap::new();
-            for (&pos, &loc) in &self.offset_to_source {
-                new_map.insert(pos + shift, loc);
+    /// Shifts every recorded source-location offset by `prefix_len` (the
+    /// version byte plus any cblocks prepended by [`Self::finalize_program`]).
+    /// Matches go-algorand's `adjustOffsetToSource` (`assembler.go`).
+    fn adjust_offset_to_source(&mut self, prefix_len: usize) {
+        let mut new_map = HashMap::with_capacity(self.offset_to_source.len());
+        for (&pos, &loc) in &self.offset_to_source {
+            new_map.insert(pos + prefix_len, loc);
+        }
+        self.offset_to_source = new_map;
+    }
+
+    // ---------- auto-salt ----------
+
+    /// Reports whether [`Self::finalize_program`] should append a salt so
+    /// `program`'s hash is off-curve. Matches go-algorand's `shouldAutoSalt`
+    /// (`assembler.go`), minus its warnings (this assembler has no warnings
+    /// channel yet).
+    fn should_auto_salt(&self, program: &[u8]) -> bool {
+        match self.auto_salt {
+            AutoSaltMode::Off => false,
+            AutoSaltMode::On => program_hash_is_edwards25519_point(program),
+            AutoSaltMode::Unset => {
+                default_auto_salt_applies(self.version, self.has_stateful_ops, program)
             }
-            self.offset_to_source = new_map;
+        }
+    }
+
+    /// Constructs the final program bytes, auto-salting a v13+ stateless
+    /// program whose hash would otherwise be on-curve. Matches go-algorand's
+    /// `finalizeProgram` (`assembler.go`).
+    fn finalize_program(&mut self) -> Result<(Vec<u8>, usize), String> {
+        let (program, prefix_len) = self.prepend_cblocks();
+        if !self.should_auto_salt(&program) {
+            return Ok((program, prefix_len));
         }
 
-        out
+        if !self.intc.is_empty() && self.cnt_intc_block == 0 {
+            self.finalize_with_auto_intc_salt()
+        } else {
+            Self::finalize_with_trailing_intc_salt(program, prefix_len)
+        }
+    }
+
+    /// Extends the program's own auto-generated intcblock with a trailing
+    /// salt constant, trying each of the [`ASSEMBLER_SALT_SEARCH_LIMIT`]
+    /// candidates until the resulting program hash is off-curve. Used when
+    /// the program already has an automatic (non-manual) intcblock. Matches
+    /// go-algorand's `finalizeProgramWithAutoIntcSalt` (`assembler.go`).
+    fn finalize_with_auto_intc_salt(&mut self) -> Result<(Vec<u8>, usize), String> {
+        let original_len = self.intc.len();
+        self.intc.push(0);
+        let mut result = None;
+        for salt in 0..ASSEMBLER_SALT_SEARCH_LIMIT {
+            self.intc[original_len] = salt;
+            let (program, prefix_len) = self.prepend_cblocks();
+            if !program_hash_is_edwards25519_point(&program) {
+                result = Some((program, prefix_len));
+                break;
+            }
+        }
+        // Matches go-algorand's `defer` restoring `ops.intc` to its
+        // source-derived length regardless of search outcome.
+        self.intc.truncate(original_len);
+        result.ok_or_else(|| {
+            "could not find an automatic intcblock salt that yields an off-curve program".into()
+        })
+    }
+
+    /// Appends a brand-new trailing one-value intcblock holding a salt
+    /// constant, trying each of the [`ASSEMBLER_SALT_SEARCH_LIMIT`]
+    /// candidates until the resulting program hash is off-curve. Used when
+    /// the program has no automatic intcblock to extend (no int literals, or
+    /// a manual `intcblock`). Matches go-algorand's
+    /// `finalizeProgramWithTrailingIntcSalt` (`assembler.go`).
+    fn finalize_with_trailing_intc_salt(
+        program: Vec<u8>,
+        prefix_len: usize,
+    ) -> Result<(Vec<u8>, usize), String> {
+        let mut candidate = program;
+        candidate.extend_from_slice(&[0x20, 1, 0]); // intcblock, count=1, value placeholder
+        let salt_offset = candidate.len() - 1;
+
+        for salt in 0..ASSEMBLER_SALT_SEARCH_LIMIT {
+            candidate[salt_offset] = salt as u8;
+            if !program_hash_is_edwards25519_point(&candidate) {
+                return Ok((candidate, prefix_len));
+            }
+        }
+        Err("could not find a trailing intcblock salt that yields an off-curve program".into())
     }
 }
 
@@ -775,50 +941,82 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
                 if parts.len() == 1 {
                     // #pragma with no keyword
                     ops.record_error(ops.source_line, 0, "empty pragma".into());
-                } else if parts[1] != "version" {
+                } else if parts[1] == "version" {
+                    if parts.len() == 2 {
+                        // #pragma version (no number)
+                        ops.record_error(ops.source_line, 0, "no version value".into());
+                    } else if parts.len() > 3 {
+                        // #pragma version N extra
+                        ops.record_error(
+                            ops.source_line,
+                            0,
+                            "unexpected tokens after version value".into(),
+                        );
+                    } else {
+                        // #pragma version N
+                        if !ops.pending.is_empty() {
+                            ops.record_error(
+                                ops.source_line,
+                                0,
+                                "#pragma version is only allowed before instructions".into(),
+                            );
+                        }
+                        if let Ok(v) = parts[2].parse::<u8>() {
+                            if v == 0 || v > MAX_AVM_VERSION {
+                                ops.record_error(
+                                    ops.source_line,
+                                    0,
+                                    format!("unsupported version: {v}"),
+                                );
+                            } else {
+                                ops.version = v;
+                                version_set = true;
+                            }
+                        } else {
+                            ops.record_error(
+                                ops.source_line,
+                                0,
+                                format!("invalid version: {}", parts[2]),
+                            );
+                        }
+                    }
+                } else if parts[1] == "autosalt" {
+                    if parts.len() == 2 {
+                        // #pragma autosalt (no value)
+                        ops.record_error(ops.source_line, 0, "no autosalt value".into());
+                    } else if parts.len() > 3 {
+                        // #pragma autosalt VALUE extra
+                        ops.record_error(
+                            ops.source_line,
+                            0,
+                            "unexpected tokens after autosalt value".into(),
+                        );
+                    } else if !ops.pending.is_empty() {
+                        ops.record_error(
+                            ops.source_line,
+                            0,
+                            "#pragma autosalt is only allowed before instructions".into(),
+                        );
+                    } else if let Some(on) = parse_pragma_bool(parts[2]) {
+                        ops.auto_salt = if on {
+                            AutoSaltMode::On
+                        } else {
+                            AutoSaltMode::Off
+                        };
+                    } else {
+                        ops.record_error(
+                            ops.source_line,
+                            0,
+                            format!("bad #pragma autosalt: {:?}", parts[2]),
+                        );
+                    }
+                } else {
                     // #pragma <unknown>
                     ops.record_error(
                         ops.source_line,
                         0,
                         format!("unsupported pragma directive: {}", parts[1]),
                     );
-                } else if parts.len() == 2 {
-                    // #pragma version (no number)
-                    ops.record_error(ops.source_line, 0, "no version value".into());
-                } else if parts.len() > 3 {
-                    // #pragma version N extra
-                    ops.record_error(
-                        ops.source_line,
-                        0,
-                        "unexpected tokens after version value".into(),
-                    );
-                } else {
-                    // #pragma version N
-                    if !ops.pending.is_empty() {
-                        ops.record_error(
-                            ops.source_line,
-                            0,
-                            "#pragma version is only allowed before instructions".into(),
-                        );
-                    }
-                    if let Ok(v) = parts[2].parse::<u8>() {
-                        if v == 0 || v > MAX_AVM_VERSION {
-                            ops.record_error(
-                                ops.source_line,
-                                0,
-                                format!("unsupported version: {v}"),
-                            );
-                        } else {
-                            ops.version = v;
-                            version_set = true;
-                        }
-                    } else {
-                        ops.record_error(
-                            ops.source_line,
-                            0,
-                            format!("invalid version: {}", parts[2]),
-                        );
-                    }
                 }
             }
             continue;
@@ -891,8 +1089,18 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
         return Err(ops.errors.clone());
     }
 
-    // Prepend version byte and constant blocks
-    ops.program = ops.prepend_cblocks();
+    // Prepend version byte and constant blocks, auto-salting a v13+
+    // stateless program whose hash would otherwise be on-curve.
+    match ops.finalize_program() {
+        Ok((program, prefix_len)) => {
+            ops.program = program;
+            ops.adjust_offset_to_source(prefix_len);
+        }
+        Err(message) => {
+            ops.record_error(ops.source_line, 0, message);
+            return Err(ops.errors.clone());
+        }
+    }
 
     Ok(ops)
 }
@@ -910,6 +1118,17 @@ fn assemble_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
         "intcblock" => asm_intc_block(ops, args),
         "bytecblock" => asm_bytec_block(ops, args),
         _ => asm_regular(ops, mnemonic, args),
+    }
+}
+
+/// Parses a `#pragma autosalt`/`#pragma typetrack`-style boolean value.
+/// Matches the spelling set accepted by go-algorand's `strconv.ParseBool`
+/// (`1`/`t`/`T`/`TRUE`/`true`/`True`, `0`/`f`/`F`/`FALSE`/`false`/`False`).
+fn parse_pragma_bool(s: &str) -> Option<bool> {
+    match s {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
     }
 }
 
@@ -1220,6 +1439,10 @@ fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
             ),
         );
         return;
+    }
+
+    if spec.mode == Mode::Application {
+        ops.has_stateful_ops = true;
     }
 
     match spec.imm {
@@ -2258,5 +2481,154 @@ mod tests {
             "00".repeat(opcode::MAX_STRING_SIZE)
         );
         assemble_string(&source).unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // #pragma autosalt / TEAL v13 auto-salt (issue #664)
+    //
+    // Reference bytes below were generated from go-algorand v5.0.0-stable's
+    // own algorithm: SHA-512/256("Program" || program) decoded with
+    // `filippo.io/edwards25519`'s `Point.SetBytes` (the same library
+    // go-algorand's `ProgramHashIsEdwards25519Point` uses), driven through
+    // go-algorand's exact `finalizeProgramWithAutoIntcSalt` /
+    // `finalizeProgramWithTrailingIntcSalt` byte-construction logic — not
+    // derived from this crate's implementation.
+    // -----------------------------------------------------------------
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_v13_program_is_auto_salted_via_existing_intcblock() {
+        // "int 1" is used twice so the v4+ single-use constant optimizer
+        // (`optimize_int_constants`) doesn't inline it as `pushint` — it
+        // must stay in a real intcblock for this to exercise
+        // `finalize_with_auto_intc_salt` rather than the trailing-intcblock
+        // path. Unsalted "int 1\nint 1\nreturn" at v13 is 0d200101222243
+        // and is on-curve per go-algorand; the assembler must extend the
+        // automatic intcblock with salt=2, yielding 0d20020102222243
+        // exactly.
+        let source = "#pragma version 13\nint 1\nint 1\nreturn\n";
+        let ops = assemble_string(source).unwrap();
+        assert_eq!(
+            ops.program,
+            hex_decode("0d20020102222243"),
+            "salted program bytes must match go-algorand's assembler output byte-for-byte"
+        );
+        assert!(
+            !program_hash_is_edwards25519_point(&ops.program),
+            "salted program hash must be off-curve"
+        );
+    }
+
+    #[test]
+    fn test_v13_program_is_auto_salted_via_trailing_intcblock() {
+        // A program with no auto-generated intcblock to extend (pushbytes/
+        // pushint only) gets a brand-new trailing intcblock. Unsalted
+        // "pushbytes 0x0102\npop\npushint 1\nreturn" at v13 is
+        // 0d8002010248810143 (on-curve); go-algorand's search finds
+        // salt=3 sufficient.
+        let source = "#pragma version 13\npushbytes 0x0102\npop\npushint 1\nreturn\n";
+        let ops = assemble_string(source).unwrap();
+        assert_eq!(
+            ops.program,
+            hex_decode("0d8002010248810143200103"),
+            "salted program bytes must match go-algorand's assembler output byte-for-byte"
+        );
+        assert!(!program_hash_is_edwards25519_point(&ops.program));
+    }
+
+    #[test]
+    fn test_pragma_autosalt_false_suppresses_salting_at_v13() {
+        // Same on-curve v13 program as above (`int 1` used twice, so it
+        // stays a real intcblock entry), but with autosalt forced off: the
+        // assembler must leave the on-curve, unsalted bytes untouched.
+        let source = "#pragma version 13\n#pragma autosalt false\nint 1\nint 1\nreturn\n";
+        let ops = assemble_string(source).unwrap();
+        assert_eq!(ops.program, hex_decode("0d200101222243"));
+        assert!(
+            program_hash_is_edwards25519_point(&ops.program),
+            "unsalted-by-request program is expected to remain on-curve in this fixture"
+        );
+    }
+
+    #[test]
+    fn test_v12_program_is_never_auto_salted() {
+        // A version one below LOGIC_SIG_OFF_CURVE_VERSION must never be
+        // salted, even though go-algorand confirms this exact program's
+        // hash is on-curve. "int 4" used twice keeps it in an intcblock
+        // (see test_v13_program_is_auto_salted_via_existing_intcblock).
+        let source = "#pragma version 12\nint 4\nint 4\nreturn\n";
+        let ops = assemble_string(source).unwrap();
+        assert_eq!(ops.program, hex_decode("0c200104222243"));
+        assert!(
+            program_hash_is_edwards25519_point(&ops.program),
+            "fixture must be on-curve to actually exercise the version gate"
+        );
+    }
+
+    #[test]
+    fn test_pragma_autosalt_true_forces_salting_below_v13() {
+        // `#pragma autosalt true` overrides the version gate and forces
+        // salting even at v12, where the default would leave the program
+        // on-curve. go-algorand's search finds salt=0 sufficient here,
+        // extending the intcblock to [5, 0].
+        let source = "#pragma version 12\n#pragma autosalt true\nint 5\nint 5\nreturn\n";
+        let ops = assemble_string(source).unwrap();
+        assert_eq!(ops.program, hex_decode("0c20020500222243"));
+        assert!(!program_hash_is_edwards25519_point(&ops.program));
+    }
+
+    #[test]
+    fn test_autosalt_pragma_only_allowed_before_instructions() {
+        let source = "#pragma version 13\nint 1\n#pragma autosalt false\nreturn\n";
+        let result = assemble_string(source);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.err().unwrap());
+        assert!(msg.contains("only allowed before instructions"), "{msg}");
+    }
+
+    #[test]
+    fn test_autosalt_pragma_bad_value_rejected() {
+        let source = "#pragma version 13\n#pragma autosalt maybe\nint 1\nreturn\n";
+        let result = assemble_string(source);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.err().unwrap());
+        assert!(msg.contains("bad #pragma autosalt"), "{msg}");
+    }
+
+    #[test]
+    fn test_disassemble_on_curve_v13_program_emits_autosalt_false() {
+        // Disassembling raw on-curve v13 bytes (as if hand-crafted, or from
+        // an older assembler run before this feature existed) must emit
+        // `#pragma autosalt false` so reassembling the disassembly
+        // round-trips to the identical bytes instead of silently salting
+        // (and changing the hash).
+        let program = hex_decode("0d2001012243");
+        assert!(program_hash_is_edwards25519_point(&program));
+        let text = crate::disassembler::disassemble(&program).unwrap();
+        assert!(
+            text.contains("#pragma autosalt false"),
+            "disassembly must opt out of re-salting an on-curve legacy program:\n{text}"
+        );
+        let ops2 = assemble_string(&text).unwrap();
+        assert_eq!(ops2.program, program);
+    }
+
+    #[test]
+    fn test_disassemble_already_salted_v13_program_omits_autosalt_pragma() {
+        // A program that's already off-curve (because it was salted, or
+        // just happens to hash off-curve) round-trips without needing the
+        // pragma at all — reassembling it wouldn't re-salt it anyway.
+        let program = hex_decode("0d200201002243");
+        assert!(!program_hash_is_edwards25519_point(&program));
+        let text = crate::disassembler::disassemble(&program).unwrap();
+        assert!(!text.contains("#pragma autosalt"));
+        let ops2 = assemble_string(&text).unwrap();
+        assert_eq!(ops2.program, program);
     }
 }
