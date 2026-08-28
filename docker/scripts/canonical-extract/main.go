@@ -25,7 +25,7 @@
 //	go run . -mode trackerdb-blobs \
 //	    -tracker-db /tmp/devnet.tracker.sqlite \
 //	    -output-dir ../../../crates/core/algo-codec/tests/fixtures/trackerdb \
-//	    -source-version v4.7.3-stable \
+//	    -source-version v4.7.4-stable \
 //	    -source-prefix /algod/data/Node
 package main
 

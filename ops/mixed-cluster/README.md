@@ -1,6 +1,6 @@
 # Mixed-Cluster Consensus Harness
 
-A 4-node docker-compose harness that runs 3 go-algorand v4.7.3-stable
+A 4-node docker-compose harness that runs 3 go-algorand v4.7.4-stable
 nodes + 1 algod-rust node on a private network. **All four nodes hold
 online stake and participate in consensus** (issue #469); the Rust node
 runs `algod-rust participate`, votes, and serves the algod v2 REST API.
@@ -287,7 +287,7 @@ quorum.
 ### The go-algorand-side authenticator
 
 `tools/cert-authenticate` is a small Go program that re-authenticates the
-exported certificates with go-algorand v4.7.3-stable's own verifier.
+exported certificates with go-algorand v4.7.4-stable's own verifier.
 `algo-cert-crossverify --export-go-input` writes it the raw `(block,
 cert)` msgpack plus the `agreement.LedgerReader` facts (seed,
 circulation, per-voter online account data) read out of the **Rust**

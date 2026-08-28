@@ -1,6 +1,6 @@
 # PLAN-32 / TASK-86 — 4-node mixed-cluster consensus harness.
 #
-# Topology: 3 go-algorand v4.7.3-stable relay nodes + 1 algod-rust node,
+# Topology: 3 go-algorand v4.7.4-stable relay nodes + 1 algod-rust node,
 # all peers, all meant to see the same genesis and progress through
 # agreement together. The netroot layout under `./netroot/` is produced
 # up-front by `scripts/start.sh` running `goal network create`

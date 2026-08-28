@@ -255,7 +255,7 @@ A second, narrower harness — `ops/mixed-cluster-p2p/` — targets the new
 libp2p-based P2P transport (`crates/node/algo-p2p`, issues #538-#542)
 rather than the WS-gossip stack this file otherwise documents. It is
 **not** a variant of the 4-node harness above; it's three real
-go-algorand v4.7.3-stable nodes, each started in plain P2P mode
+go-algorand v4.7.4-stable nodes, each started in plain P2P mode
 (`EnableP2P: true`, no WS-gossip listener), chain-bootstrapped to each
 other (1 <- 2 <- 3 — go-node-2 is only ever told go-node-1's multiaddr;
 go-node-3 is only ever told go-node-2's), which algod-rust's
@@ -284,7 +284,7 @@ Issue #543's full headline scope — "a mixed P2P cluster (Rust +
 go-algorand NEW nodes) reaches and maintains consensus over a run of
 rounds" — is still not implemented, but the architectural blocker issue
 #560's investigation originally found is now closed (PR #590):
-go-algorand v4.7.3-stable's own `gossipSubTags` map
+go-algorand v4.7.4-stable's own `gossipSubTags` map
 (`network/p2pNetwork.go`) wires up gossipsub for the `TX` tag **only**.
 Agreement traffic (votes/proposals/bundles) travels over go's per-peer
 libp2p **stream** protocol instead

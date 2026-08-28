@@ -2,7 +2,7 @@ name: Nightly P2P Consensus Soak
 
 # Issue #594 — the P2P-transport analogue of consensus-cluster.yml's
 # nightly WS-gossip mixed-cluster soak, for ops/mixed-cluster-p2p/ (3
-# go-algorand v4.7.3-stable nodes in plain P2P mode, chain-bootstrapped
+# go-algorand v4.7.4-stable nodes in plain P2P mode, chain-bootstrapped
 # 1 <- 2 <- 3, + 1 `algod-rust participate --enable-p2p` P2pOnly
 # stake-holding node). Issue #591 (PR #593) fixed the P2P block/cert
 # catch-up fetch path and, with it, live-verified the 4-node cluster
@@ -93,7 +93,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   # Same pin as the rest of the repo (see CLAUDE.md, consensus-cluster.yml).
-  GO_ALGORAND_REV: "v4.7.3-stable"
+  GO_ALGORAND_REV: "v4.7.4-stable"
   # start.sh: reuse the image built by the buildx step below.
   P2PINTEROP_SKIP_BUILD: "1"
   # Named volume run-in-docker.sh keeps its go-algorand clone + libsodium

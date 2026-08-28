@@ -63,7 +63,7 @@ import (
 // same corpus are guaranteed byte-identical output regardless of whatever
 // branch or dirty state happens to be checked out in their local go-algorand
 // clone.
-const expectedGoAlgorandPin = "v4.7.3-stable"
+const expectedGoAlgorandPin = "v4.7.4-stable"
 
 // rawAlpha is a crypto.Hashable whose HashRep is identity: ToBeHashed returns
 // an empty HashID and the raw bytes, so HashRep(rawAlpha{b}) = b. This lets

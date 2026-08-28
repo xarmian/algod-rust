@@ -2,7 +2,7 @@
 # discovery interop) + issue #589 (stake-provisioned Rust participant +
 # full multi-round consensus proof over P2P).
 #
-# Three go-algorand v4.7.3-stable nodes, each started with `EnableP2P: true`
+# Three go-algorand v4.7.4-stable nodes, each started with `EnableP2P: true`
 # (plain P2P, no WS-gossip listener — mirrors what algod-rust's own
 # `P2pOnly` mode does, see #542), chain-bootstrapped to each other via the
 # `-p`/`PEER_ADDRESS` phonebook override (go-node-2 is only ever told
