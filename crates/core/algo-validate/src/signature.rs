@@ -112,6 +112,26 @@ fn verify_pqsig_bytes(
         });
     }
 
+    // Reject an oversized public key BEFORE hashing it for address
+    // derivation. `public_key` is attacker-controlled wire input (bounded
+    // upstream by overall txn/message size caps, but not by a per-field
+    // limit at decode time the way go's `allocbound=crypto.MaxPQPublicKeySize`
+    // msgp codegen bounds it) — without this check, a public key blob much
+    // larger than a real Falcon-1024 key would still get hashed in full by
+    // `pqsig.address()` below before any cheap size check could reject it.
+    // go's own `VerifyFalcon1024` performs the equivalent size check, just
+    // later (inside signature verification); doing it first here is strictly
+    // cheaper and avoids hashing attacker-controlled oversized input.
+    if pqsig.public_key.len() != algo_falcon::FALCON_DET1024_PUBKEY_SIZE {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "pq public key size {} does not match falcon-1024 public key size {}",
+                pqsig.public_key.len(),
+                algo_falcon::FALCON_DET1024_PUBKEY_SIZE
+            ),
+        });
+    }
+
     let derived = pqsig.address();
     if derived != *authorizer {
         return Err(AlgoError::Validation {
@@ -2543,6 +2563,44 @@ mod tests {
         assert!(
             err.to_string().contains("empty"),
             "expected an empty-signature error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pqsig_oversized_public_key_rejected_cheaply() {
+        // A public key blob far larger than a real Falcon-1024 key (1793
+        // bytes) must be rejected on a cheap length check, not hashed in
+        // full for address derivation first — regression test for the
+        // pre-hash size guard in `verify_pqsig_bytes`.
+        let (_pk, sk, salt, addr) = falcon_identity(12);
+        let txn = minimal_pay_txn(addr);
+        let canonical = canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+        msg.extend_from_slice(TX_PREFIX);
+        msg.extend_from_slice(&canonical);
+        let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
+
+        let oversized_pk = vec![0x11u8; 10 * algo_falcon::FALCON_DET1024_PUBKEY_SIZE];
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(oversized_pk),
+            signature: ByteBuf::from(sig),
+        };
+        let stx = SignedTransaction {
+            txn,
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err("an oversized PQ public key must be rejected");
+        assert!(
+            err.to_string().contains("public key size"),
+            "expected a public-key-size error, got: {err}"
         );
     }
 
