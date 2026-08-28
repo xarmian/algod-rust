@@ -959,6 +959,16 @@ pub fn op_vrf_verify(machine: &mut AvmMachine, instruction: &Instruction) -> Res
 /// - Invalid signature size or verification failure pushes 0 (program continues).
 ///
 /// Cost: 1700 (static, charged by dispatch).
+///
+/// The signature argument (`sig`) is variable-length, up to
+/// `FALCON_DET1024_SIG_COMPRESSED_MAXSIZE` (1423) bytes -- go-algorand's
+/// `falcon_verify` opcode has always declared this stack type as plain `b`
+/// (`opcode.rs:350`'s `Any` mirrors that). An old, since-corrected
+/// go-algorand doc/langspec generation bug (fixed by commit `3920d70d0`,
+/// PR #6629) wrongly described this argument as a fixed `[1232]byte`; that
+/// was a documentation-only error and was never reflected in eval.go, so it
+/// never affected this implementation. See
+/// `crate::opcode`'s `falcon_verify` entry for the full note.
 pub fn op_falcon_verify(
     machine: &mut AvmMachine,
     _instruction: &Instruction,
@@ -2686,6 +2696,72 @@ mod tests {
         assert!(
             !m.pass,
             "oversized signature should fail verification (push 0)"
+        );
+    }
+
+    /// Regression test for issue #666 item (b): `falcon_verify`'s signature
+    /// argument is variable-length, up to 1423 bytes -- NOT a fixed 1232
+    /// bytes. Old go-algorand docs/langspec (pre commit `3920d70d0`, PR
+    /// #6629) wrongly claimed a fixed `[1232]byte` type; that was a
+    /// generated-docs bug that never existed in eval.go/opcodes.go, and
+    /// algod-rust's `falcon_verify` (opcode.rs / ops/crypto.rs) never had it
+    /// either. This locks in that a signature length straddling the old
+    /// (wrong) 1232 boundary, and one at the real 1423 max, both reach
+    /// dynamic verification (fail as garbage, push 0) rather than being
+    /// hard-rejected for having "the wrong size" -- proving no fixed-size
+    /// constraint is enforced anywhere in the pipeline (type-checker or
+    /// opcode).
+    #[test]
+    fn test_falcon_verify_variable_length_signature_not_fixed_1232() {
+        use super::super::falcon;
+
+        let seed = [0u8; falcon::FALCON_SEED_SIZE];
+        let (pubkey, privkey) = falcon::falcon_keygen(&seed).expect("keygen");
+
+        // A real, valid signature verifies (push 1) regardless of its exact
+        // length -- compressed Falcon signatures vary in length (typically
+        // ~1200-1240 bytes for this deterministic scheme), straddling the
+        // old mis-documented 1232-byte figure on either side across
+        // different messages/keys. If `falcon_verify` enforced a fixed
+        // 1232-byte type anywhere, a signature landing on the "wrong" side
+        // of that boundary would be spuriously hard-rejected instead of
+        // verifying.
+        let msg = b"short sig regression";
+        let sig = falcon::falcon_sign(&privkey, msg).expect("sign");
+        assert!(
+            sig.len() <= falcon::FALCON_DET1024_SIG_COMPRESSED_MAXSIZE,
+            "signature length {} exceeds the real max {}",
+            sig.len(),
+            falcon::FALCON_DET1024_SIG_COMPRESSED_MAXSIZE
+        );
+        let code = falcon_verify_code(msg, &sig, &pubkey);
+        let m = run_prog(12, &code).unwrap();
+        assert!(
+            m.pass,
+            "valid signature should verify (push 1) regardless of exact length"
+        );
+
+        // A garbage signature just *above* the old buggy 1232-byte figure
+        // (1233 bytes) must not be hard-rejected for "wrong size" -- it's
+        // still within the real 1423-byte limit, so it reaches
+        // verification and simply fails as garbage (push 0).
+        let garbage_1233 = vec![0xCDu8; 1233];
+        let code = falcon_verify_code(b"data", &garbage_1233, &pubkey);
+        let m = run_prog(12, &code).unwrap();
+        assert!(
+            !m.pass,
+            "1233-byte garbage signature should reach verification and fail (push 0), not hard-error"
+        );
+
+        // A garbage signature at the real max (1423 bytes) behaves the same
+        // way: reaches verification, fails as garbage (push 0), no hard
+        // error from a fixed-size check.
+        let garbage_max = vec![0xEFu8; falcon::FALCON_DET1024_SIG_COMPRESSED_MAXSIZE];
+        let code = falcon_verify_code(b"data", &garbage_max, &pubkey);
+        let m = run_prog(12, &code).unwrap();
+        assert!(
+            !m.pass,
+            "near-1423-byte garbage signature should reach verification and fail (push 0), not hard-error"
         );
     }
 

@@ -139,6 +139,37 @@ pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
         let (immediates, consumed) = parse_immediates(code, pc, spec.imm)?;
         pc += consumed;
 
+        // go-algorand PR #6692 ("avm: improve byte constant immediate
+        // reporting"): starting at LogicSigVersion 13, bytecblock/pushbytess
+        // reject any individual byte constant exceeding maxStringSize at
+        // execution time (`EvalContext.byteImmArgs`, eval.go). algod-rust
+        // parses the whole program once up front rather than lazily
+        // per-opcode, so this is the equivalent point to enforce it: it runs
+        // before any opcode executes, on every parse (both the pre-execution
+        // check pass and eval itself). Below v13 this check does not apply;
+        // only the (already-existing, unconditional) assembler-time check
+        // constrains pre-v13 byte constants.
+        if version >= 13 {
+            let entries = match &immediates {
+                Immediates::ByteBlock(entries) | Immediates::PushBytess(entries) => Some(entries),
+                _ => None,
+            };
+            if let Some(entries) = entries {
+                for (i, b) in entries.iter().enumerate() {
+                    if b.len() > opcode::MAX_STRING_SIZE {
+                        return Err(AlgoError::Avm {
+                            message: format!(
+                                "{} arg {i} is too big ({} bytes, limit {})",
+                                spec.name,
+                                b.len(),
+                                opcode::MAX_STRING_SIZE
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
         instructions.push(Instruction {
             opcode: op_byte,
             offset,
@@ -398,6 +429,81 @@ mod tests {
         assert_eq!(
             p.instructions[0].immediates,
             Immediates::ByteBlock(vec![b"foo".to_vec(), vec![0xAB, 0xCD]])
+        );
+    }
+
+    /// At LogicSigVersion >= 13, `bytecblock` must reject an individual byte
+    /// constant exceeding `MAX_STRING_SIZE` (4096 bytes) -- go-algorand PR
+    /// #6692 / `EvalContext.byteImmArgs` (data/transactions/logic/eval.go).
+    #[test]
+    fn test_bytecblock_oversized_constant_rejected_at_v13() {
+        let oversized = vec![0u8; crate::opcode::MAX_STRING_SIZE + 1];
+        let mut code = vec![0x26]; // bytecblock
+        crate::assembler::write_varuint_to_vec(&mut code, 1); // count=1
+        crate::assembler::write_varuint_to_vec(&mut code, oversized.len() as u64);
+        code.extend_from_slice(&oversized);
+
+        let raw = prog(13, &code);
+        let err = parse(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too big") && msg.contains("4096"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// The same oversized-constant program is accepted below v13: no size
+    /// limit is enforced at parse/execution time pre-v13 (only the
+    /// assembler-time check, which this parse-level test bypasses, applied).
+    #[test]
+    fn test_bytecblock_oversized_constant_allowed_below_v13() {
+        let oversized = vec![0u8; crate::opcode::MAX_STRING_SIZE + 1];
+        let mut code = vec![0x26]; // bytecblock
+        crate::assembler::write_varuint_to_vec(&mut code, 1); // count=1
+        crate::assembler::write_varuint_to_vec(&mut code, oversized.len() as u64);
+        code.extend_from_slice(&oversized);
+
+        let raw = prog(12, &code);
+        let p = parse(&raw).unwrap();
+        assert_eq!(
+            p.instructions[0].immediates,
+            Immediates::ByteBlock(vec![oversized])
+        );
+    }
+
+    /// Same size-limit enforcement applies to `pushbytess` at v13+.
+    #[test]
+    fn test_pushbytess_oversized_constant_rejected_at_v13() {
+        let oversized = vec![0u8; crate::opcode::MAX_STRING_SIZE + 1];
+        let mut code = vec![0x82]; // pushbytess
+        crate::assembler::write_varuint_to_vec(&mut code, 1); // count=1
+        crate::assembler::write_varuint_to_vec(&mut code, oversized.len() as u64);
+        code.extend_from_slice(&oversized);
+
+        let raw = prog(13, &code);
+        let err = parse(&raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too big") && msg.contains("4096"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// A `bytecblock` at v13 whose constants are all within the size limit
+    /// still parses fine (the check must not reject valid programs).
+    #[test]
+    fn test_bytecblock_within_limit_allowed_at_v13() {
+        let ok_sized = vec![0u8; crate::opcode::MAX_STRING_SIZE];
+        let mut code = vec![0x26]; // bytecblock
+        crate::assembler::write_varuint_to_vec(&mut code, 1); // count=1
+        crate::assembler::write_varuint_to_vec(&mut code, ok_sized.len() as u64);
+        code.extend_from_slice(&ok_sized);
+
+        let raw = prog(13, &code);
+        let p = parse(&raw).unwrap();
+        assert_eq!(
+            p.instructions[0].immediates,
+            Immediates::ByteBlock(vec![ok_sized])
         );
     }
 

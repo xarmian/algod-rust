@@ -858,7 +858,21 @@ fn asm_byte(ops: &mut OpStream, args: &[&str]) {
     }
 
     match parse_binary_args(args) {
-        Ok((val, _consumed)) => ops.byte_literal(val),
+        Ok((val, _consumed)) => {
+            if val.len() > opcode::MAX_STRING_SIZE {
+                ops.record_error(
+                    ops.source_line,
+                    0,
+                    format!(
+                        "byte value is too big ({} bytes, limit {})",
+                        val.len(),
+                        opcode::MAX_STRING_SIZE
+                    ),
+                );
+                return;
+            }
+            ops.byte_literal(val)
+        }
         Err(e) => ops.record_error(ops.source_line, 0, format!("byte {e}")),
     }
 }
@@ -874,6 +888,18 @@ fn asm_push_bytes(ops: &mut OpStream, args: &[&str]) {
     }
     match parse_binary_args(args) {
         Ok((val, _consumed)) => {
+            if val.len() > opcode::MAX_STRING_SIZE {
+                ops.record_error(
+                    ops.source_line,
+                    0,
+                    format!(
+                        "pushbytes value is too big ({} bytes, limit {})",
+                        val.len(),
+                        opcode::MAX_STRING_SIZE
+                    ),
+                );
+                return;
+            }
             ops.pending.push(0x80); // pushbytes
             write_varuint_to_vec(&mut ops.pending, val.len() as u64);
             ops.pending.extend_from_slice(&val);
@@ -959,6 +985,20 @@ fn asm_bytec_block(ops: &mut OpStream, args: &[&str]) {
     while !remaining.is_empty() {
         match parse_binary_args(remaining) {
             Ok((val, consumed)) => {
+                if val.len() > opcode::MAX_STRING_SIZE {
+                    ops.record_error(
+                        ops.source_line,
+                        0,
+                        format!(
+                            "bytecblock arg {} is too big ({} bytes, limit {})",
+                            vals.len(),
+                            val.len(),
+                            opcode::MAX_STRING_SIZE
+                        ),
+                    );
+                    remaining = &remaining[consumed..];
+                    continue;
+                }
                 vals.push(val);
                 remaining = &remaining[consumed..];
             }
@@ -1150,6 +1190,18 @@ fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
             }
             match parse_binary_args(args) {
                 Ok((val, _consumed)) => {
+                    if val.len() > opcode::MAX_STRING_SIZE {
+                        ops.record_error(
+                            ops.source_line,
+                            0,
+                            format!(
+                                "{mnemonic} value is too big ({} bytes, limit {})",
+                                val.len(),
+                                opcode::MAX_STRING_SIZE
+                            ),
+                        );
+                        return;
+                    }
                     ops.pending.push(spec.opcode);
                     write_varuint_to_vec(&mut ops.pending, val.len() as u64);
                     ops.pending.extend_from_slice(&val);
@@ -1210,6 +1262,20 @@ fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
             while !remaining.is_empty() {
                 match parse_binary_args(remaining) {
                     Ok((val, consumed)) => {
+                        if val.len() > opcode::MAX_STRING_SIZE {
+                            ops.record_error(
+                                ops.source_line,
+                                0,
+                                format!(
+                                    "{mnemonic} arg {} is too big ({} bytes, limit {})",
+                                    vals.len(),
+                                    val.len(),
+                                    opcode::MAX_STRING_SIZE
+                                ),
+                            );
+                            remaining = &remaining[consumed..];
+                            continue;
+                        }
                         vals.push(val);
                         remaining = &remaining[consumed..];
                     }
@@ -1869,5 +1935,68 @@ mod tests {
         assert_eq!(ops.program[2], 2); // length
         assert_eq!(ops.program[3], 0x01);
         assert_eq!(ops.program[4], 0x02);
+    }
+
+    /// go-algorand's `asmByte`/`asmPushBytes`/`asmByteImmArgs`
+    /// (data/transactions/logic/assembler.go) reject any byte literal over
+    /// `maxStringSize` (4096 bytes) at assembly time, unconditionally (not
+    /// version-gated). algod-rust had no equivalent check at all before this
+    /// fix (issue #666 item a).
+    fn oversized_hex_literal() -> String {
+        format!("0x{}", "00".repeat(opcode::MAX_STRING_SIZE + 1))
+    }
+
+    #[test]
+    fn test_byte_literal_oversized_rejected() {
+        let source = format!(
+            "#pragma version 2\nbyte {}\npop\nint 1\n",
+            oversized_hex_literal()
+        );
+        let result = assemble_string(&source);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.err().unwrap());
+        assert!(msg.contains("too big") && msg.contains("4096"), "{msg}");
+    }
+
+    #[test]
+    fn test_pushbytes_literal_oversized_rejected() {
+        let source = format!("#pragma version 3\npushbytes {}\n", oversized_hex_literal());
+        let result = assemble_string(&source);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.err().unwrap());
+        assert!(msg.contains("too big") && msg.contains("4096"), "{msg}");
+    }
+
+    #[test]
+    fn test_bytecblock_literal_oversized_rejected() {
+        let source = format!(
+            "#pragma version 3\nbytecblock {}\n",
+            oversized_hex_literal()
+        );
+        let result = assemble_string(&source);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.err().unwrap());
+        assert!(msg.contains("too big") && msg.contains("4096"), "{msg}");
+    }
+
+    #[test]
+    fn test_pushbytess_literal_oversized_rejected() {
+        let source = format!(
+            "#pragma version 8\npushbytess {} 0x01\n",
+            oversized_hex_literal()
+        );
+        let result = assemble_string(&source);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.err().unwrap());
+        assert!(msg.contains("too big") && msg.contains("4096"), "{msg}");
+    }
+
+    #[test]
+    fn test_byte_literal_at_limit_allowed() {
+        let source = format!(
+            "#pragma version 2\nbyte 0x{}\npop\nint 1\n",
+            "00".repeat(opcode::MAX_STRING_SIZE)
+        );
+        assemble_string(&source).unwrap();
     }
 }
