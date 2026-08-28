@@ -1792,9 +1792,9 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     /// Whether the Developer API (`/v2/teal/compile`, `/v2/teal/disassemble`,
-    /// `/v2/teal/dryrun`, `/v2/transactions/async`) is enabled. Default-on in
-    /// dev mode so `goal`/SDK clients can compile and dry-run TEAL against a
-    /// localnet/`--dev` node out of the box. This mirrors go-algorand's devmode
+    /// `/v2/transactions/async`) is enabled. Default-on in dev mode so
+    /// `goal`/SDK clients can compile TEAL against a localnet/`--dev` node
+    /// out of the box. This mirrors go-algorand's devmode
     /// networks, which ship `EnableDeveloperAPI: true` in the node's
     /// `config.json` (the config default is `false`, see
     /// `../go-algorand/config/local_defaults.go:70`); the standalone Rust node
@@ -5632,7 +5632,7 @@ mod tests {
         let cfg = adapter.get_config_json().await.expect("config ok");
         assert_eq!(cfg["DevMode"], serde_json::json!(true));
         assert_eq!(cfg["GenesisID"], serde_json::json!("testnet-v1.0"));
-        // Dev mode enables the developer API (teal/compile, dryrun), mirroring
+        // Dev mode enables the developer API (teal/compile), mirroring
         // go-algorand's devmode networks shipping `EnableDeveloperAPI: true`.
         assert_eq!(cfg["EnableDeveloperAPI"], serde_json::json!(true));
         assert!(cfg.get("Version").is_some());

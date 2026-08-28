@@ -238,7 +238,7 @@ async fn block_transaction_proof_404_matches() {
 }
 
 // ---------------------------------------------------------------------------
-// TEAL compile / disassemble / dryrun
+// TEAL compile / disassemble
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -308,7 +308,14 @@ async fn teal_disassemble_matches() {
 
 #[tokio::test]
 #[ignore = "requires `make validate-api-up`; see module docs"]
-async fn teal_dryrun_malformed_body_status_matches() {
+async fn teal_dryrun_route_removed_on_both() {
+    // Issue #674: go-algorand v5.0.0-stable removes the `dryrun` REST
+    // endpoint entirely (PR #6651, "Chore: Remove dryrun and tealdbg",
+    // v5.0.0-beta) in favor of `simulate`; algod-rust now matches. Both
+    // nodes must 404 on `POST /v2/teal/dryrun`, restoring full cross-node
+    // status-equality enforcement (this used to compare a malformed-body
+    // 400 before the endpoint's removal — see git history for the prior
+    // carve-out).
     let c = client();
     let go = c
         .post(format!("{}/v2/teal/dryrun", go_url()))
@@ -326,18 +333,16 @@ async fn teal_dryrun_malformed_body_status_matches() {
         .send()
         .await
         .unwrap();
-    // TODO(#674): go-algorand v5.0.0-stable removes the `dryrun` REST
-    // endpoint entirely, so `go.status()` is now a 404/"not found" rather
-    // than the 400 this test used to observe on a malformed body; algod-rust
-    // still serves it. The two are no longer comparable — assert only that
-    // algod-rust still 400s on a malformed body, and drop the cross-node
-    // equality check until #674 removes algod-rust's endpoint too.
+    let go_status = go.status().as_u16();
+    let rust_status = rust.status().as_u16();
     assert_eq!(
-        rust.status(),
-        400,
-        "rust POST /v2/teal/dryrun with a malformed body must still 400"
+        go_status, rust_status,
+        "POST /v2/teal/dryrun status mismatch: go={go_status} rust={rust_status}"
     );
-    let _ = go.status();
+    assert_eq!(
+        rust_status, 404,
+        "POST /v2/teal/dryrun must 404 on both nodes now that the route is removed"
+    );
 }
 
 // ---------------------------------------------------------------------------

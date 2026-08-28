@@ -47,7 +47,7 @@ pub async fn unmatched_route_fallback() -> Response {
 /// For the handful of go-algorand handlers that intentionally respond with
 /// plain text (`ctx.String(...)`) instead of the JSON error envelope — the
 /// `EnableDeveloperAPI`/`EnableExperimentalAPI`-disabled 404s for
-/// `/teal/compile`, `/teal/disassemble`, `/teal/dryrun`,
+/// `/teal/compile`, `/teal/disassemble`,
 /// `/v2/accounts/{address}/assets`, and `/v2/transactions/async`, plus
 /// `ShutdownNode`'s 501 — so the router's blanket JSON-envelope rewrite
 /// doesn't make them diverge from the real go-algorand response they

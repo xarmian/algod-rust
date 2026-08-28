@@ -173,7 +173,6 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/teal/disassemble",
             post(handlers::teal_disassemble::<N>),
         )
-        .route("/v2/teal/dryrun", post(handlers::teal_dryrun::<N>))
         // Consensus-participation metrics as JSON (issue #473). Guarded by
         // the public token like the rest of `/v2`; the static `status`
         // segment takes priority over the admin group's

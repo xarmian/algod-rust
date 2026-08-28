@@ -1297,5 +1297,5 @@ Sequence:
   send`** (TASK-287). Before TASK-287 the whole `clerk` group was a stub
   and the leg ran via Go `goal clerk send`; it has been migrated to the
   Rust CLI. The rest of the `clerk` group (rawsend / sign / group /
-  split / compile / dryrun* / simulate / inspect / multisig / tealsign)
+  split / compile / simulate / inspect / multisig / tealsign)
   remains stubbed.

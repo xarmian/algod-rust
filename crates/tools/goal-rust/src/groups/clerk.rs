@@ -3,8 +3,13 @@
 //!
 //! The full `clerk` group is implemented: `send`, the offline txn-file
 //! utilities (`inspect` / `split` / `group`), `rawsend`, `sign`, `tealsign`,
-//! `compile`, `dryrun` / `dryrun-remote`, `simulate`, and the `multisig`
-//! subcommands (`sign` / `signprogram` / `merge`).
+//! `compile`, `simulate`, and the `multisig` subcommands (`sign` /
+//! `signprogram` / `merge`).
+//!
+//! `dryrun` / `dryrun-remote` were removed (issue #674), mirroring
+//! go-algorand's removal of `POST /v2/teal/dryrun` and the `tealdbg` CLI
+//! debugger (go-algorand PR #6651, "Chore: Remove dryrun and tealdbg",
+//! v5.0.0-beta) in favor of `simulate`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,11 +24,6 @@ use clap::{Args, Subcommand};
 pub enum ClerkCmd {
     /// Compile a contract program.
     Compile(CompileArgs),
-    /// Test a program offline.
-    Dryrun(DryrunArgs),
-    /// Test a program with algod's dryrun REST endpoint.
-    #[command(name = "dryrun-remote")]
-    DryrunRemote(DryrunRemoteArgs),
     /// Group transactions together.
     Group(GroupArgs),
     /// Print a transaction file.
@@ -521,70 +521,6 @@ pub struct CompileArgs {
     pub no_out: bool,
 }
 
-/// `clerk dryrun -t <txfile> [-o out] [--dryrun-dump] [--dryrun-dump-format fmt]
-/// [--dryrun-accounts a,b] [-w wallet]`.
-///
-/// Mirrors Go's `dryrunCmd` (clerk.go:1167), the dump path. goal-rust implements
-/// the `--dryrun-dump` behavior (build a `DryrunRequest` from the txn file plus
-/// fetched account/app context and write it to `-o`), which is the LOCAL,
-/// node-context-gathering path this task targets.
-///
-/// **Out of scope (documented):** Go's non-dump default also runs the LogicSig
-/// programs locally and prints a trace; that path is deprecated in go-algorand
-/// and depends on the client-side consensus-param table + a local AVM
-/// sig-eval harness, so it is not ported. `--dryrun-dump` is therefore required
-/// here. The `-P/--proto` flag is accepted for parity (see field note).
-#[derive(Args, Debug)]
-pub struct DryrunArgs {
-    /// Transaction or transaction-group file to test (Go `-t/--txfile`).
-    /// Required.
-    #[arg(short = 't', long = "txfile")]
-    pub txfile: PathBuf,
-    /// Filename for writing the dryrun state object (Go `-o/--outfile`).
-    /// Required (the dump must go somewhere).
-    #[arg(short = 'o', long = "outfile")]
-    pub outfile: PathBuf,
-    /// Dump in dryrun-request format acceptable by the dryrun REST api instead
-    /// of running locally (Go `--dryrun-dump`). Required in goal-rust — see the
-    /// struct note.
-    #[arg(long = "dryrun-dump")]
-    pub dryrun_dump: bool,
-    /// Dryrun dump format: `json` (default) or `msgp` (Go
-    /// `--dryrun-dump-format`). goal-rust writes `json`; `msgp` is rejected (see
-    /// the handler note).
-    #[arg(long = "dryrun-dump-format", default_value = "json")]
-    pub dryrun_dump_format: String,
-    /// Additional accounts to include into the dryrun request object, as
-    /// Algorand addresses or `app(<id>)` references (Go `--dryrun-accounts`,
-    /// comma-separated).
-    #[arg(long = "dryrun-accounts", value_delimiter = ',')]
-    pub dryrun_accounts: Vec<String>,
-    /// Consensus protocol version id string (Go `-P/--proto`). When unset,
-    /// goal-rust uses the node's suggested consensus version (Go's `getProto`
-    /// fallback); the value is recorded in the dump's `protocol-version`.
-    #[arg(short = 'P', long = "proto")]
-    pub proto: Option<String>,
-}
-
-/// `clerk dryrun-remote -D <state-file> [-v] [-r] [-w wallet]`.
-///
-/// Mirrors Go's `dryrunRemoteCmd` (clerk.go:1230): POST the dryrun-request
-/// object (built by `clerk dryrun --dryrun-dump`) to `POST /v2/teal/dryrun` and
-/// print the per-transaction messages (and, with `-v`, the execution trace).
-#[derive(Args, Debug)]
-pub struct DryrunRemoteArgs {
-    /// Dryrun request object file to run (Go `-D/--dryrun-state`). Required.
-    #[arg(short = 'D', long = "dryrun-state")]
-    pub dryrun_state: PathBuf,
-    /// Print more info, including the per-step execution trace (Go
-    /// `-v/--verbose`).
-    #[arg(short = 'v', long = "verbose")]
-    pub verbose: bool,
-    /// Output the raw JSON response from algod (Go `-r/--raw`).
-    #[arg(short = 'r', long = "raw")]
-    pub raw: bool,
-}
-
 /// `wallet` is the group-level `-w` (Go's persistent clerk flag); leaves that
 /// take a wallet thread it in here.
 pub fn run(cmd: ClerkCmd, wallet: Option<String>) -> ExitCode {
@@ -597,8 +533,6 @@ pub fn run(cmd: ClerkCmd, wallet: Option<String>) -> ExitCode {
         ClerkCmd::Group(args) => crate::cmd::clerk::run_group(args),
         ClerkCmd::Rawsend(args) => crate::cmd::clerk::run_rawsend(args, datadirs()),
         ClerkCmd::Compile(args) => crate::cmd::clerk::run_compile(args, datadirs()),
-        ClerkCmd::Dryrun(args) => crate::cmd::clerk::run_dryrun(args, datadirs()),
-        ClerkCmd::DryrunRemote(args) => crate::cmd::clerk::run_dryrun_remote(args, datadirs()),
         ClerkCmd::Multisig { cmd } => {
             let Some(cmd) = cmd else {
                 return crate::print_group_help(&["clerk", "multisig"]);

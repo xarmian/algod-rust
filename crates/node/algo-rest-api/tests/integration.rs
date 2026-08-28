@@ -6589,8 +6589,9 @@ async fn simulate_invalid_format_returns_400() {
 }
 
 /// The simulate endpoint enforces go-algorand's 1MB request body limit
-/// (`MaxTealDryrunBytes`): an otherwise-valid request padded past the limit
-/// must be rejected with 400 before decoding.
+/// (`MaxSimulateBytes`, renamed from `MaxTealDryrunBytes` when dryrun was
+/// removed — see issue #674): an otherwise-valid request padded past the
+/// limit must be rejected with 400 before decoding.
 #[tokio::test]
 async fn simulate_body_too_large_returns_400() {
     let server = TestServer::start(MockNode::synced()).await;
@@ -7149,6 +7150,28 @@ async fn teal_disassemble_disabled_returns_404() {
         body.contains("EnableDeveloperAPI"),
         "404 message should mention EnableDeveloperAPI"
     );
+}
+
+/// Issue #674: go-algorand v5.0.0-stable removes `POST /v2/teal/dryrun`
+/// entirely (PR #6651, "Chore: Remove dryrun and tealdbg", v5.0.0-beta) in
+/// favor of `simulate`. The route must be gone from algod-rust too — a
+/// generic "no route matched" 404 via the router fallback, not the
+/// EnableDeveloperAPI-disabled 404 the endpoint used to return, and
+/// unconditionally so (even with the developer API enabled).
+#[tokio::test]
+async fn teal_dryrun_route_removed_returns_404() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/teal/dryrun"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
 }
 
 // ===========================================================================
