@@ -551,6 +551,7 @@ version = "0.1.0"
 dependencies = [
  "algo-error",
  "arbitrary",
+ "curve25519-dalek",
  "data-encoding",
  "hex",
  "rmp",
@@ -570,6 +571,7 @@ dependencies = [
  "algo-codec",
  "algo-consensus-crypto",
  "algo-error",
+ "algo-falcon",
  "algo-types",
  "criterion",
  "ed25519-dalek",

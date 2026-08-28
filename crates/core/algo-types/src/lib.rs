@@ -5,6 +5,7 @@ pub mod consensus;
 mod digest;
 mod header;
 pub mod networks;
+pub mod pq;
 pub(crate) mod rmp_decode;
 mod round;
 pub mod serde_bytes_array;
@@ -24,6 +25,10 @@ pub use consensus::{
 pub use digest::Digest;
 pub use header::BlockHeader;
 pub use networks::{resolve_genesis_hash, Network, ResolveGenesisError, UnknownNetwork};
+pub use pq::{
+    canonical_pq_address_salt, pq_address, PQAddressSalt, PQDelegatedProgram, PQSig,
+    PQ_SCHEME_FALCON1024,
+};
 pub use rmp_decode::check_msgpack_depth;
 pub use round::Round;
 pub use transaction::{

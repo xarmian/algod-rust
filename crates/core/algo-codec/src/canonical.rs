@@ -15,7 +15,7 @@ use algo_types::{
     AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, Block, BlockHeader,
     BoxRef, Digest, FalconVerifier, HashFactory, HeartbeatProof, HeartbeatTxnFields, HoldingRef,
     LocalsRef, LogicSig, MerkleProof, MerkleSignature, MerkleSignatureVerifier, MultisigSig,
-    MultisigSubsig, Participant, ResourceRef, Reveal, SigSlotCommit, SignedTransaction,
+    MultisigSubsig, PQSig, Participant, ResourceRef, Reveal, SigSlotCommit, SignedTransaction,
     StateProofBody, StateProofMessage, StateSchema, TealValue, Transaction, TxTailRound,
     TxTailRoundLease,
 };
@@ -503,6 +503,9 @@ pub fn canonical_encode_signed_transaction(stx: &SignedTransaction) -> Vec<u8> {
     if let Some(ref msig) = stx.msig {
         m.fields.push(("msig", canonical_encode_multisig(msig)));
     }
+    if let Some(ref pqsig) = stx.pqsig {
+        m.add_map("pqsig", canonical_encode_pqsig(pqsig));
+    }
     m.add_bytes("sig", &stx.sig);
     m.add_option_address("sgnr", &stx.auth_addr);
     m.add_map("txn", canonical_encode_transaction(&stx.txn));
@@ -533,6 +536,9 @@ pub fn canonical_encode_signed_txn_in_block(stx: &SignedTransaction) -> Vec<u8> 
     }
     if let Some(ref msig) = stx.msig {
         m.fields.push(("msig", canonical_encode_multisig(msig)));
+    }
+    if let Some(ref pqsig) = stx.pqsig {
+        m.add_map("pqsig", canonical_encode_pqsig(pqsig));
     }
 
     // ApplyData rewards fields
@@ -1388,7 +1394,26 @@ pub fn canonical_encode_logicsig(lsig: &LogicSig) -> Vec<u8> {
         m.fields.push(("msig", canonical_encode_multisig(msig)));
     }
 
+    if let Some(ref pqsig) = lsig.pqsig {
+        m.add_map("pqsig", canonical_encode_pqsig(pqsig));
+    }
+
     m.add_bytes("sig", &lsig.sig);
+
+    m.encode()
+}
+
+/// Canonically encode a PQSig as a nested msgpack map.
+/// Sorted fields: "pk", "sch", "sig", "slt" (alphabetical).
+/// Only includes non-empty/non-zero fields (Go: `PQSig`'s
+/// `_struct codec:",omitempty,omitemptyarray"`).
+pub fn canonical_encode_pqsig(pqsig: &PQSig) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    m.add_bytes("pk", &pqsig.public_key);
+    m.add_bytes("sch", &pqsig.scheme);
+    m.add_bytes("sig", &pqsig.signature);
+    m.add_u64("slt", pqsig.salt.0 as u64);
 
     m.encode()
 }

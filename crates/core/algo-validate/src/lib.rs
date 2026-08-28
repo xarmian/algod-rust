@@ -13,7 +13,8 @@ pub use fee::{
     app_call_fee_contribution, effective_max_note_bytes, effective_max_total_arg_len,
     fee_for_usage, header_fee_contribution, large_program_extra_bytes,
     logic_sig_program_fee_contribution, micros_mul_int, required_fee_for_txn,
-    required_fee_for_usage, summarize_fees, txn_fee_factor, FEE_RESIDUE_SCALE, ONE_MICROS,
+    required_fee_for_usage, signature_fee_contribution, summarize_fees, txn_fee_factor,
+    FEE_RESIDUE_SCALE, ONE_MICROS,
 };
 pub use rules::{
     compute_group_id, consensus_params_for_version, has_heartbeat, is_free_heartbeat,

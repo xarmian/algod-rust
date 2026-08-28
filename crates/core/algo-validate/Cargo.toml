@@ -10,6 +10,7 @@ algo-codec.workspace = true
 algo-error.workspace = true
 algo-avm.workspace = true
 algo-consensus-crypto.workspace = true
+algo-falcon.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true
 serde_bytes.workspace = true

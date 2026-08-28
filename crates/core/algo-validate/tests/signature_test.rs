@@ -177,6 +177,7 @@ fn make_contract_account_txn(program: &[u8]) -> SignedTransaction {
             msig: None,
             lmsig: None,
             args: None,
+            pqsig: None,
         }),
         ..Default::default()
     }
