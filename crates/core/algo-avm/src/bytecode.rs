@@ -54,6 +54,79 @@ pub enum Immediates {
     PushBytess(Vec<Vec<u8>>),
     /// switch/match: uint8 count + list of int16 branch offsets.
     Labels(Vec<i16>),
+    /// Varint-encoded (zigzag+ULEB128) branch offset for `bnz`/`bz`/`b`/
+    /// `callsub` at `LogicSigVersion >= opcode::VARINT_BRANCH_VERSION`.
+    /// Fields: `(offset, bytes_consumed)`. `bytes_consumed` is the actual
+    /// encoded length read from the program bytes (not necessarily the
+    /// minimal encoding an assembler would emit — a hand-crafted or
+    /// adversarial program may pad with redundant continuation bytes, which
+    /// `binary.Varint` on the go-algorand side accepts), and is needed both
+    /// to compute this instruction's total byte size and to reproduce the
+    /// forward-jump base point (`instr_offset + 1 + bytes_consumed`).
+    BranchVarint(i64, usize),
+}
+
+/// Compute the raw (possibly out-of-range) target byte offset for a
+/// varint-encoded branch immediate.
+///
+/// Mirrors go-algorand's `branchTargetVarint`
+/// (`data/transactions/logic/eval.go`): a **negative** `offset` is a
+/// back-jump measured from the **start** of the instruction (`instr_offset`);
+/// a **non-negative** `offset` is a forward-jump measured from the **end** of
+/// the instruction (`instr_offset + 1 + varint_len`, i.e. past the opcode
+/// byte and the varint's own encoded bytes).
+///
+/// Returns `i128` rather than `usize`/`isize` so that even an adversarial,
+/// maximal-magnitude (10-byte varint, up to `i64::MIN`/`i64::MAX`) `offset`
+/// cannot overflow before the caller performs its own `0..=program_len`
+/// bounds check — this function itself never panics or wraps.
+pub fn varint_branch_target(instr_offset: usize, varint_len: usize, offset: i64) -> i128 {
+    let base: i128 = if offset < 0 {
+        instr_offset as i128
+    } else {
+        instr_offset as i128 + 1 + varint_len as i128
+    };
+    base + offset as i128
+}
+
+/// Decode a signed zigzag+ULEB128 varint at `data[pos..]`, matching Go's
+/// `encoding/binary.Varint` exactly (including accepting non-minimal /
+/// redundant encodings, and the same two distinct failure modes):
+/// - buffer runs out before a terminating (high-bit-clear) byte is found
+///   ("program ends without branch target", matching `bytesRead == 0`)
+/// - the value would need more than the 10 bytes a 64-bit varint can ever
+///   need ("branch offset varint overflows int64", matching `bytesRead < 0`)
+///
+/// Returns `(value, bytes_consumed)`.
+pub fn read_branch_varint(data: &[u8], pos: usize) -> Result<(i64, usize), AlgoError> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    let mut i = pos;
+
+    loop {
+        if i >= data.len() {
+            return Err(AlgoError::Avm {
+                message: "program ends without branch target".to_string(),
+            });
+        }
+        let b = data[i];
+        if shift >= 63 && b > 1 {
+            return Err(AlgoError::Avm {
+                message: "branch offset varint overflows int64".to_string(),
+            });
+        }
+        result |= ((b & 0x7f) as u64) << shift;
+        i += 1;
+        if b & 0x80 == 0 {
+            let consumed = i - pos;
+            // Zigzag decode, matching Go's binary.Varint:
+            //   x := int64(ux >> 1); if ux&1 != 0 { x = ^x }
+            let value = (result >> 1) as i64;
+            let value = if result & 1 != 0 { !value } else { value };
+            return Ok((value, consumed));
+        }
+        shift += 7;
+    }
 }
 
 /// Decode an unsigned LEB128 varuint from `data` starting at `pos`.
@@ -136,7 +209,20 @@ pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
             });
         }
 
-        let (immediates, consumed) = parse_immediates(code, pc, spec.imm)?;
+        // At LogicSigVersion >= VARINT_BRANCH_VERSION, bnz/bz/b/callsub switch
+        // from the table's static `Int16` immediate kind to a varint-encoded
+        // offset (go-algorand PR #6600, `varintBranchVersion`). switch/match
+        // are untouched -- only these four opcode bytes are affected, and
+        // only at v13+; below that they keep the legacy fixed-2-byte form.
+        let imm_kind = if version >= opcode::VARINT_BRANCH_VERSION
+            && opcode::is_varint_branch_opcode(op_byte)
+        {
+            ImmKind::BranchVarint
+        } else {
+            spec.imm
+        };
+
+        let (immediates, consumed) = parse_immediates(code, pc, imm_kind)?;
         pc += consumed;
 
         // go-algorand PR #6692 ("avm: improve byte constant immediate
@@ -316,6 +402,11 @@ fn parse_immediates(
                 offsets.push(v);
             }
             Ok((Immediates::Labels(offsets), 1 + count * 2))
+        }
+
+        ImmKind::BranchVarint => {
+            let (offset, consumed) = read_branch_varint(code, pos)?;
+            Ok((Immediates::BranchVarint(offset, consumed), consumed))
         }
     }
 }

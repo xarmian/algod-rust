@@ -202,6 +202,18 @@ fn check_branch_targets(program: &Program) -> Result<(), AlgoError> {
                     resolve_branch_offset(program, idx, *label_offset, &valid_offsets, end_offset)?;
                 }
             }
+            Immediates::BranchVarint(offset, varint_len) => {
+                // bnz/bz/b/callsub at LogicSigVersion >= 13.
+                let target = resolve_varint_branch_offset(
+                    program,
+                    idx,
+                    *offset,
+                    *varint_len,
+                    &valid_offsets,
+                    end_offset,
+                )?;
+                let _ = target;
+            }
             _ => {}
         }
     }
@@ -223,6 +235,46 @@ fn resolve_branch_offset(
     let imm_len = immediate_byte_len(&instr.immediates);
     let after_instr = instr.offset + 1 + imm_len;
     let target = (after_instr as isize + offset as isize) as usize;
+
+    if !valid_offsets.contains(&target) && target != end_offset {
+        return Err(AlgoError::Avm {
+            message: format!(
+                "branch at offset {} targets offset {}, which is not a valid instruction boundary",
+                instr.offset, target
+            ),
+        });
+    }
+    Ok(target)
+}
+
+/// Resolve a varint-encoded branch offset (bnz/bz/b/callsub at
+/// LogicSigVersion >= 13) relative to the instruction at `instr_idx`.
+///
+/// Sign-dependent base point, matching go-algorand's `branchTargetVarint`:
+/// a negative offset is a back-jump from the instruction's own start; a
+/// non-negative offset is a forward-jump from the end of the instruction
+/// (opcode byte + varint bytes). The target must be a valid instruction
+/// offset (uniformly for forward and back jumps -- see `resolve_branch_offset`
+/// for why this single membership check is equivalent to go-algorand's
+/// split back-jump/forward-jump alignment checks) or exactly the
+/// end-of-program offset.
+fn resolve_varint_branch_offset(
+    program: &Program,
+    instr_idx: usize,
+    offset: i64,
+    varint_len: usize,
+    valid_offsets: &HashSet<usize>,
+    end_offset: usize,
+) -> Result<usize, AlgoError> {
+    let instr = &program.instructions[instr_idx];
+    let target = crate::bytecode::varint_branch_target(instr.offset, varint_len, offset);
+
+    if target < 0 || target > end_offset as i128 {
+        return Err(AlgoError::Avm {
+            message: format!("branch target {target} outside of program"),
+        });
+    }
+    let target = target as usize;
 
     if !valid_offsets.contains(&target) && target != end_offset {
         return Err(AlgoError::Avm {
@@ -274,6 +326,7 @@ pub fn immediate_byte_len(imm: &Immediates) -> usize {
             n
         }
         Immediates::Labels(offsets) => 1 + offsets.len() * 2, // count byte + N * int16
+        Immediates::BranchVarint(_, len) => *len,
     }
 }
 
