@@ -16,6 +16,24 @@
 
 use num_bigint::BigUint;
 
+use crate::f128::{binomial_cdf_walk_f128, f128_from_digest_ratio};
+
+/// Upper bound on `select_f128`'s `money` argument. The f128 stored
+/// exponent of a value `v` is about `log2(v) - 127` (the mantissa is
+/// normalized to `[2^127, 2^128)`), and the smallest representable `1-p`
+/// exceeds `2^-64`, so `pmf(0) = (1-p)^money` carries a stored exponent no
+/// lower than `-64*money - 128`, and the worst intermediate — the
+/// `a.exp+b.exp` sum inside a multiply, whose value parts total at most
+/// `money` — stays above `-64*money - 256`. With `money < 2^56` every such
+/// quantity is bounded by ~2^62+2^8 in magnitude, comfortably inside i64.
+/// (A 2^57 bound is NOT safe: `money = 2^57-1` with `1-p = 1/(2^64-1)`
+/// needs a stored exponent near `-2^63-63` and wraps.)
+///
+/// The bound is ~7x (about 2.8 bits) above Algorand's 10^16 microalgo
+/// supply. Matches go-algorand's `sortition.SelectF128MaxMoney`
+/// (`github.com/algorand/sortition@v1.1.1`, `sortition.go`).
+pub const SELECT_F128_MAX_MONEY: u64 = 1u64 << 56;
+
 /// Convert a 32-byte VRF output to a ratio in \[0, 1\].
 ///
 /// Interprets `vrf_output` as a big-endian unsigned 256-bit integer,
@@ -104,6 +122,41 @@ pub fn select(money: u64, total_money: u64, expected_size: f64, vrf_output: [u8;
     let ratio = vrf_output_to_ratio(vrf_output);
 
     binomial_cdf_walk(money, p, ratio)
+}
+
+/// Deterministic sortition function using a pure-software 128-bit float
+/// implementation instead of hardware doubles, matching go-algorand v42's
+/// `EnableSelectF128` (go-algorand PRs #6672 "sortition: use SelectF128",
+/// #6676 "sortition: f128 followups", #6696 "bump sortition dep to v1.1.1";
+/// upstream `github.com/algorand/sortition@v1.1.1`, `sortition.go`'s
+/// `SelectF128`). It evaluates both the VRF ratio and the binomial CDF at
+/// f128 precision using only software integer arithmetic (see [`crate::f128`]),
+/// so its result is bit-reproducible across platforms — no f64/hardware
+/// float anywhere in this path.
+///
+/// Unlike [`select`], `select_f128` takes the committee size as the exact
+/// `u64` it is in the protocol rather than a float64. `money` must be below
+/// [`SELECT_F128_MAX_MONEY`] — callers (this crate does not enforce it here,
+/// matching upstream, which "does not check it at runtime"; `algo-agreement`'s
+/// `Credential::verify` performs the bounds check before calling this,
+/// mirroring go-algorand's `UnauthenticatedCredential.Verify`).
+///
+/// CONSENSUS / MIGRATION NOTE (from upstream's doc comment, preserved
+/// verbatim in substance): `select_f128` is NOT bit-identical to the
+/// deployed float64 [`select`]. They agree on the overwhelming majority of
+/// inputs but can differ at knife-edge VRF outputs near a CDF boundary —
+/// this is why the switch is consensus-gated on `EnableSelectF128` (v42+)
+/// rather than a drop-in replacement.
+///
+/// # Panics
+///
+/// Does not panic. All internal arithmetic (see [`crate::f128`]) uses
+/// wrapping/saturating operations rather than ones that can panic on
+/// out-of-range input, matching upstream's "does not panic" contract on the
+/// vote/credential-verification path.
+pub fn select_f128(money: u64, total_money: u64, expected_size: u64, vrf_output: [u8; 32]) -> u64 {
+    let ratio = f128_from_digest_ratio(&vrf_output);
+    binomial_cdf_walk_f128(expected_size, total_money, ratio, money)
 }
 
 /// Boost 1.65.1's `binomial_ccdf` finite-sum path from
@@ -689,5 +742,238 @@ mod tests {
             diff <= max_diff,
             "statistical test: expected ~{expected}, got {total_weight}, diff={diff}, max_diff={max_diff}"
         );
+    }
+
+    // ================= select_f128 (issue #667) =================
+    //
+    // Two layers of parity evidence, both against the actual upstream Go
+    // module (`github.com/algorand/sortition@v1.1.1`), not a hand-derived
+    // approximation:
+    //
+    // 1. `test_select_f128_matches_go_fixture` below replays 221
+    //    `SelectF128` end-to-end vectors captured by driving the real,
+    //    unmodified `f128.go`/`sortition.go` source (see
+    //    `tests/fixtures/sortition_f128/vectors.json` and `f128.rs`'s own
+    //    fixture-driven arithmetic-primitive tests, which cover `mul`,
+    //    `div`, `div_u`, `add`, `int_pow`, and the digest-ratio conversion
+    //    from the same generator run).
+    // 2. The tests immediately below hand-port specific named test cases
+    //    from the module's own `f128_test.go` (`TestSelectF128RatioExactlyOne`,
+    //    `TestSelectF128CurrentConsensusFrozenTail`,
+    //    `TestSelectF128OutputCeilingRequiresStakeInvariant`,
+    //    `TestSelectF128FrozenTailReportedCase`,
+    //    `TestSelectF128NearMaximumDigest`) — these are the ones upstream's
+    //    own comments call out as pinning the FROZEN-TAIL POLICY (issue
+    //    #667's hard constraint against "cleaning up" that deliberate
+    //    approximation), so they are worth keeping as named, documented
+    //    regressions even though the bulk fixture above also covers general
+    //    parity.
+
+    #[derive(serde::Deserialize)]
+    struct SelectF128Vec {
+        money: u64,
+        total_money: u64,
+        expected_size: u64,
+        digest: String,
+        weight: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SelectF128Fixture {
+        select_f128: Vec<SelectF128Vec>,
+    }
+
+    fn parse_digest(hex_str: &str) -> [u8; 32] {
+        let bytes = hex::decode(hex_str).expect("valid hex digest");
+        bytes.try_into().expect("32-byte digest")
+    }
+
+    #[test]
+    fn test_select_f128_matches_go_fixture() {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/fixtures/sortition_f128/vectors.json");
+        let data = std::fs::read_to_string(&path).expect("read sortition_f128 fixture");
+        let fixture: SelectF128Fixture =
+            serde_json::from_str(&data).expect("parse sortition_f128 fixture");
+        assert!(
+            fixture.select_f128.len() >= 200,
+            "expected a substantial SelectF128 parity corpus, got {}",
+            fixture.select_f128.len()
+        );
+        for v in &fixture.select_f128 {
+            let digest = parse_digest(&v.digest);
+            let got = select_f128(v.money, v.total_money, v.expected_size, digest);
+            assert_eq!(
+                got, v.weight,
+                "select_f128(money={}, total={}, expected={}, digest={}) = {got}, want {}",
+                v.money, v.total_money, v.expected_size, v.digest, v.weight
+            );
+        }
+    }
+
+    fn all_0xff_digest() -> [u8; 32] {
+        [0xffu8; 32]
+    }
+
+    /// The minimal digest with exactly 129 leading one bits: the smallest
+    /// digest whose ratio rounds to exactly 1.0 at f128 precision (per
+    /// upstream's `TestSelectF128RatioExactlyOne`).
+    fn min_leading_ones_digest() -> [u8; 32] {
+        let mut d = [0xffu8; 32];
+        for b in d.iter_mut().skip(16) {
+            *b = 0;
+        }
+        d[16] = 0x80;
+        d
+    }
+
+    /// Port of upstream's `maxDigestMinusPowerOfTwo`: the all-0xff digest
+    /// with bit `bit` (counted from the LSB of the big-endian 256-bit
+    /// integer) cleared.
+    fn max_digest_minus_power_of_two(bit: u32) -> [u8; 32] {
+        let mut d = [0xffu8; 32];
+        let idx = 31 - (bit / 8) as usize;
+        d[idx] &= !(1u8 << (bit % 8));
+        d
+    }
+
+    #[test]
+    fn test_select_f128_near_maximum_digest() {
+        // TestSelectF128NearMaximumDigest.
+        let mut d = [0u8; 32];
+        for b in d.iter_mut().take(7) {
+            *b = 0xff;
+        }
+        assert_eq!(select_f128(1954, 1_999_999_999_999_964, 1500, d), 1);
+    }
+
+    #[test]
+    fn test_select_f128_ratio_exactly_one() {
+        // TestSelectF128RatioExactlyOne: pins the walk when the f128 ratio
+        // is exactly 1.0, both mathematically (all-0xff digest) and by
+        // 128-bit rounding (>= 129 leading one bits). Each case below pins
+        // a different branch of the frozen-tail / exact-boundary logic.
+        let cases: [(u64, u64, u64, u64); 4] = [
+            (1954, 1_999_999_999_999_964, 1500, 3),
+            (1954, 2_000_000_000_000_000, 1500, 5),
+            (100, 200, 100, 100),
+            (129, 258, 129, 128),
+        ];
+        for digest in [all_0xff_digest(), min_leading_ones_digest()] {
+            for (money, total, expected, want) in cases {
+                let got = select_f128(money, total, expected, digest);
+                assert_eq!(
+                    got, want,
+                    "digest={:x?} money={money}: select_f128={got}, want {want}",
+                    digest
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_select_f128_current_consensus_frozen_tail() {
+        // TestSelectF128CurrentConsensusFrozenTail: pins the promoted
+        // frozen-tail behavior at values admitted by current go-algorand
+        // consensus parameters (v41-inherited NumProposers=20,
+        // NextCommitteeSize=5000, MinBalance=100_000 microalgos; mainnet
+        // genesis supply 10^16 microalgos). In every case here, q=(1-p)
+        // rounds downward and the accumulated f128 CDF freezes below the
+        // chosen digest ratio — this is the exact scenario issue #667's
+        // "frozen tail policy" clause is protecting.
+        const MAINNET_SUPPLY: u64 = 10_000_000_000_000_000;
+        let cases: [(&str, u64, u64, u64, u32, u64); 5] = [
+            (
+                "proposer committee",
+                1_999_999_999_999_999,
+                1_999_999_999_999_999,
+                20,
+                175,
+                104,
+            ),
+            (
+                "base minimum balance",
+                100_000,
+                MAINNET_SUPPLY,
+                5_000,
+                141,
+                6,
+            ),
+            (
+                "payout minimum balance",
+                30_000_000_000,
+                MAINNET_SUPPLY,
+                5_000,
+                159,
+                15,
+            ),
+            (
+                "payout maximum balance",
+                70_000_000_000_000,
+                MAINNET_SUPPLY,
+                5_000,
+                170,
+                138,
+            ),
+            (
+                "mainnet supply ceiling",
+                MAINNET_SUPPLY,
+                MAINNET_SUPPLY,
+                5_000,
+                178,
+                5_945,
+            ),
+        ];
+        for (name, money, total, expected, clear_bit, want) in cases {
+            let digest = max_digest_minus_power_of_two(clear_bit);
+            let got = select_f128(money, total, expected, digest);
+            assert_eq!(
+                got, want,
+                "{name}: select_f128={got}, want promoted freeze index {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_f128_output_ceiling_requires_stake_invariant() {
+        // TestSelectF128OutputCeilingRequiresStakeInvariant: the frozen-tail
+        // promotion must not clip an ordinary high-mean crossing when
+        // money > total_money (a caller invariant violation, not something
+        // this function enforces — matches upstream, which does not clip
+        // this case either).
+        assert_eq!(select_f128(1_000_000, 100, 20, all_0xff_digest()), 204_858);
+    }
+
+    #[test]
+    fn test_select_f128_frozen_tail_reported_case() {
+        // TestSelectF128FrozenTailReportedCase: pmf(0)'s trial-count-
+        // amplified rounding leaves the accumulated CDF around 2^-78 below 1
+        // when money == total_money == 2e15 and committee size is 1500.
+        // Both a near-max digest and the exact all-0xff digest land above
+        // that plateau and must take the identical frozen path.
+        const ONLINE_STAKE: u64 = 2_000_000_000_000_000;
+        let d = max_digest_minus_power_of_two(176); // ratio ~= 1 - 2^-80
+        assert_eq!(select_f128(ONLINE_STAKE, ONLINE_STAKE, 1500, d), 2032);
+        assert_eq!(
+            select_f128(ONLINE_STAKE, ONLINE_STAKE, 1500, all_0xff_digest()),
+            2032
+        );
+    }
+
+    #[test]
+    fn test_select_f128_max_money_headroom() {
+        // TestSelectF128MaxMoneyHeadroom: SELECT_F128_MAX_MONEY must keep at
+        // least two bits of headroom over the 10^16 microalgo mainnet
+        // supply.
+        const MAINNET_SUPPLY: u64 = 10_000_000_000_000_000;
+        // Deliberately a runtime assertion (mirroring upstream's own
+        // `TestSelectF128MaxMoneyHeadroom`, a `testing.T` check, not a
+        // compile-time one): the point is a test that fails loudly if a
+        // future edit narrows the constant, not a `const _: () = ...`
+        // that would just move the same tripwire to compile time.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(SELECT_F128_MAX_MONEY >= 4 * MAINNET_SUPPLY);
+        }
     }
 }
