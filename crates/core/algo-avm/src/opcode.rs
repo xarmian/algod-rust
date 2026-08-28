@@ -469,6 +469,9 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
     // ---- MiMC hash (v11) ----
     op!(0xe6, "mimc", 11, Dynamic, 1, 1, Any, Uint8);
 
+    // ---- Poseidon2 hash (v13) ----
+    op!(0xe7, "poseidon2", 13, Dynamic, 1, 1, Any, Uint8);
+
     table
 };
 

@@ -315,6 +315,9 @@ pub fn dispatch(
         // ---- MiMC hash (v11+) ----
         0xe6 => crypto::op_mimc(machine, instruction),
 
+        // ---- Poseidon2 hash (v13+) ----
+        0xe7 => crypto::op_poseidon2(machine, instruction),
+
         // ---- Everything else: not yet implemented ----
         _ => {
             let name = crate::opcode::lookup(instruction.opcode)
