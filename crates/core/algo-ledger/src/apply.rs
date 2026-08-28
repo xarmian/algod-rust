@@ -1276,11 +1276,16 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
     global_txn_idx: &mut usize,
 ) -> Result<(), AlgoError> {
+    // Shared across every member of this atomic group so `gload`/`gloads`/
+    // `gloadss` in a later transaction can see whether an earlier sibling
+    // actually ran a program (see `GroupInfo::ran_program`).
+    let ran_program = RefCell::new(vec![false; group.len()]);
     for (gi_idx, stx) in group.iter().enumerate() {
         ctx.txn_index.set(*global_txn_idx);
         let gi = GroupInfo {
             txns: group,
             index: gi_idx,
+            ran_program: &ran_program,
         };
         if stx.txn.txn_type == "appl" {
             // Fresh per-call re-borrow via explicit `match`-bound reborrow.
@@ -2159,6 +2164,42 @@ fn build_avm_group(
     }
 }
 
+/// Seed a freshly-built `LedgerAvmContext`'s scratch view from the group's
+/// shared `ran_program` record, so `gload`/`gloads`/`gloadss` can see which
+/// earlier siblings already ran a program. Each such sibling gets a
+/// zero-filled placeholder row (real per-slot cross-transaction scratch
+/// values are not yet threaded through the consensus apply path -- see
+/// issue tracking that gap); a sibling that never ran (or hasn't executed
+/// yet) is left `None`, which `gload` reports as an explicit error rather
+/// than a default/garbage value.
+fn seed_avm_scratch_from_group<L: crate::store_trait::LedgerStore>(
+    avm_ctx: &mut LedgerAvmContext<'_, L>,
+    group_info: Option<&GroupInfo<'_>>,
+) {
+    if let Some(gi) = group_info {
+        for (idx, ran) in gi.ran_program.borrow().iter().enumerate() {
+            if *ran && idx < avm_ctx.scratch.len() {
+                avm_ctx.scratch[idx] = Some(crate::avm_context::default_scratch_row());
+            }
+        }
+    }
+}
+
+/// Mark the current group member as having started running its program, per
+/// the shared `ran_program` record. Mirrors go-algorand's
+/// `cx.pastScratch[cx.groupIndex] = &cx.Scratch` in `EvalContract`
+/// (`data/transactions/logic/eval.go`), which is set the instant evaluation
+/// begins -- before the program runs -- so a rejected or erroring program
+/// still counts as "ran" for `gload` purposes; only a group member whose
+/// program never actually starts (e.g. a ClearState call against an
+/// already-deleted app, which has no clear-state program to run) stays
+/// unmarked.
+fn mark_group_member_ran(group_info: Option<&GroupInfo<'_>>) {
+    if let Some(gi) = group_info {
+        gi.ran_program.borrow_mut()[gi.index] = true;
+    }
+}
+
 /// Compute the fee credit for a transaction group.
 ///
 /// Mirrors go-algorand's `feeCredit()`: sum all fees paid in the group, subtract
@@ -2219,6 +2260,17 @@ pub struct GroupInfo<'a> {
     pub txns: &'a [&'a SignedTransaction],
     /// Index of the current transaction within the group.
     pub index: usize,
+    /// Shared, group-wide record of which group members have actually
+    /// invoked their approval/clear-state program so far (`ran_program[gi]`),
+    /// mirroring go-algorand's per-group `pastScratch` population in
+    /// `EvalContract` (`data/transactions/logic/eval.go`) -- set the instant
+    /// a program starts running, even if it later rejects or errors, and
+    /// left `false` for a group member whose program never actually ran
+    /// (e.g. a ClearState call against an already-deleted app). Read by
+    /// `apply_appl` to seed each subsequent sibling's `LedgerAvmContext`
+    /// scratch view so `gload`/`gloads`/`gloadss` can distinguish "ran" from
+    /// "never ran" instead of nil-dereferencing or returning a default value.
+    pub ran_program: &'a RefCell<Vec<bool>>,
 }
 
 /// Apply a single signed transaction with a group budget for AVM execution.
@@ -3636,9 +3688,16 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     avm_ctx.txn_counter = ctx.txn_counter.get();
                     avm_ctx.fee_credit = ctx.fee_credit.get();
                     ctx.configure_avm_ctx(&mut avm_ctx);
+                    seed_avm_scratch_from_group(&mut avm_ctx, group_info);
                     if let Some(ref mut t) = tracer {
                         avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
                     }
+                    // Mark this group member as having started running its
+                    // program *before* invoking it (matching go-algorand's
+                    // `EvalContract` ordering), so a sibling that reads
+                    // `gload` on us sees "ran" even if we go on to
+                    // reject/error.
+                    mark_group_member_ran(group_info);
                     let result = if let Some(ref mut t) = tracer {
                         run_clear_state_program_with_tracer(
                             &clear_program,
@@ -3721,6 +3780,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 avm_ctx.txn_counter = ctx.txn_counter.get();
                 avm_ctx.fee_credit = ctx.fee_credit.get();
                 ctx.configure_avm_ctx(&mut avm_ctx);
+                seed_avm_scratch_from_group(&mut avm_ctx, group_info);
                 if let Some(ref mut t) = tracer {
                     avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
                 }
@@ -3728,6 +3788,11 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 // Use the group budget if provided, otherwise create a single-call budget.
                 let mut fallback_budget = GroupBudget::new(1);
                 let budget = group_budget.unwrap_or(&mut fallback_budget);
+                // Mark this group member as having started running its
+                // program *before* invoking it (matching go-algorand's
+                // `EvalContract` ordering), so a sibling that reads `gload`
+                // on us sees "ran" even if we go on to reject/error.
+                mark_group_member_ran(group_info);
                 let result = if let Some(ref mut t) = tracer {
                     run_approval_program_with_tracer(&approval_program, &mut avm_ctx, budget, *t)?
                 } else {

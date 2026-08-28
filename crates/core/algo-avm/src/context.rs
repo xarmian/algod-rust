@@ -237,8 +237,11 @@ pub trait AvmContext {
 
     // ---- Group scratch space ----
 
-    /// Read scratch slot from another transaction in the group (`gload`/`gloads`).
-    fn gload(&self, group_index: usize, slot: u8) -> Result<TealValue, AlgoError> {
+    /// Read scratch slot from another transaction in the group
+    /// (`gload`/`gloads`/`gloadss`). `op_name` is the calling opcode's name
+    /// (`"gload"`, `"gloads"`, or `"gloadss"`), used to build error messages
+    /// that match go-algorand's `opGloadImpl` (`data/transactions/logic/eval.go`).
+    fn gload(&self, op_name: &str, group_index: usize, slot: u8) -> Result<TealValue, AlgoError> {
         Err(AlgoError::Avm {
             message: "context unavailable: gload".into(),
         })

@@ -658,8 +658,24 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     pub program_hash_value: [u8; 32],
     /// Log entries collected during execution.
     pub logs: Vec<Vec<u8>>,
-    /// Group scratch space: `scratch[group_index][slot]`.
-    pub scratch: Vec<[TealValue; 256]>,
+    /// Group scratch space: `scratch[group_index]` is `Some(row)` once that
+    /// group member's program has run (`row[slot]` gives the value), or
+    /// `None` if it hasn't run yet — including a same-group sibling whose
+    /// `Type` is `appl` but which never actually executed a program (e.g. a
+    /// ClearState call against an already-deleted app). Mirrors
+    /// go-algorand's `pastScratch [maxTxGroupSize]*scratchSpace`
+    /// (`data/transactions/logic/eval.go`), which is nil until
+    /// `EvalContract` runs for that index.
+    ///
+    /// Populated from the group's shared `ran_program` state
+    /// (`apply.rs::GroupInfo`) when this context is constructed for an
+    /// app-call transaction that is part of a multi-transaction group; a
+    /// prior sibling that ran gets a zero-filled placeholder row here (the
+    /// real per-slot values a sibling actually wrote are not yet threaded
+    /// across transactions — tracked separately) so that `gload` only needs
+    /// to distinguish "ran" from "never ran" to match go-algorand's error
+    /// behavior.
+    pub scratch: Vec<Option<[TealValue; 256]>>,
     /// Inner transaction currently being built (if any).
     inner_building: Vec<InnerTxnBuilder>,
     /// Completed inner transaction groups.
@@ -933,7 +949,7 @@ impl NamedGroupResources {
 }
 
 // Helper to create a default scratch row (256 zero-uint slots).
-fn default_scratch_row() -> [TealValue; 256] {
+pub(crate) fn default_scratch_row() -> [TealValue; 256] {
     std::array::from_fn(|_| TealValue::Uint(0))
 }
 
@@ -967,7 +983,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             app_mode,
             program_hash_value: program_hash,
             logs: Vec::new(),
-            scratch: (0..group_len).map(|_| default_scratch_row()).collect(),
+            scratch: vec![None; group_len],
             inner_building: Vec::new(),
             inner_txns: Vec::new(),
             genesis_hash,
@@ -2551,17 +2567,48 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     // ---- Group scratch space ----
 
-    fn gload(&self, group_index: usize, slot: u8) -> Result<TealValue, AlgoError> {
-        if group_index >= self.scratch.len() {
+    fn gload(&self, op_name: &str, group_index: usize, slot: u8) -> Result<TealValue, AlgoError> {
+        // Mirrors go-algorand's `opGloadImpl` (`data/transactions/logic/eval.go`)
+        // check ordering: range, type, self, future, then "did not run a
+        // program" (nil pastScratch) before the actual scratch read.
+        if group_index >= self.group.len() {
             return Err(AlgoError::Avm {
                 message: format!(
-                    "gload: group_index {} out of range (group size={})",
-                    group_index,
-                    self.scratch.len()
+                    "{op_name} lookup TxnGroup[{group_index}] but it only has {}",
+                    self.group.len()
                 ),
             });
         }
-        Ok(self.scratch[group_index][slot as usize].clone())
+        if self.group[group_index].txn.txn_type != "appl" {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "can't use {op_name} on non-app call txn with index {group_index}"
+                ),
+            });
+        }
+        if group_index == self.group_index {
+            return Err(AlgoError::Avm {
+                message: format!("can't use {op_name} on self, use load instead"),
+            });
+        }
+        if group_index > self.group_index {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "{op_name} can't get future scratch space from txn with index {group_index}"
+                ),
+            });
+        }
+        match &self.scratch[group_index] {
+            Some(row) => Ok(row[slot as usize].clone()),
+            // An app call that never executed its program leaves this slot
+            // `None` even though its Type is still `appl` (e.g. a ClearState
+            // against an already-deleted app never runs a program).
+            None => Err(AlgoError::Avm {
+                message: format!(
+                    "{op_name} lookup of txn {group_index} that did not run a program"
+                ),
+            }),
+        }
     }
 
     // ---- Group created IDs (gaid/gaids) ----
@@ -4631,24 +4678,102 @@ mod tests {
     }
 
     // ---- gload tests ----
-
-    #[test]
-    fn gload_default_zero() {
-        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
-        let mut store = LedgerState::new();
-        let ctx = make_context(&mut store, vec![txn]);
-
-        let val = ctx.gload(0, 0).unwrap();
-        assert_eq!(val, TealValue::Uint(0));
-    }
+    //
+    // Mirrors go-algorand's `opGloadImpl` check ordering (range, type, self,
+    // future, then nil-pastScratch) so these pin the same error taxonomy as
+    // `TestGloadNoProgram` (`data/transactions/logic/eval_test.go`).
 
     #[test]
     fn gload_out_of_range() {
-        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let txn = make_appl_txn([10u8; 32], 42, vec![], vec![], vec![]);
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
 
-        assert!(ctx.gload(5, 0).is_err());
+        let err = ctx.gload("gload", 5, 0).unwrap_err();
+        assert!(err.to_string().contains("lookup TxnGroup[5]"), "{err}");
+    }
+
+    #[test]
+    fn gload_non_appl_sibling_errors() {
+        let pay = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let appl = make_appl_txn([10u8; 32], 42, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        // group_index=1 (the appl txn); index 0 is a pay txn.
+        let mut ctx = make_context(&mut store, vec![pay, appl]);
+        ctx.group_index = 1;
+
+        let err = ctx.gload("gload", 0, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("non-app call txn with index 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn gload_self_errors() {
+        let txn = make_appl_txn([10u8; 32], 42, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        let err = ctx.gload("gload", 0, 0).unwrap_err();
+        assert!(err.to_string().contains("on self"), "{err}");
+    }
+
+    #[test]
+    fn gload_future_errors() {
+        let a = make_appl_txn([10u8; 32], 42, vec![], vec![], vec![]);
+        let b = make_appl_txn([10u8; 32], 43, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        // group_index=0, referencing index 1 which is ahead of it.
+        let ctx = make_context(&mut store, vec![a, b]);
+
+        let err = ctx.gload("gloads", 1, 0).unwrap_err();
+        assert!(err.to_string().contains("future scratch space"), "{err}");
+    }
+
+    #[test]
+    fn gload_did_not_run_a_program_errors() {
+        // Sibling at index 0 is `appl` type but never actually ran a
+        // program (pastScratch[0] is None) -- e.g. a ClearState call
+        // against an already-deleted app. This is the go-algorand
+        // `a9e47033d` regression: the type check alone is not enough, the
+        // nil-scratch case must also be rejected rather than returning a
+        // default/garbage value.
+        let a = make_appl_txn([10u8; 32], 42, vec![], vec![], vec![]);
+        let b = make_appl_txn([10u8; 32], 43, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![a, b]);
+        ctx.group_index = 1;
+        // ctx.scratch[0] stays None: index 0's program never ran.
+
+        let err = ctx.gload("gload", 0, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("gload lookup of txn 0 that did not run a program"),
+            "{err}"
+        );
+        // gloads/gloadss substitute their own opcode name.
+        let err = ctx.gload("gloads", 0, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("gloads lookup of txn 0 that did not run a program"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn gload_returns_value_once_marked_ran() {
+        let a = make_appl_txn([10u8; 32], 42, vec![], vec![], vec![]);
+        let b = make_appl_txn([10u8; 32], 43, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![a, b]);
+        ctx.group_index = 1;
+        let mut row = default_scratch_row();
+        row[3] = TealValue::Uint(999);
+        ctx.scratch[0] = Some(row);
+
+        let val = ctx.gload("gload", 0, 3).unwrap();
+        assert_eq!(val, TealValue::Uint(999));
     }
 
     // ---- Inner transaction tests ----
