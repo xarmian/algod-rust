@@ -646,6 +646,34 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             .map(|t| t.app_budget_consumed)
             .sum();
 
+        // Fee-usage reporting (issue #671): per-txn FeesPaid (a factual report
+        // of what was actually paid, recursively summed over descendant inner
+        // txns) and per-group GroupUsage/GroupFeesPaid (the pooled fee usage
+        // and fees paid required by the group and every descendant inner-txn
+        // group). Mirrors go-algorand's `populateFeeUsage`
+        // (`ledger/simulation/trace.go`), called once per group after
+        // execution using the same protocol consensus params applied above.
+        //
+        // Deliberately no per-transaction `usage` field: upstream's own
+        // comment explains fees pool across the group and round up once for
+        // the whole tree, so usage is only actionable at the group level.
+        let mut txgroup_with_ad: Vec<SignedTransaction> = Vec::with_capacity(eval_group.len());
+        for (i, stx) in eval_group.iter().enumerate() {
+            let eval_delta = group_result.txn_results[i]
+                .apply_data
+                .as_ref()
+                .and_then(|ad| ad.eval_delta.clone());
+            group_result.txn_results[i].fees_paid =
+                trace::summarize_txn_fees_paid(stx.txn.fee, eval_delta.as_ref());
+            let mut with_ad = stx.clone();
+            with_ad.eval_delta = eval_delta;
+            txgroup_with_ad.push(with_ad);
+        }
+        let (group_usage, group_fees_paid) =
+            trace::summarize_txn_group_fee_usage(&txgroup_with_ad, &apply_ctx.consensus);
+        group_result.group_usage = group_usage;
+        group_result.group_fees_paid = group_fees_paid;
+
         result.txn_groups.push(group_result);
 
         // Surface captured initial states when state-change tracing was
