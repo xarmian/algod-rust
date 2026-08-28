@@ -1862,6 +1862,17 @@ pub struct SimulateTransactionResult {
     #[serde(rename = "exec-trace", skip_serializing_if = "Option::is_none")]
     pub exec_trace: Option<SimulationTransactionExecTrace>,
 
+    /// Total fee actually paid by this transaction and its descendant inner
+    /// transactions (recursively summed). A factual report of what was paid
+    /// — not a required amount. Matches go-algorand's
+    /// `SimulateTransactionResult.FeesPaid` (`fees-paid`). There is
+    /// deliberately no per-transaction `usage` field: fees pool across the
+    /// group and round up once for the whole tree, so usage is only
+    /// actionable at the group level (see
+    /// [`SimulateTransactionGroupResult::group_usage`]).
+    #[serde(rename = "fees-paid", skip_serializing_if = "Option::is_none")]
+    pub fees_paid: Option<u64>,
+
     #[serde(rename = "fixed-signer", skip_serializing_if = "Option::is_none")]
     pub fixed_signer: Option<String>,
 
@@ -1900,6 +1911,19 @@ pub struct SimulateTransactionGroupResult {
 
     #[serde(rename = "failure-message", skip_serializing_if = "Option::is_none")]
     pub failure_message: Option<String>,
+
+    /// Total fee usage (in `Micros`, fixed-point 1e6 scale) required by this
+    /// group and all descendant inner-transaction groups (recursively
+    /// summed). Matches go-algorand's
+    /// `SimulateTransactionGroupResult.GroupUsage` (`group-usage`).
+    #[serde(rename = "group-usage", skip_serializing_if = "Option::is_none")]
+    pub group_usage: Option<u64>,
+
+    /// Total fee actually paid by this group and all descendant
+    /// inner-transaction groups (recursively summed). Matches go-algorand's
+    /// `SimulateTransactionGroupResult.GroupFeesPaid` (`group-fees-paid`).
+    #[serde(rename = "group-fees-paid", skip_serializing_if = "Option::is_none")]
+    pub group_fees_paid: Option<u64>,
 
     #[serde(rename = "txn-results")]
     pub txn_results: Vec<SimulateTransactionResult>,

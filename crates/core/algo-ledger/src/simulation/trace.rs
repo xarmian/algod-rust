@@ -7,9 +7,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use algo_avm::tracer::{AppStateAccess, AppStateOp, AppStateType};
+use algo_types::consensus::ConsensusParams;
 use algo_types::{Address, Round, SignedTransaction, TealValue};
 
 use crate::apply::ApplyData;
+use crate::eval_delta::parse_eval_delta;
 
 /// Configuration controlling what execution details to capture during simulation.
 ///
@@ -168,6 +170,17 @@ pub struct TxnResult {
     pub txn: Option<SignedTransaction>,
     /// Apply data from execution.
     pub apply_data: Option<ApplyData>,
+    /// Total fee actually paid by this transaction, plus (recursively,
+    /// saturating) every descendant inner transaction's fee. A plain factual
+    /// report of what was paid — not what was *required* (see
+    /// [`TxnGroupResult::group_usage`] for that). Mirrors go-algorand's
+    /// `TxnResult.FeesPaid` (`ledger/simulation/trace.go`).
+    ///
+    /// There is deliberately no per-transaction `usage` field: upstream's own
+    /// comment in `populateFeeUsage` explains that fees pool across the group
+    /// and round up once for the whole tree, so usage is only actionable at
+    /// the group level (see [`TxnGroupResult::group_usage`]).
+    pub fees_paid: u64,
 }
 
 /// Result for a transaction group.
@@ -190,6 +203,72 @@ pub struct TxnGroupResult {
     /// at the group level (go-algorand additionally reports per-transaction
     /// for pre-resource-sharing program versions; this engine does not).
     pub unnamed_resources_accessed: Option<UnnamedResourcesAccessed>,
+    /// Total fee usage (in `Micros`, see [`algo_validate::fee`]) required by
+    /// this group and all descendant inner-transaction groups, recursively
+    /// summed (saturating). Mirrors go-algorand's `TxnGroupResult.GroupUsage`.
+    pub group_usage: u64,
+    /// Total fee actually paid by this group and all descendant
+    /// inner-transaction groups, recursively summed (saturating). Mirrors
+    /// go-algorand's `TxnGroupResult.GroupFeesPaid`.
+    pub group_fees_paid: u64,
+}
+
+/// Mirrors go-algorand's `summarizeTxnFeesPaid(txn)` (`ledger/simulation/trace.go`):
+/// the fee actually paid by `txn`, plus (recursively, saturating) every
+/// descendant inner transaction's fee, found by walking `eval_delta`'s `itx`
+/// entries. `eval_delta` is the transaction's *own* post-execution delta
+/// (`ApplyData.eval_delta` for a top-level transaction, or the `eval_delta`
+/// field carried directly on an inner [`SignedTransaction`] — both shapes
+/// nest the same way since each inner txn's `dt` is fully encoded before its
+/// parent's is, per [`crate::eval_delta::encode_eval_delta`]'s doc comment).
+pub fn summarize_txn_fees_paid(fee: u64, eval_delta: Option<&rmpv::Value>) -> u64 {
+    let mut fees_paid = fee;
+    if let Some(dt) = eval_delta {
+        if let Ok(delta) = parse_eval_delta(dt) {
+            if let Some(inner_txns) = &delta.inner_txns {
+                for inner in inner_txns {
+                    fees_paid = fees_paid.saturating_add(summarize_txn_fees_paid(
+                        inner.txn.fee,
+                        inner.eval_delta.as_ref(),
+                    ));
+                }
+            }
+        }
+    }
+    fees_paid
+}
+
+/// Mirrors go-algorand's `summarizeTxnGroupFeeUsage(txgroup, proto)`
+/// (`ledger/simulation/trace.go`): the pooled fee usage/fees-paid required by
+/// `txgroup` — via [`algo_validate::summarize_fees`], which mirrors go's
+/// `transactions.SummarizeFees` — plus (recursively, saturating) the
+/// usage/fees-paid of every member's descendant inner-txn group, found via
+/// each member's own `eval_delta` field.
+///
+/// Every itxn_submit call spawned anywhere within one transaction's execution
+/// is flattened into a single list on that transaction's `eval_delta` (see
+/// [`crate::avm_context`]'s `to_avm_result`), matching go-algorand's flat
+/// `ApplyData.EvalDelta.InnerTxns`; that flat list is itself treated as one
+/// pooled group here, exactly as upstream does.
+pub fn summarize_txn_group_fee_usage(
+    txgroup: &[SignedTransaction],
+    params: &ConsensusParams,
+) -> (u64, u64) {
+    let group_refs: Vec<&SignedTransaction> = txgroup.iter().collect();
+    let (mut usage, mut fees_paid) = algo_validate::summarize_fees(&group_refs, params);
+    for txn in txgroup {
+        if let Some(dt) = &txn.eval_delta {
+            if let Ok(delta) = parse_eval_delta(dt) {
+                if let Some(inner_txns) = &delta.inner_txns {
+                    let (inner_usage, inner_fees_paid) =
+                        summarize_txn_group_fee_usage(inner_txns, params);
+                    usage = usage.saturating_add(inner_usage);
+                    fees_paid = fees_paid.saturating_add(inner_fees_paid);
+                }
+            }
+        }
+    }
+    (usage, fees_paid)
 }
 
 /// Unnamed resources accessed during simulation, in deterministic order.
@@ -793,5 +872,121 @@ mod tests {
         assert!(group.failed_at.is_none());
         assert_eq!(group.app_budget_added, 0);
         assert_eq!(group.app_budget_consumed, 0);
+        assert_eq!(group.group_usage, 0);
+        assert_eq!(group.group_fees_paid, 0);
+    }
+
+    // --- summarize_txn_fees_paid / summarize_txn_group_fee_usage (issue #671) ---
+
+    /// Build a signed txn of the given fee, with an `eval_delta` reporting
+    /// `inner` as its (already-encoded) inner transactions -- mirrors how
+    /// `encode_eval_delta` nests a parent's `itx` around children that already
+    /// carry their own encoded `eval_delta`.
+    fn stxn_with_inner(fee: u64, inner: Vec<SignedTransaction>) -> SignedTransaction {
+        let mut stx = SignedTransaction {
+            txn: algo_types::Transaction {
+                txn_type: "appl".into(),
+                fee,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if !inner.is_empty() {
+            let avm_result = algo_avm::eval::AvmResult {
+                inner_transactions: inner,
+                ..algo_avm::eval::AvmResult::empty()
+            };
+            stx.eval_delta = crate::eval_delta::encode_eval_delta(&avm_result, &stx.txn);
+        }
+        stx
+    }
+
+    fn v42() -> ConsensusParams {
+        algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V42)
+            .unwrap()
+    }
+
+    #[test]
+    fn summarize_txn_fees_paid_leaf_is_own_fee() {
+        assert_eq!(summarize_txn_fees_paid(1000, None), 1000);
+    }
+
+    #[test]
+    fn summarize_txn_fees_paid_sums_recursively_over_nested_inners() {
+        // grandchild (500) -> child (1000, carries grandchild) -> parent (2000, carries child)
+        let grandchild = stxn_with_inner(500, vec![]);
+        let child = stxn_with_inner(1000, vec![grandchild]);
+        let parent_fee = 2000u64;
+        let parent = stxn_with_inner(parent_fee, vec![child]);
+
+        let total = summarize_txn_fees_paid(parent_fee, parent.eval_delta.as_ref());
+        assert_eq!(total, 2000 + 1000 + 500);
+    }
+
+    #[test]
+    fn summarize_txn_fees_paid_saturates_on_overflow() {
+        let inner = stxn_with_inner(u64::MAX, vec![]);
+        let parent = stxn_with_inner(u64::MAX, vec![inner]);
+        let total = summarize_txn_fees_paid(u64::MAX, parent.eval_delta.as_ref());
+        assert_eq!(total, u64::MAX);
+    }
+
+    #[test]
+    fn summarize_txn_group_fee_usage_matches_summarize_fees_for_flat_group() {
+        let p = v42();
+        let a = stxn_with_inner(1000, vec![]);
+        let b = stxn_with_inner(1000, vec![]);
+        let group = vec![a, b];
+        let (usage, paid) = summarize_txn_group_fee_usage(&group, &p);
+        let refs: Vec<&SignedTransaction> = group.iter().collect();
+        let (expected_usage, expected_paid) = algo_validate::summarize_fees(&refs, &p);
+        assert_eq!(usage, expected_usage);
+        assert_eq!(paid, expected_paid);
+    }
+
+    #[test]
+    fn summarize_txn_group_fee_usage_adds_nested_inner_group_usage() {
+        let p = v42();
+        // Top-level single-txn group whose transaction spawned a two-txn
+        // inner group -- the inner group's own SummarizeFees-equivalent
+        // usage/fees must be pooled on top of the outer group's usage/fees.
+        let inner_a = SignedTransaction {
+            txn: algo_types::Transaction {
+                txn_type: "pay".into(),
+                fee: 1000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let inner_b = SignedTransaction {
+            txn: algo_types::Transaction {
+                txn_type: "pay".into(),
+                fee: 1000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let outer = stxn_with_inner(2000, vec![inner_a.clone(), inner_b.clone()]);
+        let group = vec![outer];
+
+        let (usage, paid) = summarize_txn_group_fee_usage(&group, &p);
+
+        let outer_refs: Vec<&SignedTransaction> = group.iter().collect();
+        let (outer_usage, outer_paid) = algo_validate::summarize_fees(&outer_refs, &p);
+        let inner_refs: Vec<&SignedTransaction> = vec![&inner_a, &inner_b];
+        let (inner_usage, inner_paid) = algo_validate::summarize_fees(&inner_refs, &p);
+
+        assert_eq!(usage, outer_usage + inner_usage);
+        assert_eq!(paid, outer_paid + inner_paid);
+        assert_eq!(paid, 2000 + 1000 + 1000);
+    }
+
+    #[test]
+    fn summarize_txn_group_fee_usage_saturates_on_overflow() {
+        let p = v42();
+        let a = stxn_with_inner(u64::MAX, vec![]);
+        let b = stxn_with_inner(u64::MAX, vec![]);
+        let (_usage, paid) = summarize_txn_group_fee_usage(&[a, b], &p);
+        assert_eq!(paid, u64::MAX);
     }
 }

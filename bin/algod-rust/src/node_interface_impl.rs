@@ -2066,6 +2066,7 @@ impl AlgodNodeInterface {
             // spawned-inners wiring (TASK-249). Per-opcode state-changes are
             // TASK-259.
             exec_trace: result.trace.as_ref().map(Self::exec_trace_to_model),
+            fees_paid: Self::opt_nonzero_u64(result.fees_paid),
             fixed_signer: result.fixed_signer.map(|a| a.to_string()),
             logic_sig_budget_consumed: Self::opt_nonzero_u64(result.logicsig_budget_consumed),
             txn_result,
@@ -2133,6 +2134,8 @@ impl AlgodNodeInterface {
                 .failed_at
                 .map(|path| path.into_iter().map(|i| i as u64).collect()),
             failure_message: group.failure_message,
+            group_usage: Self::opt_nonzero_u64(group.group_usage),
+            group_fees_paid: Self::opt_nonzero_u64(group.group_fees_paid),
             txn_results: group
                 .txn_results
                 .into_iter()
@@ -3970,6 +3973,8 @@ mod tests {
             app_budget_added: 700,
             app_budget_consumed: 100,
             unnamed_resources_accessed: None,
+            group_usage: 0,
+            group_fees_paid: 0,
         };
         let result = SimulationResult {
             version: 2,
@@ -4001,6 +4006,44 @@ mod tests {
         assert!(txn_result.exec_trace.is_none());
         assert_eq!(txn_result.txn_result.txn, txn);
         assert!(txn_result.txn_result.pool_error.is_empty());
+        // fees_paid was left at its zero default -> omitted (None).
+        assert!(txn_result.fees_paid.is_none());
+    }
+
+    #[test]
+    fn build_simulate_response_wires_fee_usage_reporting() {
+        // Issue #671: per-txn `fees-paid` and per-group `group-usage`/
+        // `group-fees-paid` must be threaded from the simulation engine's
+        // trace fields into the REST response, and omitted only when zero.
+        let txn = SignedTransaction::default();
+        let group = TxnGroupResult {
+            txn_results: vec![TxnResult {
+                txn: Some(txn.clone()),
+                fees_paid: 3000,
+                ..Default::default()
+            }],
+            failure_message: None,
+            failed_at: None,
+            app_budget_added: 0,
+            app_budget_consumed: 0,
+            unnamed_resources_accessed: None,
+            group_usage: 2_000_000,
+            group_fees_paid: 3000,
+        };
+        let result = SimulationResult {
+            version: 2,
+            last_round: Round(1000),
+            txn_groups: vec![group],
+            eval_overrides: Default::default(),
+            trace_config: Default::default(),
+            initial_states: None,
+        };
+
+        let response = AlgodNodeInterface::build_simulate_response(result);
+        let group = &response.txn_groups[0];
+        assert_eq!(group.group_usage, Some(2_000_000));
+        assert_eq!(group.group_fees_paid, Some(3000));
+        assert_eq!(group.txn_results[0].fees_paid, Some(3000));
     }
 
     #[test]
@@ -4018,6 +4061,8 @@ mod tests {
                 app_budget_added: 0,
                 app_budget_consumed: 0,
                 unnamed_resources_accessed: None,
+                group_usage: 0,
+                group_fees_paid: 0,
             }],
             eval_overrides: Default::default(),
             trace_config: Default::default(),
@@ -4031,6 +4076,8 @@ mod tests {
         // Zero-valued budget counters collapse to None.
         assert!(group.app_budget_added.is_none());
         assert!(group.app_budget_consumed.is_none());
+        assert!(group.group_usage.is_none());
+        assert!(group.group_fees_paid.is_none());
     }
 
     #[test]
