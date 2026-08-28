@@ -476,10 +476,14 @@ fn div_step(u_hi: u64, u_mid: u64, u_lo: u64, v1: u64, v0: u64) -> (u64, u64, u6
 /// is the whole point of the port: any float64 shortcut here would defeat
 /// bit-exactness.
 pub(crate) fn f128_from_digest_ratio(d: &[u8; 32]) -> F128 {
-    let w3 = u64::from_be_bytes(d[0..8].try_into().unwrap());
-    let w2 = u64::from_be_bytes(d[8..16].try_into().unwrap());
-    let w1 = u64::from_be_bytes(d[16..24].try_into().unwrap());
-    let w0 = u64::from_be_bytes(d[24..32].try_into().unwrap());
+    // `d` is a fixed-size `&[u8; 32]`, so each 8-byte sub-slice is
+    // infallibly convertible; `.expect` (not a bare `.unwrap`) keeps a
+    // hypothetical future signature change (e.g. to `&[u8]`) diagnosable
+    // rather than an opaque panic on this consensus-critical path.
+    let w3 = u64::from_be_bytes(d[0..8].try_into().expect("8-byte slice of a 32-byte array"));
+    let w2 = u64::from_be_bytes(d[8..16].try_into().expect("8-byte slice of a 32-byte array"));
+    let w1 = u64::from_be_bytes(d[16..24].try_into().expect("8-byte slice of a 32-byte array"));
+    let w0 = u64::from_be_bytes(d[24..32].try_into().expect("8-byte slice of a 32-byte array"));
 
     let leading: u32 = if w3 != 0 {
         w3.leading_zeros()
