@@ -398,7 +398,7 @@ The `v4.7.0-stable → v4.7.2-stable` sweep is a small, security/bounds-check-fo
 
 The `v4.7.2-stable → v4.7.3-stable` sweep is a small, security/robustness-focused patch release with no consensus version bump: a tightened anti-zip-bomb gossip decompression bound, and a Go-specific panic-recovery hardening pass whose Rust-equivalent parity work is an audit-and-fix pass over algod-rust's own block-evaluation pipeline. Complete — see `docs/PHASE12_VALIDATION.md` for the evidence map.
 
-The `v4.7.3-stable → v4.7.4-stable` sweep is a small, safety/durability-focused patch release with no consensus version bump: go-algorand's early block-proposal screen now cryptographically recomputes each transaction group's ID (rather than only checking group boundaries) and enforces a max-group-size bound before accepting/relaying a proposal. algod-rust's deep validation path already performed this strong check, but its early pre-acceptance proposal screen did not — see `docs/PHASE13_PROPOSAL.md` and epic #650.
+The `v4.7.3-stable → v4.7.4-stable` sweep is a small, safety/durability-focused patch release with no consensus version bump: go-algorand's early block-proposal screen now cryptographically recomputes each transaction group's ID (rather than only checking group boundaries) and enforces a max-group-size bound before accepting/relaying a proposal. algod-rust's deep validation path already performed this strong check, but its early pre-acceptance proposal screen did not. Complete — see `docs/PHASE13_VALIDATION.md` for the evidence map.
 
 ---
 
