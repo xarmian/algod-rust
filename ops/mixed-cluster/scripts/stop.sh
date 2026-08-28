@@ -60,7 +60,7 @@ if [ "$PURGE" = "1" ]; then
         if ! MSYS_NO_PATHCONV=1 docker run --rm \
                 -v "$(host_path "$ROOT/netroot"):/netroot" \
                 --entrypoint sh \
-                algorand/algod:4.7.3-stable \
+                algorand/algod:5.0.0-stable \
                 -c 'rm -rf /netroot/* /netroot/.[!.]* 2>/dev/null || true'; then
             echo "warning: container-based purge failed (image unavailable?); \
 falling back to host-side rm (may leave root-owned files behind)" >&2

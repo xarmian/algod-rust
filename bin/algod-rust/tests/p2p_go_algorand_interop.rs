@@ -1,7 +1,7 @@
 //! Live P2P transport interop test (issue #543), plus issue #560/#564's
 //! DHT wire-protocol investigation.
 //!
-//! Dials a real go-algorand v4.7.4-stable node running in plain P2P mode
+//! Dials a real go-algorand v5.0.0-stable node running in plain P2P mode
 //! (`EnableP2P: true`, no WS-gossip listener) with algod-rust's own
 //! `algo-p2p` libp2p host, and asserts a secure (Noise-authenticated)
 //! TCP connection is established — proof that `algo-p2p`'s transport
@@ -124,7 +124,7 @@ fn go_node_multiaddr() -> Option<Multiaddr> {
 const P2PINTEROP_NETWORK_ID: &str = "p2pinterop";
 
 #[tokio::test]
-#[ignore = "requires a live go-algorand v4.7.4-stable node in P2P mode — see ops/mixed-cluster-p2p/scripts/start.sh"]
+#[ignore = "requires a live go-algorand v5.0.0-stable node in P2P mode — see ops/mixed-cluster-p2p/scripts/start.sh"]
 async fn dials_real_go_algorand_p2p_host_and_establishes_secure_connection() {
     let Some(target) = go_node_multiaddr() else {
         panic!(
@@ -187,7 +187,7 @@ async fn dials_real_go_algorand_p2p_host_and_establishes_secure_connection() {
 /// `find_closest_peers` — is the DHT primitive that actually round-trips
 /// against go-algorand for peer discovery.
 #[tokio::test]
-#[ignore = "requires a live go-algorand v4.7.4-stable node in P2P mode — see ops/mixed-cluster-p2p/scripts/start.sh"]
+#[ignore = "requires a live go-algorand v5.0.0-stable node in P2P mode — see ops/mixed-cluster-p2p/scripts/start.sh"]
 async fn discovers_go_algorand_peer_via_gossip_capability_provider_records() {
     let Some(target) = go_node_multiaddr() else {
         panic!(
@@ -281,7 +281,7 @@ async fn discovers_go_algorand_peer_via_gossip_capability_provider_records() {
 /// regression guard, with [`PROPAGATION_WAIT`] sized generously above the
 /// observed few-seconds convergence time.
 #[tokio::test]
-#[ignore = "requires the live 3-node go-algorand v4.7.4-stable chain — see ops/mixed-cluster-p2p/scripts/start.sh"]
+#[ignore = "requires the live 3-node go-algorand v5.0.0-stable chain — see ops/mixed-cluster-p2p/scripts/start.sh"]
 async fn provider_record_advertised_by_neighbor_propagates_to_queried_node() {
     let Some(target) = go_node_multiaddr() else {
         panic!(
@@ -375,7 +375,7 @@ async fn provider_record_advertised_by_neighbor_propagates_to_queried_node() {
 /// `bin/algod-rust/src/commands/p2p_transport.rs`'s `P2pTransport` now
 /// uses to carry AV/PP/VB traffic to real go-algorand peers.
 #[tokio::test]
-#[ignore = "requires a live go-algorand v4.7.4-stable node in P2P mode — see ops/mixed-cluster-p2p/scripts/start.sh"]
+#[ignore = "requires a live go-algorand v5.0.0-stable node in P2P mode — see ops/mixed-cluster-p2p/scripts/start.sh"]
 async fn algorand_ws_stream_handshake_round_trips_with_real_go_algorand_node() {
     let Some(target) = go_node_multiaddr() else {
         panic!(

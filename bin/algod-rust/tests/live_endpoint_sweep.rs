@@ -326,11 +326,18 @@ async fn teal_dryrun_malformed_body_status_matches() {
         .send()
         .await
         .unwrap();
+    // TODO(#674): go-algorand v5.0.0-stable removes the `dryrun` REST
+    // endpoint entirely, so `go.status()` is now a 404/"not found" rather
+    // than the 400 this test used to observe on a malformed body; algod-rust
+    // still serves it. The two are no longer comparable — assert only that
+    // algod-rust still 400s on a malformed body, and drop the cross-node
+    // equality check until #674 removes algod-rust's endpoint too.
     assert_eq!(
-        go.status(),
         rust.status(),
-        "POST /v2/teal/dryrun with a malformed body must 400 identically"
+        400,
+        "rust POST /v2/teal/dryrun with a malformed body must still 400"
     );
+    let _ = go.status();
 }
 
 // ---------------------------------------------------------------------------

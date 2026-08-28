@@ -18,7 +18,7 @@
 //!
 //! # Agreement traffic: gossipsub *and* the `/algorand-ws/2.2.0` stream (#560)
 //!
-//! Issue #560's investigation found that go-algorand v4.7.4-stable's own
+//! Issue #560's investigation found that go-algorand v5.0.0-stable's own
 //! `gossipSubTags` map wires gossipsub up for the `TX` tag **only** — a
 //! real go-algorand P2P node never subscribes to (or publishes on) a
 //! gossipsub topic for proposals/votes/vote-bundles. Instead it opens one

@@ -276,7 +276,23 @@ async fn get_produced_block_msgpack_matches() {
     // gaps; issue #462 implemented both (`algo_ledger::block_header`'s
     // `next_bonus` / `next_state_proof_tracking`, ports of go's
     // `bookkeeping.NextBonus` and `eval.endOfBlock`), so they are now asserted.
-    let allowed_prefixes = ["\"block\".\"rnd\""];
+    // TODO(#681): go-algorand v5.0.0-stable is the first pin in this repo's
+    // history where ConsensusCurrentVersion itself advances past genesis
+    // (V41 -> V42), so the pinned Go dev-mode node now casts a real default
+    // upgrade proposal/vote from round 1. algod-rust's block-production path
+    // deliberately never proposes/votes for protocol upgrades (see
+    // `algo_ledger::block_header`'s module doc comment) and so never
+    // populates these fields; remove this exclusion when #681 lands.
+    let allowed_prefixes = [
+        "\"block\".\"rnd\"",
+        "\"block\".\"nextbefore\"",
+        "\"block\".\"nextproto\"",
+        "\"block\".\"nextswitch\"",
+        "\"block\".\"nextyes\"",
+        "\"block\".\"upgradedelay\"",
+        "\"block\".\"upgradeprop\"",
+        "\"block\".\"upgradeyes\"",
+    ];
     mismatches.retain(|m| {
         !allowed_prefixes
             .iter()

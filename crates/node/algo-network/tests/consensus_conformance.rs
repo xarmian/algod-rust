@@ -35,7 +35,7 @@
 //!   at `v4.6.0-stable` (the Go-side certificate authenticator is built
 //!   from it inside a `golang:1.25-bookworm` container, which also runs
 //!   `make libsodium` — see `tools/cert-authenticate/run-in-docker.sh`).
-//! * `algorand/algod:4.7.3-stable` image available locally.
+//! * `algorand/algod:5.0.0-stable` image available locally.
 //! * `curl` + `python3` on PATH.
 //! * `algo-fork-detector` + `algo-cert-crossverify` built into
 //!   `target/debug` (the make target builds them; run

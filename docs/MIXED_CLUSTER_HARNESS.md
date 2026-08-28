@@ -150,7 +150,7 @@ the first place were closed by issue #468:
   `genesis.json` (including the `ConsensusProtocol: "future"` pin the
   template sets). `genesis_seed_matches_go_ledger_supply` asserts the
   resulting online / participating totals against the values a live
-  `algorand/algod:4.7.3-stable` node serves from `/v2/ledger/supply` at
+  `algorand/algod:5.0.0-stable` node serves from `/v2/ledger/supply` at
   round 0 on the same netroot.
 - **Online-stake awareness — done.** `template.json` now marks Wallet4
   `"Online": true`, so `goal network create` generates its partkey
@@ -255,7 +255,7 @@ A second, narrower harness — `ops/mixed-cluster-p2p/` — targets the new
 libp2p-based P2P transport (`crates/node/algo-p2p`, issues #538-#542)
 rather than the WS-gossip stack this file otherwise documents. It is
 **not** a variant of the 4-node harness above; it's three real
-go-algorand v4.7.4-stable nodes, each started in plain P2P mode
+go-algorand v5.0.0-stable nodes, each started in plain P2P mode
 (`EnableP2P: true`, no WS-gossip listener), chain-bootstrapped to each
 other (1 <- 2 <- 3 — go-node-2 is only ever told go-node-1's multiaddr;
 go-node-3 is only ever told go-node-2's), which algod-rust's
@@ -284,7 +284,7 @@ Issue #543's full headline scope — "a mixed P2P cluster (Rust +
 go-algorand NEW nodes) reaches and maintains consensus over a run of
 rounds" — is still not implemented, but the architectural blocker issue
 #560's investigation originally found is now closed (PR #590):
-go-algorand v4.7.4-stable's own `gossipSubTags` map
+go-algorand v5.0.0-stable's own `gossipSubTags` map
 (`network/p2pNetwork.go`) wires up gossipsub for the `TX` tag **only**.
 Agreement traffic (votes/proposals/bundles) travels over go's per-peer
 libp2p **stream** protocol instead
@@ -330,7 +330,7 @@ issue, gated on the consensus round-trip landing first).
 Investigation for #543 confirmed go-algorand's P2P support carries no
 `//go:build` tag — `network/p2p/` compiles into every standard build,
 `EnableP2P` is a pure runtime `config.json` flag, so the stock
-`algorand/algod:4.7.3-stable` Docker Hub image (already used by
+`algorand/algod:5.0.0-stable` Docker Hub image (already used by
 `ops/mixed-cluster/`) works unmodified. `EnableP2P: true` alone (without
 `EnableP2PHybridMode`) still requires `NetAddress` to be set —
 `config/localTemplate.go`'s `IsP2PListenServer()`: `(cfg.EnableP2P &&

@@ -2,7 +2,7 @@
 // algod-rust issue #618: it builds the exact hand-rolled msgpack byte
 // sequences used by the Rust unit tests in
 // crates/core/algo-types/src/transaction.rs (required_field_decode_tests
-// module) and feeds them to go-algorand v4.7.4-stable's own generated
+// module) and feeds them to go-algorand v5.0.0-stable's own generated
 // UnmarshalMsg decoders, confirming the real Go decoder accepts/rejects
 // each case the same way the Rust port does.
 //
@@ -202,10 +202,10 @@ func main() {
 	}
 
 	if mismatches > 0 {
-		fmt.Printf("\n%d/%d cases mismatched go-algorand v4.7.4-stable's real decoder\n", mismatches, len(results))
+		fmt.Printf("\n%d/%d cases mismatched go-algorand v5.0.0-stable's real decoder\n", mismatches, len(results))
 		os.Exit(2)
 	}
-	fmt.Printf("\nall %d cases match go-algorand v4.7.4-stable's real decoder\n", len(results))
+	fmt.Printf("\nall %d cases match go-algorand v5.0.0-stable's real decoder\n", len(results))
 }
 
 func decodeTransaction(name string, wantAccept bool, wantErrHas string, build func([]byte) []byte) caseResult {
