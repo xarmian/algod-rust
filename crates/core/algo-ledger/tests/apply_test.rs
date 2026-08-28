@@ -1,6 +1,9 @@
 //! Integration tests for apply.rs — covers edge cases NOT in the inline unit tests.
 
-use algo_ledger::{apply_block, apply_transaction, ApplyContext, LedgerState};
+use algo_ledger::{
+    apply_block, apply_transaction, apply_transaction_with_budget, ApplyContext, ApplyMode,
+    GroupInfo, LedgerState,
+};
 use algo_types::{AccountStatus, Address, AssetParams, Block, Round, SignedTransaction, TealValue};
 
 // ---------------------------------------------------------------------------
@@ -1453,4 +1456,141 @@ fn test_asset_close_out_with_rewards() {
 
     // close_to should have received the 500 asset units.
     assert_eq!(state.get_asset_holding(&close_to, 42).unwrap().amount, 500,);
+}
+
+// ---------------------------------------------------------------------------
+// 12. gload must error on a sibling appl txn with nil pastScratch (issue #670)
+//
+// Mirrors go-algorand's `TestGloadNoProgram` (`data/transactions/logic/
+// eval_test.go`) and the `a9e47033d` fix to `opGloadImpl`
+// (`data/transactions/logic/eval.go`): a sibling group transaction whose
+// `Type` is `appl` but which never actually executed a program -- e.g. a
+// ClearState call against an already-deleted app -- must make `gload`/
+// `gloads`/`gloadss` error, not silently return a default/garbage value.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
+    use algo_avm::group::GroupBudget;
+    use std::cell::RefCell;
+
+    const ON_COMPLETION_CLEAR_STATE: u64 = 3;
+    const ON_COMPLETION_DELETE: u64 = 5;
+
+    let creator = Address([1u8; 32]);
+    let user = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let app_id = 900u64;
+
+    let mut state = make_state(
+        &[(creator, 50_000_000), (user, 50_000_000), (fee_sink, 0)],
+        fee_sink,
+    );
+    let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+    ctx.mode = ApplyMode::Execute;
+
+    // 1. Create app `app_id` with a trivial always-approve program.
+    let create = appl_create_txn(creator, 1_000, app_id, 0);
+    apply_transaction_with_budget(&mut state, &create, &ctx, 0, None, None, None).unwrap();
+
+    // 2. User opts in.
+    let optin = appl_optin_txn(user, 1_000, app_id);
+    apply_transaction_with_budget(&mut state, &optin, &ctx, 0, None, None, None).unwrap();
+
+    // 3. Creator deletes the app. Local state for `user` survives deletion
+    // (only ClearState removes it), matching go-algorand.
+    let mut delete = SignedTransaction::default();
+    delete.txn.txn_type = "appl".into();
+    delete.txn.sender = creator;
+    delete.txn.fee = 1_000;
+    delete.txn.application_id = app_id;
+    delete.txn.on_completion = ON_COMPLETION_DELETE;
+    apply_transaction_with_budget(&mut state, &delete, &ctx, 0, None, None, None).unwrap();
+    assert!(state.get_app_params(app_id).is_none());
+    assert!(state.get_app_local_state(&user, app_id).is_some());
+
+    // 4. Build a 2-txn group:
+    //    [0] user's ClearState against the now-deleted app -- `Type` is
+    //        `appl`, but since the app has no clear-state program left to
+    //        run, `apply_appl` never invokes the AVM for this index.
+    //    [1] a second app call whose approval program does `gload 0 0`,
+    //        reading txn 0's (never-populated) scratch space.
+    let mut clear_state = SignedTransaction::default();
+    clear_state.txn.txn_type = "appl".into();
+    clear_state.txn.sender = user;
+    clear_state.txn.fee = 1_000;
+    clear_state.txn.application_id = app_id;
+    clear_state.txn.on_completion = ON_COMPLETION_CLEAR_STATE;
+
+    // Create the reader app with a trivial always-approve program first
+    // (app creation also runs the approval program, and a single-txn group
+    // can never legally `gload` -- every reference is either self or
+    // future), then update it in-place to the real `gload 0 0` (0x3a 0x00
+    // 0x00) program: reading a nil past-scratch slot must error before any
+    // further opcode runs.
+    let reader_app_id = 901u64;
+    let reader_create = appl_create_txn(creator, 1_000, reader_app_id, 0);
+    apply_transaction_with_budget(&mut state, &reader_create, &ctx, 0, None, None, None).unwrap();
+
+    let mut reader_update = appl_update_txn(creator, 1_000, reader_app_id);
+    reader_update.txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![
+        0x06, // version 6
+        0x3a, 0x00, 0x00, // gload 0 0
+    ]));
+    apply_transaction_with_budget(&mut state, &reader_update, &ctx, 0, None, None, None).unwrap();
+
+    let mut reader_call = SignedTransaction::default();
+    reader_call.txn.txn_type = "appl".into();
+    reader_call.txn.sender = creator;
+    reader_call.txn.fee = 1_000;
+    reader_call.txn.application_id = reader_app_id;
+    reader_call.txn.on_completion = 0; // NoOp
+
+    let group_refs: Vec<&SignedTransaction> = vec![&clear_state, &reader_call];
+    let ran_program = RefCell::new(vec![false; group_refs.len()]);
+    let mut budget = GroupBudget::new(1);
+
+    // Index 0: ClearState against the deleted app succeeds (clearing local
+    // state is always allowed), and does NOT mark index 0 as having run a
+    // program.
+    let gi0 = GroupInfo {
+        txns: &group_refs,
+        index: 0,
+        ran_program: &ran_program,
+    };
+    apply_transaction_with_budget(
+        &mut state,
+        &clear_state,
+        &ctx,
+        0,
+        Some(&mut budget),
+        Some(&gi0),
+        None,
+    )
+    .unwrap();
+    assert!(state.get_app_local_state(&user, app_id).is_none());
+    assert!(!ran_program.borrow()[0]);
+
+    // Index 1: the reader app's `gload 0 0` must error rather than
+    // nil-dereference, panic, or return a default zero value.
+    let gi1 = GroupInfo {
+        txns: &group_refs,
+        index: 1,
+        ran_program: &ran_program,
+    };
+    let result = apply_transaction_with_budget(
+        &mut state,
+        &reader_call,
+        &ctx,
+        0,
+        Some(&mut budget),
+        Some(&gi1),
+        None,
+    );
+    let err = result.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("gload lookup of txn 0 that did not run a program"),
+        "unexpected error message: {msg}"
+    );
 }

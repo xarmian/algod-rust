@@ -309,7 +309,7 @@ pub fn op_gload(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let (group_index, slot) = get_uint8_pair(instruction)?;
-    let value = ctx.gload(group_index as usize, slot)?;
+    let value = ctx.gload("gload", group_index as usize, slot)?;
     machine.push(teal_to_avm(value))
 }
 
@@ -321,7 +321,7 @@ pub fn op_gloads(
 ) -> Result<(), AlgoError> {
     let slot = get_uint8(instruction)?;
     let group_index = machine.pop_uint()? as usize;
-    let value = ctx.gload(group_index, slot)?;
+    let value = ctx.gload("gloads", group_index, slot)?;
     machine.push(teal_to_avm(value))
 }
 
@@ -339,7 +339,7 @@ pub fn op_gloadss(
             message: format!("gloadss scratch index >= 256 ({})", slot_raw),
         });
     }
-    let value = ctx.gload(group_index_raw as usize, slot_raw as u8)?;
+    let value = ctx.gload("gloadss", group_index_raw as usize, slot_raw as u8)?;
     machine.push(teal_to_avm(value))
 }
 
@@ -792,12 +792,20 @@ mod tests {
             Ok(())
         }
 
-        fn gload(&self, group_index: usize, slot: u8) -> Result<TealValue, AlgoError> {
+        fn gload(
+            &self,
+            op_name: &str,
+            group_index: usize,
+            slot: u8,
+        ) -> Result<TealValue, AlgoError> {
             self.group_scratch
                 .get(&(group_index, slot))
                 .cloned()
                 .ok_or_else(|| AlgoError::Avm {
-                    message: format!("gload: slot {} from group {} not found", slot, group_index),
+                    message: format!(
+                        "{op_name}: slot {} from group {} not found",
+                        slot, group_index
+                    ),
                 })
         }
 

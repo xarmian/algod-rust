@@ -893,11 +893,49 @@ impl AvmContext for DryrunAvmContext {
 
     // ---- Group scratch space ----
 
-    fn gload(&self, group_index: usize, slot: u8) -> Result<TealValue, AlgoError> {
-        if group_index >= self.group_scratch.len() {
-            return Ok(TealValue::Uint(0));
+    fn gload(&self, op_name: &str, group_index: usize, slot: u8) -> Result<TealValue, AlgoError> {
+        // Mirrors go-algorand's `opGloadImpl` (`data/transactions/logic/eval.go`)
+        // check ordering: range, type, self, future, then "did not run a
+        // program" (nil pastScratch) before the actual scratch read.
+        if group_index >= self.group.len() {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "{op_name} lookup TxnGroup[{group_index}] but it only has {}",
+                    self.group.len()
+                ),
+            });
+        }
+        if self.group[group_index].txn.txn_type != "appl" {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "can't use {op_name} on non-app call txn with index {group_index}"
+                ),
+            });
+        }
+        if group_index == self.group_index {
+            return Err(AlgoError::Avm {
+                message: format!("can't use {op_name} on self, use load instead"),
+            });
+        }
+        if group_index > self.group_index {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "{op_name} can't get future scratch space from txn with index {group_index}"
+                ),
+            });
         }
         let scratch = &self.group_scratch[group_index];
+        // An app call that never executed its program (e.g. a ClearState
+        // against an already-deleted app) leaves its scratch space empty
+        // even though its Type is still `appl` — error rather than
+        // silently returning a default/garbage value.
+        if scratch.is_empty() {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "{op_name} lookup of txn {group_index} that did not run a program"
+                ),
+            });
+        }
         let slot = slot as usize;
         if slot >= scratch.len() {
             return Ok(TealValue::Uint(0));
@@ -2661,6 +2699,57 @@ mod tests {
         assert!(
             msgs1.contains(&"PASS".to_string()),
             "txn 1 should PASS (gload from txn 0): {:?}",
+            msgs1
+        );
+    }
+
+    #[test]
+    fn test_dryrun_gload_errors_on_sibling_that_did_not_run_a_program() {
+        // Mirrors go-algorand's `TestGloadNoProgram` (issue #670): txn 0 is
+        // an `appl`-type ClearState call against an app id that isn't part
+        // of the dryrun's uploaded app state (standing in for "already
+        // deleted"), so it never actually runs a program and its scratch
+        // space stays empty. Txn 1's `gload 0 0` must error, not silently
+        // return a default/garbage value.
+        let sender = test_sender();
+        let creator_str = test_sender_str();
+
+        let teal_load = "#pragma version 10\ngload 0 0\nint 77\n==\nassert\nint 1";
+        let app2 = make_app(200, &creator_str, teal_load, "#pragma version 10\nint 1");
+        let account = make_simple_account(&creator_str, 1_000_000);
+
+        // Txn 0: ClearState against app 999, which is absent from `apps` --
+        // no program ever runs for this index.
+        let txn0 = make_app_call_txn_json(&sender, 999, 3 /* ClearState */);
+        let txn1 = make_app_call_txn_json(&sender, 200, 0);
+
+        let req = DryrunRequest {
+            accounts: vec![account],
+            apps: vec![app2],
+            latest_timestamp: 0,
+            protocol_version: String::new(),
+            round: 1,
+            sources: vec![],
+            txns: vec![txn0, txn1],
+        };
+
+        let resp = run_dryrun(req);
+        assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
+        assert_eq!(resp.txns.len(), 2);
+
+        // Txn 1 must REJECT with the nil-pastScratch error, not PASS with a
+        // default zero value.
+        let msgs1 = resp.txns[1].app_call_messages.as_ref().unwrap();
+        assert!(
+            msgs1.contains(&"REJECT".to_string()),
+            "txn 1 should REJECT (gload of a txn that never ran): {:?}",
+            msgs1
+        );
+        assert!(
+            msgs1
+                .iter()
+                .any(|m| m.contains("gload lookup of txn 0 that did not run a program")),
+            "txn 1 messages should explain the nil-pastScratch error: {:?}",
             msgs1
         );
     }
