@@ -97,6 +97,17 @@ pub struct ApplyContext {
     /// that set fee=0 draw from this credit; overpayment by inner txns adds
     /// back to it. Shared across all app calls in a group.
     pub fee_credit: Cell<u64>,
+    /// Fractional microAlgo residue (1e-12 precision) left over from the
+    /// group's fee round-ups so far but not yet consumed.
+    ///
+    /// Mirrors go-algorand's `EvalParams.feeResidue` (`data/transactions/
+    /// logic/eval.go`, PR #6650): seeded per top-level group by
+    /// `compute_group_fee_credit_and_residue` alongside `fee_credit`, then
+    /// threaded into `LedgerAvmContext::fee_residue` for the group's app
+    /// calls so nested inner-txn groups round their aggregate fee up only
+    /// once, not once per group. Shared across all app calls in a group,
+    /// same as `fee_credit`.
+    pub fee_residue: Cell<u64>,
     /// Current transaction index within the block (for mismatch reporting).
     pub txn_index: Cell<usize>,
     /// Consensus parameters for the current protocol version.
@@ -160,6 +171,7 @@ impl ApplyContext {
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
             fee_credit: Cell::new(0),
+            fee_residue: Cell::new(0),
             txn_index: Cell::new(0),
             consensus: ConsensusParams::default(),
             avm_overrides: AvmEvalOverrides::default(),
@@ -1406,6 +1418,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
         genesis_hash: gh,
         txn_counter: Cell::new(base_txn_counter),
         fee_credit: Cell::new(0),
+        fee_residue: Cell::new(0),
         txn_index: Cell::new(0),
         consensus: consensus.clone(),
         avm_overrides: Default::default(),
@@ -1472,10 +1485,11 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                         .count();
                     let mut group_budget = GroupBudget::new(num_app_calls);
 
-                    // Compute per-group fee credit (matches go-algorand feeCredit).
-                    let group_fee_credit =
-                        compute_group_fee_credit(group, ctx.consensus.min_txn_fee);
+                    // Compute per-group fee credit and residue (matches go-algorand feeCredit).
+                    let (group_fee_credit, group_fee_residue) =
+                        compute_group_fee_credit_and_residue(group, &ctx.consensus);
                     ctx.fee_credit.set(group_fee_credit);
+                    ctx.fee_residue.set(group_fee_residue);
 
                     // Snapshot the group's touched accounts before applying it, so
                     // the per-group state delta can be built by diffing afterwards
@@ -2202,22 +2216,27 @@ fn mark_group_member_ran(group_info: Option<&GroupInfo<'_>>) {
     }
 }
 
-/// Compute the fee credit for a transaction group.
+/// Compute the fee credit and fee residue for a transaction group.
 ///
-/// Mirrors go-algorand's `feeCredit()`: sum all fees paid in the group, subtract
-/// `MinTxnFee * num_non_stpf_txns`, return the difference (saturating at 0).
-/// State proof transactions are exempt from fees per go-algorand.
-pub(crate) fn compute_group_fee_credit(group: &[&SignedTransaction], min_txn_fee: u64) -> u64 {
-    let mut min_fee_count: u64 = 0;
-    let mut fees_paid: u64 = 0;
-    for stx in group {
-        if stx.txn.txn_type != "stpf" {
-            min_fee_count += 1;
-        }
-        fees_paid = fees_paid.saturating_add(stx.txn.fee);
-    }
-    let fee_needed = min_txn_fee.saturating_mul(min_fee_count);
-    fees_paid.saturating_sub(fee_needed)
+/// Mirrors go-algorand's `feeCredit(txgroup, proto) (credit MicroAlgos, residue
+/// uint64)` (`data/transactions/logic/eval.go`, PR #6650 "Fees: Handle rounding
+/// of fees with non-integral usage better"): usage-weights each group member
+/// via `SummarizeFees` (`Transaction.feeFactor`, which is 0 for `stpf` and can
+/// exceed one `MinTxnFee` for oversized notes/programs, unlike a flat per-txn
+/// count) and rounds the required fee up via `FeeForUsage` with no incoming
+/// residue (a top-level group always starts a fresh rounding sequence). The
+/// returned residue seeds the group's inner-txn evaluation
+/// (`ApplyContext::fee_residue` / `LedgerAvmContext::fee_residue`) so that
+/// inner-txn groups round their aggregate fee up only once in concert with
+/// the top-level group, rather than once per group.
+pub(crate) fn compute_group_fee_credit_and_residue(
+    group: &[&SignedTransaction],
+    params: &ConsensusParams,
+) -> (u64, u64) {
+    let (usage, fees_paid) = algo_validate::summarize_fees(group, params);
+    let (fee_needed, residue, _overflow) =
+        algo_validate::fee_for_usage(params.min_txn_fee, usage, algo_validate::ONE_MICROS, 0);
+    (fees_paid.saturating_sub(fee_needed), residue)
 }
 
 /// Detect transaction groups within a block's payset.
@@ -3689,6 +3708,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     avm_ctx.fee_sink = ctx.fee_sink;
                     avm_ctx.txn_counter = ctx.txn_counter.get();
                     avm_ctx.fee_credit = ctx.fee_credit.get();
+                    avm_ctx.fee_residue = ctx.fee_residue.get();
                     ctx.configure_avm_ctx(&mut avm_ctx);
                     seed_avm_scratch_from_group(&mut avm_ctx, group_info);
                     if let Some(ref mut t) = tracer {
@@ -3713,6 +3733,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     // Propagate updated counters back to context.
                     ctx.txn_counter.set(avm_ctx.txn_counter);
                     ctx.fee_credit.set(avm_ctx.fee_credit);
+                    ctx.fee_residue.set(avm_ctx.fee_residue);
                     // Record EvalDelta comparison (clear-state).
                     record_eval_delta_comparison(
                         stx,
@@ -3781,6 +3802,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 avm_ctx.fee_sink = ctx.fee_sink;
                 avm_ctx.txn_counter = ctx.txn_counter.get();
                 avm_ctx.fee_credit = ctx.fee_credit.get();
+                avm_ctx.fee_residue = ctx.fee_residue.get();
                 ctx.configure_avm_ctx(&mut avm_ctx);
                 seed_avm_scratch_from_group(&mut avm_ctx, group_info);
                 if let Some(ref mut t) = tracer {
@@ -3804,6 +3826,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 // Propagate updated counters back to context.
                 ctx.txn_counter.set(avm_ctx.txn_counter);
                 ctx.fee_credit.set(avm_ctx.fee_credit);
+                ctx.fee_residue.set(avm_ctx.fee_residue);
 
                 // Record EvalDelta comparison (approval program).
                 record_eval_delta_comparison(stx, &result, ctx.round, ctx.txn_index.get(), app_id);
@@ -4220,6 +4243,10 @@ pub struct InnerApplyData {
     /// Remaining fee credit after inner app call execution.
     /// Propagated back so the parent can sync its fee_credit.
     pub fee_credit: u64,
+    /// Remaining fee residue after inner app call execution.
+    /// Propagated back so the parent can sync its fee_residue (see
+    /// `LedgerAvmContext::fee_residue`).
+    pub fee_residue: u64,
     /// Final transaction counter after inner app call execution.
     /// Propagated back so the parent can sync its txn_counter.
     pub txn_counter: u64,
@@ -6498,6 +6525,7 @@ mod tests {
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
             fee_credit: Cell::new(0),
+            fee_residue: Cell::new(0),
             txn_index: Cell::new(0),
             consensus,
             avm_overrides: Default::default(),
@@ -7202,6 +7230,7 @@ mod tests {
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
             fee_credit: Cell::new(0),
+            fee_residue: Cell::new(0),
             txn_index: Cell::new(0),
             consensus,
             avm_overrides: Default::default(),
@@ -7384,6 +7413,7 @@ mod tests {
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
             fee_credit: Cell::new(0),
+            fee_residue: Cell::new(0),
             txn_index: Cell::new(0),
             consensus,
             avm_overrides: Default::default(),
@@ -8229,6 +8259,7 @@ mod tests {
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
             fee_credit: Cell::new(0),
+            fee_residue: Cell::new(0),
             txn_index: Cell::new(0),
             consensus,
             avm_overrides: Default::default(),

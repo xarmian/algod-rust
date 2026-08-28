@@ -727,6 +727,20 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// Inner transaction groups can underpay fees if the outer group overpaid.
     /// This tracks the available credit across all inner txn submissions.
     pub fee_credit: u64,
+    /// Fractional microAlgo residue (1e-12 precision, i.e. over
+    /// `algo_validate::FEE_RESIDUE_SCALE`) that this group's fee charges
+    /// have rounded up so far but not yet consumed.
+    ///
+    /// Mirrors go-algorand's `EvalParams.feeResidue` (`data/transactions/
+    /// logic/eval.go`, PR #6650): carrying it from one charge to the next
+    /// lets the whole tree of top-level and inner-txn groups round up only
+    /// once in aggregate, rather than once per group. Unlike `fee_credit`
+    /// (shared across an entire top-level group via `ApplyContext`), this is
+    /// a plain value inherited by copy into a nested inner app call's own
+    /// `LedgerAvmContext` (`execute_inner_appl`) and copied back after that
+    /// inner group finishes, so sibling inner groups see what residue was
+    /// already consumed rather than double-spending it.
+    pub fee_residue: u64,
     /// Running transaction counter for asset/app ID generation in inner txns.
     ///
     /// Mirrors go-algorand's `Counter()` — incremented before each inner txn
@@ -1042,6 +1056,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             caller_app_address_val: [0u8; 32],
             depth: 0,
             fee_credit: 0,
+            fee_residue: 0,
             txn_counter: 0,
             fee_sink: Address::ZERO,
             opcode_budget: 0,
@@ -2190,6 +2205,7 @@ fn execute_inner_appl<L: LedgerStore>(
     latest_timestamp: u64,
     genesis_hash: [u8; 32],
     fee_credit: u64,
+    fee_residue: u64,
     txn_counter: u64,
     fee_sink: Address,
     opcode_budget: &mut i64,
@@ -2301,6 +2317,7 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.caller_app_address_val = app_address(caller_app_id);
     inner_ctx.depth = caller_depth + 1;
     inner_ctx.fee_credit = fee_credit;
+    inner_ctx.fee_residue = fee_residue;
     inner_ctx.txn_counter = txn_counter;
     inner_ctx.fee_sink = fee_sink;
     // P1-3: Set parent_txn_id to the InnerID of this appl txn so that
@@ -2386,6 +2403,7 @@ fn execute_inner_appl<L: LedgerStore>(
     // encoded into the inner txn's eval_delta below.
     // Capture fee_credit and txn_counter for propagation back to parent (H5/H6).
     let child_fee_credit = inner_ctx.fee_credit;
+    let child_fee_residue = inner_ctx.fee_residue;
     let child_txn_counter = inner_ctx.txn_counter;
     // P1-3: Capture all asset/app IDs created by nested inner txns so the
     // parent can track them for snapshot rollback.
@@ -2434,8 +2452,9 @@ fn execute_inner_appl<L: LedgerStore>(
         &consensus,
     )?;
 
-    // Propagate fee_credit and txn_counter back to the parent (H5/H6).
+    // Propagate fee_credit, fee_residue, and txn_counter back to the parent (H5/H6).
     ad.fee_credit = child_fee_credit;
+    ad.fee_residue = child_fee_residue;
     ad.txn_counter = child_txn_counter;
     // P1-3: Propagate all nested created resources so the parent's
     // rollback can clean them up if a later sibling txn fails.
@@ -3404,27 +3423,47 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             })
             .collect();
 
-        // ── Fee credit / pooling (matches go-algorand opItxnSubmit) ──
+        // ── Fee credit / residue / pooling (matches go-algorand opItxnSubmit) ──
         //
-        // Total required = MinTxnFee * num_subtxns.
-        // Total paid = sum of individual fees.
-        // Shortfall is covered by fee_credit (from outer group overpayment).
-        // Overpayment is added back to fee_credit.
-        let group_fee = self
-            .consensus
-            .min_txn_fee
-            .saturating_mul(num_subtxns as u64);
-        let group_paid: u64 = txns
-            .iter()
-            .map(|stxn| stxn.txn.fee)
-            .fold(0u64, |a, b| a.saturating_add(b));
+        // Usage-weight the group via SummarizeFees (each subtxn's feeFactor —
+        // e.g. an oversized note — rather than a flat MinTxnFee * num_subtxns)
+        // and round the required fee up against the running fee_residue, so a
+        // whole tree of nested inner-txn groups rounds up its aggregate fee
+        // only once rather than once per group (go-algorand PR #6650, "Fees:
+        // Handle rounding of fees with non-integral usage better"). The
+        // updated residue is retained on `self` so later sibling groups (and,
+        // once this call returns, the caller — see `execute_inner_appl`'s
+        // fee_residue propagation) see what this group already consumed
+        // rather than double-spending it.
+        let txn_refs: Vec<&SignedTransaction> = txns.iter().collect();
+        let (usage, group_paid) = algo_validate::summarize_fees(&txn_refs, &self.consensus);
+        let (group_fee, residue, overflow) = algo_validate::fee_for_usage(
+            self.consensus.min_txn_fee,
+            usage,
+            algo_validate::ONE_MICROS,
+            self.fee_residue,
+        );
+        if overflow {
+            return Err(AlgoError::Avm {
+                message: "inner group fee saturation".to_string(),
+            });
+        }
+        self.fee_residue = residue;
         if group_paid < group_fee {
+            // See if fee_credit covers the shortfall; if not, report the
+            // actual net shortfall still owed after applying whatever credit
+            // is available (matches go-algorand's corrected message, PR
+            // #6693 "AVM: report actual inner group fee shortfall": the
+            // error used to just state the flat need, now it reports
+            // `groupFee.SubSaturate(groupPaid)` further reduced by
+            // `cx.FeeCredit`).
             let shortfall = group_fee - group_paid;
             if self.fee_credit < shortfall {
+                let net_shortfall = shortfall - self.fee_credit;
                 return Err(AlgoError::Avm {
                     message: format!(
-                        "fee too small: inner group needs {} but only paid {} with {} credit",
-                        group_fee, group_paid, self.fee_credit
+                        "group fee {} too small (needs {} more)",
+                        group_paid, net_shortfall
                     ),
                 });
             }
@@ -3833,6 +3872,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     self.latest_timestamp,
                     self.genesis_hash,
                     self.fee_credit,
+                    self.fee_residue,
                     self.txn_counter,
                     self.fee_sink,
                     &mut self.opcode_budget,
@@ -3876,8 +3916,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                                 extra_created_app_ids.push(nested_id);
                             }
                         }
-                        // Propagate fee_credit and txn_counter back from child (H5/H6).
+                        // Propagate fee_credit, fee_residue, and txn_counter back from child (H5/H6).
                         self.fee_credit = ad.fee_credit;
+                        self.fee_residue = ad.fee_residue;
                         // Update running counter from child — the child's counter
                         // accounts for any nested inner txns it created.
                         current_counter = ad.txn_counter;
