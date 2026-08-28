@@ -12,6 +12,16 @@
 /// is still 12.
 pub const MAX_AVM_VERSION: u8 = 13;
 
+/// Maximum byte string length in the AVM.
+///
+/// Matches go-algorand's `maxStringSize` / `config.MaxAVMBytesSize`
+/// (`data/transactions/logic/eval.go:50-51`). Used both at assembly time
+/// (unconditionally, for `byte`/`pushbytes`/`bytecblock`/`pushbytess`
+/// literals) and, starting at `LogicSigVersion >= 13`, at parse/execution
+/// time for the multi-constant `bytecblock`/`pushbytess` immediate forms
+/// (go-algorand PR #6692, `EvalContext.byteImmArgs`).
+pub const MAX_STRING_SIZE: usize = 4096;
+
 /// Execution mode for an opcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -347,6 +357,19 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
 
     // ---- Crypto (v7+) ----
     op!(0x84, "ed25519verify_bare", 7, Static(1900), 3, 1, Any, None);
+    // `falcon_verify`'s stack args are typed `Any` here deliberately: its
+    // middle argument (the Falcon signature) is a variable-length byte
+    // string, not a fixed `[1232]byte`. go-algorand's real `proto()` string
+    // for opcode 0x85 has always been `"bbb{1793}:T"` (plain variable-length
+    // `b`) -- only the *generated docs*
+    // (TEAL_opcodes_v12.md/v13.md, langspec_v12/v13.json) wrongly documented
+    // it as a fixed 1232-byte type, and go-algorand commit `3920d70d0`
+    // ("docs: fix falcon_verify opcode documentation", PR #6629) fixed the
+    // docs only -- eval.go/opcodes.go never had this bug. Do not "fix" this
+    // to a fixed-size type by analogy with the old docs; see
+    // `ops/crypto.rs::op_falcon_verify` and
+    // `FALCON_DET1024_SIG_COMPRESSED_MAXSIZE` (1423 bytes) in algo-falcon,
+    // which already implement the correct variable-length behavior.
     op!(0x85, "falcon_verify", 12, Static(1700), 3, 1, Any, None);
     op!(0x86, "sumhash512", 13, Dynamic, 1, 1, Any, None);
     op!(0x87, "sha512", 13, Dynamic, 1, 1, Any, None);
