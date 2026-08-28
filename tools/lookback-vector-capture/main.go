@@ -96,7 +96,7 @@ func allVersions() []protocol.ConsensusVersion {
 		protocol.ConsensusV31, protocol.ConsensusV32, protocol.ConsensusV33,
 		protocol.ConsensusV34, protocol.ConsensusV35, protocol.ConsensusV36,
 		protocol.ConsensusV37, protocol.ConsensusV38, protocol.ConsensusV39,
-		protocol.ConsensusV40, protocol.ConsensusV41,
+		protocol.ConsensusV40, protocol.ConsensusV41, protocol.ConsensusV42,
 	}
 }
 

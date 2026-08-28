@@ -407,7 +407,12 @@ fn global_latest_timestamp() {
     assert!(result, "global LatestTimestamp should be 50000");
 }
 
-/// global LogicSigVersion; int 12; ==; return
+/// global LogicSigVersion; int 13; ==; return
+///
+/// `global LogicSigVersion` reflects the active `ConsensusParams::logic_sig_version`
+/// (default consensus, currently v42 -> 13; go: `config/consensus.go` v42 block sets
+/// `LogicSigVersion = 13`), not the AVM version the test's own bytecode is assembled
+/// for (6, passed to `run_with_context` below) — those are independent axes.
 #[test]
 fn global_logicsig_version() {
     let sender = [0xAA; 32];
@@ -417,14 +422,14 @@ fn global_logicsig_version() {
 
     let code: &[u8] = &[
         0x32, 0x05, // global LogicSigVersion (field 5)
-        0x81, 0x0C, // pushint 12 (MAX_AVM_VERSION)
+        0x81, 0x0D, // pushint 13 (ConsensusParams::default().logic_sig_version)
         0x12, // ==
         0x43, // return
     ];
     let result = run_with_context(6, code, &mut ctx).unwrap();
     assert!(
         result,
-        "global LogicSigVersion should match MAX_AVM_VERSION (12)"
+        "global LogicSigVersion should match ConsensusParams::default().logic_sig_version (13)"
     );
 }
 

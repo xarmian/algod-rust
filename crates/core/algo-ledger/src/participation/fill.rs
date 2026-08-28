@@ -77,7 +77,7 @@ pub fn fill_db_with_participation_keys(
     // matching go's `FillDBWithParticipationKeys`, which reads
     // `config.Consensus[protocol.ConsensusCurrentVersion].MaxKeyregValidPeriod`
     // (../go-algorand/data/account/participation.go:231). We resolve the params
-    // explicitly from `CONSENSUS_CURRENT_VERSION` (V41) rather than relying on
+    // explicitly from `CONSENSUS_CURRENT_VERSION` (V42) rather than relying on
     // `ConsensusParams::default()` — the bound is consensus-critical, so the
     // version it comes from must be unambiguous, not an implementation detail of
     // `Default`. Mirrors the live-params resolution in the server path's
