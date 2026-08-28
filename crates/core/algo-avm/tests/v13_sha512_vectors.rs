@@ -68,53 +68,56 @@ fn sha512_parity_all_fixture_vectors() {
 }
 
 #[test]
-fn sha512_costs_15_plus_32_per_2_byte_chunk() {
+fn sha512_costs_15_plus_2_per_32_byte_chunk() {
     // cost = baseCost + chunkCost * DivCeil(len, chunkSize)
-    //      = 15 + 32 * DivCeil(len, 2)
+    //      = 15 + 2 * DivCeil(len, 32)
     //
-    // Matches go-algorand opcodes.go:658 `costByLength(15, 32, 2, 0)`.
-    // For empty input: 15 + 32 * ceil(0/2) = 15 + 0 = 15.
+    // Matches go-algorand opcodes.go:705 `costByLength(15, 2, 32, 0)` (the
+    // corrected, non-reversed argument order fixed by go-algorand PR #6695
+    // "AVM: Fix reversed costs arguments" / commit e4b8e0eac, first released
+    // in v5.0.0-beta but applying unconditionally to every LogicSigVersion
+    // that carries sha512). Values below are pinned exactly to
+    // go-algorand's `TestHashCosts` (data/transactions/logic/crypto_test.go).
     let starting_budget = 10_000i64;
 
+    // size 0 -> 15
     let mut machine = new_machine(starting_budget);
     machine.push(AvmValue::Bytes(vec![])).unwrap();
     op_sha512(&mut machine, &fake_instr()).unwrap();
     assert_eq!(
         starting_budget - machine.budget,
         15,
-        "empty-input cost must be 15"
+        "size-0 cost must be 15"
     );
 
-    // For 1 byte: 15 + 32 * ceil(1/2) = 15 + 32 * 1 = 47.
+    // size 1 -> 17
     let mut machine = new_machine(starting_budget);
     machine.push(AvmValue::Bytes(vec![0xaa])).unwrap();
     op_sha512(&mut machine, &fake_instr()).unwrap();
     assert_eq!(
         starting_budget - machine.budget,
-        47,
-        "1-byte cost must be 47"
+        17,
+        "size-1 cost must be 17"
     );
 
-    // For 2 bytes: 15 + 32 * ceil(2/2) = 15 + 32 = 47.
+    // size 64 -> 19
     let mut machine = new_machine(starting_budget);
-    machine.push(AvmValue::Bytes(vec![0xaa, 0xbb])).unwrap();
+    machine.push(AvmValue::Bytes(vec![0xaa; 64])).unwrap();
     op_sha512(&mut machine, &fake_instr()).unwrap();
     assert_eq!(
         starting_budget - machine.budget,
-        47,
-        "2-byte cost must be 47"
+        19,
+        "size-64 cost must be 19"
     );
 
-    // For 3 bytes: 15 + 32 * ceil(3/2) = 15 + 64 = 79.
+    // size 1000 -> 79
     let mut machine = new_machine(starting_budget);
-    machine
-        .push(AvmValue::Bytes(vec![0xaa, 0xbb, 0xcc]))
-        .unwrap();
+    machine.push(AvmValue::Bytes(vec![0xaa; 1000])).unwrap();
     op_sha512(&mut machine, &fake_instr()).unwrap();
     assert_eq!(
         starting_budget - machine.budget,
         79,
-        "3-byte cost must be 79"
+        "size-1000 cost must be 79"
     );
 }
 

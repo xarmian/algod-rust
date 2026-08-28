@@ -57,7 +57,7 @@ fn sumhash512_parity_all_fixture_vectors() {
         assert_eq!(expected.len(), 64, "sumhash-512 output must be 64 bytes");
 
         // Budget large enough for the largest vector
-        // (~1MB → 150 + 7 * ceil(1048576/4) = ~1.8M).
+        // (~1MB → 150 + 4 * ceil(1048576/7) = ~600K).
         let mut machine = new_machine(4_000_000);
         machine.push(AvmValue::Bytes(input)).expect("push input");
 
@@ -74,55 +74,56 @@ fn sumhash512_parity_all_fixture_vectors() {
 }
 
 #[test]
-fn sumhash512_costs_150_plus_7_per_4_byte_chunk() {
+fn sumhash512_costs_150_plus_4_per_7_byte_chunk() {
     // cost = baseCost + chunkCost * DivCeil(len, chunkSize)
-    //      = 150 + 7 * DivCeil(len, 4)
+    //      = 150 + 4 * DivCeil(len, 7)
     //
-    // Matches go-algorand opcodes.go:657 `costByLength(150, 7, 4, 0)`.
+    // Matches go-algorand opcodes.go:704 `costByLength(150, 4, 7, 0)` (the
+    // corrected, non-reversed argument order fixed by go-algorand PR #6695
+    // "AVM: Fix reversed costs arguments" / commit e4b8e0eac, first released
+    // in v5.0.0-beta but applying unconditionally to every LogicSigVersion
+    // that carries sumhash512). Values below are pinned exactly to
+    // go-algorand's `TestHashCosts` (data/transactions/logic/crypto_test.go).
     let starting_budget = 10_000i64;
 
-    // Empty: 150 + 7 * ceil(0/4) = 150.
+    // size 0 -> 150
     let mut machine = new_machine(starting_budget);
     machine.push(AvmValue::Bytes(vec![])).unwrap();
     op_sumhash512(&mut machine, &fake_instr()).unwrap();
     assert_eq!(
         starting_budget - machine.budget,
         150,
-        "empty-input cost must be 150"
+        "size-0 cost must be 150"
     );
 
-    // 1 byte: 150 + 7 * ceil(1/4) = 150 + 7 = 157.
+    // size 1 -> 154
     let mut machine = new_machine(starting_budget);
     machine.push(AvmValue::Bytes(vec![0xaa])).unwrap();
     op_sumhash512(&mut machine, &fake_instr()).unwrap();
     assert_eq!(
         starting_budget - machine.budget,
-        157,
-        "1-byte cost must be 157"
+        154,
+        "size-1 cost must be 154"
     );
 
-    // 4 bytes: 150 + 7 * ceil(4/4) = 157.
+    // size 64 -> 190
     let mut machine = new_machine(starting_budget);
-    machine
-        .push(AvmValue::Bytes(vec![0xaa, 0xbb, 0xcc, 0xdd]))
-        .unwrap();
+    machine.push(AvmValue::Bytes(vec![0xaa; 64])).unwrap();
     op_sumhash512(&mut machine, &fake_instr()).unwrap();
     assert_eq!(
         starting_budget - machine.budget,
-        157,
-        "4-byte cost must be 157"
+        190,
+        "size-64 cost must be 190"
     );
 
-    // 5 bytes: 150 + 7 * ceil(5/4) = 150 + 14 = 164.
+    // size 1000 -> 722
     let mut machine = new_machine(starting_budget);
-    machine
-        .push(AvmValue::Bytes(vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee]))
-        .unwrap();
+    machine.push(AvmValue::Bytes(vec![0xaa; 1000])).unwrap();
     op_sumhash512(&mut machine, &fake_instr()).unwrap();
     assert_eq!(
         starting_budget - machine.budget,
-        164,
-        "5-byte cost must be 164"
+        722,
+        "size-1000 cost must be 722"
     );
 }
 
