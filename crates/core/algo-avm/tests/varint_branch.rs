@@ -157,7 +157,16 @@ fn test_back_branch_varint_offset_is_negative_and_minimal() {
     // `start: int 1\npop\nb start` never terminates -- instead assert on
     // the *encoded bytes* of a known-good back branch via the assembler,
     // which is safe because we never execute it.
-    let source = "#pragma version 13\nstart:\nint 1\npop\nb start\n";
+    //
+    // `#pragma autosalt false` is required here: this specific source's
+    // unsalted program hash happens to decode as a valid Edwards25519
+    // curve point, so the auto-salt search (issue #664 / PR #692) would
+    // otherwise splice extra intcblock bytes into the program and shift
+    // every offset this test hand-verifies below. Suppressing it keeps the
+    // byte layout the deterministic, hand-computed one this test actually
+    // means to pin (the varint-branch encoding), independent of whatever
+    // the auto-salt feature does elsewhere -- see issue #694.
+    let source = "#pragma version 13\n#pragma autosalt false\nstart:\nint 1\npop\nb start\n";
     let ops = assemble_string(source).expect("assembly should succeed");
     // `int 1` is referenced once, so constant optimization emits `pushint 1`
     // directly (no intcblock). Program (post version byte): pushint 1
