@@ -1408,6 +1408,7 @@ pub fn canonical_encode_heartbeat_proof(proof: &HeartbeatProof) -> Vec<u8> {
 pub fn canonical_encode_heartbeat(hb: &HeartbeatTxnFields) -> Vec<u8> {
     let mut m = CanonicalMap::new();
     m.add_address("a", &hb.address);
+    m.add_bool("c", hb.hb_challenge_discount);
     m.add_u64("kd", hb.key_dilution);
     if let Some(ref proof) = hb.proof {
         m.add_map("prf", canonical_encode_heartbeat_proof(proof));
@@ -2062,6 +2063,89 @@ mod tests {
         } else {
             panic!("expected map");
         }
+    }
+
+    #[test]
+    fn test_heartbeat_challenge_discount_omitted_when_false() {
+        // Matches go's `codec:"c"` (bare bool, `omitempty` via the struct's
+        // `_struct` tag) -- a false HbChallengeDiscount must not appear in
+        // the encoded map at all.
+        let hb = HeartbeatTxnFields {
+            hb_challenge_discount: false,
+            ..Default::default()
+        };
+        let encoded = canonical_encode_heartbeat(&hb);
+        let val = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
+        let rmpv::Value::Map(pairs) = val else {
+            panic!("expected map");
+        };
+        let keys: Vec<String> = pairs
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !keys.contains(&"c".to_string()),
+            "expected no 'c' key when hb_challenge_discount is false, got keys: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_challenge_discount_present_when_true() {
+        let hb = HeartbeatTxnFields {
+            hb_challenge_discount: true,
+            ..Default::default()
+        };
+        let encoded = canonical_encode_heartbeat(&hb);
+
+        // Byte-level check against go-algorand's canonical msgpack encoding:
+        // a single-key fixmap {"c": true} is `0x81 0xa1 'c' 0xc3`
+        // (fixmap(1), fixstr(1) "c", msgpack `true`).
+        assert_eq!(encoded, vec![0x81, 0xa1, b'c', 0xc3]);
+
+        let val = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
+        let rmpv::Value::Map(pairs) = val else {
+            panic!("expected map");
+        };
+        let keys: Vec<String> = pairs
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(keys, vec!["c"]);
+        assert_eq!(pairs[0].1, rmpv::Value::Boolean(true));
+
+        // Round-trips through the decoder too.
+        let decoded = HeartbeatTxnFields::decode_from_bytes(&encoded).unwrap();
+        assert!(decoded.hb_challenge_discount);
+    }
+
+    #[test]
+    fn test_heartbeat_challenge_discount_key_ordering_with_other_fields() {
+        // Verify "c" sorts correctly (before "kd", "prf", "sd", "vid") when
+        // other heartbeat fields are also present.
+        let hb = HeartbeatTxnFields {
+            address: Address([2u8; 32]),
+            hb_challenge_discount: true,
+            key_dilution: 100,
+            seed: [3u8; 32],
+            vote_id: [4u8; 32],
+            proof: None,
+        };
+        let encoded = canonical_encode_heartbeat(&hb);
+        let val = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
+        let rmpv::Value::Map(pairs) = val else {
+            panic!("expected map");
+        };
+        let keys: Vec<String> = pairs
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "keys must be in lexicographic order");
+        assert_eq!(keys, vec!["a", "c", "kd", "sd", "vid"]);
+
+        let decoded = HeartbeatTxnFields::decode_from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, hb);
     }
 
     #[test]

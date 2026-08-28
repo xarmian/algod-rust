@@ -20,10 +20,9 @@
 //! (go: `ledger/eval` and `data/transactions/logic/eval.go`'s `feeResidue`) is
 //! out of scope here — see the companion AVM inner-txn fee-residue-threading
 //! issue. Likewise, the post-quantum-signature fee contribution
-//! (`proto.PQSchemeFeeContribution`) and the heartbeat challenge-discount flag
-//! (`HbChallengeDiscount`) are not yet modeled in `algo-types`, so
-//! `txn_fee_factor` treats both as zero/absent — see the companion PQ-signature
-//! and heartbeat-challenge-discount issues.
+//! (`proto.PQSchemeFeeContribution`) is not yet modeled in `algo-types`, so
+//! `txn_fee_factor` treats it as zero/absent — see the companion PQ-signature
+//! issue.
 
 use algo_types::consensus::ConsensusParams;
 use algo_types::{SignedTransaction, Transaction};
@@ -240,17 +239,25 @@ fn total_arg_bytes(txn: &Transaction) -> usize {
 /// Returns the transaction's base-fee multiplier in `Micros`: `1_000_000` for
 /// an ordinary transaction, more for one that uses billable oversized
 /// features, `0` for a state-proof transaction, and reduced by one `MinTxnFee`
-/// for a singleton (ungrouped) heartbeat.
+/// for a heartbeat that claims (and, syntactically, is entitled to claim) the
+/// challenge fee discount.
 ///
-/// # Heartbeat discount caveat
+/// # Heartbeat discount
 ///
-/// Go's v42+ behavior reads an explicit `HbChallengeDiscount` flag on the
-/// transaction instead of inferring the discount from "is this an ungrouped
-/// heartbeat". `algo-types::HeartbeatTxnFields` does not yet carry that flag
-/// (tracked by a companion heartbeat-challenge-discount issue), so this
-/// function always falls back to the pre-v42 `isSingletonHeartbeat` inference,
-/// which go's own comment confirms is the historical stand-in for the same
-/// discount. This must be revisited when the discount flag lands.
+/// Mirrors go's `Transaction.feeFactor` (`data/transactions/transaction.go`):
+/// once transaction-size pricing is enabled
+/// (`ConsensusParams::txn_size_pricing_enabled`, v42+), the discount is
+/// claimed explicitly via `HeartbeatTxnFields::hb_challenge_discount` — grouping
+/// no longer matters. Before that, the discount is inferred from "is this an
+/// ungrouped (singleton) heartbeat", unconditionally (not from whether the fee
+/// paid is actually low — that inference lives in well-formedness/apply, which
+/// use this same discount to decide the required fee and then compare it
+/// against the fee actually paid).
+///
+/// Either way, this only computes the *required* fee assuming the discount
+/// claim is syntactically valid; verifying the claiming account is actually
+/// under challenge happens at apply time
+/// (`algo_ledger::apply::apply_heartbeat`), not here.
 pub fn txn_fee_factor(txn: &Transaction, params: &ConsensusParams) -> u64 {
     if txn.txn_type == "stpf" {
         return 0;
@@ -272,10 +279,18 @@ pub fn txn_fee_factor(txn: &Transaction, params: &ConsensusParams) -> u64 {
             total_arg_bytes(txn),
         ));
     } else if txn.txn_type == "hb" {
-        // Singleton (ungrouped) heartbeat: one MinTxnFee discount. See the
-        // doc comment above re: the not-yet-modeled HbChallengeDiscount flag.
-        let is_singleton_heartbeat = txn.group == [0u8; 32];
-        if is_singleton_heartbeat {
+        let discounted = if params.txn_size_pricing_enabled() {
+            // Post-v42: the discount is claimed explicitly, regardless of
+            // grouping.
+            txn.heartbeat
+                .as_ref()
+                .is_some_and(|hb| hb.hb_challenge_discount)
+        } else {
+            // Pre-v42: any ungrouped (singleton) heartbeat is discounted,
+            // unconditionally (matches go's `isSingletonHeartbeat`).
+            txn.group == [0u8; 32]
+        };
+        if discounted {
             factor = factor.saturating_sub(ONE_MICROS);
         }
     }
@@ -580,7 +595,9 @@ mod tests {
 
     #[test]
     fn txn_fee_factor_singleton_heartbeat_is_discounted_to_zero() {
-        let p = v42();
+        // Pre-v42: any ungrouped (singleton) heartbeat is unconditionally
+        // discounted, regardless of an (unavailable) explicit flag.
+        let p = consensus_params_for_version(CONSENSUS_V41).unwrap();
         let mut txn = base_txn("hb");
         txn.group = [0u8; 32];
         assert_eq!(txn_fee_factor(&txn, &p), 0);
@@ -592,6 +609,59 @@ mod tests {
         let mut txn = base_txn("hb");
         txn.group = [0xAA; 32];
         assert_eq!(txn_fee_factor(&txn, &p), ONE_MICROS);
+    }
+
+    // ── txn_fee_factor: post-v42 explicit HbChallengeDiscount ────
+
+    fn heartbeat_txn(discount: bool) -> Transaction {
+        let mut txn = base_txn("hb");
+        txn.heartbeat = Some(algo_types::HeartbeatTxnFields {
+            hb_challenge_discount: discount,
+            ..Default::default()
+        });
+        txn
+    }
+
+    #[test]
+    fn txn_fee_factor_v42_singleton_heartbeat_without_flag_is_not_discounted() {
+        // Post-v42, grouping alone no longer implies a discount -- unlike
+        // pre-v42, an *ungrouped* heartbeat that does not set the explicit
+        // flag is NOT discounted. This is the core behavior this issue adds:
+        // before the fix, `txn_fee_factor` always used the pre-v42
+        // grouping-only inference regardless of protocol version.
+        let p = v42();
+        let mut txn = heartbeat_txn(false);
+        txn.group = [0u8; 32];
+        assert_eq!(txn_fee_factor(&txn, &p), ONE_MICROS);
+    }
+
+    #[test]
+    fn txn_fee_factor_v42_singleton_heartbeat_with_flag_is_discounted() {
+        let p = v42();
+        let mut txn = heartbeat_txn(true);
+        txn.group = [0u8; 32];
+        assert_eq!(txn_fee_factor(&txn, &p), 0);
+    }
+
+    #[test]
+    fn txn_fee_factor_v42_grouped_heartbeat_with_flag_is_discounted() {
+        // Post-v42, the explicit flag grants the discount even when grouped
+        // (unlike the pre-v42 inference, which required a singleton).
+        let p = v42();
+        let mut txn = heartbeat_txn(true);
+        txn.group = [0xAA; 32];
+        assert_eq!(txn_fee_factor(&txn, &p), 0);
+    }
+
+    #[test]
+    fn txn_fee_factor_pre_v42_ignores_explicit_flag() {
+        // Pre-v42, `HbChallengeDiscount` is meaningless to feeFactor (it is
+        // rejected outright at well-formedness instead) -- the pre-v42
+        // inference is grouping-only, matching go's `isSingletonHeartbeat`.
+        let p41 = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        let mut txn = heartbeat_txn(true);
+        txn.group = [0xAA; 32]; // grouped: not a singleton, so not discounted.
+        assert_eq!(txn_fee_factor(&txn, &p41), ONE_MICROS);
     }
 
     // ── logic_sig_program_fee_contribution / summarize_fees ──────
@@ -666,8 +736,31 @@ mod tests {
 
     #[test]
     fn required_fee_for_txn_singleton_heartbeat_is_free() {
-        let p = v42();
+        // Pre-v42: any ungrouped (singleton) heartbeat requires no fee.
+        let p = consensus_params_for_version(CONSENSUS_V41).unwrap();
         let mut txn = base_txn("hb");
+        txn.group = [0u8; 32];
+        let (fee, overflow) = required_fee_for_txn(&txn, &p);
+        assert!(!overflow);
+        assert_eq!(fee, 0);
+    }
+
+    #[test]
+    fn required_fee_for_txn_v42_singleton_heartbeat_without_flag_requires_full_fee() {
+        // Post-v42: without the explicit flag, an ungrouped heartbeat is an
+        // ordinary transaction -- no discount is inferred from grouping.
+        let p = v42();
+        let mut txn = heartbeat_txn(false);
+        txn.group = [0u8; 32];
+        let (fee, overflow) = required_fee_for_txn(&txn, &p);
+        assert!(!overflow);
+        assert_eq!(fee, p.min_txn_fee);
+    }
+
+    #[test]
+    fn required_fee_for_txn_v42_singleton_heartbeat_with_flag_is_free() {
+        let p = v42();
+        let mut txn = heartbeat_txn(true);
         txn.group = [0u8; 32];
         let (fee, overflow) = required_fee_for_txn(&txn, &p);
         assert!(!overflow);

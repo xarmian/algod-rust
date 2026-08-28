@@ -978,6 +978,7 @@ mod tests {
             seed: [0u8; 32],
             vote_id: [0u8; 32],
             key_dilution: 100,
+            hb_challenge_discount: false,
         });
 
         // Sign the transaction to pass signature checks.
@@ -1034,6 +1035,7 @@ mod tests {
             seed: [0u8; 32],
             vote_id: [1u8; 32], // Non-zero vote ID
             key_dilution: 100,
+            hb_challenge_discount: false,
         });
 
         // Sign the transaction.

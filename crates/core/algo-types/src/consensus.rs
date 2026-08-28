@@ -527,6 +527,18 @@ pub struct ConsensusParams {
     pub exclude_expired_circulation: bool,
 }
 
+impl ConsensusParams {
+    /// Mirrors go's `ConsensusParams.TxnSizePricingEnabled()` (`config/consensus.go`):
+    /// transaction-size pricing (v42+) is enabled exactly when a non-zero
+    /// per-byte surcharge is configured. This gates whether a heartbeat's
+    /// challenge fee discount is claimed via the explicit
+    /// `HeartbeatTxnFields::hb_challenge_discount` flag (when enabled) or
+    /// inferred from an underpaying singleton heartbeat (when not).
+    pub fn txn_size_pricing_enabled(&self) -> bool {
+        self.per_byte_txn_surcharge != 0
+    }
+}
+
 /// Payset commit types matching go-algorand.
 pub const PAYSET_COMMIT_UNSUPPORTED: u8 = 0;
 pub const PAYSET_COMMIT_FLAT: u8 = 1;
