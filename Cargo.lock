@@ -259,6 +259,7 @@ name = "algo-falcon"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "sha2",
 ]
 
 [[package]]

@@ -39,8 +39,13 @@ pub const FALCON_DET1024_SIG_COMPRESSED_MAXSIZE: usize = 1423;
 /// Size of a deterministic CT-format (constant-time) signature.
 pub const FALCON_DET1024_SIG_CT_SIZE: usize = 1538;
 
-/// Seed size used for deterministic key generation.
-pub const FALCON_SEED_SIZE: usize = 48;
+/// Seed size used for deterministic key generation: 32 bytes (256-bit
+/// entropy), matching go-algorand's `crypto.FalconSeedSize`
+/// (`crypto/falconWrapper.go`) as of commit `569ae3d4b` ("txn: native PQ
+/// accounts (#6639)", first released in `v5.0.0-beta`). The previous value
+/// of 48 was inherited from falcon.c's SHAKE256 explicit-seed API and did
+/// not reflect a deliberate entropy choice.
+pub const FALCON_SEED_SIZE: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Internal types and FFI
@@ -432,6 +437,79 @@ mod tests {
 
         let err = falcon_verify(&pubkey, one_byte_sig, msg).unwrap_err();
         assert!(matches!(err, FalconError::InvalidSignatureSize(1)));
+    }
+
+    /// Pins the seed size to go-algorand's post-`569ae3d4b` value.
+    ///
+    /// Upstream (`crypto/falconWrapper.go`): `FalconSeedSize` was changed from
+    /// 48 to 32 bytes -- genuine 256-bit entropy for keygen-from-seed, not the
+    /// old value inherited from falcon.c's SHAKE256 explicit-seed API. See
+    /// go-algorand issue-referenced commit `569ae3d4b` ("txn: native PQ
+    /// accounts (#6639)").
+    #[test]
+    fn test_falcon_seed_size_is_32_bytes_matching_go_algorand_post_569ae3d4b() {
+        assert_eq!(
+            FALCON_SEED_SIZE, 32,
+            "FALCON_SEED_SIZE must match go-algorand's crypto.FalconSeedSize (32), \
+             not the old pre-569ae3d4b value of 48"
+        );
+    }
+
+    /// Pins that `falcon_sign`/`falcon_verify` operate on exactly the bytes
+    /// the caller supplies, with no internal re-hashing layer.
+    ///
+    /// This is the byte-level primitive that go-algorand's `SignBytes`/
+    /// `VerifyBytes` map onto directly (both before and after commit
+    /// `48c92817b`, "falcon: sign ToBeHashed, not Hashed" -- that fix only
+    /// touched the higher-level `Sign(Hashable)`/`Verify(Hashable)`
+    /// convenience wrappers, which double-hashed via `Hash(HashRep(message))`
+    /// before handing bytes to `SignBytes`). algod-rust never implements
+    /// those higher-level wrappers -- every call site in this codebase
+    /// (state-proof signing/verification, the MSS ephemeral-key scheme, the
+    /// `falcon_verify` AVM opcode) calls straight through to these byte-level
+    /// primitives with the caller's own message bytes. A signature produced
+    /// over `msg` must therefore NOT verify against `sha256(msg)` (the old,
+    /// double-hashed convention) and vice versa -- proving no hidden hash
+    /// step is applied on either side.
+    #[test]
+    fn test_sign_verify_operate_on_raw_bytes_not_a_rehash() {
+        let seed = [3u8; FALCON_SEED_SIZE];
+        let (pubkey, privkey) = falcon_keygen(&seed).expect("keygen should succeed");
+
+        let msg = b"ToBeHashed-style domain-separated message bytes";
+        let old_convention_digest = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(msg);
+            hasher.finalize().to_vec()
+        };
+        assert_ne!(
+            msg.as_slice(),
+            old_convention_digest.as_slice(),
+            "test setup: digest must actually differ from the raw message"
+        );
+
+        // New (correct) convention: sign the raw message bytes directly.
+        let sig_over_raw = falcon_sign(&privkey, msg).expect("sign should succeed");
+        assert!(
+            falcon_verify(&pubkey, &sig_over_raw, msg).expect("verify should not error"),
+            "signature over raw message bytes must verify against those same raw bytes"
+        );
+        assert!(
+            !falcon_verify(&pubkey, &sig_over_raw, &old_convention_digest)
+                .expect("verify should not error"),
+            "a signature over raw bytes must NOT verify against sha256(raw bytes) -- \
+             that would mean we're silently accepting the old double-hashed convention"
+        );
+
+        // Old (buggy, pre-48c92817b) convention: sign a hash of the message.
+        let sig_over_digest =
+            falcon_sign(&privkey, &old_convention_digest).expect("sign should succeed");
+        assert!(
+            !falcon_verify(&pubkey, &sig_over_digest, msg).expect("verify should not error"),
+            "a signature over sha256(raw bytes) must NOT verify against the raw bytes \
+             themselves -- the two conventions must not be interchangeable"
+        );
     }
 
     #[test]
