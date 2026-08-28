@@ -3078,6 +3078,13 @@ async fn get_pending_transactions_inner<N: NodeInterface>(
 // POST /v2/transactions/simulate
 // ---------------------------------------------------------------------------
 
+/// Maximum body size accepted by the simulate endpoint.
+///
+/// Matches go-algorand's `MaxSimulateBytes = 1_000_000` (renamed from
+/// `MaxTealDryrunBytes` when the dryrun endpoint was removed and simulate
+/// became its only user — go-algorand PR #6651, v5.0.0-beta; see issue #674).
+const MAX_SIMULATE_BYTES: usize = 1_000_000;
+
 /// Simulate a transaction group without submitting it to the network.
 ///
 /// Accepts JSON or msgpack-encoded `SimulateRequest` in the request body.
@@ -3108,9 +3115,9 @@ pub async fn simulate_transaction<N: NodeInterface>(
     }
 
     // Enforce go-algorand's request body size limit: the Go handler wraps
-    // the body in `http.MaxBytesReader(nil, body, MaxTealDryrunBytes)` and
+    // the body in `http.MaxBytesReader(nil, body, MaxSimulateBytes)` and
     // returns 400 when the read overflows (handlers.go SimulateTransaction).
-    if body.len() > MAX_TEAL_DRYRUN_BYTES {
+    if body.len() > MAX_SIMULATE_BYTES {
         return error::bad_request("request body too large");
     }
 
@@ -3456,140 +3463,6 @@ pub async fn teal_disassemble<N: NodeInterface>(
     };
 
     let response = models::DisassembleResponse { result: program };
-
-    match serde_json::to_vec(&response) {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            bytes,
-        )
-            .into_response(),
-        Err(e) => error::internal_error(format!("failed to encode response: {e}")),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// POST /v2/teal/dryrun
-// ---------------------------------------------------------------------------
-
-/// Maximum body size accepted by the TEAL dryrun endpoint.
-///
-/// Matches go-algorand's `MaxTealDryrunBytes = 1_000_000`.
-const MAX_TEAL_DRYRUN_BYTES: usize = 1_000_000;
-
-/// Build a DryrunResponse containing an error and return it as HTTP 200 JSON.
-///
-/// Matches go-algorand's behavior where source expansion and transaction parse
-/// errors are returned inside the response body, not as HTTP error codes.
-fn dryrun_error_response(err: String, protocol_version: &str) -> Response {
-    use crate::models::DryrunResponse;
-    let proto = if protocol_version.is_empty() {
-        algo_types::consensus::CONSENSUS_CURRENT_VERSION.to_string()
-    } else {
-        protocol_version.to_string()
-    };
-    let resp = DryrunResponse {
-        error: err,
-        protocol_version: proto,
-        txns: Vec::new(),
-    };
-    match serde_json::to_vec(&resp) {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            bytes,
-        )
-            .into_response(),
-        Err(e) => error::internal_error(format!("failed to encode response: {e}")),
-    }
-}
-
-/// Execute a TEAL dryrun against the provided programs and inputs.
-///
-/// Accepts either a JSON `DryrunRequest` body or a msgpack-encoded
-/// `MsgpackDryrunRequest` body (tried in that order, matching go-algorand)
-/// and returns a `DryrunResponse` containing execution traces and results
-/// for each transaction.
-///
-/// Matches go-algorand's `Handlers.TealDryrun`.
-pub async fn teal_dryrun<N: NodeInterface>(
-    State(node): State<AppState<N>>,
-    body: axum::body::Bytes,
-) -> Response {
-    // Check if developer API is enabled
-    if !node.enable_developer_api() {
-        return crate::error_envelope::plain_text_response(
-            StatusCode::NOT_FOUND,
-            "/teal/dryrun was not enabled in the configuration file by setting the EnableDeveloperAPI to true",
-        );
-    }
-
-    // Enforce body size limit
-    if body.len() > MAX_TEAL_DRYRUN_BYTES {
-        return error::bad_request("request body too large");
-    }
-
-    // Decode request body: try JSON first, then msgpack (matching go-algorand
-    // handlers.go:1350-1363).
-    let (mut req, signed_txns) = match serde_json::from_slice::<models::DryrunRequest>(&body) {
-        Ok(mut json_req) => {
-            // JSON path: expand sources (may patch lsig in JSON txns),
-            // then convert JSON values to SignedTransaction.
-            match crate::dryrun::prepare_dryrun_request(&mut json_req) {
-                Ok(txns) => (json_req, txns),
-                Err(e) => {
-                    // Return source/txn parse errors in the response body
-                    // (HTTP 200), matching go-algorand's doDryrunRequest.
-                    return dryrun_error_response(e, &json_req.protocol_version);
-                }
-            }
-        }
-        Err(_) => {
-            // Msgpack path: decode directly into MsgpackDryrunRequest
-            // where txns are already SignedTransaction values.
-            match rmp_serde::from_slice::<models::MsgpackDryrunRequest>(&body) {
-                Ok(mp_req) => {
-                    let (mut req, mut txns) = mp_req.into_parts();
-                    // Expand sources for the msgpack path (patches apps
-                    // and lsig programs on SignedTransaction directly).
-                    if let Err(e) = crate::dryrun::expand_sources_with_txns(&mut req, &mut txns) {
-                        return dryrun_error_response(e, &req.protocol_version);
-                    }
-                    (req, txns)
-                }
-                Err(e) => {
-                    return error::bad_request(format!("could not decode dryrun request: {e}"));
-                }
-            }
-        }
-    };
-
-    // Fill defaults from node state when not provided (matching go-algorand
-    // handlers.go:1367-1396).
-    if req.protocol_version.is_empty() || req.round == 0 || req.latest_timestamp == 0 {
-        match node.status().await {
-            Ok(status) => {
-                if req.protocol_version.is_empty() {
-                    req.protocol_version = status.last_version.clone();
-                }
-                if req.round == 0 {
-                    req.round = status.last_round + 1;
-                }
-                // For timestamp, try to get block header; fall back to 0.
-                if req.latest_timestamp == 0 {
-                    if let Ok(hdr) = node.get_block_header(status.last_round).await {
-                        req.latest_timestamp = hdr.timestamp;
-                    }
-                }
-            }
-            Err(e) => {
-                return error::internal_error(format!("current block error: {e}"));
-            }
-        }
-    }
-
-    // Execute the dryrun
-    let response = crate::dryrun::do_dryrun_request(req, signed_txns);
 
     match serde_json::to_vec(&response) {
         Ok(bytes) => (

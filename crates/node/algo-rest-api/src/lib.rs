@@ -8,7 +8,6 @@ pub mod auth;
 pub mod block_json;
 pub mod box_name;
 pub mod cors;
-pub mod dryrun;
 pub mod error;
 pub mod error_envelope;
 pub mod format;

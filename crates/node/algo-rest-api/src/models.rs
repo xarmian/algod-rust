@@ -186,9 +186,9 @@ pub struct ApiAsset {
 /// An entry in `AccountResponse.created_assets`.
 ///
 /// A distinct, narrower type from [`ApiAsset`] (rather than making
-/// `ApiAsset::params` itself optional): `ApiAsset` is also reused by
-/// `dryrun.rs`'s `DryrunRequest` parsing, where params are always required
-/// input, not an optional output — making them `Option` there would force
+/// `ApiAsset::params` itself optional): `ApiAsset` is also reused as
+/// [`AssetResponse`] for `GET /v2/assets/{id}`, where params are always
+/// required, not an optional output — making them `Option` there would force
 /// every read site to handle a `None` that can never legitimately occur,
 /// risking an unwrap-panic on a path that already handles untrusted input.
 /// `params` is `None` only when the caller requested
@@ -278,9 +278,9 @@ pub struct ApiApplication {
 /// An entry in `AccountResponse.created_apps`. See [`ApiCreatedAsset`] for
 /// why this is a distinct type from [`ApiApplication`] rather than making
 /// `ApiApplication::params` itself optional — the same reasoning applies
-/// (`ApiApplication` is also reused by `dryrun.rs`'s `DryrunRequest`
-/// parsing, where params are always required). `params` is `None` only
-/// when the caller requested `exclude=created-apps-params` (go-algorand
+/// (`ApiApplication` is also reused as [`ApplicationResponse`] for
+/// `GET /v2/applications/{id}`, where params are always required). `params`
+/// is `None` only when the caller requested `exclude=created-apps-params` (go-algorand
 /// v4.6.0-stable, issue #507).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiCreatedApplication {
@@ -1297,42 +1297,6 @@ mod base64_bytes_array {
     }
 }
 
-/// Serde helper for serializing/deserializing `Option<Vec<Vec<u8>>>` as an
-/// array of base64 strings (skipped when `None`).
-mod optional_base64_bytes_array {
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
-    use serde::ser::SerializeSeq;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(items: &Option<Vec<Vec<u8>>>, s: S) -> Result<S::Ok, S::Error> {
-        match items {
-            Some(items) => {
-                let mut seq = s.serialize_seq(Some(items.len()))?;
-                for item in items {
-                    seq.serialize_element(&STANDARD.encode(item))?;
-                }
-                seq.end()
-            }
-            None => s.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<Vec<u8>>>, D::Error> {
-        let opt: Option<Vec<String>> = Option::deserialize(d)?;
-        match opt {
-            Some(strings) => {
-                let result: Result<Vec<Vec<u8>>, _> = strings
-                    .into_iter()
-                    .map(|s| STANDARD.decode(&s).map_err(serde::de::Error::custom))
-                    .collect();
-                result.map(Some)
-            }
-            None => Ok(None),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Supply response
 // ---------------------------------------------------------------------------
@@ -2058,214 +2022,6 @@ pub struct DisassembleResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Dryrun types
-// ---------------------------------------------------------------------------
-
-/// A TEAL value as represented in the dryrun API.
-///
-/// Matches go-algorand's `model.TealValue` used by dryrun endpoints.
-/// Note: this is distinct from `ApiTealValue` (used for app state) because the
-/// dryrun API uses `bytes` as a base64-encoded string and `type`/`uint` as u64.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DryrunTealValue {
-    /// Base64-encoded bytes value.
-    pub bytes: String,
-
-    /// Value type. 1 = bytes, 2 = uint.
-    #[serde(rename = "type")]
-    pub value_type: u64,
-
-    /// Uint value.
-    pub uint: u64,
-}
-
-/// Represents the state of the AVM at a single step during dryrun execution.
-///
-/// Matches go-algorand's `model.DryrunState`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DryrunState {
-    /// Error message if an error occurred at this step.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-
-    /// The source line number (0-indexed into the disassembly lines).
-    pub line: usize,
-
-    /// The program counter (byte offset into the program).
-    pub pc: usize,
-
-    /// Scratch space values (only non-zero entries).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scratch: Option<Vec<DryrunTealValue>>,
-
-    /// The stack at this step.
-    pub stack: Vec<DryrunTealValue>,
-}
-
-/// A source to be compiled and patched into a dryrun request.
-///
-/// Matches go-algorand's `model.DryrunSource`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DryrunSource {
-    /// Application index.
-    #[serde(rename = "app-index")]
-    pub app_index: u64,
-
-    /// Field name: "approv" for approval, "clearp" for clear state.
-    #[serde(rename = "field-name")]
-    pub field_name: String,
-
-    /// TEAL source code.
-    pub source: String,
-
-    /// Transaction index within the group.
-    #[serde(rename = "txn-index")]
-    pub txn_index: usize,
-}
-
-/// Result of a dryrun for a single transaction.
-///
-/// Matches go-algorand's `model.DryrunTxnResult`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DryrunTxnResult {
-    /// Messages from application call execution.
-    #[serde(rename = "app-call-messages", skip_serializing_if = "Option::is_none")]
-    pub app_call_messages: Option<Vec<String>>,
-
-    /// Trace of application call execution steps.
-    #[serde(rename = "app-call-trace", skip_serializing_if = "Option::is_none")]
-    pub app_call_trace: Option<Vec<DryrunState>>,
-
-    /// Budget added for this transaction.
-    #[serde(rename = "budget-added", skip_serializing_if = "Option::is_none")]
-    pub budget_added: Option<u64>,
-
-    /// Budget consumed by this transaction.
-    #[serde(rename = "budget-consumed", skip_serializing_if = "Option::is_none")]
-    pub budget_consumed: Option<u64>,
-
-    /// Disassembled approval program lines.
-    pub disassembly: Vec<String>,
-
-    /// Global state delta.
-    #[serde(rename = "global-delta", skip_serializing_if = "Option::is_none")]
-    pub global_delta: Option<StateDelta>,
-
-    /// Local state deltas per account.
-    #[serde(rename = "local-deltas", skip_serializing_if = "Option::is_none")]
-    pub local_deltas: Option<Vec<AccountStateDelta>>,
-
-    /// Disassembled logic sig program lines.
-    #[serde(
-        rename = "logic-sig-disassembly",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub logic_sig_disassembly: Option<Vec<String>>,
-
-    /// Messages from logic sig execution.
-    #[serde(rename = "logic-sig-messages", skip_serializing_if = "Option::is_none")]
-    pub logic_sig_messages: Option<Vec<String>>,
-
-    /// Trace of logic sig execution steps.
-    #[serde(rename = "logic-sig-trace", skip_serializing_if = "Option::is_none")]
-    pub logic_sig_trace: Option<Vec<DryrunState>>,
-
-    /// Log messages emitted during execution (base64-encoded).
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        with = "optional_base64_bytes_array"
-    )]
-    pub logs: Option<Vec<Vec<u8>>>,
-}
-
-/// A dryrun request.
-///
-/// Matches go-algorand's `model.DryrunRequest`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DryrunRequest {
-    /// Accounts to load into the dryrun sandbox.
-    #[serde(default)]
-    pub accounts: Vec<AccountResponse>,
-
-    /// Applications to load into the dryrun sandbox.
-    #[serde(default)]
-    pub apps: Vec<ApiApplication>,
-
-    /// Latest confirmed round timestamp (seconds since epoch).
-    #[serde(rename = "latest-timestamp", default)]
-    pub latest_timestamp: i64,
-
-    /// Protocol version string.
-    #[serde(rename = "protocol-version", default)]
-    pub protocol_version: String,
-
-    /// Round number.
-    #[serde(default)]
-    pub round: u64,
-
-    /// Sources to compile and inject into transactions or apps.
-    #[serde(default)]
-    pub sources: Vec<DryrunSource>,
-
-    /// Transactions to execute (as raw JSON / msgpack values).
-    #[serde(default)]
-    pub txns: Vec<serde_json::Value>,
-}
-
-/// A dryrun request decoded from msgpack.
-///
-/// Same fields as `DryrunRequest` but transactions are already decoded as
-/// `SignedTransaction` values (matching go-algorand's native `DryrunRequest`
-/// struct used on the msgpack path).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MsgpackDryrunRequest {
-    /// Accounts to load into the dryrun sandbox.
-    #[serde(default)]
-    pub accounts: Vec<AccountResponse>,
-
-    /// Applications to load into the dryrun sandbox.
-    #[serde(default)]
-    pub apps: Vec<ApiApplication>,
-
-    /// Latest confirmed round timestamp (seconds since epoch).
-    #[serde(rename = "latest-timestamp", default)]
-    pub latest_timestamp: i64,
-
-    /// Protocol version string.
-    #[serde(rename = "protocol-version", default)]
-    pub protocol_version: String,
-
-    /// Round number.
-    #[serde(default)]
-    pub round: u64,
-
-    /// Sources to compile and inject into transactions or apps.
-    #[serde(default)]
-    pub sources: Vec<DryrunSource>,
-
-    /// Transactions to execute (already decoded).
-    #[serde(default)]
-    pub txns: Vec<SignedTransaction>,
-}
-
-impl MsgpackDryrunRequest {
-    /// Split into a `DryrunRequest` (with empty txns) and the pre-parsed
-    /// transactions.
-    pub fn into_parts(self) -> (DryrunRequest, Vec<SignedTransaction>) {
-        let req = DryrunRequest {
-            accounts: self.accounts,
-            apps: self.apps,
-            latest_timestamp: self.latest_timestamp,
-            protocol_version: self.protocol_version,
-            round: self.round,
-            sources: self.sources,
-            txns: Vec::new(),
-        };
-        (req, self.txns)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Participation key models
 // ---------------------------------------------------------------------------
 
@@ -2318,22 +2074,6 @@ pub struct PostParticipationResponse {
     /// The participation key ID.
     #[serde(rename = "partId")]
     pub part_id: String,
-}
-
-/// Response from a dryrun request.
-///
-/// Matches go-algorand's `model.DryrunResponse`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DryrunResponse {
-    /// Error message (empty string if no error).
-    pub error: String,
-
-    /// Protocol version used.
-    #[serde(rename = "protocol-version")]
-    pub protocol_version: String,
-
-    /// Results for each transaction.
-    pub txns: Vec<DryrunTxnResult>,
 }
 
 // ---------------------------------------------------------------------------

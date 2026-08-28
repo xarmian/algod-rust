@@ -6,11 +6,9 @@ Usage:
 
 Available Commands:
   compile       Compile a contract program
-  dryrun        Test a program offline
-  dryrun-remote Test a program with algod's dryrun REST endpoint
   group         Group transactions together
   inspect       Print a transaction file
-  multisig      Provides tools working with multisig transactions 
+  multisig      Provides tools working with multisig transactions
   rawsend       Send raw transactions
   send          Send money to an address
   sign          Sign a transaction file
