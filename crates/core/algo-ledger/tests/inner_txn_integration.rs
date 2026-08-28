@@ -766,6 +766,174 @@ fn fee_credit_insufficient_fails() {
     assert!(is_failure(&result), "should fail: insufficient fee credit");
 }
 
+// ===========================================================================
+// Fee residue (FeeForUsage) — issue #677
+//
+// Mirrors go-algorand's `EvalParams.feeResidue` (`data/transactions/logic/
+// eval.go`, PR #6650 "Fees: Handle rounding of fees with non-integral usage
+// better"): an inner group's required fee is usage-weighted (an oversized
+// `Note` field contributes a fractional-of-a-MinTxnFee surcharge, in
+// `Micros`, via `SummarizeFees`/`Transaction.feeFactor`) and rounded up
+// against a running residue, so a whole tree of inner-txn groups rounds up
+// its aggregate fee only once rather than once per group.
+//
+// Consensus V42 charges `per_byte_txn_surcharge = 100` Micros per Note byte
+// beyond the free `max_txn_note_bytes = 1024` cap, at `min_txn_fee = 1000`.
+// So a Note of `1024 + over` bytes contributes `over * 100` Micros of usage
+// beyond the baseline `1_000_000` (`ONE_MICROS`):
+//   - over=7  -> usage = 1_000_700 -> true fee = 1000.7  -> rounds up to 1001,
+//                overpaying by 0.3 microAlgo (residue = 0.3 * FEE_RESIDUE_SCALE).
+//   - over=2  -> usage = 1_000_200 -> true fee = 1000.2  -> needs to round up
+//                to 1001 *unless* a carried-in residue of >= 0.2 already
+//                covers the fraction, in which case 1000 suffices exactly.
+// ===========================================================================
+
+/// Build an inner pay program fragment with an oversized `Note` (contributing
+/// a `SummarizeFees` surcharge) and an explicit `Fee`.
+fn build_inner_pay_with_note_and_fee(receiver: &[u8; 32], note_len: usize, fee: u64) -> Vec<u8> {
+    let mut code = Vec::new();
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(1)); // TypeEnum = 1 (pay)
+    code.extend([0xb2, 16]); // itxn_field TypeEnum
+    code.extend(pushbytes(receiver));
+    code.extend([0xb2, 7]); // itxn_field Receiver
+    code.extend(pushint(0)); // Amount = 0
+    code.extend([0xb2, 8]); // itxn_field Amount
+    code.extend(pushbytes(&vec![0xABu8; note_len]));
+    code.extend([0xb2, 5]); // itxn_field Note
+    code.extend(pushint(fee));
+    code.extend([0xb2, 1]); // itxn_field Fee
+    code.push(0xb3); // itxn_submit
+    code
+}
+
+/// A single inner group with an oversized Note (usage = 1_000_700, true fee =
+/// 1000.7, rounds up to 1001) that pays only 1000 must fail — and the error
+/// must report the actual net shortfall (1, not the flat requirement),
+/// matching go-algorand's corrected message (PR #6693 "AVM: report actual
+/// inner group fee shortfall": `"group fee %s too small (needs %s more)"`).
+#[test]
+fn inner_group_usage_based_fee_shortfall_reports_net_amount() {
+    let sender = [0xAA; 32];
+    let receiver = [0xBB; 32];
+    let app_id = 42u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 10_000_000);
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 0;
+    ctx.fee_residue = 0;
+
+    let mut code = build_inner_pay_with_note_and_fee(&receiver, 1024 + 7, 1000);
+    code.extend(pushint(1));
+    code.push(0x43);
+
+    let result = run_with_context(6, &code, &mut ctx);
+    assert!(
+        is_failure(&result),
+        "usage-based fee (1001) exceeds flat paid (1000): should fail"
+    );
+    let err = result.unwrap_err();
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("group fee 1000 too small (needs 1 more)"),
+        "expected the actual net shortfall (1), got: {}",
+        msg
+    );
+}
+
+/// In isolation (fresh residue=0, no fee_credit), a group with usage=1_000_200
+/// (true fee 1000.2, independently rounds up to 1001) that pays only 1000
+/// must fail. This is the control for
+/// `inner_group_fee_residue_carries_to_sibling_group` below: it shows 1000 is
+/// *not* independently sufficient for this usage, so that test's success can
+/// only be explained by the carried-in residue.
+#[test]
+fn inner_group_usage_based_fee_shortfall_without_residue_control() {
+    let sender = [0xAA; 32];
+    let receiver = [0xBB; 32];
+    let app_id = 42u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 10_000_000);
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 0;
+    ctx.fee_residue = 0;
+
+    let mut code = build_inner_pay_with_note_and_fee(&receiver, 1024 + 2, 1000);
+    code.extend(pushint(1));
+    code.push(0x43);
+
+    let result = run_with_context(6, &code, &mut ctx);
+    assert!(
+        is_failure(&result),
+        "usage=1_000_200 with no carried residue independently needs 1001, not 1000"
+    );
+}
+
+/// The core regression this issue fixes: fee_residue left over from one
+/// inner group's round-up carries forward and is consumed by the next
+/// sibling inner group's charge, so the pair rounds up only once in
+/// aggregate rather than once per group.
+///
+/// Group 1: usage=1_000_700 (Note over=7), pays exactly the rounded-up fee
+/// 1001 -- overpaying the *true* fee (1000.7) by 0.3 microAlgo, which is
+/// retained as residue (not fee_credit -- no whole-microAlgo overpayment).
+/// Group 2: usage=1_000_200 (Note over=2, true fee 1000.2) pays only 1000.
+/// Without the carried-in 0.3 residue this would fail (see the control test
+/// above); with it, the 0.2 fraction is absorbed and 1000 exactly suffices.
+#[test]
+fn inner_group_fee_residue_carries_to_sibling_group() {
+    let sender = [0xAA; 32];
+    let receiver = [0xBB; 32];
+    let app_id = 42u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 10_000_000);
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 0;
+    ctx.fee_residue = 0;
+
+    let mut code = build_inner_pay_with_note_and_fee(&receiver, 1024 + 7, 1001);
+    code.extend(build_inner_pay_with_note_and_fee(&receiver, 1024 + 2, 1000));
+    code.extend(pushint(1));
+    code.push(0x43);
+
+    let result = run_with_context(6, &code, &mut ctx);
+    assert!(
+        result.as_ref().is_ok_and(|approved| *approved),
+        "second group's 1000 should be exactly covered by the 0.3 residue \
+         left over from the first group's round-up: {:?}",
+        result
+    );
+    // The leftover residue after both groups: 0.3 - 0.2 = 0.1 microAlgo,
+    // scaled by FEE_RESIDUE_SCALE (1e12).
+    assert_eq!(
+        ctx.fee_residue, 100_000_000_000,
+        "residue should reflect 0.1 microAlgo left after both round-ups"
+    );
+    // No whole-microAlgo fee_credit was ever available or needed.
+    assert_eq!(ctx.fee_credit, 0);
+}
+
 /// Fee deducted from app address balance.
 #[test]
 fn fee_deducted_from_app_address() {

@@ -108,6 +108,7 @@ fn execute_ctx(fee_sink: Address, round: u64) -> ApplyContext {
         genesis_hash: [0u8; 32],
         txn_counter: Cell::new(0),
         fee_credit: Cell::new(0),
+        fee_residue: Cell::new(0),
         txn_index: Cell::new(0),
         consensus: algo_types::ConsensusParams::default(),
         avm_overrides: Default::default(),
@@ -975,6 +976,7 @@ fn two_app_calls_produce_distinct_inner_asset_ids() {
         genesis_hash: [0u8; 32],
         txn_counter: Cell::new(200),
         fee_credit: Cell::new(0),
+        fee_residue: Cell::new(0),
         txn_index: Cell::new(0),
         consensus: algo_types::ConsensusParams::default(),
         avm_overrides: Default::default(),
@@ -1130,6 +1132,7 @@ fn fee_credit_from_outer_overpayment_enables_inner_zero_fee() {
         genesis_hash: [0u8; 32],
         txn_counter: Cell::new(0),
         fee_credit: Cell::new(2_000 - 1_000), // overpayment
+        fee_residue: Cell::new(0),
         txn_index: Cell::new(0),
         consensus: algo_types::ConsensusParams::default(),
         avm_overrides: Default::default(),
@@ -1201,6 +1204,7 @@ fn inner_zero_fee_fails_without_fee_credit() {
         genesis_hash: [0u8; 32],
         txn_counter: Cell::new(0),
         fee_credit: Cell::new(0), // no fee credit
+        fee_residue: Cell::new(0),
         txn_index: Cell::new(0),
         consensus: algo_types::ConsensusParams::default(),
         avm_overrides: Default::default(),
@@ -1214,9 +1218,12 @@ fn inner_zero_fee_fails_without_fee_credit() {
         "inner fee=0 without fee credit should fail"
     );
     let err_msg = format!("{}", result.unwrap_err());
+    // Matches go-algorand's corrected message (PR #6693 "AVM: report actual
+    // inner group fee shortfall"): "group fee %s too small (needs %s more)",
+    // reporting the actual paid amount and the net shortfall still owed.
     assert!(
-        err_msg.contains("fee too small"),
-        "error should mention fee: {}",
+        err_msg.contains("group fee 0 too small (needs 1000 more)"),
+        "error should report actual paid amount and net shortfall: {}",
         err_msg
     );
 }

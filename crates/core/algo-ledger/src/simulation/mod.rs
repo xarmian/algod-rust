@@ -41,7 +41,7 @@ use algo_validate::{
 use ed25519_dalek::{Signer, SigningKey};
 
 use crate::apply::{
-    apply_transaction_with_budget, compute_group_fee_credit, ApplyContext, ApplyMode,
+    apply_transaction_with_budget, compute_group_fee_credit_and_residue, ApplyContext, ApplyMode,
     AvmEvalOverrides, GroupInfo,
 };
 use crate::avm_context::NamedGroupResources;
@@ -421,11 +421,11 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }));
         }
 
-        // Compute group fee credit so inner transactions can draw from
-        // overpayment by outer transactions (matches go-algorand's feeCredit).
-        let fee_credit = {
+        // Compute group fee credit and residue so inner transactions can draw
+        // from overpayment by outer transactions (matches go-algorand's feeCredit).
+        let (fee_credit, fee_residue) = {
             let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
-            compute_group_fee_credit(&group_refs, consensus.min_txn_fee)
+            compute_group_fee_credit_and_residue(&group_refs, &consensus)
         };
 
         let apply_ctx = ApplyContext {
@@ -438,6 +438,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             genesis_hash: *self.store.genesis_hash(),
             txn_counter: Cell::new(self.store.txn_counter()),
             fee_credit: Cell::new(fee_credit),
+            fee_residue: Cell::new(fee_residue),
             txn_index: Cell::new(0),
             consensus,
             // Simulation-only AVM overrides: raised log limits
