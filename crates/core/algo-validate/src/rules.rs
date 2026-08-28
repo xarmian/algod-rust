@@ -284,6 +284,139 @@ pub fn validate_transaction_wellformed(
         });
     }
 
+    // ── Application-call schema/size well-formedness ────────────────
+    // Go: `ApplicationCallTxnFields.wellFormed` (data/transactions/application.go).
+    if txn.txn_type == "appl" {
+        validate_application_call_wellformed(txn, params)?;
+    }
+
+    Ok(())
+}
+
+/// `OnCompletion` action values (Go: `data/transactions/teal.go`
+/// `OnCompletion` enum). Only the value needed by `UpdatingSizes()` is used
+/// here; the rest of the `OnCompletion` switch validation in Go's
+/// `wellFormed` is out of scope for this check.
+const ON_COMPLETION_UPDATE: u64 = 4;
+
+/// Mirrors go-algorand's `ApplicationCallTxnFields.UpdatingSizes()`
+/// (`data/transactions/application.go`): true when this is an application
+/// *update* transaction that also carries non-zero sizing fields
+/// (`ExtraProgramPages` and/or `GlobalStateSchema`).
+///
+/// Note this deliberately does NOT gate on `ApplicationID != 0` — it matches
+/// upstream exactly, which checks only `OnCompletion` and the sizing fields.
+fn updating_sizes(txn: &Transaction) -> bool {
+    let global_schema_nonempty = txn
+        .global_state_schema
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    txn.on_completion == ON_COMPLETION_UPDATE
+        && (txn.extra_program_pages != 0 || global_schema_nonempty)
+}
+
+/// Application-call-specific well-formedness checks.
+///
+/// Mirrors the schema/extra-program-pages portion of go-algorand's
+/// `ApplicationCallTxnFields.wellFormed` (`data/transactions/application.go`,
+/// current v5.0.0-stable structure, post `e885e4e8a` "Txn: Check for local
+/// schema setting in update" / #6682).
+///
+/// The critical structural rule (the bug `e885e4e8a` fixed upstream): a
+/// non-empty `LocalStateSchema` is rejected UNCONDITIONALLY whenever
+/// `ApplicationID != 0` (i.e. any non-creation app call) — local schema can
+/// only ever be set at creation. This must NOT be nested inside the
+/// `AppSizeUpdates && UpdatingSizes()` guard that conditionally allows
+/// `GlobalStateSchema`/`ExtraProgramPages` to be non-zero on a resize
+/// update — doing so would let a resize update smuggle in a `LocalStateSchema`
+/// mutation, which is exactly the vulnerability the upstream commit closed.
+fn validate_application_call_wellformed(
+    txn: &Transaction,
+    params: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    // Unconditional bound on ExtraProgramPages, regardless of creation/update.
+    if txn.extra_program_pages > params.max_absolute_extra_program_pages {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "tx.ExtraProgramPages exceeds MaxAbsoluteExtraProgramPages = {}",
+                params.max_absolute_extra_program_pages
+            ),
+        });
+    }
+
+    if txn.application_id != 0 {
+        // Local schema can only be set during creation — unconditional, no
+        // AppSizeUpdates exception. This check must stay OUTSIDE the
+        // AppSizeUpdates/UpdatingSizes conditional below.
+        let local_schema_nonempty = txn
+            .local_state_schema
+            .as_ref()
+            .is_some_and(|s| !s.is_empty());
+        if local_schema_nonempty {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "inappropriate non-zero tx.LocalStateSchema ({:?})",
+                    txn.local_state_schema
+                ),
+            });
+        }
+
+        // Global schema and extra program pages can only be set during
+        // creation, or during an update when AppSizeUpdates is active and
+        // this update is legitimately resizing.
+        if !(params.app_size_updates && updating_sizes(txn)) {
+            let global_schema_nonempty = txn
+                .global_state_schema
+                .as_ref()
+                .is_some_and(|s| !s.is_empty());
+            if global_schema_nonempty {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "inappropriate non-zero tx.GlobalStateSchema ({:?})",
+                        txn.global_state_schema
+                    ),
+                });
+            }
+            if txn.extra_program_pages != 0 {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "inappropriate non-zero tx.ExtraProgramPages ({})",
+                        txn.extra_program_pages
+                    ),
+                });
+            }
+        }
+    }
+
+    // MaxLocalSchemaEntries / MaxGlobalSchemaEntries: unconditional size caps,
+    // independent of the immutability checks above.
+    let local_entries = txn
+        .local_state_schema
+        .as_ref()
+        .map(|s| s.num_entries())
+        .unwrap_or(0);
+    if local_entries > params.max_local_schema_entries {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "tx.LocalStateSchema is too large. {} > {}",
+                local_entries, params.max_local_schema_entries
+            ),
+        });
+    }
+    let global_entries = txn
+        .global_state_schema
+        .as_ref()
+        .map(|s| s.num_entries())
+        .unwrap_or(0);
+    if global_entries > params.max_global_schema_entries {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "tx.GlobalStateSchema is too large. {} > {}",
+                global_entries, params.max_global_schema_entries
+            ),
+        });
+    }
+
     Ok(())
 }
 
@@ -1376,5 +1509,203 @@ mod tests {
     #[test]
     fn test_has_txn512_unknown_false() {
         assert!(!has_txn512("v99"));
+    }
+
+    // ── Application-call well-formedness (issue #675) ────────────
+
+    /// v42 params: `AppSizeUpdates` active, `MaxAbsoluteExtraProgramPages =
+    /// 7`, non-zero schema-entry caps — the version where the upstream fix
+    /// (`e885e4e8a`, #6682) applies.
+    fn v42_params() -> ConsensusParams {
+        consensus_params_for_version(algo_types::consensus::CONSENSUS_CURRENT_VERSION)
+            .expect("v42 (current) consensus params must be defined")
+    }
+
+    /// Build a minimal valid application-call transaction (a plain NoOp call
+    /// on an existing app, no schema/EPP fields set).
+    fn make_appl_txn() -> Transaction {
+        Transaction {
+            txn_type: "appl".into(),
+            sender: TEST_SENDER,
+            fee: MIN_TXN_FEE,
+            first_valid: Round(1000),
+            last_valid: Round(1100),
+            application_id: 42,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_appl_creation_may_set_local_and_global_schema() {
+        // ApplicationID == 0 (creation): both schemas may be freely set.
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        txn.local_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 1,
+        });
+        txn.global_state_schema = Some(algo_types::StateSchema {
+            num_uint: 2,
+            num_byte_slice: 2,
+        });
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_appl_update_with_nonzero_local_schema_rejected() {
+        // Plain update (no resize), nonzero LocalStateSchema: always illegal.
+        let mut txn = make_appl_txn();
+        txn.on_completion = ON_COMPLETION_UPDATE;
+        txn.local_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        });
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("LocalStateSchema"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_noncreation_with_nonzero_global_schema_rejected_without_app_size_updates() {
+        // Not an update (NoOp), nonzero GlobalStateSchema: illegal regardless
+        // of AppSizeUpdates, since UpdatingSizes() requires OnCompletion ==
+        // UpdateApplicationOC.
+        let mut txn = make_appl_txn();
+        txn.global_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        });
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("GlobalStateSchema"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// This is the exact scenario the upstream bug (pre `e885e4e8a`) let
+    /// through: an update transaction that legitimately resizes
+    /// GlobalStateSchema/ExtraProgramPages under AppSizeUpdates, while ALSO
+    /// smuggling in a nonzero LocalStateSchema. The nested (pre-fix)
+    /// structure would have skipped the LocalStateSchema check entirely
+    /// here because the AppSizeUpdates/UpdatingSizes guard was satisfied.
+    /// The current (correct) structure must still reject it.
+    #[test]
+    fn test_appl_update_resize_cannot_smuggle_local_schema_change() {
+        let mut txn = make_appl_txn();
+        txn.on_completion = ON_COMPLETION_UPDATE;
+        // Legitimate resize: nonzero GlobalStateSchema + ExtraProgramPages,
+        // which alone would be allowed under AppSizeUpdates.
+        txn.global_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        });
+        txn.extra_program_pages = 1;
+        // Smuggled mutation: LocalStateSchema must never change post-creation.
+        txn.local_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        });
+        let params = v42_params();
+        assert!(params.app_size_updates, "test assumes AppSizeUpdates=true");
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("LocalStateSchema"),
+            "expected LocalStateSchema rejection even though the resize itself is legitimate, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_update_legitimate_resize_without_local_schema_accepted() {
+        // Same resize as above but WITHOUT the smuggled LocalStateSchema:
+        // must be accepted under AppSizeUpdates.
+        let mut txn = make_appl_txn();
+        txn.on_completion = ON_COMPLETION_UPDATE;
+        txn.global_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        });
+        txn.extra_program_pages = 1;
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_appl_update_resize_rejected_when_app_size_updates_disabled() {
+        // Same legitimate-looking resize, but on a version where
+        // AppSizeUpdates is not yet active (v41): must be rejected.
+        let mut txn = make_appl_txn();
+        txn.on_completion = ON_COMPLETION_UPDATE;
+        txn.global_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        });
+        let v41 = consensus_params_for_version(algo_types::consensus::CONSENSUS_V41)
+            .expect("v41 consensus params must be defined");
+        assert!(
+            !v41.app_size_updates,
+            "test assumes v41 predates AppSizeUpdates"
+        );
+        let err = validate_transaction_wellformed(&txn, false, &v41, None).unwrap_err();
+        assert!(
+            err.to_string().contains("GlobalStateSchema"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_extra_program_pages_over_max_rejected() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0; // creation: EPP bound is still unconditional
+        let params = v42_params();
+        txn.extra_program_pages = params.max_absolute_extra_program_pages + 1;
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("MaxAbsoluteExtraProgramPages"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_local_schema_entries_over_max_rejected_at_creation() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0; // creation: entry-count caps still apply
+        let params = v42_params();
+        txn.local_state_schema = Some(algo_types::StateSchema {
+            num_uint: params.max_local_schema_entries + 1,
+            num_byte_slice: 0,
+        });
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("LocalStateSchema is too large"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_global_schema_entries_over_max_rejected_at_creation() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        let params = v42_params();
+        txn.global_state_schema = Some(algo_types::StateSchema {
+            num_uint: params.max_global_schema_entries + 1,
+            num_byte_slice: 0,
+        });
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("GlobalStateSchema is too large"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_noop_call_with_no_schema_fields_accepted() {
+        let txn = make_appl_txn();
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
     }
 }

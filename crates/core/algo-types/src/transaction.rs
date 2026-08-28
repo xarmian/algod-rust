@@ -650,6 +650,17 @@ pub struct StateSchema {
 }
 
 impl StateSchema {
+    /// Returns true if both fields are zero (Go: `StateSchema.Empty()`).
+    pub fn is_empty(&self) -> bool {
+        self.num_uint == 0 && self.num_byte_slice == 0
+    }
+
+    /// Total number of state entries this schema reserves (Go:
+    /// `StateSchema.NumEntries()` = `NumUint + NumByteSlice`).
+    pub fn num_entries(&self) -> u64 {
+        self.num_uint.saturating_add(self.num_byte_slice)
+    }
+
     /// Add two StateSchemas together (saturating).
     pub fn add_schema(&self, other: &StateSchema) -> StateSchema {
         StateSchema {

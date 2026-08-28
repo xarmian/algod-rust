@@ -187,8 +187,8 @@ pub struct ConsensusParams {
     /// via `PerByteTxnSurcharge`.
     pub max_absolute_txn_note_bytes: usize,
     /// Absolute hard cap on extra app program pages, beyond which an app
-    /// create/update is not well-formed regardless of size-pricing fee paid
-    /// (Go: `MaxAbsoluteExtraProgramPages`, v42+).
+    /// create/update is not well-formed (Go: `MaxAbsoluteExtraProgramPages`,
+    /// v28+ at 3, raised to 7 at v42 alongside size-pricing fees).
     pub max_absolute_extra_program_pages: u32,
     /// Absolute hard cap on the summed length of ApplicationArgs, beyond
     /// which an app call is not well-formed regardless of size-pricing fee
@@ -881,6 +881,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     let mut v28 = v27.clone();
     v28.logic_sig_version = 4;
     v28.max_extra_app_program_pages = 3;
+    v28.max_absolute_extra_program_pages = 3;
     v28.max_app_program_len = 2048;
     v28.max_asset_url_bytes = 96;
     v28.max_app_bytes_value_len = 128;
@@ -1166,6 +1167,7 @@ mod tests {
         assert!(p.enable_fee_pooling);
         assert_eq!(p.logic_sig_version, 4);
         assert_eq!(p.max_extra_app_program_pages, 3);
+        assert_eq!(p.max_absolute_extra_program_pages, 3);
         assert_eq!(p.max_app_program_len, 2048);
         assert!(p.enable_keyreg_coherency_check);
     }
@@ -1305,7 +1307,10 @@ mod tests {
         assert!(!v41.load_tracking);
         assert!(!v41.enable_select_f128);
         assert_eq!(v41.max_absolute_txn_note_bytes, 0);
-        assert_eq!(v41.max_absolute_extra_program_pages, 0);
+        // MaxAbsoluteExtraProgramPages was introduced at v28 (=3), not v42 —
+        // v42 only raises it to 7. Unlike the other `max_absolute_*`/feature
+        // fields above, it is NOT zero/unset pre-v42.
+        assert_eq!(v41.max_absolute_extra_program_pages, 3);
         assert_eq!(v41.max_absolute_total_arg_len, 0);
         assert_eq!(v41.per_byte_txn_surcharge, 0);
     }
