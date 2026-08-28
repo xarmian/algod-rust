@@ -192,7 +192,11 @@ impl F128 {
         if a.exp.wrapping_sub(b.exp) > 128 {
             return a; // b is below the round bit
         }
-        let diff = (a.exp - b.exp) as u32;
+        // `wrapping_sub` here too (not plain `-`): consistent with the
+        // guard above, and keeps this unconditionally panic-free even for
+        // out-of-precondition exponents, rather than relying on the
+        // precondition to avoid a debug-build overflow panic.
+        let diff = a.exp.wrapping_sub(b.exp) as u32;
         let (bhi, blo, round0, sticky0) = shr128gs(b.hi, b.lo, diff);
         let (slo, c) = add64(a.lo, blo, 0);
         let (shi, c2) = add64(a.hi, bhi, c);
