@@ -19,10 +19,9 @@
 //! residue through `EvalParams`/`opItxnSubmit`/inner-transaction evaluation
 //! (go: `ledger/eval` and `data/transactions/logic/eval.go`'s `feeResidue`) is
 //! out of scope here — see the companion AVM inner-txn fee-residue-threading
-//! issue. Likewise, the post-quantum-signature fee contribution
-//! (`proto.PQSchemeFeeContribution`) is not yet modeled in `algo-types`, so
-//! `txn_fee_factor` treats it as zero/absent — see the companion PQ-signature
-//! issue.
+//! issue. The post-quantum-signature fee contribution
+//! (`proto.PQSchemeFeeContribution`) is modeled by
+//! [`signature_fee_contribution`] and wired into [`summarize_fees`].
 
 use algo_types::consensus::ConsensusParams;
 use algo_types::{SignedTransaction, Transaction};
@@ -319,20 +318,53 @@ pub fn logic_sig_program_fee_contribution(
     surcharge
 }
 
+/// Mirrors go's `SignedTxn.signatureFeeContribution(proto)`
+/// (`data/transactions/signedtxn.go`, added by commit `569ae3d4b`): the
+/// additional fee-factor surcharge for a transaction's signature type. Only
+/// PQ signatures contribute (`proto.PQSchemeFeeContribution`); a top-level
+/// `PQsig` is checked first, then a PQ-delegated LogicSig's `PQsig` — an
+/// ordinary ed25519/multisig/plain-LogicSig transaction contributes zero.
+/// An unknown/unsupported PQ scheme also contributes zero, which is safe
+/// because such a transaction is rejected during signature verification
+/// regardless.
+///
+/// Note: upstream's `SignedTxn.FeeFactor` briefly (commit `569ae3d4b`)
+/// exempted free singleton heartbeats from this surcharge, but that
+/// special case was superseded by commit `9c3e95b4b` ("Make challenge
+/// discount explicit in HeartbeatTransaction"), which folds the heartbeat
+/// discount into `Transaction.feeFactor` itself via the explicit
+/// `HbChallengeDiscount` flag (already modeled by [`txn_fee_factor`]).
+/// At v5.0.0-stable, `FeeFactor` unconditionally adds
+/// `signatureFeeContribution` on top of `feeFactor` — this mirrors that
+/// current (not the issue-description's stale) behavior.
+pub fn signature_fee_contribution(stx: &SignedTransaction, params: &ConsensusParams) -> u64 {
+    if let Some(pqsig) = &stx.pqsig {
+        if !pqsig.blank() {
+            return params.pq_scheme_fee_contribution(pqsig.scheme);
+        }
+    }
+    if let Some(lsig) = &stx.lsig {
+        if let Some(pqsig) = &lsig.pqsig {
+            if !pqsig.blank() {
+                return params.pq_scheme_fee_contribution(pqsig.scheme);
+            }
+        }
+    }
+    0
+}
+
 /// Mirrors go's `SummarizeFees(txgroup, proto) (usage basics.Micros, paid
 /// basics.MicroAlgos)` (`data/transactions/signedtxn.go`): sums each member's
-/// `feeFactor` (`Micros` usage) and actual paid fee (`MicroAlgos`) across the
-/// group, plus the group's pooled LogicSig program-byte surcharge.
-///
-/// Note: go's `SignedTxn.FeeFactor` also adds a post-quantum-signature
-/// contribution (`signatureFeeContribution`) on top of `Transaction.feeFactor`;
-/// that is not yet modeled here (see the module doc comment), so this treats
-/// it as zero, matching non-PQ-signed transactions exactly.
+/// `feeFactor` (`Micros` usage), its signature-type fee surcharge (see
+/// [`signature_fee_contribution`]), and actual paid fee (`MicroAlgos`)
+/// across the group, plus the group's pooled LogicSig program-byte
+/// surcharge.
 pub fn summarize_fees(group: &[&SignedTransaction], params: &ConsensusParams) -> (u64, u64) {
     let mut usage: u64 = 0;
     let mut paid: u64 = 0;
     for stx in group {
         usage = usage.saturating_add(txn_fee_factor(&stx.txn, params));
+        usage = usage.saturating_add(signature_fee_contribution(stx, params));
         paid = paid.saturating_add(stx.txn.fee);
     }
     usage = usage.saturating_add(logic_sig_program_fee_contribution(group, params));

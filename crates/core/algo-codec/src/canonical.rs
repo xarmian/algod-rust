@@ -15,7 +15,7 @@ use algo_types::{
     AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, Block, BlockHeader,
     BoxRef, Digest, FalconVerifier, HashFactory, HeartbeatProof, HeartbeatTxnFields, HoldingRef,
     LocalsRef, LogicSig, MerkleProof, MerkleSignature, MerkleSignatureVerifier, MultisigSig,
-    MultisigSubsig, Participant, ResourceRef, Reveal, SigSlotCommit, SignedTransaction,
+    MultisigSubsig, PQSig, Participant, ResourceRef, Reveal, SigSlotCommit, SignedTransaction,
     StateProofBody, StateProofMessage, StateSchema, TealValue, Transaction, TxTailRound,
     TxTailRoundLease,
 };
@@ -503,6 +503,9 @@ pub fn canonical_encode_signed_transaction(stx: &SignedTransaction) -> Vec<u8> {
     if let Some(ref msig) = stx.msig {
         m.fields.push(("msig", canonical_encode_multisig(msig)));
     }
+    if let Some(ref pqsig) = stx.pqsig {
+        m.add_map("pqsig", canonical_encode_pqsig(pqsig));
+    }
     m.add_bytes("sig", &stx.sig);
     m.add_option_address("sgnr", &stx.auth_addr);
     m.add_map("txn", canonical_encode_transaction(&stx.txn));
@@ -533,6 +536,9 @@ pub fn canonical_encode_signed_txn_in_block(stx: &SignedTransaction) -> Vec<u8> 
     }
     if let Some(ref msig) = stx.msig {
         m.fields.push(("msig", canonical_encode_multisig(msig)));
+    }
+    if let Some(ref pqsig) = stx.pqsig {
+        m.add_map("pqsig", canonical_encode_pqsig(pqsig));
     }
 
     // ApplyData rewards fields
@@ -1388,7 +1394,26 @@ pub fn canonical_encode_logicsig(lsig: &LogicSig) -> Vec<u8> {
         m.fields.push(("msig", canonical_encode_multisig(msig)));
     }
 
+    if let Some(ref pqsig) = lsig.pqsig {
+        m.add_map("pqsig", canonical_encode_pqsig(pqsig));
+    }
+
     m.add_bytes("sig", &lsig.sig);
+
+    m.encode()
+}
+
+/// Canonically encode a PQSig as a nested msgpack map.
+/// Sorted fields: "pk", "sch", "sig", "slt" (alphabetical).
+/// Only includes non-empty/non-zero fields (Go: `PQSig`'s
+/// `_struct codec:",omitempty,omitemptyarray"`).
+pub fn canonical_encode_pqsig(pqsig: &PQSig) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    m.add_bytes("pk", &pqsig.public_key);
+    m.add_bytes("sch", &pqsig.scheme);
+    m.add_bytes("sig", &pqsig.signature);
+    m.add_u64("slt", pqsig.salt.0 as u64);
 
     m.encode()
 }
@@ -2829,5 +2854,121 @@ mod tests {
             keys, sorted_keys,
             "ledgercore account data keys should be sorted lexicographically"
         );
+    }
+
+    // ── PQSig canonical msgpack encoding (issue #660) ──────────────────────
+
+    /// Byte-level oracle test: a fully-populated `PQSig` must encode as the
+    /// exact msgpack bytes go-algorand's canonical (sorted-key, omitempty,
+    /// compact-int) codec would produce for the same field values. Fields
+    /// sort alphabetically as "pk" < "sch" < "sig" < "slt", each carried as
+    /// msgpack `bin` except `slt` (a plain small uint → positive fixint).
+    #[test]
+    fn canonical_encode_pqsig_matches_expected_bytes() {
+        let pqsig = PQSig {
+            scheme: *b"f1",
+            salt: algo_types::PQAddressSalt(5),
+            public_key: serde_bytes::ByteBuf::from(vec![0xAA, 0xAA, 0xAA]),
+            signature: serde_bytes::ByteBuf::from(vec![0xBB, 0xBB]),
+        };
+
+        let encoded = canonical_encode_pqsig(&pqsig);
+
+        let expected: Vec<u8> = vec![
+            0x84, // fixmap(4)
+            0xa2, b'p', b'k', // "pk"
+            0xc4, 0x03, 0xAA, 0xAA, 0xAA, // bin3
+            0xa3, b's', b'c', b'h', // "sch"
+            0xc4, 0x02, b'f', b'1', // bin2 "f1"
+            0xa3, b's', b'i', b'g', // "sig"
+            0xc4, 0x02, 0xBB, 0xBB, // bin2
+            0xa3, b's', b'l', b't', // "slt"
+            0x05, // positive fixint 5
+        ];
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn canonical_encode_pqsig_omits_zero_fields() {
+        // A PQSig with only `scheme` set omits pk/sig/slt (all zero-valued),
+        // matching go's per-field omitempty on the PQSig struct itself.
+        let pqsig = PQSig {
+            scheme: *b"f1",
+            salt: algo_types::PQAddressSalt(0),
+            public_key: serde_bytes::ByteBuf::new(),
+            signature: serde_bytes::ByteBuf::new(),
+        };
+        let encoded = canonical_encode_pqsig(&pqsig);
+        let expected: Vec<u8> = vec![
+            0x81, // fixmap(1)
+            0xa3, b's', b'c', b'h', // "sch"
+            0xc4, 0x02, b'f', b'1', // bin2 "f1"
+        ];
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn signed_transaction_with_pqsig_round_trips_through_rmp_serde() {
+        // Full derive-based (non-canonical) serde round trip: encode via
+        // rmp-serde, decode back, and confirm the `pqsig` field survives
+        // intact. This exercises the `#[serde(...)]` wiring on
+        // `SignedTransaction.pqsig` end to end, independent of the
+        // hand-rolled `CanonicalMap` encoder tested above.
+        let pqsig = PQSig {
+            scheme: *b"f1",
+            salt: algo_types::PQAddressSalt(7),
+            public_key: serde_bytes::ByteBuf::from(vec![0x01; 1793]),
+            signature: serde_bytes::ByteBuf::from(vec![0x02; 42]),
+        };
+        let stx = SignedTransaction {
+            txn: Transaction {
+                txn_type: "pay".into(),
+                sender: Address([9u8; 32]),
+                ..Default::default()
+            },
+            pqsig: Some(pqsig.clone()),
+            ..Default::default()
+        };
+
+        let encoded = rmp_serde::to_vec_named(&stx).expect("encode SignedTransaction");
+        let decoded: SignedTransaction =
+            rmp_serde::from_slice(&encoded).expect("decode SignedTransaction");
+
+        assert_eq!(decoded.pqsig, Some(pqsig));
+
+        // A SignedTransaction with no pqsig must round-trip to `None` (the
+        // field is entirely absent on the wire, not an empty/default map).
+        let stx_no_pq = SignedTransaction {
+            txn: Transaction {
+                txn_type: "pay".into(),
+                sender: Address([9u8; 32]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let encoded_no_pq = rmp_serde::to_vec_named(&stx_no_pq).expect("encode");
+        let decoded_no_pq: SignedTransaction =
+            rmp_serde::from_slice(&encoded_no_pq).expect("decode");
+        assert_eq!(decoded_no_pq.pqsig, None);
+    }
+
+    #[test]
+    fn logicsig_with_pqsig_round_trips_through_rmp_serde() {
+        let pqsig = PQSig {
+            scheme: *b"f1",
+            salt: algo_types::PQAddressSalt(1),
+            public_key: serde_bytes::ByteBuf::from(vec![0x03; 1793]),
+            signature: serde_bytes::ByteBuf::from(vec![0x04; 20]),
+        };
+        let lsig = LogicSig {
+            logic: serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]),
+            pqsig: Some(pqsig.clone()),
+            ..LogicSig::default()
+        };
+
+        let encoded = rmp_serde::to_vec_named(&lsig).expect("encode LogicSig");
+        let decoded: LogicSig = rmp_serde::from_slice(&encoded).expect("decode LogicSig");
+        assert_eq!(decoded.pqsig, Some(pqsig));
     }
 }

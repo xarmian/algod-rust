@@ -28,6 +28,25 @@ impl Address {
         self.0 == [0u8; 32]
     }
 
+    /// Reports whether this address is eligible to be a native post-quantum
+    /// account address: it must NOT decode as a valid Edwards25519 curve
+    /// point (otherwise the same 32 bytes could double as a spendable
+    /// ed25519 on-curve address, defeating PQ-address/ed25519-address
+    /// unambiguity). Mirrors go-algorand's `basics.Address.IsPQCompliant()`
+    /// (`data/basics/address.go`), which is `!crypto.IsEdwards25519Point(addr[:])`.
+    /// `IsEdwards25519Point` decodes the same way `filippo.io/edwards25519`'s
+    /// `Point.SetBytes` does (accepting some non-canonical point encodings,
+    /// not checking prime-order-subgroup membership); `curve25519-dalek`'s
+    /// `CompressedEdwardsY::decompress` follows the same reference algorithm
+    /// and matches that acceptance behavior (see also
+    /// `algo-avm::assembler::program_hash_is_edwards25519_point`, which uses
+    /// the identical check for LogicSig contract-account addresses).
+    pub fn is_pq_compliant(&self) -> bool {
+        curve25519_dalek::edwards::CompressedEdwardsY(self.0)
+            .decompress()
+            .is_none()
+    }
+
     /// Decode a 58-character checksummed base32 Algorand address.
     ///
     /// Algorithm: base32 decode (RFC 4648, no padding) → 36 bytes →

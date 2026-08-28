@@ -576,6 +576,7 @@ mod tests {
             sig: [0xAA; 64],
             msig: None,
             lsig: None,
+            pqsig: None,
             auth_addr: None,
             has_genesis_id: true,
             has_genesis_hash: false,

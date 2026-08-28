@@ -4,7 +4,10 @@ use algo_avm::{run_logicsig_program, run_logicsig_program_with_tracer, EvalTrace
 use algo_codec::canonical_encode_transaction;
 use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
-use algo_types::{Address, HeartbeatProof, LogicSig, MultisigSig, SignedTransaction};
+use algo_types::{
+    Address, HeartbeatProof, LogicSig, MultisigSig, PQDelegatedProgram, PQSig, SignedTransaction,
+    PQ_SCHEME_FALCON1024,
+};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha512_256};
 
@@ -67,6 +70,148 @@ pub fn verify_single_sig(stx: &SignedTransaction) -> Result<(), AlgoError> {
         .map_err(|e| AlgoError::Validation {
             message: format!("ed25519 signature verification failed: {e}"),
         })
+}
+
+/// Verify a post-quantum (Falcon-1024) authorization proof over raw
+/// to-be-signed `message` bytes, mirroring go's `PQSig.Verify(proto,
+/// message, authorizer)` (`data/transactions/pqsig.go`):
+/// 1. the envelope is non-blank;
+/// 2. the carried scheme is a *known* scheme (only Falcon-1024 is
+///    registered; an unregistered-but-defined tag like the reserved
+///    Falcon-512 is rejected here, matching go's `LookupPQScheme` miss);
+/// 3. the scheme is *enabled* under `consensus` (`PQSchemeEnabled`);
+/// 4. the address derived from `{scheme, salt, public_key}` equals
+///    `authorizer`;
+/// 5. the signature bytes are non-empty;
+/// 6. the Falcon-1024 signature verifies over `message`.
+///
+/// `message` must already be the raw domain-tag-prefixed bytes Falcon signs
+/// (go's `crypto.HashRep(message)` — NOT a hash of them; the tag is
+/// prepended, not hashed in). Callers build this via
+/// [`canonical_encode_transaction`] prefixed with `"TX"` (top-level PQSig)
+/// or [`PQDelegatedProgram::to_be_signed`] (PQ-delegated LogicSig).
+fn verify_pqsig_bytes(
+    pqsig: &PQSig,
+    message: &[u8],
+    authorizer: &Address,
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    if pqsig.blank() {
+        return Err(AlgoError::Validation {
+            message: "pq signature is blank".into(),
+        });
+    }
+    if pqsig.scheme != PQ_SCHEME_FALCON1024 {
+        return Err(AlgoError::Validation {
+            message: format!("pq signature scheme not supported: {:?}", pqsig.scheme),
+        });
+    }
+    if !consensus.pq_scheme_enabled(pqsig.scheme) {
+        return Err(AlgoError::Validation {
+            message: "pq signature scheme not enabled".into(),
+        });
+    }
+
+    // Reject an oversized public key BEFORE hashing it for address
+    // derivation. `public_key` is attacker-controlled wire input (bounded
+    // upstream by overall txn/message size caps, but not by a per-field
+    // limit at decode time the way go's `allocbound=crypto.MaxPQPublicKeySize`
+    // msgp codegen bounds it) — without this check, a public key blob much
+    // larger than a real Falcon-1024 key would still get hashed in full by
+    // `pqsig.address()` below before any cheap size check could reject it.
+    // go's own `VerifyFalcon1024` performs the equivalent size check, just
+    // later (inside signature verification); doing it first here is strictly
+    // cheaper and avoids hashing attacker-controlled oversized input.
+    if pqsig.public_key.len() != algo_falcon::FALCON_DET1024_PUBKEY_SIZE {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "pq public key size {} does not match falcon-1024 public key size {}",
+                pqsig.public_key.len(),
+                algo_falcon::FALCON_DET1024_PUBKEY_SIZE
+            ),
+        });
+    }
+
+    let derived = pqsig.address();
+    if derived != *authorizer {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "pq signature authorizer mismatch: derived {derived}, expected {authorizer}"
+            ),
+        });
+    }
+
+    if pqsig.signature.is_empty() {
+        return Err(AlgoError::Validation {
+            message: "pq signature is empty".into(),
+        });
+    }
+
+    let ok =
+        algo_falcon::falcon_verify(&pqsig.public_key, &pqsig.signature, message).map_err(|e| {
+            AlgoError::Validation {
+                message: format!("pq falcon signature verification error: {e}"),
+            }
+        })?;
+    if !ok {
+        return Err(AlgoError::Validation {
+            message: "pq falcon signature verification failed".into(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Verify a top-level `PQSig` transaction authorization proof, mirroring
+/// go's `stxnCoreChecks`'s `case pqSig:` branch
+/// (`data/transactions/verify/txn.go`): `PQsig.Verify(proto, s.Txn,
+/// s.Authorizer())`, where the signed message is `"TX" ||
+/// canonical_encode(txn)` — the exact same message ed25519 single-sig signs
+/// (see [`verify_single_sig`]), just authorized by a different signature
+/// scheme.
+pub fn verify_pqsig(
+    stx: &SignedTransaction,
+    pqsig: &PQSig,
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    let canonical = canonical_encode_transaction(&stx.txn);
+    let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+    msg.extend_from_slice(TX_PREFIX);
+    msg.extend_from_slice(&canonical);
+
+    let authorizer = match &stx.auth_addr {
+        Some(addr) => addr,
+        None => &stx.txn.sender,
+    };
+
+    verify_pqsig_bytes(pqsig, &msg, authorizer, consensus)
+}
+
+/// Verify a PQ-delegated LogicSig's authorization proof, mirroring go's
+/// `logicSigSanityCheckBatchPrep`'s PQ-delegated branch
+/// (`data/transactions/verify/txn.go`, added by commit `ef838f4e9`): the
+/// signed message is `PQDelegatedProgram{Addr: authorizer, Program:
+/// lsig.Logic}.ToBeHashed()`'s `HashRep`, i.e. `"PQProgram" || authorizer ||
+/// logic`. Verified in-place (never batched) — PQ (Falcon) signatures are
+/// not ed25519-batchable, matching upstream's explicit carve-out. This
+/// crate has no ed25519 batch verifier to carve PQSig out of in the first
+/// place (every signature path here already verifies eagerly/in-place), so
+/// no additional plumbing is needed to satisfy that constraint.
+fn verify_pq_delegated_logicsig(
+    lsig: &LogicSig,
+    pqsig: &PQSig,
+    authorizer: &Address,
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    let program = PQDelegatedProgram {
+        addr: *authorizer,
+        program: lsig.logic.to_vec(),
+    };
+    verify_pqsig_bytes(pqsig, &program.to_be_signed(), authorizer, consensus).map_err(|e| {
+        AlgoError::Validation {
+            message: format!("pq delegated logic signature validation failed: {e}"),
+        }
+    })
 }
 
 /// Compute the multisig address from the multisig parameters.
@@ -375,16 +520,18 @@ pub fn verify_logicsig_with_tracer(
         });
     }
 
-    // Count how many of sig/msig/lmsig are set — must be 0 or 1 (matches Go).
+    // Count how many of sig/msig/lmsig/pqsig are set — must be 0 or 1
+    // (matches Go's `logicSigSanityCheckBatchPrep`, which added `PQsig` to
+    // this same mutual-exclusivity count in commit `ef838f4e9`).
     let has_sig = lsig.sig != [0u8; 64];
     let has_msig = lsig.msig.is_some();
     let has_lmsig = lsig.lmsig.is_some();
-    let num_sigs = has_sig as u8 + has_msig as u8 + has_lmsig as u8;
+    let has_pqsig = lsig.pqsig.as_ref().is_some_and(|p| !p.blank());
+    let num_sigs = has_sig as u8 + has_msig as u8 + has_lmsig as u8 + has_pqsig as u8;
 
     if num_sigs > 1 {
         return Err(AlgoError::Validation {
-            message: "LogicSig should only have one of Sig, Msig, or LMsig but has more than one"
-                .into(),
+            message: "LogicSig should have only one type of delegation signature".into(),
         });
     }
 
@@ -394,7 +541,14 @@ pub fn verify_logicsig_with_tracer(
         None => &stx.txn.sender,
     };
 
-    if num_sigs == 0 {
+    // PQ-delegated LogicSig: verified in-place (never batched — Falcon is
+    // not ed25519-batchable), and short-circuits before the ed25519
+    // sig/msig/lmsig/contract-account dispatch below, matching go's
+    // `logicSigSanityCheckBatchPrep`'s early-return PQ branch.
+    if has_pqsig {
+        let pqsig = lsig.pqsig.as_ref().expect("has_pqsig implies Some");
+        verify_pq_delegated_logicsig(lsig, pqsig, authorizer, consensus)?;
+    } else if num_sigs == 0 {
         // Mode 4: Contract account — authorizer should be SHA512/256("Program" || logic)
         let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
         program_msg.extend_from_slice(PROGRAM_PREFIX);
@@ -676,19 +830,39 @@ pub fn verify_transaction_signature_with_tracer(
     consensus: &ConsensusParams,
     tracer: Option<&mut dyn EvalTracer>,
 ) -> Result<(), AlgoError> {
-    // Go-algorand requires exactly one of sig/msig/lsig.
+    // Pre-activation gate (mirrors go's `stxnCoreChecks`, commit `fc46c74ef`
+    // "transactions: disallow empty pq signatures"): hard-reject BEFORE any
+    // sig-type-count dispatch if PQ signatures are not enabled under
+    // consensus but either the top-level `SignedTxn.pqsig` or the
+    // LogicSig-delegated `Lsig.pqsig` is non-blank.
+    let stx_pqsig_present = stx.pqsig.as_ref().is_some_and(|p| !p.blank());
+    let lsig_pqsig_present = stx
+        .lsig
+        .as_ref()
+        .and_then(|l| l.pqsig.as_ref())
+        .is_some_and(|p| !p.blank());
+    if !consensus.pq_sig_enabled() && (stx_pqsig_present || lsig_pqsig_present) {
+        return Err(AlgoError::Validation {
+            message: "pq signature not enabled".into(),
+        });
+    }
+
+    // Go-algorand requires exactly one of sig/msig/lsig/pqsig — a 5th
+    // mutually-exclusive signature category alongside sig/msig/lsig/
+    // state-proof-txn (Go: `checkTxnSigTypeCounts`, commit `569ae3d4b`).
     let has_sig = stx.sig != [0u8; 64];
     let has_msig = stx.msig.is_some();
     let has_lsig = stx.lsig.is_some();
-    let count = has_sig as u8 + has_msig as u8 + has_lsig as u8;
+    let has_pqsig = stx_pqsig_present;
+    let count = has_sig as u8 + has_msig as u8 + has_lsig as u8 + has_pqsig as u8;
     if count == 0 {
         return Err(AlgoError::Validation {
-            message: "transaction has no signature (no sig, msig, or lsig)".into(),
+            message: "transaction has no signature (no sig, msig, lsig, or pqsig)".into(),
         });
     }
     if count != 1 {
         return Err(AlgoError::Validation {
-            message: format!("expected exactly one signature type, found {count}"),
+            message: format!("signedtxn should have only one type of signature, found {count}"),
         });
     }
 
@@ -710,6 +884,11 @@ pub fn verify_transaction_signature_with_tracer(
             consensus,
             tracer,
         );
+    }
+
+    if has_pqsig {
+        let pqsig = stx.pqsig.as_ref().expect("has_pqsig implies Some");
+        return verify_pqsig(stx, pqsig, consensus);
     }
 
     unreachable!()
@@ -851,7 +1030,7 @@ pub fn logic_sig_group_size_check(
 mod tests {
     use super::*;
     use algo_avm::group::GroupBudget;
-    use algo_types::{Address, MultisigSubsig, Round, Transaction};
+    use algo_types::{Address, MultisigSubsig, PQAddressSalt, Round, Transaction};
     use ed25519_dalek::SigningKey;
     use serde_bytes::ByteBuf;
 
@@ -1259,6 +1438,7 @@ mod tests {
             msig: None,
             args: None,
             lmsig: None,
+            pqsig: None,
         };
 
         let stx = SignedTransaction {
@@ -1287,6 +1467,7 @@ mod tests {
             msig: None,
             args: None,
             lmsig: None,
+            pqsig: None,
         };
 
         let stx = SignedTransaction {
@@ -1320,6 +1501,7 @@ mod tests {
             msig: None,
             args: None,
             lmsig: None,
+            pqsig: None,
         };
 
         let stx = SignedTransaction {
@@ -1375,6 +1557,7 @@ mod tests {
             msig: Some(msig),
             args: None,
             lmsig: None,
+            pqsig: None,
         };
 
         let stx = SignedTransaction {
@@ -1498,7 +1681,7 @@ mod tests {
 
         let err = verify_sig(&stx).unwrap_err();
         assert!(
-            err.to_string().contains("exactly one signature type"),
+            err.to_string().contains("only one type of signature"),
             "expected mutual exclusivity error, got: {err}"
         );
     }
@@ -1534,6 +1717,7 @@ mod tests {
             msig: Some(msig),
             args: None,
             lmsig: None,
+            pqsig: None,
         };
 
         let stx = SignedTransaction {
@@ -1550,7 +1734,7 @@ mod tests {
         let err = verify_lsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
         assert!(
             err.to_string()
-                .contains("only have one of Sig, Msig, or LMsig"),
+                .contains("only one type of delegation signature"),
             "expected mutual exclusivity error, got: {err}"
         );
     }
@@ -1651,6 +1835,7 @@ mod tests {
             msig: None,
             args: None,
             lmsig: Some(lmsig),
+            pqsig: None,
         };
 
         let stx = SignedTransaction {
@@ -1708,6 +1893,7 @@ mod tests {
             msig: None,
             args: None,
             lmsig: Some(lmsig),
+            pqsig: None,
         };
 
         let stx = SignedTransaction {
@@ -1759,6 +1945,7 @@ mod tests {
             msig: None,
             args: None,
             lmsig: Some(lmsig),
+            pqsig: None,
         };
 
         let stx = SignedTransaction {
@@ -1775,7 +1962,7 @@ mod tests {
         let err = verify_lsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
         assert!(
             err.to_string()
-                .contains("only have one of Sig, Msig, or LMsig"),
+                .contains("only one type of delegation signature"),
             "expected mutual exclusivity error, got: {err}"
         );
     }
@@ -2245,5 +2432,482 @@ mod tests {
         assert_eq!(&encoded[10..14], &[0xa3, b'o', b'f', b'f']);
         // offset=42 is positive fixint: 0x2a
         assert_eq!(encoded[14], 0x2a);
+    }
+
+    // ── Post-quantum (PQSig) signature tests (issue #660) ──────────────────
+    //
+    // Adversarial coverage for the native PQ (Falcon-1024) account
+    // authorization path added by go-algorand commits `569ae3d4b` (native PQ
+    // accounts), `ef838f4e9` (PQ-delegated LogicSig), and `fc46c74ef`
+    // (disallow empty PQ signatures).
+
+    /// Generate a real Falcon-1024 keypair and its canonical PQ address for a
+    /// given deterministic seed byte, for use by the tests below. Exercises
+    /// the actual `algo-falcon` primitive end-to-end (keygen + sign +
+    /// verify), not a stub.
+    fn falcon_identity(seed_byte: u8) -> (Vec<u8>, Vec<u8>, PQAddressSalt, Address) {
+        let seed = [seed_byte; algo_falcon::FALCON_SEED_SIZE];
+        let (pk, sk) = algo_falcon::falcon_keygen(&seed).expect("falcon keygen");
+        let (salt, addr) = algo_types::canonical_pq_address_salt(PQ_SCHEME_FALCON1024, &pk)
+            .expect("a canonical PQ salt must exist");
+        (pk, sk, salt, addr)
+    }
+
+    fn pq_enabled_consensus() -> ConsensusParams {
+        ConsensusParams {
+            enable_pq_scheme_falcon1024: true,
+            ..Default::default()
+        }
+    }
+
+    fn pq_disabled_consensus() -> ConsensusParams {
+        ConsensusParams {
+            enable_pq_scheme_falcon1024: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pqsig_valid_signature_is_accepted() {
+        let (pk, sk, salt, addr) = falcon_identity(1);
+        let txn = minimal_pay_txn(addr);
+
+        let canonical = canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+        msg.extend_from_slice(TX_PREFIX);
+        msg.extend_from_slice(&canonical);
+        let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(sig),
+        };
+        let stx = SignedTransaction {
+            txn,
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        assert!(verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus).is_ok());
+    }
+
+    #[test]
+    fn pqsig_pre_activation_gate_rejects_when_consensus_disabled() {
+        // A well-formed, otherwise-valid PQSig must be hard-rejected before
+        // any scheme/signature check runs when PQSigEnabled() is false
+        // (mirrors go's `stxnCoreChecks` pre-activation gate, commit
+        // `fc46c74ef`).
+        let (pk, sk, salt, addr) = falcon_identity(2);
+        let txn = minimal_pay_txn(addr);
+        let canonical = canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+        msg.extend_from_slice(TX_PREFIX);
+        msg.extend_from_slice(&canonical);
+        let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(sig),
+        };
+        let stx = SignedTransaction {
+            txn,
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+
+        let consensus = pq_disabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err("PQ signature must be rejected when PQ is not enabled");
+        assert!(
+            err.to_string().contains("not enabled"),
+            "expected a 'not enabled' pre-activation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pqsig_empty_signature_bytes_rejected_even_when_scheme_enabled() {
+        // A PQSig with a real scheme/salt/pubkey but an EMPTY signature is
+        // non-blank (so it passes the pre-activation gate and the sig-type
+        // count) but must still be rejected — mirrors go's
+        // `errPQSigEmpty`/commit `fc46c74ef`'s intent that an empty
+        // signature is never a valid authorization proof.
+        let (pk, _sk, salt, addr) = falcon_identity(3);
+        let txn = minimal_pay_txn(addr);
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::new(), // empty — never signed
+        };
+        let stx = SignedTransaction {
+            txn,
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err("an empty PQ signature must never verify");
+        assert!(
+            err.to_string().contains("empty"),
+            "expected an empty-signature error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pqsig_oversized_public_key_rejected_cheaply() {
+        // A public key blob far larger than a real Falcon-1024 key (1793
+        // bytes) must be rejected on a cheap length check, not hashed in
+        // full for address derivation first — regression test for the
+        // pre-hash size guard in `verify_pqsig_bytes`.
+        let (_pk, sk, salt, addr) = falcon_identity(12);
+        let txn = minimal_pay_txn(addr);
+        let canonical = canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+        msg.extend_from_slice(TX_PREFIX);
+        msg.extend_from_slice(&canonical);
+        let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
+
+        let oversized_pk = vec![0x11u8; 10 * algo_falcon::FALCON_DET1024_PUBKEY_SIZE];
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(oversized_pk),
+            signature: ByteBuf::from(sig),
+        };
+        let stx = SignedTransaction {
+            txn,
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err("an oversized PQ public key must be rejected");
+        assert!(
+            err.to_string().contains("public key size"),
+            "expected a public-key-size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pqsig_wrong_scheme_rejected() {
+        let (pk, sk, salt, addr) = falcon_identity(4);
+        let txn = minimal_pay_txn(addr);
+        let canonical = canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+        msg.extend_from_slice(TX_PREFIX);
+        msg.extend_from_slice(&canonical);
+        let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
+
+        // "f2" (Falcon-512) is a defined scheme tag upstream but has no
+        // registered verifier — must be rejected as unsupported.
+        let pqsig = PQSig {
+            scheme: *b"f2",
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(sig),
+        };
+        let stx = SignedTransaction {
+            txn,
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err("an unsupported PQ scheme must be rejected");
+        assert!(
+            err.to_string().contains("not supported"),
+            "expected an unsupported-scheme error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pqsig_address_mismatch_rejected() {
+        // The public key derives a different address than the transaction's
+        // sender/authorizer — must be rejected regardless of signature
+        // validity.
+        let (pk, sk, salt, addr) = falcon_identity(5);
+        // Use a DIFFERENT sender than the one the PQ key actually derives.
+        let mut wrong_sender = addr;
+        wrong_sender.0[0] ^= 0xFF;
+        let txn = minimal_pay_txn(wrong_sender);
+
+        let canonical = canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+        msg.extend_from_slice(TX_PREFIX);
+        msg.extend_from_slice(&canonical);
+        let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(sig),
+        };
+        let stx = SignedTransaction {
+            txn,
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err("a PQ public key that derives a different address must be rejected");
+        assert!(
+            err.to_string().contains("authorizer mismatch"),
+            "expected an authorizer-mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pqsig_and_regular_sig_both_set_rejected() {
+        // Two mutually-exclusive signature categories set at once (regular
+        // ed25519 `sig` AND `pqsig`) must be rejected as not well-formed —
+        // mirrors go's `checkTxnSigTypeCounts`'s `numSigCategories > 1` path.
+        let key = test_signing_key();
+        let (pk, sk, salt, addr) = falcon_identity(6);
+        let txn = minimal_pay_txn(addr);
+
+        let ed_sig = sign_txn(&key, &txn);
+
+        let canonical = canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+        msg.extend_from_slice(TX_PREFIX);
+        msg.extend_from_slice(&canonical);
+        let pq_sig_bytes = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(pq_sig_bytes),
+        };
+        let stx = SignedTransaction {
+            txn,
+            sig: ed_sig,
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err("setting both sig and pqsig must be rejected as not well-formed");
+        assert!(
+            err.to_string().contains("only one type of signature"),
+            "expected a not-well-formed signature-count error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pq_delegated_logicsig_valid_signature_is_accepted() {
+        let (pk, sk, salt, addr) = falcon_identity(7);
+        let program = int1_program();
+
+        let dp = PQDelegatedProgram {
+            addr,
+            program: program.clone(),
+        };
+        let sig = algo_falcon::falcon_sign(&sk, &dp.to_be_signed()).expect("falcon sign");
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(sig),
+        };
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            pqsig: Some(pqsig),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(addr),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        assert!(verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus).is_ok());
+    }
+
+    #[test]
+    fn pq_delegated_logicsig_tampered_program_rejected() {
+        // Sign over the original program, then submit a DIFFERENT program
+        // under the same delegation signature. Since the PQ-delegated
+        // signature covers `"PQProgram" || addr || program`, tampering with
+        // the program bytes after signing must invalidate the signature.
+        let (pk, sk, salt, addr) = falcon_identity(8);
+        let original_program = int1_program();
+
+        let dp = PQDelegatedProgram {
+            addr,
+            program: original_program.clone(),
+        };
+        let sig = algo_falcon::falcon_sign(&sk, &dp.to_be_signed()).expect("falcon sign");
+
+        let mut tampered_program = original_program;
+        tampered_program.push(0x81); // append an extra opcode byte
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(sig),
+        };
+        let lsig = LogicSig {
+            logic: ByteBuf::from(tampered_program),
+            pqsig: Some(pqsig),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(addr),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus)
+            .expect_err("a PQ-delegated LogicSig with a tampered program must be rejected");
+        assert!(
+            err.to_string().contains("pq delegated logic signature"),
+            "expected a pq-delegated-logic-signature error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pq_delegated_logicsig_and_regular_sig_both_set_rejected() {
+        let key = test_signing_key();
+        let (pk, sk, salt, addr) = falcon_identity(9);
+        let program = int1_program();
+        let good_ed_sig = sign_program(&key, &program);
+
+        let dp = PQDelegatedProgram {
+            addr,
+            program: program.clone(),
+        };
+        let pq_sig_bytes = algo_falcon::falcon_sign(&sk, &dp.to_be_signed()).expect("falcon sign");
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(pq_sig_bytes),
+        };
+
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            sig: good_ed_sig,
+            pqsig: Some(pqsig),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(addr),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus).expect_err(
+            "a LogicSig with both a regular delegated sig and a pqsig must be rejected",
+        );
+        assert!(
+            err.to_string()
+                .contains("only one type of delegation signature"),
+            "expected a not-well-formed delegation-signature-count error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pq_delegated_logicsig_pre_activation_gate_rejects_when_consensus_disabled() {
+        let (pk, sk, salt, addr) = falcon_identity(10);
+        let program = int1_program();
+        let dp = PQDelegatedProgram {
+            addr,
+            program: program.clone(),
+        };
+        let sig = algo_falcon::falcon_sign(&sk, &dp.to_be_signed()).expect("falcon sign");
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(sig),
+        };
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            pqsig: Some(pqsig),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(addr),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+
+        // Dispatch through the top-level entry point, which is where the
+        // pre-activation gate lives (it must inspect `Lsig.pqsig` too, not
+        // just the top-level `SignedTxn.pqsig`).
+        let consensus = pq_disabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err("a PQ-delegated LogicSig must be rejected when PQ is not enabled");
+        assert!(
+            err.to_string().contains("not enabled"),
+            "expected a 'not enabled' pre-activation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pqsig_blank_is_not_a_signature_category() {
+        // A `pqsig: Some(PQSig::default())` (all-zero fields) is Blank() and
+        // must NOT count as a signature category — it behaves exactly like
+        // `pqsig: None` (matches go's `PQSig.Blank()` semantics: a
+        // present-but-zeroed struct is the "absent" representation).
+        let (_pk, _sk, _salt, addr) = falcon_identity(11);
+        let txn = minimal_pay_txn(addr);
+
+        let stx = SignedTransaction {
+            txn,
+            pqsig: Some(PQSig::default()),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err("a blank pqsig must not count as a signature category");
+        assert!(
+            err.to_string().contains("no signature"),
+            "expected a no-signature error, got: {err}"
+        );
     }
 }

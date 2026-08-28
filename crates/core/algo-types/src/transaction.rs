@@ -143,6 +143,11 @@ pub struct SignedTransaction {
     #[serde(rename = "lsig", default, skip_serializing_if = "Option::is_none")]
     pub lsig: Option<LogicSig>,
 
+    /// Post-quantum (Falcon-1024) transaction authorization proof (Go:
+    /// `PQsig`, `data/transactions/pqsig.go`, added by commit `569ae3d4b`).
+    #[serde(rename = "pqsig", default, skip_serializing_if = "Option::is_none")]
+    pub pqsig: Option<crate::pq::PQSig>,
+
     /// Auth address for rekeyed accounts.
     #[serde(rename = "sgnr", default, skip_serializing_if = "Option::is_none")]
     pub auth_addr: Option<Address>,
@@ -206,6 +211,7 @@ impl Default for SignedTransaction {
             sig: [0u8; 64],
             msig: None,
             lsig: None,
+            pqsig: None,
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
@@ -569,6 +575,14 @@ pub struct LogicSig {
     /// Delegated logic multisig (optional).
     #[serde(rename = "lmsig", default, skip_serializing_if = "Option::is_none")]
     pub lmsig: Option<MultisigSig>,
+
+    /// Post-quantum (Falcon-1024) delegated LogicSig authorization proof
+    /// (Go: `LogicSig.PQsig`, `data/transactions/logicsig.go`, added by
+    /// commit `ef838f4e9`). Verified in-place against
+    /// `PQDelegatedProgram{Addr: authorizer, Program: Logic}` — see
+    /// `algo-validate::signature::logicsig_sanity_check`.
+    #[serde(rename = "pqsig", default, skip_serializing_if = "Option::is_none")]
+    pub pqsig: Option<crate::pq::PQSig>,
 }
 
 impl Default for LogicSig {
@@ -579,6 +593,7 @@ impl Default for LogicSig {
             msig: None,
             args: None,
             lmsig: None,
+            pqsig: None,
         }
     }
 }

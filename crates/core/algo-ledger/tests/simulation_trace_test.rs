@@ -634,6 +634,7 @@ fn simulation_trace_captures_logicsig_program() {
             msig: None,
             lmsig: None,
             args: None,
+            pqsig: None,
         }),
         ..Default::default()
     };
@@ -1028,6 +1029,7 @@ fn simulation_logicsig_budget_consumed_populated() {
             msig: None,
             lmsig: None,
             args: None,
+            pqsig: None,
         }),
         ..Default::default()
     };
@@ -1130,6 +1132,7 @@ fn simulation_logicsig_budget_set_for_txn_after_execution_failure() {
             msig: None,
             lmsig: None,
             args: None,
+            pqsig: None,
         }),
         ..Default::default()
     };
