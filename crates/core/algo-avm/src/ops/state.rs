@@ -559,6 +559,147 @@ pub fn op_box_resize(
 }
 
 // ---------------------------------------------------------------------------
+// Foreign box opcodes (0xd4/0x01-0x09, v13/foreignBoxVersion, App only)
+// ---------------------------------------------------------------------------
+//
+// Each is the "foreign" counterpart of the like-named `box_*` opcode above:
+// same stack signature, plus an extra leading app-id argument (go-algorand's
+// proto strings have a leading `i`, e.g. `app_box_extract` is `iNii:b` vs
+// plain `box_extract`'s `Nii:b`). Because the app-id is pushed *first* (i.e.
+// it is the *deepest* argument, farthest from the top of stack), popping the
+// ordinary arguments off the top first and then popping one more `uint`
+// naturally yields the app id -- unlike go-algorand's `popDeepAppID`
+// (`data/transactions/logic/box.go:311-321`), which must splice the app id
+// out from beneath the other (still-stack-resident) args to reuse its
+// index-based `boxXxxImpl` helpers unchanged. algod-rust's opcodes already
+// pop each argument individually, so no such splice is needed here.
+
+/// `app_box_create` (0xd4/0x01, v13+): pop size (uint), pop name (bytes),
+/// pop app id (uint). Push 1 if newly created, 0 if already existed.
+pub fn op_app_box_create(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let size = machine.pop_uint()?;
+    let name = machine.pop_bytes()?;
+    let app_id = machine.pop_uint()?;
+    let created = ctx.app_box_create(app_id, &name, size)?;
+    machine.push(AvmValue::Uint64(if created { 1 } else { 0 }))
+}
+
+/// `app_box_extract` (0xd4/0x02, v13+): pop length (uint), pop offset (uint),
+/// pop name (bytes), pop app id (uint). Push extracted bytes.
+pub fn op_app_box_extract(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let length = machine.pop_uint()?;
+    let offset = machine.pop_uint()?;
+    let name = machine.pop_bytes()?;
+    let app_id = machine.pop_uint()?;
+    let bytes = ctx.app_box_extract(app_id, &name, offset, length)?;
+    machine.push(AvmValue::Bytes(bytes))
+}
+
+/// `app_box_replace` (0xd4/0x03, v13+): pop value (bytes), pop offset (uint),
+/// pop name (bytes), pop app id (uint).
+pub fn op_app_box_replace(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let value = machine.pop_bytes()?;
+    let offset = machine.pop_uint()?;
+    let name = machine.pop_bytes()?;
+    let app_id = machine.pop_uint()?;
+    ctx.app_box_replace(app_id, &name, offset, &value)
+}
+
+/// `app_box_del` (0xd4/0x04, v13+): pop name (bytes), pop app id (uint).
+/// Push 1 if existed, 0 otherwise.
+pub fn op_app_box_del(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let name = machine.pop_bytes()?;
+    let app_id = machine.pop_uint()?;
+    let existed = ctx.app_box_del(app_id, &name)?;
+    machine.push(AvmValue::Uint64(if existed { 1 } else { 0 }))
+}
+
+/// `app_box_len` (0xd4/0x05, v13+): pop name (bytes), pop app id (uint).
+/// Push length (uint), push exists (bool).
+pub fn op_app_box_len(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let name = machine.pop_bytes()?;
+    let app_id = machine.pop_uint()?;
+    let (len, exists) = ctx.app_box_len(app_id, &name)?;
+    machine.push(AvmValue::Uint64(len))?;
+    machine.push(AvmValue::Uint64(if exists { 1 } else { 0 }))
+}
+
+/// `app_box_get` (0xd4/0x06, v13+): pop name (bytes), pop app id (uint).
+/// Push value (bytes, empty if not exists), push exists (bool).
+pub fn op_app_box_get(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let name = machine.pop_bytes()?;
+    let app_id = machine.pop_uint()?;
+    let (value, exists) = ctx.app_box_get(app_id, &name)?;
+    machine.push(AvmValue::Bytes(value))?;
+    machine.push(AvmValue::Uint64(if exists { 1 } else { 0 }))
+}
+
+/// `app_box_put` (0xd4/0x07, v13+): pop value (bytes), pop name (bytes),
+/// pop app id (uint).
+pub fn op_app_box_put(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let value = machine.pop_bytes()?;
+    let name = machine.pop_bytes()?;
+    let app_id = machine.pop_uint()?;
+    ctx.app_box_put(app_id, &name, &value)
+}
+
+/// `app_box_splice` (0xd4/0x08, v13+): pop replace (bytes), pop length (uint),
+/// pop start (uint), pop name (bytes), pop app id (uint).
+pub fn op_app_box_splice(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let replacement = machine.pop_bytes()?;
+    let length = machine.pop_uint()?;
+    let start = machine.pop_uint()?;
+    let name = machine.pop_bytes()?;
+    let app_id = machine.pop_uint()?;
+    ctx.app_box_splice(app_id, &name, start, length, &replacement)
+}
+
+/// `app_box_resize` (0xd4/0x09, v13+): pop size (uint), pop name (bytes),
+/// pop app id (uint).
+pub fn op_app_box_resize(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let size = machine.pop_uint()?;
+    let name = machine.pop_bytes()?;
+    let app_id = machine.pop_uint()?;
+    ctx.app_box_resize(app_id, &name, size)
+}
+
+// ---------------------------------------------------------------------------
 // voter_params_get (0x74), online_stake (0x75) — v11+
 // ---------------------------------------------------------------------------
 
@@ -654,6 +795,16 @@ mod tests {
         foreign_box_reads: HashMap<u64, bool>,
         /// Recorded `set_family_box_access` calls: app_id -> enable.
         family_box_access: HashMap<u64, bool>,
+        /// Foreign box storage: (app_id, name) -> contents. Kept separate
+        /// from `boxes` (which the plain `box_*` mock methods use) so tests
+        /// can assert the `app_box_*` opcodes threaded the correct target
+        /// `app_id` through to the context, without this mock needing to
+        /// implement real cross-app authorization (that's tested against
+        /// the real `LedgerAvmContext` in algo-ledger).
+        app_boxes: HashMap<(u64, Vec<u8>), Vec<u8>>,
+        /// The `app_id` argument most recently passed to any `app_box_*`
+        /// method, for assembler/stack-order assertions.
+        last_app_box_app_id: Option<u64>,
     }
 
     impl TestStateContext {
@@ -680,6 +831,8 @@ mod tests {
                 boxes: HashMap::new(),
                 foreign_box_reads: HashMap::new(),
                 family_box_access: HashMap::new(),
+                app_boxes: HashMap::new(),
+                last_app_box_app_id: None,
             }
         }
     }
@@ -1035,6 +1188,174 @@ mod tests {
                     .copy_from_slice(&contents[oend..oend + copy_len]);
             }
             self.boxes.insert(name.to_vec(), result);
+            Ok(())
+        }
+
+        // ---- Foreign box storage (app_box_*, issue #662) ----
+        //
+        // No authorization is simulated here (that's the ledger's job, and
+        // is covered by algo-ledger's `authorize_box_access` tests); this
+        // mock only proves the opcode handlers pop their stack arguments in
+        // the right order and thread `app_id` through correctly.
+
+        fn app_box_get(&mut self, app_id: u64, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
+            self.last_app_box_app_id = Some(app_id);
+            match self.app_boxes.get(&(app_id, name.to_vec())) {
+                Some(v) => Ok((v.clone(), true)),
+                None => Ok((Vec::new(), false)),
+            }
+        }
+
+        fn app_box_put(&mut self, app_id: u64, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
+            self.last_app_box_app_id = Some(app_id);
+            self.app_boxes
+                .insert((app_id, name.to_vec()), value.to_vec());
+            Ok(())
+        }
+
+        fn app_box_del(&mut self, app_id: u64, name: &[u8]) -> Result<bool, AlgoError> {
+            self.last_app_box_app_id = Some(app_id);
+            Ok(self.app_boxes.remove(&(app_id, name.to_vec())).is_some())
+        }
+
+        fn app_box_len(&mut self, app_id: u64, name: &[u8]) -> Result<(u64, bool), AlgoError> {
+            self.last_app_box_app_id = Some(app_id);
+            match self.app_boxes.get(&(app_id, name.to_vec())) {
+                Some(v) => Ok((v.len() as u64, true)),
+                None => Ok((0, false)),
+            }
+        }
+
+        fn app_box_create(
+            &mut self,
+            app_id: u64,
+            name: &[u8],
+            size: u64,
+        ) -> Result<bool, AlgoError> {
+            self.last_app_box_app_id = Some(app_id);
+            use std::collections::hash_map::Entry;
+            match self.app_boxes.entry((app_id, name.to_vec())) {
+                Entry::Occupied(_) => Ok(false),
+                Entry::Vacant(e) => {
+                    e.insert(vec![0u8; size as usize]);
+                    Ok(true)
+                }
+            }
+        }
+
+        fn app_box_extract(
+            &mut self,
+            app_id: u64,
+            name: &[u8],
+            offset: u64,
+            length: u64,
+        ) -> Result<Vec<u8>, AlgoError> {
+            self.last_app_box_app_id = Some(app_id);
+            let contents = self
+                .app_boxes
+                .get(&(app_id, name.to_vec()))
+                .ok_or_else(|| AlgoError::Avm {
+                    message: format!("no such box {:?}", name),
+                })?;
+            let start = offset as usize;
+            let end = start + length as usize;
+            if end > contents.len() {
+                return Err(AlgoError::Avm {
+                    message: format!("extraction end {} beyond length: {}", end, contents.len()),
+                });
+            }
+            Ok(contents[start..end].to_vec())
+        }
+
+        fn app_box_replace(
+            &mut self,
+            app_id: u64,
+            name: &[u8],
+            offset: u64,
+            value: &[u8],
+        ) -> Result<(), AlgoError> {
+            self.last_app_box_app_id = Some(app_id);
+            let contents = self
+                .app_boxes
+                .get_mut(&(app_id, name.to_vec()))
+                .ok_or_else(|| AlgoError::Avm {
+                    message: format!("no such box {:?}", name),
+                })?;
+            let start = offset as usize;
+            let end = start + value.len();
+            if end > contents.len() {
+                return Err(AlgoError::Avm {
+                    message: format!("replacement end {} beyond length: {}", end, contents.len()),
+                });
+            }
+            contents[start..end].copy_from_slice(value);
+            Ok(())
+        }
+
+        fn app_box_resize(
+            &mut self,
+            app_id: u64,
+            name: &[u8],
+            new_size: u64,
+        ) -> Result<(), AlgoError> {
+            self.last_app_box_app_id = Some(app_id);
+            let contents = self
+                .app_boxes
+                .get(&(app_id, name.to_vec()))
+                .ok_or_else(|| AlgoError::Avm {
+                    message: format!("no such box {:?}", name),
+                })?;
+            let mut resized = vec![0u8; new_size as usize];
+            let copy_len = contents.len().min(new_size as usize);
+            resized[..copy_len].copy_from_slice(&contents[..copy_len]);
+            self.app_boxes.insert((app_id, name.to_vec()), resized);
+            Ok(())
+        }
+
+        fn app_box_splice(
+            &mut self,
+            app_id: u64,
+            name: &[u8],
+            start: u64,
+            length: u64,
+            value: &[u8],
+        ) -> Result<(), AlgoError> {
+            self.last_app_box_app_id = Some(app_id);
+            let contents = self
+                .app_boxes
+                .get(&(app_id, name.to_vec()))
+                .ok_or_else(|| AlgoError::Avm {
+                    message: format!("no such box {:?}", name),
+                })?;
+            let s = start as usize;
+            if s > contents.len() {
+                return Err(AlgoError::Avm {
+                    message: format!("replacement start {} beyond length: {}", s, contents.len()),
+                });
+            }
+            let oend = (start + length) as usize;
+            if oend > contents.len() {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "splice end {} beyond original length: {}",
+                        oend,
+                        contents.len()
+                    ),
+                });
+            }
+            let mut result = vec![0u8; contents.len()];
+            result[..s].copy_from_slice(&contents[..s]);
+            let copied = value.len().min(contents.len() - s);
+            result[s..s + copied].copy_from_slice(&value[..copied]);
+            let tail_start = s + copied;
+            if tail_start < result.len() && oend < contents.len() {
+                let tail_len = result.len() - tail_start;
+                let avail = contents.len() - oend;
+                let copy_len = tail_len.min(avail);
+                result[tail_start..tail_start + copy_len]
+                    .copy_from_slice(&contents[oend..oend + copy_len]);
+            }
+            self.app_boxes.insert((app_id, name.to_vec()), result);
             Ok(())
         }
     }
@@ -2422,5 +2743,244 @@ mod tests {
         assert_eq!(m.stack.len(), 2);
         assert_eq!(m.stack[0], AvmValue::Uint64(1));
         assert_eq!(m.stack[1], AvmValue::Uint64(1)); // did_exist = true
+    }
+
+    // -----------------------------------------------------------------------
+    // Foreign box opcode tests (app_box_*, prefix 0xd4, issue #662).
+    //
+    // These exercise stack-popping order (the app-id is the *deepest*
+    // argument, pushed first) and app_id threading through to the
+    // `AvmContext`. Cross-app authorization/reentrancy semantics are tested
+    // against the real `LedgerAvmContext` in algo-ledger, since that's where
+    // `authorize_box_access`/`check_family_reentrancy` actually live.
+    // -----------------------------------------------------------------------
+
+    /// Helper: encode `app_box_create` for sub-opcode `sub` (2-byte header).
+    fn app_box_op(sub: u8) -> Vec<u8> {
+        vec![0xd4, sub]
+    }
+
+    #[test]
+    fn test_app_box_create_pops_app_id_deepest() {
+        let mut ctx = TestStateContext::new(100);
+        // pushint 77 (app id), pushbytes "mybox", pushint 10 (size), app_box_create
+        let mut code = pushint_code(77);
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.extend_from_slice(&pushint_code(10));
+        code.extend_from_slice(&app_box_op(0x01));
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 4).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Uint64(1)); // newly created
+        assert_eq!(ctx.last_app_box_app_id, Some(77));
+        assert_eq!(
+            ctx.app_boxes.get(&(77, b"mybox".to_vec())).unwrap().len(),
+            10
+        );
+        // The current app's own (non-foreign) box storage is untouched.
+        assert!(!ctx.boxes.contains_key(b"mybox".as_slice()));
+    }
+
+    #[test]
+    fn test_app_box_extract_pops_app_id_deepest() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.app_boxes
+            .insert((7, b"mybox".to_vec()), b"hello world".to_vec());
+        // pushint 7, pushbytes "mybox", pushint 6 (start), pushint 5 (len), app_box_extract
+        let mut code = pushint_code(7);
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.extend_from_slice(&pushint_code(6));
+        code.extend_from_slice(&pushint_code(5));
+        code.extend_from_slice(&app_box_op(0x02));
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 5).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Bytes(b"world".to_vec()));
+        assert_eq!(ctx.last_app_box_app_id, Some(7));
+    }
+
+    #[test]
+    fn test_app_box_replace_pops_app_id_deepest() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.app_boxes.insert((7, b"mybox".to_vec()), vec![0u8; 5]);
+        // pushint 7, pushbytes "mybox", pushint 0 (start), pushbytes "world", app_box_replace
+        let mut code = pushint_code(7);
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.extend_from_slice(&pushint_code(0));
+        code.extend_from_slice(&pushbytes_code(b"world"));
+        code.extend_from_slice(&app_box_op(0x03));
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 5).unwrap();
+        assert_eq!(m.stack.len(), 0);
+        assert_eq!(
+            ctx.app_boxes.get(&(7, b"mybox".to_vec())).unwrap(),
+            b"world"
+        );
+    }
+
+    #[test]
+    fn test_app_box_del_pops_app_id_deepest() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.app_boxes.insert((7, b"mybox".to_vec()), vec![1, 2, 3]);
+        // pushint 7, pushbytes "mybox", app_box_del
+        let mut code = pushint_code(7);
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.extend_from_slice(&app_box_op(0x04));
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Uint64(1)); // existed
+        assert!(!ctx.app_boxes.contains_key(&(7, b"mybox".to_vec())));
+    }
+
+    #[test]
+    fn test_app_box_len_pops_app_id_deepest() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.app_boxes.insert((7, b"mybox".to_vec()), vec![0u8; 42]);
+        // pushint 7, pushbytes "mybox", app_box_len
+        let mut code = pushint_code(7);
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.extend_from_slice(&app_box_op(0x05));
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        assert_eq!(m.stack.len(), 2);
+        assert_eq!(m.stack[0], AvmValue::Uint64(42));
+        assert_eq!(m.stack[1], AvmValue::Uint64(1));
+    }
+
+    #[test]
+    fn test_app_box_get_pops_app_id_deepest() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.app_boxes
+            .insert((7, b"mybox".to_vec()), vec![0xAA, 0xBB, 0xCC]);
+        // pushint 7, pushbytes "mybox", app_box_get
+        let mut code = pushint_code(7);
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.extend_from_slice(&app_box_op(0x06));
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        assert_eq!(m.stack.len(), 2);
+        assert_eq!(m.stack[0], AvmValue::Bytes(vec![0xAA, 0xBB, 0xCC]));
+        assert_eq!(m.stack[1], AvmValue::Uint64(1));
+    }
+
+    #[test]
+    fn test_app_box_put_pops_app_id_deepest() {
+        let mut ctx = TestStateContext::new(100);
+        // pushint 7, pushbytes "mybox", pushbytes "hello", app_box_put
+        let mut code = pushint_code(7);
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.extend_from_slice(&pushbytes_code(b"hello"));
+        code.extend_from_slice(&app_box_op(0x07));
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 4).unwrap();
+        assert_eq!(m.stack.len(), 0);
+        assert_eq!(
+            ctx.app_boxes.get(&(7, b"mybox".to_vec())).unwrap(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn test_app_box_splice_pops_app_id_deepest() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.app_boxes
+            .insert((7, b"mybox".to_vec()), b"hello world".to_vec());
+        // pushint 7, pushbytes "mybox", pushint 6 (start), pushint 5 (len),
+        // pushbytes "there", app_box_splice
+        let mut code = pushint_code(7);
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.extend_from_slice(&pushint_code(6));
+        code.extend_from_slice(&pushint_code(5));
+        code.extend_from_slice(&pushbytes_code(b"there"));
+        code.extend_from_slice(&app_box_op(0x08));
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 6).unwrap();
+        assert_eq!(m.stack.len(), 0);
+        assert_eq!(
+            ctx.app_boxes.get(&(7, b"mybox".to_vec())).unwrap(),
+            b"hello there"
+        );
+    }
+
+    #[test]
+    fn test_app_box_resize_pops_app_id_deepest() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.app_boxes
+            .insert((7, b"mybox".to_vec()), vec![0xAA, 0xBB]);
+        // pushint 7, pushbytes "mybox", pushint 4 (new size), app_box_resize
+        let mut code = pushint_code(7);
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.extend_from_slice(&pushint_code(4));
+        code.extend_from_slice(&app_box_op(0x09));
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 4).unwrap();
+        assert_eq!(m.stack.len(), 0);
+        assert_eq!(
+            ctx.app_boxes.get(&(7, b"mybox".to_vec())).unwrap(),
+            &vec![0xAA, 0xBB, 0, 0]
+        );
+    }
+
+    #[test]
+    fn test_app_box_create_targeting_own_app_id_behaves_like_box_create() {
+        // A caller may target its own app_id via app_box_create too (the
+        // "own boxes" fast path is an authorization concept, not something
+        // the opcode encoding itself special-cases).
+        let mut ctx = TestStateContext::new(100);
+        let mut code = pushint_code(100); // == ctx's own app_id
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.extend_from_slice(&pushint_code(5));
+        code.extend_from_slice(&app_box_op(0x01));
+        let raw = prog(13, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 4).unwrap();
+        assert_eq!(m.stack[0], AvmValue::Uint64(1));
+        assert_eq!(ctx.last_app_box_app_id, Some(100));
+    }
+
+    #[test]
+    fn test_app_box_below_v13_rejected() {
+        // app_box_create requires version 13 (foreignBoxVersion); parsing a
+        // v12 program containing it must fail with a version error.
+        let mut code = pushint_code(7);
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.extend_from_slice(&pushint_code(10));
+        code.extend_from_slice(&app_box_op(0x01));
+        let raw = prog(12, &code);
+        let err = bytecode::parse(&raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("v13"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_app_box_missing_sub_opcode_byte_rejected_at_parse() {
+        // A bare 0xd4 with no following sub-opcode byte must fail to parse.
+        let mut code = pushint_code(7);
+        code.extend_from_slice(&pushbytes_code(b"mybox"));
+        code.push(0xd4); // prefix byte with nothing after it
+        let raw = prog(13, &code);
+        let err = bytecode::parse(&raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("missing sub-opcode"), "got: {msg}");
     }
 }

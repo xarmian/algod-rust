@@ -1456,6 +1456,13 @@ fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
                 return;
             }
             ops.pending.push(spec.opcode);
+            // Multi-byte "prefix opcode" family (e.g. `app_box_*` at 0xd4):
+            // emit the sub-opcode byte right after the shared prefix byte,
+            // mirroring go-algorand's two-byte SubOpcode encoding
+            // (opcodes.go:162, `OpDetails.SubOpcode`).
+            if spec.sub_opcode != 0 {
+                ops.pending.push(spec.sub_opcode);
+            }
         }
         ImmKind::Uint8 => {
             if args.len() != 1 {
@@ -2265,6 +2272,50 @@ mod tests {
         let source = "#pragma version 13\nint 0\napp_params_set AppFamilyBoxAccess\n";
         let ops = assemble_string(source).unwrap();
         assert_eq!(&ops.program[..], &[13, 0x81, 0x00, 0x76, 0x0c]);
+    }
+
+    // -----------------------------------------------------------------------
+    // app_box_* foreign-box opcodes (prefix 0xd4, issue #662): the assembler
+    // must emit the two-byte prefix+sub-opcode header for these mnemonics,
+    // matching go-algorand's `OpDetails.SubOpcode` two-byte encoding.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_app_box_create_assembles_two_byte_header() {
+        let source = "#pragma version 13\nint 7\nbyte \"k\"\nint 10\napp_box_create\n";
+        let ops = assemble_string(source).unwrap();
+        // version, pushint 7, pushbytes "k", pushint 10, then 0xd4 0x01.
+        assert_eq!(ops.program[ops.program.len() - 2..], [0xd4, 0x01]);
+    }
+
+    #[test]
+    fn test_app_box_put_assembles_two_byte_header() {
+        let source = "#pragma version 13\nint 7\nbyte \"k\"\nbyte \"v\"\napp_box_put\n";
+        let ops = assemble_string(source).unwrap();
+        assert_eq!(ops.program[ops.program.len() - 2..], [0xd4, 0x07]);
+    }
+
+    #[test]
+    fn test_app_box_mnemonic_rejects_immediate_args() {
+        // app_box_get takes no assembler-level immediate arguments (all its
+        // operands are stack args) -- passing one must be a hard error, not
+        // silently accepted.
+        let source = "#pragma version 13\napp_box_get 5\n";
+        let result = assemble_string(source);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_app_box_create_below_v13_rejected() {
+        let source = "#pragma version 12\nint 7\nbyte \"k\"\nint 10\napp_box_create\n";
+        match assemble_string(source) {
+            Ok(_) => panic!("expected a version error"),
+            Err(errs) => assert!(
+                errs.iter().any(|e| e.message.contains("v13")),
+                "{:?}",
+                errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+            ),
+        }
     }
 
     #[test]

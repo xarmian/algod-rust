@@ -307,6 +307,25 @@ pub fn dispatch(
         0xd2 => state::op_box_splice(machine, instruction, ctx),
         0xd3 => state::op_box_resize(machine, instruction, ctx),
 
+        // ---- Foreign box opcodes (v13+, multi-byte prefix 0xd4) ----
+        0xd4 => match instruction.sub_opcode {
+            Some(0x01) => state::op_app_box_create(machine, instruction, ctx),
+            Some(0x02) => state::op_app_box_extract(machine, instruction, ctx),
+            Some(0x03) => state::op_app_box_replace(machine, instruction, ctx),
+            Some(0x04) => state::op_app_box_del(machine, instruction, ctx),
+            Some(0x05) => state::op_app_box_len(machine, instruction, ctx),
+            Some(0x06) => state::op_app_box_get(machine, instruction, ctx),
+            Some(0x07) => state::op_app_box_put(machine, instruction, ctx),
+            Some(0x08) => state::op_app_box_splice(machine, instruction, ctx),
+            Some(0x09) => state::op_app_box_resize(machine, instruction, ctx),
+            // Unreachable in practice: `opcode::resolve` (used by
+            // `bytecode::parse`) already rejects any other sub-opcode byte
+            // for prefix 0xd4 before an `Instruction` can exist.
+            other => Err(AlgoError::Avm {
+                message: format!("app_box_* opcode with invalid sub-opcode {other:?}"),
+            }),
+        },
+
         // ---- Elliptic curve opcodes (v10+) ----
         0xe0 => ec::op_ec_add(machine, instruction),
         0xe1 => ec::op_ec_scalar_mul(machine, instruction),

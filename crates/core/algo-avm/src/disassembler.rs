@@ -51,7 +51,7 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
             out.push_str(&format!("{}:\n", label));
         }
 
-        let spec = opcode::lookup(instr.opcode);
+        let spec = opcode::resolve_spec(instr.opcode, instr.sub_opcode);
         let name = spec.map(|s| s.name).unwrap_or("???");
 
         let mut line = name.to_string();
@@ -219,40 +219,51 @@ fn compute_labels_end(instr: &Instruction, count: usize) -> usize {
 }
 
 /// Compute the total size (in bytes) of an instruction including its immediates.
+///
+/// Only used for the program's final trailing-label offset (line ~194);
+/// mid-program instruction boundaries come from `Instruction::offset`
+/// itself, not from summing sizes.
 fn instruction_size(instr: &Instruction) -> usize {
-    match &instr.immediates {
-        Immediates::None => 1,
-        Immediates::Uint8(_) => 2,
-        Immediates::Uint8Pair(_, _) => 2 + 1,
-        Immediates::Uint8Triple(_, _, _) => 4,
-        Immediates::Int16(_) => 3,
-        Immediates::Varuint(v) => 1 + varuint_size(*v),
-        Immediates::Bytes(b) => 1 + varuint_size(b.len() as u64) + b.len(),
-        Immediates::IntBlock(vals) => {
-            1 + varuint_size(vals.len() as u64)
-                + vals.iter().map(|v| varuint_size(*v)).sum::<usize>()
+    // Header is 2 bytes (prefix + sub-opcode) for a multi-byte "prefix
+    // opcode" instruction (e.g. the `app_box_*` family at 0xd4), 1 byte
+    // otherwise -- must match `header_len` in `opcode::resolve`/
+    // `bytecode::parse`. Every match arm below assumes a 1-byte header, so
+    // add the extra byte up front rather than in each arm.
+    let header_extra = if instr.sub_opcode.is_some() { 1 } else { 0 };
+    header_extra
+        + match &instr.immediates {
+            Immediates::None => 1,
+            Immediates::Uint8(_) => 2,
+            Immediates::Uint8Pair(_, _) => 2 + 1,
+            Immediates::Uint8Triple(_, _, _) => 4,
+            Immediates::Int16(_) => 3,
+            Immediates::Varuint(v) => 1 + varuint_size(*v),
+            Immediates::Bytes(b) => 1 + varuint_size(b.len() as u64) + b.len(),
+            Immediates::IntBlock(vals) => {
+                1 + varuint_size(vals.len() as u64)
+                    + vals.iter().map(|v| varuint_size(*v)).sum::<usize>()
+            }
+            Immediates::ByteBlock(entries) => {
+                1 + varuint_size(entries.len() as u64)
+                    + entries
+                        .iter()
+                        .map(|b| varuint_size(b.len() as u64) + b.len())
+                        .sum::<usize>()
+            }
+            Immediates::PushInts(vals) => {
+                1 + varuint_size(vals.len() as u64)
+                    + vals.iter().map(|v| varuint_size(*v)).sum::<usize>()
+            }
+            Immediates::PushBytess(entries) => {
+                1 + varuint_size(entries.len() as u64)
+                    + entries
+                        .iter()
+                        .map(|b| varuint_size(b.len() as u64) + b.len())
+                        .sum::<usize>()
+            }
+            Immediates::Labels(offsets) => 1 + 1 + offsets.len() * 2,
+            Immediates::BranchVarint(_, len) => 1 + len,
         }
-        Immediates::ByteBlock(entries) => {
-            1 + varuint_size(entries.len() as u64)
-                + entries
-                    .iter()
-                    .map(|b| varuint_size(b.len() as u64) + b.len())
-                    .sum::<usize>()
-        }
-        Immediates::PushInts(vals) => {
-            1 + varuint_size(vals.len() as u64)
-                + vals.iter().map(|v| varuint_size(*v)).sum::<usize>()
-        }
-        Immediates::PushBytess(entries) => {
-            1 + varuint_size(entries.len() as u64)
-                + entries
-                    .iter()
-                    .map(|b| varuint_size(b.len() as u64) + b.len())
-                    .sum::<usize>()
-        }
-        Immediates::Labels(offsets) => 1 + 1 + offsets.len() * 2,
-        Immediates::BranchVarint(_, len) => 1 + len,
-    }
 }
 
 fn varuint_size(mut v: u64) -> usize {
@@ -531,5 +542,69 @@ mod tests {
                 "v={v}: round-trip bytecode mismatch\ndisassembly:\n{text}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // app_box_* foreign-box opcodes (prefix 0xd4, issue #662): the
+    // disassembler must print the correct per-sub-opcode mnemonic (not the
+    // synthetic prefix-family name) and round-trip through the assembler
+    // back to identical bytes.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_disassemble_app_box_create_shows_real_mnemonic() {
+        let source = "#pragma version 13\nint 7\nbyte \"k\"\nint 10\napp_box_create\n";
+        let ops = assemble_string(source).unwrap();
+        let text = disassemble(&ops.program).unwrap();
+        assert!(
+            text.contains("app_box_create"),
+            "expected the real per-sub-opcode mnemonic, got:\n{text}"
+        );
+        assert!(
+            !text.contains("app_box\n") && !text.contains("app_box "),
+            "must not print the synthetic prefix-family stub name:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_disassemble_app_box_create_roundtrips() {
+        let source = "#pragma version 13\nint 7\nbyte \"k\"\nint 10\napp_box_create\n";
+        let ops = assemble_string(source).unwrap();
+        let text = disassemble(&ops.program).unwrap();
+        let ops2 = assemble_string(&text)
+            .unwrap_or_else(|e| panic!("disassembly could not be reassembled: {e:?}\n{text}"));
+        assert_eq!(
+            ops.program, ops2.program,
+            "round-trip bytecode mismatch\ndisassembly:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_disassemble_app_box_as_last_instruction_end_label_correct() {
+        // Regression test for the end-offset-off-by-one bug: when the
+        // program's *last* instruction is a two-byte-header app_box_*
+        // opcode, a branch that targets the end of the program (here, a
+        // trailing label with nothing after it) must resolve to the real
+        // end offset -- after the sub-opcode byte, not one byte short of it.
+        let source =
+            "#pragma version 13\nint 0\nbnz done\nint 7\nbyte \"k\"\nint 10\napp_box_create\ndone:\n";
+        let ops = assemble_string(source).unwrap();
+        let text = disassemble(&ops.program).unwrap();
+        // A trailing label must actually appear in the disassembly (the
+        // disassembler assigns its own generic label names, so this doesn't
+        // check for "done" literally) -- with the off-by-one bug,
+        // `end_offset` would be one byte short of the real program end, so
+        // `labels.get(&end_offset)` would miss it and the label would
+        // silently vanish instead of round-tripping.
+        assert!(
+            text.trim_end().ends_with(':'),
+            "expected a trailing label line, got:\n{text}"
+        );
+        let ops2 = assemble_string(&text)
+            .unwrap_or_else(|e| panic!("disassembly could not be reassembled: {e:?}\n{text}"));
+        assert_eq!(
+            ops.program, ops2.program,
+            "round-trip bytecode mismatch\ndisassembly:\n{text}"
+        );
     }
 }
