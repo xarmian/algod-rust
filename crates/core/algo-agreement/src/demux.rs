@@ -610,6 +610,27 @@ impl Demux {
                     );
                     return None;
                 }
+                // go-algorand v4.7.4-stable (`checks: recompute group IDs`,
+                // commit b07049dfb) folded a cryptographic check into this
+                // same early screen: each payset group's claimed `Group`
+                // digest must actually commit to (be the hash of) its
+                // member transactions, and the group must not exceed the
+                // max group size. `check_payset` above only detects group
+                // *boundaries*; it never recomputes the hash. Without this,
+                // a proposal whose `Group` field doesn't commit to its
+                // transactions would pass this early screen and only be
+                // caught later, in full block validation.
+                if let Err(e) =
+                    algo_validate::validate_transaction_group(&compound.proposal.block.payset)
+                {
+                    warn!(
+                        len = msg.data.len(),
+                        prefix = %hex_prefix(&msg.data, 96),
+                        "dropping proposal with a transaction group that fails group-ID verification: {}",
+                        e
+                    );
+                    return None;
+                }
                 Some(setup_compound_message_from_network(
                     compound,
                     msg.handle,
@@ -1282,6 +1303,86 @@ mod tests {
         assert!(
             stub.disconnected.lock().unwrap().is_empty(),
             "a malformed-payset proposal must be dropped, not disconnect the peer"
+        );
+    }
+
+    #[test]
+    fn demux_raw_proposal_with_group_id_mismatch_is_dropped_not_disconnected() {
+        // go-algorand v4.7.4-stable commit b07049dfb ("checks: recompute
+        // group IDs"): `proposalCarriesInvalidTxn` now recomputes each
+        // payset group's ID (`transactions.CheckPaysetGroup`) rather than
+        // only checking group boundaries (`CheckPayset`), so a proposal
+        // whose claimed `Group` field does not actually commit to (hash)
+        // its member transactions is dropped at this early screen, not
+        // just later during full block validation.
+        use crate::stubs::StubNetwork;
+        use algo_types::{SignedTransaction, Transaction, TxnType};
+
+        let (mut demux, _av_tx, pp_tx, _vb_tx, _vv_tx, _vp_tx, _vb_res_tx, _lr_tx, quit_tx) =
+            make_test_demux();
+
+        let stub = Arc::new(StubNetwork::new());
+        demux.set_network(stub.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
+
+        // Two transactions sharing the same nonzero `group` value, but that
+        // value does not commit to (hash) these two transactions — a
+        // maliciously (or corruptly) reordered/incomplete group.
+        let bogus_group = [9u8; 32];
+        let txn1 = Transaction {
+            txn_type: TxnType::from("pay"),
+            sender: Address([1u8; 32]),
+            group: bogus_group,
+            ..Transaction::default()
+        };
+        let txn2 = Transaction {
+            txn_type: TxnType::from("pay"),
+            sender: Address([2u8; 32]),
+            group: bogus_group,
+            ..Transaction::default()
+        };
+        let compound = CompoundMessage {
+            vote: UnauthenticatedVote::default(),
+            proposal: crate::proposal::UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(1),
+                    payset: vec![
+                        SignedTransaction {
+                            txn: txn1,
+                            ..SignedTransaction::default()
+                        },
+                        SignedTransaction {
+                            txn: txn2,
+                            ..SignedTransaction::default()
+                        },
+                    ],
+                    ..algo_types::Block::default()
+                },
+                seed_proof: [0u8; crate::VRF_PROOF_SIZE],
+                original_period: crate::step::Period(0),
+                original_proposer: Address([0u8; 32]),
+            },
+        };
+        let encoded = codec::encode_compound_message(&compound);
+        pp_tx
+            .send(Message {
+                data: encoded,
+                handle: None,
+            })
+            .unwrap();
+        // Quit so `next()` returns after retrying past the dropped message,
+        // rather than blocking forever waiting for a next event.
+        quit_tx.send(()).unwrap();
+
+        let signals = default_signals();
+        let result = demux.next(&signals, None);
+
+        assert!(
+            result.is_none(),
+            "a proposal whose group ID doesn't commit to its transactions must be dropped"
+        );
+        assert!(
+            stub.disconnected.lock().unwrap().is_empty(),
+            "a group-ID-mismatch proposal must be dropped, not disconnect the peer"
         );
     }
 
