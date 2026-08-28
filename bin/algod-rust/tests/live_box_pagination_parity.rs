@@ -8,7 +8,7 @@
 //! diff against go-algorand's OAS spec and handlers, not an actual
 //! side-by-side HTTP comparison against a running go-algorand node. This
 //! file closes that gap: it deploys a real application on *each* of a real
-//! go-algorand v4.7.4-stable node and a real algod-rust node, creates the
+//! go-algorand v5.0.0-stable node and a real algod-rust node, creates the
 //! same set of boxes via real `box_put` app calls on both, and diffs the
 //! `GET /v2/applications/{id}/boxes` JSON responses field-for-field for:
 //! the legacy (unpaginated) call shape, a multi-page cursor walk with

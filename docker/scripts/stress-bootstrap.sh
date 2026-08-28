@@ -26,7 +26,7 @@ DOCKER_DIR="$(cd "$HERE/.." && pwd)"
 
 NETROOT="${DOCKER_DIR}/stress-netroot"
 TEMPLATE="${DOCKER_DIR}/config/stress-template.json"
-ALGOD_IMG="algorand/algod:4.7.3-stable"
+ALGOD_IMG="algorand/algod:5.0.0-stable"
 NUM_ROUNDS="${NUM_ROUNDS:-100000}"
 ALGOD_TOKEN="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 NODES="GoRelay RustRelay GoPart1 GoPart2 RustPart1 RustPart2"

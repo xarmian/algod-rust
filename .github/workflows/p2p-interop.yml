@@ -1,6 +1,6 @@
 name: Nightly P2P Transport Interop
 
-# Issue #543 — dial a real go-algorand v4.7.4-stable node running in
+# Issue #543 — dial a real go-algorand v5.0.0-stable node running in
 # plain P2P mode (EnableP2P: true) with algod-rust's own libp2p-based
 # `algo-p2p` transport, and assert a secure connection is established.
 # Proves real cross-implementation interop between rust-libp2p and
@@ -42,8 +42,8 @@ jobs:
           shared-key: p2p-interop
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Pull algorand/algod:4.7.3-stable
-        run: docker pull algorand/algod:4.7.3-stable
+      - name: Pull algorand/algod:5.0.0-stable
+        run: docker pull algorand/algod:5.0.0-stable
 
       - name: Bring up the P2P interop target
         run: make p2p-interop-up

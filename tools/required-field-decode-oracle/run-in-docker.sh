@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run-in-docker.sh — build + run `tools/required-field-decode-oracle`
-# against go-algorand v4.7.4-stable inside a Linux container.
+# against go-algorand v5.0.0-stable inside a Linux container.
 #
 # Issue #618. go-algorand's `crypto` package links a vendored libsodium
 # fork via cgo, so any Go program importing `data/transactions` (which
@@ -27,7 +27,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 GO_ALGORAND_DIR="${GO_ALGORAND_DIR:-$(cd "$REPO_ROOT/../go-algorand" 2>/dev/null && pwd || true)}"
 
-GO_ALGORAND_PIN="v4.7.4-stable"
+GO_ALGORAND_PIN="v5.0.0-stable"
 BUILDER_IMAGE="${BUILDER_IMAGE:-golang:1.25-bookworm}"
 SRC_VOLUME="${SRC_VOLUME:-algod-rust-goalgo-src}"
 MOD_VOLUME="${MOD_VOLUME:-algod-rust-gomod}"
