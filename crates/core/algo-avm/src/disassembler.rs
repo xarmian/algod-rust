@@ -31,6 +31,20 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
     let mut out = String::new();
     out.push_str(&format!("#pragma version {}\n", parsed.version));
 
+    // If reassembling this program at its own version would auto-salt it
+    // by default (i.e. it's a v13+ stateless program whose hash happens to
+    // be on-curve — either untouched legacy bytes, or bytes an explicit
+    // `#pragma autosalt false` opted out of salting), emit that pragma so
+    // `AssembleString(Disassemble(program))` round-trips to the same bytes
+    // instead of silently re-salting (and thus changing the hash). Matches
+    // go-algorand's `finalizeDisassemblyWithPragmas` (`assembler.go`).
+    let has_stateful_ops = parsed.instructions.iter().any(|instr| {
+        opcode::lookup(instr.opcode).is_some_and(|spec| spec.mode == opcode::Mode::Application)
+    });
+    if crate::assembler::default_auto_salt_applies(parsed.version, has_stateful_ops, program) {
+        out.push_str("#pragma autosalt false\n");
+    }
+
     for instr in &parsed.instructions {
         // Emit label if this offset is a branch target
         if let Some(label) = labels.get(&instr.offset) {
