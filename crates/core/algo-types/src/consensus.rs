@@ -233,7 +233,13 @@ pub struct ConsensusParams {
     /// plumbing (`PQSchemeEnabled`/`PQSchemeFeeContribution`) is tracked by a
     /// companion PQ-signatures issue; this flag is the consensus gate only.
     pub enable_pq_scheme_falcon1024: bool,
-    /// Enables the AVM `select` opcode variant operating on 128-bit values
+    /// Switches committee-selection (sortition) weight computation from the
+    /// hardware-double/Boost-C++ binomial CDF walk to a pure-software
+    /// 128-bit float implementation (`sortition.SelectF128`), which is
+    /// bit-identical across platforms. Not AVM-related — this gates the
+    /// vote/credential-verification weight function used throughout
+    /// consensus (see `algo-agreement`'s `UnauthenticatedCredential::verify`
+    /// and `algo-consensus-crypto::sortition::select_f128`)
     /// (Go: `EnableSelectF128`, v42+).
     pub enable_select_f128: bool,
     /// LogicSig sizes pooled across a group (Go: `EnableLogicSigSizePooling`, v40+).

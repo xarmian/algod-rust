@@ -77,9 +77,9 @@ impl UnauthenticatedCredential {
         };
 
         // Compute sortition weight
-        let expected_selection = membership.selector.committee_size(params) as f64;
+        let committee_size = membership.selector.committee_size(params);
 
-        if membership.total_money == 0 || expected_selection == 0.0 {
+        if membership.total_money == 0 || committee_size == 0 {
             return Err(CredentialError::InvalidParameters);
         }
 
@@ -87,13 +87,39 @@ impl UnauthenticatedCredential {
             return Err(CredentialError::InvalidParameters);
         }
 
+        // v42+ (`EnableSelectF128`): weight comes from the pure-software
+        // 128-bit float binomial CDF walk instead of the hardware-double
+        // Boost path. Mirrors go-algorand's `UnauthenticatedCredential.Verify`
+        // (`data/committee/credential.go`):
+        //
+        //   if proto.EnableSelectF128 {
+        //       if userMoney.Raw >= sortition.SelectF128MaxMoney {
+        //           err = fmt.Errorf(...)
+        //           return
+        //       }
+        //       weight = sortition.SelectF128(userMoney.Raw, m.TotalMoney.Raw, committeeSize, sortition.Digest(h))
+        //   } else {
+        //       weight = sortition.Select(userMoney.Raw, m.TotalMoney.Raw, float64(committeeSize), sortition.Digest(h))
+        //   }
+        //
+        // The old float64 `select` path is preserved unchanged below v42.
         let weight = if membership.balance == 0 {
             0
+        } else if params.enable_select_f128 {
+            if membership.balance >= sortition::SELECT_F128_MAX_MONEY {
+                return Err(CredentialError::MoneyAboveSelectF128Bound);
+            }
+            sortition::select_f128(
+                membership.balance,
+                membership.total_money,
+                committee_size,
+                h.0,
+            )
         } else {
             sortition::select(
                 membership.balance,
                 membership.total_money,
-                expected_selection,
+                committee_size as f64,
                 h.0,
             )
         };
@@ -338,6 +364,12 @@ pub enum CredentialError {
     ZeroWeight,
     /// Invalid parameters (e.g. total_money < balance, or zero total/expected).
     InvalidParameters,
+    /// v42+ only (`EnableSelectF128`): the account's balance is at or above
+    /// `sortition::SELECT_F128_MAX_MONEY` (2^56), the domain bound the f128
+    /// sortition implementation is defined over. Mirrors go-algorand's
+    /// `UnauthenticatedCredential.Verify` returning an error (not panicking)
+    /// for `userMoney.Raw >= sortition.SelectF128MaxMoney`.
+    MoneyAboveSelectF128Bound,
 }
 
 impl std::fmt::Display for CredentialError {
@@ -346,6 +378,9 @@ impl std::fmt::Display for CredentialError {
             Self::VrfVerificationFailed => write!(f, "VRF proof verification failed"),
             Self::ZeroWeight => write!(f, "credential has weight 0"),
             Self::InvalidParameters => write!(f, "invalid membership parameters"),
+            Self::MoneyAboveSelectF128Bound => {
+                write!(f, "user money at or above SelectF128MaxMoney")
+            }
         }
     }
 }
@@ -367,6 +402,10 @@ mod tests {
 
     fn v7_params() -> ConsensusParams {
         consensus_params_for_version(algo_types::consensus::CONSENSUS_V7).expect("v7 params")
+    }
+
+    fn v42_params() -> ConsensusParams {
+        consensus_params_for_version(algo_types::CONSENSUS_V42).expect("v42 params")
     }
 
     // ---- HashableCredential encoding tests ----
@@ -589,6 +628,82 @@ mod tests {
 
         let result = ucred.verify(&params, &membership);
         assert_eq!(result, Err(CredentialError::ZeroWeight));
+    }
+
+    // ---- v42 EnableSelectF128 wiring tests (issue #667) ----
+    //
+    // These pin the *branching* in `verify()` itself (v42 -> select_f128 +
+    // bounds check, pre-v42 -> select unchanged) — bit-for-bit parity of
+    // select_f128's own arithmetic is covered exhaustively at the
+    // algo-consensus-crypto level (221 vectors captured from the real
+    // upstream Go module, plus hand-ported frozen-tail/exact-boundary
+    // regressions from f128_test.go).
+
+    #[test]
+    fn verify_v42_rejects_balance_at_select_f128_max_money_bound() {
+        let params = v42_params();
+        assert!(params.enable_select_f128);
+
+        let kp = VrfKeypair::from_seed([9u8; 32]);
+        // balance == bound must be rejected: go-algorand's check is
+        // `userMoney.Raw >= sortition.SelectF128MaxMoney` (inclusive).
+        let membership = make_test_membership(
+            &kp,
+            SOFT,
+            sortition::SELECT_F128_MAX_MONEY,
+            sortition::SELECT_F128_MAX_MONEY + 1,
+        );
+        let ucred = make_unauthenticated_credential(&kp, &membership.selector);
+
+        let result = ucred.verify(&params, &membership);
+        assert_eq!(result, Err(CredentialError::MoneyAboveSelectF128Bound));
+    }
+
+    #[test]
+    fn verify_v42_accepts_balance_just_below_select_f128_max_money_bound() {
+        let params = v42_params();
+        let kp = VrfKeypair::from_seed([9u8; 32]);
+        let membership = make_test_membership(
+            &kp,
+            SOFT,
+            sortition::SELECT_F128_MAX_MONEY - 1,
+            sortition::SELECT_F128_MAX_MONEY,
+        );
+        let ucred = make_unauthenticated_credential(&kp, &membership.selector);
+
+        // Must not hit the bound-check error; may be Ok or ZeroWeight
+        // depending on the VRF output, but never an error at all — a panic
+        // (rather than a Result) here would itself be the bug this pins
+        // against, since this exercises select_f128 on the consensus-
+        // critical vote-verification path.
+        match ucred.verify(&params, &membership) {
+            Ok(_) | Err(CredentialError::ZeroWeight) => {}
+            Err(e) => panic!("unexpected error just below the SelectF128 bound: {e}"),
+        }
+    }
+
+    #[test]
+    fn verify_pre_v42_does_not_enforce_select_f128_bound() {
+        // Below v42, `EnableSelectF128` is false and the old float64
+        // `select` path (which has no such bound) must run unchanged — a
+        // balance that would be rejected under v42 must NOT be rejected
+        // here.
+        let params = v41_params();
+        assert!(!params.enable_select_f128);
+
+        let kp = VrfKeypair::from_seed([9u8; 32]);
+        let membership = make_test_membership(
+            &kp,
+            SOFT,
+            sortition::SELECT_F128_MAX_MONEY,
+            sortition::SELECT_F128_MAX_MONEY + 1,
+        );
+        let ucred = make_unauthenticated_credential(&kp, &membership.selector);
+
+        match ucred.verify(&params, &membership) {
+            Ok(_) | Err(CredentialError::ZeroWeight) => {}
+            Err(e) => panic!("unexpected error under pre-v42 params: {e}"),
+        }
     }
 
     // ---- lowest_output tests ----

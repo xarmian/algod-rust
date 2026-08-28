@@ -1,0 +1,2406 @@
+{
+  "add": [
+    {
+      "a": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      },
+      "b": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -126
+      },
+      "r": {
+        "hi": "c000000000000000",
+        "lo": "0000000000000000",
+        "exp": -126
+      }
+    },
+    {
+      "a": {
+        "hi": "0000000000000000",
+        "lo": "0000000000000000",
+        "exp": 0
+      },
+      "b": {
+        "hi": "a000000000000000",
+        "lo": "0000000000000000",
+        "exp": -125
+      },
+      "r": {
+        "hi": "a000000000000000",
+        "lo": "0000000000000000",
+        "exp": -125
+      }
+    },
+    {
+      "a": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffffffffff",
+        "exp": -1
+      },
+      "b": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffffffffff",
+        "exp": -1
+      },
+      "r": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffffffffff",
+        "exp": 0
+      }
+    },
+    {
+      "a": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": 0
+      },
+      "b": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -200
+      },
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": 0
+      }
+    },
+    {
+      "a": {
+        "hi": "de0b6b3a76400000",
+        "lo": "0000000000000000",
+        "exp": -68
+      },
+      "b": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      },
+      "r": {
+        "hi": "de0b6b3a76400010",
+        "lo": "0000000000000000",
+        "exp": -68
+      }
+    }
+  ],
+  "div": [
+    {
+      "a": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      },
+      "b": {
+        "hi": "c000000000000000",
+        "lo": "0000000000000000",
+        "exp": -126
+      },
+      "r": {
+        "hi": "aaaaaaaaaaaaaaaa",
+        "lo": "aaaaaaaaaaaaaaab",
+        "exp": -129
+      }
+    },
+    {
+      "a": {
+        "hi": "e8d4a51000000000",
+        "lo": "0000000000000000",
+        "exp": -88
+      },
+      "b": {
+        "hi": "ae9f7bcc00000000",
+        "lo": "0000000000000000",
+        "exp": -86
+      },
+      "r": {
+        "hi": "aaaaaaaaaaaaaaaa",
+        "lo": "aaaaaaaaaaaaaaab",
+        "exp": -129
+      }
+    },
+    {
+      "a": {
+        "hi": "e000000000000000",
+        "lo": "0000000000000000",
+        "exp": -125
+      },
+      "b": {
+        "hi": "e000000000000000",
+        "lo": "0000000000000000",
+        "exp": -125
+      },
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      }
+    },
+    {
+      "a": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffffffffff",
+        "exp": -1
+      },
+      "b": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -1
+      },
+      "r": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffffffffff",
+        "exp": -127
+      }
+    }
+  ],
+  "div_u": [
+    {
+      "a": {
+        "hi": "f424000000000000",
+        "lo": "0000000000000000",
+        "exp": -108
+      },
+      "u": 3,
+      "r": {
+        "hi": "a2c2aaaaaaaaaaaa",
+        "lo": "aaaaaaaaaaaaaaab",
+        "exp": -109
+      }
+    },
+    {
+      "a": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      },
+      "u": 7,
+      "r": {
+        "hi": "9249249249249249",
+        "lo": "2492492492492492",
+        "exp": -130
+      }
+    },
+    {
+      "a": {
+        "hi": "0000000000000000",
+        "lo": "0000000000000000",
+        "exp": 0
+      },
+      "u": 5,
+      "r": {
+        "hi": "0000000000000000",
+        "lo": "0000000000000000",
+        "exp": 0
+      }
+    },
+    {
+      "a": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffffffffff",
+        "exp": -1
+      },
+      "u": 12345,
+      "r": {
+        "hi": "a9e0ef8e31cf843d",
+        "lo": "a17ae8b6522919db",
+        "exp": -14
+      }
+    },
+    {
+      "a": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -65
+      },
+      "u": 1,
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -65
+      }
+    },
+    {
+      "a": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -65
+      },
+      "u": 4611686018427387903,
+      "r": {
+        "hi": "8000000000000002",
+        "lo": "0000000000000008",
+        "exp": -127
+      }
+    }
+  ],
+  "from_digest_ratio": [
+    {
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "0000000000000000",
+        "lo": "0000000000000000",
+        "exp": 0
+      }
+    },
+    {
+      "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "ratio": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      }
+    },
+    {
+      "digest": "8000000000000000000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "4000000000000000000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -129
+      }
+    },
+    {
+      "digest": "0000000000000000000000000000000000000000000000000000000000000001",
+      "ratio": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -383
+      }
+    },
+    {
+      "digest": "52fdfc072182654f163f5f0f9a621d729566c74d10037c4d7bbb0407d1e2c649",
+      "ratio": {
+        "hi": "a5fbf80e4304ca9e",
+        "lo": "2c7ebe1f34c43ae5",
+        "exp": -129
+      }
+    },
+    {
+      "digest": "81855ad8681d0d86d1e91e00167939cb6694d2c422acd208a0072939487f6999",
+      "ratio": {
+        "hi": "81855ad8681d0d86",
+        "lo": "d1e91e00167939cb",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "eb9d18a44784045d87f3c67cf22746e995af5a25367951baa2ff6cd471c483f1",
+      "ratio": {
+        "hi": "eb9d18a44784045d",
+        "lo": "87f3c67cf22746ea",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "5fb90badb37c5821b6d95526a41a9504680b4e7c8b763a1b1d49d4955c848621",
+      "ratio": {
+        "hi": "bf72175b66f8b043",
+        "lo": "6db2aa4d48352a09",
+        "exp": -129
+      }
+    },
+    {
+      "digest": "6325253fec738dd7a9e28bf921119c160f0702448615bbda08313f6a8eb668d2",
+      "ratio": {
+        "hi": "c64a4a7fd8e71baf",
+        "lo": "53c517f24223382c",
+        "exp": -129
+      }
+    },
+    {
+      "digest": "0bf5059875921e668a5bdf2c7fc4844592d2572bcd0668d2d6c52f5054e2d083",
+      "ratio": {
+        "hi": "bf5059875921e668",
+        "lo": "a5bdf2c7fc484459",
+        "exp": -132
+      }
+    },
+    {
+      "digest": "6bf84c7174cb7476364cc3dbd968b0f7172ed85794bb358b0c3b525da1786f9f",
+      "ratio": {
+        "hi": "d7f098e2e996e8ec",
+        "lo": "6c9987b7b2d161ee",
+        "exp": -129
+      }
+    },
+    {
+      "digest": "ff094279db1944ebd7a19d0f7bbacbe0255aa5b7d44bec40f84c892b9bffd436",
+      "ratio": {
+        "hi": "ff094279db1944eb",
+        "lo": "d7a19d0f7bbacbe0",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "29b0223beea5f4f74391f445d15afd4294040374f6924b98cbf8713f8d962d7c",
+      "ratio": {
+        "hi": "a6c088efba97d3dd",
+        "lo": "0e47d117456bf50a",
+        "exp": -130
+      }
+    },
+    {
+      "digest": "8d019192c24224e2cafccae3a61fb586b14323a6bc8f9e7df1d929333ff99393",
+      "ratio": {
+        "hi": "8d019192c24224e2",
+        "lo": "cafccae3a61fb587",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "3bea6f5b3af6de0374366c4719e43a1b067d89bc7f01f1f573981659a44ff17a",
+      "ratio": {
+        "hi": "efa9bd6cebdb780d",
+        "lo": "d0d9b11c6790e86c",
+        "exp": -130
+      }
+    },
+    {
+      "digest": "4c7215a3b539eb1e5849c6077dbb5722f5717a289a266f97647981998ebea89c",
+      "ratio": {
+        "hi": "98e42b476a73d63c",
+        "lo": "b0938c0efb76ae46",
+        "exp": -129
+      }
+    },
+    {
+      "digest": "0b4b373970115e82ed6f4125c8fa7311e4d7defa922daae7786667f7e936cd4f",
+      "ratio": {
+        "hi": "b4b373970115e82e",
+        "lo": "d6f4125c8fa7311e",
+        "exp": -132
+      }
+    },
+    {
+      "digest": "24abf7df866baa56038367ad6145de1ee8f4a8b0993ebdf8883a0ad8be9c3978",
+      "ratio": {
+        "hi": "92afdf7e19aea958",
+        "lo": "0e0d9eb58517787c",
+        "exp": -130
+      }
+    },
+    {
+      "digest": "b04883e56a156a8de563afa467d49dec6a40e9a1d007f033c2823061bdd0eaa5",
+      "ratio": {
+        "hi": "b04883e56a156a8d",
+        "lo": "e563afa467d49dec",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "9f8e4da6430105220d0b29688b734b8ea0f3ca9936e8461f10d77c96ea80a7a6",
+      "ratio": {
+        "hi": "9f8e4da643010522",
+        "lo": "0d0b29688b734b8f",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "65f606f6a63b7f3dfd2567c18979e4d60f26686d9bf2fb26c901ff354cde1607",
+      "ratio": {
+        "hi": "cbec0ded4c76fe7b",
+        "lo": "fa4acf8312f3c9ac",
+        "exp": -129
+      }
+    },
+    {
+      "digest": "ee294b39f32b7c7822ba64f84ab43ca0c6e6b91c1fd3be8990434179d3af4491",
+      "ratio": {
+        "hi": "ee294b39f32b7c78",
+        "lo": "22ba64f84ab43ca1",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "a369012db92d184fc39d1734ff5716428953bb6865fcf92b0c3a17c9028be991",
+      "ratio": {
+        "hi": "a369012db92d184f",
+        "lo": "c39d1734ff571643",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "4eb7649c6c9347800979d1830356f2a54c3deab2a4b4475d63afbe8fb56987c7",
+      "ratio": {
+        "hi": "9d6ec938d9268f00",
+        "lo": "12f3a30606ade54b",
+        "exp": -129
+      }
+    },
+    {
+      "digest": "8000000000000000000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "ff00000000000000000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ff00000000000000",
+        "lo": "0000000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "fffe000000000000000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "fffe000000000000",
+        "lo": "0000000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "fffffc0000000000000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "fffffc0000000000",
+        "lo": "0000000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "fffffff800000000000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "fffffff800000000",
+        "lo": "0000000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "fffffffff0000000000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "fffffffff0000000",
+        "lo": "0000000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "ffffffffffe00000000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffe00000",
+        "lo": "0000000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "ffffffffffffc000000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffc000",
+        "lo": "0000000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "ffffffffffffff80000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffff80",
+        "lo": "0000000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "ffffffffffffffff000000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffffff",
+        "lo": "0000000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "fffffffffffffffffe0000000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffffff",
+        "lo": "fe00000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "fffffffffffffffffffc00000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffffff",
+        "lo": "fffc000000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "fffffffffffffffffffff8000000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffffff",
+        "lo": "fffff80000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "fffffffffffffffffffffff00000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffffff",
+        "lo": "fffffff000000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "ffffffffffffffffffffffffe000000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffe0000000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "ffffffffffffffffffffffffffc0000000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffffc00000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "ffffffffffffffffffffffffffff800000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffffff8000",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "ffffffffffffffffffffffffffffff0000000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffffffff00",
+        "exp": -128
+      }
+    },
+    {
+      "digest": "fffffffffffffffffffffffffffffffe00000000000000000000000000000000",
+      "ratio": {
+        "hi": "ffffffffffffffff",
+        "lo": "fffffffffffffffe",
+        "exp": -128
+      }
+    }
+  ],
+  "from_uint64": [
+    {
+      "u": 0,
+      "r": {
+        "hi": "0000000000000000",
+        "lo": "0000000000000000",
+        "exp": 0
+      }
+    },
+    {
+      "u": 1,
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      }
+    },
+    {
+      "u": 2,
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -126
+      }
+    },
+    {
+      "u": 3,
+      "r": {
+        "hi": "c000000000000000",
+        "lo": "0000000000000000",
+        "exp": -126
+      }
+    },
+    {
+      "u": 7,
+      "r": {
+        "hi": "e000000000000000",
+        "lo": "0000000000000000",
+        "exp": -125
+      }
+    },
+    {
+      "u": 255,
+      "r": {
+        "hi": "ff00000000000000",
+        "lo": "0000000000000000",
+        "exp": -120
+      }
+    },
+    {
+      "u": 256,
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -119
+      }
+    },
+    {
+      "u": 4294967296,
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -95
+      }
+    },
+    {
+      "u": 9223372036854775808,
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -64
+      }
+    },
+    {
+      "u": 18446744073709551615,
+      "r": {
+        "hi": "ffffffffffffffff",
+        "lo": "0000000000000000",
+        "exp": -64
+      }
+    },
+    {
+      "u": 1000000,
+      "r": {
+        "hi": "f424000000000000",
+        "lo": "0000000000000000",
+        "exp": -108
+      }
+    },
+    {
+      "u": 10000000000000000,
+      "r": {
+        "hi": "8e1bc9bf04000000",
+        "lo": "0000000000000000",
+        "exp": -74
+      }
+    },
+    {
+      "u": 12345678901234567,
+      "r": {
+        "hi": "af715175ad2e1c00",
+        "lo": "0000000000000000",
+        "exp": -74
+      }
+    }
+  ],
+  "int_pow": [
+    {
+      "base": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -126
+      },
+      "e": 10,
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -117
+      }
+    },
+    {
+      "base": {
+        "hi": "c000000000000000",
+        "lo": "0000000000000000",
+        "exp": -126
+      },
+      "e": 0,
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      }
+    },
+    {
+      "base": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      },
+      "e": 1000,
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      }
+    },
+    {
+      "base": {
+        "hi": "ffffffffffffb7f1",
+        "lo": "418462a7a9937831",
+        "exp": -128
+      },
+      "e": 100000,
+      "r": {
+        "hi": "ffffffff920c8098",
+        "lo": "b8a5a6b3cbabdec9",
+        "exp": -128
+      }
+    }
+  ],
+  "mul": [
+    {
+      "a": {
+        "hi": "c000000000000000",
+        "lo": "0000000000000000",
+        "exp": -126
+      },
+      "b": {
+        "hi": "a000000000000000",
+        "lo": "0000000000000000",
+        "exp": -125
+      },
+      "r": {
+        "hi": "f000000000000000",
+        "lo": "0000000000000000",
+        "exp": -124
+      }
+    },
+    {
+      "a": {
+        "hi": "0000000000000000",
+        "lo": "0000000000000000",
+        "exp": 0
+      },
+      "b": {
+        "hi": "a000000000000000",
+        "lo": "0000000000000000",
+        "exp": -125
+      },
+      "r": {
+        "hi": "0000000000000000",
+        "lo": "0000000000000000",
+        "exp": 0
+      }
+    },
+    {
+      "a": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      },
+      "b": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      },
+      "r": {
+        "hi": "8000000000000000",
+        "lo": "0000000000000000",
+        "exp": -127
+      }
+    },
+    {
+      "a": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffffffffff",
+        "exp": -1
+      },
+      "b": {
+        "hi": "ffffffffffffffff",
+        "lo": "ffffffffffffffff",
+        "exp": -1
+      },
+      "r": {
+        "hi": "ffffffffffffffff",
+        "lo": "fffffffffffffffe",
+        "exp": 126
+      }
+    },
+    {
+      "a": {
+        "hi": "e8d4a51000000000",
+        "lo": "0000000000000000",
+        "exp": -88
+      },
+      "b": {
+        "hi": "e8d4a50fff000000",
+        "lo": "0000000000000000",
+        "exp": -88
+      },
+      "r": {
+        "hi": "d3c21bcecc04cc5a",
+        "lo": "f000000000000000",
+        "exp": -48
+      }
+    },
+    {
+      "a": {
+        "hi": "aaaaaaaaaaaaaaaa",
+        "lo": "5555555555555555",
+        "exp": 5
+      },
+      "b": {
+        "hi": "9999999999999999",
+        "lo": "1111111111111111",
+        "exp": -5
+      },
+      "r": {
+        "hi": "cccccccccccccccb",
+        "lo": "b05b05b05b05b05b",
+        "exp": 127
+      }
+    }
+  ],
+  "select_f128": [
+    {
+      "money": 1000,
+      "total_money": 10000,
+      "expected_size": 20,
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 0
+    },
+    {
+      "money": 1000,
+      "total_money": 10000,
+      "expected_size": 20,
+      "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "weight": 41
+    },
+    {
+      "money": 1000,
+      "total_money": 10000,
+      "expected_size": 20,
+      "digest": "8000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 2
+    },
+    {
+      "money": 1000,
+      "total_money": 10000,
+      "expected_size": 20,
+      "digest": "4000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 1
+    },
+    {
+      "money": 10000,
+      "total_money": 10000,
+      "expected_size": 20,
+      "digest": "8000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 20
+    },
+    {
+      "money": 10000,
+      "total_money": 10000,
+      "expected_size": 20,
+      "digest": "1000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 13
+    },
+    {
+      "money": 10000,
+      "total_money": 10000,
+      "expected_size": 20,
+      "digest": "f000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 27
+    },
+    {
+      "money": 1500,
+      "total_money": 3000,
+      "expected_size": 2990,
+      "digest": "4000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 1494
+    },
+    {
+      "money": 1500,
+      "total_money": 3000,
+      "expected_size": 2990,
+      "digest": "8000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 1495
+    },
+    {
+      "money": 1500,
+      "total_money": 3000,
+      "expected_size": 2990,
+      "digest": "c000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 1497
+    },
+    {
+      "money": 1,
+      "total_money": 10000,
+      "expected_size": 20,
+      "digest": "0100000000000000000000000000000000000000000000000000000000000000",
+      "weight": 0
+    },
+    {
+      "money": 1,
+      "total_money": 10000,
+      "expected_size": 20,
+      "digest": "8000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 0
+    },
+    {
+      "money": 1,
+      "total_money": 10000,
+      "expected_size": 20,
+      "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "weight": 1
+    },
+    {
+      "money": 10000,
+      "total_money": 10000,
+      "expected_size": 20,
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 0
+    },
+    {
+      "money": 100,
+      "total_money": 100,
+      "expected_size": 200,
+      "digest": "8000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 100
+    },
+    {
+      "money": 1,
+      "total_money": 1,
+      "expected_size": 1,
+      "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "weight": 1
+    },
+    {
+      "money": 1,
+      "total_money": 1,
+      "expected_size": 1,
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 0
+    },
+    {
+      "money": 72057594037927935,
+      "total_money": 72057594037927936,
+      "expected_size": 1,
+      "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "weight": 25
+    },
+    {
+      "money": 10000000000000000,
+      "total_money": 10000000000000000,
+      "expected_size": 1,
+      "digest": "8000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 1
+    },
+    {
+      "money": 5000000000000000,
+      "total_money": 10000000000000000,
+      "expected_size": 500,
+      "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "weight": 428
+    },
+    {
+      "money": 5000000000000000,
+      "total_money": 10000000000000000,
+      "expected_size": 500,
+      "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "weight": 0
+    },
+    {
+      "money": 108815074904,
+      "total_money": 9533179754085,
+      "expected_size": 309,
+      "digest": "7f5818526f1814be823350eab13935f31d84484517e924aef78ae151c0075592",
+      "weight": 3
+    },
+    {
+      "money": 124774569258,
+      "total_money": 5485745449832,
+      "expected_size": 1677,
+      "digest": "975deda77e758579ea3dfe4136abf752b3b8271d03e944b3c9db366b75045f8e",
+      "weight": 39
+    },
+    {
+      "money": 302863216379,
+      "total_money": 2667141723610,
+      "expected_size": 2932,
+      "digest": "fd69d28bd68584f57e37caac6e33feaa3263a399437024ba9c9b14678a274f01",
+      "weight": 376
+    },
+    {
+      "money": 139639006207,
+      "total_money": 7713894832645,
+      "expected_size": 1245,
+      "digest": "a910ae295f6e7d39069f01a239c4365854c3af7f6b41d631f92b9a8d12f41257",
+      "weight": 24
+    },
+    {
+      "money": 499110513322,
+      "total_money": 1889720884837,
+      "expected_size": 2605,
+      "digest": "325f901a52720da85ca1e4b38eaf3f44c6c6ef8362f2f54fc00e09d6fc256408",
+      "weight": 666
+    },
+    {
+      "money": 981437551529,
+      "total_money": 2622384646238,
+      "expected_size": 2439,
+      "digest": "54c15dfcac63408d8724b0cf3fae17a3f79be1072fb63c35d6042c4160f38ee9",
+      "weight": 899
+    },
+    {
+      "money": 61716608039,
+      "total_money": 1735301065187,
+      "expected_size": 2206,
+      "digest": "e210a7960732ca52cf53c3f520c889b79bf504cfb57c7601232d589baccea9d6",
+      "weight": 89
+    },
+    {
+      "money": 603350578075,
+      "total_money": 3105706924625,
+      "expected_size": 2450,
+      "digest": "e263e25c69c2e2cdcf233438bf1774ace7709a4f091e9a83fdeae0ec55eb233a",
+      "weight": 502
+    },
+    {
+      "money": 269752912500,
+      "total_money": 7728625719721,
+      "expected_size": 990,
+      "digest": "370eb36dbcfdec90b302dcdc3b9ef522e2a6f1ed0afec1f8e20faabedf6b162e",
+      "weight": 30
+    },
+    {
+      "money": 188743108884,
+      "total_money": 3360410969452,
+      "expected_size": 1680,
+      "digest": "717d3aba53af19779cb2948b6570ffa0b773963c130ad797ddeafe4e3ad29b51",
+      "weight": 93
+    },
+    {
+      "money": 973706263852,
+      "total_money": 9939332018026,
+      "expected_size": 724,
+      "digest": "25210f0ef1c3b00ce73bff706f7ff4b6f44090a32711f3208e4e4b89cb5165ce",
+      "weight": 62
+    },
+    {
+      "money": 131398851786,
+      "total_money": 5474906024831,
+      "expected_size": 2616,
+      "digest": "640082d9c6034ad2960c796503e1ce221725f50caf1fbfe831b10b7bf5b15c47",
+      "weight": 60
+    },
+    {
+      "money": 535617490720,
+      "total_money": 4456460833618,
+      "expected_size": 1558,
+      "digest": "a53dbf8e7ded323cb76f0d3fac476c9fb03fc9228fbae88fd580663a0454b683",
+      "weight": 192
+    },
+    {
+      "money": 623776390888,
+      "total_money": 8104218789910,
+      "expected_size": 451,
+      "digest": "1258250d8fb50e77f2bf4f0152e5d49435807f9d4b97be6fb77970466a5626fe",
+      "weight": 26
+    },
+    {
+      "money": 823683765929,
+      "total_money": 6226835731539,
+      "expected_size": 467,
+      "digest": "33408cf998320982c85aad70384859c05a4b13a1d5b2f5bfef5a6ed92da482ca",
+      "weight": 55
+    },
+    {
+      "money": 332500047840,
+      "total_money": 3856406827554,
+      "expected_size": 753,
+      "digest": "500944cbe800a0b1527ea64729a861d2f6497a3235c37f4192779ec1d96b3b1c",
+      "weight": 61
+    },
+    {
+      "money": 655607742924,
+      "total_money": 6857040003115,
+      "expected_size": 1261,
+      "digest": "5424fc2191d945c04767af847afd0edb5d8857b799acb18e4affabe3037ffe7f",
+      "weight": 116
+    },
+    {
+      "money": 915284969250,
+      "total_money": 8095837406975,
+      "expected_size": 1776,
+      "digest": "a68aa8af5e3993fab7e125ddebafe65a31bd5d41e2d2ce9c2b17892f0fea1931",
+      "weight": 206
+    },
+    {
+      "money": 992965067384,
+      "total_money": 1177974494088,
+      "expected_size": 237,
+      "digest": "a290a4034aa48afa3f85b8a62708caebbac880b5b89b93da53810164402104e6",
+      "weight": 205
+    },
+    {
+      "money": 281505313682,
+      "total_money": 1693937690849,
+      "expected_size": 206,
+      "digest": "48b6226a1b8b19f53784c19e9beac03c875a27db029de37ae37a423188134876",
+      "weight": 31
+    },
+    {
+      "money": 382033933288,
+      "total_money": 5414273129803,
+      "expected_size": 404,
+      "digest": "85b8e2925c6daee4de5ef9f9dcf08dfcbd02b80809398585928a0f7de50be1a6",
+      "weight": 29
+    },
+    {
+      "money": 852543408741,
+      "total_money": 6219702251632,
+      "expected_size": 2046,
+      "digest": "dc1d5768e5e60c5ead6fc7ae77ba1d259b188a4b21c86fbc23d728b45347eada",
+      "weight": 299
+    },
+    {
+      "money": 125997443447,
+      "total_money": 3665967861033,
+      "expected_size": 1312,
+      "digest": "b07590bafcccbec6177536401d9a2b7f512b54bfc9d00532adf5aaa7c3a96bc5",
+      "weight": 48
+    },
+    {
+      "money": 315672313728,
+      "total_money": 2883495349202,
+      "expected_size": 1465,
+      "digest": "9b489f1f0ae9515ef30fa47a364e75aea9e111d596e685a591121966e031650d",
+      "weight": 164
+    },
+    {
+      "money": 408027574535,
+      "total_money": 8425143219381,
+      "expected_size": 2069,
+      "digest": "510354aa84557e2398322eb5cf43d72bd2e5b887d4630fb8d4747ead6eb82acd",
+      "weight": 95
+    },
+    {
+      "money": 661857187759,
+      "total_money": 2848411573767,
+      "expected_size": 907,
+      "digest": "1c5b7c9123461c41f5ff99aa99ce24eb4d788576e3336e65491622558fdf297b",
+      "weight": 193
+    },
+    {
+      "money": 985196903301,
+      "total_money": 5600081863840,
+      "expected_size": 633,
+      "digest": "9fa007864b8d0801f29055d3090d2463718254f9442483c7b98b938045da5198",
+      "weight": 115
+    },
+    {
+      "money": 869272257725,
+      "total_money": 3240907420978,
+      "expected_size": 2557,
+      "digest": "43b99ed9d20d573ad53171c8fef7f1f4e4613bb365b2ebb44f0ffb6907136385",
+      "weight": 669
+    },
+    {
+      "money": 106090456275,
+      "total_money": 8385584343050,
+      "expected_size": 2144,
+      "digest": "cdc838f00f8ed94ee62b4de7aa1cc84c887e1f7c31e927dfe52a5f8f46627eb5",
+      "weight": 32
+    },
+    {
+      "money": 748998466867,
+      "total_money": 7456820451760,
+      "expected_size": 361,
+      "digest": "589733e563e19d3045aad3e226488ac02cca4291aed169dce5039d6ab00e40f6",
+      "weight": 34
+    },
+    {
+      "money": 532527976373,
+      "total_money": 8091019799460,
+      "expected_size": 1641,
+      "digest": "7aab2905da3b2169f5a910c9d0096e5e3ef1b570680746acd0cc7760331b6631",
+      "weight": 107
+    },
+    {
+      "money": 518393240646,
+      "total_money": 7574945997964,
+      "expected_size": 1101,
+      "digest": "38d6d342b051c0ab7ac65e502d39b216cbc50e73a32eaf936401e2506bd8b82c",
+      "weight": 69
+    },
+    {
+      "money": 811335423860,
+      "total_money": 3726963444843,
+      "expected_size": 1692,
+      "digest": "30d3160e17b95541c2aee5df820ac85de3f8e784870fd87a36cc0d163833df63",
+      "weight": 352
+    },
+    {
+      "money": 461749459233,
+      "total_money": 2093119940347,
+      "expected_size": 2488,
+      "digest": "6613a9cc9441033aa5baf40d45e24d72eac4a28e3ca030c9937ab8409a7cbf05",
+      "weight": 543
+    },
+    {
+      "money": 91911834437,
+      "total_money": 2048036369933,
+      "expected_size": 1309,
+      "digest": "ae441d14ba49a677de8b18cb454b99ddd9daa7ccbb7500dae4e2e5df8cf3859e",
+      "weight": 62
+    },
+    {
+      "money": 225202895019,
+      "total_money": 5540461488306,
+      "expected_size": 85,
+      "digest": "bddada67611fc73c82a491bfabd7a19df50fdc78a55dbbc2fd37f9296566557f",
+      "weight": 5
+    },
+    {
+      "money": 66671511698,
+      "total_money": 1059459766739,
+      "expected_size": 1771,
+      "digest": "97b8ad99408fe1e037c68bf7c5e5de1d2c68192348ec1189fb2e36973cef09ff",
+      "weight": 114
+    },
+    {
+      "money": 586259657321,
+      "total_money": 6704302638495,
+      "expected_size": 1624,
+      "digest": "14be23d640ff73495fe4a05ce1202ca7287ed3235b95e69f571fa5e656aaa51f",
+      "weight": 126
+    },
+    {
+      "money": 256927946711,
+      "total_money": 4114249321699,
+      "expected_size": 1867,
+      "digest": "ae1ebdd7aa62ab9d2420134537cd6d02282e0981e140232a4a87383a21d1845c",
+      "weight": 122
+    },
+    {
+      "money": 397762776516,
+      "total_money": 6272542838034,
+      "expected_size": 840,
+      "digest": "408a279a96879a4f3690ac2025a60c7db15e0501ebc34b734355fe4a059bd389",
+      "weight": 48
+    },
+    {
+      "money": 845450656092,
+      "total_money": 896528809372,
+      "expected_size": 247,
+      "digest": "9d920e95f1e1a3425ead69d4f975012fd1a49ed832f69e6e9c63b453ec049c9e",
+      "weight": 237
+    },
+    {
+      "money": 739456521123,
+      "total_money": 8055734371853,
+      "expected_size": 1414,
+      "digest": "7a415b0af9ce8c208bc20ee526741539fa3203c77ecba410fd6718f227e0b430",
+      "weight": 129
+    },
+    {
+      "money": 165879719289,
+      "total_money": 7810694105861,
+      "expected_size": 1822,
+      "digest": "f9bcb04929987b45d4e428811984ecad349cc35dd93515cefe0b002cee5e71c4",
+      "weight": 51
+    },
+    {
+      "money": 743379995749,
+      "total_money": 3196899498599,
+      "expected_size": 330,
+      "digest": "046296124621928739a86671cc180152b953e3bf9d19f825c3dd54ae1688e49e",
+      "weight": 59
+    },
+    {
+      "money": 822772541382,
+      "total_money": 7007344239777,
+      "expected_size": 2663,
+      "digest": "fb5efeba801a175b1c76f057832f3f36d7d893e216e4c7bbdb548d0ba4844933",
+      "weight": 350
+    },
+    {
+      "money": 990226577623,
+      "total_money": 3235280904832,
+      "expected_size": 552,
+      "digest": "0027368b34f93fb70c2c896334cb1f9cb5dfe044fa086197ff5dfd02f2ba3884",
+      "weight": 128
+    },
+    {
+      "money": 10999842440,
+      "total_money": 9010180259471,
+      "expected_size": 1068,
+      "digest": "c53d92b8d8f2a8df3b0c35f15b9b370dca80d4ca8e9a133eb52094f2dd5c0873",
+      "weight": 2
+    },
+    {
+      "money": 551887931713,
+      "total_money": 4283901353297,
+      "expected_size": 342,
+      "digest": "1f52315d82924ffe3713b52c76fd8a56da8bb07daa8eb4eb8f7334f99256e276",
+      "weight": 36
+    },
+    {
+      "money": 744569509227,
+      "total_money": 8447377670291,
+      "expected_size": 895,
+      "digest": "6ae8305bb19fc0c6b4ddb4aa3886cb5090940fc6d4cabe2153809e4ed60a0e2a",
+      "weight": 77
+    },
+    {
+      "money": 308238193528,
+      "total_money": 8452017932032,
+      "expected_size": 2088,
+      "digest": "f07f1b2ace3ca91a4eb5c2f8580819da04d02c41770c01746de44f3db6e3402e",
+      "weight": 90
+    },
+    {
+      "money": 516496209043,
+      "total_money": 10097154481053,
+      "expected_size": 2693,
+      "digest": "27ec097710954f42158bdba66d4814c064b4112538676095467c89ba98e6a543",
+      "weight": 126
+    },
+    {
+      "money": 734572741243,
+      "total_money": 7956818642459,
+      "expected_size": 182,
+      "digest": "758d70cf84765f4e5d3ceefc1c02181f570f44fcd629f08dc1ef53c9ae0d8869",
+      "weight": 16
+    },
+    {
+      "money": 40388692286,
+      "total_money": 7796202917409,
+      "expected_size": 499,
+      "digest": "fe67fdc7a2c6d2e2ef6e6431d5f5ad0489078dc61f46494dccf403dad7f09417",
+      "weight": 7
+    },
+    {
+      "money": 388988336742,
+      "total_money": 3357701254813,
+      "expected_size": 855,
+      "digest": "0d2cc04dad86d2053d5d25b014e3d8b64322cdcb5004faa46cfa2d6ad2ff933b",
+      "weight": 83
+    },
+    {
+      "money": 207942182956,
+      "total_money": 7311476791236,
+      "expected_size": 334,
+      "digest": "c3bd9a5a743f841753ba7c27f3619f387b6b1a6cb9c1dc227674aa020724d137",
+      "weight": 12
+    },
+    {
+      "money": 611265847103,
+      "total_money": 5896159365571,
+      "expected_size": 1139,
+      "digest": "dac150ca3a8f99cc1e4953365e4299565e108535b1f62e1d4ba18e17a5216441",
+      "weight": 130
+    },
+    {
+      "money": 384566776724,
+      "total_money": 10098229487867,
+      "expected_size": 984,
+      "digest": "8bfd1a937fb75c4bf02786e1faf4b610cd1377fbb9ae180655a0abefbad700c0",
+      "weight": 38
+    },
+    {
+      "money": 407084704522,
+      "total_money": 631596883373,
+      "expected_size": 2542,
+      "digest": "5f96eb9654ab94913dda503a50f9e773842f4d2a5faa60869bf365830511f2ed",
+      "weight": 1625
+    },
+    {
+      "money": 253887740107,
+      "total_money": 6431604895705,
+      "expected_size": 1230,
+      "digest": "edd03e4599d116f8d2fd93b2aed55b7d44b5b054f3f38e788e4fdf36e591568c",
+      "weight": 59
+    },
+    {
+      "money": 785452671065,
+      "total_money": 4340073149340,
+      "expected_size": 2881,
+      "digest": "41d1052cad0f1adb7efb087a5604e9e22b4d54db40bcbc6e272ff5eaddfc1471",
+      "weight": 506
+    },
+    {
+      "money": 541737579488,
+      "total_money": 7332353799605,
+      "expected_size": 1888,
+      "digest": "459ea2510be92843487a4eb8111c79a6f0195fc38ad6aee93c1df2b5897eaa38",
+      "weight": 132
+    },
+    {
+      "money": 452196668130,
+      "total_money": 3049207919562,
+      "expected_size": 1232,
+      "digest": "ad8f47ab2f65e34d31f24d6f56ee85092314a4d7656205c15322f1c97613c079",
+      "weight": 189
+    },
+    {
+      "money": 631056849026,
+      "total_money": 5413578847366,
+      "expected_size": 1617,
+      "digest": "eadb1c2c34b512c403c128ee19030a6226517b805a072512a5e4cd274b7fd1fa",
+      "weight": 208
+    },
+    {
+      "money": 465938077493,
+      "total_money": 5930318974667,
+      "expected_size": 578,
+      "digest": "23f8300510352da0f6c31203a09d1f2329651bb3ab3984ab591f2247e71cd448",
+      "weight": 38
+    },
+    {
+      "money": 178018016660,
+      "total_money": 742301969137,
+      "expected_size": 2150,
+      "digest": "d405ff4b5999a86f52f3259b452909b57937d85364d6c23deb4f14e0d9fcee91",
+      "weight": 537
+    },
+    {
+      "money": 611234327373,
+      "total_money": 7435142489539,
+      "expected_size": 2993,
+      "digest": "84df594e53322471a410cdb3fd88e48b2e7eb7ae5dae994cb5eae3eaf21cf900",
+      "weight": 247
+    },
+    {
+      "money": 461632577654,
+      "total_money": 796651892712,
+      "expected_size": 1383,
+      "digest": "5db560d6d22efd527d9c42105b851639f09ea70533d26fc60cbeb4b76ed554fc",
+      "weight": 792
+    },
+    {
+      "money": 889239914402,
+      "total_money": 6499687614980,
+      "expected_size": 2543,
+      "digest": "9917114c624dc86ace38e67bff2a60e5b2a6c20723c1b9f003e115b304c02379",
+      "weight": 352
+    },
+    {
+      "money": 333966407344,
+      "total_money": 1869850998525,
+      "expected_size": 2933,
+      "digest": "2448794546680b14c176c327fdfb1ee21962c0006b7deb4e5de87db21989d13c",
+      "weight": 499
+    },
+    {
+      "money": 909488726615,
+      "total_money": 1342564114949,
+      "expected_size": 1195,
+      "digest": "3a7f814037798cc5e10a63de027477decdeb8a8e0c279299272490106ddf8683",
+      "weight": 788
+    },
+    {
+      "money": 559445812070,
+      "total_money": 3807682424781,
+      "expected_size": 1452,
+      "digest": "126f60d31d733a5e643b7c46976647d1c1d3f8f6237c6218fa86fb47080b1f79",
+      "weight": 192
+    },
+    {
+      "money": 972396726669,
+      "total_money": 1012230505736,
+      "expected_size": 2248,
+      "digest": "6b524bde1c5b7456255fb214c3f74907b7ce1cba94210b78b5e68f049fcb002b",
+      "weight": 2150
+    },
+    {
+      "money": 357870097629,
+      "total_money": 2337809114553,
+      "expected_size": 2486,
+      "digest": "96a5d36f104255761aee1b8a232d703585dd276ee1f43c8cd7e92a993eb15107",
+      "weight": 385
+    },
+    {
+      "money": 950954975299,
+      "total_money": 7911469479884,
+      "expected_size": 2018,
+      "digest": "d02f59ba75f8ca86d0ce46a278a45f5517bff2c049cc959a227dcdd3aca677e9",
+      "weight": 256
+    },
+    {
+      "money": 35612984008,
+      "total_money": 2846380704525,
+      "expected_size": 1168,
+      "digest": "6ce8421422683dd6081af95e16f248ab03da494112449ce7bdace6c988292f95",
+      "weight": 14
+    },
+    {
+      "money": 456411459044,
+      "total_money": 6368358548307,
+      "expected_size": 1060,
+      "digest": "699bb5e4d94f34bdf631b4af1146afe34ea988fc953e71fc21ce60b396231300",
+      "weight": 74
+    },
+    {
+      "money": 538721505001,
+      "total_money": 9091604684742,
+      "expected_size": 726,
+      "digest": "0ffd12576f3fbb9a8e05883ccc51c9a1269b6d8e9d27123dce5d0bd6db649c6f",
+      "weight": 33
+    },
+    {
+      "money": 757809785840,
+      "total_money": 2495418869050,
+      "expected_size": 1577,
+      "digest": "ea06b4e4fe2bf59e6e1b6e310610ea4881206262be76120d6c97db969e003947",
+      "weight": 509
+    },
+    {
+      "money": 532820442175,
+      "total_money": 4075378192980,
+      "expected_size": 1418,
+      "digest": "46277e18cd8917c48a776c9de627b6656203b522c60e97cc61914621c5642439",
+      "weight": 177
+    },
+    {
+      "money": 201219687790,
+      "total_money": 2695257227285,
+      "expected_size": 153,
+      "digest": "13ae64317ae5d5e338c68691bea8fa1fd469b7b54d0fccd730c1284ec7e6fccd",
+      "weight": 7
+    },
+    {
+      "money": 231310545341,
+      "total_money": 1089188610012,
+      "expected_size": 575,
+      "digest": "ec800b8fa67e2308e296b334c85f7097edc16927c2451c4cd7e53f239aa4f4c8",
+      "weight": 138
+    },
+    {
+      "money": 128358804812,
+      "total_money": 7498187701279,
+      "expected_size": 509,
+      "digest": "3241f24b099d0b674bd614fad307d9b9440adab32117f0f15b1450277b00eb36",
+      "weight": 6
+    },
+    {
+      "money": 33071312548,
+      "total_money": 3777245429294,
+      "expected_size": 1794,
+      "digest": "6e0260fca84ea3195edbb54c970b77e090b644942d43fe8c4546a158bad76202",
+      "weight": 15
+    },
+    {
+      "money": 767326702542,
+      "total_money": 1565269578717,
+      "expected_size": 2163,
+      "digest": "17015d6eeb84cbccbd3fffa63bde89f33691f5db2dea41e1e608af3ff39f3a69",
+      "weight": 1017
+    },
+    {
+      "money": 622875696729,
+      "total_money": 9958220872745,
+      "expected_size": 1770,
+      "digest": "88dba204fcf2e8bd89fa9844f8061d462e28f174489e75140f84e842040141cc",
+      "weight": 111
+    },
+    {
+      "money": 113855665316,
+      "total_money": 1165363403733,
+      "expected_size": 796,
+      "digest": "3004340bdfe60062f17c53f3c9005b9995a0feb49f6bef8eaff80f4feb7ef3f2",
+      "weight": 70
+    },
+    {
+      "money": 692877958753,
+      "total_money": 6335252838802,
+      "expected_size": 840,
+      "digest": "1817339df022b6c82bb752bc21e3d8379be31328aa32edc11efc8a4b4b3f370e",
+      "weight": 79
+    },
+    {
+      "money": 409540239187,
+      "total_money": 9747463558506,
+      "expected_size": 1149,
+      "digest": "e8c870cd281d4c29910f8feb7557bfffcfe7428b4703144bd6d7fe5b3f5de748",
+      "weight": 58
+    },
+    {
+      "money": 881033925917,
+      "total_money": 8906601063540,
+      "expected_size": 1103,
+      "digest": "9185be36b0b908a38409f1a2dc202fc285610765e4c86414692bf4bde20ed899",
+      "weight": 111
+    },
+    {
+      "money": 150091347568,
+      "total_money": 3330679064104,
+      "expected_size": 1955,
+      "digest": "e97727b7eadd5ce0d234049017795f2e5a7569d7ad323c50a5b11703374174a9",
+      "weight": 101
+    },
+    {
+      "money": 997330334645,
+      "total_money": 3000861655161,
+      "expected_size": 2891,
+      "digest": "97fd3db506e28d24f6c55544cb3980a36e86747adc89ebad78d1630618d113fa",
+      "weight": 968
+    },
+    {
+      "money": 534997005833,
+      "total_money": 9550593211557,
+      "expected_size": 2254,
+      "digest": "445f8625fcec717b87a65fa0221a3aa8143062d77588168019454240ae3d3764",
+      "weight": 119
+    },
+    {
+      "money": 890933247482,
+      "total_money": 4140213449345,
+      "expected_size": 881,
+      "digest": "8ec242008226d1c6aea7f0846e12ce2d316e80da522343264ec9451ec23aaaa3",
+      "weight": 191
+    },
+    {
+      "money": 220791404896,
+      "total_money": 3995370423019,
+      "expected_size": 2947,
+      "digest": "67d64034996778affa9ee962e7dfef5e70d933d4309f0f343e96061b91b11ac3",
+      "weight": 160
+    },
+    {
+      "money": 164427198438,
+      "total_money": 2241998704475,
+      "expected_size": 591,
+      "digest": "80a9675e17a97735d1144348e22be5b75724d8f125e99c4cb4e9c3a1f0b4e9da",
+      "weight": 43
+    },
+    {
+      "money": 670949841970,
+      "total_money": 8484360816469,
+      "expected_size": 978,
+      "digest": "5146afa6ab20ee494c6ae4c2c6f17af6b53b61d2947d83a18eb3b8a1612aad5d",
+      "weight": 73
+    },
+    {
+      "money": 696646903796,
+      "total_money": 1679676486228,
+      "expected_size": 2425,
+      "digest": "3ea7e8e35fe2fcd42db820349bdf9157dcc00d9f9ed9c099b10c7194d48b623b",
+      "weight": 984
+    },
+    {
+      "money": 854870184465,
+      "total_money": 8367166405147,
+      "expected_size": 2956,
+      "digest": "0dbd84d922f85b6021b28aacc5264fe9e83deb48f18f864cbd367eb163d39c45",
+      "weight": 274
+    },
+    {
+      "money": 634949244249,
+      "total_money": 6273876403168,
+      "expected_size": 108,
+      "digest": "b0eb9073e25b1cbde9f35ba7c47292a4fd49e7def7a28824f3dfda259a86c3de",
+      "weight": 12
+    },
+    {
+      "money": 657798371447,
+      "total_money": 6329975030687,
+      "expected_size": 2128,
+      "digest": "b7e2da420f32ed5c94bc12a34dc68eb99257a7ea03b69d6c760b0681fa24e4ca",
+      "weight": 230
+    },
+    {
+      "money": 489818652319,
+      "total_money": 7362426986468,
+      "expected_size": 1664,
+      "digest": "97b7c3111c750d176b432735868208f40de7137331b544f2d28040a3581d195e",
+      "weight": 113
+    },
+    {
+      "money": 377548101079,
+      "total_money": 767616285578,
+      "expected_size": 2056,
+      "digest": "82811c945c3ff13c660936a5ddb29a0ae791fbf52c2f697bd334653f3605b362",
+      "weight": 1012
+    },
+    {
+      "money": 21132835385,
+      "total_money": 1408440042274,
+      "expected_size": 352,
+      "digest": "d91cc5b934585dd8d5adc80d573fdd194b2eae26dfc49f5e51c1f1607d7e8774",
+      "weight": 8
+    },
+    {
+      "money": 633983163316,
+      "total_money": 5687453463652,
+      "expected_size": 1306,
+      "digest": "0702f244bf2007a1e00e39c757f064518953f55621f955986f63d115b6ac998a",
+      "weight": 123
+    },
+    {
+      "money": 86688851293,
+      "total_money": 2956891465393,
+      "expected_size": 2162,
+      "digest": "65f7a757857e7eb43839a6d7616b8a7b1fb7144817904342a9bd341670511629",
+      "weight": 61
+    },
+    {
+      "money": 355566919748,
+      "total_money": 3943434210757,
+      "expected_size": 2093,
+      "digest": "41a6b1b8b3f1ff5b21f2485d9c86241fb56cdd6796245d3112df11ad9a7344db",
+      "weight": 180
+    },
+    {
+      "money": 821183132665,
+      "total_money": 2054616648677,
+      "expected_size": 2990,
+      "digest": "4917183e0b7bb38f2ce2479c28e1d39f67396217a7010448dfd39a4e7f406c8b",
+      "weight": 1175
+    },
+    {
+      "money": 291872222368,
+      "total_money": 4127268707544,
+      "expected_size": 1884,
+      "digest": "d2d804cb826d9ffc20ee0fc43885221a321e3928971bb28615f0d9f099f5b68a",
+      "weight": 144
+    },
+    {
+      "money": 673392086833,
+      "total_money": 1063643089122,
+      "expected_size": 2082,
+      "digest": "80503a910fdb2b5dbb1b9c8cd02a18fd7b5661d2c4d28aa941c50af6655c8266",
+      "weight": 1318
+    },
+    {
+      "money": 31395864307,
+      "total_money": 2740908835759,
+      "expected_size": 2294,
+      "digest": "90373c7a22efb0ef91221e04b4aa8316d4a4ffeaa11909d38cc264650e7ca416",
+      "weight": 27
+    },
+    {
+      "money": 714831884799,
+      "total_money": 7412161477881,
+      "expected_size": 1274,
+      "digest": "835ded09535271e57840380d1fd39a375b3e5513a31a4b80a2dad8731d4fd1ce",
+      "weight": 123
+    },
+    {
+      "money": 32669976884,
+      "total_money": 4463010306793,
+      "expected_size": 2761,
+      "digest": "d5158554f61af2ede73aede97e94b1d1f129aaadf9b53548553cc2304103e245",
+      "weight": 25
+    },
+    {
+      "money": 460459283166,
+      "total_money": 9716860081575,
+      "expected_size": 601,
+      "digest": "b77701f1f1c0ab94010589a4139ff521938b4f0c7bf0986585f535b6e292e5b3",
+      "weight": 31
+    },
+    {
+      "money": 602334096552,
+      "total_money": 801692638995,
+      "expected_size": 1074,
+      "digest": "f335975668f013e9da70b33bd52a72094a8f03762ea7440ce9fcd10e251837cf",
+      "weight": 854
+    },
+    {
+      "money": 15267676722,
+      "total_money": 8649737261964,
+      "expected_size": 1297,
+      "digest": "c9ccc12d2b379665e0e908a88b26e78c9f94f17acefa6d5feb70a7095e0297c5",
+      "weight": 3
+    },
+    {
+      "money": 354610542084,
+      "total_money": 8707323573278,
+      "expected_size": 1165,
+      "digest": "3e091cf98df15d62a2fd97c12ee7b085e57cc46528638defacc1e70c3aceab82",
+      "weight": 43
+    },
+    {
+      "money": 595972612345,
+      "total_money": 1446812637098,
+      "expected_size": 2615,
+      "digest": "a9faa463a554816f1ebac08f30f4c3a93fa85d79b92f0da06348b4f008880fac",
+      "weight": 1091
+    },
+    {
+      "money": 451352823362,
+      "total_money": 10198096777646,
+      "expected_size": 2788,
+      "digest": "2df0f768d8741d8647c67d57ac55f94751389ee466bbd44dbe186f2f38abbc61",
+      "weight": 113
+    },
+    {
+      "money": 910194417630,
+      "total_money": 2837586929471,
+      "expected_size": 781,
+      "digest": "a0610a7e2dcdb10b5d78423285506b42a99b00a4fb7b619b4526bb4ec78299dd",
+      "weight": 255
+    },
+    {
+      "money": 994419219986,
+      "total_money": 4593582277556,
+      "expected_size": 1691,
+      "digest": "01ad894fab8a5e339aa346e4d9952ed62dc083e3b11a823a67f23fec099a033f",
+      "weight": 319
+    },
+    {
+      "money": 605244756493,
+      "total_money": 712331036985,
+      "expected_size": 1433,
+      "digest": "37907686c16521739a95d6c532cc259c497bf397fceaea49cd46b9ad5c1b39a3",
+      "weight": 1190
+    },
+    {
+      "money": 709043808644,
+      "total_money": 6426298516568,
+      "expected_size": 2909,
+      "digest": "6fdd2f26559ededc98f5a34c874cc25621e65ba4852529b5a4e9c1b2bf8e1a8f",
+      "weight": 318
+    },
+    {
+      "money": 373739272217,
+      "total_money": 1158787398644,
+      "expected_size": 2004,
+      "digest": "8ff05a31095b6a33cabe6f4d617b549d28ad1cc4642dac96e0215ee159648160",
+      "weight": 650
+    },
+    {
+      "money": 550210324329,
+      "total_money": 1557804087781,
+      "expected_size": 2998,
+      "digest": "0d363ca90339f2d7ca508b2722d50c08def8a736590fa44855cd9eb9979c7437",
+      "weight": 1006
+    },
+    {
+      "money": 38096891571,
+      "total_money": 7490924045316,
+      "expected_size": 2389,
+      "digest": "83aa26e633b71ad18386dc58c371bdf37b4b3875b98a9423ff3becfc0d0ba2aa",
+      "weight": 12
+    },
+    {
+      "money": 765806758002,
+      "total_money": 4862911500545,
+      "expected_size": 2163,
+      "digest": "ca28f3717306b9729be998cdb2c9d856306c5ae3d89da2cdcef12f86f6110c98",
+      "weight": 355
+    },
+    {
+      "money": 65928034575,
+      "total_money": 7393715490765,
+      "expected_size": 340,
+      "digest": "d8730795ec3ee288acc349887e2e377419bcafa377d0151497b52e4d9cf2a02b",
+      "weight": 5
+    },
+    {
+      "money": 447963692861,
+      "total_money": 9941738278682,
+      "expected_size": 1837,
+      "digest": "c04cc45045c6251f23a510060fee32721872bbc95cd8d400dff00bcac2ecce62",
+      "weight": 89
+    },
+    {
+      "money": 232355396612,
+      "total_money": 2152495556086,
+      "expected_size": 328,
+      "digest": "29c7d7737ded036ff0e9aedf02a2242fd9820be618b9601e73d3ba5d8f1ae980",
+      "weight": 30
+    },
+    {
+      "money": 938760769703,
+      "total_money": 3467790368128,
+      "expected_size": 10,
+      "digest": "5cfd23062517aa49f01233c9c4b79f90fa3d1433d18cdc497914046ad77d2792",
+      "weight": 2
+    },
+    {
+      "money": 685762627198,
+      "total_money": 4279830342278,
+      "expected_size": 1600,
+      "digest": "2588c1f80f1e16a68d9e21db8b53dd316dfa4233cb453a39a90101c60efc0851",
+      "weight": 240
+    },
+    {
+      "money": 269964488046,
+      "total_money": 3906515961866,
+      "expected_size": 2742,
+      "digest": "4a3057db004bdfb5b86968193969392640d832a3387ed4ac9cdab0d2af8fcb51",
+      "weight": 182
+    },
+    {
+      "money": 724432429006,
+      "total_money": 5747850703724,
+      "expected_size": 2547,
+      "digest": "b878c41de28ad6cadf72a49279cffd6dc281c640f2e2944cde49a13ed390da1d",
+      "weight": 331
+    },
+    {
+      "money": 613504645495,
+      "total_money": 4642697516828,
+      "expected_size": 808,
+      "digest": "d92e3011d7cb668ecdb932e1ff3733982c8c460eeeff2bca46c96e8a02cfb55d",
+      "weight": 117
+    },
+    {
+      "money": 899774928899,
+      "total_money": 1746644270774,
+      "expected_size": 2771,
+      "digest": "5136b3f003fab4887dad548de7bfe6488ae55e7a71da4097db03900d4b94e776",
+      "weight": 1409
+    },
+    {
+      "money": 155640204440,
+      "total_money": 6365373159167,
+      "expected_size": 1595,
+      "digest": "a9395334e5a3893976eb1de5864d32e792ac02e68d052d9d0cfc7cfb40b77728",
+      "weight": 41
+    },
+    {
+      "money": 247655828990,
+      "total_money": 3048331706418,
+      "expected_size": 291,
+      "digest": "422f6c26cf68eb8fe350af2c27a6ece2cdf81b94c80e68e8c51106497cfa5171",
+      "weight": 20
+    },
+    {
+      "money": 337749530332,
+      "total_money": 4061192867737,
+      "expected_size": 1290,
+      "digest": "236e46f5b28732b7c750d351a08a507243d8e437cc4bef13a3edaa205fc4e996",
+      "weight": 96
+    },
+    {
+      "money": 201416299541,
+      "total_money": 8191898550235,
+      "expected_size": 996,
+      "digest": "8b4e563fa07a20afc1a3680ef261df6d37b017dee05cfc3a42e4130216e5540c",
+      "weight": 25
+    },
+    {
+      "money": 133103237534,
+      "total_money": 972026208935,
+      "expected_size": 1964,
+      "digest": "f7fcef2b18161a143ddf52fc8e88fa71cbe34c92cd4b5a0adc81e5c33e11d272",
+      "weight": 300
+    },
+    {
+      "money": 950791373626,
+      "total_money": 3978992193858,
+      "expected_size": 2972,
+      "digest": "1bc1b95a8faef22a006ed2da8ab1c08aaed2f56d6f26649036335c0881bfec1e",
+      "weight": 677
+    },
+    {
+      "money": 693898410549,
+      "total_money": 2733962369688,
+      "expected_size": 1524,
+      "digest": "95da8f1df64daf12b81ce23c8813c27fd4551103dc33561c2e8045b6b6770fa0",
+      "weight": 391
+    },
+    {
+      "money": 701252691320,
+      "total_money": 1492033504742,
+      "expected_size": 1713,
+      "digest": "3498fd885964840466176a490e7c513ba5d66090277c1ab1632a995a54f555a4",
+      "weight": 782
+    },
+    {
+      "money": 621915337385,
+      "total_money": 7306016085631,
+      "expected_size": 733,
+      "digest": "521170a0005073340e592e56951ff9652519de4421d9c5b63edbeb30a3852a1e",
+      "weight": 59
+    },
+    {
+      "money": 835251506186,
+      "total_money": 3403520525135,
+      "expected_size": 2942,
+      "digest": "a110f489635d2fb60bff62ba67f52579996af0a1f1a6fbcd8704e119196fcc28",
+      "weight": 731
+    },
+    {
+      "money": 563283034457,
+      "total_money": 5904070597965,
+      "expected_size": 1209,
+      "digest": "9a6db6a41739c26aecfc0f8a707136d81b2827a158fd7386a537514471c213a8",
+      "weight": 118
+    },
+    {
+      "money": 700633735350,
+      "total_money": 9859595906086,
+      "expected_size": 715,
+      "digest": "c8e2b9e1e368e33f126ec40c572e841c2618d49d4eb098b9533b1f4ae00b468d",
+      "weight": 56
+    },
+    {
+      "money": 767222113779,
+      "total_money": 2470151043147,
+      "expected_size": 2695,
+      "digest": "15de8c8a53bac272942cbdf8864f3747ff7f09d8a5a9d8599be7ee1744e5f1fa",
+      "weight": 798
+    },
+    {
+      "money": 136664765787,
+      "total_money": 4653322419924,
+      "expected_size": 165,
+      "digest": "295766c0e0e464971c6282b70d4c0c1fb3b69856b34c089ad2b2c745f5a033ce",
+      "weight": 3
+    },
+    {
+      "money": 437412524935,
+      "total_money": 2472550242377,
+      "expected_size": 2407,
+      "digest": "e1429c072ba69089c938685cb1eab461f05314ad6d06eaa58512f8738bde35b7",
+      "weight": 450
+    },
+    {
+      "money": 213894089291,
+      "total_money": 7714898026468,
+      "expected_size": 1336,
+      "digest": "b15ef359dd2e1fdca390565872251bc6844bc81bda88e115cc2f33e367cb85c0",
+      "weight": 40
+    },
+    {
+      "money": 306292539811,
+      "total_money": 6631402297674,
+      "expected_size": 1615,
+      "digest": "1a91fb07451c74524ec8b4eddbb41ca33dd6e49791875d716a44bec97b7c2d45",
+      "weight": 64
+    },
+    {
+      "money": 600908219878,
+      "total_money": 801263765223,
+      "expected_size": 382,
+      "digest": "46616939ffe35f2fe0bd2de129d1d1856ade975a3281a62965927d8bb695e545",
+      "weight": 276
+    },
+    {
+      "money": 946615603989,
+      "total_money": 10570604981956,
+      "expected_size": 1756,
+      "digest": "14016fcdaf1a702331dda8e678d8f476dcc91698da1688c610ec0cb1d9b8fbcd",
+      "weight": 140
+    },
+    {
+      "money": 475995207529,
+      "total_money": 8814755691639,
+      "expected_size": 2849,
+      "digest": "45dfde6d522dd92f4718cd9f8c649ac226745ca2fa1696442764758f67cd9263",
+      "weight": 146
+    },
+    {
+      "money": 322682057074,
+      "total_money": 2304547022072,
+      "expected_size": 1337,
+      "digest": "50ec7a4e930520d273a69da4ed3a330e532508e26f942961fed0e3efeed52a7b",
+      "weight": 181
+    },
+    {
+      "money": 73169239665,
+      "total_money": 5645267473542,
+      "expected_size": 2173,
+      "digest": "96250dbadc61e302bb5b70adec4505ee66b3a1d1b7bfe9c58b11e53ad556d56e",
+      "weight": 29
+    },
+    {
+      "money": 903157963558,
+      "total_money": 10370011558043,
+      "expected_size": 2133,
+      "digest": "5807017bb30b23963c745d7b4ba1787ceb30728f1762b46f6eaad5064c8029d2",
+      "weight": 180
+    },
+    {
+      "money": 860865285342,
+      "total_money": 10178733853944,
+      "expected_size": 2192,
+      "digest": "9b86e41f3f625cf624b05a48d73cd7783fdf14954a03ec1a930e9a954424eff0",
+      "weight": 189
+    },
+    {
+      "money": 869298313380,
+      "total_money": 1766815730907,
+      "expected_size": 1242,
+      "digest": "30e3f153576595c793adfe0181050df8b845ce648a66df532f78b10c83ecc863",
+      "weight": 589
+    },
+    {
+      "money": 587658307798,
+      "total_money": 3198086455268,
+      "expected_size": 1059,
+      "digest": "74fb121534b47d16f75b55fdc2a5e2e6799f8a2f8000d4292282e56863ae422a",
+      "weight": 193
+    },
+    {
+      "money": 521326340098,
+      "total_money": 10515056883552,
+      "expected_size": 355,
+      "digest": "5779900a0e40b983381e9b8d35a26abe30242c45662eebb157e6d7a8a5519de6",
+      "weight": 16
+    },
+    {
+      "money": 276814086576,
+      "total_money": 5563963303698,
+      "expected_size": 85,
+      "digest": "c4f5baa36fce3618b6a331f1e8bdd62148954fcf0846afeeb0a6cadb495c909a",
+      "weight": 6
+    },
+    {
+      "money": 996464904668,
+      "total_money": 8257566193031,
+      "expected_size": 2011,
+      "digest": "7fe671c1a3d82bf7b776208013fc8adabaefb11719f7a7e6cb0b92d4cc39b403",
+      "weight": 242
+    },
+    {
+      "money": 404432217348,
+      "total_money": 6185953759074,
+      "expected_size": 1873,
+      "digest": "ceb56bd806cb5d8ec8519af8b0aad2eb5fae2972c603ed35ff8e46644803fc04",
+      "weight": 132
+    },
+    {
+      "money": 473403187090,
+      "total_money": 9042578899215,
+      "expected_size": 810,
+      "digest": "2ff810492924c61743da4d241e12b0c519910d4e31de332c2672ea77c9a3d5c6",
+      "weight": 37
+    },
+    {
+      "money": 397680938278,
+      "total_money": 2294035057587,
+      "expected_size": 1217,
+      "digest": "0cd78a35d754b6398aeb9a1a3b12fe411c09e9bfb66416a47dd51cbd29abf8fb",
+      "weight": 187
+    },
+    {
+      "money": 835661696201,
+      "total_money": 8808043857592,
+      "expected_size": 2060,
+      "digest": "bdef36245881fc04a22d9900a246668592ca35cfc3a8faf77da494df65f7d5c3",
+      "weight": 204
+    },
+    {
+      "money": 716461265828,
+      "total_money": 4421956492619,
+      "expected_size": 1635,
+      "digest": "daa129b7cc6efd1259b6819da9544c82728276b324a36121a519aee5ae850738",
+      "weight": 282
+    },
+    {
+      "money": 440921578638,
+      "total_money": 9620205797539,
+      "expected_size": 2727,
+      "digest": "d897bd9e6bc4c325a27d1b457eb6be5c1806cd301c5d874d2e863fb0a01cbd3e",
+      "weight": 136
+    },
+    {
+      "money": 515754081236,
+      "total_money": 5286244206140,
+      "expected_size": 1286,
+      "digest": "1f5b0f9b73821dcfbbfd85bb625b6f75e4dc0ee0292ab4f17daf1d507e6c9736",
+      "weight": 113
+    },
+    {
+      "money": 986935067757,
+      "total_money": 8677572278031,
+      "expected_size": 1834,
+      "digest": "4260480d406beed9b3598c8f8c19d2f8c8b98df24c2500c8ad41cd6ed3f28357",
+      "weight": 199
+    },
+    {
+      "money": 210088245440,
+      "total_money": 2901697370350,
+      "expected_size": 2537,
+      "digest": "37915fa407599ae40a795226513153f86c9b8abe7d8aa6963c995646ec586cbf",
+      "weight": 173
+    },
+    {
+      "money": 387677392167,
+      "total_money": 4431645000903,
+      "expected_size": 1301,
+      "digest": "20a03a698c5e1df67de78891846cb9183a4b112c3bcc17bcaa5fecd6c1dbbf6e",
+      "weight": 102
+    },
+    {
+      "money": 510072435894,
+      "total_money": 664981885026,
+      "expected_size": 1416,
+      "digest": "f8ab647941f2c9a85cb06a969919b16997b0827af8f909c614545f1ad638ebb2",
+      "weight": 1149
+    },
+    {
+      "money": 794833809586,
+      "total_money": 7595739748350,
+      "expected_size": 2755,
+      "digest": "3109f6bab224e5a1d63169ec85fe1c7dd246dbafa6138448420f463d547a41c2",
+      "weight": 273
+    },
+    {
+      "money": 619386238891,
+      "total_money": 9270524411303,
+      "expected_size": 1403,
+      "digest": "454028b7c3bb87680f04f084089bbc8786ee42cf06904d017e405144d2fae141",
+      "weight": 88
+    },
+    {
+      "money": 805051725576,
+      "total_money": 8626276317564,
+      "expected_size": 589,
+      "digest": "599e2b35de6bd7c7b803cf3cf60435e473e3315f02d7292b1c3f5a19c936463c",
+      "weight": 52
+    },
+    {
+      "money": 892696001923,
+      "total_money": 1155188385877,
+      "expected_size": 340,
+      "digest": "c4ccd6b24961a35b574f0439f34ca52a393b2f017d2503ba2018fb4a0991fddc",
+      "weight": 275
+    },
+    {
+      "money": 627980044195,
+      "total_money": 9969879163888,
+      "expected_size": 2356,
+      "digest": "1949a3d48b4834b4312a17e99b3d88827b8d2238bc2b0baf92580ee6c5efe640",
+      "weight": 133
+    },
+    {
+      "money": 859358599582,
+      "total_money": 4691728115719,
+      "expected_size": 2652,
+      "digest": "f2a029a791831cbe4fc92e8f107f2f750c91bcc09f7624fa9a09b49b7712cf5d",
+      "weight": 522
+    },
+    {
+      "money": 119047301016,
+      "total_money": 2837382965603,
+      "expected_size": 1091,
+      "digest": "61b122353f06b8ee98f36c3212493d61ae9ce151cd0453f3075b18a12d7d73da",
+      "weight": 44
+    },
+    {
+      "money": 338984097641,
+      "total_money": 7286700170407,
+      "expected_size": 1505,
+      "digest": "3de7dc2d615a6fefb30c5fd727f964b4065ac9ee252bdd2bcae3e70162fe0e80",
+      "weight": 64
+    },
+    {
+      "money": 4046998468,
+      "total_money": 3267249539536,
+      "expected_size": 2414,
+      "digest": "525822ffb00dc642530fedf355f7188ef01756384760c80afb61ad903d10119a",
+      "weight": 2
+    },
+    {
+      "money": 87095335852,
+      "total_money": 5690441841282,
+      "expected_size": 1264,
+      "digest": "7d615e0ab9d2ac1e4fdc8ec4b907368c004458598efac13dc72751e7faded538",
+      "weight": 19
+    },
+    {
+      "money": 44957389718,
+      "total_money": 1764227282786,
+      "expected_size": 2450,
+      "digest": "e3dc8b16590cc843c867fbe3cf1b4eb146d65339b0b03392259f12627a8e98e8",
+      "weight": 72
+    },
+    {
+      "money": 886577224394,
+      "total_money": 3208764294236,
+      "expected_size": 1731,
+      "digest": "0f48caf4936dfc7e1f68f3bbce61d325b447a8cce7f0fcad28494f2e47dae46b",
+      "weight": 444
+    },
+    {
+      "money": 680701490498,
+      "total_money": 6786189035376,
+      "expected_size": 1615,
+      "digest": "136594b5df20a2cf0cdd755893375b7bb13d914c9a1d1db4a18f8fa36c55e52d",
+      "weight": 144
+    },
+    {
+      "money": 593220238300,
+      "total_money": 3466967870478,
+      "expected_size": 1670,
+      "digest": "035d96d583cda03b966c650c03ae53542e8da1066b68844a7e2280c664415e41",
+      "weight": 249
+    },
+    {
+      "money": 406741354635,
+      "total_money": 1948414984773,
+      "expected_size": 274,
+      "digest": "3f270b1f1223dc316d2d326d57cbd529c88698facdca425e2d5c6b10d7aecae2",
+      "weight": 52
+    },
+    {
+      "money": 347384134465,
+      "total_money": 8400976503374,
+      "expected_size": 314,
+      "digest": "7eadcbefc96dd8bfccbe3b855a96f1fd4913035f817b75954ef1827c7718aab2",
+      "weight": 13
+    },
+    {
+      "money": 811718943605,
+      "total_money": 5826253885487,
+      "expected_size": 629,
+      "digest": "4d353e498c7fbadf4186e7f8fa93bfdf281a49400f877621651b8ba87edda523",
+      "weight": 83
+    },
+    {
+      "money": 638548192867,
+      "total_money": 5098467164083,
+      "expected_size": 669,
+      "digest": "1e80b758564e82d1b2be053380616e98da06f3ef57b570ade17c51da1d602b6e",
+      "weight": 73
+    },
+    {
+      "money": 536466142027,
+      "total_money": 4531944281448,
+      "expected_size": 959,
+      "digest": "bc5a3c935fc699eb5616ccd3cac56b5f8a53ed9e6c47ba896bfefe712004ad90",
+      "weight": 120
+    },
+    {
+      "money": 826491703770,
+      "total_money": 10732597484926,
+      "expected_size": 1324,
+      "digest": "8c12cf6d95a5bd59c9d390c0dd857f6da2b7624787a0bb31908bae84896890b2",
+      "weight": 103
+    },
+    {
+      "money": 14935184048,
+      "total_money": 4193353592043,
+      "expected_size": 435,
+      "digest": "83288874e53ab90c554cc1f1d736acde67aff55007fd4b3becc4d0f3ddd96f10",
+      "weight": 1
+    },
+    {
+      "money": 598609385038,
+      "total_money": 1027853740852,
+      "expected_size": 2199,
+      "digest": "dc75255ca75d9c0462803c9bbffa51441501a03a2fbb2344aa13d27ffb9e9870",
+      "weight": 1320
+    },
+    {
+      "money": 902506268529,
+      "total_money": 8347589635345,
+      "expected_size": 2638,
+      "digest": "ea6bf048b2ec05341e5948cab0af015328b284ae7bd89a5f763ceaf5ca3e647a",
+      "weight": 309
+    },
+    {
+      "money": 859596884786,
+      "total_money": 8056940519538,
+      "expected_size": 2925,
+      "digest": "9f5bffff86beeba5110c79c0215fbe9ac9339a8ac7d41f7488588ab14ac657aa",
+      "weight": 317
+    },
+    {
+      "money": 640276004341,
+      "total_money": 2557450577380,
+      "expected_size": 316,
+      "digest": "f7d5c03a3539cdcf90147550abcb0a722f257e01d38bad47cdd5a64eef43ef4e",
+      "weight": 96
+    }
+  ]
+}
