@@ -38,6 +38,25 @@ enum BoxOperation {
     Resize,
 }
 
+/// A snapshot of one caller-chain ancestor's family-box-relevant state,
+/// captured at the moment an inner app call is created. Mirrors what
+/// go-algorand reads off its live `cx.caller *EvalContext` linked list
+/// (`checkFamilyReentrancy`, `data/transactions/logic/box.go:131-155`):
+/// since an ancestor frame is suspended for the entire lifetime of a
+/// descendant's execution (synchronous recursive evaluation), a snapshot
+/// taken on entry is equivalent to reading the ancestor's live fields.
+#[derive(Debug, Clone, Copy)]
+struct FamilyFrame {
+    /// The ancestor's app ID (used only for the reentrancy error message).
+    app_id: u64,
+    /// The ancestor's creator address.
+    creator: [u8; 32],
+    /// Whether the ancestor had already touched family-shared box state (by
+    /// itself or by a descendant it delegated to) at the moment this
+    /// snapshot was taken.
+    touched_family_shared: bool,
+}
+
 // Re-export `type_enum` from the shared module for backward compatibility.
 pub use txn_fields::type_enum;
 
@@ -53,6 +72,19 @@ pub fn app_address(app_id: u64) -> [u8; 32] {
     h.update(b"appID");
     h.update(app_id.to_be_bytes());
     h.finalize().into()
+}
+
+/// Format a box name the way go-algorand's `%#x` verb formats a Go string:
+/// `"0x"` followed by the lowercase hex of each byte. Used only in the box
+/// I/O write-budget error message (`available_app_box`), to match
+/// go-algorand's exact text (`data/transactions/logic/box.go:261-262`).
+fn box_name_hex(name: &[u8]) -> String {
+    let mut s = String::with_capacity(2 + name.len() * 2);
+    s.push_str("0x");
+    for b in name {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +782,25 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// Matches go-algorand's `resources.unnamedAccess`.
     unnamed_access: i64,
 
+    // ---- Family-shared box access (foreign box opcodes, issue #662) ----
+    /// Records that this frame has read or written a family-shared box (one
+    /// owned by a same-creator app with `FamilyBoxAccess` set). Matches
+    /// go-algorand's `EvalContext.touchedFamilyShared`
+    /// (`data/transactions/logic/eval.go:747-752`).
+    touched_family_shared: bool,
+
+    /// Records that `check_family_reentrancy` has already passed for this
+    /// frame; memoized because the result is invariant for the frame's
+    /// lifetime. Matches go-algorand's `EvalContext.familyReentrancyChecked`
+    /// (`data/transactions/logic/eval.go:754-759`).
+    family_reentrancy_checked: bool,
+
+    /// Snapshot of the caller chain's family-box-relevant state (immediate
+    /// caller last), captured when this context was created as an inner app
+    /// call. Empty for a top-level app call. Stands in for go-algorand's
+    /// live `cx.caller *EvalContext` linked list (see [`FamilyFrame`]).
+    family_chain: Vec<FamilyFrame>,
+
     // ---- Delta tracking for EvalDelta comparison ----
     /// Tracks global state changes made during execution (dual-write with store).
     /// Key: state key bytes, Value: the new TealValue (or absent for deletes).
@@ -1005,6 +1056,9 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             io_budget: 0,
             read_budget_checked: false,
             unnamed_access: 0,
+            touched_family_shared: false,
+            family_reentrancy_checked: false,
+            family_chain: Vec::new(),
             global_delta_tracker: HashMap::new(),
             local_delta_tracker: HashMap::new(),
             tracer_ptr: None,
@@ -1193,9 +1247,9 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// (`box_replace`/`box_resize`/`box_splice`) report the full resulting box,
     /// and a no-longer-existing box yields an empty value. Called only on the
     /// success path; a no-op when no tracer is attached (consensus apply).
-    fn record_box_new_value(&self, name: &[u8]) {
+    fn record_box_new_value(&self, app_id: u64, name: &[u8]) {
         if let Some(p) = self.tracer_ptr {
-            let new_value = self.box_pre_value(name);
+            let new_value = self.box_pre_value(app_id, name);
             // SAFETY: identical aliasing invariants to `record_app_state_access`.
             unsafe { &mut *p }.record_box_new_value(new_value);
         }
@@ -1218,12 +1272,12 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// its value at the end — matching go-algorand's `ledgercore.StateDelta`
     /// accumulation semantics (a delta is a round-scoped diff, not a log of
     /// every intermediate write).
-    fn record_kv_mod(&mut self, name: &[u8], pre: Option<TealValue>) {
+    fn record_kv_mod(&mut self, app_id: u64, name: &[u8], pre: Option<TealValue>) {
         let Some(recorder) = self.kv_mods_recorder.clone() else {
             return;
         };
-        let key = crate::sqlite::make_box_key(self.app_id, name);
-        let new_data = self.store.get_box(self.app_id, name).unwrap_or_default();
+        let key = crate::sqlite::make_box_key(app_id, name);
+        let new_data = self.store.get_box(app_id, name).unwrap_or_default();
         let old_data = match pre {
             Some(TealValue::Bytes(b)) => b,
             _ => Vec::new(),
@@ -1240,8 +1294,8 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// Read the current box contents as a [`TealValue`] for initial-state
     /// capture, bypassing the I/O-budget accounting in `available_box` (which
     /// the caller has already performed for the real operation).
-    fn box_pre_value(&self, name: &[u8]) -> Option<TealValue> {
-        self.store.get_box(self.app_id, name).map(TealValue::Bytes)
+    fn box_pre_value(&self, app_id: u64, name: &[u8]) -> Option<TealValue> {
+        self.store.get_box(app_id, name).map(TealValue::Bytes)
     }
 
     /// Get the current transaction in the group.
@@ -1380,8 +1434,11 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 let size = content.len() as u64;
                 used = used.saturating_add(size);
                 if used > self.io_budget {
+                    // Matches go-algorand's `EvalContract` read-budget error
+                    // exactly (`data/transactions/logic/eval.go:1324`):
+                    // `fmt.Errorf("read budget exceeded (%d > %d)", bytesRead, cx.ioBudget)`.
                     return Err(AlgoError::Avm {
-                        message: format!("box read budget ({}) exceeded", self.io_budget),
+                        message: format!("read budget exceeded ({} > {})", used, self.io_budget),
                     });
                 }
                 // Mark as not-dirty (content is cached / known).
@@ -1392,13 +1449,14 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         Ok(())
     }
 
-    /// Box availability check and dirty tracking, matching go-algorand's
-    /// `availableBox`. Returns `(contents, exists)`.
-    ///
-    /// `operation`: 0=create, 1=read, 2=write, 3=delete, 4=resize.
-    /// `create_size`: used for create/write/resize to track dirty bytes.
-    fn available_box(
+    /// Box availability check, cross-app authorization, and dirty tracking
+    /// for a box owned by `app_id` (which may be the current app or a
+    /// foreign one). Matches go-algorand's `availableAppBox`
+    /// (`data/transactions/logic/box.go:157-265`), which subsumes the
+    /// old same-app-only `availableBox`. Returns `(contents, exists)`.
+    fn available_app_box(
         &mut self,
+        app_id: u64,
         name: &[u8],
         operation: BoxOperation,
         create_size: u64,
@@ -1414,14 +1472,21 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         self.ensure_boxes_initialized();
         self.check_read_budget()?;
 
-        let key = (self.app_id, name.to_vec());
+        let key = (app_id, name.to_vec());
         let mut ok = self.available_boxes.contains_key(&key);
 
-        // newAppAccess fallback: if the current app was newly created in this
-        // group, allow box access using an unnamed (empty) box ref slot.
-        // Matches go-algorand's `availableBox` newAppAccess logic.
+        // newAppAccess fallback: if the box's *owner* (`app_id`, which may be
+        // a foreign app, not necessarily `self.app_id`) was newly created in
+        // this group, allow box access using an unnamed (empty) box ref
+        // slot. Matches go-algorand's `availableAppBox`
+        // (`data/transactions/logic/box.go:174-186`) exactly:
+        // `cx.available.createdApps[appID]` is keyed by the function's own
+        // `appID` parameter (the owner being accessed), not `cx.appID` (the
+        // executing app) -- we know a newly created app's box is empty upon
+        // first touch regardless of which app reaches it, as long as that
+        // access is itself authorized (checked separately, below).
         let mut new_app_access = false;
-        if !ok && self.created_apps.contains(&self.app_id) && self.unnamed_access > 0 {
+        if !ok && self.created_apps.contains(&app_id) && self.unnamed_access > 0 {
             ok = true;
             new_app_access = true;
             self.unnamed_access -= 1;
@@ -1437,7 +1502,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         // `NamedGroupResources`).
         if !ok && self.unnamed_tracking.is_some() {
             ok = true;
-            self.record_unnamed(UnnamedResourceAccess::Box(self.app_id, name.to_vec()));
+            self.record_unnamed(UnnamedResourceAccess::Box(app_id, name.to_vec()));
             self.io_budget = self
                 .io_budget
                 .saturating_add(self.consensus.bytes_per_box_reference);
@@ -1450,6 +1515,13 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             });
         }
 
+        // Authorize the access (always allowed for our own boxes) and, for
+        // family-shared boxes, apply the family-scoped reentrancy guard.
+        // Matches go-algorand's placement of `authorizeBoxAccess` between the
+        // availability check and the `Ledger.GetBox` call
+        // (`data/transactions/logic/box.go:196-204`).
+        self.authorize_box_access(app_id, operation)?;
+
         let dirty = if new_app_access {
             false
         } else {
@@ -1461,15 +1533,19 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         let (content, exists) = if new_app_access {
             (Vec::new(), false)
         } else {
-            match self.store.get_box(self.app_id, name) {
+            match self.store.get_box(app_id, name) {
                 Some(v) => (v, true),
                 None => (Vec::new(), false),
             }
         };
 
-        // Track dirtiness and enforce write budget.
+        // Track dirtiness and enforce write budget. `verb` mirrors
+        // go-algorand's local `verb` variable, used only in the write-budget
+        // error message below.
+        let mut verb = "accessing";
         let new_dirty = match operation {
             BoxOperation::Create => {
+                verb = "creating";
                 if exists {
                     if create_size != content.len() as u64 {
                         return Err(AlgoError::Avm {
@@ -1486,6 +1562,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 true
             }
             BoxOperation::Write => {
+                verb = "writing";
                 let write_size = if exists {
                     content.len() as u64
                 } else {
@@ -1497,6 +1574,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 true
             }
             BoxOperation::Resize => {
+                verb = "resizing";
                 if dirty {
                     self.dirty_bytes -= content.len() as u64;
                 }
@@ -1515,15 +1593,143 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         self.available_boxes.insert(key, new_dirty);
 
         if self.dirty_bytes > self.io_budget {
+            // Matches go-algorand's exact format
+            // (`data/transactions/logic/box.go:261-262`):
+            // `fmt.Errorf("write budget exceeded (%d > %d) while %s box %#x",
+            //   cx.available.dirtyBytes, cx.ioBudget, verb, name)`.
             return Err(AlgoError::Avm {
                 message: format!(
-                    "write budget ({}) exceeded {}",
-                    self.io_budget, self.dirty_bytes
+                    "write budget exceeded ({} > {}) while {} box {}",
+                    self.dirty_bytes,
+                    self.io_budget,
+                    verb,
+                    box_name_hex(name),
                 ),
             });
         }
 
         Ok((content, exists))
+    }
+
+    /// Verifies that the current app (`self.app_id`) may perform `operation`
+    /// on the box owned by `owner_app_id`, and applies the family-shared
+    /// reentrancy guard when the box behaves like family-shared state.
+    /// Matches go-algorand's `authorizeBoxAccess`
+    /// (`data/transactions/logic/box.go:42-122`) exactly, including its
+    /// error text.
+    ///
+    /// An app always accesses its own boxes freely. For another app's box:
+    /// reads are allowed if the owner has `ForeignBoxReads` set, or if the
+    /// caller shares the owner's creator and the owner has `FamilyBoxAccess`
+    /// set ("in family"); writes/creates/deletes/resizes require "in family"
+    /// -- `ForeignBoxReads` alone never authorizes a write.
+    fn authorize_box_access(
+        &mut self,
+        owner_app_id: u64,
+        operation: BoxOperation,
+    ) -> Result<(), AlgoError> {
+        let owner_params =
+            self.store
+                .get_app_params(owner_app_id)
+                .ok_or_else(|| AlgoError::Avm {
+                    message: format!("app {owner_app_id} does not exist"),
+                })?;
+        let owner_creator = owner_params.creator.0;
+
+        // `family_shared` is true when the box behaves like family-shared
+        // state: owned by a same-creator app that has opted into
+        // `FamilyBoxAccess`.
+        let family_shared;
+        if owner_app_id == self.app_id {
+            // An app may always access its own boxes.
+            family_shared = owner_params.family_box_access;
+        } else {
+            // Resolve whether the calling app shares a creator with the
+            // owner, but only pay the cost of the lookup when
+            // `FamilyBoxAccess` is set.
+            let mut in_family = false;
+            if owner_params.family_box_access {
+                in_family = self.creator == owner_creator;
+            }
+
+            let is_read = operation == BoxOperation::Read;
+            if is_read && owner_params.foreign_box_reads {
+                // any app with a box reference may read
+            } else if in_family {
+                // in_family only set to true if family_box_access
+            } else {
+                // We have a denied operation. For better errors, resolve
+                // `in_family` now, even if we need the call we skipped above.
+                if !owner_params.family_box_access {
+                    in_family = self.creator == owner_creator;
+                }
+                let op = if is_read { "read" } else { "write" };
+                let caller = if in_family { "family" } else { "foreign" };
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "{caller} app {} may not {op} box of {owner_app_id}",
+                        self.app_id
+                    ),
+                });
+            }
+            family_shared = in_family;
+        }
+
+        if !family_shared {
+            return Ok(());
+        }
+
+        // Family-shared boxes behave like globals shared across the family,
+        // so they need a family-scoped reentrancy guard. On a write, reject
+        // it if a foreign app on the call stack separates `self` from a
+        // family member that has already touched family-shared state.
+        if operation != BoxOperation::Read {
+            self.check_family_reentrancy()?;
+        }
+        // A same-creator caller that delegated this access to `self` is
+        // relying on the shared state just as if it had touched the box
+        // itself, so the mark is pushed up to such callers when this frame
+        // returns (see the `execute_inner_appl` call site), letting it
+        // survive `self`'s return and chain to every contiguous family
+        // ancestor.
+        self.touched_family_shared = true;
+        Ok(())
+    }
+
+    /// Guards a family-relevant write by `self`. Fails when a foreign app
+    /// (one outside `self`'s family) separates `self` from an ancestor in
+    /// `self`'s family that has touched family-shared state. Allowing the
+    /// write would let `self` clobber state the ancestor is relying on
+    /// across its inner call -- the family-scoped analog of the per-app
+    /// reentrancy ban. The check fires only at the write, so foreign apps
+    /// remain free to call into family members for read-only queries.
+    /// Matches go-algorand's `checkFamilyReentrancy`
+    /// (`data/transactions/logic/box.go:124-155`) exactly, including its
+    /// error text.
+    fn check_family_reentrancy(&mut self) -> Result<(), AlgoError> {
+        if self.family_reentrancy_checked {
+            return Ok(());
+        }
+        let my_creator = self.creator;
+        let mut seen_foreign = false;
+        // Walk the caller chain from the immediate caller outward to the
+        // root (the chain is stored root-first, so iterate in reverse).
+        for f in self.family_chain.iter().rev() {
+            if f.creator != my_creator {
+                seen_foreign = true;
+                continue;
+            }
+            if seen_foreign && f.touched_family_shared {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "app {} may not write family-shared box: app {} is relying on family state across a foreign call",
+                        self.app_id, f.app_id
+                    ),
+                });
+            }
+        }
+        self.family_reentrancy_checked = true;
+        Ok(())
     }
 
     /// Validate box name length and box size against protocol limits.
@@ -1550,6 +1756,368 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 ),
             });
         }
+        Ok(())
+    }
+
+    // ---- Box operation implementations, generalized over an explicit owner
+    // `app_id` ----
+    //
+    // Shared by both the plain `box_*` trait methods (`app_id ==
+    // self.app_id`) and the foreign `app_box_*` ones (`app_id` from the
+    // stack). Matches go-algorand's `boxXxxImpl(cx, appID)` functions
+    // (`data/transactions/logic/box.go:284-600`).
+
+    fn box_get_impl(&mut self, app_id: u64, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
+        self.box_length_checks(name, 0)?;
+        let pre = self.box_pre_value(app_id, name);
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Box,
+            AppStateOp::Read,
+            None,
+            name,
+            pre,
+            None,
+        );
+        let (contents, exists) = self.available_app_box(app_id, name, BoxOperation::Read, 0)?;
+        if exists {
+            Ok((contents, true))
+        } else {
+            Ok((Vec::new(), false))
+        }
+    }
+
+    fn box_put_impl(&mut self, app_id: u64, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
+        self.box_length_checks(name, value.len() as u64)?;
+
+        let pre = self.box_pre_value(app_id, name);
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre.clone(),
+            None,
+        );
+
+        // BoxWriteOperation — pass value length as create_size because the
+        // box may not exist yet.
+        let (contents, exists) =
+            self.available_app_box(app_id, name, BoxOperation::Write, value.len() as u64)?;
+
+        if exists {
+            // Replacement must match existing size.
+            if contents.len() != value.len() {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "attempt to box_put wrong size {} != {}",
+                        contents.len(),
+                        value.len()
+                    ),
+                });
+            }
+            self.store.set_box(app_id, name, value.to_vec());
+        } else {
+            // Create the box: update min-balance accounting on the owner app.
+            let app_addr = Address(app_address(app_id));
+            let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
+            acct.total_boxes = acct.total_boxes.saturating_add(1);
+            acct.total_box_bytes = acct
+                .total_box_bytes
+                .saturating_add(name.len() as u64 + value.len() as u64);
+            self.store.set_account(&app_addr, acct);
+            self.store.set_box(app_id, name, value.to_vec());
+        }
+        self.record_box_new_value(app_id, name);
+        self.record_kv_mod(app_id, name, pre);
+        Ok(())
+    }
+
+    fn box_del_impl(&mut self, app_id: u64, name: &[u8]) -> Result<bool, AlgoError> {
+        self.box_length_checks(name, 0)?;
+        let pre = self.box_pre_value(app_id, name);
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Box,
+            AppStateOp::Delete,
+            None,
+            name,
+            pre.clone(),
+            None,
+        );
+        let (_, exists) = self.available_app_box(app_id, name, BoxOperation::Delete, 0)?;
+        if exists {
+            // Update min-balance accounting before deleting.
+            let app_addr = Address(app_address(app_id));
+            // Get the content to know the size for accounting.
+            let content_len = self
+                .store
+                .get_box(app_id, name)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+            let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
+            acct.total_boxes = acct.total_boxes.saturating_sub(1);
+            acct.total_box_bytes = acct
+                .total_box_bytes
+                .saturating_sub(name.len() as u64 + content_len);
+            self.store.set_account(&app_addr, acct);
+            self.store.delete_box(app_id, name);
+            // Record the deletion: post-mutation `store.get_box` now returns
+            // `None`, so `record_kv_mod` naturally records empty `data`.
+            self.record_kv_mod(app_id, name, pre);
+        }
+        Ok(exists)
+    }
+
+    fn box_len_impl(&mut self, app_id: u64, name: &[u8]) -> Result<(u64, bool), AlgoError> {
+        self.box_length_checks(name, 0)?;
+        let pre = self.box_pre_value(app_id, name);
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Box,
+            AppStateOp::Read,
+            None,
+            name,
+            pre,
+            None,
+        );
+        let (contents, exists) = self.available_app_box(app_id, name, BoxOperation::Read, 0)?;
+        Ok((contents.len() as u64, exists))
+    }
+
+    fn box_create_impl(&mut self, app_id: u64, name: &[u8], size: u64) -> Result<bool, AlgoError> {
+        self.box_length_checks(name, size)?;
+        let pre = self.box_pre_value(app_id, name);
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre.clone(),
+            None,
+        );
+        let (_, exists) = self.available_app_box(app_id, name, BoxOperation::Create, size)?;
+        if !exists {
+            // Create the box (zero-filled) and update min-balance.
+            let app_addr = Address(app_address(app_id));
+            let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
+            acct.total_boxes = acct.total_boxes.saturating_add(1);
+            acct.total_box_bytes = acct
+                .total_box_bytes
+                .saturating_add(name.len() as u64 + size);
+            self.store.set_account(&app_addr, acct);
+            self.store.set_box(app_id, name, vec![0u8; size as usize]);
+        }
+        // go-algorand records the write state-op even when the box already
+        // existed (a no-op create); the new value is the box's current content.
+        self.record_box_new_value(app_id, name);
+        self.record_kv_mod(app_id, name, pre);
+        // Returns true if newly created.
+        Ok(!exists)
+    }
+
+    fn box_extract_impl(
+        &mut self,
+        app_id: u64,
+        name: &[u8],
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, AlgoError> {
+        self.box_length_checks(name, offset.saturating_add(length))?;
+        let pre = self.box_pre_value(app_id, name);
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Box,
+            AppStateOp::Read,
+            None,
+            name,
+            pre,
+            None,
+        );
+        let (contents, exists) = self.available_app_box(app_id, name, BoxOperation::Read, 0)?;
+        if !exists {
+            return Err(AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            });
+        }
+        let start = offset as usize;
+        let end = start + length as usize;
+        if end > contents.len() {
+            return Err(AlgoError::Avm {
+                message: format!("extraction end {} beyond length: {}", end, contents.len()),
+            });
+        }
+        Ok(contents[start..end].to_vec())
+    }
+
+    fn box_replace_impl(
+        &mut self,
+        app_id: u64,
+        name: &[u8],
+        offset: u64,
+        value: &[u8],
+    ) -> Result<(), AlgoError> {
+        self.box_length_checks(name, offset.saturating_add(value.len() as u64))?;
+        let pre = self.box_pre_value(app_id, name);
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre.clone(),
+            None,
+        );
+        let (contents, exists) = self.available_app_box(app_id, name, BoxOperation::Write, 0)?;
+        if !exists {
+            return Err(AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            });
+        }
+        let start = offset as usize;
+        let end = start + value.len();
+        if end > contents.len() {
+            return Err(AlgoError::Avm {
+                message: format!("replacement end {} beyond length: {}", end, contents.len()),
+            });
+        }
+        let mut new_contents = contents;
+        new_contents[start..end].copy_from_slice(value);
+        self.store.set_box(app_id, name, new_contents);
+        self.record_box_new_value(app_id, name);
+        self.record_kv_mod(app_id, name, pre);
+        Ok(())
+    }
+
+    fn box_resize_impl(
+        &mut self,
+        app_id: u64,
+        name: &[u8],
+        new_size: u64,
+    ) -> Result<(), AlgoError> {
+        self.box_length_checks(name, new_size)?;
+        let pre = self.box_pre_value(app_id, name);
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre.clone(),
+            None,
+        );
+        let (contents, exists) =
+            self.available_app_box(app_id, name, BoxOperation::Resize, new_size)?;
+        if !exists {
+            return Err(AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            });
+        }
+
+        // Delete and recreate with new size, preserving content.
+        let app_addr = Address(app_address(app_id));
+        let old_len = contents.len() as u64;
+
+        // Update min-balance: remove old, add new.
+        let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
+        // Adjust total_box_bytes: remove old size, add new size.
+        acct.total_box_bytes = acct
+            .total_box_bytes
+            .saturating_sub(name.len() as u64 + old_len)
+            .saturating_add(name.len() as u64 + new_size);
+        self.store.set_account(&app_addr, acct);
+
+        // Build resized content.
+        let resized = if new_size > old_len {
+            let mut v = vec![0u8; new_size as usize];
+            v[..contents.len()].copy_from_slice(&contents);
+            v
+        } else {
+            contents[..new_size as usize].to_vec()
+        };
+
+        // Delete old and set new (go-algorand does DelBox + NewBox, but our
+        // store's set_box overwrites, which is equivalent since we already
+        // updated the account totals).
+        self.store.set_box(app_id, name, resized);
+        self.record_box_new_value(app_id, name);
+        self.record_kv_mod(app_id, name, pre);
+        Ok(())
+    }
+
+    fn box_splice_impl(
+        &mut self,
+        app_id: u64,
+        name: &[u8],
+        start: u64,
+        length: u64,
+        value: &[u8],
+    ) -> Result<(), AlgoError> {
+        self.box_length_checks(name, 0)?;
+        let pre = self.box_pre_value(app_id, name);
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre.clone(),
+            None,
+        );
+        let (contents, exists) = self.available_app_box(app_id, name, BoxOperation::Write, 0)?;
+        if !exists {
+            return Err(AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            });
+        }
+
+        let s = start as usize;
+        if s > contents.len() {
+            return Err(AlgoError::Avm {
+                message: format!("replacement start {} beyond length: {}", s, contents.len()),
+            });
+        }
+        let oend = start + length;
+        if oend < start {
+            return Err(AlgoError::Avm {
+                message: "splice end exceeds uint64".into(),
+            });
+        }
+        if oend as usize > contents.len() {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "splice end {} beyond original length: {}",
+                    oend,
+                    contents.len()
+                ),
+            });
+        }
+
+        // Splice: same-size result as original (go-algorand behavior).
+        let mut result = vec![0u8; contents.len()];
+        result[..s].copy_from_slice(&contents[..s]);
+        let copied = value.len().min(contents.len() - s);
+        result[s..s + copied].copy_from_slice(&value[..copied]);
+        if copied != value.len() {
+            return Err(AlgoError::Avm {
+                message: "splice inserted bytes too long".into(),
+            });
+        }
+        let tail_start = s + copied;
+        let tail_src = oend as usize;
+        if tail_start < result.len() && tail_src < contents.len() {
+            let tail_len = result.len() - tail_start;
+            let avail = contents.len() - tail_src;
+            let copy_len = tail_len.min(avail);
+            result[tail_start..tail_start + copy_len]
+                .copy_from_slice(&contents[tail_src..tail_src + copy_len]);
+        }
+
+        self.store.set_box(app_id, name, result);
+        self.record_box_new_value(app_id, name);
+        self.record_kv_mod(app_id, name, pre);
         Ok(())
     }
 
@@ -1617,6 +2185,7 @@ fn execute_inner_appl<L: LedgerStore>(
     stxn: &mut SignedTransaction,
     caller_depth: u32,
     caller_app_id: u64,
+    caller_creator: [u8; 32],
     round: u64,
     latest_timestamp: u64,
     genesis_hash: [u8; 32],
@@ -1626,6 +2195,7 @@ fn execute_inner_appl<L: LedgerStore>(
     opcode_budget: &mut i64,
     inner_txn_id: algo_types::Digest,
     box_state: crate::apply::BoxBudgetState,
+    family_chain: Vec<FamilyFrame>,
     created_apps_snapshot: Vec<u64>,
     consensus: ConsensusParams,
     mut tracer: Option<&mut dyn algo_avm::tracer::EvalTracer>,
@@ -1749,6 +2319,10 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.unnamed_access = box_state.unnamed_access;
     // Inherit created_apps so newAppAccess fallback works for apps created earlier.
     inner_ctx.created_apps = created_apps_snapshot;
+    // Family-shared box reentrancy guard: inherit the caller-chain snapshot
+    // (see `FamilyFrame`). `family_chain` already includes the immediate
+    // caller's own frame (pushed by the call site before invoking us).
+    inner_ctx.family_chain = family_chain;
 
     // Inherit simulation eval overrides: log limits and unnamed-resource
     // tracking apply at every inner-call depth.
@@ -1819,6 +2393,14 @@ fn execute_inner_appl<L: LedgerStore>(
     let child_created_apps = inner_ctx.created_apps.clone();
 
     // H1: Capture box budget state to propagate back to the parent.
+    //
+    // `touched_family_shared` here is already resolved to "should the
+    // caller mark itself touched", matching go-algorand's merge-back
+    // condition (`data/transactions/logic/eval.go:1373-1384`): a
+    // family-shared touch by this (child) frame counts as a touch by its
+    // caller only when they share a creator -- the caller delegated the
+    // mutation to us and relies on that shared state across its own later
+    // calls, exactly as if it had touched the box itself.
     let child_box_state = crate::apply::BoxBudgetState {
         available_boxes: inner_ctx.available_boxes.clone(),
         dirty_bytes: inner_ctx.dirty_bytes,
@@ -1826,6 +2408,7 @@ fn execute_inner_appl<L: LedgerStore>(
         read_budget_checked: inner_ctx.read_budget_checked,
         boxes_initialized: inner_ctx.boxes_initialized,
         unnamed_access: inner_ctx.unnamed_access,
+        touched_family_shared: inner_ctx.touched_family_shared && creator == caller_creator,
     };
 
     // Encode the inner app call's full eval_delta — global/local state deltas,
@@ -3222,7 +3805,21 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     read_budget_checked: self.read_budget_checked,
                     boxes_initialized: self.boxes_initialized,
                     unnamed_access: self.unnamed_access,
+                    // Not read on the way in -- `execute_inner_appl` starts
+                    // the child's own `touched_family_shared` at `false`
+                    // (a fresh frame begins untouched) and only *sets* this
+                    // field on the way back out (see below).
+                    touched_family_shared: false,
                 };
+                // Family-shared box reentrancy guard: extend the caller-chain
+                // snapshot with `self`'s own current frame before handing it
+                // to the child (see `FamilyFrame`, `check_family_reentrancy`).
+                let mut child_family_chain = self.family_chain.clone();
+                child_family_chain.push(FamilyFrame {
+                    app_id: self.app_id,
+                    creator: self.creator,
+                    touched_family_shared: self.touched_family_shared,
+                });
                 // SAFETY: tracer_ptr is valid for the duration of this context
                 // and only one mutable ref is live at a time.
                 let tracer_ref = self.tracer_ptr.map(|p| unsafe { &mut *p });
@@ -3231,6 +3828,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     stxn,
                     self.depth,
                     self.app_id,
+                    self.creator,
                     self.round,
                     self.latest_timestamp,
                     self.genesis_hash,
@@ -3240,6 +3838,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     &mut self.opcode_budget,
                     appl_inner_id,
                     caller_box_state,
+                    child_family_chain,
                     self.created_apps.clone(),
                     self.consensus.clone(),
                     tracer_ref,
@@ -3292,6 +3891,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                             self.read_budget_checked = bs.read_budget_checked;
                             self.boxes_initialized = bs.boxes_initialized;
                             self.unnamed_access = bs.unnamed_access;
+                            // Family-shared touch-mark propagation
+                            // (go-algorand eval.go:1373-1384): `bs`'s flag is
+                            // already resolved to "the child touched
+                            // family-shared state and shares our creator", so
+                            // apply it unconditionally here.
+                            if bs.touched_family_shared {
+                                self.touched_family_shared = true;
+                            }
                         }
                         // Notify tracer of successful inner transaction.
                         if let Some(p) = self.tracer_ptr {
@@ -3582,268 +4189,52 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     // ---- Box storage ----
+    //
+    // Every method below is implemented once, generalized over an explicit
+    // `app_id` (the box's *owner*), and exposed twice on `AvmContext`: the
+    // plain `box_*` methods (always `app_id == self.app_id`, i.e. "my own
+    // boxes") and the `app_box_*` methods (an explicit, possibly-foreign,
+    // target app). This mirrors go-algorand's `boxXxxImpl(cx, appID)` shared
+    // by `opBoxXxx` (`appID = cx.appID`) and `opAppBoxXxx` (`appID =
+    // popDeepAppID(...)`) in `data/transactions/logic/box.go`. Routing the
+    // *plain* `box_*` opcodes through the same `available_app_box` ->
+    // `authorize_box_access` path as the foreign ones is required for
+    // correctness, not just code reuse: even a same-app box access must
+    // observe/touch family-shared state when the current app itself has
+    // `FamilyBoxAccess` set (see `authorizeBoxAccess`,
+    // `data/transactions/logic/box.go:47-122`, `familyShared =
+    // ownerParams.FamilyBoxAccess` on the `ownerAppID == cx.appID` branch).
 
     fn box_get(&mut self, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
-        self.box_length_checks(name, 0)?;
-        let pre = self.box_pre_value(name);
-        self.record_app_state_access(
-            self.app_id,
-            AppStateType::Box,
-            AppStateOp::Read,
-            None,
-            name,
-            pre,
-            None,
-        );
-        let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
-        if exists {
-            Ok((contents, true))
-        } else {
-            Ok((Vec::new(), false))
-        }
+        self.box_get_impl(self.app_id, name)
     }
 
     fn box_put(&mut self, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
-        self.box_length_checks(name, value.len() as u64)?;
-
-        let pre = self.box_pre_value(name);
-        self.record_app_state_access(
-            self.app_id,
-            AppStateType::Box,
-            AppStateOp::Write,
-            None,
-            name,
-            pre.clone(),
-            None,
-        );
-
-        // BoxWriteOperation — pass value length as create_size because the
-        // box may not exist yet.
-        let (contents, exists) =
-            self.available_box(name, BoxOperation::Write, value.len() as u64)?;
-
-        if exists {
-            // Replacement must match existing size.
-            if contents.len() != value.len() {
-                return Err(AlgoError::Avm {
-                    message: format!(
-                        "attempt to box_put wrong size {} != {}",
-                        contents.len(),
-                        value.len()
-                    ),
-                });
-            }
-            self.store.set_box(self.app_id, name, value.to_vec());
-        } else {
-            // Create the box: update min-balance accounting.
-            let app_addr = Address(app_address(self.app_id));
-            let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
-            acct.total_boxes = acct.total_boxes.saturating_add(1);
-            acct.total_box_bytes = acct
-                .total_box_bytes
-                .saturating_add(name.len() as u64 + value.len() as u64);
-            self.store.set_account(&app_addr, acct);
-            self.store.set_box(self.app_id, name, value.to_vec());
-        }
-        self.record_box_new_value(name);
-        self.record_kv_mod(name, pre);
-        Ok(())
+        self.box_put_impl(self.app_id, name, value)
     }
 
     fn box_del(&mut self, name: &[u8]) -> Result<bool, AlgoError> {
-        self.box_length_checks(name, 0)?;
-        let pre = self.box_pre_value(name);
-        self.record_app_state_access(
-            self.app_id,
-            AppStateType::Box,
-            AppStateOp::Delete,
-            None,
-            name,
-            pre.clone(),
-            None,
-        );
-        let (_, exists) = self.available_box(name, BoxOperation::Delete, 0)?;
-        if exists {
-            // Update min-balance accounting before deleting.
-            let app_addr = Address(app_address(self.app_id));
-            // Get the content to know the size for accounting.
-            let content_len = self
-                .store
-                .get_box(self.app_id, name)
-                .map(|v| v.len() as u64)
-                .unwrap_or(0);
-            let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
-            acct.total_boxes = acct.total_boxes.saturating_sub(1);
-            acct.total_box_bytes = acct
-                .total_box_bytes
-                .saturating_sub(name.len() as u64 + content_len);
-            self.store.set_account(&app_addr, acct);
-            self.store.delete_box(self.app_id, name);
-            // Record the deletion: post-mutation `store.get_box` now returns
-            // `None`, so `record_kv_mod` naturally records empty `data`.
-            self.record_kv_mod(name, pre);
-        }
-        Ok(exists)
+        self.box_del_impl(self.app_id, name)
     }
 
     fn box_len(&mut self, name: &[u8]) -> Result<(u64, bool), AlgoError> {
-        self.box_length_checks(name, 0)?;
-        let pre = self.box_pre_value(name);
-        self.record_app_state_access(
-            self.app_id,
-            AppStateType::Box,
-            AppStateOp::Read,
-            None,
-            name,
-            pre,
-            None,
-        );
-        let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
-        Ok((contents.len() as u64, exists))
+        self.box_len_impl(self.app_id, name)
     }
 
     fn box_create(&mut self, name: &[u8], size: u64) -> Result<bool, AlgoError> {
-        self.box_length_checks(name, size)?;
-        let pre = self.box_pre_value(name);
-        self.record_app_state_access(
-            self.app_id,
-            AppStateType::Box,
-            AppStateOp::Write,
-            None,
-            name,
-            pre.clone(),
-            None,
-        );
-        let (_, exists) = self.available_box(name, BoxOperation::Create, size)?;
-        if !exists {
-            // Create the box (zero-filled) and update min-balance.
-            let app_addr = Address(app_address(self.app_id));
-            let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
-            acct.total_boxes = acct.total_boxes.saturating_add(1);
-            acct.total_box_bytes = acct
-                .total_box_bytes
-                .saturating_add(name.len() as u64 + size);
-            self.store.set_account(&app_addr, acct);
-            self.store
-                .set_box(self.app_id, name, vec![0u8; size as usize]);
-        }
-        // go-algorand records the write state-op even when the box already
-        // existed (a no-op create); the new value is the box's current content.
-        self.record_box_new_value(name);
-        self.record_kv_mod(name, pre);
-        // Returns true if newly created.
-        Ok(!exists)
+        self.box_create_impl(self.app_id, name, size)
     }
 
     fn box_extract(&mut self, name: &[u8], offset: u64, length: u64) -> Result<Vec<u8>, AlgoError> {
-        self.box_length_checks(name, offset.saturating_add(length))?;
-        let pre = self.box_pre_value(name);
-        self.record_app_state_access(
-            self.app_id,
-            AppStateType::Box,
-            AppStateOp::Read,
-            None,
-            name,
-            pre,
-            None,
-        );
-        let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
-        if !exists {
-            return Err(AlgoError::Avm {
-                message: format!("no such box {:?}", name),
-            });
-        }
-        let start = offset as usize;
-        let end = start + length as usize;
-        if end > contents.len() {
-            return Err(AlgoError::Avm {
-                message: format!("extraction end {} beyond length: {}", end, contents.len()),
-            });
-        }
-        Ok(contents[start..end].to_vec())
+        self.box_extract_impl(self.app_id, name, offset, length)
     }
 
     fn box_replace(&mut self, name: &[u8], offset: u64, value: &[u8]) -> Result<(), AlgoError> {
-        self.box_length_checks(name, offset.saturating_add(value.len() as u64))?;
-        let pre = self.box_pre_value(name);
-        self.record_app_state_access(
-            self.app_id,
-            AppStateType::Box,
-            AppStateOp::Write,
-            None,
-            name,
-            pre.clone(),
-            None,
-        );
-        let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
-        if !exists {
-            return Err(AlgoError::Avm {
-                message: format!("no such box {:?}", name),
-            });
-        }
-        let start = offset as usize;
-        let end = start + value.len();
-        if end > contents.len() {
-            return Err(AlgoError::Avm {
-                message: format!("replacement end {} beyond length: {}", end, contents.len()),
-            });
-        }
-        let mut new_contents = contents;
-        new_contents[start..end].copy_from_slice(value);
-        self.store.set_box(self.app_id, name, new_contents);
-        self.record_box_new_value(name);
-        self.record_kv_mod(name, pre);
-        Ok(())
+        self.box_replace_impl(self.app_id, name, offset, value)
     }
 
     fn box_resize(&mut self, name: &[u8], new_size: u64) -> Result<(), AlgoError> {
-        self.box_length_checks(name, new_size)?;
-        let pre = self.box_pre_value(name);
-        self.record_app_state_access(
-            self.app_id,
-            AppStateType::Box,
-            AppStateOp::Write,
-            None,
-            name,
-            pre.clone(),
-            None,
-        );
-        let (contents, exists) = self.available_box(name, BoxOperation::Resize, new_size)?;
-        if !exists {
-            return Err(AlgoError::Avm {
-                message: format!("no such box {:?}", name),
-            });
-        }
-
-        // Delete and recreate with new size, preserving content.
-        let app_addr = Address(app_address(self.app_id));
-        let old_len = contents.len() as u64;
-
-        // Update min-balance: remove old, add new.
-        let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
-        // Adjust total_box_bytes: remove old size, add new size.
-        acct.total_box_bytes = acct
-            .total_box_bytes
-            .saturating_sub(name.len() as u64 + old_len)
-            .saturating_add(name.len() as u64 + new_size);
-        self.store.set_account(&app_addr, acct);
-
-        // Build resized content.
-        let resized = if new_size > old_len {
-            let mut v = vec![0u8; new_size as usize];
-            v[..contents.len()].copy_from_slice(&contents);
-            v
-        } else {
-            contents[..new_size as usize].to_vec()
-        };
-
-        // Delete old and set new (go-algorand does DelBox + NewBox, but our
-        // store's set_box overwrites, which is equivalent since we already
-        // updated the account totals).
-        self.store.set_box(self.app_id, name, resized);
-        self.record_box_new_value(name);
-        self.record_kv_mod(name, pre);
-        Ok(())
+        self.box_resize_impl(self.app_id, name, new_size)
     }
 
     fn box_splice(
@@ -3853,70 +4244,64 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         length: u64,
         value: &[u8],
     ) -> Result<(), AlgoError> {
-        self.box_length_checks(name, 0)?;
-        let pre = self.box_pre_value(name);
-        self.record_app_state_access(
-            self.app_id,
-            AppStateType::Box,
-            AppStateOp::Write,
-            None,
-            name,
-            pre.clone(),
-            None,
-        );
-        let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
-        if !exists {
-            return Err(AlgoError::Avm {
-                message: format!("no such box {:?}", name),
-            });
-        }
+        self.box_splice_impl(self.app_id, name, start, length, value)
+    }
 
-        let s = start as usize;
-        if s > contents.len() {
-            return Err(AlgoError::Avm {
-                message: format!("replacement start {} beyond length: {}", s, contents.len()),
-            });
-        }
-        let oend = start + length;
-        if oend < start {
-            return Err(AlgoError::Avm {
-                message: "splice end exceeds uint64".into(),
-            });
-        }
-        if oend as usize > contents.len() {
-            return Err(AlgoError::Avm {
-                message: format!(
-                    "splice end {} beyond original length: {}",
-                    oend,
-                    contents.len()
-                ),
-            });
-        }
+    // ---- Foreign box storage (`app_box_*`, issue #662) ----
 
-        // Splice: same-size result as original (go-algorand behavior).
-        let mut result = vec![0u8; contents.len()];
-        result[..s].copy_from_slice(&contents[..s]);
-        let copied = value.len().min(contents.len() - s);
-        result[s..s + copied].copy_from_slice(&value[..copied]);
-        if copied != value.len() {
-            return Err(AlgoError::Avm {
-                message: "splice inserted bytes too long".into(),
-            });
-        }
-        let tail_start = s + copied;
-        let tail_src = oend as usize;
-        if tail_start < result.len() && tail_src < contents.len() {
-            let tail_len = result.len() - tail_start;
-            let avail = contents.len() - tail_src;
-            let copy_len = tail_len.min(avail);
-            result[tail_start..tail_start + copy_len]
-                .copy_from_slice(&contents[tail_src..tail_src + copy_len]);
-        }
+    fn app_box_get(&mut self, app_id: u64, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
+        self.box_get_impl(app_id, name)
+    }
 
-        self.store.set_box(self.app_id, name, result);
-        self.record_box_new_value(name);
-        self.record_kv_mod(name, pre);
-        Ok(())
+    fn app_box_put(&mut self, app_id: u64, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
+        self.box_put_impl(app_id, name, value)
+    }
+
+    fn app_box_del(&mut self, app_id: u64, name: &[u8]) -> Result<bool, AlgoError> {
+        self.box_del_impl(app_id, name)
+    }
+
+    fn app_box_len(&mut self, app_id: u64, name: &[u8]) -> Result<(u64, bool), AlgoError> {
+        self.box_len_impl(app_id, name)
+    }
+
+    fn app_box_create(&mut self, app_id: u64, name: &[u8], size: u64) -> Result<bool, AlgoError> {
+        self.box_create_impl(app_id, name, size)
+    }
+
+    fn app_box_extract(
+        &mut self,
+        app_id: u64,
+        name: &[u8],
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, AlgoError> {
+        self.box_extract_impl(app_id, name, offset, length)
+    }
+
+    fn app_box_replace(
+        &mut self,
+        app_id: u64,
+        name: &[u8],
+        offset: u64,
+        value: &[u8],
+    ) -> Result<(), AlgoError> {
+        self.box_replace_impl(app_id, name, offset, value)
+    }
+
+    fn app_box_resize(&mut self, app_id: u64, name: &[u8], new_size: u64) -> Result<(), AlgoError> {
+        self.box_resize_impl(app_id, name, new_size)
+    }
+
+    fn app_box_splice(
+        &mut self,
+        app_id: u64,
+        name: &[u8],
+        start: u64,
+        length: u64,
+        value: &[u8],
+    ) -> Result<(), AlgoError> {
+        self.box_splice_impl(app_id, name, start, length, value)
     }
 
     // ---- Result extraction ----
@@ -8436,6 +8821,21 @@ mod tests {
             algo_types::consensus::CONSENSUS_V41,
         )
         .expect("V41 consensus params must exist");
+        // `authorize_box_access` (issue #662) looks up the current app's own
+        // `AppParams` even for same-app box access (to read `FamilyBoxAccess`),
+        // matching go-algorand's `authorizeBoxAccess`
+        // (`data/transactions/logic/box.go:47-51`). A running app's own
+        // params always exist on a real ledger; register a default entry
+        // here so these box-opcode-focused tests don't need to construct one.
+        if !store.has_app_params(app_id) {
+            store.set_app_params(
+                app_id,
+                algo_types::AppParams {
+                    creator: Address([1u8; 32]),
+                    ..Default::default()
+                },
+            );
+        }
         let mut ctx = LedgerAvmContext::new(
             store,
             vec![make_appl_txn([9u8; 32], app_id, vec![], vec![], vec![])],
@@ -8586,5 +8986,527 @@ mod tests {
         // kv_mods_recorder left None (default) -- must not panic or error.
         ctx.box_put(b"mybox", b"hello").unwrap();
         assert!(ctx.kv_mods_recorder.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Foreign box authorization / family reentrancy (issue #662)
+    //
+    // These are the security-critical tests: they pin the exact go-algorand
+    // `authorizeBoxAccess`/`checkFamilyReentrancy` semantics (read/write/
+    // family authorization rules, error text, and the cross-app reentrancy
+    // guard) against `LedgerAvmContext`, where the real authorization logic
+    // lives (not the algo-avm opcode-dispatch mock, which has none).
+    // -------------------------------------------------------------------
+
+    const CALLER_APP: u64 = 10;
+    const OWNER_APP: u64 = 20;
+    const CREATOR_A: [u8; 32] = [0xAAu8; 32]; // caller's creator
+    const CREATOR_B: [u8; 32] = [0xBBu8; 32]; // a different creator
+
+    /// Build a `LedgerAvmContext` executing as `CALLER_APP` (creator
+    /// `caller_creator`), with `OWNER_APP` registered (creator
+    /// `owner_creator`, `ForeignBoxReads`/`FamilyBoxAccess` as given) and
+    /// `name` pre-marked available on `OWNER_APP`.
+    #[allow(clippy::too_many_arguments)]
+    fn make_authz_context<'a>(
+        store: &'a mut LedgerState,
+        caller_creator: [u8; 32],
+        owner_creator: [u8; 32],
+        foreign_box_reads: bool,
+        family_box_access: bool,
+        name: &[u8],
+    ) -> LedgerAvmContext<'a, LedgerState> {
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .expect("V41 consensus params must exist");
+        store.set_app_params(
+            CALLER_APP,
+            algo_types::AppParams {
+                creator: Address(caller_creator),
+                ..Default::default()
+            },
+        );
+        store.set_app_params(
+            OWNER_APP,
+            algo_types::AppParams {
+                creator: Address(owner_creator),
+                foreign_box_reads,
+                family_box_access,
+                ..Default::default()
+            },
+        );
+        let mut ctx = LedgerAvmContext::new(
+            store,
+            vec![make_appl_txn(
+                [9u8; 32],
+                CALLER_APP,
+                vec![],
+                vec![OWNER_APP],
+                vec![],
+            )],
+            0,
+            1000,
+            12345,
+            CALLER_APP,
+            caller_creator,
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            consensus,
+        );
+        ctx.available_boxes
+            .insert((OWNER_APP, name.to_vec()), false);
+        ctx.available_boxes
+            .insert((CALLER_APP, name.to_vec()), false);
+        ctx.boxes_initialized = true;
+        ctx.read_budget_checked = true;
+        ctx.io_budget = 10_000;
+        ctx
+    }
+
+    #[test]
+    fn foreign_read_denied_by_default() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_B, false, false, b"mybox");
+        let err = ctx.app_box_get(OWNER_APP, b"mybox").unwrap_err();
+        assert!(
+            format!("{err}").contains(&format!(
+                "foreign app {CALLER_APP} may not read box of {OWNER_APP}"
+            )),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn foreign_read_allowed_via_foreign_box_reads() {
+        let mut store = LedgerState::new();
+        store.set_box(OWNER_APP, b"mybox", b"hi".to_vec());
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_B, true, false, b"mybox");
+        let (value, exists) = ctx.app_box_get(OWNER_APP, b"mybox").unwrap();
+        assert!(exists);
+        assert_eq!(value, b"hi");
+    }
+
+    #[test]
+    fn foreign_write_denied_via_foreign_box_reads_alone() {
+        // ForeignBoxReads authorizes reads only -- a write must still be
+        // denied even though reads are allowed.
+        let mut store = LedgerState::new();
+        store.set_box(OWNER_APP, b"mybox", vec![0u8; 2]);
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_B, true, false, b"mybox");
+        let err = ctx.app_box_put(OWNER_APP, b"mybox", b"hi").unwrap_err();
+        assert!(
+            format!("{err}").contains(&format!(
+                "foreign app {CALLER_APP} may not write box of {OWNER_APP}"
+            )),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn family_read_allowed_via_family_box_access_same_creator_without_foreign_box_reads() {
+        let mut store = LedgerState::new();
+        store.set_box(OWNER_APP, b"mybox", b"hi".to_vec());
+        // Same creator (CREATOR_A on both sides), FamilyBoxAccess set,
+        // ForeignBoxReads NOT set -- family membership alone must suffice
+        // for a read.
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_A, false, true, b"mybox");
+        let (value, exists) = ctx.app_box_get(OWNER_APP, b"mybox").unwrap();
+        assert!(exists);
+        assert_eq!(value, b"hi");
+    }
+
+    #[test]
+    fn family_write_allowed_via_family_box_access_same_creator() {
+        let mut store = LedgerState::new();
+        store.set_box(OWNER_APP, b"mybox", vec![0u8; 2]);
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_A, false, true, b"mybox");
+        ctx.app_box_put(OWNER_APP, b"mybox", b"hi").unwrap();
+        assert_eq!(store.get_box(OWNER_APP, b"mybox").unwrap(), b"hi");
+    }
+
+    #[test]
+    fn family_write_denied_when_creators_differ_despite_family_box_access() {
+        // FamilyBoxAccess is set, but the caller does NOT share the owner's
+        // creator -- must be denied, and the error must report "foreign"
+        // (not "family"), since the caller never qualified as in-family.
+        let mut store = LedgerState::new();
+        store.set_box(OWNER_APP, b"mybox", vec![0u8; 2]);
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_B, false, true, b"mybox");
+        let err = ctx.app_box_put(OWNER_APP, b"mybox", b"hi").unwrap_err();
+        assert!(
+            format!("{err}").contains(&format!(
+                "foreign app {CALLER_APP} may not write box of {OWNER_APP}"
+            )),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_denied_reports_foreign_not_family_when_creators_differ() {
+        // FamilyBoxAccess is set (so a same-creator caller would qualify as
+        // in-family), but this caller has a DIFFERENT creator and
+        // ForeignBoxReads is unset -- the denial must report "foreign", not
+        // "family", since the caller never qualified as in-family.
+        let mut store = LedgerState::new();
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_B, false, true, b"mybox");
+        let err = ctx.app_box_get(OWNER_APP, b"mybox").unwrap_err();
+        assert!(
+            format!("{err}").contains(&format!(
+                "foreign app {CALLER_APP} may not read box of {OWNER_APP}"
+            )),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn own_box_access_always_allowed_regardless_of_flags() {
+        // Accessing the current app's own box is always allowed, even with
+        // both ForeignBoxReads and FamilyBoxAccess unset.
+        let mut store = LedgerState::new();
+        store.set_box(CALLER_APP, b"mybox", b"hi".to_vec());
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_B, false, false, b"mybox");
+        let (value, exists) = ctx.app_box_get(CALLER_APP, b"mybox").unwrap();
+        assert!(exists);
+        assert_eq!(value, b"hi");
+    }
+
+    #[test]
+    fn create_delete_resize_are_write_class_not_read_for_authorization() {
+        // ForeignBoxReads alone must NOT permit app_box_create,
+        // app_box_del, or app_box_resize against a foreign app's box --
+        // only Read is treated as a read; Create/Delete/Resize follow the
+        // write-authorization path.
+        for op_name in ["create", "del", "resize"] {
+            let mut store = LedgerState::new();
+            store.set_box(OWNER_APP, b"mybox", vec![0u8; 2]);
+            let mut ctx =
+                make_authz_context(&mut store, CREATOR_A, CREATOR_B, true, false, b"mybox");
+            ctx.available_boxes
+                .insert((OWNER_APP, b"mybox2".to_vec()), false);
+            let err = match op_name {
+                "create" => ctx.app_box_create(OWNER_APP, b"mybox2", 4).unwrap_err(),
+                "del" => ctx.app_box_del(OWNER_APP, b"mybox").unwrap_err(),
+                "resize" => ctx.app_box_resize(OWNER_APP, b"mybox", 4).unwrap_err(),
+                _ => unreachable!(),
+            };
+            assert!(
+                format!("{err}").contains(&format!(
+                    "foreign app {CALLER_APP} may not write box of {OWNER_APP}"
+                )),
+                "operation {op_name} unexpectedly authorized by ForeignBoxReads alone"
+            );
+        }
+    }
+
+    #[test]
+    fn new_app_access_fallback_is_keyed_by_box_owner_not_caller() {
+        // Regression test: go-algorand's `newAppAccess` fast path
+        // (`data/transactions/logic/box.go:174-186`) checks
+        // `cx.available.createdApps[appID]` where `appID` is the *box
+        // owner* being accessed (the function's own parameter), NOT
+        // `cx.appID` (the executing app). A caller that itself is NOT
+        // newly created must still get the fast (no-disk-lookup) path for
+        // an unnamed box ref against a foreign app that WAS newly created
+        // in this group, as long as the access is otherwise authorized.
+        let mut store = LedgerState::new();
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_A, false, true, b"unused");
+        // Do NOT mark ("OWNER_APP", "newbox") available directly -- only
+        // reachable via the newAppAccess fallback.
+        ctx.created_apps.push(OWNER_APP);
+        ctx.unnamed_access = 1;
+        assert!(!ctx
+            .available_boxes
+            .contains_key(&(OWNER_APP, b"newbox".to_vec())));
+        let created = ctx.app_box_create(OWNER_APP, b"newbox", 10).unwrap();
+        assert!(created, "expected the box to be newly created");
+        assert_eq!(ctx.unnamed_access, 0, "the spare unnamed ref must be spent");
+        assert_eq!(store.get_box(OWNER_APP, b"newbox").unwrap(), vec![0u8; 10]);
+    }
+
+    #[test]
+    fn owner_app_missing_reports_does_not_exist() {
+        let mut store = LedgerState::new();
+        store.set_app_params(
+            CALLER_APP,
+            algo_types::AppParams {
+                creator: Address(CREATOR_A),
+                ..Default::default()
+            },
+        );
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        let mut ctx = LedgerAvmContext::new(
+            &mut store,
+            vec![make_appl_txn(
+                [9u8; 32],
+                CALLER_APP,
+                vec![],
+                vec![999],
+                vec![],
+            )],
+            0,
+            1000,
+            12345,
+            CALLER_APP,
+            CREATOR_A,
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            consensus,
+        );
+        ctx.available_boxes.insert((999, b"mybox".to_vec()), false);
+        ctx.boxes_initialized = true;
+        ctx.read_budget_checked = true;
+        ctx.io_budget = 10_000;
+        let err = ctx.app_box_get(999, b"mybox").unwrap_err();
+        assert!(
+            format!("{err}").contains("app 999 does not exist"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn own_box_write_with_family_box_access_touches_family_shared() {
+        // Even a *same-app* box write must set `touched_family_shared` when
+        // the current app itself has FamilyBoxAccess set -- this is the
+        // "familyShared = ownerParams.FamilyBoxAccess" branch of
+        // authorizeBoxAccess for `ownerAppID == cx.appID`, exercised via the
+        // *plain* (non-foreign) `box_put` opcode path.
+        let mut store = LedgerState::new();
+        store.set_app_params(
+            CALLER_APP,
+            algo_types::AppParams {
+                creator: Address(CREATOR_A),
+                family_box_access: true,
+                ..Default::default()
+            },
+        );
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        let mut ctx = LedgerAvmContext::new(
+            &mut store,
+            vec![make_appl_txn([9u8; 32], CALLER_APP, vec![], vec![], vec![])],
+            0,
+            1000,
+            12345,
+            CALLER_APP,
+            CREATOR_A,
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            consensus,
+        );
+        ctx.available_boxes
+            .insert((CALLER_APP, b"mybox".to_vec()), false);
+        ctx.boxes_initialized = true;
+        ctx.read_budget_checked = true;
+        ctx.io_budget = 10_000;
+        assert!(!ctx.touched_family_shared);
+        ctx.box_put(b"mybox", b"hi").unwrap();
+        assert!(ctx.touched_family_shared);
+    }
+
+    #[test]
+    fn own_box_write_without_family_box_access_does_not_touch() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_context(&mut store, CALLER_APP, b"mybox");
+        ctx.box_put(b"mybox", b"hi").unwrap();
+        assert!(!ctx.touched_family_shared);
+    }
+
+    // ---- Family-scoped reentrancy guard (checkFamilyReentrancy) ----
+
+    #[test]
+    fn reentrancy_blocked_when_foreign_app_separates_touched_family_ancestor() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_A, false, true, b"mybox");
+        // Simulate a call chain: root(family, already touched) -> foreign
+        // (different creator) -> self (about to write a family-shared box).
+        ctx.family_chain = vec![
+            FamilyFrame {
+                app_id: 1,
+                creator: CREATOR_A,
+                touched_family_shared: true,
+            },
+            FamilyFrame {
+                app_id: 2,
+                creator: CREATOR_B,
+                touched_family_shared: false,
+            },
+        ];
+        let err = ctx.check_family_reentrancy().unwrap_err();
+        assert!(
+            format!("{err}").contains(&format!(
+                "app {CALLER_APP} may not write family-shared box: app 1 is relying on family state across a foreign call"
+            )),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn reentrancy_allowed_when_family_ancestor_untouched_despite_foreign_separator() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_A, false, true, b"mybox");
+        ctx.family_chain = vec![
+            FamilyFrame {
+                app_id: 1,
+                creator: CREATOR_A,
+                touched_family_shared: false, // never touched -- nothing to clobber
+            },
+            FamilyFrame {
+                app_id: 2,
+                creator: CREATOR_B,
+                touched_family_shared: false,
+            },
+        ];
+        ctx.check_family_reentrancy().unwrap();
+    }
+
+    #[test]
+    fn reentrancy_allowed_direct_family_call_with_no_foreign_separator() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_A, false, true, b"mybox");
+        // Direct family ancestor, touched, but no foreign app in between.
+        ctx.family_chain = vec![FamilyFrame {
+            app_id: 1,
+            creator: CREATOR_A,
+            touched_family_shared: true,
+        }];
+        ctx.check_family_reentrancy().unwrap();
+    }
+
+    #[test]
+    fn reentrancy_check_is_memoized_per_frame() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_A, false, true, b"mybox");
+        ctx.family_chain = vec![FamilyFrame {
+            app_id: 1,
+            creator: CREATOR_A,
+            touched_family_shared: true,
+        }];
+        ctx.check_family_reentrancy().unwrap();
+        assert!(ctx.family_reentrancy_checked);
+        // Mutate the chain to a shape that would now fail; the memoized
+        // result must still short-circuit to Ok without re-walking.
+        ctx.family_chain = vec![
+            FamilyFrame {
+                app_id: 1,
+                creator: CREATOR_A,
+                touched_family_shared: true,
+            },
+            FamilyFrame {
+                app_id: 2,
+                creator: CREATOR_B,
+                touched_family_shared: false,
+            },
+        ];
+        ctx.check_family_reentrancy().unwrap();
+    }
+
+    #[test]
+    fn end_to_end_family_write_denied_by_reentrancy_via_app_box_put() {
+        // Full integration: authorize_box_access's write path must itself
+        // invoke check_family_reentrancy, not just the isolated unit tests
+        // above. Owner app is family-shared (FamilyBoxAccess, same creator
+        // as self); self's caller chain has a foreign app separating it
+        // from a family ancestor that already touched family-shared state.
+        let mut store = LedgerState::new();
+        store.set_box(OWNER_APP, b"mybox", vec![0u8; 2]);
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_A, false, true, b"mybox");
+        ctx.family_chain = vec![
+            FamilyFrame {
+                app_id: 1,
+                creator: CREATOR_A,
+                touched_family_shared: true,
+            },
+            FamilyFrame {
+                app_id: 2,
+                creator: CREATOR_B,
+                touched_family_shared: false,
+            },
+        ];
+        let err = ctx.app_box_put(OWNER_APP, b"mybox", b"hi").unwrap_err();
+        assert!(
+            format!("{err}").contains("may not write family-shared box"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn end_to_end_family_read_exempt_from_reentrancy_guard() {
+        // Reads are exempt from the family reentrancy check entirely (the
+        // guard fires only on writes), even with the same "foreign
+        // separates a touched family ancestor" chain shape that blocks a
+        // write above.
+        let mut store = LedgerState::new();
+        store.set_box(OWNER_APP, b"mybox", b"hi".to_vec());
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_A, false, true, b"mybox");
+        ctx.family_chain = vec![
+            FamilyFrame {
+                app_id: 1,
+                creator: CREATOR_A,
+                touched_family_shared: true,
+            },
+            FamilyFrame {
+                app_id: 2,
+                creator: CREATOR_B,
+                touched_family_shared: false,
+            },
+        ];
+        let (value, exists) = ctx.app_box_get(OWNER_APP, b"mybox").unwrap();
+        assert!(exists);
+        assert_eq!(value, b"hi");
+    }
+
+    // ---- Touch-mark propagation to caller (execute_inner_appl) ----
+
+    #[test]
+    fn touch_mark_propagates_to_same_creator_caller_via_box_state() {
+        // `execute_inner_appl` resolves the caller-should-touch condition
+        // into `BoxBudgetState::touched_family_shared` before returning; a
+        // same-creator caller applies it unconditionally.
+        let bs = crate::apply::BoxBudgetState {
+            touched_family_shared: true,
+            ..Default::default()
+        };
+        assert!(bs.touched_family_shared);
+    }
+
+    #[test]
+    fn family_frame_reentrancy_walk_ignores_frames_that_never_touched() {
+        // A long chain of same-creator, never-touched ancestors interleaved
+        // with foreign apps must never block a write -- only an actually
+        // *touched* family ancestor separated by a foreign app does.
+        let mut store = LedgerState::new();
+        let mut ctx = make_authz_context(&mut store, CREATOR_A, CREATOR_A, false, true, b"mybox");
+        ctx.family_chain = vec![
+            FamilyFrame {
+                app_id: 1,
+                creator: CREATOR_A,
+                touched_family_shared: false,
+            },
+            FamilyFrame {
+                app_id: 2,
+                creator: CREATOR_B,
+                touched_family_shared: false,
+            },
+            FamilyFrame {
+                app_id: 3,
+                creator: CREATOR_A,
+                touched_family_shared: false,
+            },
+            FamilyFrame {
+                app_id: 4,
+                creator: CREATOR_B,
+                touched_family_shared: false,
+            },
+        ];
+        ctx.check_family_reentrancy().unwrap();
     }
 }

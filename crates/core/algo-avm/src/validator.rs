@@ -126,7 +126,7 @@ fn check_size(
 /// Reject opcodes that are incompatible with the execution mode.
 fn check_mode(program: &Program, mode: Mode) -> Result<(), AlgoError> {
     for instr in &program.instructions {
-        let spec = match opcode::lookup(instr.opcode) {
+        let spec = match opcode::resolve_spec(instr.opcode, instr.sub_opcode) {
             Some(s) => s,
             None => {
                 return Err(AlgoError::Avm {
@@ -182,9 +182,13 @@ fn check_branch_targets(program: &Program) -> Result<(), AlgoError> {
         .instructions
         .last()
         .map(|instr| {
-            // Compute the byte length of this instruction's immediates.
+            // Header is 2 bytes (prefix + sub-opcode) for a multi-byte
+            // "prefix opcode" instruction (e.g. the `app_box_*` family at
+            // 0xd4), 1 byte otherwise -- must match `header_len` in
+            // `opcode::resolve`/`bytecode::parse`.
+            let header_len = if instr.sub_opcode.is_some() { 2 } else { 1 };
             let imm_len = immediate_byte_len(&instr.immediates);
-            instr.offset + 1 + imm_len
+            instr.offset + header_len + imm_len
         })
         .unwrap_or(0);
 
@@ -352,7 +356,7 @@ fn check_stack_depth(program: &Program) -> Result<(), AlgoError> {
     let mut depth: i32 = 0;
 
     for instr in &program.instructions {
-        let spec = match opcode::lookup(instr.opcode) {
+        let spec = match opcode::resolve_spec(instr.opcode, instr.sub_opcode) {
             Some(s) => s,
             None => continue,
         };

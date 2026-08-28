@@ -4251,6 +4251,13 @@ pub struct BoxBudgetState {
     pub boxes_initialized: bool,
     /// Number of unnamed box ref slots available for newly created apps.
     pub unnamed_access: i64,
+    /// Whether the caller should fold this inner call's family-shared-box
+    /// touch mark into its own (issue #662). Already resolved to the
+    /// caller-should-touch condition (child touched family-shared state
+    /// *and* shares the caller's creator) by the point it's set, matching
+    /// go-algorand's merge-back condition
+    /// (`data/transactions/logic/eval.go:1373-1384`).
+    pub touched_family_shared: bool,
 }
 
 #[cfg(test)]

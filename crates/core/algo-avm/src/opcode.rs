@@ -547,12 +547,98 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
     // ---- Poseidon2 hash (v13) ----
     op!(0xe7, "poseidon2", 13, Dynamic, 1, 1, Any, Uint8);
 
+    // ---- Foreign box opcodes (v13, App only, multi-byte prefix 0xd4) ----
+    // Registered below via `APP_BOX_SUB_OPS`; the prefix entry here only
+    // marks byte 0xd4 as a multi-byte family (go-algorand opcodes.go:787-795).
+    table[0xd4] = Some(OpSpec {
+        opcode: 0xd4,
+        name: "app_box",
+        version: FOREIGN_BOX_VERSION,
+        cost: Static(1),
+        stack_pops: 0,
+        stack_pushes: 0,
+        mode: Application,
+        imm: None,
+        sub_opcode: 0,
+        sub_ops: Some(&APP_BOX_SUB_OPS),
+    });
+
     table
+};
+
+/// Sub-opcode table for the `app_box_*` "foreign box" opcode family sharing
+/// prefix byte `0xd4` (go-algorand `opcodes.go:787-795`, `foreignBoxVersion =
+/// 13`). Each opcode is the "foreign" counterpart of an existing `box_*`
+/// opcode, taking an extra leading app-id stack argument (see
+/// `data/transactions/logic/box.go:311-321` `popDeepAppID`).
+static APP_BOX_SUB_OPS: SubOpTable = {
+    const EMPTY: Option<OpSpec> = Option::None;
+    let mut subs: SubOpTable = [EMPTY; MAX_SUB_OPCODES];
+
+    macro_rules! sub_op {
+        ($sub:expr, $name:expr, $pops:expr, $pushes:expr) => {
+            subs[$sub as usize] = Some(OpSpec {
+                opcode: 0xd4,
+                name: $name,
+                version: FOREIGN_BOX_VERSION,
+                cost: CostKind::Static(1),
+                stack_pops: $pops,
+                stack_pushes: $pushes,
+                mode: Mode::Application,
+                imm: ImmKind::None,
+                sub_opcode: $sub,
+                sub_ops: Option::None,
+            });
+        };
+    }
+
+    // proto("iNi:T")   -- app_id, name, size -> created
+    sub_op!(0x01, "app_box_create", 3, 1);
+    // proto("iNii:b")  -- app_id, name, start, length -> bytes
+    sub_op!(0x02, "app_box_extract", 4, 1);
+    // proto("iNib:")   -- app_id, name, start, replacement ->
+    sub_op!(0x03, "app_box_replace", 4, 0);
+    // proto("iN:T")    -- app_id, name -> existed
+    sub_op!(0x04, "app_box_del", 2, 1);
+    // proto("iN:iT")   -- app_id, name -> length, exists
+    sub_op!(0x05, "app_box_len", 2, 2);
+    // proto("iN:bT")   -- app_id, name -> value, exists
+    sub_op!(0x06, "app_box_get", 2, 2);
+    // proto("iNb:")    -- app_id, name, value ->
+    sub_op!(0x07, "app_box_put", 3, 0);
+    // proto("iNiib:")  -- app_id, name, start, length, replacement ->
+    sub_op!(0x08, "app_box_splice", 5, 0);
+    // proto("iNi:")    -- app_id, name, size ->
+    sub_op!(0x09, "app_box_resize", 3, 0);
+
+    subs
 };
 
 /// Look up an opcode spec by its byte value. Returns `None` for undefined opcodes.
 pub fn lookup(byte: u8) -> Option<&'static OpSpec> {
     OPCODE_TABLE[byte as usize].as_ref()
+}
+
+/// Resolve the effective [`OpSpec`] for an already-parsed instruction's
+/// `(opcode, sub_opcode)` pair, following multi-byte "prefix opcode"
+/// dispatch (e.g. the `app_box_*` family at `0xd4`) when `sub_opcode` is
+/// `Some`.
+///
+/// `lookup(opcode_byte)` alone is not enough for a prefix byte: it returns
+/// the synthetic prefix-family entry (whose `name`/`mode`/`stack_pops`/
+/// `stack_pushes` are placeholders, not the real per-sub-opcode values), so
+/// any caller that needs the *actual* opcode's metadata after parsing --
+/// the disassembler's mnemonic, the validator's mode/stack-effect checks --
+/// must resolve through the sub-opcode table instead. This differs from
+/// [`resolve`], which parses a `(prefix_byte, sub_byte)` pair fresh out of
+/// raw program bytes; this function instead re-resolves an already-decoded
+/// [`crate::bytecode::Instruction`]'s two fields.
+pub fn resolve_spec(opcode_byte: u8, sub_opcode: Option<u8>) -> Option<&'static OpSpec> {
+    let top = lookup(opcode_byte)?;
+    match (top.sub_ops, sub_opcode) {
+        (Some(subs), Some(sub)) => subs.get(sub as usize).and_then(|o| o.as_ref()),
+        _ => Some(top),
+    }
 }
 
 /// Resolve the [`OpSpec`] for the instruction starting at `code[pc]`,
@@ -604,12 +690,27 @@ fn resolve_in<'a>(
     }
 }
 
-/// Look up an opcode spec by mnemonic name. Linear scan — use for debugging/tests only.
+/// Look up an opcode spec by mnemonic name. Linear scan — use for debugging/
+/// assembler use. Also searches inside any registered `sub_ops` family (e.g.
+/// `app_box_create`), so the assembler can resolve a sub-opcode's own
+/// two-byte-header spec by its distinct mnemonic, not just the shared prefix
+/// byte's synthetic entry.
 pub fn lookup_by_name(name: &str) -> Option<&'static OpSpec> {
-    OPCODE_TABLE
-        .iter()
-        .filter_map(|o| o.as_ref())
-        .find(|s| s.name == name)
+    for entry in OPCODE_TABLE.iter().filter_map(|o| o.as_ref()) {
+        if entry.name == name {
+            return Some(entry);
+        }
+        if let Some(sub_ops) = entry.sub_ops {
+            if let Some(sub) = sub_ops
+                .iter()
+                .filter_map(|o| o.as_ref())
+                .find(|s| s.name == name)
+            {
+                return Some(sub);
+            }
+        }
+    }
+    None
 }
 
 /// Return all defined opcodes as `(byte, name)` pairs, sorted by byte value.
@@ -917,15 +1018,76 @@ mod tests {
 
     #[test]
     fn test_resolve_against_real_table_no_registered_prefixes_yet() {
-        // Sanity check against the *production* OPCODE_TABLE: as of this
-        // issue, no real opcode registers `sub_ops` (the app_box_* family
-        // lands in the companion issue), so `resolve()` must behave
-        // identically to plain `lookup()` for every currently-defined byte.
+        // Sanity check against the *production* OPCODE_TABLE: every
+        // currently-defined byte other than the `app_box_*` family's prefix
+        // (0xd4, registered in the companion box-opcodes issue) resolves as
+        // an ordinary single-byte opcode.
         for (byte, _) in all_opcodes() {
+            if byte == 0xd4 {
+                // The app_box_* prefix needs a second (sub-opcode) byte.
+                let (spec, len) = resolve(&[byte, 0x01], 0).unwrap();
+                assert_eq!(spec.opcode, byte);
+                assert_eq!(len, 2);
+                assert!(lookup(byte).unwrap().sub_ops.is_some());
+                continue;
+            }
             let (spec, len) = resolve(&[byte], 0).unwrap();
             assert_eq!(spec.opcode, byte);
             assert_eq!(len, 1);
             assert!(spec.sub_ops.is_none());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // app_box_* foreign-box opcode family (prefix byte 0xd4, issue #662).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_app_box_prefix_registered() {
+        let spec = lookup(0xd4).unwrap();
+        assert_eq!(spec.version, FOREIGN_BOX_VERSION);
+        assert_eq!(spec.mode, Mode::Application);
+        assert!(spec.sub_ops.is_some());
+    }
+
+    #[test]
+    fn test_app_box_sub_opcodes_resolve() {
+        let expected = [
+            (0x01u8, "app_box_create", 3i8, 1i8),
+            (0x02, "app_box_extract", 4, 1),
+            (0x03, "app_box_replace", 4, 0),
+            (0x04, "app_box_del", 2, 1),
+            (0x05, "app_box_len", 2, 2),
+            (0x06, "app_box_get", 2, 2),
+            (0x07, "app_box_put", 3, 0),
+            (0x08, "app_box_splice", 5, 0),
+            (0x09, "app_box_resize", 3, 0),
+        ];
+        for (sub, name, pops, pushes) in expected {
+            let (spec, len) = resolve(&[0xd4, sub], 0).unwrap();
+            assert_eq!(spec.name, name, "sub-opcode 0x{sub:02x}");
+            assert_eq!(spec.opcode, 0xd4);
+            assert_eq!(spec.sub_opcode, sub);
+            assert_eq!(spec.version, FOREIGN_BOX_VERSION);
+            assert_eq!(spec.mode, Mode::Application);
+            assert_eq!(spec.imm, ImmKind::None);
+            assert_eq!(spec.stack_pops, pops);
+            assert_eq!(spec.stack_pushes, pushes);
+            assert_eq!(len, 2);
+            // Also reachable by mnemonic (assembler lookup path).
+            assert_eq!(lookup_by_name(name).unwrap().sub_opcode, sub);
+        }
+    }
+
+    #[test]
+    fn test_app_box_missing_sub_opcode_byte() {
+        let err = resolve(&[0xd4], 0).unwrap_err();
+        assert_eq!(err, "prefix opcode 0xd4 missing sub-opcode");
+    }
+
+    #[test]
+    fn test_app_box_improper_sub_opcode() {
+        let err = resolve(&[0xd4, 0x0a], 0).unwrap_err();
+        assert_eq!(err, "prefix opcode 0xd4 with improper sub-opcode 0x0a");
     }
 }

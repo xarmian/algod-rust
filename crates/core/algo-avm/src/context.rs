@@ -498,6 +498,111 @@ pub trait AvmContext {
         })
     }
 
+    // ---- Foreign box storage (`app_box_*`, v5.0.0-stable / foreignBoxVersion) ----
+    //
+    // Each is the "foreign" counterpart of the like-named `box_*` method
+    // above, operating on a box owned by `app_id` rather than the current
+    // app. Matches go-algorand's `boxXxxImpl(cx, popDeepAppID(cx, depth))`
+    // (`data/transactions/logic/box.go:311-599`): the *implementation* is
+    // shared with the plain `box_*` path (both eventually authorize via
+    // `authorizeBoxAccess`/`availableAppBox`); only the target app differs.
+    // Accessing `app_id == current_app_id()` is always allowed, matching
+    // `authorizeBoxAccess`'s "an app may always access its own boxes" rule.
+    // Accessing another app's box additionally requires that app's
+    // `ForeignBoxReads`/`FamilyBoxAccess` `AppParams` flags to permit it (see
+    // `data/transactions/logic/box.go:42-122`).
+
+    /// `app_box_get` (0xd4/0x06): get a box's contents. Returns `(value, exists)`.
+    fn app_box_get(&mut self, app_id: u64, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
+        let _ = (app_id, name);
+        Err(AlgoError::Avm {
+            message: "context unavailable: app_box_get".into(),
+        })
+    }
+
+    /// `app_box_put` (0xd4/0x07): write or create a box on `app_id`.
+    fn app_box_put(&mut self, app_id: u64, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
+        let _ = (app_id, name, value);
+        Err(AlgoError::Avm {
+            message: "context unavailable: app_box_put".into(),
+        })
+    }
+
+    /// `app_box_del` (0xd4/0x04): delete a box on `app_id`. Returns whether it existed.
+    fn app_box_del(&mut self, app_id: u64, name: &[u8]) -> Result<bool, AlgoError> {
+        let _ = (app_id, name);
+        Err(AlgoError::Avm {
+            message: "context unavailable: app_box_del".into(),
+        })
+    }
+
+    /// `app_box_len` (0xd4/0x05): get a box's length on `app_id`. Returns `(length, exists)`.
+    fn app_box_len(&mut self, app_id: u64, name: &[u8]) -> Result<(u64, bool), AlgoError> {
+        let _ = (app_id, name);
+        Err(AlgoError::Avm {
+            message: "context unavailable: app_box_len".into(),
+        })
+    }
+
+    /// `app_box_create` (0xd4/0x01): create a box of the given size on `app_id`.
+    fn app_box_create(&mut self, app_id: u64, name: &[u8], size: u64) -> Result<bool, AlgoError> {
+        let _ = (app_id, name, size);
+        Err(AlgoError::Avm {
+            message: "context unavailable: app_box_create".into(),
+        })
+    }
+
+    /// `app_box_extract` (0xd4/0x02): extract a slice from a box on `app_id`.
+    fn app_box_extract(
+        &mut self,
+        app_id: u64,
+        name: &[u8],
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, AlgoError> {
+        let _ = (app_id, name, offset, length);
+        Err(AlgoError::Avm {
+            message: "context unavailable: app_box_extract".into(),
+        })
+    }
+
+    /// `app_box_replace` (0xd4/0x03): replace bytes within a box on `app_id`.
+    fn app_box_replace(
+        &mut self,
+        app_id: u64,
+        name: &[u8],
+        offset: u64,
+        value: &[u8],
+    ) -> Result<(), AlgoError> {
+        let _ = (app_id, name, offset, value);
+        Err(AlgoError::Avm {
+            message: "context unavailable: app_box_replace".into(),
+        })
+    }
+
+    /// `app_box_resize` (0xd4/0x09): resize a box on `app_id`.
+    fn app_box_resize(&mut self, app_id: u64, name: &[u8], new_size: u64) -> Result<(), AlgoError> {
+        let _ = (app_id, name, new_size);
+        Err(AlgoError::Avm {
+            message: "context unavailable: app_box_resize".into(),
+        })
+    }
+
+    /// `app_box_splice` (0xd4/0x08): splice bytes within a box on `app_id`.
+    fn app_box_splice(
+        &mut self,
+        app_id: u64,
+        name: &[u8],
+        start: u64,
+        length: u64,
+        value: &[u8],
+    ) -> Result<(), AlgoError> {
+        let _ = (app_id, name, start, length, value);
+        Err(AlgoError::Avm {
+            message: "context unavailable: app_box_splice".into(),
+        })
+    }
+
     // ---- Resource availability ----
 
     /// Check if an asset is available (in foreign arrays or created by a prior
