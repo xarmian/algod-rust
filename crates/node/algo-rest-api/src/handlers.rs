@@ -3959,21 +3959,79 @@ pub async fn abort_catchup<N: NodeInterface>(
 }
 
 // ---------------------------------------------------------------------------
-// POST /v2/shutdown  —  Shutdown node (stub)
+// POST /v2/shutdown (deprecated), POST /v2/node/shutdown (canonical)  —
+// Shutdown node (stub)
 // ---------------------------------------------------------------------------
 
 /// Shutdown the node.
 ///
-/// Matches go-algorand's `Handlers.ShutdownNode` which returns 501
-/// "Endpoint not implemented." as plain text via `ctx.String(...)`
-/// (`handlers.go:407`) rather than the JSON error envelope every other
-/// handler uses — `SkipEnvelopeRewrite` opts this response out of the
-/// router's JSON-envelope rewrite so it stays byte-for-byte conformant.
+/// Matches go-algorand's `Handlers.ShutdownNode2` (`handlers.go` ~line 429,
+/// backing the canonical `POST /v2/node/shutdown`) which returns 501
+/// "Endpoint not implemented." as plain text via `ctx.String(...)` rather
+/// than the JSON error envelope every other handler uses —
+/// `SkipEnvelopeRewrite` opts this response out of the router's
+/// JSON-envelope rewrite so it stays byte-for-byte conformant.
+///
+/// The deprecated `POST /v2/shutdown` route is wired to this same handler
+/// (see `router.rs`), mirroring go-algorand's `ShutdownNode` delegating to
+/// `ShutdownNode2` — both routes return byte-identical responses today
+/// since neither is actually implemented upstream yet.
 pub async fn shutdown_node<N: NodeInterface>(State(_node): State<AppState<N>>) -> Response {
     crate::error_envelope::plain_text_response(
         StatusCode::NOT_IMPLEMENTED,
         "Endpoint not implemented.",
     )
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/node/peers  —  Connected peers
+// ---------------------------------------------------------------------------
+
+/// Get information about connected peers.
+///
+/// Matches go-algorand's `Handlers.GetPeers` (`handlers.go:1025`) and its
+/// `convertPeers` helper (`handlers.go:1043`): builds the inbound list, then
+/// appends the outbound list, each individually sorted by network address
+/// ascending (NOT a single sort over the combined list — go sorts inside
+/// each separate `convertPeers` call). Unknown transport types default to
+/// `"ws"`, matching go's `peerStatusNetworkTypes` map fallback.
+pub async fn get_peers<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
+    let (inbound, outbound) = match node.get_peers().await {
+        Ok(peers) => peers,
+        Err(e) => return error::internal_error(format!("failed to get peers: {e}")),
+    };
+
+    let mut peers = convert_peers(inbound, "inbound");
+    peers.extend(convert_peers(outbound, "outbound"));
+
+    let resp = models::GetPeersResponse { peers };
+    match serde_json::to_vec(&resp) {
+        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
+        Err(_) => error::internal_error("failed to encode response"),
+    }
+}
+
+/// Convert a single direction's connected-peer list into API `PeerStatus`
+/// entries, sorted by network address ascending.
+///
+/// Mirrors go-algorand's `convertPeers` (`handlers.go:1043`).
+fn convert_peers(
+    peers: Vec<crate::node::PeerInfo>,
+    connection_type: &str,
+) -> Vec<models::PeerStatus> {
+    let mut statuses: Vec<models::PeerStatus> = peers
+        .into_iter()
+        .map(|p| models::PeerStatus {
+            connection_type: connection_type.to_string(),
+            network_address: p.network_address,
+            network_type: match p.network_type {
+                crate::node::PeerNetworkType::P2p => "p2p".to_string(),
+                crate::node::PeerNetworkType::Ws => "ws".to_string(),
+            },
+        })
+        .collect();
+    statuses.sort_by(|a, b| a.network_address.cmp(&b.network_address));
+    statuses
 }
 
 // ---------------------------------------------------------------------------

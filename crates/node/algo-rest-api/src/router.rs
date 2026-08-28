@@ -205,6 +205,18 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             post(handlers::start_catchup::<N>).delete(handlers::abort_catchup::<N>),
         )
         .route("/v2/shutdown", post(handlers::shutdown_node::<N>))
+        // Canonical route (go-algorand PR #6674); the deprecated
+        // `/v2/shutdown` above delegates to the same stub handler, mirroring
+        // go's `ShutdownNode` -> `ShutdownNode2` relationship.
+        .route("/v2/node/shutdown", post(handlers::shutdown_node::<N>))
+        // go-algorand PR #6674 tags `GetPeers` `private` only (no
+        // `nonparticipating`/`participating` split), so — like
+        // `/v2/shutdown` and `/v2/catchup/*` above — it's registered with
+        // `adminMiddleware` (router.go:144/146), i.e. this repo's admin
+        // group: the admin token only, not the public API token. Peer
+        // network topology is operationally sensitive info, matching go's
+        // own access tier for this endpoint.
+        .route("/v2/node/peers", get(handlers::get_peers::<N>))
         .route(
             "/debug/settings/pprof",
             get(handlers::get_debug_settings_prof::<N>).put(handlers::put_debug_settings_prof::<N>),

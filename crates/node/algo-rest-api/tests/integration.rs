@@ -169,6 +169,12 @@ struct MockNode {
     participation_status: Option<serde_json::Value>,
     /// Prometheus exposition text (None = not participating).
     metrics_exposition: Option<String>,
+    /// Peers result: `(inbound, outbound)`. `None` = use default
+    /// `NotImplemented`.
+    peers_result: Option<(
+        Vec<algo_rest_api::node::PeerInfo>,
+        Vec<algo_rest_api::node::PeerInfo>,
+    )>,
 }
 
 impl Clone for MockNode {
@@ -233,6 +239,7 @@ impl Clone for MockNode {
             set_sync_round_result: self.set_sync_round_result.clone(),
             participation_status: self.participation_status.clone(),
             metrics_exposition: self.metrics_exposition.clone(),
+            peers_result: self.peers_result.clone(),
         }
     }
 }
@@ -347,6 +354,7 @@ impl MockNode {
             // endpoints answer 404 unless a test opts in.
             participation_status: None,
             metrics_exposition: None,
+            peers_result: None,
         }
     }
 
@@ -1152,6 +1160,21 @@ impl NodeInterface for MockNode {
 
     fn latest_round_for_catchup(&self) -> u64 {
         self.latest_round_for_catchup
+    }
+
+    async fn get_peers(
+        &self,
+    ) -> Result<
+        (
+            Vec<algo_rest_api::node::PeerInfo>,
+            Vec<algo_rest_api::node::PeerInfo>,
+        ),
+        NodeError,
+    > {
+        match &self.peers_result {
+            Some(result) => Ok(result.clone()),
+            None => Err(NodeError::NotImplemented("get_peers")),
+        }
     }
 }
 
@@ -7618,6 +7641,197 @@ async fn shutdown_returns_501() {
     assert_eq!(resp.status(), 501);
     let body = resp.text().await.unwrap();
     assert_eq!(body, "Endpoint not implemented.");
+}
+
+#[tokio::test]
+async fn shutdown_node_canonical_route_returns_identical_response() {
+    // go-algorand PR #6674 adds the canonical `POST /v2/node/shutdown`
+    // route (`ShutdownNode2`); the deprecated `/v2/shutdown` delegates to
+    // it. Both are still upstream 501 stubs, so both routes here must
+    // return byte-identical responses (issue #673).
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/node/shutdown"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+    let body = resp.text().await.unwrap();
+    assert_eq!(body, "Endpoint not implemented.");
+}
+
+#[tokio::test]
+async fn shutdown_node_canonical_route_accepts_timeout_query_param() {
+    // Both routes accept the same `timeout` query param (OAS3
+    // `algod.oas3.yml` ~line 5963); the stub ignores it but must not reject
+    // the request for carrying it.
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/node/shutdown?timeout=5"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+}
+
+#[tokio::test]
+async fn shutdown_node_canonical_route_requires_admin_token() {
+    // `/v2/node/shutdown` is tagged `private` upstream (admin-only), same
+    // tier as `/v2/shutdown` and `/v2/catchup/*`.
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/node/shutdown"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// GET /v2/node/peers
+// ===========================================================================
+
+#[tokio::test]
+async fn get_peers_empty() {
+    let mut node = MockNode::synced();
+    node.peers_result = Some((Vec::new(), Vec::new()));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/node/peers"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // Top-level key is capitalized "Peers" per go-algorand's OAS3 schema —
+    // NOT lowercase, unlike the rest of this API's convention.
+    assert_eq!(body["Peers"], serde_json::json!([]));
+    assert!(body.get("peers").is_none());
+}
+
+#[tokio::test]
+async fn get_peers_mixed_inbound_outbound_ws_p2p_sorted() {
+    use algo_rest_api::node::{PeerInfo, PeerNetworkType};
+
+    let mut node = MockNode::synced();
+    node.peers_result = Some((
+        // Inbound: intentionally out of address order to verify sorting.
+        vec![
+            PeerInfo {
+                network_address: "10.0.0.9:4160".to_string(),
+                network_type: PeerNetworkType::Ws,
+            },
+            PeerInfo {
+                network_address: "10.0.0.2:4160".to_string(),
+                network_type: PeerNetworkType::P2p,
+            },
+        ],
+        // Outbound: also out of order.
+        vec![
+            PeerInfo {
+                network_address: "10.0.0.5:4160".to_string(),
+                network_type: PeerNetworkType::P2p,
+            },
+            PeerInfo {
+                network_address: "10.0.0.1:4160".to_string(),
+                network_type: PeerNetworkType::Ws,
+            },
+        ],
+    ));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/node/peers"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let peers = body["Peers"].as_array().unwrap();
+    assert_eq!(peers.len(), 4);
+
+    // Inbound peers come first (sorted by address), then outbound (sorted
+    // by address) — go's `convertPeers` sorts each direction's slice
+    // independently, not the combined list (`handlers.go:1031-1033`).
+    assert_eq!(peers[0]["network-address"], "10.0.0.2:4160");
+    assert_eq!(peers[0]["connection-type"], "inbound");
+    assert_eq!(peers[0]["network-type"], "p2p");
+
+    assert_eq!(peers[1]["network-address"], "10.0.0.9:4160");
+    assert_eq!(peers[1]["connection-type"], "inbound");
+    assert_eq!(peers[1]["network-type"], "ws");
+
+    assert_eq!(peers[2]["network-address"], "10.0.0.1:4160");
+    assert_eq!(peers[2]["connection-type"], "outbound");
+    assert_eq!(peers[2]["network-type"], "ws");
+
+    assert_eq!(peers[3]["network-address"], "10.0.0.5:4160");
+    assert_eq!(peers[3]["connection-type"], "outbound");
+    assert_eq!(peers[3]["network-type"], "p2p");
+}
+
+#[tokio::test]
+async fn get_peers_not_implemented_returns_500() {
+    // Default MockNode has no peers_result configured.
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/node/peers"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+}
+
+#[tokio::test]
+async fn get_peers_requires_admin_token() {
+    // Tagged `private` (admin-only) upstream — the public API token must be
+    // rejected, matching go's `adminMiddleware`-only registration
+    // (router.go:144/146) and this endpoint's sensitivity: it reveals live
+    // peer network topology.
+    let mut node = MockNode::synced();
+    node.peers_result = Some((Vec::new(), Vec::new()));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/node/peers"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn get_peers_rejects_missing_token() {
+    let mut node = MockNode::synced();
+    node.peers_result = Some((Vec::new(), Vec::new()));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/node/peers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
 }
 
 // ===========================================================================
