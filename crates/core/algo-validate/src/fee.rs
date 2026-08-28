@@ -55,15 +55,54 @@ pub fn micros_mul_int(m: u64, i: i64) -> (u64, bool) {
     }
 }
 
+/// Widening 64x64->128 multiply, split into (hi, lo) 64-bit halves. Mirrors
+/// go's `bits.Mul64`. Always exact: the true 128-bit product of two u64
+/// values never exceeds `u128::MAX`.
+fn mul64(a: u64, b: u64) -> (u64, u64) {
+    let full = (a as u128) * (b as u128);
+    ((full >> 64) as u64, full as u64)
+}
+
 /// Mirrors go's `basics.Mul2div(a, b, c, d) (quotient, remainder, overflow)`
-/// (`data/basics/overflow.go`): computes `a*b*c/d` and `a*b*c%d` using a wide
-/// intermediate so the three-factor product never truncates before the
-/// division. Go hand-rolls this with `bits.Mul64`/`bits.Div64` because it
-/// lacks a native 128-bit integer type; Rust's `u128` does this directly.
-/// `overflow` is true only when the quotient itself does not fit in a u64
-/// (the *fee*, not the residue, saturates in that case).
+/// (`data/basics/overflow.go`): computes `a*b*c/d` and `a*b*c%d`.
+///
+/// The three-factor product `a*b*c` can need up to 192 bits (three u64
+/// factors), which does **not** always fit in a `u128`: naively computing
+/// `(a as u128) * (b as u128) * (c as u128)` overflows `u128` (and panics in
+/// debug builds / silently wraps in release) whenever all three factors are
+/// large -- e.g. `a == b == c == u64::MAX` -- which would corrupt the fee
+/// arithmetic below with a wrong, too-small result. So this mirrors go's own
+/// carry-safe construction (`bits.Mul64`/`bits.Div64`, three widening
+/// 64x64->128 multiplies combined via carries) instead, using `u128` in place
+/// of go's `uint64` at each step (Rust's native 128-bit widening multiply
+/// exactly plays the role `bits.Mul64` plays in go): this catches genuine
+/// overflow (the product needs more than ~192 bits of quotient, or the
+/// quotient itself does not fit in a u64) at the same boundary go does,
+/// without ever overflowing an intermediate.
 fn mul2div_u64(a: u64, b: u64, c: u64, d: u128) -> (u64, u128, bool) {
-    let numerator = (a as u128) * (b as u128) * (c as u128);
+    let (x, y) = mul64(a, b); // a*b == x*2^64 + y, exact
+    let (j, k) = mul64(y, c); // y*c == j*2^64 + k, exact
+    let (l, m) = mul64(x, c); // x*c == l*2^64 + m, exact
+    if l > 0 {
+        // a*b*c needs more than ~192 bits' worth of quotient room: no
+        // divisor gets this back down to a single u64 "digit".
+        return (u64::MAX, 0, true);
+    }
+    // j_plus_m is the high 64 bits of (a*b*c) once combined with k as the
+    // low 64 bits, saturated to u64 exactly like go's `AddSaturate(J, M)`.
+    let j_plus_m_wide = (j as u128) + (m as u128);
+    let j_plus_m = if j_plus_m_wide > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        j_plus_m_wide as u64
+    };
+    if d <= j_plus_m as u128 {
+        // Even ignoring the low 64 bits (k), the quotient already needs more
+        // than a u64 can hold.
+        return (u64::MAX, 0, true);
+    }
+    // The exact 128-bit value (j_plus_m : k), safely representable in u128.
+    let numerator = ((j_plus_m as u128) << 64) | (k as u128);
     let quo = numerator / d;
     let rem = numerator % d;
     if quo > u64::MAX as u128 {
@@ -384,6 +423,21 @@ mod tests {
         assert!(!overflow);
         assert_eq!(fee, 0);
         assert_eq!(residue, 0);
+    }
+
+    #[test]
+    fn fee_for_usage_extreme_inputs_do_not_panic_and_report_overflow() {
+        // Regression test: a naive `(a as u128) * (b as u128) * (c as u128)`
+        // implementation of the underlying three-factor multiply overflows
+        // `u128` itself (not just `u64`) when all three factors are large,
+        // which panics in debug builds and silently wraps in release --
+        // exactly the "wrong fee accepted" failure mode this primitive must
+        // never produce. u64::MAX cubed is nowhere near representable, so
+        // this must cleanly report overflow rather than panicking or wrapping
+        // to a small, wrong fee.
+        let (fee, _residue, overflow) = fee_for_usage(u64::MAX, u64::MAX, u64::MAX, 0);
+        assert!(overflow);
+        assert_eq!(fee, u64::MAX);
     }
 
     #[test]
