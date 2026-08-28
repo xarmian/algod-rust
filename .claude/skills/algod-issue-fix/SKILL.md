@@ -84,13 +84,9 @@ If a check fails, read its actual logs (`gh run view <run-id> --log-failed`) bef
 
 ## Creating a new issue (follow-ups, spin-offs, open-topics)
 
-Every issue you file from this workflow — a deferred self-review finding (step 6), an out-of-scope bug, or an open-topics-sweep item (step 9) — must be created with `gh issue create`, never left as a bare comment or TODO. Before running `gh issue create`:
+Every issue you file from this workflow — a deferred self-review finding (step 6), an out-of-scope bug, or an open-topics-sweep item (step 9) — goes through the **`algod-issue-create`** skill, never a bare `gh issue create` improvised inline and never a bare comment or TODO. That skill owns the body template, the mandatory label set, and — critically — deciding whether this issue is parity-related and, if so, running `go-algorand-version-lookup` to attach the correct `algod:<tag>` label(s). Don't skip the lookup because the follow-up "obviously" is or isn't upstream-related; let the skill make that call explicitly.
 
-- **Labels are mandatory, not optional.** Apply the same taxonomy as PRs (step 4): a `phase:<n>` label matching the epic/phase it belongs to, one domain label (`consensus` / `ledger` / `avm` / `networking` / `rest-api` / `sync` / `infrastructure`), and the kind (`bug` / `enhancement` / `conformance` / `documentation` / `testing`). Check `gh label list` if unsure a label exists — don't invent one. Pass them at creation (`gh issue create --label ... --label ...`); an unlabeled issue is not done.
-- **State root cause, not just symptom, in the body.** Don't file "X is broken" — file what you know or suspect about *why*, citing the go-algorand file/function if the investigation already got that far. An issue that only restates the symptom forces the next person to redo the investigation from zero.
-- **Instruct TDD explicitly in the body.** Every new issue's body must tell whoever picks it up to write a failing test that pins the correct behavior *before* touching the fix (mirroring step 2 of this workflow) — don't assume the assignee will independently rediscover this repo's TDD-first culture.
-- **Acceptance criteria as a `- [ ]` checklist** (per step 1) — no issue leaves your hands without them.
-- If the issue belongs to an active version-upgrade epic, insert it into that epic's working plan (per step 9), not just file it loose.
+If the issue belongs to an active version-upgrade epic, insert it into that epic's working plan (per step 9), not just file it loose.
 
 ## When to delegate to a background agent
 

@@ -56,39 +56,16 @@ Also read the upstream release notes for **every** release in the range — not 
 
 ## Stage 3 — Issue creation
 
-One issue per *feature-level* change (group the commits that implement one feature; never one issue per commit — upstream features routinely span several commits, and commit-level issues create artificial ordering problems). For each issue use this template:
+One issue per *feature-level* change (group the commits that implement one feature; never one issue per commit — upstream features routinely span several commits, and commit-level issues create artificial ordering problems). Create each one with the **`algod-issue-create`** skill — it owns the body template and the mandatory label set (`phase:<N>`, domain, effort, kind). Feed it, per issue: the upstream commits/PRs and files from stage 2, the affected algod-rust crates, and `Part of epic #<epic-number>` to insert into the body.
 
-```
-Title: <area>: <what changes> (go-algorand NEW)
+**Upstream-version labeling is where this loop differs from a one-off `algod-issue-create` call**, because stage 2 already enumerated `TAGS_IN_RANGE` and every issue here is parity work by construction — every issue gets at least one `algod:<tag>` label, always including `algod:NEW`. Run `go-algorand-version-lookup` per issue (not once for the whole batch — different issues in the same epic can have different origins) rather than re-deriving the tag logic inline:
 
-## Upstream change
-- go-algorand commits/PRs: <SHAs / PR links from stage 2>
-- Files: <go paths>
-- First released in: <the exact go-algorand tag where this feature first appeared — a beta/rc tag counts as its own release here, not the later stable tag it was folded into>
+- The lookup's `ORIGIN_TAG` is the earliest tag in `TAGS_IN_RANGE` (pre-releases included) whose history contains the change — label `algod:<origin-tag>`. Do not collapse a beta/rc-only feature onto a later stable tag as its *only* label — the origin label is what makes pre-release-exclusive work visible.
+- The lookup's pin-reachability check tells you whether `NEW` also ships the feature (go-algorand's stable release notes typically re-list every change since the last stable, including ones that first landed in an intermediate pre-release). If so, **add `algod:NEW` as a second label** (`gh issue edit <n> --add-label "algod:NEW"`). A feature that reached `NEW` should never end up with only a pre-release label and no `algod:NEW` label — `algod:NEW` is the label a future reader filters by to see "everything that shipped in this pin."
+- The two labels can be identical when the origin tag already *is* `NEW` — the common case for a range with no intermediate pre-release, or for work with no upstream origin at all (the new-scope P2P transport work, labeled by domain/effort only, no `algod:` label needed since it doesn't map to a single upstream commit — `go-algorand-version-lookup` reports this as "not applicable").
+- Create missing `algod:<tag>` labels as needed: `gh label create "algod:<tag>" --description "Introduced in go-algorand <tag>" --color 8250DF`.
 
-## What algod-rust must do
-- Affected crates: <crates>
-- <precise description of the behavior delta, citing the go source>
-
-## Acceptance criteria
-- [ ] TDD: failing test first, pinned to the NEW behavior
-- [ ] Parity: fixtures/oracle comparison against go-algorand NEW where byte-level
-- [ ] `cargo fmt` / `clippy -D warnings` / full workspace suite green
-- [ ] (consensus-critical only) live mixed-cluster verification against NEW Go nodes
-
-Part of epic #<epic-number>.
-```
-
-**Labels are mandatory, on every issue** (`gh label list` for the taxonomy; create missing ones with `gh label create`):
-
-- the new `phase:<N>` label (create it: `gh label create "phase:<N>" --description "Phase <N>: go-algorand NEW parity" --color 0E8A16`),
-- **upstream-version label(s) naming every release that ships the feature** — `algod:<tag>`, one label per applicable tag, and **every issue gets at least one of these labels, always including `algod:NEW`** (create labels per tag in `TAGS_IN_RANGE` as needed: `gh label create "algod:<tag>" --description "Introduced in go-algorand <tag>" --color 8250DF`). Concretely:
-  - Find the feature's true **origin** tag first — the earliest tag in the **full** `TAGS_IN_RANGE` list (pre-releases included) whose git history contains the change (`git -C ../go-algorand tag --contains <sha> --list | sort -V | head -1`, cross-checked against that tag's own release notes). Label with `algod:<origin-tag>`. Do not collapse a beta/rc-only feature onto a later stable tag as its *only* label — the origin label is what makes pre-release-exclusive work visible.
-  - **Then also check whether `NEW` itself ships the same feature** — i.e. whether `NEW`'s own published release notes/changelog lists the same upstream PR/commit (go-algorand's stable release notes typically re-list every change since the last stable, including ones that first landed in an intermediate pre-release — that re-listing means the feature genuinely is part of `NEW`'s own documented surface, not just an ancestor's). If so, **add `algod:NEW` as a second label on the same issue** (`gh issue edit <n> --add-label "algod:NEW"`) — do not treat the origin tag as the only truth. A feature that reached `NEW` should never end up with only a pre-release label and no `algod:NEW` label, since `NEW` is the actual thing this whole epic is upgrading the pin to, and `algod:NEW` is the label a future reader will filter by to see "everything that shipped in this pin."
-  - The two labels can be identical (an issue can carry just one `algod:<tag>` label) when the origin tag already *is* `NEW` — that's the common case for a version range with no intermediate pre-release, or for work with no upstream origin at all (the new-scope P2P transport work, labeled by domain/effort only, no `algod:` label needed since it doesn't map to a single upstream commit).
-- one domain label: `consensus` / `ledger` / `avm` / `networking` / `rest-api` / `sync` / `infrastructure`,
-- one effort label: `effort:small` / `effort:medium` / `effort:large`,
-- `conformance` for parity-verification work, `enhancement` for new features.
+Also create the new `phase:<N>` label if it doesn't exist yet: `gh label create "phase:<N>" --description "Phase <N>: go-algorand NEW parity" --color 0E8A16`.
 
 Then create the **epic issue** itself (label `epic` + `phase:<N>`): the full classified inventory from stage 2 (including the justified `not-applicable` list), all sub-issue numbers in **dependency order** (consensus params and encoding first — everything else reads them; then ledger/AVM; then agreement/network; API last), and the epic-level acceptance criteria. Follow the structure of issue #107's decomposition comment.
 
