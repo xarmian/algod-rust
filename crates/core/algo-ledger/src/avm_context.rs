@@ -2177,6 +2177,10 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             approved,
             error: None,
             coverage: algo_avm::OpcodeCoverage::default(),
+            // Not this context's own machine-level scratch (this method has
+            // no access to it -- `self.scratch` only holds *sibling* rows
+            // for `gload`), so there's no real value to report here.
+            scratch: default_scratch_row(),
         }
     }
 }
