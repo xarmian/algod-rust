@@ -18,44 +18,52 @@ MPL-2.0, OpenSSL, and a couple of Apache-2.0-with-exception variants), and
 licenses` on every PR via `EmbarkStudios/cargo-deny-action` (which
 downloads a prebuilt `cargo-deny` binary rather than compiling one).
 
-That CI job is marked **advisory** (`continue-on-error: true`) rather than
-blocking, for one honest reason: **`cargo-deny` itself could not be built
-or run in this authoring session** to pre-confirm the full dependency tree
-passes `deny.toml`'s allow-list before landing the check. This session
-runs on a Windows sandbox with a broken VS "18" toolchain install (see
-`CLAUDE.md`'s Windows environment notes) and, independently, a hard
-`Access is denied` sandbox restriction on executing freshly-built binaries
-out of the temp directory `cargo install` uses — confirmed by two
-different failure modes on two separate `cargo install cargo-deny
---locked` attempts (build-script execution denied from `%TEMP%`, then a
-`link.exe`/`msvcrt.lib` failure once redirected to an in-repo build
-directory, tracing back to the same broken VS "18" install). Neither
-failure is specific to `cargo-deny`'s dependencies or to this repo's own
-code — GitHub Actions' `ubuntu-latest` runners don't share either
-constraint — but it means this PR cannot say "we ran cargo-deny locally
-and it's clean," only "the manual audit below, done via `cargo metadata`,
-found nothing incompatible." The job stays advisory until a real CI run
-(or a working local install) confirms a clean pass, at which point
-`continue-on-error` should be dropped.
+**This session could not build or run `cargo-deny` itself** to pre-confirm
+the dependency tree before wiring the CI job — this Windows sandbox has a
+broken VS "18" toolchain install (see `CLAUDE.md`'s Windows environment
+notes) and, independently, a hard `Access is denied` restriction on
+executing freshly-built binaries out of the temp directory `cargo install`
+uses, confirmed by two different failure modes on two separate `cargo
+install cargo-deny --locked` attempts. Neither failure is specific to
+`cargo-deny`'s own dependencies or to this repo's code — GitHub Actions'
+`ubuntu-latest` runners share neither constraint — but it meant the job
+had to land initially as **advisory** (`continue-on-error: true`) rather
+than a claim of "verified clean," backed only by the manual `cargo
+metadata` audit below.
 
-**Update from this PR's actual CI run**: the real `cargo-deny` invocation
-in CI (ubuntu-latest, prebuilt binary, none of this session's local-sandbox
-issues) surfaced a second, genuinely useful finding: `deny.toml`'s
-`[advisories]`/`[licenses]` sections (added by earlier phase-15 work,
-before `cargo-deny` was ever actually run against them) were written
-against an older `cargo-deny` config schema and failed to parse under the
-pinned action's `cargo-deny` 0.20.2 — `advisories.vulnerability` and
-`advisories.notice` were removed (both advisory kinds now always error,
-with no separate lint-level knob), `advisories.unmaintained` changed from
-a lint-level (`"warn"`/`"deny"`) to a scope selector (one of `"all"` /
-`"workspace"` / `"transitive"` / `"none"`), and `licenses.unlicensed` was
-removed (there is no longer a separate "no license field" lint level —
-every non-excepted dependency must simply resolve to an allowed license).
-Fixed in this PR (see `deny.toml`'s comments) using cargo-deny's own
-current-schema documentation. This is exactly the kind of gap the
-advisory (non-blocking) posture of the CI job exists to surface honestly
-rather than hide — a config that had never actually been exercised by the
-tool it configures.
+**That advisory run then did its job.** The real `cargo-deny` invocation
+in CI (ubuntu-latest, prebuilt binary via `EmbarkStudios/cargo-deny-action`)
+surfaced two real, useful findings in two successive runs, both fixed in
+this PR and both visible in this branch's commit history:
+
+1. `deny.toml`'s `[advisories]`/`[licenses]` sections (added by earlier
+   phase-15 work, before `cargo-deny` was ever actually run against them)
+   were written against an older config schema and failed to parse under
+   the pinned action's `cargo-deny` 0.20.2 — `advisories.vulnerability`
+   and `advisories.notice` were removed (both advisory kinds now always
+   error, no separate lint-level knob), `advisories.unmaintained` changed
+   from a lint-level (`"warn"`/`"deny"`) to a scope selector (one of
+   `"all"` / `"workspace"` / `"transitive"` / `"none"`), and
+   `licenses.unlicensed` was removed (every non-excepted dependency must
+   simply resolve to an allowed license, with no separate "missing
+   license field" lint level). Fixed against cargo-deny's current-schema
+   documentation.
+2. Once the config parsed, `cargo-deny` correctly rejected all 27 of
+   algod-rust's own AGPL-3.0-or-later-licensed workspace crates — it
+   checks first-party workspace crates' own `license` field against the
+   same allow-list as third-party dependencies, and AGPL-3.0-or-later
+   wasn't on it. **Zero external/third-party dependencies were rejected**
+   — exactly consistent with the manual audit below. Fixed by adding
+   `AGPL-3.0-or-later` to the allow-list with a comment clarifying this
+   covers algod-rust's own crates checking their own (correct) license,
+   not a statement that an AGPL third-party dependency would be
+   acceptable.
+
+After both fixes, the job's own CI run reports **`licenses ok`** — a
+genuinely clean pass, not an assumption. The `dependency-licenses` job is
+therefore **blocking** (no `continue-on-error`), not advisory: this PR's
+own CI is the confirmation the earlier draft of this document said would
+be needed before that promotion.
 
 ## Manual audit (this PR's actual verification)
 
