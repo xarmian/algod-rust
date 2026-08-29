@@ -108,6 +108,25 @@ impl std::fmt::Display for AssemblyError {
 
 impl std::error::Error for AssemblyError {}
 
+/// A non-fatal warning produced during assembly, with source location
+/// information. Unlike [`AssemblyError`], one or more warnings never stop
+/// assembly from succeeding. Matches go-algorand's `sourceError` as used for
+/// `OpStream.Warnings` (`assembler.go`).
+#[derive(Debug, Clone)]
+pub struct AssemblyWarning {
+    pub line: usize,
+    pub col: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for AssemblyWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}: {}", self.line, self.col, self.message)
+    }
+}
+
+impl std::error::Error for AssemblyWarning {}
+
 // ---------------------------------------------------------------------------
 // Source location
 // ---------------------------------------------------------------------------
@@ -167,6 +186,9 @@ pub struct OpStream {
     pub version: u8,
     /// Errors accumulated during assembly.
     pub errors: Vec<AssemblyError>,
+    /// Non-fatal warnings accumulated during assembly. Assembly can still
+    /// succeed (`Ok`) with warnings present.
+    pub warnings: Vec<AssemblyWarning>,
     /// PC-to-source-line mapping.
     pub offset_to_source: HashMap<usize, SourceLocation>,
 
@@ -194,6 +216,11 @@ pub struct OpStream {
     /// State of the `#pragma autosalt` directive (defaults to the
     /// version-gated behavior until overridden).
     auto_salt: AutoSaltMode,
+    /// Source line of the `#pragma autosalt` directive that set
+    /// [`Self::auto_salt`], if any. Used to attribute `shouldAutoSalt`'s
+    /// warnings to the pragma line, matching go-algorand's
+    /// `OpStream.autoSaltToken`.
+    auto_salt_line: usize,
 }
 
 impl OpStream {
@@ -202,6 +229,7 @@ impl OpStream {
             program: Vec::new(),
             version: 0, // will be set by pragma or default
             errors: Vec::new(),
+            warnings: Vec::new(),
             offset_to_source: HashMap::new(),
             pending: Vec::new(),
             labels: HashMap::new(),
@@ -217,11 +245,20 @@ impl OpStream {
             source_line: 0,
             has_stateful_ops: false,
             auto_salt: AutoSaltMode::Unset,
+            auto_salt_line: 0,
         }
     }
 
     fn record_error(&mut self, line: usize, col: usize, msg: String) {
         self.errors.push(AssemblyError {
+            line,
+            col,
+            message: msg,
+        });
+    }
+
+    fn record_warning(&mut self, line: usize, col: usize, msg: String) {
+        self.warnings.push(AssemblyWarning {
             line,
             col,
             message: msg,
@@ -822,12 +859,30 @@ impl OpStream {
 
     /// Reports whether [`Self::finalize_program`] should append a salt so
     /// `program`'s hash is off-curve. Matches go-algorand's `shouldAutoSalt`
-    /// (`assembler.go`), minus its warnings (this assembler has no warnings
-    /// channel yet).
-    fn should_auto_salt(&self, program: &[u8]) -> bool {
+    /// (`assembler.go`), including its two diagnostic warnings for an
+    /// explicit `#pragma autosalt` that's likely a no-op or ineffective.
+    fn should_auto_salt(&mut self, program: &[u8]) -> bool {
         match self.auto_salt {
-            AutoSaltMode::Off => false,
-            AutoSaltMode::On => program_hash_is_edwards25519_point(program),
+            AutoSaltMode::Off => {
+                if !self.has_stateful_ops && program_hash_is_edwards25519_point(program) {
+                    self.record_warning(
+                        self.auto_salt_line,
+                        0,
+                        "#pragma autosalt false leaves program hash on curve".into(),
+                    );
+                }
+                false
+            }
+            AutoSaltMode::On => {
+                if self.has_stateful_ops {
+                    self.record_warning(
+                        self.auto_salt_line,
+                        0,
+                        "#pragma autosalt true used with stateful opcodes".into(),
+                    );
+                }
+                program_hash_is_edwards25519_point(program)
+            }
             AutoSaltMode::Unset => {
                 default_auto_salt_applies(self.version, self.has_stateful_ops, program)
             }
@@ -1003,6 +1058,7 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
                         } else {
                             AutoSaltMode::Off
                         };
+                        ops.auto_salt_line = ops.source_line;
                     } else {
                         ops.record_error(
                             ops.source_line,
@@ -2672,6 +2728,95 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{:?}", result.err().unwrap());
         assert!(msg.contains("bad #pragma autosalt"), "{msg}");
+    }
+
+    #[test]
+    fn test_autosalt_false_on_curve_program_produces_warning() {
+        // go-algorand's `shouldAutoSalt` (assembler.go) warns
+        // "#pragma autosalt false leaves program hash on curve" when the
+        // user explicitly disables auto-salt and the resulting (unsalted)
+        // program hash is still on-curve. Same fixture as
+        // `test_pragma_autosalt_false_suppresses_salting_at_v13`.
+        let source = "#pragma version 13\n#pragma autosalt false\nint 1\nint 1\nreturn\n";
+        let ops = assemble_string(source).unwrap();
+        assert!(
+            program_hash_is_edwards25519_point(&ops.program),
+            "fixture must be on-curve to exercise the warning"
+        );
+        assert_eq!(
+            ops.warnings.len(),
+            1,
+            "expected exactly one warning, got {:?}",
+            ops.warnings
+        );
+        assert!(
+            ops.warnings[0]
+                .message
+                .contains("#pragma autosalt false leaves program hash on curve"),
+            "{:?}",
+            ops.warnings
+        );
+    }
+
+    #[test]
+    fn test_autosalt_false_off_curve_program_produces_no_warning() {
+        // Same directive, but the underlying program is already off-curve
+        // (no salting would be needed anyway), so no warning should fire.
+        let mut found = None;
+        for v in 0u64..64 {
+            let src = format!(
+                "#pragma version 13\n#pragma autosalt false\nint {v}\nint {v}\nreturn\n"
+            );
+            let ops = assemble_string(&src).unwrap();
+            if !program_hash_is_edwards25519_point(&ops.program) {
+                found = Some(ops);
+                break;
+            }
+        }
+        let ops = found.expect("expected at least one off-curve fixture in range");
+        assert!(
+            !program_hash_is_edwards25519_point(&ops.program),
+            "fixture must be off-curve so the warning genuinely doesn't apply"
+        );
+        assert!(
+            ops.warnings.is_empty(),
+            "expected no warnings, got {:?}",
+            ops.warnings
+        );
+    }
+
+    #[test]
+    fn test_autosalt_true_with_stateful_ops_produces_warning() {
+        // go-algorand's `shouldAutoSalt` warns
+        // "#pragma autosalt true used with stateful opcodes" when the user
+        // forces auto-salt on for a program that has app-only opcodes
+        // (salting is meaningless there — stateful programs are never
+        // used as LogicSig contract-account addresses).
+        let source =
+            "#pragma version 13\n#pragma autosalt true\nint 0\napp_global_get\npop\nint 1\nreturn\n";
+        let ops = assemble_string(source).unwrap();
+        assert_eq!(
+            ops.warnings.len(),
+            1,
+            "expected exactly one warning, got {:?}",
+            ops.warnings
+        );
+        assert!(
+            ops.warnings[0]
+                .message
+                .contains("#pragma autosalt true used with stateful opcodes"),
+            "{:?}",
+            ops.warnings
+        );
+    }
+
+    #[test]
+    fn test_assembly_succeeds_with_only_warnings_present() {
+        // Warnings must never turn a successful assembly into a failure.
+        let source = "#pragma version 13\n#pragma autosalt false\nint 1\nint 1\nreturn\n";
+        let result = assemble_string(source);
+        assert!(result.is_ok(), "assembly with only warnings must be Ok");
+        assert_eq!(result.unwrap().warnings.len(), 1);
     }
 
     #[test]
