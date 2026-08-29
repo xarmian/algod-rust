@@ -62,6 +62,21 @@ fn write_token_file(path: &Path, token: &str) -> std::io::Result<()> {
     }
 }
 
+/// Emits the AGPL section 13 startup log banner, recording where the
+/// corresponding source is available for operators running the binary
+/// directly -- HTTP clients get the equivalent pointer via the
+/// `X-Algod-Rust-Source` response header (see `crate::source_header`).
+///
+/// Factored out of [`ApiServer::serve`] as a standalone function so it can
+/// be unit tested (see the `tests` module below) without needing a full
+/// `NodeInterface` implementation and a bound listener.
+fn log_source_banner() {
+    tracing::info!(
+        source = crate::source_header::SOURCE_URL,
+        "algod-rust is free software licensed under the AGPLv3 -- corresponding source is available at the URL above"
+    );
+}
+
 /// Name of the file containing the bound listen address.
 const NET_FILE: &str = "algod.net";
 
@@ -217,6 +232,7 @@ impl ApiServer {
         }
 
         tracing::info!(addr = %local_addr, "REST API server listening");
+        log_source_banner();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router)
@@ -228,5 +244,60 @@ impl ApiServer {
         });
 
         Ok((local_addr, handle))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// A `MakeWriter` that appends every write into a shared in-memory
+    /// buffer, so a test can assert on the exact rendered log line without
+    /// depending on this repo's real (JSON/env-filter) tracing setup.
+    #[derive(Clone, Default)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufferWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Verifies the AGPL section 13 startup banner ([`log_source_banner`])
+    /// actually emits a log line naming the exact source repository URL --
+    /// the "Startup log banner verified" acceptance criterion from issue
+    /// #742.
+    #[test]
+    fn startup_banner_logs_the_exact_source_url() {
+        let buffer = BufferWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, log_source_banner);
+
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains(crate::source_header::SOURCE_URL),
+            "startup banner must log the exact source repository URL, got: {logged:?}"
+        );
+        assert!(
+            logged.contains("AGPLv3"),
+            "startup banner should mention the AGPLv3 license, got: {logged:?}"
+        );
     }
 }

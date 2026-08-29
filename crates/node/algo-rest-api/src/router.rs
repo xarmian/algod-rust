@@ -37,6 +37,7 @@ use crate::cors::cors_layer;
 use crate::error_envelope::{json_envelope_layer, unmatched_route_fallback};
 use crate::handlers;
 use crate::node::NodeInterface;
+use crate::source_header::source_header_layer;
 
 /// Token configuration for the API router.
 ///
@@ -374,6 +375,18 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
     router = router.layer(middleware::from_fn(
         crate::format::normalize_vary_header_casing,
     ));
+
+    // Absolute outermost layer: AGPL section 13 source-availability pointer
+    // (issue #742). Added last so it wraps every other layer above,
+    // including `cors_layer`'s short-circuited `OPTIONS` preflight response
+    // and the unmatched-route fallback -- the header must be present on
+    // every response unconditionally, matching the "offer cannot be
+    // removed" obligation. It only appends a brand-new header name after
+    // the inner layers have already produced their response, so it cannot
+    // perturb any existing header value, order, or body (see
+    // `source_header` module docs; `docs/LICENSING.md` records the
+    // mechanism).
+    router = router.layer(middleware::from_fn(source_header_layer));
 
     router.with_state(node)
 }

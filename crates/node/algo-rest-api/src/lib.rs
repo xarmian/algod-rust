@@ -36,6 +36,7 @@ pub mod models;
 pub mod node;
 pub mod router;
 pub mod server;
+pub mod source_header;
 
 // Re-export key types for convenience.
 pub use error::ErrorResponse;

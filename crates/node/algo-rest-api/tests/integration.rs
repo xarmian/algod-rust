@@ -1264,6 +1264,43 @@ async fn health_returns_200_with_null_body() {
     assert_eq!(body, "null\n");
 }
 
+/// AGPL section 13 source-availability pointer (issue #742): the
+/// `X-Algod-Rust-Source` header must be present on every response,
+/// regardless of endpoint or auth tier, without perturbing the response
+/// body. `/health` (no-auth) and `/versions` (whose body is byte-for-byte
+/// parity-tested against go-algorand) are representative of both.
+#[tokio::test]
+async fn source_header_present_and_body_untouched() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let health = server
+        .client
+        .get(server.url("/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        health.headers().get("x-algod-rust-source").unwrap(),
+        "https://github.com/xarmian/algod-rust"
+    );
+
+    let versions = server
+        .client
+        .get(server.url("/versions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        versions.headers().get("x-algod-rust-source").unwrap(),
+        "https://github.com/xarmian/algod-rust"
+    );
+    let body: serde_json::Value = versions.json().await.unwrap();
+    assert!(
+        body.get("x-algod-rust-source").is_none(),
+        "the source pointer must be a header only, never leak into the JSON body"
+    );
+}
+
 #[tokio::test]
 async fn health_works_without_auth_token() {
     let server = TestServer::start(MockNode::synced()).await;
