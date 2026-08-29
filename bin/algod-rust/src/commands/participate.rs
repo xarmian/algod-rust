@@ -900,8 +900,27 @@ impl SimpleBlockEvaluator {
         // 3. Group ID consistency.
         algo_validate::validate_transaction_group(txgroup)?;
 
-        // 4. Group fee pooling (for multi-txn groups with fee pooling enabled).
-        if in_group && params.enable_fee_pooling {
+        // 4. Group fee total check. Go's `CheckGroupFees`/`SummarizeFees`
+        // (`ledger/eval/eval.go`) run unconditionally for every top-level
+        // group -- including a size-1 (ungrouped) submission -- not just
+        // "multi-txn groups with pooling enabled"; `EnableFeePooling` was a
+        // real config flag pre-v28 but go-algorand has since removed it
+        // entirely (see `ledger/eval_simple_test.go`'s `TestFeePooling`:
+        // "FeePooling was added in v28, but we have now removed the
+        // consensus flag"), and never gated whether the group-total *size-
+        // pricing surcharge* (v42+) gets computed at all. Gating this call
+        // on `in_group` (issue #703's live-parity testing surfaced this: a
+        // single oversized-LogicSig transaction, submitted ungrouped, was
+        // wrongly accepted underpaid) skipped the only place
+        // `logic_sig_program_fee_contribution`'s pooled program-byte
+        // surcharge is folded into the required fee -- note/app-args/
+        // app-program surcharges are covered by `txn_fee_factor` inside the
+        // per-transaction well-formedness check above regardless of
+        // grouping, but the LogicSig surcharge is pooled across the group
+        // and only visible to `summarize_fees`. `block.rs`'s block-level
+        // validation already calls this unconditionally (see 4b there);
+        // this matches that established, correct pattern.
+        {
             let refs: Vec<&algo_types::SignedTransaction> = txgroup.iter().collect();
             algo_validate::validate_group_fees_with_params(&refs, params).map_err(|e| {
                 algo_error::AlgoError::Validation {

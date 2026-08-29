@@ -1221,11 +1221,27 @@ pub fn validate_group_fees_with_params(
     use std::collections::HashMap;
 
     // Collect the group's members by group ID (preserving encounter order).
+    // A transaction with `group == 0` isn't part of an *atomic multi-txn*
+    // group, but it is still its own top-level, size-1 "txgroup" as far as
+    // go's fee check is concerned — `ledger/eval.go`'s `CheckGroupFees`/
+    // `SummarizeFees(txgroup, proto)` run on whatever slice of transactions
+    // was submitted/evaluated together, size 1 included, regardless of
+    // whether its members share an explicit `Group` digest. Treating
+    // `group == 0` as "skip" (as this function did before issue #703's live
+    // dual-node testing caught it) silently dropped the *only* place
+    // `logic_sig_program_fee_contribution`'s pooled LogicSig-program-byte
+    // surcharge is checked for a standalone submission — note/app-args/
+    // app-program surcharges are separately covered per-transaction by
+    // `required_fee_for_txn` inside well-formedness regardless of grouping,
+    // but the LogicSig surcharge is only ever computed here. So every
+    // ungrouped transaction is now checked too, as a singleton group of one.
     let mut groups: HashMap<&[u8], Vec<&SignedTransaction>> = HashMap::new();
     let mut order: Vec<&[u8]> = Vec::new();
+    let mut singletons: Vec<&SignedTransaction> = Vec::new();
 
     for stx in txns {
         if stx.txn.group == [0u8; 32] {
+            singletons.push(stx);
             continue;
         }
         let grp: &[u8] = stx.txn.group.as_ref();
@@ -1244,17 +1260,29 @@ pub fn validate_group_fees_with_params(
     // program-byte surcharge. For a group with no size-pricing/state-proof/
     // heartbeat-discount members this reduces to exactly `len(group) *
     // min_txn_fee`, matching the previous flat count-based check.
-    for grp_key in &order {
-        let members = &groups[grp_key];
+    let check_members = |members: &[&SignedTransaction],
+                         group_id: String|
+     -> Result<(), crate::block::BlockValidationError> {
         let (usage, total_fee) = crate::fee::summarize_fees(members, params);
         let (required_fee, overflow) = crate::fee::required_fee_for_usage(usage, params);
         if overflow || total_fee < required_fee {
             return Err(crate::block::BlockValidationError::GroupFeePoolingFailed {
-                group_id: hex::encode(grp_key),
+                group_id,
                 total_fee,
                 required_fee,
             });
         }
+        Ok(())
+    };
+
+    for grp_key in &order {
+        check_members(&groups[grp_key], hex::encode(grp_key))?;
+    }
+    for stx in &singletons {
+        check_members(
+            std::slice::from_ref(stx),
+            format!("ungrouped:{}", algo_codec::compute_txn_id(&stx.txn)),
+        )?;
     }
     Ok(())
 }

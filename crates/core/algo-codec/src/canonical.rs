@@ -457,7 +457,22 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
     // Key registration (keyreg)
     m.add_bool("nonpart", tx.non_participation);
 
-    m.add_bytes("note", &tx.note);
+    // `Note []byte` is Go's variable-length slice (`data/transactions/
+    // transaction.go`), not a fixed-size `[N]byte` digest -- its omitempty
+    // is length-only (`len(tx.Note) == 0`), so a genuinely non-empty but
+    // all-zero note (a real, valid value -- e.g. zero-padding) must still
+    // be signed/encoded, not treated as absent. `add_bytes`'s all-zero-omit
+    // rule is only correct for fixed-size digest/key/signature fields;
+    // using it here silently dropped the note from the canonical encoding
+    // whenever it happened to be all zero bytes, producing a signature
+    // that a real go-algorand node's own (correct, length-only) canonical
+    // re-encoding would never match -- confirmed live via issue #703's
+    // dual-node testing (an all-zero note of any nonzero length rejected
+    // by a real go-algorand node with "At least one signature didn't pass
+    // verification", while algod-rust's own signature check -- built on
+    // this same wrong encoding on both the signing and verifying side --
+    // self-consistently accepted it).
+    m.add_var_bytes("note", &tx.note);
     m.add_address("rcv", &tx.receiver);
     m.add_option_address("rekey", &tx.rekey_to);
 
@@ -2088,6 +2103,62 @@ mod tests {
         } else {
             panic!("expected map");
         }
+    }
+
+    #[test]
+    fn test_all_zero_nonempty_note_is_not_omitted() {
+        // `Note []byte` is Go's variable-length slice (`data/transactions/
+        // transaction.go`): its omitempty is `len(tx.Note) == 0`, not "all
+        // bytes zero" (that all-zero-content rule only applies to Go's
+        // fixed-size `[N]byte` digest/key fields, e.g. Lease/Group). A
+        // non-empty note that happens to be entirely zero bytes (a normal,
+        // valid value -- e.g. zero-padding) must still appear in the
+        // canonical encoding. Regression test for issue #703's live
+        // dual-node testing, which caught this: signing over the buggy
+        // (note-omitted) encoding produced a signature a real go-algorand
+        // node's own correct canonical re-encoding rejected outright.
+        let tx = Transaction {
+            txn_type: "pay".into(),
+            sender: Address([1u8; 32]),
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(200),
+            note: vec![0u8; 32].into(),
+            ..Default::default()
+        };
+
+        let encoded = canonical_encode_transaction(&tx);
+        let val = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
+        let rmpv::Value::Map(pairs) = val else {
+            panic!("expected map");
+        };
+        let keys: Vec<String> = pairs
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            keys.contains(&"note".to_string()),
+            "expected 'note' key for a non-empty all-zero note, got keys: {keys:?}"
+        );
+
+        // An empty (zero-length) note must still be omitted.
+        let tx_empty_note = Transaction {
+            note: Vec::new().into(),
+            ..tx
+        };
+        let encoded_empty = canonical_encode_transaction(&tx_empty_note);
+        let val_empty = rmpv::decode::read_value(&mut &encoded_empty[..]).unwrap();
+        let rmpv::Value::Map(pairs_empty) = val_empty else {
+            panic!("expected map");
+        };
+        let keys_empty: Vec<String> = pairs_empty
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !keys_empty.contains(&"note".to_string()),
+            "expected no 'note' key for an empty note, got keys: {keys_empty:?}"
+        );
     }
 
     #[test]
