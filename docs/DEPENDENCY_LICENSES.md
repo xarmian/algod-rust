@@ -38,6 +38,25 @@ found nothing incompatible." The job stays advisory until a real CI run
 (or a working local install) confirms a clean pass, at which point
 `continue-on-error` should be dropped.
 
+**Update from this PR's actual CI run**: the real `cargo-deny` invocation
+in CI (ubuntu-latest, prebuilt binary, none of this session's local-sandbox
+issues) surfaced a second, genuinely useful finding: `deny.toml`'s
+`[advisories]`/`[licenses]` sections (added by earlier phase-15 work,
+before `cargo-deny` was ever actually run against them) were written
+against an older `cargo-deny` config schema and failed to parse under the
+pinned action's `cargo-deny` 0.20.2 — `advisories.vulnerability` and
+`advisories.notice` were removed (both advisory kinds now always error,
+with no separate lint-level knob), `advisories.unmaintained` changed from
+a lint-level (`"warn"`/`"deny"`) to a scope selector (one of `"all"` /
+`"workspace"` / `"transitive"` / `"none"`), and `licenses.unlicensed` was
+removed (there is no longer a separate "no license field" lint level —
+every non-excepted dependency must simply resolve to an allowed license).
+Fixed in this PR (see `deny.toml`'s comments) using cargo-deny's own
+current-schema documentation. This is exactly the kind of gap the
+advisory (non-blocking) posture of the CI job exists to surface honestly
+rather than hide — a config that had never actually been exercised by the
+tool it configures.
+
 ## Manual audit (this PR's actual verification)
 
 Performed via `cargo metadata --format-version 1` (enumerates the full

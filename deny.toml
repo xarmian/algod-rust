@@ -1,11 +1,18 @@
+# `vulnerability` and `notice` were removed from cargo-deny's schema
+# (current versions always error on both; there is no longer a lint-level
+# knob for them). `unmaintained` changed from a lint-level ("warn"/"deny")
+# to a scope selector; "workspace" here means only direct workspace
+# dependencies are checked against RUSTSEC unmaintained advisories.
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+unmaintained = "workspace"
 yanked = "warn"
-notice = "warn"
 
+# `unlicensed` was removed from cargo-deny's schema — recent versions
+# always require every non-excepted dependency to resolve to an `allow`ed
+# license (no separate lint-level for "no license field at all" vs. "wrong
+# license"); see the `ring` note below for the one dependency this repo
+# currently has that lacks a `license` field.
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
