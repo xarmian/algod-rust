@@ -539,6 +539,34 @@ pub struct ConsensusParams {
     /// `GET /v2/ledger/supply`'s `online-stake` (Go: `ExcludeExpiredCirculation`,
     /// v38+).
     pub exclude_expired_circulation: bool,
+
+    // ── Protocol upgrade vote (Go: `data/bookkeeping/block.go`
+    // `applyUpgradeVote`/`ProcessUpgradeParams`) ─────────────────
+    /// The upgrade proposal this protocol version's block proposer will make
+    /// by default when no upgrade is currently pending: the target protocol
+    /// version and the wait-rounds delay between vote acceptance and
+    /// switch-over (Go: `ApprovedUpgrades`, a `map[ConsensusVersion]uint64`).
+    /// In go-algorand's own version history this map is reset to `{}` at
+    /// every version boundary and then populated with at most one
+    /// `vN.ApprovedUpgrades[vN+1] = delay` entry (`config/consensus.go`), so
+    /// it is modeled here as `Option<(target version, delay)>` rather than a
+    /// full map. `None` means this version proposes no upgrade.
+    pub approved_upgrade: Option<(&'static str, u64)>,
+    /// Rounds an upgrade proposal is voted on before its fate (accepted or
+    /// expired) is decided (Go: `UpgradeVoteRounds`).
+    pub upgrade_vote_rounds: u64,
+    /// Minimum fraction of yes-votes, out of `upgrade_vote_rounds`, needed to
+    /// accept a pending upgrade proposal (Go: `UpgradeThreshold`).
+    pub upgrade_threshold: u64,
+    /// Wait-rounds delay used when a proposal specifies `UpgradeDelay == 0`
+    /// (Go: `DefaultUpgradeWaitRounds`).
+    pub default_upgrade_wait_rounds: u64,
+    /// Minimum permissible `UpgradeDelay` for a new proposal, inclusive
+    /// (Go: `MinUpgradeWaitRounds`, v22+; zero before that).
+    pub min_upgrade_wait_rounds: u64,
+    /// Maximum permissible `UpgradeDelay` for a new proposal, inclusive
+    /// (Go: `MaxUpgradeWaitRounds`, v22+; zero before that).
+    pub max_upgrade_wait_rounds: u64,
 }
 
 impl ConsensusParams {
@@ -746,6 +774,15 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         // Dynamic filter
         dynamic_filter_timeout: false,
         exclude_expired_circulation: false,
+        // Protocol upgrade vote (Go base struct: config/consensus.go's
+        // `initConsensusProtocols`, the values set on the v7-equivalent
+        // struct literal before any version-specific overrides).
+        approved_upgrade: None,
+        upgrade_vote_rounds: 10_000,
+        upgrade_threshold: 9_000,
+        default_upgrade_wait_rounds: 10_000,
+        min_upgrade_wait_rounds: 0,
+        max_upgrade_wait_rounds: 0,
     };
     if version == CONSENSUS_V7 {
         return Some(v7);
@@ -867,8 +904,9 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     }
 
     // ── v20 ─────────────────────────────────────────────────────
-    let v20 = v19.clone();
+    let mut v20 = v19.clone();
     // v20 adds MaxAssetDecimals (not modeled) and changes DefaultUpgradeWaitRounds
+    v20.default_upgrade_wait_rounds = 140_000;
     if version == CONSENSUS_V20 {
         return Some(v20);
     }
@@ -880,8 +918,10 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     }
 
     // ── v22 ─────────────────────────────────────────────────────
-    let v22 = v21.clone();
-    // v22 adds MinUpgradeWaitRounds, MaxUpgradeWaitRounds (not modeled)
+    let mut v22 = v21.clone();
+    // v22 adds MinUpgradeWaitRounds, MaxUpgradeWaitRounds
+    v22.min_upgrade_wait_rounds = 10_000;
+    v22.max_upgrade_wait_rounds = 150_000;
     if version == CONSENSUS_V22 {
         return Some(v22);
     }
@@ -1069,6 +1109,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v39.state_proof_block_hash_in_light_header = true;
     v39.agreement_deadline_timeout_period0 = Duration::from_secs(4);
     v39.dynamic_filter_timeout = true;
+    v39.max_upgrade_wait_rounds = 250_000;
     if version == CONSENSUS_V39 {
         return Some(v39);
     }
@@ -1105,6 +1146,10 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v41.max_app_txn_accounts = 8;
     v41.max_app_access = 16;
     v41.bytes_per_box_reference = 2_048;
+    // v41 can be upgraded to v42, with a wait delay of 7d
+    // (208000 = 7 * 24 * 60 * 60 / ~2.9s ballpark round time), per
+    // `config/consensus.go`: `v41.ApprovedUpgrades[protocol.ConsensusV42] = 208000`.
+    v41.approved_upgrade = Some((CONSENSUS_V42, 208_000));
     if version == CONSENSUS_V41 {
         return Some(v41);
     }
@@ -1114,6 +1159,9 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     // consensus version v42 (#6677)"). v42 := v41 with ApprovedUpgrades
     // reset and the fields below overridden.
     let mut v42 = v41.clone();
+    // v42 resets ApprovedUpgrades to an empty map (no known approved upgrade
+    // beyond v42 yet) — go: `v42.ApprovedUpgrades = map[...]{}`.
+    v42.approved_upgrade = None;
     v42.logic_sig_version = 13;
     v42.app_size_updates = true;
     v42.allow_zero_local_app_ref = true;
@@ -1370,6 +1418,54 @@ mod tests {
         assert_eq!(p.max_app_txn_accounts, 8);
         assert_eq!(p.max_app_access, 16);
         assert_eq!(p.bytes_per_box_reference, 2_048);
+    }
+
+    // ── Protocol upgrade vote params (issue #681) ────────────────
+    // go: config/consensus.go — `v41.ApprovedUpgrades[protocol.ConsensusV42] =
+    // 208000` (line ~1555) is the first ConsensusCurrentVersion advance in
+    // this repo's version-pin history (V41 -> V42, go-algorand v5.0.0-stable).
+
+    #[test]
+    fn test_v41_approves_v42_upgrade() {
+        let v41 = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        assert_eq!(v41.approved_upgrade, Some((CONSENSUS_V42, 208_000)));
+    }
+
+    #[test]
+    fn test_v42_has_no_further_approved_upgrade() {
+        // v42 resets ApprovedUpgrades to {} — nothing beyond it is known yet.
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert_eq!(v42.approved_upgrade, None);
+    }
+
+    #[test]
+    fn test_upgrade_vote_timing_params_inherited_to_v41_and_v42() {
+        // go base struct: UpgradeVoteRounds=10000, UpgradeThreshold=9000,
+        // DefaultUpgradeWaitRounds=10000 (v20+: 140000, but that's overridden
+        // back down implicitly by v41/v42 inheriting straight from v20's
+        // successors — assert the actual inherited chain values here).
+        // MinUpgradeWaitRounds=10000/MaxUpgradeWaitRounds=150000 (v22+),
+        // MaxUpgradeWaitRounds=250000 (v39+, supersedes v22's 150000).
+        for version in [CONSENSUS_V41, CONSENSUS_V42] {
+            let p = consensus_params_for_version(version).unwrap();
+            assert_eq!(p.upgrade_vote_rounds, 10_000, "version {version}");
+            assert_eq!(p.upgrade_threshold, 9_000, "version {version}");
+            assert_eq!(p.default_upgrade_wait_rounds, 140_000, "version {version}");
+            assert_eq!(p.min_upgrade_wait_rounds, 10_000, "version {version}");
+            assert_eq!(p.max_upgrade_wait_rounds, 250_000, "version {version}");
+        }
+    }
+
+    #[test]
+    fn test_upgrade_wait_rounds_bounds_before_v22_are_zero() {
+        // Go zero-value: MinUpgradeWaitRounds/MaxUpgradeWaitRounds are unset
+        // until v22 introduces them.
+        let v21 = consensus_params_for_version(CONSENSUS_V21).unwrap();
+        assert_eq!(v21.min_upgrade_wait_rounds, 0);
+        assert_eq!(v21.max_upgrade_wait_rounds, 0);
+        let v22 = consensus_params_for_version(CONSENSUS_V22).unwrap();
+        assert_eq!(v22.min_upgrade_wait_rounds, 10_000);
+        assert_eq!(v22.max_upgrade_wait_rounds, 150_000);
     }
 
     #[test]

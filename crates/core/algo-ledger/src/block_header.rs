@@ -3,19 +3,21 @@
 //!
 //! A fresh block evaluator starts from the *next* round's header skeleton:
 //! `round = prev.round + 1`, `branch = prev.Hash()`, an advanced rewards state,
-//! a clamped timestamp, and carried-over upgrade/genesis/special-address fields.
-//! The seed, proposer, payset and txn commitments are filled later (the seed and
-//! proposer by the producer/agreement, the payset and commitments by the
-//! evaluator when it assembles transactions).
+//! a clamped timestamp, and an advanced upgrade vote/state (see
+//! [`process_upgrade_params`]). The seed, proposer, payset and txn commitments
+//! are filled later (the seed and proposer by the producer/agreement, the
+//! payset and commitments by the evaluator when it assembles transactions).
 //!
-//! Scope vs go: algod-rust never *proposes* protocol upgrades and `ConsensusParams`
-//! does not model the upgrade-vote params (`UpgradeThreshold`, `UpgradeVoteRounds`,
-//! `ApprovedUpgrades`, wait-rounds). So the upgrade machinery here ports only the
-//! parameter-free, faithful parts: the protocol switch-over at `NextProtocolSwitchOn`
-//! and carry-forward of the upgrade state. A pending proposal reaching its vote
-//! deadline (which would need the threshold to decide) is rejected rather than
-//! guessed — block production in algod-rust only happens on dev/localnet and
-//! single-node agreement, where no upgrade is ever in flight.
+//! Scope vs go: this ports go's default upgrade-proposal/vote decision
+//! algorithm (`ProcessUpgradeParams` + `UpgradeState.applyUpgradeVote`)
+//! faithfully, including `ApprovedUpgrades`/`UpgradeVoteRounds`/
+//! `UpgradeThreshold`/wait-rounds bounds (`ConsensusParams`, see
+//! `algo_types::consensus`). Every block proposer in go casts the *same*
+//! default vote (propose when nothing is pending and a newer approved version
+//! exists; otherwise approve iff the local build still approves the pending
+//! target) — there is no separate "non-proposer" vote policy to model, which
+//! matters here because algod-rust is always the sole proposer for its own
+//! chain (issue #681).
 
 use algo_codec::{compute_block_header_digest, compute_block_header_digest_512};
 use algo_error::AlgoError;
@@ -25,7 +27,7 @@ use algo_types::{Address, BlockHeader, ConsensusParams, Round};
 use crate::rewards::RewardsState;
 
 /// The upgrade-state fields carried on a block header, resolved for the next
-/// round. Mirrors the subset of go's `UpgradeState` we advance.
+/// round. Mirrors go's `UpgradeState`.
 struct NextUpgradeState {
     current_protocol: String,
     next_protocol: String,
@@ -34,56 +36,180 @@ struct NextUpgradeState {
     next_protocol_switch_on: Round,
 }
 
-/// Advance the upgrade state from `prev` to its next round.
+/// The upgrade-vote fields cast on the new block header. Mirrors go's
+/// `UpgradeVote`.
+struct NextUpgradeVote {
+    upgrade_propose: String,
+    upgrade_delay: u64,
+    upgrade_approve: bool,
+}
+
+/// Port of go's `UpgradeState.applyUpgradeVote(r, vote)`
+/// (`data/bookkeeping/block.go`): given the previous block's `UpgradeState`
+/// and this block's `UpgradeVote`, compute the `UpgradeState` for the block at
+/// round `r`. `params` are `config.Consensus[s.CurrentProtocol]` — the
+/// *previous* (not yet switched) protocol's parameters, exactly as go looks
+/// them up.
 ///
-/// algod-rust casts no upgrade vote, so this only carries the prior state
-/// forward and applies the parameter-free protocol switch-over at
-/// `NextProtocolSwitchOn` (go `applyUpgradeVote`, the switch branch). A pending
-/// proposal at its `NextProtocolVoteBefore` deadline cannot be resolved without
-/// `UpgradeThreshold` (unmodeled) and is rejected.
-fn next_upgrade_state(prev: &BlockHeader, next_round: u64) -> Result<NextUpgradeState, AlgoError> {
-    // No pending proposal: carry the (empty) upgrade state forward.
-    if prev.next_protocol.is_empty() {
-        return Ok(NextUpgradeState {
-            current_protocol: prev.current_protocol.clone(),
-            next_protocol: String::new(),
-            next_protocol_approvals: 0,
-            next_protocol_vote_before: Round(0),
-            next_protocol_switch_on: Round(0),
-        });
-    }
+/// Returns an error exactly where go's `applyUpgradeVote` does: a new
+/// proposal while one is already pending, a proposed delay outside
+/// `[MinUpgradeWaitRounds, MaxUpgradeWaitRounds]`, a nonzero delay without a
+/// proposal, or an approval with no pending proposal / past its deadline.
+/// These are all invariants of a *self-consistent* vote — reachable only from
+/// a malformed externally-produced block, never from
+/// [`process_upgrade_params`]'s own vote construction.
+fn apply_upgrade_vote(
+    prev_state: &NextUpgradeState,
+    r: u64,
+    vote: &NextUpgradeVote,
+    params: &ConsensusParams,
+) -> Result<NextUpgradeState, AlgoError> {
+    let mut next_protocol = prev_state.next_protocol.clone();
+    let mut next_protocol_approvals = prev_state.next_protocol_approvals;
+    let mut next_protocol_vote_before = prev_state.next_protocol_vote_before.0;
+    let mut next_protocol_switch_on = prev_state.next_protocol_switch_on.0;
+    let mut current_protocol = prev_state.current_protocol.clone();
 
-    // A proposal is in flight. Switch over once we reach the switch-on round.
-    if next_round == prev.next_protocol_switch_on.0 {
-        return Ok(NextUpgradeState {
-            current_protocol: prev.next_protocol.clone(),
-            next_protocol: String::new(),
-            next_protocol_approvals: 0,
-            next_protocol_vote_before: Round(0),
-            next_protocol_switch_on: Round(0),
-        });
-    }
+    // Apply proposal of upgrade to a new protocol.
+    if !vote.upgrade_propose.is_empty() {
+        if !next_protocol.is_empty() {
+            return Err(AlgoError::Ledger {
+                message: "apply_upgrade_vote: new proposal during existing proposal".to_string(),
+            });
+        }
 
-    // Resolving the vote at its deadline (go's "clear failed proposal" branch)
-    // needs UpgradeThreshold, which ConsensusParams does not model. algod-rust
-    // does not produce blocks across an upgrade, so reject rather than guess.
-    if next_round == prev.next_protocol_vote_before.0 {
+        let upgrade_delay = if vote.upgrade_delay > params.max_upgrade_wait_rounds
+            || vote.upgrade_delay < params.min_upgrade_wait_rounds
+        {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "apply_upgrade_vote: proposed upgrade wait rounds {} out of permissible \
+                     range [{}, {}]",
+                    vote.upgrade_delay,
+                    params.min_upgrade_wait_rounds,
+                    params.max_upgrade_wait_rounds
+                ),
+            });
+        } else if vote.upgrade_delay == 0 {
+            params.default_upgrade_wait_rounds
+        } else {
+            vote.upgrade_delay
+        };
+
+        next_protocol = vote.upgrade_propose.clone();
+        next_protocol_approvals = 0;
+        next_protocol_vote_before = r + params.upgrade_vote_rounds;
+        next_protocol_switch_on = r + params.upgrade_vote_rounds + upgrade_delay;
+    } else if vote.upgrade_delay != 0 {
         return Err(AlgoError::Ledger {
             message: format!(
-                "make_next_block_header: cannot resolve in-flight protocol upgrade vote at \
-                 round {next_round} (NextProtocolVoteBefore) — upgrade-vote params are not modeled"
+                "apply_upgrade_vote: upgrade delay {} nonzero when not proposing",
+                vote.upgrade_delay
             ),
         });
     }
 
-    // Otherwise carry the pending proposal forward unchanged.
+    // Apply approval of existing protocol upgrade.
+    if vote.upgrade_approve {
+        if next_protocol.is_empty() {
+            return Err(AlgoError::Ledger {
+                message: "apply_upgrade_vote: approval without an active proposal".to_string(),
+            });
+        }
+        if r >= next_protocol_vote_before {
+            return Err(AlgoError::Ledger {
+                message: "apply_upgrade_vote: approval after vote deadline".to_string(),
+            });
+        }
+        next_protocol_approvals += 1;
+    }
+
+    // Clear out failed proposal: reached the vote deadline without threshold approvals.
+    if r == next_protocol_vote_before && next_protocol_approvals < params.upgrade_threshold {
+        next_protocol.clear();
+        next_protocol_approvals = 0;
+        next_protocol_vote_before = 0;
+        next_protocol_switch_on = 0;
+    }
+
+    // Switch over to the new approved protocol.
+    if r == next_protocol_switch_on {
+        current_protocol = next_protocol.clone();
+        next_protocol.clear();
+        next_protocol_approvals = 0;
+        next_protocol_vote_before = 0;
+        next_protocol_switch_on = 0;
+    }
+
     Ok(NextUpgradeState {
+        current_protocol,
+        next_protocol,
+        next_protocol_approvals,
+        next_protocol_vote_before: Round(next_protocol_vote_before),
+        next_protocol_switch_on: Round(next_protocol_switch_on),
+    })
+}
+
+/// Port of go's `bookkeeping.ProcessUpgradeParams(prev)`
+/// (`data/bookkeeping/block.go`): decide this block's default upgrade vote and
+/// apply it, returning the vote cast and the resulting `UpgradeState`.
+///
+/// - If no upgrade is currently pending (`prev.NextProtocol == ""`), propose
+///   the version named in `prevParams.ApprovedUpgrades` (this build's default
+///   upgrade target for `prev.CurrentProtocol`), if any, and vote to approve
+///   it (go: the `for k, v := range ... break` loop always takes the single
+///   modeled entry — see [`ConsensusParams::approved_upgrade`]'s doc comment).
+/// - If a proposal is pending and its vote window hasn't closed yet
+///   (`round < prev.NextProtocolVoteBefore`), cast a yes/no vote depending on
+///   whether *this* build's `ApprovedUpgrades` still names the pending target
+///   — i.e. every proposer (including algod-rust as sole proposer of its own
+///   chain) votes according to its own binary's approved-upgrades table, not
+///   a separately configured "approve" flag.
+/// - Either way, feed the resulting vote through [`apply_upgrade_vote`] to
+///   compute the new `UpgradeState`.
+fn process_upgrade_params(
+    prev: &BlockHeader,
+    prev_params: &ConsensusParams,
+) -> Result<(NextUpgradeVote, NextUpgradeState), AlgoError> {
+    let mut vote = NextUpgradeVote {
+        upgrade_propose: String::new(),
+        upgrade_delay: 0,
+        upgrade_approve: false,
+    };
+
+    if prev.next_protocol.is_empty() {
+        if let Some((target, delay)) = prev_params.approved_upgrade {
+            vote.upgrade_propose = target.to_string();
+            vote.upgrade_delay = delay;
+            vote.upgrade_approve = true;
+        }
+    }
+
+    let round = prev.round.0 + 1;
+    if round < prev.next_protocol_vote_before.0 {
+        vote.upgrade_approve = prev_params
+            .approved_upgrade
+            .is_some_and(|(target, _)| target == prev.next_protocol);
+    }
+
+    let prev_state = NextUpgradeState {
         current_protocol: prev.current_protocol.clone(),
         next_protocol: prev.next_protocol.clone(),
         next_protocol_approvals: prev.next_protocol_approvals,
         next_protocol_vote_before: prev.next_protocol_vote_before,
         next_protocol_switch_on: prev.next_protocol_switch_on,
-    })
+    };
+    let state = apply_upgrade_vote(&prev_state, round, &vote, prev_params).map_err(|e| {
+        AlgoError::Ledger {
+            message: format!(
+                "process_upgrade_params: constructed invalid upgrade vote for round {round} in \
+                 state (next_protocol={:?}, next_protocol_vote_before={:?}): {e}",
+                prev.next_protocol, prev.next_protocol_vote_before
+            ),
+        }
+    })?;
+
+    Ok((vote, state))
 }
 
 /// Compute the proposer bonus ("bi") for the round after `prev`.
@@ -408,16 +534,32 @@ fn clamp_timestamp(timestamp: i64, prev_timestamp: i64, params: &ConsensusParams
 /// timestamp clamp and the 512-hash gate) is the resolved protocol *after* any
 /// switch-over — matching go, which looks up params for `upgradeState.CurrentProtocol`.
 ///
-/// Returns an error if the resolved protocol is unknown or an in-flight upgrade
-/// vote would need the unmodeled `UpgradeThreshold` to resolve (see
-/// [`next_upgrade_state`]).
+/// Returns an error if `prev`'s protocol or the resolved next protocol is
+/// unknown, or if the upgrade vote/state constructed by
+/// [`process_upgrade_params`] is not internally self-consistent (see
+/// [`apply_upgrade_vote`] — unreachable from this function's own vote
+/// construction, but guards a malformed `prev` header).
 pub fn make_next_block_header(
     prev: &BlockHeader,
     timestamp: i64,
     rewards: RewardsState,
 ) -> Result<BlockHeader, AlgoError> {
     let next_round = prev.round.0 + 1;
-    let upgrade = next_upgrade_state(prev, next_round)?;
+
+    // Params of the protocol `prev` ran under — needed both to decide the
+    // upgrade vote (go's `ProcessUpgradeParams` looks up
+    // `config.Consensus[prev.CurrentProtocol]` first, erroring if unknown)
+    // and, further down, by `NextBonus` to detect a plan change (upgrade)
+    // between the two rounds.
+    let prev_params =
+        consensus_params_for_version(&prev.current_protocol).ok_or_else(|| AlgoError::Ledger {
+            message: format!(
+                "make_next_block_header: unknown previous protocol '{}'",
+                prev.current_protocol
+            ),
+        })?;
+
+    let (vote, upgrade) = process_upgrade_params(prev, &prev_params)?;
 
     // Params for the protocol the new block runs under (post switch-over),
     // matching go's `config.Consensus[upgradeState.CurrentProtocol]`.
@@ -430,10 +572,6 @@ pub fn make_next_block_header(
         }
     })?;
 
-    // Params of the protocol `prev` ran under, needed by go's `NextBonus` to
-    // detect a plan change (upgrade) between the two rounds.
-    let prev_params =
-        consensus_params_for_version(&prev.current_protocol).unwrap_or_else(|| params.clone());
     let bonus = next_bonus(prev, &params, &prev_params);
     let state_proof_tracking = next_state_proof_tracking(prev, next_round, &params);
 
@@ -462,15 +600,15 @@ pub fn make_next_block_header(
         rewards_rate: rewards.rewards_rate,
         rewards_residue: rewards.rewards_residue,
         rewards_recalculation_round: Round(rewards.rewards_recalculation_round),
-        // Resolved upgrade state; no vote is cast.
+        // Resolved upgrade state and the vote cast for it (go `ProcessUpgradeParams`).
         current_protocol: upgrade.current_protocol,
         next_protocol: upgrade.next_protocol,
         next_protocol_approvals: upgrade.next_protocol_approvals,
         next_protocol_vote_before: upgrade.next_protocol_vote_before,
         next_protocol_switch_on: upgrade.next_protocol_switch_on,
-        upgrade_propose: String::new(),
-        upgrade_delay: 0,
-        upgrade_approve: false,
+        upgrade_propose: vote.upgrade_propose,
+        upgrade_delay: vote.upgrade_delay,
+        upgrade_approve: vote.upgrade_approve,
         // Proposer bonus per the BonusPlan (go `NextBonus`).
         bonus,
         // The evaluator adds the assembled transaction count.
@@ -501,7 +639,8 @@ pub fn make_next_block_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use algo_types::CONSENSUS_V41;
+    use algo_types::consensus::CONSENSUS_V40;
+    use algo_types::{CONSENSUS_V41, CONSENSUS_V42};
 
     fn v41_params() -> ConsensusParams {
         consensus_params_for_version(CONSENSUS_V41).expect("v41 params")
@@ -603,8 +742,15 @@ mod tests {
     }
 
     #[test]
-    fn no_pending_upgrade_carries_empty_state() {
-        let hdr = make_next_block_header(&prev_header(), 1500, rewards()).unwrap();
+    fn no_pending_upgrade_and_no_approved_target_carries_empty_state() {
+        // v42 is the current build's own latest known version (its own
+        // `approved_upgrade` is None — nothing newer is known yet), so no
+        // default proposal is cast.
+        let prev = BlockHeader {
+            current_protocol: CONSENSUS_V42.to_string(),
+            ..prev_header()
+        };
+        let hdr = make_next_block_header(&prev, 1500, rewards()).unwrap();
         assert!(hdr.next_protocol.is_empty());
         assert_eq!(hdr.next_protocol_approvals, 0);
         assert_eq!(hdr.next_protocol_vote_before, Round(0));
@@ -613,15 +759,73 @@ mod tests {
         assert!(!hdr.upgrade_approve);
     }
 
+    // ── Default upgrade proposal/vote (issue #681) ───────────────
+    // go: `data/bookkeeping/block.go`'s `ProcessUpgradeParams` +
+    // `UpgradeState.applyUpgradeVote`. `prev_header()` runs v41, whose
+    // `approved_upgrade` names v42 with a 208000-round delay
+    // (`config/consensus.go`: `v41.ApprovedUpgrades[protocol.ConsensusV42] =
+    // 208000`) — the exact V41→V42 upgrade this issue was filed over.
+
+    #[test]
+    fn proposes_default_upgrade_when_newer_approved_version_exists() {
+        // prev.round = 5 → this block is round 6, with no upgrade pending yet.
+        let hdr = make_next_block_header(&prev_header(), 1500, rewards()).unwrap();
+
+        assert_eq!(hdr.upgrade_propose, CONSENSUS_V42, "casts the default vote");
+        assert_eq!(hdr.upgrade_delay, 208_000, "raw ApprovedUpgrades delay");
+        assert!(
+            hdr.upgrade_approve,
+            "proposer also votes yes on its own proposal"
+        );
+
+        assert_eq!(hdr.current_protocol, CONSENSUS_V41, "not switched over yet");
+        assert_eq!(hdr.next_protocol, CONSENSUS_V42);
+        assert_eq!(
+            hdr.next_protocol_approvals, 1,
+            "proposer's own yes vote counts"
+        );
+        assert_eq!(
+            hdr.next_protocol_vote_before,
+            Round(6 + 10_000),
+            "round + UpgradeVoteRounds"
+        );
+        assert_eq!(
+            hdr.next_protocol_switch_on,
+            Round(6 + 10_000 + 208_000),
+            "round + UpgradeVoteRounds + UpgradeDelay"
+        );
+    }
+
+    #[test]
+    fn accumulates_approvals_across_consecutive_rounds() {
+        // Single proposer (algod-rust's own dev-mode chain) votes yes every
+        // round the proposal is still open, since its own ApprovedUpgrades
+        // table still names the pending target every round.
+        let mut hdr = make_next_block_header(&prev_header(), 1500, rewards()).unwrap();
+        assert_eq!(hdr.next_protocol_approvals, 1);
+
+        for expected_approvals in 2..=5u64 {
+            hdr = make_next_block_header(&hdr, hdr.timestamp + 1, rewards()).unwrap();
+            assert_eq!(hdr.next_protocol_approvals, expected_approvals);
+            assert!(hdr.upgrade_approve, "still voting yes");
+            assert!(
+                hdr.upgrade_propose.is_empty(),
+                "no re-proposal while one is pending"
+            );
+            assert_eq!(hdr.next_protocol, CONSENSUS_V42, "proposal still pending");
+        }
+    }
+
     #[test]
     fn switches_protocol_at_switch_on_round() {
-        // Pending proposal to switch to v41 at round 6 (= next round). The new
-        // block runs the switched-to protocol and clears the pending state.
+        // Pending proposal (v40 -> v41) reaching its switch-on round at round 6
+        // (= next round). The new block runs the switched-to protocol and
+        // clears the pending state.
         let prev = BlockHeader {
             round: Round(5),
-            current_protocol: "some-older-proto".to_string(),
+            current_protocol: CONSENSUS_V40.to_string(),
             next_protocol: CONSENSUS_V41.to_string(),
-            next_protocol_approvals: 3,
+            next_protocol_approvals: 9_500,
             next_protocol_vote_before: Round(4),
             next_protocol_switch_on: Round(6),
             ..BlockHeader::default()
@@ -656,18 +860,48 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unresolvable_upgrade_vote_deadline() {
-        // Pending proposal reaching its vote deadline needs UpgradeThreshold
-        // (unmodeled) → error rather than guess.
+    fn vote_deadline_below_threshold_clears_failed_proposal() {
+        // Pending proposal reaching its vote deadline (round 6) with only 100
+        // accumulated approvals — well under v41's UpgradeThreshold (9000) —
+        // fails: go's `applyUpgradeVote` "clear out failed proposal" branch.
         let prev = BlockHeader {
             round: Round(5),
             current_protocol: CONSENSUS_V41.to_string(),
-            next_protocol: CONSENSUS_V41.to_string(),
+            next_protocol: CONSENSUS_V42.to_string(),
+            next_protocol_approvals: 100,
             next_protocol_vote_before: Round(6),
-            next_protocol_switch_on: Round(20),
+            next_protocol_switch_on: Round(214_000),
             ..BlockHeader::default()
         };
-        assert!(make_next_block_header(&prev, 0, rewards()).is_err());
+        let hdr = make_next_block_header(&prev, 0, rewards()).expect("resolves, doesn't error");
+        assert!(hdr.next_protocol.is_empty(), "failed proposal cleared");
+        assert_eq!(hdr.next_protocol_approvals, 0);
+        assert_eq!(hdr.next_protocol_vote_before, Round(0));
+        assert_eq!(hdr.next_protocol_switch_on, Round(0));
+        assert_eq!(
+            hdr.current_protocol, CONSENSUS_V41,
+            "stays on the current protocol; the upgrade never happened"
+        );
+    }
+
+    #[test]
+    fn vote_deadline_at_threshold_survives_and_awaits_switch_on() {
+        // Same deadline round, but with enough accumulated approvals to clear
+        // v41's UpgradeThreshold (9000): the proposal survives past its vote
+        // deadline and keeps waiting for NextProtocolSwitchOn.
+        let prev = BlockHeader {
+            round: Round(5),
+            current_protocol: CONSENSUS_V41.to_string(),
+            next_protocol: CONSENSUS_V42.to_string(),
+            next_protocol_approvals: 9_000,
+            next_protocol_vote_before: Round(6),
+            next_protocol_switch_on: Round(214_000),
+            ..BlockHeader::default()
+        };
+        let hdr = make_next_block_header(&prev, 0, rewards()).expect("resolves, doesn't error");
+        assert_eq!(hdr.next_protocol, CONSENSUS_V42, "proposal survives");
+        assert_eq!(hdr.next_protocol_switch_on, Round(214_000));
+        assert_eq!(hdr.current_protocol, CONSENSUS_V41, "not switched yet");
     }
 
     #[test]
