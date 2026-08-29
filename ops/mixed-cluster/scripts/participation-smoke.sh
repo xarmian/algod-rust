@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # participation-smoke.sh — issue #469 acceptance gate.
 #
 # Brings up the 4-node mixed cluster (3 go-algorand relays + 1

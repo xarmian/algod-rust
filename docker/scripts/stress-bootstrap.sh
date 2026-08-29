@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # stress-bootstrap.sh — lay out the 6-node stress-test network on disk.
 #
 # Issue #100 wants a mixed cluster where all four participation nodes hold

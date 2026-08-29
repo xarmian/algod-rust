@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Issue #496 (Phase 7) — 3 Go + 3 Rust mixed-cluster soak verifier.
 #
 # Copy of ../../mixed-cluster/scripts/verify-soak.sh pointed at this

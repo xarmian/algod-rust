@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 name: Dual-Node REST Conformance
 
 # Live conformance check for issue #129: boots a real go-algorand

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # consensus-round-trip.sh — issue #589 acceptance gate.
 #
 # Brings up the 4-node P2P-mode cluster (3 go-algorand P2P nodes + 1

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # PLAN-32 / TASK-87 — per-round metric collector for the mixed cluster.
 #
 # Polls each Go node's /v2/status on a fixed interval, detects round

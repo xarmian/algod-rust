@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Per-node round + liveness snapshot for the issue #496 (Phase 7) 6-node
 # mixed cluster (3 Go + 3 Rust, all six consensus participants). Exits
 # non-zero if any node is unreachable / not running / more than

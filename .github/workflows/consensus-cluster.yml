@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 name: Nightly Consensus Cluster
 
 # Issue #488 — run the Epic 42 mixed-cluster consensus harness

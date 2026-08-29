@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Wrapper entrypoint for go-relay that starts algod normally and then
 # runs the transaction generator in the background.
 #

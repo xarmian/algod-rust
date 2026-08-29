@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # PLAN-32 / TASK-86 — 4-node mixed-cluster consensus harness.
 #
 # Topology: 3 go-algorand v5.0.0-stable relay nodes + 1 algod-rust node,

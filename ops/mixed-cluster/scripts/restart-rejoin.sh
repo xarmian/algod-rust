@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # restart-rejoin.sh — issue #471 (Epic 42d) restart / rejoin conformance.
 #
 # Restarts the algod-rust node WHILE the mixed cluster is actively

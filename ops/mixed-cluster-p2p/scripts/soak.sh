@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Issue #594 — P2P mixed-cluster soak harness. Thin wrapper around
 # scripts/metrics.py, mirroring `ops/mixed-cluster/scripts/soak.sh`
 # (PLAN-32 / TASK-87) for `ops/mixed-cluster-p2p/`.
