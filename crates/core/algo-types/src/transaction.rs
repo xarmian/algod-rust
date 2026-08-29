@@ -705,6 +705,13 @@ pub struct BoxRef {
     pub name: Option<ByteBuf>,
 }
 
+impl BoxRef {
+    /// Mirrors go-algorand's `BoxRef.Empty()`.
+    pub fn is_empty(&self) -> bool {
+        self.index == 0 && self.name.is_none()
+    }
+}
+
 // ── Heartbeat types ────────────────────────────────────────────
 
 /// Heartbeat proof (crypto.HeartbeatProof in Go).
@@ -1000,6 +1007,13 @@ pub struct HoldingRef {
     pub asset: u64,
 }
 
+impl HoldingRef {
+    /// Mirrors go-algorand's `HoldingRef.Empty()`.
+    pub fn is_empty(&self) -> bool {
+        self.address == 0 && self.asset == 0
+    }
+}
+
 /// Locals reference (index-based, within Access list).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LocalsRef {
@@ -1010,6 +1024,13 @@ pub struct LocalsRef {
     /// App index (0=ApplicationID, n-1=1-based index into Access list).
     #[serde(rename = "p", default, skip_serializing_if = "is_zero_u64")]
     pub app: u64,
+}
+
+impl LocalsRef {
+    /// Mirrors go-algorand's `LocalsRef.Empty()`.
+    pub fn is_empty(&self) -> bool {
+        self.address == 0 && self.app == 0
+    }
 }
 
 /// Unified resource reference (V41+ Access list entry).
@@ -1038,6 +1059,20 @@ pub struct ResourceRef {
     /// Box reference.
     #[serde(rename = "b", default, skip_serializing_if = "Option::is_none")]
     pub box_ref: Option<BoxRef>,
+}
+
+impl ResourceRef {
+    /// Mirrors go-algorand's `ResourceRef.Empty()`. An empty `ResourceRef` is
+    /// allowed in `tx.Access` — it asks for a box-quota bump without naming
+    /// any specific resource.
+    pub fn is_empty(&self) -> bool {
+        self.address.is_zero()
+            && self.asset == 0
+            && self.app == 0
+            && self.holding.as_ref().map_or(true, |h| h.is_empty())
+            && self.locals.as_ref().map_or(true, |l| l.is_empty())
+            && self.box_ref.as_ref().map_or(true, |b| b.is_empty())
+    }
 }
 
 // ════════════════════════════════════════════════════════════════

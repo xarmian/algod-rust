@@ -3,7 +3,7 @@
 // rewards-pool-sender checks, heartbeat fee exemption.
 
 use algo_error::AlgoError;
-use algo_types::{Address, Digest, SignedTransaction, Transaction};
+use algo_types::{Address, Digest, ResourceRef, SignedTransaction, Transaction};
 
 // Re-export the comprehensive ConsensusParams and lookup function from algo-types.
 pub use algo_types::consensus::ConsensusParams;
@@ -358,11 +358,82 @@ pub fn validate_transaction_wellformed(
     Ok(())
 }
 
-/// `OnCompletion` action values (Go: `data/transactions/teal.go`
-/// `OnCompletion` enum). Only the value needed by `UpdatingSizes()` is used
-/// here; the rest of the `OnCompletion` switch validation in Go's
-/// `wellFormed` is out of scope for this check.
+/// `OnCompletion` action values (Go: `data/transactions/application.go`
+/// `OnCompletion` enum, `NoOpOC`..`DeleteApplicationOC` = 0..5).
+const ON_COMPLETION_NOOP: u64 = 0;
+const ON_COMPLETION_OPTIN: u64 = 1;
+const ON_COMPLETION_CLOSEOUT: u64 = 2;
+const ON_COMPLETION_CLEARSTATE: u64 = 3;
 const ON_COMPLETION_UPDATE: u64 = 4;
+const ON_COMPLETION_DELETE: u64 = 5;
+
+/// Maximum byte-slice length for a single `ApplicationArgs` entry (Go:
+/// `config.MaxAVMBytesSize`, `data/transactions/logic/eval.go`). This is a
+/// hardcoded AVM constant, not a versioned consensus parameter — it has been
+/// 4096 since apps launched and matches `algo_avm::opcode::MAX_STRING_SIZE`.
+const MAX_AVM_BYTES_SIZE: usize = algo_avm::opcode::MAX_STRING_SIZE;
+
+/// go-algorand's `syncProgramsVersion`
+/// (`data/transactions/transaction.go`): AVM programs at this version or
+/// higher require the ApprovalProgram/ClearStateProgram versions to match.
+const SYNC_PROGRAMS_VERSION: u64 = 6;
+
+/// Parse the leading AVM version byte(s) out of program bytecode, mirroring
+/// go-algorand's `transactions.ProgramVersion` (`data/transactions/transaction.go`):
+/// a `binary.Uvarint`-encoded version number at the start of the bytecode.
+/// Empty bytecode, or a malformed (overflowing / unterminated) varint, is an
+/// error — this is what makes `CheckContractVersions` reject a missing
+/// program at creation/update time.
+fn parse_program_version(bytecode: &[u8]) -> Result<u64, AlgoError> {
+    if bytecode.is_empty() {
+        return Err(AlgoError::Validation {
+            message: "invalid program (empty)".to_string(),
+        });
+    }
+    let mut version: u64 = 0;
+    let mut shift: u32 = 0;
+    for (i, &b) in bytecode.iter().enumerate() {
+        if i >= 10 {
+            return Err(AlgoError::Validation {
+                message: "invalid version".to_string(),
+            });
+        }
+        if i == 9 && b > 1 {
+            // 10th byte may only contribute a single extra bit for a u64.
+            return Err(AlgoError::Validation {
+                message: "invalid version".to_string(),
+            });
+        }
+        version |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Ok(version);
+        }
+        shift += 7;
+    }
+    Err(AlgoError::Validation {
+        message: "invalid version".to_string(),
+    })
+}
+
+/// Mirrors go-algorand's `CheckContractVersions(approval, clear, previous,
+/// proto)` (`data/transactions/transaction.go`) as called from `wellFormed`
+/// — always with an empty `previous` (the downgrade check only applies when
+/// checking against existing on-chain `AppParams`, which `wellFormed` never
+/// has), so only the version-parse and version-match portions apply here.
+fn check_contract_versions(approval: &[u8], clear: &[u8]) -> Result<(), AlgoError> {
+    let av = parse_program_version(approval).map_err(|e| AlgoError::Validation {
+        message: format!("bad ApprovalProgram: {e}"),
+    })?;
+    let cv = parse_program_version(clear).map_err(|e| AlgoError::Validation {
+        message: format!("bad ClearStateProgram: {e}"),
+    })?;
+    if (av >= SYNC_PROGRAMS_VERSION || cv >= SYNC_PROGRAMS_VERSION) && av != cv {
+        return Err(AlgoError::Validation {
+            message: format!("program version mismatch: {av} != {cv}"),
+        });
+    }
+    Ok(())
+}
 
 /// Mirrors go-algorand's `ApplicationCallTxnFields.UpdatingSizes()`
 /// (`data/transactions/application.go`): true when this is an application
@@ -380,25 +451,274 @@ fn updating_sizes(txn: &Transaction) -> bool {
         && (txn.extra_program_pages != 0 || global_schema_nonempty)
 }
 
+/// Mirrors go-algorand's `ApplicationCallTxnFields.WellSizedPrograms`
+/// (`data/transactions/application.go`): bounds `ApprovalProgram` /
+/// `ClearStateProgram` length, individually and summed, against
+/// `MaxAppProgramLen` / `MaxAppTotalProgramLen` scaled by
+/// `1 + extra_pages`.
+fn well_sized_programs(
+    approval_len: usize,
+    clear_len: usize,
+    extra_pages: u32,
+    params: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    let pages = 1usize + extra_pages as usize;
+    let max_program_len = pages * params.max_app_program_len;
+    if approval_len > max_program_len {
+        return Err(AlgoError::Validation {
+            message: format!("approval program too long. ({approval_len} > {max_program_len})"),
+        });
+    }
+    if clear_len > max_program_len {
+        return Err(AlgoError::Validation {
+            message: format!("clear state program too long. ({clear_len} > {max_program_len})"),
+        });
+    }
+    let max_total_program_len = pages * params.max_app_total_program_len;
+    if approval_len + clear_len > max_total_program_len {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "app programs too long. ({approval_len} + {clear_len} > {max_total_program_len})"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Mirrors go-algorand's `HoldingRef.Resolve` (`data/transactions/application.go`)
+/// as invoked from `ResourceRef.wellFormed` — only the error path matters
+/// here (the resolved address/asset aren't needed for a structural check).
+fn holding_ref_resolve(
+    hr: &algo_types::HoldingRef,
+    access: &[ResourceRef],
+) -> Result<(), AlgoError> {
+    if hr.address != 0 {
+        if hr.address > access.len() as u64 {
+            return Err(AlgoError::Validation {
+                message: format!("holding Address reference {} outside tx.Access", hr.address),
+            });
+        }
+        if access[(hr.address - 1) as usize].address.is_zero() {
+            return Err(AlgoError::Validation {
+                message: format!("holding Address reference {} is not an Address", hr.address),
+            });
+        }
+    }
+    if hr.asset == 0 || hr.asset > access.len() as u64 {
+        return Err(AlgoError::Validation {
+            message: format!("holding Asset reference {} outside tx.Access", hr.asset),
+        });
+    }
+    if access[(hr.asset - 1) as usize].asset == 0 {
+        return Err(AlgoError::Validation {
+            message: format!("holding Asset reference {} is not an Asset", hr.asset),
+        });
+    }
+    Ok(())
+}
+
+/// Mirrors go-algorand's `LocalsRef.Resolve`.
+fn locals_ref_resolve(lr: &algo_types::LocalsRef, access: &[ResourceRef]) -> Result<(), AlgoError> {
+    if lr.address != 0 {
+        if lr.address > access.len() as u64 {
+            return Err(AlgoError::Validation {
+                message: format!("locals Address reference {} outside tx.Access", lr.address),
+            });
+        }
+        if access[(lr.address - 1) as usize].address.is_zero() {
+            return Err(AlgoError::Validation {
+                message: format!("locals Address reference {} is not an Address", lr.address),
+            });
+        }
+    }
+    if lr.app != 0 {
+        if lr.app > access.len() as u64 {
+            return Err(AlgoError::Validation {
+                message: format!("locals App reference {} outside tx.Access", lr.app),
+            });
+        }
+        if access[(lr.app - 1) as usize].app == 0 {
+            return Err(AlgoError::Validation {
+                message: format!("locals App reference {} is not an App", lr.app),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Mirrors go-algorand's `BoxRef.Resolve` as called from `ResourceRef` (the
+/// `tx.Access`-list flavor of `BoxRef`, where `Index` refers into `Access`
+/// itself — distinct from the `tx.Boxes` flavor, where `Index` refers into
+/// `tx.ForeignApps`).
+fn access_box_ref_resolve(
+    br: &algo_types::BoxRef,
+    access: &[ResourceRef],
+) -> Result<(), AlgoError> {
+    if br.index == 0 {
+        return Ok(());
+    }
+    if br.index <= access.len() as u64 {
+        if access[(br.index - 1) as usize].app == 0 {
+            return Err(AlgoError::Validation {
+                message: format!("box Index reference {} is not an App", br.index),
+            });
+        }
+        return Ok(());
+    }
+    Err(AlgoError::Validation {
+        message: format!("box Index {} outside tx.Access", br.index),
+    })
+}
+
+/// Mirrors go-algorand's `ResourceRef.wellFormed` (`data/transactions/application.go`):
+/// a `tx.Access` entry must be empty, or a single kind of resource, with any
+/// internal indices pointing to proper locations inside `access`.
+fn resource_ref_wellformed(
+    rr: &ResourceRef,
+    access: &[ResourceRef],
+    in_create: bool,
+    params: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    let mut count = 0u32;
+    if !rr.address.is_zero() {
+        count += 1;
+    }
+    if rr.asset != 0 {
+        count += 1;
+    }
+    if rr.app != 0 {
+        count += 1;
+    }
+    if let Some(holding) = rr.holding.as_ref() {
+        if !holding.is_empty() {
+            holding_ref_resolve(holding, access)?;
+            count += 1;
+        }
+    }
+    if let Some(locals) = rr.locals.as_ref() {
+        if !locals.is_empty() {
+            if !params.allow_zero_local_app_ref && locals.app == 0 {
+                return Err(AlgoError::Validation {
+                    message: "0 App in LocalsRef is not supported".to_string(),
+                });
+            }
+            if in_create && locals.app == 0 {
+                return Err(AlgoError::Validation {
+                    message: "0 App in LocalsRef during app create is not allowed or necessary"
+                        .to_string(),
+                });
+            }
+            locals_ref_resolve(locals, access)?;
+            count += 1;
+        }
+    }
+    if let Some(box_ref) = rr.box_ref.as_ref() {
+        if !box_ref.is_empty() {
+            let name_len = box_ref.name.as_ref().map_or(0, |n| n.len());
+            if params.enable_box_ref_name_error && name_len > params.max_app_key_len {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "tx.Access box Name too long, max len {} bytes",
+                        params.max_app_key_len
+                    ),
+                });
+            }
+            access_box_ref_resolve(box_ref, access)?;
+            count += 1;
+        }
+    }
+    match count {
+        0 => {
+            if !rr.is_empty() {
+                return Err(AlgoError::Validation {
+                    message: "tx.Access with unknown content".to_string(),
+                });
+            }
+            Ok(())
+        }
+        1 => Ok(()),
+        _ => Err(AlgoError::Validation {
+            message: "tx.Access element has fields from multiple types".to_string(),
+        }),
+    }
+}
+
 /// Application-call-specific well-formedness checks.
 ///
-/// Mirrors the schema/extra-program-pages portion of go-algorand's
+/// A (line-for-line, in the same order) port of go-algorand's
 /// `ApplicationCallTxnFields.wellFormed` (`data/transactions/application.go`,
-/// current v5.0.0-stable structure, post `e885e4e8a` "Txn: Check for local
-/// schema setting in update" / #6682).
+/// current v5.0.0-stable structure). Originally landed (#675/PR #700) for
+/// just the schema/extra-program-pages immutability portion (post
+/// `e885e4e8a` "Txn: Check for local schema setting in update" / #6682);
+/// extended (#701) to cover every remaining sub-check: `OnCompletion`
+/// validity, `RejectVersion`, program-presence/`CheckContractVersions`,
+/// `WellSizedPrograms`, `MaxAppArgs`/arg-length bounds, and the
+/// `Access`/`Accounts`/`ForeignApps`/`ForeignAssets`/`Boxes` reference-count
+/// bounds (including each `Access` entry's own structural
+/// `ResourceRef.wellFormed` check).
 ///
-/// The critical structural rule (the bug `e885e4e8a` fixed upstream): a
-/// non-empty `LocalStateSchema` is rejected UNCONDITIONALLY whenever
-/// `ApplicationID != 0` (i.e. any non-creation app call) — local schema can
-/// only ever be set at creation. This must NOT be nested inside the
-/// `AppSizeUpdates && UpdatingSizes()` guard that conditionally allows
-/// `GlobalStateSchema`/`ExtraProgramPages` to be non-zero on a resize
-/// update — doing so would let a resize update smuggle in a `LocalStateSchema`
-/// mutation, which is exactly the vulnerability the upstream commit closed.
+/// The critical structural rule from the original #675 fix (the bug
+/// `e885e4e8a` fixed upstream): a non-empty `LocalStateSchema` is rejected
+/// UNCONDITIONALLY whenever `ApplicationID != 0` (i.e. any non-creation app
+/// call) — local schema can only ever be set at creation. This must NOT be
+/// nested inside the `AppSizeUpdates && UpdatingSizes()` guard that
+/// conditionally allows `GlobalStateSchema`/`ExtraProgramPages` to be
+/// non-zero on a resize update — doing so would let a resize update smuggle
+/// in a `LocalStateSchema` mutation, which is exactly the vulnerability the
+/// upstream commit closed.
 fn validate_application_call_wellformed(
     txn: &Transaction,
     params: &ConsensusParams,
 ) -> Result<(), AlgoError> {
+    // Ensure requested action is valid.
+    match txn.on_completion {
+        ON_COMPLETION_NOOP
+        | ON_COMPLETION_OPTIN
+        | ON_COMPLETION_CLOSEOUT
+        | ON_COMPLETION_CLEARSTATE
+        | ON_COMPLETION_UPDATE
+        | ON_COMPLETION_DELETE => { /* ok */ }
+        other => {
+            return Err(AlgoError::Validation {
+                message: format!("invalid application OnCompletion ({other})"),
+            });
+        }
+    }
+
+    if !params.enable_app_versioning && txn.reject_version > 0 {
+        return Err(AlgoError::Validation {
+            message: "tx.RejectVersion is not supported".to_string(),
+        });
+    }
+    if txn.reject_version > 0 && txn.application_id == 0 {
+        return Err(AlgoError::Validation {
+            message: "tx.RejectVersion cannot be set during creation".to_string(),
+        });
+    }
+
+    // Programs may only be set for creation or update.
+    let approval_bytes: &[u8] = txn
+        .approval_program
+        .as_ref()
+        .map_or(&[][..], |b| b.as_slice());
+    let clear_bytes: &[u8] = txn
+        .clear_state_program
+        .as_ref()
+        .map_or(&[][..], |b| b.as_slice());
+    if txn.application_id != 0 && txn.on_completion != ON_COMPLETION_UPDATE {
+        if !approval_bytes.is_empty() || !clear_bytes.is_empty() {
+            return Err(AlgoError::Validation {
+                message: "programs may only be specified during application creation or update"
+                    .to_string(),
+            });
+        }
+    } else {
+        // This checks version matching, but not downgrading — downgrading
+        // depends on chain state (existing AppParams), which `wellFormed`
+        // never has access to, so it always passes an empty `previous`.
+        check_contract_versions(approval_bytes, clear_bytes)?;
+    }
+
     // Unconditional bound on ExtraProgramPages, regardless of creation/update.
     if txn.extra_program_pages > params.max_absolute_extra_program_pages {
         return Err(AlgoError::Validation {
@@ -408,6 +728,8 @@ fn validate_application_call_wellformed(
             ),
         });
     }
+
+    let mut effective_epp = txn.extra_program_pages;
 
     if txn.application_id != 0 {
         // Local schema can only be set during creation — unconditional, no
@@ -450,6 +772,44 @@ fn validate_application_call_wellformed(
                     ),
                 });
             }
+            // We haven't checked the app params to know the actual EPP, so
+            // allow maximum-size programs for now (Go: `effectiveEPP =
+            // uint32(proto.MaxAbsoluteExtraProgramPages)`).
+            effective_epp = params.max_absolute_extra_program_pages;
+        }
+    }
+
+    well_sized_programs(
+        approval_bytes.len(),
+        clear_bytes.len(),
+        effective_epp,
+        params,
+    )?;
+
+    // Limit total number of arguments.
+    let num_args = txn.app_arguments.as_ref().map_or(0, |a| a.len());
+    if num_args > params.max_app_args {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "tx.ApplicationArgs has too many arguments. {} > {}",
+                num_args, params.max_app_args
+            ),
+        });
+    }
+
+    // Each individual argument is bounded by the hardcoded AVM byte-slice
+    // size ceiling (Go: `config.MaxAVMBytesSize`), independent of any
+    // consensus-versioned total-length cap.
+    if let Some(args) = txn.app_arguments.as_ref() {
+        for (i, arg) in args.iter().enumerate() {
+            let l = arg.as_ref().map_or(0, |b| b.len());
+            if l > MAX_AVM_BYTES_SIZE {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "tx.ApplicationArgs[{i}] length is too long. {l} > {MAX_AVM_BYTES_SIZE}"
+                    ),
+                });
+            }
         }
     }
 
@@ -476,6 +836,119 @@ fn validate_application_call_wellformed(
                 total_arg_bytes, max_total_arg_len
             ),
         });
+    }
+
+    // ── Access / legacy reference-array bounds ───────────────────
+    // Go: `data/transactions/application.go`, `wellFormed`'s `if
+    // len(ac.Access) > 0 { ... } else { ... }` block.
+    let access = txn.access.as_deref().unwrap_or(&[]);
+    if !access.is_empty() {
+        if access.len() > params.max_app_access {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "tx.Access too long, max number of references is {}",
+                    params.max_app_access
+                ),
+            });
+        }
+        // When tx.Access is used, no other references are allowed.
+        if txn.accounts.as_ref().is_some_and(|v| !v.is_empty()) {
+            return Err(AlgoError::Validation {
+                message: "tx.Accounts can't be used when tx.Access is used".to_string(),
+            });
+        }
+        if txn.foreign_apps.as_ref().is_some_and(|v| !v.is_empty()) {
+            return Err(AlgoError::Validation {
+                message: "tx.ForeignApps can't be used when tx.Access is used".to_string(),
+            });
+        }
+        if txn.foreign_assets.as_ref().is_some_and(|v| !v.is_empty()) {
+            return Err(AlgoError::Validation {
+                message: "tx.ForeignAssets can't be used when tx.Access is used".to_string(),
+            });
+        }
+        if txn.boxes.as_ref().is_some_and(|v| !v.is_empty()) {
+            return Err(AlgoError::Validation {
+                message: "tx.Boxes can't be used when tx.Access is used".to_string(),
+            });
+        }
+
+        for rr in access {
+            resource_ref_wellformed(rr, access, txn.application_id == 0, params)?;
+        }
+    } else {
+        let num_accounts = txn.accounts.as_ref().map_or(0, |v| v.len());
+        if num_accounts > params.max_app_txn_accounts {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "tx.Accounts too long, max number of accounts is {}",
+                    params.max_app_txn_accounts
+                ),
+            });
+        }
+        let num_foreign_apps = txn.foreign_apps.as_ref().map_or(0, |v| v.len());
+        if num_foreign_apps > params.max_app_txn_foreign_apps {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "tx.ForeignApps too long, max number of foreign apps is {}",
+                    params.max_app_txn_foreign_apps
+                ),
+            });
+        }
+        let num_foreign_assets = txn.foreign_assets.as_ref().map_or(0, |v| v.len());
+        if num_foreign_assets > params.max_app_txn_foreign_assets {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "tx.ForeignAssets too long, max number of foreign assets is {}",
+                    params.max_app_txn_foreign_assets
+                ),
+            });
+        }
+        let num_boxes = txn.boxes.as_ref().map_or(0, |v| v.len());
+        if num_boxes > params.max_app_box_references {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "tx.Boxes too long, max number of box references is {}",
+                    params.max_app_box_references
+                ),
+            });
+        }
+
+        // Limit the sum of all types of references that bring in resource records.
+        let total_refs = num_accounts + num_foreign_apps + num_foreign_assets + num_boxes;
+        if total_refs > params.max_app_total_txn_references {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "tx references exceed MaxAppTotalTxnReferences = {}",
+                    params.max_app_total_txn_references
+                ),
+            });
+        }
+    }
+
+    if let Some(boxes) = txn.boxes.as_ref() {
+        let num_foreign_apps = txn.foreign_apps.as_ref().map_or(0, |v| v.len()) as u64;
+        for (i, br) in boxes.iter().enumerate() {
+            // Recall 0 is the current app, so indexes are shifted — the
+            // test is for greater-than, not greater-or-equal.
+            if br.index > num_foreign_apps {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "tx.Boxes[{i}].Index is {}. Exceeds len(tx.ForeignApps)",
+                        br.index
+                    ),
+                });
+            }
+            let name_len = br.name.as_ref().map_or(0, |n| n.len());
+            if params.enable_box_ref_name_error && name_len > params.max_app_key_len {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "tx.Boxes[{i}].Name too long, max len {} bytes",
+                        params.max_app_key_len
+                    ),
+                });
+            }
+        }
     }
 
     // MaxLocalSchemaEntries / MaxGlobalSchemaEntries: unconditional size caps,
@@ -822,7 +1295,9 @@ pub fn validate_genesis_consistency(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use algo_types::{Address, HeartbeatProof, HeartbeatTxnFields, Round};
+    use algo_types::{
+        Address, BoxRef, HeartbeatProof, HeartbeatTxnFields, HoldingRef, LocalsRef, Round,
+    };
     use serde_bytes::ByteBuf;
 
     /// A non-zero sender address for tests.
@@ -987,11 +1462,13 @@ mod tests {
         let params = ConsensusParams::default(); // v42, MaxAbsoluteTotalArgLen = 16384
         let mut txn = make_valid_txn();
         txn.txn_type = "appl".into();
-        txn.app_arguments = Some(vec![Some(ByteBuf::from(vec![
-            0u8;
-            params.max_absolute_total_arg_len
-                + 1
-        ]))]);
+        txn.application_id = 42; // non-creation NoOp call: no program-presence check
+                                 // Split the over-the-hard-cap length across several args, each
+                                 // individually within MAX_AVM_BYTES_SIZE (4096) so the per-arg
+                                 // check doesn't fire first — only the summed hard cap should.
+        let per_arg = MAX_AVM_BYTES_SIZE;
+        let num_args = params.max_absolute_total_arg_len / per_arg + 2;
+        txn.app_arguments = Some(vec![Some(ByteBuf::from(vec![0u8; per_arg])); num_args]);
         // Overpay generously so the fee check can't mask the structural
         // hard-cap rejection we're testing for.
         txn.fee = u64::MAX / 2;
@@ -1822,11 +2299,23 @@ mod tests {
         }
     }
 
+    /// Set minimal-but-valid ApprovalProgram/ClearStateProgram bytes: a
+    /// single version byte, same version on both sides, well under any
+    /// program-length cap. Required on any txn that will take `wellFormed`'s
+    /// creation/update program-version-check branch (`ApplicationID == 0`,
+    /// or `OnCompletion == UpdateApplicationOC`) — `CheckContractVersions`
+    /// rejects a missing/empty program on that branch.
+    fn set_min_programs(txn: &mut Transaction) {
+        txn.approval_program = Some(ByteBuf::from(vec![6]));
+        txn.clear_state_program = Some(ByteBuf::from(vec![6]));
+    }
+
     #[test]
     fn test_appl_creation_may_set_local_and_global_schema() {
         // ApplicationID == 0 (creation): both schemas may be freely set.
         let mut txn = make_appl_txn();
         txn.application_id = 0;
+        set_min_programs(&mut txn);
         txn.local_state_schema = Some(algo_types::StateSchema {
             num_uint: 1,
             num_byte_slice: 1,
@@ -1844,6 +2333,7 @@ mod tests {
         // Plain update (no resize), nonzero LocalStateSchema: always illegal.
         let mut txn = make_appl_txn();
         txn.on_completion = ON_COMPLETION_UPDATE;
+        set_min_programs(&mut txn);
         txn.local_state_schema = Some(algo_types::StateSchema {
             num_uint: 1,
             num_byte_slice: 0,
@@ -1885,6 +2375,7 @@ mod tests {
     fn test_appl_update_resize_cannot_smuggle_local_schema_change() {
         let mut txn = make_appl_txn();
         txn.on_completion = ON_COMPLETION_UPDATE;
+        set_min_programs(&mut txn);
         // Legitimate resize: nonzero GlobalStateSchema + ExtraProgramPages,
         // which alone would be allowed under AppSizeUpdates.
         txn.global_state_schema = Some(algo_types::StateSchema {
@@ -1912,6 +2403,7 @@ mod tests {
         // must be accepted under AppSizeUpdates.
         let mut txn = make_appl_txn();
         txn.on_completion = ON_COMPLETION_UPDATE;
+        set_min_programs(&mut txn);
         txn.global_state_schema = Some(algo_types::StateSchema {
             num_uint: 1,
             num_byte_slice: 0,
@@ -1927,6 +2419,7 @@ mod tests {
         // AppSizeUpdates is not yet active (v41): must be rejected.
         let mut txn = make_appl_txn();
         txn.on_completion = ON_COMPLETION_UPDATE;
+        set_min_programs(&mut txn);
         txn.global_state_schema = Some(algo_types::StateSchema {
             num_uint: 1,
             num_byte_slice: 0,
@@ -1948,6 +2441,7 @@ mod tests {
     fn test_appl_extra_program_pages_over_max_rejected() {
         let mut txn = make_appl_txn();
         txn.application_id = 0; // creation: EPP bound is still unconditional
+        set_min_programs(&mut txn);
         let params = v42_params();
         txn.extra_program_pages = params.max_absolute_extra_program_pages + 1;
         let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
@@ -1961,6 +2455,7 @@ mod tests {
     fn test_appl_local_schema_entries_over_max_rejected_at_creation() {
         let mut txn = make_appl_txn();
         txn.application_id = 0; // creation: entry-count caps still apply
+        set_min_programs(&mut txn);
         let params = v42_params();
         txn.local_state_schema = Some(algo_types::StateSchema {
             num_uint: params.max_local_schema_entries + 1,
@@ -1977,6 +2472,7 @@ mod tests {
     fn test_appl_global_schema_entries_over_max_rejected_at_creation() {
         let mut txn = make_appl_txn();
         txn.application_id = 0;
+        set_min_programs(&mut txn);
         let params = v42_params();
         txn.global_state_schema = Some(algo_types::StateSchema {
             num_uint: params.max_global_schema_entries + 1,
@@ -1994,5 +2490,838 @@ mod tests {
         let txn = make_appl_txn();
         let params = v42_params();
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    // ── Application-call well-formedness (issue #701) ────────────
+    // Remaining `ApplicationCallTxnFields.wellFormed` structural checks not
+    // covered by #675/PR #700 (schema/EPP immutability only).
+
+    // -- OnCompletion --
+
+    #[test]
+    fn test_appl_invalid_on_completion_rejected() {
+        let mut txn = make_appl_txn();
+        txn.on_completion = 6; // one past DeleteApplicationOC = 5
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid application OnCompletion"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_every_on_completion_value_0_to_5_accepted() {
+        let params = v42_params();
+        for oc in 0..=5u64 {
+            let mut txn = make_appl_txn();
+            txn.on_completion = oc;
+            if oc == ON_COMPLETION_UPDATE {
+                set_min_programs(&mut txn);
+            }
+            assert!(
+                validate_transaction_wellformed(&txn, false, &params, None).is_ok(),
+                "OnCompletion {oc} should be accepted"
+            );
+        }
+    }
+
+    // -- RejectVersion --
+
+    #[test]
+    fn test_appl_reject_version_rejected_when_versioning_disabled() {
+        let mut txn = make_appl_txn();
+        txn.reject_version = 1;
+        let v40 = consensus_params_for_version(algo_types::consensus::CONSENSUS_V40)
+            .expect("v40 consensus params must be defined");
+        assert!(
+            !v40.enable_app_versioning,
+            "test assumes v40 predates EnableAppVersioning"
+        );
+        let err = validate_transaction_wellformed(&txn, false, &v40, None).unwrap_err();
+        assert!(
+            err.to_string().contains("RejectVersion is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_reject_version_cannot_be_set_during_creation() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0; // creation
+        txn.reject_version = 1;
+        set_min_programs(&mut txn);
+        let params = v42_params();
+        assert!(params.enable_app_versioning);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("RejectVersion cannot be set during creation"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_reject_version_on_noncreation_call_accepted() {
+        let mut txn = make_appl_txn();
+        txn.reject_version = 1; // application_id != 0 (non-creation)
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    // -- Program presence / CheckContractVersions --
+
+    #[test]
+    fn test_appl_programs_set_on_plain_noop_call_rejected() {
+        // Not a creation (ApplicationID != 0), not an update: programs must
+        // be absent.
+        let mut txn = make_appl_txn();
+        set_min_programs(&mut txn);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("programs may only be specified during application creation or update"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_creation_missing_approval_program_rejected() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        txn.clear_state_program = Some(ByteBuf::from(vec![6]));
+        // ApprovalProgram left unset.
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("bad ApprovalProgram"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_creation_missing_clear_state_program_rejected() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        txn.approval_program = Some(ByteBuf::from(vec![6]));
+        // ClearStateProgram left unset.
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("bad ClearStateProgram"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_creation_mismatched_program_versions_rejected() {
+        // Both >= syncProgramsVersion (6), but different: must match.
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        txn.approval_program = Some(ByteBuf::from(vec![6]));
+        txn.clear_state_program = Some(ByteBuf::from(vec![7]));
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("program version mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_creation_mismatched_pre_sync_versions_accepted() {
+        // Both below syncProgramsVersion (6): mismatch is fine.
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        txn.approval_program = Some(ByteBuf::from(vec![2]));
+        txn.clear_state_program = Some(ByteBuf::from(vec![4]));
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_appl_update_requires_programs_present() {
+        let mut txn = make_appl_txn();
+        txn.on_completion = ON_COMPLETION_UPDATE;
+        // No programs set at all.
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("bad ApprovalProgram"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -- WellSizedPrograms --
+
+    #[test]
+    fn test_appl_approval_program_too_long_rejected() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        let params = v42_params();
+        let mut approval = vec![6u8];
+        approval.extend(vec![0u8; params.max_app_program_len]); // over the 1-page cap
+        txn.approval_program = Some(ByteBuf::from(approval));
+        txn.clear_state_program = Some(ByteBuf::from(vec![6]));
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("approval program too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_clear_state_program_too_long_rejected() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        let params = v42_params();
+        let mut clear = vec![6u8];
+        clear.extend(vec![0u8; params.max_app_program_len]);
+        txn.approval_program = Some(ByteBuf::from(vec![6]));
+        txn.clear_state_program = Some(ByteBuf::from(clear));
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("clear state program too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_total_program_length_too_long_rejected() {
+        // Each individually within MaxAppProgramLen, but summed over
+        // MaxAppTotalProgramLen (1 page): must be rejected on the summed
+        // check even though neither individual check fires.
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        let params = v42_params();
+        assert!(params.max_app_total_program_len < 2 * params.max_app_program_len);
+        let half = params.max_app_total_program_len / 2 + 1;
+        assert!(half <= params.max_app_program_len);
+        let mut approval = vec![6u8];
+        approval.extend(vec![0u8; half - 1]);
+        let mut clear = vec![6u8];
+        clear.extend(vec![0u8; half - 1]);
+        txn.approval_program = Some(ByteBuf::from(approval));
+        txn.clear_state_program = Some(ByteBuf::from(clear));
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("app programs too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_update_program_size_uses_effective_epp_when_resizing() {
+        // A resize update (AppSizeUpdates active) with ExtraProgramPages = 1
+        // should get a 2-page size ceiling, not the 1-page default.
+        let mut txn = make_appl_txn();
+        txn.on_completion = ON_COMPLETION_UPDATE;
+        let params = v42_params();
+        txn.global_state_schema = Some(algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        });
+        txn.extra_program_pages = 1;
+        let mut approval = vec![6u8];
+        // Over 1 page, but within 2 pages.
+        approval.extend(vec![0u8; params.max_app_program_len + 10]);
+        txn.approval_program = Some(ByteBuf::from(approval));
+        txn.clear_state_program = Some(ByteBuf::from(vec![6]));
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    // -- MaxAppArgs / arg length --
+
+    #[test]
+    fn test_appl_max_app_args_count_exceeded_rejected() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        txn.app_arguments = Some(vec![
+            Some(ByteBuf::from(Vec::new()));
+            params.max_app_args + 1
+        ]);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ApplicationArgs has too many arguments"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_max_app_args_count_at_limit_accepted() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        txn.app_arguments = Some(vec![Some(ByteBuf::from(Vec::new())); params.max_app_args]);
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_appl_single_arg_over_max_avm_bytes_size_rejected() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        txn.app_arguments = Some(vec![Some(ByteBuf::from(vec![0u8; MAX_AVM_BYTES_SIZE + 1]))]);
+        // Overpay generously so the size-pricing fee surcharge can't mask
+        // the structural rejection we're testing for.
+        txn.fee = u64::MAX / 2;
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ApplicationArgs[0] length is too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_args_total_length_over_max_rejected() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        // Several args, each at MAX_AVM_BYTES_SIZE (so the per-arg check
+        // doesn't fire), but summed over MaxAbsoluteTotalArgLen.
+        let per_arg = MAX_AVM_BYTES_SIZE;
+        let num_args = params.max_absolute_total_arg_len / per_arg + 2;
+        txn.app_arguments = Some(vec![Some(ByteBuf::from(vec![0u8; per_arg])); num_args]);
+        // Overpay generously so the size-pricing fee surcharge can't mask
+        // the structural rejection we're testing for.
+        txn.fee = u64::MAX / 2;
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ApplicationArgs total length is too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -- Access mutual exclusion / MaxAppAccess --
+
+    #[test]
+    fn test_appl_access_with_accounts_rejected() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![ResourceRef {
+            app: 7,
+            ..Default::default()
+        }]);
+        txn.accounts = Some(vec![Address([9u8; 32])]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tx.Accounts can't be used when tx.Access is used"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_with_foreign_apps_rejected() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![ResourceRef {
+            app: 7,
+            ..Default::default()
+        }]);
+        txn.foreign_apps = Some(vec![7]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tx.ForeignApps can't be used when tx.Access is used"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_with_foreign_assets_rejected() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![ResourceRef {
+            app: 7,
+            ..Default::default()
+        }]);
+        txn.foreign_assets = Some(vec![7]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tx.ForeignAssets can't be used when tx.Access is used"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_with_boxes_rejected() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![ResourceRef {
+            app: 7,
+            ..Default::default()
+        }]);
+        txn.boxes = Some(vec![BoxRef {
+            index: 0,
+            name: Some(ByteBuf::from(b"x".to_vec())),
+        }]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tx.Boxes can't be used when tx.Access is used"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_over_max_app_access_rejected() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        txn.access = Some(
+            (0..params.max_app_access + 1)
+                .map(|_| ResourceRef {
+                    app: 7,
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("tx.Access too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_at_max_app_access_accepted() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        txn.access = Some(
+            (0..params.max_app_access)
+                .map(|_| ResourceRef {
+                    app: 7,
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    // -- ResourceRef.wellFormed --
+
+    #[test]
+    fn test_appl_access_ref_with_multiple_kinds_rejected() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![ResourceRef {
+            asset: 1,
+            app: 1,
+            ..Default::default()
+        }]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tx.Access element has fields from multiple types"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_empty_ref_accepted() {
+        // An all-zero ResourceRef is allowed: it just asks for a box quota
+        // bump.
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![ResourceRef::default()]);
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_appl_access_holding_address_index_out_of_bounds_rejected() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![ResourceRef {
+            holding: Some(HoldingRef {
+                address: 5, // out of bounds: only 1 element in Access
+                asset: 1,
+            }),
+            ..Default::default()
+        }]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holding Address reference 5 outside tx.Access"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_holding_address_index_wrong_type_rejected() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![
+            ResourceRef {
+                app: 7, // index 1 is an App, not an Address
+                ..Default::default()
+            },
+            ResourceRef {
+                holding: Some(HoldingRef {
+                    address: 1, // points at the App entry above
+                    asset: 1,
+                }),
+                ..Default::default()
+            },
+        ]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holding Address reference 1 is not an Address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_holding_asset_zero_rejected() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![
+            ResourceRef {
+                address: Address([2u8; 32]),
+                ..Default::default()
+            },
+            ResourceRef {
+                holding: Some(HoldingRef {
+                    // A valid Address index makes this HoldingRef non-empty
+                    // (an all-zero HoldingRef is simply "empty", not an
+                    // error) and clears the Address-resolution step, so
+                    // Asset = 0 is the specific invalid part under test.
+                    address: 1,
+                    asset: 0,
+                }),
+                ..Default::default()
+            },
+        ]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holding Asset reference 0 outside tx.Access"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_holding_valid_reference_accepted() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![
+            ResourceRef {
+                asset: 99,
+                ..Default::default()
+            },
+            ResourceRef {
+                holding: Some(HoldingRef {
+                    address: 0, // 0 = sender
+                    asset: 1,   // 1-based index into Access -> the asset above
+                }),
+                ..Default::default()
+            },
+        ]);
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_appl_access_locals_zero_app_rejected_when_disallowed() {
+        let mut txn = make_appl_txn();
+        // Address = 1 makes the LocalsRef non-empty (an all-zero LocalsRef
+        // is simply "empty", not an error) without needing App to resolve
+        // it — the zero-App checks fire before Resolve is ever called.
+        txn.access = Some(vec![ResourceRef {
+            locals: Some(LocalsRef { address: 1, app: 0 }),
+            ..Default::default()
+        }]);
+        let v41 = consensus_params_for_version(algo_types::consensus::CONSENSUS_V41)
+            .expect("v41 consensus params must be defined");
+        assert!(
+            !v41.allow_zero_local_app_ref,
+            "test assumes v41 predates AllowZeroLocalAppRef"
+        );
+        let err = validate_transaction_wellformed(&txn, false, &v41, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("0 App in LocalsRef is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_locals_zero_app_rejected_during_create_even_when_allowed() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0; // creation
+        set_min_programs(&mut txn);
+        txn.access = Some(vec![ResourceRef {
+            locals: Some(LocalsRef { address: 1, app: 0 }),
+            ..Default::default()
+        }]);
+        let params = v42_params();
+        assert!(
+            params.allow_zero_local_app_ref,
+            "test assumes v42 allows AllowZeroLocalAppRef"
+        );
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("0 App in LocalsRef during app create is not allowed or necessary"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_locals_zero_app_accepted_on_noncreation_call() {
+        let mut txn = make_appl_txn(); // application_id != 0, NoOp
+        txn.access = Some(vec![
+            ResourceRef {
+                address: Address([3u8; 32]),
+                ..Default::default()
+            },
+            ResourceRef {
+                // App = 0 ("current app") is fine here: not creation, and
+                // AllowZeroLocalAppRef is active at v42.
+                locals: Some(LocalsRef { address: 1, app: 0 }),
+                ..Default::default()
+            },
+        ]);
+        let params = v42_params();
+        assert!(params.allow_zero_local_app_ref);
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_appl_access_locals_app_index_out_of_bounds_rejected() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![ResourceRef {
+            locals: Some(LocalsRef { address: 0, app: 5 }),
+            ..Default::default()
+        }]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("locals App reference 5 outside tx.Access"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_box_index_out_of_bounds_rejected() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![ResourceRef {
+            box_ref: Some(BoxRef {
+                index: 3,
+                name: Some(ByteBuf::from(b"x".to_vec())),
+            }),
+            ..Default::default()
+        }]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("box Index 3 outside tx.Access"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_box_index_wrong_type_rejected() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![
+            ResourceRef {
+                asset: 9, // index 1 is an Asset, not an App
+                ..Default::default()
+            },
+            ResourceRef {
+                box_ref: Some(BoxRef {
+                    index: 1,
+                    name: Some(ByteBuf::from(b"x".to_vec())),
+                }),
+                ..Default::default()
+            },
+        ]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("box Index reference 1 is not an App"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_access_box_current_app_accepted() {
+        let mut txn = make_appl_txn();
+        txn.access = Some(vec![ResourceRef {
+            box_ref: Some(BoxRef {
+                index: 0, // 0 = current app
+                name: Some(ByteBuf::from(b"x".to_vec())),
+            }),
+            ..Default::default()
+        }]);
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_appl_access_box_name_too_long_rejected_when_enabled() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        assert!(
+            params.enable_box_ref_name_error,
+            "test assumes v42 has EnableBoxRefNameError"
+        );
+        txn.access = Some(vec![ResourceRef {
+            box_ref: Some(BoxRef {
+                index: 0,
+                name: Some(ByteBuf::from(vec![0u8; params.max_app_key_len + 1])),
+            }),
+            ..Default::default()
+        }]);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("tx.Access box Name too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -- Non-Access reference-array bounds --
+
+    #[test]
+    fn test_appl_max_app_txn_accounts_exceeded_rejected() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        txn.accounts = Some(vec![Address([2u8; 32]); params.max_app_txn_accounts + 1]);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("tx.Accounts too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_max_app_txn_foreign_apps_exceeded_rejected() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        txn.foreign_apps = Some(vec![1u64; params.max_app_txn_foreign_apps + 1]);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("tx.ForeignApps too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_max_app_txn_foreign_assets_exceeded_rejected() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        txn.foreign_assets = Some(vec![1u64; params.max_app_txn_foreign_assets + 1]);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("tx.ForeignAssets too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_max_app_box_references_exceeded_rejected() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        txn.boxes = Some(vec![
+            BoxRef {
+                index: 0,
+                name: Some(ByteBuf::from(b"x".to_vec())),
+            };
+            params.max_app_box_references + 1
+        ]);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("tx.Boxes too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_max_app_total_txn_references_exceeded_rejected() {
+        // Each individual field is within its own per-field bound, but the
+        // sum across Accounts + ForeignApps + ForeignAssets exceeds
+        // MaxAppTotalTxnReferences. At v42 all the per-field caps equal
+        // MaxAppTotalTxnReferences (8), so no single field can be pushed
+        // over the sum alone — split the excess across two fields instead.
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        let per_field = params.max_app_total_txn_references / 2;
+        assert!(per_field <= params.max_app_txn_accounts);
+        assert!(per_field <= params.max_app_txn_foreign_apps);
+        txn.accounts = Some(vec![Address([2u8; 32]); per_field]);
+        txn.foreign_apps = Some(vec![1u64; per_field + 1]);
+        assert!(
+            per_field + (per_field + 1) > params.max_app_total_txn_references,
+            "test setup must actually exceed the sum bound"
+        );
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tx references exceed MaxAppTotalTxnReferences"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_references_at_all_limits_accepted() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        // Individually and summed, exactly at the caps.
+        let n = params.max_app_total_txn_references;
+        txn.accounts = Some(vec![Address([2u8; 32]); n.min(params.max_app_txn_accounts)]);
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    // -- tx.Boxes index / name bound (non-Access path) --
+
+    #[test]
+    fn test_appl_box_index_exceeds_foreign_apps_rejected() {
+        let mut txn = make_appl_txn();
+        txn.foreign_apps = Some(vec![7]);
+        txn.boxes = Some(vec![BoxRef {
+            index: 2, // only 1 ForeignApps entry -> valid indices are 0, 1
+            name: Some(ByteBuf::from(b"x".to_vec())),
+        }]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("Exceeds len(tx.ForeignApps)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_box_name_too_long_rejected_when_enabled() {
+        let mut txn = make_appl_txn();
+        let params = v42_params();
+        assert!(params.enable_box_ref_name_error);
+        txn.boxes = Some(vec![BoxRef {
+            index: 0,
+            name: Some(ByteBuf::from(vec![0u8; params.max_app_key_len + 1])),
+        }]);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("tx.Boxes[0].Name too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_box_name_over_key_len_accepted_when_flag_disabled() {
+        // Same over-length name, but at a version predating
+        // EnableBoxRefNameError: not rejected by this specific check.
+        let mut txn = make_appl_txn();
+        let v36 = consensus_params_for_version(algo_types::consensus::CONSENSUS_V36)
+            .expect("v36 consensus params must be defined");
+        assert!(!v36.enable_box_ref_name_error);
+        txn.foreign_apps = Some(vec![1]);
+        txn.boxes = Some(vec![BoxRef {
+            index: 0,
+            name: Some(ByteBuf::from(vec![0u8; v36.max_app_key_len + 1])),
+        }]);
+        assert!(validate_transaction_wellformed(&txn, false, &v36, None).is_ok());
     }
 }
