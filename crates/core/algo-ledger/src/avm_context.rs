@@ -1348,7 +1348,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// Lazily initialize the available-boxes map and I/O budget from the
     /// transaction group's box references. Matches go-algorand's
     /// `computeAvailability` + `fillApplicationCallForeign` for boxes.
-    fn ensure_boxes_initialized(&mut self) {
+    pub(crate) fn ensure_boxes_initialized(&mut self) {
         if self.boxes_initialized {
             return;
         }
@@ -1432,11 +1432,19 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         self.io_budget = num_box_refs.saturating_mul(self.consensus.bytes_per_box_reference);
     }
 
-    /// Perform the one-time read budget check (on first box read for a
-    /// top-level call). Sums the sizes of all available boxes and verifies
-    /// against the I/O budget. Matches go-algorand's read budget check in
-    /// `EvalContract`.
-    fn check_read_budget(&mut self) -> Result<(), AlgoError> {
+    /// Perform the one-time read budget check for a top-level call. Sums the
+    /// sizes of all available boxes and verifies against the I/O budget.
+    /// Matches go-algorand's read budget check in `EvalContract`
+    /// (`data/transactions/logic/eval.go:1275-1344`), which runs eagerly,
+    /// unconditionally, for every top-level app call -- gated only on
+    /// `cx.caller == nil && !cx.readBudgetChecked`, not on the program ever
+    /// executing a box opcode. `apply_appl` (issue #725) calls this
+    /// unconditionally before running the approval/clear-state program, in
+    /// addition to the pre-existing lazy call sites (`available_app_box`, and
+    /// the inner-`appl`-dispatch path in `itxn_submit`) -- `read_budget_checked`
+    /// makes every call after the first a no-op, so this is "also called
+    /// eagerly" rather than a replacement.
+    pub(crate) fn check_read_budget(&mut self) -> Result<(), AlgoError> {
         if self.read_budget_checked {
             return Ok(());
         }

@@ -3766,6 +3766,24 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     // `gload` on us sees "ran" even if we go on to
                     // reject/error.
                     mark_group_member_ran(group_info);
+                    // Eager box read-I/O-budget check (issue #725): matches
+                    // go-algorand's `EvalContract`'s
+                    // `if cx.caller == nil && !cx.readBudgetChecked { ... }`
+                    // gate (`data/transactions/logic/eval.go:1275-1344`),
+                    // which runs unconditionally before a single opcode
+                    // executes -- regardless of whether the clear-state
+                    // program ever touches a box. Under go-algorand's
+                    // `EnableBareBudgetError = true` (set at V38, current
+                    // through this repo's V42 pin and never reverted), this
+                    // failure is a bare error, not a
+                    // `logic.EvalError` -- so unlike an ordinary
+                    // ClearState-program rejection/error, it is NOT swallowed
+                    // by `ledger/apply/application.go`'s
+                    // `if _, ok := evalErr.(logic.EvalError); !ok { return
+                    // evalErr }` and must fail the outer transaction, which
+                    // `?` does here.
+                    avm_ctx.ensure_boxes_initialized();
+                    avm_ctx.check_read_budget()?;
                     let result = if let Some(ref mut t) = tracer {
                         run_clear_state_program_with_tracer(
                             &clear_program,
@@ -3867,6 +3885,19 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 // `EvalContract` ordering), so a sibling that reads `gload`
                 // on us sees "ran" even if we go on to reject/error.
                 mark_group_member_ran(group_info);
+                // Eager box read-I/O-budget check (issue #725): matches
+                // go-algorand's `EvalContract`'s
+                // `if cx.caller == nil && !cx.readBudgetChecked { ... }` gate
+                // (`data/transactions/logic/eval.go:1275-1344`), which sums
+                // the sizes of all boxes referenced by the group's box refs
+                // against the I/O budget those refs grant -- unconditionally,
+                // before a single opcode executes, regardless of whether the
+                // approval program ever touches a box. Preserves the
+                // existing lazy call sites (`available_app_box`,
+                // `itxn_submit`'s inner-`appl` dispatch): `read_budget_checked`
+                // makes every call after this one a no-op.
+                avm_ctx.ensure_boxes_initialized();
+                avm_ctx.check_read_budget()?;
                 let mut result = if let Some(ref mut t) = tracer {
                     run_approval_program_with_tracer(&approval_program, &mut avm_ctx, budget, *t)?
                 } else {
@@ -9458,6 +9489,234 @@ mod tests {
             msg.contains("write budget exceeded")
                 && msg.contains(&format!("updating app {app_id}")),
             "expected a write-budget-exceeded rejection for the oversized update, got: {msg}"
+        );
+    }
+
+    // ---- Issue #725: box read-I/O-budget check must run eagerly for every
+    // top-level app call, not only when a box opcode actually executes ----
+    //
+    // Oracle: go-algorand's `EvalContract`'s eager
+    // `if cx.caller == nil && !cx.readBudgetChecked { ... }` gate
+    // (`data/transactions/logic/eval.go:1275-1344`) runs this check
+    // unconditionally at the start of every top-level contract evaluation,
+    // before a single opcode executes -- regardless of whether the
+    // approval/clear-state program ever touches a box. Each test below uses
+    // a trivial approval program (`int 1; return`) that never executes a
+    // box opcode, so the *only* way the rejection below can fire is via the
+    // eager top-level call added to `apply_appl` -- the pre-existing lazy
+    // call sites (`available_app_box`, `itxn_submit`) are never reached.
+
+    #[test]
+    fn issue_725_no_box_opcode_but_oversized_referenced_box_is_rejected_eagerly() {
+        use crate::store_trait::LedgerStore;
+
+        let creator = Address([7u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        // Round 1: create an app whose approval/clear programs never touch
+        // any box opcode.
+        let approval = trivial_clear_program();
+        let clear = trivial_clear_program();
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let &app_id = delta1
+            .creatables
+            .keys()
+            .next()
+            .expect("app create must register a creatable");
+
+        // Directly seed an existing box for this app whose size (3000 bytes)
+        // exceeds the I/O budget a single box reference grants
+        // (`BytesPerBoxReference == 2048` under V41) -- standing in for a
+        // box that was written to in some earlier round.
+        state.set_box(app_id, b"mybox", vec![0u8; 3_000]);
+
+        // Round 2: call the app again, referencing that box via `txn.boxes`,
+        // but the approval program (still the same trivial, box-opcode-free
+        // program) never actually reads it.
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 1_000;
+        call.txn.application_id = app_id;
+        call.txn.boxes = Some(vec![algo_types::BoxRef {
+            index: 0,
+            name: Some(serde_bytes::ByteBuf::from(b"mybox".to_vec())),
+        }]);
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![call],
+            ..Block::default()
+        };
+
+        let err = apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read budget exceeded (3000 > 2048)"),
+            "expected an eager read-budget rejection even though the program never executed a box opcode, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn issue_725_no_box_opcode_and_small_referenced_box_is_accepted() {
+        // Companion to the rejection test above: identical setup, but the
+        // existing box is small enough to fit the I/O budget the single box
+        // ref grants, so the call must succeed.
+        use crate::store_trait::LedgerStore;
+
+        let creator = Address([7u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        let approval = trivial_clear_program();
+        let clear = trivial_clear_program();
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let &app_id = delta1
+            .creatables
+            .keys()
+            .next()
+            .expect("app create must register a creatable");
+
+        // Well within the 2048-byte budget a single box ref grants.
+        state.set_box(app_id, b"mybox", vec![0u8; 10]);
+
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 1_000;
+        call.txn.application_id = app_id;
+        call.txn.boxes = Some(vec![algo_types::BoxRef {
+            index: 0,
+            name: Some(serde_bytes::ByteBuf::from(b"mybox".to_vec())),
+        }]);
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![call],
+            ..Block::default()
+        };
+
+        apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute)
+            .expect("a small existing box referenced without a box opcode must not be rejected");
+    }
+
+    #[test]
+    fn issue_725_eager_check_does_not_double_count_when_box_opcode_also_runs() {
+        // Regression for the `read_budget_checked` guard: a program that
+        // *does* execute a box opcode (`box_len`) against the same
+        // eagerly-checked box must not re-sum/re-reject on the lazy call
+        // site inside `available_app_box` -- the eager `apply_appl` call
+        // must have already flipped `read_budget_checked`, making the later
+        // in-program call a no-op. Uses a box just under the budget so any
+        // accidental double-counting (summing the box's bytes twice) would
+        // push it over and wrongly reject.
+        use crate::store_trait::LedgerStore;
+
+        let creator = Address([7u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        // `box_len mybox` then discard both results, approve.
+        let approval = algo_avm::assembler::assemble_string(
+            "#pragma version 8\npushbytes \"mybox\"\nbox_len\npop\npop\nint 1\nreturn\n",
+        )
+        .expect("box_len program must assemble")
+        .program;
+        let clear = trivial_clear_program();
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        create.txn.boxes = Some(vec![algo_types::BoxRef {
+            index: 0,
+            name: Some(serde_bytes::ByteBuf::from(b"mybox".to_vec())),
+        }]);
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let &app_id = delta1
+            .creatables
+            .keys()
+            .next()
+            .expect("app create must register a creatable");
+
+        // Just under the single box ref's 2048-byte budget; double-counting
+        // it (eager sum + a second, un-guarded lazy sum) would push the
+        // total to 4000 and wrongly reject.
+        state.set_box(app_id, b"mybox", vec![0u8; 2_000]);
+
+        let approval2 = algo_avm::assembler::assemble_string(
+            "#pragma version 8\npushbytes \"mybox\"\nbox_len\npop\npop\nint 1\nreturn\n",
+        )
+        .expect("box_len program must assemble")
+        .program;
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 1_000;
+        call.txn.application_id = app_id;
+        call.txn.on_completion = ON_COMPLETION_UPDATE;
+        call.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval2));
+        call.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(trivial_clear_program()));
+        call.txn.boxes = Some(vec![algo_types::BoxRef {
+            index: 0,
+            name: Some(serde_bytes::ByteBuf::from(b"mybox".to_vec())),
+        }]);
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![call],
+            ..Block::default()
+        };
+
+        apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute).expect(
+            "eager read-budget check + a later in-program box opcode must not double-count the same box",
         );
     }
 }
