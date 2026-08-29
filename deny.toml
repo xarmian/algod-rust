@@ -46,17 +46,21 @@ allow = [
     "AGPL-3.0-or-later",
 ]
 
-# `ring` (a transitive TLS/crypto dependency) has, for several releases,
-# shipped with no Cargo.toml `license` field at all — a well-known upstream
-# quirk, not something specific to algod-rust. Its own LICENSE file states a
-# mix of an ISC-style license (original code) and the OpenSSL license (code
-# derived from BoringSSL/OpenSSL), both permissive. This session could not
-# run cargo-deny itself to compute the license-file hash `clarify` requires
-# (see docs/DEPENDENCY_LICENSES.md for why); when CI's first real run
-# reports the correct hash, replace this comment with a proper
-# `[[licenses.clarify]]` block. Until then the `dependency-licenses` CI job
-# stays advisory (`continue-on-error: true`) specifically because of this
-# gap, not because the license itself is in doubt.
+# `ring 0.16.20` (a transitive TLS/crypto dependency present in Cargo.lock)
+# has, for several releases, shipped with no Cargo.toml `license` field at
+# all — a well-known upstream quirk, not something specific to algod-rust.
+# Its own LICENSE file states a mix of an ISC-style license (original code)
+# and the OpenSSL license (code derived from BoringSSL/OpenSSL), both
+# permissive. This session could not read that vendored LICENSE file or run
+# cargo-deny to see whether it would need an explicit `[[licenses.clarify]]`
+# entry (see docs/DEPENDENCY_LICENSES.md) — but CI's real `cargo-deny` run
+# reports a clean `licenses ok` with no rejection for `ring` at all, meaning
+# either the resolver/target combination cargo-deny actually checks doesn't
+# pull in this particular `ring` version, or cargo-deny's own crate-level
+# override list already knows about it. No `clarify` block has turned out
+# to be necessary in practice; if a future `cargo-deny` run ever does reject
+# `ring` for a missing license, add one then using the hash the error
+# message reports.
 
 [bans]
 multiple-versions = "warn"
