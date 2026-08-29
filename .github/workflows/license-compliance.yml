@@ -1,0 +1,60 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: License Compliance
+
+# Part of the Phase 15 licensing-compliance epic (#732), implementing issue
+# #731 parts D/E. Two independent, fast, non-build-dependent checks that run
+# on every PR (no path filter — a new file anywhere can be missing a header):
+#
+#   header-check        - every in-scope tracked source file has an SPDX
+#                          license header (see docs/LICENSING_AUDIT.md).
+#                          Pure `git ls-files` + grep-the-first-20-lines via
+#                          .github/scripts/check-license-headers.py — no
+#                          Rust/Go toolchain, no build, seconds not minutes.
+#   dependency-licenses  - the crates.io dependency tree stays
+#                          AGPL-compatible, via cargo-deny + deny.toml.
+#                          Confirmed passing clean ("licenses ok") on this
+#                          PR's own CI run after fixing deny.toml's schema
+#                          (see docs/DEPENDENCY_LICENSES.md) — blocking.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: license-compliance-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  header-check:
+    name: License Header Presence
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check every in-scope file for an SPDX header
+        run: python3 .github/scripts/check-license-headers.py
+
+  dependency-licenses:
+    name: Dependency License Compatibility (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run cargo-deny (licenses)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
