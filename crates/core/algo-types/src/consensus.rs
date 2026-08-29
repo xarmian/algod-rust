@@ -92,6 +92,16 @@ pub const CONSENSUS_ALPHA3: &str = "alpha3";
 pub const CONSENSUS_ALPHA4: &str = "alpha4";
 pub const CONSENSUS_ALPHA5: &str = "alpha5";
 
+// ── FNet versions ────────────────────────────────────────────────
+// go: protocol/consensus.go (v5.0.0-stable), `ConsensusVFnet1`..`ConsensusVFnet4`.
+// A dedicated test-network series (AF's FNet), analogous to the vAlphaX
+// series above. algod-rust does not target FNet as a network, but these are
+// included for table-completeness/documentation parity with go-algorand.
+pub const CONSENSUS_VFNET1: &str = "fnet1";
+pub const CONSENSUS_VFNET2: &str = "fnet2";
+pub const CONSENSUS_VFNET3: &str = "fnet3";
+pub const CONSENSUS_VFNET4: &str = "fnet4";
+
 /// The current (latest release) consensus version.
 pub const CONSENSUS_CURRENT_VERSION: &str = CONSENSUS_V42;
 
@@ -142,6 +152,10 @@ pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
     CONSENSUS_ALPHA3,
     CONSENSUS_ALPHA4,
     CONSENSUS_ALPHA5,
+    CONSENSUS_VFNET1,
+    CONSENSUS_VFNET2,
+    CONSENSUS_VFNET3,
+    CONSENSUS_VFNET4,
 ];
 
 // ── ConsensusParams ─────────────────────────────────────────────────
@@ -1159,6 +1173,52 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         return consensus_params_for_version(CONSENSUS_V36);
     }
 
+    // ── FNet versions ───────────────────────────────────────────
+    // go: config/consensus.go (v5.0.0-stable), commit 189914a64 ("FNet: add
+    // fnet1..4 consensus versions, genesis, and docker (#6675)"). Modeled
+    // for table-completeness parity only; algod-rust does not join FNet.
+    //
+    // fnet1 is the FNet genesis protocol: v39 base, LogicSigVersion bumped to
+    // 11 (TEAL v11), plus FNet-tuned payouts/bonus overrides.
+    if version == CONSENSUS_VFNET1 {
+        let mut fnet1 =
+            consensus_params_for_version(CONSENSUS_V39).expect("v39 must be constructible");
+        fnet1.logic_sig_version = 11;
+        fnet1.payouts_enabled = true;
+        fnet1.payouts_percent = 75;
+        fnet1.payouts_go_online_fee = 2_000_000; // 2 algos
+        fnet1.payouts_min_balance = 30_000_000_000; // 30,000 algos
+        fnet1.payouts_max_balance = 70_000_000_000_000; // 70M algos
+        fnet1.payouts_max_mark_absent = 32;
+        fnet1.payouts_challenge_interval = 1_000;
+        fnet1.payouts_challenge_grace_period = 200;
+        fnet1.payouts_challenge_bits = 5;
+        fnet1.bonus_base_amount = 10_000_000; // 10 algos
+        fnet1.bonus_decay_interval = 250_000;
+        return Some(fnet1);
+    }
+
+    // fnet2 guards against a block-opcode change the fnet1 client did not
+    // support; no parameter change from fnet1.
+    if version == CONSENSUS_VFNET2 {
+        return consensus_params_for_version(CONSENSUS_VFNET1);
+    }
+
+    // fnet3 disables challenges (no heartbeats yet, so challenged accounts
+    // were being evicted); otherwise same as fnet2.
+    if version == CONSENSUS_VFNET3 {
+        let mut fnet3 =
+            consensus_params_for_version(CONSENSUS_VFNET2).expect("fnet2 must be constructible");
+        fnet3.payouts_challenge_interval = 0;
+        return Some(fnet3);
+    }
+
+    // fnet4 re-enables challenges (back to fnet1's parameters) ahead of the
+    // upgrade path to v40.
+    if version == CONSENSUS_VFNET4 {
+        return consensus_params_for_version(CONSENSUS_VFNET1);
+    }
+
     // Unknown version
     None
 }
@@ -1454,6 +1514,51 @@ mod tests {
         let a5 = consensus_params_for_version(CONSENSUS_ALPHA5).unwrap();
         let v36 = consensus_params_for_version(CONSENSUS_V36).unwrap();
         assert_eq!(a5.logic_sig_version, v36.logic_sig_version);
+    }
+
+    #[test]
+    fn test_fnet_versions() {
+        // go: config/consensus.go (v5.0.0-stable) vFnet1: v39 base with
+        // LogicSigVersion=11 and FNet-tuned payouts/bonus.
+        let f1 = consensus_params_for_version(CONSENSUS_VFNET1).unwrap();
+        let v39 = consensus_params_for_version(CONSENSUS_V39).unwrap();
+        assert_eq!(f1.logic_sig_version, 11);
+        assert!(f1.payouts_enabled);
+        assert_eq!(f1.payouts_percent, 75);
+        assert_eq!(f1.payouts_go_online_fee, 2_000_000);
+        assert_eq!(f1.payouts_min_balance, 30_000_000_000);
+        assert_eq!(f1.payouts_max_balance, 70_000_000_000_000);
+        assert_eq!(f1.payouts_max_mark_absent, 32);
+        assert_eq!(f1.payouts_challenge_interval, 1_000);
+        assert_eq!(f1.payouts_challenge_grace_period, 200);
+        assert_eq!(f1.payouts_challenge_bits, 5);
+        assert_eq!(f1.bonus_base_amount, 10_000_000);
+        assert_eq!(f1.bonus_decay_interval, 250_000);
+        // Everything else carried unchanged from v39.
+        assert_eq!(
+            f1.enable_logicsig_cost_pooling,
+            v39.enable_logicsig_cost_pooling
+        );
+
+        // fnet2: no parameter change from fnet1.
+        let f2 = consensus_params_for_version(CONSENSUS_VFNET2).unwrap();
+        assert_eq!(f2.logic_sig_version, f1.logic_sig_version);
+        assert_eq!(f2.payouts_challenge_interval, f1.payouts_challenge_interval);
+
+        // fnet3: challenges disabled (no heartbeats yet), otherwise same as fnet2.
+        let f3 = consensus_params_for_version(CONSENSUS_VFNET3).unwrap();
+        assert_eq!(f3.payouts_challenge_interval, 0);
+        assert_eq!(f3.payouts_percent, f1.payouts_percent);
+
+        // fnet4: back to fnet1's parameters (challenges re-enabled).
+        let f4 = consensus_params_for_version(CONSENSUS_VFNET4).unwrap();
+        assert_eq!(f4.payouts_challenge_interval, f1.payouts_challenge_interval);
+        assert_eq!(f4.logic_sig_version, f1.logic_sig_version);
+
+        // FNet entries must never be reachable through mainnet/testnet's own
+        // version strings — they are additive, standalone table entries.
+        assert_ne!(CONSENSUS_VFNET1, CONSENSUS_V39);
+        assert_ne!(CONSENSUS_VFNET1, CONSENSUS_CURRENT_VERSION);
     }
 
     #[test]

@@ -670,6 +670,24 @@ mod tests {
         assert!(make_next_block_header(&prev, 0, rewards()).is_err());
     }
 
+    #[test]
+    fn rejects_unknown_current_protocol_gracefully() {
+        // Regression test for issue #676: a well-formed but unrecognized
+        // future consensus-version string reaching `current_protocol` (e.g.
+        // an upstream named version not yet modeled in
+        // `consensus_params_for_version`) must produce a proper `AlgoError`
+        // at the block-header-upgrade path, never a panic.
+        let prev = BlockHeader {
+            round: Round(5),
+            current_protocol: "future-vNEXT-unrecognized".to_string(),
+            ..BlockHeader::default()
+        };
+        assert!(
+            make_next_block_header(&prev, 0, rewards()).is_err(),
+            "unknown protocol must error, not panic"
+        );
+    }
+
     // ── Bonus payout ("bi") ─────────────────────────────────────
     // go: data/bookkeeping/block.go `computeBonus`; plan values from
     // config/consensus.go v40 (BaseAmount 10_000_000, DecayInterval 1_000_000).

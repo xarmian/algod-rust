@@ -1143,6 +1143,23 @@ mod genesis_block_tests {
     }
 
     #[test]
+    fn make_genesis_block_rejects_unknown_protocol_gracefully() {
+        // Regression test for issue #676: a well-formed but unrecognized
+        // future consensus-version string (e.g. a not-yet-modeled upstream
+        // named version, such as a hypothetical `fnetN` before it was added
+        // to `consensus_params_for_version`) must produce a proper
+        // `AlgoError`, never a panic, at genesis load.
+        let fees = Address([0xFE; 32]).to_algorand_string();
+        let rwd = Address([0xFD; 32]).to_algorand_string();
+        let json = format!(
+            r#"{{"id":"v1","network":"localnet","proto":"future-vNEXT-unrecognized","fees":"{fees}","rwd":"{rwd}","timestamp":0,"alloc":[{{"addr":"{rwd}","comment":"RewardsPool","state":{{"algo":1000000000000,"onl":0}}}}]}}"#
+        );
+        let g = parse_genesis_json(&json).unwrap();
+        let result = make_genesis_block(&g);
+        assert!(result.is_err(), "unknown protocol must error, not panic");
+    }
+
+    #[test]
     fn genesis_block_round_trips_through_codec() {
         let g = test_genesis();
         let blk = make_genesis_block(&g).unwrap();
