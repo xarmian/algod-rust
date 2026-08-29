@@ -924,6 +924,33 @@ async fn app_program_size_pricing_boundaries_match_live() {
     if let Err(e) = assert_case_parity(&outcome, true) {
         failures.push(e);
     }
+
+    // Issue #723: same size and exactly-correct fee as the accepted case
+    // just above, but with NO "io bump" box refs at all. Before #723,
+    // algod-rust had no `considerBudgetProgramWrites` gate and would accept
+    // this outright (matching only the fee-boundary decision, not go's
+    // separate write-budget decision); go-algorand always rejected it. Now
+    // that algod-rust implements the same write-budget gate
+    // (`LedgerAvmContext::consider_budget_program_writes`), both sides must
+    // reject -- proving accept/reject now matches go's write-budget
+    // decision on its own, without papering over it via box-ref bumps.
+    let outcome = run_program_case(
+        &c,
+        &sk,
+        "program_over_soft_exact_fee_no_box_bumps_reject_write_budget",
+        ProgramCase {
+            approval: approval.clone(),
+            clear: clear_program.clone(),
+            epp,
+            fee: over_soft_required,
+            box_bumps: io_bump_boxes(0),
+        },
+    )
+    .await;
+    if let Err(e) = assert_case_parity(&outcome, false) {
+        failures.push(e);
+    }
+
     let outcome = run_program_case(
         &c,
         &sk,
