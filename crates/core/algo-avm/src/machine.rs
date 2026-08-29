@@ -172,6 +172,17 @@ pub struct AvmMachine {
     /// Set by `callsub` when the branch target is a `proto` instruction.
     /// Cleared by `proto` after checking. Mirrors Go's `cx.fromCallsub`.
     pub from_callsub: bool,
+    /// Test-only seam: when set, cost-charging resolves opcode specs
+    /// against this table instead of the real production `OPCODE_TABLE`.
+    /// Lets unit tests pin `step`/`step_with_tracer`'s exact cost-resolution
+    /// logic against a private table with a deliberately mismatched
+    /// sub-opcode cost (see issue #698) -- the production table has no such
+    /// mismatch today (every `app_box_*` sub-opcode and the `0xd4` prefix
+    /// stub declare the same `CostKind::Static(1)`), so there is otherwise
+    /// no externally observable divergence to regression-test against.
+    /// Does not exist in non-test builds; absent from the public API.
+    #[cfg(test)]
+    cost_table_override: Option<&'static [Option<opcode::OpSpec>; 256]>,
 }
 
 impl AvmMachine {
@@ -213,7 +224,25 @@ impl AvmMachine {
             end_of_program_offset,
             opcode_hits: [false; 256],
             from_callsub: false,
+            #[cfg(test)]
+            cost_table_override: None,
         }
+    }
+
+    /// Resolve the [`opcode::OpSpec`] to use for cost-charging `(opcode_byte,
+    /// sub_opcode)`. Always [`opcode::resolve_spec`] (the real production
+    /// table) except in test builds where [`Self::cost_table_override`] has
+    /// been set.
+    fn resolve_cost_spec(
+        &self,
+        opcode_byte: u8,
+        sub_opcode: Option<u8>,
+    ) -> Option<&'static opcode::OpSpec> {
+        #[cfg(test)]
+        if let Some(table) = self.cost_table_override {
+            return opcode::resolve_spec_in(table, opcode_byte, sub_opcode);
+        }
+        opcode::resolve_spec(opcode_byte, sub_opcode)
     }
 
     /// Execute one instruction and advance the PC.
@@ -239,8 +268,12 @@ impl AvmMachine {
         // Record opcode hit for coverage tracking.
         self.opcode_hits[instr.opcode as usize] = true;
 
-        // Charge static cost.
-        if let Some(spec) = opcode::lookup(instr.opcode) {
+        // Charge static cost. Must resolve through `resolve_spec` (not the
+        // bare prefix-byte `lookup`) so a multi-byte "prefix opcode" family
+        // (e.g. `app_box_*` at 0xd4) charges its actual sub-opcode's own
+        // declared cost, not the synthetic prefix-family stub's -- see
+        // issue #698.
+        if let Some(spec) = self.resolve_cost_spec(instr.opcode, instr.sub_opcode) {
             if let CostKind::Static(cost) = spec.cost {
                 self.charge_cost(cost)?;
             }
@@ -300,8 +333,12 @@ impl AvmMachine {
         // exhaustion opcodes are visible in the trace, matching go-algorand).
         tracer.before_opcode(self.pc, instr.opcode);
 
-        // Charge static cost.
-        if let Some(spec) = opcode::lookup(instr.opcode) {
+        // Charge static cost. Must resolve through `resolve_spec` (not the
+        // bare prefix-byte `lookup`) so a multi-byte "prefix opcode" family
+        // (e.g. `app_box_*` at 0xd4) charges its actual sub-opcode's own
+        // declared cost, not the synthetic prefix-family stub's -- see
+        // issue #698.
+        if let Some(spec) = self.resolve_cost_spec(instr.opcode, instr.sub_opcode) {
             if let CostKind::Static(cost) = spec.cost {
                 if let Err(e) = self.charge_cost(cost) {
                     let msg = e.to_string();
@@ -630,6 +667,138 @@ mod tests {
         assert!(m.charge_cost(5).is_ok());
         assert_eq!(m.budget, 5);
         assert!(m.charge_cost(6).is_err());
+    }
+
+    /// Build a private single-prefix-family opcode table (mirroring the
+    /// pattern in `opcode.rs`'s own `resolve()` tests) where sub-opcode `6`
+    /// declares a *different* static cost (7) than its prefix entry `0xf0`'s
+    /// synthetic stub (1). Leaked to get the `'static` lifetime
+    /// `AvmMachine::cost_table_override` requires.
+    fn mismatched_cost_test_table() -> &'static [Option<opcode::OpSpec>; 256] {
+        use crate::opcode::{CostKind as CK, ImmKind, Mode, OpSpec, SubOpTable, MAX_SUB_OPCODES};
+
+        const EMPTY: Option<OpSpec> = None;
+        let mut subs: SubOpTable = [EMPTY; MAX_SUB_OPCODES];
+        subs[6] = Some(OpSpec {
+            opcode: 0xf0,
+            name: "test_sub_expensive",
+            version: 13,
+            cost: CK::Static(7),
+            stack_pops: 0,
+            stack_pushes: 0,
+            mode: Mode::Any,
+            imm: ImmKind::None,
+            sub_opcode: 6,
+            sub_ops: None,
+        });
+        let subs: &'static SubOpTable = Box::leak(Box::new(subs));
+
+        let mut table: [Option<OpSpec>; 256] = [EMPTY; 256];
+        table[0xf0] = Some(OpSpec {
+            opcode: 0xf0,
+            name: "test_prefix",
+            version: 13,
+            cost: CK::Static(1), // the stub's own declared cost
+            stack_pops: 0,
+            stack_pushes: 0,
+            mode: Mode::Any,
+            imm: ImmKind::None,
+            sub_opcode: 0,
+            sub_ops: Some(subs),
+        });
+        Box::leak(Box::new(table))
+    }
+
+    #[test]
+    fn test_step_charges_sub_opcode_cost_not_prefix_stub() {
+        // Regression pin for issue #698: `AvmMachine::step` must charge cost
+        // via `opcode::resolve_spec(instr.opcode, instr.sub_opcode)` (through
+        // `resolve_cost_spec`), not the bare prefix-byte `opcode::lookup
+        // (instr.opcode)`. The latter returns only the synthetic
+        // prefix-family stub entry for a multi-byte "prefix opcode" family
+        // (e.g. `app_box_*` at 0xd4), which is harmless in production only
+        // because every registered `app_box_*` sub-opcode happens to share
+        // the same `CostKind::Static(1)` as the `0xd4` stub -- so this test
+        // injects a private table (`cost_table_override`, test-only) with a
+        // deliberate mismatch to make the divergence externally observable
+        // via `step`'s own budget accounting.
+        use crate::bytecode::{Immediates, Instruction};
+
+        let program = Program {
+            version: 13,
+            instructions: vec![Instruction {
+                opcode: 0xf0,
+                sub_opcode: Some(6),
+                offset: 0,
+                immediates: Immediates::None,
+            }],
+        };
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
+        m.cost_table_override = Some(mismatched_cost_test_table());
+
+        // Dispatch will error afterward (0xf0 isn't a real opcode `ops::dispatch`
+        // knows how to run) -- irrelevant here, since cost is charged before
+        // dispatch runs.
+        let _ = m.step(&mut NullContext);
+        assert_eq!(
+            m.budget, 693,
+            "must charge the sub-opcode's own cost (7), not the prefix stub's (1)"
+        );
+    }
+
+    #[test]
+    fn test_step_with_tracer_charges_sub_opcode_cost_not_prefix_stub() {
+        // Same as `test_step_charges_sub_opcode_cost_not_prefix_stub`, but
+        // for `step_with_tracer`'s separate (near-identical) cost-charging
+        // block -- issue #698 covers both call sites.
+        use crate::bytecode::{Immediates, Instruction};
+        use crate::tracer::EvalTracer;
+
+        struct NullTracer;
+        impl EvalTracer for NullTracer {}
+
+        let program = Program {
+            version: 13,
+            instructions: vec![Instruction {
+                opcode: 0xf0,
+                sub_opcode: Some(6),
+                offset: 0,
+                immediates: Immediates::None,
+            }],
+        };
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
+        m.cost_table_override = Some(mismatched_cost_test_table());
+
+        let _ = m.step_with_tracer(&mut NullContext, &mut NullTracer);
+        assert_eq!(
+            m.budget, 693,
+            "must charge the sub-opcode's own cost (7), not the prefix stub's (1)"
+        );
+    }
+
+    #[test]
+    fn test_app_box_get_charges_its_own_declared_cost_via_machine_step() {
+        // End-to-end sanity check against the *production* opcode table:
+        // `app_box_get` (0xd4/0x06) must be charged through
+        // `AvmMachine::step` at its own declared static cost (1), resolved
+        // via `opcode::resolve_spec`, not just the `0xd4` prefix stub's cost
+        // (also 1 today -- see issue #698 and the injected-table tests above
+        // for why identical costs today can't alone prove the resolution is
+        // correct).
+        let raw = prog(13, &[0xd4, 0x06]);
+        let program = parse(&raw).unwrap();
+        assert_eq!(program.instructions[0].opcode, 0xd4);
+        assert_eq!(program.instructions[0].sub_opcode, Some(6));
+
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
+        // Dispatch itself will error (NullContext has no box storage and the
+        // stack is empty) -- irrelevant here, since cost is charged before
+        // dispatch runs.
+        let _ = m.step(&mut NullContext);
+        assert_eq!(
+            m.budget, 699,
+            "app_box_get must charge cost 1, its own declared static cost"
+        );
     }
 
     #[test]
