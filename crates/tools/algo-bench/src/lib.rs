@@ -1,3 +1,8 @@
+// Copyright (c) 2026 Algod DAO
+//
+// SPDX-License-Identifier: MIT
+// For the full license text, see LICENSE-MIT at the repository root.
+
 //! `algo-bench` -- benchmark metrics collection, JSON output, and comparison
 //! table rendering for algod-rust vs. go-algorand performance comparisons.
 

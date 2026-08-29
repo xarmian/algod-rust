@@ -1,3 +1,8 @@
+// Copyright (c) 2026 Algod DAO
+//
+// SPDX-License-Identifier: MIT
+// For the full license text, see LICENSE-MIT at the repository root.
+
 use crate::output::BenchComparison;
 
 /// Format a byte count in human-readable form (B, KB, MB, GB, TB).

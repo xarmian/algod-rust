@@ -1,3 +1,8 @@
+// Copyright (c) 2026 Algod DAO
+//
+// SPDX-License-Identifier: MIT
+// For the full license text, see LICENSE-MIT at the repository root.
+
 //! Shared types + helpers for the `trie_replay` perf bench (TASK-145 / PLAN-144).
 //!
 //! This module is the Rust side of a deterministic Rust↔Go perf comparison

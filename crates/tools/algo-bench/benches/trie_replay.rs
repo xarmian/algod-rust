@@ -1,3 +1,8 @@
+// Copyright (c) 2026 Algod DAO
+//
+// SPDX-License-Identifier: MIT
+// For the full license text, see LICENSE-MIT at the repository root.
+
 //! Trie replay perf bench (TASK-145 / PLAN-144).
 //!
 //! Runs three measured phases against the Rust `MerkleTrie`:
