@@ -3,6 +3,7 @@ name = "algo-fork-detector"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 # PLAN-32 / TASK-88 — mixed-cluster fork detector.
 #
