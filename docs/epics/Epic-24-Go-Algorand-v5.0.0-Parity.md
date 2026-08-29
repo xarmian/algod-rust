@@ -49,7 +49,7 @@ Headline items, by consensus risk:
 - [x] #663 — Falcon-1024 seed size + sign-message convention fix — merged, PR #683
 - [x] #669 — sha512/sumhash512 opcode cost formula bugfix — merged, PR #684
 - [x] #670 — gload/gloads nil-pastScratch fix — merged, PR #685
-- [ ] #686 — gload/gloads must return sibling's real scratch value, not a zero placeholder (found during #670; depends on #670)
+- [x] #686 — gload/gloads must return sibling's real scratch value, not a zero placeholder (found during #670; depends on #670) — merged, PR #713
 - [x] #672 — assembler match-opcode type tracking + deadcode disassembly fix — merged, PR #687
 - [x] #666 — byte-constant size-limit enforcement + falcon_verify audit — merged, PR #688
 - [x] #665 — poseidon2 opcode — merged, PR #689
@@ -66,26 +66,36 @@ Headline items, by consensus risk:
 - [x] #660 — post-quantum Falcon-1024 account signatures (depends on #663) — merged, PR #706
 - [x] #671 — simulate API fee-usage reporting (depends on #657, #677) — merged, PR #708
 - [x] #674 — remove dryrun REST endpoint — merged, PR #709
-- [ ] #673 — GET /v2/node/peers + POST /v2/node/shutdown canonical route (in progress)
-- [ ] #676 — FNet consensus version table entries
-- [ ] #681 — algod-rust block production never proposes/votes for protocol upgrades (found during Stage 5's pin sweep — see PR #680; the first pin bump in this repo's history where `ConsensusCurrentVersion` itself advances, surfacing a previously-unreachable gap)
-- [ ] #691 — live byte-for-byte assembler verification + mixed-cluster check for #661 (deferred, needs go-algorand build toolchain)
-- [ ] #693 — assembler warnings channel (deferred from #664; upstream's two `shouldAutoSalt` diagnostics have no algod-rust warnings mechanism to attach to yet)
-- [ ] #698 — machine.rs cost-charging gap for multi-byte opcodes (found during #662, currently harmless)
-- [ ] #701 — remaining ApplicationCallTxnFields.wellFormed sub-checks (found during #675; OnCompletion validity, RejectVersion, program/arg/reference-count bounds, etc.)
-- [ ] #703 — live fixture/oracle parity tests for big-transaction size-pricing boundaries (found during #657, needs go-algorand build toolchain)
-- [ ] #707 — upgrade #660's hand-computed msgpack byte-oracle test to a live go-algorand-captured fixture
+- [x] #673 — GET /v2/node/peers + POST /v2/node/shutdown canonical route — merged, PR #710
+- [x] #676 — FNet consensus version table entries — merged, PR #711
+- [x] #681 — algod-rust block production never proposes/votes for protocol upgrades (found during Stage 5's pin sweep — see PR #680; the first pin bump in this repo's history where `ConsensusCurrentVersion` itself advances, surfacing a previously-unreachable gap) — merged, PR #712
+- [x] #691 — live byte-for-byte assembler verification + mixed-cluster check for #661 — merged, PR #719; both criteria confirmed live-verified after #720 landed
+- [x] #693 — assembler warnings channel (deferred from #664; upstream's two `shouldAutoSalt` diagnostics have no algod-rust warnings mechanism to attach to yet) — merged, PR #717
+- [x] #698 — machine.rs cost-charging gap for multi-byte opcodes (found during #662, currently harmless) — merged, PR #715
+- [x] #701 — remaining ApplicationCallTxnFields.wellFormed sub-checks (found during #675; OnCompletion validity, RejectVersion, program/arg/reference-count bounds, etc.) — merged, PR #716
+- [x] #714 — gload unconditionally errors inside an inner-transaction group (found during #686) — merged, PR #718
+- [x] #720 — shared test genesis lagging at consensus V41, blocking every AVM v13 live-verification test (found during #691) — merged, PR #721
+- [x] #703 — live fixture/oracle parity tests for big-transaction size-pricing boundaries (found during #657, unblocked by #720) — merged, PR #722; found and fixed two real production bugs (canonical Note-field omitempty rule, group-fee check skipping ungrouped txns)
+- [x] #723 — gate oversized app-program writes behind the box I/O write budget (found during #703) — merged, PR #724
+- [x] #707 — upgrade #660's hand-computed msgpack byte-oracle test to a live go-algorand-captured fixture — merged, PR #728
+- [x] #725 — box read-I/O-budget check only ever lazily triggered (found during #723) — merged, PR #726
+- [x] #727 — box budget state not shared across sibling top-level app calls in a group (found during #725) — merged, PR #729
 
 ## Epic-level acceptance criteria
 
-- [ ] All sub-issues above closed (merged or honestly disposed).
-- [ ] `docs/PHASE14_PROPOSAL.md`, `docs/epics/Epic-24-Go-Algorand-v5.0.0-Parity.md`,
+- [x] All sub-issues above closed (merged; none required honest disposition — every item surfaced was implemented).
+- [x] `docs/PHASE14_PROPOSAL.md`, `docs/epics/Epic-24-Go-Algorand-v5.0.0-Parity.md`,
       `docs/PROJECT_SCOPE.md` updated.
-- [ ] Version pin swept from `v4.7.4-stable` to `v5.0.0-stable` across the
-      repo (CLAUDE.md, workflows, docker compose, docs).
-- [ ] Full gate green on `main` (fmt, clippy, full workspace suite).
-- [ ] Live mixed-cluster soak against `v5.0.0-stable` Go nodes, with
-      particular attention to `SelectF128` committee-selection agreement.
-- [ ] `docs/PHASE14_VALIDATION.md` evidence map written at close-out.
-- [ ] Hard gate: `gh issue list --label "phase:14" --state open` empty
-      before this epic closes.
+- [x] Version pin swept from `v4.7.4-stable` to `v5.0.0-stable` across the
+      repo (CLAUDE.md, workflows, docker compose, docs) — PR #680.
+- [x] Full gate green on `main` (fmt, clippy, full workspace suite) —
+      re-verified 2026-08-29, only the documented `algo-network` doctest
+      flake present.
+- [x] Live mixed-cluster soak against `v5.0.0-stable` Go nodes, with
+      particular attention to `SelectF128` committee-selection agreement —
+      30-round soak, zero rejections (PR #699); plus live dual-node
+      verification for #681, #691, #703, #723.
+- [x] `docs/PHASE14_VALIDATION.md` evidence map written at close-out.
+- [x] Hard gate: `gh issue list --label "phase:14" --state open` empty
+      before this epic closes — confirmed 2026-08-29 (only the epic issue
+      itself remained).
