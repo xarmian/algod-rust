@@ -191,6 +191,22 @@ Verified individually per the proposal's instruction not to assume:
 | All of `docs/*.md`, `docs/epics/*.md` | (b) MIT | Planning/proposal/validation/architecture documentation. These describe go-algorand's behavior extensively (as they must, to specify parity work) but are original prose analysis and project records, not verbatim reproductions of go-algorand source or documentation. None were found to quote ported algorithms closely enough to themselves be derivative. |
 | `docs/LICENSING_AUDIT.md` (this file), `docs/LICENSING.md` | (b) MIT | Original to this phase. |
 
+**File-level headers are deliberately NOT added to prose Markdown docs**
+(`README.md`, `CLAUDE.md`, all of `docs/*.md`, `.claude/**/*.md`) — this
+diverges from the per-file header sweep applied to every other
+MIT-classified file in the repository, so the decision and its rationale
+are recorded explicitly here rather than left implicit. A per-file
+copyright/SPDX comment block is standard practice for source and config
+files (compilers/linters and tooling like `cargo-license`/REUSE scanners
+read them), but is not standard or expected practice for a project's own
+prose documentation — no mainstream open-source project headers its
+README or design docs this way, and doing so here would add no
+verification/attribution value beyond what the repo-root `COPYING` /
+`LICENSE-MIT` files and this audit table already provide for every file
+in the tree, including the unheadered docs. If this decision needs
+revisiting, it is a small, contained follow-up (a handful of files), not
+a re-audit.
+
 ## `crates/tools/goal-rust/tests/fixtures/license.txt`
 
 This file is a **test fixture** — captured output used to assert that
