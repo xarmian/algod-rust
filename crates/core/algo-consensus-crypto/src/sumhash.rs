@@ -1,8 +1,36 @@
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
+//
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Sumhash-512: a subset-sum hash function matching go-algorand's `go-sumhash`.
 //!
 //! The hash produces 64-byte (512-bit) digests using matrix-vector multiplication
 //! over GF(2^64). The matrix is derived deterministically from a seed using SHAKE256.
 //! Algorand uses the seed `b"Algorand"` with parameters n=8, m=1024.
+//!
+//! This file reimplements the Sumhash-512 algorithm and Algorand's
+//! parameters for it, matching `github.com/algorand/go-sumhash`
+//! (MIT License), one of the MIT-licensed SDK/helper libraries
+//! go-algorand's own `COPYING_FAQ` (item 1) identifies. MIT's only
+//! obligation is preserving the copyright/permission notice in
+//! redistributions; that attribution is recorded here and in
+//! `docs/LICENSING.md` / `docs/LICENSING_AUDIT.md`.
 
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake256;
