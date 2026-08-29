@@ -37,3 +37,25 @@ make help          # localnet, fixtures, conformance, replay, benchmarks
 - [docs/DEV_WORKFLOW.md](docs/DEV_WORKFLOW.md) — fixture generation, localnet, testing
 - [docs/CONFORMANCE_STRATEGY.md](docs/CONFORMANCE_STRATEGY.md) — parity verification vs go-algorand
 - [docs/COVERAGE.md](docs/COVERAGE.md) — test coverage reporting, thresholds, best practices
+
+## Licensing
+
+algod-rust is a **modified work based on go-algorand**
+(https://github.com/algorand/go-algorand), developed file-by-file against
+its source as the authoritative reference. As such, algod-rust is
+licensed **as a whole** under the **GNU Affero General Public License
+v3.0 or later**, preserving go-algorand's own section 7e Additional Terms
+(which reserve all rights in the Algorand trademarks to Algorand
+Foundation Ltd. — this license grants none) as inherited additional
+terms. See [`COPYING`](COPYING) for the full license text.
+
+Individual files that are genuinely original to this project, with no
+derivation from go-algorand's AGPL-licensed material, are marked MIT and
+are additionally available under the terms in
+[`LICENSE-MIT`](LICENSE-MIT) (Copyright (c) 2026 Algod DAO). See
+[`docs/LICENSING_AUDIT.md`](docs/LICENSING_AUDIT.md) for the file-level
+classification, and [`docs/LICENSING.md`](docs/LICENSING.md) for the full
+rationale — why algod-rust is classified this way, the AGPL section 13
+network-source obligation, trademark and patent posture, and third-party
+attributions (e.g. the poseidon2 AVM opcode, ported from gnark-crypto,
+Apache-2.0).
