@@ -1,7 +1,7 @@
 {
   "id": "v1",
   "network": "localnet-rust",
-  "proto": "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed",
+  "proto": "https://github.com/algorandfoundation/specs/tree/268b63433a907455d439995bf916f6b296018f4f",
   "devmode": true,
   "timestamp": 0,
   "fees": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",

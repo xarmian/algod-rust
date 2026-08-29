@@ -271,17 +271,14 @@ validate-api-logs:
 ## file's module docs); live_box_pagination_parity (issue #551) follows
 ## it for the same reason.
 ##
-## live_varint_branch_parity only runs its `assembler_byte_diff` test
-## here, not its full ignored set: this harness's shared genesis
-## (docker/localnet-rust/data/genesis.json) is still pinned to consensus
-## V41 (LogicSigVersion 12), so the file's other test,
+## live_varint_branch_parity runs its full ignored set here (issue #720):
+## this harness's shared genesis (docker/localnet-rust/data/genesis.json)
+## was bumped from consensus V41 (LogicSigVersion 12) to go-algorand
+## v5.0.0-stable's ConsensusCurrentVersion V42 (LogicSigVersion 13), so
 ## `mixed_forward_and_back_branch_execution_trace_matches_live` (a v13
-## program), is rejected by the protocol version check before either
-## AVM interpreter is even reached — see issue #720, which tracks
-## bumping this harness to V42. That test stays in the file (ready to
-## wire in once #720 lands) but is deliberately excluded from this
-## target's invocation via the name filter below rather than run and
-## fail.
+## program) is no longer rejected by the protocol version check before
+## either AVM interpreter is reached, and now runs alongside
+## `assembler_byte_diff_matches_v13_varint_branch_programs`.
 ##
 ## live_longpoll_parity's timeout test adds a real ~60s wait (go's
 ## WaitForBlockTimeout is a fixed 1-minute constant that can't be shortened
@@ -300,7 +297,7 @@ validate-api:
 	 cargo test --release -p algod-rust --test live_headers_parity -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_endpoint_sweep -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_txn_cross_verification -- --ignored --nocapture --test-threads=1 && \
-	 cargo test --release -p algod-rust --test live_varint_branch_parity assembler_byte_diff -- --ignored --nocapture --test-threads=1 && \
+	 cargo test --release -p algod-rust --test live_varint_branch_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_box_pagination_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_state_delta_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_longpoll_parity -- --ignored --nocapture --test-threads=1 && \
