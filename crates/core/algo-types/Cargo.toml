@@ -11,6 +11,7 @@ fuzzing = ["arbitrary"]
 [dependencies]
 algo-error.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 rmp.workspace = true
 rmpv.workspace = true
 hex.workspace = true
@@ -21,5 +22,4 @@ curve25519-dalek.workspace = true
 arbitrary = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
-serde_json.workspace = true
 rmp-serde.workspace = true

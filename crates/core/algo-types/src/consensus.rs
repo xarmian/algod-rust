@@ -25,6 +25,8 @@
 // Each version inherits from its predecessor and overrides specific fields,
 // exactly matching the Go initialisation chain.
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 
 // ── Global protocol parameters (not per-version) ──────────────────
@@ -186,7 +188,7 @@ pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
 ///
 /// Values are derived per-version from go-algorand `config/consensus.go`
 /// at tag v4.6.0-stable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConsensusParams {
     // ── AVM / LogicSig ──────────────────────────────────────────
     /// Protocol's max AVM version (Go: `LogicSigVersion`).
@@ -1380,6 +1382,538 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
 
     // Unknown version
     None
+}
+
+// ── Configurable consensus.json load/merge/save ─────────────────────
+//
+// Mirrors go-algorand's `PreloadConfigurableConsensusProtocols` /
+// `LoadConfigurableConsensusProtocols` / `SaveConfigurableConsensus`
+// (`config/config.go`) and `ConsensusProtocols.Merge` (`config/consensus.go`
+// ~line 858): an operator may drop a `consensus.json` file into a node's
+// data directory to override the built-in per-version consensus parameters.
+// A missing file is not an error (silent fallback to the built-in table); a
+// present-but-malformed file is. Each override entry either deletes its
+// version (when `ApprovedUpgrades` is absent/null) or replaces the *entire*
+// `ConsensusParams` struct for that version wholesale (never a field-by-field
+// merge within one version).
+
+/// go-algorand's `time.Duration` has no custom `MarshalJSON`, so it encodes
+/// as a bare JSON integer of nanoseconds via the default `encoding/json`
+/// int64 path. This reproduces that on both sides so the same file
+/// deserializes identically in Go and Rust.
+mod duration_nanos {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(value.as_nanos() as u64)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+        let nanos = u64::deserialize(deserializer)?;
+        Ok(Duration::from_nanos(nanos))
+    }
+}
+
+/// JSON shape of go-algorand's `config.Payouts` (`ProposerPayoutRules`),
+/// embedded in `ConsensusParams` as the nested `"Payouts"` object.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct PayoutsOverride {
+    pub enabled: bool,
+    pub go_online_fee: u64,
+    pub percent: u64,
+    pub min_balance: u64,
+    pub max_balance: u64,
+    pub max_mark_absent: usize,
+    pub challenge_interval: u64,
+    pub challenge_grace_period: u64,
+    pub challenge_bits: u32,
+}
+
+/// JSON shape of go-algorand's `config.BonusPlan`, embedded in
+/// `ConsensusParams` as the nested `"Bonus"` object.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct BonusOverride {
+    pub base_round: u64,
+    pub base_amount: u64,
+    pub decay_interval: u64,
+}
+
+/// JSON-deserializable mirror of go-algorand's `config.ConsensusParams`
+/// (`config/consensus.go`), used only for parsing/writing a
+/// `consensus.json` override entry. Field names match go's JSON tags
+/// (go's default `encoding/json` struct-field naming: the exported Go field
+/// name verbatim), so the exact same file deserializes on both sides.
+///
+/// Every field carries the container-level `#[serde(default)]`: a JSON key
+/// absent from the file takes this struct's (zero-valued) `Default`, exactly
+/// matching Go's `json.Unmarshal`-into-a-zero-value-struct semantics — which
+/// matters because `Merge`'s "otherwise" branch (see
+/// [`merge_consensus_protocols`]) replaces a version's *entire*
+/// `ConsensusParams`, not just the fields the file happens to set.
+///
+/// Two fields algod-rust models on `ConsensusParams` (`max_log_size`,
+/// `max_log_calls`) are deliberately absent here: they mirror the AVM's
+/// `logic.Bounds` (`data/transactions/logic/eval.go`), not go's
+/// `config.ConsensusParams` — go-algorand's own `consensus.json` can never
+/// set them, so [`ConsensusParamsOverride::to_consensus_params`] always fills
+/// them with the flat defaults every built-in version already uses.
+///
+/// Unknown JSON keys (fields go-algorand's struct has that algod-rust
+/// doesn't yet model) are silently ignored rather than rejected — this is
+/// not `deny_unknown_fields` — so a real go-algorand-authored file that also
+/// sets fields algod-rust doesn't yet track still loads instead of erroring.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ConsensusParamsOverride {
+    pub logic_sig_version: u64,
+    pub logic_sig_max_size: u64,
+    pub max_absolute_logic_sig_program_size: u64,
+    pub logic_sig_max_cost: u64,
+    pub max_app_program_cost: u64,
+    pub min_balance: u64,
+    pub min_txn_fee: u64,
+    pub max_txn_life: u64,
+    pub max_txn_note_bytes: usize,
+    pub max_tx_group_size: usize,
+    pub max_txn_bytes_per_block: u64,
+    pub max_absolute_txn_note_bytes: usize,
+    pub max_absolute_extra_program_pages: u32,
+    pub max_absolute_total_arg_len: usize,
+    pub per_byte_txn_surcharge: u64,
+    pub enable_fee_pooling: bool,
+    pub support_tx_groups: bool,
+    pub support_transaction_leases: bool,
+    pub fix_transaction_leases: bool,
+    pub support_rekeying: bool,
+    /// Go: `Heartbeat` (not `EnableHeartbeat`).
+    #[serde(rename = "Heartbeat")]
+    pub enable_heartbeat: bool,
+    pub enforce_auth_addr_sender_diff: bool,
+    pub load_tracking: bool,
+    pub app_size_updates: bool,
+    pub allow_zero_local_app_ref: bool,
+    #[serde(rename = "EnablePQSchemeFalcon1024")]
+    pub enable_pq_scheme_falcon1024: bool,
+    pub enable_select_f128: bool,
+    #[serde(rename = "EnableLogicSigSizePooling")]
+    pub enable_logicsig_size_pooling: bool,
+    #[serde(rename = "EnableLogicSigCostPooling")]
+    pub enable_logicsig_cost_pooling: bool,
+    pub enable_app_cost_pooling: bool,
+    pub enable_inner_transaction_pooling: bool,
+    pub application: bool,
+    pub asset: bool,
+    pub max_inner_transactions: usize,
+    pub min_inner_appl_version: u64,
+    pub max_app_key_len: usize,
+    pub max_app_bytes_value_len: usize,
+    pub max_app_sum_key_value_lens: usize,
+    pub max_extra_app_program_pages: u32,
+    pub max_app_program_len: usize,
+    pub max_app_total_program_len: usize,
+    pub max_global_schema_entries: u64,
+    pub max_local_schema_entries: u64,
+    pub max_app_args: usize,
+    pub max_app_total_arg_len: usize,
+    pub max_app_txn_accounts: usize,
+    pub max_app_txn_foreign_apps: usize,
+    pub max_app_txn_foreign_assets: usize,
+    pub max_app_total_txn_references: usize,
+    pub max_app_access: usize,
+    pub max_box_size: u64,
+    pub bytes_per_box_reference: u64,
+    pub max_app_box_references: usize,
+    pub enable_box_ref_name_error: bool,
+    pub app_flat_params_min_balance: u64,
+    pub app_flat_opt_in_min_balance: u64,
+    pub schema_min_balance_per_entry: u64,
+    pub schema_uint_min_balance: u64,
+    pub schema_bytes_min_balance: u64,
+    pub box_flat_min_balance: u64,
+    pub box_byte_min_balance: u64,
+    pub maximum_minimum_balance: u64,
+    pub max_assets_per_account: u32,
+    pub deeper_block_header_history: u64,
+    pub reward_unit: u64,
+    pub rewards_rate_refresh_interval: u64,
+    pub max_timestamp_increment: i64,
+    pub payset_commit: u8,
+    #[serde(rename = "EnableSHA256TxnCommitmentHeader")]
+    pub enable_sha256_txn_commitment_header: bool,
+    pub enable_sha512_block_hash: bool,
+    pub require_genesis_hash: bool,
+    pub support_genesis_hash: bool,
+    pub max_apps_created: usize,
+    pub max_apps_opted_in: usize,
+    pub max_keyreg_valid_period: u64,
+    pub enable_keyreg_coherency_check: bool,
+    pub enable_state_proof_keyreg_check: bool,
+    pub state_proof_interval: u64,
+    pub state_proof_voters_lookback: u64,
+    pub state_proof_block_hash_in_light_header: bool,
+    pub state_proof_weight_threshold: u32,
+    pub state_proof_strength_target: u64,
+    pub isolate_clear_state: bool,
+    #[serde(rename = "MaxAssetURLBytes")]
+    pub max_asset_url_bytes: usize,
+    pub max_asset_name_bytes: usize,
+    pub max_asset_unit_name_bytes: usize,
+    pub max_proposed_expired_online_accounts: usize,
+    #[serde(rename = "Payouts")]
+    pub payouts: PayoutsOverride,
+    #[serde(rename = "Bonus")]
+    pub bonus: BonusOverride,
+    pub support_become_non_participating_transactions: bool,
+    pub enable_app_versioning: bool,
+    pub num_proposers: u64,
+    pub soft_committee_size: u64,
+    pub soft_committee_threshold: u64,
+    pub cert_committee_size: u64,
+    pub cert_committee_threshold: u64,
+    pub next_committee_size: u64,
+    pub next_committee_threshold: u64,
+    pub late_committee_size: u64,
+    pub late_committee_threshold: u64,
+    pub redo_committee_size: u64,
+    pub redo_committee_threshold: u64,
+    pub down_committee_size: u64,
+    pub down_committee_threshold: u64,
+    #[serde(with = "duration_nanos")]
+    pub agreement_filter_timeout: Duration,
+    #[serde(with = "duration_nanos")]
+    pub agreement_filter_timeout_period0: Duration,
+    #[serde(with = "duration_nanos")]
+    pub agreement_deadline_timeout_period0: Duration,
+    #[serde(with = "duration_nanos")]
+    pub fast_recovery_lambda: Duration,
+    pub seed_lookback: u64,
+    pub seed_refresh_interval: u64,
+    pub max_bal_lookback: u64,
+    pub default_key_dilution: u64,
+    pub credential_domain_separation_enabled: bool,
+    pub dynamic_filter_timeout: bool,
+    pub exclude_expired_circulation: bool,
+    /// `nil`/absent means "delete this version" per
+    /// [`merge_consensus_protocols`]; `{}` means "replace this version, no
+    /// outbound upgrade proposal of its own" — the distinction is exactly
+    /// go's `consensusParams.ApprovedUpgrades == nil` check
+    /// (`config/consensus.go`), which is why this stays `Option` rather than
+    /// defaulting to an empty map.
+    #[serde(rename = "ApprovedUpgrades")]
+    pub approved_upgrades: Option<HashMap<String, u64>>,
+    pub upgrade_vote_rounds: u64,
+    pub upgrade_threshold: u64,
+    pub default_upgrade_wait_rounds: u64,
+    pub min_upgrade_wait_rounds: u64,
+    pub max_upgrade_wait_rounds: u64,
+    pub pending_residue_rewards: bool,
+    pub initial_rewards_rate_calculation: bool,
+    pub rewards_calculation_fix: bool,
+    #[serde(rename = "UnifyInnerTxIDs")]
+    pub unify_inner_tx_ids: bool,
+    pub unfunded_senders: bool,
+    #[serde(rename = "EnablePrecheckECDSACurve")]
+    pub enable_precheck_ecdsa_curve: bool,
+    pub app_forbid_low_resources: bool,
+    pub state_proof_top_voters: u64,
+}
+
+impl ConsensusParamsOverride {
+    /// Convert a fully-specified override entry into the internal
+    /// `ConsensusParams` representation used everywhere else in the
+    /// codebase. Every field is taken verbatim (including Go-zero-value
+    /// defaults for anything the file omitted) because [`merge_consensus_protocols`]'s
+    /// "otherwise" branch replaces the whole struct, not just the fields the
+    /// file happened to set.
+    ///
+    /// go-algorand's `ApprovedUpgrades` is a `map[ConsensusVersion]uint64`
+    /// (arbitrarily many target versions); algod-rust models at most one
+    /// outbound upgrade proposal per version (`ConsensusParams::approved_upgrade`),
+    /// matching every entry go-algorand's own version history has ever
+    /// actually populated. If an override supplies more than one entry, the
+    /// lexicographically-smallest target-version name is kept — a documented
+    /// limitation of this internal representation, not a silent gap (no
+    /// known consensus.json, including go-algorand's own, has ever needed
+    /// more than one).
+    fn to_consensus_params(&self) -> ConsensusParams {
+        let approved_upgrade = self
+            .approved_upgrades
+            .as_ref()
+            .and_then(|targets| targets.iter().min_by_key(|(version, _)| version.as_str()))
+            .map(|(version, &delay)| (static_version_name(version), delay));
+
+        ConsensusParams {
+            logic_sig_version: self.logic_sig_version,
+            logic_sig_max_size: self.logic_sig_max_size,
+            max_absolute_logic_sig_program_size: self.max_absolute_logic_sig_program_size,
+            logic_sig_max_cost: self.logic_sig_max_cost,
+            max_app_program_cost: self.max_app_program_cost,
+            min_balance: self.min_balance,
+            min_txn_fee: self.min_txn_fee,
+            max_txn_life: self.max_txn_life,
+            max_txn_note_bytes: self.max_txn_note_bytes,
+            max_tx_group_size: self.max_tx_group_size,
+            max_txn_bytes_per_block: self.max_txn_bytes_per_block,
+            max_absolute_txn_note_bytes: self.max_absolute_txn_note_bytes,
+            max_absolute_extra_program_pages: self.max_absolute_extra_program_pages,
+            max_absolute_total_arg_len: self.max_absolute_total_arg_len,
+            per_byte_txn_surcharge: self.per_byte_txn_surcharge,
+            enable_fee_pooling: self.enable_fee_pooling,
+            support_tx_groups: self.support_tx_groups,
+            support_transaction_leases: self.support_transaction_leases,
+            fix_transaction_leases: self.fix_transaction_leases,
+            support_rekeying: self.support_rekeying,
+            enable_heartbeat: self.enable_heartbeat,
+            enforce_auth_addr_sender_diff: self.enforce_auth_addr_sender_diff,
+            load_tracking: self.load_tracking,
+            app_size_updates: self.app_size_updates,
+            allow_zero_local_app_ref: self.allow_zero_local_app_ref,
+            enable_pq_scheme_falcon1024: self.enable_pq_scheme_falcon1024,
+            enable_select_f128: self.enable_select_f128,
+            enable_logicsig_size_pooling: self.enable_logicsig_size_pooling,
+            enable_logicsig_cost_pooling: self.enable_logicsig_cost_pooling,
+            enable_app_cost_pooling: self.enable_app_cost_pooling,
+            enable_inner_transaction_pooling: self.enable_inner_transaction_pooling,
+            application: self.application,
+            asset: self.asset,
+            max_inner_transactions: self.max_inner_transactions,
+            min_inner_appl_version: self.min_inner_appl_version,
+            max_app_key_len: self.max_app_key_len,
+            max_app_bytes_value_len: self.max_app_bytes_value_len,
+            max_app_sum_key_value_lens: self.max_app_sum_key_value_lens,
+            max_extra_app_program_pages: self.max_extra_app_program_pages,
+            max_app_program_len: self.max_app_program_len,
+            max_app_total_program_len: self.max_app_total_program_len,
+            max_global_schema_entries: self.max_global_schema_entries,
+            max_local_schema_entries: self.max_local_schema_entries,
+            max_app_args: self.max_app_args,
+            max_app_total_arg_len: self.max_app_total_arg_len,
+            max_app_txn_accounts: self.max_app_txn_accounts,
+            max_app_txn_foreign_apps: self.max_app_txn_foreign_apps,
+            max_app_txn_foreign_assets: self.max_app_txn_foreign_assets,
+            max_app_total_txn_references: self.max_app_total_txn_references,
+            max_app_access: self.max_app_access,
+            max_box_size: self.max_box_size,
+            bytes_per_box_reference: self.bytes_per_box_reference,
+            max_app_box_references: self.max_app_box_references,
+            enable_box_ref_name_error: self.enable_box_ref_name_error,
+            app_flat_params_min_balance: self.app_flat_params_min_balance,
+            app_flat_opt_in_min_balance: self.app_flat_opt_in_min_balance,
+            schema_min_balance_per_entry: self.schema_min_balance_per_entry,
+            schema_uint_min_balance: self.schema_uint_min_balance,
+            schema_bytes_min_balance: self.schema_bytes_min_balance,
+            box_flat_min_balance: self.box_flat_min_balance,
+            box_byte_min_balance: self.box_byte_min_balance,
+            maximum_minimum_balance: self.maximum_minimum_balance,
+            max_assets_per_account: self.max_assets_per_account,
+            // Not part of go's `config.ConsensusParams` JSON shape — see the
+            // struct doc comment.
+            max_log_size: 1024,
+            max_log_calls: 32,
+            deeper_block_header_history: self.deeper_block_header_history,
+            reward_unit: self.reward_unit,
+            rewards_rate_refresh_interval: self.rewards_rate_refresh_interval,
+            max_timestamp_increment: self.max_timestamp_increment,
+            payset_commit: self.payset_commit,
+            enable_sha256_txn_commitment_header: self.enable_sha256_txn_commitment_header,
+            enable_sha512_block_hash: self.enable_sha512_block_hash,
+            require_genesis_hash: self.require_genesis_hash,
+            support_genesis_hash: self.support_genesis_hash,
+            max_apps_created: self.max_apps_created,
+            max_apps_opted_in: self.max_apps_opted_in,
+            max_keyreg_valid_period: self.max_keyreg_valid_period,
+            enable_keyreg_coherency_check: self.enable_keyreg_coherency_check,
+            enable_state_proof_keyreg_check: self.enable_state_proof_keyreg_check,
+            state_proof_interval: self.state_proof_interval,
+            state_proof_voters_lookback: self.state_proof_voters_lookback,
+            state_proof_block_hash_in_light_header: self.state_proof_block_hash_in_light_header,
+            state_proof_weight_threshold: self.state_proof_weight_threshold,
+            state_proof_strength_target: self.state_proof_strength_target,
+            isolate_clear_state: self.isolate_clear_state,
+            max_asset_url_bytes: self.max_asset_url_bytes,
+            max_asset_name_bytes: self.max_asset_name_bytes,
+            max_asset_unit_name_bytes: self.max_asset_unit_name_bytes,
+            max_proposed_expired_online_accounts: self.max_proposed_expired_online_accounts,
+            payouts_enabled: self.payouts.enabled,
+            payouts_go_online_fee: self.payouts.go_online_fee,
+            payouts_percent: self.payouts.percent,
+            payouts_min_balance: self.payouts.min_balance,
+            payouts_max_balance: self.payouts.max_balance,
+            payouts_max_mark_absent: self.payouts.max_mark_absent,
+            payouts_challenge_interval: self.payouts.challenge_interval,
+            payouts_challenge_grace_period: self.payouts.challenge_grace_period,
+            payouts_challenge_bits: self.payouts.challenge_bits,
+            bonus_base_round: self.bonus.base_round,
+            bonus_base_amount: self.bonus.base_amount,
+            bonus_decay_interval: self.bonus.decay_interval,
+            support_become_non_participating_transactions: self
+                .support_become_non_participating_transactions,
+            enable_app_versioning: self.enable_app_versioning,
+            num_proposers: self.num_proposers,
+            soft_committee_size: self.soft_committee_size,
+            soft_committee_threshold: self.soft_committee_threshold,
+            cert_committee_size: self.cert_committee_size,
+            cert_committee_threshold: self.cert_committee_threshold,
+            next_committee_size: self.next_committee_size,
+            next_committee_threshold: self.next_committee_threshold,
+            late_committee_size: self.late_committee_size,
+            late_committee_threshold: self.late_committee_threshold,
+            redo_committee_size: self.redo_committee_size,
+            redo_committee_threshold: self.redo_committee_threshold,
+            down_committee_size: self.down_committee_size,
+            down_committee_threshold: self.down_committee_threshold,
+            agreement_filter_timeout: self.agreement_filter_timeout,
+            agreement_filter_timeout_period0: self.agreement_filter_timeout_period0,
+            agreement_deadline_timeout_period0: self.agreement_deadline_timeout_period0,
+            fast_recovery_lambda: self.fast_recovery_lambda,
+            seed_lookback: self.seed_lookback,
+            seed_refresh_interval: self.seed_refresh_interval,
+            max_bal_lookback: self.max_bal_lookback,
+            default_key_dilution: self.default_key_dilution,
+            credential_domain_separation_enabled: self.credential_domain_separation_enabled,
+            dynamic_filter_timeout: self.dynamic_filter_timeout,
+            exclude_expired_circulation: self.exclude_expired_circulation,
+            approved_upgrade,
+            upgrade_vote_rounds: self.upgrade_vote_rounds,
+            upgrade_threshold: self.upgrade_threshold,
+            default_upgrade_wait_rounds: self.default_upgrade_wait_rounds,
+            min_upgrade_wait_rounds: self.min_upgrade_wait_rounds,
+            max_upgrade_wait_rounds: self.max_upgrade_wait_rounds,
+            pending_residue_rewards: self.pending_residue_rewards,
+            initial_rewards_rate_calculation: self.initial_rewards_rate_calculation,
+            rewards_calculation_fix: self.rewards_calculation_fix,
+            unify_inner_tx_ids: self.unify_inner_tx_ids,
+            unfunded_senders: self.unfunded_senders,
+            enable_precheck_ecdsa_curve: self.enable_precheck_ecdsa_curve,
+            app_forbid_low_resources: self.app_forbid_low_resources,
+            state_proof_top_voters: self.state_proof_top_voters,
+        }
+    }
+}
+
+/// The `consensus.json` file shape: a map from consensus-version string to
+/// override entry (Go: `config.ConsensusProtocols`, a
+/// `map[protocol.ConsensusVersion]config.ConsensusParams`).
+pub type ConsensusOverrides = HashMap<String, ConsensusParamsOverride>;
+
+/// Filename go-algorand looks for under a node's data directory to load
+/// configurable consensus-parameter overrides (Go:
+/// `config.ConfigurableConsensusProtocolsFilename`, `config/config.go`).
+pub const CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME: &str = "consensus.json";
+
+/// Resolve a JSON-supplied target-version string to a `&'static str`: reuse
+/// the matching compile-time constant when the name is a known protocol
+/// version, else leak the owned string. `consensus.json` is loaded at most
+/// once per node lifetime (startup), so the leak is bounded by the (small,
+/// finite) number of distinct override target-version names a node is ever
+/// configured with — the same "load once, live forever" lifetime the
+/// compile-time table already assumes for `ConsensusParams::approved_upgrade`.
+fn static_version_name(name: &str) -> &'static str {
+    if let Some(&known) = KNOWN_PROTOCOL_VERSIONS.iter().find(|&&k| k == name) {
+        known
+    } else {
+        Box::leak(name.to_owned().into_boxed_str())
+    }
+}
+
+/// Build the compile-time built-in consensus-parameter table for every
+/// version algod-rust knows, keyed by version string. Rust analog of
+/// go-algorand's package-level `Consensus` map, freshly populated by
+/// `initConsensusProtocols()` (`config/consensus.go`).
+pub fn built_in_consensus_protocols() -> HashMap<String, ConsensusParams> {
+    KNOWN_PROTOCOL_VERSIONS
+        .iter()
+        .filter_map(|&version| {
+            consensus_params_for_version(version).map(|params| (version.to_string(), params))
+        })
+        .collect()
+}
+
+/// Merge configurable `consensus.json` overrides onto a base consensus
+/// table, mirroring go-algorand's `ConsensusProtocols.Merge`
+/// (`config/consensus.go` ~line 858): per override entry, an absent/null
+/// `ApprovedUpgrades` deletes that version from the result (and prunes any
+/// other version's `approved_upgrade` that pointed at the deleted version);
+/// otherwise the version is added/replaced *wholesale* — this is a
+/// whole-struct replace-per-version-key, not a field-by-field merge within
+/// one version's params.
+pub fn merge_consensus_protocols(
+    base: HashMap<String, ConsensusParams>,
+    overrides: ConsensusOverrides,
+) -> HashMap<String, ConsensusParams> {
+    let mut merged = base;
+
+    for (version, params) in overrides {
+        match params.approved_upgrades {
+            None => {
+                merged.remove(&version);
+                for other in merged.values_mut() {
+                    if other.approved_upgrade.map(|(target, _)| target) == Some(version.as_str()) {
+                        other.approved_upgrade = None;
+                    }
+                }
+            }
+            Some(_) => {
+                let resolved = params.to_consensus_params();
+                merged.insert(version, resolved);
+            }
+        }
+    }
+
+    merged
+}
+
+/// Load `<data_dir>/consensus.json` (if present) and merge it onto the
+/// built-in consensus table, mirroring go-algorand's
+/// `PreloadConfigurableConsensusProtocols` (`config/config.go` ~line 336): a
+/// missing file is not an error (falls back to the built-in table
+/// unchanged); a present-but-malformed file surfaces as a real error.
+pub fn preload_configurable_consensus_protocols(
+    data_dir: &Path,
+) -> algo_error::Result<HashMap<String, ConsensusParams>> {
+    let path = data_dir.join(CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
+    let base = built_in_consensus_protocols();
+
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(base),
+        Err(e) => {
+            return Err(algo_error::AlgoError::Config(format!(
+                "reading {}: {e}",
+                path.display()
+            )))
+        }
+    };
+
+    let overrides: ConsensusOverrides = serde_json::from_str(&contents)
+        .map_err(|e| algo_error::AlgoError::Config(format!("parsing {}: {e}", path.display())))?;
+
+    Ok(merge_consensus_protocols(base, overrides))
+}
+
+/// Write (or, for an empty override map, delete) `<data_dir>/consensus.json`,
+/// mirroring go-algorand's `SaveConfigurableConsensus` (`config/config.go`
+/// ~line 314).
+pub fn save_configurable_consensus(
+    data_dir: &Path,
+    overrides: &ConsensusOverrides,
+) -> algo_error::Result<()> {
+    let path = data_dir.join(CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
+
+    if overrides.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(algo_error::AlgoError::Io(e)),
+        };
+    }
+
+    let encoded = serde_json::to_vec_pretty(overrides)
+        .map_err(|e| algo_error::AlgoError::Config(format!("encoding consensus.json: {e}")))?;
+    std::fs::write(&path, encoded).map_err(algo_error::AlgoError::Io)
 }
 
 #[cfg(test)]

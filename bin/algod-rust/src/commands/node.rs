@@ -184,13 +184,37 @@ async fn run_start(
         info!("genesis sets \"devmode\": true but --follow was given — following the peer instead of self-producing blocks");
     }
 
+    // Load `<data_dir>/consensus.json` (if present) and merge it onto the
+    // built-in consensus table (issue #750; Go:
+    // `PreloadConfigurableConsensusProtocols`, `config/config.go`). A missing
+    // file falls back to the built-in table unchanged; a malformed file is a
+    // real startup error rather than being silently ignored. This is the
+    // node's "active protocol version" consensus-parameter resolution point
+    // (the genesis protocol) -- the other ~57 call sites of
+    // `consensus_params_for_version` throughout ledger/AVM/agreement remain
+    // on the compile-time built-in table only; threading operator overrides
+    // through every one of them is a materially larger architectural change
+    // (go's own design keeps a single mutable package-level `Consensus` map
+    // read everywhere) tracked separately rather than folded into this
+    // startup wiring.
+    let consensus_overrides_path =
+        data_dir.join(algo_types::consensus::CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
+    let consensus_protocols =
+        algo_types::consensus::preload_configurable_consensus_protocols(data_dir)
+            .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
+    if consensus_overrides_path.exists() {
+        info!(path = %consensus_overrides_path.display(), "loaded consensus-parameter overrides");
+    }
+
     // Dev-mode block production restores the genesis hash stripped from committed
     // transactions by treating a zero hash as "stripped" (see
     // `dev_producer::restore_block_genesis_fields`). That is only unambiguous
     // under protocols that require a genesis hash, so refuse dev mode on legacy
     // optional-genesis-hash protocols rather than risk mis-derived txids.
     if dev_mode {
-        let params = algo_types::consensus::consensus_params_for_version(&genesis.proto)
+        let params = consensus_protocols
+            .get(&genesis.proto)
+            .cloned()
             .ok_or_else(|| {
                 anyhow::anyhow!("dev mode: unknown genesis protocol '{}'", genesis.proto)
             })?;
