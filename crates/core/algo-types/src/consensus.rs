@@ -325,6 +325,11 @@ pub struct ConsensusParams {
     pub bytes_per_box_reference: u64,
     /// Max box references per app call (Go: `MaxAppBoxReferences`).
     pub max_app_box_references: usize,
+    /// Whether box ref names are validated early, at `wellFormed` time
+    /// (Go: `EnableBoxRefNameError`, v38+). Before v38, an over-long box
+    /// name in `tx.Boxes`/`tx.Access` was only ever caught later, deep in
+    /// box-resolution logic; from v38 on it's rejected at well-formedness.
+    pub enable_box_ref_name_error: bool,
 
     // ── Min balance economics ───────────────────────────────────
     /// Flat MBR for creating an app (Go: `AppFlatParamsMinBalance`).
@@ -695,6 +700,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         max_box_size: 0,
         bytes_per_box_reference: 0,
         max_app_box_references: 0,
+        enable_box_ref_name_error: false,
         app_flat_params_min_balance: 0,
         app_flat_opt_in_min_balance: 0,
         schema_min_balance_per_entry: 0,
@@ -1098,6 +1104,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v38.agreement_filter_timeout_period0 = Duration::from_millis(3000);
     // online circulation on-demand expiration (config/consensus.go v38)
     v38.exclude_expired_circulation = true;
+    v38.enable_box_ref_name_error = true;
     if version == CONSENSUS_V38 {
         return Some(v38);
     }

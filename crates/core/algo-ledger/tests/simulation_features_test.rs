@@ -797,8 +797,13 @@ fn simulate_rejects_box_index_exceeding_foreign_apps() {
     let err = simulate(&mut state, request).expect_err("out-of-range box index must be rejected");
     match err {
         SimulatorError::InvalidRequest(e) => {
+            // Now caught by `wellFormed`'s own box-index/ForeignApps bound
+            // (issue #701), which mirrors upstream's exact message
+            // capitalization ("tx.Boxes[i].Index ... Exceeds
+            // len(tx.ForeignApps)"), rather than only the separate
+            // `check_application_call_boxes` group-level check.
             assert!(
-                e.message.contains("box"),
+                e.message.to_lowercase().contains("box"),
                 "expected a box-index rejection, got: {}",
                 e.message
             );

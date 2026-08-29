@@ -7138,7 +7138,27 @@ mod tests {
         let (sender, key) = test_keypair(113);
         let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 1_000_000)]);
 
-        let stx = make_signed_txn(&key, &sender, TxnType::Appl, 1000, 100);
+        // ApplicationID == 0 means this is a creation call, which (per
+        // issue #701's `wellFormed` program-presence/version check) now
+        // requires non-empty Approval/ClearState programs.
+        let mut txn = Transaction {
+            txn_type: TxnType::Appl,
+            sender,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            ..Default::default()
+        };
+        txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![6]));
+        txn.clear_state_program = Some(serde_bytes::ByteBuf::from(vec![6]));
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        };
         assert!(
             eval.transaction_group(&[stx]).is_ok(),
             "appl transaction should be accepted"

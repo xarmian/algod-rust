@@ -67,6 +67,13 @@ fn check_state_proof_reveals(txn: &Transaction) -> Result<(), AlgoError> {
 /// Mirrors Go's `checkApplicationCallBoxes`: when a txn doesn't use the
 /// `Access`-based resource list, every box ref's `Index` must be within
 /// `ForeignApps`'s bounds (0 always refers to the called app itself).
+///
+/// This is a group-level check (run once per txn in `check_txn_group`,
+/// independent of consensus params). `rules::validate_application_call_wellformed`
+/// (issue #701) separately ports the same bound — plus the
+/// `EnableBoxRefNameError` box-name-length check this function doesn't
+/// cover — directly from upstream's `wellFormed`, so a box-index violation
+/// is now caught by both; that's intentional redundancy, not a bug.
 fn check_application_call_boxes(txn: &Transaction) -> Result<(), AlgoError> {
     if txn.access.is_some() {
         return Ok(());
