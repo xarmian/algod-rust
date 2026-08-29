@@ -302,14 +302,15 @@ pub fn genesis_hash(genesis: &GenesisJson) -> [u8; 32] {
 ///
 /// Faithful for the consequential header fields (round, protocol, seed =
 /// genesis hash, rewards state, genesis hash/id, timestamp). Two go gating
-/// consensus params are not modeled in [`algo_types::ConsensusParams`], so we
-/// apply the behavior every localnet-relevant (modern) protocol uses and
-/// document it:
-/// - `InitialRewardsRateCalculation` (enabled on modern protocols) → the
-///   rewards rate subtracts `MinBalance` from the rewards-pool balance.
-/// - `AppForbidLowResources` (enabled on modern protocols) → `TxnCounter`
-///   starts at 1000, so the first created asset/app gets id 1001 like a real
-///   network.
+/// consensus params are version-gated via [`algo_types::ConsensusParams`]
+/// (`data/bookkeeping/genesis.go`'s `MakeGenesisBlock`), so a genesis built
+/// under an older protocol reproduces go's canonical pre-fix behavior:
+/// - `InitialRewardsRateCalculation` (v26+) → the rewards rate subtracts
+///   `MinBalance` from the rewards-pool balance before dividing; before v26,
+///   the whole pool balance is divided directly.
+/// - `AppForbidLowResources` (v38+) → `TxnCounter` starts at 1000, so the
+///   first created asset/app gets id 1001 like a real network; before v38,
+///   it starts at 0 (first id 1).
 ///
 /// `txn_commitment` is set to go's real empty-*non-nil*-payset commitment
 /// (see [`GENESIS_EMPTY_PAYSET_COMMITMENT`]), matching
@@ -327,8 +328,8 @@ pub fn make_genesis_block(genesis: &GenesisJson) -> Result<algo_types::Block, Al
     let genesis_id = format!("{}-{}", genesis.network, genesis.id);
 
     // Rewards rate: go's MakeGenesisBlock divides the rewards-pool balance by
-    // the refresh interval (subtracting MinBalance under
-    // InitialRewardsRateCalculation, which modern protocols enable).
+    // the refresh interval, subtracting MinBalance first under
+    // InitialRewardsRateCalculation (v26+).
     let refresh = params.rewards_rate_refresh_interval;
     let rewards_pool_balance = genesis
         .alloc
@@ -336,10 +337,12 @@ pub fn make_genesis_block(genesis: &GenesisJson) -> Result<algo_types::Block, Al
         .find(|a| a.addr == genesis.rwd)
         .map(|a| a.state.algo)
         .unwrap_or(0);
-    let rewards_rate = rewards_pool_balance
-        .saturating_sub(params.min_balance)
-        .checked_div(refresh)
-        .unwrap_or_default();
+    let initial_rewards = if params.initial_rewards_rate_calculation {
+        rewards_pool_balance.saturating_sub(params.min_balance)
+    } else {
+        rewards_pool_balance
+    };
+    let rewards_rate = initial_rewards.checked_div(refresh).unwrap_or_default();
 
     Ok(algo_types::Block {
         round: algo_types::Round(0),
@@ -359,8 +362,13 @@ pub fn make_genesis_block(genesis: &GenesisJson) -> Result<algo_types::Block, Al
         rewards_residue: 0,
         rewards_recalculation_round: algo_types::Round(refresh),
         current_protocol: genesis.proto.clone(),
-        // Modern-protocol AppForbidLowResources behavior (see doc comment).
-        txn_counter: 1000,
+        // AppForbidLowResources (v38+): bump TxnCounter so the first
+        // created asset/app gets id 1001, not id 1 (see doc comment).
+        txn_counter: if params.app_forbid_low_resources {
+            1000
+        } else {
+            0
+        },
         txn_commitment: GENESIS_EMPTY_PAYSET_COMMITMENT,
         ..Default::default()
     })
@@ -1196,5 +1204,76 @@ mod genesis_block_tests {
         let dh = algo_types::BlockHeader::decode_from_reader(&mut hdr.as_slice())
             .expect("decode header");
         assert_eq!(dh.round, algo_types::Round(0));
+    }
+
+    /// Build a genesis JSON pinned to `proto` (a `CONSENSUS_V*` version
+    /// string) instead of `"future"`, so version-gated genesis behavior
+    /// (`InitialRewardsRateCalculation`, `AppForbidLowResources`) can be
+    /// tested on both sides of their real activation boundary.
+    fn test_genesis_for_proto(proto: &str) -> GenesisJson {
+        let fees = Address([0xFE; 32]).to_algorand_string();
+        let rwd = Address([0xFD; 32]).to_algorand_string();
+        let json = format!(
+            r#"{{"id":"v1","network":"localnet","proto":"{proto}","fees":"{fees}","rwd":"{rwd}","timestamp":0,"alloc":[{{"addr":"{rwd}","comment":"RewardsPool","state":{{"algo":1000000000000,"onl":0}}}}]}}"#
+        );
+        parse_genesis_json(&json).unwrap()
+    }
+
+    #[test]
+    fn app_forbid_low_resources_txn_counter_activation_boundary() {
+        // v37 (pre-fix): TxnCounter starts at 0, so the first created
+        // asset/app would get id 1.
+        let g37 = test_genesis_for_proto(algo_types::consensus::CONSENSUS_V37);
+        let blk37 = make_genesis_block(&g37).unwrap();
+        assert_eq!(
+            blk37.txn_counter, 0,
+            "pre-v38 genesis must not bump TxnCounter"
+        );
+
+        // v38 (post-fix): TxnCounter starts at 1000, so the first created
+        // asset/app gets id 1001.
+        let g38 = test_genesis_for_proto(algo_types::consensus::CONSENSUS_V38);
+        let blk38 = make_genesis_block(&g38).unwrap();
+        assert_eq!(
+            blk38.txn_counter, 1000,
+            "v38+ genesis must bump TxnCounter to 1000"
+        );
+    }
+
+    #[test]
+    fn initial_rewards_rate_calculation_activation_boundary() {
+        let pool_balance = 1_000_000_000_000u64;
+
+        // v25 (pre-fix): rate = poolBalance / refreshInterval (no MinBalance
+        // subtraction).
+        let g25 = test_genesis_for_proto(algo_types::consensus::CONSENSUS_V25);
+        let params25 = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V25,
+        )
+        .unwrap();
+        let blk25 = make_genesis_block(&g25).unwrap();
+        let expected25 = pool_balance / params25.rewards_rate_refresh_interval;
+        assert_eq!(
+            blk25.rewards_rate, expected25,
+            "pre-v26 genesis must not subtract MinBalance from the rewards rate"
+        );
+
+        // v26 (post-fix): rate = (poolBalance - MinBalance) / refreshInterval.
+        let g26 = test_genesis_for_proto(algo_types::consensus::CONSENSUS_V26);
+        let params26 = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V26,
+        )
+        .unwrap();
+        let blk26 = make_genesis_block(&g26).unwrap();
+        let expected26 =
+            (pool_balance - params26.min_balance) / params26.rewards_rate_refresh_interval;
+        assert_eq!(
+            blk26.rewards_rate, expected26,
+            "v26+ genesis must subtract MinBalance from the rewards rate"
+        );
+        assert_ne!(
+            expected25, expected26,
+            "sanity: the two formulas must actually differ for this test to be meaningful"
+        );
     }
 }

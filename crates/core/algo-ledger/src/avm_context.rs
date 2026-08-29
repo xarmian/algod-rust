@@ -1048,6 +1048,124 @@ pub(crate) fn default_scratch_row() -> [TealValue; 256] {
 }
 
 impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
+    /// Core asset-reference resolution, matching go-algorand's
+    /// `resolveAsset` (`data/transactions/logic/eval.go`) *before* its
+    /// `AppForbidLowResources` low-id check (applied by the caller via
+    /// [`Self::check_forbidden_low_resource`], matching go's `defer`).
+    fn resolve_asset_unchecked(&self, index: u64) -> Result<u64, AlgoError> {
+        let txn = &self.current_txn().txn;
+        // Direct reference (go-algorand `asaReference`, AVM v4+): a value that
+        // names an *available* asset is the asset ID itself, checked before
+        // slot interpretation. With unnamed-resource tracking enabled
+        // (simulation `allow_unnamed_resources`), every asset is available and
+        // the access is recorded at the querying opcode.
+        if index != 0 {
+            let in_foreign = txn
+                .foreign_assets
+                .as_deref()
+                .is_some_and(|assets| assets.contains(&index));
+            if in_foreign
+                || txn.xaid == index
+                || txn.config_asset == index
+                || txn.freeze_asset == index
+                || self.created_assets.contains(&index)
+                || self.unnamed_tracking.is_some()
+            {
+                return Ok(index);
+            }
+        }
+        if index == 0 {
+            // Index 0 = the "implied" asset: xfer_asset, config_asset, or freeze_asset
+            let id = if txn.xaid != 0 {
+                txn.xaid
+            } else if txn.config_asset != 0 {
+                txn.config_asset
+            } else {
+                txn.freeze_asset
+            };
+            if id == 0 {
+                return Err(AlgoError::Avm {
+                    message: "resolve_asset: index 0 but no implied asset".to_string(),
+                });
+            }
+            return Ok(id);
+        }
+        let assets = txn.foreign_assets.as_deref().unwrap_or(&[]);
+        let i = (index - 1) as usize;
+        if i < assets.len() {
+            Ok(assets[i])
+        } else {
+            Err(AlgoError::Avm {
+                message: format!(
+                    "resolve_asset: index {} out of range (foreign_assets len={})",
+                    index,
+                    assets.len() + 1
+                ),
+            })
+        }
+    }
+
+    /// Core app-reference resolution, matching go-algorand's `resolveApp`
+    /// (`data/transactions/logic/eval.go`) *before* its
+    /// `AppForbidLowResources` low-id check (applied by the caller via
+    /// [`Self::check_forbidden_low_resource`], matching go's `defer`).
+    fn resolve_app_unchecked(&self, index: u64) -> Result<u64, AlgoError> {
+        if index == 0 {
+            return Ok(self.app_id);
+        }
+        let txn = &self.current_txn().txn;
+        // Direct reference (go-algorand `appReference`, AVM v4+): a value that
+        // names an *available* app is the app ID itself, checked before slot
+        // interpretation. With unnamed-resource tracking enabled, every app is
+        // available and the access is recorded at the querying opcode.
+        {
+            let in_foreign = txn
+                .foreign_apps
+                .as_deref()
+                .is_some_and(|apps| apps.contains(&index));
+            if in_foreign
+                || index == self.app_id
+                || txn.application_id == index
+                || self.created_apps.contains(&index)
+                || self.unnamed_tracking.is_some()
+            {
+                return Ok(index);
+            }
+        }
+        let apps = txn.foreign_apps.as_deref().unwrap_or(&[]);
+        let i = (index - 1) as usize;
+        if i < apps.len() {
+            Ok(apps[i])
+        } else {
+            Err(AlgoError::Avm {
+                message: format!(
+                    "resolve_app: index {} out of range (foreign_apps len={})",
+                    index,
+                    apps.len() + 1
+                ),
+            })
+        }
+    }
+
+    /// `AppForbidLowResources` (go-algorand v38+, `config/consensus.go`):
+    /// forbids AVM opcodes from resolving an asset/application ID <= 255
+    /// (`lastForbiddenResource`), to reduce ambiguity between IDs and
+    /// slot-index references. Mirrors the `defer` check at the end of go's
+    /// `resolveAsset`/`resolveApp`/`appReference`/`assetReference`
+    /// (`data/transactions/logic/eval.go`), which runs on every successfully
+    /// resolved id (including id 0 special-cases like "current app") when
+    /// the consensus flag is enabled. Before v38, no such restriction
+    /// applies.
+    fn check_forbidden_low_resource(&self, id: u64, kind: &str) -> Result<(), AlgoError> {
+        const LAST_FORBIDDEN_RESOURCE: u64 = 255;
+        if self.consensus.app_forbid_low_resources && id <= LAST_FORBIDDEN_RESOURCE {
+            return Err(AlgoError::Avm {
+                message: format!("low {kind} lookup {id}"),
+            });
+        }
+        Ok(())
+    }
+
     /// Create a new context. `scratch` is initialized to the right number of
     /// zero-filled rows for the group.
     #[allow(clippy::too_many_arguments)]
@@ -2916,94 +3034,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn resolve_asset(&self, index: u64) -> Result<u64, AlgoError> {
-        let txn = &self.current_txn().txn;
-        // Direct reference (go-algorand `asaReference`, AVM v4+): a value that
-        // names an *available* asset is the asset ID itself, checked before
-        // slot interpretation. With unnamed-resource tracking enabled
-        // (simulation `allow_unnamed_resources`), every asset is available and
-        // the access is recorded at the querying opcode.
-        if index != 0 {
-            let in_foreign = txn
-                .foreign_assets
-                .as_deref()
-                .is_some_and(|assets| assets.contains(&index));
-            if in_foreign
-                || txn.xaid == index
-                || txn.config_asset == index
-                || txn.freeze_asset == index
-                || self.created_assets.contains(&index)
-                || self.unnamed_tracking.is_some()
-            {
-                return Ok(index);
-            }
-        }
-        if index == 0 {
-            // Index 0 = the "implied" asset: xfer_asset, config_asset, or freeze_asset
-            let id = if txn.xaid != 0 {
-                txn.xaid
-            } else if txn.config_asset != 0 {
-                txn.config_asset
-            } else {
-                txn.freeze_asset
-            };
-            if id == 0 {
-                return Err(AlgoError::Avm {
-                    message: "resolve_asset: index 0 but no implied asset".to_string(),
-                });
-            }
-            return Ok(id);
-        }
-        let assets = txn.foreign_assets.as_deref().unwrap_or(&[]);
-        let i = (index - 1) as usize;
-        if i < assets.len() {
-            Ok(assets[i])
-        } else {
-            Err(AlgoError::Avm {
-                message: format!(
-                    "resolve_asset: index {} out of range (foreign_assets len={})",
-                    index,
-                    assets.len() + 1
-                ),
-            })
-        }
+        let id = self.resolve_asset_unchecked(index)?;
+        self.check_forbidden_low_resource(id, "Asset")?;
+        Ok(id)
     }
 
     fn resolve_app(&self, index: u64) -> Result<u64, AlgoError> {
-        if index == 0 {
-            return Ok(self.app_id);
-        }
-        let txn = &self.current_txn().txn;
-        // Direct reference (go-algorand `appReference`, AVM v4+): a value that
-        // names an *available* app is the app ID itself, checked before slot
-        // interpretation. With unnamed-resource tracking enabled, every app is
-        // available and the access is recorded at the querying opcode.
-        {
-            let in_foreign = txn
-                .foreign_apps
-                .as_deref()
-                .is_some_and(|apps| apps.contains(&index));
-            if in_foreign
-                || index == self.app_id
-                || txn.application_id == index
-                || self.created_apps.contains(&index)
-                || self.unnamed_tracking.is_some()
-            {
-                return Ok(index);
-            }
-        }
-        let apps = txn.foreign_apps.as_deref().unwrap_or(&[]);
-        let i = (index - 1) as usize;
-        if i < apps.len() {
-            Ok(apps[i])
-        } else {
-            Err(AlgoError::Avm {
-                message: format!(
-                    "resolve_app: index {} out of range (foreign_apps len={})",
-                    index,
-                    apps.len() + 1
-                ),
-            })
-        }
+        let id = self.resolve_app_unchecked(index)?;
+        self.check_forbidden_low_resource(id, "App")?;
+        Ok(id)
     }
 
     // ---- State reads ----
@@ -3974,12 +4013,21 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
         // P1-3: Compute the effective parent txn ID for inner ID computation.
         // For top-level contexts (parent_txn_id is zero), compute from the
-        // outer transaction. For nested contexts, use the stored parent_txn_id.
-        let effective_parent_txid = if self.parent_txn_id.0 != [0u8; 32] {
-            self.parent_txn_id
-        } else {
-            algo_codec::compute_txn_id(&self.group[self.group_index].txn)
-        };
+        // outer transaction. For nested contexts, use the stored
+        // parent_txn_id -- but only under UnifyInnerTxIDs (v34+; go's
+        // `getTxID`/`currentTxID`, `data/transactions/logic/eval.go`), which
+        // recursively derives each level's own ID from its real ancestor
+        // chain. Before v34 (go's `getTxIDNotUnified`), a nested inner
+        // transaction's children are always parented on the *raw* hash of
+        // the immediate calling transaction (`cx.caller.txn.ID()`), ignoring
+        // that the caller may itself be nested -- i.e. the same raw-hash
+        // formula used for a top-level parent, applied unconditionally.
+        let effective_parent_txid =
+            if self.consensus.unify_inner_tx_ids && self.parent_txn_id.0 != [0u8; 32] {
+                self.parent_txn_id
+            } else {
+                algo_codec::compute_txn_id(&self.group[self.group_index].txn)
+            };
         // The offset base for inner ID computation: number of already-submitted inner txns.
         let id_offset_base: usize = self.inner_txns.iter().map(|g| g.len()).sum();
 
@@ -4459,6 +4507,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn supports_budget_pooling(&self) -> bool {
         true
+    }
+
+    fn enable_precheck_ecdsa_curve(&self) -> bool {
+        self.consensus.enable_precheck_ecdsa_curve
     }
 
     // ---- Resource availability ----
@@ -5054,29 +5106,87 @@ mod tests {
 
     #[test]
     fn resolve_asset_implied_and_foreign() {
+        // Realistic (> 255) ids: under the default (modern) consensus,
+        // AppForbidLowResources forbids resolving low asset/app ids (see
+        // `low_resource_ids_forbidden_under_app_forbid_low_resources` below),
+        // so ordinary resolution-mechanics tests must use ids a real
+        // AppForbidLowResources-era chain (first id 1001) would actually
+        // hand out.
         let sender = [10u8; 32];
-        let mut txn = make_appl_txn(sender, 42, vec![], vec![], vec![50, 60]);
-        txn.txn.xaid = 99; // implied asset
+        let mut txn = make_appl_txn(sender, 1042, vec![], vec![], vec![1050, 1060]);
+        txn.txn.xaid = 1099; // implied asset
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
 
-        assert_eq!(ctx.resolve_asset(0).unwrap(), 99);
-        assert_eq!(ctx.resolve_asset(1).unwrap(), 50);
-        assert_eq!(ctx.resolve_asset(2).unwrap(), 60);
+        assert_eq!(ctx.resolve_asset(0).unwrap(), 1099);
+        assert_eq!(ctx.resolve_asset(1).unwrap(), 1050);
+        assert_eq!(ctx.resolve_asset(2).unwrap(), 1060);
         assert!(ctx.resolve_asset(3).is_err());
     }
 
     #[test]
     fn resolve_app_current_and_foreign() {
+        // Realistic (> 255) ids -- see comment on
+        // `resolve_asset_implied_and_foreign` above.
         let sender = [10u8; 32];
-        let txn = make_appl_txn(sender, 42, vec![], vec![100, 200], vec![]);
+        let txn = make_appl_txn(sender, 1042, vec![], vec![1100, 1200], vec![]);
         let mut store = LedgerState::new();
-        let ctx = make_context(&mut store, vec![txn]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 1042;
 
-        assert_eq!(ctx.resolve_app(0).unwrap(), 42); // current app
-        assert_eq!(ctx.resolve_app(1).unwrap(), 100);
-        assert_eq!(ctx.resolve_app(2).unwrap(), 200);
+        assert_eq!(ctx.resolve_app(0).unwrap(), 1042); // current app
+        assert_eq!(ctx.resolve_app(1).unwrap(), 1100);
+        assert_eq!(ctx.resolve_app(2).unwrap(), 1200);
         assert!(ctx.resolve_app(3).is_err());
+    }
+
+    // ── AppForbidLowResources (v38+) activation boundary ────────────────
+
+    #[test]
+    fn low_resource_ids_forbidden_under_app_forbid_low_resources() {
+        // v38+ (modern default): resolving an asset/app id <= 255 must be
+        // rejected, even when it's directly named (available).
+        let sender = [10u8; 32];
+        let mut txn = make_appl_txn(sender, 42, vec![], vec![100], vec![50]);
+        txn.txn.xaid = 50;
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        assert!(ctx.consensus.app_forbid_low_resources);
+        ctx.app_id = 42;
+
+        assert!(
+            ctx.resolve_asset(1).is_err(),
+            "v38+ must forbid a directly-named low asset id"
+        );
+        assert!(
+            ctx.resolve_app(1).is_err(),
+            "v38+ must forbid a directly-named low app id"
+        );
+        assert!(
+            ctx.resolve_app(0).is_err(),
+            "v38+ must forbid a low *current app* id too (matches go's defer, which \
+             checks the resolved id unconditionally)"
+        );
+    }
+
+    #[test]
+    fn low_resource_ids_allowed_before_app_forbid_low_resources() {
+        // Before v38, low ids are resolved without restriction.
+        let sender = [10u8; 32];
+        let mut txn = make_appl_txn(sender, 42, vec![], vec![100], vec![50]);
+        txn.txn.xaid = 50;
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 42;
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V37,
+        )
+        .expect("v37 params");
+        assert!(!ctx.consensus.app_forbid_low_resources);
+
+        assert_eq!(ctx.resolve_asset(1).unwrap(), 50);
+        assert_eq!(ctx.resolve_app(1).unwrap(), 100);
+        assert_eq!(ctx.resolve_app(0).unwrap(), 42);
     }
 
     // ---- State read/write tests ----
@@ -7930,6 +8040,124 @@ mod tests {
         assert_ne!(
             computed_inner_id.0, id_with_fake_parent.0,
             "different parent IDs should produce different inner txn IDs"
+        );
+    }
+
+    /// UnifyInnerTxIDs (go-algorand v34+, `config/consensus.go`) activation
+    /// boundary: a *nested* inner-appl context (simulated here by setting
+    /// `parent_txn_id` to a value that differs from the raw hash of this
+    /// context's own group transaction, exactly as `execute_inner_appl` does
+    /// for a real 2-levels-deep nesting) must parent its own children on
+    /// that correctly-propagated ancestor id at v34+ (matching go's
+    /// `getTxID`/`currentTxID`), but on the raw hash of its own transaction
+    /// before v34 (matching go's `getTxIDNotUnified`, which always uses
+    /// `cx.caller.txn.ID()` -- a plain hash, blind to the caller's own
+    /// nesting).
+    #[test]
+    fn unify_inner_tx_ids_activation_boundary() {
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let raw_self_hash = algo_codec::compute_txn_id(&txn.txn);
+        // A fake ancestor id, distinct from this context's own raw txn hash
+        // -- simulates genuinely being a nested (2+ levels deep) inner-appl
+        // context whose `parent_txn_id` was propagated from its own caller.
+        let fake_ancestor = algo_types::Digest([0xABu8; 32]);
+        assert_ne!(
+            fake_ancestor.0, raw_self_hash.0,
+            "sanity: must actually differ"
+        );
+
+        // ── Pre-v34 (not unified): child must be parented on the raw hash
+        // of this context's own transaction, ignoring parent_txn_id. ──
+        let mut store_pre = LedgerState::new();
+        setup_app(
+            &mut store_pre,
+            42,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        setup_app(
+            &mut store_pre,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        store_pre.set_account(
+            &Address(app_address(42)),
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let mut ctx_pre = make_context(&mut store_pre, vec![txn.clone()]);
+        ctx_pre.fee_sink = Address([0xFEu8; 32]);
+        ctx_pre.opcode_budget = 2000;
+        ctx_pre.txn_counter = 500;
+        ctx_pre.parent_txn_id = fake_ancestor;
+        ctx_pre.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V33,
+        )
+        .expect("v33 params");
+        assert!(!ctx_pre.consensus.unify_inner_tx_ids);
+        ctx_pre.itxn_begin().unwrap();
+        ctx_pre.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx_pre.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100
+        ctx_pre.itxn_submit().unwrap();
+        let inner_txn_pre = ctx_pre.inner_txns()[0][0].txn.clone();
+        let computed_pre = ctx_pre.inner_txn_ids()[0][0];
+        let expected_pre = algo_avm::itxn::compute_inner_txn_id(&raw_self_hash, 0, &inner_txn_pre);
+        assert_eq!(
+            computed_pre.0, expected_pre.0,
+            "pre-v34 must parent on this context's own raw txn hash, not parent_txn_id"
+        );
+
+        // ── v34+ (unified): child must be parented on parent_txn_id. ──
+        let mut store_post = LedgerState::new();
+        setup_app(
+            &mut store_post,
+            42,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        setup_app(
+            &mut store_post,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        store_post.set_account(
+            &Address(app_address(42)),
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let mut ctx_post = make_context(&mut store_post, vec![txn]);
+        ctx_post.fee_sink = Address([0xFEu8; 32]);
+        ctx_post.opcode_budget = 2000;
+        ctx_post.txn_counter = 500;
+        ctx_post.parent_txn_id = fake_ancestor;
+        ctx_post.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V34,
+        )
+        .expect("v34 params");
+        assert!(ctx_post.consensus.unify_inner_tx_ids);
+        ctx_post.itxn_begin().unwrap();
+        ctx_post.itxn_field(16, TealValue::Uint(6)).unwrap();
+        ctx_post.itxn_field(24, TealValue::Uint(100)).unwrap();
+        ctx_post.itxn_submit().unwrap();
+        let inner_txn_post = ctx_post.inner_txns()[0][0].txn.clone();
+        let computed_post = ctx_post.inner_txn_ids()[0][0];
+        let expected_post =
+            algo_avm::itxn::compute_inner_txn_id(&fake_ancestor, 0, &inner_txn_post);
+        assert_eq!(
+            computed_post.0, expected_post.0,
+            "v34+ must parent on the propagated parent_txn_id"
+        );
+
+        assert_ne!(
+            computed_pre.0, computed_post.0,
+            "sanity: the two protocol versions must actually compute different ids"
         );
     }
 

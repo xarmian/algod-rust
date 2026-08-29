@@ -129,11 +129,10 @@ pub struct RewardsState {
 /// the ledger by the caller — exactly as go's evaluator does in
 /// `eval.StartEvaluator`.
 ///
-/// Two go consensus flags are not modeled in [`algo_types::ConsensusParams`]:
-/// `PendingResidueRewards` (enabled v18+) and `RewardsCalculationFix` (enabled
-/// v31+). algod-rust targets modern protocols (v41) where both are enabled, so
-/// this applies that behavior unconditionally and documents the divergence —
-/// matching the existing modern-protocol assumptions in `make_genesis_block`.
+/// `params.pending_residue_rewards` (v18+) and `params.rewards_calculation_fix`
+/// (v31+) are version-gated so that replaying a historical block from before
+/// each fix's real activation round reproduces go-algorand's canonical
+/// (pre-fix) result rather than the modern one unconditionally.
 ///
 /// Overflow semantics mirror go's `OverflowTracker`: an overflow in the level
 /// advance abandons it and keeps the previous level (with any refreshed
@@ -149,13 +148,18 @@ pub fn next_rewards_state(
 
     // Time to refresh the rewards rate from the current pool balance.
     if next_round == res.rewards_recalculation_round {
-        // PendingResidueRewards (modern: enabled): the outstanding residue
-        // counts against what the pool may spend on the next rate.
-        let max_spent_over = match params.min_balance.checked_add(res.rewards_residue) {
-            Some(v) => v,
-            // Overflow (go's OAdd overflowed): spend the whole pool so the new
-            // rate becomes 0.
-            None => incentive_pool_balance,
+        // PendingResidueRewards (v18+): the outstanding residue counts
+        // against what the pool may spend on the next rate. Before v18, only
+        // MinBalance was reserved.
+        let max_spent_over = if params.pending_residue_rewards {
+            match params.min_balance.checked_add(res.rewards_residue) {
+                Some(v) => v,
+                // Overflow (go's OAdd overflowed): spend the whole pool so the
+                // new rate becomes 0.
+                None => incentive_pool_balance,
+            }
+        } else {
+            params.min_balance
         };
         let new_rate = incentive_pool_balance.saturating_sub(max_spent_over);
         // RewardsRateRefreshInterval is a positive consensus param; guard a
@@ -177,8 +181,13 @@ pub fn next_rewards_state(
         return res;
     }
 
-    // RewardsCalculationFix (modern: enabled): use the freshly-refreshed rate.
-    let rewards_rate = res.rewards_rate;
+    // RewardsCalculationFix (v31+): use the freshly-refreshed rate immediately.
+    // Before v31, use the rate as it stood before this round's refresh.
+    let rewards_rate = if params.rewards_calculation_fix {
+        res.rewards_rate
+    } else {
+        prev.rewards_rate
+    };
 
     // Mirror go's OverflowTracker: abandon the level advance on overflow.
     let rewards_with_residue = match rewards_rate.checked_add(res.rewards_residue) {
@@ -445,6 +454,123 @@ mod tests {
     fn v41() -> algo_types::ConsensusParams {
         algo_types::consensus::consensus_params_for_version(algo_types::CONSENSUS_V41)
             .expect("v41 params")
+    }
+
+    fn params_for(version: &str) -> algo_types::ConsensusParams {
+        algo_types::consensus::consensus_params_for_version(version)
+            .unwrap_or_else(|| panic!("{version} params"))
+    }
+
+    // ── PendingResidueRewards activation boundary (v17 -> v18) ─────────
+
+    #[test]
+    fn test_pending_residue_rewards_flag_activation() {
+        let v17 = params_for(algo_types::consensus::CONSENSUS_V17);
+        let v18 = params_for(algo_types::consensus::CONSENSUS_V18);
+        assert!(!v17.pending_residue_rewards, "v17 must be pre-fix");
+        assert!(v18.pending_residue_rewards, "v18 must be post-fix");
+    }
+
+    #[test]
+    fn test_nrs_pending_residue_rewards_pre_v18_ignores_residue() {
+        // Before v18, the residue must NOT count against the pool's
+        // max-spend when refreshing the rate: maxSpentOver == MinBalance only.
+        let params = params_for(algo_types::consensus::CONSENSUS_V17);
+        let pool = 10_000_000_000u64;
+        let prev = RewardsState {
+            rewards_recalculation_round: 5,
+            rewards_residue: 1_000_000,
+            ..Default::default()
+        };
+        let next = next_rewards_state(prev, 5, &params, pool, 0);
+        let expected_rate = (pool - params.min_balance) / params.rewards_rate_refresh_interval;
+        assert_eq!(
+            next.rewards_rate, expected_rate,
+            "pre-v18 residue must not reduce the refreshed rate"
+        );
+    }
+
+    #[test]
+    fn test_nrs_pending_residue_rewards_v18_counts_residue() {
+        // At/after v18, the residue DOES count against the pool's max-spend.
+        let params = params_for(algo_types::consensus::CONSENSUS_V18);
+        let pool = 10_000_000_000u64;
+        let residue = 1_000_000u64;
+        let prev = RewardsState {
+            rewards_recalculation_round: 5,
+            rewards_residue: residue,
+            ..Default::default()
+        };
+        let next = next_rewards_state(prev, 5, &params, pool, 0);
+        let expected_rate =
+            (pool - (params.min_balance + residue)) / params.rewards_rate_refresh_interval;
+        assert_eq!(
+            next.rewards_rate, expected_rate,
+            "v18+ residue must reduce the refreshed rate"
+        );
+    }
+
+    // ── RewardsCalculationFix activation boundary (v30 -> v31) ─────────
+
+    #[test]
+    fn test_rewards_calculation_fix_flag_activation() {
+        let v30 = params_for(algo_types::consensus::CONSENSUS_V30);
+        let v31 = params_for(algo_types::consensus::CONSENSUS_V31);
+        assert!(!v30.rewards_calculation_fix, "v30 must be pre-fix");
+        assert!(v31.rewards_calculation_fix, "v31 must be post-fix");
+    }
+
+    #[test]
+    fn test_nrs_rewards_calculation_fix_pre_v31_uses_stale_rate() {
+        // Before v31, a rate refresh that happens on the SAME round as a
+        // level advance must use the *previous* round's rate for that
+        // advance, not the freshly-refreshed one.
+        let params = params_for(algo_types::consensus::CONSENSUS_V30);
+        let pool = 10_000_000_000u64;
+        let prev = RewardsState {
+            rewards_level: 100,
+            rewards_rate: 42, // stale rate, used pre-fix
+            rewards_residue: 0,
+            rewards_recalculation_round: 5, // triggers a refresh this round
+        };
+        let total_reward_units = 100u64;
+        let next = next_rewards_state(prev, 5, &params, pool, total_reward_units);
+        // rewardsWithResidue = stale rate (42) + residue (0) = 42
+        let rewards_with_residue = prev.rewards_rate + prev.rewards_residue;
+        let expected_level = prev.rewards_level + rewards_with_residue / total_reward_units;
+        let expected_residue = rewards_with_residue % total_reward_units;
+        assert_eq!(
+            next.rewards_level, expected_level,
+            "pre-v31 must advance the level using the stale (pre-refresh) rate"
+        );
+        assert_eq!(next.rewards_residue, expected_residue);
+        // Sanity: the refreshed rate differs from the stale rate used above,
+        // proving this test actually exercises the "use stale rate" branch.
+        assert_ne!(next.rewards_rate, 42);
+    }
+
+    #[test]
+    fn test_nrs_rewards_calculation_fix_v31_uses_fresh_rate() {
+        // At/after v31, the SAME refresh-and-advance round must use the
+        // freshly-refreshed rate for the level advance.
+        let params = params_for(algo_types::consensus::CONSENSUS_V31);
+        let pool = 10_000_000_000u64;
+        let prev = RewardsState {
+            rewards_level: 100,
+            rewards_rate: 42, // stale rate, must NOT be used post-fix
+            rewards_residue: 0,
+            rewards_recalculation_round: 5,
+        };
+        let next = next_rewards_state(prev, 5, &params, pool, 100);
+        let refreshed_rate =
+            pool.saturating_sub(params.min_balance) / params.rewards_rate_refresh_interval;
+        let expected_level = 100 + refreshed_rate / 100;
+        let expected_residue = refreshed_rate % 100;
+        assert_eq!(
+            next.rewards_level, expected_level,
+            "v31+ must advance the level using the freshly-refreshed rate"
+        );
+        assert_eq!(next.rewards_residue, expected_residue);
     }
 
     #[test]
