@@ -2222,6 +2222,25 @@ fn execute_inner_appl<L: LedgerStore>(
     log_limits: (u64, u64),
     unnamed_tracking: Option<Arc<NamedGroupResources>>,
     kv_mods_recorder: Option<KvModsRecorder>,
+    // ── Inner-group sibling context (issue #714) ──
+    //
+    // go-algorand's `EvalContract` treats an inner transaction group exactly
+    // like a top-level group: `opItxnSubmit` builds one `NewInnerEvalParams`
+    // shared by every sibling in the inner group (`data/transactions/logic/
+    // eval.go`), so `cx.pastScratch` is a real, correctly-sized array across
+    // the whole inner group, not a single-element placeholder. `inner_siblings`
+    // is the full (snapshotted) inner-group txn list built by `itxn_submit`,
+    // `sibling_index` is this call's position within it, and `inner_ran_program`
+    // / `inner_scratch` are that inner group's shared, `RefCell`-guarded
+    // ran/scratch record -- the same `GroupInfo::ran_program`/`GroupInfo::
+    // scratch` pattern `apply.rs` established for top-level groups (#686),
+    // generalized here so a nested inner-of-inner call seeds its own
+    // independent record (built fresh by its own `itxn_submit`), not this
+    // group's.
+    inner_siblings: Vec<SignedTransaction>,
+    sibling_index: usize,
+    inner_ran_program: &RefCell<Vec<bool>>,
+    inner_scratch: &RefCell<Vec<Option<[TealValue; 256]>>>,
 ) -> Result<crate::apply::InnerApplyData, AlgoError> {
     use algo_avm::eval::{
         run_approval_program, run_approval_program_with_tracer, run_clear_state_program,
@@ -2302,12 +2321,14 @@ fn execute_inner_appl<L: LedgerStore>(
     budget.add(*opcode_budget);
 
     // ── Create child AVM context ──
-    // Build a single-txn group containing just the inner app call.
-    let inner_group = vec![stxn.clone()];
+    // Build the full inner-group sibling list (not just this one txn) so
+    // `gload`/`gloads`/`gloadss` against an earlier sibling in this same
+    // inner group can see it (issue #714), mirroring go-algorand sharing one
+    // `EvalParams`/`pastScratch` across an entire inner group.
     let mut inner_ctx = LedgerAvmContext::new(
         store,
-        inner_group,
-        0, // group_index
+        inner_siblings,
+        sibling_index,
         round,
         latest_timestamp,
         effective_app_id,
@@ -2363,6 +2384,29 @@ fn execute_inner_appl<L: LedgerStore>(
         inner_ctx.tracer_ptr = Some(*t as *mut dyn algo_avm::tracer::EvalTracer);
     }
 
+    // Seed this inner-group member's scratch view from the shared inner-group
+    // ran/scratch record, so `gload`/`gloads`/`gloadss` can see which earlier
+    // siblings within *this* inner group already ran a program and read back
+    // the real per-slot values they wrote (issue #714; mirrors
+    // `apply.rs::seed_avm_scratch_from_group` for top-level groups). A
+    // sibling that never ran (or hasn't executed yet) is left `None`.
+    {
+        let ran = inner_ran_program.borrow();
+        let recorded = inner_scratch.borrow();
+        for idx in 0..inner_ctx.scratch.len().min(ran.len()) {
+            if ran[idx] {
+                inner_ctx.scratch[idx] =
+                    Some(recorded[idx].clone().unwrap_or_else(default_scratch_row));
+            }
+        }
+    }
+    // Mark this inner-group member as having started running its program
+    // *before* invoking it (matches go-algorand's `EvalContract` ordering --
+    // `cx.pastScratch[cx.groupIndex] = &cx.Scratch` is set immediately on
+    // entry, before any opcode runs), so a sibling that reads `gload` on us
+    // sees "ran" even if we go on to reject/error.
+    inner_ran_program.borrow_mut()[sibling_index] = true;
+
     // ── Execute the program ──
     let avm_result = if on_completion == ON_COMPLETION_CLEAR_STATE {
         // ClearStateOC: run clear state program. On failure, still clear state.
@@ -2389,6 +2433,12 @@ fn execute_inner_appl<L: LedgerStore>(
 
     // ── Update shared opcode budget ──
     *opcode_budget = budget.remaining();
+
+    // Record this inner-group member's real final scratch space so a later
+    // sibling's `gload` sees the actual values written, not a zero-filled
+    // placeholder (issue #714) -- regardless of whether this program
+    // approved, rejected, or errored (see `AvmResult::scratch`'s doc).
+    inner_scratch.borrow_mut()[sibling_index] = Some(avm_result.scratch.clone());
 
     // ── Check approval ──
     if on_completion != ON_COMPLETION_CLEAR_STATE && !avm_result.approved {
@@ -3763,9 +3813,21 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             unsafe { &mut *p }.before_txn_group(txns.len());
         }
 
-        for (i, stxn) in txns.iter_mut().enumerate() {
+        // Shared across every member of *this* inner group so `gload`/
+        // `gloads`/`gloadss` in a later inner sibling can see whether an
+        // earlier sibling actually ran a program and read back the real
+        // values it wrote (issue #714) -- the same `ran_program`/`scratch`
+        // pattern `apply.rs::GroupInfo` established for top-level groups
+        // (#686), generalized here for inner groups. A nested inner-of-inner
+        // call gets its own fresh pair from its own `itxn_submit`, so it
+        // never leaks or shadows this group's record.
+        let inner_ran_program: RefCell<Vec<bool>> = RefCell::new(vec![false; num_subtxns]);
+        let inner_scratch: RefCell<Vec<Option<[TealValue; 256]>>> =
+            RefCell::new(vec![None; num_subtxns]);
+
+        for i in 0..num_subtxns {
             // Deduct fee from sender to fee_sink (matches go-algorand takeFee).
-            let fee = stxn.txn.fee;
+            let fee = txns[i].txn.fee;
             if fee > 0 {
                 if fee_sink.is_zero() {
                     self.store.restore_snapshot(snapshot);
@@ -3783,7 +3845,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     }
                     return Err(AlgoError::Avm { message: err_msg });
                 }
-                let mut sender_acct = self.store.get_or_default_account(&stxn.txn.sender);
+                let sender = txns[i].txn.sender;
+                let mut sender_acct = self.store.get_or_default_account(&sender);
                 if sender_acct.micro_algos < fee {
                     self.store.restore_snapshot(snapshot);
                     for &id in &extra_created_asset_ids {
@@ -3796,7 +3859,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     }
                     let err_msg = format!(
                         "inner tx {}: sender {} has insufficient balance {} for fee {}",
-                        i, stxn.txn.sender, sender_acct.micro_algos, fee,
+                        i, sender, sender_acct.micro_algos, fee,
                     );
                     if let Some(p) = self.tracer_ptr {
                         unsafe { &mut *p }.after_txn_group(Some(&err_msg));
@@ -3804,7 +3867,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     return Err(AlgoError::Avm { message: err_msg });
                 }
                 sender_acct.micro_algos -= fee;
-                self.store.set_account(&stxn.txn.sender, sender_acct);
+                self.store.set_account(&sender, sender_acct);
 
                 let mut sink_acct = self.store.get_or_default_account(&fee_sink);
                 sink_acct.micro_algos += fee;
@@ -3821,14 +3884,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             }
 
             // Dispatch to the appropriate apply function.
-            if stxn.txn.txn_type == "appl" {
+            if txns[i].txn.txn_type == "appl" {
                 // ── Inner app call — recursive AVM execution ──
                 // P1-3: Compute this inner appl txn's InnerID, which becomes the
                 // parent_txn_id for any nested inner txns it may create.
                 let appl_inner_id = algo_avm::itxn::compute_inner_txn_id(
                     &effective_parent_txid,
                     id_offset_base + i,
-                    &stxn.txn,
+                    &txns[i].txn,
                 );
                 // H1: Snapshot box state to pass to inner context.
                 // Ensure boxes are initialized before extracting state.
@@ -3866,6 +3929,17 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 // SAFETY: tracer_ptr is valid for the duration of this context
                 // and only one mutable ref is live at a time.
                 let tracer_ref = self.tracer_ptr.map(|p| unsafe { &mut *p });
+                // Snapshot the full inner-group sibling list *before* taking a
+                // mutable borrow of this member (issue #714), so `gload`/
+                // `gloads`/`gloadss` within this inner group sees the whole
+                // group, not just this one txn. Siblings before `i` already
+                // carry their real post-execution ApplyData (mutated in place
+                // as this loop progressed); siblings at/after `i` still carry
+                // their pre-execution defaults -- matching go-algorand's
+                // `TxnGroup[j].ApplyData` population order (`ep.RecordAD`
+                // runs sequentially as `cx.Ledger.Perform(i, ep)` returns).
+                let siblings_snapshot: Vec<SignedTransaction> = txns.clone();
+                let stxn = &mut txns[i];
                 let result = execute_inner_appl(
                     self.store,
                     stxn,
@@ -3889,6 +3963,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     (self.max_log_calls, self.max_log_size),
                     self.unnamed_tracking.clone(),
                     self.kv_mods_recorder.clone(),
+                    siblings_snapshot,
+                    i,
+                    &inner_ran_program,
+                    &inner_scratch,
                 );
                 match result {
                     Ok(ad) => {
@@ -3973,6 +4051,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     }
                 }
             } else {
+                let stxn = &mut txns[i];
                 let result = match stxn.txn.txn_type.as_str() {
                     "pay" => apply_pay(self.store, &stxn.txn),
                     "axfer" => apply_axfer(self.store, &stxn.txn),
@@ -5329,6 +5408,253 @@ mod tests {
 
         let val = ctx.gload("gload", 0, 3).unwrap();
         assert_eq!(val, TealValue::Uint(999));
+    }
+
+    // ---- gload within an INNER transaction group (issue #714) ----
+    //
+    // Mirrors go-algorand's `NewInnerEvalParams`/`opItxnSubmit`
+    // (`data/transactions/logic/eval.go`): an inner transaction group shares
+    // one `EvalParams` (and therefore one `pastScratch` array) across all of
+    // its members, exactly like a top-level group. Before this fix,
+    // `execute_inner_appl` always built a single-element AVM group with
+    // `group_index = 0` for *every* inner app call regardless of how many
+    // siblings were actually submitted together, so `gload`/`gloads`/
+    // `gloadss` against a real inner-group sibling unconditionally errored.
+
+    #[test]
+    fn gload_sees_real_sibling_value_within_inner_transaction_group() {
+        // Set up: outer app 42 submits ONE inner group of two app calls:
+        //   [0] writer app: `pushint 42; store 5; pushint 1` -- writes 42
+        //       into scratch slot 5, then approves.
+        //   [1] reader app: `gload 0 5; pushint 42; ==` -- approves iff
+        //       sibling index 0's scratch slot 5 really equals 42. Before
+        //       the fix, `execute_inner_appl` gave the reader its own
+        //       single-element group with `group_index = 0`, so `gload 0 5`
+        //       (targeting its own index) hit the "can't use gload on self"
+        //       error rather than reading the real sibling value.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        let writer_app_id = 910u64;
+        let reader_app_id = 911u64;
+        setup_app(
+            &mut store,
+            writer_app_id,
+            vec![
+                0x06, // version 6
+                0x81, 0x2a, // pushint 42
+                0x35, 0x05, // store 5
+                0x81, 0x01, // pushint 1 (approve)
+            ],
+            make_program(6, true),
+        );
+        setup_app(
+            &mut store,
+            reader_app_id,
+            vec![
+                0x06, // version 6
+                0x3a, 0x00, 0x05, // gload 0 5
+                0x81, 0x2a, // pushint 42
+                0x12, // ==
+            ],
+            make_program(6, true),
+        );
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(
+            sender,
+            42,
+            vec![],
+            vec![writer_app_id, reader_app_id],
+            vec![],
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(writer_app_id)).unwrap(); // ApplicationID
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(reader_app_id)).unwrap(); // ApplicationID
+        ctx.itxn_submit().expect(
+            "gload within an inner transaction group must see the real sibling value (42), \
+             not error as if the inner group only had one member",
+        );
+
+        assert_eq!(ctx.num_inner_txns(), 2);
+    }
+
+    #[test]
+    fn gload_within_single_member_inner_group_still_errors_on_self() {
+        // Regression check for the fix above: a single-member inner group
+        // (the common case -- one `itxn_submit` with no `itxn_next`) must
+        // still report the *same* error taxonomy as before (#670): `gload`
+        // against any index, including self, errors correctly rather than
+        // being accidentally "fixed" into returning a value now that the
+        // group can have more than one member.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        let self_gload_app_id = 912u64;
+        setup_app(
+            &mut store,
+            self_gload_app_id,
+            vec![
+                0x06, // version 6
+                0x3a, 0x00, 0x00, // gload 0 0 (targets self: the only member)
+            ],
+            make_program(6, true),
+        );
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![self_gload_app_id], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(self_gload_app_id))
+            .unwrap(); // ApplicationID
+        let err = ctx.itxn_submit().unwrap_err();
+        assert!(
+            err.to_string().contains("can't use gload on self"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nested_inner_group_seeds_its_own_independent_scratch_record() {
+        // A nested inner-of-inner group: outer app 42 submits a single
+        // inner app call to "nester" (app 920), whose own approval program
+        // itself submits a two-member inner group (writer 921, reader 922)
+        // via itxn_begin/itxn_field/itxn_next/itxn_submit. The nested
+        // group's `gload` must resolve correctly using its OWN
+        // `ran_program`/`scratch` record (sized 2, for [writer, reader]),
+        // entirely independent of the outer level's own inner-group record
+        // (sized 1, for [nester] alone) -- proving one level's record
+        // doesn't leak into or get shadowed by another's.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        let nester_app_id = 920u64;
+        // The nester's own approval program embeds these two IDs as raw
+        // single-byte `pushint` varuint operands (below), so they must fit
+        // in 7 bits (< 128) to encode correctly.
+        let writer_app_id = 30u64;
+        let reader_app_id = 31u64;
+
+        setup_app(
+            &mut store,
+            writer_app_id,
+            vec![
+                0x06, // version 6
+                0x81, 0x2a, // pushint 42
+                0x35, 0x05, // store 5
+                0x81, 0x01, // pushint 1 (approve)
+            ],
+            make_program(6, true),
+        );
+        setup_app(
+            &mut store,
+            reader_app_id,
+            vec![
+                0x06, // version 6
+                0x3a, 0x00, 0x05, // gload 0 5
+                0x81, 0x2a, // pushint 42
+                0x12, // ==
+            ],
+            make_program(6, true),
+        );
+        // The nester's own approval program builds and submits a 2-member
+        // inner group [writer, reader] and approves iff `itxn_submit`
+        // itself succeeded (which it only will if the reader's own `gload`
+        // resolved correctly).
+        setup_app(
+            &mut store,
+            nester_app_id,
+            vec![
+                0x06, // version 6
+                0xb1, // itxn_begin
+                0x81,
+                0x06, // pushint 6 (TypeEnum = appl)
+                0xb2,
+                0x10, // itxn_field 16 (TypeEnum)
+                0x81,
+                writer_app_id as u8, // pushint <writer_app_id>
+                0xb2,
+                0x18, // itxn_field 24 (ApplicationID)
+                0xb6, // itxn_next
+                0x81,
+                0x06, // pushint 6 (TypeEnum = appl)
+                0xb2,
+                0x10, // itxn_field 16 (TypeEnum)
+                0x81,
+                reader_app_id as u8, // pushint <reader_app_id>
+                0xb2,
+                0x18, // itxn_field 24 (ApplicationID)
+                0xb3, // itxn_submit
+                0x81,
+                0x01, // pushint 1 (approve)
+            ],
+            make_program(6, true),
+        );
+
+        // Fund both the outer app's address (pays the nester's fee) and the
+        // nester app's address (pays writer/reader's fees).
+        let outer_app_addr = Address(app_address(42));
+        store.set_account(
+            &outer_app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let nester_app_addr = Address(app_address(nester_app_id));
+        store.set_account(
+            &nester_app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![nester_app_id], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 3000;
+        ctx.depth = 0;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(nester_app_id)).unwrap(); // ApplicationID
+        ctx.itxn_submit().expect(
+            "nested inner group must seed its own independent scratch record so the \
+             nested reader's gload resolves the nested writer's real value",
+        );
+
+        assert_eq!(ctx.num_inner_txns(), 1);
     }
 
     // ---- Inner transaction tests ----
