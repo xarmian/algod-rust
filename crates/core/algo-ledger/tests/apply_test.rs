@@ -2,7 +2,7 @@
 
 use algo_ledger::{
     apply_block, apply_transaction, apply_transaction_with_budget, ApplyContext, ApplyMode,
-    GroupInfo, LedgerState,
+    BoxBudgetState, GroupInfo, LedgerState,
 };
 use algo_types::{AccountStatus, Address, AssetParams, Block, Round, SignedTransaction, TealValue};
 
@@ -1491,11 +1491,11 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
 
     // 1. Create app `app_id` with a trivial always-approve program.
     let create = appl_create_txn(creator, 1_000, app_id, 0);
-    apply_transaction_with_budget(&mut state, &create, &ctx, 0, None, None, None).unwrap();
+    apply_transaction_with_budget(&mut state, &create, &ctx, 0, None, None, None, None).unwrap();
 
     // 2. User opts in.
     let optin = appl_optin_txn(user, 1_000, app_id);
-    apply_transaction_with_budget(&mut state, &optin, &ctx, 0, None, None, None).unwrap();
+    apply_transaction_with_budget(&mut state, &optin, &ctx, 0, None, None, None, None).unwrap();
 
     // 3. Creator deletes the app. Local state for `user` survives deletion
     // (only ClearState removes it), matching go-algorand.
@@ -1505,7 +1505,7 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
     delete.txn.fee = 1_000;
     delete.txn.application_id = app_id;
     delete.txn.on_completion = ON_COMPLETION_DELETE;
-    apply_transaction_with_budget(&mut state, &delete, &ctx, 0, None, None, None).unwrap();
+    apply_transaction_with_budget(&mut state, &delete, &ctx, 0, None, None, None, None).unwrap();
     assert!(state.get_app_params(app_id).is_none());
     assert!(state.get_app_local_state(&user, app_id).is_some());
 
@@ -1530,14 +1530,16 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
     // further opcode runs.
     let reader_app_id = 901u64;
     let reader_create = appl_create_txn(creator, 1_000, reader_app_id, 0);
-    apply_transaction_with_budget(&mut state, &reader_create, &ctx, 0, None, None, None).unwrap();
+    apply_transaction_with_budget(&mut state, &reader_create, &ctx, 0, None, None, None, None)
+        .unwrap();
 
     let mut reader_update = appl_update_txn(creator, 1_000, reader_app_id);
     reader_update.txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![
         0x06, // version 6
         0x3a, 0x00, 0x00, // gload 0 0
     ]));
-    apply_transaction_with_budget(&mut state, &reader_update, &ctx, 0, None, None, None).unwrap();
+    apply_transaction_with_budget(&mut state, &reader_update, &ctx, 0, None, None, None, None)
+        .unwrap();
 
     let mut reader_call = SignedTransaction::default();
     reader_call.txn.txn_type = "appl".into();
@@ -1566,6 +1568,7 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
         &ctx,
         0,
         Some(&mut budget),
+        None,
         Some(&gi0),
         None,
     )
@@ -1587,6 +1590,7 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
         &ctx,
         0,
         Some(&mut budget),
+        None,
         Some(&gi1),
         None,
     );
@@ -1643,7 +1647,8 @@ fn test_gload_returns_sibling_real_scratch_value_not_zero_placeholder() {
     writer_create.txn.clear_state_program =
         Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]));
     writer_create.apply_data_application_id = writer_app_id;
-    apply_transaction_with_budget(&mut state, &writer_create, &ctx, 0, None, None, None).unwrap();
+    apply_transaction_with_budget(&mut state, &writer_create, &ctx, 0, None, None, None, None)
+        .unwrap();
 
     // 2. Create the reader app with a trivial always-approve program first
     // (app creation also runs the approval program, and a single-txn group
@@ -1653,7 +1658,8 @@ fn test_gload_returns_sibling_real_scratch_value_not_zero_placeholder() {
     // `gload 0 5; pushint 42; ==` -- approves iff sibling index 0's
     // scratch slot 5 really equals 42.
     let reader_create = appl_create_txn(creator, 1_000, reader_app_id, 0);
-    apply_transaction_with_budget(&mut state, &reader_create, &ctx, 0, None, None, None).unwrap();
+    apply_transaction_with_budget(&mut state, &reader_create, &ctx, 0, None, None, None, None)
+        .unwrap();
 
     let mut reader_update = appl_update_txn(creator, 1_000, reader_app_id);
     reader_update.txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![
@@ -1662,7 +1668,8 @@ fn test_gload_returns_sibling_real_scratch_value_not_zero_placeholder() {
         0x81, 0x2a, // pushint 42
         0x12, // ==
     ]));
-    apply_transaction_with_budget(&mut state, &reader_update, &ctx, 0, None, None, None).unwrap();
+    apply_transaction_with_budget(&mut state, &reader_update, &ctx, 0, None, None, None, None)
+        .unwrap();
 
     // 3. Build the 2-txn atomic group: [0] call writer app, [1] call reader app.
     let mut writer_call = SignedTransaction::default();
@@ -1697,6 +1704,7 @@ fn test_gload_returns_sibling_real_scratch_value_not_zero_placeholder() {
         &ctx,
         0,
         Some(&mut budget),
+        None,
         Some(&gi0),
         None,
     )
@@ -1719,8 +1727,223 @@ fn test_gload_returns_sibling_real_scratch_value_not_zero_placeholder() {
         &ctx,
         0,
         Some(&mut budget),
+        None,
         Some(&gi1),
         None,
     )
     .expect("gload must see the sibling's real scratch value (42), not a zero placeholder");
+}
+
+// ---------------------------------------------------------------------------
+// 14. Box read/write I/O budget must be shared across sibling top-level app
+//     calls within one atomic group (issue #727)
+//
+// go-algorand shares one `EvalParams` instance -- and hence its
+// `ioBudget`/`available.dirtyBytes` fields -- by pointer across every
+// top-level transaction in a group (`ledger/eval/eval.go:1090`'s single
+// `NewAppEvalParams` call). These tests drive the REAL `apply_appl` code
+// path (via `apply_transaction_with_budget`, exactly as `apply_block`'s
+// Execute-mode group loop does) with two sibling app-create calls, each
+// contributing oversized-program write-budget bytes that individually fit
+// the group's shared io_budget but combined must not.
+// ---------------------------------------------------------------------------
+
+/// Build an app-create transaction whose approval program is `extra_bytes`
+/// long above a 3-byte fixed skeleton (`pushbytes <padding>; pop; pushint 1`)
+/// -- always approves, regardless of padding content -- and whose
+/// clear-state program is a trivial 3-byte always-approve program. With the
+/// test's `max_app_total_program_len`/`max_extra_app_program_pages` both
+/// zeroed (no free tier), the combined approval+clear length is exactly this
+/// call's oversized-program-write-budget contribution.
+fn oversized_create_txn(
+    sender: Address,
+    fee: u64,
+    app_id: u64,
+    padding_len: u8,
+) -> SignedTransaction {
+    let mut approval = vec![0x06, 0x80, padding_len]; // version 6; pushbytes <len>
+    approval.extend(std::iter::repeat(0u8).take(padding_len as usize));
+    approval.push(0x48); // pop
+    approval.push(0x81); // pushint
+    approval.push(0x01); // ...1 (approve)
+
+    let mut stx = SignedTransaction::default();
+    stx.txn.txn_type = "appl".into();
+    stx.txn.sender = sender;
+    stx.txn.fee = fee;
+    stx.txn.application_id = 0;
+    stx.txn.on_completion = 0; // NoOp
+    stx.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+    stx.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]));
+    stx.txn.boxes = Some(vec![algo_types::BoxRef {
+        index: 0,
+        name: Some(serde_bytes::ByteBuf::from(b"b".to_vec())),
+    }]);
+    stx.apply_data_application_id = app_id;
+    stx
+}
+
+#[test]
+fn write_budget_combined_oversized_create_calls_in_one_group_rejected() {
+    use algo_avm::group::GroupBudget;
+    use std::cell::RefCell;
+
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    // Each call's approval program is a 6-byte skeleton (`pushbytes <len>`,
+    // `pop`, `pushint 1`) plus `padding_len` (50) bytes of padding = 56
+    // bytes, plus a 3-byte clear-state program = 59 "extra" bytes total --
+    // comfortably under a 60-byte shared io_budget alone, but 118 combined
+    // comfortably exceeds it.
+    let app_a = oversized_create_txn(creator, 1_000, 501, 50);
+    let app_b = oversized_create_txn(creator, 1_000, 502, 50);
+    let extra_bytes_per_call = (app_a.txn.approval_program.as_ref().unwrap().len()
+        + app_a.txn.clear_state_program.as_ref().unwrap().len())
+        as u64;
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+    let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+    ctx.mode = ApplyMode::Execute;
+    // Zero the free program-size tier so every byte of each call's combined
+    // approval+clear length counts as "extra" (same technique
+    // avm_context.rs's `zero_free_program_tier` uses for the underlying
+    // `consider_budget_program_writes` unit tests).
+    ctx.consensus.max_app_total_program_len = 0;
+    ctx.consensus.max_extra_app_program_pages = 0;
+    // Each call has exactly one box ref, so the group's box-ref-derived
+    // io_budget is `2 * bytes_per_box_reference`. Choose
+    // `bytes_per_box_reference` so the shared io_budget (60) comfortably
+    // covers ONE call's extra bytes alone but not both combined.
+    assert!(
+        extra_bytes_per_call < 60 && extra_bytes_per_call * 2 > 60,
+        "test fixture must have one call fit alone (<60) but two combined exceed (>60): got {extra_bytes_per_call}"
+    );
+    ctx.consensus.bytes_per_box_reference = 30; // 2 refs * 30 = 60 shared io_budget
+
+    let group_refs: Vec<&SignedTransaction> = vec![&app_a, &app_b];
+    let ran_program = RefCell::new(vec![false; group_refs.len()]);
+    let scratch = RefCell::new(vec![None; group_refs.len()]);
+    let mut budget = GroupBudget::new(2);
+    let mut group_box_budget = BoxBudgetState::default();
+
+    let gi0 = GroupInfo {
+        txns: &group_refs,
+        index: 0,
+        ran_program: &ran_program,
+        scratch: &scratch,
+    };
+    // App A alone: its own 59 extra bytes fit comfortably under the
+    // 60-byte shared io_budget.
+    apply_transaction_with_budget(
+        &mut state,
+        &app_a,
+        &ctx,
+        0,
+        Some(&mut budget),
+        Some(&mut group_box_budget),
+        Some(&gi0),
+        None,
+    )
+    .expect("app A's own oversized-program bytes must fit the shared io_budget alone");
+
+    let gi1 = GroupInfo {
+        txns: &group_refs,
+        index: 1,
+        ran_program: &ran_program,
+        scratch: &scratch,
+    };
+    // App B, sharing `group_box_budget` with app A: the COMBINED extra bytes
+    // (118) must exceed the shared 60-byte io_budget and reject, even
+    // though app B's own extra bytes (59) would fit alone.
+    let err = apply_transaction_with_budget(
+        &mut state,
+        &app_b,
+        &ctx,
+        0,
+        Some(&mut budget),
+        Some(&mut group_box_budget),
+        Some(&gi1),
+        None,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("write budget exceeded"),
+        "app B must be rejected once app A's contribution is shared via group_box_budget: {msg}"
+    );
+}
+
+#[test]
+fn write_budget_combined_oversized_create_calls_without_group_sharing_wrongly_accepted() {
+    // Oracle test: pins the OLD (buggy) per-top-level-call-reset behavior
+    // that issue #727 fixes. Identical fixture to the rejection test above,
+    // but each call is applied with `group_box_budget: None` -- exactly how
+    // `apply_appl` behaved before this fix built a fresh, unshared
+    // `LedgerAvmContext` for every top-level app call. Without sharing, app
+    // B's own dirty_bytes check only ever sees its own 59 extra bytes
+    // against the 60-byte io_budget and incorrectly succeeds, silently
+    // admitting a group whose combined program-write footprint (118 bytes)
+    // exceeds what its box refs actually grant (60 bytes) -- a real
+    // consensus-acceptance divergence from go-algorand were this the
+    // production code path.
+    use algo_avm::group::GroupBudget;
+    use std::cell::RefCell;
+
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let app_a = oversized_create_txn(creator, 1_000, 501, 50);
+    let app_b = oversized_create_txn(creator, 1_000, 502, 50);
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+    let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+    ctx.mode = ApplyMode::Execute;
+    ctx.consensus.max_app_total_program_len = 0;
+    ctx.consensus.max_extra_app_program_pages = 0;
+    ctx.consensus.bytes_per_box_reference = 30;
+
+    let group_refs: Vec<&SignedTransaction> = vec![&app_a, &app_b];
+    let ran_program = RefCell::new(vec![false; group_refs.len()]);
+    let scratch = RefCell::new(vec![None; group_refs.len()]);
+    let mut budget = GroupBudget::new(2);
+
+    let gi0 = GroupInfo {
+        txns: &group_refs,
+        index: 0,
+        ran_program: &ran_program,
+        scratch: &scratch,
+    };
+    apply_transaction_with_budget(
+        &mut state,
+        &app_a,
+        &ctx,
+        0,
+        Some(&mut budget),
+        None, // no group-scoped box budget -- the pre-#727 behavior
+        Some(&gi0),
+        None,
+    )
+    .unwrap();
+
+    let gi1 = GroupInfo {
+        txns: &group_refs,
+        index: 1,
+        ran_program: &ran_program,
+        scratch: &scratch,
+    };
+    apply_transaction_with_budget(
+        &mut state,
+        &app_b,
+        &ctx,
+        0,
+        Some(&mut budget),
+        None,
+        Some(&gi1),
+        None,
+    )
+    .expect(
+        "without group-wide box-budget sharing, app B's isolated dirty_bytes check \
+         wrongly accepts a group whose combined program-write footprint exceeds its io_budget",
+    );
 }

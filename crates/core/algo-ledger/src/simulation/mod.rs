@@ -42,7 +42,7 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use crate::apply::{
     apply_transaction_with_budget, compute_group_fee_credit_and_residue, ApplyContext, ApplyMode,
-    AvmEvalOverrides, GroupInfo,
+    AvmEvalOverrides, BoxBudgetState, GroupInfo,
 };
 use crate::avm_context::NamedGroupResources;
 use crate::store_trait::LedgerStore;
@@ -506,6 +506,13 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         if request.extra_opcode_budget != 0 {
             group_budget.add(request.extra_opcode_budget);
         }
+        // Group-scoped box I/O budget state (issue #727): mirrors
+        // go-algorand's shared `EvalParams.ioBudget`/`readBudgetChecked`/
+        // `available` (boxes, dirtyBytes, updateBytes), which persist
+        // across every top-level app-call transaction in this simulated
+        // group via one shared `EvalParams` pointer, matching the real
+        // apply path (`apply::apply_block_impl`)'s own `group_box_budget`.
+        let mut group_box_budget = BoxBudgetState::default();
 
         // Shared across the whole simulated group so `gload`/`gloads`/
         // `gloadss` can tell whether an earlier sibling actually ran a
@@ -543,6 +550,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     &apply_ctx,
                     0,
                     Some(&mut group_budget),
+                    Some(&mut group_box_budget),
                     Some(&gi),
                     Some(&mut tracer),
                 )

@@ -1286,6 +1286,7 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     group: &[&SignedTransaction],
     ctx: &ApplyContext,
     group_budget: &mut GroupBudget,
+    group_box_budget: &mut BoxBudgetState,
     mut tracer: Option<&mut dyn EvalTracer>,
     mut apply_data_out: Option<&mut Vec<ApplyData>>,
     global_txn_idx: &mut usize,
@@ -1320,6 +1321,7 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
                 ctx,
                 0,
                 Some(&mut *group_budget),
+                Some(&mut *group_box_budget),
                 Some(&gi),
                 tracer_ref,
             )?;
@@ -1487,6 +1489,16 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                         .filter(|stx| stx.txn.txn_type == "appl")
                         .count();
                     let mut group_budget = GroupBudget::new(num_app_calls);
+                    // Group-scoped box I/O budget state (issue #727): mirrors
+                    // go-algorand's shared `EvalParams.ioBudget`/
+                    // `readBudgetChecked`/`available` (boxes, dirtyBytes,
+                    // updateBytes), which persist across every top-level
+                    // app-call transaction in this atomic group via one
+                    // shared `EvalParams` pointer -- not just within a
+                    // single top-level call's own inner-txn tree (which the
+                    // existing `BoxBudgetState` propagation already
+                    // handled).
+                    let mut group_box_budget = BoxBudgetState::default();
 
                     // Compute per-group fee credit and residue (matches go-algorand feeCredit).
                     let (group_fee_credit, group_fee_residue) =
@@ -1555,6 +1567,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                             group,
                             &ctx,
                             &mut group_budget,
+                            &mut group_box_budget,
                             tracer_reborrow,
                             apply_data_out.as_deref_mut(),
                             &mut global_txn_idx,
@@ -1567,6 +1580,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                         group,
                         &ctx,
                         &mut group_budget,
+                        &mut group_box_budget,
                         tracer_reborrow,
                         apply_data_out.as_deref_mut(),
                         &mut global_txn_idx,
@@ -2342,18 +2356,30 @@ pub struct GroupInfo<'a> {
 
 /// Apply a single signed transaction with a group budget for AVM execution.
 ///
-/// Same as `apply_transaction` but threads the group budget and group info
-/// through to `apply_appl` for Execute-mode pooled budget accounting.
+/// Same as `apply_transaction` but threads the group budget, group-scoped
+/// box I/O budget (issue #727), and group info through to `apply_appl` for
+/// Execute-mode pooled budget accounting.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_transaction_with_budget<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     stx: &SignedTransaction,
     ctx: &ApplyContext,
     depth: u32,
     group_budget: Option<&mut GroupBudget>,
+    group_box_budget: Option<&mut BoxBudgetState>,
     group_info: Option<&GroupInfo<'_>>,
     tracer: Option<&mut dyn EvalTracer>,
 ) -> Result<ApplyData, AlgoError> {
-    apply_transaction_inner(store, stx, ctx, depth, group_budget, group_info, tracer)
+    apply_transaction_inner(
+        store,
+        stx,
+        ctx,
+        depth,
+        group_budget,
+        group_box_budget,
+        group_info,
+        tracer,
+    )
 }
 
 /// Apply a single signed transaction to the ledger state.
@@ -2378,7 +2404,7 @@ pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
     ctx: &ApplyContext,
     depth: u32,
 ) -> Result<ApplyData, AlgoError> {
-    apply_transaction_inner(store, stx, ctx, depth, None, None, None)
+    apply_transaction_inner(store, stx, ctx, depth, None, None, None, None)
 }
 
 /// Apply a single signed transaction with an optional execution tracer.
@@ -2392,17 +2418,19 @@ pub fn apply_transaction_with_tracer<L: crate::store_trait::LedgerStore>(
     depth: u32,
     tracer: &mut dyn EvalTracer,
 ) -> Result<ApplyData, AlgoError> {
-    apply_transaction_inner(store, stx, ctx, depth, None, None, Some(tracer))
+    apply_transaction_inner(store, stx, ctx, depth, None, None, None, Some(tracer))
 }
 
 /// Core transaction application logic, shared by `apply_transaction`,
 /// `apply_transaction_with_tracer`, and `apply_transaction_with_budget`.
+#[allow(clippy::too_many_arguments)]
 fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     stx: &SignedTransaction,
     ctx: &ApplyContext,
     depth: u32,
     group_budget: Option<&mut GroupBudget>,
+    group_box_budget: Option<&mut BoxBudgetState>,
     group_info: Option<&GroupInfo<'_>>,
     tracer: Option<&mut dyn EvalTracer>,
 ) -> Result<ApplyData, AlgoError> {
@@ -2581,6 +2609,7 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
         ctx,
         depth,
         group_budget,
+        group_box_budget,
         group_info,
         tracer,
         &reward_addrs,
@@ -2607,6 +2636,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
     ctx: &ApplyContext,
     depth: u32,
     group_budget: Option<&mut GroupBudget>,
+    group_box_budget: Option<&mut BoxBudgetState>,
     group_info: Option<&GroupInfo<'_>>,
     mut tracer: Option<&mut dyn EvalTracer>,
     reward_addrs: &[Address],
@@ -2680,8 +2710,16 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 // Capture the app ID that will be created (txn_counter + 1)
                 // before apply_appl runs, in case we need it for ApplyData.
                 let pre_apply_counter = ctx.txn_counter.get();
-                let executed_eval_delta =
-                    apply_appl(store, stx, ctx, depth, group_budget, group_info, tracer_ref)?;
+                let executed_eval_delta = apply_appl(
+                    store,
+                    stx,
+                    ctx,
+                    depth,
+                    group_budget,
+                    group_box_budget,
+                    group_info,
+                    tracer_ref,
+                )?;
                 // For appl creates, capture the created application ID.
                 if txn.application_id == 0 {
                     apply_data.application_id = if stx.apply_data_application_id != 0 {
@@ -3614,13 +3652,21 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
 ///
 /// In `Execute` mode, the AVM programs are run to produce state changes
 /// directly. In `Replay` mode, the recorded EvalDelta from the block is used.
-/// The optional `group_budget` is consumed only in `Execute` mode.
+/// The optional `group_budget` and `group_box_budget` are consumed only in
+/// `Execute` mode. `group_box_budget` (issue #727) carries the box I/O
+/// budget state (`io_budget`/`dirty_bytes`/`update_bytes`/
+/// `read_budget_checked`/`available_boxes`/`boxes_initialized`) across every
+/// top-level `appl` call in the same atomic group, mirroring go-algorand's
+/// single shared `EvalParams` pointer (`ledger/eval/eval.go:1090`) -- the
+/// same role `group_budget` already plays for pooled opcode-cost budget.
+#[allow(clippy::too_many_arguments)]
 fn apply_appl<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     stx: &SignedTransaction,
     ctx: &ApplyContext,
     depth: u32,
     group_budget: Option<&mut GroupBudget>,
+    mut group_box_budget: Option<&mut BoxBudgetState>,
     group_info: Option<&GroupInfo<'_>>,
     mut tracer: Option<&mut dyn EvalTracer>,
 ) -> Result<Option<rmpv::Value>, AlgoError> {
@@ -3760,6 +3806,17 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     if let Some(ref mut t) = tracer {
                         avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
                     }
+                    // Seed box I/O budget state from the group-scoped carrier
+                    // (issue #727): a prior sibling top-level app call in
+                    // this same atomic group may already have computed
+                    // `io_budget`/checked the read budget/accumulated
+                    // `dirty_bytes` -- go-algorand shares this state by
+                    // pointer across the whole group's `EvalParams`
+                    // (`ledger/eval/eval.go:1090`), not just within one
+                    // call's own inner-txn tree.
+                    if let Some(ref gbb) = group_box_budget {
+                        avm_ctx.load_box_budget_state(gbb);
+                    }
                     // Mark this group member as having started running its
                     // program *before* invoking it (matching go-algorand's
                     // `EvalContract` ordering), so a sibling that reads
@@ -3794,6 +3851,17 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     } else {
                         run_clear_state_program(&clear_program, &mut avm_ctx, &ctx.consensus)
                     };
+                    // Export box I/O budget state back to the group-scoped
+                    // carrier (issue #727) so the next top-level app call in
+                    // this group sees the accumulated state. Matches
+                    // go-algorand's shared `EvalParams` pointer, which keeps
+                    // this state regardless of whether ClearState ultimately
+                    // rejects (a ClearState rejection is swallowed at the
+                    // ledger/apply layer, never rolling back the
+                    // already-shared `EvalParams` fields).
+                    if let Some(ref mut gbb) = group_box_budget {
+                        avm_ctx.save_box_budget_state(gbb);
+                    }
                     // Record this clear-state program's real final scratch
                     // space so a sibling's `gload` sees the actual values
                     // written, not a zero-filled placeholder (issue #686).
@@ -3876,6 +3944,17 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 if let Some(ref mut t) = tracer {
                     avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
                 }
+                // Seed box I/O budget state from the group-scoped carrier
+                // (issue #727): a prior sibling top-level app call in this
+                // same atomic group may already have computed
+                // `io_budget`/checked the read budget/accumulated
+                // `dirty_bytes` -- go-algorand shares this state by pointer
+                // across the whole group's `EvalParams`
+                // (`ledger/eval/eval.go:1090`), not just within one call's
+                // own inner-txn tree.
+                if let Some(ref gbb) = group_box_budget {
+                    avm_ctx.load_box_budget_state(gbb);
+                }
 
                 // Use the group budget if provided, otherwise create a single-call budget.
                 let mut fallback_budget = GroupBudget::new(1);
@@ -3913,6 +3992,15 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         result.approved = false;
                         result.error = Some(e.to_string());
                     }
+                }
+                // Export box I/O budget state back to the group-scoped
+                // carrier (issue #727) so the next top-level app call in
+                // this group sees the accumulated state -- regardless of
+                // whether this call's own program approved, since
+                // go-algorand's shared `EvalParams` pointer accumulates
+                // this state unconditionally as each top-level call runs.
+                if let Some(ref mut gbb) = group_box_budget {
+                    avm_ctx.save_box_budget_state(gbb);
                 }
                 // Record this approval program's real final scratch space
                 // so a sibling's `gload` sees the actual values written,

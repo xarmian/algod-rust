@@ -1345,6 +1345,51 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
 
     // ---- Box helpers ----
 
+    /// Seed this context's box I/O budget state from a group-scoped carrier
+    /// (issue #727).
+    ///
+    /// go-algorand shares one `EvalParams` instance -- and hence its
+    /// `ioBudget`/`readBudgetChecked`/`available` (boxes, dirtyBytes,
+    /// updateBytes, unnamedAccess) fields -- by pointer across every
+    /// top-level transaction in an atomic group (`ledger/eval/eval.go:1090`'s
+    /// single `NewAppEvalParams` call, threaded through the group loop at
+    /// `ledger/eval/eval.go:1117-1124`). algod-rust instead builds a fresh
+    /// `LedgerAvmContext` per top-level `appl` call, so callers must
+    /// explicitly seed/export this state via a group-scoped
+    /// [`crate::apply::BoxBudgetState`] carrier that outlives any single
+    /// call's context -- this is the top-level-group analog of the
+    /// existing per-inner-call `box_state` propagation (see
+    /// `execute_inner_appl`'s `inner_ctx.available_boxes = box_state...`
+    /// seeding a few hundred lines above).
+    pub fn load_box_budget_state(&mut self, state: &crate::apply::BoxBudgetState) {
+        self.available_boxes = state.available_boxes.clone();
+        self.dirty_bytes = state.dirty_bytes;
+        self.io_budget = state.io_budget;
+        self.update_bytes = state.update_bytes.clone();
+        self.read_budget_checked = state.read_budget_checked;
+        self.boxes_initialized = state.boxes_initialized;
+        self.unnamed_access = state.unnamed_access;
+    }
+
+    /// Export this context's box I/O budget state back into a group-scoped
+    /// carrier, so the next top-level app call in the same atomic group
+    /// sees the accumulated state (issue #727). Counterpart to
+    /// [`Self::load_box_budget_state`]; see its doc for the go-algorand
+    /// parity rationale.
+    ///
+    /// `touched_family_shared` is deliberately left untouched: it is a
+    /// one-shot inner-call-to-caller return signal (issue #662), not
+    /// persistent group-wide state, and group-level callers never read it.
+    pub fn save_box_budget_state(&self, state: &mut crate::apply::BoxBudgetState) {
+        state.available_boxes = self.available_boxes.clone();
+        state.dirty_bytes = self.dirty_bytes;
+        state.io_budget = self.io_budget;
+        state.update_bytes = self.update_bytes.clone();
+        state.read_budget_checked = self.read_budget_checked;
+        state.boxes_initialized = self.boxes_initialized;
+        state.unnamed_access = self.unnamed_access;
+    }
+
     /// Lazily initialize the available-boxes map and I/O budget from the
     /// transaction group's box references. Matches go-algorand's
     /// `computeAvailability` + `fillApplicationCallForeign` for boxes.
@@ -10210,5 +10255,270 @@ mod tests {
             "stale contribution from the prior create must be undone before adding the new one"
         );
         assert_eq!(ctx.update_bytes.get(&9), Some(&40));
+    }
+
+    // ---- issue #727: box I/O budget state shared across sibling
+    // top-level app calls in one atomic group ----
+    //
+    // go-algorand shares one `EvalParams` instance -- and hence its
+    // `ioBudget`/`readBudgetChecked`/`available` (boxes, dirtyBytes,
+    // updateBytes) fields -- by pointer across every top-level transaction
+    // in a group (`ledger/eval/eval.go:1090`'s single `NewAppEvalParams`
+    // call, threaded through the group loop at `ledger/eval/eval.go:
+    // 1117-1124`). These tests pin the [`LedgerAvmContext::
+    // load_box_budget_state`]/[`LedgerAvmContext::save_box_budget_state`]
+    // round trip that `apply_appl` now uses to carry a
+    // [`crate::apply::BoxBudgetState`] across two separate top-level
+    // `LedgerAvmContext`s the same way `apply_appl` does for two sibling
+    // top-level `appl` calls in one group -- at the same unit-test fidelity
+    // as the `consider_budget_program_writes_*` tests above (direct field
+    // manipulation rather than a full AVM run), since the group-sharing
+    // bug lives entirely in this seed/export boundary, not in the box
+    // opcodes themselves.
+
+    #[test]
+    fn box_budget_state_round_trip_preserves_all_fields() {
+        let mut store = LedgerState::new();
+        let txn = make_program_txn(0, 0, 10, 0);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.available_boxes.insert((7, b"a".to_vec()), true);
+        ctx.dirty_bytes = 123;
+        ctx.io_budget = 456;
+        ctx.update_bytes.insert(7, 99);
+        ctx.read_budget_checked = true;
+        ctx.boxes_initialized = true;
+        ctx.unnamed_access = 3;
+
+        let mut carrier = crate::apply::BoxBudgetState::default();
+        ctx.save_box_budget_state(&mut carrier);
+        assert_eq!(
+            carrier.available_boxes.get(&(7, b"a".to_vec())),
+            Some(&true)
+        );
+        assert_eq!(carrier.dirty_bytes, 123);
+        assert_eq!(carrier.io_budget, 456);
+        assert_eq!(carrier.update_bytes.get(&7), Some(&99));
+        assert!(carrier.read_budget_checked);
+        assert!(carrier.boxes_initialized);
+        assert_eq!(carrier.unnamed_access, 3);
+
+        // A fresh context (as `apply_appl` builds for every top-level call)
+        // starts at the defaults; loading the carrier must fully overwrite
+        // them, not merge.
+        let txn2 = make_program_txn(0, 0, 10, 0);
+        let mut store2 = LedgerState::new();
+        let mut ctx2 = make_context(&mut store2, vec![txn2]);
+        assert!(
+            !ctx2.boxes_initialized,
+            "fresh context starts uninitialized"
+        );
+        ctx2.load_box_budget_state(&carrier);
+        assert_eq!(ctx2.available_boxes.get(&(7, b"a".to_vec())), Some(&true));
+        assert_eq!(ctx2.dirty_bytes, 123);
+        assert_eq!(ctx2.io_budget, 456);
+        assert_eq!(ctx2.update_bytes.get(&7), Some(&99));
+        assert!(ctx2.read_budget_checked);
+        assert!(ctx2.boxes_initialized);
+        assert_eq!(ctx2.unnamed_access, 3);
+    }
+
+    #[test]
+    fn write_budget_combined_oversized_programs_across_siblings_rejected() {
+        // Two top-level app calls, each creating an oversized program of 40
+        // extra bytes. Each individually fits a 50-byte io_budget alone, but
+        // their COMBINED 80 bytes must not -- matching go-algorand's shared
+        // `EvalParams.available.dirtyBytes`, which accumulates across every
+        // top-level call in the group, not just within one call's own
+        // execution.
+        let group_box_budget_io = 50u64;
+
+        // Sibling A (app 100): creates with 40 extra bytes -- fits alone.
+        let mut store_a = LedgerState::new();
+        let txn_a = make_program_txn(0, 0, 40, 0);
+        let mut ctx_a = make_context(&mut store_a, vec![txn_a]);
+        ctx_a.app_id = 100;
+        zero_free_program_tier(&mut ctx_a);
+        ctx_a.boxes_initialized = true;
+        ctx_a.io_budget = group_box_budget_io;
+        ctx_a.consider_budget_program_writes().unwrap();
+        assert_eq!(
+            ctx_a.dirty_bytes, 40,
+            "sibling A alone must fit the shared budget"
+        );
+
+        // Export sibling A's state into the group-scoped carrier that
+        // `apply_appl` threads between top-level calls.
+        let mut carrier = crate::apply::BoxBudgetState::default();
+        ctx_a.save_box_budget_state(&mut carrier);
+
+        // Sibling B (app 200, a DIFFERENT app): also creates with 40 extra
+        // bytes -- fits alone too, but seeded with A's carried-over
+        // dirty_bytes, the combined 80 bytes must exceed the shared 50-byte
+        // budget.
+        let mut store_b = LedgerState::new();
+        let txn_b = make_program_txn(0, 0, 40, 0);
+        let mut ctx_b = make_context(&mut store_b, vec![txn_b]);
+        ctx_b.app_id = 200;
+        zero_free_program_tier(&mut ctx_b);
+        ctx_b.load_box_budget_state(&carrier);
+        assert_eq!(
+            ctx_b.dirty_bytes, 40,
+            "sibling B must inherit sibling A's already-spent dirty_bytes"
+        );
+
+        let err = ctx_b.consider_budget_program_writes().unwrap_err();
+        assert_eq!(
+            format!("{err}"),
+            "AVM: write budget exceeded (80 > 50) while creating app 200",
+            "combined oversized-program bytes across siblings must exceed the shared budget"
+        );
+    }
+
+    #[test]
+    fn write_budget_combined_oversized_programs_across_siblings_accepted_with_enough_budget() {
+        // Companion to the rejection test above: identical siblings, but the
+        // group supplies enough shared io_budget (100) to cover the combined
+        // 80 extra bytes, so both must succeed.
+        let group_box_budget_io = 100u64;
+
+        let mut store_a = LedgerState::new();
+        let txn_a = make_program_txn(0, 0, 40, 0);
+        let mut ctx_a = make_context(&mut store_a, vec![txn_a]);
+        ctx_a.app_id = 100;
+        zero_free_program_tier(&mut ctx_a);
+        ctx_a.boxes_initialized = true;
+        ctx_a.io_budget = group_box_budget_io;
+        ctx_a.consider_budget_program_writes().unwrap();
+
+        let mut carrier = crate::apply::BoxBudgetState::default();
+        ctx_a.save_box_budget_state(&mut carrier);
+
+        let mut store_b = LedgerState::new();
+        let txn_b = make_program_txn(0, 0, 40, 0);
+        let mut ctx_b = make_context(&mut store_b, vec![txn_b]);
+        ctx_b.app_id = 200;
+        zero_free_program_tier(&mut ctx_b);
+        ctx_b.load_box_budget_state(&carrier);
+
+        ctx_b.consider_budget_program_writes().unwrap();
+        assert_eq!(
+            ctx_b.dirty_bytes, 80,
+            "both siblings' contributions must be reflected in the shared dirty_bytes total"
+        );
+    }
+
+    #[test]
+    fn read_budget_check_result_shared_across_siblings_not_rerun() {
+        // Sibling A (app 100) performs the group's one-time read-budget
+        // check against an existing box sized exactly to the group's
+        // box-ref-derived io_budget (100 bytes, no surplus), then WRITES to
+        // that same box, growing it to 150 bytes. Sibling B (app 200 -- a
+        // different app with no box opcode of its own) must see the
+        // check-already-performed state from the shared carrier and must
+        // NOT re-run the read-budget check against the box's now-larger
+        // size -- matching go-algorand's `readBudgetChecked` gate, which is
+        // set once on the shared `EvalParams` and never re-evaluated for
+        // any later top-level call in the group, regardless of what an
+        // earlier sibling wrote in the meantime.
+        let app_id = 100u64;
+        let box_name = b"K".to_vec();
+
+        let mut store = LedgerState::new();
+        store.set_box(app_id, &box_name, vec![0u8; 100]); // 100-byte box
+
+        let txn_a = make_appl_txn([9u8; 32], app_id, vec![], vec![], vec![]);
+        let mut ctx_a = make_context(&mut store, vec![txn_a]);
+        ctx_a.app_id = app_id;
+        ctx_a
+            .available_boxes
+            .insert((app_id, box_name.clone()), false);
+        ctx_a.boxes_initialized = true; // box refs already resolved
+        ctx_a.io_budget = 100; // exactly matches the box's current size
+
+        ctx_a.check_read_budget().unwrap();
+        assert!(ctx_a.read_budget_checked);
+
+        // Sibling A now writes the box, growing it to 150 bytes (a plain
+        // equal-size replacement isn't required by `box_put`'s ledger
+        // helper directly here -- simulate the resize the way `box_resize`
+        // would, since only the resulting on-chain size matters for this
+        // test).
+        ctx_a.store.set_box(app_id, &box_name, vec![0u8; 150]);
+
+        let mut carrier = crate::apply::BoxBudgetState::default();
+        ctx_a.save_box_budget_state(&mut carrier);
+        assert!(carrier.read_budget_checked);
+
+        // Sibling B: a fresh context for a DIFFERENT app, seeded from the
+        // carrier.
+        let txn_b = make_appl_txn([9u8; 32], 200, vec![], vec![], vec![]);
+        let mut ctx_b = make_context(ctx_a.store, vec![txn_b]);
+        ctx_b.app_id = 200;
+        assert!(
+            !ctx_b.read_budget_checked,
+            "a fresh context starts unchecked before seeding"
+        );
+        ctx_b.load_box_budget_state(&carrier);
+        assert!(
+            ctx_b.read_budget_checked,
+            "seeding from the group carrier must mark the read budget as already checked"
+        );
+
+        // With the fix, this is a no-op regardless of the box's current
+        // (now 150-byte) size -- it must NOT error even though 150 > 100.
+        ctx_b.check_read_budget().unwrap();
+    }
+
+    #[test]
+    fn read_budget_check_without_group_sharing_incorrectly_reruns_and_rejects() {
+        // Oracle test: pins the OLD (buggy) per-call-reset behavior this
+        // issue fixes, so a regression back to "fresh `LedgerAvmContext` per
+        // top-level call, no group carrier" is caught. Same setup as the
+        // fixed-behavior test above, but sibling B is built the way
+        // `apply_appl` used to build every top-level call's context --
+        // `boxes_initialized`/`read_budget_checked` left at their `false`
+        // defaults, exactly like a group carrier was never consulted.
+        // Because the group's box refs deterministically resolve to the
+        // same `available_boxes`/`io_budget` regardless of which sibling
+        // computes them, sibling B redundantly re-runs the check -- and
+        // since sibling A's write already grew the box on `store` to 150
+        // bytes, the re-check now sees 150 > 100 and incorrectly rejects a
+        // call that go-algorand (and the fixed algod-rust) would let
+        // through untouched.
+        let app_id = 100u64;
+        let box_name = b"K".to_vec();
+
+        let mut store = LedgerState::new();
+        store.set_box(app_id, &box_name, vec![0u8; 100]);
+
+        let txn_a = make_appl_txn([9u8; 32], app_id, vec![], vec![], vec![]);
+        let mut ctx_a = make_context(&mut store, vec![txn_a]);
+        ctx_a.app_id = app_id;
+        ctx_a
+            .available_boxes
+            .insert((app_id, box_name.clone()), false);
+        ctx_a.boxes_initialized = true;
+        ctx_a.io_budget = 100;
+        ctx_a.check_read_budget().unwrap();
+        ctx_a.store.set_box(app_id, &box_name, vec![0u8; 150]);
+
+        // Sibling B: same box ref, but NOT seeded from any group carrier --
+        // reproduces the pre-fix per-top-level-call reset.
+        let txn_b = make_appl_txn([9u8; 32], 200, vec![], vec![], vec![]);
+        let mut ctx_b = make_context(ctx_a.store, vec![txn_b]);
+        ctx_b.app_id = 200;
+        ctx_b
+            .available_boxes
+            .insert((app_id, box_name.clone()), false);
+        ctx_b.io_budget = 100; // same deterministic group-wide computation
+                               // `boxes_initialized`/`read_budget_checked` left false, as a fresh
+                               // top-level `LedgerAvmContext` always starts.
+
+        let err = ctx_b.check_read_budget().unwrap_err();
+        assert_eq!(
+            format!("{err}"),
+            "AVM: read budget exceeded (150 > 100)",
+            "without group-wide sharing, sibling B wrongly re-checks against the box's post-write size"
+        );
     }
 }
