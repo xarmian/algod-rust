@@ -85,23 +85,37 @@ restates this obligation in plain language:
 
 **What algod-rust does today to satisfy this, stated honestly:** the
 repository itself is public at
-`https://github.com/xarmian/algod-rust`, and this PR adds a README
-"Licensing" section pointing to it, `COPYING`, and this document. That
-satisfies the obligation for anyone who *finds the repository*. It does
-**not** yet satisfy the obligation for a user who only *interacts with a
-running algod-rust node* (e.g. over its REST API or P2P/gossip
-interfaces) without independently knowing where the source lives — the
-FAQ's requirement is specifically that the "download source" pointer be
-reachable from the running, user-facing software itself. **No such
-in-node mechanism (a `source` field on `/versions`, a startup banner
-line, or equivalent) exists in algod-rust as of this PR.** This is
-recorded here as an honest gap, not papered over: implementing a
-verified, correctly-wired source-pointer surface in the running node is
-explicitly deferred as follow-up scope to a later part of
-[#731](https://github.com/xarmian/algod-rust/issues/731) /
-[epic #732](https://github.com/xarmian/algod-rust/issues/732), so it can
-be implemented and tested as a proper code change rather than bundled
-into this docs/license-files-only PR.
+`https://github.com/xarmian/algod-rust`, and a README "Licensing"
+section points to it, `COPYING`, and this document, satisfying the
+obligation for anyone who *finds the repository*.
+[#742](https://github.com/xarmian/algod-rust/issues/742) closed the
+remaining gap — a user who only *interacts with a running algod-rust
+node* without independently knowing where the source lives — by adding
+an in-node mechanism reachable from the running software itself, exactly
+as the FAQ requires:
+
+- **HTTP clients**: every REST API response — success, error, unmatched
+  route, and the CORS preflight response — carries an
+  `X-Algod-Rust-Source: https://github.com/xarmian/algod-rust` header.
+  It is applied by `source_header_layer`
+  (`crates/node/algo-rest-api/src/source_header.rs`), registered as the
+  absolute outermost middleware layer in `router::build_router`
+  (`crates/node/algo-rest-api/src/router.rs`) so it wraps every other
+  layer and cannot be bypassed or removed by any inner route/error path.
+  It is a header-only addition: no existing response body (including the
+  byte-for-byte parity-tested `/versions` JSON) is modified.
+- **Operators running the binary directly**: `ApiServer::serve`
+  (`crates/node/algo-rest-api/src/server.rs`) logs a one-line startup
+  banner naming the same source URL whenever the REST API boots,
+  covering every entry point that starts it (`algod-rust node`,
+  `algod-rust participate`, etc.) from a single call site.
+
+Both mechanisms are covered by tests (`source_header` module tests,
+`server::tests::startup_banner_logs_the_exact_source_url`, and
+`bin/algod-rust/tests/live_headers_parity.rs`'s
+`source_header_present_on_representative_endpoint`, the last verified
+live against a real go-algorand node to confirm no header-order
+regression).
 
 ## 3. Trademark posture
 

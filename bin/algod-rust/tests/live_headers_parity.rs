@@ -48,6 +48,14 @@
 //! can differ in length once gzip-negotiated (compressed size is never
 //! expected to match exactly between two independent gzip implementations
 //! or the same implementation at a different compression level).
+//!
+//! `x-algod-rust-source` (issue #742) is also allowlisted here: it is a
+//! deliberate, algod-rust-only addition (the AGPL section 13
+//! source-availability pointer), so go-algorand never sends it and the
+//! "every other header name must match" check would otherwise flag it as a
+//! spurious rust-only header on every single comparison in this file.
+//! `source_header_present_on_representative_endpoint` below asserts its
+//! actual presence/value instead.
 
 use std::collections::BTreeSet;
 
@@ -55,7 +63,7 @@ const DEV_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 /// Headers excluded from the "every other header name must match" check.
 /// See the module doc comment for why each is here.
-const ALLOWLISTED_HEADERS: &[&str] = &["date", "server"];
+const ALLOWLISTED_HEADERS: &[&str] = &["date", "server", "x-algod-rust-source"];
 
 fn go_url() -> String {
     std::env::var("ALGOD_GO_URL").unwrap_or_else(|_| "http://127.0.0.1:4001".to_string())
@@ -407,6 +415,37 @@ async fn framing_matches_uncompressed() {
         go_framed, rust_framed,
         "uncompressed /v2/status must use the same framing strategy on both nodes"
     );
+}
+
+// ---------------------------------------------------------------------------
+// AGPL section 13 source-availability pointer (issue #742)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires `make validate-api-up`; see module docs"]
+async fn source_header_present_on_representative_endpoint() {
+    let c = client();
+    // Representative of both a common (no-auth) and a v2 (authenticated)
+    // endpoint -- the header is applied by the outermost router layer, so
+    // it must be present on every response regardless of auth tier.
+    for path in ["/health", "/v2/status"] {
+        let rust = get(&c, &rust_url(), path).await;
+        assert_eq!(
+            header_value(&rust, "x-algod-rust-source"),
+            Some("https://github.com/xarmian/algod-rust"),
+            "{path}: X-Algod-Rust-Source must be present with the exact source repo URL"
+        );
+
+        // go-algorand never sends this header -- it's an algod-rust-only
+        // addition, which is exactly why it's allowlisted out of the
+        // full-header-set diffs above rather than expected to match.
+        let go = get(&c, &go_url(), path).await;
+        assert_eq!(
+            header_value(&go, "x-algod-rust-source"),
+            None,
+            "{path}: sanity check -- go-algorand must not send this header"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

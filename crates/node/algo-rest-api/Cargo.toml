@@ -35,6 +35,7 @@ num-bigint.workspace = true
 serde_bytes.workspace = true
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
 flate2 = { workspace = true }
