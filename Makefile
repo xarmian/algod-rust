@@ -280,6 +280,13 @@ validate-api-logs:
 ## either AVM interpreter is reached, and now runs alongside
 ## `assembler_byte_diff_matches_v13_varint_branch_programs`.
 ##
+## live_fee_size_pricing_parity (issue #703, follow-up to #657/#677) runs
+## right after live_varint_branch_parity for the same reason: it submits
+## transactions from the shared dev account at v42's size-pricing
+## boundaries (note/app-args/app-program/logicsig-program bytes) and needs
+## --test-threads=1 so its per-family cases don't race each other's
+## first-valid/last-valid round window.
+##
 ## live_longpoll_parity's timeout test adds a real ~60s wait (go's
 ## WaitForBlockTimeout is a fixed 1-minute constant that can't be shortened
 ## without diverging from what's being verified — see that test's doc
@@ -298,6 +305,7 @@ validate-api:
 	 cargo test --release -p algod-rust --test live_endpoint_sweep -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_txn_cross_verification -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_varint_branch_parity -- --ignored --nocapture --test-threads=1 && \
+	 cargo test --release -p algod-rust --test live_fee_size_pricing_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_box_pagination_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_state_delta_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_longpoll_parity -- --ignored --nocapture --test-threads=1 && \
