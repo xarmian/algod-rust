@@ -88,6 +88,13 @@ const EXCLUDED_VERSIONS: &[&str] = &[
     algo_types::consensus::CONSENSUS_ALPHA3,
     algo_types::consensus::CONSENSUS_ALPHA4,
     algo_types::consensus::CONSENSUS_ALPHA5,
+    // FNet (dedicated test network, like the vAlphaX series above) — see
+    // issue #676. Mainnet/testnet never activate these and the capture
+    // tool deliberately doesn't emit them.
+    algo_types::consensus::CONSENSUS_VFNET1,
+    algo_types::consensus::CONSENSUS_VFNET2,
+    algo_types::consensus::CONSENSUS_VFNET3,
+    algo_types::consensus::CONSENSUS_VFNET4,
 ];
 
 /// The set of consensus versions the parity harness must cover,
