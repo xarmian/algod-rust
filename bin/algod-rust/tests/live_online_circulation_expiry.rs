@@ -5,7 +5,8 @@
 //! Extends `live_go_parity.rs`'s dual-node harness (see that file's module
 //! docs for setup) with a crafted keyreg scenario. Both go-algorand
 //! v4.6.0-stable and algod-rust boot from the identical dev-mode genesis
-//! (`docker/localnet-rust/data/genesis.json`, consensus v41), whose only
+//! (`docker/localnet-rust/data/genesis.json`, consensus V42 since issue
+//! #720), whose only
 //! *online* account is the funded dev wallet
 //! (`E4A7NFAARAKFG4ZK7KQ7VZBO5XEQIUKBK2U3KNLAFTX6R3HTJBFG75MQZE`) -- with no
 //! participation key registered yet (`VoteLastValid == 0` in the genesis
@@ -24,7 +25,9 @@
 //!
 //! `online-stake` is computed at agreement's lookback round
 //! (`BalanceRound(latest) = latest.SubSaturate(MaxBalLookback)`,
-//! `MaxBalLookback = 320` at consensus v41). Both go's `onlineCirculation`
+//! `MaxBalLookback = 320`, unchanged from v41 through v42 -- set once at
+//! v7's definition and never overridden by a later version). Both go's
+//! `onlineCirculation`
 //! and algod-rust's `online_circulation_at_round` skip the expired-stake
 //! subtraction entirely while that lookback round is still 0 (go's explicit
 //! genesis-balance carve-out for the first `MaxBalLookback` rounds) -- so
@@ -76,8 +79,9 @@ const DEV_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 /// `docs/DEV_WORKFLOW.md`'s funded dev account (25-word mnemonic).
 const DEV_MNEMONIC: &str = "under this above produce during card issue fire gloom reopen topple rough cat smooth salad put broken decade vocal loud pulp gauge hurdle absorb olympic";
 
-/// Consensus v41's `MaxBalLookback` (`config/consensus.go`,
-/// `2 * SeedRefreshInterval(80) * SeedLookback(2)`). The round the
+/// `MaxBalLookback` (`config/consensus.go`,
+/// `2 * SeedRefreshInterval(80) * SeedLookback(2)`), unchanged from v41
+/// through v42 (this harness's consensus version since issue #720). The round the
 /// expired-stake exclusion first becomes observable at is strictly beyond
 /// this (see module docs).
 const MAX_BAL_LOOKBACK: u64 = 320;

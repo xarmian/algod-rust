@@ -27,25 +27,22 @@
 //!     encoding identically, not merely that both *accepted* the
 //!     transaction.
 //!
-//! ## Test 2 is not yet wired into CI (see issue #720)
+//! ## Test 2 is now wired into CI (issue #720)
 //!
-//! `Makefile`'s `validate-api` target intentionally invokes only test 1
-//! (`cargo test ... live_varint_branch_parity assembler_byte_diff ...`).
-//! Test 2 fails against this harness's *current* shared genesis
-//! (`docker/localnet-rust/data/genesis.json`), which is still pinned to
+//! Test 2 originally failed against this harness's shared genesis
+//! (`docker/localnet-rust/data/genesis.json`), which was pinned to
 //! consensus V41 (`LogicSigVersion` 12) rather than go-algorand
 //! v5.0.0-stable's `ConsensusCurrentVersion` V42 (`LogicSigVersion` 13) --
 //! confirmed live in this repo's own CI
 //! (<https://github.com/xarmian/algod-rust/actions/runs/33253102996>,
 //! `... check failed on ApprovalProgram: program version 13 greater than
-//! protocol supported version 12`). That is a pre-existing harness gap
+//! protocol supported version 12`). That was a pre-existing harness gap
 //! (this shared genesis was apparently never bumped forward through
-//! phases 9-14's version-upgrade sweeps), not a v13 varint-branch defect,
-//! and fixing it touches every other `validate-api`-dependent live test's
-//! assumptions (V42 changes fee/size-limit parameters) -- too broad a
-//! blast radius for this issue, so it's tracked separately as issue #720.
-//! Test 2 stays in this file, fully written and ready, so it can be wired
-//! into `Makefile`'s `validate-api` target the moment #720 lands.
+//! phases 9-14's version-upgrade sweeps), not a v13 varint-branch defect.
+//! Issue #720 bumped the harness's genesis `proto` to V42 and audited
+//! every other `validate-api`-dependent live test for V42-specific
+//! assumptions (fee/size-limit parameters), so `Makefile`'s `validate-api`
+//! target now runs this file's full ignored set, test 2 included.
 //!
 //! ## Why this harness, not `ops/mixed-cluster/`
 //!
@@ -75,8 +72,8 @@
 //! make validate-api-down
 //! ```
 //!
-//! or in one step: `make validate-api`, which runs only test 1 (see
-//! "Test 2 is not yet wired into CI" below).
+//! or in one step: `make validate-api`, which runs both tests (see
+//! "Test 2 is now wired into CI" above).
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -462,7 +459,7 @@ return
 const CLEAR_SOURCE: &str = "#pragma version 13\nint 1\nreturn\n";
 
 #[tokio::test]
-#[ignore = "requires `make validate-api-up`; run with --test-threads=1; ALSO blocked on issue #720 (validate-api's shared genesis is pinned to consensus V41, LogicSigVersion 12 -- v13 app creation is rejected before either AVM interpreter runs) -- see module docs"]
+#[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
 async fn mixed_forward_and_back_branch_execution_trace_matches_live() {
     let c = client();
     let approval = assemble_string(APPROVAL_SOURCE)
