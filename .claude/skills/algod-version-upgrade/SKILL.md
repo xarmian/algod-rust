@@ -114,6 +114,7 @@ For each live-parity failure the pin bump surfaces:
 
 For each sub-issue **in the epic's dependency order**, run the full `algod-issue-fix` skill (all nine steps: investigate → TDD → fix → PR → self-review → fix findings → CI → fix CI → merge-with-confirmation). Additional rules for this loop:
 
+- **Licensing headers apply here too.** This loop creates real new Rust/Go source files implementing parity features (proposal docs from stage 4 are exempt Markdown, these are not) — every new source file a sub-issue's implementation creates must carry the correct license header per `CLAUDE.md`'s Licensing section, exactly per `algod-issue-fix`'s own self-review (step 5) and pre-merge acceptance-criteria audit (step 9), since that's the skill actually doing the implementation work in this loop.
 - **Sequential, not parallel** — these issues share consensus surfaces; parallel branches here have repeatedly produced conflicts. One issue merged before the next begins.
 - **Every PR gets labels** matching its issue: `phase:<N>` + every `algod:<tag>` upstream-version label the issue carries (usually including `algod:NEW`, per stage 3) + the domain label + `conformance`/`enhancement` (`gh pr create --label ... --label ...`, or `gh pr edit <n> --add-label ...` immediately after creation). A PR with no labels is not done.
 - PR bodies say `Fixes #<sub-issue>` and `Part of #<epic>`.

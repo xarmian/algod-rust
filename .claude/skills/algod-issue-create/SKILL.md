@@ -40,6 +40,7 @@ Title: <area>: <what changes> [(go-algorand <tag>)]   ← version suffix only if
 - [ ] Parity: fixtures/oracle comparison against go-algorand where byte-level   ← parity issues only
 - [ ] `cargo fmt` / `clippy -D warnings` / full workspace suite green
 - [ ] (consensus-critical only) live mixed-cluster verification
+- [ ] New files carry the correct license header per CLAUDE.md's Licensing section   ← only when this issue creates new source files
 ```
 
 Every issue this skill creates must:

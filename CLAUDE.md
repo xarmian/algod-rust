@@ -59,6 +59,36 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   "fix" `run_clear_state_program`'s empty-on-error result by analogy with
   `run_approval_program` — it's already correct.
 
+## Licensing
+
+- algod-rust as a whole is a modified work based on go-algorand, licensed
+  **AGPL-3.0-or-later** (preserving go-algorand's section 7e Additional
+  Terms), with individual MIT-eligible files additionally available under
+  MIT. See `docs/LICENSING.md` for the rationale and `docs/LICENSING_AUDIT.md`
+  for the file/directory-level classification.
+- The legal entity for every copyright/attribution statement in this repo
+  is **Algod DAO**.
+- **Every new source file created in this repo must carry the correct
+  license header at creation time.** Default to the AGPL header (mirroring
+  the format already used across `crates/core/*`/`crates/node/*`/`bin/*`/
+  `crates/tools/*`/`tools/*.go` — see `crates/core/algo-types/src/consensus.rs`
+  for the canonical template to copy) whenever the new file ports,
+  translates, or is structurally derived from go-algorand (or the AGPL
+  `sortition`/`falcon` Go modules) — this is the default for essentially
+  all consensus/protocol/API/wire-format work in this repo, per
+  `docs/LICENSING_AUDIT.md`'s "when in doubt, AGPL" rule. Use the MIT
+  header (see `docs/LICENSING_AUDIT.md`'s MIT template, e.g.
+  `crates/tools/algo-bench`) only for genuinely original files with no
+  AGPL derivation (repo tooling/CI/ops scripts not embedding ported
+  logic). If a new file ports from a third-party source (e.g.
+  gnark-crypto, go-sumhash), add the localized third-party attribution
+  comment on top of the AGPL/MIT header, following the pattern in
+  `crates/core/algo-avm/src/ops/crypto.rs` (poseidon2) and
+  `crates/core/algo-consensus-crypto/src/sumhash.rs` (go-sumhash).
+- Prose Markdown docs (README, `CLAUDE.md` itself, `docs/*.md`) are
+  deliberately exempt from per-file headers — see `docs/LICENSING_AUDIT.md`'s
+  explicit note on this.
+
 ## Bash Tool Constraints
 
 - Do NOT chain test runs hoping for different results. If a test fails, diagnose the issue first.

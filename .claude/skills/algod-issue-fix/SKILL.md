@@ -57,6 +57,7 @@ Before treating the PR as ready, review your own diff as if it were someone else
 - Check the diffstat for surprises: stray fixture/benchmark output, accidental formatting-only churn in unrelated files, files that shouldn't exist (temp scratch, `bench-results/*.json`).
 - Re-read the new tests: do they actually exercise the fix, or would they pass even without it? (Temporarily revert the fix locally and confirm the new test fails, if there's any doubt.)
 - Check for the idiomatic-Rust bar in step 3 as if reviewing a stranger's PR — it's easy to wave through your own shortcuts.
+- **Licensing header check.** For every file the diff *creates* (not modifies — existing files already carry their header), confirm it has the correct license header per `CLAUDE.md`'s Licensing section: AGPL by default (copy the template in `crates/core/algo-types/src/consensus.rs`) for anything porting/translating/structurally deriving from go-algorand, MIT only for genuinely original tooling with no AGPL derivation, plus a third-party attribution comment layered on top if the file ports from a third-party source. A new file missing its header is a self-review finding like any other — fix it in step 6, don't wave it through.
 
 ### 6. Fix self-review findings
 
@@ -72,7 +73,7 @@ If a check fails, read its actual logs (`gh run view <run-id> --log-failed`) bef
 
 ### 9. Merge to main
 
-- **Acceptance-criteria audit first.** Walk the issue's `- [ ]` checklist item by item against what the PR actually delivers, and leave the issue reflecting the truth of each item *before* the merge:
+- **Acceptance-criteria audit first.** Walk the issue's `- [ ]` checklist item by item against what the PR actually delivers, and leave the issue reflecting the truth of each item *before* the merge. This audit is also where the licensing check from step 5 gets a final, first-class pass: any file the PR newly created must carry the correct license header (AGPL/MIT per `CLAUDE.md`'s Licensing section, plus third-party attribution if applicable) — treat a missing header exactly like an unmet acceptance criterion, not a footnote, and do not merge until it's fixed.
   - **Fixed** → mark it checked (`- [x]`) in the issue body (`gh issue edit N --body ...`), citing the evidence (test name, PR, measurement) in the tick or in an accompanying comment.
   - **Obsolete** (the criterion no longer makes sense — requirements changed, the approach made it moot, upstream removed the need) → do NOT silently delete or tick it: strike it through (`- [x] ~~criterion~~`) and post a comment explaining *why* it is obsolete and on whose call (user decision, upstream change, superseded design).
   - **Moved to a different issue** (out of scope here, deferred, structurally unreachable in this PR) → post a comment naming the destination issue number (which the open-topics sweep below just created), and annotate the item in the body (`- [ ] criterion — moved to #M`) so nobody re-implements or double-counts it.
