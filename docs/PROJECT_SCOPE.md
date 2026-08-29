@@ -404,6 +404,12 @@ The `v4.7.4-stable → v5.0.0-stable` sweep is a consensus-upgrade release (V41 
 
 ---
 
+## Phase 15 — Licensing and Legal-Framework Compliance
+
+Brings algod-rust into full compliance with the legal framework it operates under. go-algorand's node software is AGPL-3.0-or-later with section 7e Additional Terms, and its `COPYING_FAQ` states that reimplementing the node/APIs/consensus automatically produces an AGPL-licensed work — which is exactly what algod-rust is. The project-owner decisions this phase implements: algod-rust as a whole is classified as a **modified work based on go-algorand under AGPL-3.0-or-later** (preserving the inherited section 7e trademark terms); **MIT is preferred wherever legally possible** for files not derived from AGPL material; the legal entity for all algod-rust copyright/attribution statements is **`Algod DAO`**. Scope: full per-file AGPL/MIT/third-party audit, repo-level `COPYING`/`LICENSE-MIT`, per-file modified-work headers with SPDX identifiers, `Cargo.toml` license metadata, `docs/LICENSING.md` (AGPL section 13 network-source obligation, trademark posture, patent rationale, third-party attributions such as gnark-crypto's Apache-2.0 poseidon2), and updates to `CLAUDE.md`/`.claude/skills/*` so future files get correct headers by default. See `docs/PHASE15_PROPOSAL.md`, `docs/epics/Epic-25-Licensing-Compliance.md`, and epic issue [#732](https://github.com/xarmian/algod-rust/issues/732).
+
+---
+
 # 6. Project Success Criteria
 
 The project succeeds when:
