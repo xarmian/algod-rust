@@ -1,3 +1,8 @@
+// Copyright (c) 2026 Algod DAO
+//
+// SPDX-License-Identifier: MIT
+// For the full license text, see LICENSE-MIT at the repository root.
+
 //! `trie_bench_compare` — diff Rust↔Go `trie_replay` JSON outputs and
 //! rewrite the results block in `docs/PERF_TRIE.md` (TASK-145 / PLAN-144).
 //!
