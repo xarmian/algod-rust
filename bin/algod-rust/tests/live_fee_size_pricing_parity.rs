@@ -58,7 +58,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use algo_avm::assembler::assemble_string;
 use algo_codec::{canonical_encode_transaction, compute_group_id, compute_txn_id};
 use algo_types::consensus::{consensus_params_for_version, ConsensusParams, CONSENSUS_V42};
-use algo_types::{LogicSig, SignedTransaction, StateSchema, Transaction, TxnType};
+use algo_types::{BoxRef, LogicSig, SignedTransaction, StateSchema, Transaction, TxnType};
 use ed25519_dalek::Signer;
 use serde_bytes::ByteBuf;
 
@@ -346,10 +346,16 @@ async fn run_case(
     mutate: impl Fn(&mut Transaction),
     fee: u64,
 ) -> CaseOutcome {
+    // `mutate` runs first and may itself set `.note` to a specific length
+    // under test (the note-bytes family does exactly this) -- only fill in
+    // a tracing tag when it didn't, so this helper never clobbers the field
+    // a case is actually exercising.
     let mut go_txn = base_txn(c, &go_url()).await;
     mutate(&mut go_txn);
     go_txn.fee = fee;
-    go_txn.note = ByteBuf::from(unique_note(&format!("{label}-go")));
+    if go_txn.note.is_empty() {
+        go_txn.note = ByteBuf::from(unique_note(&format!("{label}-go")));
+    }
     let go_stx = sign(&mut go_txn, sk);
     let go_bytes = encode(&go_stx);
     let go = submit(c, &go_url(), &go_bytes).await;
@@ -357,7 +363,9 @@ async fn run_case(
     let mut rust_txn = base_txn(c, &rust_url()).await;
     mutate(&mut rust_txn);
     rust_txn.fee = fee;
-    rust_txn.note = ByteBuf::from(unique_note(&format!("{label}-rust")));
+    if rust_txn.note.is_empty() {
+        rust_txn.note = ByteBuf::from(unique_note(&format!("{label}-rust")));
+    }
     let rust_stx = sign(&mut rust_txn, sk);
     let rust_bytes = encode(&rust_stx);
     let rust = submit(c, &rust_url(), &rust_bytes).await;
@@ -789,15 +797,58 @@ async fn app_program_size_pricing_boundaries_match_live() {
         algo_validate::required_fee_for_txn(&txn, &params).0
     };
 
-    async fn run_program_case(
-        c: &reqwest::Client,
-        sk: &ed25519_dalek::SigningKey,
-        label: &'static str,
+    // go-algorand gates *creating* (or updating/deleting) an app whose
+    // approval+clear program grows past the fee-free allowance
+    // (`soft_limit`, computed via the fixed constant `MaxExtraAppProgramPages`
+    // regardless of this txn's own `ExtraProgramPages`) behind the box I/O
+    // write budget too, not just the fee surcharge under test here --
+    // `considerBudgetProgramWrites` (`data/transactions/logic/eval.go`) folds
+    // `LargeProgramExtraBytes(proto, totalProgramSize)` into the same
+    // `dirtyBytes`/`ioBudget` accounting used for box reads/writes
+    // (`BytesPerBoxReference`). Confirmed missing in algod-rust (issue
+    // filed as a follow-up in epic #678) via this file's first CI run: a
+    // real go-algorand node rejected `program_over_soft_exact_fee_accept`/
+    // `program_at_hard_cap_exact_fee_accept` with "write budget exceeded"
+    // even though the fee paid was exactly correct, while algod-rust (which
+    // has no such gate at all) accepted. That's a distinct mechanism from
+    // the size-pricing fee formula #703 verifies, so rather than either
+    // papering over the mismatch or scope-creeping a ledger-apply fix into
+    // this testing PR, every case below supplies enough empty ("pure I/O
+    // bump") box refs to satisfy go's budget for its own program-size
+    // overage -- isolating the fee-boundary decision this test exists to
+    // check from that separate, already-tracked gap.
+    let bumps_for_extra = |extra_bytes: usize| -> usize {
+        extra_bytes.div_ceil(params.bytes_per_box_reference as usize)
+    };
+    let io_bump_boxes = |n: usize| -> Option<Vec<BoxRef>> {
+        if n == 0 {
+            None
+        } else {
+            Some(vec![BoxRef::default(); n])
+        }
+    };
+
+    struct ProgramCase {
         approval: Vec<u8>,
         clear: Vec<u8>,
         epp: u32,
         fee: u64,
+        box_bumps: Option<Vec<BoxRef>>,
+    }
+
+    async fn run_program_case(
+        c: &reqwest::Client,
+        sk: &ed25519_dalek::SigningKey,
+        label: &'static str,
+        case: ProgramCase,
     ) -> CaseOutcome {
+        let ProgramCase {
+            approval,
+            clear,
+            epp,
+            fee,
+            box_bumps,
+        } = case;
         let mutate = |txn: &mut Transaction| {
             txn.txn_type = TxnType::Appl;
             txn.approval_program = Some(approval.clone().into());
@@ -807,6 +858,7 @@ async fn app_program_size_pricing_boundaries_match_live() {
                 num_uint: 0,
                 num_byte_slice: 0,
             });
+            txn.boxes = box_bumps.clone();
         };
         run_case(c, sk, label, mutate, fee).await
     }
@@ -819,10 +871,13 @@ async fn app_program_size_pricing_boundaries_match_live() {
         &c,
         &sk,
         "program_at_soft_cap_min_fee",
-        approval,
-        clear_program.clone(),
-        epp,
-        params.min_txn_fee,
+        ProgramCase {
+            approval,
+            clear: clear_program.clone(),
+            epp,
+            fee: params.min_txn_fee,
+            box_bumps: io_bump_boxes(0),
+        },
     )
     .await;
     if let Err(e) = assert_case_parity(&outcome, true) {
@@ -833,6 +888,7 @@ async fn app_program_size_pricing_boundaries_match_live() {
     // well-formedness, and a surcharge for the fee.
     let over_soft = soft_limit + 50;
     let over_soft_required = required_fee(over_soft - clear_len, clear_len);
+    let over_soft_bumps = bumps_for_extra(over_soft - soft_limit);
     let epp = epp_for(over_soft);
     let approval_len = over_soft - clear_len;
     let approval = program_of_len(approval_len, 8);
@@ -840,10 +896,13 @@ async fn app_program_size_pricing_boundaries_match_live() {
         &c,
         &sk,
         "program_over_soft_min_fee_reject",
-        approval.clone(),
-        clear_program.clone(),
-        epp,
-        params.min_txn_fee,
+        ProgramCase {
+            approval: approval.clone(),
+            clear: clear_program.clone(),
+            epp,
+            fee: params.min_txn_fee,
+            box_bumps: io_bump_boxes(over_soft_bumps),
+        },
     )
     .await;
     if let Err(e) = assert_case_parity(&outcome, false) {
@@ -853,10 +912,13 @@ async fn app_program_size_pricing_boundaries_match_live() {
         &c,
         &sk,
         "program_over_soft_exact_fee_accept",
-        approval.clone(),
-        clear_program.clone(),
-        epp,
-        over_soft_required,
+        ProgramCase {
+            approval: approval.clone(),
+            clear: clear_program.clone(),
+            epp,
+            fee: over_soft_required,
+            box_bumps: io_bump_boxes(over_soft_bumps),
+        },
     )
     .await;
     if let Err(e) = assert_case_parity(&outcome, true) {
@@ -866,10 +928,13 @@ async fn app_program_size_pricing_boundaries_match_live() {
         &c,
         &sk,
         "program_over_soft_fee_minus_one_reject",
-        approval,
-        clear_program.clone(),
-        epp,
-        over_soft_required - 1,
+        ProgramCase {
+            approval,
+            clear: clear_program.clone(),
+            epp,
+            fee: over_soft_required - 1,
+            box_bumps: io_bump_boxes(over_soft_bumps),
+        },
     )
     .await;
     if let Err(e) = assert_case_parity(&outcome, false) {
@@ -878,15 +943,19 @@ async fn app_program_size_pricing_boundaries_match_live() {
 
     // At the hard cap, using the maximum extra pages.
     let hard_required = required_fee(hard_limit - clear_len, clear_len);
+    let hard_bumps = bumps_for_extra(hard_limit - soft_limit);
     let approval = program_of_len(hard_limit - clear_len, 8);
     let outcome = run_program_case(
         &c,
         &sk,
         "program_at_hard_cap_exact_fee_accept",
-        approval.clone(),
-        clear_program.clone(),
-        hard_epp,
-        hard_required,
+        ProgramCase {
+            approval: approval.clone(),
+            clear: clear_program.clone(),
+            epp: hard_epp,
+            fee: hard_required,
+            box_bumps: io_bump_boxes(hard_bumps),
+        },
     )
     .await;
     if let Err(e) = assert_case_parity(&outcome, true) {
@@ -896,26 +965,34 @@ async fn app_program_size_pricing_boundaries_match_live() {
         &c,
         &sk,
         "program_at_hard_cap_fee_minus_one_reject",
-        approval,
-        clear_program.clone(),
-        hard_epp,
-        hard_required - 1,
+        ProgramCase {
+            approval,
+            clear: clear_program.clone(),
+            epp: hard_epp,
+            fee: hard_required - 1,
+            box_bumps: io_bump_boxes(hard_bumps),
+        },
     )
     .await;
     if let Err(e) = assert_case_parity(&outcome, false) {
         failures.push(e);
     }
 
-    // Over the hard cap, even at max extra pages: rejected regardless of fee.
+    // Over the hard cap, even at max extra pages: rejected regardless of fee
+    // (well-formedness rejects this before AVM execution / the write-budget
+    // gate are ever reached, so no box bumps are needed here).
     let approval = program_of_len(hard_limit + 1 - clear_len, 8);
     let outcome = run_program_case(
         &c,
         &sk,
         "program_over_hard_cap_reject_unconditional",
-        approval,
-        clear_program.clone(),
-        hard_epp,
-        hard_required + 1_000_000,
+        ProgramCase {
+            approval,
+            clear: clear_program.clone(),
+            epp: hard_epp,
+            fee: hard_required + 1_000_000,
+            box_bumps: io_bump_boxes(0),
+        },
     )
     .await;
     if let Err(e) = assert_case_parity(&outcome, false) {
@@ -928,10 +1005,13 @@ async fn app_program_size_pricing_boundaries_match_live() {
         &c,
         &sk,
         "program_epp_over_absolute_max_reject_unconditional",
-        program_of_len(20, 8),
-        clear_program,
-        hard_epp + 1,
-        hard_required + 1_000_000,
+        ProgramCase {
+            approval: program_of_len(20, 8),
+            clear: clear_program,
+            epp: hard_epp + 1,
+            fee: hard_required + 1_000_000,
+            box_bumps: io_bump_boxes(0),
+        },
     )
     .await;
     if let Err(e) = assert_case_parity(&outcome, false) {
