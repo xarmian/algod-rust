@@ -252,21 +252,24 @@ validate-api-logs:
 ## Bring up the dual-node harness, run every live parity suite
 ## (bin/algod-rust/tests/live_go_parity.rs, live_msgpack_parity.rs,
 ## live_auth_parity.rs, live_headers_parity.rs, live_endpoint_sweep.rs,
-## live_txn_cross_verification.rs, live_box_pagination_parity.rs,
-## live_longpoll_parity.rs, live_online_circulation_expiry.rs), and tear
-## down even if a suite fails — matching algokey-e2e's pattern. Reuses the
-## same `target/release` build that validate-api-up already produced, so
-## the harness process and the test binaries are never compiled twice.
+## live_txn_cross_verification.rs, live_varint_branch_parity.rs,
+## live_box_pagination_parity.rs, live_longpoll_parity.rs,
+## live_online_circulation_expiry.rs), and tear down even if a suite fails
+## — matching algokey-e2e's pattern. Reuses the same `target/release`
+## build that validate-api-up already produced, so the harness process
+## and the test binaries are never compiled twice.
 ##
 ## Order matters: live_go_parity, live_msgpack_parity, live_auth_parity,
 ## live_headers_parity, and live_endpoint_sweep assume genesis-only state
 ## (round 0) or are otherwise read-only, so they run first, before
-## live_txn_cross_verification, live_box_pagination_parity,
-## live_longpoll_parity, and live_online_circulation_expiry submit
-## transactions and advance both nodes' rounds. live_box_pagination_parity
-## (issue #551) runs right after live_txn_cross_verification since it also
-## deploys apps/submits transactions on the shared dev account and needs
-## --test-threads=1 for the same reason (see each file's module docs).
+## live_txn_cross_verification, live_varint_branch_parity,
+## live_box_pagination_parity, live_longpoll_parity, and
+## live_online_circulation_expiry submit transactions and advance both
+## nodes' rounds. live_varint_branch_parity (issue #691) runs right after
+## live_txn_cross_verification since it also deploys/calls an app on the
+## shared dev account and needs --test-threads=1 for the same reason (see
+## each file's module docs); live_box_pagination_parity (issue #551)
+## follows it for the same reason.
 ## live_longpoll_parity's timeout test adds a real ~60s wait (go's
 ## WaitForBlockTimeout is a fixed 1-minute constant that can't be shortened
 ## without diverging from what's being verified — see that test's doc
@@ -284,6 +287,7 @@ validate-api:
 	 cargo test --release -p algod-rust --test live_headers_parity -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_endpoint_sweep -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_txn_cross_verification -- --ignored --nocapture --test-threads=1 && \
+	 cargo test --release -p algod-rust --test live_varint_branch_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_box_pagination_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_state_delta_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_longpoll_parity -- --ignored --nocapture --test-threads=1 && \
