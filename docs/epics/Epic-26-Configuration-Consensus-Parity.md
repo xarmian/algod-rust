@@ -33,20 +33,17 @@ All three predate the version-delta sweeps.
 
 ## Sub-issues (dependency order, priority-first)
 
-- [ ] Consensus-critical historical-replay param gaps (highest priority)
-- [ ] Custom consensus.json load/merge/save mechanism
-- [ ] Remaining medium-priority consensus param gaps
-- [ ] config.json load/migration mechanism (foundational plumbing)
-- [ ] Networking config field gaps
-- [ ] Storage/data-dir config field gaps
-- [ ] REST/API config field gaps
-- [ ] Catchup/sync config field gaps
-- [ ] Agreement/queue/vote-compression config field gaps
-- [ ] Telemetry/metrics/logging config field gaps
-- [ ] Dead-file cleanup: `docker/localnet-rust/data/config.json`
-
-(Filled in with issue numbers once created — see `docs/PHASE16_PROPOSAL.md`
-and the epic issue itself for the live list.)
+- [ ] #747 — consensus: add missing historical-replay-correctness ConsensusParams fields (`PendingResidueRewards`, `InitialRewardsRateCalculation`, `RewardsCalculationFix`, `UnifyInnerTxIDs`, `UnfundedSenders`, `EnablePrecheckECDSACurve`, `AppForbidLowResources`, `StateProofTopVoters`) — **highest priority**, independent of the rest
+- [ ] #750 — consensus: implement custom consensus.json load/merge/save (`LoadConfigurableConsensusProtocols` equivalent) — independent
+- [ ] #752 — consensus: add remaining missing ConsensusParams fields (`LogicSigMsig`/`LogicSigLMsig`, `EnableBareBudgetError`, `StateProofMaxRecoveryIntervals`, `CatchpointLookback`, `EnableLedgerDataUpdateRound`, `StateProofUseTrackerVerification`, catchpoint file-version interop) — independent
+- [ ] #754 — config: implement config.json loading and version migration (`config.Local` equivalent) — **foundational plumbing**, everything below depends on this
+- [ ] #748 — config: networking config field gaps (depends on #754)
+- [ ] #749 — config: storage/data-directory config field gaps (depends on #754)
+- [ ] #751 — config: REST/API config field gaps, including the `EndpointAddress` default-on divergence (depends on #754)
+- [ ] #753 — config: catchup/sync config field gaps (depends on #754)
+- [ ] #755 — config: agreement-protocol config field gaps — also contains 2 live bugs (stale queue-length constants, delta-cache lookback window 80x too large) fixable independent of #754 (depends on #754 for the config-wiring half only)
+- [ ] #756 — config: telemetry/metrics/logging config fields — remote telemetry disposed as a deliberate non-goal (privacy/trust reasons); Prometheus `/metrics` always-on confirmed NOT a bug (matches go-algorand's own unconditional route) (depends on #754)
+- [ ] #757 — config: wire up or remove the decorative `docker/localnet-rust/data/config.json` (depends on #754)
 
 ## Epic-level acceptance criteria
 
