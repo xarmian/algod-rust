@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 """Unit tests for the issue #471 equivocation detector.
 
 These are the negative controls for the cluster suite: before the

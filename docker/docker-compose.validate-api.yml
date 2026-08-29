@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Dual-node REST conformance harness (issue #129).
 #
 # Boots a *real* go-algorand v4.6.0-stable node from the **same genesis.json**

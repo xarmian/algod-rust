@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 name: algokey-rust e2e
 
 # End-to-end test suite for algokey-rust against a live algod-go localnet

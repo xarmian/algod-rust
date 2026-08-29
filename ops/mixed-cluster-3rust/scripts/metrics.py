@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Issue #496 (Phase 7) — per-round metric collector for the 3 Go + 3 Rust
 # mixed cluster.
 #

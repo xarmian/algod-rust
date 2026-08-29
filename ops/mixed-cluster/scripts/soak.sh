@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # PLAN-32 / TASK-87 — mixed-cluster soak harness.
 #
 # Thin wrapper around scripts/metrics.py that:

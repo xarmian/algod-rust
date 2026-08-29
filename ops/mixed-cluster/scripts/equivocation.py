@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 """Equivocation detector for the algod-rust node's vote log (issue #471).
 
 A node *equivocates* when it signs two different values at the same

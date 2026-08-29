@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 """Aggregate the issue #100 stress-benchmark samples into one JSON report.
 
 `bench-stress.sh` collects three kinds of raw evidence while the cluster runs:

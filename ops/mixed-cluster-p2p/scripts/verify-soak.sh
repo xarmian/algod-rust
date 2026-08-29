@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # verify-soak.sh — issue #596 (P2P analogue of ops/mixed-cluster's
 # verify-soak.sh, issue #470 §2 / TASK-88 / TASK-95).
 #

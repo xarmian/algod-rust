@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Tear down the issue #496 (Phase 7) 6-node mixed-cluster harness. By
 # default this stops containers and removes their volumes but preserves
 # netroot/ so a subsequent start.sh can reuse keys + genesis. Pass

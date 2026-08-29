@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Tear down the P2P interop + consensus harness (issues #543, #589). By
 # default this stops all four containers (`docker compose down -v`, which
 # also removes rust-node-4's named data volume) but preserves the

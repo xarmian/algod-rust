@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Generate diverse transaction types on the devnet localnet.
 # This script runs inside (or via docker exec into) the algod-go container.
 # It creates: pay, acfg (ASA create), axfer (opt-in + transfer), afrz,

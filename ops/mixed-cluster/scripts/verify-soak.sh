@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # PLAN-32 / TASK-88 + TASK-95 — mixed-cluster soak verifier.
 #
 # Wraps the two verifier tools:

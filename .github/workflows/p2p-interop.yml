@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 name: Nightly P2P Transport Interop
 
 # Issue #543 — dial a real go-algorand v5.0.0-stable node running in

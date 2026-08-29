@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Per-node round + liveness snapshot for the 4-node P2P interop cluster
 # (issue #589) — 3 go-algorand P2P nodes + 1 algod-rust `P2pOnly`
 # participant. Exits non-zero if any node is unreachable / not running /

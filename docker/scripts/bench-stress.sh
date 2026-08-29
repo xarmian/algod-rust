@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # bench-stress.sh — issue #100 mixed-cluster stress benchmark.
 #
 # Brings up the 6-node topology in docker-compose.stress-test.yml (1 Go relay +

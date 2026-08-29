@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Generate the docker localnet `genesis.json` from `genesis.json.in`,
 # deriving the `proto` spec-URL from the single shared Rust constant
 # `CONSENSUS_CURRENT_VERSION` (crates/core/algo-types/src/consensus.rs)

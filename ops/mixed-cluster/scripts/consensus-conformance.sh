@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # consensus-conformance.sh — issue #470 (Epic 42c) acceptance gate.
 #
 # One command that runs the whole positive Layer-9 conformance suite

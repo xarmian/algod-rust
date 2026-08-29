@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Docker Compose overlay that adds a relay node for WebSocket integration tests.
 #
 # The relay is the same `algorand/algod` Docker image configured with

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
 # Capture golden block-header fixtures from a real go-algorand node running
 # under the `vFuture`/"future" consensus protocol (issue #548).
 #
