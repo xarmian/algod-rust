@@ -410,6 +410,12 @@ Brings algod-rust into full compliance with the legal framework it operates unde
 
 ---
 
+## Phase 16 — Node Configuration and Consensus-Parameter Parity
+
+Audits algod-rust's node-configuration surface and consensus-parameter struct against go-algorand's, field by field, and closes every real divergence found — unlike phases 9–14, which only tracked *version-delta* parity (what changed between two pins) and had no reason to catch a gap present since the original phase 0–3 port. Headline findings: algod-rust has no `config.json` ingestion mechanism at all (go-algorand's ~97 real `Local` fields are ~9 matching, ~20 different, ~10 not-applicable, and ~58 with no equivalent); 23 consensus-parameter fields are absent from `consensus.rs` (8 self-documented as skipped, 15 silently missing — several are historical-replay-correctness risks, i.e. bugfix-activation flags that must be version-gated rather than applied unconditionally); and no custom consensus.json load/merge/save mechanism exists, even though a real go-algorand-authored one already sits unused in the repo (`docker/config/vfuture-consensus.json`). See `docs/PHASE16_PROPOSAL.md`, `docs/epics/Epic-26-Configuration-Consensus-Parity.md`, and epic issue [#745](https://github.com/xarmian/algod-rust/issues/745).
+
+---
+
 # 6. Project Success Criteria
 
 The project succeeds when:
