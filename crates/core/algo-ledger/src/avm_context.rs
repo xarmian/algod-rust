@@ -788,6 +788,15 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// I/O budget: `num_box_refs * BYTES_PER_BOX_REFERENCE`.
     io_budget: u64,
 
+    /// Per-app-ID oversized-program-bytes contribution currently folded into
+    /// `dirty_bytes` by [`Self::consider_budget_program_writes`]. Matches
+    /// go-algorand's `resources.updateBytes` (`data/transactions/logic/
+    /// resources.go:58-61`): keyed per app so that a later create/update/
+    /// delete call against the same app within the group first undoes this
+    /// app's previous contribution (rather than double-counting it) before
+    /// folding in the new one.
+    update_bytes: HashMap<u64, u64>,
+
     /// Whether the read budget check has already been performed.
     read_budget_checked: bool,
 
@@ -1069,6 +1078,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             boxes_initialized: false,
             dirty_bytes: 0,
             io_budget: 0,
+            update_bytes: HashMap::new(),
             read_budget_checked: false,
             unnamed_access: 0,
             touched_family_shared: false,
@@ -1461,6 +1471,101 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Fold this app call's oversized-program-bytes contribution into the
+    /// box-write-budget accounting, and reject if it pushes the group over
+    /// its I/O budget. Matches go-algorand's
+    /// `EvalContext.considerBudgetProgramWrites()` exactly
+    /// (`data/transactions/logic/eval.go:540-569`), called after a
+    /// successful (approving) run of the approval program for any
+    /// transaction that creates, updates, or deletes an app:
+    ///
+    /// ```go
+    /// func (cx *EvalContext) considerBudgetProgramWrites() error {
+    ///     creating := cx.txn.Txn.ApplicationID == 0
+    ///     updating := cx.txn.Txn.OnCompletion == transactions.UpdateApplicationOC
+    ///     deleting := cx.txn.Txn.OnCompletion == transactions.DeleteApplicationOC
+    ///     if !creating && !updating && !deleting { return nil }
+    ///     if creating && deleting { return nil } // never written
+    ///
+    ///     oldSize := cx.available.updateBytes[cx.appID]
+    ///     cx.available.dirtyBytes = basics.SubSaturate(cx.available.dirtyBytes, oldSize)
+    ///     newSize := uint64(transactions.LargeProgramExtraBytes(*cx.Proto,
+    ///         len(cx.txn.Txn.ApprovalProgram)+len(cx.txn.Txn.ClearStateProgram)))
+    ///     cx.available.dirtyBytes = basics.AddSaturate(cx.available.dirtyBytes, newSize)
+    ///     cx.available.updateBytes[cx.appID] = newSize
+    ///     if cx.available.dirtyBytes > cx.ioBudget {
+    ///         verb := "creating"
+    ///         if updating { verb = "updating" }
+    ///         return fmt.Errorf("write budget exceeded (%d > %d) while %s app %d", ...)
+    ///     }
+    ///     return nil
+    /// }
+    /// ```
+    ///
+    /// Not called for ClearState: a ClearState call's `OnCompletion` is
+    /// never `UpdateApplicationOC`/`DeleteApplicationOC` and its
+    /// `ApplicationID` is always nonzero (clearing state requires already
+    /// being opted in), so `creating`/`updating`/`deleting` are all false
+    /// and go's own function would no-op immediately anyway.
+    pub(crate) fn consider_budget_program_writes(&mut self) -> Result<(), AlgoError> {
+        let (creating, updating, deleting, approval_len, clear_len) = {
+            let txn = &self.group[self.group_index].txn;
+            (
+                txn.application_id == 0,
+                txn.on_completion == crate::apply::ON_COMPLETION_UPDATE,
+                txn.on_completion == crate::apply::ON_COMPLETION_DELETE,
+                txn.approval_program.as_ref().map(|p| p.len()).unwrap_or(0),
+                txn.clear_state_program
+                    .as_ref()
+                    .map(|p| p.len())
+                    .unwrap_or(0),
+            )
+        };
+        if !creating && !updating && !deleting {
+            // No program size change.
+            return Ok(());
+        }
+        if creating && deleting {
+            // Program never gets written.
+            return Ok(());
+        }
+
+        // go computes `ioBudget` eagerly, from the group's box refs, at the
+        // very start of every top-level `EvalContract` call regardless of
+        // whether the program touches boxes at all
+        // (`data/transactions/logic/eval.go:1276-1287`) -- a program can use
+        // box refs purely as "io bump" budget without ever executing a box
+        // opcode. Mirror that here: ensure the budget is populated before
+        // consulting it (a no-op if a box opcode, or an earlier top-level
+        // sibling in this group, already triggered it).
+        self.ensure_boxes_initialized();
+
+        // The "sizes" below are actually the size above the old maximum size.
+        let old_size = *self.update_bytes.get(&self.app_id).unwrap_or(&0);
+        self.dirty_bytes = self.dirty_bytes.saturating_sub(old_size);
+
+        let new_size =
+            algo_validate::large_program_extra_bytes(&self.consensus, approval_len + clear_len)
+                as u64;
+        self.dirty_bytes = self.dirty_bytes.saturating_add(new_size);
+        self.update_bytes.insert(self.app_id, new_size);
+
+        if self.dirty_bytes > self.io_budget {
+            // go's verb selection (`eval.go:561-564`) literally only checks
+            // for "updating"; a delete-only call (not creating, not
+            // updating) still reports "creating" as its default. Mirrored
+            // exactly, quirk and all.
+            let verb = if updating { "updating" } else { "creating" };
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "write budget exceeded ({} > {}) while {} app {}",
+                    self.dirty_bytes, self.io_budget, verb, self.app_id
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -2356,6 +2461,7 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.available_boxes = box_state.available_boxes;
     inner_ctx.dirty_bytes = box_state.dirty_bytes;
     inner_ctx.io_budget = box_state.io_budget;
+    inner_ctx.update_bytes = box_state.update_bytes;
     inner_ctx.read_budget_checked = true; // inner calls skip the read check (go-algorand line 556)
     inner_ctx.boxes_initialized = box_state.boxes_initialized;
     inner_ctx.unnamed_access = box_state.unnamed_access;
@@ -2422,7 +2528,20 @@ fn execute_inner_appl<L: LedgerStore>(
             run_approval_program(&program, &mut inner_ctx, &mut budget)
         };
         match res {
-            Ok(result) => result,
+            Ok(mut result) => {
+                // Mirrors go-algorand's `EvalContract`
+                // (`data/transactions/logic/eval.go:1353-1358`): `err ==
+                // nil && pass` gates `considerBudgetProgramWrites`, and a
+                // failure there flips `pass` to false the same as any other
+                // post-execution rejection (issue #723).
+                if result.approved {
+                    if let Err(e) = inner_ctx.consider_budget_program_writes() {
+                        result.approved = false;
+                        result.error = Some(e.to_string());
+                    }
+                }
+                result
+            }
             Err(e) => {
                 // Update the shared budget with what was consumed.
                 *opcode_budget = budget.remaining();
@@ -2477,6 +2596,7 @@ fn execute_inner_appl<L: LedgerStore>(
         available_boxes: inner_ctx.available_boxes.clone(),
         dirty_bytes: inner_ctx.dirty_bytes,
         io_budget: inner_ctx.io_budget,
+        update_bytes: inner_ctx.update_bytes.clone(),
         read_budget_checked: inner_ctx.read_budget_checked,
         boxes_initialized: inner_ctx.boxes_initialized,
         unnamed_access: inner_ctx.unnamed_access,
@@ -3908,6 +4028,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     available_boxes: self.available_boxes.clone(),
                     dirty_bytes: self.dirty_bytes,
                     io_budget: self.io_budget,
+                    update_bytes: self.update_bytes.clone(),
                     read_budget_checked: self.read_budget_checked,
                     boxes_initialized: self.boxes_initialized,
                     unnamed_access: self.unnamed_access,
@@ -4011,6 +4132,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                             self.available_boxes = bs.available_boxes;
                             self.dirty_bytes = bs.dirty_bytes;
                             self.io_budget = bs.io_budget;
+                            self.update_bytes = bs.update_bytes;
                             self.read_budget_checked = bs.read_budget_checked;
                             self.boxes_initialized = bs.boxes_initialized;
                             self.unnamed_access = bs.unnamed_access;
@@ -9879,5 +10001,206 @@ mod tests {
             },
         ];
         ctx.check_family_reentrancy().unwrap();
+    }
+
+    // ---- `consider_budget_program_writes` (issue #723) ----
+    //
+    // Direct unit tests against the method itself (rather than a full AVM
+    // run) so the oracle -- go-algorand's `EvalContext.
+    // considerBudgetProgramWrites()`, `data/transactions/logic/eval.go:
+    // 540-569` -- can be pinned precisely: old-size subtraction, per-appID
+    // tracking, the creating-and-deleting exemption, and the exact verb
+    // quirk (a delete-only call reports "creating", matching go's `verb :=
+    // "creating"; if updating { verb = "updating" }` which never checks
+    // `deleting`). `make_context` uses `ConsensusParams::default()`, which
+    // is the real (large) V42 free-tier allowance, so
+    // `zero_free_program_tier` below zeroes it out per-test -- keeping the
+    // arithmetic in these tests simple and exact rather than needing every
+    // test program to actually exceed V42's real several-KB free tier.
+
+    fn make_program_txn(
+        application_id: u64,
+        on_completion: u64,
+        approval_len: usize,
+        clear_len: usize,
+    ) -> SignedTransaction {
+        let mut txn = make_appl_txn([9u8; 32], application_id, vec![], vec![], vec![]);
+        txn.txn.on_completion = on_completion;
+        txn.txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![0u8; approval_len]));
+        txn.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(vec![0u8; clear_len]));
+        txn
+    }
+
+    /// Zero out the free program-size tier (`MaxAppTotalProgramLen *
+    /// (1+MaxExtraAppProgramPages)`) so every byte of a test program's
+    /// combined approval+clear length counts as "extra" -- keeping the
+    /// arithmetic in these tests exact and independent of the real
+    /// consensus version's (large) free allowance.
+    fn zero_free_program_tier<L: LedgerStore>(ctx: &mut LedgerAvmContext<'_, L>) {
+        ctx.consensus.max_app_total_program_len = 0;
+        ctx.consensus.max_extra_app_program_pages = 0;
+    }
+
+    #[test]
+    fn consider_budget_program_writes_rejects_oversized_create_with_no_io_budget() {
+        let mut store = LedgerState::new();
+        let txn = make_program_txn(0, 0, 50, 10); // creating, total 60 bytes
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 1016;
+        zero_free_program_tier(&mut ctx);
+        ctx.boxes_initialized = true;
+        ctx.io_budget = 0;
+
+        let err = ctx.consider_budget_program_writes().unwrap_err();
+        // Matches go-algorand's exact error text
+        // (`data/transactions/logic/eval.go:565-566`):
+        // `fmt.Errorf("write budget exceeded (%d > %d) while %s app %d", ...)`.
+        assert_eq!(
+            format!("{err}"),
+            "AVM: write budget exceeded (60 > 0) while creating app 1016"
+        );
+    }
+
+    #[test]
+    fn consider_budget_program_writes_accepts_oversized_create_with_enough_io_budget() {
+        // Companion to the rejection test above: the identical oversized
+        // create succeeds once the group supplies enough "io bump" budget
+        // (here, a manually-set `io_budget` standing in for box refs) to
+        // cover the program's extra bytes.
+        let mut store = LedgerState::new();
+        let txn = make_program_txn(0, 0, 50, 10); // creating, total 60 bytes
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 1016;
+        zero_free_program_tier(&mut ctx);
+        ctx.boxes_initialized = true;
+        ctx.io_budget = 60;
+
+        ctx.consider_budget_program_writes().unwrap();
+        assert_eq!(ctx.dirty_bytes, 60);
+        assert_eq!(ctx.update_bytes.get(&1016), Some(&60));
+    }
+
+    #[test]
+    fn consider_budget_program_writes_rejects_oversized_update_with_correct_verb() {
+        let mut store = LedgerState::new();
+        let txn = make_program_txn(77, crate::apply::ON_COMPLETION_UPDATE, 200, 5); // updating, total 205 bytes
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 77;
+        zero_free_program_tier(&mut ctx);
+        ctx.boxes_initialized = true;
+        ctx.io_budget = 100;
+
+        let err = ctx.consider_budget_program_writes().unwrap_err();
+        assert_eq!(
+            format!("{err}"),
+            "AVM: write budget exceeded (205 > 100) while updating app 77"
+        );
+    }
+
+    #[test]
+    fn consider_budget_program_writes_accepts_oversized_update_with_enough_io_budget() {
+        let mut store = LedgerState::new();
+        let txn = make_program_txn(77, crate::apply::ON_COMPLETION_UPDATE, 200, 5);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 77;
+        zero_free_program_tier(&mut ctx);
+        ctx.boxes_initialized = true;
+        ctx.io_budget = 205;
+
+        ctx.consider_budget_program_writes().unwrap();
+    }
+
+    #[test]
+    fn consider_budget_program_writes_exempts_create_and_delete_in_same_txn() {
+        // go: `if creating && deleting { return nil }` -- the program never
+        // gets written, so no budget check applies regardless of size or
+        // available io_budget.
+        let mut store = LedgerState::new();
+        let txn = make_program_txn(0, crate::apply::ON_COMPLETION_DELETE, 9_999, 9_999);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 5;
+        zero_free_program_tier(&mut ctx);
+        ctx.boxes_initialized = true;
+        ctx.io_budget = 0;
+
+        ctx.consider_budget_program_writes().unwrap();
+        assert_eq!(
+            ctx.dirty_bytes, 0,
+            "exempted call must not touch dirty_bytes"
+        );
+        assert!(ctx.update_bytes.is_empty());
+    }
+
+    #[test]
+    fn consider_budget_program_writes_delete_only_reports_creating_verb() {
+        // go's verb selection literally only branches on `updating`
+        // (`eval.go:561-564`): a delete-only call (not creating, since
+        // ApplicationID != 0, and not updating) still falls through to the
+        // "creating" default. Mirrored exactly, quirk and all.
+        let mut store = LedgerState::new();
+        let txn = make_program_txn(77, crate::apply::ON_COMPLETION_DELETE, 200, 5);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 77;
+        zero_free_program_tier(&mut ctx);
+        ctx.boxes_initialized = true;
+        ctx.io_budget = 0;
+
+        let err = ctx.consider_budget_program_writes().unwrap_err();
+        assert_eq!(
+            format!("{err}"),
+            "AVM: write budget exceeded (205 > 0) while creating app 77"
+        );
+    }
+
+    #[test]
+    fn consider_budget_program_writes_is_noop_for_noop_call() {
+        // Neither creating, updating, nor deleting -- a plain NoOp call must
+        // never consult (or mutate) the write budget, matching go's early
+        // `if !creating && !updating && !deleting { return nil }`.
+        let mut store = LedgerState::new();
+        let txn = make_program_txn(77, 0, 9_999, 9_999); // OnCompletion NoOp
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 77;
+        zero_free_program_tier(&mut ctx);
+        ctx.boxes_initialized = true;
+        ctx.io_budget = 0;
+
+        ctx.consider_budget_program_writes().unwrap();
+        assert_eq!(ctx.dirty_bytes, 0);
+        assert!(ctx.update_bytes.is_empty());
+    }
+
+    #[test]
+    fn consider_budget_program_writes_second_call_undoes_prior_contribution() {
+        // A later create/update/delete call against the *same* app within
+        // the group must first subtract its own previously-recorded
+        // contribution before folding in the new one -- matching go's
+        // `oldSize := cx.available.updateBytes[cx.appID];
+        // cx.available.dirtyBytes = basics.SubSaturate(...)`. Otherwise a
+        // shrinking update (or repeated evaluation of the same app within a
+        // group) would double-count bytes that were already charged.
+        let mut store = LedgerState::new();
+        let txn = make_program_txn(0, 0, 100, 0); // creating, 100 bytes
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 9;
+        zero_free_program_tier(&mut ctx);
+        ctx.boxes_initialized = true;
+        ctx.io_budget = 1_000;
+        ctx.consider_budget_program_writes().unwrap();
+        assert_eq!(ctx.dirty_bytes, 100);
+
+        // Same app, now updating with a smaller program (40 bytes): the
+        // stale 100-byte contribution must be undone first, leaving
+        // dirty_bytes at 40, not 140.
+        ctx.group[0].txn.on_completion = crate::apply::ON_COMPLETION_UPDATE;
+        ctx.group[0].txn.application_id = 9;
+        ctx.group[0].txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![0u8; 40]));
+        ctx.group[0].txn.clear_state_program = Some(serde_bytes::ByteBuf::from(vec![]));
+        ctx.consider_budget_program_writes().unwrap();
+        assert_eq!(
+            ctx.dirty_bytes, 40,
+            "stale contribution from the prior create must be undone before adding the new one"
+        );
+        assert_eq!(ctx.update_bytes.get(&9), Some(&40));
     }
 }
