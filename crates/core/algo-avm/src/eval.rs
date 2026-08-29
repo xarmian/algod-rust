@@ -13,7 +13,7 @@ use algo_types::{Address, SignedTransaction, TealValue};
 use crate::bytecode;
 use crate::context::AvmContext;
 use crate::group::GroupBudget;
-use crate::machine::{AvmMachine, ExecMode, OpcodeCoverage};
+use crate::machine::{AvmMachine, AvmValue, ExecMode, OpcodeCoverage};
 use crate::tracer::{EvalTracer, ProgramType};
 
 /// SHA-512/256 hash of program bytes, matching go-algorand's
@@ -69,6 +69,31 @@ pub struct AvmResult {
     pub error: Option<String>,
     /// Opcode coverage from this execution run.
     pub coverage: OpcodeCoverage,
+    /// The program's final scratch-space contents (all 256 slots), as left
+    /// behind when execution stopped -- whether by clean completion,
+    /// rejection, or runtime error. Mirrors go-algorand's `cx.Scratch`,
+    /// which a later sibling's `gload`/`gloads`/`gloadss` reads via
+    /// `cx.pastScratch[groupIndex]` (`data/transactions/logic/eval.go`): the
+    /// pointer is live and reflects whatever `store`/`stores` wrote up to
+    /// the point execution stopped, not just a successful run's final
+    /// state. Callers that thread real cross-transaction `gload` values
+    /// (`algo_ledger::apply`) read this field instead of substituting a
+    /// zero-filled placeholder.
+    pub scratch: [TealValue; 256],
+}
+
+/// Snapshot an `AvmMachine`'s scratch space into `TealValue`s for storage
+/// outside the machine (e.g. in `AvmResult`, for cross-transaction `gload`).
+fn scratch_snapshot(scratch: &[AvmValue]) -> [TealValue; 256] {
+    std::array::from_fn(|i| match &scratch[i] {
+        AvmValue::Uint64(v) => TealValue::Uint(*v),
+        AvmValue::Bytes(b) => TealValue::Bytes(b.clone()),
+    })
+}
+
+/// An all-zero scratch row, matching a fresh machine's initial scratch space.
+fn empty_scratch() -> [TealValue; 256] {
+    std::array::from_fn(|_| TealValue::Uint(0))
 }
 
 impl AvmResult {
@@ -82,6 +107,7 @@ impl AvmResult {
             approved: false,
             error: None,
             coverage: OpcodeCoverage::default(),
+            scratch: empty_scratch(),
         }
     }
 }
@@ -123,6 +149,7 @@ pub fn run_approval_program(
             budget.consume(cost_used)?;
 
             let coverage = machine.opcode_coverage();
+            let scratch = scratch_snapshot(&machine.scratch);
             // Extract accumulated state from the context into the result.
             let result = AvmResult {
                 global_delta: ctx.take_global_delta(),
@@ -132,6 +159,7 @@ pub fn run_approval_program(
                 approved: pass,
                 error: None,
                 coverage,
+                scratch,
             };
             Ok(result)
         }
@@ -147,8 +175,11 @@ pub fn run_approval_program(
             // go-algorand's per-opcode `saveEvalDelta` (tracer.go): the
             // ledger never applies a rejected/erroring app call, but the
             // caller (notably simulation) still needs visibility into the
-            // partial EvalDelta observed up to the point of failure.
+            // partial EvalDelta observed up to the point of failure. The
+            // scratch snapshot is preserved the same way, for the same
+            // reason `gload` sees it (see the `scratch` field doc).
             let coverage = machine.opcode_coverage();
+            let scratch = scratch_snapshot(&machine.scratch);
             let result = AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
@@ -157,6 +188,7 @@ pub fn run_approval_program(
                 approved: false,
                 error: Some(e.to_string()),
                 coverage,
+                scratch,
             };
             Ok(result)
         }
@@ -202,6 +234,7 @@ pub fn run_clear_state_program(
     match machine.run(ctx) {
         Ok(true) => {
             let coverage = machine.opcode_coverage();
+            let scratch = scratch_snapshot(&machine.scratch);
             // Program approved — extract accumulated state from the context.
             AvmResult {
                 global_delta: ctx.take_global_delta(),
@@ -211,13 +244,18 @@ pub fn run_clear_state_program(
                 approved: true,
                 error: None,
                 coverage,
+                scratch,
             }
         }
         Ok(false) => {
             // Program cleanly rejected: return empty result with no
             // deltas/logs/inner txns (caller handles local state clearing).
+            // The scratch space is still real -- `gload` visibility into a
+            // sibling's writes doesn't depend on that sibling's ClearState
+            // program actually approving (see the `scratch` field doc).
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
+            result.scratch = scratch_snapshot(&machine.scratch);
             result
         }
         Err(e) => {
@@ -232,9 +270,12 @@ pub fn run_clear_state_program(
             // them, so it never hits the tracer's per-opcode EvalDelta
             // substitution — a clear-state failure's `ApplyData.EvalDelta`
             // is empty in go-algorand's simulate response too, both for a
-            // clean reject and a runtime error.
+            // clean reject and a runtime error. Scratch space is unaffected
+            // by this EvalDelta-suppression rule -- see the `scratch` field
+            // doc.
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
+            result.scratch = scratch_snapshot(&machine.scratch);
             result.error = Some(e.to_string());
             result
         }
@@ -339,6 +380,7 @@ pub fn run_approval_program_with_tracer(
             tracer.record_program_cost(ProgramType::Approval, machine.cost);
 
             let coverage = machine.opcode_coverage();
+            let scratch = scratch_snapshot(&machine.scratch);
             let result = AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
@@ -347,6 +389,7 @@ pub fn run_approval_program_with_tracer(
                 approved: pass,
                 error: None,
                 coverage,
+                scratch,
             };
             Ok(result)
         }
@@ -361,6 +404,7 @@ pub fn run_approval_program_with_tracer(
             // Preserve partial state accumulated before the failing opcode
             // (see the matching comment in the non-tracer variant above).
             let coverage = machine.opcode_coverage();
+            let scratch = scratch_snapshot(&machine.scratch);
             let result = AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
@@ -369,6 +413,7 @@ pub fn run_approval_program_with_tracer(
                 approved: false,
                 error: Some(msg),
                 coverage,
+                scratch,
             };
             Ok(result)
         }
@@ -418,6 +463,7 @@ pub fn run_clear_state_program_with_tracer(
             tracer.after_program(ProgramType::ClearState, true, None);
             tracer.record_program_cost(ProgramType::ClearState, machine.cost);
             let coverage = machine.opcode_coverage();
+            let scratch = scratch_snapshot(&machine.scratch);
             AvmResult {
                 global_delta: ctx.take_global_delta(),
                 local_deltas: ctx.take_local_deltas(),
@@ -426,13 +472,18 @@ pub fn run_clear_state_program_with_tracer(
                 approved: true,
                 error: None,
                 coverage,
+                scratch,
             }
         }
         Ok(false) => {
             tracer.after_program(ProgramType::ClearState, false, None);
             tracer.record_program_cost(ProgramType::ClearState, machine.cost);
+            // Scratch space is real even on clean rejection -- see the
+            // `scratch` field doc and the matching comment in the
+            // non-tracer variant above.
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
+            result.scratch = scratch_snapshot(&machine.scratch);
             result
         }
         Err(e) => {
@@ -443,8 +494,11 @@ pub fn run_clear_state_program_with_tracer(
             // comment in the non-tracer variant above (go-algorand never
             // fails the outer transaction for a ClearState program error, so
             // it never substitutes a partial EvalDelta for this case).
+            // Scratch space is unaffected by that rule -- see the `scratch`
+            // field doc.
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
+            result.scratch = scratch_snapshot(&machine.scratch);
             result.error = Some(msg);
             result
         }
@@ -571,6 +625,7 @@ mod tests {
             approved: true,
             error: None,
             coverage: OpcodeCoverage::default(),
+            scratch: empty_scratch(),
         };
 
         assert!(result.approved);

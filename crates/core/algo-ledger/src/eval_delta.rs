@@ -815,6 +815,7 @@ mod tests {
             approved: true,
             error: None,
             coverage: algo_avm::machine::OpcodeCoverage::default(),
+            scratch: crate::avm_context::default_scratch_row(),
         }
     }
 

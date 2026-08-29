@@ -1548,6 +1548,7 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
 
     let group_refs: Vec<&SignedTransaction> = vec![&clear_state, &reader_call];
     let ran_program = RefCell::new(vec![false; group_refs.len()]);
+    let scratch = RefCell::new(vec![None; group_refs.len()]);
     let mut budget = GroupBudget::new(1);
 
     // Index 0: ClearState against the deleted app succeeds (clearing local
@@ -1557,6 +1558,7 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
         txns: &group_refs,
         index: 0,
         ran_program: &ran_program,
+        scratch: &scratch,
     };
     apply_transaction_with_budget(
         &mut state,
@@ -1577,6 +1579,7 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
         txns: &group_refs,
         index: 1,
         ran_program: &ran_program,
+        scratch: &scratch,
     };
     let result = apply_transaction_with_budget(
         &mut state,
@@ -1593,4 +1596,131 @@ fn test_gload_errors_on_sibling_clear_state_txn_that_never_ran_a_program() {
         msg.contains("gload lookup of txn 0 that did not run a program"),
         "unexpected error message: {msg}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 13. gload must return a sibling's REAL scratch value, not a zero
+//     placeholder (issue #686)
+//
+// Mirrors go-algorand's `cx.pastScratch[cx.groupIndex] = &cx.Scratch`
+// (`data/transactions/logic/eval.go`): a live pointer into the sibling's
+// actual scratch space. A 2-txn group where txn 0's approval program
+// writes a nonzero value to a scratch slot via `store`, and txn 1 reads it
+// via `gload 0 <slot>`, must see the real written value through the real
+// ledger-apply (consensus) path -- not the zero-filled placeholder
+// `seed_avm_scratch_from_group` used to substitute (issue #670 only fixed
+// the "never ran" case, not this one).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_gload_returns_sibling_real_scratch_value_not_zero_placeholder() {
+    use algo_avm::group::GroupBudget;
+    use std::cell::RefCell;
+
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let writer_app_id = 902u64;
+    let reader_app_id = 903u64;
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+    let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+    ctx.mode = ApplyMode::Execute;
+
+    // 1. Create the writer app: `pushint 42; store 5; pushint 1` -- writes
+    // 42 into scratch slot 5, then approves.
+    let mut writer_create = SignedTransaction::default();
+    writer_create.txn.txn_type = "appl".into();
+    writer_create.txn.sender = creator;
+    writer_create.txn.fee = 1_000;
+    writer_create.txn.application_id = 0;
+    writer_create.txn.on_completion = 0; // NoOp
+    writer_create.txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![
+        0x06, // version 6
+        0x81, 0x2a, // pushint 42
+        0x35, 0x05, // store 5
+        0x81, 0x01, // pushint 1 (approve)
+    ]));
+    writer_create.txn.clear_state_program =
+        Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]));
+    writer_create.apply_data_application_id = writer_app_id;
+    apply_transaction_with_budget(&mut state, &writer_create, &ctx, 0, None, None, None).unwrap();
+
+    // 2. Create the reader app with a trivial always-approve program first
+    // (app creation also runs the approval program, and a single-txn group
+    // can never legally `gload` -- every reference is either self or
+    // future -- so the real `gload 0 5` program can't be the creation
+    // program itself), then update it in-place to the real program:
+    // `gload 0 5; pushint 42; ==` -- approves iff sibling index 0's
+    // scratch slot 5 really equals 42.
+    let reader_create = appl_create_txn(creator, 1_000, reader_app_id, 0);
+    apply_transaction_with_budget(&mut state, &reader_create, &ctx, 0, None, None, None).unwrap();
+
+    let mut reader_update = appl_update_txn(creator, 1_000, reader_app_id);
+    reader_update.txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![
+        0x06, // version 6
+        0x3a, 0x00, 0x05, // gload 0 5
+        0x81, 0x2a, // pushint 42
+        0x12, // ==
+    ]));
+    apply_transaction_with_budget(&mut state, &reader_update, &ctx, 0, None, None, None).unwrap();
+
+    // 3. Build the 2-txn atomic group: [0] call writer app, [1] call reader app.
+    let mut writer_call = SignedTransaction::default();
+    writer_call.txn.txn_type = "appl".into();
+    writer_call.txn.sender = creator;
+    writer_call.txn.fee = 1_000;
+    writer_call.txn.application_id = writer_app_id;
+    writer_call.txn.on_completion = 0; // NoOp
+
+    let mut reader_call = SignedTransaction::default();
+    reader_call.txn.txn_type = "appl".into();
+    reader_call.txn.sender = creator;
+    reader_call.txn.fee = 1_000;
+    reader_call.txn.application_id = reader_app_id;
+    reader_call.txn.on_completion = 0; // NoOp
+
+    let group_refs: Vec<&SignedTransaction> = vec![&writer_call, &reader_call];
+    let ran_program = RefCell::new(vec![false; group_refs.len()]);
+    let scratch = RefCell::new(vec![None; group_refs.len()]);
+    let mut budget = GroupBudget::new(2);
+
+    // Index 0: writer app call -- stores 42 in scratch slot 5, approves.
+    let gi0 = GroupInfo {
+        txns: &group_refs,
+        index: 0,
+        ran_program: &ran_program,
+        scratch: &scratch,
+    };
+    apply_transaction_with_budget(
+        &mut state,
+        &writer_call,
+        &ctx,
+        0,
+        Some(&mut budget),
+        Some(&gi0),
+        None,
+    )
+    .unwrap();
+
+    // Index 1: reader app call -- `gload 0 5` must see the REAL value (42)
+    // the writer wrote, not a zero placeholder. Before the fix, this
+    // returned 0, `0 == 42` was false, and the reader program rejected the
+    // transaction (an `Err` here, silently wrong rather than a stub
+    // error).
+    let gi1 = GroupInfo {
+        txns: &group_refs,
+        index: 1,
+        ran_program: &ran_program,
+        scratch: &scratch,
+    };
+    apply_transaction_with_budget(
+        &mut state,
+        &reader_call,
+        &ctx,
+        0,
+        Some(&mut budget),
+        Some(&gi1),
+        None,
+    )
+    .expect("gload must see the sibling's real scratch value (42), not a zero placeholder");
 }

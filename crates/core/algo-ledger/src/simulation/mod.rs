@@ -509,8 +509,11 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         // Shared across the whole simulated group so `gload`/`gloads`/
         // `gloadss` can tell whether an earlier sibling actually ran a
-        // program (see `apply::GroupInfo::ran_program`).
+        // program (see `apply::GroupInfo::ran_program`) and read back the
+        // real values it wrote (see `apply::GroupInfo::scratch`, issue
+        // #686).
         let ran_program = std::cell::RefCell::new(vec![false; eval_group.len()]);
+        let scratch = std::cell::RefCell::new(vec![None; eval_group.len()]);
 
         for i in 0..eval_group.len() {
             apply_ctx.txn_index.set(i);
@@ -532,6 +535,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     txns: &group_refs,
                     index: i,
                     ran_program: &ran_program,
+                    scratch: &scratch,
                 };
                 apply_transaction_with_budget(
                     self.store,

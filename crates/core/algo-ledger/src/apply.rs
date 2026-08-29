@@ -11,7 +11,7 @@ use algo_error::AlgoError;
 use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{
     AccountStatus, Address, AppLocalState, AppParams, AssetHolding, AssetParams, AssetParamsRecord,
-    Block, Round, SignedTransaction,
+    Block, Round, SignedTransaction, TealValue,
 };
 use sha2::{Digest, Sha512_256};
 
@@ -1292,14 +1292,17 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
 ) -> Result<(), AlgoError> {
     // Shared across every member of this atomic group so `gload`/`gloads`/
     // `gloadss` in a later transaction can see whether an earlier sibling
-    // actually ran a program (see `GroupInfo::ran_program`).
+    // actually ran a program (see `GroupInfo::ran_program`) and read back
+    // the real values it wrote (see `GroupInfo::scratch`).
     let ran_program = RefCell::new(vec![false; group.len()]);
+    let scratch = RefCell::new(vec![None; group.len()]);
     for (gi_idx, stx) in group.iter().enumerate() {
         ctx.txn_index.set(*global_txn_idx);
         let gi = GroupInfo {
             txns: group,
             index: gi_idx,
             ran_program: &ran_program,
+            scratch: &scratch,
         };
         if stx.txn.txn_type == "appl" {
             // Fresh per-call re-borrow via explicit `match`-bound reborrow.
@@ -2181,21 +2184,39 @@ fn build_avm_group(
 }
 
 /// Seed a freshly-built `LedgerAvmContext`'s scratch view from the group's
-/// shared `ran_program` record, so `gload`/`gloads`/`gloadss` can see which
-/// earlier siblings already ran a program. Each such sibling gets a
-/// zero-filled placeholder row (real per-slot cross-transaction scratch
-/// values are not yet threaded through the consensus apply path -- see
-/// issue tracking that gap); a sibling that never ran (or hasn't executed
-/// yet) is left `None`, which `gload` reports as an explicit error rather
-/// than a default/garbage value.
+/// shared `ran_program`/`scratch` record, so `gload`/`gloads`/`gloadss` can
+/// see which earlier siblings already ran a program and read back the real
+/// per-slot values those siblings' `store`/`stores` wrote (issue #686;
+/// mirrors go-algorand's `cx.pastScratch[cx.groupIndex] = &cx.Scratch`,
+/// `data/transactions/logic/eval.go`, which is a live pointer into the
+/// sibling's actual scratch space, not a placeholder). A sibling that never
+/// ran (or hasn't executed yet) is left `None`, which `gload` reports as an
+/// explicit error rather than a default/garbage value.
+///
+/// Gated on `ran_program` rather than `scratch` alone: `ran_program[idx]` is
+/// set the instant that sibling's evaluation *starts* (matching
+/// go-algorand's ordering), while `scratch[idx]` is only populated once
+/// that evaluation *returns* a result. A sibling that started but hit a
+/// hard pre-execution error (e.g. failed the program-version-ceiling
+/// check) before producing an `AvmResult` -- practically unreachable in a
+/// valid block, since such a transaction would fail validation before
+/// reaching group apply -- still falls back to an all-zero row rather than
+/// an erroring `None`, matching `cx.Scratch`'s zero-initialized state at
+/// the point go-algorand sets the `pastScratch` pointer.
 fn seed_avm_scratch_from_group<L: crate::store_trait::LedgerStore>(
     avm_ctx: &mut LedgerAvmContext<'_, L>,
     group_info: Option<&GroupInfo<'_>>,
 ) {
     if let Some(gi) = group_info {
-        for (idx, ran) in gi.ran_program.borrow().iter().enumerate() {
-            if *ran && idx < avm_ctx.scratch.len() {
-                avm_ctx.scratch[idx] = Some(crate::avm_context::default_scratch_row());
+        let ran = gi.ran_program.borrow();
+        let recorded = gi.scratch.borrow();
+        for idx in 0..avm_ctx.scratch.len().min(ran.len()) {
+            if ran[idx] {
+                avm_ctx.scratch[idx] = Some(
+                    recorded[idx]
+                        .clone()
+                        .unwrap_or_else(crate::avm_context::default_scratch_row),
+                );
             }
         }
     }
@@ -2213,6 +2234,20 @@ fn seed_avm_scratch_from_group<L: crate::store_trait::LedgerStore>(
 fn mark_group_member_ran(group_info: Option<&GroupInfo<'_>>) {
     if let Some(gi) = group_info {
         gi.ran_program.borrow_mut()[gi.index] = true;
+    }
+}
+
+/// Record this group member's *real* final scratch space, once its program
+/// has actually run (approved, rejected, or errored -- see `AvmResult::
+/// scratch`'s doc for why all three cases still carry real data), so a
+/// later sibling's `gload`/`gloads`/`gloadss` reads what this transaction
+/// actually wrote via `store`/`stores` rather than a zero-filled
+/// placeholder (issue #686). Call this immediately after the program run
+/// that produced `result`, alongside `mark_group_member_ran` (which is
+/// called *before* the run to match go-algorand's ordering).
+fn record_group_member_scratch(group_info: Option<&GroupInfo<'_>>, scratch: &[TealValue; 256]) {
+    if let Some(gi) = group_info {
+        gi.scratch.borrow_mut()[gi.index] = Some(scratch.clone());
     }
 }
 
@@ -2292,6 +2327,17 @@ pub struct GroupInfo<'a> {
     /// scratch view so `gload`/`gloads`/`gloadss` can distinguish "ran" from
     /// "never ran" instead of nil-dereferencing or returning a default value.
     pub ran_program: &'a RefCell<Vec<bool>>,
+    /// Shared, group-wide record of each group member's *real* final
+    /// scratch-space contents, once that member's program has run
+    /// (`scratch[gi]`). Populated by `record_group_member_scratch`
+    /// immediately after a group member's `run_approval_program`/
+    /// `run_clear_state_program` call returns, and read by
+    /// `seed_avm_scratch_from_group` to seed each subsequent sibling's
+    /// `LedgerAvmContext::scratch` with the actual values earlier siblings
+    /// wrote via `store`/`stores` -- not a zero-filled placeholder (issue
+    /// #686). `None` until that index's program has run, matching
+    /// `ran_program`.
+    pub scratch: &'a RefCell<Vec<Option<[TealValue; 256]>>>,
 }
 
 /// Apply a single signed transaction with a group budget for AVM execution.
@@ -3730,6 +3776,10 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     } else {
                         run_clear_state_program(&clear_program, &mut avm_ctx, &ctx.consensus)
                     };
+                    // Record this clear-state program's real final scratch
+                    // space so a sibling's `gload` sees the actual values
+                    // written, not a zero-filled placeholder (issue #686).
+                    record_group_member_scratch(group_info, &result.scratch);
                     // Propagate updated counters back to context.
                     ctx.txn_counter.set(avm_ctx.txn_counter);
                     ctx.fee_credit.set(avm_ctx.fee_credit);
@@ -3822,6 +3872,12 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 } else {
                     run_approval_program(&approval_program, &mut avm_ctx, budget)?
                 };
+                // Record this approval program's real final scratch space
+                // so a sibling's `gload` sees the actual values written,
+                // not a zero-filled placeholder (issue #686) -- regardless
+                // of whether this program approved, rejected, or errored
+                // (see `AvmResult::scratch`'s doc).
+                record_group_member_scratch(group_info, &result.scratch);
 
                 // Propagate updated counters back to context.
                 ctx.txn_counter.set(avm_ctx.txn_counter);
