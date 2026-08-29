@@ -3772,9 +3772,10 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     // gate (`data/transactions/logic/eval.go:1275-1344`),
                     // which runs unconditionally before a single opcode
                     // executes -- regardless of whether the clear-state
-                    // program ever touches a box. Under V41's
-                    // `EnableBareBudgetError = true` (set at V38 and never
-                    // reverted), this failure is a bare error, not a
+                    // program ever touches a box. Under go-algorand's
+                    // `EnableBareBudgetError = true` (set at V38, current
+                    // through this repo's V42 pin and never reverted), this
+                    // failure is a bare error, not a
                     // `logic.EvalError` -- so unlike an ordinary
                     // ClearState-program rejection/error, it is NOT swallowed
                     // by `ledger/apply/application.go`'s
