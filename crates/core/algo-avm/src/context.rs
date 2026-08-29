@@ -362,6 +362,17 @@ pub trait AvmContext {
         false
     }
 
+    /// `EnablePrecheckECDSACurve` (go-algorand v38+, `config/consensus.go`):
+    /// the `ecdsa_verify` opcode bails early, returning `false`, if the
+    /// supplied Secp256r1 public key is not on the curve, instead of
+    /// (pre-fix) proceeding directly to signature verification with a
+    /// possibly-invalid point. Defaults to `true` (the modern/always-fixed
+    /// behavior) so stub/test contexts that don't wire consensus params get
+    /// the safe, current behavior.
+    fn enable_precheck_ecdsa_curve(&self) -> bool {
+        true
+    }
+
     /// Read a field from the last submitted inner transaction.
     fn last_itxn_field(
         &self,
