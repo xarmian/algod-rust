@@ -634,7 +634,21 @@ pub fn lookup(byte: u8) -> Option<&'static OpSpec> {
 /// raw program bytes; this function instead re-resolves an already-decoded
 /// [`crate::bytecode::Instruction`]'s two fields.
 pub fn resolve_spec(opcode_byte: u8, sub_opcode: Option<u8>) -> Option<&'static OpSpec> {
-    let top = lookup(opcode_byte)?;
+    resolve_spec_in(&OPCODE_TABLE, opcode_byte, sub_opcode)
+}
+
+/// Same as [`resolve_spec`], but against an explicit table. Exists so tests
+/// (in this module and in `machine.rs`) can exercise the prefix/sub-opcode
+/// resolution logic used by cost-charging against a private table with a
+/// deliberately mismatched sub-opcode cost, without needing a real
+/// cost-mismatched multi-byte family registered in the production
+/// [`OPCODE_TABLE`] (mirrors the [`resolve`]/[`resolve_in`] split above).
+pub(crate) fn resolve_spec_in(
+    table: &[Option<OpSpec>; 256],
+    opcode_byte: u8,
+    sub_opcode: Option<u8>,
+) -> Option<&OpSpec> {
+    let top = table[opcode_byte as usize].as_ref()?;
     match (top.sub_ops, sub_opcode) {
         (Some(subs), Some(sub)) => subs.get(sub as usize).and_then(|o| o.as_ref()),
         _ => Some(top),
