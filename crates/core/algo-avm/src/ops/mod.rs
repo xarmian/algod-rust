@@ -101,7 +101,7 @@ pub fn dispatch(
         0x02 => crypto::op_keccak256(machine, instruction),
         0x03 => crypto::op_sha512_256(machine, instruction),
         0x04 => crypto::op_ed25519verify(machine, instruction, ctx),
-        0x05 => crypto::op_ecdsa_verify(machine, instruction),
+        0x05 => crypto::op_ecdsa_verify(machine, instruction, ctx),
         0x06 => crypto::op_ecdsa_pk_decompress(machine, instruction),
         0x07 => crypto::op_ecdsa_pk_recover(machine, instruction),
 

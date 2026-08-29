@@ -592,6 +592,67 @@ pub struct ConsensusParams {
     /// Maximum permissible `UpgradeDelay` for a new proposal, inclusive
     /// (Go: `MaxUpgradeWaitRounds`, v22+; zero before that).
     pub max_upgrade_wait_rounds: u64,
+
+    // ── Rewards fixes (historical-replay correctness) ───────────
+    /// Fix the rewards calculation by avoiding subtracting too much from the
+    /// rewards pool: the outstanding `RewardsResidue` counts against what the
+    /// pool may spend when the rate refreshes (Go: `PendingResidueRewards`,
+    /// v18+). Before v18, only `MinBalance` was reserved, not
+    /// `MinBalance + RewardsResidue`.
+    pub pending_residue_rewards: bool,
+    /// Update the *genesis* rewards-rate calculation to take the reward
+    /// pool's minimum balance into account (Go: `InitialRewardsRateCalculation`,
+    /// v26+): `(poolBalance - MinBalance) / RewardsRateRefreshInterval`
+    /// instead of `poolBalance / RewardsRateRefreshInterval`. Baked once into
+    /// the genesis block's `RewardsRate`, so it only matters for historical
+    /// replay of a chain whose genesis predates v26 (this never changes
+    /// after genesis is created).
+    pub initial_rewards_rate_calculation: bool,
+    /// When the rewards rate refreshes at a recalculation round, use the
+    /// freshly-refreshed rate immediately for that same round's level
+    /// advance, rather than the previous round's rate (Go:
+    /// `RewardsCalculationFix`, v31+).
+    pub rewards_calculation_fix: bool,
+
+    // ── Inner transaction IDs (historical-replay correctness) ────
+    /// Enables a consistent, unified way of computing inner transaction IDs
+    /// that is correctly recursive through multiple levels of nesting (Go:
+    /// `UnifyInnerTxIDs`, v34+). Before v34, a nested (2+ levels deep) inner
+    /// transaction's ID was derived from its immediate parent's *raw* txn
+    /// hash rather than that parent's own correctly-computed (possibly
+    /// itself-nested) ID.
+    pub unify_inner_tx_ids: bool,
+
+    // ── Account existence (live semantics) ───────────────────────
+    /// Ensures that accounts with no balance (so they don't even "exist")
+    /// can still be a transaction sender without being forced into
+    /// existence by a rewards-bookkeeping write: avoids persisting a
+    /// rewards-base update to an account that has zero balance and whose
+    /// balance this transaction leaves unchanged (Go: `UnfundedSenders`,
+    /// v34+).
+    pub unfunded_senders: bool,
+
+    // ── ECDSA precheck (historical-replay correctness) ───────────
+    /// The `ecdsa_verify` opcode bails early, returning `false`, if the
+    /// supplied Secp256r1 public key is not on the curve, instead of
+    /// (pre-fix) proceeding directly to signature verification with a
+    /// possibly-invalid point (Go: `EnablePrecheckECDSACurve`, v38+).
+    pub enable_precheck_ecdsa_curve: bool,
+
+    // ── Low-resource-ID restrictions (live-acceptance risk) ──────
+    /// Forbids AVM opcodes from resolving asset/application IDs <= 255 (to
+    /// reduce ambiguity with slot-index references), and raises the first
+    /// asset/app ID allocated on a new chain's genesis to 1001 (Go:
+    /// `AppForbidLowResources`, v38+).
+    pub app_forbid_low_resources: bool,
+
+    // ── State proofs (live-acceptance risk) ──────────────────────
+    /// Bound on how many online accounts (top-N by normalized balance)
+    /// participate in forming a state proof's voter-commitment vector (Go:
+    /// `StateProofTopVoters`, v34+ = 1024). Zero means state proofs are not
+    /// yet consensus-active for this version (matches `state_proof_interval
+    /// == 0`).
+    pub state_proof_top_voters: u64,
 }
 
 impl ConsensusParams {
@@ -809,6 +870,14 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         default_upgrade_wait_rounds: 10_000,
         min_upgrade_wait_rounds: 0,
         max_upgrade_wait_rounds: 0,
+        pending_residue_rewards: false,
+        initial_rewards_rate_calculation: false,
+        rewards_calculation_fix: false,
+        unify_inner_tx_ids: false,
+        unfunded_senders: false,
+        enable_precheck_ecdsa_curve: false,
+        app_forbid_low_resources: false,
+        state_proof_top_voters: 0,
     };
     if version == CONSENSUS_V7 {
         return Some(v7);
@@ -919,6 +988,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v18.max_asset_name_bytes = 32;
     v18.max_asset_unit_name_bytes = 8;
     v18.max_asset_url_bytes = 32;
+    // Go: v18.PendingResidueRewards = true (config/consensus.go:1058).
+    v18.pending_residue_rewards = true;
     if version == CONSENSUS_V18 {
         return Some(v18);
     }
@@ -1003,6 +1074,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     let mut v26 = v25.clone();
     v26.logic_sig_version = 3;
     v26.payset_commit = PAYSET_COMMIT_MERKLE;
+    // Go: v26.InitialRewardsRateCalculation = true (config/consensus.go:1213).
+    v26.initial_rewards_rate_calculation = true;
     if version == CONSENSUS_V26 {
         return Some(v26);
     }
@@ -1055,6 +1128,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v31.enable_state_proof_keyreg_check = true;
     v31.max_keyreg_valid_period = 256 * (1 << 16) - 1;
     v31.max_proposed_expired_online_accounts = 32;
+    // Go: v31.RewardsCalculationFix = true (config/consensus.go:1312).
+    v31.rewards_calculation_fix = true;
     if version == CONSENSUS_V31 {
         return Some(v31);
     }
@@ -1089,6 +1164,11 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     // Go: v34.StateProofStrengthTarget = 256 (config/consensus.go:1308).
     v34.state_proof_strength_target = 256;
     v34.agreement_filter_timeout_period0 = Duration::from_millis(3400);
+    // Go: v34.StateProofTopVoters = 1024, v34.UnifyInnerTxIDs = true,
+    // v34.UnfundedSenders = true (config/consensus.go:1379,1388,1392).
+    v34.state_proof_top_voters = 1024;
+    v34.unify_inner_tx_ids = true;
+    v34.unfunded_senders = true;
     if version == CONSENSUS_V34 {
         return Some(v34);
     }
@@ -1125,6 +1205,10 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     // online circulation on-demand expiration (config/consensus.go v38)
     v38.exclude_expired_circulation = true;
     v38.enable_box_ref_name_error = true;
+    // Go: v38.EnablePrecheckECDSACurve = true, v38.AppForbidLowResources = true
+    // (config/consensus.go:1446-1447).
+    v38.enable_precheck_ecdsa_curve = true;
+    v38.app_forbid_low_resources = true;
     if version == CONSENSUS_V38 {
         return Some(v38);
     }
@@ -2097,5 +2181,101 @@ mod tests {
                 "{ver} should have credential domain separation"
             );
         }
+    }
+
+    // ── issue #747: historical-replay-correctness fields ────────────────
+
+    #[test]
+    fn test_pending_residue_rewards_v18_activation() {
+        assert!(
+            !consensus_params_for_version(CONSENSUS_V17)
+                .unwrap()
+                .pending_residue_rewards
+        );
+        assert!(
+            consensus_params_for_version(CONSENSUS_V18)
+                .unwrap()
+                .pending_residue_rewards
+        );
+        assert!(
+            consensus_params_for_version(CONSENSUS_V41)
+                .unwrap()
+                .pending_residue_rewards
+        );
+    }
+
+    #[test]
+    fn test_initial_rewards_rate_calculation_v26_activation() {
+        assert!(
+            !consensus_params_for_version(CONSENSUS_V25)
+                .unwrap()
+                .initial_rewards_rate_calculation
+        );
+        assert!(
+            consensus_params_for_version(CONSENSUS_V26)
+                .unwrap()
+                .initial_rewards_rate_calculation
+        );
+        assert!(
+            consensus_params_for_version(CONSENSUS_V41)
+                .unwrap()
+                .initial_rewards_rate_calculation
+        );
+    }
+
+    #[test]
+    fn test_rewards_calculation_fix_v31_activation() {
+        assert!(
+            !consensus_params_for_version(CONSENSUS_V30)
+                .unwrap()
+                .rewards_calculation_fix
+        );
+        assert!(
+            consensus_params_for_version(CONSENSUS_V31)
+                .unwrap()
+                .rewards_calculation_fix
+        );
+        assert!(
+            consensus_params_for_version(CONSENSUS_V41)
+                .unwrap()
+                .rewards_calculation_fix
+        );
+    }
+
+    #[test]
+    fn test_v34_activation_cluster() {
+        // UnifyInnerTxIDs, UnfundedSenders, StateProofTopVoters all activate
+        // together at v34 (config/consensus.go:1379,1388,1392).
+        let v33 = consensus_params_for_version(CONSENSUS_V33).unwrap();
+        assert!(!v33.unify_inner_tx_ids);
+        assert!(!v33.unfunded_senders);
+        assert_eq!(v33.state_proof_top_voters, 0);
+
+        let v34 = consensus_params_for_version(CONSENSUS_V34).unwrap();
+        assert!(v34.unify_inner_tx_ids);
+        assert!(v34.unfunded_senders);
+        assert_eq!(v34.state_proof_top_voters, 1024);
+
+        let v41 = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        assert!(v41.unify_inner_tx_ids);
+        assert!(v41.unfunded_senders);
+        assert_eq!(v41.state_proof_top_voters, 1024);
+    }
+
+    #[test]
+    fn test_v38_activation_cluster() {
+        // EnablePrecheckECDSACurve, AppForbidLowResources both activate
+        // together at v38 (config/consensus.go:1446-1447).
+        let v37 = consensus_params_for_version(CONSENSUS_V37).unwrap();
+        assert!(!v37.enable_precheck_ecdsa_curve);
+        assert!(!v37.app_forbid_low_resources);
+
+        let v38 = consensus_params_for_version(CONSENSUS_V38).unwrap();
+        assert!(v38.enable_precheck_ecdsa_curve);
+        assert!(v38.app_forbid_low_resources);
+
+        let v41 = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        assert!(v41.enable_precheck_ecdsa_curve);
+        assert!(v41.app_forbid_low_resources);
     }
 }

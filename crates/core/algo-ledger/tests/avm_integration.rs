@@ -159,6 +159,16 @@ fn make_lsig_context<'a>(
     )
 }
 
+/// Consensus params from just before `AppForbidLowResources` (v38+, issue
+/// #747) activates. Several fixtures in this file predate that flag and use
+/// low (<= 255) app/asset ids (e.g. app 42, asset 7) purely for test
+/// convenience; those tests use this to opt out of the low-id resolution
+/// restriction, which has its own dedicated coverage elsewhere.
+fn pre_app_forbid_low_resources_consensus() -> algo_types::ConsensusParams {
+    algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V37)
+        .expect("v37 params")
+}
+
 /// Run a program through the AVM using the given context. Returns Ok(pass/reject).
 fn run_with_context(
     version: u8,
@@ -721,6 +731,11 @@ fn asset_holding_get_balance() {
         },
     );
     let mut ctx = make_context(&mut store, vec![txn]);
+    // This test's fixture uses low (<= 255) app/asset ids for convenience,
+    // predating AppForbidLowResources (v38+, issue #747). Downgrade
+    // consensus so the low-id resolution restriction doesn't fire here --
+    // that restriction is covered by its own dedicated tests.
+    ctx.consensus = pre_app_forbid_low_resources_consensus();
 
     // The opcode: pop account (index), then the asset comes from the immediate field.
     // asset_holding_get (0x70) has a uint8 immediate (holding field index).
@@ -763,6 +778,7 @@ fn asset_holding_get_nonexistent() {
         },
     );
     let mut ctx = make_context(&mut store, vec![txn]);
+    ctx.consensus = pre_app_forbid_low_resources_consensus();
 
     // asset_holding_get returns (value, exists_flag) where exists_flag is on top.
     // If not opted in, exists_flag = 0.
@@ -805,6 +821,7 @@ fn asset_holding_get_frozen() {
         },
     );
     let mut ctx = make_context(&mut store, vec![txn]);
+    ctx.consensus = pre_app_forbid_low_resources_consensus();
 
     let code: &[u8] = &[
         0x81, 0x00, // pushint 0  (account: sender)
@@ -1147,6 +1164,7 @@ fn app_opted_in_check() {
     seed_app(&mut store);
     opt_in_account(&mut store, Address(sender));
     let mut ctx = make_context(&mut store, vec![txn]);
+    ctx.consensus = pre_app_forbid_low_resources_consensus();
 
     // int 0 (sender); int 0 (current app); app_opted_in; return
     let code: &[u8] = &[
@@ -1168,6 +1186,7 @@ fn app_opted_in_false() {
     seed_app(&mut store);
     // Don't opt in the sender.
     let mut ctx = make_context(&mut store, vec![txn]);
+    ctx.consensus = pre_app_forbid_low_resources_consensus();
 
     let code: &[u8] = &[
         0x81, 0x00, // pushint 0  (sender)

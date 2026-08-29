@@ -590,6 +590,7 @@ const SECP256R1_VERSION: u8 = 7;
 pub fn op_ecdsa_verify(
     machine: &mut AvmMachine,
     instruction: &Instruction,
+    ctx: &dyn crate::context::AvmContext,
 ) -> Result<(), AlgoError> {
     let curve_byte = get_uint8(instruction)?;
     let curve = EcdsaCurve::from_u8(curve_byte)?;
@@ -622,7 +623,14 @@ pub fn op_ecdsa_verify(
 
     let result = match curve {
         EcdsaCurve::Secp256k1 => ecdsa_verify_secp256k1(&data, &sig_r, &sig_s, &pk_x, &pk_y),
-        EcdsaCurve::Secp256r1 => ecdsa_verify_secp256r1(&data, &sig_r, &sig_s, &pk_x, &pk_y),
+        EcdsaCurve::Secp256r1 => ecdsa_verify_secp256r1(
+            &data,
+            &sig_r,
+            &sig_s,
+            &pk_x,
+            &pk_y,
+            ctx.enable_precheck_ecdsa_curve(),
+        ),
     };
 
     machine.push(AvmValue::Uint64(if result { 1 } else { 0 }))
@@ -770,16 +778,39 @@ fn ecdsa_verify_secp256k1(
 }
 
 /// Verify ECDSA signature on secp256r1 (P-256 / NIST).
+///
+/// `enable_precheck` mirrors go-algorand's `EnablePrecheckECDSACurve`
+/// consensus flag (v38+, `config/consensus.go`): `data/transactions/logic/
+/// crypto.go` reads `if !cx.Proto.EnablePrecheckECDSACurve ||
+/// secp256r1.IsOnCurve(x, y) { ... verify ... }` -- pre-v38, an off-curve
+/// public key is passed straight to Go's (non-validating) `ecdsa.Verify`;
+/// v38+ bails to `false` immediately without the expensive verify call.
+///
+/// Known limitation: the underlying `p256` crate's safe API
+/// (`AffinePoint::from_encoded_point`) *always* validates that a decoded
+/// point lies on the curve, by design -- there is no supported way to
+/// construct an off-curve `AffinePoint` and feed it through verification
+/// the way pre-fix go-algorand's non-validating `ecdsa.Verify` could. This
+/// means both branches below always reject an off-curve public key,
+/// matching go's v38+ behavior even when asked for the pre-fix path. For
+/// every genuinely on-curve key (i.e. every real signature ever produced by
+/// legitimate key generation, and hence every actual historical
+/// transaction), `enable_precheck` has no effect on the result either way,
+/// so this is a historical-replay gap only for a maliciously-crafted
+/// off-curve point -- tracked as a follow-up rather than fixed here (see
+/// issue tracking this gap in the PR/issue description).
 fn ecdsa_verify_secp256r1(
     data: &[u8],
     sig_r: &[u8],
     sig_s: &[u8],
     pk_x: &[u8],
     pk_y: &[u8],
+    enable_precheck: bool,
 ) -> bool {
     use p256::ecdsa::signature::hazmat::PrehashVerifier;
     use p256::elliptic_curve::sec1::FromEncodedPoint;
     use p256::{AffinePoint, EncodedPoint};
+    let _ = enable_precheck; // see doc comment: both branches validate on-curve today.
 
     // Build the uncompressed point (0x04 || x || y)
     let Some(x_padded) = pad_to_32(pk_x) else {
@@ -2232,6 +2263,40 @@ mod tests {
         );
     }
 
+    /// `EnablePrecheckECDSACurve` (go-algorand v38+, `config/consensus.go`):
+    /// for every genuinely on-curve public key (i.e. every real signature
+    /// produced by legitimate key generation -- the only case any real
+    /// historical transaction could exercise), the flag must have no effect
+    /// on the verify result, in either direction. See the doc comment on
+    /// `ecdsa_verify_secp256r1` for the known limitation that an off-curve
+    /// point can't currently be constructed to test the true divergence.
+    #[test]
+    fn test_ecdsa_verify_secp256r1_precheck_flag_is_a_no_op_for_on_curve_keys() {
+        use p256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
+        let vk = sk.verifying_key();
+        let msg = [0x11u8; 32];
+        let (sig, _recid) = sk.sign_prehash(&msg).unwrap();
+        let sig_bytes = sig.to_bytes();
+        let encoded = vk.to_encoded_point(false);
+        let x = encoded.x().unwrap();
+        let y = encoded.y().unwrap();
+
+        let with_precheck =
+            ecdsa_verify_secp256r1(&msg, &sig_bytes[..32], &sig_bytes[32..], x, y, true);
+        let without_precheck =
+            ecdsa_verify_secp256r1(&msg, &sig_bytes[..32], &sig_bytes[32..], x, y, false);
+        assert!(
+            with_precheck,
+            "v38+ must verify a genuine on-curve signature"
+        );
+        assert_eq!(
+            with_precheck, without_precheck,
+            "the flag must not change the result for a genuinely on-curve key"
+        );
+    }
+
     #[test]
     fn test_ecdsa_verify_secp256r1_version_gating() {
         // Secp256r1 requires version 7+, should fail on version 5
@@ -3153,6 +3218,7 @@ mod tests {
             &high_s_bytes,
             vk.to_encoded_point(false).x().unwrap(),
             vk.to_encoded_point(false).y().unwrap(),
+            true,
         );
         assert!(
             result,
@@ -3238,7 +3304,7 @@ mod tests {
         let (sig_raw, _) = sk.sign_prehash(&data).unwrap();
         let raw_bytes = sig_raw.to_bytes();
         assert!(
-            ecdsa_verify_secp256r1(&data, &raw_bytes[..32], &raw_bytes[32..], x, y),
+            ecdsa_verify_secp256r1(&data, &raw_bytes[..32], &raw_bytes[32..], x, y, true),
             "secp256r1 must verify a signature made over the raw 32-byte data"
         );
 
@@ -3246,7 +3312,7 @@ mod tests {
         let (sig_ph, _) = sk.sign_prehash(&prehashed).unwrap();
         let ph_bytes = sig_ph.to_bytes();
         assert!(
-            !ecdsa_verify_secp256r1(&data, &ph_bytes[..32], &ph_bytes[32..], x, y),
+            !ecdsa_verify_secp256r1(&data, &ph_bytes[..32], &ph_bytes[32..], x, y, true),
             "secp256r1 must NOT verify a signature made over SHA-512/256(data) \
              (would indicate an erroneous application-level prehash; BT-294 class)"
         );

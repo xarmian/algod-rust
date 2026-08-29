@@ -2670,10 +2670,33 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         // Apply rewards to transaction participants only (not snapshot-only addresses).
         let mut total_rewards: u64 = 0;
         for addr in reward_addrs {
-            let mut account = store.get_or_default_account(addr);
+            let account_before = store.get_or_default_account(addr);
+            let mut account = account_before.clone();
             let reward = apply_rewards(&mut account, ctx.rewards_level);
             total_rewards += reward;
-            store.set_account(addr, account);
+
+            // UnfundedSenders (go-algorand v34+, `config/consensus.go`):
+            // don't force a zero-balance account into on-disk existence
+            // merely by bumping its RewardsBase, when this transaction
+            // doesn't otherwise move algos through it. Mirrors go's
+            // `roundCowState.Move` (`ledger/eval/eval.go`), whose
+            // fee-payment call site (`cs.Move(tx.Sender, ep.Specials.FeeSink,
+            // tx.Fee, ...)`, `ledger/eval/eval.go`) writes the sender's
+            // updated account only if
+            // `!amt.IsZero() || fromBal.RewardUnits(...) > 0 ||
+            // !proto.UnfundedSenders`. Scoped here to the sender/fee case,
+            // the one universally-applicable across every txn type (every
+            // transaction's sender pays `txn.fee`, possibly zero under fee
+            // pooling); other reward_addrs roles keep the unconditional
+            // write.
+            let skip_write = ctx.consensus.unfunded_senders
+                && *addr == txn.sender
+                && txn.fee == 0
+                && account_before.micro_algos == 0
+                && reward == 0;
+            if !skip_write {
+                store.set_account(addr, account);
+            }
 
             // Track per-address rewards.
             if *addr == txn.sender {
@@ -2700,22 +2723,22 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         // Dispatch by transaction type and capture InnerApplyData.
         match txn.txn_type.as_str() {
             "pay" => {
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
                 let ad = apply_pay(store, &stx.txn)?;
                 apply_data.closing_amount = ad.closing_amount;
             }
             "acfg" => {
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
                 let ad = apply_acfg(store, &stx.txn, ctx.txn_counter.get())?;
                 apply_data.config_asset = ad.config_asset;
             }
             "axfer" => {
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
                 let ad = apply_axfer(store, &stx.txn)?;
                 apply_data.asset_closing_amount = ad.asset_closing_amount;
             }
             "afrz" => {
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
                 apply_afrz(store, &stx.txn)?;
             }
             "appl" => {
@@ -2756,7 +2779,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 }
             }
             "keyreg" => {
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
                 apply_keyreg(store, &stx.txn, ctx.round, &ctx.consensus)?;
             }
             "hb" => {
@@ -2765,7 +2788,7 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                         message: "heartbeat transaction not supported".to_string(),
                     });
                 }
-                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
                 apply_heartbeat(store, &stx.txn, ctx.round, &ctx.consensus)?;
             }
             other => {
@@ -2846,6 +2869,19 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
         // This tracks which round last modified each account, used by the
         // Merkle trie V6 hash builder as affinity bytes.
         for addr in snapshot_addrs {
+            // UnfundedSenders (v34+): the sender-specific skip-write above
+            // (rewards loop, `apply_fee`) is only meaningful if this
+            // bookkeeping pass doesn't independently force the same
+            // zero-balance sender into existence just to record
+            // `update_round`. Mirrors go's real update-round tracking,
+            // which only ever touches an account that some other write
+            // path actually persisted (`putAccount`) this round.
+            if ctx.consensus.unfunded_senders
+                && *addr == txn.sender
+                && store.get_account(addr).is_none()
+            {
+                continue;
+            }
             let mut account = store.get_or_default_account(addr);
             if account.update_round < ctx.round {
                 account.update_round = ctx.round;
@@ -2863,18 +2899,32 @@ fn apply_fee<L: crate::store_trait::LedgerStore>(
     sender: &Address,
     fee: u64,
     fee_sink: &Address,
+    consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
-    let mut sender_account = store.get_or_default_account(sender);
-    if sender_account.micro_algos < fee {
+    let sender_account_before = store.get_or_default_account(sender);
+    if sender_account_before.micro_algos < fee {
         return Err(AlgoError::Ledger {
             message: format!(
                 "sender {} has insufficient balance {} for fee {}",
-                sender, sender_account.micro_algos, fee,
+                sender, sender_account_before.micro_algos, fee,
             ),
         });
     }
+    let mut sender_account = sender_account_before.clone();
     sender_account.micro_algos -= fee;
-    store.set_account(sender, sender_account);
+    // UnfundedSenders (go-algorand v34+, `config/consensus.go`): mirrors
+    // go's `roundCowState.Move` (`ledger/eval/eval.go`) fee-payment call
+    // site (`cs.Move(tx.Sender, ep.Specials.FeeSink, tx.Fee, ...)`,
+    // `ledger/eval/eval.go`), which writes the sender's updated account only
+    // if `!amt.IsZero() || fromBal.RewardUnits(...) > 0 || !proto.
+    // UnfundedSenders`. A zero-fee transaction from a genuinely
+    // zero-balance sender must not be forced into on-disk existence by
+    // this fee no-op write. Before v34, the write always happens.
+    let skip_write =
+        consensus.unfunded_senders && fee == 0 && sender_account_before.micro_algos == 0;
+    if !skip_write {
+        store.set_account(sender, sender_account);
+    }
 
     let mut fee_sink_account = store.get_or_default_account(fee_sink);
     fee_sink_account.micro_algos += fee;
@@ -3698,7 +3748,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     let mut captured_eval_delta: Option<rmpv::Value> = None;
 
     // Debit fee first.
-    apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+    apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
 
     let is_create = txn.application_id == 0;
     let app_id = if is_create {
@@ -7653,6 +7703,74 @@ mod tests {
             failed_eval_delta: Cell::new(None),
             kv_mods_recorder: None,
         }
+    }
+
+    fn apply_context_for_version(fee_sink: Address, round: u64, version: &str) -> ApplyContext {
+        use algo_types::consensus::consensus_params_for_version;
+        let consensus = consensus_params_for_version(version).expect("known version");
+        ApplyContext {
+            rewards_level: 100,
+            fee_sink,
+            round,
+            mode: ApplyMode::Replay,
+            validate: false,
+            latest_timestamp: 0,
+            genesis_hash: [0u8; 32],
+            txn_counter: Cell::new(0),
+            fee_credit: Cell::new(0),
+            fee_residue: Cell::new(0),
+            txn_index: Cell::new(0),
+            consensus,
+            avm_overrides: Default::default(),
+            failed_eval_delta: Cell::new(None),
+            kv_mods_recorder: None,
+        }
+    }
+
+    /// UnfundedSenders (go-algorand v34+, `config/consensus.go`) activation
+    /// boundary: a zero-balance, zero-fee sender (e.g. a fee-pooled group
+    /// member) must not be forced into on-disk existence merely by a
+    /// rewards-bookkeeping write when the transaction doesn't otherwise move
+    /// algos through it.
+    ///
+    /// Before v34, the write always happens (a bumped `RewardsBase` makes the
+    /// account no longer equal to `AccountData::default()`), which then trips
+    /// the post-transaction min-balance check for a genuinely zero-balance
+    /// account -- this is the actual historical bug `UnfundedSenders` fixes:
+    /// pre-v34, a truly zero-balance account could not act as a transaction
+    /// sender at all, even paying zero fee.
+    #[test]
+    fn unfunded_senders_skips_write_for_zero_balance_zero_fee_sender() {
+        let sender = Address([7u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        // ── Pre-v34: the rewards-bookkeeping write happens unconditionally,
+        // touching the zero-balance sender into existence and tripping the
+        // min-balance check. ──
+        let mut store_pre = LedgerState::new();
+        store_pre.fee_sink = fee_sink;
+        let ctx_pre = apply_context_for_version(fee_sink, 1, algo_types::consensus::CONSENSUS_V33);
+        assert!(!ctx_pre.consensus.unfunded_senders);
+        let txn_pre = pay_txn(sender, Address::default(), 0, 0);
+        let err = apply_transaction(&mut store_pre, &txn_pre, &ctx_pre, 0)
+            .expect_err("pre-v34 must reject a zero-balance sender (min balance violation)");
+        assert!(
+            format!("{err}").contains("below minimum balance"),
+            "unexpected error: {err}"
+        );
+
+        // ── v34+: the write is skipped -- the sender stays fully
+        // non-existent, so the min-balance check never sees it. ──
+        let mut store_post = LedgerState::new();
+        store_post.fee_sink = fee_sink;
+        let ctx_post = apply_context_for_version(fee_sink, 1, algo_types::consensus::CONSENSUS_V34);
+        assert!(ctx_post.consensus.unfunded_senders);
+        let txn_post = pay_txn(sender, Address::default(), 0, 0);
+        apply_transaction(&mut store_post, &txn_post, &ctx_post, 0).expect("apply v34+");
+        assert!(
+            store_post.get_account(&sender).is_none(),
+            "v34+ must leave a zero-balance, zero-fee sender fully unwritten"
+        );
     }
 
     #[test]
