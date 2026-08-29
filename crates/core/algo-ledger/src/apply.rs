@@ -3867,11 +3867,22 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 // `EvalContract` ordering), so a sibling that reads `gload`
                 // on us sees "ran" even if we go on to reject/error.
                 mark_group_member_ran(group_info);
-                let result = if let Some(ref mut t) = tracer {
+                let mut result = if let Some(ref mut t) = tracer {
                     run_approval_program_with_tracer(&approval_program, &mut avm_ctx, budget, *t)?
                 } else {
                     run_approval_program(&approval_program, &mut avm_ctx, budget)?
                 };
+                // Mirrors go-algorand's `EvalContract`
+                // (`data/transactions/logic/eval.go:1353-1358`): `err == nil
+                // && pass` gates `considerBudgetProgramWrites`, and a
+                // failure there flips `pass` to false the same as any other
+                // post-execution rejection (issue #723).
+                if result.approved {
+                    if let Err(e) = avm_ctx.consider_budget_program_writes() {
+                        result.approved = false;
+                        result.error = Some(e.to_string());
+                    }
+                }
                 // Record this approval program's real final scratch space
                 // so a sibling's `gload` sees the actual values written,
                 // not a zero-filled placeholder (issue #686) -- regardless
@@ -4355,6 +4366,11 @@ pub struct BoxBudgetState {
     pub boxes_initialized: bool,
     /// Number of unnamed box ref slots available for newly created apps.
     pub unnamed_access: i64,
+    /// Per-app-ID oversized-program-bytes contribution currently folded
+    /// into `dirty_bytes` (issue #723). Mirrors go-algorand's
+    /// `resources.updateBytes`; see
+    /// `LedgerAvmContext::consider_budget_program_writes`.
+    pub update_bytes: std::collections::HashMap<u64, u64>,
     /// Whether the caller should fold this inner call's family-shared-box
     /// touch mark into its own (issue #662). Already resolved to the
     /// caller-should-touch condition (child touched family-shared state
@@ -9257,6 +9273,191 @@ mod tests {
             delta3.creatables.is_empty(),
             "a pure reconfigure is not a create/destroy transition -- no Creatables entry: {:?}",
             delta3.creatables
+        );
+    }
+
+    // ---- Issue #723: considerBudgetProgramWrites (oversized app-program
+    // create/update gated behind the box I/O write budget) ----
+    //
+    // End-to-end tests through the full apply path (real AVM execution),
+    // complementing the direct unit tests against
+    // `LedgerAvmContext::consider_budget_program_writes` in
+    // `avm_context.rs`'s test module. V41's free program-size tier is
+    // `MaxAppTotalProgramLen(2048) * (1+MaxExtraAppProgramPages(3)) == 8192`
+    // bytes (approval+clear combined); `BytesPerBoxReference == 2048`.
+
+    /// An approving program of (approximately) `payload_len` extra bytes,
+    /// built the same way as `bin/algod-rust/tests/
+    /// live_fee_size_pricing_parity.rs`'s `program_of_len`: a `pushbytes`
+    /// literal immediately `pop`ped, so the padding is real (assembled,
+    /// executable) bytes rather than dead code after a terminator.
+    fn padded_approving_program(payload_len: usize) -> Vec<u8> {
+        // `pushbytes` literals are capped at 4096 bytes each, so split the
+        // padding across as many chunks as needed (each immediately
+        // `pop`ped) rather than one oversized literal.
+        const CHUNK: usize = 3_800;
+        let mut src = "#pragma version 6\n".to_string();
+        let mut remaining = payload_len;
+        while remaining > 0 {
+            let take = remaining.min(CHUNK);
+            src.push_str(&format!("pushbytes 0x{}\npop\n", "00".repeat(take)));
+            remaining -= take;
+        }
+        src.push_str("int 1\nreturn\n");
+        algo_avm::assembler::assemble_string(&src)
+            .expect("padded program must assemble")
+            .program
+    }
+
+    fn trivial_clear_program() -> Vec<u8> {
+        algo_avm::assembler::assemble_string("#pragma version 6\nint 1\nreturn\n")
+            .expect("clear program must assemble")
+            .program
+    }
+
+    #[test]
+    fn issue_723_create_with_oversized_program_and_no_box_refs_is_rejected() {
+        let creator = Address([7u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        let approval = padded_approving_program(8_200); // pushes total well past the 8192-byte free tier
+        let clear = trivial_clear_program();
+        let total_len = approval.len() + clear.len();
+        assert!(
+            total_len > 8_192,
+            "test program must actually exceed V41's free tier, got {total_len}"
+        );
+
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        // No box refs supplied -> io_budget == 0, so any nonzero extra bytes
+        // exceed it immediately.
+
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+
+        let err = apply_block_with_delta_mode(&mut state, &block, ApplyMode::Execute).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("write budget exceeded") && msg.contains("creating app"),
+            "expected a write-budget-exceeded rejection for the oversized create, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn issue_723_create_with_oversized_program_and_enough_box_bumps_is_accepted() {
+        // Companion to the rejection test above: the identical oversized
+        // create succeeds once enough empty ("io bump") box refs are
+        // supplied to cover the program's extra bytes -- matching how
+        // `bin/algod-rust/tests/live_fee_size_pricing_parity.rs`'s
+        // `app_program_size_pricing_boundaries_match_live` works around
+        // this exact gap today.
+        let creator = Address([7u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        let approval = padded_approving_program(8_200);
+        let clear = trivial_clear_program();
+        let total_len = approval.len() + clear.len();
+        let extra = total_len.saturating_sub(8_192);
+        let bumps_needed = extra.div_ceil(2_048); // V41 BytesPerBoxReference
+
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        create.txn.boxes = Some(vec![algo_types::BoxRef::default(); bumps_needed]);
+
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+
+        let delta = apply_block_with_delta_mode(&mut state, &block, ApplyMode::Execute)
+            .expect("enough io-bump box refs must satisfy the write budget");
+        assert_eq!(
+            delta.creatables.len(),
+            1,
+            "app create must succeed and register a creatable"
+        );
+    }
+
+    #[test]
+    fn issue_723_update_with_oversized_program_and_no_box_refs_is_rejected() {
+        let creator = Address([7u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        // Round 1: create a small (well within the free tier) app.
+        let small_approval = trivial_clear_program();
+        let small_clear = trivial_clear_program();
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(small_approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(small_clear));
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let &app_id = delta1
+            .creatables
+            .keys()
+            .next()
+            .expect("app create must register a creatable");
+
+        // Round 2: update it with an oversized program and no box refs.
+        let approval = padded_approving_program(8_200);
+        let clear = trivial_clear_program();
+        let mut update = SignedTransaction::default();
+        update.txn.txn_type = "appl".into();
+        update.txn.sender = creator;
+        update.txn.fee = 10_000;
+        update.txn.application_id = app_id;
+        update.txn.on_completion = ON_COMPLETION_UPDATE;
+        update.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        update.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![update],
+            ..Block::default()
+        };
+
+        let err = apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("write budget exceeded")
+                && msg.contains(&format!("updating app {app_id}")),
+            "expected a write-budget-exceeded rejection for the oversized update, got: {msg}"
         );
     }
 }
