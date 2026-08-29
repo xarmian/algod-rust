@@ -1,3 +1,23 @@
+// Copyright (C) 2019-2026 Algorand Foundation Ltd.
+// Modifications Copyright (C) 2026 Algod DAO
+// This file is part of algod-rust, a modified work based on go-algorand
+// (https://github.com/algorand/go-algorand).
+//
+// algod-rust is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// algod-rust is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with algod-rust.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Crypto opcodes: sha256, keccak256, sha512_256, sha3_256, ed25519verify,
 //! ed25519verify_bare, ecdsa_verify, ecdsa_pk_decompress, ecdsa_pk_recover,
 //! base64_decode, json_ref, vrf_verify, falcon_verify.
@@ -1130,6 +1150,20 @@ fn mimc_miyaguchi_preneel<F: ark_ff::Field>(data: &[F], constants: &[F]) -> F {
 // ---------------------------------------------------------------------------
 // Poseidon2 hash (0xe7, v13+)
 // ---------------------------------------------------------------------------
+//
+// This block (op_poseidon2, poseidon2_bn254, poseidon2_bls12_381,
+// poseidon2_merkle_damgard, poseidon2_permutation, poseidon2_sbox,
+// poseidon2_mat_mul_external, poseidon2_mat_mul_internal, and
+// poseidon2_round_keys, including its MiMC-derived round-key/constant
+// derivation) contains a Rust port of the Poseidon2 permutation
+// implementation from gnark-crypto v0.18.1
+// (github.com/consensys/gnark-crypto), Copyright ConsenSys Software Inc.,
+// licensed under the Apache License, Version 2.0
+// (http://www.apache.org/licenses/LICENSE-2.0). Use of this ported portion
+// is subject to the Apache License, Version 2.0's NOTICE/attribution
+// terms (section 4); this comment carries that attribution forward.
+// See docs/LICENSING.md and docs/LICENSING_AUDIT.md for the full
+// classification and rationale.
 
 /// `poseidon2` (0xe7, v13+): pop bytes, push 32-byte Poseidon2 hash.
 ///
