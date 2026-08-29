@@ -140,8 +140,10 @@ fn mixed_block_grouped_and_ungrouped_passes() {
     let sg2 = wrap_signed(gtxn2);
     let su = wrap_signed(utxn);
 
-    // validate_group_fees should pass for the whole payset
-    // (it only checks grouped txns, skips ungrouped ones).
+    // validate_group_fees should pass for the whole payset: the grouped
+    // pair is checked pooled (usage summed across the group), and the
+    // ungrouped txn is checked as its own singleton group -- it pays
+    // MIN_TXN_FEE, which covers an ordinary transaction on its own.
     let txn_refs: Vec<&SignedTransaction> = vec![&sg1, &sg2, &su];
     validate_group_fees(&txn_refs).expect("mixed block group fees should be valid");
 
@@ -199,11 +201,26 @@ fn fee_pooling_one_below_minimum_fails() {
     );
 }
 
-// ── Test 7: Ungrouped txns skipped by validate_group_fees ─────────────
-
+// ── Test 7: Ungrouped txns are each checked as their own singleton group ──
+//
+// Go's `ledger/eval.go` `CheckGroupFees`/`SummarizeFees` run unconditionally
+// on every top-level txgroup, size-1 (ungrouped) submissions included --
+// there is no "skip when `Group` is zero" carve-out upstream. This
+// function previously treated `group == 0` as "not part of a group, skip
+// the pooled-usage check entirely", which correctly matched the flat
+// per-txn minimum-fee rule for *ordinary* transactions (redundant with
+// `validate_transaction_rules`'s own check) but silently never enforced
+// the size-pricing surcharges that are *only* computed at the group level
+// -- most notably `logic_sig_program_fee_contribution`'s pooled LogicSig
+// program-byte surcharge, which has no other enforcement point for a
+// standalone submission. Confirmed live via issue #703's dual-node
+// testing: a real go-algorand node correctly rejected an ungrouped,
+// underpaid, oversized-LogicSig transaction that algod-rust wrongly
+// accepted because of this exact gap.
 #[test]
-fn validate_group_fees_skips_ungrouped_txns() {
-    // All ungrouped txns — validate_group_fees should return Ok regardless of fee.
+fn validate_group_fees_rejects_underpaid_ungrouped_txns() {
+    // All ungrouped txns, each individually underpaid — each is now its
+    // own size-1 "group" and must independently satisfy its required fee.
     let txn1 = make_txn(0, 100); // no group, zero fee
     let txn2 = make_txn(500, 200); // no group, sub-minimum fee
 
@@ -211,6 +228,25 @@ fn validate_group_fees_skips_ungrouped_txns() {
     let stx2 = wrap_signed(txn2);
     let txn_refs: Vec<&SignedTransaction> = vec![&stx1, &stx2];
 
+    let err = validate_group_fees(&txn_refs).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("ungrouped:"),
+        "expected the singleton group's label to identify it as ungrouped, got: {msg}"
+    );
+}
+
+#[test]
+fn validate_group_fees_accepts_adequately_paid_ungrouped_txns() {
+    // Each ungrouped txn independently pays at least MIN_TXN_FEE: the
+    // singleton-group check must pass for every one of them.
+    let txn1 = make_txn(MIN_TXN_FEE, 100);
+    let txn2 = make_txn(MIN_TXN_FEE, 200);
+
+    let stx1 = wrap_signed(txn1);
+    let stx2 = wrap_signed(txn2);
+    let txn_refs: Vec<&SignedTransaction> = vec![&stx1, &stx2];
+
     validate_group_fees(&txn_refs)
-        .expect("ungrouped txns should be skipped by validate_group_fees");
+        .expect("adequately-paid ungrouped txns should each pass their own singleton check");
 }
