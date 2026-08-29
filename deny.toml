@@ -34,6 +34,16 @@ allow = [
     # data license (attribution/notice-preservation only, no copyleft) — see
     # docs/DEPENDENCY_LICENSES.md.
     "CDLA-Permissive-2.0",
+    # cargo-deny checks first-party workspace crates' own `license` field
+    # against this same allow-list, not just third-party dependencies. Most
+    # of algod-rust's workspace crates are correctly, deliberately licensed
+    # AGPL-3.0-or-later (see docs/LICENSING_AUDIT.md) — this entry lets
+    # those crates pass their own self-check. It is NOT a statement that an
+    # AGPL third-party *dependency* would be fine to pull in: the manual
+    # audit in docs/DEPENDENCY_LICENSES.md confirms zero of the 588
+    # external dependencies are AGPL/GPL-family, and that remains the
+    # substance of this check.
+    "AGPL-3.0-or-later",
 ]
 
 # `ring` (a transitive TLS/crypto dependency) has, for several releases,
