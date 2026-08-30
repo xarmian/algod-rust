@@ -42,6 +42,13 @@
 //! Before the fix, `A` never sends anything beyond forwarding the `TX`
 //! itself, so `C`'s outgoing filter never contains the digest and this test
 //! fails.
+//!
+//! `C`'s outgoing filter is inspected via
+//! `WebsocketNetwork::peer_outgoing_message_filter` (issue #803): each
+//! connection now owns an independent `MessageFilter` instance rather than
+//! the whole network sharing one, so this per-peer accessor (keyed by `C`'s
+//! only peer, `A`'s address) is what actually reflects the state that
+//! `C`'s real connection to `A` consulted/updated.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -148,7 +155,7 @@ async fn hub_broadcasts_digest_skip_to_other_peers_after_processing_large_tx() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen = false;
     while Instant::now() < deadline {
-        if let Some(filter) = net_c.outgoing_message_filter() {
+        if let Some(filter) = net_c.peer_outgoing_message_filter(&a_addr).await {
             // `add=false` — just check, don't mutate the filter, so a
             // retry loop iteration doesn't corrupt the result.
             if filter.check_digest(&digest, false, false) {
