@@ -36,7 +36,9 @@ use async_trait::async_trait;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-use crate::commands::network_common::{genesis_id_for, resolve_unsigned_limit};
+use crate::commands::network_common::{
+    genesis_id_for, resolve_automatic_catchpoint_config, resolve_unsigned_limit,
+};
 
 // ---------------------------------------------------------------------------
 // SqliteLedger-backed block service
@@ -619,6 +621,21 @@ pub async fn run(
 
     let latest = sqlite_ledger.current_round().0;
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
+
+    // Issue #770: automatic interval-driven catchpoint generation, wired
+    // into the live block-apply loop via `commit_block`. A no-op unless
+    // `config.json` resolves `CatchpointTracking`/`CatchpointInterval`/
+    // `CatchpointDir` to an enabled state (see
+    // `resolve_automatic_catchpoint_config`).
+    if let Some(auto_cfg) = resolve_automatic_catchpoint_config(node_config) {
+        info!(
+            interval = auto_cfg.interval,
+            file_history_length = auto_cfg.file_history_length,
+            dir = %auto_cfg.dir.display(),
+            "automatic catchpoint generation enabled"
+        );
+        sqlite_ledger.configure_automatic_catchpoints(Some(auto_cfg));
+    }
 
     // Optional: bootstrap genesis state when the ledger is fresh.
     // Without this the relay's accountbase + accounttotals stay empty

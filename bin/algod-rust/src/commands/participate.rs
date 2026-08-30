@@ -60,7 +60,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::commands::dual_gossip_node;
-use crate::commands::network_common::genesis_id_for;
+use crate::commands::network_common::{genesis_id_for, resolve_automatic_catchpoint_config};
 use crate::commands::p2p_transport::{NetworkMode, P2pOptions, P2pTransport, P2pTransportConfig};
 use crate::config::RestConfig;
 use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
@@ -3153,6 +3153,21 @@ pub async fn run(
         sqlite_ledger
             .vacuum_accounts_database()
             .map_err(|e| anyhow::anyhow!("vacuum accounts database: {e}"))?;
+    }
+
+    // Issue #770: automatic interval-driven catchpoint generation, wired
+    // into the live block-apply loop via `commit_block`. A no-op unless
+    // `config.json` resolves `CatchpointTracking`/`CatchpointInterval`/
+    // `CatchpointDir` to an enabled state (see
+    // `resolve_automatic_catchpoint_config`).
+    if let Some(auto_cfg) = resolve_automatic_catchpoint_config(&node_config) {
+        info!(
+            interval = auto_cfg.interval,
+            file_history_length = auto_cfg.file_history_length,
+            dir = %auto_cfg.dir.display(),
+            "automatic catchpoint generation enabled"
+        );
+        sqlite_ledger.configure_automatic_catchpoints(Some(auto_cfg));
     }
 
     // Reject anything but a fully populated block archive before
