@@ -287,13 +287,28 @@ async fn txn_template(client: &reqwest::Client, base: &str) -> TxnTemplate {
     }
 }
 
+/// go's `MaxTxnLife` (`config/consensus.go`: `1000`, unchanged since v7):
+/// the hard cap on `LastValid - FirstValid` for *any* transaction's own
+/// validity window -- distinct from (and much smaller than) a keyreg's
+/// `VoteFirst`/`VoteLast` participation-key window, which is bounded
+/// separately by `MaxKeyregValidPeriod` (~16.7M rounds). Every
+/// transaction built below must stay within this window regardless of how
+/// far this test advances the chain, since -- unlike the original
+/// `live_online_circulation_expiry.rs`, which runs early enough that a
+/// fixed `[1, 1000]` window suffices for its whole run -- this file
+/// deliberately runs last, so the chain's current round may already be
+/// well past 1000 before this test's own advancement even starts.
+const MAX_TXN_LIFE: u64 = 1000;
+
 impl TxnTemplate {
-    fn base_txn(&self) -> algo_types::Transaction {
+    /// Build a transaction valid starting at `first_valid`, with a window
+    /// capped by [`MAX_TXN_LIFE`].
+    fn base_txn(&self, first_valid: u64) -> algo_types::Transaction {
         algo_types::Transaction {
             sender: dev_address(),
             fee: self.min_fee,
-            first_valid: Round(1),
-            last_valid: Round(1_000_000),
+            first_valid: Round(first_valid),
+            last_valid: Round(first_valid + MAX_TXN_LIFE),
             genesis_id: self.genesis_id.clone(),
             genesis_hash: self.genesis_hash,
             ..Default::default()
@@ -306,7 +321,8 @@ impl TxnTemplate {
 /// exactly one.
 async fn advance_one_round(client: &reqwest::Client, base: &str, tmpl: &TxnTemplate, tag: &str) {
     let sk = dev_signing_key();
-    let mut txn = tmpl.base_txn();
+    let first_valid = current_round(client, base).await;
+    let mut txn = tmpl.base_txn(first_valid);
     txn.txn_type = TxnType::Pay;
     txn.receiver = dev_address();
     txn.amount = 0;
@@ -417,7 +433,7 @@ async fn voters_commitment_matches_independent_recomputation_from_live_state() {
         let round_at_keyreg = current_round(&c, &base).await;
         let vote_first = 1u64;
         let vote_last = round_at_keyreg + 5_000;
-        let mut keyreg = tmpl.base_txn();
+        let mut keyreg = tmpl.base_txn(round_at_keyreg);
         keyreg.txn_type = TxnType::Keyreg;
         keyreg.vote_pk = Some([0x11u8; 32]);
         keyreg.selection_pk = Some([0x22u8; 32]);
