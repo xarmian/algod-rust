@@ -1,6 +1,6 @@
 {
   "source": "algod-rust/tools/rewards-innertxid-oracle (issue #760)",
-  "go_algorand_pin": "unknown (unpinned)",
+  "go_algorand_pin": "v5.0.0-stable",
   "rewards_vectors": [
     {
       "version": "v10",
