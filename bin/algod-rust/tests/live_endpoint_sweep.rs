@@ -157,7 +157,11 @@ async fn assert_status_parity(path: &str, token: &str) {
 async fn account_assets_list_and_experimental_disabled_on_both() {
     // `docker/localnet-rust/data/config.json` doesn't set
     // `EnableExperimentalAPI`, so `/v2/experimental` must be consistently
-    // disabled (or consistently enabled) on both nodes.
+    // disabled (or consistently enabled) on both nodes. Note `node start`
+    // (issue #757) only wires `EndpointAddress`/`DNSBootstrapID`/
+    // `EnableDeveloperAPI` from this file so far — `EnableExperimentalAPI`
+    // stays hardcoded false on the algod-rust side regardless of the file,
+    // same as go's own field-absent default.
     //
     // `/v2/accounts/{address}/assets` is asserted separately: go-algorand
     // v4.6.0-stable (PR #6559) unconditionally serves this endpoint (no

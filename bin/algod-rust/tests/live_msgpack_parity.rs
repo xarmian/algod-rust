@@ -501,11 +501,12 @@ async fn ledger_state_delta_not_found_error_prefix_matches() {
 #[tokio::test]
 #[ignore = "requires `make validate-api-up`; see module docs"]
 async fn txn_group_delta_status_matches() {
-    // Neither node has the txn-group-delta tracer enabled by
-    // `docker/localnet-rust/data/config.json`, so both must report the same
-    // status (go: 501 via `notImplemented` when `GetTracer()` isn't a
-    // `*eval.TxnGroupDeltaTracer`; algod-rust: hardcoded 501, see
-    // `handlers::get_txn_group_delta`) rather than diverging on 200 vs 501.
+    // `TxnGroupDeltaTracer` isn't a `config.json` field at all (go wires it
+    // in programmatically, see `ledger/eval/txntracer.go`) — neither node
+    // enables it, so both must report the same status (go: 501 via
+    // `notImplemented` when `GetTracer()` isn't a `*eval.TxnGroupDeltaTracer`;
+    // algod-rust: hardcoded 501, see `handlers::get_txn_group_delta`) rather
+    // than diverging on 200 vs 501.
     let unknown_group_id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let c = client();
     let go = get(
