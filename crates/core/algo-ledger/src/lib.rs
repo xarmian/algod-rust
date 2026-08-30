@@ -52,6 +52,7 @@ pub mod trie_hash;
 pub mod txn_group_delta_tracer;
 pub mod txtail_cache;
 pub mod voters;
+pub mod voters_tracker;
 
 pub use apply::{
     apply_acfg, apply_afrz, apply_axfer, apply_block, apply_block_capturing_apply_data,
@@ -90,6 +91,9 @@ pub use sqlite::{
 pub use state::{schema_min_balance, LedgerState, StateSnapshot};
 pub use store_trait::LedgerStore;
 pub use txn_group_delta_tracer::{TxnGroupDelta, TxnGroupDeltaTracer};
+pub use voters_tracker::{
+    expected_voters_tracking, prune_voters_snapshots, record_voters_snapshot,
+};
 
 pub use delta_cache::{DeltaCache, DEFAULT_WINDOW_SIZE};
 

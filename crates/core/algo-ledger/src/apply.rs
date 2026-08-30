@@ -1717,6 +1717,9 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
             reset_expired_online_accounts(store, block, &consensus)?;
             validate_absent_online_accounts(store, block, &consensus, ctx.validate)?;
             suspend_absent_accounts(store, block, &consensus)?;
+            if ctx.validate {
+                validate_state_proof_tracking(store, block, &consensus)?;
+            }
             apply_proposer_payout(store, block)?;
             record_proposal(store, block)
         })();
@@ -1772,6 +1775,36 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     {
         tracing::warn!(
             "prune_state_proof_verification_contexts failed for round {}: {e}",
+            block.round.0
+        );
+    }
+
+    // Voters-snapshot cache (issue #780): mirrors go's
+    // `votersTracker.newBlock`/`postCommit` -- record this block's own
+    // online-account snapshot if it's a "voters round", then prune entries
+    // no longer needed. Auxiliary tracker writes, same failure policy as the
+    // state-proof-verification-context tracker above: these feed *future*
+    // block production/validation, not this block's own correctness, so a
+    // failure here is logged rather than failing the whole block apply.
+    if let Err(e) = crate::voters_tracker::record_voters_snapshot(
+        store,
+        block.round.0,
+        block.rewards_level,
+        &consensus,
+    ) {
+        tracing::warn!(
+            "record_voters_snapshot failed for round {}: {e}",
+            block.round.0
+        );
+    }
+    if let Err(e) = crate::voters_tracker::prune_voters_snapshots(
+        store,
+        block.round.0,
+        &block.state_proof_tracking,
+        &consensus,
+    ) {
+        tracing::warn!(
+            "prune_voters_snapshots failed for round {}: {e}",
             block.round.0
         );
     }
@@ -1971,6 +2004,74 @@ fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
         }
     }
 
+    Ok(())
+}
+
+/// Cross-check an incoming block's own `state_proof_tracking` `"v"`/`"t"`
+/// fields (voters commitment / online total weight) against an independent
+/// recomputation from the voters-snapshot cache, rejecting a mismatch --
+/// issue #780, matching go's `endOfBlock`'s `eval.validate` branch
+/// (`ledger/eval/eval.go:1532-1562`). Only called when `ctx.validate` (never
+/// for trusted replay of already-accepted blocks).
+///
+/// The commitment root must match exactly. The online total weight matches
+/// exactly too when `consensus.exclude_expired_circulation` (v38+, i.e.
+/// every protocol this repo currently targets) -- go additionally tolerates
+/// up to a 1% delta on older protocols, which this ports for completeness
+/// even though it is unreachable at the currently-supported consensus
+/// versions.
+fn validate_state_proof_tracking<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    block: &Block,
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    if consensus.state_proof_interval == 0 {
+        return Ok(());
+    }
+
+    let (expected_root, expected_weight) =
+        crate::voters_tracker::expected_voters_tracking(store, block.round.0, consensus)?;
+    let actual_root =
+        crate::block_header::state_proof_voters_commitment(&block.state_proof_tracking);
+    let actual_weight =
+        crate::block_header::state_proof_online_total_weight(&block.state_proof_tracking);
+
+    if actual_root != expected_root {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "StateProofVotersCommitment wrong: {actual_root:?} != {expected_root:?}"
+            ),
+        });
+    }
+
+    if actual_weight == expected_weight {
+        return Ok(());
+    }
+
+    if consensus.exclude_expired_circulation {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "StateProofOnlineTotalWeight wrong: {actual_weight} != {expected_weight}"
+            ),
+        });
+    }
+
+    // go: `stakeDiffusionFactor := uint64(1)`, `allowedDelta :=
+    // expectedVotersWeight * 1 / 100` -- tolerate up to 1% skew.
+    let (high, low) = if expected_weight < actual_weight {
+        (actual_weight, expected_weight)
+    } else {
+        (expected_weight, actual_weight)
+    };
+    let allowed_delta = ((expected_weight as u128) / 100) as u64;
+    if high - low > allowed_delta {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "StateProofOnlineTotalWeight wrong: {actual_weight} != {expected_weight} greater \
+                 than {allowed_delta}"
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -8423,6 +8524,141 @@ mod tests {
             "expected not-Online error for nonexistent absent, got: {}",
             err_msg
         );
+    }
+
+    // ── Voters-tracking cross-check (issue #780) ────────────────────────
+    // go's `endOfBlock`'s `eval.validate` branch independently recomputes
+    // the expected voters commitment/online-total-weight from the voters
+    // snapshot cache and rejects a block whose own `state_proof_tracking`
+    // disagrees, rather than trusting the incoming value -- these pin that
+    // behavior end-to-end through `apply_block_validating`.
+
+    fn spt_value(voters_commitment: &[u8], online_total_weight: u64) -> Option<rmpv::Value> {
+        let mut fields = Vec::new();
+        if !voters_commitment.is_empty() {
+            fields.push((
+                rmpv::Value::from("v"),
+                rmpv::Value::Binary(voters_commitment.to_vec()),
+            ));
+        }
+        if online_total_weight != 0 {
+            fields.push((
+                rmpv::Value::from("t"),
+                rmpv::Value::from(online_total_weight),
+            ));
+        }
+        Some(rmpv::Value::Map(vec![(
+            rmpv::Value::from(0u64),
+            rmpv::Value::Map(fields),
+        )]))
+    }
+
+    /// Shared setup: a V41 ledger with one online account, a voters snapshot
+    /// recorded at round 240 (V41: interval 256, lookback 16 -- `(240 + 16)
+    /// % 256 == 0`), and the ledger positioned at round 255 so the next
+    /// applied block is round 256 (an interval multiple, consuming the
+    /// round-240 snapshot). Returns the snapshot's real `(root, weight)`.
+    fn state_with_voters_snapshot_at_240() -> (LedgerState, Vec<u8>, u64) {
+        let fee_sink = Address([3u8; 32]);
+        let online_addr = Address([7u8; 32]);
+        let mut state =
+            make_state_with_accounts(&[(online_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+        {
+            let acct = state.get_or_default_account_mut(&online_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_first_valid = 0;
+            acct.vote_last_valid = 10_000_000;
+        }
+        let params = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        crate::voters_tracker::record_voters_snapshot(&mut state, 240, 0, &params).unwrap();
+        let (root, weight) =
+            crate::voters_tracker::expected_voters_tracking(&state, 256, &params).unwrap();
+        assert!(!root.is_empty(), "setup sanity: snapshot must be real");
+        state.current_round = Round(255);
+        (state, root, weight)
+    }
+
+    #[test]
+    fn validate_state_proof_tracking_accepts_the_recomputed_commitment() {
+        let (mut state, root, weight) = state_with_voters_snapshot_at_240();
+        let block = Block {
+            round: Round(256),
+            state_proof_tracking: spt_value(&root, weight),
+            ..make_empty_block_with_protocol(
+                Address([3u8; 32]),
+                algo_types::consensus::CONSENSUS_V41,
+                None,
+                None,
+            )
+        };
+        apply_block_validating(&mut state, &block)
+            .expect("matching voters commitment/weight must be accepted");
+    }
+
+    #[test]
+    fn validate_state_proof_tracking_rejects_wrong_commitment() {
+        let (mut state, _root, weight) = state_with_voters_snapshot_at_240();
+        let tampered_root = vec![0xFFu8; 64];
+        let block = Block {
+            round: Round(256),
+            state_proof_tracking: spt_value(&tampered_root, weight),
+            ..make_empty_block_with_protocol(
+                Address([3u8; 32]),
+                algo_types::consensus::CONSENSUS_V41,
+                None,
+                None,
+            )
+        };
+        let err = apply_block_validating(&mut state, &block).unwrap_err();
+        assert!(
+            err.to_string().contains("StateProofVotersCommitment wrong"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_state_proof_tracking_rejects_wrong_weight_under_exclude_expired_circulation() {
+        // V41 has ExcludeExpiredCirculation=true, so the weight check is
+        // exact (no 1% tolerance).
+        let (mut state, root, weight) = state_with_voters_snapshot_at_240();
+        let block = Block {
+            round: Round(256),
+            state_proof_tracking: spt_value(&root, weight + 1),
+            ..make_empty_block_with_protocol(
+                Address([3u8; 32]),
+                algo_types::consensus::CONSENSUS_V41,
+                None,
+                None,
+            )
+        };
+        let err = apply_block_validating(&mut state, &block).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("StateProofOnlineTotalWeight wrong"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_state_proof_tracking_is_skipped_outside_validate_mode() {
+        // Replay (validate=false) must not cross-check at all -- a garbage
+        // commitment must still apply cleanly, matching go's `eval.validate`
+        // gate.
+        let (mut state, _root, _weight) = state_with_voters_snapshot_at_240();
+        let block = Block {
+            round: Round(256),
+            state_proof_tracking: spt_value(&[0xFFu8; 64], 999_999),
+            ..make_empty_block_with_protocol(
+                Address([3u8; 32]),
+                algo_types::consensus::CONSENSUS_V41,
+                None,
+                None,
+            )
+        };
+        apply_block(&mut state, &block).expect("replay must not validate voters tracking");
     }
 
     // ── Validation-path tests (validate=true, matching Go's eval.validate) ──

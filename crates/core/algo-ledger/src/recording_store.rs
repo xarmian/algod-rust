@@ -502,4 +502,32 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner
             .delete_state_proof_verification_contexts_before(before_round)
     }
+
+    // ---- Voters snapshot cache (issue #780) ----
+
+    fn online_accounts(&self) -> Vec<(Address, AccountData)> {
+        self.inner.online_accounts()
+    }
+
+    fn put_voters_snapshot(
+        &mut self,
+        round: u64,
+        voters_commitment: Vec<u8>,
+        online_total_weight: u64,
+    ) -> Result<(), AlgoError> {
+        self.inner
+            .put_voters_snapshot(round, voters_commitment, online_total_weight)
+    }
+
+    fn get_voters_snapshot(&self, round: u64) -> Result<Option<(Vec<u8>, u64)>, AlgoError> {
+        self.inner.get_voters_snapshot(round)
+    }
+
+    fn voters_snapshot_rounds(&self) -> Result<Vec<u64>, AlgoError> {
+        self.inner.voters_snapshot_rounds()
+    }
+
+    fn delete_voters_snapshot(&mut self, round: u64) -> Result<(), AlgoError> {
+        self.inner.delete_voters_snapshot(round)
+    }
 }

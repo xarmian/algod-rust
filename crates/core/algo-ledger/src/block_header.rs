@@ -464,18 +464,19 @@ const STATE_PROOF_BASIC: u64 = 0;
 /// (`ledger/eval/eval.go:1333–1349`) returns zeroes for every round that is not
 /// a multiple of `StateProofInterval`.
 ///
-/// # Known gap
-///
-/// `"v"`/`"t"` are always left zero here. On rounds that *are* a multiple of
-/// `StateProofInterval` go fills them from `VotersForStateProof`, i.e. the root
-/// of a vector commitment over the online participants' state-proof keys — a
-/// voters tracker and Merkle-tree machinery algod-rust does not have. Blocks
-/// produced by algod-rust at round % 256 == 0 will therefore omit `"v"`/`"t"`
-/// where go-algorand would set them.
+/// `voters_tracking` is `(voters_commitment, online_total_weight)` -- the
+/// result of go's `stateProofVotersAndTotal` for *this* block, i.e. already
+/// resolved by the caller from the voters-snapshot cache (issue #780's
+/// `crate::voters_tracker`) at `next_round - StateProofVotersLookback`, or
+/// `(vec![], 0)` when `next_round` isn't a `StateProofInterval` multiple or no
+/// snapshot exists yet -- mirroring go silently leaving them zero in both
+/// cases (`ledger/eval/eval.go`'s `stateProofVotersAndTotal` returns zeroes
+/// whenever `voters == nil`, not just off-multiple rounds).
 fn next_state_proof_tracking(
     prev: &BlockHeader,
     next_round: u64,
     params: &ConsensusParams,
+    voters_tracking: (&[u8], u64),
 ) -> Option<rmpv::Value> {
     // go: `if eval.proto.StateProofInterval > 0` (eval.go:1390).
     let interval = params.state_proof_interval;
@@ -499,9 +500,22 @@ fn next_state_proof_tracking(
     // One entry, keyed by StateProofBasic. Zero-valued fields ("v" voters
     // commitment, "t" online total weight) are omitted, matching go's
     // `codec:",omitempty"` on StateProofTrackingData.
+    let (voters_commitment, online_total_weight) = voters_tracking;
     let mut fields = Vec::new();
     if next != 0 {
         fields.push((rmpv::Value::from("n"), rmpv::Value::from(next)));
+    }
+    if !voters_commitment.is_empty() {
+        fields.push((
+            rmpv::Value::from("v"),
+            rmpv::Value::Binary(voters_commitment.to_vec()),
+        ));
+    }
+    if online_total_weight != 0 {
+        fields.push((
+            rmpv::Value::from("t"),
+            rmpv::Value::from(online_total_weight),
+        ));
     }
     Some(rmpv::Value::Map(vec![(
         rmpv::Value::from(STATE_PROOF_BASIC),
@@ -554,6 +568,13 @@ fn clamp_timestamp(timestamp: i64, prev_timestamp: i64, params: &ConsensusParams
 /// timestamp clamp and the 512-hash gate) is the resolved protocol *after* any
 /// switch-over — matching go, which looks up params for `upgradeState.CurrentProtocol`.
 ///
+/// `voters_tracking` is `(voters_commitment, online_total_weight)` for *this*
+/// block's `"spt"` map — see [`next_state_proof_tracking`]'s doc comment for
+/// how the caller should resolve it (issue #780: `crate::voters_tracker`'s
+/// snapshot cache). Pass `(Vec::new(), 0)` when the caller has no snapshot
+/// available (e.g. state proofs disabled, or a fresh chain that hasn't formed
+/// one yet) — this reproduces go's own zero-fill in exactly the same cases.
+///
 /// Returns an error if `prev`'s protocol or the resolved next protocol is
 /// unknown, or if the upgrade vote/state constructed by
 /// [`process_upgrade_params`] is not internally self-consistent (see
@@ -563,6 +584,7 @@ pub fn make_next_block_header(
     prev: &BlockHeader,
     timestamp: i64,
     rewards: RewardsState,
+    voters_tracking: (Vec<u8>, u64),
 ) -> Result<BlockHeader, AlgoError> {
     let next_round = prev.round.0 + 1;
 
@@ -593,7 +615,12 @@ pub fn make_next_block_header(
     })?;
 
     let bonus = next_bonus(prev, &params, &prev_params);
-    let state_proof_tracking = next_state_proof_tracking(prev, next_round, &params);
+    let state_proof_tracking = next_state_proof_tracking(
+        prev,
+        next_round,
+        &params,
+        (&voters_tracking.0, voters_tracking.1),
+    );
 
     let branch = compute_block_header_digest(prev).0;
     let prev512 = if params.enable_sha512_block_hash {
@@ -696,7 +723,8 @@ mod tests {
     #[test]
     fn advances_round_branch_and_carries_fields() {
         let prev = prev_header();
-        let hdr = make_next_block_header(&prev, 1500, rewards()).expect("make header");
+        let hdr = make_next_block_header(&prev, 1500, rewards(), Default::default())
+            .expect("make header");
 
         assert_eq!(hdr.round, Round(6), "round = prev + 1");
         assert_eq!(
@@ -729,7 +757,8 @@ mod tests {
         // v41 enables the SHA-512 block hash → prev512 = prev.Hash512().
         assert!(v41_params().enable_sha512_block_hash);
         let prev = prev_header();
-        let hdr = make_next_block_header(&prev, 1500, rewards()).expect("make header");
+        let hdr = make_next_block_header(&prev, 1500, rewards(), Default::default())
+            .expect("make header");
         assert_eq!(hdr.prev512, compute_block_header_digest_512(&prev));
         assert_ne!(hdr.prev512, [0u8; 64], "prev512 must be set under v41");
     }
@@ -741,13 +770,16 @@ mod tests {
         let prev = prev_header(); // prev.timestamp = 1000
 
         // Too early → clamped up to prev.
-        let early = make_next_block_header(&prev, 500, rewards()).unwrap();
+        let early = make_next_block_header(&prev, 500, rewards(), Default::default()).unwrap();
         assert_eq!(early.timestamp, 1000);
         // Too late → clamped to prev + max increment.
-        let late = make_next_block_header(&prev, 1000 + inc + 10_000, rewards()).unwrap();
+        let late =
+            make_next_block_header(&prev, 1000 + inc + 10_000, rewards(), Default::default())
+                .unwrap();
         assert_eq!(late.timestamp, 1000 + inc);
         // Within range → unchanged.
-        let ok = make_next_block_header(&prev, 1000 + inc - 1, rewards()).unwrap();
+        let ok =
+            make_next_block_header(&prev, 1000 + inc - 1, rewards(), Default::default()).unwrap();
         assert_eq!(ok.timestamp, 1000 + inc - 1);
     }
 
@@ -757,7 +789,7 @@ mod tests {
             timestamp: 0,
             ..prev_header()
         };
-        let hdr = make_next_block_header(&prev, 42, rewards()).unwrap();
+        let hdr = make_next_block_header(&prev, 42, rewards(), Default::default()).unwrap();
         assert_eq!(hdr.timestamp, 42, "no clamp when prev timestamp <= 0");
     }
 
@@ -770,7 +802,7 @@ mod tests {
             current_protocol: CONSENSUS_V42.to_string(),
             ..prev_header()
         };
-        let hdr = make_next_block_header(&prev, 1500, rewards()).unwrap();
+        let hdr = make_next_block_header(&prev, 1500, rewards(), Default::default()).unwrap();
         assert!(hdr.next_protocol.is_empty());
         assert_eq!(hdr.next_protocol_approvals, 0);
         assert_eq!(hdr.next_protocol_vote_before, Round(0));
@@ -789,7 +821,8 @@ mod tests {
     #[test]
     fn proposes_default_upgrade_when_newer_approved_version_exists() {
         // prev.round = 5 → this block is round 6, with no upgrade pending yet.
-        let hdr = make_next_block_header(&prev_header(), 1500, rewards()).unwrap();
+        let hdr =
+            make_next_block_header(&prev_header(), 1500, rewards(), Default::default()).unwrap();
 
         assert_eq!(hdr.upgrade_propose, CONSENSUS_V42, "casts the default vote");
         assert_eq!(hdr.upgrade_delay, 208_000, "raw ApprovedUpgrades delay");
@@ -821,11 +854,13 @@ mod tests {
         // Single proposer (algod-rust's own dev-mode chain) votes yes every
         // round the proposal is still open, since its own ApprovedUpgrades
         // table still names the pending target every round.
-        let mut hdr = make_next_block_header(&prev_header(), 1500, rewards()).unwrap();
+        let mut hdr =
+            make_next_block_header(&prev_header(), 1500, rewards(), Default::default()).unwrap();
         assert_eq!(hdr.next_protocol_approvals, 1);
 
         for expected_approvals in 2..=5u64 {
-            hdr = make_next_block_header(&hdr, hdr.timestamp + 1, rewards()).unwrap();
+            hdr = make_next_block_header(&hdr, hdr.timestamp + 1, rewards(), Default::default())
+                .unwrap();
             assert_eq!(hdr.next_protocol_approvals, expected_approvals);
             assert!(hdr.upgrade_approve, "still voting yes");
             assert!(
@@ -850,7 +885,8 @@ mod tests {
             next_protocol_switch_on: Round(6),
             ..BlockHeader::default()
         };
-        let hdr = make_next_block_header(&prev, 0, rewards()).expect("switch ok");
+        let hdr =
+            make_next_block_header(&prev, 0, rewards(), Default::default()).expect("switch ok");
         assert_eq!(
             hdr.current_protocol, CONSENSUS_V41,
             "switched to next protocol"
@@ -872,7 +908,7 @@ mod tests {
             next_protocol_switch_on: Round(200),
             ..BlockHeader::default()
         };
-        let hdr = make_next_block_header(&prev, 0, rewards()).unwrap();
+        let hdr = make_next_block_header(&prev, 0, rewards(), Default::default()).unwrap();
         assert_eq!(hdr.next_protocol, CONSENSUS_V41);
         assert_eq!(hdr.next_protocol_approvals, 2);
         assert_eq!(hdr.next_protocol_vote_before, Round(100));
@@ -893,7 +929,8 @@ mod tests {
             next_protocol_switch_on: Round(214_000),
             ..BlockHeader::default()
         };
-        let hdr = make_next_block_header(&prev, 0, rewards()).expect("resolves, doesn't error");
+        let hdr = make_next_block_header(&prev, 0, rewards(), Default::default())
+            .expect("resolves, doesn't error");
         assert!(hdr.next_protocol.is_empty(), "failed proposal cleared");
         assert_eq!(hdr.next_protocol_approvals, 0);
         assert_eq!(hdr.next_protocol_vote_before, Round(0));
@@ -918,7 +955,8 @@ mod tests {
             next_protocol_switch_on: Round(214_000),
             ..BlockHeader::default()
         };
-        let hdr = make_next_block_header(&prev, 0, rewards()).expect("resolves, doesn't error");
+        let hdr = make_next_block_header(&prev, 0, rewards(), Default::default())
+            .expect("resolves, doesn't error");
         assert_eq!(hdr.next_protocol, CONSENSUS_V42, "proposal survives");
         assert_eq!(hdr.next_protocol_switch_on, Round(214_000));
         assert_eq!(hdr.current_protocol, CONSENSUS_V41, "not switched yet");
@@ -937,7 +975,7 @@ mod tests {
             ..BlockHeader::default()
         };
         assert!(
-            make_next_block_header(&prev, 0, rewards()).is_err(),
+            make_next_block_header(&prev, 0, rewards(), Default::default()).is_err(),
             "unknown protocol must error, not panic"
         );
     }
@@ -1001,10 +1039,10 @@ mod tests {
             bonus: 0,
             ..BlockHeader::default()
         };
-        let hdr = make_next_block_header(&genesis, 1, rewards()).unwrap();
+        let hdr = make_next_block_header(&genesis, 1, rewards(), Default::default()).unwrap();
         assert_eq!(hdr.bonus, 10_000_000);
         // And the next round carries it forward unchanged.
-        let hdr2 = make_next_block_header(&hdr, 2, rewards()).unwrap();
+        let hdr2 = make_next_block_header(&hdr, 2, rewards(), Default::default()).unwrap();
         assert_eq!(hdr2.bonus, 10_000_000);
     }
 
@@ -1012,6 +1050,63 @@ mod tests {
 
     fn spt_next_round(hdr: &BlockHeader) -> u64 {
         state_proof_next_round(&hdr.state_proof_tracking)
+    }
+
+    // ── Voters commitment / online total weight wiring (issue #780) ─────
+    // Before #780, "v"/"t" were always left zero (see the pre-#780 "Known
+    // gap" doc comment this issue closed). These pin the real behavior:
+    // `make_next_block_header` embeds whatever `voters_tracking` the caller
+    // resolved from the voters-snapshot cache (`crate::voters_tracker`),
+    // exactly as go's `stateProofVotersAndTotal` result flows into
+    // `endOfBlock`'s `StateProofTracking` map.
+
+    #[test]
+    fn embeds_voters_commitment_and_weight_when_caller_supplies_them() {
+        let prev = BlockHeader {
+            round: Round(255),
+            current_protocol: CONSENSUS_V41.to_string(),
+            state_proof_tracking: Some(rmpv::Value::Map(vec![(
+                rmpv::Value::from(0u64),
+                rmpv::Value::Map(vec![(rmpv::Value::from("n"), rmpv::Value::from(256u64))]),
+            )])),
+            ..BlockHeader::default()
+        };
+        // Round 256 (the next round) is a StateProofInterval (256) multiple
+        // -- the caller has resolved a real snapshot for it.
+        let root = vec![0xABu8; 64];
+        let hdr = make_next_block_header(&prev, 0, rewards(), (root.clone(), 42_000_000)).unwrap();
+
+        assert_eq!(
+            crate::block_header::state_proof_voters_commitment(&hdr.state_proof_tracking),
+            root,
+            "\"v\" must carry the caller-supplied voters commitment"
+        );
+        assert_eq!(
+            crate::block_header::state_proof_online_total_weight(&hdr.state_proof_tracking),
+            42_000_000,
+            "\"t\" must carry the caller-supplied online total weight"
+        );
+    }
+
+    #[test]
+    fn omits_voters_fields_when_caller_supplies_none() {
+        // The default (empty-vec, 0) tuple -- what the caller passes when
+        // `next_round` isn't a StateProofInterval multiple, or no snapshot
+        // exists yet (`voters_tracker::expected_voters_tracking`'s
+        // documented zero-fill) -- must leave "v"/"t" omitted, matching
+        // go's `codec:",omitempty"` on zero-valued StateProofTrackingData
+        // fields.
+        let prev = BlockHeader {
+            round: Round(5),
+            current_protocol: CONSENSUS_V41.to_string(),
+            ..BlockHeader::default()
+        };
+        let hdr = make_next_block_header(&prev, 0, rewards(), Default::default()).unwrap();
+        assert!(state_proof_voters_commitment(&hdr.state_proof_tracking).is_empty());
+        assert_eq!(
+            state_proof_online_total_weight(&hdr.state_proof_tracking),
+            0
+        );
     }
 
     #[test]
@@ -1032,7 +1127,7 @@ mod tests {
             current_protocol: CONSENSUS_V41.to_string(),
             ..BlockHeader::default()
         };
-        let hdr = make_next_block_header(&genesis, 1, rewards()).unwrap();
+        let hdr = make_next_block_header(&genesis, 1, rewards(), Default::default()).unwrap();
         assert_eq!(
             hdr.state_proof_tracking,
             Some(rmpv::Value::Map(vec![(
@@ -1051,9 +1146,9 @@ mod tests {
             current_protocol: CONSENSUS_V41.to_string(),
             ..BlockHeader::default()
         };
-        let mut hdr = make_next_block_header(&genesis, 1, rewards()).unwrap();
+        let mut hdr = make_next_block_header(&genesis, 1, rewards(), Default::default()).unwrap();
         for _ in 0..5 {
-            hdr = make_next_block_header(&hdr, 1, rewards()).unwrap();
+            hdr = make_next_block_header(&hdr, 1, rewards(), Default::default()).unwrap();
             assert_eq!(
                 spt_next_round(&hdr),
                 512,
@@ -1070,7 +1165,7 @@ mod tests {
             current_protocol: algo_types::consensus::CONSENSUS_V33.to_string(),
             ..BlockHeader::default()
         };
-        let hdr = make_next_block_header(&prev, 0, rewards()).unwrap();
+        let hdr = make_next_block_header(&prev, 0, rewards(), Default::default()).unwrap();
         assert_eq!(hdr.state_proof_tracking, None);
     }
 
@@ -1100,7 +1195,7 @@ mod tests {
             current_protocol: "no-such-protocol".to_string(),
             ..BlockHeader::default()
         };
-        assert!(make_next_block_header(&prev, 0, rewards()).is_err());
+        assert!(make_next_block_header(&prev, 0, rewards(), Default::default()).is_err());
     }
 
     // ── Load tracking ("ld"/"ct") ───────────────────────────────
@@ -1180,7 +1275,7 @@ mod tests {
             congestion_tax: 100_000,
             ..prev_header()
         };
-        let hdr = make_next_block_header(&prev, 1500, rewards()).unwrap();
+        let hdr = make_next_block_header(&prev, 1500, rewards(), Default::default()).unwrap();
         assert_eq!(
             hdr.congestion_tax,
             next_congestion_tax(prev.load, prev.congestion_tax),

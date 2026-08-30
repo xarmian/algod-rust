@@ -2095,14 +2095,24 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
                     .saturating_add(acct.micro_algos)
             })
             .unwrap_or(0);
-        let total_reward_units = {
+        let (total_reward_units, voters_tracking) = {
             let l = self
                 .ledger
                 .lock()
                 .map_err(|e| algo_error::AlgoError::Ledger {
                     message: format!("ledger lock poisoned: {e}"),
                 })?;
-            l.total_reward_units()?
+            // Issue #780: resolve the voters snapshot cache for the block
+            // being built -- (voters_commitment, online_total_weight) for
+            // the header's "spt" map, or (vec![], 0) when `next_round` isn't
+            // a StateProofInterval multiple or no snapshot has been recorded
+            // yet, exactly like go's `stateProofVotersAndTotal`.
+            let voters_tracking = algo_ledger::voters_tracker::expected_voters_tracking(
+                &*l,
+                next_round,
+                &consensus_params,
+            )?;
+            (l.total_reward_units()?, voters_tracking)
         };
         let prev_rewards = algo_ledger::RewardsState {
             rewards_level: hdr.rewards_level,
@@ -2124,7 +2134,8 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(hdr.timestamp);
-        let next_hdr = algo_ledger::make_next_block_header(&hdr, timestamp, rewards)?;
+        let next_hdr =
+            algo_ledger::make_next_block_header(&hdr, timestamp, rewards, voters_tracking)?;
 
         // Use the caller-provided byte limit, or the consensus protocol
         // default if the caller passed 0. Take the minimum of the two when
