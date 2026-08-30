@@ -73,12 +73,21 @@
 //!   networking follow-up rather than added here as no-op knobs (see
 //!   PR description for #748 for the full enumerated list with go
 //!   defaults and disposition).
-//! - `enrichNetworkingConfig`'s field-level post-load normalization
-//!   (`NetAddress`-driven `GossipFanout`/`EnableLedgerService` side effects,
-//!   `PublicAddress` lowercasing) — that's networking-config-field-gap
-//!   territory (#748, tracked further in its follow-up). The mechanism here
-//!   is structured so such a hook can be layered on after
-//!   [`Local::load_from_data_dir`] without any architectural change.
+//! - `enrichNetworkingConfig`'s field-level post-load normalization.
+//!   Issue #788 (the "#748 follow-up" this note used to point at) resolved
+//!   this: algod-rust deliberately keeps `NetAddress` as a
+//!   CLI-flag-per-subcommand concept (`relay --bind-address`, required;
+//!   `participate --listen-address`, optional) rather than promoting it to
+//!   a `Local` field, because neither of go's other two side effects has a
+//!   real behavior to gate here (`EnableLedgerService`/`EnableBlockService`
+//!   are already documented no-ops; `PublicAddress` is still round-trip
+//!   only) — unifying onto a shared field would just relocate, not close,
+//!   those gaps. The one side effect that *does* have a real algod-rust
+//!   equivalent — the `GossipFanout` bump for a listen-server node — is
+//!   implemented as [`Local::gossip_fanout_for_listen_server`], called
+//!   explicitly by `relay`/`participate` once each knows it is (or isn't)
+//!   acting as a listen server, rather than firing automatically off a
+//!   `Local` field that doesn't exist.
 //! - Wiring every field into actual runtime behavior — left to the owning
 //!   per-area issue, since each one needs to decide the exact
 //!   CLI-flag/TOML/`config.json` precedence for its own fields. #748 wires
@@ -2963,7 +2972,49 @@ impl Local {
         }
         self.catchpoint_tracking == CATCHPOINT_TRACKING_MODE_TRACKED && self.catchpoint_interval > 0
     }
+
+    /// Go: `enrichNetworkingConfig`'s `GossipFanout` bump
+    /// (`config/config.go:170-179`): a listen-server node's `GossipFanout`
+    /// gets substituted with [`DEFAULT_RELAY_GOSSIP_FANOUT`] (go's
+    /// `defaultRelayGossipFanout`, 8) *unless* the operator already
+    /// overrode it away from the ordinary default (4) in `config.json` —
+    /// mirroring go's exact gate, `source.GossipFanout ==
+    /// defaultLocal.GossipFanout`, an equality check against the default
+    /// rather than an "was this field present in the JSON" flag.
+    ///
+    /// algod-rust has no `NetAddress` field on [`Local`] itself to key this
+    /// off automatically (its equivalent is the CLI-flag-per-subcommand
+    /// `relay --bind-address` / `participate --listen-address` design —
+    /// see the module docs' "Explicitly out of scope" note and issue
+    /// #788's PR description for why full field unification onto a shared
+    /// `Local::net_address` wasn't warranted). Callers that already know
+    /// they are acting as a listen server (`relay`: unconditionally;
+    /// `participate`: only once `--listen-address` resolves to `Some`)
+    /// call this explicitly instead.
+    ///
+    /// `EnableLedgerService`/`EnableBlockService` auto-enable and
+    /// `PublicAddress` lowercasing — the other two `enrichNetworkingConfig`
+    /// side effects — are deliberately NOT implemented anywhere:
+    /// `enable_ledger_service`/`enable_block_service` are already
+    /// documented, deliberate no-ops in this crate (see their own doc
+    /// comments) with no runtime behavior to gate, so auto-flipping them
+    /// would only change which no-op flag reads `true`; `public_address`
+    /// remains round-trip-only (no behavioral use anywhere in algod-rust
+    /// yet), so lowercasing it would be normalizing a value nothing reads.
+    pub fn gossip_fanout_for_listen_server(&self) -> i64 {
+        if self.gossip_fanout == GOSSIP_FANOUT.at(LATEST_VERSION) {
+            DEFAULT_RELAY_GOSSIP_FANOUT
+        } else {
+            self.gossip_fanout
+        }
+    }
 }
+
+/// Go: `defaultRelayGossipFanout` (`config/config.go:88`) — the gossip
+/// fanout `enrichNetworkingConfig` substitutes for a listen-server node
+/// whose `GossipFanout` wasn't explicitly overridden away from the ordinary
+/// default. See [`Local::gossip_fanout_for_listen_server`].
+pub const DEFAULT_RELAY_GOSSIP_FANOUT: i64 = 8;
 
 /// Go's `CatchpointTrackingModeUntracked` (`config/config.go:91`): never
 /// track or store catchpoints, regardless of `CatchpointInterval`.
@@ -4181,5 +4232,54 @@ mod tests {
             ..Local::default()
         };
         assert!(!cfg.tracks_catchpoints());
+    }
+
+    // --- `gossip_fanout_for_listen_server` (issue #788) --------------------
+    //
+    // Go: `enrichNetworkingConfig` (`config/config.go:170-179`) substitutes
+    // `defaultRelayGossipFanout` (8) for a listen-server node's
+    // `GossipFanout` unless the operator already overrode it away from the
+    // ordinary default (4).
+
+    /// A default (un-overridden) `GossipFanout` gets bumped to go's
+    /// `defaultRelayGossipFanout` (8) for a node known to be a listen
+    /// server.
+    #[test]
+    fn gossip_fanout_for_listen_server_bumps_default_to_relay_fanout() {
+        let cfg = Local::default();
+        assert_eq!(cfg.gossip_fanout, 4, "precondition: ordinary default is 4");
+        assert_eq!(cfg.gossip_fanout_for_listen_server(), 8);
+    }
+
+    /// An operator-overridden `GossipFanout` (anything other than the
+    /// ordinary default) is left untouched — go's equality check against
+    /// `defaultLocal.GossipFanout` is the only gate, not "always bump".
+    #[test]
+    fn gossip_fanout_for_listen_server_preserves_explicit_override() {
+        let cfg = Local {
+            gossip_fanout: 20,
+            ..Local::default()
+        };
+        assert_eq!(cfg.gossip_fanout_for_listen_server(), 20);
+
+        // An explicit override *equal to go's relay default* is also just
+        // preserved, not doubled or re-derived — it already reads 8.
+        let cfg_already_eight = Local {
+            gossip_fanout: 8,
+            ..Local::default()
+        };
+        assert_eq!(cfg_already_eight.gossip_fanout_for_listen_server(), 8);
+    }
+
+    /// An explicit override of exactly `0` (or negative, which go's `int`
+    /// field permits round-tripping through JSON) is still "explicit" —
+    /// it must not be confused with "unset" and silently bumped.
+    #[test]
+    fn gossip_fanout_for_listen_server_preserves_explicit_zero_override() {
+        let cfg = Local {
+            gossip_fanout: 0,
+            ..Local::default()
+        };
+        assert_eq!(cfg.gossip_fanout_for_listen_server(), 0);
     }
 }

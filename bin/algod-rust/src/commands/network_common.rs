@@ -73,6 +73,29 @@ pub fn resolve_automatic_catchpoint_config(
     })
 }
 
+/// Resolve the effective `WebsocketNetworkConfig::gossip_fanout` for a
+/// command that may or may not be acting as a listen server, applying go's
+/// `enrichNetworkingConfig` `GossipFanout` bump (`config/config.go:170-179`,
+/// [`algo_config::Local::gossip_fanout_for_listen_server`]) only when
+/// `is_listen_server` is true, then flooring the result at `peers_count` —
+/// the pre-existing, algod-rust-only heuristic (not from go) that a node
+/// should target at least as many outgoing connections as it was given
+/// static peer addresses for. Shared by `relay` (always a listen server)
+/// and `participate` (a listen server only once `--listen-address`
+/// resolves to `Some`) — issue #788.
+pub fn resolve_gossip_fanout(
+    node_config: &algo_config::Local,
+    is_listen_server: bool,
+    peers_count: usize,
+) -> usize {
+    let base = if is_listen_server {
+        node_config.gossip_fanout_for_listen_server()
+    } else {
+        node_config.gossip_fanout
+    };
+    peers_count.max(base.max(0) as usize)
+}
+
 /// Map a network name to its genesis ID.
 ///
 /// Returns `None` for unknown networks.
@@ -141,5 +164,48 @@ mod tests {
         assert_eq!(resolved.interval, 5_000);
         assert_eq!(resolved.file_history_length, 10);
         assert_eq!(resolved.dir, std::path::PathBuf::from("/data/catchpoints"));
+    }
+
+    // --- `resolve_gossip_fanout` (issue #788) -------------------------------
+
+    /// A listen server (`relay`, always; `participate`, once
+    /// `--listen-address` resolves) with a stock (un-overridden)
+    /// `GossipFanout` gets go's relay default (8), not the ordinary
+    /// default (4) — the core `enrichNetworkingConfig` parity fix.
+    #[test]
+    fn resolve_gossip_fanout_listen_server_bumps_stock_default() {
+        let cfg = algo_config::Local::default();
+        assert_eq!(resolve_gossip_fanout(&cfg, true, 0), 8);
+    }
+
+    /// A non-listen-server node (e.g. `participate` with no
+    /// `--listen-address`) keeps the ordinary default (4) — go never
+    /// applies `defaultRelayGossipFanout` to a node with no listen
+    /// address.
+    #[test]
+    fn resolve_gossip_fanout_non_listen_server_keeps_ordinary_default() {
+        let cfg = algo_config::Local::default();
+        assert_eq!(resolve_gossip_fanout(&cfg, false, 0), 4);
+    }
+
+    /// An explicit `config.json` override survives the listen-server bump
+    /// untouched, whether or not the node is a listen server.
+    #[test]
+    fn resolve_gossip_fanout_preserves_explicit_override_either_way() {
+        let cfg = algo_config::Local {
+            gossip_fanout: 20,
+            ..algo_config::Local::default()
+        };
+        assert_eq!(resolve_gossip_fanout(&cfg, true, 0), 20);
+        assert_eq!(resolve_gossip_fanout(&cfg, false, 0), 20);
+    }
+
+    /// `--peers` acts as a floor regardless of the resolved base value —
+    /// the algod-rust-only heuristic layered on top of go's own logic.
+    #[test]
+    fn resolve_gossip_fanout_peers_count_floors_the_result() {
+        let cfg = algo_config::Local::default();
+        assert_eq!(resolve_gossip_fanout(&cfg, true, 12), 12);
+        assert_eq!(resolve_gossip_fanout(&cfg, false, 12), 12);
     }
 }

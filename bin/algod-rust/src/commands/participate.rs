@@ -60,7 +60,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::commands::dual_gossip_node;
-use crate::commands::network_common::{genesis_id_for, resolve_automatic_catchpoint_config};
+use crate::commands::network_common::{
+    genesis_id_for, resolve_automatic_catchpoint_config, resolve_gossip_fanout,
+};
 use crate::commands::p2p_transport::{NetworkMode, P2pOptions, P2pTransport, P2pTransportConfig};
 use crate::config::RestConfig;
 use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
@@ -3371,6 +3373,13 @@ pub async fn run(
         None
     };
 
+    // Issue #788 (`enrichNetworkingConfig`'s `GossipFanout` bump,
+    // `config/config.go:170-179`): once a node has a real listen address
+    // (go's `NetAddress != ""` equivalent), its `GossipFanout` gets bumped
+    // to go's relay default unless explicitly overridden. Computed before
+    // `effective_listen_address` is moved into `net_address` below.
+    let is_listen_server = effective_listen_address.is_some();
+
     let net_config = WebsocketNetworkConfig {
         genesis_id: resolved_genesis_id.clone(),
         network_id: network.to_string(),
@@ -3386,9 +3395,7 @@ pub async fn run(
         // P2P-only mode `net_address` is forced to `None` above, so this
         // can never open a listener regardless.
         relay_messages: ws_active && (relay_messages || node_config.force_relay_messages),
-        gossip_fanout: peers
-            .len()
-            .max(node_config.gossip_fanout.max(0) as usize)
+        gossip_fanout: resolve_gossip_fanout(&node_config, is_listen_server, peers.len())
             .max(algo_network::DEFAULT_GOSSIP_FANOUT),
         max_connections_per_ip: resolved_net.max_connections_per_ip,
         incoming_connections_limit: resolved_net.incoming_connections_limit,
