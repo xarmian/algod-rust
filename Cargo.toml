@@ -5,6 +5,7 @@ members = [
     "crates/core/algo-types",
     "crates/core/algo-codec",
     "crates/node/algo-rest-client",
+    "crates/node/algo-config",
     "crates/tools/algo-fixtures",
     "crates/tools/algo-conformance",
     "crates/core/algo-validate",
@@ -109,6 +110,7 @@ algo-error = { path = "crates/core/algo-error" }
 algo-types = { path = "crates/core/algo-types" }
 algo-codec = { path = "crates/core/algo-codec" }
 algo-rest-client = { path = "crates/node/algo-rest-client" }
+algo-config = { path = "crates/node/algo-config" }
 algo-fixtures = { path = "crates/tools/algo-fixtures" }
 algo-conformance = { path = "crates/tools/algo-conformance" }
 algo-validate = { path = "crates/core/algo-validate" }

@@ -372,6 +372,39 @@ async fn main() -> anyhow::Result<()> {
             p2p_listen_address,
         } => {
             let file_config = crate::config::AlgodRustConfig::load(config.as_deref())?;
+            // Load `<data-dir>/config.json` (go-algorand `config.Local`
+            // equivalent — issue #754/epic #745). This is currently
+            // observational only: the loaded fields aren't yet wired into
+            // runtime behavior (e.g. `algo-network`'s connection limits
+            // still come from `WsNetworkConfig`'s hardcoded defaults) —
+            // that wiring, and its exact precedence against the
+            // `--config` TOML file and CLI flags above, is each
+            // per-area follow-up issue's own call to make (#748 for
+            // networking, etc.). Loading it here now proves the mechanism
+            // works end-to-end against a real data directory and keeps
+            // operators informed of what a dropped-in `config.json` would
+            // resolve to once that wiring lands.
+            if let Some(dir) = data_dir.as_deref() {
+                match algo_config::Local::load_from_data_dir(dir) {
+                    Ok(node_config) => {
+                        tracing::debug!(
+                            version = node_config.version,
+                            max_connections_per_ip = node_config.max_connections_per_ip,
+                            incoming_connections_limit = node_config.incoming_connections_limit,
+                            enable_p2p = node_config.enable_p2p,
+                            enable_p2p_hybrid_mode = node_config.enable_p2p_hybrid_mode,
+                            p2p_persist_peer_id = node_config.p2p_persist_peer_id,
+                            "loaded config.json (not yet wired into runtime behavior)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to load config.json; continuing without it"
+                        );
+                    }
+                }
+            }
             let rest_opts = commands::participate::RestOptions {
                 listen: rest_listen,
                 data_dir,

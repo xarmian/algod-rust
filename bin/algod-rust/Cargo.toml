@@ -15,6 +15,7 @@ algo-codec.workspace = true
 algo-error.workspace = true
 algo-network.workspace = true
 algo-rest-client.workspace = true
+algo-config.workspace = true
 algo-validate.workspace = true
 algo-bench.workspace = true
 algo-conformance.workspace = true
