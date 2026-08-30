@@ -3779,7 +3779,12 @@ pub async fn run(
             .with_enable_developer_api(node_config.enable_developer_api)
             .with_enable_experimental_api(node_config.enable_experimental_api)
             .with_max_api_resources_per_account(node_config.max_api_resources_per_account)
-            .with_max_api_box_per_application(node_config.max_api_box_per_application);
+            .with_max_api_box_per_application(node_config.max_api_box_per_application)
+            // `config.json`'s `EnableRuntimeMetrics`/`EnableNetDevMetrics`
+            // (issue #776): process-wide `/metrics` counters, wired
+            // independently of the participation-metrics collector above.
+            .with_enable_runtime_metrics(node_config.enable_runtime_metrics)
+            .with_enable_netdev_metrics(node_config.enable_netdev_metrics);
         if let Some(p2p) = &p2p_transport {
             adapter = adapter.with_p2p_network(p2p.clone() as Arc<dyn algo_network::GossipNode>);
         }

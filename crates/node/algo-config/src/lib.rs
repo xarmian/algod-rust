@@ -921,6 +921,33 @@ static ENABLE_PROFILER: VersionedDefault<bool> = VersionedDefault::new(&[(0, || 
 static ENABLE_TOP_ACCOUNTS_REPORTING: VersionedDefault<bool> =
     VersionedDefault::new(&[(0, || false)]);
 
+// --- Metrics fields (issue #776, follow-up to #756) -------------------------
+//
+// #756's investigation found algod-rust's `/metrics` Prometheus registry had
+// zero runtime- or netdev-style counters to gate, so it split these two
+// fields off rather than build brand-new metrics infrastructure inside a
+// config-audit issue. This issue adds that infrastructure
+// (`algo_rest_api::process_metrics`) and wires both flags to it for real —
+// see that module's doc comment for the Go-runtime -> Rust mapping decision.
+
+/// Go: `EnableRuntimeMetrics bool` `version[22]:"false"` (`localTemplate.go:368-369`).
+/// Introduced by go-algorand commit `c516ac37e` ("metrics: collect and report
+/// Go runtime.metrics (#4041)"). Gates `daemon/algod/server.go:338-340`'s
+/// registration of `metrics.NewRuntimeMetrics()` into the process-wide
+/// Prometheus registry. Wired into
+/// `AlgodNodeInterface::metrics_exposition` — see
+/// `algo_rest_api::process_metrics::RuntimeMetricsSnapshot`.
+static ENABLE_RUNTIME_METRICS: VersionedDefault<bool> = VersionedDefault::new(&[(22, || false)]);
+
+/// Go: `EnableNetDevMetrics bool` `version[34]:"false"` (`localTemplate.go:371-372`).
+/// Introduced by go-algorand commit `e14fea6b3` ("metrics: collect total
+/// netdev sent/received bytes (#6108)"). Gates
+/// `daemon/algod/server.go:342-344`'s registration of `metrics.NetDevMetrics`
+/// into the process-wide Prometheus registry. Wired into
+/// `AlgodNodeInterface::metrics_exposition` — see
+/// `algo_rest_api::process_metrics::NetDevMetricsSnapshot`.
+static ENABLE_NET_DEV_METRICS: VersionedDefault<bool> = VersionedDefault::new(&[(34, || false)]);
+
 // --- Remaining networking fields (issue #768, follow-up to #748) -----------
 //
 // #748 scoped down `config.Local`'s full networking-field enumeration to
@@ -1378,6 +1405,12 @@ fn default_enable_dht_providers() -> bool {
 }
 fn default_dht_mode() -> String {
     DHT_MODE.at(LATEST_VERSION)
+}
+fn default_enable_runtime_metrics() -> bool {
+    ENABLE_RUNTIME_METRICS.at(LATEST_VERSION)
+}
+fn default_enable_netdev_metrics() -> bool {
+    ENABLE_NET_DEV_METRICS.at(LATEST_VERSION)
 }
 
 /// Convert go's `BaseLoggerDebugLevel` (`config.Local`, go's `logging.Level`
@@ -2147,6 +2180,24 @@ pub struct Local {
     /// comment.
     #[serde(rename = "DHTMode", default = "default_dht_mode")]
     pub dht_mode: String,
+
+    /// Go: `EnableRuntimeMetrics`. Wired into
+    /// `AlgodNodeInterface::metrics_exposition` (issue #776) — see
+    /// [`ENABLE_RUNTIME_METRICS`]'s doc comment.
+    #[serde(
+        rename = "EnableRuntimeMetrics",
+        default = "default_enable_runtime_metrics"
+    )]
+    pub enable_runtime_metrics: bool,
+
+    /// Go: `EnableNetDevMetrics`. Wired into
+    /// `AlgodNodeInterface::metrics_exposition` (issue #776) — see
+    /// [`ENABLE_NET_DEV_METRICS`]'s doc comment.
+    #[serde(
+        rename = "EnableNetDevMetrics",
+        default = "default_enable_netdev_metrics"
+    )]
+    pub enable_netdev_metrics: bool,
 }
 
 impl Default for Local {
@@ -2271,6 +2322,8 @@ impl Local {
             p2p_private_key_location: P2P_PRIVATE_KEY_LOCATION.at(version),
             enable_dht_providers: ENABLE_DHT_PROVIDERS.at(version),
             dht_mode: DHT_MODE.at(version),
+            enable_runtime_metrics: ENABLE_RUNTIME_METRICS.at(version),
+            enable_netdev_metrics: ENABLE_NET_DEV_METRICS.at(version),
         }
     }
 
@@ -2752,6 +2805,18 @@ impl Local {
                 next,
             );
             migrate_field(&mut self.dht_mode, &DHT_MODE, cur, next);
+            migrate_field(
+                &mut self.enable_runtime_metrics,
+                &ENABLE_RUNTIME_METRICS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_netdev_metrics,
+                &ENABLE_NET_DEV_METRICS,
+                cur,
+                next,
+            );
             self.version = next;
         }
         Ok(())
@@ -3005,6 +3070,8 @@ mod tests {
             ENABLE_DHT_PROVIDERS.max_tag_version(),
             DHT_MODE.max_tag_version(),
             ARCHIVAL.max_tag_version(),
+            ENABLE_RUNTIME_METRICS.max_tag_version(),
+            ENABLE_NET_DEV_METRICS.max_tag_version(),
         ]
         .into_iter()
         .max()
@@ -3123,6 +3190,8 @@ mod tests {
         assert_eq!(d.p2p_private_key_location, "");
         assert!(!d.enable_dht_providers);
         assert_eq!(d.dht_mode, "");
+        assert!(!d.enable_runtime_metrics);
+        assert!(!d.enable_netdev_metrics);
     }
 
     // --- Remaining networking fields (issue #768) ------------------------
@@ -3220,6 +3289,59 @@ mod tests {
             .expect("parses");
         assert!(cfg.enable_dht_providers);
         assert_eq!(cfg.dht_mode, "server");
+    }
+
+    /// Issue #776: `EnableRuntimeMetrics`/`EnableNetDevMetrics` default to
+    /// `false` (matching go) and round-trip through `config.json` overlay
+    /// independently of each other.
+    #[test]
+    fn enable_runtime_and_netdev_metrics_default_false_and_overlay() {
+        let d = Local::default();
+        assert!(!d.enable_runtime_metrics, "go's default is false");
+        assert!(!d.enable_netdev_metrics, "go's default is false");
+
+        let cfg = Local::load_from_str(r#"{"EnableRuntimeMetrics": true}"#).expect("parses");
+        assert!(cfg.enable_runtime_metrics);
+        assert!(
+            !cfg.enable_netdev_metrics,
+            "untouched field keeps its default"
+        );
+
+        let cfg = Local::load_from_str(r#"{"EnableNetDevMetrics": true}"#).expect("parses");
+        assert!(!cfg.enable_runtime_metrics);
+        assert!(cfg.enable_netdev_metrics);
+    }
+
+    /// `EnableRuntimeMetrics` carries `version[22]`: a config loaded at a
+    /// pre-22 version must still migrate it to `false` once it reaches
+    /// version 22, and an explicit operator override must survive the
+    /// migration walk (mirrors the same guarantee tested elsewhere for
+    /// `DisableLocalhostConnectionRateLimit`'s version-34 tag).
+    #[test]
+    fn enable_runtime_metrics_migrates_at_version_22_boundary() {
+        let mut cfg = Local::load_from_str(r#"{"Version": 21}"#).expect("parses");
+        assert!(!cfg.enable_runtime_metrics);
+        cfg.migrate().expect("migrates");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert!(
+            !cfg.enable_runtime_metrics,
+            "tag default is false; migrating past version 22 changes nothing observable here"
+        );
+    }
+
+    /// `EnableNetDevMetrics` carries `version[34]`: an explicit override set
+    /// on an old-versioned config must survive migration all the way to
+    /// [`LATEST_VERSION`].
+    #[test]
+    fn enable_netdev_metrics_override_survives_migration_past_version_34() {
+        let mut cfg = Local::load_from_str(r#"{"Version": 30, "EnableNetDevMetrics": true}"#)
+            .expect("parses");
+        cfg.migrate().expect("migrates");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert!(
+            cfg.enable_netdev_metrics,
+            "explicit override must not be clobbered by the version-34 tag's default"
+        );
     }
 
     #[test]

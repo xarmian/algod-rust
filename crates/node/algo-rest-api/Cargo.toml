@@ -33,6 +33,7 @@ data-encoding.workspace = true
 rmpv.workspace = true
 num-bigint.workspace = true
 serde_bytes.workspace = true
+sysinfo.workspace = true
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
