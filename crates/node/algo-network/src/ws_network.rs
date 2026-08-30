@@ -281,6 +281,25 @@ impl Default for WebsocketNetworkConfig {
     }
 }
 
+/// Builds a fresh outgoing-message filter for one new peer connection, or
+/// `None` when outgoing filtering is disabled.
+///
+/// Deliberately a plain function (not cached state): every call site that
+/// establishes a real connection — the inbound accept path
+/// (`handle_gossip_websocket`) and both outbound-dial paths
+/// (`WebsocketNetwork::mesh_connect`, `NetworkConnectFn::try_dial`) — must
+/// call this itself to get its *own* instance rather than cloning an `Arc`
+/// built once and shared network-wide. See
+/// [`WebsocketNetwork::new_outgoing_message_filter`]'s docs for why (issue
+/// #803).
+fn build_outgoing_message_filter(
+    enabled: bool,
+    bucket_count: usize,
+    bucket_size: usize,
+) -> Option<Arc<MessageFilter>> {
+    enabled.then(|| Arc::new(MessageFilter::new(bucket_count, bucket_size)))
+}
+
 // ---------------------------------------------------------------------------
 // Direction tracking
 // ---------------------------------------------------------------------------
@@ -300,6 +319,14 @@ struct PeerEntry {
     handle: PeerHandle,
     /// Direction of the connection.
     direction: PeerDirection,
+    /// This connection's own outgoing-message filter, if outgoing filtering
+    /// is enabled — a fresh, independently-owned instance per connection
+    /// (issue #803), not shared with any other peer. Kept here (rather than
+    /// only inside the connection's read/write tasks) so
+    /// [`WebsocketNetwork::peer_outgoing_message_filter`] can expose a
+    /// single connection's dedup state for diagnostics/tests without
+    /// affecting any other peer's.
+    outgoing_filter: Option<Arc<MessageFilter>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,13 +355,11 @@ pub struct WebsocketNetwork {
     multiplexer: Arc<Multiplexer>,
 
     /// Deduplication filter for incoming messages. `None` when
-    /// `enable_incoming_message_filter` is off (go's default).
+    /// `enable_incoming_message_filter` is off (go's default). This one
+    /// *is* correctly shared network-wide — mirroring go's
+    /// `wn.incomingMsgFilter` (`network/wsNetwork.go:660`), a single
+    /// instance copied by reference into every `wsPeer`.
     incoming_message_filter: Option<Arc<MessageFilter>>,
-
-    /// Deduplication filter for outgoing messages (`MsgDigestSkip`
-    /// tracking). `None` when `enable_outgoing_network_message_filtering`
-    /// is off.
-    outgoing_message_filter: Option<Arc<MessageFilter>>,
 
     /// Cancellation token for coordinated shutdown.
     cancel: CancellationToken,
@@ -397,12 +422,6 @@ impl WebsocketNetwork {
                 config.incoming_message_filter_bucket_size,
             ))
         });
-        let outgoing_message_filter = config.enable_outgoing_network_message_filtering.then(|| {
-            Arc::new(MessageFilter::new(
-                config.outgoing_message_filter_bucket_count,
-                config.outgoing_message_filter_bucket_size,
-            ))
-        });
         Self {
             config,
             peers: Arc::new(RwLock::new(HashMap::new())),
@@ -410,7 +429,6 @@ impl WebsocketNetwork {
             phonebook,
             multiplexer: Arc::new(Multiplexer::new()),
             incoming_message_filter,
-            outgoing_message_filter,
             cancel: CancellationToken::new(),
             mesh_update_tx: Mutex::new(None),
             pending_disconnects: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -450,10 +468,43 @@ impl WebsocketNetwork {
         self.incoming_message_filter.as_ref()
     }
 
-    /// Returns the outgoing-message dedup filter, if
-    /// `enable_outgoing_network_message_filtering` is on (go's default).
-    pub fn outgoing_message_filter(&self) -> Option<&Arc<MessageFilter>> {
-        self.outgoing_message_filter.as_ref()
+    /// Constructs a fresh, independently-owned outgoing-message filter for a
+    /// new peer connection, sized from this network's config
+    /// (`enable_outgoing_network_message_filtering` /
+    /// `outgoing_message_filter_bucket_count` / `_bucket_size`). Returns
+    /// `None` when filtering is disabled.
+    ///
+    /// Every call returns a *new* [`MessageFilter`] instance — deliberately.
+    /// Go's `outgoingMsgFilter` is a per-`wsPeer` field, constructed fresh
+    /// in `wsPeer.init()` for each connection object
+    /// (`network/wsPeer.go:213`, `network/wsPeer.go:469`), populated only by
+    /// `MsgDigestSkip` messages *that specific peer* sends, and consulted
+    /// only when deciding whether to send *to that specific peer*
+    /// (`network/wsPeer.go:932`). Sharing one instance across connections
+    /// (this network's behaviour before issue #803) means one peer's
+    /// `MsgDigestSkip` claim wrongly suppresses sends to every other peer
+    /// too — never clone one call's result into more than one connection's
+    /// [`crate::ws_peer::WsPeerConfig::outgoing_filter`].
+    pub fn new_outgoing_message_filter(&self) -> Option<Arc<MessageFilter>> {
+        build_outgoing_message_filter(
+            self.config.enable_outgoing_network_message_filtering,
+            self.config.outgoing_message_filter_bucket_count,
+            self.config.outgoing_message_filter_bucket_size,
+        )
+    }
+
+    /// Returns the outgoing-message filter belonging to one specific
+    /// connected peer (looked up by remote address), if outgoing filtering
+    /// is enabled and that peer is currently connected.
+    ///
+    /// Each connection owns its own filter instance (issue #803): this is a
+    /// per-*connection* view, not a network-wide one. Mainly useful for
+    /// diagnostics/tests that need to observe a single connection's dedup
+    /// state without that state being (or appearing to be) shared with any
+    /// other peer.
+    pub async fn peer_outgoing_message_filter(&self, addr: &str) -> Option<Arc<MessageFilter>> {
+        let peers = self.peers.read().await;
+        peers.get(addr).and_then(|e| e.outgoing_filter.clone())
     }
 
     /// Returns a reference to the connection tracker.
@@ -493,6 +544,18 @@ impl WebsocketNetwork {
         peers.len()
     }
 
+    /// Returns the remote addresses of all currently connected peers
+    /// (both inbound and outbound), in unspecified order.
+    ///
+    /// Mainly useful for diagnostics/tests that need to enumerate peer keys
+    /// without knowing them in advance (e.g. an accepted inbound
+    /// connection's remote address is assigned by the OS, not chosen by
+    /// either side).
+    pub async fn peer_addresses(&self) -> Vec<String> {
+        let peers = self.peers.read().await;
+        peers.keys().cloned().collect()
+    }
+
     /// Returns lightweight [`UnicastPeer`] references for all connected
     /// outbound peers.
     ///
@@ -515,7 +578,19 @@ impl WebsocketNetwork {
     /// a receive/dispatch loop that reads messages, dispatches them to the
     /// multiplexer, and removes the peer on disconnect or error.  The
     /// receive task respects the network's [`CancellationToken`].
-    pub async fn add_peer(&self, mut handle: PeerHandle, direction: PeerDirection) {
+    ///
+    /// `outgoing_filter` is the filter this specific connection's
+    /// [`WsPeerConfig`](crate::ws_peer::WsPeerConfig) was already
+    /// constructed with (see [`Self::new_outgoing_message_filter`]) — it is
+    /// recorded here only so [`Self::peer_outgoing_message_filter`] can
+    /// expose this one connection's dedup state; it must be a fresh
+    /// instance per call, never one shared with another peer (issue #803).
+    pub async fn add_peer(
+        &self,
+        mut handle: PeerHandle,
+        direction: PeerDirection,
+        outgoing_filter: Option<Arc<MessageFilter>>,
+    ) {
         let addr = handle.remote_addr().to_string();
 
         // Take the incoming receiver before storing the handle.
@@ -528,7 +603,14 @@ impl WebsocketNetwork {
         // Store the peer entry.
         {
             let mut peers = self.peers.write().await;
-            peers.insert(addr.clone(), PeerEntry { handle, direction });
+            peers.insert(
+                addr.clone(),
+                PeerEntry {
+                    handle,
+                    direction,
+                    outgoing_filter,
+                },
+            );
         }
 
         tracing::info!(addr = %addr, direction = ?direction, "peer added to network");
@@ -539,7 +621,12 @@ impl WebsocketNetwork {
             let cancel = self.cancel.clone();
             let peers = Arc::clone(&self.peers);
             let peer_addr = addr;
-            let outgoing_message_filter = self.outgoing_message_filter.clone();
+            // Whether *any* outgoing filtering is enabled network-wide —
+            // this only gates whether we bother computing a digest and
+            // notifying other peers below; it is not any one connection's
+            // filter instance (each connection has its own, see
+            // `PeerEntry::outgoing_filter` / issue #803).
+            let outgoing_filtering_enabled = self.config.enable_outgoing_network_message_filtering;
             let broadcast_handle: Option<BroadcastHandle> = {
                 let guard = self
                     .broadcast_thread
@@ -577,7 +664,7 @@ impl WebsocketNetwork {
                                     // for any large dedup-safe message *before*
                                     // wn.Handle() decides what to do with it
                                     // (network/wsNetwork.go:1249-1251).
-                                    if outgoing_message_filter.is_some()
+                                    if outgoing_filtering_enabled
                                         && dedup_safe_tag(&tag)
                                         && request_data.len() >= MESSAGE_FILTER_SIZE
                                     {
@@ -774,11 +861,17 @@ impl WebsocketNetwork {
             // `request_connect_outgoing` calls) — both establish real peer
             // connections, so both must attach the filters or dedup only
             // works depending on which path happened to dial.
+            //
+            // Issue #803: `outgoing_filter` must be a *fresh* instance per
+            // connection, not the (removed) network-wide shared Arc — a
+            // `MsgDigestSkip` from one peer must never suppress sends to a
+            // different one.
+            let outgoing_filter = self.new_outgoing_message_filter();
             let connect_config = ConnectConfig {
                 genesis_id: self.config.genesis_id.clone(),
                 peer_config: Some(crate::ws_peer::WsPeerConfig {
                     incoming_filter: self.incoming_message_filter.clone(),
-                    outgoing_filter: self.outgoing_message_filter.clone(),
+                    outgoing_filter: outgoing_filter.clone(),
                     ..crate::ws_peer::WsPeerConfig::default()
                 }),
                 ..ConnectConfig::default()
@@ -787,7 +880,8 @@ impl WebsocketNetwork {
             let addr_clone = addr.clone();
             match try_connect(&addr_clone, &connect_config).await {
                 Ok(handle) => {
-                    self.add_peer(handle, PeerDirection::Outbound).await;
+                    self.add_peer(handle, PeerDirection::Outbound, outgoing_filter)
+                        .await;
                     tracing::info!(addr = %addr_clone, "outbound connection established");
                 }
                 Err(e) => {
@@ -1365,13 +1459,23 @@ struct NetworkConnectFn {
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     genesis_id: String,
     broadcast_thread: Arc<std::sync::Mutex<Option<BroadcastThread>>>,
-    /// Issue #789: the network's constructed incoming/outgoing
-    /// `MessageFilter`s, threaded into every real outbound (mesh-dial)
-    /// connection's `WsPeerConfig` so dedup actually runs on the wire —
-    /// previously `try_dial` always built `WsPeerConfig::default()`, so
-    /// these filters (config-driven since #768) had zero live effect.
+    /// Issue #789: the network's constructed incoming `MessageFilter`,
+    /// threaded into every real outbound (mesh-dial) connection's
+    /// `WsPeerConfig` so dedup actually runs on the wire — previously
+    /// `try_dial` always built `WsPeerConfig::default()`, so this filter
+    /// (config-driven since #768) had zero live effect. This one is
+    /// legitimately shared network-wide, mirroring go's `wn.incomingMsgFilter`
+    /// (see [`WebsocketNetwork`]'s field doc).
     incoming_message_filter: Option<Arc<MessageFilter>>,
-    outgoing_message_filter: Option<Arc<MessageFilter>>,
+    /// Config needed to build a *fresh* outgoing-message filter for each
+    /// dial (issue #803): unlike the incoming filter above, go's
+    /// `outgoingMsgFilter` is a per-connection instance
+    /// (`network/wsPeer.go:213,469`), so this cannot be a single shared
+    /// `Arc` — every `try_dial` call must build its own via
+    /// [`build_outgoing_message_filter`].
+    outgoing_message_filter_enabled: bool,
+    outgoing_message_filter_bucket_count: usize,
+    outgoing_message_filter_bucket_size: usize,
 }
 
 impl ConnectFn for NetworkConnectFn {
@@ -1383,7 +1487,14 @@ impl ConnectFn for NetworkConnectFn {
         let genesis_id = self.genesis_id.clone();
         let broadcast_thread = Arc::clone(&self.broadcast_thread);
         let incoming_message_filter = self.incoming_message_filter.clone();
-        let outgoing_message_filter = self.outgoing_message_filter.clone();
+        // Issue #803: build a fresh outgoing filter for *this* connection —
+        // never reuse an instance across dials, or one peer's
+        // `MsgDigestSkip` would suppress sends to a different peer.
+        let outgoing_message_filter = build_outgoing_message_filter(
+            self.outgoing_message_filter_enabled,
+            self.outgoing_message_filter_bucket_count,
+            self.outgoing_message_filter_bucket_size,
+        );
 
         Box::pin(async move {
             use crate::ws_peer::WsPeerConfig;
@@ -1394,7 +1505,7 @@ impl ConnectFn for NetworkConnectFn {
                 peer_config: Some(WsPeerConfig {
                     request_timeout: Some(Duration::from_secs(5)),
                     incoming_filter: incoming_message_filter,
-                    outgoing_filter: outgoing_message_filter,
+                    outgoing_filter: outgoing_message_filter.clone(),
                     ..WsPeerConfig::default()
                 }),
                 ..ConnectConfig::default()
@@ -1413,6 +1524,7 @@ impl ConnectFn for NetworkConnectFn {
                             PeerEntry {
                                 handle,
                                 direction: PeerDirection::Outbound,
+                                outgoing_filter: outgoing_message_filter,
                             },
                         );
                     }
@@ -1586,7 +1698,9 @@ impl WebsocketNetwork {
             genesis_id: self.config.genesis_id.clone(),
             broadcast_thread: Arc::clone(&self.broadcast_thread),
             incoming_message_filter: self.incoming_message_filter.clone(),
-            outgoing_message_filter: self.outgoing_message_filter.clone(),
+            outgoing_message_filter_enabled: self.config.enable_outgoing_network_message_filtering,
+            outgoing_message_filter_bucket_count: self.config.outgoing_message_filter_bucket_count,
+            outgoing_message_filter_bucket_size: self.config.outgoing_message_filter_bucket_size,
         };
 
         let peer_counter = NetworkPeerCounter {
@@ -1935,18 +2049,26 @@ async fn handle_gossip_websocket(
     // outbound-dial path's `WsPeerConfig`. Without this, `WebsocketNetwork`
     // constructs the filters (config-driven since #768) but no accepted
     // connection ever consulted them, so gossip dedup had zero effect.
+    //
+    // Issue #803: `new_outgoing_message_filter()` builds a *fresh* filter
+    // for this one connection — it must never be the same instance handed
+    // to any other accepted or dialed peer, or one peer's `MsgDigestSkip`
+    // would wrongly suppress sends to a completely different peer.
+    let outgoing_filter = network.new_outgoing_message_filter();
     let handle = PeerHandle::new_inbound(
         socket,
         remote_addr.clone(),
         version,
         network.cancel.child_token(),
         network.incoming_message_filter().cloned(),
-        network.outgoing_message_filter().cloned(),
+        outgoing_filter.clone(),
     );
 
     // Register the inbound peer in the peer map via add_peer, which
     // also spawns the receive/dispatch loop for multiplexer integration.
-    network.add_peer(handle, PeerDirection::Inbound).await;
+    network
+        .add_peer(handle, PeerDirection::Inbound, outgoing_filter)
+        .await;
 
     // Wait for the peer to disconnect (watch for removal from the peer map
     // or cancellation).  When it disconnects, release the connection tracker.
@@ -2204,8 +2326,42 @@ mod tests {
         // incoming filter is not (go's `EnableIncomingMessageFilter`
         // defaults `false`).
         let _mux = net.multiplexer();
-        assert!(net.outgoing_message_filter().is_some());
+        assert!(net.new_outgoing_message_filter().is_some());
         assert!(net.incoming_message_filter().is_none());
+    }
+
+    /// Issue #803: unlike `incoming_message_filter()` (one shared instance,
+    /// intentionally), `new_outgoing_message_filter()` must hand back a
+    /// *different* `MessageFilter` object on every call — that's exactly
+    /// what makes each new peer connection's outgoing filter independent of
+    /// every other connection's.
+    #[test]
+    fn new_outgoing_message_filter_returns_independent_instances() {
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let config = WebsocketNetworkConfig {
+            genesis_id: "test".to_string(),
+            enable_outgoing_network_message_filtering: true,
+            ..Default::default()
+        };
+        let net = WebsocketNetwork::new(config, phonebook);
+
+        let first = net
+            .new_outgoing_message_filter()
+            .expect("enabled outgoing filter is constructed");
+        let second = net
+            .new_outgoing_message_filter()
+            .expect("enabled outgoing filter is constructed");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "each connection must get its own MessageFilter instance, not a shared one"
+        );
+
+        // Recording a digest in one connection's filter must never be
+        // visible through a different connection's filter.
+        let digest = crate::message_filter::generate_message_digest(&Tag::Transaction, b"m1");
+        first.check_digest(&digest, true, true);
+        assert!(first.check_digest(&digest, false, false));
+        assert!(!second.check_digest(&digest, false, false));
     }
 
     #[test]
@@ -2227,7 +2383,7 @@ mod tests {
             .incoming_message_filter()
             .expect("enabled incoming filter is constructed");
         let outgoing = net
-            .outgoing_message_filter()
+            .new_outgoing_message_filter()
             .expect("enabled outgoing filter is constructed");
 
         // Exercise the configured (small) bucket size: inserting 3 distinct
@@ -2254,7 +2410,7 @@ mod tests {
         };
         let net = WebsocketNetwork::new(config, phonebook);
         assert!(net.incoming_message_filter().is_none());
-        assert!(net.outgoing_message_filter().is_none());
+        assert!(net.new_outgoing_message_filter().is_none());
     }
 
     // -----------------------------------------------------------------------
