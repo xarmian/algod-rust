@@ -27,6 +27,19 @@ use tracing::{debug, info, warn};
 /// Default chunk size for streaming reads (64 KiB).
 const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 
+/// Default minimum acceptable download speed (bytes/second) — go's
+/// `MinCatchpointFileDownloadBytesPerSecond` default (`config.Local`,
+/// `../go-algorand/config/local_defaults.go:118`, matching
+/// `defaultMinCatchpointFileDownloadBytesPerSecond` in
+/// `catchup/ledgerFetcher.go:45`).
+const DEFAULT_MIN_BYTES_PER_SECOND: u64 = 20 * 1024;
+
+/// Floor added to the per-chunk stall-detection window regardless of
+/// configured speed, mirroring go's `maxCatchpointFileChunkDownloadDuration`
+/// 2-minute floor (`catchup/ledgerFetcher.go:157`) — a slow-but-still-moving
+/// peer over a real network shouldn't be killed by an overly tight window.
+const STALL_WINDOW_FLOOR: Duration = Duration::from_secs(120);
+
 /// Progress information reported during a catchpoint file download.
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
@@ -50,16 +63,47 @@ pub struct CatchpointDownloadConfig {
     pub max_retries: u32,
     /// Delay between retries, doubled on each successive retry (default: 1s).
     pub retry_delay: Duration,
+    /// Minimum acceptable sustained download speed, in bytes/second — go's
+    /// `MinCatchpointFileDownloadBytesPerSecond` (`config.Local`, issue
+    /// #749). If no `chunk_size` bytes arrive within the resulting
+    /// per-chunk stall window, the in-progress request is abandoned as a
+    /// recoverable error and retried (same path as a dropped connection),
+    /// rather than hanging indefinitely on a stalled peer. `0` disables
+    /// stall detection entirely (only the overall `timeout` still applies).
+    pub min_bytes_per_second: u64,
 }
 
 impl Default for CatchpointDownloadConfig {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(30 * 60),
+            // go's real default is 12h (`MaxCatchpointDownloadDuration`,
+            // version 28 onward) — the previous 30-minute value here
+            // matched neither of go's real defaults (2h pre-28, 12h from
+            // 28 onward), issue #749.
+            timeout: Duration::from_secs(12 * 60 * 60),
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_retries: 3,
             retry_delay: Duration::from_secs(1),
+            min_bytes_per_second: DEFAULT_MIN_BYTES_PER_SECOND,
         }
+    }
+}
+
+impl CatchpointDownloadConfig {
+    /// Per-chunk stall-detection window: how long a single `response.chunk()`
+    /// read may take before it's treated as a stall. Mirrors (not
+    /// byte-for-byte — algod-rust's `chunk_size` is far smaller than go's
+    /// `maxCatchpointFileChunkSize`) go's formula at
+    /// `catchup/ledgerFetcher.go:157-162`: a fixed floor plus
+    /// `chunk_size / min_bytes_per_second`. Returns `None` when
+    /// `min_bytes_per_second` is `0` (stall detection disabled).
+    fn stall_window(&self) -> Option<Duration> {
+        if self.min_bytes_per_second == 0 {
+            return None;
+        }
+        let extra =
+            Duration::from_secs_f64(self.chunk_size as f64 / self.min_bytes_per_second as f64);
+        Some(STALL_WINDOW_FLOOR + extra)
     }
 }
 
@@ -244,16 +288,14 @@ impl CatchpointDownloader {
 
         let mut bytes_downloaded: u64 = 0;
         let mut bytes_since_progress: usize = 0;
+        let stall_window = self.config.stall_window();
 
         // Use reqwest's chunk() method to stream the response body without
         // buffering the entire payload in memory.
-        while let Some(chunk) = response.chunk().await.map_err(|e| AlgoError::RestClient {
-            source: Box::new(e),
-            context: format!(
-                "reading chunk at offset {bytes_downloaded} from {}",
-                path.display()
-            ),
-        })? {
+        while let Some(chunk) = self
+            .read_chunk_with_stall_check(&mut response, stall_window, bytes_downloaded, path)
+            .await?
+        {
             file.write_all(&chunk).await.map_err(|e| {
                 AlgoError::Io(std::io::Error::new(
                     e.kind(),
@@ -302,6 +344,55 @@ impl CatchpointDownloader {
             path.display()
         );
         Ok(())
+    }
+
+    /// Read the next chunk from `response`, applying the per-chunk
+    /// stall-detection window (go's `MinCatchpointFileDownloadBytesPerSecond`,
+    /// issue #749) when one is configured. A read that exceeds
+    /// `stall_window` is treated as a recoverable error identically to a
+    /// dropped connection — [`Self::download`]'s outer retry loop restarts
+    /// the whole request rather than hanging on a peer that stopped sending
+    /// data.
+    async fn read_chunk_with_stall_check(
+        &self,
+        response: &mut reqwest::Response,
+        stall_window: Option<Duration>,
+        bytes_downloaded: u64,
+        path: &Path,
+    ) -> Result<Option<bytes::Bytes>> {
+        let read = response.chunk();
+        let result = match stall_window {
+            Some(window) => match tokio::time::timeout(window, read).await {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!(
+                        bytes_downloaded,
+                        stall_window_secs = window.as_secs_f64(),
+                        path = %path.display(),
+                        "catchpoint download: no data received within the stall window, \
+                         treating as a recoverable interruption"
+                    );
+                    return Err(AlgoError::RestClient {
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "no bytes received within {:.1}s (min download speed not met)",
+                                window.as_secs_f64()
+                            ),
+                        )),
+                        context: format!("stalled reading chunk at offset {bytes_downloaded}"),
+                    });
+                }
+            },
+            None => read.await,
+        };
+        result.map_err(|e| AlgoError::RestClient {
+            source: Box::new(e),
+            context: format!(
+                "reading chunk at offset {bytes_downloaded} from {}",
+                path.display()
+            ),
+        })
     }
 
     /// Execute a GET request with retry and exponential backoff.
@@ -503,6 +594,7 @@ mod tests {
                 chunk_size: 16,
                 max_retries: 3,
                 retry_delay: Duration::from_millis(10),
+                min_bytes_per_second: 0,
             },
         );
 
@@ -553,11 +645,133 @@ mod tests {
 
     #[test]
     fn test_default_config() {
+        // go's real defaults (issue #749): MaxCatchpointDownloadDuration is
+        // 12h (version 28 onward), not the previous hardcoded 30-minute
+        // value, which matched neither of go's real defaults (2h pre-28,
+        // 12h from 28 onward).
         let config = CatchpointDownloadConfig::default();
-        assert_eq!(config.timeout, Duration::from_secs(30 * 60));
+        assert_eq!(config.timeout, Duration::from_secs(12 * 60 * 60));
         assert_eq!(config.chunk_size, DEFAULT_CHUNK_SIZE);
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.retry_delay, Duration::from_secs(1));
+        assert_eq!(
+            config.min_bytes_per_second, DEFAULT_MIN_BYTES_PER_SECOND,
+            "go's MinCatchpointFileDownloadBytesPerSecond default is 20*1024"
+        );
+    }
+
+    #[test]
+    fn stall_window_is_none_when_min_bytes_per_second_is_zero() {
+        let config = CatchpointDownloadConfig {
+            min_bytes_per_second: 0,
+            ..CatchpointDownloadConfig::default()
+        };
+        assert!(config.stall_window().is_none());
+    }
+
+    #[test]
+    fn stall_window_scales_with_configured_speed_and_respects_the_floor() {
+        // A very high configured speed still respects (stays within a
+        // handful of microseconds of) the 2-minute floor.
+        let fast = CatchpointDownloadConfig {
+            chunk_size: 64 * 1024,
+            min_bytes_per_second: 1_000_000_000,
+            ..CatchpointDownloadConfig::default()
+        };
+        let fast_window = fast.stall_window().unwrap();
+        assert!(
+            fast_window >= STALL_WINDOW_FLOOR
+                && fast_window < STALL_WINDOW_FLOOR + Duration::from_millis(1),
+            "expected ~= the floor, got {fast_window:?}"
+        );
+
+        // A slow configured speed extends the window beyond the floor.
+        let slow = CatchpointDownloadConfig {
+            chunk_size: 64 * 1024,
+            min_bytes_per_second: 1024,
+            ..CatchpointDownloadConfig::default()
+        };
+        let window = slow.stall_window().unwrap();
+        assert!(
+            window > STALL_WINDOW_FLOOR,
+            "a slow configured speed must extend the window beyond the floor, got {window:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_chunk_with_stall_check_times_out_on_a_stalled_response() {
+        // Direct unit test of the stall-detection primitive itself (issue
+        // #749), using an explicit short window rather than
+        // `config.stall_window()`'s real 2-minute floor — proving the
+        // arithmetic in `stall_window` is exercised separately above.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                // Send headers, then stall well past the test's window
+                // before ever writing a body byte.
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                    .await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let _ = socket.write_all(b"data").await;
+            }
+        });
+
+        let dl = CatchpointDownloader::new(&format!("http://{addr}"), "");
+        let mut response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+
+        let result = dl
+            .read_chunk_with_stall_check(
+                &mut response,
+                Some(Duration::from_millis(100)),
+                0,
+                Path::new("test.tmp"),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a chunk read exceeding the stall window must be treated as an error"
+        );
+        assert!(
+            is_recoverable_stream_error(&result.unwrap_err()),
+            "a stall timeout must be recoverable (retried), like a dropped connection"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_chunk_with_stall_check_succeeds_when_data_arrives_in_time() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata")
+                    .await;
+            }
+        });
+
+        let dl = CatchpointDownloader::new(&format!("http://{addr}"), "");
+        let mut response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+
+        let result = dl
+            .read_chunk_with_stall_check(
+                &mut response,
+                Some(Duration::from_secs(5)),
+                0,
+                Path::new("test.tmp"),
+            )
+            .await;
+
+        let chunk = result.expect("data arriving well within the window must succeed");
+        assert_eq!(chunk.unwrap().as_ref(), b"data");
     }
 
     #[test]

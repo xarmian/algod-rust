@@ -3077,6 +3077,30 @@ pub async fn run(
         anyhow::anyhow!("failed to open ledger at {}: {}", ledger_path.display(), e)
     })?;
 
+    // Apply config-driven storage settings (issue #749):
+    // `LedgerSynchronousMode` (SQLite `synchronous` pragma on the main
+    // ledger connection) and `DisableLedgerLRUCache` (merkle trie page
+    // cache eviction). `open` already applied
+    // `algo_ledger::sqlite::DEFAULT_LEDGER_SYNCHRONOUS_MODE`, so this is a
+    // no-op unless the operator's `config.json` overrides it.
+    sqlite_ledger
+        .set_synchronous_mode(node_config.ledger_synchronous_mode)
+        .map_err(|e| anyhow::anyhow!("set ledger synchronous mode: {e}"))?;
+    sqlite_ledger.set_lru_cache_disabled(node_config.disable_ledger_lru_cache);
+
+    // `OptimizeAccountsDatabaseOnStartup` (issue #749): run SQLite `VACUUM`
+    // on the accounts DB once, mirroring go's
+    // `Ledger.reloadLedger` -> `accountUpdates.vacuumDatabase`
+    // (`../go-algorand/ledger/ledger.go:268-272`). Opt-in and potentially
+    // slow on a large accounts DB, matching go's own "not a typical
+    // operational use-case" framing.
+    if node_config.optimize_accounts_database_on_startup {
+        info!("OptimizeAccountsDatabaseOnStartup: vacuuming accounts database");
+        sqlite_ledger
+            .vacuum_accounts_database()
+            .map_err(|e| anyhow::anyhow!("vacuum accounts database: {e}"))?;
+    }
+
     // Reject anything but a fully populated block archive before
     // booting agreement. Participating with a missing tail block — or
     // with the catchpoint-only "blockdb empty" shape — would risk

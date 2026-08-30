@@ -317,6 +317,14 @@ pub struct MerkleTrieCache {
     /// page. PLAN-144 TASK-148; mirrors Go's
     /// `MemoryConfig.MaxChildrenPagesThreshold`.
     max_children_pages_threshold: u64,
+    /// When `true`, [`MerkleTrieCache::evict`] is a no-op — go's
+    /// `DisableLedgerLRUCache` (`config.Local`, wired via issue #749).
+    /// Everything stays resident in memory regardless of
+    /// `cached_node_count_target`; go's own doc comment on the field
+    /// warns this "might result in significant performance degradation
+    /// and SHOULD NOT be used for other reasons than testing" — this is
+    /// a real (if inadvisable) toggle, not a dropped no-op.
+    lru_disabled: bool,
 }
 
 impl std::fmt::Debug for MerkleTrieCache {
@@ -335,6 +343,7 @@ impl std::fmt::Debug for MerkleTrieCache {
                 &self.pending_deletion_pages.len(),
             )
             .field("has_lazy_loader", &self.lazy_loader.is_some())
+            .field("lru_disabled", &self.lru_disabled)
             .finish()
     }
 }
@@ -368,6 +377,7 @@ impl MerkleTrieCache {
             lazy_loader: None,
             target_page_fill_factor: DEFAULT_PAGE_FILL_FACTOR,
             max_children_pages_threshold: DEFAULT_MAX_CHILDREN_PAGES_THRESHOLD,
+            lru_disabled: false,
         }
     }
 
@@ -383,6 +393,20 @@ impl MerkleTrieCache {
     /// Read-only view of the eviction target (for tests + diagnostics).
     pub fn cache_target(&self) -> usize {
         self.cached_node_count_target
+    }
+
+    /// Enable/disable LRU eviction — go's `DisableLedgerLRUCache`
+    /// (`config.Local`, issue #749). Production calls this on every load
+    /// to apply `SqliteLedger`'s configured value, mirroring
+    /// `set_cache_target`'s pattern.
+    pub fn set_lru_disabled(&mut self, disabled: bool) {
+        self.lru_disabled = disabled;
+    }
+
+    /// Read-only view of whether LRU eviction is disabled (for tests +
+    /// diagnostics).
+    pub fn lru_disabled(&self) -> bool {
+        self.lru_disabled
     }
 
     /// Install an owned page committer as the cache's lazy loader.
@@ -662,6 +686,10 @@ impl MerkleTrieCache {
     ///
     /// Wired into `SqliteLedger::commit_block` (PLAN-144 TASK-147).
     pub fn evict(&mut self, root_id: Option<u64>) -> usize {
+        if self.lru_disabled {
+            // go's `DisableLedgerLRUCache`: keep everything resident.
+            return 0;
+        }
         // Pin the root page at the front.
         let root_page = root_id.map(|rid| self.page_of(rid));
         if let Some(rp) = root_page {
@@ -1584,6 +1612,33 @@ mod tests {
         // a and b were on un-pinned pages; eviction took them.
         assert!(!cache.contains_in_memory(a));
         assert!(!cache.contains_in_memory(b));
+    }
+
+    #[test]
+    fn evict_is_a_noop_when_lru_disabled() {
+        // go's `DisableLedgerLRUCache`: everything stays resident even
+        // when the node count exceeds the eviction target.
+        let mut cache = MerkleTrieCache::with_target(1);
+        let a = cache.allocate(TrieNode::leaf(vec![1; 36]));
+        cache.next_node_id += NODES_PER_PAGE;
+        let b = cache.allocate(TrieNode::leaf(vec![2; 36]));
+        cache.next_node_id += NODES_PER_PAGE;
+        let c = cache.allocate(TrieNode::leaf(vec![3; 36]));
+        assert_eq!(cache.cached_node_count(), 3);
+
+        cache.set_lru_disabled(true);
+        assert!(cache.lru_disabled());
+        let evicted = cache.evict(Some(c));
+
+        assert_eq!(evicted, 0, "disabled LRU must evict nothing");
+        assert_eq!(
+            cache.cached_node_count(),
+            3,
+            "all nodes must remain resident despite target=1"
+        );
+        assert!(cache.contains_in_memory(a));
+        assert!(cache.contains_in_memory(b));
+        assert!(cache.contains_in_memory(c));
     }
 
     #[test]

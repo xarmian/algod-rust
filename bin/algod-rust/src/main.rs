@@ -141,11 +141,26 @@ async fn main() -> anyhow::Result<()> {
             genesis_id,
             relay_addr,
             dns_bootstrap,
+            data_dir,
         } => {
             let (resolved_url, resolved_token, net_name) =
                 commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
 
             if catchpoint.is_some() || catchpoint_auto {
+                // Load `<data-dir>/config.json` for
+                // `AccountsRebuildSynchronousMode` (issue #749): the
+                // catchpoint-sync bulk-import connection's SQLite
+                // `synchronous` pragma, previously hardcoded to `NORMAL`.
+                let node_config = match data_dir.as_deref() {
+                    Some(dir) => algo_config::Local::load_from_data_dir(dir).unwrap_or_else(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to load config.json; continuing with defaults"
+                        );
+                        algo_config::Local::default()
+                    }),
+                    None => algo_config::Local::default(),
+                };
                 // Catchpoint sync path.
                 commands::catchpoint_sync::run(
                     net_name,
@@ -161,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
                     avm_execute,
                     fail_fast,
                     end,
+                    node_config.accounts_rebuild_synchronous_mode,
                 )
                 .await?;
             } else {
@@ -192,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
                 label,
                 reward_unit,
                 no_verify,
+                data_dir,
             } => {
                 commands::catchpoint::run_import(
                     &file,
@@ -199,11 +216,12 @@ async fn main() -> anyhow::Result<()> {
                     label.as_deref(),
                     reward_unit,
                     !no_verify,
+                    data_dir.as_deref(),
                 )
                 .await?;
             }
-            CatchpointAction::Verify { db, file } => {
-                commands::catchpoint::run_verify(&db, file.as_deref()).await?;
+            CatchpointAction::Verify { db, file, data_dir } => {
+                commands::catchpoint::run_verify(&db, file.as_deref(), data_dir.as_deref()).await?;
             }
             CatchpointAction::Export {
                 db,
@@ -213,15 +231,17 @@ async fn main() -> anyhow::Result<()> {
                 block_digest,
                 no_online_data,
                 no_gzip,
+                data_dir,
             } => {
                 commands::catchpoint::run_export(
                     &db,
-                    &output,
+                    output,
                     round,
                     blocks_round,
                     block_digest.as_deref(),
                     no_online_data,
                     no_gzip,
+                    data_dir.as_deref(),
                 )
                 .await?;
             }
@@ -231,9 +251,17 @@ async fn main() -> anyhow::Result<()> {
                 genesis_id,
                 round,
                 output,
+                data_dir,
             } => {
-                commands::catchpoint::run_download(&url, &token, &genesis_id, round, &output)
-                    .await?;
+                commands::catchpoint::run_download(
+                    &url,
+                    &token,
+                    &genesis_id,
+                    round,
+                    output,
+                    data_dir.as_deref(),
+                )
+                .await?;
             }
         },
         Commands::Bench { action } => match action {

@@ -246,6 +246,44 @@ pub const TRACKER_SUFFIX: &str = ".tracker.sqlite";
 /// (`../go-algorand/ledger/ledger.go:336`).
 pub const BLOCK_SUFFIX: &str = ".block.sqlite";
 
+/// Default SQLite `synchronous` pragma value for the main ledger
+/// connection — go's `LedgerSynchronousMode` default (`FULL` = 2,
+/// `../go-algorand/config/local_defaults.go:106`). Overridable via
+/// [`SqliteLedger::set_synchronous_mode`] (issue #749).
+pub const DEFAULT_LEDGER_SYNCHRONOUS_MODE: i64 = 2;
+
+/// Default SQLite `synchronous` pragma value for rebuild-shaped
+/// connections that bulk-load a fresh accounts snapshot (catchpoint
+/// import/verify, catchpoint-sync bulk import) — go's
+/// `AccountsRebuildSynchronousMode` default (`NORMAL` = 1,
+/// `../go-algorand/config/local_defaults.go:25`). This is the value both
+/// [`open_ledger_connection`] and `SyncEngine::open_db` hardcoded
+/// unconditionally before issue #749.
+pub const DEFAULT_ACCOUNTS_REBUILD_SYNCHRONOUS_MODE: i64 = 1;
+
+/// Run SQLite `VACUUM` on `conn`'s main schema — go's
+/// `OptimizeAccountsDatabaseOnStartup` (`config.Local`, issue #749). Free
+/// function for callers holding a raw [`Connection`] (e.g. catchpoint
+/// import CLI tooling) rather than a [`SqliteLedger`]; see
+/// [`SqliteLedger::vacuum_accounts_database`] for the method form.
+pub fn vacuum_connection(conn: &Connection) -> Result<(), AlgoError> {
+    conn.execute_batch("VACUUM;")
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("vacuum accounts database error: {e}"),
+        })
+}
+
+/// Clamp an operator-supplied `synchronous` pragma value to SQLite's valid
+/// range (`0` = OFF .. `3` = EXTRA), matching go's own PRAGMA-level values
+/// (`../go-algorand/util/db/dbutil.go:441-461`). An out-of-range value from
+/// a hand-edited `config.json` is clamped rather than rejected — this pragma
+/// only affects durability/performance trade-offs, not correctness, so a
+/// bogus value degrading gracefully to the nearest valid mode is preferable
+/// to refusing to start the node.
+pub(crate) fn clamp_synchronous_mode(mode: i64) -> i64 {
+    mode.clamp(0, 3)
+}
+
 /// Derive the ledger prefix from a path that may already include a
 /// `.sqlite` or `.tracker.sqlite` suffix.
 ///
@@ -289,8 +327,24 @@ pub fn block_path_for_prefix(prefix: &Path) -> std::path::PathBuf {
 /// bare connection (without running any schema DDL or loading cached chain
 /// state) so callers that perform raw SQL — catchpoint import, ad-hoc
 /// maintenance tooling, etc. — can address both schemas through the same
-/// connection. Both schemas are switched to WAL mode and `synchronous=NORMAL`.
+/// connection. Both schemas are switched to WAL mode and `synchronous=NORMAL`
+/// (go's `AccountsRebuildSynchronousMode` default — see
+/// [`open_ledger_connection_with_sync_mode`] for a configurable variant).
 pub fn open_ledger_connection(path: &Path) -> Result<Connection, AlgoError> {
+    open_ledger_connection_with_sync_mode(path, DEFAULT_ACCOUNTS_REBUILD_SYNCHRONOUS_MODE)
+}
+
+/// Same as [`open_ledger_connection`], but with an explicit SQLite
+/// `synchronous` pragma value (`0`=OFF, `1`=NORMAL, `2`=FULL, `3`=EXTRA) —
+/// go's `AccountsRebuildSynchronousMode` (`config.Local`, issue #749),
+/// applied to this "rebuild"-shaped connection (catchpoint import/verify
+/// and other raw-SQL maintenance tooling that bulk-loads a fresh
+/// snapshot).
+pub fn open_ledger_connection_with_sync_mode(
+    path: &Path,
+    sync_mode: i64,
+) -> Result<Connection, AlgoError> {
+    let sync_mode = clamp_synchronous_mode(sync_mode);
     let prefix = derive_ledger_prefix(path);
     let tracker = tracker_path_for_prefix(&prefix);
     let block = block_path_for_prefix(&prefix);
@@ -310,12 +364,12 @@ pub fn open_ledger_connection(path: &Path) -> Result<Connection, AlgoError> {
             block.display()
         ),
     })?;
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA journal_mode=WAL;
          PRAGMA blockdb.journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         PRAGMA blockdb.synchronous=NORMAL;",
-    )
+         PRAGMA synchronous={sync_mode};
+         PRAGMA blockdb.synchronous={sync_mode};"
+    ))
     .map_err(|e| AlgoError::Ledger {
         message: format!("set pragmas on ledger connection: {e}"),
     })?;
@@ -1951,6 +2005,11 @@ pub struct SqliteLedger {
     /// `load_trie` time and to any trie set via `enable_trie` /
     /// `rebuild_trie_from_db`. PLAN-144 TASK-147.
     trie_cache_target: Option<usize>,
+    /// Whether the trie's LRU page cache eviction is disabled — go's
+    /// `DisableLedgerLRUCache` (`config.Local`, issue #749). Applied
+    /// alongside `trie_cache_target` at `load_trie` time and to any trie
+    /// set via `enable_trie` / `rebuild_trie_from_db`.
+    lru_cache_disabled: bool,
     /// In-memory rolling window of recent [`crate::state_delta::StateDelta`]s,
     /// keyed by round. Populated by [`Self::apply_block_caching_delta`] (used
     /// by the live sync driver in `bin/algod-rust`) and served by the REST API
@@ -2219,6 +2278,20 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("pragma error: {e}"),
             })?;
+        // Explicitly set the synchronous mode to go's `LedgerSynchronousMode`
+        // default (`FULL` = 2) rather than relying on SQLite's own
+        // compile-time default happening to match. `config.Local`'s
+        // real default is 2 (`../go-algorand/config/local_defaults.go:106`);
+        // callers with a loaded config apply a different value via
+        // `set_synchronous_mode` after `open`/`open_with_prefix` (issue
+        // #749).
+        conn.execute_batch(&format!(
+            "PRAGMA synchronous={DEFAULT_LEDGER_SYNCHRONOUS_MODE};
+             PRAGMA blockdb.synchronous={DEFAULT_LEDGER_SYNCHRONOUS_MODE};"
+        ))
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("synchronous pragma error: {e}"),
+        })?;
 
         // G12 (TASK-109): refuse pre-v3 tracker DBs cleanly before
         // schema creation. Go's `performResourceTableMigration`
@@ -2383,6 +2456,7 @@ impl SqliteLedger {
             trie: None,
             pre_mutations: Vec::new(),
             trie_cache_target: None,
+            lru_cache_disabled: false,
             delta_cache: crate::delta_cache::DeltaCache::with_default_window(),
             group_delta_tracer: None,
             pending_totals_delta: AccountTotalsDelta::default(),
@@ -2705,16 +2779,60 @@ impl SqliteLedger {
         self.apply_trie_cache_target();
     }
 
+    /// Enable/disable the trie's LRU page-cache eviction — go's
+    /// `DisableLedgerLRUCache` (`config.Local`, issue #749). Takes effect
+    /// immediately on the currently loaded trie (if any) and is applied to
+    /// any future trie reloaded via `load_trie` / `enable_trie`.
+    pub fn set_lru_cache_disabled(&mut self, disabled: bool) {
+        self.lru_cache_disabled = disabled;
+        self.apply_trie_cache_target();
+    }
+
     /// Apply the configured `trie_cache_target` (or
     /// [`crate::merkle_cache::DEFAULT_CACHED_NODES_TARGET`] when unset)
-    /// to the currently loaded trie, if any.
+    /// and `lru_cache_disabled` to the currently loaded trie, if any.
     fn apply_trie_cache_target(&mut self) {
         let target = self
             .trie_cache_target
             .unwrap_or(crate::merkle_cache::DEFAULT_CACHED_NODES_TARGET);
         if let Some(t) = self.trie.as_mut() {
             t.set_cache_target(target);
+            t.set_lru_disabled(self.lru_cache_disabled);
         }
+    }
+
+    /// Override the SQLite `synchronous` pragma on the main ledger
+    /// connection (tracker + attached `blockdb` schema) — go's
+    /// `LedgerSynchronousMode` (`config.Local`, issue #749). `init` sets
+    /// [`DEFAULT_LEDGER_SYNCHRONOUS_MODE`] (`FULL` = 2, matching go's own
+    /// default) at open time; callers with a loaded config apply a
+    /// different value via this method. Takes effect immediately, unlike
+    /// `journal_mode`, which SQLite requires to be set once at connect
+    /// time.
+    pub fn set_synchronous_mode(&self, mode: i64) -> Result<(), AlgoError> {
+        let mode = clamp_synchronous_mode(mode);
+        self.conn
+            .execute_batch(&format!(
+                "PRAGMA synchronous={mode}; PRAGMA blockdb.synchronous={mode};"
+            ))
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("set synchronous mode error: {e}"),
+            })
+    }
+
+    /// Run SQLite `VACUUM` on the tracker (accounts) schema — go's
+    /// `OptimizeAccountsDatabaseOnStartup` (`config.Local`, issue #749),
+    /// which calls `accountUpdates.vacuumDatabase` →
+    /// `trackerSQLStore.Vacuum` (`../go-algorand/ledger/ledger.go:268-272`,
+    /// `ledger/store/trackerdb/sqlitedriver/sqlitedriver.go:141`). `VACUUM`
+    /// rewrites the whole main-schema file to reclaim free space and
+    /// defragment it; it does not touch the attached `blockdb` schema
+    /// (SQLite's `VACUUM` only ever operates on the connection's `main`
+    /// schema). Expensive on a large accounts DB — callers should only
+    /// invoke this once at startup when the config flag is set, never on
+    /// a hot path.
+    pub fn vacuum_accounts_database(&self) -> Result<(), AlgoError> {
+        vacuum_connection(&self.conn)
     }
 
     // ---- Delta cache helpers below; see PLAN-36 TASK-128 ----
@@ -5814,6 +5932,130 @@ impl LedgerStore for SqliteLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // Storage config wiring (issue #749): synchronous mode, vacuum,
+    // open_ledger_connection_with_sync_mode
+    // ---------------------------------------------------------------------
+
+    fn query_synchronous(conn: &Connection, schema: &str) -> i64 {
+        let sql = if schema.is_empty() {
+            "PRAGMA synchronous".to_string()
+        } else {
+            format!("PRAGMA {schema}.synchronous")
+        };
+        conn.query_row(&sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn init_sets_default_ledger_synchronous_mode_explicitly() {
+        // Regression for issue #749: `init` previously left `synchronous`
+        // at SQLite's own implicit default; it must now explicitly match
+        // go's `LedgerSynchronousMode` default (FULL = 2).
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        assert_eq!(
+            query_synchronous(&ledger.conn, ""),
+            DEFAULT_LEDGER_SYNCHRONOUS_MODE
+        );
+        assert_eq!(
+            query_synchronous(&ledger.conn, "blockdb"),
+            DEFAULT_LEDGER_SYNCHRONOUS_MODE
+        );
+    }
+
+    #[test]
+    fn set_synchronous_mode_overrides_both_schemas() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_synchronous_mode(0).unwrap();
+        assert_eq!(query_synchronous(&ledger.conn, ""), 0);
+        assert_eq!(query_synchronous(&ledger.conn, "blockdb"), 0);
+    }
+
+    #[test]
+    fn set_synchronous_mode_clamps_out_of_range_values() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_synchronous_mode(99).unwrap();
+        assert_eq!(
+            query_synchronous(&ledger.conn, ""),
+            3,
+            "an out-of-range config.json value must clamp to EXTRA(3), not error or misbehave"
+        );
+        ledger.set_synchronous_mode(-5).unwrap();
+        assert_eq!(query_synchronous(&ledger.conn, ""), 0);
+    }
+
+    #[test]
+    fn open_ledger_connection_with_sync_mode_applies_requested_mode() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-test-sync-mode-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("ledger");
+        // Default (unspecified) uses the rebuild-mode default (NORMAL = 1).
+        {
+            let conn = open_ledger_connection(&prefix).unwrap();
+            assert_eq!(
+                query_synchronous(&conn, ""),
+                DEFAULT_ACCOUNTS_REBUILD_SYNCHRONOUS_MODE
+            );
+        }
+        // Explicit override applies the requested mode.
+        {
+            let conn = open_ledger_connection_with_sync_mode(&prefix, 3).unwrap();
+            assert_eq!(query_synchronous(&conn, ""), 3);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vacuum_accounts_database_succeeds_on_a_fresh_ledger() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.vacuum_accounts_database().unwrap();
+    }
+
+    #[test]
+    fn vacuum_connection_succeeds_on_a_raw_connection() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-test-vacuum-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("ledger");
+        let conn = open_ledger_connection(&prefix).unwrap();
+        vacuum_connection(&conn).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_lru_cache_disabled_propagates_to_the_loaded_trie() {
+        // go's `DisableLedgerLRUCache` (issue #749), wired through
+        // `SqliteLedger` -> `MerkleTrie` -> `MerkleTrieCache`.
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.enable_trie();
+        assert!(!ledger.trie.as_ref().unwrap().lru_disabled());
+
+        ledger.set_lru_cache_disabled(true);
+        assert!(ledger.trie.as_ref().unwrap().lru_disabled());
+
+        // Must also apply to a trie reloaded after this point (mirrors
+        // `trie_cache_target`'s "sticks across reloads" contract).
+        ledger.load_trie().unwrap();
+        assert!(ledger.trie.as_ref().unwrap().lru_disabled());
+
+        ledger.set_lru_cache_disabled(false);
+        assert!(!ledger.trie.as_ref().unwrap().lru_disabled());
+    }
+
+    #[test]
+    fn clamp_synchronous_mode_clamps_both_directions() {
+        assert_eq!(clamp_synchronous_mode(-1), 0);
+        assert_eq!(clamp_synchronous_mode(0), 0);
+        assert_eq!(clamp_synchronous_mode(3), 3);
+        assert_eq!(clamp_synchronous_mode(4), 3);
+    }
 
     // ---------------------------------------------------------------------
     // total_reward_units (TASK-275)

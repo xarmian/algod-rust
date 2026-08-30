@@ -298,6 +298,17 @@ impl MerkleTrie {
         self.cache.cache_target()
     }
 
+    /// Enable/disable LRU eviction on the underlying [`MerkleTrieCache`] —
+    /// go's `DisableLedgerLRUCache` (`config.Local`, issue #749).
+    pub fn set_lru_disabled(&mut self, disabled: bool) {
+        self.cache.set_lru_disabled(disabled);
+    }
+
+    /// Read-only view of whether LRU eviction is disabled.
+    pub fn lru_disabled(&self) -> bool {
+        self.cache.lru_disabled()
+    }
+
     /// In-memory node count across all resident pages. Used by tests +
     /// `SqliteLedger`'s eviction wiring to log post-evict cache size.
     pub fn cached_node_count(&self) -> usize {

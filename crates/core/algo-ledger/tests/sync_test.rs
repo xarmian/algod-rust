@@ -49,6 +49,7 @@ fn test_config() -> SyncConfig {
         avm_execute: false,
         fail_fast: true,
         end_round: None,
+        accounts_rebuild_synchronous_mode: 1,
     }
 }
 
@@ -595,6 +596,7 @@ fn test_sync_config_various_constructions() {
         avm_execute: true,
         fail_fast: false,
         end_round: None,
+        accounts_rebuild_synchronous_mode: 1,
     };
 
     assert!(config.catchpoint_label.is_none());
