@@ -110,12 +110,11 @@ fn load_corpus() -> Corpus {
     serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("malformed oracle fixture {p:?}: {e}"))
 }
 
-/// Every version this repo tracks (`KNOWN_PROTOCOL_VERSIONS` starting at
-/// V10) must be present exactly once in the captured corpus, INCLUDING the
-/// non-production placeholder/test versions this repo's registry carries --
-/// the Go tool only emits real `protocol.ConsensusV*` versions, so any
-/// registry entry without a matching real go-algorand version is itself a
-/// finding, not something this test should silently skip.
+/// The Go tool's `allVersions()` emits exactly V10..V42 (33 versions, see
+/// its module docs for why that range) -- a corpus with a different count
+/// means either the tool's version list or this repo's own captured
+/// fixture has drifted from that range and needs investigation before
+/// trusting the per-version assertions below.
 #[test]
 fn corpus_covers_every_tracked_version_v10_through_v42() {
     let corpus = load_corpus();
