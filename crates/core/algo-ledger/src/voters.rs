@@ -62,8 +62,8 @@
 //!   replacement for that broader total.
 //!
 //! Wiring this into block production/validation, plus a byte-level oracle
-//! fixture against a live go-algorand voters commitment, is filed as a
-//! follow-up (see the PR description for the issue number).
+//! fixture against a live go-algorand voters commitment, is filed as
+//! follow-up issue xarmian/algod-rust#780.
 
 use algo_consensus_crypto::{merklearray, merklesig, stateproof as crypto_sp};
 use algo_types::Address;
