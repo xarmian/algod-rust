@@ -130,6 +130,10 @@ pub struct LedgerState {
     block_store: HashMap<u64, BlockEntry>,
     txtail_store: HashMap<u64, Vec<u8>>,
     state_proof_verification_store: HashMap<u64, Vec<u8>>,
+    /// Voters-snapshot cache (issue #780): `round -> (voters_commitment,
+    /// online_total_weight)`. See `store_trait::LedgerStore`'s "Voters
+    /// snapshot cache" section.
+    voters_snapshot_store: HashMap<u64, (Vec<u8>, u64)>,
 }
 
 impl LedgerState {
@@ -160,6 +164,7 @@ impl LedgerState {
             block_store: HashMap::new(),
             txtail_store: HashMap::new(),
             state_proof_verification_store: HashMap::new(),
+            voters_snapshot_store: HashMap::new(),
         }
     }
 
@@ -1616,6 +1621,43 @@ impl crate::store_trait::LedgerStore for LedgerState {
     ) -> Result<(), algo_error::AlgoError> {
         self.state_proof_verification_store
             .retain(|&r, _| r >= before_round);
+        Ok(())
+    }
+
+    // ---- Voters snapshot cache (issue #780) ----
+
+    fn online_accounts(&self) -> Vec<(Address, AccountData)> {
+        self.accounts
+            .iter()
+            .filter(|(_, acct)| acct.status == AccountStatus::Online)
+            .map(|(addr, acct)| (*addr, acct.clone()))
+            .collect()
+    }
+
+    fn put_voters_snapshot(
+        &mut self,
+        round: u64,
+        voters_commitment: Vec<u8>,
+        online_total_weight: u64,
+    ) -> Result<(), algo_error::AlgoError> {
+        self.voters_snapshot_store
+            .insert(round, (voters_commitment, online_total_weight));
+        Ok(())
+    }
+
+    fn get_voters_snapshot(
+        &self,
+        round: u64,
+    ) -> Result<Option<(Vec<u8>, u64)>, algo_error::AlgoError> {
+        Ok(self.voters_snapshot_store.get(&round).cloned())
+    }
+
+    fn voters_snapshot_rounds(&self) -> Result<Vec<u64>, algo_error::AlgoError> {
+        Ok(self.voters_snapshot_store.keys().copied().collect())
+    }
+
+    fn delete_voters_snapshot(&mut self, round: u64) -> Result<(), algo_error::AlgoError> {
+        self.voters_snapshot_store.remove(&round);
         Ok(())
     }
 }

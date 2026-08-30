@@ -502,4 +502,56 @@ pub trait LedgerStore {
         let _ = before_round;
         Ok(())
     }
+
+    // ---- Voters snapshot cache (issue #780) ----
+    //
+    // Mirrors go-algorand's `ledger/voters.go::votersTracker` in-memory
+    // `votersForRoundCache`: a snapshot of the top online participants'
+    // vector-commitment root and the network-wide online total weight, taken
+    // at each "voters round" `r` where `(r + StateProofVotersLookback) %
+    // StateProofInterval == 0`, and consumed `StateProofVotersLookback`
+    // rounds later when the block at the next `StateProofInterval` multiple
+    // is produced/validated. See `crate::voters_tracker`.
+
+    /// Return every online account, for state-proof voter-set selection.
+    /// Restricted to accounts with `AccountStatus::Online` -- matches go's
+    /// `TopOnlineAccounts`, which is only ever fed already-online candidates.
+    ///
+    /// No default (empty) implementation: an override that silently returned
+    /// nothing would make every voters snapshot vacuous (an empty voters
+    /// commitment/zero total weight) without any visible error, which is far
+    /// worse than a compile-time reminder to implement this for a new
+    /// backend.
+    fn online_accounts(&self) -> Vec<(Address, AccountData)>;
+
+    /// Store a voters snapshot -- `(voters_commitment, online_total_weight)`
+    /// -- keyed by the round it was taken at (go's `votersForRoundCache` map
+    /// key).
+    fn put_voters_snapshot(
+        &mut self,
+        round: u64,
+        voters_commitment: Vec<u8>,
+        online_total_weight: u64,
+    ) -> Result<(), AlgoError> {
+        let _ = (round, voters_commitment, online_total_weight);
+        Ok(())
+    }
+
+    /// Retrieve a voters snapshot by its round key.
+    fn get_voters_snapshot(&self, round: u64) -> Result<Option<(Vec<u8>, u64)>, AlgoError> {
+        let _ = round;
+        Ok(None)
+    }
+
+    /// Every round currently holding a cached voters snapshot -- used by the
+    /// retention sweep (go's `removeOldVoters`) to decide what to delete.
+    fn voters_snapshot_rounds(&self) -> Result<Vec<u64>, AlgoError> {
+        Ok(Vec::new())
+    }
+
+    /// Delete the voters snapshot recorded at `round`, if any.
+    fn delete_voters_snapshot(&mut self, round: u64) -> Result<(), AlgoError> {
+        let _ = round;
+        Ok(())
+    }
 }

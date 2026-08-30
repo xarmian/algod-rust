@@ -221,6 +221,16 @@ CREATE TABLE IF NOT EXISTS stateproofverification (
     lastattestedround INTEGER PRIMARY KEY NOT NULL,
     verificationcontext BLOB NOT NULL
 );
+
+-- Voters-snapshot cache (issue #780): mirrors go-algorand's in-memory
+-- `votersTracker.votersForRoundCache`. Persisted (rather than kept purely
+-- in-memory) so a restarted node doesn't lose a snapshot it needs to serve a
+-- block within `StateProofVotersLookback` rounds of restart.
+CREATE TABLE IF NOT EXISTS votersnapshot (
+    round INTEGER PRIMARY KEY NOT NULL,
+    voterscommitment BLOB NOT NULL,
+    onlinetotalweight INTEGER NOT NULL
+);
 ";
 
 /// DDL run on the attached `blockdb` schema. Mirrors
@@ -5951,6 +5961,126 @@ impl LedgerStore for SqliteLedger {
             )
             .map_err(|e| AlgoError::Ledger {
                 message: format!("delete_state_proof_verification_contexts_before error: {e}"),
+            })?;
+        Ok(())
+    }
+
+    // ---- Voters snapshot cache (issue #780) ----
+
+    fn online_accounts(&self) -> Vec<(Address, AccountData)> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT address, data FROM accountbase WHERE normalizedonlinebalance > 0")
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("online_accounts: prepare error: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("online_accounts: query error: {e}");
+                return Vec::new();
+            }
+        };
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (addr_bytes, data) = match row {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("online_accounts: row read error: {e}");
+                    continue;
+                }
+            };
+            let addr_len = addr_bytes.len();
+            let addr_arr: [u8; 32] = match addr_bytes.try_into() {
+                Ok(a) => a,
+                Err(_) => {
+                    tracing::error!("online_accounts: bad address length {addr_len} (expected 32)");
+                    continue;
+                }
+            };
+            match decode_account_data(&data) {
+                Ok(account) => {
+                    if account.status == AccountStatus::Online {
+                        out.push((Address(addr_arr), account));
+                    }
+                }
+                Err(e) => tracing::error!("online_accounts: decode error: {e}"),
+            }
+        }
+        out
+    }
+
+    fn put_voters_snapshot(
+        &mut self,
+        round: u64,
+        voters_commitment: Vec<u8>,
+        online_total_weight: u64,
+    ) -> Result<(), AlgoError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO votersnapshot (round, voterscommitment, onlinetotalweight) VALUES (?1, ?2, ?3)",
+                params![round as i64, voters_commitment, online_total_weight as i64],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("put_voters_snapshot error: {e}"),
+            })?;
+        Ok(())
+    }
+
+    fn get_voters_snapshot(&self, round: u64) -> Result<Option<(Vec<u8>, u64)>, AlgoError> {
+        self.conn
+            .query_row(
+                "SELECT voterscommitment, onlinetotalweight FROM votersnapshot WHERE round = ?1",
+                params![round as i64],
+                |row| {
+                    let commitment: Vec<u8> = row.get(0)?;
+                    let weight: i64 = row.get(1)?;
+                    Ok((commitment, weight as u64))
+                },
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("get_voters_snapshot error: {e}"),
+            })
+    }
+
+    fn voters_snapshot_rounds(&self) -> Result<Vec<u64>, AlgoError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT round FROM votersnapshot")
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("prepare voters_snapshot_rounds error: {e}"),
+            })?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query voters_snapshot_rounds error: {e}"),
+            })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let r = row.map_err(|e| AlgoError::Ledger {
+                message: format!("read voters_snapshot_rounds row error: {e}"),
+            })?;
+            out.push(r as u64);
+        }
+        Ok(out)
+    }
+
+    fn delete_voters_snapshot(&mut self, round: u64) -> Result<(), AlgoError> {
+        self.conn
+            .execute(
+                "DELETE FROM votersnapshot WHERE round = ?1",
+                params![round as i64],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("delete_voters_snapshot error: {e}"),
             })?;
         Ok(())
     }
