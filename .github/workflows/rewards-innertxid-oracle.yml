@@ -67,24 +67,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             autoconf automake libtool build-essential
-          mkdir -p "$RUNNER_TEMP/go-algorand-src"
-          git clone --depth 1 --branch "$GO_ALGORAND_REV" \
+          # Clone as a *sibling* of the checked-out repo (not $RUNNER_TEMP) --
+          # tools/rewards-innertxid-oracle's go.mod `replace` directive and its
+          # own goAlgorandDir()/verifyGoAlgorandPin() resolve go-algorand
+          # relative to the tool's own source location (`../../../go-algorand`,
+          # matching this repo's local-dev convention), so this is the one
+          # location that needs no go.mod edits and lets the tool's own pin
+          # check pass for real (rather than being skipped via
+          # --allow-unpinned). A full (non-shallow) clone is used so
+          # `git describe --tags --exact-match` reliably finds the tag.
+          git clone --branch "$GO_ALGORAND_REV" \
             https://github.com/algorand/go-algorand.git \
-            "$RUNNER_TEMP/go-algorand-src"
-          cd "$RUNNER_TEMP/go-algorand-src"
+            "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          cd "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
           make libsodium
-
-      - name: Point the tool's go-algorand dependency at the freshly-built checkout
-        run: |
-          set -euo pipefail
-          cd tools/rewards-innertxid-oracle
-          go mod edit -replace "github.com/algorand/go-algorand=$RUNNER_TEMP/go-algorand-src"
 
       - name: Run the oracle tool and diff against the committed fixture
         run: |
           set -euo pipefail
           cd tools/rewards-innertxid-oracle
-          go run . -allow-unpinned
+          go run .
           cd "$GITHUB_WORKSPACE"
           git diff --exit-code -- crates/core/algo-ledger/tests/fixtures/rewards_innertxid/oracle.json || {
             echo "::error::committed oracle.json is stale -- regenerate via 'cd tools/rewards-innertxid-oracle && go run .' against the pinned go-algorand checkout and commit the result"
