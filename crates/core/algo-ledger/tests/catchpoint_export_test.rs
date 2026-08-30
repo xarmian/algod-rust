@@ -695,6 +695,80 @@ fn export_with_sp_contexts_and_no_online_data_selects_v7() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Atomic file write (issue #794)
+// ---------------------------------------------------------------------------
+//
+// `export_catchpoint_file` must never leave a truncated/partial file visible
+// at `out_path`: it writes the final archive to a temp file in the same
+// directory and only `rename`s it into place after the write (and an fsync)
+// has succeeded. A reader (the catchpoint download HTTP handler, an
+// operator's `cp`, or a later restart) must only ever observe either the
+// previous file or the fully-written new one, never a half-written one.
+
+#[test]
+fn export_leaves_no_temp_file_behind_after_success() {
+    let src = build_source_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catchpoint.tar.gz");
+
+    export_catchpoint_file(&src, &path, &export_options()).unwrap();
+
+    assert!(path.exists(), "final catchpoint file must exist");
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "catchpoint.tar.gz")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no scratch/temp files should survive a successful export, found: {leftovers:?}"
+    );
+}
+
+#[test]
+fn export_failure_never_corrupts_or_replaces_the_destination() {
+    // Force the final `rename` step to fail deterministically and
+    // cross-platform by making the destination an existing, non-empty
+    // directory (renaming a file onto an existing directory always fails,
+    // on both Unix and Windows) -- this stands in for "the process was
+    // killed/crashed after the temp file was written but before the atomic
+    // rename completed", which is exactly the class of failure the
+    // temp-file-then-rename scheme exists to make safe.
+    let src = build_source_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catchpoint.tar.gz");
+
+    std::fs::create_dir(&path).unwrap();
+    let sentinel = path.join("sentinel.txt");
+    std::fs::write(&sentinel, b"old contents must survive").unwrap();
+
+    let result = export_catchpoint_file(&src, &path, &export_options());
+    assert!(
+        result.is_err(),
+        "export must report the rename failure, not silently succeed"
+    );
+
+    // The "old" thing at the destination path must be completely untouched.
+    assert!(path.is_dir(), "destination directory must survive intact");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"old contents must survive"
+    );
+
+    // And no leftover scratch/temp file should be left behind in the parent
+    // directory after the failed attempt.
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "catchpoint.tar.gz")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a failed export must not leave temp files behind, found: {leftovers:?}"
+    );
+}
+
 #[test]
 fn export_of_empty_ledger_produces_importable_file() {
     let conn = Connection::open_in_memory().unwrap();

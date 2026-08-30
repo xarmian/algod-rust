@@ -75,6 +75,15 @@ use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
 /// the process, long enough that normal in-flight requests finish.
 const REST_SHUTDOWN_HARD_CAP: Duration = Duration::from_secs(5);
 
+/// How long shutdown waits for an in-flight automatic catchpoint export
+/// (issue #770) to finish before giving up (issue #794). Bounded rather
+/// than unconditional: `export_catchpoint_file` writes atomically (temp
+/// file + rename, issue #794), so an abandoned wait can only lose the
+/// newest catchpoint being written -- it can never leave a half-written
+/// file at a path a restart or a peer's catchpoint download would treat
+/// as valid.
+const CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A no-op `EventsProcessingMonitor` for production use.
 ///
 /// Unlike `StubEventsProcessingMonitor` which stores all events in a Vec
@@ -4179,6 +4188,32 @@ pub async fn run(
             ),
         }
     }
+
+    // Issue #794: don't let the process exit while a background automatic
+    // catchpoint export (issue #770) is still writing. `export_catchpoint_file`
+    // now writes atomically (temp file + rename), so abandoning the wait
+    // can never leave a corrupt file at a previously-published path -- but
+    // waiting (briefly, bounded) still lets the newest catchpoint actually
+    // land instead of being silently dropped on every restart.
+    let wait_result = tokio::task::spawn_blocking({
+        let ledger = Arc::clone(&ledger);
+        move || {
+            ledger
+                .lock()
+                .unwrap()
+                .wait_for_pending_catchpoint_export_timeout(CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT)
+        }
+    })
+    .await;
+    match wait_result {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            timeout = ?CATCHPOINT_EXPORT_SHUTDOWN_TIMEOUT,
+            "shutting down with an automatic catchpoint export still in flight"
+        ),
+        Err(e) => warn!(error = %e, "catchpoint-export shutdown wait task panicked"),
+    }
+
     info!("consensus participation stopped");
 
     Ok(())

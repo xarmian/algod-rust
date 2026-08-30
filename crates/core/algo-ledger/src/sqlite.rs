@@ -3454,13 +3454,72 @@ impl SqliteLedger {
 
     /// Block until any in-flight automatic catchpoint export finishes.
     /// Not called by the live apply loop (which is deliberately
-    /// fire-and-forget) — for tests and for a future graceful-shutdown
-    /// hook that wants to avoid an abrupt process exit mid-write.
+    /// fire-and-forget) — used by tests, and by
+    /// [`Self::wait_for_pending_catchpoint_export_timeout`] once the wait
+    /// is known to be short.
     pub fn wait_for_pending_catchpoint_export(&mut self) {
         if let Some(handle) = self.catchpoint_worker.take() {
             if let Err(e) = handle.join() {
                 tracing::warn!("automatic catchpoint export thread panicked: {e:?}");
             }
+        }
+    }
+
+    /// Graceful-shutdown hook (issue #794): wait for any in-flight
+    /// automatic catchpoint export to finish, but give up after `timeout`
+    /// rather than blocking the process's exit forever.
+    ///
+    /// Returns `true` if there was nothing pending or the pending export
+    /// finished within `timeout`; returns `false` if the timeout was hit
+    /// first, in which case the export thread is left running detached
+    /// (its `JoinHandle` is *not* taken, so a later call can still observe
+    /// and join it) and the caller should log a warning rather than treat
+    /// this as fatal. Because [`writer::export_catchpoint_file`] now
+    /// writes to a temp file and only `rename`s it into place on success
+    /// (issue #794's other half), abandoning the wait here can at worst
+    /// lose the newest catchpoint file being written — it can never leave
+    /// a corrupt file at a previously-published path for a later restart
+    /// or a peer's catchpoint download to observe.
+    ///
+    /// `JoinHandle::join` itself has no timeout variant, so this polls
+    /// `JoinHandle::is_finished` on a short interval instead — the same
+    /// technique used by `maybe_spawn_automatic_catchpoint`'s "still
+    /// running" overlap check just above.
+    pub fn wait_for_pending_catchpoint_export_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> bool {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+        let Some(handle) = &self.catchpoint_worker else {
+            return true;
+        };
+        if handle.is_finished() {
+            self.wait_for_pending_catchpoint_export();
+            return true;
+        }
+
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let Some(handle) = &self.catchpoint_worker else {
+                return true;
+            };
+            if handle.is_finished() {
+                self.wait_for_pending_catchpoint_export();
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    ?timeout,
+                    "automatic catchpoint export still running at shutdown timeout; \
+                     exiting without waiting further (the in-progress file, if any, is \
+                     written atomically so it can never be observed half-written)"
+                );
+                return false;
+            }
+            std::thread::sleep(
+                POLL_INTERVAL.min(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
         }
     }
 
@@ -6328,6 +6387,60 @@ mod tests {
             format!("PRAGMA {schema}.synchronous")
         };
         conn.query_row(&sql, [], |row| row.get(0)).unwrap()
+    }
+
+    // ---------------------------------------------------------------------
+    // Graceful-shutdown wait for a pending catchpoint export (issue #794)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn wait_for_pending_catchpoint_export_timeout_true_when_nothing_pending() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        assert!(ledger.catchpoint_worker.is_none());
+        assert!(
+            ledger.wait_for_pending_catchpoint_export_timeout(std::time::Duration::from_millis(10))
+        );
+    }
+
+    #[test]
+    fn wait_for_pending_catchpoint_export_timeout_waits_for_a_short_export_to_finish() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.catchpoint_worker = Some(std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }));
+
+        let start = std::time::Instant::now();
+        let finished =
+            ledger.wait_for_pending_catchpoint_export_timeout(std::time::Duration::from_secs(5));
+        assert!(finished, "a short export must be waited out, not abandoned");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(150),
+            "must have actually waited for the thread rather than returning immediately"
+        );
+        assert!(
+            ledger.catchpoint_worker.is_none(),
+            "a finished export's handle must be joined/cleared"
+        );
+    }
+
+    #[test]
+    fn wait_for_pending_catchpoint_export_timeout_gives_up_at_the_deadline() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.catchpoint_worker = Some(std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }));
+
+        let start = std::time::Instant::now();
+        let finished = ledger
+            .wait_for_pending_catchpoint_export_timeout(std::time::Duration::from_millis(100));
+        assert!(
+            !finished,
+            "a bounded wait must report the timeout instead of blocking until the export exits"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "must not have blocked past the bounded timeout"
+        );
     }
 
     #[test]
