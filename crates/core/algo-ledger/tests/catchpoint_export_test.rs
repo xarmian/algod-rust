@@ -522,6 +522,108 @@ fn export_without_online_data_omits_online_chunks() {
     assert_eq!(count, 0);
 }
 
+// ---------------------------------------------------------------------------
+// Catchpoint file-format version selection (issue #752)
+// ---------------------------------------------------------------------------
+//
+// Mirrors go-algorand's `catchpointTracker.createCatchpoint`
+// (`ledger/catchpointtracker.go:810-827`): the file-format version is
+// selected from `EnableCatchpointsWithSPContexts` (v38+) and
+// `EnableCatchpointsWithOnlineAccounts` (v40+), not hardcoded.
+
+#[test]
+fn select_catchpoint_file_version_matches_go() {
+    use algo_ledger::catchpoint::select_catchpoint_file_version;
+    use algo_ledger::catchpoint::{
+        CATCHPOINT_FILE_VERSION_V6, CATCHPOINT_FILE_VERSION_V7, CATCHPOINT_FILE_VERSION_V8,
+    };
+
+    // Neither flag (pre-v38): V6.
+    assert_eq!(
+        select_catchpoint_file_version(false, false).unwrap(),
+        CATCHPOINT_FILE_VERSION_V6
+    );
+    // SP contexts only (v38-v39): V7.
+    assert_eq!(
+        select_catchpoint_file_version(true, false).unwrap(),
+        CATCHPOINT_FILE_VERSION_V7
+    );
+    // Both (v40+, current): V8.
+    assert_eq!(
+        select_catchpoint_file_version(true, true).unwrap(),
+        CATCHPOINT_FILE_VERSION_V8
+    );
+    // Online accounts without SP contexts is invalid (go:
+    // `createCatchpoint`'s own error for this combination) -- structurally
+    // unreachable via the real per-version consensus table (online accounts
+    // only ever activates at v40, after SP contexts at v38), but the
+    // override/consensus.json path (issue #762) could still construct it.
+    let err = select_catchpoint_file_version(false, true).unwrap_err();
+    assert!(err.to_string().contains("SP contexts not enabled"));
+}
+
+#[test]
+fn export_rejects_v6_selection_as_unimplemented() {
+    // `enable_sp_contexts: false` selects V6, whose content shape (no
+    // SP-verification entry at all) this writer doesn't implement --
+    // exporting must fail loudly rather than silently mislabel a V8-shaped
+    // file as V6.
+    let src = build_source_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v6-unsupported.tar.gz");
+
+    let opts = ExportOptions {
+        enable_sp_contexts: false,
+        include_online_data: false,
+        ..export_options()
+    };
+    let err = export_catchpoint_file(&src, &path, &opts).unwrap_err();
+    assert!(
+        matches!(err, algo_ledger::catchpoint::CatchpointError::UnsupportedVersion(v) if v == algo_ledger::catchpoint::CATCHPOINT_FILE_VERSION_V6),
+        "expected an UnsupportedVersion(V6) error, got: {err}"
+    );
+}
+
+#[test]
+fn export_with_sp_contexts_and_no_online_data_selects_v7() {
+    // The combination this writer already fully supports content-wise:
+    // SP-verification blob present, online-accounts tables omitted.
+    let src = build_source_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v7.tar.gz");
+
+    let opts = ExportOptions {
+        enable_sp_contexts: true,
+        include_online_data: false,
+        ..export_options()
+    };
+    export_catchpoint_file(&src, &path, &opts).unwrap();
+
+    use std::io::Read as _;
+    let bytes = std::fs::read(&path).unwrap();
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+    let mut found_version = None;
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap().to_string_lossy() == "content.msgpack" {
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            let header: algo_ledger::catchpoint::CatchpointFileHeader =
+                rmp_serde::from_slice(&data).unwrap();
+            found_version = Some(header.version);
+        }
+    }
+    assert_eq!(
+        found_version,
+        Some(algo_ledger::catchpoint::CATCHPOINT_FILE_VERSION_V7)
+    );
+
+    // And it must still be importable (this writer's V7 content is real,
+    // not just a relabeled V8 file).
+    let dst = Connection::open_in_memory().unwrap();
+    import_catchpoint_file(&dst, &path, REWARD_UNITS).unwrap();
+}
+
 #[test]
 fn export_of_empty_ledger_produces_importable_file() {
     let conn = Connection::open_in_memory().unwrap();

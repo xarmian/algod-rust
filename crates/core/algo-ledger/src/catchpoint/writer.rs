@@ -88,7 +88,10 @@ use flate2::Compression;
 use rusqlite::Connection;
 use sha2::{Digest, Sha512_256};
 
-use super::types::{CatchpointError, CatchpointFileHeader, CATCHPOINT_FILE_VERSION_V8};
+use super::types::{
+    CatchpointError, CatchpointFileHeader, CATCHPOINT_FILE_VERSION_V6, CATCHPOINT_FILE_VERSION_V7,
+    CATCHPOINT_FILE_VERSION_V8,
+};
 use super::verify::{
     build_sp_verification_blob, count_accounts, encode_account_totals, encode_mixed_map,
     encode_msgpack_bin, encode_msgpack_uint, encode_online_account_record,
@@ -114,6 +117,54 @@ pub const DEFAULT_MAX_BAL_LOOKBACK: u64 = 320;
 
 const CONTENT_FILENAME: &str = "content.msgpack";
 const SP_VERIFICATION_FILENAME: &str = "stateProofVerificationContext.msgpack";
+
+/// Select the on-disk catchpoint file format version for a given consensus
+/// version's gate flags, exactly mirroring go-algorand's
+/// `catchpointTracker.createCatchpoint` (`ledger/catchpointtracker.go:810-827`,
+/// consulting `config.Consensus[blockProto].EnableCatchpointsWithSPContexts`
+/// and `.EnableCatchpointsWithOnlineAccounts`, issue #752):
+///
+/// - `enable_catchpoints_with_online_accounts` (requires
+///   `enable_catchpoints_with_sp_contexts` also true) → V8.
+/// - else `enable_catchpoints_with_sp_contexts` → V7.
+/// - else → V6.
+///
+/// # Scope (issue #752)
+///
+/// This writer's pipeline always builds and hashes the SP-verification blob
+/// (`stateProofVerificationContext.msgpack`) into the label, and
+/// [`ExportOptions::include_online_data`] already independently controls
+/// whether the V8-only online-accounts tables are populated -- so both V7
+/// (SP contexts, no online accounts) and V8 (both) are genuinely correct
+/// content this writer already produces, not just a correctly-labeled
+/// header over the wrong shape. V6 (no SP-verification content at all) is
+/// the one gap: this writer has no way to omit the SP-verification blob or
+/// use go's `MakeCatchpointLabelMakerV6` (a different hash input than the
+/// V7/V8 maker used unconditionally here), so [`export_catchpoint_file`]
+/// rejects a V6 selection with [`CatchpointError::UnsupportedVersion`]
+/// rather than silently writing a self-inconsistent V6-labeled file with V7
+/// content. Full V6 producer/consumer support (needed for byte-compatible
+/// catchpoint files against a real go-algorand node running a consensus
+/// version predating v38's `EnableCatchpointsWithSPContexts`) is tracked as
+/// a separate follow-up.
+pub fn select_catchpoint_file_version(
+    enable_sp_contexts: bool,
+    enable_online_accounts: bool,
+) -> Result<u64, CatchpointError> {
+    if enable_online_accounts {
+        if !enable_sp_contexts {
+            return Err(CatchpointError::ImportError(
+                "invalid params for catchpoint file version v8: SP contexts not enabled"
+                    .to_string(),
+            ));
+        }
+        Ok(CATCHPOINT_FILE_VERSION_V8)
+    } else if enable_sp_contexts {
+        Ok(CATCHPOINT_FILE_VERSION_V7)
+    } else {
+        Ok(CATCHPOINT_FILE_VERSION_V6)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Options / result
@@ -141,7 +192,19 @@ pub struct ExportOptions {
     /// (go: `params.EnableCatchpointsWithOnlineAccounts`, true since
     /// consensus v40). When false, those chunks are omitted and their label
     /// component hashes are the hash of an empty stream.
+    ///
+    /// Together with [`Self::enable_sp_contexts`], this also selects the
+    /// on-disk file-format version byte via
+    /// [`select_catchpoint_file_version`] (issue #752).
     pub include_online_data: bool,
+
+    /// Whether V7+ catchpoint files (state-proof verification contexts) are
+    /// enabled for the target consensus version (go:
+    /// `params.EnableCatchpointsWithSPContexts`, true since consensus v38,
+    /// issue #752). Must be true whenever [`Self::include_online_data`] is,
+    /// matching go's own invariant that V8 catchpoints carry V7's SP
+    /// contexts too. Defaults to `true` (current/v42 consensus).
+    pub enable_sp_contexts: bool,
 
     /// Online-account history horizon. `Some(n)` reproduces go's
     /// `MaxBalLookback` normalization (see
@@ -167,6 +230,7 @@ impl Default for ExportOptions {
             blocks_round: 0,
             block_header_digest: [0u8; 32],
             include_online_data: true,
+            enable_sp_contexts: true,
             max_bal_lookback: Some(DEFAULT_MAX_BAL_LOOKBACK),
             accounts_per_chunk: BALANCES_PER_CATCHPOINT_FILE_CHUNK,
             max_resources_per_chunk: RESOURCES_PER_CATCHPOINT_FILE_CHUNK,
@@ -237,6 +301,24 @@ pub fn export_catchpoint_file(
         ));
     }
 
+    // Select the on-disk file-format version from the same two consensus
+    // gates go-algorand's `createCatchpoint` consults (issue #752). This
+    // writer's pipeline already produces correct V7 *and* V8 content --
+    // the SP-verification blob is always built and hashed into the label,
+    // and `include_online_data` already independently controls whether the
+    // V8-only online-accounts tables are populated -- so V7
+    // (`enable_sp_contexts` true, `include_online_data` false) and V8 (both
+    // true) are both real, not just correctly-labeled-but-wrong-shape. Only
+    // V6 (`enable_sp_contexts` false, meaning no SP-verification content at
+    // all) is a genuine content-shape gap this writer doesn't implement --
+    // see `select_catchpoint_file_version`'s doc for why that's rejected
+    // rather than silently mislabeled.
+    let file_version =
+        select_catchpoint_file_version(opts.enable_sp_contexts, opts.include_online_data)?;
+    if file_version == CATCHPOINT_FILE_VERSION_V6 {
+        return Err(CatchpointError::UnsupportedVersion(file_version));
+    }
+
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -301,7 +383,7 @@ pub fn export_catchpoint_file(
 
     // --- Stage 2: repack with the header first ----------------------------
     let header = CatchpointFileHeader {
-        version: CATCHPOINT_FILE_VERSION_V8,
+        version: file_version,
         balances_round: opts.balances_round,
         blocks_round: opts.blocks_round,
         totals: totals.clone(),

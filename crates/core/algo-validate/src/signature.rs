@@ -608,13 +608,27 @@ pub fn verify_logicsig_with_tracer(
                 message: format!("logicsig delegated signature verification failed: {e}"),
             })?;
     } else if let Some(msig) = &lsig.msig {
-        // Mode 2: Delegated multisig — verify multisig on "Program" || logic
+        // Mode 2: Delegated multisig — verify multisig on "Program" || logic.
+        // Gated on `LogicSigMsig` (Go: `data/transactions/verify/txn.go`'s
+        // `logicSigSanityCheckBatchPrep`, v18+, retired at v41 in favor of
+        // `LogicSigLMsig` -- see issue #752).
+        if !consensus.logic_sig_msig {
+            return Err(AlgoError::Validation {
+                message: "LogicSig Msig field not supported in this consensus version".into(),
+            });
+        }
         let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
         program_msg.extend_from_slice(PROGRAM_PREFIX);
         program_msg.extend_from_slice(&lsig.logic);
         verify_logicsig_multisig(stx, msig, &program_msg)?;
     } else if let Some(lmsig) = &lsig.lmsig {
-        // Mode 3: Delegated logic-multisig (lmsig)
+        // Mode 3: Delegated logic-multisig (lmsig). Gated on `LogicSigLMsig`
+        // (Go: same function, v41+ -- see issue #752).
+        if !consensus.logic_sig_lmsig {
+            return Err(AlgoError::Validation {
+                message: "LogicSig LMsig field not supported in this consensus version".into(),
+            });
+        }
         // Signed data: "MsigProgram" || authorizer_addr || program
         // This matches Go's MultisigProgram{Addr: Digest(authorizer), Program: logic}.ToBeHashed()
         let mut lmsig_msg = Vec::with_capacity(MSIG_PROGRAM_PREFIX.len() + 32 + lsig.logic.len());
@@ -1591,8 +1605,28 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(verify_lsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
-        assert!(verify_sig(&stx).is_ok());
+        // `verify_lsig`/`verify_sig`'s default (v42) consensus has
+        // `LogicSigMsig = false` (retired at v41, issue #752) -- use a
+        // pre-v41 version that still accepts msig delegation for both legs
+        // of this check.
+        let msig_consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V40,
+        )
+        .expect("v40 must be a known protocol version");
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        assert!(verify_logicsig(
+            &stx,
+            stx.lsig.as_ref().unwrap(),
+            &group,
+            0,
+            &mut budget,
+            &msig_consensus
+        )
+        .is_ok());
+        assert!(
+            verify_transaction_signature(&stx, &group, 0, &mut budget, &msig_consensus).is_ok()
+        );
     }
 
     // ---- Security / edge-case tests ----
@@ -1933,6 +1967,189 @@ mod tests {
             err.to_string().contains("verification failed"),
             "expected verification failure, got: {err}"
         );
+    }
+
+    // ---- LogicSigMsig / LogicSigLMsig consensus gating (issue #752) ----
+    //
+    // `logicsig_sanity_check` (the client-tool path exercised by the tests
+    // above) never had a consensus version to gate against, by design. The
+    // real, live-acceptance gate lives in `verify_logicsig`/
+    // `verify_logicsig_with_tracer` (`data/transactions/verify/txn.go`'s
+    // `logicSigSanityCheckBatchPrep`, v5.0.0-stable), which these tests
+    // exercise end-to-end (delegation check + actual TEAL execution).
+
+    /// Build a real, verifiable msig-delegated LogicSig over `int1_program()`
+    /// (approves unconditionally), plus the `SignedTransaction` whose sender
+    /// is the msig address.
+    fn msig_delegated_int1_lsig() -> (SignedTransaction, LogicSig) {
+        let keys: Vec<SigningKey> = (40u8..43).map(signing_key_from_seed).collect();
+        let msig_addr = compute_msig_addr(&keys, 1, 2);
+        let program = int1_program();
+
+        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + program.len());
+        program_msg.extend_from_slice(PROGRAM_PREFIX);
+        program_msg.extend_from_slice(&program);
+
+        let subsigs: Vec<MultisigSubsig> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                use ed25519_dalek::Signer;
+                let pk = key.verifying_key();
+                let signature = if i < 2 {
+                    key.sign(&program_msg).to_bytes()
+                } else {
+                    [0u8; 64]
+                };
+                MultisigSubsig {
+                    public_key: pk.to_bytes(),
+                    signature,
+                }
+            })
+            .collect();
+        let msig = MultisigSig {
+            version: 1,
+            threshold: 2,
+            subsigs,
+        };
+
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            msig: Some(msig),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(msig_addr),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+        (stx, lsig)
+    }
+
+    /// Build a real, verifiable lmsig-delegated LogicSig over
+    /// `int1_program()`, plus the `SignedTransaction` whose sender is the
+    /// msig address.
+    fn lmsig_delegated_int1_lsig() -> (SignedTransaction, LogicSig) {
+        let keys: Vec<SigningKey> = (50u8..53).map(signing_key_from_seed).collect();
+        let msig_addr = compute_msig_addr(&keys, 1, 2);
+        let program = int1_program();
+
+        let subsigs: Vec<MultisigSubsig> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let pk = key.verifying_key();
+                let signature = if i < 2 {
+                    sign_lmsig_msg(key, &msig_addr, &program)
+                } else {
+                    [0u8; 64]
+                };
+                MultisigSubsig {
+                    public_key: pk.to_bytes(),
+                    signature,
+                }
+            })
+            .collect();
+        let lmsig = MultisigSig {
+            version: 1,
+            threshold: 2,
+            subsigs,
+        };
+
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            lmsig: Some(lmsig),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(msig_addr),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+        (stx, lsig)
+    }
+
+    #[test]
+    fn verify_logicsig_msig_rejected_at_v41_plus() {
+        // v41 retires `LogicSigMsig` (config/consensus.go:1525) -- a
+        // correctly-signed msig-delegated LogicSig must now be rejected
+        // outright, never reaching program execution.
+        let (stx, lsig) = msig_delegated_int1_lsig();
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .expect("v41 must be a known protocol version");
+        assert!(
+            !consensus.logic_sig_msig,
+            "v41 must have LogicSigMsig=false"
+        );
+
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus)
+            .expect_err("msig delegation must be rejected once LogicSigMsig is retired");
+        assert!(
+            err.to_string().contains("Msig field not supported"),
+            "expected a Msig-not-supported error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_logicsig_msig_accepted_before_v41() {
+        // v40 (LogicSigMsig=true, LogicSigLMsig=false) must still accept a
+        // correctly-signed msig-delegated LogicSig, actually executing the
+        // program.
+        let (stx, lsig) = msig_delegated_int1_lsig();
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V40,
+        )
+        .expect("v40 must be a known protocol version");
+        assert!(consensus.logic_sig_msig, "v40 must have LogicSigMsig=true");
+
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        assert!(verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus).is_ok());
+    }
+
+    #[test]
+    fn verify_logicsig_lmsig_rejected_before_v41() {
+        // Before v41, `LogicSigLMsig` is false -- an lmsig-delegated LogicSig
+        // must be rejected outright even though the signature itself is
+        // valid, matching go's `logicSigSanityCheckBatchPrep`.
+        let (stx, lsig) = lmsig_delegated_int1_lsig();
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V40,
+        )
+        .expect("v40 must be a known protocol version");
+        assert!(
+            !consensus.logic_sig_lmsig,
+            "v40 must have LogicSigLMsig=false"
+        );
+
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus)
+            .expect_err("lmsig delegation must be rejected before LogicSigLMsig activates");
+        assert!(
+            err.to_string().contains("LMsig field not supported"),
+            "expected an LMsig-not-supported error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_logicsig_lmsig_accepted_at_v41_plus() {
+        // At/after v41 (LogicSigLMsig=true), a correctly-signed
+        // lmsig-delegated LogicSig must be accepted end-to-end.
+        let (stx, lsig) = lmsig_delegated_int1_lsig();
+        let consensus = ConsensusParams::default(); // v42, LogicSigLMsig=true
+        assert!(
+            consensus.logic_sig_lmsig,
+            "current consensus must allow LMsig"
+        );
+
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        assert!(verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus).is_ok());
     }
 
     #[test]

@@ -655,6 +655,68 @@ pub struct ConsensusParams {
     /// yet consensus-active for this version (matches `state_proof_interval
     /// == 0`).
     pub state_proof_top_voters: u64,
+
+    // ── LogicSig authorization modes (issue #752) ──────────────────
+    /// Legacy ed25519-multisig LogicSig delegation is accepted (Go:
+    /// `LogicSigMsig`, v18+, retired at v41 in favor of `LogicSigLMsig`).
+    pub logic_sig_msig: bool,
+    /// Newer lhash-based multisig LogicSig delegation ("LMsig") is accepted
+    /// (Go: `LogicSigLMsig`, v41+, replaces `LogicSigMsig` in the same
+    /// release).
+    pub logic_sig_lmsig: bool,
+
+    // ── I/O budget error classification (issue #752) ───────────────
+    /// Box read-I/O-budget overruns are a bare error rather than a
+    /// `logic.EvalError` (Go: `EnableBareBudgetError`, v38+). This matters
+    /// only for ClearState-program semantics: go's
+    /// `ledger/apply/application.go` swallows a ClearState program's
+    /// `logic.EvalError` unconditionally (clearing out is always allowed)
+    /// but re-propagates any *other* error kind, failing the outer
+    /// transaction. Before v38, an io-budget overrun was itself an
+    /// `EvalError` and so was swallowed like any other ClearState failure;
+    /// from v38 on it is a bare error and fails the transaction.
+    /// Approval-program semantics are unaffected either way (any error there
+    /// already fails the transaction, regardless of error kind).
+    pub enable_bare_budget_error: bool,
+
+    // ── State proof catch-up / verification source (issue #752) ────
+    /// Number of state-proof intervals the node will try to catch up with
+    /// before giving up and releasing resources reserved for building state
+    /// proofs (Go: `StateProofMaxRecoveryIntervals`, v34+ = 10). A
+    /// resource-management/liveness knob, not a block-acceptance rule; 0
+    /// before v34 (state proofs not yet consensus-active).
+    pub state_proof_max_recovery_intervals: u64,
+    /// Whether the node sources state-proof verification data from the
+    /// state-proof verification tracker rather than recomputing it (Go:
+    /// `StateProofUseTrackerVerification`, v38+). An internal
+    /// implementation-detail toggle for *where* verification data comes
+    /// from, with no live-consensus-acceptance impact.
+    pub state_proof_use_tracker_verification: bool,
+
+    // ── Catchpoint / on-disk format (issue #752) ────────────────────
+    /// Round lookback used to decide which round's account snapshot becomes
+    /// the next catchpoint: the snapshot for round X is taken at
+    /// `X - CatchpointLookback` (Go: `CatchpointLookback`, v33+ = 320).
+    /// Distinct from [`Self::max_bal_lookback`] (Go: `MaxBalLookback`), which
+    /// bounds online-account history retention and only happens to share the
+    /// same numeric value (320) at every version modeled here.
+    pub catchpoint_lookback: u64,
+    /// Enables `UpdateRound` on-disk in account/resource records and
+    /// catchpoint merkle-trie keys (Go: `EnableLedgerDataUpdateRound`,
+    /// v32+). Per go's own doc comment this is never reflected in on-chain
+    /// state and has zero live-consensus-acceptance impact —
+    /// catchpoint-file-format only.
+    pub enable_ledger_data_update_round: bool,
+    /// Enables version-7 catchpoint files (adds state-proof verification
+    /// contexts and catchpoint-label versioning) (Go:
+    /// `EnableCatchpointsWithSPContexts`, v38+).
+    pub enable_catchpoints_with_sp_contexts: bool,
+    /// Enables version-8 catchpoint files (adds `onlineaccounts` /
+    /// `onlineroundparamstail` tables, for historical stake lookups) (Go:
+    /// `EnableCatchpointsWithOnlineAccounts`, v40+). go-algorand requires
+    /// [`Self::enable_catchpoints_with_sp_contexts`] to also be true whenever
+    /// this is true (v8 catchpoints carry v7's SP contexts too).
+    pub enable_catchpoints_with_online_accounts: bool,
 }
 
 impl ConsensusParams {
@@ -903,6 +965,15 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         enable_precheck_ecdsa_curve: false,
         app_forbid_low_resources: false,
         state_proof_top_voters: 0,
+        logic_sig_msig: false,
+        logic_sig_lmsig: false,
+        enable_bare_budget_error: false,
+        state_proof_max_recovery_intervals: 0,
+        state_proof_use_tracker_verification: false,
+        catchpoint_lookback: 0,
+        enable_ledger_data_update_round: false,
+        enable_catchpoints_with_sp_contexts: false,
+        enable_catchpoints_with_online_accounts: false,
     };
     if version == CONSENSUS_V7 {
         return Some(v7);
@@ -1015,6 +1086,11 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v18.max_asset_url_bytes = 32;
     // Go: v18.PendingResidueRewards = true (config/consensus.go:1058).
     v18.pending_residue_rewards = true;
+    // Go: v18.LogicSigMsig = true (config/consensus.go:1066), formalizing
+    // msig-authorized LogicSigs that were unconditionally allowed since v18
+    // (retroactively added to the v18 struct literal by commit `3b1ac0f59`
+    // alongside `LogicSigLMsig`; see issue #752).
+    v18.logic_sig_msig = true;
     if version == CONSENSUS_V18 {
         return Some(v18);
     }
@@ -1165,6 +1241,9 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v32.max_apps_created = 0; // unlimited
     v32.max_apps_opted_in = 0; // unlimited
     v32.maximum_minimum_balance = 0; // remove limit
+                                     // Go: v32.EnableLedgerDataUpdateRound = true (config/consensus.go:1338).
+                                     // Catchpoint-file-format-only: never appears in on-chain state (issue #752).
+    v32.enable_ledger_data_update_round = true;
     if version == CONSENSUS_V32 {
         return Some(v32);
     }
@@ -1173,6 +1252,10 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     let mut v33 = v32.clone();
     v33.deeper_block_header_history = 1;
     v33.max_txn_bytes_per_block = 5 * 1024 * 1024;
+    // Go: v33.CatchpointLookback = 320 (config/consensus.go:1362). Distinct
+    // from `max_bal_lookback`, which already carries 320 unconditionally
+    // from the v7 base (issue #752).
+    v33.catchpoint_lookback = 320;
     if version == CONSENSUS_V33 {
         return Some(v33);
     }
@@ -1182,6 +1265,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v34.logic_sig_version = 7;
     v34.min_inner_appl_version = 4;
     v34.enable_sha256_txn_commitment_header = true;
+    // Go: v34.StateProofMaxRecoveryIntervals = 10 (config/consensus.go:1383).
+    v34.state_proof_max_recovery_intervals = 10;
     v34.state_proof_interval = 256;
     v34.state_proof_voters_lookback = 16;
     // Go: v34.StateProofWeightThreshold = (1 << 32) * 30 / 100 (config/consensus.go:1307).
@@ -1234,6 +1319,12 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     // (config/consensus.go:1446-1447).
     v38.enable_precheck_ecdsa_curve = true;
     v38.app_forbid_low_resources = true;
+    // Go: v38.StateProofUseTrackerVerification = true,
+    // v38.EnableCatchpointsWithSPContexts = true (config/consensus.go:1438-1439),
+    // v38.EnableBareBudgetError = true (config/consensus.go:1448) (issue #752).
+    v38.state_proof_use_tracker_verification = true;
+    v38.enable_catchpoints_with_sp_contexts = true;
+    v38.enable_bare_budget_error = true;
     if version == CONSENSUS_V38 {
         return Some(v38);
     }
@@ -1270,6 +1361,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     // `BaseRound` is left at its zero value, so the plan applies at upgrade time.
     v40.bonus_base_amount = 10_000_000;
     v40.bonus_decay_interval = 1_000_000;
+    // Go: v40.EnableCatchpointsWithOnlineAccounts = true (config/consensus.go:1504).
+    v40.enable_catchpoints_with_online_accounts = true;
     if version == CONSENSUS_V40 {
         return Some(v40);
     }
@@ -1282,6 +1375,12 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v41.max_app_txn_accounts = 8;
     v41.max_app_access = 16;
     v41.bytes_per_box_reference = 2_048;
+    // Go: v41.LogicSigMsig = false, v41.LogicSigLMsig = true
+    // (config/consensus.go:1525-1526) -- v41 retires ed25519-multisig
+    // LogicSig delegation in favor of the newer lhash-based `LMsig` mode
+    // (issue #752).
+    v41.logic_sig_msig = false;
+    v41.logic_sig_lmsig = true;
     // v41 can be upgraded to v42, with a wait delay of 7d
     // (208000 = 7 * 24 * 60 * 60 / ~2.9s ballpark round time), per
     // `config/consensus.go`: `v41.ApprovedUpgrades[protocol.ConsensusV42] = 208000`.
@@ -1642,6 +1741,19 @@ pub struct ConsensusParamsOverride {
     pub enable_precheck_ecdsa_curve: bool,
     pub app_forbid_low_resources: bool,
     pub state_proof_top_voters: u64,
+    pub logic_sig_msig: bool,
+    /// Go: `LogicSigLMsig` (capital `M`).
+    #[serde(rename = "LogicSigLMsig")]
+    pub logic_sig_lmsig: bool,
+    pub enable_bare_budget_error: bool,
+    pub state_proof_max_recovery_intervals: u64,
+    pub state_proof_use_tracker_verification: bool,
+    pub catchpoint_lookback: u64,
+    pub enable_ledger_data_update_round: bool,
+    /// Go: `EnableCatchpointsWithSPContexts` (capital `SP`).
+    #[serde(rename = "EnableCatchpointsWithSPContexts")]
+    pub enable_catchpoints_with_sp_contexts: bool,
+    pub enable_catchpoints_with_online_accounts: bool,
 }
 
 impl ConsensusParamsOverride {
@@ -1813,6 +1925,15 @@ impl ConsensusParamsOverride {
             enable_precheck_ecdsa_curve: self.enable_precheck_ecdsa_curve,
             app_forbid_low_resources: self.app_forbid_low_resources,
             state_proof_top_voters: self.state_proof_top_voters,
+            logic_sig_msig: self.logic_sig_msig,
+            logic_sig_lmsig: self.logic_sig_lmsig,
+            enable_bare_budget_error: self.enable_bare_budget_error,
+            state_proof_max_recovery_intervals: self.state_proof_max_recovery_intervals,
+            state_proof_use_tracker_verification: self.state_proof_use_tracker_verification,
+            catchpoint_lookback: self.catchpoint_lookback,
+            enable_ledger_data_update_round: self.enable_ledger_data_update_round,
+            enable_catchpoints_with_sp_contexts: self.enable_catchpoints_with_sp_contexts,
+            enable_catchpoints_with_online_accounts: self.enable_catchpoints_with_online_accounts,
         }
     }
 }
@@ -2916,5 +3037,156 @@ mod tests {
         let v41 = consensus_params_for_version(CONSENSUS_V41).unwrap();
         assert!(v41.enable_precheck_ecdsa_curve);
         assert!(v41.app_forbid_low_resources);
+    }
+
+    // ── Issue #752: LogicSigMsig/LMsig, EnableBareBudgetError,
+    // StateProofMaxRecoveryIntervals, CatchpointLookback,
+    // EnableLedgerDataUpdateRound, StateProofUseTrackerVerification,
+    // EnableCatchpointsWithSPContexts/EnableCatchpointsWithOnlineAccounts ──
+
+    #[test]
+    fn logic_sig_msig_and_lmsig_swap_at_v41() {
+        // v18 introduces LogicSigMsig=true, retroactively formalized by
+        // commit `3b1ac0f59` (config/consensus.go:1066).
+        let v17 = consensus_params_for_version(CONSENSUS_V17).unwrap();
+        assert!(!v17.logic_sig_msig);
+        assert!(!v17.logic_sig_lmsig);
+
+        let v18 = consensus_params_for_version(CONSENSUS_V18).unwrap();
+        assert!(v18.logic_sig_msig);
+        assert!(!v18.logic_sig_lmsig);
+
+        let v40 = consensus_params_for_version(CONSENSUS_V40).unwrap();
+        assert!(v40.logic_sig_msig);
+        assert!(!v40.logic_sig_lmsig);
+
+        // v41 retires LogicSigMsig in favor of LogicSigLMsig, in the same
+        // release (config/consensus.go:1525-1526).
+        let v41 = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        assert!(!v41.logic_sig_msig);
+        assert!(v41.logic_sig_lmsig);
+
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert!(!v42.logic_sig_msig);
+        assert!(v42.logic_sig_lmsig);
+    }
+
+    #[test]
+    fn enable_bare_budget_error_activates_at_v38() {
+        let v37 = consensus_params_for_version(CONSENSUS_V37).unwrap();
+        assert!(!v37.enable_bare_budget_error);
+        let v38 = consensus_params_for_version(CONSENSUS_V38).unwrap();
+        assert!(v38.enable_bare_budget_error);
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert!(v42.enable_bare_budget_error);
+    }
+
+    #[test]
+    fn state_proof_max_recovery_intervals_activates_at_v34() {
+        let v33 = consensus_params_for_version(CONSENSUS_V33).unwrap();
+        assert_eq!(v33.state_proof_max_recovery_intervals, 0);
+        let v34 = consensus_params_for_version(CONSENSUS_V34).unwrap();
+        assert_eq!(v34.state_proof_max_recovery_intervals, 10);
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert_eq!(v42.state_proof_max_recovery_intervals, 10);
+    }
+
+    #[test]
+    fn catchpoint_lookback_activates_at_v33_distinct_from_max_bal_lookback() {
+        let v32 = consensus_params_for_version(CONSENSUS_V32).unwrap();
+        assert_eq!(v32.catchpoint_lookback, 0);
+        // `max_bal_lookback` (a different field) is 320 from the v7 base,
+        // unconditionally -- must not be confused with `catchpoint_lookback`.
+        assert_eq!(v32.max_bal_lookback, 320);
+
+        let v33 = consensus_params_for_version(CONSENSUS_V33).unwrap();
+        assert_eq!(v33.catchpoint_lookback, 320);
+        assert_eq!(v33.max_bal_lookback, 320);
+
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert_eq!(v42.catchpoint_lookback, 320);
+    }
+
+    #[test]
+    fn enable_ledger_data_update_round_activates_at_v32() {
+        let v31 = consensus_params_for_version(CONSENSUS_V31).unwrap();
+        assert!(!v31.enable_ledger_data_update_round);
+        let v32 = consensus_params_for_version(CONSENSUS_V32).unwrap();
+        assert!(v32.enable_ledger_data_update_round);
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert!(v42.enable_ledger_data_update_round);
+    }
+
+    #[test]
+    fn state_proof_use_tracker_verification_and_sp_contexts_activate_at_v38() {
+        let v37 = consensus_params_for_version(CONSENSUS_V37).unwrap();
+        assert!(!v37.state_proof_use_tracker_verification);
+        assert!(!v37.enable_catchpoints_with_sp_contexts);
+
+        let v38 = consensus_params_for_version(CONSENSUS_V38).unwrap();
+        assert!(v38.state_proof_use_tracker_verification);
+        assert!(v38.enable_catchpoints_with_sp_contexts);
+
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert!(v42.state_proof_use_tracker_verification);
+        assert!(v42.enable_catchpoints_with_sp_contexts);
+    }
+
+    #[test]
+    fn enable_catchpoints_with_online_accounts_activates_at_v40() {
+        let v39 = consensus_params_for_version(CONSENSUS_V39).unwrap();
+        assert!(!v39.enable_catchpoints_with_online_accounts);
+        // SP contexts must already be on by v39 (activated at v38), so v40's
+        // online-accounts flag is a valid V8-selecting combination.
+        assert!(v39.enable_catchpoints_with_sp_contexts);
+
+        let v40 = consensus_params_for_version(CONSENSUS_V40).unwrap();
+        assert!(v40.enable_catchpoints_with_online_accounts);
+        assert!(v40.enable_catchpoints_with_sp_contexts);
+
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert!(v42.enable_catchpoints_with_online_accounts);
+    }
+
+    #[test]
+    fn consensus_json_override_round_trips_issue_752_fields() {
+        // A `consensus.json` override that sets one of the new fields must
+        // survive the JSON round trip and merge correctly (issue #762's
+        // override registry, extended by issue #752's new fields).
+        let json = r#"{
+            "vTest752": {
+                "LogicSigMsig": false,
+                "LogicSigLMsig": true,
+                "EnableBareBudgetError": true,
+                "StateProofMaxRecoveryIntervals": 7,
+                "StateProofUseTrackerVerification": true,
+                "CatchpointLookback": 640,
+                "EnableLedgerDataUpdateRound": true,
+                "EnableCatchpointsWithSPContexts": true,
+                "EnableCatchpointsWithOnlineAccounts": true
+            }
+        }"#;
+        let overrides: ConsensusOverrides = serde_json::from_str(json).unwrap();
+        let entry = overrides.get("vTest752").expect("entry must parse");
+        assert!(!entry.logic_sig_msig);
+        assert!(entry.logic_sig_lmsig);
+        assert!(entry.enable_bare_budget_error);
+        assert_eq!(entry.state_proof_max_recovery_intervals, 7);
+        assert!(entry.state_proof_use_tracker_verification);
+        assert_eq!(entry.catchpoint_lookback, 640);
+        assert!(entry.enable_ledger_data_update_round);
+        assert!(entry.enable_catchpoints_with_sp_contexts);
+        assert!(entry.enable_catchpoints_with_online_accounts);
+
+        let params = entry.to_consensus_params();
+        assert!(!params.logic_sig_msig);
+        assert!(params.logic_sig_lmsig);
+        assert!(params.enable_bare_budget_error);
+        assert_eq!(params.state_proof_max_recovery_intervals, 7);
+        assert!(params.state_proof_use_tracker_verification);
+        assert_eq!(params.catchpoint_lookback, 640);
+        assert!(params.enable_ledger_data_update_round);
+        assert!(params.enable_catchpoints_with_sp_contexts);
+        assert!(params.enable_catchpoints_with_online_accounts);
     }
 }

@@ -555,6 +555,121 @@ fn clearstate_execute_program_errors_still_clears_local_state() {
     );
 }
 
+/// ClearState in Execute mode where the eager box read-I/O-budget check
+/// (issue #725) overruns -- under `EnableBareBudgetError = true` (v38+,
+/// issue #752) this is a bare error, not a `logic.EvalError`, so
+/// `ledger/apply/application.go` does NOT swallow it: the outer transaction
+/// fails outright and local state is left untouched, unlike an ordinary
+/// ClearState program rejection/error.
+#[test]
+fn clearstate_io_budget_overrun_fails_transaction_at_v38_plus() {
+    use algo_ledger::LedgerStore;
+
+    let creator = Address([1u8; 32]);
+    let sender = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[(creator, 50_000_000), (sender, 50_000_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let app_id = 204u64;
+    create_app(
+        &mut state,
+        app_id,
+        creator,
+        approval_program(),
+        approval_program(),
+    );
+    opt_in_account(&mut state, &sender, app_id);
+
+    // `execute_ctx`'s default (v42) consensus grants 2048 bytes of read
+    // budget per box reference; seed a box far larger than that.
+    state.set_box(app_id, b"mybox", vec![0u8; 3_000]);
+
+    let ctx = execute_ctx(fee_sink, 1);
+    let mut stx = appl_clearstate_txn(sender, app_id, 1_000);
+    stx.txn.boxes = Some(vec![algo_types::BoxRef {
+        index: 0,
+        name: Some(serde_bytes::ByteBuf::from(b"mybox".to_vec())),
+    }]);
+
+    let result = apply_transaction(&mut state, &stx, &ctx, 0);
+    assert!(
+        result.is_err(),
+        "an io-budget overrun must fail the outer transaction once EnableBareBudgetError is true"
+    );
+
+    // Since the transaction failed outright, local state must NOT have been
+    // cleared (unlike an ordinary ClearState program rejection/error).
+    assert!(
+        state.get_app_local_state(&sender, app_id).is_some(),
+        "a failed outer transaction must not have cleared local state"
+    );
+}
+
+/// Companion to the test above: before v38 (`EnableBareBudgetError = false`),
+/// the exact same io-budget overrun was itself a `logic.EvalError` in
+/// go-algorand, so `ledger/apply/application.go` swallows it like any other
+/// ClearState failure -- the outer transaction still succeeds and local
+/// state is still cleared (clearing out is always allowed).
+#[test]
+fn clearstate_io_budget_overrun_swallowed_before_v38() {
+    use algo_ledger::LedgerStore;
+
+    let creator = Address([1u8; 32]);
+    let sender = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[(creator, 50_000_000), (sender, 50_000_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let app_id = 205u64;
+    create_app(
+        &mut state,
+        app_id,
+        creator,
+        approval_program(),
+        approval_program(),
+    );
+    opt_in_account(&mut state, &sender, app_id);
+
+    // v37: boxes are supported (bytes_per_box_reference == 1024, since v36)
+    // but EnableBareBudgetError is not yet set (that's v38).
+    let v37_consensus =
+        algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V37)
+            .expect("v37 must be a known protocol version");
+    assert!(!v37_consensus.enable_bare_budget_error);
+    assert_eq!(v37_consensus.bytes_per_box_reference, 1_024);
+
+    state.set_box(app_id, b"mybox", vec![0u8; 3_000]);
+
+    let mut ctx = execute_ctx(fee_sink, 1);
+    ctx.consensus = v37_consensus;
+    let mut stx = appl_clearstate_txn(sender, app_id, 1_000);
+    stx.txn.boxes = Some(vec![algo_types::BoxRef {
+        index: 0,
+        name: Some(serde_bytes::ByteBuf::from(b"mybox".to_vec())),
+    }]);
+
+    let result = apply_transaction(&mut state, &stx, &ctx, 0);
+    assert!(
+        result.is_ok(),
+        "before EnableBareBudgetError, an io-budget overrun must be swallowed like any \
+         other ClearState failure, not fail the outer transaction: {:?}",
+        result.err()
+    );
+
+    // Clearing out is always allowed: local state must be gone regardless.
+    assert!(
+        state.get_app_local_state(&sender, app_id).is_none(),
+        "local state should be cleared even when the io-budget check itself is swallowed"
+    );
+}
+
 /// ClearState in Execute mode when the app has been deleted -- local state
 /// is still cleared (allows users to reclaim min balance).
 #[test]
