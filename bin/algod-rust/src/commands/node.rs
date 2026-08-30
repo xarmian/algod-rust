@@ -335,7 +335,13 @@ async fn run_start(
         // ORs this with dev-mode (see
         // `AlgodNodeInterface::enable_developer_api`), so `--dev` keeps
         // working unchanged whether or not this is set.
-        .with_enable_developer_api(file_config.enable_developer_api);
+        .with_enable_developer_api(file_config.enable_developer_api)
+        // `config.json`'s `EnableRuntimeMetrics`/`EnableNetDevMetrics`
+        // (issue #776): process-wide `/metrics` counters, independent of
+        // consensus participation, so `node start` wires them the same way
+        // `participate` does.
+        .with_enable_runtime_metrics(file_config.enable_runtime_metrics)
+        .with_enable_netdev_metrics(file_config.enable_netdev_metrics);
     if dev_mode {
         let pool = Arc::new(TransactionPool::new(
             PoolConfig::default(),

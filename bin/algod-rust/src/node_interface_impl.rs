@@ -267,6 +267,14 @@ pub struct AlgodNodeInterface {
     /// `config.json`'s `MaxAPIBoxPerApplication` (issue #751), same fix as
     /// `max_api_resources_per_account_cfg`.
     max_api_box_per_application_cfg: u64,
+    /// `config.json`'s `EnableRuntimeMetrics` (issue #776). Gates whether
+    /// `GET /metrics` includes the Go-runtime-equivalent process counters
+    /// from `algo_rest_api::process_metrics::RuntimeMetricsSnapshot`.
+    enable_runtime_metrics_cfg: bool,
+    /// `config.json`'s `EnableNetDevMetrics` (issue #776). Gates whether
+    /// `GET /metrics` includes the network-interface byte counters from
+    /// `algo_rest_api::process_metrics::NetDevMetricsSnapshot`.
+    enable_netdev_metrics_cfg: bool,
 }
 
 impl AlgodNodeInterface {
@@ -300,6 +308,8 @@ impl AlgodNodeInterface {
             enable_experimental_api_cfg: false,
             max_api_resources_per_account_cfg: 100_000,
             max_api_box_per_application_cfg: 100_000,
+            enable_runtime_metrics_cfg: false,
+            enable_netdev_metrics_cfg: false,
         }
     }
 
@@ -427,6 +437,22 @@ impl AlgodNodeInterface {
     #[must_use]
     pub fn with_max_api_box_per_application(mut self, max: u64) -> Self {
         self.max_api_box_per_application_cfg = max;
+        self
+    }
+
+    /// Set `config.json`'s `EnableRuntimeMetrics` value (issue #776).
+    /// Builder-style, matching the other collaborators.
+    #[must_use]
+    pub fn with_enable_runtime_metrics(mut self, enabled: bool) -> Self {
+        self.enable_runtime_metrics_cfg = enabled;
+        self
+    }
+
+    /// Set `config.json`'s `EnableNetDevMetrics` value (issue #776).
+    /// Builder-style, matching the other collaborators.
+    #[must_use]
+    pub fn with_enable_netdev_metrics(mut self, enabled: bool) -> Self {
+        self.enable_netdev_metrics_cfg = enabled;
         self
     }
 
@@ -1889,12 +1915,42 @@ impl NodeInterface for AlgodNodeInterface {
         serde_json::to_value(metrics.snapshot()).ok()
     }
 
-    /// The same counters in Prometheus text exposition format, served by
-    /// `GET /metrics`. Rendered by `algo-agreement` so no `prometheus` crate
-    /// dependency enters the workspace.
+    /// The same participation counters, plus (issue #776) the Go-runtime-
+    /// equivalent process counters and network-interface counters when
+    /// their respective `config.json` flags are set, all in Prometheus text
+    /// exposition format, served by `GET /metrics`. Rendered by
+    /// `algo-agreement`/`algo_rest_api::process_metrics` so no `prometheus`
+    /// crate dependency enters the workspace.
+    ///
+    /// `None` (404) only when there is genuinely nothing to report: no
+    /// participation metrics attached AND both new gates are off. A
+    /// non-participating node with `EnableRuntimeMetrics`/
+    /// `EnableNetDevMetrics` set still gets a 200 — those counters are
+    /// process-wide, not consensus-participation-specific, matching
+    /// go-algorand's own `/metrics` (its registrations are independent of
+    /// whether the node holds a participation key).
     fn metrics_exposition(&self) -> Option<String> {
-        let metrics = self.participation_metrics.as_ref()?;
-        Some(metrics.snapshot().to_prometheus_text())
+        let mut text = String::new();
+        if let Some(metrics) = self.participation_metrics.as_ref() {
+            text.push_str(&metrics.snapshot().to_prometheus_text());
+        }
+        if self.enable_runtime_metrics_cfg {
+            text.push_str(
+                &algo_rest_api::process_metrics::RuntimeMetricsSnapshot::capture()
+                    .to_prometheus_text(),
+            );
+        }
+        if self.enable_netdev_metrics_cfg {
+            text.push_str(
+                &algo_rest_api::process_metrics::NetDevMetricsSnapshot::capture()
+                    .to_prometheus_text(),
+            );
+        }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     /// Whether the Developer API (`/v2/teal/compile`, `/v2/teal/disassemble`,
@@ -3103,6 +3159,71 @@ mod tests {
         let text = adapter.metrics_exposition().expect("exposition available");
         assert!(text.contains("algod_rust_agreement_votes_cast_total{step=\"soft\"} 2"));
         assert!(text.contains("algod_rust_agreement_last_committed_round 11"));
+    }
+
+    // ── Runtime/netdev metrics config-gating (issue #776) ───────────────
+
+    /// Neither flag set and no participation metrics attached: `/metrics`
+    /// must still 404, matching the pre-#776 behavior exactly (a node with
+    /// nothing enabled has nothing to report).
+    #[test]
+    fn runtime_and_netdev_metrics_absent_by_default() {
+        let adapter = make_adapter();
+        assert!(adapter.metrics_exposition().is_none());
+    }
+
+    /// `EnableRuntimeMetrics` alone (no participation metrics attached) must
+    /// still return `Some` — these are process-wide counters, not gated on
+    /// consensus participation, matching go-algorand's own `/metrics`.
+    #[test]
+    fn enable_runtime_metrics_gate_adds_runtime_series_without_participation() {
+        let adapter = make_adapter().with_enable_runtime_metrics(true);
+        let text = adapter
+            .metrics_exposition()
+            .expect("runtime metrics alone must make /metrics available");
+        assert!(text.contains("algod_rust_runtime_resident_memory_bytes"));
+        assert!(!text.contains("algod_rust_netdev_"));
+        assert!(!text.contains("algod_rust_agreement_"));
+    }
+
+    /// `EnableNetDevMetrics` alone (no participation metrics attached) must
+    /// still return `Some`.
+    #[test]
+    fn enable_netdev_metrics_gate_adds_netdev_series_without_participation() {
+        let adapter = make_adapter().with_enable_netdev_metrics(true);
+        let text = adapter
+            .metrics_exposition()
+            .expect("netdev metrics alone must make /metrics available");
+        assert!(text.contains("algod_rust_netdev_received_bytes"));
+        assert!(text.contains("algod_rust_netdev_sent_bytes"));
+        assert!(!text.contains("algod_rust_runtime_"));
+    }
+
+    /// With both gates off, attaching participation metrics keeps the
+    /// pre-#776 shape: only the agreement series are present.
+    #[test]
+    fn both_metrics_gates_off_reports_only_participation_series() {
+        let metrics = Arc::new(algo_agreement::ParticipationMetrics::new());
+        let adapter = make_adapter().with_participation_metrics(metrics);
+        let text = adapter.metrics_exposition().expect("exposition available");
+        assert!(text.contains("algod_rust_agreement_"));
+        assert!(!text.contains("algod_rust_runtime_"));
+        assert!(!text.contains("algod_rust_netdev_"));
+    }
+
+    /// With both gates on and participation metrics attached, all three
+    /// series families are present in one exposition.
+    #[test]
+    fn both_metrics_gates_on_combine_with_participation_series() {
+        let metrics = Arc::new(algo_agreement::ParticipationMetrics::new());
+        let adapter = make_adapter()
+            .with_participation_metrics(metrics)
+            .with_enable_runtime_metrics(true)
+            .with_enable_netdev_metrics(true);
+        let text = adapter.metrics_exposition().expect("exposition available");
+        assert!(text.contains("algod_rust_agreement_"));
+        assert!(text.contains("algod_rust_runtime_"));
+        assert!(text.contains("algod_rust_netdev_"));
     }
 
     #[test]

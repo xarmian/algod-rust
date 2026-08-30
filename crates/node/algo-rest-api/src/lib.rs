@@ -34,6 +34,7 @@ pub mod format;
 pub mod handlers;
 pub mod models;
 pub mod node;
+pub mod process_metrics;
 pub mod router;
 pub mod server;
 pub mod source_header;

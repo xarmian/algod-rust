@@ -512,6 +512,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "sysinfo",
  "thiserror 2.0.18",
  "tokio",
  "tower",
