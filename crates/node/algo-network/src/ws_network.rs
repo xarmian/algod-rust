@@ -73,7 +73,9 @@ use crate::handshake::{check_protocol_version_match, VersionMatch, SUPPORTED_PRO
 use crate::health_service::health_router;
 use crate::mesh::{ConnectFn, MeshRequest, MeshThread, PeerCounter};
 use crate::message::OutgoingMessage;
-use crate::message_filter::MessageFilter;
+use crate::message_filter::{
+    dedup_safe_tag, generate_message_digest, MessageFilter, MESSAGE_FILTER_SIZE,
+};
 use crate::peer_role::{ARCHIVAL_ROLE, RELAY_ROLE};
 use crate::phonebook::Phonebook;
 use crate::request_response::{encode_uvarint, hash_topics, RESPONSE_HASH_FIELD};
@@ -537,6 +539,7 @@ impl WebsocketNetwork {
             let cancel = self.cancel.clone();
             let peers = Arc::clone(&self.peers);
             let peer_addr = addr;
+            let outgoing_message_filter = self.outgoing_message_filter.clone();
             let broadcast_handle: Option<BroadcastHandle> = {
                 let guard = self
                     .broadcast_thread
@@ -567,6 +570,22 @@ impl WebsocketNetwork {
                                     } else {
                                         None
                                     };
+                                    // Issue #798: tell every *other* connected peer
+                                    // "I already have this, don't re-send it" before
+                                    // dispatching — mirrors go's messageHandlerThread,
+                                    // which calls sendFilterMessage() unconditionally
+                                    // for any large dedup-safe message *before*
+                                    // wn.Handle() decides what to do with it
+                                    // (network/wsNetwork.go:1249-1251).
+                                    if outgoing_message_filter.is_some()
+                                        && dedup_safe_tag(&tag)
+                                        && request_data.len() >= MESSAGE_FILTER_SIZE
+                                    {
+                                        let digest =
+                                            generate_message_digest(&tag, &request_data);
+                                        send_digest_skip_notification(&peers, digest, &peer_addr)
+                                            .await;
+                                    }
                                     // Dispatch to the multiplexer.
                                     let out = multiplexer.handle(incoming).await;
                                     // Act on forwarding policy.
@@ -1045,6 +1064,41 @@ impl WebsocketNetwork {
     }
 }
 
+/// Broadcast a `MsgDigestSkip` notification (a 32-byte digest) to every
+/// connected peer except `except`, telling them "I already have this exact
+/// message, don't bother re-sending it to me".
+///
+/// Mirrors go's `msgHandler.sendFilterMessage()` (`network/wsNetwork.go:1326`),
+/// which is invoked from `messageHandlerThread` right after a large
+/// (`>= messageFilterSize`) message is pulled off the read buffer —
+/// `net.Broadcast(ctx, protocol.MsgDigestSkipTag, digest[:], false, msg.Sender)`.
+/// Called from the real peer receive-dispatch loops
+/// ([`WebsocketNetwork::add_peer`]'s recv task, covering both the inbound
+/// accept path and `mesh_connect`'s outbound dial path, and
+/// `NetworkConnectFn::try_dial`'s recv task, covering `MeshThread`'s
+/// periodic outbound dial) rather than duplicating the peer-iteration
+/// logic in each.
+async fn send_digest_skip_notification(
+    peers: &Arc<RwLock<HashMap<String, PeerEntry>>>,
+    digest: [u8; 32],
+    except: &str,
+) {
+    let msg = OutgoingMessage::new(Tag::MsgDigestSkip, digest.to_vec());
+    let peers_guard = peers.read().await;
+    for (addr, entry) in peers_guard.iter() {
+        if addr == except {
+            continue;
+        }
+        if let Err(e) = entry.handle.send(msg.clone()) {
+            tracing::debug!(
+                addr = %addr,
+                error = %e,
+                "failed to enqueue MsgDigestSkip notification"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GossipNode trait implementation
 // ---------------------------------------------------------------------------
@@ -1334,6 +1388,7 @@ impl ConnectFn for NetworkConnectFn {
         Box::pin(async move {
             use crate::ws_peer::WsPeerConfig;
 
+            let recv_outgoing_message_filter = outgoing_message_filter.clone();
             let connect_config = ConnectConfig {
                 genesis_id,
                 peer_config: Some(WsPeerConfig {
@@ -1391,11 +1446,33 @@ impl ConnectFn for NetworkConnectFn {
                                         match msg {
                                             Some(incoming) => {
                                                 let tag = incoming.tag;
+                                                let request_data = incoming.data.clone();
                                                 let relay_data = if broadcast_handle.is_some() {
-                                                    Some((incoming.data.clone(), incoming.sender.clone()))
+                                                    Some((request_data.clone(), incoming.sender.clone()))
                                                 } else {
                                                     None
                                                 };
+                                                // Issue #798: broadcast a
+                                                // MsgDigestSkip to every other
+                                                // connected peer before
+                                                // dispatching — see the
+                                                // matching comment in
+                                                // `add_peer`'s recv task.
+                                                if recv_outgoing_message_filter.is_some()
+                                                    && dedup_safe_tag(&tag)
+                                                    && request_data.len() >= MESSAGE_FILTER_SIZE
+                                                {
+                                                    let digest = generate_message_digest(
+                                                        &tag,
+                                                        &request_data,
+                                                    );
+                                                    send_digest_skip_notification(
+                                                        &recv_peers,
+                                                        digest,
+                                                        &recv_addr,
+                                                    )
+                                                    .await;
+                                                }
                                                 let out = recv_multiplexer.handle(incoming).await;
                                                 match out.action {
                                                     ForwardingPolicy::Broadcast => {
