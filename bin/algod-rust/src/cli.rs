@@ -276,6 +276,16 @@ pub enum Commands {
         /// (issue #748).
         #[arg(long)]
         dns_bootstrap: Option<String>,
+
+        /// Data directory to load `<data-dir>/config.json` from (go-algorand
+        /// `config.Local` equivalent, issue #754/epic #745). Currently used
+        /// by catchpoint-sync mode for `AccountsRebuildSynchronousMode`
+        /// (issue #749): the bulk-import connection's SQLite `synchronous`
+        /// pragma, previously hardcoded to `NORMAL` unconditionally. A
+        /// missing `--data-dir` (or missing `config.json`) falls back to
+        /// go-matching defaults.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Catchpoint operations: import, verify, export, and download catchpoint files.
@@ -814,6 +824,15 @@ pub enum CatchpointAction {
         /// Skip verification after import.
         #[arg(long)]
         no_verify: bool,
+
+        /// Data directory to load `<data-dir>/config.json` from (issue
+        /// #749): `AccountsRebuildSynchronousMode` (SQLite `synchronous`
+        /// pragma on the import connection, previously hardcoded to
+        /// `NORMAL`) and `OptimizeAccountsDatabaseOnStartup` (runs `VACUUM`
+        /// on the imported accounts DB after import). Missing/absent falls
+        /// back to go-matching defaults (`NORMAL`, vacuum off).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Verify an already-imported catchpoint database.
@@ -825,6 +844,12 @@ pub enum CatchpointAction {
         /// Path to the catchpoint file (required for block header digest).
         #[arg(long)]
         file: Option<PathBuf>,
+
+        /// Data directory to load `<data-dir>/config.json` from (issue
+        /// #749): `AccountsRebuildSynchronousMode` for the verify
+        /// connection.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Export a catchpoint file from a local ledger database.
@@ -833,9 +858,12 @@ pub enum CatchpointAction {
         #[arg(long, default_value = "./ledger.sqlite")]
         db: PathBuf,
 
-        /// Output catchpoint file path.
+        /// Output catchpoint file path. Optional when `--data-dir`'s
+        /// `config.json` sets a non-empty `CatchpointDir` (issue #749):
+        /// defaults to `<CatchpointDir>/<round>.catchpoint(.tar.gz)`.
+        /// Required otherwise.
         #[arg(long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
 
         /// Round of the account snapshot. Defaults to `acctrounds('acctbase')`.
         #[arg(long)]
@@ -858,6 +886,11 @@ pub enum CatchpointAction {
         /// Write an uncompressed tar instead of tar.gz.
         #[arg(long)]
         no_gzip: bool,
+
+        /// Data directory to load `<data-dir>/config.json` from — see
+        /// `--output`'s note on `CatchpointDir` (issue #749).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Download a catchpoint file from an algod node.
@@ -878,9 +911,21 @@ pub enum CatchpointAction {
         #[arg(long)]
         round: u64,
 
-        /// Output file path.
+        /// Output file path. Optional when `--data-dir`'s `config.json`
+        /// sets a non-empty `CatchpointDir` (issue #749): defaults to
+        /// `<CatchpointDir>/<round>.catchpoint`. Required otherwise.
         #[arg(long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
+
+        /// Data directory to load `<data-dir>/config.json` from (issue
+        /// #749): `CatchpointDir` (default output location, see
+        /// `--output`), `MaxCatchpointDownloadDuration` (overall request
+        /// timeout, previously hardcoded to 30 minutes, matching neither
+        /// of go's real defaults), and
+        /// `MinCatchpointFileDownloadBytesPerSecond` (per-chunk stall
+        /// detection, previously entirely absent).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 }
 

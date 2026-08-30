@@ -313,6 +313,97 @@ static DNS_BOOTSTRAP_ID: VersionedDefault<String> = VersionedDefault::new(&[
     }),
 ]);
 
+/// Go: `CatchpointDir string` `version[31]:""` (`localTemplate.go:114`).
+/// Adopted from go's 9-field hot/cold directory-splitting group as a
+/// judgment-called subset (issue #749): algod-rust's fixed
+/// `<prefix>.tracker.sqlite` + `<prefix>.block.sqlite` layout has no
+/// hot/cold split, so `HotDataDir`/`ColdDataDir`/`TrackerDBDir`/
+/// `BlockDBDir`/`CrashDBDir`/`LogFileDir`/`LogArchiveDir` are recorded as
+/// an explicit architectural non-goal rather than added here. Wired into
+/// `algod-rust catchpoint export`/`download`'s default output location
+/// (`bin/algod-rust/src/commands/catchpoint.rs`).
+static CATCHPOINT_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
+
+/// Go: `StateproofDir string` `version[31]:""` (`localTemplate.go:118`).
+/// **Documented no-op** (same pattern as `enable_ledger_service`):
+/// algod-rust persists state-proof signing secrets as rows inside the
+/// existing partkey `ErasableDb` file
+/// (`crates/core/algo-ledger/src/participation/stateproof_persist.rs`)
+/// rather than a separate stateproof-only database/directory, so there is
+/// no distinct location to redirect yet. Round-trips through `config.json`
+/// for forward compatibility; real wiring is deferred to whichever future
+/// issue splits stateproof persistence into its own storage location.
+static STATEPROOF_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
+
+/// Go: `CatchpointInterval uint64` `version[7]:"10000"` (`localTemplate.go:399`).
+/// **Config field only** — go's automatic interval-driven catchpoint
+/// generation runs inside the live block-apply loop
+/// (`ledger/catchpointtracker.go`), which algod-rust doesn't have at all
+/// (`algod-rust catchpoint` is a one-shot import/verify/export/download
+/// CLI, not a background daemon feature). Judgment call recorded in issue
+/// #749: wiring automatic generation is out of scope here and tracked by
+/// a dedicated follow-up issue.
+static CATCHPOINT_INTERVAL: VersionedDefault<u64> = VersionedDefault::new(&[(7, || 10_000)]);
+
+/// Go: `CatchpointFileHistoryLength int` `version[7]:"365"` (`localTemplate.go:401`).
+/// Same config-field-only scope as `CatchpointInterval` above.
+static CATCHPOINT_FILE_HISTORY_LENGTH: VersionedDefault<i64> =
+    VersionedDefault::new(&[(7, || 365)]);
+
+/// Go: `CatchpointTracking int64` `version[11]:"0"` (`localTemplate.go:447`).
+/// Same config-field-only scope as `CatchpointInterval` above.
+static CATCHPOINT_TRACKING: VersionedDefault<i64> = VersionedDefault::new(&[(11, || 0)]);
+
+/// Go: `OptimizeAccountsDatabaseOnStartup bool` `version[10]:"false"`
+/// (`localTemplate.go:439`). Wired into `SqliteLedger::vacuum_accounts_database`
+/// (runs SQLite `VACUUM` on the tracker/accounts schema), matching go's
+/// `Ledger.reloadLedger` calling `l.accts.vacuumDatabase` when this flag
+/// (or a schema-upgrade-triggered `VacuumOnStartup`) is set
+/// (`../go-algorand/ledger/ledger.go:268-272`).
+static OPTIMIZE_ACCOUNTS_DATABASE_ON_STARTUP: VersionedDefault<bool> =
+    VersionedDefault::new(&[(10, || false)]);
+
+/// Go: `LedgerSynchronousMode int` `version[12]:"2"` (`localTemplate.go:455`).
+/// `2` = SQLite `PRAGMA synchronous=FULL`. Wired into
+/// `SqliteLedger::set_synchronous_mode`, applied to the main ledger
+/// connection (tracker + attached block schema).
+static LEDGER_SYNCHRONOUS_MODE: VersionedDefault<i64> = VersionedDefault::new(&[(12, || 2)]);
+
+/// Go: `AccountsRebuildSynchronousMode int` `version[12]:"1"`
+/// (`localTemplate.go:460`). `1` = SQLite `PRAGMA synchronous=NORMAL`.
+/// Wired into the rebuild-shaped connections that bulk-load a fresh
+/// accounts snapshot: `open_ledger_connection_with_sync_mode` (catchpoint
+/// import/verify) and the catchpoint-sync orchestrator's `open_db`
+/// (`crates/core/algo-ledger/src/sync/mod.rs`) — both previously hardcoded
+/// `PRAGMA synchronous=NORMAL` unconditionally, matching this field's
+/// default but with no way to override it.
+static ACCOUNTS_REBUILD_SYNCHRONOUS_MODE: VersionedDefault<i64> =
+    VersionedDefault::new(&[(12, || 1)]);
+
+/// Go: `MaxCatchpointDownloadDuration time.Duration` `version[13]:"7200000000000"
+/// version[28]:"43200000000000"` (`localTemplate.go:465`). Nanoseconds
+/// (go's raw `time.Duration` JSON encoding). Wired into
+/// `CatchpointDownloadConfig::timeout` (`algo-rest-client`), which
+/// previously hardcoded a 30-minute timeout that matched neither of go's
+/// real defaults (2h pre-version-28, 12h from version 28 onward).
+static MAX_CATCHPOINT_DOWNLOAD_DURATION: VersionedDefault<i64> =
+    VersionedDefault::new(&[(13, || 7_200_000_000_000), (28, || 43_200_000_000_000)]);
+
+/// Go: `MinCatchpointFileDownloadBytesPerSecond uint64` `version[13]:"20480"`
+/// (`localTemplate.go:470`). Wired into `CatchpointDownloadConfig`'s
+/// per-chunk stall-detection timeout, mirroring (not byte-for-byte
+/// replicating) go's `ledgerFetcher.go` watchdog-stream-reader formula.
+static MIN_CATCHPOINT_FILE_DOWNLOAD_BYTES_PER_SECOND: VersionedDefault<u64> =
+    VersionedDefault::new(&[(13, || 20_480)]);
+
+/// Go: `DisableLedgerLRUCache bool` `version[27]:"false"` (`localTemplate.go:593`).
+/// Wired into `MerkleTrieCache`'s eviction: when set, `evict()` becomes a
+/// no-op, matching go's "disables LRU caches in ledger... SHOULD NOT be
+/// used for other reasons than testing" (performance-degrading by
+/// design, not a not-applicable knob — algod-rust's merkle trie page
+/// cache is a real LRU implementation, see `merkle_cache.rs`).
+static DISABLE_LEDGER_LRU_CACHE: VersionedDefault<bool> = VersionedDefault::new(&[(27, || false)]);
+
 fn default_version() -> u32 {
     // Mirrors go's explicit `c.Version = 0 // Reset to 0 so we get the
     // version from the loaded file` (config.go:124) — a `version` key
@@ -376,6 +467,39 @@ fn default_force_relay_messages() -> bool {
 }
 fn default_dns_bootstrap_id() -> String {
     DNS_BOOTSTRAP_ID.at(LATEST_VERSION)
+}
+fn default_catchpoint_dir() -> String {
+    CATCHPOINT_DIR.at(LATEST_VERSION)
+}
+fn default_stateproof_dir() -> String {
+    STATEPROOF_DIR.at(LATEST_VERSION)
+}
+fn default_catchpoint_interval() -> u64 {
+    CATCHPOINT_INTERVAL.at(LATEST_VERSION)
+}
+fn default_catchpoint_file_history_length() -> i64 {
+    CATCHPOINT_FILE_HISTORY_LENGTH.at(LATEST_VERSION)
+}
+fn default_catchpoint_tracking() -> i64 {
+    CATCHPOINT_TRACKING.at(LATEST_VERSION)
+}
+fn default_optimize_accounts_database_on_startup() -> bool {
+    OPTIMIZE_ACCOUNTS_DATABASE_ON_STARTUP.at(LATEST_VERSION)
+}
+fn default_ledger_synchronous_mode() -> i64 {
+    LEDGER_SYNCHRONOUS_MODE.at(LATEST_VERSION)
+}
+fn default_accounts_rebuild_synchronous_mode() -> i64 {
+    ACCOUNTS_REBUILD_SYNCHRONOUS_MODE.at(LATEST_VERSION)
+}
+fn default_max_catchpoint_download_duration() -> i64 {
+    MAX_CATCHPOINT_DOWNLOAD_DURATION.at(LATEST_VERSION)
+}
+fn default_min_catchpoint_file_download_bytes_per_second() -> u64 {
+    MIN_CATCHPOINT_FILE_DOWNLOAD_BYTES_PER_SECOND.at(LATEST_VERSION)
+}
+fn default_disable_ledger_lru_cache() -> bool {
+    DISABLE_LEDGER_LRU_CACHE.at(LATEST_VERSION)
 }
 
 /// `config.Local`-equivalent node configuration, loaded from `config.json`
@@ -545,6 +669,96 @@ pub struct Local {
     /// `observe` subcommand it was previously confined to (issue #748).
     #[serde(rename = "DNSBootstrapID", default = "default_dns_bootstrap_id")]
     pub dns_bootstrap_id: String,
+
+    /// Go: `CatchpointDir`. Wired into `algod-rust catchpoint export`/
+    /// `download`'s default output directory when `--output` is omitted
+    /// (issue #749). Empty string means "no override" (caller must supply
+    /// an explicit output path), matching go's "falls back to
+    /// ColdDataDir/datadir" semantics adapted to algod-rust's simpler
+    /// one-shot-CLI catchpoint model.
+    #[serde(rename = "CatchpointDir", default = "default_catchpoint_dir")]
+    pub catchpoint_dir: String,
+
+    /// Go: `StateproofDir`. **Documented no-op** — see this field's
+    /// `VersionedDefault` doc comment. Round-trips through `config.json`
+    /// for forward compatibility.
+    #[serde(rename = "StateproofDir", default = "default_stateproof_dir")]
+    pub stateproof_dir: String,
+
+    /// Go: `CatchpointInterval`. **Config-field-only** (issue #749):
+    /// algod-rust has no automatic interval-driven catchpoint generation
+    /// in a live block-apply loop yet — see this field's `VersionedDefault`
+    /// doc comment for the recorded scope-split decision and follow-up.
+    #[serde(rename = "CatchpointInterval", default = "default_catchpoint_interval")]
+    pub catchpoint_interval: u64,
+
+    /// Go: `CatchpointFileHistoryLength`. Config-field-only, same scope
+    /// note as `catchpoint_interval`.
+    #[serde(
+        rename = "CatchpointFileHistoryLength",
+        default = "default_catchpoint_file_history_length"
+    )]
+    pub catchpoint_file_history_length: i64,
+
+    /// Go: `CatchpointTracking`. Config-field-only, same scope note as
+    /// `catchpoint_interval`.
+    #[serde(rename = "CatchpointTracking", default = "default_catchpoint_tracking")]
+    pub catchpoint_tracking: i64,
+
+    /// Go: `OptimizeAccountsDatabaseOnStartup`. Wired into
+    /// `SqliteLedger::vacuum_accounts_database` (issue #749).
+    #[serde(
+        rename = "OptimizeAccountsDatabaseOnStartup",
+        default = "default_optimize_accounts_database_on_startup"
+    )]
+    pub optimize_accounts_database_on_startup: bool,
+
+    /// Go: `LedgerSynchronousMode`. Wired into
+    /// `SqliteLedger::set_synchronous_mode` (issue #749), replacing the
+    /// previously-implicit (unset) SQLite `synchronous` pragma on the main
+    /// ledger connection.
+    #[serde(
+        rename = "LedgerSynchronousMode",
+        default = "default_ledger_synchronous_mode"
+    )]
+    pub ledger_synchronous_mode: i64,
+
+    /// Go: `AccountsRebuildSynchronousMode`. Wired into the
+    /// rebuild-shaped connections (catchpoint import/verify, catchpoint-sync
+    /// bulk import) that previously hardcoded `PRAGMA synchronous=NORMAL`
+    /// unconditionally (issue #749).
+    #[serde(
+        rename = "AccountsRebuildSynchronousMode",
+        default = "default_accounts_rebuild_synchronous_mode"
+    )]
+    pub accounts_rebuild_synchronous_mode: i64,
+
+    /// Go: `MaxCatchpointDownloadDuration`. Nanoseconds. Wired into
+    /// `CatchpointDownloadConfig::timeout` (issue #749 fixed a prior
+    /// hardcoded 30-minute value that matched neither of go's real
+    /// defaults).
+    #[serde(
+        rename = "MaxCatchpointDownloadDuration",
+        default = "default_max_catchpoint_download_duration"
+    )]
+    pub max_catchpoint_download_duration: i64,
+
+    /// Go: `MinCatchpointFileDownloadBytesPerSecond`. Wired into
+    /// `CatchpointDownloadConfig`'s per-chunk stall-detection timeout
+    /// (issue #749).
+    #[serde(
+        rename = "MinCatchpointFileDownloadBytesPerSecond",
+        default = "default_min_catchpoint_file_download_bytes_per_second"
+    )]
+    pub min_catchpoint_file_download_bytes_per_second: u64,
+
+    /// Go: `DisableLedgerLRUCache`. Wired into `MerkleTrieCache`'s
+    /// eviction (issue #749): when `true`, `evict()` becomes a no-op.
+    #[serde(
+        rename = "DisableLedgerLRUCache",
+        default = "default_disable_ledger_lru_cache"
+    )]
+    pub disable_ledger_lru_cache: bool,
 }
 
 impl Default for Local {
@@ -581,6 +795,19 @@ impl Local {
             block_service_mem_cap: BLOCK_SERVICE_MEM_CAP.at(version),
             force_relay_messages: FORCE_RELAY_MESSAGES.at(version),
             dns_bootstrap_id: DNS_BOOTSTRAP_ID.at(version),
+            catchpoint_dir: CATCHPOINT_DIR.at(version),
+            stateproof_dir: STATEPROOF_DIR.at(version),
+            catchpoint_interval: CATCHPOINT_INTERVAL.at(version),
+            catchpoint_file_history_length: CATCHPOINT_FILE_HISTORY_LENGTH.at(version),
+            catchpoint_tracking: CATCHPOINT_TRACKING.at(version),
+            optimize_accounts_database_on_startup: OPTIMIZE_ACCOUNTS_DATABASE_ON_STARTUP
+                .at(version),
+            ledger_synchronous_mode: LEDGER_SYNCHRONOUS_MODE.at(version),
+            accounts_rebuild_synchronous_mode: ACCOUNTS_REBUILD_SYNCHRONOUS_MODE.at(version),
+            max_catchpoint_download_duration: MAX_CATCHPOINT_DOWNLOAD_DURATION.at(version),
+            min_catchpoint_file_download_bytes_per_second:
+                MIN_CATCHPOINT_FILE_DOWNLOAD_BYTES_PER_SECOND.at(version),
+            disable_ledger_lru_cache: DISABLE_LEDGER_LRU_CACHE.at(version),
         }
     }
 
@@ -691,6 +918,62 @@ impl Local {
                 next,
             );
             migrate_field(&mut self.dns_bootstrap_id, &DNS_BOOTSTRAP_ID, cur, next);
+            migrate_field(&mut self.catchpoint_dir, &CATCHPOINT_DIR, cur, next);
+            migrate_field(&mut self.stateproof_dir, &STATEPROOF_DIR, cur, next);
+            migrate_field(
+                &mut self.catchpoint_interval,
+                &CATCHPOINT_INTERVAL,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.catchpoint_file_history_length,
+                &CATCHPOINT_FILE_HISTORY_LENGTH,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.catchpoint_tracking,
+                &CATCHPOINT_TRACKING,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.optimize_accounts_database_on_startup,
+                &OPTIMIZE_ACCOUNTS_DATABASE_ON_STARTUP,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.ledger_synchronous_mode,
+                &LEDGER_SYNCHRONOUS_MODE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.accounts_rebuild_synchronous_mode,
+                &ACCOUNTS_REBUILD_SYNCHRONOUS_MODE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.max_catchpoint_download_duration,
+                &MAX_CATCHPOINT_DOWNLOAD_DURATION,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.min_catchpoint_file_download_bytes_per_second,
+                &MIN_CATCHPOINT_FILE_DOWNLOAD_BYTES_PER_SECOND,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.disable_ledger_lru_cache,
+                &DISABLE_LEDGER_LRU_CACHE,
+                cur,
+                next,
+            );
             self.version = next;
         }
         Ok(())
@@ -822,6 +1105,17 @@ mod tests {
             BLOCK_SERVICE_MEM_CAP.max_tag_version(),
             FORCE_RELAY_MESSAGES.max_tag_version(),
             DNS_BOOTSTRAP_ID.max_tag_version(),
+            CATCHPOINT_DIR.max_tag_version(),
+            STATEPROOF_DIR.max_tag_version(),
+            CATCHPOINT_INTERVAL.max_tag_version(),
+            CATCHPOINT_FILE_HISTORY_LENGTH.max_tag_version(),
+            CATCHPOINT_TRACKING.max_tag_version(),
+            OPTIMIZE_ACCOUNTS_DATABASE_ON_STARTUP.max_tag_version(),
+            LEDGER_SYNCHRONOUS_MODE.max_tag_version(),
+            ACCOUNTS_REBUILD_SYNCHRONOUS_MODE.max_tag_version(),
+            MAX_CATCHPOINT_DOWNLOAD_DURATION.max_tag_version(),
+            MIN_CATCHPOINT_FILE_DOWNLOAD_BYTES_PER_SECOND.max_tag_version(),
+            DISABLE_LEDGER_LRU_CACHE.max_tag_version(),
         ]
         .into_iter()
         .max()
@@ -861,6 +1155,65 @@ mod tests {
             d.dns_bootstrap_id,
             "<network>.algorand.network?backup=<network>.algorand.net&dedup=<name>.algorand-<network>.(network|net)"
         );
+        assert_eq!(d.catchpoint_dir, "");
+        assert_eq!(d.stateproof_dir, "");
+        assert_eq!(d.catchpoint_interval, 10_000);
+        assert_eq!(d.catchpoint_file_history_length, 365);
+        assert_eq!(d.catchpoint_tracking, 0);
+        assert!(!d.optimize_accounts_database_on_startup);
+        assert_eq!(d.ledger_synchronous_mode, 2, "go's default is FULL(2)");
+        assert_eq!(
+            d.accounts_rebuild_synchronous_mode, 1,
+            "go's default is NORMAL(1)"
+        );
+        assert_eq!(
+            d.max_catchpoint_download_duration, 43_200_000_000_000,
+            "go's post-version-28 default (12h in ns), not the pre-28 2h value"
+        );
+        assert_eq!(d.min_catchpoint_file_download_bytes_per_second, 20_480);
+        assert!(!d.disable_ledger_lru_cache);
+    }
+
+    #[test]
+    fn max_catchpoint_download_duration_migrates_from_2h_to_12h_default() {
+        // A config.json written before version 28, left at version 13's own
+        // default (2h in ns) — i.e. never touched by the operator — must
+        // advance to version 28's 12h default across migration.
+        let cfg = Local::load_from_str(
+            r#"{"Version": 13, "MaxCatchpointDownloadDuration": 7200000000000}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.max_catchpoint_download_duration, 43_200_000_000_000);
+    }
+
+    #[test]
+    fn max_catchpoint_download_duration_explicit_override_survives_migration() {
+        let cfg = Local::load_from_str(
+            r#"{"Version": 13, "MaxCatchpointDownloadDuration": 999000000000}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(
+            cfg.max_catchpoint_download_duration, 999_000_000_000,
+            "an explicit non-default override must survive migration"
+        );
+    }
+
+    #[test]
+    fn catchpoint_dir_and_stateproof_dir_round_trip_through_json() {
+        let cfg = Local::load_from_str(
+            r#"{"CatchpointDir": "/data/catchpoints", "StateproofDir": "/data/stateproof"}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.catchpoint_dir, "/data/catchpoints");
+        assert_eq!(cfg.stateproof_dir, "/data/stateproof");
+    }
+
+    #[test]
+    fn disable_ledger_lru_cache_partial_overlay() {
+        let cfg = Local::load_from_str(r#"{"DisableLedgerLRUCache": true}"#).expect("parses");
+        assert!(cfg.disable_ledger_lru_cache);
     }
 
     #[test]

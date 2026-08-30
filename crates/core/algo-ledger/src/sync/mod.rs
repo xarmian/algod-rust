@@ -159,6 +159,12 @@ pub struct SyncConfig {
     pub fail_fast: bool,
     /// Optional end round — stop replay at this round instead of the network tip.
     pub end_round: Option<u64>,
+    /// SQLite `synchronous` pragma value applied to the bulk-import
+    /// connection opened by [`SyncEngine::open_db`] — go's
+    /// `AccountsRebuildSynchronousMode` (`config.Local`, issue #749).
+    /// `1` (NORMAL) matches go's default and this field's previously
+    /// hardcoded, unconditional value.
+    pub accounts_rebuild_synchronous_mode: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -570,12 +576,20 @@ impl SyncOrchestrator {
         .map_err(|e| AlgoError::Ledger {
             message: format!("attach sync block database {}: {e}", block_path.display()),
         })?;
-        conn.execute_batch(
+        // `synchronous` pragma value is go's `AccountsRebuildSynchronousMode`
+        // (`config.Local`, issue #749) — this bulk-import path is exactly
+        // the "rebuild" scenario that field governs. `sync_mode` is a
+        // small validated int (0-3), not free-form user input, so direct
+        // interpolation into the pragma statement (which SQLite does not
+        // allow as a bound parameter) is safe.
+        let sync_mode =
+            crate::sqlite::clamp_synchronous_mode(self.config.accounts_rebuild_synchronous_mode);
+        conn.execute_batch(&format!(
             "PRAGMA journal_mode=WAL;
              PRAGMA blockdb.journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA blockdb.synchronous=NORMAL;",
-        )
+             PRAGMA synchronous={sync_mode};
+             PRAGMA blockdb.synchronous={sync_mode};"
+        ))
         .map_err(|e| AlgoError::Ledger {
             message: format!("set sync database pragmas: {e}"),
         })?;
@@ -2031,5 +2045,64 @@ impl SyncBackend for NoopBackend {
 
     fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal [`SyncConfig`] pointed at a fresh temp-dir ledger
+    /// prefix, for exercising [`SyncOrchestrator::open_db`] directly.
+    fn test_config(db_path: PathBuf, accounts_rebuild_synchronous_mode: i64) -> SyncConfig {
+        SyncConfig {
+            catchpoint_label: None,
+            algod_url: String::new(),
+            algod_token: String::new(),
+            genesis_id: "test".to_string(),
+            genesis_hash: [0u8; 32],
+            db_path,
+            concurrency: 1,
+            follow_after_sync: false,
+            compare_mode: false,
+            trie_path: None,
+            avm_execute: false,
+            fail_fast: false,
+            end_round: None,
+            accounts_rebuild_synchronous_mode,
+        }
+    }
+
+    fn query_synchronous(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// Regression for issue #749: `open_db`'s `synchronous` pragma
+    /// previously hardcoded `NORMAL` unconditionally; it must now honor
+    /// `SyncConfig::accounts_rebuild_synchronous_mode`.
+    #[test]
+    fn open_db_applies_configured_accounts_rebuild_synchronous_mode() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-open-db-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("ledger");
+
+        // Default go-matching value (NORMAL = 1) — preserves the
+        // previously-hardcoded behavior when config is unset/default.
+        let orchestrator = SyncOrchestrator::new(test_config(db_path.clone(), 1));
+        let conn = orchestrator.open_db().unwrap();
+        assert_eq!(query_synchronous(&conn), 1);
+        drop(conn);
+
+        // Explicit override (EXTRA = 3) applies to the same connection path.
+        let orchestrator = SyncOrchestrator::new(test_config(db_path, 3));
+        let conn = orchestrator.open_db().unwrap();
+        assert_eq!(query_synchronous(&conn), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

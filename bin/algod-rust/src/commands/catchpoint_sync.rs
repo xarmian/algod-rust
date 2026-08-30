@@ -932,6 +932,7 @@ pub async fn run(
     avm_execute: bool,
     fail_fast: bool,
     end: Option<u64>,
+    accounts_rebuild_synchronous_mode: i64,
 ) -> anyhow::Result<()> {
     // Determine the catchpoint label to use.
     let label = match (catchpoint_label, catchpoint_auto) {
@@ -969,6 +970,7 @@ pub async fn run(
         avm_execute,
         fail_fast,
         end_round: end,
+        accounts_rebuild_synchronous_mode,
     };
 
     info!(

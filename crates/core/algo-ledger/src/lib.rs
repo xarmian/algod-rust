@@ -83,8 +83,8 @@ pub use rewards::{
 };
 pub use sqlite::{
     block_path_for_prefix, derive_ledger_prefix, ledger_exists, open_ledger_connection,
-    remove_ledger_files, tracker_path_for_prefix, CrossFileState, ReadSnapshot, SqliteLedger,
-    BLOCK_SUFFIX, TRACKER_SUFFIX,
+    open_ledger_connection_with_sync_mode, remove_ledger_files, tracker_path_for_prefix,
+    CrossFileState, ReadSnapshot, SqliteLedger, BLOCK_SUFFIX, TRACKER_SUFFIX,
 };
 pub use state::{schema_min_balance, LedgerState, StateSnapshot};
 pub use store_trait::LedgerStore;

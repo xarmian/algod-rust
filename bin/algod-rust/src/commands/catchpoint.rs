@@ -19,16 +19,55 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use algo_ledger::catchpoint::{
     export_catchpoint_file, import_catchpoint_file, parse_catchpoint_label, validate_post_import,
     verify_catchpoint, ExportOptions,
 };
-use algo_ledger::open_ledger_connection;
-use algo_rest_client::{CatchpointDownloader, DownloadProgress};
+use algo_ledger::open_ledger_connection_with_sync_mode;
+use algo_rest_client::{CatchpointDownloadConfig, CatchpointDownloader, DownloadProgress};
 use tracing::{error, info, warn};
+
+/// Load `<data_dir>/config.json` (go-algorand `config.Local` equivalent,
+/// issue #754/epic #745), falling back to fully-materialized go-matching
+/// defaults when `data_dir` is `None` or its `config.json` fails to load.
+/// Mirrors the pattern established for `participate` (issue #748).
+fn load_node_config(data_dir: Option<&Path>) -> algo_config::Local {
+    match data_dir {
+        Some(dir) => match algo_config::Local::load_from_data_dir(dir) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                warn!(error = %e, "failed to load config.json; continuing with defaults");
+                algo_config::Local::default()
+            }
+        },
+        None => algo_config::Local::default(),
+    }
+}
+
+/// Resolve a catchpoint file's output path: the explicit `--output` when
+/// given, else `<CatchpointDir>/<default_filename>` when `config.json` sets
+/// a non-empty `CatchpointDir` (go: `config.Local.CatchpointDir`, issue
+/// #749) — matching go's "falls back to a configured directory" model
+/// adapted to algod-rust's simpler one-shot-CLI catchpoint tooling (no
+/// implicit hot/cold directory split, see the `catchpoint_dir` field doc
+/// in `algo-config`).
+fn resolve_catchpoint_output_path(
+    output: Option<PathBuf>,
+    catchpoint_dir: &str,
+    default_filename: &str,
+) -> anyhow::Result<PathBuf> {
+    match output {
+        Some(p) => Ok(p),
+        None if !catchpoint_dir.is_empty() => Ok(Path::new(catchpoint_dir).join(default_filename)),
+        None => anyhow::bail!(
+            "must specify --output, or set a non-empty CatchpointDir in \
+             <data-dir>/config.json"
+        ),
+    }
+}
 
 /// Run the catchpoint import subcommand.
 ///
@@ -40,14 +79,22 @@ pub async fn run_import(
     label: Option<&str>,
     reward_unit: u64,
     verify: bool,
+    data_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
     let timer = Instant::now();
+    let node_config = load_node_config(data_dir);
 
     // Step 1: Open database connection. `db_path` is a ledger prefix (or
     // legacy `.sqlite`-suffixed path); the helper opens the tracker file
     // and attaches the block file as `blockdb`, matching the layout used by
     // sync/relay/participate so downstream tooling sees the same data.
-    let conn = open_ledger_connection(db_path).map_err(|e| anyhow::anyhow!("open db: {e}"))?;
+    // Import is exactly the "rebuild" scenario go's
+    // `AccountsRebuildSynchronousMode` governs (issue #749).
+    let conn = open_ledger_connection_with_sync_mode(
+        db_path,
+        node_config.accounts_rebuild_synchronous_mode,
+    )
+    .map_err(|e| anyhow::anyhow!("open db: {e}"))?;
 
     println!("=== Catchpoint Import ===");
     println!("File:     {}", file_path.display());
@@ -295,6 +342,21 @@ pub async fn run_import(
     println!("  may be incorrectly accepted or rejected.");
     warn!("lease table not reconstructed — lookback block download required before processing new blocks");
 
+    // Step 9: Optionally optimize (VACUUM) the freshly-imported accounts
+    // database — go's `OptimizeAccountsDatabaseOnStartup` (issue #749).
+    // Import is the point in this CLI's lifecycle closest to go's
+    // reload-triggered vacuum, since it just bulk-wrote a fresh snapshot.
+    if node_config.optimize_accounts_database_on_startup {
+        println!("\nOptimizing (VACUUM) accounts database...");
+        let vacuum_timer = Instant::now();
+        algo_ledger::sqlite::vacuum_connection(&conn)
+            .map_err(|e| anyhow::anyhow!("vacuum accounts database: {e}"))?;
+        println!(
+            "Vacuum complete ({:.1}s)",
+            vacuum_timer.elapsed().as_secs_f64()
+        );
+    }
+
     let total_elapsed = timer.elapsed();
     println!("=== Done ({:.1}s total) ===", total_elapsed.as_secs_f64());
 
@@ -302,10 +364,19 @@ pub async fn run_import(
 }
 
 /// Run the catchpoint verify subcommand (verify an already-imported database).
-pub async fn run_verify(db_path: &Path, file_path: Option<&Path>) -> anyhow::Result<()> {
+pub async fn run_verify(
+    db_path: &Path,
+    file_path: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    let node_config = load_node_config(data_dir);
     // Open via the split-ledger helper so the verify pass sees the same data
     // (tracker + attached `blockdb`) that import/sync wrote.
-    let conn = open_ledger_connection(db_path).map_err(|e| anyhow::anyhow!("open db: {e}"))?;
+    let conn = open_ledger_connection_with_sync_mode(
+        db_path,
+        node_config.accounts_rebuild_synchronous_mode,
+    )
+    .map_err(|e| anyhow::anyhow!("open db: {e}"))?;
 
     println!("=== Catchpoint Verify ===");
     println!("Database: {}", db_path.display());
@@ -367,16 +438,23 @@ pub async fn run_verify(db_path: &Path, file_path: Option<&Path>) -> anyhow::Res
 /// Writes a go-algorand-format catchpoint file from the local ledger's
 /// tracker tables. See `algo_ledger::catchpoint::writer` and
 /// `../go-algorand/ledger/catchpointfilewriter.go`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_export(
     db_path: &Path,
-    output: &Path,
+    output: Option<PathBuf>,
     round: Option<u64>,
     blocks_round: Option<u64>,
     block_digest: Option<&str>,
     no_online_data: bool,
     no_gzip: bool,
+    data_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let conn = open_ledger_connection(db_path).map_err(|e| anyhow::anyhow!("open db: {e}"))?;
+    let node_config = load_node_config(data_dir);
+    let conn = open_ledger_connection_with_sync_mode(
+        db_path,
+        node_config.accounts_rebuild_synchronous_mode,
+    )
+    .map_err(|e| anyhow::anyhow!("open db: {e}"))?;
 
     // Default the snapshot round to whatever the tracker DB is committed at.
     let balances_round = match round {
@@ -401,6 +479,13 @@ pub async fn run_export(
         None => block_header_digest_at(&conn, blocks_round)?,
     };
 
+    let default_filename = format!(
+        "{balances_round}.catchpoint{}",
+        if no_gzip { ".tar" } else { ".tar.gz" }
+    );
+    let output =
+        resolve_catchpoint_output_path(output, &node_config.catchpoint_dir, &default_filename)?;
+
     println!("=== Catchpoint Export ===");
     println!("Database:       {}", db_path.display());
     println!("Output:         {}", output.display());
@@ -417,7 +502,7 @@ pub async fn run_export(
     };
 
     let timer = Instant::now();
-    let result = export_catchpoint_file(&conn, output, &opts)
+    let result = export_catchpoint_file(&conn, &output, &opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
     let elapsed = timer.elapsed();
 
@@ -475,22 +560,41 @@ pub async fn run_download(
     algod_token: &str,
     genesis_id: &str,
     round: u64,
-    output: &Path,
+    output: Option<PathBuf>,
+    data_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let node_config = load_node_config(data_dir);
+    let output = resolve_catchpoint_output_path(
+        output,
+        &node_config.catchpoint_dir,
+        &format!("{round}.catchpoint"),
+    )?;
+
     println!("=== Catchpoint Download ===");
     println!("URL:        {algod_url}");
     println!("Genesis ID: {genesis_id}");
     println!("Round:      {round}");
     println!("Output:     {}", output.display());
 
-    let downloader = CatchpointDownloader::new(algod_url, algod_token);
+    // go: MaxCatchpointDownloadDuration (overall request timeout) and
+    // MinCatchpointFileDownloadBytesPerSecond (per-chunk stall detection),
+    // issue #749 — previously hardcoded to a 30-minute timeout with no
+    // stall detection at all.
+    let download_config = CatchpointDownloadConfig {
+        timeout: std::time::Duration::from_nanos(
+            node_config.max_catchpoint_download_duration.max(0) as u64,
+        ),
+        min_bytes_per_second: node_config.min_catchpoint_file_download_bytes_per_second,
+        ..Default::default()
+    };
+    let downloader = CatchpointDownloader::with_config(algod_url, algod_token, download_config);
 
     let timer = Instant::now();
     downloader
         .download(
             genesis_id,
             round,
-            output,
+            &output,
             Some(|progress: DownloadProgress| {
                 if let Some(total) = progress.total_bytes {
                     let pct = (progress.bytes_downloaded as f64 / total as f64) * 100.0;
@@ -516,4 +620,70 @@ pub async fn run_download(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_output_path_uses_explicit_output_when_given() {
+        let resolved =
+            resolve_catchpoint_output_path(Some(PathBuf::from("/tmp/x.tar.gz")), "", "default")
+                .unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/x.tar.gz"));
+    }
+
+    #[test]
+    fn resolve_output_path_explicit_output_wins_over_catchpoint_dir() {
+        let resolved = resolve_catchpoint_output_path(
+            Some(PathBuf::from("/tmp/x.tar.gz")),
+            "/data/catchpoints",
+            "default",
+        )
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/x.tar.gz"));
+    }
+
+    #[test]
+    fn resolve_output_path_falls_back_to_catchpoint_dir() {
+        let resolved =
+            resolve_catchpoint_output_path(None, "/data/catchpoints", "42.catchpoint").unwrap();
+        assert_eq!(resolved, PathBuf::from("/data/catchpoints/42.catchpoint"));
+    }
+
+    #[test]
+    fn resolve_output_path_errors_when_neither_output_nor_catchpoint_dir_is_set() {
+        let err = resolve_catchpoint_output_path(None, "", "42.catchpoint").unwrap_err();
+        assert!(err.to_string().contains("CatchpointDir"));
+    }
+
+    #[test]
+    fn load_node_config_with_no_data_dir_returns_go_matching_defaults() {
+        let cfg = load_node_config(None);
+        assert_eq!(cfg, algo_config::Local::default());
+        assert_eq!(cfg.accounts_rebuild_synchronous_mode, 1);
+        assert_eq!(cfg.ledger_synchronous_mode, 2);
+    }
+
+    #[test]
+    fn load_node_config_reads_data_dir_config_json() {
+        let dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-cli-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(algo_config::CONFIG_FILENAME),
+            r#"{"CatchpointDir": "/data/catchpoints", "AccountsRebuildSynchronousMode": 3}"#,
+        )
+        .unwrap();
+
+        let cfg = load_node_config(Some(&dir));
+        assert_eq!(cfg.catchpoint_dir, "/data/catchpoints");
+        assert_eq!(cfg.accounts_rebuild_synchronous_mode, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

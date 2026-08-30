@@ -529,6 +529,7 @@ dependencies = [
  "algo-types",
  "async-trait",
  "base64",
+ "bytes",
  "reqwest",
  "rmp-serde",
  "rmpv",
