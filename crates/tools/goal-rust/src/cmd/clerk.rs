@@ -1324,11 +1324,14 @@ fn run_multisig_sign_inner(
 /// up from `-A/--msig-address`. Whether the signature lands in `Msig` (legacy)
 /// or `LMsig` is keyed on `--legacy-msig`.
 ///
-/// NOTE vs Go: Go auto-detects `useLegacyMsig` from the node's consensus params
-/// (`!LogicSigLMsig`) when the flag is unset. goal-rust does NOT — the Rust
-/// consensus-param table doesn't model the `LogicSigLMsig` gate — so it defaults
-/// to the modern `LMsig` field; pass `--legacy-msig` for the legacy `Msig`
-/// field (see [`MultisigSignProgramArgs::legacy_msig`]).
+/// NOTE vs Go: Go auto-detects `useLegacyMsig` from the *live node's* current
+/// consensus params (`!LogicSigLMsig`) when the flag is unset. goal-rust does
+/// NOT: `algo_types::ConsensusParams` models `logic_sig_lmsig`/`logic_sig_msig`
+/// (issue #752), but this is an offline signing command with no node
+/// connection and no consensus version to look the flag up under, so there's
+/// nothing to detect client-side — it defaults to the modern `LMsig` field;
+/// pass `--legacy-msig` for the legacy `Msig` field (see
+/// [`MultisigSignProgramArgs::legacy_msig`]).
 pub fn run_multisig_signprogram(
     args: MultisigSignProgramArgs,
     wallet: Option<String>,
@@ -1409,13 +1412,15 @@ fn run_multisig_signprogram_inner(
         return Err("one of --program/-p, --program-bytes/-P, or --lsig/-L is required".into());
     }
 
-    // Go auto-detects `useLegacyMsig` from the node's consensus params
-    // (`!LogicSigLMsig`) when `--legacy-msig` is omitted (multisig.go:219-226).
-    // goal-rust does NOT: the Rust consensus-param table
-    // (`algo_types::ConsensusParams`) doesn't model the `LogicSigLMsig` gate, so
-    // there is nothing to detect client-side. We default to the modern `LMsig`
-    // field (useLegacyMsig=false); `--legacy-msig` forces the legacy `Msig`
-    // field. See the flag's doc-comment for the full rationale.
+    // Go auto-detects `useLegacyMsig` from the live node's current consensus
+    // params (`!LogicSigLMsig`) when `--legacy-msig` is omitted
+    // (multisig.go:219-226). goal-rust does NOT: `algo_types::ConsensusParams`
+    // models `logic_sig_lmsig`/`logic_sig_msig` (issue #752), but this is an
+    // offline command with no node connection and no consensus version to
+    // look the flag up under, so there is nothing to detect client-side. We
+    // default to the modern `LMsig` field (useLegacyMsig=false);
+    // `--legacy-msig` forces the legacy `Msig` field. See the flag's
+    // doc-comment for the full rationale.
     let use_legacy_msig = args.legacy_msig;
 
     // Get or create the partial multisig (multisig.go:228-251).
