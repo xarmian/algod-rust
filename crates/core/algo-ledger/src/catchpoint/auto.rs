@@ -86,23 +86,40 @@ fn parse_round_from_filename(name: &str) -> Option<u64> {
     rest.parse::<u64>().ok()
 }
 
+/// Returns `true` for a leftover write-temp scratch file from an
+/// interrupted export (issue #794): [`super::writer::export_catchpoint_file`]
+/// writes the final archive to `<final-name>.tmp` and only `rename`s it
+/// onto the real name on success, so any `*.catchpoint.tar[.gz].tmp` file
+/// found on disk is necessarily stale (either an in-progress export was
+/// killed mid-write, or the process crashed before the rename) -- a
+/// still-running export's temp file never reaches this scan because
+/// `maybe_spawn_automatic_catchpoint` never overlaps two exports and prune
+/// only runs after one has already finished.
+fn is_stale_write_temp_file(name: &str) -> bool {
+    name.strip_suffix(".tmp")
+        .map(|rest| rest.ends_with(".catchpoint.tar.gz") || rest.ends_with(".catchpoint.tar"))
+        .unwrap_or(false)
+}
+
 /// Apply the retention policy to `dir`: keep only the newest `keep`
 /// catchpoint files (by round, parsed from the filename), deleting the
 /// rest. `keep == -1` is a no-op (unlimited retention); `keep == 0`
 /// deletes every catchpoint file in `dir`, including one just written.
 ///
-/// Non-catchpoint files in `dir` are left untouched. Returns the paths
-/// actually removed (for testing / logging); a per-file removal error is
-/// logged by the caller and does not abort the rest of the pass -- one
-/// locked/in-use file on a given platform should not prevent pruning the
-/// others.
+/// Also removes any stale write-temp scratch file left behind by an
+/// export that was interrupted before its atomic rename completed (issue
+/// #794) -- unconditionally, regardless of `keep`, since such a file is
+/// never a valid catchpoint and `parse_round_from_filename` already
+/// refuses to treat it as one.
+///
+/// Other non-catchpoint files in `dir` are left untouched. Returns the
+/// paths actually removed (for testing / logging); a per-file removal
+/// error is logged by the caller and does not abort the rest of the pass
+/// -- one locked/in-use file on a given platform should not prevent
+/// pruning the others.
 pub fn prune_catchpoint_files(dir: &Path, keep: i64) -> std::io::Result<Vec<PathBuf>> {
-    if keep < 0 {
-        // Unlimited retention.
-        return Ok(Vec::new());
-    }
-
     let mut entries: Vec<(u64, PathBuf)> = Vec::new();
+    let mut stale_temp_files: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -112,15 +129,48 @@ pub fn prune_catchpoint_files(dir: &Path, keep: i64) -> std::io::Result<Vec<Path
         let Some(name) = name.to_str() else {
             continue;
         };
+        if is_stale_write_temp_file(name) {
+            stale_temp_files.push(entry.path());
+            continue;
+        }
         if let Some(round) = parse_round_from_filename(name) {
             entries.push((round, entry.path()));
         }
     }
+
+    if keep < 0 {
+        // Unlimited retention of real catchpoint files -- but a
+        // crash-leftover temp file is still garbage regardless of
+        // retention policy.
+        let mut removed = Vec::with_capacity(stale_temp_files.len());
+        for path in stale_temp_files {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path),
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "automatic catchpoint: failed to remove stale write-temp file"
+                ),
+            }
+        }
+        return Ok(removed);
+    }
+
     entries.sort_by_key(|(round, _)| *round);
 
     let keep = keep as usize;
     let to_remove_count = entries.len().saturating_sub(keep);
-    let mut removed = Vec::with_capacity(to_remove_count);
+    let mut removed = Vec::with_capacity(to_remove_count + stale_temp_files.len());
+    for path in stale_temp_files {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path),
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "automatic catchpoint: failed to remove stale write-temp file"
+            ),
+        }
+    }
     for (_, path) in entries.into_iter().take(to_remove_count) {
         // Best-effort: a single file that can't be removed (e.g. held open
         // by another process) shouldn't abort pruning the rest.
@@ -248,6 +298,83 @@ mod tests {
         let removed = prune_catchpoint_files(&dir, 5).unwrap();
         assert_eq!(removed.len(), 0);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stale write-temp cleanup (issue #794)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn recognizes_write_temp_scratch_filenames() {
+        assert!(is_stale_write_temp_file("20000.catchpoint.tar.gz.tmp"));
+        assert!(is_stale_write_temp_file("20000.catchpoint.tar.tmp"));
+        // A real catchpoint file, or an unrelated file, is not a temp file.
+        assert!(!is_stale_write_temp_file("20000.catchpoint.tar.gz"));
+        assert!(!is_stale_write_temp_file("20000.catchpoint.tar"));
+        assert!(!is_stale_write_temp_file("README.txt"));
+        // The *other* scratch convention (`export_catchpoint_file`'s stage-1
+        // archive) is a distinct, already-cleaned-up-by-the-exporter file
+        // and must not be swept here.
+        assert!(!is_stale_write_temp_file(
+            "20000.catchpoint.tar.gz.stage1.tmp"
+        ));
+    }
+
+    #[test]
+    fn prune_removes_stale_write_temp_file_regardless_of_retention() {
+        let dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-prune-stale-temp-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        touch(&dir, &catchpoint_filename(10_000));
+        touch(&dir, &catchpoint_filename(20_000));
+        // A crash-leftover from an interrupted export at round 30000 --
+        // `20000` and `10000` above are real, finished, renamed files;
+        // this one never made it past the atomic rename.
+        touch(&dir, "30000.catchpoint.tar.gz.tmp");
+
+        // Even with unlimited retention (-1), the stale temp file is
+        // garbage and must go.
+        let removed = prune_catchpoint_files(&dir, -1).unwrap();
+        assert_eq!(removed, vec![dir.join("30000.catchpoint.tar.gz.tmp")]);
+
+        let remaining: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(remaining.contains(&"10000.catchpoint.tar.gz".to_string()));
+        assert!(remaining.contains(&"20000.catchpoint.tar.gz".to_string()));
+        assert!(!remaining.iter().any(|n| n.ends_with(".tmp")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_removes_stale_write_temp_file_alongside_normal_retention() {
+        let dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-prune-stale-temp-retention-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        touch(&dir, &catchpoint_filename(10_000));
+        touch(&dir, &catchpoint_filename(20_000));
+        touch(&dir, "30000.catchpoint.tar.gz.tmp");
+
+        let removed = prune_catchpoint_files(&dir, 1).unwrap();
+        assert_eq!(removed.len(), 2, "removed: {removed:?}");
+
+        let remaining: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(remaining, vec!["20000.catchpoint.tar.gz".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

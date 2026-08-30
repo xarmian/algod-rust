@@ -659,8 +659,36 @@ fn as_slices(records: &[Vec<u8>]) -> Vec<&[u8]> {
 // Stage 2 — repack with the header first
 // ---------------------------------------------------------------------------
 
+/// Scratch-file path the final archive is written to before the atomic
+/// rename into `out_path` (issue #794). Uses the same "`<out_path>` plus a
+/// suffix `parse_round_from_filename` doesn't recognize" convention as
+/// [`stage1_path_for`]'s `.stage1.tmp`, so a crash-leftover write-temp file
+/// is never mistaken for a real catchpoint file by
+/// `super::auto::prune_catchpoint_files`.
+fn write_temp_path_for(out_path: &Path) -> PathBuf {
+    let mut s = out_path.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
 /// Prepend `content.msgpack` and copy the stage-1 entries verbatim into the
 /// final (optionally gzipped) archive.
+///
+/// Writes to a temp file in `out_path`'s own directory (so the later rename
+/// is same-filesystem and therefore atomic), fsyncs it, and only then
+/// `rename`s it onto `out_path` -- never opens/truncates `out_path` itself
+/// until the new content is fully and durably written. This closes issue
+/// #794: without it, `File::create(out_path)` truncates any previous file
+/// (or a reader mid-download) the instant this function is entered, so a
+/// write error partway through (disk full, process killed) left a
+/// zero-length or truncated file at the path a restart or a peer's
+/// catchpoint download would treat as valid. On any failure -- writing or
+/// renaming -- the temp file is removed and `out_path` is left completely
+/// untouched, matching go's own append-then-not-yet-visible discipline
+/// (go tracks catchpoint files as never-committed DB rows across a crash,
+/// via `finishFirstStageAfterCrash`; algod-rust's simpler filename-based
+/// scheme gets the same "never observe a half file" guarantee from the
+/// temp-then-rename step instead).
 ///
 /// Go: `doRepackCatchpoint` in `../go-algorand/ledger/catchpointtracker.go`.
 fn repack(
@@ -669,18 +697,36 @@ fn repack(
     header_bytes: &[u8],
     gzip: bool,
 ) -> Result<(), CatchpointError> {
-    let out = File::create(out_path)?;
-    if gzip {
-        // go uses gzip.BestSpeed for the published catchpoint file.
-        let mut encoder = GzEncoder::new(BufWriter::new(out), Compression::fast());
-        repack_into(stage1_path, &mut encoder, header_bytes)?;
-        let mut inner = encoder.finish()?;
-        inner.flush()?;
-    } else {
-        let mut writer = BufWriter::new(out);
-        repack_into(stage1_path, &mut writer, header_bytes)?;
-        writer.flush()?;
+    let temp_path = write_temp_path_for(out_path);
+
+    let write_result: Result<(), CatchpointError> = (|| {
+        let out = File::create(&temp_path)?;
+        if gzip {
+            // go uses gzip.BestSpeed for the published catchpoint file.
+            let mut encoder = GzEncoder::new(BufWriter::new(out), Compression::fast());
+            repack_into(stage1_path, &mut encoder, header_bytes)?;
+            let mut inner = encoder.finish()?;
+            inner.flush()?;
+            inner.get_ref().sync_all()?;
+        } else {
+            let mut writer = BufWriter::new(out);
+            repack_into(stage1_path, &mut writer, header_bytes)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
     }
+
+    if let Err(e) = std::fs::rename(&temp_path, out_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(CatchpointError::Io(e));
+    }
+
     Ok(())
 }
 
@@ -995,4 +1041,80 @@ fn encode_msgpack_str(s: &str) -> Vec<u8> {
     }
     buf.extend_from_slice(bytes);
     buf
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    //! White-box regression for issue #794: `repack` (the stage-2 writer
+    //! behind `export_catchpoint_file`) must never truncate/replace
+    //! `out_path` until the new content is fully and durably written.
+    //!
+    //! These tests call the private `repack` directly (rather than the
+    //! full `export_catchpoint_file` pipeline) so a write failure can be
+    //! forced deterministically -- by pointing `stage1_path` at a file
+    //! that doesn't exist -- without needing to fault-inject partway
+    //! through a real tar/gzip stream.
+    use super::*;
+
+    #[test]
+    fn repack_failure_leaves_an_existing_destination_file_untouched() {
+        // Before the fix, `File::create(out_path)` truncated the
+        // destination to zero bytes *before* the (here, guaranteed)
+        // failure to open the missing stage1 file was even discovered --
+        // so the old file was destroyed regardless of whether the write
+        // itself ever produced a single byte of new content.
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("existing.catchpoint.tar.gz");
+        std::fs::write(&out_path, b"old catchpoint bytes must survive").unwrap();
+        let missing_stage1 = dir.path().join("does-not-exist.stage1.tmp");
+
+        let result = repack(&missing_stage1, &out_path, b"header", true);
+        assert!(
+            result.is_err(),
+            "repack must report the stage1-open failure"
+        );
+
+        assert_eq!(
+            std::fs::read(&out_path).unwrap(),
+            b"old catchpoint bytes must survive",
+            "a failed repack must never touch the previous file at out_path"
+        );
+
+        let temp_path = write_temp_path_for(&out_path);
+        assert!(
+            !temp_path.exists(),
+            "a failed repack must clean up its own temp file, found {temp_path:?}"
+        );
+    }
+
+    #[test]
+    fn repack_success_replaces_destination_atomically_and_cleans_up_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("existing.catchpoint.tar");
+        std::fs::write(&out_path, b"old catchpoint bytes").unwrap();
+
+        // A minimal, real stage-1 archive: a bare tar with no entries.
+        let stage1_path = dir.path().join("real.stage1.tmp");
+        {
+            let file = File::create(&stage1_path).unwrap();
+            let mut builder = tar::Builder::new(BufWriter::new(file));
+            builder.finish().unwrap();
+            builder.into_inner().unwrap().flush().unwrap();
+        }
+
+        repack(&stage1_path, &out_path, b"header-bytes", false).unwrap();
+
+        let contents = std::fs::read(&out_path).unwrap();
+        assert_ne!(
+            contents, b"old catchpoint bytes",
+            "a successful repack must replace the old destination content"
+        );
+        assert!(!contents.is_empty());
+
+        let temp_path = write_temp_path_for(&out_path);
+        assert!(
+            !temp_path.exists(),
+            "no write-temp file should survive a successful repack, found {temp_path:?}"
+        );
+    }
 }
