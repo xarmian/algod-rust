@@ -253,6 +253,20 @@ pub struct AlgodNodeInterface {
     /// `"p2p"`-typed entries. `None` for read-only/test contexts and
     /// `NetworkMode::WsOnly` nodes.
     p2p_network: Option<Arc<dyn GossipNode>>,
+    /// `config.json`'s `EnableDeveloperAPI` (issue #751). Independent of
+    /// `dev_mode` — see [`Self::enable_developer_api`]'s trait-method doc
+    /// comment for the conflation bug this fixes and the OR-with-`dev_mode`
+    /// convenience behavior preserved for `--dev`.
+    enable_developer_api_cfg: bool,
+    /// `config.json`'s `EnableExperimentalAPI` (issue #751). Previously a
+    /// hardcoded trait-default `false` with no config wiring at all.
+    enable_experimental_api_cfg: bool,
+    /// `config.json`'s `MaxAPIResourcesPerAccount` (issue #751), replacing
+    /// the prior hardcoded `100_000` trait-default-only value.
+    max_api_resources_per_account_cfg: u64,
+    /// `config.json`'s `MaxAPIBoxPerApplication` (issue #751), same fix as
+    /// `max_api_resources_per_account_cfg`.
+    max_api_box_per_application_cfg: u64,
 }
 
 impl AlgodNodeInterface {
@@ -282,6 +296,10 @@ impl AlgodNodeInterface {
             participation_metrics: None,
             ws_network: None,
             p2p_network: None,
+            enable_developer_api_cfg: false,
+            enable_experimental_api_cfg: false,
+            max_api_resources_per_account_cfg: 100_000,
+            max_api_box_per_application_cfg: 100_000,
         }
     }
 
@@ -376,6 +394,39 @@ impl AlgodNodeInterface {
     #[must_use]
     pub fn with_p2p_network(mut self, network: Arc<dyn GossipNode>) -> Self {
         self.p2p_network = Some(network);
+        self
+    }
+
+    /// Set `config.json`'s `EnableDeveloperAPI` value (issue #751).
+    /// Builder-style, matching the other collaborators. The effective
+    /// value returned by [`NodeInterface::enable_developer_api`] is this
+    /// value OR'd with `dev_mode`, so `--dev` keeps working as a
+    /// convenience default-override without being the only way to enable
+    /// the developer API.
+    #[must_use]
+    pub fn with_enable_developer_api(mut self, enabled: bool) -> Self {
+        self.enable_developer_api_cfg = enabled;
+        self
+    }
+
+    /// Set `config.json`'s `EnableExperimentalAPI` value (issue #751).
+    #[must_use]
+    pub fn with_enable_experimental_api(mut self, enabled: bool) -> Self {
+        self.enable_experimental_api_cfg = enabled;
+        self
+    }
+
+    /// Set `config.json`'s `MaxAPIResourcesPerAccount` value (issue #751).
+    #[must_use]
+    pub fn with_max_api_resources_per_account(mut self, max: u64) -> Self {
+        self.max_api_resources_per_account_cfg = max;
+        self
+    }
+
+    /// Set `config.json`'s `MaxAPIBoxPerApplication` value (issue #751).
+    #[must_use]
+    pub fn with_max_api_box_per_application(mut self, max: u64) -> Self {
+        self.max_api_box_per_application_cfg = max;
         self
     }
 
@@ -1847,17 +1898,49 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     /// Whether the Developer API (`/v2/teal/compile`, `/v2/teal/disassemble`,
-    /// `/v2/transactions/async`) is enabled. Default-on in dev mode so
-    /// `goal`/SDK clients can compile TEAL against a localnet/`--dev` node
-    /// out of the box. This mirrors go-algorand's devmode
-    /// networks, which ship `EnableDeveloperAPI: true` in the node's
-    /// `config.json` (the config default is `false`, see
-    /// `../go-algorand/config/local_defaults.go:70`); the standalone Rust node
-    /// has no config-file layer yet (PLAN-43), so dev mode carries the flag
-    /// directly. Non-dev nodes keep the trait default (`false`) until that
-    /// config layer lands.
+    /// `/v2/transactions/async`) is enabled.
+    ///
+    /// Independent `config.json` toggle (`EnableDeveloperAPI`, default
+    /// `false`, matching go — issue #751), OR'd with `dev_mode` so `--dev`
+    /// keeps its existing convenience behavior of enabling the developer
+    /// API out of the box for `goal`/SDK clients against a localnet node —
+    /// mirroring go-algorand's devmode networks, which ship
+    /// `EnableDeveloperAPI: true` in their `config.json`
+    /// (`../go-algorand/config/local_defaults.go:70`). Previously this
+    /// returned `self.dev_mode` directly with no independent config value
+    /// at all — a real conflation bug: a production relay/participation
+    /// node could not enable the developer API without also being in dev
+    /// mode (instant single-node block production), and vice versa. Now a
+    /// production node can set `EnableDeveloperAPI: true` in `config.json`
+    /// to get `/v2/teal/compile` etc. without dev mode, while `--dev`
+    /// remains *a* way to turn it on, not the *only* way.
     fn enable_developer_api(&self) -> bool {
-        self.dev_mode
+        self.enable_developer_api_cfg || self.dev_mode
+    }
+
+    /// Whether the Experimental API is enabled in the node configuration.
+    ///
+    /// `config.json`'s `EnableExperimentalAPI` (issue #751) — previously a
+    /// hardcoded trait-default `false` with no config wiring at all.
+    fn enable_experimental_api(&self) -> bool {
+        self.enable_experimental_api_cfg
+    }
+
+    /// Maximum number of asset/app resources returned per account lookup.
+    ///
+    /// `config.json`'s `MaxAPIResourcesPerAccount` (issue #751), replacing
+    /// a prior hardcoded `100_000` trait-default-only value with the same
+    /// default now genuinely configurable.
+    fn max_api_resources_per_account(&self) -> u64 {
+        self.max_api_resources_per_account_cfg
+    }
+
+    /// Maximum number of boxes per application that the API will return.
+    ///
+    /// `config.json`'s `MaxAPIBoxPerApplication` (issue #751), same fix as
+    /// `max_api_resources_per_account`.
+    fn max_api_box_per_application(&self) -> u64 {
+        self.max_api_box_per_application_cfg
     }
 
     /// Get the dev-mode block-timestamp offset. Returns `Err` (mapped by the
@@ -5744,6 +5827,55 @@ mod tests {
         let cfg = adapter.get_config_json().await.expect("config ok");
         assert_eq!(cfg["DevMode"], serde_json::json!(false));
         assert_eq!(cfg["EnableDeveloperAPI"], serde_json::json!(false));
+    }
+
+    /// Issue #751: `EnableDeveloperAPI` is a real independent config toggle,
+    /// not conflated with `dev_mode` — a production (non-dev) node can turn
+    /// on the developer API via `config.json` alone.
+    #[tokio::test]
+    async fn enable_developer_api_config_toggle_works_independently_of_dev_mode() {
+        let adapter = adapter_with_pool().with_enable_developer_api(true);
+        assert!(!adapter.is_dev_mode());
+        assert!(
+            adapter.enable_developer_api(),
+            "config-set EnableDeveloperAPI must enable the developer API even without --dev"
+        );
+    }
+
+    /// `--dev` remains a convenience default-override, not the only way to
+    /// enable the developer API: dev mode alone (no config override) still
+    /// enables it, matching the pre-#751 behavior operators rely on.
+    #[tokio::test]
+    async fn dev_mode_alone_still_enables_developer_api_as_convenience_default() {
+        let adapter = adapter_with_pool().with_dev_mode();
+        assert!(adapter.enable_developer_api());
+    }
+
+    /// Issue #751: `EnableExperimentalAPI` is now genuinely wired to
+    /// `config.json` (previously a hardcoded `false` trait-default with no
+    /// wiring at all).
+    #[tokio::test]
+    async fn enable_experimental_api_config_toggle() {
+        let adapter = adapter_with_pool();
+        assert!(!adapter.enable_experimental_api());
+        let adapter = adapter_with_pool().with_enable_experimental_api(true);
+        assert!(adapter.enable_experimental_api());
+    }
+
+    /// Issue #751: `MaxAPIResourcesPerAccount`/`MaxAPIBoxPerApplication` are
+    /// now genuinely configurable (previously hardcoded `100_000`
+    /// trait-default-only methods despite claiming to be "configurable" in
+    /// their doc comments).
+    #[tokio::test]
+    async fn max_api_resources_and_box_limits_are_configurable() {
+        let adapter = adapter_with_pool();
+        assert_eq!(adapter.max_api_resources_per_account(), 100_000);
+        assert_eq!(adapter.max_api_box_per_application(), 100_000);
+        let adapter = adapter_with_pool()
+            .with_max_api_resources_per_account(5)
+            .with_max_api_box_per_application(7);
+        assert_eq!(adapter.max_api_resources_per_account(), 5);
+        assert_eq!(adapter.max_api_box_per_application(), 7);
     }
 
     /// `latest_round_for_catchup` tracks the ledger's current round.

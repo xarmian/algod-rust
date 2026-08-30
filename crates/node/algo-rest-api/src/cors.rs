@@ -44,11 +44,28 @@ use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, ALLOW,
     VARY,
 };
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use crate::auth;
+
+/// `Access-Control-Request-Private-Network` — the preflight request header
+/// a Private-Network-Access-aware browser sends when the target is on a
+/// more-private address space than the requesting page. No `http` crate
+/// constant exists for this non-standard (Chrome-originated) header, so it
+/// is declared here, matching go's literal string lookup
+/// (`daemon/algod/api/server/lib/middlewares/cors.go:40`).
+fn access_control_request_private_network() -> HeaderName {
+    HeaderName::from_static("access-control-request-private-network")
+}
+
+/// `Access-Control-Allow-Private-Network` — the response header go sets
+/// when `EnablePrivateNetworkAccessHeader` is on and the preflight request
+/// asked for it (`cors.go:41`).
+fn access_control_allow_private_network() -> HeaderName {
+    HeaderName::from_static("access-control-allow-private-network")
+}
 
 /// `Access-Control-Allow-Methods` value, matching go's
 /// `AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]` (cors.go).
@@ -74,8 +91,30 @@ const ALLOW_METHODS: &str = "GET,POST,PUT,DELETE,OPTIONS";
 ///   gzip-negotiated response's `Vary: Accept-Encoding` as the first
 ///   (client-visible-first) value.
 pub async fn cors_layer(request: Request, next: Next) -> Response {
+    cors_layer_with_options(request, next, false).await
+}
+
+/// Like [`cors_layer`], but also honors `config.json`'s
+/// `EnablePrivateNetworkAccessHeader` (issue #751): when `true` and an
+/// `OPTIONS` preflight carries `Access-Control-Request-Private-Network:
+/// true`, the response gains `Access-Control-Allow-Private-Network: true`
+/// alongside the usual preflight headers — matching go's
+/// `middlewares.MakeCORS` (`cors.go:40-42`), which checks this only inside
+/// the `if req.Method == http.MethodOptions` branch, gated on the same
+/// config flag.
+pub async fn cors_layer_with_options(
+    request: Request,
+    next: Next,
+    enable_private_network_access_header: bool,
+) -> Response {
     if request.method() == Method::OPTIONS {
-        return preflight_response();
+        let requested_private_network = enable_private_network_access_header
+            && request
+                .headers()
+                .get(access_control_request_private_network())
+                .map(|v| v.as_bytes() == b"true")
+                .unwrap_or(false);
+        return preflight_response(requested_private_network);
     }
 
     let has_origin = request.headers().contains_key(axum::http::header::ORIGIN);
@@ -93,7 +132,7 @@ pub async fn cors_layer(request: Request, next: Next) -> Response {
 /// v4.6.0-stable): `204 No Content` with `Access-Control-Allow-Origin: *`,
 /// `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`, and a
 /// multi-value `Vary` header.
-fn preflight_response() -> Response {
+fn preflight_response(include_private_network_allow: bool) -> Response {
     let mut response = StatusCode::NO_CONTENT.into_response();
     let headers = response.headers_mut();
     headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, wildcard());
@@ -102,6 +141,12 @@ fn preflight_response() -> Response {
         HeaderValue::from_static(ALLOW_METHODS),
     );
     headers.insert(ACCESS_CONTROL_ALLOW_HEADERS, allow_headers_value());
+    if include_private_network_allow {
+        headers.insert(
+            access_control_allow_private_network(),
+            HeaderValue::from_static("true"),
+        );
+    }
     // axum's routing internals unconditionally add an `Allow` header — the
     // *route's actual registered methods* (e.g. `GET,HEAD` for a GET-only
     // route) — to any response that doesn't already set one, regardless of
@@ -249,6 +294,83 @@ mod tests {
             "*"
         );
         assert_eq!(resp.headers().get(VARY).unwrap(), "Origin");
+    }
+
+    fn test_router_with_private_network_access(enable: bool) -> Router {
+        Router::new()
+            .route("/x", get(|| async { "hi" }))
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                cors_layer_with_options(req, next, enable).await
+            }))
+    }
+
+    /// Issue #751: `EnablePrivateNetworkAccessHeader` gates
+    /// `Access-Control-Allow-Private-Network: true` on a preflight that
+    /// asked for it.
+    #[tokio::test]
+    async fn private_network_access_header_added_when_enabled_and_requested() {
+        let resp = test_router_with_private_network_access(true)
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/x")
+                    .header("Origin", "https://example.com")
+                    .header("Access-Control-Request-Method", "GET")
+                    .header("Access-Control-Request-Private-Network", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers()
+                .get("Access-Control-Allow-Private-Network")
+                .unwrap(),
+            "true"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_network_access_header_absent_when_disabled() {
+        let resp = test_router_with_private_network_access(false)
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/x")
+                    .header("Origin", "https://example.com")
+                    .header("Access-Control-Request-Method", "GET")
+                    .header("Access-Control-Request-Private-Network", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp
+            .headers()
+            .get("Access-Control-Allow-Private-Network")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn private_network_access_header_absent_when_not_requested() {
+        // Enabled in config, but the preflight didn't ask for it -- go's
+        // check requires both the config flag AND the request header.
+        let resp = test_router_with_private_network_access(true)
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/x")
+                    .header("Origin", "https://example.com")
+                    .header("Access-Control-Request-Method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp
+            .headers()
+            .get("Access-Control-Allow-Private-Network")
+            .is_none());
     }
 
     #[tokio::test]
