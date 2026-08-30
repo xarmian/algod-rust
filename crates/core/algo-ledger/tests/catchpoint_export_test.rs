@@ -562,25 +562,79 @@ fn select_catchpoint_file_version_matches_go() {
     assert!(err.to_string().contains("SP contexts not enabled"));
 }
 
+/// List the tar entry names of a (possibly gzipped) catchpoint file, for
+/// asserting shape (e.g. that a V6 export has no SP-verification entry).
+fn tar_entry_names(path: &std::path::Path) -> Vec<String> {
+    let bytes = std::fs::read(path).unwrap();
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+    archive
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+        .collect()
+}
+
 #[test]
-fn export_rejects_v6_selection_as_unimplemented() {
-    // `enable_sp_contexts: false` selects V6, whose content shape (no
-    // SP-verification entry at all) this writer doesn't implement --
-    // exporting must fail loudly rather than silently mislabel a V8-shaped
-    // file as V6.
+fn export_v6_selection_omits_sp_verification_entry_and_verifies() {
+    // Issue #766: `enable_sp_contexts: false` selects V6 (the format used by
+    // every consensus version before v38's `EnableCatchpointsWithSPContexts`).
+    // A real V6 catchpoint file has no `stateProofVerificationContext.msgpack`
+    // entry at all (go: `catchpointTracker.createCatchpoint` only calls
+    // `getSPVerificationData` when `EnableCatchpointsWithSPContexts` is set),
+    // and its label omits the SP-verification hash component entirely (go:
+    // `MakeCatchpointLabelMakerV6`, `ledger/ledgercore/catchpointlabel.go`).
     let src = build_source_db();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("v6-unsupported.tar.gz");
+    let path = dir.path().join("v6.tar.gz");
 
     let opts = ExportOptions {
         enable_sp_contexts: false,
         include_online_data: false,
         ..export_options()
     };
-    let err = export_catchpoint_file(&src, &path, &opts).unwrap_err();
+    export_catchpoint_file(&src, &path, &opts).unwrap();
+
+    let entries = tar_entry_names(&path);
     assert!(
-        matches!(err, algo_ledger::catchpoint::CatchpointError::UnsupportedVersion(v) if v == algo_ledger::catchpoint::CATCHPOINT_FILE_VERSION_V6),
-        "expected an UnsupportedVersion(V6) error, got: {err}"
+        entries.contains(&"content.msgpack".to_string()),
+        "entries: {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|n| n == "stateProofVerificationContext.msgpack"),
+        "V6 export must not carry an SP-verification tar entry, got: {entries:?}"
+    );
+
+    let bytes = std::fs::read(&path).unwrap();
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+    let mut found_version = None;
+    for entry in archive.entries().unwrap() {
+        use std::io::Read as _;
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap().to_string_lossy() == "content.msgpack" {
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            let header: algo_ledger::catchpoint::CatchpointFileHeader =
+                rmp_serde::from_slice(&data).unwrap();
+            found_version = Some(header.version);
+        }
+    }
+    assert_eq!(
+        found_version,
+        Some(algo_ledger::catchpoint::CATCHPOINT_FILE_VERSION_V6)
+    );
+
+    // Importable, and the label round-trips: verify_catchpoint reconstructs
+    // the label with `make_catchpoint_label_v6` for a V6-versioned DB and
+    // must match what the exporter wrote into the header.
+    let dst = Connection::open_in_memory().unwrap();
+    import_catchpoint_file(&dst, &path, REWARD_UNITS).unwrap();
+    let verified = verify_catchpoint(&dst, &BLOCK_DIGEST).unwrap();
+    assert!(
+        verified.success,
+        "V6 label mismatch: expected {}, computed {}",
+        verified.expected_label, verified.computed_label
     );
 }
 
@@ -622,6 +676,23 @@ fn export_with_sp_contexts_and_no_online_data_selects_v7() {
     // not just a relabeled V8 file).
     let dst = Connection::open_in_memory().unwrap();
     import_catchpoint_file(&dst, &path, REWARD_UNITS).unwrap();
+
+    // Regression guard (found while implementing issue #766): a V7 file's
+    // label must be built with `make_catchpoint_label_v7` (block_hash ||
+    // balances_root || totals || sp_hash), NOT the V8 maker, which appends
+    // two extra hash components (online-accounts / online-round-params)
+    // that don't exist in a V7 label at all -- even when those components
+    // happen to be "hash of an empty stream" rather than omitted, they still
+    // change the final SHA512/256 input and thus the label. Before the
+    // fix, `verify_catchpoint`'s version-dispatched label reconstruction
+    // (V7 => `make_catchpoint_label_v7`) silently disagreed with what the
+    // exporter had written into the header.
+    let verified = verify_catchpoint(&dst, &BLOCK_DIGEST).unwrap();
+    assert!(
+        verified.success,
+        "V7 label mismatch: expected {}, computed {}",
+        verified.expected_label, verified.computed_label
+    );
 }
 
 #[test]

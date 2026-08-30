@@ -43,8 +43,8 @@ use std::path::Path;
 use flate2::read::GzDecoder;
 
 use super::types::{
-    CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6, CATCHPOINT_FILE_VERSION_V7,
-    CATCHPOINT_FILE_VERSION_V8,
+    CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6, CATCHPOINT_FILE_VERSION_V6,
+    CATCHPOINT_FILE_VERSION_V7, CATCHPOINT_FILE_VERSION_V8,
 };
 
 // ---------------------------------------------------------------------------
@@ -343,14 +343,15 @@ fn process_entry<R: Read>(
         let header: CatchpointFileHeader = rmp_serde::from_slice(&data)
             .map_err(|e| CatchpointError::DecodeError(format!("header msgpack: {e}")))?;
 
-        // V7 and V8 (current go-algorand formats) are supported: this
-        // crate's chunk/SP-verification handling is driven entirely by
-        // which tar entries are actually present, not by the header version
-        // field, so a V7 file (no online-accounts entries) parses the same
-        // way a V8 file with `include_online_data: false` already does
-        // (issue #752). V5/V6 (no SP-verification entry at all) are not
-        // supported -- see `writer::select_catchpoint_file_version`'s doc.
-        if header.version != CATCHPOINT_FILE_VERSION_V7
+        // V6, V7, and V8 (issues #752, #766) are supported: this crate's
+        // chunk/SP-verification handling is driven entirely by which tar
+        // entries are actually present, not by the header version field, so
+        // a V6 file (no SP-verification entry, no online-accounts entries)
+        // parses the same way a V8 file with both features disabled already
+        // does. V5 (predating the accounts/resources schema split) is out
+        // of scope -- see issue #766's "V5 support" acceptance criterion.
+        if header.version != CATCHPOINT_FILE_VERSION_V6
+            && header.version != CATCHPOINT_FILE_VERSION_V7
             && header.version != CATCHPOINT_FILE_VERSION_V8
         {
             return Err(CatchpointError::UnsupportedVersion(header.version));

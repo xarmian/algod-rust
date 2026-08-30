@@ -46,11 +46,15 @@
 //! ```text
 //! gzip(tar):
 //!   content.msgpack                        CatchpointFileHeader
-//!   stateProofVerificationContext.msgpack  catchpointStateProofVerificationContext
+//!   stateProofVerificationContext.msgpack  catchpointStateProofVerificationContext (V7+ only)
 //!   balances.1.msgpack                     CatchpointSnapshotChunkV6
 //!   balances.2.msgpack
 //!   ...
 //! ```
+//!
+//! `stateProofVerificationContext.msgpack` is omitted entirely for a V6
+//! export (`ExportOptions::enable_sp_contexts: false`), matching go's
+//! pre-v38 catchpoint files, which predate state proofs.
 //!
 //! Chunk entries are plain (uncompressed) msgpack, matching go-algorand's
 //! *final* catchpoint file: go's stage-1 scratch file is Snappy-framed, but
@@ -95,8 +99,8 @@ use super::types::{
 use super::verify::{
     build_sp_verification_blob, count_accounts, encode_account_totals, encode_mixed_map,
     encode_msgpack_bin, encode_msgpack_uint, encode_online_account_record,
-    encode_online_round_params_record, hash_sp_verification_blob, make_catchpoint_label_v8,
-    read_account_totals, rebuild_trie_from_db,
+    encode_online_round_params_record, hash_sp_verification_blob, make_catchpoint_label_v6,
+    make_catchpoint_label_v7, make_catchpoint_label_v8, read_account_totals, rebuild_trie_from_db,
 };
 
 // ---------------------------------------------------------------------------
@@ -129,24 +133,19 @@ const SP_VERIFICATION_FILENAME: &str = "stateProofVerificationContext.msgpack";
 /// - else `enable_catchpoints_with_sp_contexts` → V7.
 /// - else → V6.
 ///
-/// # Scope (issue #752)
+/// # Scope (issues #752, #766)
 ///
-/// This writer's pipeline always builds and hashes the SP-verification blob
-/// (`stateProofVerificationContext.msgpack`) into the label, and
-/// [`ExportOptions::include_online_data`] already independently controls
-/// whether the V8-only online-accounts tables are populated -- so both V7
-/// (SP contexts, no online accounts) and V8 (both) are genuinely correct
-/// content this writer already produces, not just a correctly-labeled
-/// header over the wrong shape. V6 (no SP-verification content at all) is
-/// the one gap: this writer has no way to omit the SP-verification blob or
-/// use go's `MakeCatchpointLabelMakerV6` (a different hash input than the
-/// V7/V8 maker used unconditionally here), so [`export_catchpoint_file`]
-/// rejects a V6 selection with [`CatchpointError::UnsupportedVersion`]
-/// rather than silently writing a self-inconsistent V6-labeled file with V7
-/// content. Full V6 producer/consumer support (needed for byte-compatible
-/// catchpoint files against a real go-algorand node running a consensus
-/// version predating v38's `EnableCatchpointsWithSPContexts`) is tracked as
-/// a separate follow-up.
+/// [`ExportOptions::enable_sp_contexts`] gates whether the SP-verification
+/// blob (`stateProofVerificationContext.msgpack`) is built, hashed, and
+/// written as a tar entry at all, and [`ExportOptions::include_online_data`]
+/// independently controls whether the V8-only online-accounts tables are
+/// populated -- so V6 (neither), V7 (SP contexts, no online accounts), and
+/// V8 (both) are all genuinely correct content this writer produces, not
+/// just a correctly-labeled header over the wrong shape. The label itself is
+/// built with the version-appropriate maker
+/// ([`make_catchpoint_label_v6`]/`_v7`/`_v8` in [`super::verify`]), matching
+/// go's `CatchpointLabelMakerV6`/`V7`/`Current`
+/// (`ledger/ledgercore/catchpointlabel.go`).
 pub fn select_catchpoint_file_version(
     enable_sp_contexts: bool,
     enable_online_accounts: bool,
@@ -302,22 +301,11 @@ pub fn export_catchpoint_file(
     }
 
     // Select the on-disk file-format version from the same two consensus
-    // gates go-algorand's `createCatchpoint` consults (issue #752). This
-    // writer's pipeline already produces correct V7 *and* V8 content --
-    // the SP-verification blob is always built and hashed into the label,
-    // and `include_online_data` already independently controls whether the
-    // V8-only online-accounts tables are populated -- so V7
-    // (`enable_sp_contexts` true, `include_online_data` false) and V8 (both
-    // true) are both real, not just correctly-labeled-but-wrong-shape. Only
-    // V6 (`enable_sp_contexts` false, meaning no SP-verification content at
-    // all) is a genuine content-shape gap this writer doesn't implement --
-    // see `select_catchpoint_file_version`'s doc for why that's rejected
-    // rather than silently mislabeled.
+    // gates go-algorand's `createCatchpoint` consults (issue #752). All
+    // three formats (V6/V7/V8) are real, version-appropriate content: see
+    // `select_catchpoint_file_version`'s doc.
     let file_version =
         select_catchpoint_file_version(opts.enable_sp_contexts, opts.include_online_data)?;
-    if file_version == CATCHPOINT_FILE_VERSION_V6 {
-        return Err(CatchpointError::UnsupportedVersion(file_version));
-    }
 
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -328,12 +316,21 @@ pub fn export_catchpoint_file(
     // --- Label components -------------------------------------------------
     //
     // Go computes these in `finishFirstStage` before the file is published:
-    // the balances Merkle root, the SP verification hash, and (V8+) the
-    // online-accounts / online-round-params verification hashes.
+    // the balances Merkle root, the SP verification hash (V7+ only -- V6
+    // predates state proofs entirely, go: `MakeCatchpointLabelMakerV6` takes
+    // no SP-verification input), and (V8+) the online-accounts /
+    // online-round-params verification hashes.
     let balances_root = rebuild_trie_from_db(conn)?;
-    let sp_blob = build_sp_verification_blob(conn)?;
-    let sp_hash = hash_sp_verification_blob(&sp_blob);
     let totals = read_account_totals(conn)?;
+
+    // V6 has no SP-verification content at all: skip building/hashing the
+    // blob entirely rather than computing a value the V6 label never uses.
+    let sp_blob = if opts.enable_sp_contexts {
+        Some(build_sp_verification_blob(conn)?)
+    } else {
+        None
+    };
+    let sp_hash = sp_blob.as_deref().map(hash_sp_verification_blob);
 
     let online_accounts = if opts.include_online_data {
         read_online_accounts(conn, opts.online_horizon_round())?
@@ -353,15 +350,37 @@ pub fn export_catchpoint_file(
     let online_accounts_hash = hash_records(b"OA", &online_accounts);
     let online_round_params_hash = hash_records(b"ORP", &online_round_params);
 
-    let label = make_catchpoint_label_v8(
-        opts.blocks_round,
-        &opts.block_header_digest,
-        &balances_root,
-        &totals,
-        &sp_hash,
-        &online_accounts_hash,
-        &online_round_params_hash,
-    );
+    // Use the version-appropriate label maker (go:
+    // `CatchpointLabelMakerV6`/`V7`/`Current`) -- each successive version
+    // extends the previous one's hash input by one more component, so
+    // using the wrong maker for a given file version silently produces a
+    // label that won't match what `verify_catchpoint` reconstructs on
+    // import (see issue #766's regression test for the V7 case this
+    // caught).
+    let label = match file_version {
+        CATCHPOINT_FILE_VERSION_V6 => make_catchpoint_label_v6(
+            opts.blocks_round,
+            &opts.block_header_digest,
+            &balances_root,
+            &totals,
+        ),
+        CATCHPOINT_FILE_VERSION_V7 => make_catchpoint_label_v7(
+            opts.blocks_round,
+            &opts.block_header_digest,
+            &balances_root,
+            &totals,
+            &sp_hash.expect("V7 always builds the SP-verification hash"),
+        ),
+        _ => make_catchpoint_label_v8(
+            opts.blocks_round,
+            &opts.block_header_digest,
+            &balances_root,
+            &totals,
+            &sp_hash.expect("V8 always builds the SP-verification hash"),
+            &online_accounts_hash,
+            &online_round_params_hash,
+        ),
+    };
 
     // --- Stage 1: chunks into a scratch tar -------------------------------
     let stage1_path = stage1_path_for(out_path);
@@ -369,7 +388,7 @@ pub fn export_catchpoint_file(
         conn,
         &stage1_path,
         opts,
-        &sp_blob,
+        sp_blob.as_deref(),
         &online_accounts,
         &online_round_params,
     );
@@ -441,19 +460,23 @@ impl StageOneStats {
         conn: &Connection,
         stage1_path: &Path,
         opts: &ExportOptions,
-        sp_blob: &[u8],
+        sp_blob: Option<&[u8]>,
         online_accounts: &[Vec<u8>],
         online_round_params: &[Vec<u8>],
     ) -> Result<Self, CatchpointError> {
         let file = File::create(stage1_path)?;
         let mut builder = tar::Builder::new(BufWriter::new(file));
 
-        // Entry 1: state proof verification context.
-        append_entry(&mut builder, SP_VERIFICATION_FILENAME, sp_blob)?;
+        // Entry 1: state proof verification context -- omitted entirely for
+        // V6 (`sp_blob` is `None`), which predates state proofs and has no
+        // such tar entry in a real go-algorand-produced file.
+        if let Some(sp_blob) = sp_blob {
+            append_entry(&mut builder, SP_VERIFICATION_FILENAME, sp_blob)?;
+        }
 
         let mut total_chunks = 0u64;
         let total_kvs;
-        let mut biggest_chunk_len = sp_blob.len() as u64;
+        let mut biggest_chunk_len = sp_blob.map_or(0, |b| b.len() as u64);
 
         {
             // Entries 2..: balances chunks. go's `readDatabaseStep` yields all
