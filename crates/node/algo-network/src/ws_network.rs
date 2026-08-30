@@ -747,8 +747,21 @@ impl WebsocketNetwork {
                 connecting.insert(addr.clone());
             }
 
+            // Issue #789: thread this network's constructed incoming/outgoing
+            // MessageFilters into this dial path too. `mesh_connect` is a
+            // second, independent outbound-dial code path from
+            // `NetworkConnectFn::try_dial` (that one backs the periodic
+            // `MeshThread`; this one backs explicit
+            // `request_connect_outgoing` calls) — both establish real peer
+            // connections, so both must attach the filters or dedup only
+            // works depending on which path happened to dial.
             let connect_config = ConnectConfig {
                 genesis_id: self.config.genesis_id.clone(),
+                peer_config: Some(crate::ws_peer::WsPeerConfig {
+                    incoming_filter: self.incoming_message_filter.clone(),
+                    outgoing_filter: self.outgoing_message_filter.clone(),
+                    ..crate::ws_peer::WsPeerConfig::default()
+                }),
                 ..ConnectConfig::default()
             };
 
@@ -1298,6 +1311,13 @@ struct NetworkConnectFn {
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     genesis_id: String,
     broadcast_thread: Arc<std::sync::Mutex<Option<BroadcastThread>>>,
+    /// Issue #789: the network's constructed incoming/outgoing
+    /// `MessageFilter`s, threaded into every real outbound (mesh-dial)
+    /// connection's `WsPeerConfig` so dedup actually runs on the wire —
+    /// previously `try_dial` always built `WsPeerConfig::default()`, so
+    /// these filters (config-driven since #768) had zero live effect.
+    incoming_message_filter: Option<Arc<MessageFilter>>,
+    outgoing_message_filter: Option<Arc<MessageFilter>>,
 }
 
 impl ConnectFn for NetworkConnectFn {
@@ -1308,6 +1328,8 @@ impl ConnectFn for NetworkConnectFn {
         let tasks = Arc::clone(&self.tasks);
         let genesis_id = self.genesis_id.clone();
         let broadcast_thread = Arc::clone(&self.broadcast_thread);
+        let incoming_message_filter = self.incoming_message_filter.clone();
+        let outgoing_message_filter = self.outgoing_message_filter.clone();
 
         Box::pin(async move {
             use crate::ws_peer::WsPeerConfig;
@@ -1316,6 +1338,8 @@ impl ConnectFn for NetworkConnectFn {
                 genesis_id,
                 peer_config: Some(WsPeerConfig {
                     request_timeout: Some(Duration::from_secs(5)),
+                    incoming_filter: incoming_message_filter,
+                    outgoing_filter: outgoing_message_filter,
                     ..WsPeerConfig::default()
                 }),
                 ..ConnectConfig::default()
@@ -1484,6 +1508,8 @@ impl WebsocketNetwork {
             tasks: Arc::new(Mutex::new(Vec::new())),
             genesis_id: self.config.genesis_id.clone(),
             broadcast_thread: Arc::clone(&self.broadcast_thread),
+            incoming_message_filter: self.incoming_message_filter.clone(),
+            outgoing_message_filter: self.outgoing_message_filter.clone(),
         };
 
         let peer_counter = NetworkPeerCounter {
@@ -1826,11 +1852,19 @@ async fn handle_gossip_websocket(
 
     // Create a proper inbound PeerHandle that wraps the axum WebSocket
     // with read/write loops, so this peer is visible to broadcasts.
+    //
+    // Issue #789: thread the network's constructed incoming/outgoing
+    // MessageFilters into the real inbound connection, matching the
+    // outbound-dial path's `WsPeerConfig`. Without this, `WebsocketNetwork`
+    // constructs the filters (config-driven since #768) but no accepted
+    // connection ever consulted them, so gossip dedup had zero effect.
     let handle = PeerHandle::new_inbound(
         socket,
         remote_addr.clone(),
         version,
         network.cancel.child_token(),
+        network.incoming_message_filter().cloned(),
+        network.outgoing_message_filter().cloned(),
     );
 
     // Register the inbound peer in the peer map via add_peer, which
