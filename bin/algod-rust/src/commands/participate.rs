@@ -2462,15 +2462,18 @@ pub struct NetworkOptions {
 }
 
 /// Fully-resolved networking configuration, ready to fold into
-/// [`WebsocketNetworkConfig`].
+/// [`WebsocketNetworkConfig`]. `pub(crate)` so `commands::relay` can reuse
+/// the exact same CLI-overrides-`config.json` merge [`NetworkOptions`]
+/// already implements for `participate` (issue #768 gives `relay` its own
+/// `config.json` loading via the same mechanism).
 #[derive(Debug, Clone)]
-struct ResolvedNetwork {
-    max_connections_per_ip: u32,
-    incoming_connections_limit: u32,
-    connections_rate_limiting_count: u32,
-    broadcast_connections_limit: u32,
-    tls_cert_file: Option<String>,
-    tls_key_file: Option<String>,
+pub(crate) struct ResolvedNetwork {
+    pub(crate) max_connections_per_ip: u32,
+    pub(crate) incoming_connections_limit: u32,
+    pub(crate) connections_rate_limiting_count: u32,
+    pub(crate) broadcast_connections_limit: u32,
+    pub(crate) tls_cert_file: Option<String>,
+    pub(crate) tls_key_file: Option<String>,
 }
 
 use crate::commands::network_common::resolve_unsigned_limit;
@@ -2489,7 +2492,7 @@ impl NetworkOptions {
     /// Merge CLI overrides onto the loaded `config.json` (`Local`), which
     /// itself already carries go-matching built-in defaults for every
     /// field here.
-    fn resolve(&self, local: &algo_config::Local) -> ResolvedNetwork {
+    pub(crate) fn resolve(&self, local: &algo_config::Local) -> ResolvedNetwork {
         ResolvedNetwork {
             max_connections_per_ip: resolve_unsigned_limit(
                 self.max_connections_per_ip
@@ -3379,6 +3382,23 @@ pub async fn run(
         tls_cert_file: resolved_net.tls_cert_file,
         tls_key_file: resolved_net.tls_key_file,
         block_service_mem_cap: node_config.block_service_mem_cap,
+        // Message-hash dedup filter sizing + localhost rate-limit
+        // exemption (issue #768).
+        enable_incoming_message_filter: node_config.enable_incoming_message_filter,
+        incoming_message_filter_bucket_count: node_config
+            .incoming_message_filter_bucket_count
+            .max(0) as usize,
+        incoming_message_filter_bucket_size: node_config.incoming_message_filter_bucket_size.max(0)
+            as usize,
+        enable_outgoing_network_message_filtering: node_config
+            .enable_outgoing_network_message_filtering,
+        outgoing_message_filter_bucket_count: node_config
+            .outgoing_message_filter_bucket_count
+            .max(0) as usize,
+        outgoing_message_filter_bucket_size: node_config.outgoing_message_filter_bucket_size.max(0)
+            as usize,
+        disable_localhost_connection_rate_limit: node_config
+            .disable_localhost_connection_rate_limit,
         ..Default::default()
     };
 
@@ -3539,6 +3559,14 @@ pub async fn run(
             bootstrap_peers,
             persist_peer_id: resolved_p2p.persist_peer_id,
             data_dir: p2p_data_dir,
+            // `config.json`'s `P2PPrivateKeyLocation` (issue #768): a
+            // custom path override for the P2P peer-ID private key file,
+            // alongside the existing `--p2p-persist-peer-id` flag. Empty
+            // (go's default) means "use the data-dir-derived default".
+            private_key_path: (!node_config.p2p_private_key_location.is_empty())
+                .then(|| PathBuf::from(&node_config.p2p_private_key_location)),
+            enable_dht_providers: node_config.enable_dht_providers,
+            dht_mode: node_config.dht_mode.clone(),
         })
         .await
         .map_err(|e| anyhow::anyhow!("failed to start P2P transport: {e}"))?;
@@ -4909,6 +4937,65 @@ mod tests {
         };
         let resolved = opts.resolve(None).unwrap().unwrap();
         assert!(resolved.disable_api_auth);
+    }
+
+    // --- NetworkOptions::resolve (issue #768: now shared with `relay`) ----
+
+    #[test]
+    fn network_options_resolve_falls_back_to_config_json_when_no_cli_override() {
+        let local = algo_config::Local {
+            max_connections_per_ip: 4,
+            incoming_connections_limit: 100,
+            connections_rate_limiting_count: 20,
+            broadcast_connections_limit: -1,
+            tls_cert_file: "/etc/cert.pem".to_string(),
+            tls_key_file: "/etc/key.pem".to_string(),
+            ..algo_config::Local::default()
+        };
+
+        let opts = NetworkOptions::default();
+        let resolved = opts.resolve(&local);
+
+        assert_eq!(resolved.max_connections_per_ip, 4);
+        assert_eq!(resolved.incoming_connections_limit, 100);
+        assert_eq!(resolved.connections_rate_limiting_count, 20);
+        assert_eq!(
+            resolved.broadcast_connections_limit,
+            algo_network::UNBOUNDED_BROADCAST_CONNECTIONS_LIMIT,
+            "-1 (unbounded) must translate to the sentinel, not wrap to a huge u32"
+        );
+        assert_eq!(resolved.tls_cert_file.as_deref(), Some("/etc/cert.pem"));
+        assert_eq!(resolved.tls_key_file.as_deref(), Some("/etc/key.pem"));
+    }
+
+    #[test]
+    fn network_options_resolve_cli_override_wins_over_config_json() {
+        let local = algo_config::Local {
+            max_connections_per_ip: 4,
+            tls_cert_file: "/etc/cert.pem".to_string(),
+            ..algo_config::Local::default()
+        };
+
+        let opts = NetworkOptions {
+            max_connections_per_ip: Some(99),
+            tls_cert_file: Some("/opt/mycert.pem".to_string()),
+            ..NetworkOptions::default()
+        };
+        let resolved = opts.resolve(&local);
+
+        assert_eq!(resolved.max_connections_per_ip, 99);
+        assert_eq!(resolved.tls_cert_file.as_deref(), Some("/opt/mycert.pem"));
+    }
+
+    #[test]
+    fn network_options_resolve_empty_tls_paths_are_none() {
+        // Go's own "" == unset convention: an untouched `config.json`
+        // (empty TLSCertFile/TLSKeyFile) must resolve to `None`, not
+        // `Some("")`.
+        let local = algo_config::Local::default();
+        let resolved = NetworkOptions::default().resolve(&local);
+        assert_eq!(resolved.tls_cert_file, None);
+        assert_eq!(resolved.tls_key_file, None);
     }
 
     #[test]

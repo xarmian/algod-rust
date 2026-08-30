@@ -71,14 +71,15 @@ use algo_network::{
     PeerOption, RequestTracker, Router, Tag, DEFAULT_REQUEST_TIMEOUT, RESPONSE_HASH_FIELD,
 };
 use algo_p2p::{
-    build_headers, handshake_inbound, handshake_outbound, read_frame, write_frame, IdentityConfig,
-    MessageValidationResult, P2pBehaviourEvent, P2pHost, PeerMetaHeaders, ALGORAND_WS_PROTOCOL_V22,
+    build_headers, handshake_inbound, handshake_outbound, read_frame, resolve_dht_mode,
+    write_frame, IdentityConfig, MessageValidationResult, P2pBehaviourEvent, P2pHost,
+    PeerMetaHeaders, ALGORAND_WS_PROTOCOL_V22,
 };
 use async_trait::async_trait;
 use libp2p::futures::{AsyncReadExt, StreamExt as _};
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{Stream as P2pRawStream, SwarmEvent};
-use libp2p::{gossipsub, kad, Multiaddr, PeerId};
+use libp2p::{gossipsub, Multiaddr, PeerId};
 use tokio::sync::mpsc;
 
 use crate::config::P2pConfig;
@@ -553,6 +554,27 @@ pub struct P2pTransportConfig {
     pub persist_peer_id: bool,
     /// Data directory the persisted identity key is written under.
     pub data_dir: Option<PathBuf>,
+    /// Custom path to the P2P peer-ID private key file, overriding the
+    /// `data_dir`-derived default location. Matches go's
+    /// `P2PPrivateKeyLocation` (`config.Local`, issue #768) — an empty
+    /// value (the default) means "use `data_dir`'s conventional location",
+    /// the same as go's own empty-string default.
+    pub private_key_path: Option<PathBuf>,
+    /// Whether the DHT is used for peer discovery and capabilities
+    /// advertisement at all. Matches go's `EnableDHTProviders`
+    /// (`config.Local`, issue #768; go default `false`). When `false`,
+    /// this host never seeds/bootstraps the DHT or advertises a mode —
+    /// the underlying `kad::Behaviour` is still composed into the swarm
+    /// (rust-libp2p has no cheaper way to omit a `NetworkBehaviour` field
+    /// at runtime), but it is never given bootstrap peers, never
+    /// bootstrapped, and never promoted out of its default client mode,
+    /// so it neither advertises this node nor is queried for routing.
+    pub enable_dht_providers: bool,
+    /// DHT operation mode string. Matches go's `DHTMode` (`config.Local`,
+    /// issue #768) — see [`resolve_dht_mode`]'s doc comment for the exact
+    /// `""`/`"server"`/`"client"` semantics. Only consulted when
+    /// `enable_dht_providers` is `true`.
+    pub dht_mode: String,
 }
 
 /// Split a multiaddr into its dialable transport address and an optional
@@ -616,7 +638,7 @@ impl P2pTransport {
     /// WS-gossip node's own "register before traffic can arrive" ordering.
     pub async fn start(cfg: P2pTransportConfig) -> Result<Self, anyhow::Error> {
         let identity_cfg = IdentityConfig {
-            private_key_path: None,
+            private_key_path: cfg.private_key_path.clone(),
             data_dir: cfg.data_dir.clone(),
             persist_peer_id: cfg.persist_peer_id,
         };
@@ -627,23 +649,34 @@ impl P2pTransport {
         if let Some(addr) = &cfg.listen_multiaddr {
             host.listen(addr.clone())
                 .map_err(|e| anyhow::anyhow!("failed to listen on {addr}: {e}"))?;
-            // A node meant to be discoverable (has a listen address) should
-            // run the DHT in Server mode — mirrors go's
-            // `cfg.IsListenServer()` (see `P2pHost::set_dht_mode`'s doc
-            // comment).
-            host.set_dht_mode(Some(kad::Mode::Server));
+        }
+
+        // `EnableDHTProviders`/`DHTMode` (issue #768): the DHT is only
+        // seeded, bootstrapped, and mode-set when DHT-based peer
+        // discovery/capabilities advertisement is enabled — go's
+        // `EnableDHTProviders` gates the whole subsystem (`network/p2p/
+        // capabilities.go`'s `CapabilitiesDiscovery`), not just its mode.
+        // The gossip-mesh bootstrap dial below is unconditional either
+        // way: it is plain P2P peer connectivity, not DHT routing.
+        if cfg.enable_dht_providers {
+            host.set_dht_mode(resolve_dht_mode(
+                &cfg.dht_mode,
+                cfg.listen_multiaddr.is_some(),
+            ));
         }
 
         for addr in &cfg.bootstrap_peers {
-            let (base, peer) = split_peer_id(addr);
-            if let Some(peer) = peer {
-                host.add_bootstrap_peer(peer, base);
+            if cfg.enable_dht_providers {
+                let (base, peer) = split_peer_id(addr);
+                if let Some(peer) = peer {
+                    host.add_bootstrap_peer(peer, base);
+                }
             }
             if let Err(e) = host.dial(addr.clone()) {
                 tracing::warn!(addr = %addr, error = %e, "failed to dial P2P bootstrap peer");
             }
         }
-        if !cfg.bootstrap_peers.is_empty() {
+        if cfg.enable_dht_providers && !cfg.bootstrap_peers.is_empty() {
             host.bootstrap_dht();
         }
 
@@ -1185,6 +1218,9 @@ mod tests {
             bootstrap_peers: vec![],
             persist_peer_id: false,
             data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: true,
+            dht_mode: String::new(),
         })
         .await
         .expect("start p2p transport");
@@ -1210,6 +1246,9 @@ mod tests {
             bootstrap_peers: vec![],
             persist_peer_id: false,
             data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: true,
+            dht_mode: String::new(),
         })
         .await
         .expect("start p2p transport");
@@ -1231,6 +1270,9 @@ mod tests {
             bootstrap_peers: vec![],
             persist_peer_id: false,
             data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: true,
+            dht_mode: String::new(),
         })
         .await
         .expect("start listener");
@@ -1252,6 +1294,9 @@ mod tests {
             bootstrap_peers: vec![dial_addr],
             persist_peer_id: false,
             data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: true,
+            dht_mode: String::new(),
         })
         .await
         .expect("start dialer");
@@ -1656,6 +1701,9 @@ mod tests {
             bootstrap_peers: vec![],
             persist_peer_id: false,
             data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: true,
+            dht_mode: String::new(),
         })
         .await
         .expect("start transport");

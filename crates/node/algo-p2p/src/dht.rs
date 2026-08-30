@@ -32,6 +32,7 @@
 //! [`crate::host`], which is where go's `CapabilitiesDiscovery` /
 //! `p2pNetwork` glue those pieces together.
 
+use libp2p::kad;
 use libp2p::StreamProtocol;
 
 /// Algorand's DHT protocol-name pattern:
@@ -92,6 +93,32 @@ pub fn dht_config(network_id: &str) -> libp2p::kad::Config {
     libp2p::kad::Config::new(dht_protocol_name(network_id))
 }
 
+/// Resolve go's `DHTMode` config string (`config.Local.DHTMode`,
+/// `version[38]`, issue #768) into the [`kad::Mode`] to pass to
+/// [`crate::host::P2pHost::set_dht_mode`].
+///
+/// Go's exact semantics (`localTemplate.go:632-638`):
+/// - `"server"` — always operate as DHT server.
+/// - `"client"` — always operate as DHT client only.
+/// - `""` (default) — server if the node has a listen address (`NetAddress`
+///   or `P2PHybridNetAddress` set, i.e. `cfg.IsListenServer()`), client
+///   otherwise.
+///
+/// The `""` + no-listen-address case returns `None` rather than
+/// `Some(kad::Mode::Client)`: `set_dht_mode(None)` restores rust-libp2p's
+/// own automatic mode-switching, which starts as client and only promotes
+/// to server once an external address is confirmed reachable — the
+/// direct rust-libp2p equivalent of "client, but never advertised as
+/// discoverable" (see [`crate::host::P2pHost::set_dht_mode`]'s doc
+/// comment for why that promotion never actually fires today).
+pub fn resolve_dht_mode(dht_mode: &str, has_listen_address: bool) -> Option<kad::Mode> {
+    match dht_mode {
+        "server" => Some(kad::Mode::Server),
+        "client" => Some(kad::Mode::Client),
+        _ => has_listen_address.then_some(kad::Mode::Server),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +147,34 @@ mod tests {
             dht_protocol_name("mainnet-v1.0"),
             dht_protocol_name("testnet-v1.0")
         );
+    }
+
+    // --- resolve_dht_mode (issue #768) -------------------------------------
+
+    #[test]
+    fn dht_mode_explicit_server_always_server() {
+        assert_eq!(resolve_dht_mode("server", false), Some(kad::Mode::Server));
+        assert_eq!(resolve_dht_mode("server", true), Some(kad::Mode::Server));
+    }
+
+    #[test]
+    fn dht_mode_explicit_client_always_client() {
+        assert_eq!(resolve_dht_mode("client", false), Some(kad::Mode::Client));
+        assert_eq!(resolve_dht_mode("client", true), Some(kad::Mode::Client));
+    }
+
+    #[test]
+    fn dht_mode_empty_follows_listen_address() {
+        assert_eq!(resolve_dht_mode("", true), Some(kad::Mode::Server));
+        assert_eq!(resolve_dht_mode("", false), None);
+    }
+
+    #[test]
+    fn dht_mode_unrecognized_value_falls_back_to_empty_semantics() {
+        // An unrecognized value isn't rejected (this is a config-string
+        // field, not an enum) — falls back to the same listen-address-based
+        // behavior as "".
+        assert_eq!(resolve_dht_mode("bogus", true), Some(kad::Mode::Server));
+        assert_eq!(resolve_dht_mode("bogus", false), None);
     }
 }

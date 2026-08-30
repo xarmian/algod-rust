@@ -498,6 +498,7 @@ pub async fn run(
     mem_cap_mb: u64,
     ledger_path: &Path,
     genesis_json_path: Option<&Path>,
+    node_config: &algo_config::Local,
 ) -> anyhow::Result<()> {
     // Resolve genesis ID: use the provided value, or look it up by network name.
     let resolved_genesis_id = if genesis_id.is_empty() {
@@ -562,6 +563,24 @@ pub async fn run(
         } else {
             peers.len().max(algo_network::DEFAULT_GOSSIP_FANOUT)
         },
+        // Message-hash dedup filter sizing + localhost rate-limit
+        // exemption (issue #768) — same `config.json` fields
+        // `participate` wires, now available on `relay` too.
+        enable_incoming_message_filter: node_config.enable_incoming_message_filter,
+        incoming_message_filter_bucket_count: node_config
+            .incoming_message_filter_bucket_count
+            .max(0) as usize,
+        incoming_message_filter_bucket_size: node_config.incoming_message_filter_bucket_size.max(0)
+            as usize,
+        enable_outgoing_network_message_filtering: node_config
+            .enable_outgoing_network_message_filtering,
+        outgoing_message_filter_bucket_count: node_config
+            .outgoing_message_filter_bucket_count
+            .max(0) as usize,
+        outgoing_message_filter_bucket_size: node_config.outgoing_message_filter_bucket_size.max(0)
+            as usize,
+        disable_localhost_connection_rate_limit: node_config
+            .disable_localhost_connection_rate_limit,
         ..Default::default()
     };
 

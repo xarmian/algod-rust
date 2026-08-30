@@ -322,45 +322,55 @@ pub enum Commands {
         #[arg(long, value_delimiter = ',')]
         peers: Vec<String>,
 
-        /// Maximum incoming connections.
-        #[arg(long, default_value = "2400")]
-        incoming_limit: u32,
+        /// Maximum incoming connections. `None` (the default: no CLI flag
+        /// passed) falls back to `<data-dir>/config.json`'s
+        /// `IncomingConnectionsLimit` (issue #768 — relay previously had
+        /// no `config.json` at all, only this flag's own hardcoded
+        /// default, matching go's value coincidentally but with no way to
+        /// override it via `config.json` the way `participate` can).
+        #[arg(long)]
+        incoming_limit: Option<i64>,
 
-        /// Maximum connections per IP address.
-        #[arg(long, default_value = "8")]
-        max_per_ip: u32,
+        /// Maximum connections per IP address. See `incoming_limit`'s note
+        /// — falls back to `config.json`'s `MaxConnectionsPerIP`.
+        #[arg(long)]
+        max_per_ip: Option<i64>,
 
-        /// Connection rate limit: maximum new connections per window.
-        #[arg(long, default_value = "60")]
-        rate_limit: u32,
+        /// Connection rate limit: maximum new connections per window. See
+        /// `incoming_limit`'s note — falls back to `config.json`'s
+        /// `ConnectionsRateLimitingCount`.
+        #[arg(long)]
+        rate_limit: Option<u64>,
 
         /// Connection-rate-limit window, in seconds (go:
-        /// `config.Local.ConnectionsRateLimitingWindowSeconds`).
-        /// Previously entirely missing — only the *count* half of this
-        /// pair existed (issue #748); go's default is 1 second, not the
-        /// 60 seconds this was previously hardcoded to.
-        #[arg(long, default_value = "1")]
-        rate_limit_window_seconds: u64,
+        /// `config.Local.ConnectionsRateLimitingWindowSeconds`). See
+        /// `incoming_limit`'s note.
+        #[arg(long)]
+        rate_limit_window_seconds: Option<u64>,
 
         /// Maximum peers a single broadcast is delivered to. A negative
         /// value means unbounded, matching go's real
-        /// `BroadcastConnectionsLimit` default of `-1` (issue #748 fixed
-        /// this flag's prior hardcoded default of `35`, which diverged
-        /// from go).
-        #[arg(long, default_value = "-1", allow_negative_numbers = true)]
-        broadcast_limit: i64,
+        /// `BroadcastConnectionsLimit` default of `-1`. See
+        /// `incoming_limit`'s note — falls back to `config.json`'s
+        /// `BroadcastConnectionsLimit`.
+        #[arg(long, allow_negative_numbers = true)]
+        broadcast_limit: Option<i64>,
 
-        /// Path to TLS certificate file (optional).
+        /// Path to TLS certificate file (optional). Falls back to
+        /// `config.json`'s `TLSCertFile` when not passed.
         #[arg(long)]
         tls_cert: Option<String>,
 
-        /// Path to TLS private key file (optional).
+        /// Path to TLS private key file (optional). Falls back to
+        /// `config.json`'s `TLSKeyFile` when not passed.
         #[arg(long)]
         tls_key: Option<String>,
 
-        /// Block service memory cap in MB.
-        #[arg(long, default_value = "500")]
-        mem_cap_mb: u64,
+        /// Block service memory cap in MB. See `incoming_limit`'s note —
+        /// falls back to `config.json`'s `BlockServiceMemCap` (converted
+        /// from bytes to MB).
+        #[arg(long)]
+        mem_cap_mb: Option<u64>,
 
         /// Optional path to a genesis.json file. When set, and the local
         /// ledger is empty, the relay seeds genesis accounts + account
@@ -371,6 +381,14 @@ pub enum Commands {
         /// See PLAN-32 / TASK-95.
         #[arg(long)]
         genesis_json: Option<PathBuf>,
+
+        /// Data directory to load `<data-dir>/config.json` from (issue
+        /// #768). Mirrors `participate --data-dir`'s own config-loading
+        /// mechanism — a missing directory or missing `config.json`
+        /// within it is not an error; every field falls back to its
+        /// go-matching built-in default.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 
     /// Observe gossip traffic: connect to relay peers and log all messages as JSON lines.

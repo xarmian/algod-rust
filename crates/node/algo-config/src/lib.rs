@@ -90,6 +90,7 @@
 //!   `block_service_mem_cap` into `algo-network`/`algo-rest-api` — see that
 //!   issue's PR description for exactly which code path each one drives.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -104,7 +105,13 @@ pub const CONFIG_FILENAME: &str = "config.json";
 /// `latest_version_matches_max_field_tag` test enforces that they stay in
 /// sync, mirroring go's `!!! WARNING !!!` comment on `Local.Version`
 /// ("This field tag must be updated any time we add a new version").
-pub const LATEST_VERSION: u32 = 35;
+///
+/// Bumped from 35 to 38 by issue #768 (`DHTMode` carries `version[38]`
+/// upstream, `localTemplate.go:638`) — go's own `Local.Version` struct tag
+/// already lists every version through 38 at this repo's `v5.0.0-stable`
+/// pin, so this only catches algod-rust's own field set up to what a real
+/// field here now needs, not a new upstream version.
+pub const LATEST_VERSION: u32 = 38;
 
 /// Errors from loading, migrating, or saving a [`Local`] config.
 #[derive(Debug, thiserror::Error)]
@@ -893,6 +900,172 @@ static ENABLE_PROFILER: VersionedDefault<bool> = VersionedDefault::new(&[(0, || 
 static ENABLE_TOP_ACCOUNTS_REPORTING: VersionedDefault<bool> =
     VersionedDefault::new(&[(0, || false)]);
 
+// --- Remaining networking fields (issue #768, follow-up to #748) -----------
+//
+// #748 scoped down `config.Local`'s full networking-field enumeration to
+// what could be wired with real behavioral impact in one PR. This issue
+// closes the rest of the enumerated gap. Per-field disposition (see issue
+// #768's body for the full table):
+//
+// - `public_address`/`p2p_hybrid_net_address`: round-trip only. Go gates
+//   `P2PHybridNetAddress`-driven hybrid-mode validation
+//   (`ValidateP2PHybridConfig`, `localTemplate.go:800-812`) on
+//   `PublicAddress` being set; algod-rust has no hybrid-mode
+//   listen-address validation path to gate yet (`enable_p2p_hybrid_mode`
+//   is itself a round-trip-only field already — see its doc comment).
+// - `announce_participation_key`/`reserved_fds`: round-trip only, no
+//   underlying announcement/FD-accounting subsystem exists.
+// - `priority_peers`: round-trip only (no per-IP peer-priority scheduling
+//   in the phonebook/mesh yet), but demonstrates the non-`Copy`
+//   `VersionedDefault<BTreeMap<String, bool>>` shape end-to-end.
+// - The four message-filter fields plus `enable_outgoing_network_message_filtering`/
+//   `enable_incoming_message_filter`: wired into `algo_network`'s existing
+//   `MessageFilter` bucket construction (`message_filter.rs`), which
+//   previously hardcoded a single bucket-size constant with no
+//   bucket-count knob and no incoming/outgoing split at all.
+// - `dns_security_flags`/`network_protocol_version`/
+//   `use_x_forwarded_for_address_field`/`disable_outgoing_connection_throttling`/
+//   `block_service_custom_fallback_endpoints`/`enable_request_logger`/
+//   `fallback_dns_resolver_address`: round-trip only, no underlying
+//   DNS-response-validation, protocol-version-override,
+//   X-Forwarded-For-aware client-IP resolution, outgoing-throttle-disable,
+//   custom-fallback-endpoint, request-logging, or fallback-DNS-resolver
+//   subsystem exists to gate.
+// - `disable_localhost_connection_rate_limit`: wired into the inbound
+//   connection-rate limiter (`algo_network::ConnectionTracker`) as a
+//   real behavioral fix — localhost connections previously got no
+//   exemption from the same per-IP rate limiter as everything else.
+// - `p2p_private_key_location`: wired as a custom-path override alongside
+//   the existing `--p2p-persist-peer-id` boolean flag.
+// - `enable_dht_providers`/`dht_mode`: wired into `algo_p2p::dht`'s
+//   existing (previously config-less) DHT construction.
+// - `EnableVoteCompression`/`StatefulVoteCompressionTableSize`/
+//   `EnableBatchVerification` are **deliberately NOT added** here, per
+//   issue #768's explicit instruction: confirmed no vote-compression code
+//   exists anywhere in algod-rust's gossip wire protocol, and
+//   `algo_validate::signature` itself documents "no ed25519 batch
+//   verifier" today — a no-op knob for a nonexistent feature is worse
+//   than no knob (same precedent #748 set). Add them only once a future
+//   issue actually builds the underlying feature.
+
+/// Go: `PublicAddress string` `version[0]:""` (`localTemplate.go:65`).
+/// Round-trip only — see the module note above.
+static PUBLIC_ADDRESS: VersionedDefault<String> = VersionedDefault::new(&[(0, String::new)]);
+
+/// Go: `P2PHybridNetAddress string` `version[34]:""` (`localTemplate.go:627`).
+/// Round-trip only — see the module note above.
+static P2P_HYBRID_NET_ADDRESS: VersionedDefault<String> =
+    VersionedDefault::new(&[(34, String::new)]);
+
+/// Go: `AnnounceParticipationKey bool` `version[4]:"true"`
+/// (`localTemplate.go:155`). Round-trip only — see the module note above.
+static ANNOUNCE_PARTICIPATION_KEY: VersionedDefault<bool> = VersionedDefault::new(&[(4, || true)]);
+
+/// Go: `PriorityPeers map[string]bool` `version[4]:""` (`localTemplate.go:159`).
+/// Round-trip only — demonstrates the non-`Copy`
+/// `VersionedDefault<BTreeMap<String, bool>>` shape (`T` only needs
+/// `Default`, not `Copy` — see [`VersionedDefault::at`]'s doc comment).
+static PRIORITY_PEERS: VersionedDefault<BTreeMap<String, bool>> =
+    VersionedDefault::new(&[(4, BTreeMap::new)]);
+
+/// Go: `ReservedFDs uint64` `version[2]:"256"` (`localTemplate.go:167`).
+/// Round-trip only — see the module note above.
+static RESERVED_FDS: VersionedDefault<u64> = VersionedDefault::new(&[(2, || 256)]);
+
+/// Go: `IncomingMessageFilterBucketCount int` `version[0]:"5"`
+/// (`localTemplate.go:283`). Wired into `algo_network`'s incoming
+/// `MessageFilter` bucket construction.
+static INCOMING_MESSAGE_FILTER_BUCKET_COUNT: VersionedDefault<i64> =
+    VersionedDefault::new(&[(0, || 5)]);
+
+/// Go: `IncomingMessageFilterBucketSize int` `version[0]:"512"`
+/// (`localTemplate.go:286`). Wired into `algo_network`'s incoming
+/// `MessageFilter` bucket construction — algod-rust's prior hardcoded
+/// bucket capacity (`MESSAGE_FILTER_SIZE`, 5000) was actually go's
+/// unrelated `messageFilterSize` large-message-notification threshold,
+/// not a bucket-size default at all; this field supplies the real one.
+static INCOMING_MESSAGE_FILTER_BUCKET_SIZE: VersionedDefault<i64> =
+    VersionedDefault::new(&[(0, || 512)]);
+
+/// Go: `OutgoingMessageFilterBucketCount int` `version[0]:"3"`
+/// (`localTemplate.go:289`). Wired into `algo_network`'s outgoing
+/// `MessageFilter` bucket construction.
+static OUTGOING_MESSAGE_FILTER_BUCKET_COUNT: VersionedDefault<i64> =
+    VersionedDefault::new(&[(0, || 3)]);
+
+/// Go: `OutgoingMessageFilterBucketSize int` `version[0]:"128"`
+/// (`localTemplate.go:292`). Wired into `algo_network`'s outgoing
+/// `MessageFilter` bucket construction.
+static OUTGOING_MESSAGE_FILTER_BUCKET_SIZE: VersionedDefault<i64> =
+    VersionedDefault::new(&[(0, || 128)]);
+
+/// Go: `EnableOutgoingNetworkMessageFiltering bool` `version[0]:"true"`
+/// (`localTemplate.go:295`). Wired: gates whether an outgoing
+/// `MessageFilter` is constructed at all.
+static ENABLE_OUTGOING_NETWORK_MESSAGE_FILTERING: VersionedDefault<bool> =
+    VersionedDefault::new(&[(0, || true)]);
+
+/// Go: `EnableIncomingMessageFilter bool` `version[0]:"false"`
+/// (`localTemplate.go:298`). Wired: gates whether an incoming
+/// `MessageFilter` is constructed at all.
+static ENABLE_INCOMING_MESSAGE_FILTER: VersionedDefault<bool> =
+    VersionedDefault::new(&[(0, || false)]);
+
+/// Go: `DNSSecurityFlags uint32` `version[6]:"1" version[34]:"9"`
+/// (`localTemplate.go:385`). Round-trip only — see the module note above.
+static DNS_SECURITY_FLAGS: VersionedDefault<u32> = VersionedDefault::new(&[(6, || 1), (34, || 9)]);
+
+/// Go: `NetworkProtocolVersion string` `version[6]:""` (`localTemplate.go:395`).
+/// Round-trip only — see the module note above.
+static NETWORK_PROTOCOL_VERSION: VersionedDefault<String> =
+    VersionedDefault::new(&[(6, String::new)]);
+
+/// Go: `UseXForwardedForAddressField string` `version[0]:""`
+/// (`localTemplate.go:337`). Round-trip only — see the module note above.
+static USE_X_FORWARDED_FOR_ADDRESS_FIELD: VersionedDefault<String> =
+    VersionedDefault::new(&[(0, String::new)]);
+
+/// Go: `DisableOutgoingConnectionThrottling bool` `version[5]:"false"`
+/// (`localTemplate.go:392`). Round-trip only — see the module note above.
+static DISABLE_OUTGOING_CONNECTION_THROTTLING: VersionedDefault<bool> =
+    VersionedDefault::new(&[(5, || false)]);
+
+/// Go: `DisableLocalhostConnectionRateLimit bool` `version[16]:"true"`
+/// (`localTemplate.go:481`). Wired into `algo_network::ConnectionTracker`:
+/// when `true` (go's real default), loopback addresses are exempted from
+/// the inbound per-IP connection-rate limiter.
+static DISABLE_LOCALHOST_CONNECTION_RATE_LIMIT: VersionedDefault<bool> =
+    VersionedDefault::new(&[(16, || true)]);
+
+/// Go: `BlockServiceCustomFallbackEndpoints string` `version[16]:""`
+/// (`localTemplate.go:486`). Round-trip only — see the module note above.
+static BLOCK_SERVICE_CUSTOM_FALLBACK_ENDPOINTS: VersionedDefault<String> =
+    VersionedDefault::new(&[(16, String::new)]);
+
+/// Go: `EnableRequestLogger bool` `version[4]:"false"` (`localTemplate.go:354`).
+/// Round-trip only — see the module note above.
+static ENABLE_REQUEST_LOGGER: VersionedDefault<bool> = VersionedDefault::new(&[(4, || false)]);
+
+/// Go: `FallbackDNSResolverAddress string` `version[0]:""`
+/// (`localTemplate.go:229`). Round-trip only — see the module note above.
+static FALLBACK_DNS_RESOLVER_ADDRESS: VersionedDefault<String> =
+    VersionedDefault::new(&[(0, String::new)]);
+
+/// Go: `P2PPrivateKeyLocation string` `version[29]:""`
+/// (`localTemplate.go:647`). Wired as a custom-path override for the
+/// P2P peer-ID private key file, alongside the existing
+/// `p2p_persist_peer_id` boolean flag.
+static P2P_PRIVATE_KEY_LOCATION: VersionedDefault<String> =
+    VersionedDefault::new(&[(29, String::new)]);
+
+/// Go: `EnableDHTProviders bool` `version[34]:"false"` (`localTemplate.go:630`).
+/// Wired into `algo_p2p::dht`'s DHT construction.
+static ENABLE_DHT_PROVIDERS: VersionedDefault<bool> = VersionedDefault::new(&[(34, || false)]);
+
+/// Go: `DHTMode string` `version[38]:""` (`localTemplate.go:638`).
+/// Wired into `algo_p2p::dht`'s DHT construction.
+static DHT_MODE: VersionedDefault<String> = VersionedDefault::new(&[(38, String::new)]);
+
 fn default_version() -> u32 {
     // Mirrors go's explicit `c.Version = 0 // Reset to 0 so we get the
     // version from the loaded file` (config.go:124) — a `version` key
@@ -1115,6 +1288,72 @@ fn default_enable_profiler() -> bool {
 }
 fn default_enable_top_accounts_reporting() -> bool {
     ENABLE_TOP_ACCOUNTS_REPORTING.at(LATEST_VERSION)
+}
+fn default_public_address() -> String {
+    PUBLIC_ADDRESS.at(LATEST_VERSION)
+}
+fn default_p2p_hybrid_net_address() -> String {
+    P2P_HYBRID_NET_ADDRESS.at(LATEST_VERSION)
+}
+fn default_announce_participation_key() -> bool {
+    ANNOUNCE_PARTICIPATION_KEY.at(LATEST_VERSION)
+}
+fn default_priority_peers() -> BTreeMap<String, bool> {
+    PRIORITY_PEERS.at(LATEST_VERSION)
+}
+fn default_reserved_fds() -> u64 {
+    RESERVED_FDS.at(LATEST_VERSION)
+}
+fn default_incoming_message_filter_bucket_count() -> i64 {
+    INCOMING_MESSAGE_FILTER_BUCKET_COUNT.at(LATEST_VERSION)
+}
+fn default_incoming_message_filter_bucket_size() -> i64 {
+    INCOMING_MESSAGE_FILTER_BUCKET_SIZE.at(LATEST_VERSION)
+}
+fn default_outgoing_message_filter_bucket_count() -> i64 {
+    OUTGOING_MESSAGE_FILTER_BUCKET_COUNT.at(LATEST_VERSION)
+}
+fn default_outgoing_message_filter_bucket_size() -> i64 {
+    OUTGOING_MESSAGE_FILTER_BUCKET_SIZE.at(LATEST_VERSION)
+}
+fn default_enable_outgoing_network_message_filtering() -> bool {
+    ENABLE_OUTGOING_NETWORK_MESSAGE_FILTERING.at(LATEST_VERSION)
+}
+fn default_enable_incoming_message_filter() -> bool {
+    ENABLE_INCOMING_MESSAGE_FILTER.at(LATEST_VERSION)
+}
+fn default_dns_security_flags() -> u32 {
+    DNS_SECURITY_FLAGS.at(LATEST_VERSION)
+}
+fn default_network_protocol_version() -> String {
+    NETWORK_PROTOCOL_VERSION.at(LATEST_VERSION)
+}
+fn default_use_x_forwarded_for_address_field() -> String {
+    USE_X_FORWARDED_FOR_ADDRESS_FIELD.at(LATEST_VERSION)
+}
+fn default_disable_outgoing_connection_throttling() -> bool {
+    DISABLE_OUTGOING_CONNECTION_THROTTLING.at(LATEST_VERSION)
+}
+fn default_disable_localhost_connection_rate_limit() -> bool {
+    DISABLE_LOCALHOST_CONNECTION_RATE_LIMIT.at(LATEST_VERSION)
+}
+fn default_block_service_custom_fallback_endpoints() -> String {
+    BLOCK_SERVICE_CUSTOM_FALLBACK_ENDPOINTS.at(LATEST_VERSION)
+}
+fn default_enable_request_logger() -> bool {
+    ENABLE_REQUEST_LOGGER.at(LATEST_VERSION)
+}
+fn default_fallback_dns_resolver_address() -> String {
+    FALLBACK_DNS_RESOLVER_ADDRESS.at(LATEST_VERSION)
+}
+fn default_p2p_private_key_location() -> String {
+    P2P_PRIVATE_KEY_LOCATION.at(LATEST_VERSION)
+}
+fn default_enable_dht_providers() -> bool {
+    ENABLE_DHT_PROVIDERS.at(LATEST_VERSION)
+}
+fn default_dht_mode() -> String {
+    DHT_MODE.at(LATEST_VERSION)
 }
 
 /// Convert go's `BaseLoggerDebugLevel` (`config.Local`, go's `logging.Level`
@@ -1710,6 +1949,173 @@ pub struct Local {
         default = "default_enable_top_accounts_reporting"
     )]
     pub enable_top_accounts_reporting: bool,
+
+    // --- Remaining networking fields (issue #768) ------------------------
+    /// Go: `PublicAddress`. Round-trip only — see the module note above
+    /// [`PUBLIC_ADDRESS`].
+    #[serde(rename = "PublicAddress", default = "default_public_address")]
+    pub public_address: String,
+
+    /// Go: `P2PHybridNetAddress`. Round-trip only — see
+    /// [`P2P_HYBRID_NET_ADDRESS`]'s doc comment.
+    #[serde(
+        rename = "P2PHybridNetAddress",
+        default = "default_p2p_hybrid_net_address"
+    )]
+    pub p2p_hybrid_net_address: String,
+
+    /// Go: `AnnounceParticipationKey`. Round-trip only — see
+    /// [`ANNOUNCE_PARTICIPATION_KEY`]'s doc comment.
+    #[serde(
+        rename = "AnnounceParticipationKey",
+        default = "default_announce_participation_key"
+    )]
+    pub announce_participation_key: bool,
+
+    /// Go: `PriorityPeers`. Round-trip only, but demonstrates the
+    /// non-`Copy` `VersionedDefault<BTreeMap<String, bool>>` shape — see
+    /// [`PRIORITY_PEERS`]'s doc comment.
+    #[serde(rename = "PriorityPeers", default = "default_priority_peers")]
+    pub priority_peers: BTreeMap<String, bool>,
+
+    /// Go: `ReservedFDs`. Round-trip only — see [`RESERVED_FDS`]'s doc
+    /// comment.
+    #[serde(rename = "ReservedFDs", default = "default_reserved_fds")]
+    pub reserved_fds: u64,
+
+    /// Go: `IncomingMessageFilterBucketCount`. Wired into `algo-network`'s
+    /// incoming `MessageFilter` bucket construction — see
+    /// [`INCOMING_MESSAGE_FILTER_BUCKET_COUNT`]'s doc comment.
+    #[serde(
+        rename = "IncomingMessageFilterBucketCount",
+        default = "default_incoming_message_filter_bucket_count"
+    )]
+    pub incoming_message_filter_bucket_count: i64,
+
+    /// Go: `IncomingMessageFilterBucketSize`. Wired into `algo-network`'s
+    /// incoming `MessageFilter` bucket construction — see
+    /// [`INCOMING_MESSAGE_FILTER_BUCKET_SIZE`]'s doc comment.
+    #[serde(
+        rename = "IncomingMessageFilterBucketSize",
+        default = "default_incoming_message_filter_bucket_size"
+    )]
+    pub incoming_message_filter_bucket_size: i64,
+
+    /// Go: `OutgoingMessageFilterBucketCount`. Wired into `algo-network`'s
+    /// outgoing `MessageFilter` bucket construction.
+    #[serde(
+        rename = "OutgoingMessageFilterBucketCount",
+        default = "default_outgoing_message_filter_bucket_count"
+    )]
+    pub outgoing_message_filter_bucket_count: i64,
+
+    /// Go: `OutgoingMessageFilterBucketSize`. Wired into `algo-network`'s
+    /// outgoing `MessageFilter` bucket construction.
+    #[serde(
+        rename = "OutgoingMessageFilterBucketSize",
+        default = "default_outgoing_message_filter_bucket_size"
+    )]
+    pub outgoing_message_filter_bucket_size: i64,
+
+    /// Go: `EnableOutgoingNetworkMessageFiltering`. Wired: gates whether an
+    /// outgoing `MessageFilter` is constructed at all.
+    #[serde(
+        rename = "EnableOutgoingNetworkMessageFiltering",
+        default = "default_enable_outgoing_network_message_filtering"
+    )]
+    pub enable_outgoing_network_message_filtering: bool,
+
+    /// Go: `EnableIncomingMessageFilter`. Wired: gates whether an incoming
+    /// `MessageFilter` is constructed at all.
+    #[serde(
+        rename = "EnableIncomingMessageFilter",
+        default = "default_enable_incoming_message_filter"
+    )]
+    pub enable_incoming_message_filter: bool,
+
+    /// Go: `DNSSecurityFlags`. Round-trip only — see
+    /// [`DNS_SECURITY_FLAGS`]'s doc comment.
+    #[serde(rename = "DNSSecurityFlags", default = "default_dns_security_flags")]
+    pub dns_security_flags: u32,
+
+    /// Go: `NetworkProtocolVersion`. Round-trip only — see
+    /// [`NETWORK_PROTOCOL_VERSION`]'s doc comment.
+    #[serde(
+        rename = "NetworkProtocolVersion",
+        default = "default_network_protocol_version"
+    )]
+    pub network_protocol_version: String,
+
+    /// Go: `UseXForwardedForAddressField`. Round-trip only — see
+    /// [`USE_X_FORWARDED_FOR_ADDRESS_FIELD`]'s doc comment.
+    #[serde(
+        rename = "UseXForwardedForAddressField",
+        default = "default_use_x_forwarded_for_address_field"
+    )]
+    pub use_x_forwarded_for_address_field: String,
+
+    /// Go: `DisableOutgoingConnectionThrottling`. Round-trip only — see
+    /// [`DISABLE_OUTGOING_CONNECTION_THROTTLING`]'s doc comment.
+    #[serde(
+        rename = "DisableOutgoingConnectionThrottling",
+        default = "default_disable_outgoing_connection_throttling"
+    )]
+    pub disable_outgoing_connection_throttling: bool,
+
+    /// Go: `DisableLocalhostConnectionRateLimit`. Wired into
+    /// `algo_network::ConnectionTracker` — see
+    /// [`DISABLE_LOCALHOST_CONNECTION_RATE_LIMIT`]'s doc comment.
+    #[serde(
+        rename = "DisableLocalhostConnectionRateLimit",
+        default = "default_disable_localhost_connection_rate_limit"
+    )]
+    pub disable_localhost_connection_rate_limit: bool,
+
+    /// Go: `BlockServiceCustomFallbackEndpoints`. Round-trip only — see
+    /// [`BLOCK_SERVICE_CUSTOM_FALLBACK_ENDPOINTS`]'s doc comment.
+    #[serde(
+        rename = "BlockServiceCustomFallbackEndpoints",
+        default = "default_block_service_custom_fallback_endpoints"
+    )]
+    pub block_service_custom_fallback_endpoints: String,
+
+    /// Go: `EnableRequestLogger`. Round-trip only — see
+    /// [`ENABLE_REQUEST_LOGGER`]'s doc comment.
+    #[serde(
+        rename = "EnableRequestLogger",
+        default = "default_enable_request_logger"
+    )]
+    pub enable_request_logger: bool,
+
+    /// Go: `FallbackDNSResolverAddress`. Round-trip only — see
+    /// [`FALLBACK_DNS_RESOLVER_ADDRESS`]'s doc comment.
+    #[serde(
+        rename = "FallbackDNSResolverAddress",
+        default = "default_fallback_dns_resolver_address"
+    )]
+    pub fallback_dns_resolver_address: String,
+
+    /// Go: `P2PPrivateKeyLocation`. Wired as a custom-path override for
+    /// the P2P peer-ID private key file — see
+    /// [`P2P_PRIVATE_KEY_LOCATION`]'s doc comment.
+    #[serde(
+        rename = "P2PPrivateKeyLocation",
+        default = "default_p2p_private_key_location"
+    )]
+    pub p2p_private_key_location: String,
+
+    /// Go: `EnableDHTProviders`. Wired into `algo_p2p::dht` — see
+    /// [`ENABLE_DHT_PROVIDERS`]'s doc comment.
+    #[serde(
+        rename = "EnableDHTProviders",
+        default = "default_enable_dht_providers"
+    )]
+    pub enable_dht_providers: bool,
+
+    /// Go: `DHTMode`. Wired into `algo_p2p::dht` — see [`DHT_MODE`]'s doc
+    /// comment.
+    #[serde(rename = "DHTMode", default = "default_dht_mode")]
+    pub dht_mode: String,
 }
 
 impl Default for Local {
@@ -1807,6 +2213,32 @@ impl Local {
             log_archive_max_age: LOG_ARCHIVE_MAX_AGE.at(version),
             enable_profiler: ENABLE_PROFILER.at(version),
             enable_top_accounts_reporting: ENABLE_TOP_ACCOUNTS_REPORTING.at(version),
+            public_address: PUBLIC_ADDRESS.at(version),
+            p2p_hybrid_net_address: P2P_HYBRID_NET_ADDRESS.at(version),
+            announce_participation_key: ANNOUNCE_PARTICIPATION_KEY.at(version),
+            priority_peers: PRIORITY_PEERS.at(version),
+            reserved_fds: RESERVED_FDS.at(version),
+            incoming_message_filter_bucket_count: INCOMING_MESSAGE_FILTER_BUCKET_COUNT.at(version),
+            incoming_message_filter_bucket_size: INCOMING_MESSAGE_FILTER_BUCKET_SIZE.at(version),
+            outgoing_message_filter_bucket_count: OUTGOING_MESSAGE_FILTER_BUCKET_COUNT.at(version),
+            outgoing_message_filter_bucket_size: OUTGOING_MESSAGE_FILTER_BUCKET_SIZE.at(version),
+            enable_outgoing_network_message_filtering: ENABLE_OUTGOING_NETWORK_MESSAGE_FILTERING
+                .at(version),
+            enable_incoming_message_filter: ENABLE_INCOMING_MESSAGE_FILTER.at(version),
+            dns_security_flags: DNS_SECURITY_FLAGS.at(version),
+            network_protocol_version: NETWORK_PROTOCOL_VERSION.at(version),
+            use_x_forwarded_for_address_field: USE_X_FORWARDED_FOR_ADDRESS_FIELD.at(version),
+            disable_outgoing_connection_throttling: DISABLE_OUTGOING_CONNECTION_THROTTLING
+                .at(version),
+            disable_localhost_connection_rate_limit: DISABLE_LOCALHOST_CONNECTION_RATE_LIMIT
+                .at(version),
+            block_service_custom_fallback_endpoints: BLOCK_SERVICE_CUSTOM_FALLBACK_ENDPOINTS
+                .at(version),
+            enable_request_logger: ENABLE_REQUEST_LOGGER.at(version),
+            fallback_dns_resolver_address: FALLBACK_DNS_RESOLVER_ADDRESS.at(version),
+            p2p_private_key_location: P2P_PRIVATE_KEY_LOCATION.at(version),
+            enable_dht_providers: ENABLE_DHT_PROVIDERS.at(version),
+            dht_mode: DHT_MODE.at(version),
         }
     }
 
@@ -2180,6 +2612,113 @@ impl Local {
                 cur,
                 next,
             );
+            migrate_field(&mut self.public_address, &PUBLIC_ADDRESS, cur, next);
+            migrate_field(
+                &mut self.p2p_hybrid_net_address,
+                &P2P_HYBRID_NET_ADDRESS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.announce_participation_key,
+                &ANNOUNCE_PARTICIPATION_KEY,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.priority_peers, &PRIORITY_PEERS, cur, next);
+            migrate_field(&mut self.reserved_fds, &RESERVED_FDS, cur, next);
+            migrate_field(
+                &mut self.incoming_message_filter_bucket_count,
+                &INCOMING_MESSAGE_FILTER_BUCKET_COUNT,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.incoming_message_filter_bucket_size,
+                &INCOMING_MESSAGE_FILTER_BUCKET_SIZE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.outgoing_message_filter_bucket_count,
+                &OUTGOING_MESSAGE_FILTER_BUCKET_COUNT,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.outgoing_message_filter_bucket_size,
+                &OUTGOING_MESSAGE_FILTER_BUCKET_SIZE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_outgoing_network_message_filtering,
+                &ENABLE_OUTGOING_NETWORK_MESSAGE_FILTERING,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_incoming_message_filter,
+                &ENABLE_INCOMING_MESSAGE_FILTER,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.dns_security_flags, &DNS_SECURITY_FLAGS, cur, next);
+            migrate_field(
+                &mut self.network_protocol_version,
+                &NETWORK_PROTOCOL_VERSION,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.use_x_forwarded_for_address_field,
+                &USE_X_FORWARDED_FOR_ADDRESS_FIELD,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.disable_outgoing_connection_throttling,
+                &DISABLE_OUTGOING_CONNECTION_THROTTLING,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.disable_localhost_connection_rate_limit,
+                &DISABLE_LOCALHOST_CONNECTION_RATE_LIMIT,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.block_service_custom_fallback_endpoints,
+                &BLOCK_SERVICE_CUSTOM_FALLBACK_ENDPOINTS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_request_logger,
+                &ENABLE_REQUEST_LOGGER,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.fallback_dns_resolver_address,
+                &FALLBACK_DNS_RESOLVER_ADDRESS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.p2p_private_key_location,
+                &P2P_PRIVATE_KEY_LOCATION,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_dht_providers,
+                &ENABLE_DHT_PROVIDERS,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.dht_mode, &DHT_MODE, cur, next);
             self.version = next;
         }
         Ok(())
@@ -2349,6 +2888,28 @@ mod tests {
             ENABLE_ASSEMBLE_STATS.max_tag_version(),
             ENABLE_PROCESS_BLOCK_STATS.max_tag_version(),
             MAX_BLOCK_HISTORY_LOOKBACK.max_tag_version(),
+            PUBLIC_ADDRESS.max_tag_version(),
+            P2P_HYBRID_NET_ADDRESS.max_tag_version(),
+            ANNOUNCE_PARTICIPATION_KEY.max_tag_version(),
+            PRIORITY_PEERS.max_tag_version(),
+            RESERVED_FDS.max_tag_version(),
+            INCOMING_MESSAGE_FILTER_BUCKET_COUNT.max_tag_version(),
+            INCOMING_MESSAGE_FILTER_BUCKET_SIZE.max_tag_version(),
+            OUTGOING_MESSAGE_FILTER_BUCKET_COUNT.max_tag_version(),
+            OUTGOING_MESSAGE_FILTER_BUCKET_SIZE.max_tag_version(),
+            ENABLE_OUTGOING_NETWORK_MESSAGE_FILTERING.max_tag_version(),
+            ENABLE_INCOMING_MESSAGE_FILTER.max_tag_version(),
+            DNS_SECURITY_FLAGS.max_tag_version(),
+            NETWORK_PROTOCOL_VERSION.max_tag_version(),
+            USE_X_FORWARDED_FOR_ADDRESS_FIELD.max_tag_version(),
+            DISABLE_OUTGOING_CONNECTION_THROTTLING.max_tag_version(),
+            DISABLE_LOCALHOST_CONNECTION_RATE_LIMIT.max_tag_version(),
+            BLOCK_SERVICE_CUSTOM_FALLBACK_ENDPOINTS.max_tag_version(),
+            ENABLE_REQUEST_LOGGER.max_tag_version(),
+            FALLBACK_DNS_RESOLVER_ADDRESS.max_tag_version(),
+            P2P_PRIVATE_KEY_LOCATION.max_tag_version(),
+            ENABLE_DHT_PROVIDERS.max_tag_version(),
+            DHT_MODE.max_tag_version(),
         ]
         .into_iter()
         .max()
@@ -2441,6 +3002,144 @@ mod tests {
         assert_eq!(d.max_acct_lookback, 4);
         assert!(!d.enable_agreement_reporting);
         assert!(!d.enable_agreement_time_metrics);
+        assert_eq!(d.public_address, "");
+        assert_eq!(d.p2p_hybrid_net_address, "");
+        assert!(d.announce_participation_key);
+        assert!(d.priority_peers.is_empty());
+        assert_eq!(d.reserved_fds, 256);
+        assert_eq!(d.incoming_message_filter_bucket_count, 5);
+        assert_eq!(d.incoming_message_filter_bucket_size, 512);
+        assert_eq!(d.outgoing_message_filter_bucket_count, 3);
+        assert_eq!(d.outgoing_message_filter_bucket_size, 128);
+        assert!(d.enable_outgoing_network_message_filtering);
+        assert!(!d.enable_incoming_message_filter);
+        assert_eq!(d.dns_security_flags, 9, "go's post-version-34 default (9)");
+        assert_eq!(d.network_protocol_version, "");
+        assert_eq!(d.use_x_forwarded_for_address_field, "");
+        assert!(!d.disable_outgoing_connection_throttling);
+        assert!(
+            d.disable_localhost_connection_rate_limit,
+            "go's real default is true (localhost is exempt by default)"
+        );
+        assert_eq!(d.block_service_custom_fallback_endpoints, "");
+        assert!(!d.enable_request_logger);
+        assert_eq!(d.fallback_dns_resolver_address, "");
+        assert_eq!(d.p2p_private_key_location, "");
+        assert!(!d.enable_dht_providers);
+        assert_eq!(d.dht_mode, "");
+    }
+
+    // --- Remaining networking fields (issue #768) ------------------------
+
+    #[test]
+    fn priority_peers_round_trips_as_map() {
+        let cfg = Local::load_from_str(
+            r#"{"PriorityPeers": {"10.0.0.1:4160": true, "10.0.0.2:4160": false}}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.priority_peers.len(), 2);
+        assert_eq!(cfg.priority_peers.get("10.0.0.1:4160"), Some(&true));
+        assert_eq!(cfg.priority_peers.get("10.0.0.2:4160"), Some(&false));
+
+        // Round-trip through save/load.
+        let json = cfg.to_json_minimized().expect("serializes");
+        let reloaded = Local::load_from_str(&json).expect("reparses");
+        assert_eq!(reloaded.priority_peers, cfg.priority_peers);
+    }
+
+    #[test]
+    fn priority_peers_defaults_to_empty_map() {
+        assert!(Local::default().priority_peers.is_empty());
+        assert!(Local::default_at_version(0).priority_peers.is_empty());
+    }
+
+    #[test]
+    fn message_filter_fields_partial_overlay() {
+        let cfg = Local::load_from_str(
+            r#"{"IncomingMessageFilterBucketCount": 7, "OutgoingMessageFilterBucketSize": 64,
+                "EnableIncomingMessageFilter": true}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.incoming_message_filter_bucket_count, 7);
+        assert_eq!(cfg.outgoing_message_filter_bucket_size, 64);
+        assert!(cfg.enable_incoming_message_filter);
+        // Untouched fields keep their defaults.
+        assert_eq!(cfg.incoming_message_filter_bucket_size, 512);
+        assert_eq!(cfg.outgoing_message_filter_bucket_count, 3);
+        assert!(cfg.enable_outgoing_network_message_filtering);
+    }
+
+    #[test]
+    fn dns_security_flags_migrates_across_version_34() {
+        // A config saved at version 6 (pre-bump) with the field still at
+        // its then-current default (1) must advance to the new default (9)
+        // when migrated forward — the operator never explicitly overrode
+        // it away from the old default.
+        let mut cfg = Local::default_at_version(6);
+        assert_eq!(cfg.dns_security_flags, 1);
+        cfg.migrate().expect("migrates");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.dns_security_flags, 9);
+    }
+
+    #[test]
+    fn dns_security_flags_explicit_override_survives_migration() {
+        // An operator who explicitly set a custom flags value keeps it
+        // across the version-34 bump, mirroring migrate_field's
+        // "still equal to old default" guard.
+        let mut cfg = Local::default_at_version(6);
+        cfg.dns_security_flags = 3; // explicit override, not the v6 default of 1
+        cfg.migrate().expect("migrates");
+        assert_eq!(cfg.dns_security_flags, 3);
+    }
+
+    #[test]
+    fn disable_localhost_connection_rate_limit_defaults_true() {
+        assert!(Local::default().disable_localhost_connection_rate_limit);
+        // Pin `Version` to the latest so `migrate()` is a no-op and the
+        // explicit override below isn't reinterpreted as "still at the
+        // pre-version-16 zero-value default" (which — like any bool
+        // field explicitly set to `false` under an unversioned/`0`
+        // config — would otherwise get advanced back to `true` by
+        // `migrate_field`'s old-default equality check; see
+        // `field_at_default_that_happens_to_match_a_later_versions_default_still_advances`
+        // for that documented, go-matching quirk).
+        let cfg = Local::load_from_str(
+            r#"{"Version": 38, "DisableLocalhostConnectionRateLimit": false}"#,
+        )
+        .expect("parses");
+        assert!(!cfg.disable_localhost_connection_rate_limit);
+    }
+
+    #[test]
+    fn p2p_private_key_location_round_trip() {
+        let cfg =
+            Local::load_from_str(r#"{"P2PPrivateKeyLocation": "/data/p2p.key"}"#).expect("parses");
+        assert_eq!(cfg.p2p_private_key_location, "/data/p2p.key");
+    }
+
+    #[test]
+    fn dht_fields_round_trip() {
+        let cfg = Local::load_from_str(r#"{"EnableDHTProviders": true, "DHTMode": "server"}"#)
+            .expect("parses");
+        assert!(cfg.enable_dht_providers);
+        assert_eq!(cfg.dht_mode, "server");
+    }
+
+    #[test]
+    fn vote_compression_and_batch_verification_fields_are_not_present() {
+        // Explicitly asserts issue #768's disposition: these upstream
+        // fields must NOT exist on `Local` at all (no-op knobs for
+        // nonexistent features are worse than no knob). Encoded as a
+        // negative JSON-shape check so a future accidental re-add is
+        // caught: `serde` would otherwise silently accept and drop an
+        // unknown field, so this only guards the "someone adds it as a
+        // real field" case together with the source-level absence, which
+        // is the actual contract here.
+        let default_json = Local::default().to_json_full().expect("serializes");
+        assert!(!default_json.contains("EnableVoteCompression"));
+        assert!(!default_json.contains("StatefulVoteCompressionTableSize"));
+        assert!(!default_json.contains("EnableBatchVerification"));
     }
 
     // --- Catchup/sync fields (issue #753) --------------------------------

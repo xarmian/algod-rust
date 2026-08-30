@@ -54,7 +54,7 @@ pub mod streams;
 pub mod wsproto;
 
 pub use capabilities::Capability;
-pub use dht::dht_protocol_name;
+pub use dht::{dht_protocol_name, resolve_dht_mode};
 pub use dnsaddr::{resolve_multiaddrs, DnsaddrError, DnsaddrResolver, HickoryDnsaddrResolver};
 pub use errors::P2pError;
 pub use host::{
