@@ -153,6 +153,8 @@ struct MockNode {
     enable_developer_api: bool,
     /// Whether the experimental API is enabled.
     enable_experimental_api: bool,
+    /// Mirrors go's `config.Local.DisableAPIAuth` (issue #748).
+    disable_api_auth: bool,
     /// Asset resource records for lookup_assets, keyed by address bytes.
     asset_resources_by_addr: BTreeMap<[u8; 32], Vec<AssetResourceWithIDs>>,
     /// App resource records for lookup_applications, keyed by address bytes.
@@ -241,6 +243,7 @@ impl Clone for MockNode {
             state_deltas: self.state_deltas.clone(),
             enable_developer_api: self.enable_developer_api,
             enable_experimental_api: self.enable_experimental_api,
+            disable_api_auth: self.disable_api_auth,
             asset_resources_by_addr: self.asset_resources_by_addr.clone(),
             app_resources_by_addr: self.app_resources_by_addr.clone(),
             participation_records: self.participation_records.clone(),
@@ -354,6 +357,7 @@ impl MockNode {
             state_deltas: BTreeMap::new(),
             enable_developer_api: false,
             enable_experimental_api: false,
+            disable_api_auth: false,
             asset_resources_by_addr: BTreeMap::new(),
             app_resources_by_addr: BTreeMap::new(),
             participation_records: Vec::new(),
@@ -1215,11 +1219,13 @@ impl TestServer {
         let api_token = generate_token();
         let admin_token = generate_token();
         let enable_experimental_api = node.enable_experimental_api;
+        let disable_api_auth = node.disable_api_auth;
 
         let tokens = TokenConfig {
             api_token: api_token.clone(),
             admin_token: admin_token.clone(),
             enable_experimental_api,
+            disable_api_auth,
         };
 
         let router = build_router(Arc::new(node), tokens);
@@ -1708,6 +1714,54 @@ async fn authenticated_route_returns_200_with_valid_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+/// Issue #748: `DisableAPIAuth` (go: `config.Local.DisableAPIAuth`) skips
+/// the token check on public (non-admin) routes entirely — a request with
+/// NO token at all must succeed.
+#[tokio::test]
+async fn disable_api_auth_allows_public_route_without_any_token() {
+    let server = TestServer::start(MockNode {
+        disable_api_auth: true,
+        ..MockNode::synced()
+    })
+    .await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/params"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "DisableAPIAuth must allow public routes through with no token"
+    );
+}
+
+/// Issue #748: `DisableAPIAuth`'s doc comment scopes it to "public
+/// (non-admin)" endpoints only — admin routes must still reject a request
+/// with no token even when it's set.
+#[tokio::test]
+async fn disable_api_auth_does_not_affect_admin_routes() {
+    let server = TestServer::start(MockNode {
+        disable_api_auth: true,
+        ..MockNode::synced()
+    })
+    .await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/participation"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "DisableAPIAuth must not weaken admin-route authentication"
+    );
 }
 
 #[tokio::test]

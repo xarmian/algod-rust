@@ -296,6 +296,10 @@ async fn run_start(
         data_dir: Some(data_dir.to_path_buf()),
         api_token: None,
         admin_token: None,
+        // `node start` has no `<data-dir>/config.json` wiring yet (only
+        // `participate` loads it) — default to go's own default (auth
+        // enabled) rather than inventing a different one here.
+        disable_api_auth: false,
     };
     let shutdown_future = {
         let token = shutdown_token.clone();

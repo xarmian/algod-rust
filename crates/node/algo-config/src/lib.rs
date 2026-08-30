@@ -52,7 +52,8 @@
 //!    with one `(version, || default)` entry per `version[N]:"default"` tag
 //!    the field carries in `../go-algorand/config/localTemplate.go` (or, for
 //!    an algod-rust-only field with no go equivalent, a single `(0, || default)`
-//!    entry).
+//!    entry). `T` only needs `Default` (+ `PartialEq` for migration) — it does
+//!    **not** need to be `Copy`, so `String`/`Vec`/map-typed fields work too.
 //! 3. Add `field: MY_FIELD.at(version),` to [`Local::default_at_version`].
 //! 4. Add `fn default_my_field() -> T { MY_FIELD.at(LATEST_VERSION) }` and
 //!    reference it from the field's `#[serde(default = "...")]`.
@@ -64,19 +65,30 @@
 //!
 //! # Explicitly out of scope for this issue
 //!
-//! - The remaining ~90 `config.Local` fields (tracked by epic #745's
-//!   per-area follow-up issues #748/#749/#751/#753/#755/#756/#757).
+//! - The remaining `config.Local` fields with no underlying algod-rust
+//!   feature to gate yet (message-hash-bucket dedup filtering, DHT peer
+//!   discovery, vote compression, ed25519 batch verification, per-IP
+//!   priority peers, reserved-FD accounting, X-Forwarded-For handling,
+//!   request logging, DNS security flags) — tracked by epic #745's
+//!   networking follow-up rather than added here as no-op knobs (see
+//!   PR description for #748 for the full enumerated list with go
+//!   defaults and disposition).
 //! - `enrichNetworkingConfig`'s field-level post-load normalization
 //!   (`NetAddress`-driven `GossipFanout`/`EnableLedgerService` side effects,
 //!   `PublicAddress` lowercasing) — that's networking-config-field-gap
-//!   territory (#748). The mechanism here is structured so such a hook can
-//!   be layered on after [`Local::load_from_data_dir`] without any
-//!   architectural change.
-//! - Wiring these fields into actual runtime behavior (e.g. having
-//!   `algo-network` read `max_connections_per_ip` / `incoming_connections_limit`
-//!   from this struct instead of `WsNetworkConfig`'s hardcoded values) — left
-//!   to the owning per-area issue, since each one needs to decide the exact
-//!   CLI-flag/TOML/`config.json` precedence for its own fields.
+//!   territory (#748, tracked further in its follow-up). The mechanism here
+//!   is structured so such a hook can be layered on after
+//!   [`Local::load_from_data_dir`] without any architectural change.
+//! - Wiring every field into actual runtime behavior — left to the owning
+//!   per-area issue, since each one needs to decide the exact
+//!   CLI-flag/TOML/`config.json` precedence for its own fields. #748 wires
+//!   `max_connections_per_ip`, `incoming_connections_limit`,
+//!   `broadcast_connections_limit`, `connections_rate_limiting_count`/
+//!   `_window_seconds`, `tls_cert_file`/`tls_key_file`,
+//!   `enable_gossip_service`/`enable_block_service`/
+//!   `enable_gossip_block_service`, `disable_api_auth`, and
+//!   `block_service_mem_cap` into `algo-network`/`algo-rest-api` — see that
+//!   issue's PR description for exactly which code path each one drives.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -148,7 +160,7 @@ pub struct VersionedDefault<T: 'static> {
     entries: &'static [VersionedDefaultEntry<T>],
 }
 
-impl<T: Copy + Default> VersionedDefault<T> {
+impl<T: Default> VersionedDefault<T> {
     /// Build a version history from its `(version, default)` entries.
     pub const fn new(entries: &'static [VersionedDefaultEntry<T>]) -> Self {
         Self { entries }
@@ -159,7 +171,10 @@ impl<T: Copy + Default> VersionedDefault<T> {
     /// `GetVersionedDefaultLocalConfig` (`config/migrate.go:181`). Before
     /// this field's first tag applies, the value is `T::default()` —
     /// Rust's zero value, matching go's untagged zero value (e.g. `0` for
-    /// `int`, `false` for `bool`).
+    /// `int`, `false` for `bool`, `""` for `string`).
+    ///
+    /// `T` only needs [`Default`] here (not `Copy`) — each matching entry's
+    /// constructor is called fresh, never duplicated from a prior value.
     pub fn at(&self, version: u32) -> T {
         let mut chosen: T = T::default();
         for (v, f) in self.entries {
@@ -193,7 +208,7 @@ impl<T: Copy + Default> VersionedDefault<T> {
 /// the operator never explicitly overrode this field away from its old
 /// default. An explicit override is therefore preserved across every
 /// future version step, forever.
-fn migrate_field<T: Copy + Default + PartialEq>(
+fn migrate_field<T: Default + PartialEq>(
     current: &mut T,
     history: &VersionedDefault<T>,
     cur_version: u32,
@@ -235,6 +250,69 @@ static ENABLE_P2P_HYBRID_MODE: VersionedDefault<bool> = VersionedDefault::new(&[
 /// Go: `P2PPersistPeerID bool` `version[29]:"false"` (`localTemplate.go:642`).
 static P2P_PERSIST_PEER_ID: VersionedDefault<bool> = VersionedDefault::new(&[(29, || false)]);
 
+/// Go: `GossipFanout int` `version[0]:"4"` (`localTemplate.go:52`).
+static GOSSIP_FANOUT: VersionedDefault<i64> = VersionedDefault::new(&[(0, || 4)]);
+
+/// Go: `BroadcastConnectionsLimit int` `version[4]:"-1"` (`localTemplate.go:148`).
+/// `-1` means unbounded — issue #748 fixed algod-rust's prior hardcoded `35`
+/// default, which diverged from go's real (unbounded) default.
+static BROADCAST_CONNECTIONS_LIMIT: VersionedDefault<i64> = VersionedDefault::new(&[(4, || -1)]);
+
+/// Go: `ConnectionsRateLimitingCount uint` `version[4]:"60"` (`localTemplate.go:351`).
+static CONNECTIONS_RATE_LIMITING_COUNT: VersionedDefault<u64> =
+    VersionedDefault::new(&[(4, || 60)]);
+
+/// Go: `ConnectionsRateLimitingWindowSeconds uint` `version[4]:"1"`
+/// (`localTemplate.go:345`).
+static CONNECTIONS_RATE_LIMITING_WINDOW_SECONDS: VersionedDefault<u64> =
+    VersionedDefault::new(&[(4, || 1)]);
+
+/// Go: `TLSCertFile string` `version[0]:""` (`localTemplate.go:74`).
+static TLS_CERT_FILE: VersionedDefault<String> = VersionedDefault::new(&[(0, || String::new())]);
+
+/// Go: `TLSKeyFile string` `version[0]:""` (`localTemplate.go:77`).
+static TLS_KEY_FILE: VersionedDefault<String> = VersionedDefault::new(&[(0, || String::new())]);
+
+/// Go: `DisableAPIAuth bool` `version[30]:"false"` (`localTemplate.go:650`).
+static DISABLE_API_AUTH: VersionedDefault<bool> = VersionedDefault::new(&[(30, || false)]);
+
+/// Go: `EnableGossipService bool` `version[33]:"true"` (`localTemplate.go:407`).
+static ENABLE_GOSSIP_SERVICE: VersionedDefault<bool> = VersionedDefault::new(&[(33, || true)]);
+
+/// Go: `EnableLedgerService bool` `version[7]:"false"` (`localTemplate.go:411`).
+/// algod-rust has no ledger-serving HTTP service yet (no equivalent to go's
+/// `LedgerService` full-ledger/catchpoint-over-the-wire endpoint) — this
+/// field round-trips through `config.json` for parity but is a documented
+/// no-op until that service exists.
+static ENABLE_LEDGER_SERVICE: VersionedDefault<bool> = VersionedDefault::new(&[(7, || false)]);
+
+/// Go: `EnableBlockService bool` `version[7]:"false"` (`localTemplate.go:415`).
+static ENABLE_BLOCK_SERVICE: VersionedDefault<bool> = VersionedDefault::new(&[(7, || false)]);
+
+/// Go: `EnableGossipBlockService bool` `version[8]:"true"` (`localTemplate.go:419`).
+static ENABLE_GOSSIP_BLOCK_SERVICE: VersionedDefault<bool> = VersionedDefault::new(&[(8, || true)]);
+
+/// Go: `BlockServiceMemCap uint64` `version[28]:"500000000"` (`localTemplate.go:616`).
+/// This is a literal byte count (500,000,000 decimal), not `500 * 1024 *
+/// 1024` — issue #748 fixed algod-rust's prior binary-MiB interpretation,
+/// which diverged from go's exact byte count.
+static BLOCK_SERVICE_MEM_CAP: VersionedDefault<u64> =
+    VersionedDefault::new(&[(28, || 500_000_000)]);
+
+/// Go: `ForceRelayMessages bool` `version[0]:"false"` (`localTemplate.go:340`).
+static FORCE_RELAY_MESSAGES: VersionedDefault<bool> = VersionedDefault::new(&[(0, || false)]);
+
+/// Go: `DNSBootstrapID string` `version[0]:"<network>.algorand.network"
+/// version[28]:"<network>.algorand.network?backup=<network>.algorand.net&dedup=<name>.algorand-<network>.(network|net)"`
+/// (`localTemplate.go:188`). The `<network>`/`<name>` placeholders are
+/// substituted by the DNS-bootstrap resolution code, not here.
+static DNS_BOOTSTRAP_ID: VersionedDefault<String> = VersionedDefault::new(&[
+    (0, || "<network>.algorand.network".to_string()),
+    (28, || {
+        "<network>.algorand.network?backup=<network>.algorand.net&dedup=<name>.algorand-<network>.(network|net)".to_string()
+    }),
+]);
+
 fn default_version() -> u32 {
     // Mirrors go's explicit `c.Version = 0 // Reset to 0 so we get the
     // version from the loaded file` (config.go:124) — a `version` key
@@ -257,6 +335,48 @@ fn default_enable_p2p_hybrid_mode() -> bool {
 fn default_p2p_persist_peer_id() -> bool {
     P2P_PERSIST_PEER_ID.at(LATEST_VERSION)
 }
+fn default_gossip_fanout() -> i64 {
+    GOSSIP_FANOUT.at(LATEST_VERSION)
+}
+fn default_broadcast_connections_limit() -> i64 {
+    BROADCAST_CONNECTIONS_LIMIT.at(LATEST_VERSION)
+}
+fn default_connections_rate_limiting_count() -> u64 {
+    CONNECTIONS_RATE_LIMITING_COUNT.at(LATEST_VERSION)
+}
+fn default_connections_rate_limiting_window_seconds() -> u64 {
+    CONNECTIONS_RATE_LIMITING_WINDOW_SECONDS.at(LATEST_VERSION)
+}
+fn default_tls_cert_file() -> String {
+    TLS_CERT_FILE.at(LATEST_VERSION)
+}
+fn default_tls_key_file() -> String {
+    TLS_KEY_FILE.at(LATEST_VERSION)
+}
+fn default_disable_api_auth() -> bool {
+    DISABLE_API_AUTH.at(LATEST_VERSION)
+}
+fn default_enable_gossip_service() -> bool {
+    ENABLE_GOSSIP_SERVICE.at(LATEST_VERSION)
+}
+fn default_enable_ledger_service() -> bool {
+    ENABLE_LEDGER_SERVICE.at(LATEST_VERSION)
+}
+fn default_enable_block_service() -> bool {
+    ENABLE_BLOCK_SERVICE.at(LATEST_VERSION)
+}
+fn default_enable_gossip_block_service() -> bool {
+    ENABLE_GOSSIP_BLOCK_SERVICE.at(LATEST_VERSION)
+}
+fn default_block_service_mem_cap() -> u64 {
+    BLOCK_SERVICE_MEM_CAP.at(LATEST_VERSION)
+}
+fn default_force_relay_messages() -> bool {
+    FORCE_RELAY_MESSAGES.at(LATEST_VERSION)
+}
+fn default_dns_bootstrap_id() -> String {
+    DNS_BOOTSTRAP_ID.at(LATEST_VERSION)
+}
 
 /// `config.Local`-equivalent node configuration, loaded from `config.json`
 /// as a partial overlay onto version-tagged defaults. See the module docs
@@ -267,25 +387,24 @@ fn default_p2p_persist_peer_id() -> bool {
 /// "value when absent from the JSON" — each one falls back to its own
 /// latest-version default, except `version` itself, which falls back to
 /// `0`, matching go's explicit reset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Local {
     /// Tracks which version of the defaults this config was last migrated
     /// to. Go: `Local.Version` (`localTemplate.go:46`).
     #[serde(rename = "Version", default = "default_version")]
     pub version: u32,
 
-    /// Go: `MaxConnectionsPerIP`. Not yet wired into `algo-network`'s
-    /// runtime connection limiting (`WsNetworkConfig::max_connections_per_ip`
-    /// is still a hardcoded default) — that wiring is networking-config
-    /// follow-up territory (epic #745, e.g. #748).
+    /// Go: `MaxConnectionsPerIP`. Wired into `algo-network`'s
+    /// `WebsocketNetworkConfig::max_connections_per_ip` on both `relay` and
+    /// `participate` (issue #748).
     #[serde(
         rename = "MaxConnectionsPerIP",
         default = "default_max_connections_per_ip"
     )]
     pub max_connections_per_ip: i64,
 
-    /// Go: `IncomingConnectionsLimit`. Not yet wired into
-    /// `WsNetworkConfig::incoming_connections_limit` — see
+    /// Go: `IncomingConnectionsLimit`. Wired into
+    /// `WebsocketNetworkConfig::incoming_connections_limit` — see
     /// `max_connections_per_ip`'s note.
     #[serde(
         rename = "IncomingConnectionsLimit",
@@ -307,6 +426,125 @@ pub struct Local {
     /// Go: `P2PPersistPeerID`.
     #[serde(rename = "P2PPersistPeerID", default = "default_p2p_persist_peer_id")]
     pub p2p_persist_peer_id: bool,
+
+    /// Go: `GossipFanout`. Target number of outgoing gossip peers.
+    #[serde(rename = "GossipFanout", default = "default_gossip_fanout")]
+    pub gossip_fanout: i64,
+
+    /// Go: `BroadcastConnectionsLimit`. `-1` means unbounded. Wired into
+    /// `WebsocketNetworkConfig::broadcast_connections_limit` (issue #748
+    /// fixed algod-rust's prior hardcoded `35` default, which diverged
+    /// from go's real unbounded-by-default behavior).
+    #[serde(
+        rename = "BroadcastConnectionsLimit",
+        default = "default_broadcast_connections_limit"
+    )]
+    pub broadcast_connections_limit: i64,
+
+    /// Go: `ConnectionsRateLimitingCount`.
+    #[serde(
+        rename = "ConnectionsRateLimitingCount",
+        default = "default_connections_rate_limiting_count"
+    )]
+    pub connections_rate_limiting_count: u64,
+
+    /// Go: `ConnectionsRateLimitingWindowSeconds`. Previously entirely
+    /// absent from algod-rust, which only modeled the *count* half of this
+    /// pair (issue #748).
+    #[serde(
+        rename = "ConnectionsRateLimitingWindowSeconds",
+        default = "default_connections_rate_limiting_window_seconds"
+    )]
+    pub connections_rate_limiting_window_seconds: u64,
+
+    /// Go: `TLSCertFile`. Wired into both `relay` and `participate` (the
+    /// latter previously had no TLS knob at all — issue #748).
+    #[serde(rename = "TLSCertFile", default = "default_tls_cert_file")]
+    pub tls_cert_file: String,
+
+    /// Go: `TLSKeyFile`. See `tls_cert_file`'s note.
+    #[serde(rename = "TLSKeyFile", default = "default_tls_key_file")]
+    pub tls_key_file: String,
+
+    /// Go: `DisableAPIAuth`. Wired into `algo-rest-api`'s router: when set,
+    /// the public (non-admin) API token check is skipped, matching go's own
+    /// "non-admin only" scope for this knob — admin endpoints still always
+    /// require the admin token.
+    #[serde(rename = "DisableAPIAuth", default = "default_disable_api_auth")]
+    pub disable_api_auth: bool,
+
+    /// Go: `EnableGossipService`. Wired: when `false`, the gossip WS
+    /// listener is not opened even if a listen address is configured.
+    #[serde(
+        rename = "EnableGossipService",
+        default = "default_enable_gossip_service"
+    )]
+    pub enable_gossip_service: bool,
+
+    /// Go: `EnableLedgerService`. **Documented no-op**: algod-rust has no
+    /// ledger-serving HTTP service to gate yet (see this field's
+    /// `VersionedDefault` doc comment). Round-trips through `config.json`
+    /// for forward compatibility; wiring is deferred to whichever follow-up
+    /// issue implements the underlying service.
+    #[serde(
+        rename = "EnableLedgerService",
+        default = "default_enable_ledger_service"
+    )]
+    pub enable_ledger_service: bool,
+
+    /// Go: `EnableBlockService`. **Deliberately not wired to gate the HTTP
+    /// block-fetch route** (`/v{n}/{genesisID}/block/{round}`), unlike go
+    /// where this route is a secondary/archival path: in algod-rust's
+    /// actual architecture that same route is the primary relay-to-relay
+    /// and `sync`-to-relay catchup mechanism (`bin/algod-rust/src/
+    /// commands/{relay,sync}.rs`), so honoring go's real default (`false`)
+    /// would silently break block catchup for anyone who didn't know to
+    /// flip this on — a regression risk judged not worth taking for a
+    /// config-parity field alone (issue #748). The field still round-trips
+    /// through `config.json` for forward compatibility. `EnableGossipService`/
+    /// `EnableGossipBlockService` below are the fields actually wired to
+    /// gate real behavior.
+    #[serde(
+        rename = "EnableBlockService",
+        default = "default_enable_block_service"
+    )]
+    pub enable_block_service: bool,
+
+    /// Go: `EnableGossipBlockService`. Wired: gates whether the
+    /// `UniEnsBlockReq` gossip-tag handler is registered.
+    #[serde(
+        rename = "EnableGossipBlockService",
+        default = "default_enable_gossip_block_service"
+    )]
+    pub enable_gossip_block_service: bool,
+
+    /// Go: `BlockServiceMemCap`. Wired into
+    /// `WebsocketNetworkConfig::block_service_mem_cap`'s default (issue
+    /// #748 fixed a prior binary-MiB-vs-decimal-byte-count divergence).
+    #[serde(
+        rename = "BlockServiceMemCap",
+        default = "default_block_service_mem_cap"
+    )]
+    pub block_service_mem_cap: u64,
+
+    /// Go: `ForceRelayMessages`: relay (forward) gossip messages even when
+    /// no listen address is configured. Wired into
+    /// `WebsocketNetworkConfig::relay_messages` alongside the existing
+    /// `--relay-messages` CLI flag on `participate` (issue #748 also fixed
+    /// a related bug: the WS listener previously refused to bind when a
+    /// listen address was set but this flag was `false`, which does not
+    /// match go's `IsListenServer`-only listener gating).
+    #[serde(
+        rename = "ForceRelayMessages",
+        default = "default_force_relay_messages"
+    )]
+    pub force_relay_messages: bool,
+
+    /// Go: `DNSBootstrapID`. Wired into `relay`/`participate`/`sync
+    /// --gossip`, generalizing the DNS-bootstrap template beyond the
+    /// `observe` subcommand it was previously confined to (issue #748).
+    #[serde(rename = "DNSBootstrapID", default = "default_dns_bootstrap_id")]
+    pub dns_bootstrap_id: String,
 }
 
 impl Default for Local {
@@ -328,6 +566,21 @@ impl Local {
             enable_p2p: ENABLE_P2P.at(version),
             enable_p2p_hybrid_mode: ENABLE_P2P_HYBRID_MODE.at(version),
             p2p_persist_peer_id: P2P_PERSIST_PEER_ID.at(version),
+            gossip_fanout: GOSSIP_FANOUT.at(version),
+            broadcast_connections_limit: BROADCAST_CONNECTIONS_LIMIT.at(version),
+            connections_rate_limiting_count: CONNECTIONS_RATE_LIMITING_COUNT.at(version),
+            connections_rate_limiting_window_seconds: CONNECTIONS_RATE_LIMITING_WINDOW_SECONDS
+                .at(version),
+            tls_cert_file: TLS_CERT_FILE.at(version),
+            tls_key_file: TLS_KEY_FILE.at(version),
+            disable_api_auth: DISABLE_API_AUTH.at(version),
+            enable_gossip_service: ENABLE_GOSSIP_SERVICE.at(version),
+            enable_ledger_service: ENABLE_LEDGER_SERVICE.at(version),
+            enable_block_service: ENABLE_BLOCK_SERVICE.at(version),
+            enable_gossip_block_service: ENABLE_GOSSIP_BLOCK_SERVICE.at(version),
+            block_service_mem_cap: BLOCK_SERVICE_MEM_CAP.at(version),
+            force_relay_messages: FORCE_RELAY_MESSAGES.at(version),
+            dns_bootstrap_id: DNS_BOOTSTRAP_ID.at(version),
         }
     }
 
@@ -379,6 +632,65 @@ impl Local {
                 cur,
                 next,
             );
+            migrate_field(&mut self.gossip_fanout, &GOSSIP_FANOUT, cur, next);
+            migrate_field(
+                &mut self.broadcast_connections_limit,
+                &BROADCAST_CONNECTIONS_LIMIT,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.connections_rate_limiting_count,
+                &CONNECTIONS_RATE_LIMITING_COUNT,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.connections_rate_limiting_window_seconds,
+                &CONNECTIONS_RATE_LIMITING_WINDOW_SECONDS,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.tls_cert_file, &TLS_CERT_FILE, cur, next);
+            migrate_field(&mut self.tls_key_file, &TLS_KEY_FILE, cur, next);
+            migrate_field(&mut self.disable_api_auth, &DISABLE_API_AUTH, cur, next);
+            migrate_field(
+                &mut self.enable_gossip_service,
+                &ENABLE_GOSSIP_SERVICE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_ledger_service,
+                &ENABLE_LEDGER_SERVICE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_block_service,
+                &ENABLE_BLOCK_SERVICE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_gossip_block_service,
+                &ENABLE_GOSSIP_BLOCK_SERVICE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.block_service_mem_cap,
+                &BLOCK_SERVICE_MEM_CAP,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.force_relay_messages,
+                &FORCE_RELAY_MESSAGES,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.dns_bootstrap_id, &DNS_BOOTSTRAP_ID, cur, next);
             self.version = next;
         }
         Ok(())
@@ -496,6 +808,20 @@ mod tests {
             ENABLE_P2P.max_tag_version(),
             ENABLE_P2P_HYBRID_MODE.max_tag_version(),
             P2P_PERSIST_PEER_ID.max_tag_version(),
+            GOSSIP_FANOUT.max_tag_version(),
+            BROADCAST_CONNECTIONS_LIMIT.max_tag_version(),
+            CONNECTIONS_RATE_LIMITING_COUNT.max_tag_version(),
+            CONNECTIONS_RATE_LIMITING_WINDOW_SECONDS.max_tag_version(),
+            TLS_CERT_FILE.max_tag_version(),
+            TLS_KEY_FILE.max_tag_version(),
+            DISABLE_API_AUTH.max_tag_version(),
+            ENABLE_GOSSIP_SERVICE.max_tag_version(),
+            ENABLE_LEDGER_SERVICE.max_tag_version(),
+            ENABLE_BLOCK_SERVICE.max_tag_version(),
+            ENABLE_GOSSIP_BLOCK_SERVICE.max_tag_version(),
+            BLOCK_SERVICE_MEM_CAP.max_tag_version(),
+            FORCE_RELAY_MESSAGES.max_tag_version(),
+            DNS_BOOTSTRAP_ID.max_tag_version(),
         ]
         .into_iter()
         .max()
@@ -512,6 +838,29 @@ mod tests {
         assert!(!d.enable_p2p);
         assert!(!d.enable_p2p_hybrid_mode);
         assert!(!d.p2p_persist_peer_id);
+        assert_eq!(d.gossip_fanout, 4);
+        assert_eq!(
+            d.broadcast_connections_limit, -1,
+            "go's real default is unbounded (-1), not algod-rust's old hardcoded 35"
+        );
+        assert_eq!(d.connections_rate_limiting_count, 60);
+        assert_eq!(d.connections_rate_limiting_window_seconds, 1);
+        assert_eq!(d.tls_cert_file, "");
+        assert_eq!(d.tls_key_file, "");
+        assert!(!d.disable_api_auth);
+        assert!(d.enable_gossip_service);
+        assert!(!d.enable_ledger_service);
+        assert!(!d.enable_block_service);
+        assert!(d.enable_gossip_block_service);
+        assert_eq!(
+            d.block_service_mem_cap, 500_000_000,
+            "go's literal byte count, not a binary-MiB approximation"
+        );
+        assert!(!d.force_relay_messages);
+        assert_eq!(
+            d.dns_bootstrap_id,
+            "<network>.algorand.network?backup=<network>.algorand.net&dedup=<name>.algorand-<network>.(network|net)"
+        );
     }
 
     #[test]
@@ -522,6 +871,12 @@ mod tests {
         let at0 = Local::default_at_version(0);
         assert_eq!(at0.max_connections_per_ip, 0);
         assert_eq!(at0.incoming_connections_limit, -1);
+        assert_eq!(at0.gossip_fanout, 4);
+        assert_eq!(
+            at0.broadcast_connections_limit, 0,
+            "BroadcastConnectionsLimit has no tag before version 4"
+        );
+        assert_eq!(at0.dns_bootstrap_id, "<network>.algorand.network");
 
         let at3 = Local::default_at_version(3);
         assert_eq!(at3.max_connections_per_ip, 30);
@@ -529,6 +884,14 @@ mod tests {
         let at27 = Local::default_at_version(27);
         assert_eq!(at27.max_connections_per_ip, 15);
         assert_eq!(at27.incoming_connections_limit, 2_400);
+        assert_eq!(at27.dns_bootstrap_id, "<network>.algorand.network");
+
+        let at28 = Local::default_at_version(28);
+        assert_eq!(at28.block_service_mem_cap, 500_000_000);
+        assert_eq!(
+            at28.dns_bootstrap_id,
+            "<network>.algorand.network?backup=<network>.algorand.net&dedup=<name>.algorand-<network>.(network|net)"
+        );
 
         let at34 = Local::default_at_version(34);
         assert_eq!(at34.max_connections_per_ip, 15);
@@ -556,6 +919,16 @@ mod tests {
         assert_eq!(cfg.incoming_connections_limit, 2_400);
         assert!(!cfg.enable_p2p_hybrid_mode);
         assert!(!cfg.p2p_persist_peer_id);
+        assert_eq!(cfg.broadcast_connections_limit, -1);
+    }
+
+    #[test]
+    fn string_field_partial_overlay_only_overrides_present_field() {
+        let cfg = Local::load_from_str(r#"{"TLSCertFile": "/etc/algod/cert.pem"}"#)
+            .expect("partial object parses");
+        assert_eq!(cfg.tls_cert_file, "/etc/algod/cert.pem");
+        // TLSKeyFile untouched — still its versioned default (empty).
+        assert_eq!(cfg.tls_key_file, "");
     }
 
     // --- Version migration: the core TDD target of this issue ----------
@@ -618,6 +991,31 @@ mod tests {
                 latest: LATEST_VERSION
             }
         ));
+    }
+
+    #[test]
+    fn string_field_migration_preserves_explicit_override() {
+        // DNSBootstrapID explicitly set to something other than any
+        // version's default must never be clobbered by migrate().
+        let cfg = Local::load_from_str(r#"{"Version": 0, "DNSBootstrapID": "custom.example.net"}"#)
+            .expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.dns_bootstrap_id, "custom.example.net");
+    }
+
+    #[test]
+    fn string_field_migration_advances_when_left_at_old_default() {
+        // DNSBootstrapID left at version 0's default must advance to
+        // version 28's template across the migration.
+        let cfg = Local::load_from_str(
+            r#"{"Version": 0, "DNSBootstrapID": "<network>.algorand.network"}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(
+            cfg.dns_bootstrap_id,
+            "<network>.algorand.network?backup=<network>.algorand.net&dedup=<name>.algorand-<network>.(network|net)"
+        );
     }
 
     // --- File loading ----------------------------------------------------
@@ -692,12 +1090,15 @@ mod tests {
         assert!(!obj.contains_key("IncomingConnectionsLimit"));
         assert!(!obj.contains_key("EnableP2PHybridMode"));
         assert!(!obj.contains_key("P2PPersistPeerID"));
+        assert!(!obj.contains_key("TLSCertFile"));
+        assert!(!obj.contains_key("BroadcastConnectionsLimit"));
     }
 
     #[test]
     fn save_non_default_round_trips_back_to_the_same_config() {
         let cfg = Local {
             max_connections_per_ip: 42,
+            tls_cert_file: "/etc/algod/cert.pem".to_string(),
             ..Local::default()
         };
         let json = cfg.to_json_minimized().expect("serializes");

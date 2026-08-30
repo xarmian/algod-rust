@@ -103,6 +103,12 @@ pub struct ApiServerConfig {
     /// Override for the admin API token. If `None`, the token is read from
     /// `algod.admin.token` in the data directory (or generated if it doesn't exist).
     pub admin_token: Option<String>,
+
+    /// Turns off authentication for public (non-admin) API endpoints.
+    /// Mirrors go-algorand's `config.Local.DisableAPIAuth` (issue #748).
+    /// Callers should default this to `false` (auth enabled), matching
+    /// go's default, when no `config.json` override is present.
+    pub disable_api_auth: bool,
 }
 
 /// The REST API HTTP server.
@@ -220,6 +226,7 @@ impl ApiServer {
             api_token,
             admin_token,
             enable_experimental_api: node.enable_experimental_api(),
+            disable_api_auth: self.config.disable_api_auth,
         };
 
         let router = router::build_router(node, tokens);

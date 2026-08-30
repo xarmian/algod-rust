@@ -2426,6 +2426,89 @@ fn open_crash_db(ledger_path: &Path) -> anyhow::Result<rusqlite::Connection> {
     Ok(conn)
 }
 
+/// CLI overrides for the networking `config.json` fields wired into
+/// `algo-network` (issue #748). Each `None` means "not explicitly passed
+/// on the CLI" — the loaded `algo_config::Local` value applies instead
+/// (itself already `config.json`-overlaid onto go-matching built-in
+/// defaults), closing the gap where these knobs previously existed only
+/// on `relay`, not `participate`.
+#[derive(Debug, Default, Clone)]
+pub struct NetworkOptions {
+    /// `--max-per-ip`. Go: `MaxConnectionsPerIP`.
+    pub max_connections_per_ip: Option<i64>,
+    /// `--incoming-limit`. Go: `IncomingConnectionsLimit`.
+    pub incoming_connections_limit: Option<i64>,
+    /// `--rate-limit`. Go: `ConnectionsRateLimitingCount`.
+    pub connections_rate_limiting_count: Option<u64>,
+    /// `--rate-limit-window-seconds`. Go: `ConnectionsRateLimitingWindowSeconds`.
+    pub connections_rate_limiting_window_seconds: Option<u64>,
+    /// `--broadcast-limit`. Go: `BroadcastConnectionsLimit`.
+    pub broadcast_connections_limit: Option<i64>,
+    /// `--tls-cert`. Go: `TLSCertFile`.
+    pub tls_cert_file: Option<String>,
+    /// `--tls-key`. Go: `TLSKeyFile`.
+    pub tls_key_file: Option<String>,
+}
+
+/// Fully-resolved networking configuration, ready to fold into
+/// [`WebsocketNetworkConfig`].
+#[derive(Debug, Clone)]
+struct ResolvedNetwork {
+    max_connections_per_ip: u32,
+    incoming_connections_limit: u32,
+    connections_rate_limiting_count: u32,
+    broadcast_connections_limit: u32,
+    tls_cert_file: Option<String>,
+    tls_key_file: Option<String>,
+}
+
+use crate::commands::network_common::resolve_unsigned_limit;
+
+/// Go's empty-string-means-unset convention (`TLSCertFile`/`TLSKeyFile`
+/// both default to `""`) translated to `Option<String>`.
+fn non_empty(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+impl NetworkOptions {
+    /// Merge CLI overrides onto the loaded `config.json` (`Local`), which
+    /// itself already carries go-matching built-in defaults for every
+    /// field here.
+    fn resolve(&self, local: &algo_config::Local) -> ResolvedNetwork {
+        ResolvedNetwork {
+            max_connections_per_ip: resolve_unsigned_limit(
+                self.max_connections_per_ip
+                    .unwrap_or(local.max_connections_per_ip),
+            ),
+            incoming_connections_limit: resolve_unsigned_limit(
+                self.incoming_connections_limit
+                    .unwrap_or(local.incoming_connections_limit),
+            ),
+            connections_rate_limiting_count: self
+                .connections_rate_limiting_count
+                .unwrap_or(local.connections_rate_limiting_count)
+                .try_into()
+                .unwrap_or(u32::MAX),
+            broadcast_connections_limit: resolve_unsigned_limit(
+                self.broadcast_connections_limit
+                    .unwrap_or(local.broadcast_connections_limit),
+            ),
+            tls_cert_file: self
+                .tls_cert_file
+                .clone()
+                .or_else(|| non_empty(&local.tls_cert_file)),
+            tls_key_file: self
+                .tls_key_file
+                .clone()
+                .or_else(|| non_empty(&local.tls_key_file)),
+        }
+    }
+}
+
 /// CLI + TOML inputs for the REST API server. CLI fields already
 /// shadow the TOML fields at parse time; this struct keeps them
 /// together so the resolver sees a single consistent bundle.
@@ -2446,6 +2529,10 @@ pub struct RestOptions {
     /// The parsed `[rest]` table, if any. Provides defaults for every
     /// CLI flag above; CLI flags always win when both are set.
     pub file_rest: Option<RestConfig>,
+    /// `config.json`'s `DisableAPIAuth` (go: `config.Local.DisableAPIAuth`,
+    /// issue #748). There is no CLI flag for this (matching go, which has
+    /// none either) — `config.json` is the only source.
+    pub disable_api_auth: bool,
 }
 
 /// Fully-resolved REST configuration, ready to hand to [`ApiServer`].
@@ -2457,6 +2544,7 @@ struct ResolvedRest {
     admin_token: Option<String>,
     genesis_path: Option<PathBuf>,
     async_backlog_size: Option<usize>,
+    disable_api_auth: bool,
 }
 
 impl RestOptions {
@@ -2506,6 +2594,7 @@ impl RestOptions {
             admin_token,
             genesis_path,
             async_backlog_size,
+            disable_api_auth: self.disable_api_auth,
         }))
     }
 }
@@ -2946,6 +3035,9 @@ pub async fn run(
     genesis_hash_hex: Option<&str>,
     rest_opts: RestOptions,
     p2p_opts: P2pOptions,
+    network_opts: NetworkOptions,
+    node_config: algo_config::Local,
+    dns_bootstrap_override: Option<&str>,
 ) -> anyhow::Result<()> {
     let resolved_p2p = p2p_opts.resolve();
     let network_mode = resolved_p2p.mode;
@@ -3118,7 +3210,20 @@ pub async fn run(
         None
     };
 
-    let phonebook = Arc::new(Phonebook::new(60, Duration::from_secs(60)));
+    // Resolve networking config.json fields (issue #748): CLI flags win
+    // when explicitly passed, otherwise the loaded `config.json` (`Local`,
+    // itself already carrying go-matching built-in defaults) applies.
+    // This closes the prior `relay`-only gap for these knobs on
+    // `participate`.
+    let resolved_net = network_opts.resolve(&node_config);
+    let rate_limit_window_secs = network_opts
+        .connections_rate_limiting_window_seconds
+        .unwrap_or(node_config.connections_rate_limiting_window_seconds);
+
+    let phonebook = Arc::new(Phonebook::new(
+        resolved_net.connections_rate_limiting_count as usize,
+        Duration::from_secs(rate_limit_window_secs),
+    ));
     if ws_active && !peers.is_empty() {
         phonebook.replace_peer_list(peers, "cli", RELAY_ROLE);
         info!(count = peers.len(), "added initial peer addresses");
@@ -3127,24 +3232,78 @@ pub async fn run(
             "P2P-only mode is active; ignoring --peers (WS-gossip peer list) — use \
              --p2p-bootstrap-peers instead."
         );
+    } else if ws_active && peers.is_empty() {
+        // No explicit --peers: fall back to DNS SRV discovery on known
+        // networks, mirroring `sync --gossip`/`observe` (issue #748 — this
+        // was previously entirely absent from `participate`, which had no
+        // way to find peers besides an explicit --peers list).
+        if let Some(network_name) = genesis_id_for(network).map(|_| network) {
+            let dns_template = dns_bootstrap_override.unwrap_or(&node_config.dns_bootstrap_id);
+            match algo_network::Discovery::new(
+                phonebook.clone(),
+                Box::new(algo_network::HickorySrvResolver::new(None)),
+                dns_template,
+                network_name,
+                dns_bootstrap_override.is_some(),
+            ) {
+                Ok(discovery) => {
+                    discovery.refresh_phonebook_addresses().await;
+                    info!("DNS discovery complete");
+                }
+                Err(e) => {
+                    warn!(error = %e, "DNS bootstrap discovery failed; continuing with no peers");
+                }
+            }
+        } else {
+            debug!(
+                network = network,
+                "no --peers and unrecognized network name; skipping DNS discovery"
+            );
+        }
     }
+
+    // `EnableGossipService` (go: gates the gossip WS listener itself,
+    // independent of whether a listen address is configured) — when
+    // false, suppress listening entirely even if `--listen-address` was
+    // given (issue #748).
+    let effective_listen_address = if node_config.enable_gossip_service {
+        effective_listen_address
+    } else {
+        if effective_listen_address.is_some() {
+            warn!(
+                "EnableGossipService is false in config.json; ignoring --listen-address — \
+                 no WS-gossip listener will be opened"
+            );
+        }
+        None
+    };
 
     let net_config = WebsocketNetworkConfig {
         genesis_id: resolved_genesis_id.clone(),
         network_id: network.to_string(),
         net_address: effective_listen_address,
         // Default participation nodes to "peer" (non-relay) mode;
-        // `--relay-messages` lets callers opt this node into a relay
-        // role when another peer needs to dial it for gossip (e.g.
-        // the two-binary tx-propagation E2E in PLAN-74 / TASK-80).
-        // `WebsocketNetwork` gates the inbound listener on both
-        // `net_address.is_some()` and `relay_messages`, so setting
-        // this flag without `--listen-address` only enables outbound
-        // broadcast forwarding — typically useful only when both are
-        // set together. In P2P-only mode `net_address` is forced to
-        // `None` above, so this can never open a listener regardless.
-        relay_messages: ws_active && relay_messages,
-        gossip_fanout: peers.len().max(algo_network::DEFAULT_GOSSIP_FANOUT),
+        // `--relay-messages`/`ForceRelayMessages` let callers opt this
+        // node into forwarding gossip even without a listen address.
+        // `WebsocketNetwork` itself now derives the *effective* forwarding
+        // decision as `net_address.is_some() || relay_messages` (go's
+        // `IsListenServer() || ForceRelayMessages`) — see issue #748's fix
+        // to `ws_network.rs`; this field is just go's `ForceRelayMessages`
+        // input, OR'd from both the CLI flag and `config.json`. In
+        // P2P-only mode `net_address` is forced to `None` above, so this
+        // can never open a listener regardless.
+        relay_messages: ws_active && (relay_messages || node_config.force_relay_messages),
+        gossip_fanout: peers
+            .len()
+            .max(node_config.gossip_fanout.max(0) as usize)
+            .max(algo_network::DEFAULT_GOSSIP_FANOUT),
+        max_connections_per_ip: resolved_net.max_connections_per_ip,
+        incoming_connections_limit: resolved_net.incoming_connections_limit,
+        connections_rate_limiting_count: resolved_net.connections_rate_limiting_count,
+        broadcast_connections_limit: resolved_net.broadcast_connections_limit,
+        tls_cert_file: resolved_net.tls_cert_file,
+        tls_key_file: resolved_net.tls_key_file,
+        block_service_mem_cap: node_config.block_service_mem_cap,
         ..Default::default()
     };
 
@@ -3183,21 +3342,25 @@ pub async fn run(
     ));
     gossip_node.register_http_handler("/", block_service.http_router());
 
-    gossip_node.multiplexer().register_handlers(vec![
-        algo_network::handler::TaggedMessageHandler {
-            tag: algo_network::Tag::Transaction,
-            handler: Arc::new(algo_network::TxTagHandler::new(
-                pool.clone(),
-                tx_seen_cache.clone(),
-            )),
-        },
-        algo_network::handler::TaggedMessageHandler {
+    let mut gossip_handlers = vec![algo_network::handler::TaggedMessageHandler {
+        tag: algo_network::Tag::Transaction,
+        handler: Arc::new(algo_network::TxTagHandler::new(
+            pool.clone(),
+            tx_seen_cache.clone(),
+        )),
+    }];
+    // `EnableGossipBlockService` (go default: true, matching algod-rust's
+    // prior always-on behavior) — gate the UniEnsBlockReq gossip-tag
+    // handler so it can be turned off via config.json (issue #748).
+    if node_config.enable_gossip_block_service {
+        gossip_handlers.push(algo_network::handler::TaggedMessageHandler {
             tag: algo_network::Tag::UniEnsBlockReq,
             handler: Arc::new(ParticipateBlockRequestHandler {
                 block_service: Arc::clone(&block_service),
             }),
-        },
-    ]);
+        });
+    }
+    gossip_node.multiplexer().register_handlers(gossip_handlers);
 
     // -------------------------------------------------------------------
     // Bootstrap the pool's block evaluator from the current ledger tip
@@ -3312,21 +3475,24 @@ pub async fn run(
         // P2P `/algorand-ws` stream now writes back a handler's `Respond`
         // result (see `p2p_transport.rs`'s `spawn_ws_peer`), but only if a
         // handler is actually registered here to produce one.
-        transport.multiplexer().register_handlers(vec![
-            algo_network::handler::TaggedMessageHandler {
-                tag: algo_network::Tag::Transaction,
-                handler: Arc::new(algo_network::TxTagHandler::new(
-                    pool.clone(),
-                    tx_seen_cache.clone(),
-                )),
-            },
-            algo_network::handler::TaggedMessageHandler {
+        let mut p2p_handlers = vec![algo_network::handler::TaggedMessageHandler {
+            tag: algo_network::Tag::Transaction,
+            handler: Arc::new(algo_network::TxTagHandler::new(
+                pool.clone(),
+                tx_seen_cache.clone(),
+            )),
+        }];
+        // See the matching `enable_gossip_block_service` gate on the
+        // WS-gossip registration above (issue #748).
+        if node_config.enable_gossip_block_service {
+            p2p_handlers.push(algo_network::handler::TaggedMessageHandler {
                 tag: algo_network::Tag::UniEnsBlockReq,
                 handler: Arc::new(ParticipateBlockRequestHandler {
                     block_service: Arc::clone(&block_service),
                 }),
-            },
-        ]);
+            });
+        }
+        transport.multiplexer().register_handlers(p2p_handlers);
 
         Some(Arc::new(transport))
     } else {
@@ -3422,6 +3588,7 @@ pub async fn run(
             data_dir: cfg.data_dir.clone(),
             api_token: cfg.api_token.clone(),
             admin_token: cfg.admin_token.clone(),
+            disable_api_auth: cfg.disable_api_auth,
         };
 
         info!(
@@ -4421,6 +4588,7 @@ mod tests {
                 listen: Some("127.0.0.1:1111".to_string()),
                 ..RestConfig::default()
             }),
+            disable_api_auth: false,
         };
         let resolved = opts
             .resolve(None)
@@ -4462,6 +4630,7 @@ mod tests {
             data_dir: None,
             genesis_path: None,
             file_rest: None,
+            disable_api_auth: false,
         };
         let ledger_parent = std::path::Path::new("/srv/algod");
         let resolved = opts.resolve(Some(ledger_parent)).unwrap().unwrap();
@@ -4479,6 +4648,7 @@ mod tests {
             data_dir: Some(PathBuf::from("/var/lib/algod")),
             genesis_path: None,
             file_rest: None,
+            disable_api_auth: false,
         };
         let resolved = opts
             .resolve(Some(std::path::Path::new("/srv/algod")))
@@ -4518,6 +4688,31 @@ mod tests {
         };
         let resolved = opts.resolve(None).unwrap().unwrap();
         assert_eq!(resolved.async_backlog_size, Some(42));
+    }
+
+    /// Issue #748: `config.json`'s `DisableAPIAuth` must reach
+    /// `ResolvedRest` (and from there `ApiServerConfig`/`TokenConfig`) —
+    /// there is no CLI flag for it (matching go, which has none either),
+    /// so `RestOptions::disable_api_auth` is the only path in.
+    #[test]
+    fn rest_options_disable_api_auth_plumbed_through_resolve() {
+        let opts = RestOptions {
+            listen: Some("127.0.0.1:4001".into()),
+            disable_api_auth: true,
+            ..RestOptions::default()
+        };
+        let resolved = opts.resolve(None).unwrap().unwrap();
+        assert!(resolved.disable_api_auth);
+    }
+
+    #[test]
+    fn rest_options_disable_api_auth_defaults_to_false() {
+        let opts = RestOptions {
+            listen: Some("127.0.0.1:4001".into()),
+            ..RestOptions::default()
+        };
+        let resolved = opts.resolve(None).unwrap().unwrap();
+        assert!(!resolved.disable_api_auth);
     }
 
     #[test]

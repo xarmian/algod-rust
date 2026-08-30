@@ -81,8 +81,11 @@ const BLOCK_RESPONSE_RETRY_AFTER: &str = "1";
 /// Matches Go's `BlockResponseLatestRoundHeader`.
 const BLOCK_RESPONSE_LATEST_ROUND_HEADER: &str = "X-Latest-Round";
 
-/// Default block service memory cap: 500 MiB.
-pub const DEFAULT_BLOCK_SERVICE_MEM_CAP: u64 = 500 * 1024 * 1024;
+/// Default block service memory cap: 500,000,000 bytes, matching go's
+/// `BlockServiceMemCap` literal `"500000000"` exactly (issue #748 fixed a
+/// prior divergence: this used to be `500 * 1024 * 1024` = 524,288,000, a
+/// binary-MiB approximation rather than go's literal decimal byte count).
+pub const DEFAULT_BLOCK_SERVICE_MEM_CAP: u64 = 500_000_000;
 
 // WS error messages matching Go constants.
 const NO_ROUND_NUMBER_ERR_MSG: &str = "can't find the round number";

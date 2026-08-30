@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-use crate::commands::network_common::genesis_id_for;
+use crate::commands::network_common::{genesis_id_for, resolve_unsigned_limit};
 
 // ---------------------------------------------------------------------------
 // SqliteLedger-backed block service
@@ -491,7 +491,8 @@ pub async fn run(
     incoming_limit: u32,
     max_per_ip: u32,
     rate_limit: u32,
-    broadcast_limit: u32,
+    rate_limit_window_seconds: u64,
+    broadcast_limit: i64,
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
     mem_cap_mb: u64,
@@ -512,7 +513,11 @@ pub async fn run(
         genesis_id.to_string()
     };
 
-    let mem_cap = mem_cap_mb * 1024 * 1024;
+    // Decimal megabytes, matching go's `BlockServiceMemCap` literal byte
+    // count (`500000000`, not `500 * 1024 * 1024`) — issue #748 fixed a
+    // prior binary-MiB interpretation here that overcounted by ~5%.
+    let mem_cap = mem_cap_mb * 1_000_000;
+    let resolved_broadcast_limit = resolve_unsigned_limit(broadcast_limit);
 
     info!(
         bind = bind_address,
@@ -521,6 +526,7 @@ pub async fn run(
         incoming_limit = incoming_limit,
         max_per_ip = max_per_ip,
         rate_limit = rate_limit,
+        rate_limit_window_seconds = rate_limit_window_seconds,
         broadcast_limit = broadcast_limit,
         mem_cap_mb = mem_cap_mb,
         peers = peers.len(),
@@ -528,7 +534,10 @@ pub async fn run(
     );
 
     // Build phonebook and seed with any initial peer addresses.
-    let phonebook = Arc::new(Phonebook::new(rate_limit as usize, Duration::from_secs(60)));
+    let phonebook = Arc::new(Phonebook::new(
+        rate_limit as usize,
+        Duration::from_secs(rate_limit_window_seconds),
+    ));
 
     if !peers.is_empty() {
         phonebook.replace_peer_list(peers, "cli", RELAY_ROLE);
@@ -544,7 +553,7 @@ pub async fn run(
         incoming_connections_limit: incoming_limit,
         max_connections_per_ip: max_per_ip,
         connections_rate_limiting_count: rate_limit,
-        broadcast_connections_limit: broadcast_limit,
+        broadcast_connections_limit: resolved_broadcast_limit,
         tls_cert_file: tls_cert.map(|s| s.to_string()),
         tls_key_file: tls_key.map(|s| s.to_string()),
         block_service_mem_cap: mem_cap,

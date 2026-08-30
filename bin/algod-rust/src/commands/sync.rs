@@ -126,6 +126,7 @@ async fn setup_gossip_network(
     algod_token: &str,
     genesis_id_override: Option<&str>,
     relay_addrs_cli: &[String],
+    dns_bootstrap_override: Option<&str>,
 ) -> anyhow::Result<Arc<WebsocketNetwork>> {
     // Resolve genesis ID for WS handshake:
     // 1. Explicit --genesis-id override
@@ -159,14 +160,19 @@ async fn setup_gossip_network(
         phonebook.replace_peer_list(relay_addrs_cli, "cli", RELAY_ROLE);
         info!(count = relay_addrs_cli.len(), "added CLI relay addresses");
     } else if matches!(network, "mainnet" | "testnet" | "devnet" | "betanet") {
-        // Known networks: discover relay peers via DNS SRV.
+        // Known networks: discover relay peers via DNS SRV. `--dns-bootstrap`
+        // generalizes `algo_config::Local::dns_bootstrap_id`
+        // (go: `config.Local.DNSBootstrapID`) to gossip-mode sync, which
+        // previously always used the hardcoded template (issue #748 — this
+        // knob was confined to the `observe` subcommand before).
+        let dns_template = dns_bootstrap_override.unwrap_or(DNS_BOOTSTRAP_TEMPLATE);
         let resolver = Box::new(HickorySrvResolver::new(None));
         let discovery = Discovery::new(
             phonebook.clone(),
             resolver,
-            DNS_BOOTSTRAP_TEMPLATE,
+            dns_template,
             network,
-            false,
+            dns_bootstrap_override.is_some(),
         )?;
         discovery.refresh_phonebook_addresses().await;
         info!("DNS discovery complete");
@@ -247,6 +253,7 @@ pub async fn run(
     gossip: bool,
     genesis_id_override: Option<&str>,
     relay_addrs: &[String],
+    dns_bootstrap_override: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = Arc::new(AlgodClient::new(algod_url, algod_token));
 
@@ -380,6 +387,7 @@ pub async fn run(
                 algod_token,
                 genesis_id_override,
                 relay_addrs,
+                dns_bootstrap_override,
             )
             .await?;
             let fallback: Arc<dyn BlockSource> = Arc::new(FallbackBlockSource {

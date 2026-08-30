@@ -223,7 +223,9 @@ pub use listener::{ConnectionGuard, RejectingLimitListener, RESERVED_HEALTH_SERV
 // ---------------------------------------------------------------------------
 
 // WebSocket network coordinator implementing GossipNode
-pub use ws_network::{PeerDirection, WebsocketNetwork, WebsocketNetworkConfig};
+pub use ws_network::{
+    PeerDirection, WebsocketNetwork, WebsocketNetworkConfig, UNBOUNDED_BROADCAST_CONNECTIONS_LIMIT,
+};
 
 // Mesh connectivity thread — maintains target outgoing connection count
 pub use mesh::{
