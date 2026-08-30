@@ -22,6 +22,7 @@ pub mod agreement_network;
 pub mod block_cert;
 pub mod block_fetcher;
 pub mod block_service;
+pub mod bloom;
 pub mod broadcast;
 pub mod compression;
 pub mod connect;
@@ -282,6 +283,9 @@ pub use tx_sync_service::{
     PendingTxGroupsSource, TxSyncService, TX_SYNC_REQUEST_CONTENT_TYPE,
     TX_SYNC_RESPONSE_CONTENT_TYPE,
 };
+
+// go-algorand-wire-compatible Bloom filter (issue #792)
+pub use bloom::{BloomDecodeError, Filter as BloomFilter};
 
 // Client (peer) side of the TxSyncer pull protocol
 pub use tx_sync_client::{GossipTxSyncPeerSource, HttpTxSyncClient};

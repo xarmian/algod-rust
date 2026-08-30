@@ -218,6 +218,13 @@ async fn connect_to(b: &Arc<WebsocketNetwork>, a_addr: &str) {
 fn make_tx(note: u8) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
     stx.txn.txn_type = algo_types::TxnType::Pay;
+    // A non-zero sender: `canonical_encode_transaction` (used by the
+    // TxSyncer's tx-sync response, issue #792) omits an empty "snd" the
+    // same way go's own omitempty does, and `Transaction::sender` has no
+    // `#[serde(default)]` (matching that a real transaction's sender is
+    // never legitimately absent), so a still-zero sender would fail to
+    // round-trip through that wire encoding.
+    stx.txn.sender = Address([1u8; 32]);
     stx.txn.fee = 1_000_000; // well above MinTxnFee (1_000)
     stx.txn.first_valid = Round(1);
     stx.txn.last_valid = Round(1_000);
