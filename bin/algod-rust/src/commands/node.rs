@@ -75,6 +75,17 @@ fn resolve_listen_addr(cli_listen: Option<&str>, config_endpoint_address: &str) 
         .unwrap_or_else(|| DEFAULT_LISTEN.to_string())
 }
 
+/// Whether `config.json`'s `DNSBootstrapID` is set to a value `node start`
+/// cannot act on. Returns `true` (a warning is owed) whenever the field is
+/// non-empty — `node start` is REST-only by design (issue #779) and has no
+/// gossip/relay networking layer that could ever resolve a DNS-SRV bootstrap
+/// peer, unlike `participate`/`relay`. Pulled out as its own function so the
+/// decision is independently testable rather than only reachable by running
+/// the full `run_start` startup sequence.
+fn dns_bootstrap_unconsumed(dns_bootstrap_id: &str) -> bool {
+    !dns_bootstrap_id.is_empty()
+}
+
 pub async fn run(cmd: NodeCommands) -> anyhow::Result<()> {
     match cmd {
         NodeCommands::Start {
@@ -280,19 +291,35 @@ async fn run_start(
         }
     };
     // `DNSBootstrapID` (config.json) has a real, exercised consumer on
-    // `algod-rust participate` (issue #748's `Discovery`/`Phonebook`
-    // DNS-SRV peer bootstrap) but `node start` has no gossip/relay
-    // networking layer at all — its only peer-syncing affordance is
-    // `--follow <url>`, which takes an explicit REST peer URL rather than
-    // discovering one. Wiring DNS-bootstrap-driven peer discovery into
-    // `node start` would mean building that discovery mechanism from
-    // scratch, which is out of this issue's scope (see issue #757's
-    // "narrow scope, file a follow-up" allowance) — tracked as a follow-up.
-    if !file_config.dns_bootstrap_id.is_empty() {
+    // `algod-rust participate`/`relay` (issue #748's `Discovery`/`Phonebook`
+    // DNS-SRV peer bootstrap over the gossip WS protocol), but `node start`
+    // has no gossip/relay networking layer at all — its only peer-syncing
+    // affordance is `--follow <url>`, an explicit REST peer URL.
+    //
+    // Issue #779 investigated giving `node start` a DNS-bootstrap-driven
+    // auto-follow path (resolving a peer via `Discovery`/`HickorySrvResolver`
+    // and feeding it into `--follow`) and concluded that is not just
+    // out-of-scope-for-now but architecturally incoherent: go-algorand's SRV
+    // records (`DNSBootstrapID`) resolve *gossip*-protocol relay addresses
+    // (the WS port `participate`/`relay` dial), not REST API addresses —
+    // there is no protocol-level relationship between a discovered gossip
+    // peer and a `--follow`-able REST endpoint. Auto-deriving one from the
+    // other would be pure guesswork (same host, unrelated port), not a real
+    // discovery mechanism. Consuming `DNSBootstrapID` for real would require
+    // giving `node start` an actual gossip/relay networking layer first —
+    // which would turn it into a second `participate`/`relay`, duplicating
+    // machinery those commands already own — so this is formally
+    // out-of-scope by design, not a follow-up to build. `node start` stays
+    // REST-only: self-produced blocks (`--dev`) or one explicit REST peer
+    // (`--follow`).
+    if dns_bootstrap_unconsumed(&file_config.dns_bootstrap_id) {
         info!(
             dns_bootstrap_id = %file_config.dns_bootstrap_id,
-            "config.json sets DNSBootstrapID, but `node start` has no peer-discovery \
-             mechanism to act on it (only `participate` does) — ignoring"
+            "config.json sets DNSBootstrapID, but `node start` is REST-only and has no \
+             gossip-protocol networking layer to resolve DNS-SRV bootstrap peers for — \
+             ignoring (see issue #779; use `algod-rust participate`/`relay` for \
+             DNS-bootstrap-driven peer discovery, or `node start --follow <url>` for an \
+             explicit REST peer)"
         );
     }
 
@@ -724,6 +751,33 @@ mod config_json_wiring_tests {
         assert_eq!(cfg.endpoint_address, "0.0.0.0:8080");
         assert_eq!(cfg.dns_bootstrap_id, "");
         assert!(cfg.enable_developer_api);
+    }
+
+    // -------------------------------------------------------------------
+    // `dns_bootstrap_unconsumed` — issue #779's disposition: `node start`
+    // is REST-only by design and must warn (not silently ignore, and not
+    // pretend to act on) a non-empty `DNSBootstrapID`, since it has no
+    // gossip-protocol networking layer to resolve DNS-SRV bootstrap peers
+    // for (unlike `participate`/`relay`, whose `Discovery`/`Phonebook`
+    // machinery is the real consumer — issue #748).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn dns_bootstrap_unconsumed_true_when_set() {
+        assert!(
+            dns_bootstrap_unconsumed("<network>.algorand.network"),
+            "a non-empty DNSBootstrapID must be flagged as unconsumed — node start has \
+             no networking layer to act on it"
+        );
+    }
+
+    #[test]
+    fn dns_bootstrap_unconsumed_false_when_unset() {
+        assert!(
+            !dns_bootstrap_unconsumed(""),
+            "an empty (unset) DNSBootstrapID — the stock docker/localnet-rust/data/config.json \
+             default — must not trigger a warning; there is nothing to ignore"
+        );
     }
 
     #[test]

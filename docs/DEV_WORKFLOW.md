@@ -140,9 +140,17 @@ dial the wrong endpoint — point your client at `127.0.0.1:4001` instead (e.g.
 rewrite `algod.net`, or use whatever endpoint flag your client exposes). The
 token is the fixed `aaaa…` value above.
 
-The staged `config.json` in the data dir is a go-algorand-format placeholder for
-operator familiarity; the Rust `node start` command does not consume it (it
-takes its listen address from `-l` and tokens from `algod.token`).
+The staged `config.json` in the data dir is a real, consumed input as of
+issue #757 — `node start` loads `<data-dir>/config.json` (`EndpointAddress`,
+`EnableDeveloperAPI`, `EnableRuntimeMetrics`/`EnableNetDevMetrics`, REST
+timeout/connection-limit fields, etc.), with an explicit `-l`/`--listen` CLI
+flag still taking precedence when given. One field is a deliberate exception:
+`DNSBootstrapID` is loaded and logged but has no consumer — `node start` is a
+REST-only localnet/dev node with no gossip/relay networking layer to resolve
+DNS-SRV bootstrap peers for (they're gossip-protocol addresses, not REST
+endpoints), so the field is formally out of scope by design (issue #779).
+Use `algod-rust participate`/`relay` for real DNS-bootstrap-driven peer
+discovery.
 
 ### The funded dev account
 
