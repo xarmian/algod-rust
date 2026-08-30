@@ -2013,12 +2013,15 @@ pub struct SqliteLedger {
     /// In-memory rolling window of recent [`crate::state_delta::StateDelta`]s,
     /// keyed by round. Populated by [`Self::apply_block_caching_delta`] (used
     /// by the live sync driver in `bin/algod-rust`) and served by the REST API
-    /// adapter's `get_state_delta_for_round`. Window size is
-    /// [`crate::delta_cache::DEFAULT_WINDOW_SIZE`] (320 rounds), matching
-    /// go-algorand's in-memory delta retention in `accountUpdates.deltas`
-    /// (`../go-algorand/ledger/acctupdates.go` @ `v4.6.0-stable`). The cache is
-    /// in-memory only — it does not survive a restart, matching Go.
-    /// PLAN-36 TASK-128.
+    /// adapter's `get_state_delta_for_round`. Window size defaults to
+    /// [`crate::delta_cache::DEFAULT_WINDOW_SIZE`] (4 rounds), matching
+    /// go-algorand's `config.Local.MaxAcctLookback` default, which bounds
+    /// `accountUpdates.deltas`'s in-memory retention
+    /// (`../go-algorand/ledger/acctupdates.go:294` @ `v5.0.0-stable`).
+    /// Configurable via [`Self::set_delta_cache_window`] (issue #755 --
+    /// prior to that issue this was hardcoded to 320, 80x go's real
+    /// default, with no config knob). The cache is in-memory only -- it
+    /// does not survive a restart, matching Go. PLAN-36 TASK-128.
     delta_cache: crate::delta_cache::DeltaCache,
 
     /// Optional per-transaction-group state-delta tracer backing the
@@ -2786,6 +2789,17 @@ impl SqliteLedger {
     pub fn set_lru_cache_disabled(&mut self, disabled: bool) {
         self.lru_cache_disabled = disabled;
         self.apply_trie_cache_target();
+    }
+
+    /// Override the in-memory delta-cache retention window — go's
+    /// `MaxAcctLookback` (`config.Local`, issue #755). `open`/
+    /// `open_in_memory` already start at
+    /// [`crate::delta_cache::DEFAULT_WINDOW_SIZE`] (4 rounds, go's real
+    /// default), so this is a no-op unless the operator's `config.json`
+    /// overrides it. Applies lazily on the next cache insert/advance, same
+    /// as [`Self::set_lru_cache_disabled`]'s trie-cache application.
+    pub fn set_delta_cache_window(&mut self, window_size: usize) {
+        self.delta_cache.set_window_size(window_size);
     }
 
     /// Apply the configured `trie_cache_target` (or

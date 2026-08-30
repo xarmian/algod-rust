@@ -171,17 +171,37 @@ impl RootRouter {
     ///
     /// Returns the updated player and the list of actions.
     ///
+    /// `tracer` is go's `t *tracer` argument to `rootRouter.submitTop`
+    /// (`agreement/router.go:175`), which unconditionally calls
+    /// `t.ainTop`/`t.aoutTop` around the dispatch — driven here by
+    /// `Tracer::log_event_in`/`Tracer::log_actions`. `None` (the common
+    /// case for tests and any caller that hasn't wired up
+    /// `EnableAgreementReporting`/`EnableAgreementTimeMetrics`, issue #755)
+    /// skips tracing entirely at zero cost.
+    ///
     /// Mirrors Go's `rootRouter.submitTop`.
     pub fn submit_top(
         &mut self,
         state: Player,
         e: Event,
         params: &ConsensusParams,
+        tracer: Option<&mut crate::player::Tracer>,
     ) -> (Player, Vec<Action>) {
         self.update(&state, Round(0), true);
         let mut player = state;
-        let actions = player.handle(self, e, params);
-        (player, actions)
+        if let Some(t) = tracer {
+            t.log_event_in(
+                StateMachineTag::Demultiplexer,
+                StateMachineTag::PlayerMachine,
+                &e,
+            );
+            let actions = player.handle(self, e, params);
+            t.log_actions(&actions);
+            (player, actions)
+        } else {
+            let actions = player.handle(self, e, params);
+            (player, actions)
+        }
     }
 
     /// Dispatch an event to the appropriate state machine at this level.
@@ -870,9 +890,37 @@ mod tests {
         let params = test_params();
 
         let (new_player, actions) =
-            router.submit_top(player, crate::events::Event::default(), &params);
+            router.submit_top(player, crate::events::Event::default(), &params, None);
         assert!(actions.is_empty());
         assert_eq!(new_player.round, Round(0));
+    }
+
+    /// Issue #755: `EnableAgreementReporting`/`EnableAgreementTimeMetrics`
+    /// are wired into a real `Tracer` (`Tracer::new`), and `submit_top` is
+    /// where that tracer observes every event dispatched to the player --
+    /// mirroring go's `rootRouter.submitTop(t *tracer, ...)` calling
+    /// `t.ainTop`/`t.aoutTop` unconditionally (`agreement/router.go:175-188`).
+    /// A caller that supplies a tracer must see it actually invoked, not
+    /// silently ignored.
+    #[test]
+    fn root_router_submit_top_drives_supplied_tracer() {
+        let mut router = RootRouter::default();
+        let player = Player::default();
+        let params = test_params();
+        let mut tracer = crate::player::Tracer::new(true, true);
+        assert_eq!(tracer.seq, 0);
+
+        let (_new_player, _actions) = router.submit_top(
+            player,
+            crate::events::Event::default(),
+            &params,
+            Some(&mut tracer),
+        );
+
+        assert!(
+            tracer.seq > 0,
+            "submit_top must drive the supplied tracer's log_event_in"
+        );
     }
 
     #[test]

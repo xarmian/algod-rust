@@ -682,6 +682,82 @@ static ENABLE_PROCESS_BLOCK_STATS: VersionedDefault<bool> = VersionedDefault::ne
 /// **Documented no-op** — see the module-level note above.
 static MAX_BLOCK_HISTORY_LOOKBACK: VersionedDefault<u64> = VersionedDefault::new(&[(31, || 0)]);
 
+// --- Agreement-protocol fields (issue #755) ---------------------------------
+//
+// Scope decisions recorded here (see issue #755's PR description for the
+// full write-up):
+//
+// - `AgreementIncomingVotesQueueLength`/`...ProposalsQueueLength`/
+//   `...BundlesQueueLength` are wired into
+//   `algo_network::AgreementNetworkConfig` (`vote_queue_len`/
+//   `proposal_queue_len`/`bundle_queue_len`), which sizes the bounded
+//   channels `AgreementNetworkBridge` uses to buffer incoming gossip
+//   messages by tag. This also **fixes a real stale-default bug**: the
+//   proposal/bundle constants in `algo-network` were still go's pre-v27
+//   values (25/7) even though go bumped both at version 27 (to 50/15) --
+//   see `crates/node/algo-network/src/agreement_network.rs`'s
+//   `DEFAULT_PROPOSAL_QUEUE_LEN`/`DEFAULT_BUNDLE_QUEUE_LEN`.
+// - `MaxAcctLookback` is wired into `SqliteLedger::set_delta_cache_window`
+//   (issue #755 **also fixes a real behavioral-divergence bug**: the
+//   ledger's actual in-memory delta-cache window,
+//   `crate::delta_cache::DEFAULT_WINDOW_SIZE`, was hardcoded to 320 rounds
+//   -- 80x go's real `MaxAcctLookback` default of 4
+//   (`ledger/acctupdates.go:294`). Investigated and found no algod-rust
+//   architectural reason for 320: it does not correspond to any other
+//   consensus constant this crate needs a 320-round window for (the
+//   *unrelated* balance/seed lookback constant that happens to also equal
+//   320, `BALANCE_LOOKBACK` in `algo-ledger/src/apply.rs`, governs online
+//   participation/stake accounting, not delta-cache retention). The
+//   constant is now go-matching (4) and independently configurable.
+// - `EnableAgreementReporting`/`EnableAgreementTimeMetrics` are wired into
+//   `algo_agreement::Tracer::new` via `Service::with_tracer`, constructed
+//   from these two config bools at agreement-service startup
+//   (`bin/algod-rust/src/commands/participate.rs`). The tracer's
+//   `log_event_in`/`log_actions` calls are invoked from
+//   `RootRouter::submit_top` (mirroring go's `rootRouter.submitTop`
+//   calling `t.ainTop`/`t.aoutTop` at the same dispatch point,
+//   `agreement/router.go:175-188`) -- a single, low-risk call site rather
+//   than threading a tracer parameter through every internal dispatch
+//   function in the state-machine tree.
+
+/// Go: `AgreementIncomingVotesQueueLength uint64` `version[21]:"10000"
+/// version[27]:"20000"` (`localTemplate.go:554-555`). Wired into
+/// `algo_network::AgreementNetworkConfig::vote_queue_len`.
+static AGREEMENT_INCOMING_VOTES_QUEUE_LENGTH: VersionedDefault<u64> =
+    VersionedDefault::new(&[(21, || 10_000), (27, || 20_000)]);
+
+/// Go: `AgreementIncomingProposalsQueueLength uint64` `version[21]:"25"
+/// version[27]:"50"` (`localTemplate.go:557-558`). Wired into
+/// `algo_network::AgreementNetworkConfig::proposal_queue_len`. See the
+/// module-level note above -- algod-rust's own constant for this was stale
+/// at the pre-v27 value before this issue.
+static AGREEMENT_INCOMING_PROPOSALS_QUEUE_LENGTH: VersionedDefault<u64> =
+    VersionedDefault::new(&[(21, || 25), (27, || 50)]);
+
+/// Go: `AgreementIncomingBundlesQueueLength uint64` `version[21]:"7"
+/// version[27]:"15"` (`localTemplate.go:560-561`). Wired into
+/// `algo_network::AgreementNetworkConfig::bundle_queue_len`. See the
+/// module-level note above -- algod-rust's own constant for this was stale
+/// at the pre-v27 value before this issue.
+static AGREEMENT_INCOMING_BUNDLES_QUEUE_LENGTH: VersionedDefault<u64> =
+    VersionedDefault::new(&[(21, || 7), (27, || 15)]);
+
+/// Go: `MaxAcctLookback uint64` `version[23]:"4"` (`localTemplate.go:563-565`).
+/// Wired into `SqliteLedger::set_delta_cache_window`. **Fixes a real
+/// behavioral divergence** -- see the module-level note above.
+static MAX_ACCT_LOOKBACK: VersionedDefault<u64> = VersionedDefault::new(&[(23, || 4)]);
+
+/// Go: `EnableAgreementReporting bool` `version[3]:"false"`
+/// (`localTemplate.go:219-220`). Wired into `Tracer::new`'s first argument
+/// via `Service::with_tracer` -- see the module-level note above.
+static ENABLE_AGREEMENT_REPORTING: VersionedDefault<bool> = VersionedDefault::new(&[(3, || false)]);
+
+/// Go: `EnableAgreementTimeMetrics bool` `version[3]:"false"`
+/// (`localTemplate.go:222-223`). Wired into `Tracer::new`'s second argument
+/// via `Service::with_tracer` -- see the module-level note above.
+static ENABLE_AGREEMENT_TIME_METRICS: VersionedDefault<bool> =
+    VersionedDefault::new(&[(3, || false)]);
+
 fn default_version() -> u32 {
     // Mirrors go's explicit `c.Version = 0 // Reset to 0 so we get the
     // version from the loaded file` (config.go:124) — a `version` key
@@ -859,6 +935,24 @@ fn default_enable_process_block_stats() -> bool {
 }
 fn default_max_block_history_lookback() -> u64 {
     MAX_BLOCK_HISTORY_LOOKBACK.at(LATEST_VERSION)
+}
+fn default_agreement_incoming_votes_queue_length() -> u64 {
+    AGREEMENT_INCOMING_VOTES_QUEUE_LENGTH.at(LATEST_VERSION)
+}
+fn default_agreement_incoming_proposals_queue_length() -> u64 {
+    AGREEMENT_INCOMING_PROPOSALS_QUEUE_LENGTH.at(LATEST_VERSION)
+}
+fn default_agreement_incoming_bundles_queue_length() -> u64 {
+    AGREEMENT_INCOMING_BUNDLES_QUEUE_LENGTH.at(LATEST_VERSION)
+}
+fn default_max_acct_lookback() -> u64 {
+    MAX_ACCT_LOOKBACK.at(LATEST_VERSION)
+}
+fn default_enable_agreement_reporting() -> bool {
+    ENABLE_AGREEMENT_REPORTING.at(LATEST_VERSION)
+}
+fn default_enable_agreement_time_metrics() -> bool {
+    ENABLE_AGREEMENT_TIME_METRICS.at(LATEST_VERSION)
 }
 
 /// `config.Local`-equivalent node configuration, loaded from `config.json`
@@ -1328,6 +1422,61 @@ pub struct Local {
         default = "default_max_block_history_lookback"
     )]
     pub max_block_history_lookback: u64,
+
+    /// Go: `AgreementIncomingVotesQueueLength`. Wired into
+    /// `algo_network::AgreementNetworkConfig::vote_queue_len` (issue #755)
+    /// — see [`AGREEMENT_INCOMING_VOTES_QUEUE_LENGTH`]'s doc comment.
+    #[serde(
+        rename = "AgreementIncomingVotesQueueLength",
+        default = "default_agreement_incoming_votes_queue_length"
+    )]
+    pub agreement_incoming_votes_queue_length: u64,
+
+    /// Go: `AgreementIncomingProposalsQueueLength`. Wired into
+    /// `algo_network::AgreementNetworkConfig::proposal_queue_len` (issue
+    /// #755) — **fixes a real stale-default bug**, see
+    /// [`AGREEMENT_INCOMING_PROPOSALS_QUEUE_LENGTH`]'s doc comment.
+    #[serde(
+        rename = "AgreementIncomingProposalsQueueLength",
+        default = "default_agreement_incoming_proposals_queue_length"
+    )]
+    pub agreement_incoming_proposals_queue_length: u64,
+
+    /// Go: `AgreementIncomingBundlesQueueLength`. Wired into
+    /// `algo_network::AgreementNetworkConfig::bundle_queue_len` (issue
+    /// #755) — **fixes a real stale-default bug**, see
+    /// [`AGREEMENT_INCOMING_BUNDLES_QUEUE_LENGTH`]'s doc comment.
+    #[serde(
+        rename = "AgreementIncomingBundlesQueueLength",
+        default = "default_agreement_incoming_bundles_queue_length"
+    )]
+    pub agreement_incoming_bundles_queue_length: u64,
+
+    /// Go: `MaxAcctLookback`. Wired into
+    /// `SqliteLedger::set_delta_cache_window` (issue #755) — **fixes a
+    /// real behavioral-divergence bug** (algod-rust's delta-cache window
+    /// was hardcoded 80x too large), see [`MAX_ACCT_LOOKBACK`]'s doc
+    /// comment.
+    #[serde(rename = "MaxAcctLookback", default = "default_max_acct_lookback")]
+    pub max_acct_lookback: u64,
+
+    /// Go: `EnableAgreementReporting`. Wired into `Tracer::new`'s first
+    /// argument via `Service::with_tracer` (issue #755) — see
+    /// [`ENABLE_AGREEMENT_REPORTING`]'s doc comment.
+    #[serde(
+        rename = "EnableAgreementReporting",
+        default = "default_enable_agreement_reporting"
+    )]
+    pub enable_agreement_reporting: bool,
+
+    /// Go: `EnableAgreementTimeMetrics`. Wired into `Tracer::new`'s second
+    /// argument via `Service::with_tracer` (issue #755) — see
+    /// [`ENABLE_AGREEMENT_TIME_METRICS`]'s doc comment.
+    #[serde(
+        rename = "EnableAgreementTimeMetrics",
+        default = "default_enable_agreement_time_metrics"
+    )]
+    pub enable_agreement_time_metrics: bool,
 }
 
 impl Default for Local {
@@ -1407,6 +1556,15 @@ impl Local {
             enable_assemble_stats: ENABLE_ASSEMBLE_STATS.at(version),
             enable_process_block_stats: ENABLE_PROCESS_BLOCK_STATS.at(version),
             max_block_history_lookback: MAX_BLOCK_HISTORY_LOOKBACK.at(version),
+            agreement_incoming_votes_queue_length: AGREEMENT_INCOMING_VOTES_QUEUE_LENGTH
+                .at(version),
+            agreement_incoming_proposals_queue_length: AGREEMENT_INCOMING_PROPOSALS_QUEUE_LENGTH
+                .at(version),
+            agreement_incoming_bundles_queue_length: AGREEMENT_INCOMING_BUNDLES_QUEUE_LENGTH
+                .at(version),
+            max_acct_lookback: MAX_ACCT_LOOKBACK.at(version),
+            enable_agreement_reporting: ENABLE_AGREEMENT_REPORTING.at(version),
+            enable_agreement_time_metrics: ENABLE_AGREEMENT_TIME_METRICS.at(version),
         }
     }
 
@@ -1720,6 +1878,37 @@ impl Local {
                 cur,
                 next,
             );
+            migrate_field(
+                &mut self.agreement_incoming_votes_queue_length,
+                &AGREEMENT_INCOMING_VOTES_QUEUE_LENGTH,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.agreement_incoming_proposals_queue_length,
+                &AGREEMENT_INCOMING_PROPOSALS_QUEUE_LENGTH,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.agreement_incoming_bundles_queue_length,
+                &AGREEMENT_INCOMING_BUNDLES_QUEUE_LENGTH,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.max_acct_lookback, &MAX_ACCT_LOOKBACK, cur, next);
+            migrate_field(
+                &mut self.enable_agreement_reporting,
+                &ENABLE_AGREEMENT_REPORTING,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_agreement_time_metrics,
+                &ENABLE_AGREEMENT_TIME_METRICS,
+                cur,
+                next,
+            );
             self.version = next;
         }
         Ok(())
@@ -1975,6 +2164,12 @@ mod tests {
         assert!(!d.enable_assemble_stats);
         assert!(!d.enable_process_block_stats);
         assert_eq!(d.max_block_history_lookback, 0);
+        assert_eq!(d.agreement_incoming_votes_queue_length, 20_000);
+        assert_eq!(d.agreement_incoming_proposals_queue_length, 50);
+        assert_eq!(d.agreement_incoming_bundles_queue_length, 15);
+        assert_eq!(d.max_acct_lookback, 4);
+        assert!(!d.enable_agreement_reporting);
+        assert!(!d.enable_agreement_time_metrics);
     }
 
     // --- Catchup/sync fields (issue #753) --------------------------------
@@ -2046,6 +2241,78 @@ mod tests {
             cfg.catchup_parallel_blocks, 16,
             "an untouched field migrates forward to the new default"
         );
+    }
+
+    // --- Agreement-protocol fields (issue #755) --------------------------
+
+    #[test]
+    fn agreement_queue_lengths_default_to_v27_plus_values_and_overlay() {
+        // go's `AgreementIncomingVotesQueueLength`/`...ProposalsQueueLength`/
+        // `...BundlesQueueLength` bumped at version 27 to 20000/50/15
+        // (`config/localTemplate.go`). At `LATEST_VERSION` (35) the
+        // materialized default must be the v27+ value, not the stale
+        // pre-v27 one (10000/25/7).
+        let d = Local::default();
+        assert_eq!(d.agreement_incoming_votes_queue_length, 20_000);
+        assert_eq!(d.agreement_incoming_proposals_queue_length, 50);
+        assert_eq!(d.agreement_incoming_bundles_queue_length, 15);
+
+        let cfg = Local::load_from_str(
+            r#"{"AgreementIncomingVotesQueueLength": 1000, "AgreementIncomingProposalsQueueLength": 5, "AgreementIncomingBundlesQueueLength": 2}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.agreement_incoming_votes_queue_length, 1000);
+        assert_eq!(cfg.agreement_incoming_proposals_queue_length, 5);
+        assert_eq!(cfg.agreement_incoming_bundles_queue_length, 2);
+    }
+
+    #[test]
+    fn agreement_queue_lengths_explicit_override_survives_migration() {
+        // A config pinned at version 21 (pre-bump) that never touched the
+        // field must migrate forward to the v27+ default; one that
+        // explicitly set the pre-bump value must keep it unchanged.
+        let cfg = Local::load_from_str(r#"{"Version": 21}"#).expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.agreement_incoming_votes_queue_length, 20_000);
+        assert_eq!(cfg.agreement_incoming_proposals_queue_length, 50);
+        assert_eq!(cfg.agreement_incoming_bundles_queue_length, 15);
+
+        let cfg =
+            Local::load_from_str(r#"{"Version": 21, "AgreementIncomingProposalsQueueLength": 99}"#)
+                .expect("parses");
+        assert_eq!(
+            cfg.agreement_incoming_proposals_queue_length, 99,
+            "explicit override must survive migration"
+        );
+    }
+
+    #[test]
+    fn max_acct_lookback_defaults_to_go_value_of_4_and_overlays() {
+        // Issue #755: algod-rust's actual in-memory delta-cache window
+        // (`DeltaCache::DEFAULT_WINDOW_SIZE`) was hardcoded to 320 rounds,
+        // 80x go's real `MaxAcctLookback` default of 4
+        // (`config/localTemplate.go:563-565`, consumed at
+        // `ledger/acctupdates.go:294`). This field now carries the correct
+        // go-matching default and is a real configurable knob.
+        assert_eq!(Local::default().max_acct_lookback, 4);
+        let cfg = Local::load_from_str(r#"{"MaxAcctLookback": 64}"#).expect("parses");
+        assert_eq!(cfg.max_acct_lookback, 64);
+    }
+
+    #[test]
+    fn enable_agreement_reporting_and_time_metrics_default_false_and_overlay() {
+        // go: `EnableAgreementReporting`/`EnableAgreementTimeMetrics bool`
+        // `version[3]:"false"` (`config/localTemplate.go:219-223`).
+        let d = Local::default();
+        assert!(!d.enable_agreement_reporting);
+        assert!(!d.enable_agreement_time_metrics);
+
+        let cfg = Local::load_from_str(
+            r#"{"EnableAgreementReporting": true, "EnableAgreementTimeMetrics": true}"#,
+        )
+        .expect("parses");
+        assert!(cfg.enable_agreement_reporting);
+        assert!(cfg.enable_agreement_time_metrics);
     }
 
     // --- REST/API fields (issue #751) -----------------------------------

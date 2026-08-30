@@ -28,7 +28,18 @@ use std::collections::HashMap;
 use crate::state_delta::StateDelta;
 
 /// Default number of rounds to keep in the in-memory cache.
-pub const DEFAULT_WINDOW_SIZE: usize = 320;
+///
+/// Matches go-algorand's `config.Local.MaxAcctLookback` default (4 rounds,
+/// `config/localTemplate.go:563-565`, consumed by `accountUpdates.deltas`
+/// at `ledger/acctupdates.go:294`). Issue #755: this was previously
+/// hardcoded to 320 -- 80x go's real default and not derived from any
+/// go-algorand constant (the *unrelated* consensus balance/seed-lookback
+/// constant that also happens to equal 320,
+/// `algo_ledger::apply::BALANCE_LOOKBACK`, governs online-participation
+/// accounting, not delta-cache retention). Configurable via
+/// `algo_config::Local::max_acct_lookback` /
+/// `SqliteLedger::set_delta_cache_window`.
+pub const DEFAULT_WINDOW_SIZE: usize = 4;
 
 /// In-memory rolling window cache for recent round deltas.
 pub struct DeltaCache {
@@ -108,6 +119,21 @@ impl DeltaCache {
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
+
+    /// Change the retained window size (`config.Local.MaxAcctLookback`,
+    /// issue #755). Takes effect on the next [`insert`](Self::insert) /
+    /// [`advance`](Self::advance) call -- existing cached entries older
+    /// than the new, possibly smaller window are evicted then, not
+    /// immediately, matching how `set_lru_cache_disabled` /
+    /// `set_trie_cache_target` apply lazily elsewhere in `SqliteLedger`.
+    pub fn set_window_size(&mut self, window_size: usize) {
+        self.window_size = window_size;
+    }
+
+    /// The currently configured window size.
+    pub fn window_size(&self) -> usize {
+        self.window_size
+    }
 }
 
 #[cfg(test)]
@@ -161,5 +187,31 @@ mod tests {
         let cache = DeltaCache::with_default_window();
         assert_eq!(cache.window_size, DEFAULT_WINDOW_SIZE);
         assert!(cache.is_empty());
+    }
+
+    /// Issue #755: `DEFAULT_WINDOW_SIZE` must match go-algorand's real
+    /// `MaxAcctLookback` default of 4 rounds
+    /// (`config/localTemplate.go:563-565`), not the previous hardcoded 320
+    /// (which was 80x too large and did not correspond to any go-algorand
+    /// constant governing delta-cache retention).
+    #[test]
+    fn default_window_size_matches_go_max_acct_lookback() {
+        assert_eq!(DEFAULT_WINDOW_SIZE, 4);
+    }
+
+    #[test]
+    fn set_window_size_changes_future_eviction_but_not_existing_entries() {
+        let mut cache = DeltaCache::with_default_window();
+        cache.insert(0, StateDelta::default());
+        assert_eq!(cache.window_size(), DEFAULT_WINDOW_SIZE);
+
+        // Shrinking the window doesn't retroactively evict until the next
+        // insert/advance.
+        cache.set_window_size(1);
+        assert!(cache.get(0).is_some());
+
+        // The next advance applies the new, smaller window.
+        cache.advance(1);
+        assert!(cache.get(0).is_none());
     }
 }

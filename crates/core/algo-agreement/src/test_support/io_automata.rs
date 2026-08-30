@@ -175,8 +175,9 @@ impl IoAutomataConcretePlayer {
         let player = std::mem::take(&mut self.player);
         let router = &mut self.router;
         let params = &self.params;
-        let actions_result =
-            catch_unwind(AssertUnwindSafe(|| router.submit_top(player, e, params)));
+        let actions_result = catch_unwind(AssertUnwindSafe(|| {
+            router.submit_top(player, e, params, None)
+        }));
 
         match actions_result {
             Ok((player, actions)) => {
