@@ -3386,9 +3386,9 @@ pub async fn run(
     // `TxSyncServeResponseSize` are threaded from `node_config` here rather
     // than left at `TxSyncerConfig::default()`. Note this doesn't yet drive
     // a running sync loop: `algo_network::TxSyncer::start` is never invoked
-    // anywhere in this binary today (a separate, real gap — see issue
-    // #753's PR description) — only `seen_cache_size` is read below, for an
-    // unrelated seen-tx dedup cache.
+    // anywhere in this binary today — a separate, real gap tracked by
+    // issue #774 — only `seen_cache_size` is read below, for an unrelated
+    // seen-tx dedup cache.
     let tx_syncer_config = algo_network::TxSyncerConfig {
         sync_timeout: std::time::Duration::from_secs(
             node_config.tx_sync_timeout_seconds.max(0) as u64

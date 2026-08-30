@@ -29,7 +29,8 @@
 //! specifically the `syncCert` / `fetchRound` path that handles certificate-
 //! driven single-block fetches.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -468,7 +469,7 @@ impl CatchupService {
         // failure/stop condition is found — either a worker discovering an
         // unsupported round, or the main thread's validation loop below.
         let next_to_fetch = Arc::new(AtomicU64::new(start_round.0));
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
         // A zero-capacity (rendezvous) channel: a worker's `send` only
         // completes once the main loop below is actively receiving, so a
         // worker can be at most one completed-but-unconsumed fetch ahead of
@@ -515,8 +516,7 @@ impl CatchupService {
         // worker has exited (each worker holds its own clone until then).
         drop(result_tx);
 
-        let mut buffer: std::collections::BTreeMap<u64, FetchOutcome> =
-            std::collections::BTreeMap::new();
+        let mut buffer: BTreeMap<u64, FetchOutcome> = BTreeMap::new();
         let mut next_apply = start_round.0;
         let mut fetched = 0u64;
         // Once `true`, the main loop below only drains the channel (never
