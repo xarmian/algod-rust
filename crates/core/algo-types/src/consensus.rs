@@ -724,7 +724,30 @@ impl Default for ConsensusParams {
 /// exactly mirroring go-algorand's `initConsensusProtocols()`.
 ///
 /// Returns `None` for unknown protocol versions.
+///
+/// # Consensus.json overrides (issue #762)
+///
+/// Before anything else, this consults the process-global override registry
+/// populated (at most once, at startup) by [`install_consensus_overrides`].
+/// A version present in that registry wins wholesale -- `Some(params)` for a
+/// version a loaded `consensus.json` replaced or added, `None` for one it
+/// deleted -- exactly mirroring go-algorand's single mutable package-level
+/// `config.Consensus` map, which every caller of `config.Consensus[version]`
+/// transparently observes once `LoadConfigurableConsensusProtocols` has run.
+///
+/// When the registry has never been installed (the default for the
+/// overwhelming majority of this workspace's tests, tools, and any code path
+/// that never goes through `bin/algod-rust`'s real startup), or for any
+/// version the loaded overrides never touched, this falls through to the
+/// exact same compile-time computation below as before this feature
+/// existed -- zero behavior change.
 pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
+    if let Some(overrides) = CONSENSUS_OVERRIDES.get() {
+        if let Some(entry) = overrides.get(version) {
+            return entry.clone();
+        }
+    }
+
     // Build the v7 base and walk forward to find the right version.
     // This mirrors go-algorand's initConsensusProtocols exactly.
 
@@ -1830,6 +1853,88 @@ pub fn built_in_consensus_protocols() -> HashMap<String, ConsensusParams> {
             consensus_params_for_version(version).map(|params| (version.to_string(), params))
         })
         .collect()
+}
+
+/// Process-global, write-once-at-startup consensus-parameter override
+/// registry (issue #762). A fixed `HashMap<String, ConsensusParams>` (the
+/// full merged table `preload_configurable_consensus_protocols` already
+/// produces) is deliberately *not* what's stored here: instead this stores
+/// only the *diff* against the compile-time built-in table --
+/// `Some(params)` for a version an override replaces or newly adds, `None`
+/// for a version an override deletes (mirroring
+/// [`merge_consensus_protocols`]'s "absent `ApprovedUpgrades` deletes the
+/// version" semantics: it becomes unknown, not silently falls back to its
+/// old built-in definition).
+///
+/// Storing only the diff -- rather than the whole merged table -- means a
+/// version the loaded `consensus.json` never mentions is completely
+/// unaffected by installing this registry: [`consensus_params_for_version`]
+/// only ever consults this map for a version key present in it, falling
+/// through to the ordinary compile-time computation for everything else.
+/// This is what keeps the "before this global is populated... zero behavior
+/// change" invariant honest even *after* population, for every version a
+/// custom `consensus.json` didn't touch -- which is the common case (a
+/// private network typically overrides only its current protocol version).
+static CONSENSUS_OVERRIDES: std::sync::OnceLock<HashMap<String, Option<ConsensusParams>>> =
+    std::sync::OnceLock::new();
+
+/// Install this node's consensus-parameter overrides -- loaded from
+/// `<data_dir>/consensus.json` at startup and merged onto the built-in table
+/// by [`preload_configurable_consensus_protocols`] -- as the process-global
+/// source [`consensus_params_for_version`] consults before falling back to
+/// the compile-time built-in table. This is what threads a custom
+/// `consensus.json` through all ~57 call sites of
+/// `consensus_params_for_version` across ledger apply, AVM evaluation,
+/// agreement/committee logic, REST API handlers, and simulation (issue
+/// #762) -- every one of them already calls that single function, so fixing
+/// it here is enough; no call site itself needs to change.
+///
+/// `merged` is exactly the return value of
+/// [`preload_configurable_consensus_protocols`] (or, equivalently,
+/// [`merge_consensus_protocols`]'s output): the built-in table with any
+/// loaded overrides already merged on top. This function diffs `merged`
+/// against a *fresh* [`built_in_consensus_protocols`] call to recover which
+/// versions the load actually touched (replaced, added, or deleted) --
+/// reusing `merge_consensus_protocols`'s already-correct wholesale-replace/
+/// delete/dangling-`approved_upgrade`-pruning semantics rather than
+/// re-implementing them, and (critically) so that a version the override
+/// never mentions is not re-recorded here at all, leaving
+/// [`consensus_params_for_version`] behaviorally untouched for it.
+///
+/// # Write-once / thread-safety
+///
+/// Must be called at most once, early in `bin/algod-rust`'s single startup
+/// thread, strictly before any ledger/AVM/agreement consensus-evaluation
+/// logic runs on any thread. A second call (e.g. an accidental double
+/// invocation) is silently ignored rather than panicking or clobbering the
+/// first: a write-once-then-read-only global must never partially change an
+/// already-running node's view of consensus parameters mid-flight, and a
+/// silent second-call no-op is safer for a consensus-critical global than a
+/// panic that would take the whole node down over what is, at worst, a
+/// harmless redundant call. `OnceLock` guarantees the read side
+/// ([`consensus_params_for_version`]) never observes a partially-written
+/// map from any thread, without needing a lock on the read path.
+pub fn install_consensus_overrides(merged: &HashMap<String, ConsensusParams>) {
+    // Computed before any lookup could possibly observe a partially-applied
+    // registry (`CONSENSUS_OVERRIDES` is not yet set while this runs), so
+    // every `consensus_params_for_version` call `built_in_consensus_protocols`
+    // makes here still resolves purely from the compile-time table.
+    let built_in = built_in_consensus_protocols();
+
+    let mut diff: HashMap<String, Option<ConsensusParams>> = HashMap::new();
+    for (version, params) in merged {
+        if built_in.get(version) != Some(params) {
+            diff.insert(version.clone(), Some(params.clone()));
+        }
+    }
+    for version in built_in.keys() {
+        if !merged.contains_key(version) {
+            diff.insert(version.clone(), None);
+        }
+    }
+
+    // Ignore the error (registry already installed): see write-once note above.
+    let _ = CONSENSUS_OVERRIDES.set(diff);
 }
 
 /// Merge configurable `consensus.json` overrides onto a base consensus

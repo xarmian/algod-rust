@@ -188,20 +188,27 @@ async fn run_start(
     // built-in consensus table (issue #750; Go:
     // `PreloadConfigurableConsensusProtocols`, `config/config.go`). A missing
     // file falls back to the built-in table unchanged; a malformed file is a
-    // real startup error rather than being silently ignored. This is the
-    // node's "active protocol version" consensus-parameter resolution point
-    // (the genesis protocol) -- the other ~57 call sites of
-    // `consensus_params_for_version` throughout ledger/AVM/agreement remain
-    // on the compile-time built-in table only; threading operator overrides
-    // through every one of them is a materially larger architectural change
-    // (go's own design keeps a single mutable package-level `Consensus` map
-    // read everywhere) tracked separately rather than folded into this
-    // startup wiring.
+    // real startup error rather than being silently ignored.
+    //
+    // Installing the merge result via `install_consensus_overrides` (issue
+    // #762) makes `consensus_params_for_version` itself override-aware, so
+    // every one of its ~57 call sites throughout ledger apply, AVM
+    // evaluation, agreement/committee logic, REST API handlers, and
+    // simulation transparently observes these overrides from this point
+    // onward -- mirroring go-algorand's single mutable package-level
+    // `config.Consensus` map, which every `config.Consensus[version]` caller
+    // sees update the instant `LoadConfigurableConsensusProtocols` runs. This
+    // call happens once, here, on the node's single startup thread, strictly
+    // before the ledger/participation/agreement machinery constructed below
+    // ever evaluates a transaction or block -- see
+    // `install_consensus_overrides`'s doc comment for the write-once /
+    // thread-safety contract this relies on.
     let consensus_overrides_path =
         data_dir.join(algo_types::consensus::CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
     let consensus_protocols =
         algo_types::consensus::preload_configurable_consensus_protocols(data_dir)
             .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
+    algo_types::consensus::install_consensus_overrides(&consensus_protocols);
     if consensus_overrides_path.exists() {
         info!(path = %consensus_overrides_path.display(), "loaded consensus-parameter overrides");
     }
