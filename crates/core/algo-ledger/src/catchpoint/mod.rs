@@ -42,6 +42,6 @@ pub use verify::{
     CatchpointVerifyResult, ValidationWarning, MAX_TXN_LIFE,
 };
 pub use writer::{
-    export_catchpoint_file, ExportOptions, ExportResult, BALANCES_PER_CATCHPOINT_FILE_CHUNK,
-    RESOURCES_PER_CATCHPOINT_FILE_CHUNK,
+    export_catchpoint_file, select_catchpoint_file_version, ExportOptions, ExportResult,
+    BALANCES_PER_CATCHPOINT_FILE_CHUNK, RESOURCES_PER_CATCHPOINT_FILE_CHUNK,
 };

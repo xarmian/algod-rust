@@ -43,7 +43,8 @@ use std::path::Path;
 use flate2::read::GzDecoder;
 
 use super::types::{
-    CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6, CATCHPOINT_FILE_VERSION_V8,
+    CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6, CATCHPOINT_FILE_VERSION_V7,
+    CATCHPOINT_FILE_VERSION_V8,
 };
 
 // ---------------------------------------------------------------------------
@@ -342,9 +343,16 @@ fn process_entry<R: Read>(
         let header: CatchpointFileHeader = rmp_serde::from_slice(&data)
             .map_err(|e| CatchpointError::DecodeError(format!("header msgpack: {e}")))?;
 
-        // Intentionally only V8 (current go-algorand format) is supported.
-        // V6/V7 support could be added later if needed for historical catchpoints.
-        if header.version != CATCHPOINT_FILE_VERSION_V8 {
+        // V7 and V8 (current go-algorand formats) are supported: this
+        // crate's chunk/SP-verification handling is driven entirely by
+        // which tar entries are actually present, not by the header version
+        // field, so a V7 file (no online-accounts entries) parses the same
+        // way a V8 file with `include_online_data: false` already does
+        // (issue #752). V5/V6 (no SP-verification entry at all) are not
+        // supported -- see `writer::select_catchpoint_file_version`'s doc.
+        if header.version != CATCHPOINT_FILE_VERSION_V7
+            && header.version != CATCHPOINT_FILE_VERSION_V8
+        {
             return Err(CatchpointError::UnsupportedVersion(header.version));
         }
 

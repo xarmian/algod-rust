@@ -145,13 +145,15 @@ pub struct MultisigSignProgramArgs {
     /// Use legacy multisig (`Msig`) rather than the LogicSig multisig field
     /// (`LMsig`) (Go `--legacy-msig`).
     ///
-    /// NOTE vs Go: Go auto-detects this from the node's consensus params
-    /// (`!LogicSigLMsig`) when the flag is omitted. goal-rust does NOT — the
-    /// Rust consensus-param table (`algo_types::ConsensusParams`) doesn't model
-    /// the `LogicSigLMsig` gate, so there's nothing to detect client-side.
-    /// goal-rust therefore defaults to the modern `LMsig` field; pass
-    /// `--legacy-msig` to force the legacy `Msig` field (required on protocols
-    /// before LMsig was enabled).
+    /// NOTE vs Go: Go auto-detects this from the *live node's* current
+    /// consensus params (`!LogicSigLMsig`) when the flag is omitted.
+    /// goal-rust does NOT: `algo_types::ConsensusParams` models
+    /// `logic_sig_lmsig`/`logic_sig_msig` (issue #752), but this is an
+    /// offline signing command with no node connection and no consensus
+    /// version to look the flag up under, so there's nothing to detect
+    /// client-side. goal-rust therefore defaults to the modern `LMsig`
+    /// field; pass `--legacy-msig` to force the legacy `Msig` field
+    /// (required on protocols before v41's `LogicSigLMsig` activation).
     #[arg(long = "legacy-msig")]
     pub legacy_msig: bool,
     /// Wallet password (skip the prompt). goal-rust convention shared with the

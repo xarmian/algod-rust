@@ -3899,27 +3899,48 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     // gate (`data/transactions/logic/eval.go:1275-1344`),
                     // which runs unconditionally before a single opcode
                     // executes -- regardless of whether the clear-state
-                    // program ever touches a box. Under go-algorand's
-                    // `EnableBareBudgetError = true` (set at V38, current
-                    // through this repo's V42 pin and never reverted), this
-                    // failure is a bare error, not a
-                    // `logic.EvalError` -- so unlike an ordinary
+                    // program ever touches a box.
+                    //
+                    // Whether an overrun here fails the outer transaction is
+                    // gated on `EnableBareBudgetError` (v38+, issue #752),
+                    // not unconditional: when true, this is a bare error, not
+                    // a `logic.EvalError` -- so unlike an ordinary
                     // ClearState-program rejection/error, it is NOT swallowed
                     // by `ledger/apply/application.go`'s
                     // `if _, ok := evalErr.(logic.EvalError); !ok { return
-                    // evalErr }` and must fail the outer transaction, which
-                    // `?` does here.
+                    // evalErr }` and must fail the outer transaction. Before
+                    // v38, this same overrun *was* an `EvalError`, so
+                    // go's `EvalContract` returns it before a single opcode
+                    // runs (`eval.go:1334`, i.e. the ClearState program never
+                    // actually executes) and `application.go` swallows it
+                    // like any other ClearState failure -- mirrored below by
+                    // building an empty `AvmResult` instead of running the
+                    // program, exactly as `run_clear_state_program`'s own
+                    // `Err(e)` branch already does for in-program errors.
                     avm_ctx.ensure_boxes_initialized();
-                    avm_ctx.check_read_budget()?;
-                    let result = if let Some(ref mut t) = tracer {
-                        run_clear_state_program_with_tracer(
-                            &clear_program,
-                            &mut avm_ctx,
-                            &ctx.consensus,
-                            *t,
-                        )
-                    } else {
-                        run_clear_state_program(&clear_program, &mut avm_ctx, &ctx.consensus)
+                    let result = match avm_ctx.check_read_budget() {
+                        Err(e) if ctx.consensus.enable_bare_budget_error => return Err(e),
+                        Err(e) => {
+                            let mut empty = algo_avm::eval::AvmResult::empty();
+                            empty.error = Some(e.to_string());
+                            empty
+                        }
+                        Ok(()) => {
+                            if let Some(ref mut t) = tracer {
+                                run_clear_state_program_with_tracer(
+                                    &clear_program,
+                                    &mut avm_ctx,
+                                    &ctx.consensus,
+                                    *t,
+                                )
+                            } else {
+                                run_clear_state_program(
+                                    &clear_program,
+                                    &mut avm_ctx,
+                                    &ctx.consensus,
+                                )
+                            }
+                        }
                     };
                     // Export box I/O budget state back to the group-scoped
                     // carrier (issue #727) so the next top-level app call in
