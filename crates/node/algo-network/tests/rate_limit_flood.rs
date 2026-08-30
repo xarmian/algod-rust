@@ -129,6 +129,14 @@ async fn per_ip_rate_limit_rejects_rapid_redial() {
         max_connections_per_ip: 100,        // per-IP connection gate lax
         connections_rate_limiting_count: 2, // per-IP rate gate strict
         mesh_interval: Duration::from_secs(3600),
+        // This test dials the relay from 127.0.0.1 specifically to
+        // exercise the rate-limit gate — go's real
+        // `DisableLocalhostConnectionRateLimit` default (`true`, issue
+        // #768) would otherwise exempt every dial here from the rate
+        // limiter regardless of `connections_rate_limiting_count`, which
+        // is the localhost-*convenience* behavior go intends, not a bug
+        // this test should be defeated by.
+        disable_localhost_connection_rate_limit: false,
         ..Default::default()
     };
     let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));

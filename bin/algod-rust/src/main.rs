@@ -324,22 +324,59 @@ async fn main() -> anyhow::Result<()> {
             tls_key,
             mem_cap_mb,
             genesis_json,
+            data_dir,
         } => {
+            // Load `<data-dir>/config.json` (issue #768: relay previously
+            // had no `config.json` loading at all, only this command's own
+            // hardcoded CLI-flag defaults — now wired the same way
+            // `participate` was in issue #748).
+            let node_config = match data_dir.as_deref() {
+                Some(dir) => match algo_config::Local::load_from_data_dir(dir) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to load config.json; continuing with defaults"
+                        );
+                        algo_config::Local::default()
+                    }
+                },
+                None => algo_config::Local::default(),
+            };
+            let network_opts = commands::participate::NetworkOptions {
+                max_connections_per_ip: max_per_ip,
+                incoming_connections_limit: incoming_limit,
+                connections_rate_limiting_count: rate_limit,
+                connections_rate_limiting_window_seconds: rate_limit_window_seconds,
+                broadcast_connections_limit: broadcast_limit,
+                tls_cert_file: tls_cert,
+                tls_key_file: tls_key,
+            };
+            let resolved_net = network_opts.resolve(&node_config);
+            let rate_limit_window_secs = network_opts
+                .connections_rate_limiting_window_seconds
+                .unwrap_or(node_config.connections_rate_limiting_window_seconds);
+            let resolved_broadcast_limit =
+                broadcast_limit.unwrap_or(node_config.broadcast_connections_limit);
+            let resolved_mem_cap_mb =
+                mem_cap_mb.unwrap_or(node_config.block_service_mem_cap / 1_000_000);
+
             commands::relay::run(
                 &bind_address,
                 genesis_id.as_deref().unwrap_or(""),
                 &network,
                 &peers,
-                incoming_limit,
-                max_per_ip,
-                rate_limit,
-                rate_limit_window_seconds,
-                broadcast_limit,
-                tls_cert.as_deref(),
-                tls_key.as_deref(),
-                mem_cap_mb,
+                resolved_net.incoming_connections_limit,
+                resolved_net.max_connections_per_ip,
+                resolved_net.connections_rate_limiting_count,
+                rate_limit_window_secs,
+                resolved_broadcast_limit,
+                resolved_net.tls_cert_file.as_deref(),
+                resolved_net.tls_key_file.as_deref(),
+                resolved_mem_cap_mb,
                 &ledger_path,
                 genesis_json.as_deref(),
+                &node_config,
             )
             .await?;
         }

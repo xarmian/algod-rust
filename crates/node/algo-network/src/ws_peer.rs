@@ -2657,7 +2657,7 @@ mod tests {
         let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
         let last_packet_time = Arc::new(RwLock::new(Instant::now()));
 
-        let outgoing_filter = Arc::new(MessageFilter::new(1024));
+        let outgoing_filter = Arc::new(MessageFilter::new(2, 1024));
 
         let closing_clone = closing.clone();
         let _read_task = tokio::spawn(read_loop(
@@ -2714,7 +2714,7 @@ mod tests {
         let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
         let last_packet_time = Arc::new(RwLock::new(Instant::now()));
 
-        let incoming_filter = Arc::new(MessageFilter::new(1024));
+        let incoming_filter = Arc::new(MessageFilter::new(2, 1024));
 
         let closing_clone = closing.clone();
         let _read_task = tokio::spawn(read_loop(
@@ -3088,7 +3088,7 @@ mod tests {
 
         let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
 
-        let outgoing_filter = Arc::new(MessageFilter::new(1024));
+        let outgoing_filter = Arc::new(MessageFilter::new(2, 1024));
 
         // Pre-populate the outgoing filter with the digest of a large TX
         // message (>= MESSAGE_FILTER_SIZE so the outgoing filter is consulted).
@@ -3160,7 +3160,7 @@ mod tests {
 
         let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
 
-        let outgoing_filter = Arc::new(MessageFilter::new(1024));
+        let outgoing_filter = Arc::new(MessageFilter::new(2, 1024));
 
         // Add the digest for a PP message.
         let pp_payload = b"proposal-payload";

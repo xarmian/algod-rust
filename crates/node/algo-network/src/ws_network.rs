@@ -197,6 +197,43 @@ pub struct WebsocketNetworkConfig {
     /// (524,288,000), a binary-MiB approximation rather than go's literal
     /// decimal byte count).
     pub block_service_mem_cap: u64,
+
+    // -------------------------------------------------------------------
+    // Message-hash dedup filter sizing (issue #768)
+    // -------------------------------------------------------------------
+    /// Whether an incoming-message dedup filter is constructed at all
+    /// (default: `false`, matching go's `EnableIncomingMessageFilter`).
+    pub enable_incoming_message_filter: bool,
+
+    /// Number of ring buckets for the incoming-message filter (default: 5).
+    ///
+    /// Matches Go's `IncomingMessageFilterBucketCount`.
+    pub incoming_message_filter_bucket_count: usize,
+
+    /// Maximum entries per incoming-filter bucket (default: 512).
+    ///
+    /// Matches Go's `IncomingMessageFilterBucketSize`.
+    pub incoming_message_filter_bucket_size: usize,
+
+    /// Whether an outgoing-message dedup filter is constructed at all
+    /// (default: `true`, matching go's
+    /// `EnableOutgoingNetworkMessageFiltering`).
+    pub enable_outgoing_network_message_filtering: bool,
+
+    /// Number of ring buckets for the outgoing-message filter (default: 3).
+    ///
+    /// Matches Go's `OutgoingMessageFilterBucketCount`.
+    pub outgoing_message_filter_bucket_count: usize,
+
+    /// Maximum entries per outgoing-filter bucket (default: 128).
+    ///
+    /// Matches Go's `OutgoingMessageFilterBucketSize`.
+    pub outgoing_message_filter_bucket_size: usize,
+
+    /// Whether inbound connections from loopback addresses are exempted
+    /// from the per-IP connection-rate limiter (default: `true`, matching
+    /// go's `DisableLocalhostConnectionRateLimit`).
+    pub disable_localhost_connection_rate_limit: bool,
 }
 
 /// Default block-service memory cap: 500,000,000 bytes.
@@ -231,6 +268,13 @@ impl Default for WebsocketNetworkConfig {
             tls_cert_file: None,
             tls_key_file: None,
             block_service_mem_cap: DEFAULT_BLOCK_SERVICE_MEM_CAP,
+            enable_incoming_message_filter: false,
+            incoming_message_filter_bucket_count: 5,
+            incoming_message_filter_bucket_size: 512,
+            enable_outgoing_network_message_filtering: true,
+            outgoing_message_filter_bucket_count: 3,
+            outgoing_message_filter_bucket_size: 128,
+            disable_localhost_connection_rate_limit: true,
         }
     }
 }
@@ -281,8 +325,14 @@ pub struct WebsocketNetwork {
     /// Message handler dispatch.
     multiplexer: Arc<Multiplexer>,
 
-    /// Deduplication filter for incoming messages.
-    message_filter: Arc<MessageFilter>,
+    /// Deduplication filter for incoming messages. `None` when
+    /// `enable_incoming_message_filter` is off (go's default).
+    incoming_message_filter: Option<Arc<MessageFilter>>,
+
+    /// Deduplication filter for outgoing messages (`MsgDigestSkip`
+    /// tracking). `None` when `enable_outgoing_network_message_filtering`
+    /// is off.
+    outgoing_message_filter: Option<Arc<MessageFilter>>,
 
     /// Cancellation token for coordinated shutdown.
     cancel: CancellationToken,
@@ -339,15 +389,26 @@ impl WebsocketNetwork {
     /// shared phonebook.
     pub fn new(config: WebsocketNetworkConfig, phonebook: Arc<Phonebook>) -> Self {
         let node_random: u64 = rand::random();
+        let incoming_message_filter = config.enable_incoming_message_filter.then(|| {
+            Arc::new(MessageFilter::new(
+                config.incoming_message_filter_bucket_count,
+                config.incoming_message_filter_bucket_size,
+            ))
+        });
+        let outgoing_message_filter = config.enable_outgoing_network_message_filtering.then(|| {
+            Arc::new(MessageFilter::new(
+                config.outgoing_message_filter_bucket_count,
+                config.outgoing_message_filter_bucket_size,
+            ))
+        });
         Self {
             config,
             peers: Arc::new(RwLock::new(HashMap::new())),
             connecting: Mutex::new(HashSet::new()),
             phonebook,
             multiplexer: Arc::new(Multiplexer::new()),
-            message_filter: Arc::new(MessageFilter::new(
-                crate::message_filter::MESSAGE_FILTER_SIZE,
-            )),
+            incoming_message_filter,
+            outgoing_message_filter,
             cancel: CancellationToken::new(),
             mesh_update_tx: Mutex::new(None),
             pending_disconnects: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -381,9 +442,16 @@ impl WebsocketNetwork {
         &self.multiplexer
     }
 
-    /// Returns a reference to the message filter.
-    pub fn message_filter(&self) -> &Arc<MessageFilter> {
-        &self.message_filter
+    /// Returns the incoming-message dedup filter, if
+    /// `enable_incoming_message_filter` is on (go's default is off).
+    pub fn incoming_message_filter(&self) -> Option<&Arc<MessageFilter>> {
+        self.incoming_message_filter.as_ref()
+    }
+
+    /// Returns the outgoing-message dedup filter, if
+    /// `enable_outgoing_network_message_filtering` is on (go's default).
+    pub fn outgoing_message_filter(&self) -> Option<&Arc<MessageFilter>> {
+        self.outgoing_message_filter.as_ref()
     }
 
     /// Returns a reference to the connection tracker.
@@ -1604,10 +1672,18 @@ fn validate_incoming_connection(
         );
     }
 
-    // 5. Rate limit
-    if !network
-        .connection_tracker
-        .check_rate_limit(remote_ip, network.config.connections_rate_limiting_count)
+    // 5. Rate limit — go's `DisableLocalhostConnectionRateLimit`
+    // (`network/requestTracker.go:261,450`: `rateLimitedRemoteHost :=
+    // (!cfg.DisableLocalhostConnectionRateLimit) || (!isLocalhost(host))`)
+    // exempts loopback remotes from the rate limiter specifically (the
+    // per-IP *connection-count* limit above still applies to localhost —
+    // this only affects the rate-limit check).
+    let rate_limited_remote =
+        !network.config.disable_localhost_connection_rate_limit || !remote_ip.is_loopback();
+    if rate_limited_remote
+        && !network
+            .connection_tracker
+            .check_rate_limit(remote_ip, network.config.connections_rate_limiting_count)
     {
         // Undo tracking — this request will not proceed.
         network.connection_tracker.release_connection(remote_ip);
@@ -2011,9 +2087,63 @@ mod tests {
         // Phonebook should be the same Arc.
         assert!(Arc::ptr_eq(net.phonebook(), &phonebook));
 
-        // Multiplexer and message filter should be accessible.
+        // Multiplexer and message filters should be accessible. The
+        // outgoing filter is constructed by default (go's
+        // `EnableOutgoingNetworkMessageFiltering` defaults `true`); the
+        // incoming filter is not (go's `EnableIncomingMessageFilter`
+        // defaults `false`).
         let _mux = net.multiplexer();
-        let _filter = net.message_filter();
+        assert!(net.outgoing_message_filter().is_some());
+        assert!(net.incoming_message_filter().is_none());
+    }
+
+    #[test]
+    fn message_filters_sized_from_config() {
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let config = WebsocketNetworkConfig {
+            genesis_id: "test".to_string(),
+            enable_incoming_message_filter: true,
+            incoming_message_filter_bucket_count: 7,
+            incoming_message_filter_bucket_size: 3,
+            enable_outgoing_network_message_filtering: true,
+            outgoing_message_filter_bucket_count: 2,
+            outgoing_message_filter_bucket_size: 2,
+            ..Default::default()
+        };
+        let net = WebsocketNetwork::new(config, phonebook);
+
+        let incoming = net
+            .incoming_message_filter()
+            .expect("enabled incoming filter is constructed");
+        let outgoing = net
+            .outgoing_message_filter()
+            .expect("enabled outgoing filter is constructed");
+
+        // Exercise the configured (small) bucket size: inserting 3 distinct
+        // digests into a bucket capped at 2 must trigger at least one
+        // auto-rotation, evidenced by the first digest still being found
+        // (ring-preserved) while the filter keeps functioning.
+        let d1 = crate::message_filter::generate_message_digest(&Tag::Transaction, b"m1");
+        let d2 = crate::message_filter::generate_message_digest(&Tag::Transaction, b"m2");
+        assert!(!outgoing.check_digest(&d1, true, false));
+        assert!(!outgoing.check_digest(&d2, true, false));
+        assert!(outgoing.check_digest(&d1, false, false));
+
+        assert!(!incoming.check_digest(&d1, true, false));
+        assert!(incoming.check_digest(&d1, false, false));
+    }
+
+    #[test]
+    fn message_filter_disabled_by_default_config_off() {
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let config = WebsocketNetworkConfig {
+            genesis_id: "test".to_string(),
+            enable_outgoing_network_message_filtering: false,
+            ..Default::default()
+        };
+        let net = WebsocketNetwork::new(config, phonebook);
+        assert!(net.incoming_message_filter().is_none());
+        assert!(net.outgoing_message_filter().is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -2275,6 +2405,68 @@ mod tests {
         // Rejected path releases the active count, but the rate-limit
         // timestamps are not removed, ensuring the rate window is enforced.
         assert_eq!(net.connection_tracker.active_count(ip), 3);
+    }
+
+    #[test]
+    fn validate_incoming_localhost_exempt_from_rate_limit_by_default() {
+        // go's `DisableLocalhostConnectionRateLimit` defaults to `true`
+        // (issue #768) — a loopback remote must NOT be rate-limited even
+        // when it would otherwise exceed `connections_rate_limiting_count`.
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            max_connections_per_ip: 100,
+            connections_rate_limiting_count: 3,
+            ..Default::default()
+        };
+        assert!(
+            config.disable_localhost_connection_rate_limit,
+            "default must match go's true"
+        );
+        let net = WebsocketNetwork::new(
+            config,
+            Arc::new(Phonebook::new(10, Duration::from_secs(60))),
+        );
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        net.connection_tracker.track_connection(ip);
+        net.connection_tracker.track_connection(ip);
+        net.connection_tracker.track_connection(ip);
+
+        let headers = valid_incoming_headers("peer-random-loopback");
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
+        assert!(
+            matches!(result, ValidationResult::Ok { .. }),
+            "loopback IP must be exempt from the rate limit"
+        );
+    }
+
+    #[test]
+    fn validate_incoming_localhost_rate_limited_when_exemption_disabled() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            max_connections_per_ip: 100,
+            connections_rate_limiting_count: 3,
+            disable_localhost_connection_rate_limit: false,
+            ..Default::default()
+        };
+        let net = WebsocketNetwork::new(
+            config,
+            Arc::new(Phonebook::new(10, Duration::from_secs(60))),
+        );
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        net.connection_tracker.track_connection(ip);
+        net.connection_tracker.track_connection(ip);
+        net.connection_tracker.track_connection(ip);
+
+        let headers = valid_incoming_headers("peer-random-loopback-2");
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
+        assert!(
+            matches!(result, ValidationResult::Rejected(_)),
+            "with the exemption off, loopback follows the same rate limit as any IP"
+        );
     }
 
     #[test]
