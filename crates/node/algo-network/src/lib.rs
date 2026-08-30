@@ -52,6 +52,9 @@ pub mod phonebook;
 pub mod request_response;
 pub mod request_tracker;
 pub mod srv_resolver;
+pub mod tx_sync_client;
+pub mod tx_sync_pool_adapter;
+pub mod tx_sync_service;
 pub mod tx_syncer;
 pub mod tx_tag_handler;
 pub mod ws_network;
@@ -262,6 +265,26 @@ pub use tx_syncer::{
     sync_round, NoOpSolicitedTxHandler, PeerSource, PendingTxAggregate, SeenTxCache,
     SolicitedTxHandler, TxSyncError, TxSyncPeerClient, TxSyncer, TxSyncerConfig,
 };
+
+// ---------------------------------------------------------------------------
+// Re-exports: TxSyncer production pool adapters (issue #774)
+// ---------------------------------------------------------------------------
+
+// PendingTxAggregate / SolicitedTxHandler backed by a real TransactionPool
+pub use tx_sync_pool_adapter::{PoolPendingTxAggregate, PoolSolicitedTxHandler};
+
+// ---------------------------------------------------------------------------
+// Re-exports: Transaction-sync HTTP service (issue #774)
+// ---------------------------------------------------------------------------
+
+// Server side of the TxSyncer pull protocol
+pub use tx_sync_service::{
+    PendingTxGroupsSource, TxSyncService, TX_SYNC_REQUEST_CONTENT_TYPE,
+    TX_SYNC_RESPONSE_CONTENT_TYPE,
+};
+
+// Client (peer) side of the TxSyncer pull protocol
+pub use tx_sync_client::{GossipTxSyncPeerSource, HttpTxSyncClient};
 
 // ---------------------------------------------------------------------------
 // Re-exports: TX-tag inbound handler (Plan 33, gap G1 — inbound half)

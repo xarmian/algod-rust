@@ -3454,6 +3454,20 @@ pub async fn run(
     ));
     gossip_node.register_http_handler("/", block_service.http_router());
 
+    // Serve the TxSyncer pull protocol's HTTP endpoint (issue #774). Like
+    // `block_service` above, this must be registered before `start_arc()`
+    // so the route exists the moment the listener accepts its first
+    // connection. `PoolPendingTxAggregate` is also reused below as the
+    // `TxSyncer`'s own `PendingTxAggregate` — same pool, same snapshot
+    // semantics.
+    let tx_sync_pool_aggregate = Arc::new(algo_network::PoolPendingTxAggregate::new(pool.clone()));
+    let tx_sync_service = algo_network::TxSyncService::new(
+        tx_sync_pool_aggregate.clone(),
+        resolved_genesis_id.clone(),
+        tx_syncer_config.server_response_size,
+    );
+    gossip_node.register_http_handler("/", tx_sync_service.http_router());
+
     let mut gossip_handlers = vec![algo_network::handler::TaggedMessageHandler {
         tag: algo_network::Tag::Transaction,
         handler: Arc::new(algo_network::TxTagHandler::new(
@@ -3647,6 +3661,50 @@ pub async fn run(
         p2p_active_gossip_node.clone(),
         tx_seen_cache.clone(),
     ));
+
+    // -----------------------------------------------------------------------
+    // 3b-2. Start the transaction-sync pull loop (issue #774).
+    //
+    // go-algorand always runs `rpcs.TxSyncer` alongside gossip broadcast
+    // (`node/node.go:342`, unconditional since the initial commit,
+    // `v1.0.23-stable`): each tick, sample one peer, ask it (via Bloom
+    // filter over HTTP) for transaction groups we're missing. Without
+    // this, a node that missed a gossip broadcast — a dropped connection
+    // mid-relay, a peer that joined the mesh just after the broadcast —
+    // has no fallback recovery path; algod-rust had the full engine
+    // (`TxSyncer`, `sync_round`, its three collaborator traits) built
+    // (PLAN-33) but `TxSyncer::start` was never called anywhere in this
+    // binary.
+    //
+    // `GossipTxSyncPeerSource` samples `gossip_node`'s (WS-gossip)
+    // outgoing-connected peers specifically — see that type's doc
+    // comment for why only outgoing connections are dialable HTTP
+    // targets — and pulls from each sampled peer's `TxSyncService`
+    // endpoint (registered above). This deliberately does not cover the
+    // P2P transport: `P2pTransport`'s peers communicate over a libp2p
+    // stream, not a dialable HTTP listener, so there is no HTTP peer
+    // client to build for them. In `P2pOnly` mode `gossip_node` has no
+    // WS peers at all (mirrors the same acknowledged gap noted elsewhere
+    // in this file for other WS-specific affordances), so `sample_peer`
+    // simply returns `None` and each round is a no-op — safe, not a
+    // crash, but a real coverage gap tracked as a follow-up rather than
+    // silently absorbed.
+    // -----------------------------------------------------------------------
+    let tx_syncer = Arc::new(algo_network::TxSyncer::new(
+        tx_syncer_config,
+        tx_sync_pool_aggregate,
+        Arc::new(algo_network::GossipTxSyncPeerSource::new(
+            gossip_node.clone() as Arc<dyn GossipNode>,
+            resolved_genesis_id.clone(),
+            reqwest::Client::new(),
+            node_config.tx_sync_serve_response_size.max(0) as usize,
+        )),
+        Arc::new(algo_network::PoolSolicitedTxHandler::new(
+            Arc::new(PoolIngestAdapter::new(pool.clone())),
+            tx_seen_cache.clone(),
+        )),
+    ));
+    tx_syncer.start();
 
     // -----------------------------------------------------------------------
     // 3c. Optional: start the REST API server.
@@ -4065,6 +4123,10 @@ pub async fn run(
     catchup_service.stop();
     pool_follower_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = pool_follower.join();
+    // Stop the tx-sync pull loop before tearing down gossip — it samples
+    // peers from `gossip_node`, so stopping it first avoids a
+    // last-second round starting against a network that's mid-shutdown.
+    tx_syncer.stop().await;
     gossip_node.stop().await;
 
     // Await the REST server last — its graceful shutdown depends on
