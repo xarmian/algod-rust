@@ -70,7 +70,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rmp_serde::{decode, encode};
 use serde::{Deserialize, Serialize};
@@ -116,6 +116,57 @@ pub struct CadaverMetadata {
 ///
 /// Mirrors Go's `cadaverSizeMinimum = 100 * 1024`.
 pub const CADAVER_SIZE_MINIMUM: u64 = 100 * 1024;
+
+/// Resolve `config.Local`'s `CadaverSizeTarget`/`CadaverDirectory` (issue
+/// #756) into a [`CadaverConfig`], or `None` if cadaver tracing is
+/// disabled — go's `MakeService`/`makeTracer` size-target logic
+/// (`../go-algorand/agreement/service.go:110-119`,
+/// `../go-algorand/agreement/trace.go:76-97`), ported field-for-field:
+///
+/// * `size_target == 0` → cadaver tracing is disabled: returns `Ok(None)`,
+///   matching go's `fileSizeTarget == 0` "disabled" branch.
+/// * `size_target != 0` but below [`CADAVER_SIZE_MINIMUM`] → returns
+///   `Err(SizeTargetTooSmall)`. go additionally rejects a *negative*
+///   `int64(cadaverSizeTarget)` (an overflow artifact of go's `uint64` ->
+///   `int64` cast); that case cannot arise here because `size_target` stays
+///   `u64` throughout, so there is nothing to replicate.
+/// * otherwise → `Ok(Some(CadaverConfig { .. }))`, with `directory` falling
+///   back to `default_directory` when empty. go falls back to
+///   `ColdDataDir`, which algod-rust doesn't have (`CATCHPOINT_DIR`'s doc
+///   comment in `algo-config` records that hot/cold-directory split as an
+///   architectural non-goal); callers here supply whatever directory
+///   should stand in for it — typically the node's data directory.
+///
+/// Note: this function does **not** call [`Cadaver::open`] itself, so the
+/// [`CADAVER_SIZE_MINIMUM`] check surfaces through the returned
+/// `CadaverConfig` only once a caller actually opens it — this crate has no
+/// live call site that opens a `Cadaver` during agreement service startup
+/// yet (only tests and the `autopsy` CLI reader construct one today), so
+/// wiring an actual running node to produce cadaver files end-to-end is
+/// tracked as a separate follow-up rather than done as part of this
+/// config-field-audit issue.
+pub fn resolve_cadaver_config(
+    size_target: u64,
+    directory: &str,
+    default_directory: &Path,
+    base_filename: &str,
+    version_commit_hash: String,
+) -> Option<CadaverConfig> {
+    if size_target == 0 {
+        return None;
+    }
+    let base_directory = if directory.is_empty() {
+        default_directory.to_path_buf()
+    } else {
+        PathBuf::from(directory)
+    };
+    Some(CadaverConfig {
+        base_directory,
+        base_filename: base_filename.to_string(),
+        file_size_target: size_target,
+        version_commit_hash,
+    })
+}
 
 /// Snapshot of `(round, period, step)` written with every `Player` entry.
 ///
@@ -903,6 +954,70 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- resolve_cadaver_config (issue #756) --------------------------
+
+    #[test]
+    fn resolve_cadaver_config_zero_size_target_disables_tracing() {
+        let cfg = resolve_cadaver_config(
+            0,
+            "",
+            Path::new("/var/lib/algod"),
+            "agreement",
+            "v1".to_string(),
+        );
+        assert!(cfg.is_none(), "size target 0 must disable cadaver tracing");
+    }
+
+    #[test]
+    fn resolve_cadaver_config_empty_directory_falls_back_to_default() {
+        let cfg = resolve_cadaver_config(
+            CADAVER_SIZE_MINIMUM,
+            "",
+            Path::new("/var/lib/algod"),
+            "agreement",
+            "v1".to_string(),
+        )
+        .expect("nonzero size target enables tracing");
+        assert_eq!(cfg.base_directory, PathBuf::from("/var/lib/algod"));
+        assert_eq!(cfg.base_filename, "agreement");
+        assert_eq!(cfg.file_size_target, CADAVER_SIZE_MINIMUM);
+        assert_eq!(cfg.version_commit_hash, "v1");
+    }
+
+    #[test]
+    fn resolve_cadaver_config_explicit_directory_overrides_default() {
+        let cfg = resolve_cadaver_config(
+            CADAVER_SIZE_MINIMUM,
+            "/data/cadaver",
+            Path::new("/var/lib/algod"),
+            "agreement",
+            "v1".to_string(),
+        )
+        .expect("nonzero size target enables tracing");
+        assert_eq!(cfg.base_directory, PathBuf::from("/data/cadaver"));
+    }
+
+    #[test]
+    fn resolve_cadaver_config_too_small_but_nonzero_target_is_caught_by_open() {
+        // resolve_cadaver_config itself doesn't validate the minimum size —
+        // it defers to Cadaver::open, mirroring go's makeTracer error but
+        // surfaced at the point the file is actually opened.
+        let cfg = resolve_cadaver_config(
+            1,
+            "",
+            Path::new("/var/lib/algod"),
+            "agreement",
+            "v1".to_string(),
+        )
+        .expect("nonzero size target enables tracing, even if too small");
+        assert_eq!(cfg.file_size_target, 1);
+        match Cadaver::open(cfg) {
+            Err(CadaverError::SizeTargetTooSmall(1)) => {}
+            Err(e) => panic!("expected SizeTargetTooSmall(1), got error {e:?}"),
+            Ok(_) => panic!("expected SizeTargetTooSmall(1), got Ok"),
+        }
     }
 
     #[test]

@@ -96,9 +96,48 @@ labeling convention used).
   pebbledb) is out of scope — algod-rust has its own fixed storage
   design; this is recorded as a deliberate architectural difference, not
   a gap to close.
-- Adding a remote telemetry-reporting subsystem from scratch is treated
-  as a judgment call for whoever picks up that sub-issue, not mandated —
-  see the sub-issue for the specific disposition reasoning.
+- **Remote telemetry-reporting is a deliberate non-goal (decided in issue
+  [#756](https://github.com/xarmian/algod-rust/issues/756)).** algod-rust
+  will not implement go-algorand's remote-telemetry-reporting client (GUID
+  generation, HTTP/WebSocket shipping of agreement/catchup/node lifecycle
+  events to a configurable endpoint, `logging.config` loading —
+  `../go-algorand/logging/telemetry.go`, `telemetryConfig.go`). Reasoning:
+  - It has zero effect on consensus correctness or any wire-format/
+    ledger-state/API-response byte that a client or conformance harness
+    observes — unlike every other Phase 9–16 parity item, nothing here is
+    a divergence a peer or client could detect.
+  - go-algorand's own default configuration ships credentials pointing at
+    an Algorand-Inc-operated endpoint
+    (`../go-algorand/config/telemetryConfig.go:34-35,61,70-71`).
+    Reproducing that default would mean a community-run algod-rust node
+    phones home to a third party's infrastructure out of the box — an
+    operator-trust and privacy decision this project should not make
+    unilaterally on operators' behalf, especially for a reimplementation
+    whose whole premise is running independently of Algorand Inc.'s own
+    infrastructure. Telemetry is disabled by default upstream too
+    (`Enable: false`), but the credentials and endpoint still ship,
+    meaning any operator who flips the flag reports to Algorand Inc. by
+    default rather than to an endpoint they chose.
+  - It is substantial, single-purpose new work (a GUID-keyed reporting
+    client, its own wire protocol, a second config-file format) with no
+    reuse elsewhere in the node.
+
+  This is the same disposition pattern as the `GoMemLimit`/
+  `DeadlockDetection`/`RunHosted` and sqlite-vs-pebbledb items above: a
+  recorded architectural decision, not a silently dropped feature. If an
+  operator ever wants opt-in reporting to their *own* endpoint, that is a
+  new feature request to evaluate on its own merits, not a parity gap to
+  close. Fields whose *only* upstream purpose is feeding this declined
+  subsystem (`PeerConnectionsUpdateInterval`, `HeartbeatUpdateInterval`,
+  `EnableAccountUpdatesStats`, `AccountUpdatesStatsInterval`) are
+  dispositioned the same way and are not modeled in `algo-config::Local`
+  at all (see issue #756's closing comment for the per-field trace back to
+  go-algorand's `sendPeerConnectionsTelemetryStatus`/heartbeat-goroutine/
+  `acctupdates.go` call sites). Fields with independent local meaning
+  beyond remote reporting (`TelemetryToLog`, `BaseLoggerDebugLevel`,
+  `CadaverSizeTarget`/`CadaverDirectory`, log-rotation fields,
+  `EnableProfiler`, `EnableTopAccountsReporting`) were still added to
+  `algo-config::Local` — see issue #756.
 
 ## Success criteria
 
