@@ -768,6 +768,131 @@ static ENABLE_AGREEMENT_REPORTING: VersionedDefault<bool> = VersionedDefault::ne
 static ENABLE_AGREEMENT_TIME_METRICS: VersionedDefault<bool> =
     VersionedDefault::new(&[(3, || false)]);
 
+// --- Logging / telemetry / profiling fields (issue #756) --------------------
+//
+// See issue #756's disposition write-up (also `docs/PHASE16_PROPOSAL.md`'s
+// "Remote telemetry-reporting is a deliberate non-goal" section) for the
+// full reasoning. Two categories below:
+//
+// 1. Fields that round-trip through `config.json` with a real (if
+//    currently no-op) meaning, added here: `TelemetryToLog`,
+//    `BaseLoggerDebugLevel`, `CadaverSizeTarget`/`CadaverDirectory`,
+//    `LogSizeLimit`/`LogArchiveName`/`LogArchiveMaxAge`, `EnableProfiler`,
+//    `EnableTopAccountsReporting`.
+// 2. Fields deliberately NOT added at all: `PeerConnectionsUpdateInterval`,
+//    `HeartbeatUpdateInterval`, `EnableAccountUpdatesStats`,
+//    `AccountUpdatesStatsInterval`. Each one's *only* upstream effect is
+//    feeding the remote-telemetry-reporting pipeline this issue declines to
+//    build (`network/wsNetwork.go`'s `sendPeerConnectionsTelemetryStatus`
+//    checks `log.GetTelemetryEnabled()` and returns immediately when
+//    telemetry is off; `cmd/algod/main.go`'s heartbeat goroutine calls
+//    `log.EventWithDetails`; `ledger/acctupdates.go:2291` calls
+//    `au.log.Metrics(telemetryspec.Accounts, ...)` — all three are
+//    telemetry-event emission, gated on a telemetry subsystem algod-rust
+//    doesn't have). Since algod-rust has no telemetry client for these
+//    intervals to govern, adding them as inert round-trip fields would
+//    misrepresent them as "will matter once you set them" — unlike the
+//    fields above (which have *some* independent local meaning: log
+//    verbosity, cadaver file rotation, etc.), these four have none. Same
+//    disposition pattern as the networking fields already excluded in the
+//    module docs above (message-hash-bucket dedup filtering, etc.).
+
+/// Go: `TelemetryToLog bool` `version[5]:"true"` (`localTemplate.go:374-375`).
+/// **Documented no-op**: controls whether telemetry-tagged log lines are
+/// *also* mirrored into local `node.log` — distinct from (and independent
+/// of) the remote-telemetry-reporting client itself, which is a deliberate
+/// non-goal (see module note above). algod-rust's tracing output has no
+/// concept of a "telemetry-tagged" log line to mirror, since there is no
+/// telemetry event-emission subsystem producing them. Round-trips through
+/// `config.json` for forward compatibility; would gain real meaning only if
+/// a future issue adds telemetry-tagged tracing events independent of the
+/// remote-reporting client.
+static TELEMETRY_TO_LOG: VersionedDefault<bool> = VersionedDefault::new(&[(5, || true)]);
+
+/// Go: `BaseLoggerDebugLevel uint32` `version[0]:"1" version[1]:"4"`
+/// (`localTemplate.go:79-80`). go's `logging.Level`: 0=Panic, 1=Fatal,
+/// 2=Error, 3=Warn, 4=Info, 5=Debug. [`base_logger_debug_level_to_filter_directive`]
+/// converts this into a `tracing_subscriber::EnvFilter` directive string.
+/// **Not wired into the CLI's global subscriber**: `bin/algod-rust/src/
+/// main.rs` initializes the process-wide tracing subscriber (from
+/// `RUST_LOG`, defaulting to `"info"`) before any subcommand parses its
+/// `--data-dir` and loads that directory's `config.json` — restructuring
+/// every subcommand's startup order to load config before installing the
+/// logger is a cross-cutting change out of scope for this config-audit
+/// issue. The conversion helper exists so that restructuring, whenever it
+/// happens, has a ready-made and independently tested go-level -> directive
+/// mapping to call.
+static BASE_LOGGER_DEBUG_LEVEL: VersionedDefault<u32> =
+    VersionedDefault::new(&[(0, || 1), (1, || 4)]);
+
+/// Go: `CadaverSizeTarget uint64` `version[0]:"1073741824" version[24]:"0"`
+/// (`localTemplate.go:82-83`). `0` disables cadaver tracing entirely (go's
+/// `agreement/trace.go:84-85` `makeTracer`'s `fileSizeTarget == 0` branch).
+/// [`crate::trace`] --- see `algo_agreement::trace::resolve_cadaver_config`
+/// for the real conversion into a [`CadaverConfig`]-shaped writer
+/// configuration (that function lives in `algo-agreement` since
+/// [`CadaverConfig`] is defined there, not in this crate).
+///
+/// [`CadaverConfig`]: https://docs.rs/algo-agreement (see
+/// `algo_agreement::trace::CadaverConfig`)
+static CADAVER_SIZE_TARGET: VersionedDefault<u64> =
+    VersionedDefault::new(&[(0, || 1_073_741_824), (24, || 0)]);
+
+/// Go: `CadaverDirectory string` `version[27]:""` (`localTemplate.go:86`).
+/// Empty string means "use the fallback directory" — go falls back to
+/// `ColdDataDir` (`agreement/service.go:111-114`), which algod-rust doesn't
+/// have (see [`CATCHPOINT_DIR`]'s doc comment for that architectural
+/// non-goal); the caller-supplied default directory in
+/// `resolve_cadaver_config` stands in for it instead.
+static CADAVER_DIRECTORY: VersionedDefault<String> =
+    VersionedDefault::new(&[(27, || String::new())]);
+
+/// Go: `LogSizeLimit uint64` `version[0]:"1073741824"` (`localTemplate.go:190-191`).
+/// **Documented no-op**: algod-rust's process logging always writes to
+/// stdout via `tracing_subscriber` (`bin/algod-rust/src/main.rs`) — there is
+/// no file-based `node.log` writer to size-limit or rotate. Round-trips
+/// through `config.json` for forward compatibility; would gain real meaning
+/// only if a future issue adds a file-backed rotating log writer (go itself
+/// treats `0` as "write to stdout instead", so a from-scratch writer would
+/// need to replicate that same escape hatch).
+static LOG_SIZE_LIMIT: VersionedDefault<u64> = VersionedDefault::new(&[(0, || 1_073_741_824)]);
+
+/// Go: `LogArchiveName string` `version[4]:"node.archive.log"`
+/// (`localTemplate.go:193-201`). Same documented-no-op scope as
+/// `log_size_limit` — the archive filename template has nothing to name
+/// without a rotating file-backed log writer.
+static LOG_ARCHIVE_NAME: VersionedDefault<String> =
+    VersionedDefault::new(&[(4, || "node.archive.log".to_string())]);
+
+/// Go: `LogArchiveMaxAge string` `version[4]:""` (`localTemplate.go:203-205`).
+/// Same documented-no-op scope as `log_size_limit`.
+static LOG_ARCHIVE_MAX_AGE: VersionedDefault<String> =
+    VersionedDefault::new(&[(4, || String::new())]);
+
+/// Go: `EnableProfiler bool` `version[0]:"false"` (`localTemplate.go:364-366`).
+/// Gates go's `net/http/pprof` debug endpoints
+/// (`daemon/algod/api/server/router.go:126`, `daemon/algod/server.go:26`) —
+/// distinct from the always-available `/debug/settings/pprof` mutex/block
+/// sample-rate admin endpoint algod-rust already has
+/// (`crates/node/algo-rest-api/src/handlers.rs::get_debug_settings_prof`,
+/// unconditional in both implementations). **Documented no-op**: algod-rust
+/// has no equivalent embedded CPU/heap-profiling HTTP endpoint to gate —
+/// Rust's profiling conventions favor external tooling (`perf`,
+/// `cargo flamegraph`, `tokio-console`) over an in-process pprof server, so
+/// building one is a from-scratch feature, not a config-gating fix, and is
+/// out of scope for this config-audit issue. Round-trips through
+/// `config.json` for forward compatibility.
+static ENABLE_PROFILER: VersionedDefault<bool> = VersionedDefault::new(&[(0, || false)]);
+
+/// Go: `EnableTopAccountsReporting bool` `version[0]:"false"`
+/// (`localTemplate.go:216-217`). go's own doc comment: "Deprecated, do not
+/// use." **Documented not-applicable**, matching upstream's own
+/// deprecation — round-trips through `config.json` for forward
+/// compatibility (an operator's existing file may still carry this key),
+/// but is never read for any behavior.
+static ENABLE_TOP_ACCOUNTS_REPORTING: VersionedDefault<bool> =
+    VersionedDefault::new(&[(0, || false)]);
+
 fn default_version() -> u32 {
     // Mirrors go's explicit `c.Version = 0 // Reset to 0 so we get the
     // version from the loaded file` (config.go:124) — a `version` key
@@ -963,6 +1088,52 @@ fn default_enable_agreement_reporting() -> bool {
 }
 fn default_enable_agreement_time_metrics() -> bool {
     ENABLE_AGREEMENT_TIME_METRICS.at(LATEST_VERSION)
+}
+fn default_telemetry_to_log() -> bool {
+    TELEMETRY_TO_LOG.at(LATEST_VERSION)
+}
+fn default_base_logger_debug_level() -> u32 {
+    BASE_LOGGER_DEBUG_LEVEL.at(LATEST_VERSION)
+}
+fn default_cadaver_size_target() -> u64 {
+    CADAVER_SIZE_TARGET.at(LATEST_VERSION)
+}
+fn default_cadaver_directory() -> String {
+    CADAVER_DIRECTORY.at(LATEST_VERSION)
+}
+fn default_log_size_limit() -> u64 {
+    LOG_SIZE_LIMIT.at(LATEST_VERSION)
+}
+fn default_log_archive_name() -> String {
+    LOG_ARCHIVE_NAME.at(LATEST_VERSION)
+}
+fn default_log_archive_max_age() -> String {
+    LOG_ARCHIVE_MAX_AGE.at(LATEST_VERSION)
+}
+fn default_enable_profiler() -> bool {
+    ENABLE_PROFILER.at(LATEST_VERSION)
+}
+fn default_enable_top_accounts_reporting() -> bool {
+    ENABLE_TOP_ACCOUNTS_REPORTING.at(LATEST_VERSION)
+}
+
+/// Convert go's `BaseLoggerDebugLevel` (`config.Local`, go's `logging.Level`
+/// in `../go-algorand/logging/log.go:51-75`: 0=Panic, 1=Fatal, 2=Error,
+/// 3=Warn, 4=Info, 5=Debug) into a `tracing_subscriber::EnvFilter` directive
+/// string. algod-rust's `tracing` crate has no distinct Panic/Fatal
+/// severities (both terminate the process without a dedicated log level
+/// below Error), so levels 0 and 1 both map to `"error"` — the closest
+/// applicable severity, matching that go's Panic/Fatal logger calls still
+/// emit an error-severity message before terminating. Any level above 5
+/// (an operator-supplied out-of-range value) also maps to `"debug"`, go's
+/// own most-verbose level, rather than panicking on an unrecognized input.
+pub fn base_logger_debug_level_to_filter_directive(level: u32) -> &'static str {
+    match level {
+        0..=2 => "error",
+        3 => "warn",
+        4 => "info",
+        _ => "debug",
+    }
 }
 
 /// `config.Local`-equivalent node configuration, loaded from `config.json`
@@ -1486,6 +1657,59 @@ pub struct Local {
         default = "default_enable_agreement_time_metrics"
     )]
     pub enable_agreement_time_metrics: bool,
+
+    /// Go: `TelemetryToLog`. **Documented no-op** — see
+    /// [`TELEMETRY_TO_LOG`]'s doc comment.
+    #[serde(rename = "TelemetryToLog", default = "default_telemetry_to_log")]
+    pub telemetry_to_log: bool,
+
+    /// Go: `BaseLoggerDebugLevel`. Not wired into the CLI's global
+    /// subscriber — see [`BASE_LOGGER_DEBUG_LEVEL`]'s doc comment and
+    /// [`base_logger_debug_level_to_filter_directive`].
+    #[serde(
+        rename = "BaseLoggerDebugLevel",
+        default = "default_base_logger_debug_level"
+    )]
+    pub base_logger_debug_level: u32,
+
+    /// Go: `CadaverSizeTarget`. `0` disables cadaver tracing. See
+    /// [`CADAVER_SIZE_TARGET`]'s doc comment and
+    /// `algo_agreement::trace::resolve_cadaver_config`.
+    #[serde(rename = "CadaverSizeTarget", default = "default_cadaver_size_target")]
+    pub cadaver_size_target: u64,
+
+    /// Go: `CadaverDirectory`. See [`CADAVER_DIRECTORY`]'s doc comment.
+    #[serde(rename = "CadaverDirectory", default = "default_cadaver_directory")]
+    pub cadaver_directory: String,
+
+    /// Go: `LogSizeLimit`. **Documented no-op** — see [`LOG_SIZE_LIMIT`]'s
+    /// doc comment.
+    #[serde(rename = "LogSizeLimit", default = "default_log_size_limit")]
+    pub log_size_limit: u64,
+
+    /// Go: `LogArchiveName`. **Documented no-op** — see
+    /// [`LOG_ARCHIVE_NAME`]'s doc comment.
+    #[serde(rename = "LogArchiveName", default = "default_log_archive_name")]
+    pub log_archive_name: String,
+
+    /// Go: `LogArchiveMaxAge`. **Documented no-op** — see
+    /// [`LOG_ARCHIVE_MAX_AGE`]'s doc comment.
+    #[serde(rename = "LogArchiveMaxAge", default = "default_log_archive_max_age")]
+    pub log_archive_max_age: String,
+
+    /// Go: `EnableProfiler`. **Documented no-op** — see [`ENABLE_PROFILER`]'s
+    /// doc comment.
+    #[serde(rename = "EnableProfiler", default = "default_enable_profiler")]
+    pub enable_profiler: bool,
+
+    /// Go: `EnableTopAccountsReporting`. **Documented not-applicable**
+    /// (upstream's own "Deprecated, do not use") — see
+    /// [`ENABLE_TOP_ACCOUNTS_REPORTING`]'s doc comment.
+    #[serde(
+        rename = "EnableTopAccountsReporting",
+        default = "default_enable_top_accounts_reporting"
+    )]
+    pub enable_top_accounts_reporting: bool,
 }
 
 impl Default for Local {
@@ -1574,6 +1798,15 @@ impl Local {
             max_acct_lookback: MAX_ACCT_LOOKBACK.at(version),
             enable_agreement_reporting: ENABLE_AGREEMENT_REPORTING.at(version),
             enable_agreement_time_metrics: ENABLE_AGREEMENT_TIME_METRICS.at(version),
+            telemetry_to_log: TELEMETRY_TO_LOG.at(version),
+            base_logger_debug_level: BASE_LOGGER_DEBUG_LEVEL.at(version),
+            cadaver_size_target: CADAVER_SIZE_TARGET.at(version),
+            cadaver_directory: CADAVER_DIRECTORY.at(version),
+            log_size_limit: LOG_SIZE_LIMIT.at(version),
+            log_archive_name: LOG_ARCHIVE_NAME.at(version),
+            log_archive_max_age: LOG_ARCHIVE_MAX_AGE.at(version),
+            enable_profiler: ENABLE_PROFILER.at(version),
+            enable_top_accounts_reporting: ENABLE_TOP_ACCOUNTS_REPORTING.at(version),
         }
     }
 
@@ -1915,6 +2148,35 @@ impl Local {
             migrate_field(
                 &mut self.enable_agreement_time_metrics,
                 &ENABLE_AGREEMENT_TIME_METRICS,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.telemetry_to_log, &TELEMETRY_TO_LOG, cur, next);
+            migrate_field(
+                &mut self.base_logger_debug_level,
+                &BASE_LOGGER_DEBUG_LEVEL,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.cadaver_size_target,
+                &CADAVER_SIZE_TARGET,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.cadaver_directory, &CADAVER_DIRECTORY, cur, next);
+            migrate_field(&mut self.log_size_limit, &LOG_SIZE_LIMIT, cur, next);
+            migrate_field(&mut self.log_archive_name, &LOG_ARCHIVE_NAME, cur, next);
+            migrate_field(
+                &mut self.log_archive_max_age,
+                &LOG_ARCHIVE_MAX_AGE,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.enable_profiler, &ENABLE_PROFILER, cur, next);
+            migrate_field(
+                &mut self.enable_top_accounts_reporting,
+                &ENABLE_TOP_ACCOUNTS_REPORTING,
                 cur,
                 next,
             );
@@ -2715,5 +2977,140 @@ mod tests {
         let obj = value.as_object().unwrap();
         assert_eq!(obj.len(), 1);
         assert!(obj.contains_key("Version"));
+    }
+
+    // --- Logging / telemetry / profiling fields (issue #756) ---------------
+
+    #[test]
+    fn base_logger_debug_level_migrates_from_1_to_4_default() {
+        // Left at version 0's own default (1 = Fatal), never touched by the
+        // operator, must advance to version 1's default (4 = Info).
+        let cfg =
+            Local::load_from_str(r#"{"Version": 0, "BaseLoggerDebugLevel": 1}"#).expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.base_logger_debug_level, 4);
+    }
+
+    #[test]
+    fn base_logger_debug_level_explicit_override_survives_migration() {
+        let cfg =
+            Local::load_from_str(r#"{"Version": 0, "BaseLoggerDebugLevel": 5}"#).expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(
+            cfg.base_logger_debug_level, 5,
+            "an explicit non-default override must survive migration"
+        );
+    }
+
+    #[test]
+    fn base_logger_debug_level_to_filter_directive_covers_gos_full_range() {
+        assert_eq!(base_logger_debug_level_to_filter_directive(0), "error"); // Panic
+        assert_eq!(base_logger_debug_level_to_filter_directive(1), "error"); // Fatal
+        assert_eq!(base_logger_debug_level_to_filter_directive(2), "error"); // Error
+        assert_eq!(base_logger_debug_level_to_filter_directive(3), "warn"); // Warn
+        assert_eq!(base_logger_debug_level_to_filter_directive(4), "info"); // Info
+        assert_eq!(base_logger_debug_level_to_filter_directive(5), "debug"); // Debug
+        assert_eq!(
+            base_logger_debug_level_to_filter_directive(99),
+            "debug",
+            "out-of-range levels fall back to the most verbose directive, not a panic"
+        );
+    }
+
+    #[test]
+    fn cadaver_size_target_migrates_from_1gib_to_disabled_default() {
+        // Left at version 0's own default (1 GiB), never touched by the
+        // operator, must advance to version 24's default (0 = disabled).
+        let cfg = Local::load_from_str(r#"{"Version": 0, "CadaverSizeTarget": 1073741824}"#)
+            .expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.cadaver_size_target, 0);
+    }
+
+    #[test]
+    fn cadaver_size_target_explicit_override_survives_migration() {
+        let cfg = Local::load_from_str(r#"{"Version": 0, "CadaverSizeTarget": 209715200}"#)
+            .expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(
+            cfg.cadaver_size_target, 209_715_200,
+            "an explicit non-default override must survive migration"
+        );
+    }
+
+    #[test]
+    fn cadaver_directory_round_trips_through_json() {
+        let cfg = Local::load_from_str(r#"{"CadaverDirectory": "/data/cadaver"}"#).expect("parses");
+        assert_eq!(cfg.cadaver_directory, "/data/cadaver");
+    }
+
+    #[test]
+    fn telemetry_to_log_defaults_true_and_round_trips() {
+        assert!(Local::default().telemetry_to_log);
+        // Pin `Version` at LATEST_VERSION so migration is a no-op: an
+        // override to `false` (this field's pre-tag zero value) written at
+        // an earlier version would be indistinguishable from "never set"
+        // and get advanced back to the post-tag `true` default by
+        // `migrate_field` -- exactly mirroring go's own
+        // `reflect.DeepEqual`-based ambiguity for a bool field whose
+        // explicit override equals its untagged zero value. Only
+        // migration-preservation tests need to exercise that boundary
+        // (see `field_explicitly_overridden_away_from_default_is_never_clobbered`);
+        // this test is just pinning the plain JSON round-trip.
+        let cfg =
+            Local::load_from_str(r#"{"Version": 35, "TelemetryToLog": false}"#).expect("parses");
+        assert!(!cfg.telemetry_to_log);
+    }
+
+    #[test]
+    fn log_rotation_fields_round_trip_through_json() {
+        let cfg = Local::load_from_str(
+            r#"{"LogSizeLimit": 500000, "LogArchiveName": "custom.archive.log", "LogArchiveMaxAge": "168h"}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.log_size_limit, 500_000);
+        assert_eq!(cfg.log_archive_name, "custom.archive.log");
+        assert_eq!(cfg.log_archive_max_age, "168h");
+        // Defaults match go's `local_defaults.go`.
+        let default_cfg = Local::default();
+        assert_eq!(default_cfg.log_size_limit, 1_073_741_824);
+        assert_eq!(default_cfg.log_archive_name, "node.archive.log");
+        assert_eq!(default_cfg.log_archive_max_age, "");
+    }
+
+    #[test]
+    fn enable_profiler_round_trip() {
+        assert!(!Local::default().enable_profiler);
+        let cfg = Local::load_from_str(r#"{"EnableProfiler": true}"#).expect("parses");
+        assert!(cfg.enable_profiler);
+    }
+
+    #[test]
+    fn enable_top_accounts_reporting_round_trip_default_false() {
+        assert!(!Local::default().enable_top_accounts_reporting);
+        let cfg = Local::load_from_str(r#"{"EnableTopAccountsReporting": true}"#).expect("parses");
+        assert!(cfg.enable_top_accounts_reporting);
+    }
+
+    /// Deliberately-excluded telemetry-only fields (`PeerConnectionsUpdateInterval`,
+    /// `HeartbeatUpdateInterval`, `EnableAccountUpdatesStats`,
+    /// `AccountUpdatesStatsInterval`) must NOT round-trip through
+    /// `config.json` — an operator's file setting these keys should not
+    /// silently be accepted as if they had an effect, so an unknown-field
+    /// parse must not error (`serde_json` ignores unknown fields by
+    /// default) but the resulting `Local` must carry no field for them.
+    /// This test pins that "present in JSON, absent from `Local`" shape by
+    /// asserting the config still parses and the known-fields set is
+    /// otherwise unaffected.
+    #[test]
+    fn telemetry_only_fields_are_accepted_but_ignored_not_modeled() {
+        let cfg = Local::load_from_str(
+            r#"{"PeerConnectionsUpdateInterval": 60, "HeartbeatUpdateInterval": 30, "EnableAccountUpdatesStats": true, "AccountUpdatesStatsInterval": 1}"#,
+        )
+        .expect("unknown JSON keys are ignored, not rejected");
+        // Nothing to assert on the ignored keys themselves (they have no
+        // field) -- confirm the rest of the config still loaded at its
+        // ordinary defaults, i.e. parsing wasn't otherwise disrupted.
+        assert_eq!(cfg, Local::default());
     }
 }
