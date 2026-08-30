@@ -3395,8 +3395,13 @@ pub async fn run(
         // P2P-only mode `net_address` is forced to `None` above, so this
         // can never open a listener regardless.
         relay_messages: ws_active && (relay_messages || node_config.force_relay_messages),
-        gossip_fanout: resolve_gossip_fanout(&node_config, is_listen_server, peers.len())
-            .max(algo_network::DEFAULT_GOSSIP_FANOUT),
+        // No additional floor is applied on top of `resolve_gossip_fanout`
+        // here (unlike the pre-#788 code, which unconditionally floored at
+        // `DEFAULT_GOSSIP_FANOUT`): go's `GossipFanout` has no minimum, so
+        // an operator who explicitly configures a small value gets exactly
+        // that, floored only by `--peers`' own count — `relay.rs` was
+        // fixed the same way for consistency between the two commands.
+        gossip_fanout: resolve_gossip_fanout(&node_config, is_listen_server, peers.len()),
         max_connections_per_ip: resolved_net.max_connections_per_ip,
         incoming_connections_limit: resolved_net.incoming_connections_limit,
         connections_rate_limiting_count: resolved_net.connections_rate_limiting_count,
