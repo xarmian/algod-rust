@@ -127,6 +127,33 @@ pub enum TxSyncError {
     /// The [`SolicitedTxHandler`] rejected a transaction group.
     #[error("handler rejected transaction group: {0}")]
     Handler(String),
+
+    /// The peer returned a transaction group in which every txid was
+    /// already present in the pending set we told it (via the request's
+    /// Bloom filter) that we held.
+    ///
+    /// Mirrors go's `TxSyncer.syncFromClient` defense
+    /// (`rpcs/txSyncer.go`): a well-behaved peer never echoes back a
+    /// group we explicitly said we already have, so a group that's
+    /// *entirely* covered by our own pending set indicates the peer is
+    /// either misbehaving or adversarial (wastefully or maliciously
+    /// re-sending known transactions). go closes the connection and
+    /// aborts the round with an error; algod-rust has no persistent
+    /// per-peer connection to close (a fresh [`HttpSync`] client is built
+    /// per round — see `tx_sync_client`'s module doc), so surfacing this
+    /// as an error here achieves the same "stop trusting this peer for
+    /// the round" effect: the round aborts without forwarding the
+    /// offending group (or any group after it in the same response) to
+    /// the handler, while the syncer loop's existing
+    /// log-and-continue-next-tick handling (see [`TxSyncer::start`])
+    /// keeps the loop itself alive.
+    ///
+    /// [`HttpSync`]: crate::tx_sync_client::HttpTxSyncClient
+    #[error("peer {peer} sent a transaction group that was entirely included in the bloom filter")]
+    AlreadyKnownGroup {
+        /// Remote address of the offending peer (for logs).
+        peer: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +600,47 @@ pub async fn sync_round(
 
     let groups = peer.sync(&pending, config.sync_timeout).await?;
 
+    // Misbehaving/malicious-peer defense, ported from go's
+    // `TxSyncer.syncFromClient` (`rpcs/txSyncer.go`, see issue #801).
+    //
+    // go re-tests every returned txid against the very Bloom filter it
+    // sent the peer, then (only on a filter hit, to avoid building the
+    // map on the common all-miss path) confirms membership against the
+    // exact pending-id set to rule out an honest false positive; a group
+    // rejects only when *every* txid in it is confirmed pending.
+    //
+    // A Bloom filter has no false negatives for the elements it was
+    // built from (`Filter::set`/`Filter::test` use the same hash
+    // functions), so `filter.test(x)` is guaranteed `true` for every
+    // `x` actually in `pending`, and for any `x` not in `pending` the
+    // subsequent exact-map check always excludes it regardless of
+    // whether the filter test was a hit or a false positive. The net
+    // effect go's two-step check computes is therefore exactly "is this
+    // txid in our own pending set" — the filter step is a performance
+    // optimization (skip the hashmap build unless the cheap probabilistic
+    // test already suggests a hit), not a source of additional true
+    // positives. `sync_round` already holds the exact `pending` list (the
+    // same one passed into `peer.sync` to build the wire-format filter),
+    // so checking membership against it directly is behaviorally
+    // identical to go's filter-then-confirm sequence without needing the
+    // peer client's transient, randomly-keyed `Filter` instance to leak
+    // out of the `TxSyncPeerClient` trait (which is deliberately kept
+    // free of wire-format specifics — see this module's doc comment).
+    let pending_set: HashSet<Digest> = pending.into_iter().collect();
+
     for group in groups {
+        let entirely_known = group
+            .iter()
+            .all(|txn| pending_set.contains(&algo_codec::compute_txn_id(&txn.txn)));
+        if entirely_known {
+            warn!(
+                peer = %peer.address(),
+                "TxSyncer.sync_round: peer sent a transaction group entirely covered by our own pending set",
+            );
+            return Err(TxSyncError::AlreadyKnownGroup {
+                peer: peer.address(),
+            });
+        }
         handler.handle(group).await?;
     }
     Ok(())
@@ -594,6 +661,18 @@ mod tests {
     /// Build a deterministic 32-byte digest from a single byte, for tests.
     fn d(b: u8) -> Digest {
         Digest([b; 32])
+    }
+
+    /// Build a distinct, realistic pending/returned transaction. Real
+    /// transactions always have a non-zero type and sender (see the
+    /// identical comment in `tx_sync_client`'s test helper) — `fee`
+    /// varies the encoding so each call yields a distinct computed txid.
+    fn make_txn(fee: u64) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = algo_types::TxnType::Pay;
+        stx.txn.sender = algo_types::Address([1u8; 32]);
+        stx.txn.fee = fee;
+        stx
     }
 
     struct FakePeer {
@@ -665,9 +744,11 @@ mod tests {
         let peer = Arc::new(FakePeer {
             addr: "peer-a".into(),
             calls: calls.clone(),
-            // Two empty groups is enough to show the loop iterates; we don't
-            // need real transactions for the skeleton.
-            canned: vec![vec![], vec![]],
+            // Two groups of genuinely new (not already-pending) transactions
+            // -- realistic responses, and none of them trip the #801
+            // already-known-group defense since none of their computed
+            // txids are in the pool's pending set below.
+            canned: vec![vec![make_txn(101)], vec![make_txn(102)]],
         });
         let cfg = TxSyncerConfig::default();
         let pool = FakePool(vec![d(1), d(2), d(3)]);
@@ -732,6 +813,83 @@ mod tests {
         let handler = NoOpSolicitedTxHandler;
         let err = sync_round(&cfg, &pool, &src, &handler).await.unwrap_err();
         assert!(matches!(err, TxSyncError::Peer { .. }));
+    }
+
+    /// Issue #801: a peer that returns a group in which *every* txid is
+    /// already in our own pending set (i.e., a group we told it, via the
+    /// request's Bloom filter, that we already have in full) must be
+    /// rejected -- not silently forwarded to the handler -- exactly like
+    /// go's `TxSyncer.syncFromClient` (`rpcs/txSyncer.go`).
+    ///
+    /// This must fail against the *old* code (which forwarded every
+    /// returned group unconditionally): before the fix, this test would
+    /// see the handler invoked and `sync_round` return `Ok(())`.
+    #[tokio::test]
+    async fn sync_round_rejects_group_entirely_covered_by_pending_set() {
+        let handler_calls = Arc::new(StdMutex::new(0));
+        let known = make_txn(7);
+        // The pool's pending set already contains `known`'s computed txid --
+        // a well-behaved peer would never echo this back to us.
+        let known_id = algo_codec::compute_txn_id(&known.txn);
+        let peer = Arc::new(FakePeer {
+            addr: "misbehaving-peer".into(),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            canned: vec![vec![known]],
+        });
+        let cfg = TxSyncerConfig::default();
+        let pool = FakePool(vec![known_id, d(9)]);
+        let source = FakePeerSource { peer };
+        let handler = CountingHandler {
+            calls: handler_calls.clone(),
+        };
+
+        let err = sync_round(&cfg, &pool, &source, &handler)
+            .await
+            .expect_err("entirely-known group must be rejected");
+        assert!(
+            matches!(err, TxSyncError::AlreadyKnownGroup { ref peer } if peer == "misbehaving-peer"),
+            "expected AlreadyKnownGroup, got {err:?}",
+        );
+        assert_eq!(
+            *handler_calls.lock().unwrap(),
+            0,
+            "the entirely-known group must never reach the handler",
+        );
+    }
+
+    /// Control case: a group where only *some* txids are already pending
+    /// (a partial match -- or, equivalently, what an honest Bloom-filter
+    /// false positive on a single unrelated txid would look like from the
+    /// requester's perspective) must still be forwarded normally. Only a
+    /// group that is *entirely* covered trips the defense.
+    #[tokio::test]
+    async fn sync_round_forwards_group_with_partial_pending_overlap() {
+        let handler_calls = Arc::new(StdMutex::new(0));
+        let already_known = make_txn(7);
+        let genuinely_new = make_txn(8);
+        let known_id = algo_codec::compute_txn_id(&already_known.txn);
+        let peer = Arc::new(FakePeer {
+            addr: "honest-peer".into(),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+            canned: vec![vec![already_known, genuinely_new]],
+        });
+        let cfg = TxSyncerConfig::default();
+        // Only one of the two txids in the returned group is actually
+        // pending -- the group as a whole is not entirely covered.
+        let pool = FakePool(vec![known_id]);
+        let source = FakePeerSource { peer };
+        let handler = CountingHandler {
+            calls: handler_calls.clone(),
+        };
+
+        sync_round(&cfg, &pool, &source, &handler)
+            .await
+            .expect("partial-overlap group must be forwarded, not rejected");
+        assert_eq!(
+            *handler_calls.lock().unwrap(),
+            1,
+            "partially-known group must still reach the handler",
+        );
     }
 
     // ── Seen-hash LRU ───────────────────────────────────────────
