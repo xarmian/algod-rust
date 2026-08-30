@@ -42,6 +42,17 @@ FROM runtime AS localnet
 COPY docker/localnet-rust/data/ /algod/data/
 EXPOSE 8080
 ENTRYPOINT ["algod-rust"]
+# `node start` now genuinely parses /algod/data/config.json (issue #757:
+# EndpointAddress, DNSBootstrapID, EnableDeveloperAPI). The explicit
+# `-l 0.0.0.0:8080` / `--dev` flags below are kept as an override layered on
+# top of it rather than removed, mirroring go-algorand's own
+# CLI-flag-overrides-config-file precedent — they currently agree with the
+# file's `EndpointAddress`/`EnableDeveloperAPI` values (pinned by
+# bin/algod-rust/src/commands/node.rs's
+# `resolve_listen_addr_matches_docker_config_when_no_cli_override` test), so
+# either could be dropped without changing behavior, but keeping both makes
+# the CLI invocation self-documenting without depending on the data dir's
+# contents.
 CMD ["node", "start", "-d", "/algod/data", "--dev", "-l", "0.0.0.0:8080"]
 
 # Final stage: keep `runtime` (the `follow` default) as the image a plain
