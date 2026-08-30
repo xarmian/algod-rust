@@ -35,6 +35,14 @@ pub struct Cli {
 
 const DEFAULT_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+// `Participate`'s variant has grown large (issue #748 added several new
+// `Option<T>` networking-config CLI flags to close its gap with `relay`)
+// relative to the smallest variants — clap CLI arg enums are inherently
+// heap-adjacent (each match arm is only ever constructed once at
+// startup, never in a hot loop), so the size difference clippy flags
+// here isn't a real perf concern; boxing individual fields would only
+// add noise to every call site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum Commands {
     /// Capture block fixtures from a Go algod node.
@@ -261,6 +269,13 @@ pub enum Commands {
         /// When provided, DNS discovery and algod URL auto-seeding are skipped.
         #[arg(long)]
         relay_addr: Vec<String>,
+
+        /// Override the DNS bootstrap template for gossip-mode peer
+        /// discovery (go: `config.Local.DNSBootstrapID`). Generalizes the
+        /// `--dns-bootstrap` knob previously confined to `observe`
+        /// (issue #748).
+        #[arg(long)]
+        dns_bootstrap: Option<String>,
     },
 
     /// Catchpoint operations: import, verify, export, and download catchpoint files.
@@ -305,13 +320,25 @@ pub enum Commands {
         #[arg(long, default_value = "8")]
         max_per_ip: u32,
 
-        /// Connection rate limit (connections per second per IP).
+        /// Connection rate limit: maximum new connections per window.
         #[arg(long, default_value = "60")]
         rate_limit: u32,
 
-        /// Maximum peers per broadcast.
-        #[arg(long, default_value = "35")]
-        broadcast_limit: u32,
+        /// Connection-rate-limit window, in seconds (go:
+        /// `config.Local.ConnectionsRateLimitingWindowSeconds`).
+        /// Previously entirely missing — only the *count* half of this
+        /// pair existed (issue #748); go's default is 1 second, not the
+        /// 60 seconds this was previously hardcoded to.
+        #[arg(long, default_value = "1")]
+        rate_limit_window_seconds: u64,
+
+        /// Maximum peers a single broadcast is delivered to. A negative
+        /// value means unbounded, matching go's real
+        /// `BroadcastConnectionsLimit` default of `-1` (issue #748 fixed
+        /// this flag's prior hardcoded default of `35`, which diverged
+        /// from go).
+        #[arg(long, default_value = "-1", allow_negative_numbers = true)]
+        broadcast_limit: i64,
 
         /// Path to TLS certificate file (optional).
         #[arg(long)]
@@ -561,6 +588,61 @@ pub enum Commands {
         /// one directly; unset means outbound-only P2P participation.
         #[arg(long)]
         p2p_listen_address: Option<String>,
+
+        /// Maximum connections allowed from a single IP address (go:
+        /// `config.Local.MaxConnectionsPerIP`). Previously only available
+        /// on `relay`; closes that gap (issue #748). Falls back to
+        /// `<data-dir>/config.json`'s value (itself defaulted to go's
+        /// current default of 8) when unset.
+        #[arg(long)]
+        max_per_ip: Option<i64>,
+
+        /// Maximum simultaneous inbound connections (go:
+        /// `config.Local.IncomingConnectionsLimit`). Previously only
+        /// available on `relay`; closes that gap (issue #748). A negative
+        /// value means unbounded, matching go. Falls back to
+        /// `<data-dir>/config.json`'s value when unset.
+        #[arg(long)]
+        incoming_limit: Option<i64>,
+
+        /// Connection-rate limit: maximum new connections per window (go:
+        /// `config.Local.ConnectionsRateLimitingCount`). Previously only
+        /// available on `relay`; closes that gap (issue #748).
+        #[arg(long)]
+        rate_limit: Option<u64>,
+
+        /// Connection-rate-limit window, in seconds (go:
+        /// `config.Local.ConnectionsRateLimitingWindowSeconds`).
+        /// Previously entirely absent from algod-rust, which only modeled
+        /// the *count* half of this pair (issue #748).
+        #[arg(long)]
+        rate_limit_window_seconds: Option<u64>,
+
+        /// Maximum peers a single broadcast is delivered to (go:
+        /// `config.Local.BroadcastConnectionsLimit`). A negative value
+        /// means unbounded, matching go's real default (issue #748 fixed
+        /// algod-rust's prior hardcoded-`35` divergence). Previously only
+        /// available on `relay`.
+        #[arg(long)]
+        broadcast_limit: Option<i64>,
+
+        /// Path to TLS certificate file (go: `config.Local.TLSCertFile`).
+        /// Previously only available on `relay`; closes that gap (issue
+        /// #748).
+        #[arg(long)]
+        tls_cert: Option<String>,
+
+        /// Path to TLS private key file (go: `config.Local.TLSKeyFile`).
+        /// Previously only available on `relay`.
+        #[arg(long)]
+        tls_key: Option<String>,
+
+        /// Override the DNS bootstrap template used for peer discovery
+        /// when `--peers` is empty (go: `config.Local.DNSBootstrapID`).
+        /// Generalizes the `--dns-bootstrap` knob previously confined to
+        /// `observe` (issue #748).
+        #[arg(long)]
+        dns_bootstrap: Option<String>,
     },
 
     /// Follow mode: continuously validate new blocks as they arrive.

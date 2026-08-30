@@ -164,9 +164,19 @@ pub struct WebsocketNetworkConfig {
     /// Matches Go's `ConnectionsRateLimitingCount`.
     pub connections_rate_limiting_count: u32,
 
-    /// Number of outgoing connections used for broadcast (default: 35).
+    /// Maximum number of peers a single broadcast is delivered to (default:
+    /// [`UNBOUNDED_BROADCAST_CONNECTIONS_LIMIT`], i.e. unbounded).
     ///
-    /// Matches the target broadcast fanout.
+    /// Matches Go's `BroadcastConnectionsLimit`, whose real default is `-1`
+    /// (unbounded) — go's config type is a signed `int` so it can hold that
+    /// sentinel directly; this field stays `u32` for the broadcast hot path
+    /// (peer counts never approach `u32::MAX`), so callers translate a
+    /// negative `config.json`/CLI value to
+    /// [`UNBOUNDED_BROADCAST_CONNECTIONS_LIMIT`] before constructing this
+    /// config (see `algo_config::Local::broadcast_connections_limit` and its
+    /// callers in `bin/algod-rust`). Issue #748 fixed algod-rust's prior
+    /// hardcoded default of `35`, which diverged from go's real
+    /// unbounded-by-default behavior.
     pub broadcast_connections_limit: u32,
 
     /// Path to TLS certificate file.  `None` means plain HTTP/WS.
@@ -179,15 +189,29 @@ pub struct WebsocketNetworkConfig {
     /// Matches Go's `TLSKeyFile`.
     pub tls_key_file: Option<String>,
 
-    /// Memory cap for the block service cache in bytes (default: 500 MiB).
+    /// Memory cap for the block service cache in bytes (default:
+    /// 500,000,000 — see [`DEFAULT_BLOCK_SERVICE_MEM_CAP`]).
     ///
-    /// Matches Go's `BlockServiceMemCap` (500_000_000 in Go, we use
-    /// 500 * 1024 * 1024 = 524_288_000 for a clean binary multiple).
+    /// Matches Go's `BlockServiceMemCap` exactly (issue #748 fixed a prior
+    /// divergence: this used to default to `500 * 1024 * 1024`
+    /// (524,288,000), a binary-MiB approximation rather than go's literal
+    /// decimal byte count).
     pub block_service_mem_cap: u64,
 }
 
-/// Default block-service memory cap: 500 MiB.
-const DEFAULT_BLOCK_SERVICE_MEM_CAP: u64 = 500 * 1024 * 1024;
+/// Default block-service memory cap: 500,000,000 bytes.
+///
+/// Matches Go's `BlockServiceMemCap` literal `"500000000"`
+/// (`config/localTemplate.go:616`) exactly. Issue #748 fixed a prior
+/// divergence here: this constant used to be `500 * 1024 * 1024`
+/// (524,288,000 — a binary-MiB approximation), about 5% larger than go's
+/// real decimal byte count.
+const DEFAULT_BLOCK_SERVICE_MEM_CAP: u64 = 500_000_000;
+
+/// Sentinel meaning "no cap" for [`WebsocketNetworkConfig::broadcast_connections_limit`].
+/// Translates go's `-1` (unbounded) `BroadcastConnectionsLimit` default —
+/// see that field's doc comment.
+pub const UNBOUNDED_BROADCAST_CONNECTIONS_LIMIT: u32 = u32::MAX;
 
 impl Default for WebsocketNetworkConfig {
     fn default() -> Self {
@@ -203,7 +227,7 @@ impl Default for WebsocketNetworkConfig {
             relay_messages: false,
             max_connections_per_ip: 8,
             connections_rate_limiting_count: 60,
-            broadcast_connections_limit: 35,
+            broadcast_connections_limit: UNBOUNDED_BROADCAST_CONNECTIONS_LIMIT,
             tls_cert_file: None,
             tls_key_file: None,
             block_service_mem_cap: DEFAULT_BLOCK_SERVICE_MEM_CAP,
@@ -376,6 +400,21 @@ impl WebsocketNetwork {
     /// listen address and relay_messages is enabled).
     pub fn is_relay(&self) -> bool {
         self.config.net_address.is_some() && self.config.relay_messages
+    }
+
+    /// Whether this node should forward (relay) gossip messages to its
+    /// peers right now — go's
+    /// `wn.relayMessages = wn.config.IsListenServer() || wn.config.ForceRelayMessages`
+    /// (`network/wsNetwork.go:601`). Note the `||`: a node that is
+    /// listening for inbound connections always forwards, regardless of
+    /// `ForceRelayMessages`/`relay_messages`; that config field's only
+    /// independent effect is letting a *non-listening* node forward too.
+    /// This is deliberately different from [`Self::is_relay`] (which is an
+    /// `&&`-based "is this a full listen+relay peer" diagnostic predicate,
+    /// unrelated to whether messages actually get forwarded) — see issue
+    /// #748, which found the two had been conflated.
+    fn effective_relay_messages(&self) -> bool {
+        self.config.net_address.is_some() || self.config.relay_messages
     }
 
     /// Returns the number of currently connected peers.
@@ -743,9 +782,22 @@ impl WebsocketNetwork {
             None => return Ok(()),
         };
 
-        if !self.config.relay_messages {
-            return Ok(());
-        }
+        // NOTE: whether to *bind the listener* depends only on
+        // `net_address` being set — matching go's `IsListenServer()`
+        // (`NetAddress != ""`), which gates `wsNetwork.go`'s HTTP server
+        // startup independent of `ForceRelayMessages`. `relay_messages`
+        // (this config's mirror of `ForceRelayMessages`) instead gates
+        // *outbound* message forwarding (see `relay()` and the broadcast
+        // thread startup below), matching go's
+        // `wn.relayMessages = wn.config.IsListenServer() || wn.config.ForceRelayMessages`
+        // (`network/wsNetwork.go:601`) — note the `||`, not `&&`: a
+        // listening node always forwards, regardless of
+        // `ForceRelayMessages`, and `ForceRelayMessages` lets a
+        // *non-listening* node forward too. Previously this function also
+        // required `relay_messages` to bind at all, which meant a node
+        // with a listen address configured but `--relay-messages` unset
+        // silently accepted no inbound connections — a real conformance
+        // gap (issue #748).
 
         // Build optional TLS acceptor from config.
         let tls_acceptor = self.build_tls_acceptor()?;
@@ -946,7 +998,7 @@ impl GossipNode for WebsocketNetwork {
         _wait: bool,
         except: Option<Arc<dyn Peer>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !self.config.relay_messages {
+        if !self.effective_relay_messages() {
             return Ok(());
         }
 
@@ -1392,7 +1444,7 @@ impl WebsocketNetwork {
         }
 
         // Start the broadcast thread if relay mode is active.
-        if self.config.relay_messages {
+        if self.effective_relay_messages() {
             let peers_ref = Arc::clone(&self.peers);
             let peers_fn = move || {
                 // Use try_read to avoid blocking the broadcast thread.
@@ -2369,5 +2421,114 @@ mod tests {
         assert!(!listening);
 
         net.stop().await;
+    }
+
+    /// Issue #748: a listen address alone must open the listener, matching
+    /// go's `IsListenServer()`-only gating (`NetAddress != ""`) — the
+    /// listener bind must NOT also require `relay_messages`/
+    /// `ForceRelayMessages`. Before the fix, `start_relay_server` silently
+    /// refused to bind whenever `relay_messages` was `false`, even with a
+    /// listen address configured.
+    #[tokio::test]
+    async fn net_address_alone_opens_the_listener_without_relay_messages() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: false,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+        net.start_relay_server().await.unwrap();
+
+        let (addr, listening) = net.address();
+        assert!(
+            listening,
+            "a configured listen address must open a listener"
+        );
+        assert!(!addr.is_empty());
+
+        net.stop().await;
+    }
+
+    /// Issue #748: go's `relayMessages = IsListenServer() || ForceRelayMessages`
+    /// (`network/wsNetwork.go:601`) is an OR, not an AND — a listening node
+    /// forwards messages regardless of `ForceRelayMessages`. Verified here
+    /// via the `relay()` trait method, which previously dropped messages
+    /// silently whenever the (misnamed-in-effect) `relay_messages` config
+    /// field was `false`, even for a listening node.
+    #[tokio::test]
+    async fn listening_node_forwards_messages_even_without_force_relay_messages() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: false,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+        assert!(
+            net.effective_relay_messages(),
+            "a listening node must forward regardless of relay_messages"
+        );
+        net.stop().await;
+    }
+
+    /// A non-listening node with `relay_messages: false` (go's
+    /// `ForceRelayMessages: false`) must NOT forward — this is the
+    /// "peer, not relay" default participation-node case, unaffected by
+    /// issue #748's fix.
+    #[tokio::test]
+    async fn non_listening_node_without_force_relay_messages_does_not_forward() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            net_address: None,
+            relay_messages: false,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+        assert!(!net.effective_relay_messages());
+        net.stop().await;
+    }
+
+    /// A non-listening node with `ForceRelayMessages: true` must still
+    /// forward — the other half of go's OR semantics.
+    #[tokio::test]
+    async fn non_listening_node_with_force_relay_messages_still_forwards() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            net_address: None,
+            relay_messages: true,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+        assert!(net.effective_relay_messages());
+        net.stop().await;
+    }
+
+    /// Issue #748: go's `BroadcastConnectionsLimit` default is `-1`
+    /// (unbounded), not algod-rust's old hardcoded `35`.
+    #[test]
+    fn default_broadcast_connections_limit_is_unbounded() {
+        let config = WebsocketNetworkConfig::default();
+        assert_eq!(
+            config.broadcast_connections_limit,
+            UNBOUNDED_BROADCAST_CONNECTIONS_LIMIT
+        );
+    }
+
+    /// Issue #748: go's `BlockServiceMemCap` default is the literal byte
+    /// count `500000000`, not a binary-MiB approximation
+    /// (`500 * 1024 * 1024 = 524288000`).
+    #[test]
+    fn default_block_service_mem_cap_matches_go_byte_count_exactly() {
+        let config = WebsocketNetworkConfig::default();
+        assert_eq!(config.block_service_mem_cap, 500_000_000);
     }
 }

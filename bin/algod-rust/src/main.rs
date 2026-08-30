@@ -140,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
             gossip,
             genesis_id,
             relay_addr,
+            dns_bootstrap,
         } => {
             let (resolved_url, resolved_token, net_name) =
                 commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
@@ -179,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
                     gossip,
                     genesis_id.as_deref(),
                     &relay_addr,
+                    dns_bootstrap.as_deref(),
                 )
                 .await?;
             }
@@ -288,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
             incoming_limit,
             max_per_ip,
             rate_limit,
+            rate_limit_window_seconds,
             broadcast_limit,
             tls_cert,
             tls_key,
@@ -302,6 +305,7 @@ async fn main() -> anyhow::Result<()> {
                 incoming_limit,
                 max_per_ip,
                 rate_limit,
+                rate_limit_window_seconds,
                 broadcast_limit,
                 tls_cert.as_deref(),
                 tls_key.as_deref(),
@@ -370,46 +374,55 @@ async fn main() -> anyhow::Result<()> {
             p2p_persist_peer_id,
             p2p_bootstrap_peers,
             p2p_listen_address,
+            max_per_ip,
+            incoming_limit,
+            rate_limit,
+            rate_limit_window_seconds,
+            broadcast_limit,
+            tls_cert,
+            tls_key,
+            dns_bootstrap,
         } => {
             let file_config = crate::config::AlgodRustConfig::load(config.as_deref())?;
             // Load `<data-dir>/config.json` (go-algorand `config.Local`
-            // equivalent — issue #754/epic #745). This is currently
-            // observational only: the loaded fields aren't yet wired into
-            // runtime behavior (e.g. `algo-network`'s connection limits
-            // still come from `WsNetworkConfig`'s hardcoded defaults) —
-            // that wiring, and its exact precedence against the
-            // `--config` TOML file and CLI flags above, is each
-            // per-area follow-up issue's own call to make (#748 for
-            // networking, etc.). Loading it here now proves the mechanism
-            // works end-to-end against a real data directory and keeps
-            // operators informed of what a dropped-in `config.json` would
-            // resolve to once that wiring lands.
-            if let Some(dir) = data_dir.as_deref() {
-                match algo_config::Local::load_from_data_dir(dir) {
-                    Ok(node_config) => {
+            // equivalent — issue #754/epic #745), now actually wired into
+            // networking runtime behavior (issue #748): connection
+            // limits, rate limiting, TLS, broadcast fanout, gossip/block
+            // service toggles, and DNS bootstrap all flow from here
+            // through `commands::participate::run`'s `network_opts`/
+            // `node_config` parameters. A missing `--data-dir` (or a
+            // missing `config.json` within it) is not an error — `Local`
+            // falls back to its fully-materialized, go-matching defaults.
+            let node_config = match data_dir.as_deref() {
+                Some(dir) => match algo_config::Local::load_from_data_dir(dir) {
+                    Ok(cfg) => {
                         tracing::debug!(
-                            version = node_config.version,
-                            max_connections_per_ip = node_config.max_connections_per_ip,
-                            incoming_connections_limit = node_config.incoming_connections_limit,
-                            enable_p2p = node_config.enable_p2p,
-                            enable_p2p_hybrid_mode = node_config.enable_p2p_hybrid_mode,
-                            p2p_persist_peer_id = node_config.p2p_persist_peer_id,
-                            "loaded config.json (not yet wired into runtime behavior)"
+                            version = cfg.version,
+                            max_connections_per_ip = cfg.max_connections_per_ip,
+                            incoming_connections_limit = cfg.incoming_connections_limit,
+                            enable_p2p = cfg.enable_p2p,
+                            enable_p2p_hybrid_mode = cfg.enable_p2p_hybrid_mode,
+                            p2p_persist_peer_id = cfg.p2p_persist_peer_id,
+                            "loaded config.json"
                         );
+                        cfg
                     }
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "failed to load config.json; continuing without it"
+                            "failed to load config.json; continuing with defaults"
                         );
+                        algo_config::Local::default()
                     }
-                }
-            }
+                },
+                None => algo_config::Local::default(),
+            };
             let rest_opts = commands::participate::RestOptions {
                 listen: rest_listen,
                 data_dir,
                 genesis_path,
                 file_rest: file_config.rest().cloned(),
+                disable_api_auth: node_config.disable_api_auth,
             };
             let p2p_opts = commands::p2p_transport::P2pOptions {
                 enable_p2p,
@@ -418,6 +431,15 @@ async fn main() -> anyhow::Result<()> {
                 p2p_bootstrap_peers,
                 p2p_listen_address,
                 file_p2p: file_config.p2p().cloned(),
+            };
+            let network_opts = commands::participate::NetworkOptions {
+                max_connections_per_ip: max_per_ip,
+                incoming_connections_limit: incoming_limit,
+                connections_rate_limiting_count: rate_limit,
+                connections_rate_limiting_window_seconds: rate_limit_window_seconds,
+                broadcast_connections_limit: broadcast_limit,
+                tls_cert_file: tls_cert,
+                tls_key_file: tls_key,
             };
             commands::participate::run(
                 &ledger_path,
@@ -433,6 +455,9 @@ async fn main() -> anyhow::Result<()> {
                 genesis_hash.as_deref(),
                 rest_opts,
                 p2p_opts,
+                network_opts,
+                node_config,
+                dns_bootstrap.as_deref(),
             )
             .await?;
         }

@@ -24,6 +24,23 @@
 pub const DNS_BOOTSTRAP_TEMPLATE: &str =
     "<network>.algorand.network?backup=<network>.algorand.net&dedup=<name>.algorand-<network>.(network|net)";
 
+/// Translate a go-style signed connection-limit field (where a negative
+/// value, per go's own `version[N]:"-1"` defaults, means "unbounded") into
+/// `algo-network`'s unsigned representation. Negative becomes
+/// [`algo_network::UNBOUNDED_BROADCAST_CONNECTIONS_LIMIT`] (`u32::MAX`,
+/// used generically here for any "no cap" sentinel, not just the
+/// broadcast-specific one); non-negative values are clamped rather than
+/// wrapped if they somehow exceed `u32::MAX`. Shared by `relay` and
+/// `participate` (issue #748) for `MaxConnectionsPerIP`,
+/// `IncomingConnectionsLimit`, and `BroadcastConnectionsLimit`.
+pub fn resolve_unsigned_limit(value: i64) -> u32 {
+    if value < 0 {
+        algo_network::UNBOUNDED_BROADCAST_CONNECTIONS_LIMIT
+    } else {
+        u32::try_from(value).unwrap_or(u32::MAX)
+    }
+}
+
 /// Map a network name to its genesis ID.
 ///
 /// Returns `None` for unknown networks.

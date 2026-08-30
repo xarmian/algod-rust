@@ -58,6 +58,18 @@ pub struct TokenConfig {
     /// When true, experimental endpoints are registered in the router.
     /// Mirrors go-algorand's `Config().EnableExperimentalAPI`.
     pub enable_experimental_api: bool,
+
+    /// Turns off authentication for public (non-admin) API endpoints.
+    /// Mirrors go-algorand's `config.Local.DisableAPIAuth` (issue #748).
+    ///
+    /// Scope matches go exactly: only the public/authenticated and
+    /// follower-mode data tiers skip the token check when this is set —
+    /// admin-tier routes (shutdown, catchup management, participation key
+    /// management, peer listing) always require the admin token
+    /// regardless, since `DisableAPIAuth`'s own doc comment
+    /// (`config/localTemplate.go:649`) scopes it to "public (non-admin)"
+    /// endpoints.
+    pub disable_api_auth: bool,
 }
 
 /// Build the complete API router.
@@ -210,14 +222,20 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
         .route(
             "/v2/devmode/blocks/offset/:offset",
             post(handlers::set_block_timestamp_offset::<N>),
-        )
-        .layer(middleware::from_fn_with_state(
-            // Authenticated routes accept either the admin or the public token,
-            // matching go-algorand's `[adminToken, apiToken]` public middleware
-            // (router.go:96) — the admin token is valid everywhere.
+        );
+    // Authenticated routes accept either the admin or the public token,
+    // matching go-algorand's `[adminToken, apiToken]` public middleware
+    // (router.go:96) — the admin token is valid everywhere. Skipped
+    // entirely when `DisableAPIAuth` is set (issue #748) — admin-tier
+    // routes below are unaffected and always stay authenticated.
+    let authenticated = if tokens.disable_api_auth {
+        authenticated
+    } else {
+        authenticated.layer(middleware::from_fn_with_state(
             vec![tokens.admin_token.clone(), tokens.api_token.clone()],
             auth::require_token,
-        ));
+        ))
+    };
 
     // Admin routes (admin API token required)
     let admin = Router::new()
@@ -278,12 +296,18 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             .route(
                 "/v2/ledger/sync/:round",
                 post(handlers::set_sync_round::<N>),
-            )
-            .layer(middleware::from_fn_with_state(
-                // Data API uses the public middleware (admin token also valid).
+            );
+        // Data API uses the public middleware (admin token also valid),
+        // skipped when `DisableAPIAuth` is set (issue #748) — same
+        // "non-admin only" scope as the `authenticated` group above.
+        let data = if tokens.disable_api_auth {
+            data
+        } else {
+            data.layer(middleware::from_fn_with_state(
                 vec![tokens.admin_token.clone(), tokens.api_token.clone()],
                 auth::require_token,
-            ));
+            ))
+        };
         router = router.merge(data);
     }
 
@@ -295,12 +319,18 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             .route(
                 "/v2/transactions/async",
                 post(handlers::raw_transaction_async::<N>),
-            )
-            .layer(middleware::from_fn_with_state(
-                // Experimental routes use the public middleware (admin token also valid).
+            );
+        // Experimental routes use the public middleware (admin token also
+        // valid), skipped when `DisableAPIAuth` is set — same scope note
+        // as above.
+        let experimental = if tokens.disable_api_auth {
+            experimental
+        } else {
+            experimental.layer(middleware::from_fn_with_state(
                 vec![tokens.admin_token.clone(), tokens.api_token.clone()],
                 auth::require_token,
-            ));
+            ))
+        };
         router = router.merge(experimental);
     }
 
