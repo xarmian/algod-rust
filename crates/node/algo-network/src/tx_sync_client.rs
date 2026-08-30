@@ -92,6 +92,13 @@ impl TxSyncPeerClient for HttpTxSyncClient {
         pending: &[Digest],
         timeout: Duration,
     ) -> Result<Vec<Vec<SignedTransaction>>, TxSyncError> {
+        // A single overall deadline for the whole round-trip (send +
+        // headers + body read), not one `timeout` budget for the send and
+        // a *second*, fresh `timeout` budget for the read — a peer that's
+        // merely slow (not hung) could otherwise make one `sync()` call
+        // take up to ~2x the configured `sync_timeout`.
+        let deadline = tokio::time::Instant::now() + timeout;
+
         let body = rmp_serde::to_vec(&pending.to_vec()).map_err(|e| TxSyncError::Peer {
             peer: self.peer_addr.clone(),
             message: format!("encode pending ids: {e}"),
@@ -102,7 +109,7 @@ impl TxSyncPeerClient for HttpTxSyncClient {
         );
 
         let send_result = tokio::time::timeout(
-            timeout,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
             self.http
                 .post(&url)
                 .header("Content-Type", TX_SYNC_REQUEST_CONTENT_TYPE)
@@ -133,7 +140,7 @@ impl TxSyncPeerClient for HttpTxSyncClient {
             });
         }
 
-        let bytes = self.read_bounded(response, timeout).await?;
+        let bytes = self.read_bounded(response, deadline, timeout).await?;
         rmp_serde::from_slice(&bytes).map_err(|e| TxSyncError::Peer {
             peer: self.peer_addr.clone(),
             message: format!("decode response: {e}"),
@@ -143,16 +150,21 @@ impl TxSyncPeerClient for HttpTxSyncClient {
 
 impl HttpTxSyncClient {
     /// Read `response`'s body, aborting as soon as it would exceed
-    /// `response_size_limit` bytes or `timeout` elapses — whichever
-    /// comes first. Never trusts `Content-Length` alone: a peer can omit
-    /// or understate it and still stream an unbounded body, so the
-    /// stream itself is capped as it's read.
+    /// `response_size_limit` bytes or `deadline` passes — whichever comes
+    /// first. Never trusts `Content-Length` alone: a peer can omit or
+    /// understate it and still stream an unbounded body, so the stream
+    /// itself is capped as it's read.
+    ///
+    /// `deadline` is the *overall* round-trip deadline computed once in
+    /// [`sync`](Self::sync) (not a fresh `timeout` window started here) —
+    /// see that method's comment. `original_timeout` is threaded through
+    /// only to report in [`TxSyncError::Timeout`].
     async fn read_bounded(
         &self,
         response: reqwest::Response,
-        timeout: Duration,
+        deadline: tokio::time::Instant,
+        original_timeout: Duration,
     ) -> Result<Vec<u8>, TxSyncError> {
-        let deadline = tokio::time::Instant::now() + timeout;
         let mut buf = Vec::new();
         let mut stream = response.bytes_stream();
         loop {
@@ -161,7 +173,7 @@ impl HttpTxSyncClient {
                 .await
                 .map_err(|_| TxSyncError::Timeout {
                     peer: self.peer_addr.clone(),
-                    elapsed: timeout,
+                    elapsed: original_timeout,
                 })?;
             match next {
                 Some(Ok(chunk)) => {
