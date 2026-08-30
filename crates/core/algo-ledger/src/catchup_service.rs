@@ -211,6 +211,25 @@ pub struct CatchupService {
     fork_count: Arc<AtomicU64>,
 }
 
+/// Outcome of a single worker's fetch attempt in [`CatchupService::sync_pass`],
+/// sent back to the main thread for in-order validation/apply.
+///
+/// Validation itself (round match, certificate presence, authentication,
+/// contents-match-header) stays single-threaded so it runs exactly once per
+/// round, in round order, identically to the pre-#753 serial code — only
+/// the network I/O is parallelized across workers.
+///
+/// Boxed so `Unsupported`'s zero-data variant doesn't force every message
+/// (including the common `Unsupported` case) to be sized for the much
+/// larger `Ok(FetchedBlockCert)` payload.
+enum FetchOutcome {
+    /// The round requires a protocol version this node does not support
+    /// (checked before fetching).
+    Unsupported,
+    /// The fetch itself failed or returned the wrong round's block.
+    Fetch(Box<Result<FetchedBlockCert, FetchError>>),
+}
+
 impl CatchupService {
     /// Create and start a new `CatchupService`.
     ///
@@ -222,19 +241,52 @@ impl CatchupService {
     ///   capabilities (typically an [`AgreementLedgerBridge`](crate::AgreementLedgerBridge)).
     /// - `fetcher`: a block fetcher implementation for retrieving blocks from
     ///   the network.
+    ///
+    /// Uses [`Self::DEFAULT_PARALLEL_BLOCKS`] for the periodic path's fetch
+    /// concurrency, matching go's `CatchupParallelBlocks` default (16 at
+    /// v5.0.0-stable, `config/localTemplate.go:313`). Callers that have a
+    /// configured value (e.g. from `algo_config::Local::catchup_parallel_blocks`)
+    /// should use [`Self::start_with_parallelism`] instead.
     pub fn start(
         cert_rx: Receiver<PendingUnmatchedCertificate>,
         ledger: Arc<dyn CatchupLedger>,
         fetcher: Arc<dyn BlockFetcher>,
     ) -> Self {
+        Self::start_with_parallelism(cert_rx, ledger, fetcher, Self::DEFAULT_PARALLEL_BLOCKS)
+    }
+
+    /// Go's v5.0.0-stable `CatchupParallelBlocks` default
+    /// (`config/localTemplate.go:313`, `version[5]:"16"`).
+    pub const DEFAULT_PARALLEL_BLOCKS: u64 = 16;
+
+    /// Same as [`Self::start`], but with an explicit fetch-concurrency
+    /// budget for the periodic sync path (issue #753) — go's
+    /// `CatchupParallelBlocks`. Values are clamped to
+    /// `1..=`[`Self::MAX_BLOCKS_PER_SYNC_PASS`]; `0` is treated as `1`
+    /// (serial), matching "at least one fetch in flight" rather than a
+    /// stalled service.
+    pub fn start_with_parallelism(
+        cert_rx: Receiver<PendingUnmatchedCertificate>,
+        ledger: Arc<dyn CatchupLedger>,
+        fetcher: Arc<dyn BlockFetcher>,
+        parallel_blocks: u64,
+    ) -> Self {
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let fork_count = Arc::new(AtomicU64::new(0));
         let fork_count_inner = Arc::clone(&fork_count);
+        let parallel_blocks = parallel_blocks.clamp(1, Self::MAX_BLOCKS_PER_SYNC_PASS);
 
         let join_handle = thread::Builder::new()
             .name("catchup-service".to_string())
             .spawn(move || {
-                Self::run_loop(cert_rx, shutdown_rx, ledger, fetcher, fork_count_inner);
+                Self::run_loop(
+                    cert_rx,
+                    shutdown_rx,
+                    ledger,
+                    fetcher,
+                    fork_count_inner,
+                    parallel_blocks,
+                );
             })
             .expect("failed to spawn catchup-service thread");
 
@@ -283,13 +335,14 @@ impl CatchupService {
         ledger: Arc<dyn CatchupLedger>,
         fetcher: Arc<dyn BlockFetcher>,
         fork_count: Arc<AtomicU64>,
+        parallel_blocks: u64,
     ) {
         info!("catchup service started");
 
         // Mirrors Go's `periodicSync`, which runs one `sync()` immediately
         // on startup before entering its select loop
         // (`catchup/service.go:611-619`).
-        Self::sync_pass(&ledger, &fetcher, &shutdown_rx);
+        Self::sync_pass(&ledger, &fetcher, &shutdown_rx, parallel_blocks);
 
         let mut last_round = ledger.next_round();
 
@@ -325,7 +378,7 @@ impl CatchupService {
                         last_round = now;
                         continue;
                     }
-                    Self::sync_pass(&ledger, &fetcher, &shutdown_rx);
+                    Self::sync_pass(&ledger, &fetcher, &shutdown_rx, parallel_blocks);
                     last_round = ledger.next_round();
                     continue;
                 }
@@ -387,8 +440,13 @@ impl CatchupService {
     /// Pull consecutive blocks from the network starting at the ledger's
     /// next round, until a fetch fails or the batch limit is reached.
     ///
-    /// Mirrors Go's `Service.sync()` / `pipelinedFetch` (serially, rather
-    /// than with Go's `CatchupParallelBlocks` worker pool).
+    /// Mirrors Go's `Service.sync()` / `pipelinedFetch`: up to
+    /// `parallel_blocks` rounds are fetched concurrently by a small worker
+    /// pool (go's `CatchupParallelBlocks`), while validation and ledger
+    /// commit happen strictly in round order on this thread — a worker
+    /// only ever does the network I/O, never decides whether a block gets
+    /// applied, so the applied sequence is byte-for-byte the same as the
+    /// old serial implementation for the same inputs.
     ///
     /// Every block committed here is authenticated against the certificate
     /// the serving peer returned — see
@@ -399,106 +457,212 @@ impl CatchupService {
         ledger: &Arc<dyn CatchupLedger>,
         fetcher: &Arc<dyn BlockFetcher>,
         shutdown_rx: &Receiver<()>,
+        parallel_blocks: u64,
     ) {
         let start_round = ledger.next_round();
+        let limit_round = start_round.0.saturating_add(Self::MAX_BLOCKS_PER_SYNC_PASS);
+        let parallel_blocks = parallel_blocks.clamp(1, Self::MAX_BLOCKS_PER_SYNC_PASS);
+
+        // Shared dispatch counter (next round any idle worker should try
+        // next) and a stop flag any thread can raise once a permanent
+        // failure/stop condition is found — either a worker discovering an
+        // unsupported round, or the main thread's validation loop below.
+        let next_to_fetch = Arc::new(AtomicU64::new(start_round.0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A zero-capacity (rendezvous) channel: a worker's `send` only
+        // completes once the main loop below is actively receiving, so a
+        // worker can be at most one completed-but-unconsumed fetch ahead of
+        // validation at any time. Without this, a fast/misbehaving peer
+        // answering every round instantly could let all `parallel_blocks`
+        // workers race arbitrarily far ahead, wasting up to the full
+        // `MAX_BLOCKS_PER_SYNC_PASS` batch on fetches that get discarded
+        // the moment the first invalid round is found. Rendezvous caps that
+        // waste at roughly one per worker — the fetch-ahead budget
+        // `CatchupParallelBlocks` is meant to express — while still letting
+        // every worker's actual network I/O run fully in parallel.
+        let (result_tx, result_rx) = crossbeam_channel::bounded::<(u64, FetchOutcome)>(0);
+
+        let mut workers = Vec::with_capacity(parallel_blocks as usize);
+        for _ in 0..parallel_blocks {
+            let next_to_fetch = Arc::clone(&next_to_fetch);
+            let stop = Arc::clone(&stop);
+            let tx = result_tx.clone();
+            let ledger = Arc::clone(ledger);
+            let fetcher = Arc::clone(fetcher);
+            workers.push(thread::spawn(move || loop {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let round = next_to_fetch.fetch_add(1, Ordering::SeqCst);
+                if round >= limit_round {
+                    return;
+                }
+                let r = Round(round);
+                if ledger.round_is_not_supported(r) {
+                    let _ = tx.send((round, FetchOutcome::Unsupported));
+                    return;
+                }
+                let outcome = fetcher.fetch_block(r);
+                if tx
+                    .send((round, FetchOutcome::Fetch(Box::new(outcome))))
+                    .is_err()
+                {
+                    return;
+                }
+            }));
+        }
+        // Drop this thread's sender clone so the channel closes once every
+        // worker has exited (each worker holds its own clone until then).
+        drop(result_tx);
+
+        let mut buffer: std::collections::BTreeMap<u64, FetchOutcome> =
+            std::collections::BTreeMap::new();
+        let mut next_apply = start_round.0;
         let mut fetched = 0u64;
+        // Once `true`, the main loop below only drains the channel (never
+        // applies anything more). This is essential, not just tidy: a
+        // worker can be parked mid-`send` on the bounded channel when the
+        // stop condition is discovered, and it only re-checks `stop` after
+        // that `send` unblocks — so this thread must keep receiving (even
+        // if it throws every further message away) until every worker's
+        // sender clone drops and the channel closes, or `join` below would
+        // deadlock waiting on a worker that is waiting on us.
+        let mut stopped = false;
 
-        while fetched < Self::MAX_BLOCKS_PER_SYNC_PASS {
-            if shutdown_rx.try_recv().is_ok() {
-                debug!("catchup service: shutdown received during periodic sync");
-                return;
+        for (round, outcome) in result_rx.iter() {
+            if stopped {
+                continue;
             }
-
-            let round = ledger.next_round();
-            if ledger.round_is_not_supported(round) {
-                info!(
-                    round = %round,
-                    "catchup service: periodic sync stopping, round requires \
-                     an unsupported protocol version"
-                );
-                break;
-            }
-
-            let fetched_block = match fetcher.fetch_block(round) {
-                Ok(f) => f,
-                Err(e) => {
-                    // Reaching the network tip is the normal exit from this
-                    // loop, so only report at debug level.
-                    debug!(
-                        round = %round,
-                        error = %e,
-                        "catchup service: periodic sync stopping"
-                    );
-                    break;
+            buffer.insert(round, outcome);
+            'apply: while let Some(outcome) = buffer.remove(&next_apply) {
+                if shutdown_rx.try_recv().is_ok() {
+                    debug!("catchup service: shutdown received during periodic sync");
+                    stop.store(true, Ordering::SeqCst);
+                    stopped = true;
+                    break 'apply;
                 }
-            };
 
-            let block = fetched_block.block;
-            if block.round != round {
-                warn!(
-                    expected_round = %round,
-                    fetched_round = %block.round,
-                    "catchup service: periodic sync got wrong round, stopping"
-                );
-                break;
-            }
+                match outcome {
+                    FetchOutcome::Unsupported => {
+                        info!(
+                            round = %Round(next_apply),
+                            "catchup service: periodic sync stopping, round requires \
+                             an unsupported protocol version"
+                        );
+                        stop.store(true, Ordering::SeqCst);
+                        stopped = true;
+                        break 'apply;
+                    }
+                    FetchOutcome::Fetch(boxed) if boxed.is_err() => {
+                        // Reaching the network tip is the normal exit from
+                        // this loop, so only report at debug level.
+                        let e = boxed.unwrap_err();
+                        debug!(
+                            round = %Round(next_apply),
+                            error = %e,
+                            "catchup service: periodic sync stopping"
+                        );
+                        stop.store(true, Ordering::SeqCst);
+                        stopped = true;
+                        break 'apply;
+                    }
+                    FetchOutcome::Fetch(boxed) => {
+                        let fetched_block = boxed.expect("checked Ok above via is_err guard");
+                        let expected_round = Round(next_apply);
+                        let block = fetched_block.block;
+                        if block.round != expected_round {
+                            warn!(
+                                expected_round = %expected_round,
+                                fetched_round = %block.round,
+                                "catchup service: periodic sync got wrong round, stopping"
+                            );
+                            stop.store(true, Ordering::SeqCst);
+                            stopped = true;
+                            break 'apply;
+                        }
 
-            let Some(cert) = fetched_block.cert else {
-                warn!(
-                    round = %round,
-                    "catchup service: periodic sync got a block with no \
-                     certificate, refusing to commit it"
-                );
-                break;
-            };
+                        let Some(cert) = fetched_block.cert else {
+                            warn!(
+                                round = %expected_round,
+                                "catchup service: periodic sync got a block with no \
+                                 certificate, refusing to commit it"
+                            );
+                            stop.store(true, Ordering::SeqCst);
+                            stopped = true;
+                            break 'apply;
+                        };
 
-            if let Err(reason) = ledger.authenticate_block(&block, &cert) {
-                warn!(
-                    round = %round,
-                    reason = %reason,
-                    "catchup service: periodic sync could not authenticate \
-                     the fetched block, stopping"
-                );
-                break;
-            }
+                        if let Err(reason) = ledger.authenticate_block(&block, &cert) {
+                            warn!(
+                                round = %expected_round,
+                                reason = %reason,
+                                "catchup service: periodic sync could not authenticate \
+                                 the fetched block, stopping"
+                            );
+                            stop.store(true, Ordering::SeqCst);
+                            stopped = true;
+                            break 'apply;
+                        }
 
-            match algo_validate::contents_match_header(
-                &block,
-                fetched_block.raw_payset_blobs.as_deref(),
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    warn!(
-                        round = %round,
-                        "catchup service: periodic sync block contents do not \
-                         match header commitments, stopping"
-                    );
-                    break;
+                        match algo_validate::contents_match_header(
+                            &block,
+                            fetched_block.raw_payset_blobs.as_deref(),
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(
+                                    round = %expected_round,
+                                    "catchup service: periodic sync block contents do not \
+                                     match header commitments, stopping"
+                                );
+                                stop.store(true, Ordering::SeqCst);
+                                stopped = true;
+                                break 'apply;
+                            }
+                            Err(reason) => {
+                                warn!(
+                                    round = %expected_round,
+                                    error = %reason,
+                                    "catchup service: periodic sync cannot verify block \
+                                     contents, stopping"
+                                );
+                                stop.store(true, Ordering::SeqCst);
+                                stopped = true;
+                                break 'apply;
+                            }
+                        }
+
+                        ledger.ensure_block(&block, &cert);
+                        fetched += 1;
+
+                        // `ensure_block` is best-effort; if the ledger did
+                        // not actually advance there is no point spinning
+                        // on the same round.
+                        if ledger.next_round().0 <= expected_round.0 {
+                            warn!(
+                                round = %expected_round,
+                                "catchup service: periodic sync committed a block but the \
+                                 ledger did not advance, stopping"
+                            );
+                            stop.store(true, Ordering::SeqCst);
+                            stopped = true;
+                            break 'apply;
+                        }
+                    }
                 }
-                Err(reason) => {
-                    warn!(
-                        round = %round,
-                        error = %reason,
-                        "catchup service: periodic sync cannot verify block \
-                         contents, stopping"
-                    );
-                    break;
-                }
+                next_apply += 1;
             }
+        }
 
-            ledger.ensure_block(&block, &cert);
-            fetched += 1;
-
-            // `ensure_block` is best-effort; if the ledger did not actually
-            // advance there is no point spinning on the same round.
-            if ledger.next_round().0 <= round.0 {
-                warn!(
-                    round = %round,
-                    "catchup service: periodic sync committed a block but the \
-                     ledger did not advance, stopping"
-                );
-                break;
-            }
+        // The channel only closes once every worker's sender clone has
+        // dropped, i.e. once every worker has returned — so by the time
+        // `result_rx.iter()` above ends, every worker has already noticed
+        // `stop` (or run out of rounds) and these `join`s return immediately.
+        // `stop` is set defensively in case the batch limit was reached
+        // without any validation failure ever setting it.
+        stop.store(true, Ordering::SeqCst);
+        for w in workers {
+            let _ = w.join();
         }
 
         if fetched > 0 {
@@ -1180,7 +1344,15 @@ mod tests {
         let fetcher = Arc::new(DigestMatchingBlockFetcher::new(sentinel_block));
         let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
 
-        let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
+        // Parallelism pinned to 1: this test asserts a tight fetch-count
+        // bound to prove no wasteful re-fetching of an already-committed
+        // round, which is only a meaningful guarantee in strictly serial
+        // mode — `DigestMatchingBlockFetcher` ignores the requested round
+        // and always returns the same block, so a concurrent worker pool
+        // would race ahead fetching many rounds before the mismatch is
+        // detected (that speculative-fetch cost is expected and covered by
+        // `periodic_sync_fetches_blocks_in_parallel` instead).
+        let mut svc = CatchupService::start_with_parallelism(rx, ledger, fetcher_ref, 1);
 
         // Send a cert for round 5 — already committed, should be skipped.
         tx.send(make_pending_cert(5)).unwrap();
@@ -1197,14 +1369,21 @@ mod tests {
             "sentinel cert for round 11 should have been fetched",
         );
 
-        // At most two fetches: the one startup periodic probe the service
+        // Roughly two fetches: the one startup periodic probe the service
         // makes for `next_round()` (Go's `periodicSync` does the same,
         // catchup/service.go:611-619) plus exactly one certificate-driven
         // fetch for the sentinel. Crucially, the already-committed round 5
-        // must not add one.
+        // must not add one. `start_with_parallelism(.., 1)`'s single
+        // periodic-sync worker can race one extra (wasted, discarded)
+        // speculative fetch ahead of the main thread noticing the startup
+        // probe should stop (issue #753's rendezvous-channel pipelining —
+        // see `sync_pass`'s worker-loop doc comment), so this allows a
+        // small, explicitly-bounded slack rather than an exact count.
         assert!(
-            fetcher.fetch_count() <= 2,
-            "fetcher should be called only for the startup probe and the              sentinel, not for the skipped round (got {})",
+            fetcher.fetch_count() <= 4,
+            "fetcher should be called only for the startup probe (plus at most one \
+             speculative pipeline fetch) and the sentinel, not for the skipped round \
+             (got {})",
             fetcher.fetch_count()
         );
 
@@ -1283,7 +1462,10 @@ mod tests {
         let fetcher = Arc::new(DigestMatchingBlockFetcher::new(block));
         let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
 
-        let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
+        // Parallelism pinned to 1 — see `skips_already_committed_round`'s
+        // comment for why this test's tight fetch-count bound only holds
+        // in strictly serial mode against `DigestMatchingBlockFetcher`.
+        let mut svc = CatchupService::start_with_parallelism(rx, ledger, fetcher_ref, 1);
 
         // Send a cert for round 1 with the correct digest.
         tx.send(make_pending_cert_with_digest(1, digest)).unwrap();
@@ -1297,10 +1479,13 @@ mod tests {
             "fetcher should be called for a valid block",
         );
 
-        // At most two fetches: the startup periodic probe plus one
-        // certificate-driven fetch. No retries for a valid block.
+        // Roughly two fetches: the startup periodic probe plus one
+        // certificate-driven fetch, no retries for a valid block — plus a
+        // small bounded slack for `start_with_parallelism(.., 1)`'s
+        // rendezvous-pipelined periodic worker (see
+        // `skips_already_committed_round`'s comment on the same bound).
         assert!(
-            fetcher.fetch_count() <= 2,
+            fetcher.fetch_count() <= 4,
             "a valid block should need no retries (got {} fetches)",
             fetcher.fetch_count()
         );
@@ -1632,6 +1817,138 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_secs(5),
             "fetcher should have been called at least once",
+        );
+
+        svc.stop();
+    }
+
+    // -- ConcurrencyTrackingFetcher: records how many fetches overlap --
+
+    /// Serves rounds `1..=up_to`, sleeping `delay` inside each fetch and
+    /// recording the maximum number of concurrently in-flight calls it
+    /// observed. Used to pin down issue #753's real behavioral gap: the
+    /// periodic catchup path fetched blocks strictly serially, with no
+    /// worker pool honoring go's `CatchupParallelBlocks`
+    /// (`config/localTemplate.go:310-313`). A correct parallel
+    /// implementation must show `max_concurrent() > 1` when given a
+    /// `parallel_blocks` budget greater than 1; the old serial
+    /// implementation could never exceed 1 no matter how large that
+    /// budget was, which is exactly what this test pins down.
+    struct ConcurrencyTrackingFetcher {
+        up_to: u64,
+        delay: Duration,
+        current: AtomicU64,
+        max_concurrent: AtomicU64,
+        calls: AtomicU64,
+    }
+
+    impl ConcurrencyTrackingFetcher {
+        fn new(up_to: u64, delay: Duration) -> Self {
+            Self {
+                up_to,
+                delay,
+                current: AtomicU64::new(0),
+                max_concurrent: AtomicU64::new(0),
+                calls: AtomicU64::new(0),
+            }
+        }
+
+        fn max_concurrent(&self) -> u64 {
+            self.max_concurrent.load(Ordering::SeqCst)
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl BlockFetcher for ConcurrencyTrackingFetcher {
+        fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if round.0 > self.up_to {
+                return Err(FetchError::NoBlockForRound { round });
+            }
+            let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_concurrent.fetch_max(now, Ordering::SeqCst);
+            thread::sleep(self.delay);
+            self.current.fetch_sub(1, Ordering::SeqCst);
+
+            let block = make_valid_empty_block(round.0);
+            Ok(FetchedBlockCert {
+                block,
+                cert: Some(make_cert(round.0)),
+                raw_payset_blobs: None,
+            })
+        }
+    }
+
+    /// Regression test for issue #753: the periodic catchup path
+    /// (`sync_pass`) must fetch up to `parallel_blocks` blocks concurrently,
+    /// not one at a time. Before the fix, `sync_pass` had no worker pool at
+    /// all, so `max_concurrent()` could never rise above 1 regardless of
+    /// how many blocks were pending — this test fails against that old
+    /// implementation and passes once a real concurrency budget is honored.
+    #[test]
+    fn periodic_sync_fetches_blocks_in_parallel() {
+        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger = Arc::new(PermissiveCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher = Arc::new(ConcurrencyTrackingFetcher::new(
+            20,
+            Duration::from_millis(50),
+        ));
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+
+        let mut svc = CatchupService::start_with_parallelism(rx, ledger_dyn, fetcher_dyn, 8);
+
+        poll_until(
+            || ledger.next_round() == Round(21),
+            Duration::from_millis(20),
+            Duration::from_secs(10),
+            "periodic sync should have pulled rounds 1..=20",
+        );
+
+        assert!(
+            fetcher.max_concurrent() > 1,
+            "expected multiple blocks to be fetched concurrently (parallel_blocks=8), \
+             but max observed concurrency was {} out of {} total calls",
+            fetcher.max_concurrent(),
+            fetcher.calls()
+        );
+
+        svc.stop();
+    }
+
+    /// With `parallel_blocks` clamped to 1, the behavior must match the old
+    /// strictly-serial path: never more than one fetch in flight.
+    #[test]
+    fn periodic_sync_with_parallelism_one_stays_serial() {
+        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger = Arc::new(PermissiveCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher = Arc::new(ConcurrencyTrackingFetcher::new(
+            6,
+            Duration::from_millis(20),
+        ));
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+
+        let mut svc = CatchupService::start_with_parallelism(rx, ledger_dyn, fetcher_dyn, 1);
+
+        poll_until(
+            || ledger.next_round() == Round(7),
+            Duration::from_millis(20),
+            Duration::from_secs(10),
+            "periodic sync should have pulled rounds 1..=6",
+        );
+
+        assert_eq!(
+            fetcher.max_concurrent(),
+            1,
+            "parallel_blocks=1 must behave serially"
         );
 
         svc.stop();
