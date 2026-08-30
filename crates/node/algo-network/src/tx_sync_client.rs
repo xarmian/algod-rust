@@ -19,10 +19,29 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Transaction-sync client — HTTP peer side of the [`TxSyncer`] pull
-//! protocol (issue #774).
+//! protocol (issues #774, #792).
 //!
 //! [`HttpTxSyncClient`] implements [`TxSyncPeerClient`] against
-//! [`crate::tx_sync_service::TxSyncService`]'s HTTP endpoint.
+//! [`crate::tx_sync_service::TxSyncService`]'s HTTP endpoint, speaking
+//! go's real Bloom-filter wire protocol (`rpcs/httpTxSync.go`'s
+//! `HTTPTxSync.Sync`): build a [`Filter`] sized by
+//! `Filter::optimal(pending.len(), 0.01)` (matching go's
+//! `TxSyncer.syncFromClient`'s `bloomFilterFalsePositiveRate`), set every
+//! locally-pending txid, POST it form-encoded to go's real path
+//! (`/v1/{genesisID}/txsync`), and regroup the flat response array by each
+//! transaction's `Group` field (matching go's
+//! `bookkeeping.SignedTxnsToGroups`).
+//!
+//! Go's filter uses a monotonically-incrementing per-syncer `counter` as
+//! the hash prefix, purely so successive filters from the same client
+//! don't share identical hash patterns; the wire format does not require
+//! (and the peer does not verify) any particular prefix value, so this
+//! client uses a fresh random `u32` per call instead of threading a
+//! persistent counter through every [`HttpTxSyncClient`] —
+//! [`GossipTxSyncPeerSource`] constructs a new client per sampled peer
+//! each round, and a random nonce gives the same "don't repeat" property
+//! without extra shared mutable state.
+//!
 //! [`GossipTxSyncPeerSource`] implements [`PeerSource`] by sampling one
 //! outgoing-connected peer from any [`GossipNode`] (`WebsocketNetwork` or
 //! the libp2p `P2pTransport` both qualify), matching Go's
@@ -46,9 +65,38 @@ use rand::Rng;
 
 use algo_types::{Digest, SignedTransaction};
 
+use crate::bloom::Filter;
 use crate::gossip_node::{GossipNode, PeerOption};
-use crate::tx_sync_service::TX_SYNC_REQUEST_CONTENT_TYPE;
+use crate::tx_sync_service::{TX_SYNC_REQUEST_CONTENT_TYPE, TX_SYNC_RESPONSE_CONTENT_TYPE};
 use crate::tx_syncer::{PeerSource, TxSyncError, TxSyncPeerClient};
+
+/// False-positive rate for the client's Bloom filter, matching go's
+/// `rpcs.bloomFilterFalsePositiveRate` (`txSyncer.go`).
+const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
+
+/// Partition a flat list of transactions into groups by each txn's
+/// `Group` field. A zero `Group` (ungrouped) always starts its own
+/// singleton group, even for consecutive ungrouped txns; a nonzero
+/// `Group` shared by consecutive txns bundles them together. Matches go's
+/// `data/bookkeeping.SignedTxnsToGroups` exactly.
+fn signed_txns_to_groups(txns: Vec<SignedTransaction>) -> Vec<Vec<SignedTransaction>> {
+    let mut groups: Vec<Vec<SignedTransaction>> = Vec::new();
+    let mut current: Vec<SignedTransaction> = Vec::new();
+    for stxn in txns {
+        let starts_new_group = match current.first() {
+            Some(first) => first.txn.group != stxn.txn.group || first.txn.group == [0u8; 32],
+            None => false,
+        };
+        if starts_new_group {
+            groups.push(std::mem::take(&mut current));
+        }
+        current.push(stxn);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
 
 /// [`TxSyncPeerClient`] that pulls missing transactions from a peer over
 /// HTTP, against [`crate::tx_sync_service::TxSyncService`]'s endpoint.
@@ -99,14 +147,27 @@ impl TxSyncPeerClient for HttpTxSyncClient {
         // take up to ~2x the configured `sync_timeout`.
         let deadline = tokio::time::Instant::now() + timeout;
 
-        let body = rmp_serde::to_vec(&pending.to_vec()).map_err(|e| TxSyncError::Peer {
-            peer: self.peer_addr.clone(),
-            message: format!("encode pending ids: {e}"),
-        })?;
-        let url = format!(
-            "http://{}/v1/{}/rust-txsync",
-            self.peer_addr, self.genesis_id
+        // Build go's real wire request: a Bloom filter over every locally
+        // pending txid, sized by go's own `Optimal` formula. See the
+        // module doc comment for why the prefix is a random nonce rather
+        // than a threaded, persistent counter.
+        let (size_bits, num_hashes) = Filter::optimal(pending.len(), BLOOM_FALSE_POSITIVE_RATE);
+        let prefix: u32 = rand::thread_rng().gen();
+        let mut filter = Filter::new(size_bits, num_hashes, prefix);
+        for id in pending {
+            filter.set(id.as_bytes());
+        }
+        let bloom_param = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE,
+            filter.marshal_binary(),
         );
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("bf", &bloom_param)
+            .finish()
+            .into_bytes();
+
+        // go's real path: `/v1/{genesisID}/txsync` (`TxServiceHTTPPath`).
+        let url = format!("http://{}/v1/{}/txsync", self.peer_addr, self.genesis_id);
 
         let send_result = tokio::time::timeout(
             deadline.saturating_duration_since(tokio::time::Instant::now()),
@@ -133,6 +194,14 @@ impl TxSyncPeerClient for HttpTxSyncClient {
             }
         };
 
+        // go's server returns 204 No Content when it has nothing to send
+        // (`HTTPTxSync.Sync`'s `http.StatusNoContent` case) rather than an
+        // empty 200 body; our `TxSyncService` always answers 200 with an
+        // empty array, but tolerate 204 too since it's the real go
+        // server's documented behavior for "no transactions".
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(Vec::new());
+        }
         if !response.status().is_success() {
             return Err(TxSyncError::Peer {
                 peer: self.peer_addr.clone(),
@@ -140,11 +209,25 @@ impl TxSyncPeerClient for HttpTxSyncClient {
             });
         }
 
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        if content_type.as_deref() != Some(TX_SYNC_RESPONSE_CONTENT_TYPE) {
+            return Err(TxSyncError::Peer {
+                peer: self.peer_addr.clone(),
+                message: format!("unexpected response content type {content_type:?}"),
+            });
+        }
+
         let bytes = self.read_bounded(response, deadline, timeout).await?;
-        rmp_serde::from_slice(&bytes).map_err(|e| TxSyncError::Peer {
-            peer: self.peer_addr.clone(),
-            message: format!("decode response: {e}"),
-        })
+        let txns: Vec<SignedTransaction> =
+            rmp_serde::from_slice(&bytes).map_err(|e| TxSyncError::Peer {
+                peer: self.peer_addr.clone(),
+                message: format!("decode response: {e}"),
+            })?;
+        Ok(signed_txns_to_groups(txns))
     }
 }
 
@@ -268,6 +351,13 @@ mod tests {
 
     fn make_txn(fee: u64) -> SignedTransaction {
         let mut stx = SignedTransaction::default();
+        // See the identical comment in `tx_sync_service`'s test helper: a
+        // real pending transaction always has a non-empty type and a
+        // non-zero sender, and the server's response now goes through the
+        // real canonical wire encoding (which omits either when
+        // zero-valued), so this fixture must set both.
+        stx.txn.txn_type = algo_types::TxnType::Pay;
+        stx.txn.sender = algo_types::Address([1u8; 32]);
         stx.txn.fee = fee;
         stx
     }
@@ -359,6 +449,73 @@ mod tests {
             matches!(result, Err(TxSyncError::Peer { .. })),
             "expected a bounded-size rejection, got {result:?}"
         );
+    }
+
+    /// go's server returns a *flat* array (`protocol.EncodeReflect(txns)`
+    /// over `[]transactions.SignedTxn`, never grouped); the client must
+    /// reconstruct groups from each txn's `Group` field
+    /// (`bookkeeping.SignedTxnsToGroups`). This proves that round-trip
+    /// through the real (in-process) `TxSyncService` server.
+    #[tokio::test]
+    async fn http_client_regroups_flat_response_by_group_field() {
+        let group_id = [7u8; 32];
+        let mut a = make_txn(1);
+        a.txn.group = group_id;
+        let mut b = make_txn(2);
+        b.txn.group = group_id;
+        let solo = make_txn(3); // ungrouped -- its own singleton group
+
+        let service = TxSyncService::new(
+            Arc::new(FakePool(vec![
+                vec![a.clone(), b.clone()],
+                vec![solo.clone()],
+            ])),
+            "g".to_string(),
+            1_000_000,
+        );
+        let addr = spawn_router(service.http_router()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client =
+            HttpTxSyncClient::new(addr, "g".to_string(), reqwest::Client::new(), 1_000_000);
+        let mut groups = client
+            .sync(&[], Duration::from_secs(5))
+            .await
+            .expect("sync should succeed");
+        groups.sort_by_key(|g| g.len());
+
+        assert_eq!(groups.len(), 2, "grouped pair + solo singleton");
+        assert_eq!(groups[0], vec![solo]);
+        assert_eq!(groups[1], vec![a, b]);
+    }
+
+    #[test]
+    fn signed_txns_to_groups_bundles_consecutive_same_group() {
+        let group_id = [9u8; 32];
+        let mut a = make_txn(1);
+        a.txn.group = group_id;
+        let mut b = make_txn(2);
+        b.txn.group = group_id;
+        let groups = signed_txns_to_groups(vec![a.clone(), b.clone()]);
+        assert_eq!(groups, vec![vec![a, b]]);
+    }
+
+    #[test]
+    fn signed_txns_to_groups_splits_ungrouped_into_singletons() {
+        let a = make_txn(1);
+        let b = make_txn(2);
+        let groups = signed_txns_to_groups(vec![a.clone(), b.clone()]);
+        assert_eq!(groups, vec![vec![a], vec![b]]);
+    }
+
+    #[test]
+    fn signed_txns_to_groups_breaks_on_group_change() {
+        let mut a = make_txn(1);
+        a.txn.group = [1u8; 32];
+        let mut b = make_txn(2);
+        b.txn.group = [2u8; 32];
+        let groups = signed_txns_to_groups(vec![a.clone(), b.clone()]);
+        assert_eq!(groups, vec![vec![a], vec![b]]);
     }
 
     struct FakeGossip {

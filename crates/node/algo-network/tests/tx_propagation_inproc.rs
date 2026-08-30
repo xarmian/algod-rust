@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use algo_codec::compute_txn_id;
 use algo_error::AlgoError;
+use algo_network::block_service::{BlockService, BlockServiceError, LedgerForBlockService};
 use algo_network::handler::TaggedMessageHandler;
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, PoolIngestAdapter};
 use algo_network::phonebook::Phonebook;
@@ -218,6 +219,13 @@ async fn connect_to(b: &Arc<WebsocketNetwork>, a_addr: &str) {
 fn make_tx(note: u8) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
     stx.txn.txn_type = algo_types::TxnType::Pay;
+    // A non-zero sender: `canonical_encode_transaction` (used by the
+    // TxSyncer's tx-sync response, issue #792) omits an empty "snd" the
+    // same way go's own omitempty does, and `Transaction::sender` has no
+    // `#[serde(default)]` (matching that a real transaction's sender is
+    // never legitimately absent), so a still-zero sender would fail to
+    // round-trip through that wire encoding.
+    stx.txn.sender = Address([1u8; 32]);
     stx.txn.fee = 1_000_000; // well above MinTxnFee (1_000)
     stx.txn.first_valid = Round(1);
     stx.txn.last_valid = Round(1_000);
@@ -497,6 +505,81 @@ async fn resubmitting_a_confirmed_txn_is_rejected() {
         err.contains("already in ledger"),
         "error should surface go's ledgercore.TransactionInLedgerError-style message, got: {err}"
     );
+
+    net_a.stop().await;
+}
+
+/// Issue #792: switching `TxSyncService`'s route from a wildcard first path
+/// segment (`/:version_seg/:genesis_id/rust-txsync`, #774) to go's real
+/// literal path (`/v1/:genesis_id/txsync`) means it now shares its mount
+/// point (`register_http_handler("/", ...)`, both nested at `/`) with
+/// `BlockService`'s *wildcard* first segment
+/// (`/:version_seg/:genesis_id/block/:round`) and the gossip upgrade
+/// endpoint's *literal* `/v1/:genesis_id/gossip`. A router mis-registration
+/// here (matchit panics on genuinely conflicting routes) would only
+/// surface at router-build time, i.e. when the node actually starts — not
+/// at compile time. This test builds a real relay node with both services
+/// mounted together and proves it starts without panicking and that both
+/// endpoints answer correctly, closing that gap.
+#[tokio::test]
+async fn tx_sync_and_block_service_coexist_on_one_relay_node() {
+    init_tracing();
+
+    struct FakeLedger;
+    impl LedgerForBlockService for FakeLedger {
+        fn encoded_block_cert(&self, _round: u64) -> Result<(Vec<u8>, Vec<u8>), BlockServiceError> {
+            Err(BlockServiceError::BlockNotAvailable {
+                round: 0,
+                latest_round: Some(0),
+            })
+        }
+        fn latest_round(&self) -> u64 {
+            0
+        }
+    }
+
+    let net_a = build_node("test-v1.0", true);
+    let node_a = wire_node(&net_a);
+
+    let block_service = BlockService::new(Arc::new(FakeLedger), "test-v1.0".to_string(), 1_000_000);
+    let tx_sync_service = algo_network::TxSyncService::new(
+        Arc::new(algo_network::PoolPendingTxAggregate::new(
+            node_a.pool.clone(),
+        )),
+        "test-v1.0".to_string(),
+        1_000_000,
+    );
+    net_a.register_http_handler("/", block_service.http_router());
+    net_a.register_http_handler("/", tx_sync_service.http_router());
+
+    // The assertion is really "this doesn't panic" -- a matchit route
+    // conflict between the wildcard block-service route and the literal
+    // gossip/tx-sync routes would panic here, at first-request routing
+    // time (axum builds/uses the merged trie lazily).
+    net_a.start_arc().await.expect("node A start");
+    let (a_addr, listening_a) = net_a.address();
+    assert!(listening_a);
+
+    // tx-sync endpoint answers (empty pool, empty bloom filter -> 200
+    // with an empty array; the point is it's routed at all, not 404/500).
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{a_addr}/v1/test-v1.0/txsync"))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("bf=AAAAAQAAAAAA") // 9-byte filter: numHashes=1, prefix=0, 1 zero data byte
+        .send()
+        .await
+        .expect("tx-sync request should reach the server");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // block-service endpoint (distinct route shape) still answers too,
+    // proving the wildcard route wasn't shadowed by the literal ones.
+    let resp = client
+        .get(format!("http://{a_addr}/v1/test-v1.0/block/0"))
+        .send()
+        .await
+        .expect("block-service request should reach the server");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 
     net_a.stop().await;
 }
