@@ -234,10 +234,10 @@ fn go_output_actually_distinguishes_both_version_boundaries() {
             .unwrap_or_else(|| panic!("version {version} missing from oracle fixture"))
     };
 
-    let v17 = find("v17");
-    let v18 = find("v18");
-    let v30 = find("v30");
-    let v31 = find("v31");
+    let v17 = find(algo_types::consensus::CONSENSUS_V17);
+    let v18 = find(algo_types::consensus::CONSENSUS_V18);
+    let v30 = find(algo_types::consensus::CONSENSUS_V30);
+    let v31 = find(algo_types::consensus::CONSENSUS_V31);
 
     // PendingResidueRewards (v17->v18): the refreshed rate must differ,
     // while this round's level/residue (computed from the *old* rate on
