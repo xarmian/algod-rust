@@ -198,6 +198,35 @@ impl Hashable for Participant {
     }
 }
 
+/// An indexable array of [`Participant`]s, ready for vector-commitment tree
+/// construction (go: `basics.ParticipantsArray`, a `[]Participant` with
+/// `Marshal`/`Length` methods). `Participant` already implements
+/// [`Hashable`] above -- this wrapper only supplies the [`merklearray::Array`]
+/// indexing `merklearray::build_vector_commitment_tree` needs.
+///
+/// Used by `algo_ledger::voters` (issue #758) to build the state-proof
+/// voters commitment over the top-N selected online accounts, mirroring
+/// go's `ledgercore.votersForRound.LoadTree`.
+#[derive(Debug, Clone, Default)]
+pub struct ParticipantsArray(pub Vec<Participant>);
+
+impl merklearray::Array for ParticipantsArray {
+    fn length(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn marshal(&self, pos: u64) -> Result<Box<dyn Hashable>, MerkleError> {
+        self.0
+            .get(pos as usize)
+            .cloned()
+            .map(|p| Box::new(p) as Box<dyn Hashable>)
+            .ok_or(MerkleError::PosOutOfBound {
+                pos,
+                bound: self.0.len() as u64,
+            })
+    }
+}
+
 /// A proof on Algorand's state (go: `stateproof.StateProof`).
 #[derive(Debug, Clone, Default)]
 pub struct StateProof {
