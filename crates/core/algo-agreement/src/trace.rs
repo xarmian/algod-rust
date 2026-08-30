@@ -123,14 +123,17 @@ pub const CADAVER_SIZE_MINIMUM: u64 = 100 * 1024;
 /// (`../go-algorand/agreement/service.go:110-119`,
 /// `../go-algorand/agreement/trace.go:76-97`), ported field-for-field:
 ///
-/// * `size_target == 0` → cadaver tracing is disabled: returns `Ok(None)`,
+/// * `size_target == 0` → cadaver tracing is disabled: returns `None`,
 ///   matching go's `fileSizeTarget == 0` "disabled" branch.
-/// * `size_target != 0` but below [`CADAVER_SIZE_MINIMUM`] → returns
-///   `Err(SizeTargetTooSmall)`. go additionally rejects a *negative*
-///   `int64(cadaverSizeTarget)` (an overflow artifact of go's `uint64` ->
-///   `int64` cast); that case cannot arise here because `size_target` stays
-///   `u64` throughout, so there is nothing to replicate.
-/// * otherwise → `Ok(Some(CadaverConfig { .. }))`, with `directory` falling
+/// * `size_target != 0` but below [`CADAVER_SIZE_MINIMUM`] → still returns
+///   `Some(CadaverConfig { .. })` (see the note below on why validation is
+///   deferred); [`Cadaver::open`] is what turns that case into an error
+///   (`CadaverError::SizeTargetTooSmall`). go rejects this same case inside
+///   `makeTracer` itself, plus a *negative* `int64(cadaverSizeTarget)` (an
+///   overflow artifact of go's `uint64` -> `int64` cast); the negative case
+///   cannot arise here because `size_target` stays `u64` throughout, so
+///   there is nothing to replicate for it.
+/// * otherwise → `Some(CadaverConfig { .. })`, with `directory` falling
 ///   back to `default_directory` when empty. go falls back to
 ///   `ColdDataDir`, which algod-rust doesn't have (`CATCHPOINT_DIR`'s doc
 ///   comment in `algo-config` records that hot/cold-directory split as an
