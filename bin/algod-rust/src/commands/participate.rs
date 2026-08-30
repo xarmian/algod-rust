@@ -3382,8 +3382,25 @@ pub async fn run(
         PoolConfig::default(),
         pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
     ));
+    // Issue #753: `TxSyncTimeoutSeconds`/`TxSyncIntervalSeconds`/
+    // `TxSyncServeResponseSize` are threaded from `node_config` here rather
+    // than left at `TxSyncerConfig::default()`. Note this doesn't yet drive
+    // a running sync loop: `algo_network::TxSyncer::start` is never invoked
+    // anywhere in this binary today — a separate, real gap tracked by
+    // issue #774 — only `seen_cache_size` is read below, for an unrelated
+    // seen-tx dedup cache.
+    let tx_syncer_config = algo_network::TxSyncerConfig {
+        sync_timeout: std::time::Duration::from_secs(
+            node_config.tx_sync_timeout_seconds.max(0) as u64
+        ),
+        sync_interval: std::time::Duration::from_secs(
+            node_config.tx_sync_interval_seconds.max(0) as u64
+        ),
+        server_response_size: node_config.tx_sync_serve_response_size.max(0) as usize,
+        ..algo_network::TxSyncerConfig::default()
+    };
     let tx_seen_cache = Arc::new(algo_network::SeenTxCache::new(
-        algo_network::TxSyncerConfig::default().seen_cache_size,
+        tx_syncer_config.seen_cache_size,
     ));
     // Serve blocks to peers, both over HTTP (`/v1/{genesisID}/block/{round}`)
     // and over gossip (`UniEnsBlockReq`). Registered before `start_arc()` so
@@ -3877,7 +3894,15 @@ pub async fn run(
 
     let catchup_ledger: Arc<dyn algo_ledger::CatchupLedger> = catchup_bridge;
 
-    let mut catchup_service = CatchupService::start(cert_rx, catchup_ledger, block_fetcher);
+    // Issue #753: honor `CatchupParallelBlocks` (go default 16 at v5) for
+    // the live periodic catchup path's fetch concurrency, rather than the
+    // hardcoded serial behavior `CatchupService::start` used before.
+    let mut catchup_service = CatchupService::start_with_parallelism(
+        cert_rx,
+        catchup_ledger,
+        block_fetcher,
+        node_config.catchup_parallel_blocks,
+    );
     info!("catchup service started");
 
     // -----------------------------------------------------------------------

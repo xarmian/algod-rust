@@ -554,6 +554,134 @@ static TX_INCOMING_FILTER_MAX_SIZE: VersionedDefault<u64> =
 /// dev mode remains *a* way to turn it on, not the *only* way.
 static ENABLE_DEVELOPER_API: VersionedDefault<bool> = VersionedDefault::new(&[(9, || false)]);
 
+// --- Catchup/sync fields (issue #753) ---------------------------------------
+//
+// Scope decisions recorded here (see issue #753's PR description for the
+// full write-up):
+//
+// - `CatchupParallelBlocks` is the one field in this group with a real
+//   behavioral gap, not just missing config plumbing: the live node's
+//   periodic catchup path (`algo_ledger::CatchupService::sync_pass`) fetched
+//   blocks strictly serially before this issue, with no worker pool at all.
+//   That gap is now closed (`CatchupService::start_with_parallelism`); this
+//   field supplies the live value.
+// - `TxSyncTimeoutSeconds`/`TxSyncIntervalSeconds`/`TxSyncServeResponseSize`
+//   have a matching `algo_network::TxSyncerConfig` with the same defaults
+//   already. `TxSyncer::start` itself is never invoked anywhere in the live
+//   node binary today (only `TxSyncerConfig::default().seen_cache_size` is
+//   read, to size an unrelated seen-tx cache) — a real, separate gap tracked
+//   by its own follow-up issue rather than absorbed here. These fields still
+//   round-trip through `config.json` and are threaded into the
+//   `TxSyncerConfig` `participate` constructs at startup.
+// - `EnableVerbosedTransactionSyncLogging`/`TransactionSyncDataExchangeRate`/
+//   `TransactionSyncSignificantMessageThreshold` are **not applicable**:
+//   investigated and confirmed dead in go-algorand v5.0.0-stable itself —
+//   these fields exist only in `config/localTemplate.go`/`local_defaults.go`
+//   with zero consumers anywhere in non-test Go source (no `txnsync`
+//   package, no adaptive rate-based tx-sync protocol at this pin; that
+//   experiment was retired upstream). Deliberately not added here.
+// - The 9-field `TxBacklog*RateLimiting*`/congestion-manager group
+//   (`TxBacklogServiceRateWindowSeconds`, `TxBacklogReservedCapacityPerPeer`,
+//   `TxBacklogAppTxRateLimiterMaxSize`, `TxBacklogAppTxPerSecondRate`,
+//   `TxBacklogRateLimitingCongestionPct`, `TxBacklogAppRateLimitingCongestionPct`,
+//   `EnableTxBacklogAppRateLimiting`, `TxBacklogAppRateLimitingCountERLDrops`,
+//   `EnableTxBacklogRateLimiting`) implements an ERL (Early Random Drop)
+//   congestion manager plus an app-transaction rate limiter in go's
+//   `data/pools/`. **Architectural decision recorded here**: not ported.
+//   This is a whole admission/drop subsystem that changes pool behavior
+//   under load, not a tunable knob on existing behavior (unlike the
+//   documented-no-op pattern used elsewhere in this file for fields that
+//   gate real-but-not-yet-built machinery) — porting it is real new
+//   pool-admission-control functionality, judged out of scope for a
+//   config-parity issue. algod-rust's `algo-pool` keeps its current
+//   unconditional-admission model (bounded only by `TxPoolSize`/
+//   `TxBacklogSize`, both already correct at their v5 defaults and not
+//   requiring config-surfacing beyond this general mechanism). Treated the
+//   same as `CatchpointDir`'s hot/cold-directory-splitting group above: a
+//   judgment-called non-goal, not silently dropped.
+// - `EnableAssembleStats`/`EnableProcessBlockStats`/`MaxBlockHistoryLookback`
+//   are telemetry-event toggles / a lookback bound with no existing
+//   algod-rust machinery to gate yet (no `AssembleBlockMetrics`/
+//   `ProcessBlockMetrics` telemetry events, and the block DB always answers
+//   transaction-ID lookback questions across its full retained history) —
+//   **documented no-ops**, same pattern as `enable_ledger_service` above.
+//   They round-trip through `config.json` for forward compatibility.
+
+/// Go: `CatchupParallelBlocks uint64` `version[3]:"50" version[5]:"16"`
+/// (`localTemplate.go:310-313`). Wired into
+/// `CatchupService::start_with_parallelism` — see the module-level note
+/// above for why this is the one field in this group with real behavioral
+/// content, not just config plumbing.
+static CATCHUP_PARALLEL_BLOCKS: VersionedDefault<u64> =
+    VersionedDefault::new(&[(3, || 50), (5, || 16)]);
+
+/// Go: `CatchupFailurePeerRefreshRate int` `version[0]:"10"`
+/// (`localTemplate.go:207-208`). Config-field-only: algod-rust's periodic
+/// catchup path does not track consecutive-failure counts per peer set to
+/// replace yet (its retry/backoff is per-round, not peer-set-wide — see
+/// `CatchupService::backoff_with_jitter`). Round-trips through
+/// `config.json` for forward compatibility.
+static CATCHUP_FAILURE_PEER_REFRESH_RATE: VersionedDefault<i64> =
+    VersionedDefault::new(&[(0, || 10)]);
+
+/// Go: `CatchupHTTPBlockFetchTimeoutSec int` `version[9]:"4"`
+/// (`localTemplate.go:421-422`). Config-field-only: algod-rust's HTTP block
+/// fetcher (`HttpBlockFetcher`, `algo-rest-client`) uses a fixed 30-second
+/// client timeout rather than a per-relay-then-try-another-relay budget.
+/// Round-trips through `config.json` for forward compatibility.
+static CATCHUP_HTTP_BLOCK_FETCH_TIMEOUT_SEC: VersionedDefault<i64> =
+    VersionedDefault::new(&[(9, || 4)]);
+
+/// Go: `CatchupGossipBlockFetchTimeoutSec int` `version[9]:"4"`
+/// (`localTemplate.go:424-425`). Config-field-only, same scope note as
+/// `catchup_http_block_fetch_timeout_sec` (algod-rust's `GossipBlockFetcher`
+/// already inherits a fixed 4-second per-peer timeout from
+/// `GossipBlockSource`, matching this default's value but not yet
+/// configurable).
+static CATCHUP_GOSSIP_BLOCK_FETCH_TIMEOUT_SEC: VersionedDefault<i64> =
+    VersionedDefault::new(&[(9, || 4)]);
+
+/// Go: `CatchupLedgerDownloadRetryAttempts int` `version[9]:"50"`
+/// (`localTemplate.go:427-428`). Config-field-only: algod-rust's
+/// catchpoint-sync ledger download does not yet cap retries by an explicit
+/// attempt count. Round-trips through `config.json` for forward
+/// compatibility.
+static CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS: VersionedDefault<i64> =
+    VersionedDefault::new(&[(9, || 50)]);
+
+/// Go: `CatchupBlockDownloadRetryAttempts int` `version[9]:"1000"`
+/// (`localTemplate.go:430-431`). Config-field-only, same scope note as
+/// `catchup_ledger_download_retry_attempts`.
+static CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS: VersionedDefault<i64> =
+    VersionedDefault::new(&[(9, || 1_000)]);
+
+/// Go: `TxSyncTimeoutSeconds int64` `version[0]:"30"` (`localTemplate.go:277`).
+/// Wired into `algo_network::TxSyncerConfig::sync_timeout` — see the
+/// module-level note above on `TxSyncer::start` not being invoked from the
+/// live node yet.
+static TX_SYNC_TIMEOUT_SECONDS: VersionedDefault<i64> = VersionedDefault::new(&[(0, || 30)]);
+
+/// Go: `TxSyncIntervalSeconds int64` `version[0]:"60"` (`localTemplate.go:280`).
+/// See `tx_sync_timeout_seconds`'s note.
+static TX_SYNC_INTERVAL_SECONDS: VersionedDefault<i64> = VersionedDefault::new(&[(0, || 60)]);
+
+/// Go: `TxSyncServeResponseSize int` `version[3]:"1000000"`
+/// (`localTemplate.go:324-325`). See `tx_sync_timeout_seconds`'s note.
+static TX_SYNC_SERVE_RESPONSE_SIZE: VersionedDefault<i64> =
+    VersionedDefault::new(&[(3, || 1_000_000)]);
+
+/// Go: `EnableAssembleStats bool` `version[0]:""` (`localTemplate.go:315-316`).
+/// **Documented no-op** — see the module-level note above.
+static ENABLE_ASSEMBLE_STATS: VersionedDefault<bool> = VersionedDefault::new(&[(0, || false)]);
+
+/// Go: `EnableProcessBlockStats bool` `version[0]:""` (`localTemplate.go:318-319`).
+/// **Documented no-op** — see the module-level note above.
+static ENABLE_PROCESS_BLOCK_STATS: VersionedDefault<bool> = VersionedDefault::new(&[(0, || false)]);
+
+/// Go: `MaxBlockHistoryLookback uint64` `version[31]:"0"` (`localTemplate.go:568-569`).
+/// **Documented no-op** — see the module-level note above.
+static MAX_BLOCK_HISTORY_LOOKBACK: VersionedDefault<u64> = VersionedDefault::new(&[(31, || 0)]);
+
 fn default_version() -> u32 {
     // Mirrors go's explicit `c.Version = 0 // Reset to 0 so we get the
     // version from the loaded file` (config.go:124) — a `version` key
@@ -695,6 +823,42 @@ fn default_tx_incoming_filter_max_size() -> u64 {
 }
 fn default_enable_developer_api() -> bool {
     ENABLE_DEVELOPER_API.at(LATEST_VERSION)
+}
+fn default_catchup_parallel_blocks() -> u64 {
+    CATCHUP_PARALLEL_BLOCKS.at(LATEST_VERSION)
+}
+fn default_catchup_failure_peer_refresh_rate() -> i64 {
+    CATCHUP_FAILURE_PEER_REFRESH_RATE.at(LATEST_VERSION)
+}
+fn default_catchup_http_block_fetch_timeout_sec() -> i64 {
+    CATCHUP_HTTP_BLOCK_FETCH_TIMEOUT_SEC.at(LATEST_VERSION)
+}
+fn default_catchup_gossip_block_fetch_timeout_sec() -> i64 {
+    CATCHUP_GOSSIP_BLOCK_FETCH_TIMEOUT_SEC.at(LATEST_VERSION)
+}
+fn default_catchup_ledger_download_retry_attempts() -> i64 {
+    CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS.at(LATEST_VERSION)
+}
+fn default_catchup_block_download_retry_attempts() -> i64 {
+    CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS.at(LATEST_VERSION)
+}
+fn default_tx_sync_timeout_seconds() -> i64 {
+    TX_SYNC_TIMEOUT_SECONDS.at(LATEST_VERSION)
+}
+fn default_tx_sync_interval_seconds() -> i64 {
+    TX_SYNC_INTERVAL_SECONDS.at(LATEST_VERSION)
+}
+fn default_tx_sync_serve_response_size() -> i64 {
+    TX_SYNC_SERVE_RESPONSE_SIZE.at(LATEST_VERSION)
+}
+fn default_enable_assemble_stats() -> bool {
+    ENABLE_ASSEMBLE_STATS.at(LATEST_VERSION)
+}
+fn default_enable_process_block_stats() -> bool {
+    ENABLE_PROCESS_BLOCK_STATS.at(LATEST_VERSION)
+}
+fn default_max_block_history_lookback() -> u64 {
+    MAX_BLOCK_HISTORY_LOOKBACK.at(LATEST_VERSION)
 }
 
 /// `config.Local`-equivalent node configuration, loaded from `config.json`
@@ -1065,6 +1229,105 @@ pub struct Local {
         default = "default_enable_developer_api"
     )]
     pub enable_developer_api: bool,
+
+    /// Go: `CatchupParallelBlocks`. Wired into
+    /// `CatchupService::start_with_parallelism` (issue #753 fixed a real
+    /// behavioral gap: the periodic catchup path previously fetched blocks
+    /// strictly serially with no worker pool at all).
+    #[serde(
+        rename = "CatchupParallelBlocks",
+        default = "default_catchup_parallel_blocks"
+    )]
+    pub catchup_parallel_blocks: u64,
+
+    /// Go: `CatchupFailurePeerRefreshRate`. Config-field-only (issue #753)
+    /// — see [`CATCHUP_FAILURE_PEER_REFRESH_RATE`]'s doc comment.
+    #[serde(
+        rename = "CatchupFailurePeerRefreshRate",
+        default = "default_catchup_failure_peer_refresh_rate"
+    )]
+    pub catchup_failure_peer_refresh_rate: i64,
+
+    /// Go: `CatchupHTTPBlockFetchTimeoutSec`. Config-field-only (issue
+    /// #753) — see [`CATCHUP_HTTP_BLOCK_FETCH_TIMEOUT_SEC`]'s doc comment.
+    #[serde(
+        rename = "CatchupHTTPBlockFetchTimeoutSec",
+        default = "default_catchup_http_block_fetch_timeout_sec"
+    )]
+    pub catchup_http_block_fetch_timeout_sec: i64,
+
+    /// Go: `CatchupGossipBlockFetchTimeoutSec`. Config-field-only (issue
+    /// #753) — see [`CATCHUP_GOSSIP_BLOCK_FETCH_TIMEOUT_SEC`]'s doc comment.
+    #[serde(
+        rename = "CatchupGossipBlockFetchTimeoutSec",
+        default = "default_catchup_gossip_block_fetch_timeout_sec"
+    )]
+    pub catchup_gossip_block_fetch_timeout_sec: i64,
+
+    /// Go: `CatchupLedgerDownloadRetryAttempts`. Config-field-only (issue
+    /// #753) — see [`CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS`]'s doc comment.
+    #[serde(
+        rename = "CatchupLedgerDownloadRetryAttempts",
+        default = "default_catchup_ledger_download_retry_attempts"
+    )]
+    pub catchup_ledger_download_retry_attempts: i64,
+
+    /// Go: `CatchupBlockDownloadRetryAttempts`. Config-field-only (issue
+    /// #753) — see [`CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS`]'s doc comment.
+    #[serde(
+        rename = "CatchupBlockDownloadRetryAttempts",
+        default = "default_catchup_block_download_retry_attempts"
+    )]
+    pub catchup_block_download_retry_attempts: i64,
+
+    /// Go: `TxSyncTimeoutSeconds`. Wired into
+    /// `algo_network::TxSyncerConfig::sync_timeout` (issue #753) — see
+    /// [`TX_SYNC_TIMEOUT_SECONDS`]'s doc comment.
+    #[serde(
+        rename = "TxSyncTimeoutSeconds",
+        default = "default_tx_sync_timeout_seconds"
+    )]
+    pub tx_sync_timeout_seconds: i64,
+
+    /// Go: `TxSyncIntervalSeconds`. Wired into
+    /// `algo_network::TxSyncerConfig::sync_interval` (issue #753).
+    #[serde(
+        rename = "TxSyncIntervalSeconds",
+        default = "default_tx_sync_interval_seconds"
+    )]
+    pub tx_sync_interval_seconds: i64,
+
+    /// Go: `TxSyncServeResponseSize`. Wired into
+    /// `algo_network::TxSyncerConfig::server_response_size` (issue #753).
+    #[serde(
+        rename = "TxSyncServeResponseSize",
+        default = "default_tx_sync_serve_response_size"
+    )]
+    pub tx_sync_serve_response_size: i64,
+
+    /// Go: `EnableAssembleStats`. **Documented no-op** (issue #753) — see
+    /// [`ENABLE_ASSEMBLE_STATS`]'s doc comment.
+    #[serde(
+        rename = "EnableAssembleStats",
+        default = "default_enable_assemble_stats"
+    )]
+    pub enable_assemble_stats: bool,
+
+    /// Go: `EnableProcessBlockStats`. **Documented no-op** (issue #753) —
+    /// see [`ENABLE_PROCESS_BLOCK_STATS`]'s doc comment.
+    #[serde(
+        rename = "EnableProcessBlockStats",
+        default = "default_enable_process_block_stats"
+    )]
+    pub enable_process_block_stats: bool,
+
+    /// Go: `MaxBlockHistoryLookback`. **Documented no-op** (issue #753) —
+    /// see [`MAX_BLOCK_HISTORY_LOOKBACK`]'s doc comment.
+    #[serde(
+        rename = "MaxBlockHistoryLookback",
+        default = "default_max_block_history_lookback"
+    )]
+    pub max_block_history_lookback: u64,
 }
 
 impl Default for Local {
@@ -1129,6 +1392,21 @@ impl Local {
             enable_txn_eval_tracer: ENABLE_TXN_EVAL_TRACER.at(version),
             tx_incoming_filter_max_size: TX_INCOMING_FILTER_MAX_SIZE.at(version),
             enable_developer_api: ENABLE_DEVELOPER_API.at(version),
+            catchup_parallel_blocks: CATCHUP_PARALLEL_BLOCKS.at(version),
+            catchup_failure_peer_refresh_rate: CATCHUP_FAILURE_PEER_REFRESH_RATE.at(version),
+            catchup_http_block_fetch_timeout_sec: CATCHUP_HTTP_BLOCK_FETCH_TIMEOUT_SEC.at(version),
+            catchup_gossip_block_fetch_timeout_sec: CATCHUP_GOSSIP_BLOCK_FETCH_TIMEOUT_SEC
+                .at(version),
+            catchup_ledger_download_retry_attempts: CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS
+                .at(version),
+            catchup_block_download_retry_attempts: CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS
+                .at(version),
+            tx_sync_timeout_seconds: TX_SYNC_TIMEOUT_SECONDS.at(version),
+            tx_sync_interval_seconds: TX_SYNC_INTERVAL_SECONDS.at(version),
+            tx_sync_serve_response_size: TX_SYNC_SERVE_RESPONSE_SIZE.at(version),
+            enable_assemble_stats: ENABLE_ASSEMBLE_STATS.at(version),
+            enable_process_block_stats: ENABLE_PROCESS_BLOCK_STATS.at(version),
+            max_block_history_lookback: MAX_BLOCK_HISTORY_LOOKBACK.at(version),
         }
     }
 
@@ -1370,6 +1648,78 @@ impl Local {
                 cur,
                 next,
             );
+            migrate_field(
+                &mut self.catchup_parallel_blocks,
+                &CATCHUP_PARALLEL_BLOCKS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.catchup_failure_peer_refresh_rate,
+                &CATCHUP_FAILURE_PEER_REFRESH_RATE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.catchup_http_block_fetch_timeout_sec,
+                &CATCHUP_HTTP_BLOCK_FETCH_TIMEOUT_SEC,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.catchup_gossip_block_fetch_timeout_sec,
+                &CATCHUP_GOSSIP_BLOCK_FETCH_TIMEOUT_SEC,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.catchup_ledger_download_retry_attempts,
+                &CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.catchup_block_download_retry_attempts,
+                &CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.tx_sync_timeout_seconds,
+                &TX_SYNC_TIMEOUT_SECONDS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.tx_sync_interval_seconds,
+                &TX_SYNC_INTERVAL_SECONDS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.tx_sync_serve_response_size,
+                &TX_SYNC_SERVE_RESPONSE_SIZE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_assemble_stats,
+                &ENABLE_ASSEMBLE_STATS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_process_block_stats,
+                &ENABLE_PROCESS_BLOCK_STATS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.max_block_history_lookback,
+                &MAX_BLOCK_HISTORY_LOOKBACK,
+                cur,
+                next,
+            );
             self.version = next;
         }
         Ok(())
@@ -1527,6 +1877,18 @@ mod tests {
             ENABLE_TXN_EVAL_TRACER.max_tag_version(),
             TX_INCOMING_FILTER_MAX_SIZE.max_tag_version(),
             ENABLE_DEVELOPER_API.max_tag_version(),
+            CATCHUP_PARALLEL_BLOCKS.max_tag_version(),
+            CATCHUP_FAILURE_PEER_REFRESH_RATE.max_tag_version(),
+            CATCHUP_HTTP_BLOCK_FETCH_TIMEOUT_SEC.max_tag_version(),
+            CATCHUP_GOSSIP_BLOCK_FETCH_TIMEOUT_SEC.max_tag_version(),
+            CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS.max_tag_version(),
+            CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS.max_tag_version(),
+            TX_SYNC_TIMEOUT_SECONDS.max_tag_version(),
+            TX_SYNC_INTERVAL_SECONDS.max_tag_version(),
+            TX_SYNC_SERVE_RESPONSE_SIZE.max_tag_version(),
+            ENABLE_ASSEMBLE_STATS.max_tag_version(),
+            ENABLE_PROCESS_BLOCK_STATS.max_tag_version(),
+            MAX_BLOCK_HISTORY_LOOKBACK.max_tag_version(),
         ]
         .into_iter()
         .max()
@@ -1598,6 +1960,92 @@ mod tests {
         assert!(!d.enable_txn_eval_tracer);
         assert_eq!(d.tx_incoming_filter_max_size, 500_000);
         assert!(!d.enable_developer_api);
+        assert_eq!(
+            d.catchup_parallel_blocks, 16,
+            "go's v5 default (16), not the pre-version-5 value of 50"
+        );
+        assert_eq!(d.catchup_failure_peer_refresh_rate, 10);
+        assert_eq!(d.catchup_http_block_fetch_timeout_sec, 4);
+        assert_eq!(d.catchup_gossip_block_fetch_timeout_sec, 4);
+        assert_eq!(d.catchup_ledger_download_retry_attempts, 50);
+        assert_eq!(d.catchup_block_download_retry_attempts, 1_000);
+        assert_eq!(d.tx_sync_timeout_seconds, 30);
+        assert_eq!(d.tx_sync_interval_seconds, 60);
+        assert_eq!(d.tx_sync_serve_response_size, 1_000_000);
+        assert!(!d.enable_assemble_stats);
+        assert!(!d.enable_process_block_stats);
+        assert_eq!(d.max_block_history_lookback, 0);
+    }
+
+    // --- Catchup/sync fields (issue #753) --------------------------------
+
+    #[test]
+    fn catchup_parallel_blocks_defaults_to_v5_value_and_overlays() {
+        assert_eq!(Local::default().catchup_parallel_blocks, 16);
+        let cfg = Local::load_from_str(r#"{"CatchupParallelBlocks": 4}"#).expect("parses");
+        assert_eq!(cfg.catchup_parallel_blocks, 4);
+    }
+
+    #[test]
+    fn catchup_timeouts_and_retry_attempts_partial_overlay() {
+        let cfg = Local::load_from_str(
+            r#"{"CatchupHTTPBlockFetchTimeoutSec": 8, "CatchupBlockDownloadRetryAttempts": 5}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.catchup_http_block_fetch_timeout_sec, 8);
+        assert_eq!(cfg.catchup_block_download_retry_attempts, 5);
+        assert_eq!(
+            cfg.catchup_gossip_block_fetch_timeout_sec, 4,
+            "untouched field keeps its default"
+        );
+        assert_eq!(
+            cfg.catchup_ledger_download_retry_attempts, 50,
+            "untouched field keeps its default"
+        );
+        assert_eq!(cfg.catchup_failure_peer_refresh_rate, 10);
+    }
+
+    #[test]
+    fn tx_sync_fields_round_trip_and_overlay() {
+        let cfg = Local::load_from_str(
+            r#"{"TxSyncTimeoutSeconds": 5, "TxSyncIntervalSeconds": 15, "TxSyncServeResponseSize": 2000}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.tx_sync_timeout_seconds, 5);
+        assert_eq!(cfg.tx_sync_interval_seconds, 15);
+        assert_eq!(cfg.tx_sync_serve_response_size, 2000);
+    }
+
+    #[test]
+    fn assemble_and_process_block_stats_and_max_block_history_lookback_round_trip() {
+        let cfg = Local::load_from_str(
+            r#"{"EnableAssembleStats": true, "EnableProcessBlockStats": true, "MaxBlockHistoryLookback": 1000}"#,
+        )
+        .expect("parses");
+        assert!(cfg.enable_assemble_stats);
+        assert!(cfg.enable_process_block_stats);
+        assert_eq!(cfg.max_block_history_lookback, 1000);
+    }
+
+    #[test]
+    fn catchup_parallel_blocks_explicit_override_survives_migration() {
+        // An operator-chosen value that never matches any version's default
+        // (50 and 16 are the only tagged defaults) must survive migration
+        // unchanged; a config that never touched the field must instead
+        // advance to the new version[5] default of 16.
+        let cfg =
+            Local::load_from_str(r#"{"Version": 3, "CatchupParallelBlocks": 4}"#).expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(
+            cfg.catchup_parallel_blocks, 4,
+            "explicit override must survive migration"
+        );
+
+        let cfg = Local::load_from_str(r#"{"Version": 3}"#).expect("parses");
+        assert_eq!(
+            cfg.catchup_parallel_blocks, 16,
+            "an untouched field migrates forward to the new default"
+        );
     }
 
     // --- REST/API fields (issue #751) -----------------------------------
