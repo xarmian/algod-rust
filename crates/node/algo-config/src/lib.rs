@@ -343,23 +343,44 @@ static CATCHPOINT_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, |
 static STATEPROOF_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
 
 /// Go: `CatchpointInterval uint64` `version[7]:"10000"` (`localTemplate.go:399`).
-/// **Config field only** — go's automatic interval-driven catchpoint
-/// generation runs inside the live block-apply loop
-/// (`ledger/catchpointtracker.go`), which algod-rust doesn't have at all
-/// (`algod-rust catchpoint` is a one-shot import/verify/export/download
-/// CLI, not a background daemon feature). Judgment call recorded in issue
-/// #749: wiring automatic generation is out of scope here and tracked by
-/// a dedicated follow-up issue.
+/// Wired into the live block-apply loop (issue #770): `SqliteLedger::commit_block`
+/// automatically exports a catchpoint file every `CatchpointInterval` rounds
+/// when [`Local::stores_catchpoints`] resolves to `true`, matching go's
+/// `catchpointTracker` (`ledger/catchpointtracker.go`).
 static CATCHPOINT_INTERVAL: VersionedDefault<u64> = VersionedDefault::new(&[(7, || 10_000)]);
 
 /// Go: `CatchpointFileHistoryLength int` `version[7]:"365"` (`localTemplate.go:401`).
-/// Same config-field-only scope as `CatchpointInterval` above.
+/// Wired into the automatic-generation retention/pruning policy (issue
+/// #770) — see [`Local::stores_catchpoints`] and
+/// `algo_ledger::sqlite::SqliteLedger::configure_automatic_catchpoints`.
 static CATCHPOINT_FILE_HISTORY_LENGTH: VersionedDefault<i64> =
     VersionedDefault::new(&[(7, || 365)]);
 
 /// Go: `CatchpointTracking int64` `version[11]:"0"` (`localTemplate.go:447`).
-/// Same config-field-only scope as `CatchpointInterval` above.
+/// Wired into [`Local::stores_catchpoints`]/[`Local::tracks_catchpoints`]
+/// (issue #770), which mirror go's `config.Local.StoresCatchpoints`/
+/// `TracksCatchpoints` (`config/localTemplate.go:1052-1080`) mode
+/// resolution exactly, including the automatic-mode archival gate.
 static CATCHPOINT_TRACKING: VersionedDefault<i64> = VersionedDefault::new(&[(11, || 0)]);
+
+/// Go: `Archival bool` `version[0]:"false"` (`localTemplate.go:49`).
+///
+/// algod-rust does not yet implement go's non-archival block-pruning
+/// behavior (`Ledger.setDbLogging`/`trackerRegistry` "forget old blocks"
+/// path) — every algod-rust node currently retains its full block
+/// history regardless of this flag. This field is added now (issue #770,
+/// narrower than a full archival-mode implementation) solely so
+/// [`Local::stores_catchpoints`] can reproduce go's exact
+/// `CatchpointTrackingModeAutomatic`/`CatchpointTrackingModeTracked`
+/// mode-resolution gate (`config/localTemplate.go:1052-1069`), which
+/// consults `cfg.Archival` for those two modes. It defaults to `false`,
+/// matching go's own default — so a stock config with the default
+/// `CatchpointTracking = 0` (automatic) does **not** auto-generate
+/// catchpoints, exactly mirroring a stock non-archival go-algorand node.
+/// Set `CatchpointTracking = 2` (Stored) to force generation regardless
+/// of this flag, or set both `Archival = true` and leave `CatchpointTracking`
+/// at its automatic/tracked default.
+static ARCHIVAL: VersionedDefault<bool> = VersionedDefault::new(&[(0, || false)]);
 
 /// Go: `OptimizeAccountsDatabaseOnStartup bool` `version[10]:"false"`
 /// (`localTemplate.go:439`). Wired into `SqliteLedger::vacuum_accounts_database`
@@ -1145,6 +1166,9 @@ fn default_catchpoint_file_history_length() -> i64 {
 fn default_catchpoint_tracking() -> i64 {
     CATCHPOINT_TRACKING.at(LATEST_VERSION)
 }
+fn default_archival() -> bool {
+    ARCHIVAL.at(LATEST_VERSION)
+}
 fn default_optimize_accounts_database_on_startup() -> bool {
     OPTIMIZE_ACCOUNTS_DATABASE_ON_STARTUP.at(LATEST_VERSION)
 }
@@ -1558,25 +1582,32 @@ pub struct Local {
     #[serde(rename = "StateproofDir", default = "default_stateproof_dir")]
     pub stateproof_dir: String,
 
-    /// Go: `CatchpointInterval`. **Config-field-only** (issue #749):
-    /// algod-rust has no automatic interval-driven catchpoint generation
-    /// in a live block-apply loop yet — see this field's `VersionedDefault`
-    /// doc comment for the recorded scope-split decision and follow-up.
+    /// Go: `CatchpointInterval`. Wired into the live block-apply loop
+    /// (issue #770) — see this field's `VersionedDefault` doc comment.
     #[serde(rename = "CatchpointInterval", default = "default_catchpoint_interval")]
     pub catchpoint_interval: u64,
 
-    /// Go: `CatchpointFileHistoryLength`. Config-field-only, same scope
-    /// note as `catchpoint_interval`.
+    /// Go: `CatchpointFileHistoryLength`. Wired into automatic-generation
+    /// retention (issue #770) — see this field's `VersionedDefault` doc
+    /// comment.
     #[serde(
         rename = "CatchpointFileHistoryLength",
         default = "default_catchpoint_file_history_length"
     )]
     pub catchpoint_file_history_length: i64,
 
-    /// Go: `CatchpointTracking`. Config-field-only, same scope note as
-    /// `catchpoint_interval`.
+    /// Go: `CatchpointTracking`. Wired into [`Local::stores_catchpoints`]/
+    /// [`Local::tracks_catchpoints`] (issue #770) — see this field's
+    /// `VersionedDefault` doc comment.
     #[serde(rename = "CatchpointTracking", default = "default_catchpoint_tracking")]
     pub catchpoint_tracking: i64,
+
+    /// Go: `Archival`. See the [`ARCHIVAL`] static's doc comment for the
+    /// narrow scope this field is added under (issue #770): it exists
+    /// solely to feed [`Local::stores_catchpoints`]'s automatic-mode gate,
+    /// not as a general archival-vs-pruning-node implementation.
+    #[serde(rename = "Archival", default = "default_archival")]
+    pub archival: bool,
 
     /// Go: `OptimizeAccountsDatabaseOnStartup`. Wired into
     /// `SqliteLedger::vacuum_accounts_database` (issue #749).
@@ -2157,6 +2188,7 @@ impl Local {
             catchpoint_interval: CATCHPOINT_INTERVAL.at(version),
             catchpoint_file_history_length: CATCHPOINT_FILE_HISTORY_LENGTH.at(version),
             catchpoint_tracking: CATCHPOINT_TRACKING.at(version),
+            archival: ARCHIVAL.at(version),
             optimize_accounts_database_on_startup: OPTIMIZE_ACCOUNTS_DATABASE_ON_STARTUP
                 .at(version),
             ledger_synchronous_mode: LEDGER_SYNCHRONOUS_MODE.at(version),
@@ -2369,6 +2401,7 @@ impl Local {
                 cur,
                 next,
             );
+            migrate_field(&mut self.archival, &ARCHIVAL, cur, next);
             migrate_field(
                 &mut self.optimize_accounts_database_on_startup,
                 &OPTIMIZE_ACCOUNTS_DATABASE_ON_STARTUP,
@@ -2817,7 +2850,68 @@ impl Local {
             source,
         })
     }
+
+    /// Returns `true` if the node is configured to *write catchpoint files
+    /// to disk*. Mirrors go's `config.Local.StoresCatchpoints()`
+    /// (`config/localTemplate.go:1052-1069`) exactly, including its
+    /// "unrecognized `CatchpointTracking` value behaves like Automatic"
+    /// `default: fallthrough` case.
+    ///
+    /// Consulted by the live block-apply loop (issue #770,
+    /// `algo_ledger::sqlite::SqliteLedger::commit_block`) to gate automatic
+    /// interval-driven catchpoint generation, and available to
+    /// `algod-rust catchpoint export` callers that want to match the same
+    /// resolution the live loop uses.
+    pub fn stores_catchpoints(&self) -> bool {
+        // Go compares `CatchpointInterval <= 0`; the field here is `u64`
+        // (matching go's own field type), so `<= 0` degenerates to `== 0`.
+        if self.catchpoint_interval == 0 {
+            return false;
+        }
+        match self.catchpoint_tracking {
+            CATCHPOINT_TRACKING_MODE_UNTRACKED => false,
+            CATCHPOINT_TRACKING_MODE_STORED => true,
+            // Go's `switch` has an explicit `case Automatic, Tracked:` arm
+            // plus a `default: fallthrough` into it — i.e. every value
+            // other than Untracked/Stored resolves the same way. Matched
+            // here with an unconditional fallback for that reason, not as
+            // a shortcut.
+            CATCHPOINT_TRACKING_MODE_AUTOMATIC | CATCHPOINT_TRACKING_MODE_TRACKED => self.archival,
+            _ => self.archival,
+        }
+    }
+
+    /// Returns `true` if the node is configured to *track* catchpoints —
+    /// a superset of [`Self::stores_catchpoints`] that also covers
+    /// `CatchpointTracking == Tracked` with a non-archival node (tracked,
+    /// not written to disk). Mirrors go's
+    /// `config.Local.TracksCatchpoints()` (`config/localTemplate.go:1072-1080`).
+    ///
+    /// algod-rust does not yet implement the "tracked but not stored"
+    /// mode's underlying mechanism (an in-memory-only merkle-trie
+    /// bookkeeping path with no file write) — this method is provided for
+    /// parity/completeness and future callers, but issue #770's automatic
+    /// file-generation wiring only consults [`Self::stores_catchpoints`].
+    pub fn tracks_catchpoints(&self) -> bool {
+        if self.stores_catchpoints() {
+            return true;
+        }
+        self.catchpoint_tracking == CATCHPOINT_TRACKING_MODE_TRACKED && self.catchpoint_interval > 0
+    }
 }
+
+/// Go's `CatchpointTrackingModeUntracked` (`config/config.go:91`): never
+/// track or store catchpoints, regardless of `CatchpointInterval`.
+pub const CATCHPOINT_TRACKING_MODE_UNTRACKED: i64 = -1;
+/// Go's `CatchpointTrackingModeAutomatic` (`config/config.go:95`, the
+/// default): archival nodes store catchpoints, non-archival nodes don't.
+pub const CATCHPOINT_TRACKING_MODE_AUTOMATIC: i64 = 0;
+/// Go's `CatchpointTrackingModeTracked` (`config/config.go:99`): same
+/// storage gate as Automatic (archival-only), but always tracks.
+pub const CATCHPOINT_TRACKING_MODE_TRACKED: i64 = 1;
+/// Go's `CatchpointTrackingModeStored` (`config/config.go:103`): always
+/// store catchpoint files, regardless of `Archival`.
+pub const CATCHPOINT_TRACKING_MODE_STORED: i64 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -2910,6 +3004,7 @@ mod tests {
             P2P_PRIVATE_KEY_LOCATION.max_tag_version(),
             ENABLE_DHT_PROVIDERS.max_tag_version(),
             DHT_MODE.max_tag_version(),
+            ARCHIVAL.max_tag_version(),
         ]
         .into_iter()
         .max()
@@ -2954,6 +3049,7 @@ mod tests {
         assert_eq!(d.catchpoint_interval, 10_000);
         assert_eq!(d.catchpoint_file_history_length, 365);
         assert_eq!(d.catchpoint_tracking, 0);
+        assert!(!d.archival, "go's default is false");
         assert!(!d.optimize_accounts_database_on_startup);
         assert_eq!(d.ledger_synchronous_mode, 2, "go's default is FULL(2)");
         assert_eq!(
@@ -3811,5 +3907,157 @@ mod tests {
         // field) -- confirm the rest of the config still loaded at its
         // ordinary defaults, i.e. parsing wasn't otherwise disrupted.
         assert_eq!(cfg, Local::default());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #770: `stores_catchpoints`/`tracks_catchpoints` mode
+    // resolution, mirroring go's `config_test.go`
+    // `TestStoresCatchpoints`/`TestTracksCatchpointsWithoutStoring`.
+    // -----------------------------------------------------------------
+
+    /// `CatchpointInterval == 0` disables catchpoint generation
+    /// regardless of `CatchpointTracking` or `Archival` -- go's
+    /// `cfg.CatchpointInterval <= 0` short-circuit.
+    #[test]
+    fn stores_catchpoints_false_when_interval_is_zero() {
+        for tracking in [
+            CATCHPOINT_TRACKING_MODE_UNTRACKED,
+            CATCHPOINT_TRACKING_MODE_AUTOMATIC,
+            CATCHPOINT_TRACKING_MODE_TRACKED,
+            CATCHPOINT_TRACKING_MODE_STORED,
+        ] {
+            let cfg = Local {
+                catchpoint_interval: 0,
+                catchpoint_tracking: tracking,
+                archival: true,
+                ..Local::default()
+            };
+            assert!(
+                !cfg.stores_catchpoints(),
+                "tracking={tracking} must not store when interval is 0"
+            );
+        }
+    }
+
+    /// `CatchpointTrackingModeUntracked` (-1) never stores, even on an
+    /// archival node with a positive interval.
+    #[test]
+    fn stores_catchpoints_false_for_untracked_mode() {
+        let cfg = Local {
+            catchpoint_interval: 10_000,
+            catchpoint_tracking: CATCHPOINT_TRACKING_MODE_UNTRACKED,
+            archival: true,
+            ..Local::default()
+        };
+        assert!(!cfg.stores_catchpoints());
+    }
+
+    /// `CatchpointTrackingModeStored` (2) always stores when interval > 0,
+    /// regardless of `Archival`.
+    #[test]
+    fn stores_catchpoints_true_for_stored_mode_regardless_of_archival() {
+        for archival in [false, true] {
+            let cfg = Local {
+                catchpoint_interval: 10_000,
+                catchpoint_tracking: CATCHPOINT_TRACKING_MODE_STORED,
+                archival,
+                ..Local::default()
+            };
+            assert!(
+                cfg.stores_catchpoints(),
+                "Stored mode must store regardless of archival={archival}"
+            );
+        }
+    }
+
+    /// `CatchpointTrackingModeAutomatic` (0, the default) and
+    /// `CatchpointTrackingModeTracked` (1) both gate on `Archival`: store
+    /// only when the node is archival.
+    #[test]
+    fn stores_catchpoints_automatic_and_tracked_modes_gate_on_archival() {
+        for tracking in [
+            CATCHPOINT_TRACKING_MODE_AUTOMATIC,
+            CATCHPOINT_TRACKING_MODE_TRACKED,
+        ] {
+            let non_archival = Local {
+                catchpoint_interval: 10_000,
+                catchpoint_tracking: tracking,
+                archival: false,
+                ..Local::default()
+            };
+            assert!(
+                !non_archival.stores_catchpoints(),
+                "tracking={tracking} on a non-archival node must not store"
+            );
+
+            let archival = Local {
+                catchpoint_interval: 10_000,
+                catchpoint_tracking: tracking,
+                archival: true,
+                ..Local::default()
+            };
+            assert!(
+                archival.stores_catchpoints(),
+                "tracking={tracking} on an archival node must store"
+            );
+        }
+    }
+
+    /// A stock default config (`CatchpointTracking = 0`, `Archival =
+    /// false`, `CatchpointInterval = 10_000`) must NOT auto-generate
+    /// catchpoints -- exactly matching a stock non-archival go-algorand
+    /// node, even though `CatchpointInterval` is positive.
+    #[test]
+    fn stores_catchpoints_false_for_stock_default_config() {
+        assert!(!Local::default().stores_catchpoints());
+    }
+
+    /// An unrecognized `CatchpointTracking` value falls through to the
+    /// same archival-gated behavior as Automatic/Tracked -- go's `switch`
+    /// has a `default: fallthrough` case into exactly that arm.
+    #[test]
+    fn stores_catchpoints_unrecognized_tracking_value_falls_through_to_archival_gate() {
+        let non_archival = Local {
+            catchpoint_interval: 10_000,
+            catchpoint_tracking: 99,
+            archival: false,
+            ..Local::default()
+        };
+        assert!(!non_archival.stores_catchpoints());
+
+        let archival = Local {
+            catchpoint_interval: 10_000,
+            catchpoint_tracking: 99,
+            archival: true,
+            ..Local::default()
+        };
+        assert!(archival.stores_catchpoints());
+    }
+
+    /// `tracks_catchpoints` is a superset of `stores_catchpoints`: Tracked
+    /// mode on a non-archival node tracks without storing.
+    #[test]
+    fn tracks_catchpoints_true_for_tracked_mode_without_storing() {
+        let cfg = Local {
+            catchpoint_interval: 10_000,
+            catchpoint_tracking: CATCHPOINT_TRACKING_MODE_TRACKED,
+            archival: false,
+            ..Local::default()
+        };
+        assert!(!cfg.stores_catchpoints());
+        assert!(cfg.tracks_catchpoints());
+    }
+
+    /// `tracks_catchpoints` is false when neither storing nor Tracked mode
+    /// applies.
+    #[test]
+    fn tracks_catchpoints_false_when_untracked() {
+        let cfg = Local {
+            catchpoint_interval: 10_000,
+            catchpoint_tracking: CATCHPOINT_TRACKING_MODE_UNTRACKED,
+            archival: false,
+            ..Local::default()
+        };
+        assert!(!cfg.tracks_catchpoints());
     }
 }

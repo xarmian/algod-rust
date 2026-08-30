@@ -41,6 +41,38 @@ pub fn resolve_unsigned_limit(value: i64) -> u32 {
     }
 }
 
+/// Resolve `config.json`'s catchpoint fields into the
+/// [`algo_ledger::catchpoint::AutoCatchpointConfig`] the live block-apply
+/// loop needs, or `None` when automatic generation should stay disabled
+/// (issue #770). Shared by `relay` and `participate`, mirroring how
+/// `resolve_unsigned_limit` above is shared for connection-limit fields.
+///
+/// Mirrors go's own `CatchpointDir` fallback semantics: even when
+/// [`algo_config::Local::stores_catchpoints`] resolves to `true`, an empty
+/// `CatchpointDir` leaves nowhere to write files, so generation is
+/// disabled (with a warning) rather than writing into the current working
+/// directory or panicking.
+pub fn resolve_automatic_catchpoint_config(
+    node_config: &algo_config::Local,
+) -> Option<algo_ledger::catchpoint::AutoCatchpointConfig> {
+    if !node_config.stores_catchpoints() {
+        return None;
+    }
+    if node_config.catchpoint_dir.is_empty() {
+        tracing::warn!(
+            "CatchpointTracking/CatchpointInterval resolve to automatic catchpoint \
+             generation, but CatchpointDir is empty; disabling automatic generation \
+             (set CatchpointDir in config.json to enable it)"
+        );
+        return None;
+    }
+    Some(algo_ledger::catchpoint::AutoCatchpointConfig {
+        interval: node_config.catchpoint_interval,
+        file_history_length: node_config.catchpoint_file_history_length,
+        dir: std::path::PathBuf::from(&node_config.catchpoint_dir),
+    })
+}
+
 /// Map a network name to its genesis ID.
 ///
 /// Returns `None` for unknown networks.
@@ -69,5 +101,45 @@ mod tests {
     #[test]
     fn genesis_id_for_unknown_network() {
         assert_eq!(genesis_id_for("foonet"), None);
+    }
+
+    /// Issue #770: a stock default config must not enable automatic
+    /// catchpoint generation (matches `Local::stores_catchpoints`'s own
+    /// "stock default = false" behavior).
+    #[test]
+    fn resolve_automatic_catchpoint_config_none_for_stock_default() {
+        assert!(resolve_automatic_catchpoint_config(&algo_config::Local::default()).is_none());
+    }
+
+    /// Even with `CatchpointTracking` resolving to "stores", an empty
+    /// `CatchpointDir` must disable automatic generation rather than
+    /// writing into an unspecified location.
+    #[test]
+    fn resolve_automatic_catchpoint_config_none_when_dir_is_empty() {
+        let cfg = algo_config::Local {
+            catchpoint_interval: 10_000,
+            catchpoint_tracking: 2, // Stored
+            catchpoint_dir: String::new(),
+            ..algo_config::Local::default()
+        };
+        assert!(resolve_automatic_catchpoint_config(&cfg).is_none());
+    }
+
+    /// The happy path: Stored mode with a non-empty `CatchpointDir`
+    /// resolves to a populated `AutoCatchpointConfig` carrying the
+    /// configured interval/history-length/dir through unchanged.
+    #[test]
+    fn resolve_automatic_catchpoint_config_populated_when_enabled() {
+        let cfg = algo_config::Local {
+            catchpoint_interval: 5_000,
+            catchpoint_file_history_length: 10,
+            catchpoint_tracking: 2, // Stored
+            catchpoint_dir: "/data/catchpoints".to_string(),
+            ..algo_config::Local::default()
+        };
+        let resolved = resolve_automatic_catchpoint_config(&cfg).unwrap();
+        assert_eq!(resolved.interval, 5_000);
+        assert_eq!(resolved.file_history_length, 10);
+        assert_eq!(resolved.dir, std::path::PathBuf::from("/data/catchpoints"));
     }
 }

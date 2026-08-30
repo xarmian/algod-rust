@@ -18,6 +18,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+pub mod auto;
 pub mod checkpoint;
 pub mod importer;
 pub mod msgp_compat;
@@ -27,6 +28,7 @@ pub mod types;
 pub mod verify;
 pub mod writer;
 
+pub use auto::{catchpoint_filename, prune_catchpoint_files, AutoCatchpointConfig};
 pub use importer::{import_catchpoint_file, ImportResult, ImportStats};
 pub use parser::{CatchpointEntry, CatchpointReader, CatchpointReaderFile};
 pub use types::{

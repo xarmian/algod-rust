@@ -2050,6 +2050,21 @@ pub struct SqliteLedger {
     /// flushed to the `accounttotals` row as a single UPDATE in
     /// `commit_block` — see [`AccountTotalsDelta`] and issue #523.
     pending_totals_delta: AccountTotalsDelta,
+
+    /// Automatic interval-driven catchpoint generation config (issue
+    /// #770), set via [`Self::configure_automatic_catchpoints`]. `None`
+    /// (the default) disables the feature entirely — matching go's
+    /// `CatchpointInterval == 0` — with zero per-commit overhead beyond
+    /// one `Option` check.
+    catchpoint_auto: Option<crate::catchpoint::AutoCatchpointConfig>,
+
+    /// Background export thread spawned by the most recent automatic
+    /// catchpoint generation, if one is still tracked. Mirrors go's
+    /// `catchpointTracker.isWritingCatchpointDataFile()` guard: a new
+    /// export is skipped (rather than started concurrently) while the
+    /// previous one hasn't finished, since both would otherwise write the
+    /// same-shaped file set from an overlapping snapshot.
+    catchpoint_worker: Option<std::thread::JoinHandle<()>>,
 }
 
 /// In-memory accumulator for the per-round change to the `accounttotals`
@@ -2477,6 +2492,8 @@ impl SqliteLedger {
             delta_cache: crate::delta_cache::DeltaCache::with_default_window(),
             group_delta_tracer: None,
             pending_totals_delta: AccountTotalsDelta::default(),
+            catchpoint_auto: None,
+            catchpoint_worker: None,
         })
     }
 
@@ -3404,7 +3421,216 @@ impl SqliteLedger {
         // The committed lease changes stand; discard the rollback snapshot.
         self.lease_snapshot = None;
         self.in_block = false;
+
+        // Issue #770: automatic interval-driven catchpoint generation.
+        // Fire-and-forget on a background OS thread — deliberately placed
+        // after COMMIT (and after `in_block` is cleared) so this never
+        // delays the block-apply hot path: the caller's `commit_block()`
+        // returns as soon as the (cheap, indexed) digest lookup and the
+        // read-only snapshot connection are opened, not when the export
+        // itself finishes.
+        self.maybe_spawn_automatic_catchpoint();
+
         Ok(())
+    }
+
+    /// Configure (or disable, with `None`) automatic interval-driven
+    /// catchpoint generation (issue #770). Callers resolve
+    /// `enabled`/`interval`/`file_history_length`/`dir` from
+    /// `algo_config::Local` once at node startup
+    /// (`Local::stores_catchpoints`, `Local::catchpoint_interval`,
+    /// `Local::catchpoint_file_history_length`, `Local::catchpoint_dir`)
+    /// and call this before the live apply loop starts.
+    ///
+    /// A `Some(cfg)` with `cfg.interval == 0` is treated the same as
+    /// `None` (disabled) — defensive, since `Local::stores_catchpoints()`
+    /// already implies `catchpoint_interval > 0`.
+    pub fn configure_automatic_catchpoints(
+        &mut self,
+        cfg: Option<crate::catchpoint::AutoCatchpointConfig>,
+    ) {
+        self.catchpoint_auto = cfg.filter(|c| c.interval > 0);
+    }
+
+    /// Block until any in-flight automatic catchpoint export finishes.
+    /// Not called by the live apply loop (which is deliberately
+    /// fire-and-forget) — for tests and for a future graceful-shutdown
+    /// hook that wants to avoid an abrupt process exit mid-write.
+    pub fn wait_for_pending_catchpoint_export(&mut self) {
+        if let Some(handle) = self.catchpoint_worker.take() {
+            if let Err(e) = handle.join() {
+                tracing::warn!("automatic catchpoint export thread panicked: {e:?}");
+            }
+        }
+    }
+
+    /// Read the block header digest recorded for `round` in
+    /// `blockdb.blocks`. Every committed round has a row here — real ones
+    /// via `put_block`, synthesized ones via `flush_chain_state` — so this
+    /// is a fast, always-populated indexed lookup, not a fallible
+    /// best-effort read.
+    fn block_header_digest_at_round(&self, round: u64) -> Result<[u8; 32], AlgoError> {
+        let hdrdata: Vec<u8> = self
+            .conn
+            .query_row(
+                "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
+                params![round as i64],
+                |row| row.get(0),
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("automatic catchpoint: read block header at round {round}: {e}"),
+            })?;
+        let header: BlockHeader =
+            rmp_serde::from_slice(&hdrdata).map_err(|e| AlgoError::Ledger {
+                message: format!("automatic catchpoint: decode block header at round {round}: {e}"),
+            })?;
+        Ok(algo_codec::compute_block_header_digest(&header).0)
+    }
+
+    /// Check whether this just-committed round is a catchpoint round
+    /// (`round % interval == 0`) under the configured
+    /// [`crate::catchpoint::AutoCatchpointConfig`], and if so spawn a
+    /// background thread that exports (and then prunes per the retention
+    /// policy) the catchpoint file.
+    ///
+    /// Everything done on the calling thread here is cheap and bounded:
+    /// one indexed `SELECT`, one consensus-table lookup, and opening a
+    /// *separate* read-only SQLite connection (WAL mode allows concurrent
+    /// readers without blocking `self.conn`'s writer). The actual
+    /// chunked-export I/O — the part that can take a meaningful fraction
+    /// of a second on a large accounts database — all happens on the
+    /// spawned thread, after this function (and therefore
+    /// `commit_block`) has already returned.
+    fn maybe_spawn_automatic_catchpoint(&mut self) {
+        let Some(cfg) = self.catchpoint_auto.clone() else {
+            return;
+        };
+        let round = self.current_round.0;
+        // Round 0 (genesis) is never a catchpoint round in go either
+        // (`calculateCatchpointRounds` operates on `[oldBase+1, ..]`), and
+        // guards against `0 % interval == 0` trivially firing on genesis
+        // seeding.
+        if round == 0 || round % cfg.interval != 0 {
+            return;
+        }
+        let Some(prefix) = self.db_prefix.clone() else {
+            tracing::warn!(
+                round,
+                "automatic catchpoint generation is configured but this ledger is in-memory \
+                 (no on-disk tracker file to snapshot); skipping"
+            );
+            return;
+        };
+
+        // Don't overlap with a still-running previous export — mirrors
+        // go's `isWritingCatchpointDataFile()` guard. If the previous
+        // thread already finished, join it now (propagating any logged
+        // panic) so `catchpoint_worker` is free for the new one.
+        if let Some(handle) = &self.catchpoint_worker {
+            if !handle.is_finished() {
+                tracing::warn!(
+                    round,
+                    "previous automatic catchpoint export is still running; skipping this round \
+                     (interval is too short for export duration, or disk I/O is unusually slow)"
+                );
+                return;
+            }
+        }
+        if let Some(handle) = self.catchpoint_worker.take() {
+            if let Err(e) = handle.join() {
+                tracing::warn!("automatic catchpoint export thread panicked: {e:?}");
+            }
+        }
+
+        let digest = match self.block_header_digest_at_round(round) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(round, error = %e, "automatic catchpoint: skipping this round");
+                return;
+            }
+        };
+
+        let (enable_sp_contexts, include_online_data) =
+            match algo_types::consensus_params_for_version(&self.protocol) {
+                Some(p) => (
+                    p.enable_catchpoints_with_sp_contexts,
+                    p.enable_catchpoints_with_online_accounts,
+                ),
+                None => {
+                    tracing::warn!(
+                        round,
+                        protocol = %self.protocol,
+                        "automatic catchpoint: unrecognized consensus version; \
+                         falling back to the pre-SP-contexts (V6) file format"
+                    );
+                    (false, false)
+                }
+            };
+
+        // Open the read-only snapshot connection *now*, synchronously —
+        // this is fast (no data is read yet, just the file open + a
+        // deferred BEGIN) but pins a consistent WAL view of exactly this
+        // round even if more blocks are applied on `self.conn` before the
+        // spawned thread is scheduled to run.
+        let tracker_path = tracker_path_for_prefix(&prefix);
+        let conn = match Connection::open_with_flags(
+            &tracker_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(round, error = %e, "automatic catchpoint: failed to open read snapshot; skipping");
+                return;
+            }
+        };
+        if let Err(e) = conn.execute_batch("BEGIN DEFERRED") {
+            tracing::warn!(round, error = %e, "automatic catchpoint: failed to pin snapshot; skipping");
+            return;
+        }
+
+        let out_path = cfg.dir.join(crate::catchpoint::catchpoint_filename(round));
+        let dir = cfg.dir.clone();
+        let history_length = cfg.file_history_length;
+        let opts = crate::catchpoint::ExportOptions {
+            balances_round: round,
+            blocks_round: round,
+            block_header_digest: digest,
+            include_online_data,
+            enable_sp_contexts,
+            ..Default::default()
+        };
+
+        let spawned = std::thread::Builder::new()
+            .name(format!("catchpoint-export-{round}"))
+            .spawn(move || {
+                match crate::catchpoint::export_catchpoint_file(&conn, &out_path, &opts) {
+                    Ok(result) => {
+                        tracing::info!(
+                            round,
+                            label = %result.label,
+                            size = result.file_size,
+                            accounts = result.total_accounts,
+                            "automatic catchpoint export complete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(round, error = %e, "automatic catchpoint export failed");
+                        // Still fall through to pruning: an old, valid
+                        // catchpoint set shouldn't accumulate unboundedly
+                        // just because the newest generation attempt
+                        // failed.
+                    }
+                }
+                if let Err(e) = crate::catchpoint::prune_catchpoint_files(&dir, history_length) {
+                    tracing::warn!(round, error = %e, "automatic catchpoint: pruning old files failed");
+                }
+            });
+        match spawned {
+            Ok(handle) => self.catchpoint_worker = Some(handle),
+            Err(e) => {
+                tracing::warn!(round, error = %e, "automatic catchpoint: failed to spawn export thread");
+            }
+        }
     }
 
     /// Rollback the current block-level transaction, discarding all changes
