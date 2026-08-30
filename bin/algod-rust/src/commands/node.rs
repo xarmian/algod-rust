@@ -58,6 +58,23 @@ use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
 /// go-algorand's default algod endpoint port.
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 
+/// Resolve `node start`'s REST listen address: an explicit `--listen`/`-l`
+/// CLI flag always wins (issue #757, mirroring `participate`'s
+/// `RestOptions::resolve` CLI-flag-overrides-config.json precedence,
+/// `commands/participate.rs`); otherwise fall back to config.json's
+/// `EndpointAddress` when non-empty; otherwise [`DEFAULT_LISTEN`].
+///
+/// Unlike `participate` (where REST is optional and an explicit empty
+/// `EndpointAddress` opts out of serving it at all), `node start`'s entire
+/// purpose is to serve the REST API, so an empty/unset config value falls
+/// through to `DEFAULT_LISTEN` rather than disabling the server.
+fn resolve_listen_addr(cli_listen: Option<&str>, config_endpoint_address: &str) -> String {
+    cli_listen
+        .map(str::to_string)
+        .or_else(|| Some(config_endpoint_address.to_string()).filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| DEFAULT_LISTEN.to_string())
+}
+
 pub async fn run(cmd: NodeCommands) -> anyhow::Result<()> {
     match cmd {
         NodeCommands::Start {
@@ -236,6 +253,49 @@ async fn run_start(
 
     let ledger = Arc::new(Mutex::new(sqlite_ledger));
 
+    // -----------------------------------------------------------------------
+    // 2b. Load `<data_dir>/config.json` (go-algorand `config.Local`
+    //     equivalent, issue #754) — `node start` previously never read this
+    //     file at all, leaving `docker/localnet-rust/data/config.json`
+    //     decorative dead weight (issue #757). A missing file falls back to
+    //     `Local::default()` (go-matching defaults, same as `participate`'s
+    //     handling in `main.rs`); a malformed one is logged and defaults are
+    //     used rather than refusing to start — `node start` is the
+    //     localnet/dev entry point and a bad hand-edited config.json
+    //     shouldn't brick it.
+    let file_config = match algo_config::Local::load_from_data_dir(data_dir) {
+        Ok(cfg) => {
+            info!(
+                version = cfg.version,
+                endpoint_address = %cfg.endpoint_address,
+                dns_bootstrap_id = %cfg.dns_bootstrap_id,
+                enable_developer_api = cfg.enable_developer_api,
+                "loaded config.json"
+            );
+            cfg
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to load config.json; continuing with defaults");
+            algo_config::Local::default()
+        }
+    };
+    // `DNSBootstrapID` (config.json) has a real, exercised consumer on
+    // `algod-rust participate` (issue #748's `Discovery`/`Phonebook`
+    // DNS-SRV peer bootstrap) but `node start` has no gossip/relay
+    // networking layer at all — its only peer-syncing affordance is
+    // `--follow <url>`, which takes an explicit REST peer URL rather than
+    // discovering one. Wiring DNS-bootstrap-driven peer discovery into
+    // `node start` would mean building that discovery mechanism from
+    // scratch, which is out of this issue's scope (see issue #757's
+    // "narrow scope, file a follow-up" allowance) — tracked as a follow-up.
+    if !file_config.dns_bootstrap_id.is_empty() {
+        info!(
+            dns_bootstrap_id = %file_config.dns_bootstrap_id,
+            "config.json sets DNSBootstrapID, but `node start` has no peer-discovery \
+             mechanism to act on it (only `participate` does) — ignoring"
+        );
+    }
+
     // Participation-key registry. Lives at <genesisDir>/partregistry.sqlite,
     // matching go's `config.ParticipationRegistryFilename`
     // (../go-algorand/node/node.go:868). Backs the admin-only
@@ -269,7 +329,13 @@ async fn run_start(
     };
     let mut node_interface = AlgodNodeInterface::new(ledger.clone(), node_config)
         .with_shutdown_token(shutdown_token.clone())
-        .with_participation_store(part_store);
+        .with_participation_store(part_store)
+        // config.json's `EnableDeveloperAPI` (issue #751/#757) — mirrors
+        // `participate`'s wiring. `enable_developer_api()` itself already
+        // ORs this with dev-mode (see
+        // `AlgodNodeInterface::enable_developer_api`), so `--dev` keeps
+        // working unchanged whether or not this is set.
+        .with_enable_developer_api(file_config.enable_developer_api);
     if dev_mode {
         let pool = Arc::new(TransactionPool::new(
             PoolConfig::default(),
@@ -285,16 +351,10 @@ async fn run_start(
     // 4. Serve the REST API. `ApiServer::serve` writes algod.net /
     //    algod.token / algod.admin.token into the data dir for `goal` to read.
     // -----------------------------------------------------------------------
-    let listen_addr: SocketAddr = listen.unwrap_or(DEFAULT_LISTEN).parse().with_context(|| {
-        format!(
-            "parsing --listen address {:?}",
-            listen.unwrap_or(DEFAULT_LISTEN)
-        )
-    })?;
-    // `node start` has no `<data-dir>/config.json` wiring yet (only
-    // `participate` loads it) — default every REST/API field (issue #751)
-    // to go's own defaults rather than inventing different ones here.
-    let default_rest_config = algo_config::Local::default();
+    let listen_str = resolve_listen_addr(listen, &file_config.endpoint_address);
+    let listen_addr: SocketAddr = listen_str
+        .parse()
+        .with_context(|| format!("parsing listen address {listen_str:?}"))?;
     let api_config = ApiServerConfig {
         listen_addr,
         data_dir: Some(data_dir.to_path_buf()),
@@ -302,10 +362,10 @@ async fn run_start(
         admin_token: None,
         disable_api_auth: false,
         enable_private_network_access_header: false,
-        rest_read_timeout_seconds: default_rest_config.rest_read_timeout_seconds,
-        rest_write_timeout_seconds: default_rest_config.rest_write_timeout_seconds,
-        rest_connections_soft_limit: default_rest_config.rest_connections_soft_limit,
-        rest_connections_hard_limit: default_rest_config.rest_connections_hard_limit,
+        rest_read_timeout_seconds: file_config.rest_read_timeout_seconds,
+        rest_write_timeout_seconds: file_config.rest_write_timeout_seconds,
+        rest_connections_soft_limit: file_config.rest_connections_soft_limit,
+        rest_connections_hard_limit: file_config.rest_connections_hard_limit,
     };
     let shutdown_future = {
         let token = shutdown_token.clone();
@@ -595,5 +655,90 @@ mod follow_loop_tests {
 
         cancel.cancel();
         let _ = loop_handle.await;
+    }
+}
+
+#[cfg(test)]
+mod config_json_wiring_tests {
+    use super::*;
+
+    // -------------------------------------------------------------------
+    // `resolve_listen_addr` — issue #757's CLI-flag-overrides-config.json
+    // precedence for `node start`'s REST listen address.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn cli_listen_flag_wins_over_config_endpoint_address() {
+        assert_eq!(
+            resolve_listen_addr(Some("127.0.0.1:9999"), "0.0.0.0:8080"),
+            "127.0.0.1:9999",
+            "an explicit --listen must override config.json's EndpointAddress"
+        );
+    }
+
+    #[test]
+    fn config_endpoint_address_used_when_no_cli_flag() {
+        assert_eq!(
+            resolve_listen_addr(None, "0.0.0.0:8080"),
+            "0.0.0.0:8080",
+            "with no --listen, config.json's EndpointAddress must be honored \
+             (this is the fix for issue #757 — previously `node start` never \
+             consulted config.json at all and always fell back to \
+             DEFAULT_LISTEN here)"
+        );
+    }
+
+    #[test]
+    fn default_listen_used_when_neither_cli_nor_config_set() {
+        assert_eq!(
+            resolve_listen_addr(None, ""),
+            DEFAULT_LISTEN,
+            "an empty config.json EndpointAddress must not disable REST for \
+             `node start` (unlike `participate`, which treats that as an \
+             opt-out) — it falls through to DEFAULT_LISTEN"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // The real `docker/localnet-rust/data/config.json` fixture must parse
+    // cleanly via the same `Local::load_from_data_dir` mechanism `node
+    // start` now calls, and its fields must be exactly what
+    // docker/Dockerfile's `localnet` CMD / this test's expectations agree
+    // on -- proving the file is a genuine input, not decoration.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn docker_localnet_rust_config_json_loads_and_matches_expected_fields() {
+        // CARGO_MANIFEST_DIR is `bin/algod-rust`; the fixture lives at the
+        // repo root's `docker/localnet-rust/data/`.
+        let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/localnet-rust/data");
+        let cfg = algo_config::Local::load_from_data_dir(&data_dir)
+            .expect("docker/localnet-rust/data/config.json must parse as a valid Local config");
+        assert_eq!(cfg.endpoint_address, "0.0.0.0:8080");
+        assert_eq!(cfg.dns_bootstrap_id, "");
+        assert!(cfg.enable_developer_api);
+    }
+
+    #[test]
+    fn resolve_listen_addr_matches_docker_config_when_no_cli_override() {
+        // Pins that, absent a --listen flag, `node start` would resolve to
+        // exactly the address docker/Dockerfile's `localnet` CMD passes
+        // explicitly via `-l 0.0.0.0:8080` — i.e. the CLI flag and the
+        // config.json file agree, so keeping both (rather than dropping
+        // one) is a no-op precedence-wise, just an explicit-override
+        // safety net matching go-algorand's own CLI-overrides-config.json
+        // precedent.
+        let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/localnet-rust/data");
+        let cfg = algo_config::Local::load_from_data_dir(&data_dir).expect("loads");
+        assert_eq!(
+            resolve_listen_addr(None, &cfg.endpoint_address),
+            "0.0.0.0:8080"
+        );
+        assert_eq!(
+            resolve_listen_addr(Some("0.0.0.0:8080"), &cfg.endpoint_address),
+            "0.0.0.0:8080"
+        );
     }
 }
