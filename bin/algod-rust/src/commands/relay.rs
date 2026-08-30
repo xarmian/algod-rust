@@ -37,7 +37,8 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::commands::network_common::{
-    genesis_id_for, resolve_automatic_catchpoint_config, resolve_unsigned_limit,
+    genesis_id_for, resolve_automatic_catchpoint_config, resolve_gossip_fanout,
+    resolve_unsigned_limit,
 };
 
 // ---------------------------------------------------------------------------
@@ -560,11 +561,13 @@ pub async fn run(
         tls_cert_file: tls_cert.map(|s| s.to_string()),
         tls_key_file: tls_key.map(|s| s.to_string()),
         block_service_mem_cap: mem_cap,
-        gossip_fanout: if peers.is_empty() {
-            algo_network::DEFAULT_GOSSIP_FANOUT
-        } else {
-            peers.len().max(algo_network::DEFAULT_GOSSIP_FANOUT)
-        },
+        // Issue #788: a relay is unconditionally a listen server (that's
+        // what `--bind-address` is), so it always applies go's
+        // `enrichNetworkingConfig` `GossipFanout` bump — `node_config`
+        // previously wasn't even consulted here, silently ignoring any
+        // `GossipFanout` set in `config.json` in favor of a hardcoded
+        // `DEFAULT_GOSSIP_FANOUT`/`peers.len()` floor.
+        gossip_fanout: resolve_gossip_fanout(node_config, true, peers.len()),
         // Message-hash dedup filter sizing + localhost rate-limit
         // exemption (issue #768) — same `config.json` fields
         // `participate` wires, now available on `relay` too.
