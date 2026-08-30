@@ -204,6 +204,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "algo-conformance"
 version = "0.1.0"
 dependencies = [
@@ -592,6 +601,7 @@ dependencies = [
  "algo-avm",
  "algo-bench",
  "algo-codec",
+ "algo-config",
  "algo-conformance",
  "algo-consensus-crypto",
  "algo-error",
