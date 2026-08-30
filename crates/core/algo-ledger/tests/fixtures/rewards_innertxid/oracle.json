@@ -1,0 +1,515 @@
+{
+  "source": "algod-rust/tools/rewards-innertxid-oracle (issue #760)",
+  "go_algorand_pin": "v5.0.0-stable",
+  "rewards_vectors": [
+    {
+      "version": "v10",
+      "pending_residue_rewards": false,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 1,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "v11",
+      "pending_residue_rewards": false,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 1,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "v12",
+      "pending_residue_rewards": false,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 1,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/0c8a9dc44d7368cc266d5407b79fb3311f4fc795",
+      "pending_residue_rewards": false,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 1,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/2526b6ae062b4fe5e163e06e41e1d9b9219135a9",
+      "pending_residue_rewards": false,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 1,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/a26ed78ed8f834e2b9ccb6eb7d3ee9f629a6e622",
+      "pending_residue_rewards": false,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 1,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/22726c9dcd12d9cddce4a8bd7e8ccaa707f74101",
+      "pending_residue_rewards": false,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 1,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/5615adc36bad610c7f165fa2967f4ecfa75125f0",
+      "pending_residue_rewards": false,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 1,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/0e196e82bfd6e327994bec373c4cc81bc878ef5c",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/4a9db6a25595c6fd097cf9cc137cc83027787eaa",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/8096e2df2da75c3339986317f9abe69d4fa86b4b",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/57016b942f6d97e6d4c0688b373bb0a2fc85a1a2",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/e5f565421d720c6f75cdd186f7098495caf9101f",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/3a83c4c743f8b17adfd73944b4319c25722a6782",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bea19289bf41217d2c0af30522fa222ef1366466",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/ac2255d586c4474d4ebcf3809acccb59b7ef34ff",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d050b3cade6d5c664df8bd729bf219f179812595",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/65b4ab3266c52c56a0fa7d591754887d68faad0a",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abc54f79f9ad679d2d22f0fb9909fb005c16f8a1",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bc36005dbd776e6d1eaf0c560619bb183215645c",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": false,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1178,
+      "next_rate": 0,
+      "next_residue": 4,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/85e6db1fdbdef00aa232c75199e10dc5fe9498f6",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d5ac876d7ede07367dbaa26e149aa42589aac1f7",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/830a4e673148498cc7230a0d1ba1ed0a5471acc6",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/2dd5435993f6f6d65691140f592ebca5ef19ffbd",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/433d8e9a7274b6fca703d91213e05c7e6a589e69",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/44fa607d6051730f5264526bf3c108d51f0eadb6",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/1ac4dd1f85470e1fb36c8a65520e1313d7dfed5e",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abd3d4823c6f77349fc04c3af7b1e99fe4df699f",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/925a46433742afb0b51bb939354bd907fa88bf95",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/268b63433a907455d439995bf916f6b296018f4f",
+      "pending_residue_rewards": true,
+      "rewards_calculation_fix": true,
+      "min_balance": 100000,
+      "rewards_rate_refresh_interval": 500000,
+      "next_level": 1142,
+      "next_rate": 0,
+      "next_residue": 6,
+      "next_recalculation_round": 1500000
+    }
+  ],
+  "inner_id_vectors": [
+    {
+      "txn_label": "pay_simple",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 0,
+      "inner_id_hex": "a0ab2cd982f403e955d8180bd7c5f823986dd551830c4964e8716c350a6e1297"
+    },
+    {
+      "txn_label": "pay_simple",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 1,
+      "inner_id_hex": "82ea4a8c47b48be518a4183c930e7ebe28a048cf74064aef0973233089fb68fa"
+    },
+    {
+      "txn_label": "pay_simple",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 7,
+      "inner_id_hex": "e6031bfd417965ea62c05856d791b522bebbc4086604640de8db92e2ab3062f0"
+    },
+    {
+      "txn_label": "pay_simple",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 0,
+      "inner_id_hex": "58cb5f782073228f600fb1ee4759a46751d136764be11e484f99ce0c54c6c5f1"
+    },
+    {
+      "txn_label": "pay_simple",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 1,
+      "inner_id_hex": "6ef50c8017fd3f78733c513311ec1411a89224e081bb12585fb2c0b7dbc74788"
+    },
+    {
+      "txn_label": "pay_simple",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 7,
+      "inner_id_hex": "275e456f3152bdb880826b08a307b54413935e6a9e016061c2c2f147c2f55cf2"
+    },
+    {
+      "txn_label": "pay_with_extras",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 0,
+      "inner_id_hex": "c35409c15adcb609deb8f793c0d63f9d0fc06983078cb44a1ca743cbe9c77ec2"
+    },
+    {
+      "txn_label": "pay_with_extras",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 1,
+      "inner_id_hex": "4570878329eeb86c9858cc8a30b3582c54afd2d39f325b87e68b82bcbf8408e3"
+    },
+    {
+      "txn_label": "pay_with_extras",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 7,
+      "inner_id_hex": "0f17cb794448ec25dd411cb98a59714678f3c147b6595819fb64642f783eec52"
+    },
+    {
+      "txn_label": "pay_with_extras",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 0,
+      "inner_id_hex": "ae43c1b8cdbf168b2291afd0fb79ec9ee3b6dc21c1bb63cd07aab214dac9c83a"
+    },
+    {
+      "txn_label": "pay_with_extras",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 1,
+      "inner_id_hex": "8b6068c6bc25dbbd67cd319ce1b20506ac216be5fec9f35049014681433e008e"
+    },
+    {
+      "txn_label": "pay_with_extras",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 7,
+      "inner_id_hex": "87dc9d3944b0be769682e36506b026c0700813676622c87a0ed68ece11d10a07"
+    },
+    {
+      "txn_label": "axfer",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 0,
+      "inner_id_hex": "39e668eb46eefebd3016dc94683302c1b364ed7f704d3d772bf9267ef610d5cf"
+    },
+    {
+      "txn_label": "axfer",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 1,
+      "inner_id_hex": "038c508ca3622d56ddce01d30df459231ffab41be130eb9852049d26f1c582ed"
+    },
+    {
+      "txn_label": "axfer",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 7,
+      "inner_id_hex": "ba5c948a21f894ca349f4364b02589ae7aa4c9eccfb3d938774e115127df6e68"
+    },
+    {
+      "txn_label": "axfer",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 0,
+      "inner_id_hex": "d4da83f9c5d4e23fe8fe0ff13d09f0200d6e09fa8845cfcd9469e40f08cbd5b9"
+    },
+    {
+      "txn_label": "axfer",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 1,
+      "inner_id_hex": "8426ff6502debc19624d8fb2cce22661af11468812b3a4be2b2368faa75a6cbe"
+    },
+    {
+      "txn_label": "axfer",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 7,
+      "inner_id_hex": "aafe0729dc056d7ff288e2ab8a462820c0143d787e9fa57c1ab8d803407989c4"
+    },
+    {
+      "txn_label": "appl_call",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 0,
+      "inner_id_hex": "370930189193c86dd5f7387c5f9d8e6d37be0d5c5c5956fbec441d99686e4026"
+    },
+    {
+      "txn_label": "appl_call",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 1,
+      "inner_id_hex": "f756d45aaab7232e5c38e42cc2f213ff4fc3c41e938ef6a4e5aab7ddcb572fc7"
+    },
+    {
+      "txn_label": "appl_call",
+      "parent_hex": "abababababababababababababababababababababababababababababababab",
+      "index": 7,
+      "inner_id_hex": "a7741da4f40bc1d301c89df6e2fc06ba6de13ce0b35daee55698039dccd3d423"
+    },
+    {
+      "txn_label": "appl_call",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 0,
+      "inner_id_hex": "fc995f904020e941ad8053786363740f2ff70d03ef8ed968cff8d604a04c1e72"
+    },
+    {
+      "txn_label": "appl_call",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 1,
+      "inner_id_hex": "d4e9fcae62472578289fe78bc9c92a8c2ded7abf161fc0f8c75dcd6db9013602"
+    },
+    {
+      "txn_label": "appl_call",
+      "parent_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "index": 7,
+      "inner_id_hex": "71d5aed78cb6b387a2eefc4a39cbaf9a5732fc48030ef66f9d28eafbd65fe779"
+    }
+  ]
+}

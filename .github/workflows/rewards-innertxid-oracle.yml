@@ -1,0 +1,94 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+name: Rewards/InnerTxnID oracle drift check
+
+# Issue #760 (follow-up to #747/PR #759): verifies that the checked-in
+# byte-level go-algorand oracle fixture
+# (crates/core/algo-ledger/tests/fixtures/rewards_innertxid/oracle.json) is
+# not stale -- i.e. that running `tools/rewards-innertxid-oracle` against a
+# real, freshly-built go-algorand v5.0.0-stable actually reproduces the
+# committed file byte-for-byte. `cargo test --workspace` (default CI) reads
+# only the committed fixture and never builds go-algorand, so this is the
+# only job that re-derives it from real go-algorand source.
+#
+# Building go-algorand's crypto package requires cgo + the vendored
+# libsodium fork (see CLAUDE.md's CI Workflows section) -- `make libsodium`
+# below, same as algokey-e2e.yml.
+
+on:
+  pull_request:
+    paths:
+      - "tools/rewards-innertxid-oracle/**"
+      - "crates/core/algo-ledger/src/rewards.rs"
+      - "crates/core/algo-avm/src/itxn.rs"
+      - "crates/core/algo-ledger/tests/fixtures/rewards_innertxid/**"
+      - ".github/workflows/rewards-innertxid-oracle.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tools/rewards-innertxid-oracle/**"
+      - "crates/core/algo-ledger/src/rewards.rs"
+      - "crates/core/algo-avm/src/itxn.rs"
+      - "crates/core/algo-ledger/tests/fixtures/rewards_innertxid/**"
+      - ".github/workflows/rewards-innertxid-oracle.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: rewards-innertxid-oracle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin go-algorand to the same rev the rest of the repo references.
+  GO_ALGORAND_REV: "v5.0.0-stable"
+
+jobs:
+  oracle-drift-check:
+    name: Regenerate oracle fixture from real go-algorand and diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Build go-algorand's libsodium fork
+        run: |
+          set -euo pipefail
+          # go-algorand's crypto package links a vendored libsodium fork via
+          # cgo; without this, `go build`/`go run` on anything importing
+          # data/transactions or data/bookkeeping (both import crypto) fails
+          # with "sodium.h: No such file or directory".
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool build-essential
+          # Clone as a *sibling* of the checked-out repo (not $RUNNER_TEMP) --
+          # tools/rewards-innertxid-oracle's go.mod `replace` directive and its
+          # own goAlgorandDir()/verifyGoAlgorandPin() resolve go-algorand
+          # relative to the tool's own source location (`../../../go-algorand`,
+          # matching this repo's local-dev convention), so this is the one
+          # location that needs no go.mod edits and lets the tool's own pin
+          # check pass for real (rather than being skipped via
+          # --allow-unpinned). A full (non-shallow) clone is used so
+          # `git describe --tags --exact-match` reliably finds the tag.
+          git clone --branch "$GO_ALGORAND_REV" \
+            https://github.com/algorand/go-algorand.git \
+            "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          cd "$(dirname "$GITHUB_WORKSPACE")/go-algorand"
+          make libsodium
+
+      - name: Run the oracle tool and diff against the committed fixture
+        run: |
+          set -euo pipefail
+          cd tools/rewards-innertxid-oracle
+          go run .
+          cd "$GITHUB_WORKSPACE"
+          git diff --exit-code -- crates/core/algo-ledger/tests/fixtures/rewards_innertxid/oracle.json || {
+            echo "::error::committed oracle.json is stale -- regenerate via 'cd tools/rewards-innertxid-oracle && go run .' against the pinned go-algorand checkout and commit the result"
+            exit 1
+          }

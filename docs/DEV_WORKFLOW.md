@@ -722,6 +722,62 @@ against a different go-algorand tag.
   protocol change, explicitly anchored by
   `tests/lookback_boundary.rs :: v7_to_v8_transition_shifts_balance_round_by_160`
 
+## Rewards/InnerTxnID Oracle Regeneration
+
+`algo_ledger::rewards::next_rewards_state` (the `PendingResidueRewards`
+v18+ / `RewardsCalculationFix` v31+ gated formulas) and
+`algo_avm::itxn::compute_inner_txn_id` (go's `Transaction.InnerID`) were
+originally verified only by direct line-by-line comparison against the
+go-algorand source (issue #747/PR #759), not by running go-algorand's own
+code and diffing real output. Issue #760 closes that depth gap with a
+byte-level oracle: `tools/rewards-innertxid-oracle` runs the real,
+unmodified go-algorand functions against fixed inputs and records the
+output as a JSON corpus.
+
+### Fixture location
+
+- `crates/core/algo-ledger/tests/fixtures/rewards_innertxid/oracle.json` —
+  a single JSON envelope with `rewards_vectors` (one shared scenario run
+  through every consensus version V10..V42) and `inner_id_vectors` (4
+  representative transaction shapes × 2 parents × 3 indices). Consumed by
+  `crates/core/algo-ledger/tests/rewards_state_oracle.rs` and
+  `crates/core/algo-avm/tests/inner_txn_id_oracle.rs` (the latter reads the
+  file via a relative path across the two crates rather than duplicating
+  it).
+
+### Regenerating
+
+```bash
+cd tools/rewards-innertxid-oracle
+go run .
+```
+
+Building go-algorand's `crypto` package (imported transitively by
+`data/bookkeeping` and `data/transactions`) requires cgo + the vendored
+libsodium fork — see CLAUDE.md's CI Workflows section — so this tool
+cannot be run in an environment without a working cgo toolchain (e.g. this
+project's Windows dev sandbox). `.github/workflows/rewards-innertxid-oracle.yml`
+builds go-algorand from source (`make libsodium`) and re-runs this tool on
+every PR touching the relevant paths, failing if the regenerated output
+drifts from the committed fixture — that workflow is the source of truth
+for whether the fixture is current, not local regeneration.
+
+### When to regenerate
+
+- Bumping the go-algorand pin to a release that touches
+  `bookkeeping.RewardsState.NextRewardsState`, `Transaction.InnerID`, or
+  the `PendingResidueRewards`/`RewardsCalculationFix`/`MinBalance`/
+  `RewardsRateRefreshInterval` fields in `config/consensus.go`.
+- Adding a new consensus version to
+  `tools/rewards-innertxid-oracle/main.go :: allVersions()`.
+
+### References
+
+- `data/bookkeeping/block.go:413` — `RewardsState.NextRewardsState`
+- `config/consensus.go:1058` — `v18.PendingResidueRewards = true`
+- `config/consensus.go:1312` — `v31.RewardsCalculationFix = true`
+- `data/transactions/transaction.go:297` — `Transaction.InnerID`
+
 ## Agreement Codec Tests
 
 Two complementary test harnesses guard the `algo-agreement::codec` wire
