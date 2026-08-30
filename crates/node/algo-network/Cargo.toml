@@ -41,10 +41,16 @@ hickory-resolver.workspace = true
 regex.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
+# HTTP client for the TxSyncer pull protocol's peer client (issue #774):
+# `TxSyncService`'s HTTP server already needed axum; the peer-side client
+# needs an HTTP client, and `reqwest` was already a vetted workspace
+# dependency used as a production dependency elsewhere (`bin/algod-rust`,
+# `algo-rest-client`) — promoted here from dev-only rather than adding a
+# genuinely new dependency.
+reqwest.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
 rmpv.workspace = true
 tower.workspace = true
 tracing-subscriber.workspace = true
-reqwest.workspace = true

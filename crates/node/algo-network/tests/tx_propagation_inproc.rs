@@ -318,6 +318,118 @@ async fn txn_propagates_from_a_to_b_via_gossip() {
     net_a.stop().await;
 }
 
+/// Issue #774: `algo_network::TxSyncer` was fully built (state machine,
+/// `sync_round`, `PeerSource`/`PendingTxAggregate`/`SolicitedTxHandler`
+/// abstractions) but never wired to real production collaborators nor
+/// ever started anywhere in the live node — the transaction sync loop
+/// never ran, so a node that missed a gossip broadcast had no pull-based
+/// fallback recovery, unlike go-algorand (which always runs
+/// `rpcs.TxSyncer` alongside gossip).
+///
+/// This test proves the fix end-to-end over real network I/O: node A
+/// gets a transaction inserted directly into its pool (bypassing
+/// `LocalTxBroadcaster` entirely, i.e. gossip broadcast never happens —
+/// simulating exactly the "missed broadcast" scenario the issue is
+/// about), node B is wired with the new production
+/// `PoolPendingTxAggregate` / `GossipTxSyncPeerSource` (HTTP, via
+/// `TxSyncService`) / `PoolSolicitedTxHandler` collaborators and a
+/// running `TxSyncer`, and node B's pool is asserted to pick up the
+/// transaction purely via the periodic pull — never via gossip, since
+/// gossip never carried it.
+#[tokio::test]
+async fn txsyncer_pulls_txn_that_gossip_never_delivered() {
+    init_tracing();
+
+    // Node A: relay, serving gossip AND the new TxSyncService HTTP
+    // endpoint (registered before `start_arc()`, same requirement as
+    // the TX-tag handler above).
+    let net_a = build_node("test-v1.0", true);
+    let node_a = wire_node(&net_a);
+    let tx_sync_service = algo_network::TxSyncService::new(
+        Arc::new(algo_network::PoolPendingTxAggregate::new(
+            node_a.pool.clone(),
+        )),
+        "test-v1.0".to_string(),
+        1_000_000,
+    );
+    net_a.register_http_handler("/", tx_sync_service.http_router());
+    net_a.start_arc().await.expect("node A start");
+
+    let (a_addr, listening_a) = net_a.address();
+    assert!(listening_a, "node A should be listening");
+
+    // Node B: participant, dials A. No transaction ever reaches B via
+    // gossip in this test — the whole point is that only the TxSyncer
+    // pull path can deliver it.
+    let net_b = build_node("test-v1.0", false);
+    let node_b = wire_node(&net_b);
+    connect_to(&net_b, &a_addr).await;
+    net_b.start_arc().await.expect("node B start");
+    net_b.request_connect_outgoing(false).await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if net_a.peer_count().await >= 1 && net_b.peer_count().await >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(net_a.peer_count().await >= 1, "A should have peer B");
+    assert!(net_b.peer_count().await >= 1, "B should have peer A");
+
+    // Insert directly into A's pool -- bypasses `LocalTxBroadcaster`
+    // (and therefore gossip) entirely, simulating a dropped/missed
+    // broadcast that only a pull-based sync can recover from.
+    let tx = make_tx(0x77);
+    let txid = compute_txn_id(&tx.txn);
+    node_a
+        .pool
+        .remember(vec![tx])
+        .expect("direct pool insert should succeed");
+    assert!(node_a.pool.pending_tx_ids().contains(&txid));
+    assert!(
+        !node_b.pool.pending_tx_ids().contains(&txid),
+        "node B must not have this txid yet -- it was never broadcast"
+    );
+
+    // Wire and start B's TxSyncer: this is the code path under test.
+    // Production `PeerSource` (HTTP, sampling A via
+    // `PeerOption::PeersConnectedOut`), `PendingTxAggregate`, and
+    // `SolicitedTxHandler`, all backed by real `TransactionPool`s.
+    let tx_syncer = algo_network::TxSyncer::new(
+        algo_network::TxSyncerConfig {
+            sync_interval: Duration::from_millis(100),
+            sync_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+        Arc::new(algo_network::PoolPendingTxAggregate::new(
+            node_b.pool.clone(),
+        )),
+        Arc::new(algo_network::GossipTxSyncPeerSource::new(
+            net_b.clone() as Arc<dyn GossipNode>,
+            "test-v1.0".to_string(),
+            reqwest::Client::new(),
+            1_000_000,
+        )),
+        Arc::new(algo_network::PoolSolicitedTxHandler::new(
+            Arc::new(PoolIngestAdapter::new(node_b.pool.clone())),
+            node_b._seen.clone(),
+        )),
+    );
+    tx_syncer.start();
+
+    let appeared = wait_for_txid(&node_b.pool, &txid, Duration::from_secs(5)).await;
+
+    tx_syncer.stop().await;
+    net_b.stop().await;
+    net_a.stop().await;
+
+    assert!(
+        appeared,
+        "node B's TxSyncer should have pulled the txn that gossip never delivered",
+    );
+}
+
 /// Issue #456: `LocalTxBroadcaster::submit_group` (the non-dev-mode
 /// relay/participate broadcast path) must reject resubmission of an
 /// already-confirmed transaction, mirroring go's
