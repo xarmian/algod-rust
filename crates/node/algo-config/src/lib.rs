@@ -404,6 +404,156 @@ static MIN_CATCHPOINT_FILE_DOWNLOAD_BYTES_PER_SECOND: VersionedDefault<u64> =
 /// cache is a real LRU implementation, see `merkle_cache.rs`).
 static DISABLE_LEDGER_LRU_CACHE: VersionedDefault<bool> = VersionedDefault::new(&[(27, || false)]);
 
+// --- REST/API fields (issue #751) ------------------------------------------
+
+/// Go: `EndpointAddress string` `version[0]:"127.0.0.1:0"`
+/// (`localTemplate.go:170`). The headline finding of issue #751: go always
+/// starts the REST API server (`daemon/algod/server.go` unconditionally
+/// calls `Start`, using this as the bind address — there is no "off"
+/// switch upstream), while algod-rust's `--rest-listen` previously had no
+/// default at all, meaning "no REST" was the out-of-the-box behavior. No
+/// documented rationale for that opt-in default was found anywhere
+/// (`cli.rs`'s own doc comment only cited pre-TASK-79 migration inertia) —
+/// **decision recorded here: align with go's always-on ephemeral-port
+/// default.** `bin/algod-rust/src/commands/participate.rs`'s
+/// `RestOptions::resolve` now falls back to this field when neither
+/// `--rest-listen` nor `[rest].listen` is set, and treats an *explicit*
+/// empty string as an algod-rust-only "disable REST" affordance (go's own
+/// `addr == ""` falls back to binding port 80, which is not a real off
+/// switch and doesn't fit `participate`'s REST-is-optional architecture).
+static ENDPOINT_ADDRESS: VersionedDefault<String> =
+    VersionedDefault::new(&[(0, || "127.0.0.1:0".to_string())]);
+
+/// Go: `RestReadTimeoutSeconds int` `version[4]:"15"` (`localTemplate.go:176`).
+/// Wired into `ApiServerConfig`/`ApiServer::serve` as an overall
+/// per-request timeout alongside `rest_write_timeout_seconds` (see that
+/// field's note for why the two collapse into one `tower_http::timeout`
+/// layer rather than separate read/write phases).
+static REST_READ_TIMEOUT_SECONDS: VersionedDefault<i64> = VersionedDefault::new(&[(4, || 15)]);
+
+/// Go: `RestWriteTimeoutSeconds int` `version[4]:"120"` (`localTemplate.go:179`).
+/// go's `net/http.Server` exposes independent `ReadTimeout`/`WriteTimeout`
+/// phases; axum/hyper's server builder (`crates/node/algo-rest-api/src/
+/// server.rs`) has no equivalent split, so both fields are wired together
+/// into a single `tower_http::timeout::TimeoutLayer` bounding total
+/// request-to-response time at `max(read, write)` — an approximation
+/// documented at the call site, not a byte-for-byte port of go's two-phase
+/// timeout.
+static REST_WRITE_TIMEOUT_SECONDS: VersionedDefault<i64> = VersionedDefault::new(&[(4, || 120)]);
+
+/// Go: `EnablePrivateNetworkAccessHeader bool` `version[35]:"false"`
+/// (`localTemplate.go:173`). Wired into the REST router: when `true`, adds
+/// `Access-Control-Allow-Private-Network: true` to CORS preflight
+/// responses (Chrome's Private Network Access spec), matching go's
+/// `daemon/algod/api/server/v2/dependencies.go` CORS middleware.
+static ENABLE_PRIVATE_NETWORK_ACCESS_HEADER: VersionedDefault<bool> =
+    VersionedDefault::new(&[(35, || false)]);
+
+/// Go: `RestConnectionsSoftLimit uint64` `version[20]:"1024"`
+/// (`localTemplate.go:544`). Wired into the REST router as a
+/// `tower::limit::ConcurrencyLimitLayer` bound: once in-flight requests
+/// reach this count, further requests wait rather than being admitted
+/// immediately (go's soft limit governs a similar admission-queue
+/// backpressure point, not an outright rejection).
+static REST_CONNECTIONS_SOFT_LIMIT: VersionedDefault<u64> = VersionedDefault::new(&[(20, || 1024)]);
+
+/// Go: `RestConnectionsHardLimit uint64` `version[20]:"2048"`
+/// (`localTemplate.go:547`). Wired into `ApiServer::serve`'s accept loop:
+/// once concurrently-open connections reach this count, further accepted
+/// sockets are closed immediately rather than handed to the router,
+/// mirroring go's `limitlistener.RejectingLimitListener`.
+static REST_CONNECTIONS_HARD_LIMIT: VersionedDefault<u64> = VersionedDefault::new(&[(20, || 2048)]);
+
+/// Go: `MaxAPIResourcesPerAccount uint64` `version[21]:"100000"`
+/// (`localTemplate.go:552`). Wired into `AlgodNodeInterface::
+/// max_api_resources_per_account`, replacing the prior hardcoded
+/// trait-default-only `100_000` (same value, now genuinely configurable).
+static MAX_API_RESOURCES_PER_ACCOUNT: VersionedDefault<u64> =
+    VersionedDefault::new(&[(21, || 100_000)]);
+
+/// Go: `EnableUsageLog bool` `version[24]:"false"` (`localTemplate.go:573`).
+/// **Documented no-op** (same pattern as `enable_ledger_service`):
+/// algod-rust has no 10Hz CPU/RAM usage sampling/logging machinery to gate
+/// yet. Round-trips through `config.json` for forward compatibility;
+/// wiring is deferred to whichever follow-up issue adds that sampler.
+static ENABLE_USAGE_LOG: VersionedDefault<bool> = VersionedDefault::new(&[(24, || false)]);
+
+/// Go: `MaxAPIBoxPerApplication uint64` `version[25]:"100000"`
+/// (`localTemplate.go:577`). Same "hardcoded → genuinely configurable"
+/// fix as `max_api_resources_per_account`.
+static MAX_API_BOX_PER_APPLICATION: VersionedDefault<u64> =
+    VersionedDefault::new(&[(25, || 100_000)]);
+
+/// Go: `TxIncomingFilteringFlags uint32` `version[26]:"1"`
+/// (`localTemplate.go:584`). **Documented no-op**: algod-rust's gossip
+/// transaction-message ingestion has no per-message-hash dedup filtering
+/// stage to gate (only pool-level duplicate-transaction rejection exists
+/// today). Round-trips through `config.json`; wiring is deferred to
+/// whichever follow-up issue adds that filtering layer.
+static TX_INCOMING_FILTERING_FLAGS: VersionedDefault<u32> = VersionedDefault::new(&[(26, || 1)]);
+
+/// Go: `EnableExperimentalAPI bool` `version[26]:"false"`
+/// (`localTemplate.go:588`). Was previously a hardcoded trait-default
+/// `false` with no config wiring at all (unlike `EnableDeveloperAPI`, this
+/// one wasn't even conflated with `dev_mode` — it was simply unwireable).
+/// Now a genuine, independent config toggle.
+static ENABLE_EXPERIMENTAL_API: VersionedDefault<bool> = VersionedDefault::new(&[(26, || false)]);
+
+/// Go: `EnableFollowMode bool` `version[27]:"false"` (`localTemplate.go:598`).
+/// **Architectural decision recorded here (issue #751)**: algod-rust keeps
+/// its existing separate `algod-rust follow` CLI subcommand
+/// (`bin/algod-rust/src/commands/follow.rs`, `cli.rs`'s `Commands::Follow`)
+/// rather than unifying follower behavior into a mode flag on
+/// `participate`. Investigated whether the two-entry-point split was a
+/// deliberate divergence or an accreted implementation choice: found no
+/// documented rationale either way, but concluded unification is *not*
+/// clearly the right call — `follow` is a genuinely different runtime
+/// shape (no agreement service, no participation keys, no pool, a
+/// different network-attachment path entirely) built and tested as its own
+/// binary entry point, and collapsing it into a `participate --follow`
+/// flag would require threading "agreement service absent" through every
+/// code path `participate::run` currently assumes has one, for no
+/// behavioral gain — `algod-rust follow` already does everything
+/// `EnableFollowMode` does. This field therefore round-trips through
+/// `config.json` for forward/inspection compatibility only; it is a
+/// documented no-op that does not gate any runtime behavior, and the
+/// `Follow` subcommand remains the one way to run in follower mode.
+static ENABLE_FOLLOW_MODE: VersionedDefault<bool> = VersionedDefault::new(&[(27, || false)]);
+
+/// Go: `EnableTxnEvalTracer bool` `version[27]:"false"` (`localTemplate.go:602`,
+/// gates `ledger.go:125`'s attachment of a `logic.EvalTracer` to the
+/// *live* `BlockEvaluator`, exposing per-transaction trace data via algod
+/// APIs for already-applied blocks). **Documented no-op**: algod-rust's
+/// `EvalTracer` machinery (`algo_avm::tracer::EvalTracer`) exists and is
+/// already wired for *simulate* (`Simulator::new_with_developer_api`,
+/// gated by `EnableDeveloperAPI`), but there is no live block-apply trace
+/// capture/API-exposure path to gate — `apply_transaction`'s
+/// `Option<&mut dyn EvalTracer>` parameter is always `None` on the real
+/// apply path today. Adding that capture/exposure machinery is new
+/// functionality, out of scope for a config-knob issue; this field
+/// round-trips through `config.json` for forward compatibility.
+static ENABLE_TXN_EVAL_TRACER: VersionedDefault<bool> = VersionedDefault::new(&[(27, || false)]);
+
+/// Go: `TxIncomingFilterMaxSize uint64` `version[28]:"500000"`
+/// (`localTemplate.go:612`). Same documented-no-op scope as
+/// `tx_incoming_filtering_flags` (only relevant once that filtering layer
+/// exists).
+static TX_INCOMING_FILTER_MAX_SIZE: VersionedDefault<u64> =
+    VersionedDefault::new(&[(28, || 500_000)]);
+
+/// Go: `EnableDeveloperAPI bool` `version[9]:"false"` (`localTemplate.go:435`).
+/// **Fixes a real conflation bug** (issue #751): `AlgodNodeInterface::
+/// enable_developer_api` previously returned `self.dev_mode` directly —
+/// the *same* flag that also drives instant-block-production dev mode —
+/// rather than reading an independent config value. go's
+/// `EnableDeveloperAPI` is a standalone flag: a production relay/
+/// participation node can enable the developer API without being in dev
+/// mode, and vice versa. Now independently configurable (default `false`,
+/// matching go), with `--dev`'s existing convenience behavior of enabling
+/// the developer API preserved as an OR (`config value || dev_mode`) —
+/// dev mode remains *a* way to turn it on, not the *only* way.
+static ENABLE_DEVELOPER_API: VersionedDefault<bool> = VersionedDefault::new(&[(9, || false)]);
+
 fn default_version() -> u32 {
     // Mirrors go's explicit `c.Version = 0 // Reset to 0 so we get the
     // version from the loaded file` (config.go:124) — a `version` key
@@ -500,6 +650,51 @@ fn default_min_catchpoint_file_download_bytes_per_second() -> u64 {
 }
 fn default_disable_ledger_lru_cache() -> bool {
     DISABLE_LEDGER_LRU_CACHE.at(LATEST_VERSION)
+}
+fn default_endpoint_address() -> String {
+    ENDPOINT_ADDRESS.at(LATEST_VERSION)
+}
+fn default_rest_read_timeout_seconds() -> i64 {
+    REST_READ_TIMEOUT_SECONDS.at(LATEST_VERSION)
+}
+fn default_rest_write_timeout_seconds() -> i64 {
+    REST_WRITE_TIMEOUT_SECONDS.at(LATEST_VERSION)
+}
+fn default_enable_private_network_access_header() -> bool {
+    ENABLE_PRIVATE_NETWORK_ACCESS_HEADER.at(LATEST_VERSION)
+}
+fn default_rest_connections_soft_limit() -> u64 {
+    REST_CONNECTIONS_SOFT_LIMIT.at(LATEST_VERSION)
+}
+fn default_rest_connections_hard_limit() -> u64 {
+    REST_CONNECTIONS_HARD_LIMIT.at(LATEST_VERSION)
+}
+fn default_max_api_resources_per_account() -> u64 {
+    MAX_API_RESOURCES_PER_ACCOUNT.at(LATEST_VERSION)
+}
+fn default_enable_usage_log() -> bool {
+    ENABLE_USAGE_LOG.at(LATEST_VERSION)
+}
+fn default_max_api_box_per_application() -> u64 {
+    MAX_API_BOX_PER_APPLICATION.at(LATEST_VERSION)
+}
+fn default_tx_incoming_filtering_flags() -> u32 {
+    TX_INCOMING_FILTERING_FLAGS.at(LATEST_VERSION)
+}
+fn default_enable_experimental_api() -> bool {
+    ENABLE_EXPERIMENTAL_API.at(LATEST_VERSION)
+}
+fn default_enable_follow_mode() -> bool {
+    ENABLE_FOLLOW_MODE.at(LATEST_VERSION)
+}
+fn default_enable_txn_eval_tracer() -> bool {
+    ENABLE_TXN_EVAL_TRACER.at(LATEST_VERSION)
+}
+fn default_tx_incoming_filter_max_size() -> u64 {
+    TX_INCOMING_FILTER_MAX_SIZE.at(LATEST_VERSION)
+}
+fn default_enable_developer_api() -> bool {
+    ENABLE_DEVELOPER_API.at(LATEST_VERSION)
 }
 
 /// `config.Local`-equivalent node configuration, loaded from `config.json`
@@ -759,6 +954,117 @@ pub struct Local {
         default = "default_disable_ledger_lru_cache"
     )]
     pub disable_ledger_lru_cache: bool,
+
+    /// Go: `EndpointAddress`. The headline fix of issue #751 — see
+    /// [`ENDPOINT_ADDRESS`]'s doc comment for the full decision record.
+    #[serde(rename = "EndpointAddress", default = "default_endpoint_address")]
+    pub endpoint_address: String,
+
+    /// Go: `RestReadTimeoutSeconds`. Wired into `ApiServer::serve` (issue
+    /// #751) — see [`REST_READ_TIMEOUT_SECONDS`]'s doc comment.
+    #[serde(
+        rename = "RestReadTimeoutSeconds",
+        default = "default_rest_read_timeout_seconds"
+    )]
+    pub rest_read_timeout_seconds: i64,
+
+    /// Go: `RestWriteTimeoutSeconds`. See `rest_read_timeout_seconds`'s note.
+    #[serde(
+        rename = "RestWriteTimeoutSeconds",
+        default = "default_rest_write_timeout_seconds"
+    )]
+    pub rest_write_timeout_seconds: i64,
+
+    /// Go: `EnablePrivateNetworkAccessHeader`. Wired into the REST router's
+    /// CORS middleware (issue #751).
+    #[serde(
+        rename = "EnablePrivateNetworkAccessHeader",
+        default = "default_enable_private_network_access_header"
+    )]
+    pub enable_private_network_access_header: bool,
+
+    /// Go: `RestConnectionsSoftLimit`. Wired into the REST router as a
+    /// concurrency-limit admission bound (issue #751).
+    #[serde(
+        rename = "RestConnectionsSoftLimit",
+        default = "default_rest_connections_soft_limit"
+    )]
+    pub rest_connections_soft_limit: u64,
+
+    /// Go: `RestConnectionsHardLimit`. Wired into `ApiServer::serve`'s
+    /// accept loop (issue #751).
+    #[serde(
+        rename = "RestConnectionsHardLimit",
+        default = "default_rest_connections_hard_limit"
+    )]
+    pub rest_connections_hard_limit: u64,
+
+    /// Go: `MaxAPIResourcesPerAccount`. Wired into
+    /// `AlgodNodeInterface::max_api_resources_per_account`, replacing a
+    /// prior hardcoded trait-default-only value (issue #751).
+    #[serde(
+        rename = "MaxAPIResourcesPerAccount",
+        default = "default_max_api_resources_per_account"
+    )]
+    pub max_api_resources_per_account: u64,
+
+    /// Go: `EnableUsageLog`. **Documented no-op** — see
+    /// [`ENABLE_USAGE_LOG`]'s doc comment.
+    #[serde(rename = "EnableUsageLog", default = "default_enable_usage_log")]
+    pub enable_usage_log: bool,
+
+    /// Go: `MaxAPIBoxPerApplication`. Same "hardcoded → configurable" fix
+    /// as `max_api_resources_per_account` (issue #751).
+    #[serde(
+        rename = "MaxAPIBoxPerApplication",
+        default = "default_max_api_box_per_application"
+    )]
+    pub max_api_box_per_application: u64,
+
+    /// Go: `TxIncomingFilteringFlags`. **Documented no-op** — see
+    /// [`TX_INCOMING_FILTERING_FLAGS`]'s doc comment.
+    #[serde(
+        rename = "TxIncomingFilteringFlags",
+        default = "default_tx_incoming_filtering_flags"
+    )]
+    pub tx_incoming_filtering_flags: u32,
+
+    /// Go: `EnableExperimentalAPI`. Now genuinely wired (issue #751) — see
+    /// [`ENABLE_EXPERIMENTAL_API`]'s doc comment.
+    #[serde(
+        rename = "EnableExperimentalAPI",
+        default = "default_enable_experimental_api"
+    )]
+    pub enable_experimental_api: bool,
+
+    /// Go: `EnableFollowMode`. **Documented no-op / architectural decision
+    /// recorded** — see [`ENABLE_FOLLOW_MODE`]'s doc comment.
+    #[serde(rename = "EnableFollowMode", default = "default_enable_follow_mode")]
+    pub enable_follow_mode: bool,
+
+    /// Go: `EnableTxnEvalTracer`. **Documented no-op** — see
+    /// [`ENABLE_TXN_EVAL_TRACER`]'s doc comment.
+    #[serde(
+        rename = "EnableTxnEvalTracer",
+        default = "default_enable_txn_eval_tracer"
+    )]
+    pub enable_txn_eval_tracer: bool,
+
+    /// Go: `TxIncomingFilterMaxSize`. **Documented no-op** — see
+    /// [`TX_INCOMING_FILTER_MAX_SIZE`]'s doc comment.
+    #[serde(
+        rename = "TxIncomingFilterMaxSize",
+        default = "default_tx_incoming_filter_max_size"
+    )]
+    pub tx_incoming_filter_max_size: u64,
+
+    /// Go: `EnableDeveloperAPI`. **Fixes the `dev_mode` conflation bug** —
+    /// see [`ENABLE_DEVELOPER_API`]'s doc comment.
+    #[serde(
+        rename = "EnableDeveloperAPI",
+        default = "default_enable_developer_api"
+    )]
+    pub enable_developer_api: bool,
 }
 
 impl Default for Local {
@@ -808,6 +1114,21 @@ impl Local {
             min_catchpoint_file_download_bytes_per_second:
                 MIN_CATCHPOINT_FILE_DOWNLOAD_BYTES_PER_SECOND.at(version),
             disable_ledger_lru_cache: DISABLE_LEDGER_LRU_CACHE.at(version),
+            endpoint_address: ENDPOINT_ADDRESS.at(version),
+            rest_read_timeout_seconds: REST_READ_TIMEOUT_SECONDS.at(version),
+            rest_write_timeout_seconds: REST_WRITE_TIMEOUT_SECONDS.at(version),
+            enable_private_network_access_header: ENABLE_PRIVATE_NETWORK_ACCESS_HEADER.at(version),
+            rest_connections_soft_limit: REST_CONNECTIONS_SOFT_LIMIT.at(version),
+            rest_connections_hard_limit: REST_CONNECTIONS_HARD_LIMIT.at(version),
+            max_api_resources_per_account: MAX_API_RESOURCES_PER_ACCOUNT.at(version),
+            enable_usage_log: ENABLE_USAGE_LOG.at(version),
+            max_api_box_per_application: MAX_API_BOX_PER_APPLICATION.at(version),
+            tx_incoming_filtering_flags: TX_INCOMING_FILTERING_FLAGS.at(version),
+            enable_experimental_api: ENABLE_EXPERIMENTAL_API.at(version),
+            enable_follow_mode: ENABLE_FOLLOW_MODE.at(version),
+            enable_txn_eval_tracer: ENABLE_TXN_EVAL_TRACER.at(version),
+            tx_incoming_filter_max_size: TX_INCOMING_FILTER_MAX_SIZE.at(version),
+            enable_developer_api: ENABLE_DEVELOPER_API.at(version),
         }
     }
 
@@ -974,6 +1295,81 @@ impl Local {
                 cur,
                 next,
             );
+            migrate_field(&mut self.endpoint_address, &ENDPOINT_ADDRESS, cur, next);
+            migrate_field(
+                &mut self.rest_read_timeout_seconds,
+                &REST_READ_TIMEOUT_SECONDS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.rest_write_timeout_seconds,
+                &REST_WRITE_TIMEOUT_SECONDS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_private_network_access_header,
+                &ENABLE_PRIVATE_NETWORK_ACCESS_HEADER,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.rest_connections_soft_limit,
+                &REST_CONNECTIONS_SOFT_LIMIT,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.rest_connections_hard_limit,
+                &REST_CONNECTIONS_HARD_LIMIT,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.max_api_resources_per_account,
+                &MAX_API_RESOURCES_PER_ACCOUNT,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.enable_usage_log, &ENABLE_USAGE_LOG, cur, next);
+            migrate_field(
+                &mut self.max_api_box_per_application,
+                &MAX_API_BOX_PER_APPLICATION,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.tx_incoming_filtering_flags,
+                &TX_INCOMING_FILTERING_FLAGS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_experimental_api,
+                &ENABLE_EXPERIMENTAL_API,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.enable_follow_mode, &ENABLE_FOLLOW_MODE, cur, next);
+            migrate_field(
+                &mut self.enable_txn_eval_tracer,
+                &ENABLE_TXN_EVAL_TRACER,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.tx_incoming_filter_max_size,
+                &TX_INCOMING_FILTER_MAX_SIZE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_developer_api,
+                &ENABLE_DEVELOPER_API,
+                cur,
+                next,
+            );
             self.version = next;
         }
         Ok(())
@@ -1116,6 +1512,21 @@ mod tests {
             MAX_CATCHPOINT_DOWNLOAD_DURATION.max_tag_version(),
             MIN_CATCHPOINT_FILE_DOWNLOAD_BYTES_PER_SECOND.max_tag_version(),
             DISABLE_LEDGER_LRU_CACHE.max_tag_version(),
+            ENDPOINT_ADDRESS.max_tag_version(),
+            REST_READ_TIMEOUT_SECONDS.max_tag_version(),
+            REST_WRITE_TIMEOUT_SECONDS.max_tag_version(),
+            ENABLE_PRIVATE_NETWORK_ACCESS_HEADER.max_tag_version(),
+            REST_CONNECTIONS_SOFT_LIMIT.max_tag_version(),
+            REST_CONNECTIONS_HARD_LIMIT.max_tag_version(),
+            MAX_API_RESOURCES_PER_ACCOUNT.max_tag_version(),
+            ENABLE_USAGE_LOG.max_tag_version(),
+            MAX_API_BOX_PER_APPLICATION.max_tag_version(),
+            TX_INCOMING_FILTERING_FLAGS.max_tag_version(),
+            ENABLE_EXPERIMENTAL_API.max_tag_version(),
+            ENABLE_FOLLOW_MODE.max_tag_version(),
+            ENABLE_TXN_EVAL_TRACER.max_tag_version(),
+            TX_INCOMING_FILTER_MAX_SIZE.max_tag_version(),
+            ENABLE_DEVELOPER_API.max_tag_version(),
         ]
         .into_iter()
         .max()
@@ -1172,6 +1583,120 @@ mod tests {
         );
         assert_eq!(d.min_catchpoint_file_download_bytes_per_second, 20_480);
         assert!(!d.disable_ledger_lru_cache);
+        assert_eq!(d.endpoint_address, "127.0.0.1:0");
+        assert_eq!(d.rest_read_timeout_seconds, 15);
+        assert_eq!(d.rest_write_timeout_seconds, 120);
+        assert!(!d.enable_private_network_access_header);
+        assert_eq!(d.rest_connections_soft_limit, 1024);
+        assert_eq!(d.rest_connections_hard_limit, 2048);
+        assert_eq!(d.max_api_resources_per_account, 100_000);
+        assert!(!d.enable_usage_log);
+        assert_eq!(d.max_api_box_per_application, 100_000);
+        assert_eq!(d.tx_incoming_filtering_flags, 1);
+        assert!(!d.enable_experimental_api);
+        assert!(!d.enable_follow_mode);
+        assert!(!d.enable_txn_eval_tracer);
+        assert_eq!(d.tx_incoming_filter_max_size, 500_000);
+        assert!(!d.enable_developer_api);
+    }
+
+    // --- REST/API fields (issue #751) -----------------------------------
+
+    #[test]
+    fn endpoint_address_defaults_to_gos_always_on_ephemeral_port() {
+        // The headline fix: go's `EndpointAddress` always defaults to
+        // "127.0.0.1:0" (REST always starts, on an ephemeral local port).
+        // algod-rust's config layer must carry that same default so
+        // `RestOptions::resolve` can align with it.
+        assert_eq!(Local::default().endpoint_address, "127.0.0.1:0");
+        let cfg = Local::load_from_str("{}").expect("parses");
+        assert_eq!(cfg.endpoint_address, "127.0.0.1:0");
+    }
+
+    #[test]
+    fn endpoint_address_explicit_override_survives_migration() {
+        let cfg = Local::load_from_str(r#"{"Version": 0, "EndpointAddress": "0.0.0.0:8080"}"#)
+            .expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.endpoint_address, "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn endpoint_address_explicit_empty_string_is_preserved_as_disable_affordance() {
+        // algod-rust treats an explicit empty `EndpointAddress` as "disable
+        // REST" (see that field's `VersionedDefault` doc comment) — an
+        // explicit override, so migration must never clobber it back to
+        // the "127.0.0.1:0" default.
+        let cfg = Local::load_from_str(r#"{"Version": 0, "EndpointAddress": ""}"#).expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.endpoint_address, "");
+    }
+
+    #[test]
+    fn rest_timeouts_partial_overlay() {
+        let cfg = Local::load_from_str(r#"{"RestReadTimeoutSeconds": 5}"#).expect("parses");
+        assert_eq!(cfg.rest_read_timeout_seconds, 5);
+        assert_eq!(
+            cfg.rest_write_timeout_seconds, 120,
+            "untouched field keeps its default"
+        );
+    }
+
+    #[test]
+    fn rest_connections_limits_partial_overlay() {
+        let cfg = Local::load_from_str(r#"{"RestConnectionsSoftLimit": 10}"#).expect("parses");
+        assert_eq!(cfg.rest_connections_soft_limit, 10);
+        assert_eq!(cfg.rest_connections_hard_limit, 2048);
+    }
+
+    #[test]
+    fn max_api_resources_and_boxes_partial_overlay() {
+        let cfg = Local::load_from_str(
+            r#"{"MaxAPIResourcesPerAccount": 5, "MaxAPIBoxPerApplication": 7}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.max_api_resources_per_account, 5);
+        assert_eq!(cfg.max_api_box_per_application, 7);
+    }
+
+    #[test]
+    fn enable_developer_api_and_experimental_api_default_false_and_overlay() {
+        let cfg = Local::default();
+        assert!(!cfg.enable_developer_api, "go's default is false");
+        assert!(!cfg.enable_experimental_api, "go's default is false");
+        let cfg =
+            Local::load_from_str(r#"{"EnableDeveloperAPI": true, "EnableExperimentalAPI": true}"#)
+                .expect("parses");
+        assert!(cfg.enable_developer_api);
+        assert!(cfg.enable_experimental_api);
+    }
+
+    #[test]
+    fn enable_follow_mode_and_txn_eval_tracer_and_usage_log_round_trip() {
+        let cfg = Local::load_from_str(
+            r#"{"EnableFollowMode": true, "EnableTxnEvalTracer": true, "EnableUsageLog": true}"#,
+        )
+        .expect("parses");
+        assert!(cfg.enable_follow_mode);
+        assert!(cfg.enable_txn_eval_tracer);
+        assert!(cfg.enable_usage_log);
+    }
+
+    #[test]
+    fn tx_incoming_filter_fields_round_trip() {
+        let cfg = Local::load_from_str(
+            r#"{"TxIncomingFilteringFlags": 3, "TxIncomingFilterMaxSize": 42}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.tx_incoming_filtering_flags, 3);
+        assert_eq!(cfg.tx_incoming_filter_max_size, 42);
+    }
+
+    #[test]
+    fn enable_private_network_access_header_round_trip() {
+        let cfg =
+            Local::load_from_str(r#"{"EnablePrivateNetworkAccessHeader": true}"#).expect("parses");
+        assert!(cfg.enable_private_network_access_header);
     }
 
     #[test]

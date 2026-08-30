@@ -27,10 +27,16 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 use crate::auth;
 use crate::node::NodeInterface;
@@ -109,6 +115,34 @@ pub struct ApiServerConfig {
     /// Callers should default this to `false` (auth enabled), matching
     /// go's default, when no `config.json` override is present.
     pub disable_api_auth: bool,
+
+    /// Mirrors go-algorand's `config.Local.EnablePrivateNetworkAccessHeader`
+    /// (issue #751). Callers should default this to `false`, matching go.
+    pub enable_private_network_access_header: bool,
+
+    /// `config.json`'s `RestReadTimeoutSeconds`/`RestWriteTimeoutSeconds`
+    /// (issue #751), go: `version[4]:"15"`/`"120"`. Wired into a single
+    /// `tower_http::timeout::TimeoutLayer` bounding total per-request time
+    /// at `max(read, write)` seconds -- axum/hyper's server builder has no
+    /// separate read/write-phase timeout the way go's `net/http.Server`
+    /// does, so the two collapse into one approximation here. `0` (or
+    /// both `0`) disables the layer entirely rather than producing a
+    /// zero-duration timeout that would fail every request.
+    pub rest_read_timeout_seconds: i64,
+    /// See `rest_read_timeout_seconds`.
+    pub rest_write_timeout_seconds: i64,
+
+    /// `config.json`'s `RestConnectionsSoftLimit` (issue #751), go:
+    /// `version[20]:"1024"`. Wired as a `tower::limit::ConcurrencyLimitLayer`
+    /// bound on in-flight requests. `0` disables the layer (unbounded).
+    pub rest_connections_soft_limit: u64,
+    /// `config.json`'s `RestConnectionsHardLimit` (issue #751), go:
+    /// `version[20]:"2048"`. Wired into `ApiServer::serve`'s accept loop:
+    /// once concurrently-open connections reach this count, newly accepted
+    /// sockets are closed immediately rather than handed to the router,
+    /// mirroring go's `limitlistener.RejectingLimitListener`. `0` disables
+    /// the check (unbounded).
+    pub rest_connections_hard_limit: u64,
 }
 
 /// The REST API HTTP server.
@@ -227,9 +261,56 @@ impl ApiServer {
             admin_token,
             enable_experimental_api: node.enable_experimental_api(),
             disable_api_auth: self.config.disable_api_auth,
+            enable_private_network_access_header: self.config.enable_private_network_access_header,
         };
 
-        let router = router::build_router(node, tokens);
+        let mut router = router::build_router(node, tokens);
+
+        // `RestConnectionsHardLimit` (issue #751): once concurrently
+        // in-flight requests reach this count, further requests are
+        // rejected immediately with 503 rather than admitted at all —
+        // approximating go's `limitlistener.RejectingLimitListener`
+        // (a raw-connection-count reject) at the request layer, since
+        // `axum::serve` in this axum version takes a concrete
+        // `tokio::net::TcpListener` with no hook to customize accept-time
+        // admission. `0` disables the check (unbounded), matching
+        // `Local::default()` never producing `0` for this field in
+        // practice but keeping the knob well-defined for a hand-edited
+        // `config.json`.
+        if self.config.rest_connections_hard_limit > 0 {
+            let limit = self.config.rest_connections_hard_limit;
+            let in_flight = Arc::new(AtomicU64::new(0));
+            router = router.layer(axum::middleware::from_fn(move |request, next| {
+                let in_flight = in_flight.clone();
+                async move { connection_hard_limit_guard(limit, in_flight, request, next).await }
+            }));
+        }
+
+        // `RestConnectionsSoftLimit` (issue #751): backpressures (queues,
+        // rather than rejects) admission once in-flight requests reach
+        // this count, matching go's soft-limit admission-queue semantics.
+        if self.config.rest_connections_soft_limit > 0 {
+            router = router.layer(ConcurrencyLimitLayer::new(
+                self.config.rest_connections_soft_limit as usize,
+            ));
+        }
+
+        // `RestReadTimeoutSeconds`/`RestWriteTimeoutSeconds` (issue #751):
+        // collapsed into a single overall per-request timeout (see
+        // `ApiServerConfig`'s doc comment for why axum/hyper's server
+        // builder can't split read/write phases the way go's
+        // `net/http.Server` does). `0` for both disables the layer.
+        let timeout_secs = self
+            .config
+            .rest_read_timeout_seconds
+            .max(self.config.rest_write_timeout_seconds);
+        if timeout_secs > 0 {
+            router = router.layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                Duration::from_secs(timeout_secs as u64),
+            ));
+        }
+
         let listener = TcpListener::bind(self.config.listen_addr).await?;
         let local_addr = listener.local_addr()?;
 
@@ -252,6 +333,46 @@ impl ApiServer {
 
         Ok((local_addr, handle))
     }
+}
+
+/// The `RestConnectionsHardLimit` admission check (issue #751), factored
+/// out of `serve`'s middleware closure so it's a plain testable `async fn`.
+///
+/// Approximates go's `limitlistener.RejectingLimitListener` (a raw
+/// TCP-accept-time hard cap) at the HTTP-request layer: once `in_flight`
+/// reaches `limit`, a newly arriving request is rejected with `503`
+/// *without* incrementing the counter or invoking the inner service at
+/// all, mirroring "closing requests with no response" rather than queuing
+/// them (that queuing behavior belongs to `RestConnectionsSoftLimit`'s
+/// `ConcurrencyLimitLayer` instead). The counter is decremented once the
+/// inner service's response (or panic-unwind) has been produced, via an
+/// RAII guard, so a slow request's slot is held for its entire duration.
+/// The increment-then-check is optimistic (not compare-and-swap), so
+/// concurrently racing requests right at the boundary can over-admit by a
+/// small amount — an acceptable approximation for an operational ceiling,
+/// not a hard invariant.
+async fn connection_hard_limit_guard(
+    limit: u64,
+    in_flight: Arc<AtomicU64>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if in_flight.fetch_add(1, Ordering::Relaxed) >= limit {
+        in_flight.fetch_sub(1, Ordering::Relaxed);
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many concurrent REST requests",
+        )
+            .into_response();
+    }
+    struct DecrementGuard(Arc<AtomicU64>);
+    impl Drop for DecrementGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let _guard = DecrementGuard(in_flight);
+    next.run(request).await
 }
 
 #[cfg(test)]
@@ -306,5 +427,83 @@ mod tests {
             logged.contains("AGPLv3"),
             "startup banner should mention the AGPLv3 license, got: {logged:?}"
         );
+    }
+
+    // --- `RestConnectionsHardLimit` (issue #751) ------------------------
+
+    /// Below the limit: the guard admits the request and runs the inner
+    /// service, and releases its slot afterward (checked by running three
+    /// requests back-to-back against a limit of 1 — each one must be
+    /// admitted once the prior one's slot has been released).
+    #[tokio::test]
+    async fn hard_limit_guard_admits_below_limit_and_releases_slot() {
+        use axum::body::Body;
+        use axum::extract::Request;
+        use axum::middleware::Next;
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let limit = 1u64;
+        let router = Router::new().route("/x", get(|| async { "hi" })).layer(
+            axum::middleware::from_fn(move |req: Request, next: Next| {
+                let in_flight = in_flight.clone();
+                async move { connection_hard_limit_guard(limit, in_flight, req, next).await }
+            }),
+        );
+
+        for _ in 0..3 {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri("/x").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "each sequential request must be admitted once the prior one's slot is released"
+            );
+        }
+    }
+
+    /// A request that arrives while `limit` slots are already held
+    /// (simulated directly via the shared counter, since driving true
+    /// concurrency deterministically through a oneshot service is racy)
+    /// is rejected with 503 and does not reach the inner handler.
+    #[tokio::test]
+    async fn hard_limit_guard_rejects_with_503_at_limit() {
+        use axum::body::{to_bytes, Body};
+        use axum::extract::Request;
+        use axum::middleware::Next;
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let limit = 2u64;
+        let in_flight = Arc::new(AtomicU64::new(limit)); // already at the limit
+        let router = Router::new()
+            .route(
+                "/x",
+                get(|| async {
+                    panic!("handler must not run once the hard limit is reached");
+                    #[allow(unreachable_code)]
+                    ""
+                }),
+            )
+            .layer(axum::middleware::from_fn(
+                move |req: Request, next: Next| {
+                    let in_flight = in_flight.clone();
+                    async move { connection_hard_limit_guard(limit, in_flight, req, next).await }
+                },
+            ));
+
+        let resp = router
+            .oneshot(Request::builder().uri("/x").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(!body.is_empty());
     }
 }

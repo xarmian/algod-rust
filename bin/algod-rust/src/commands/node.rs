@@ -291,15 +291,21 @@ async fn run_start(
             listen.unwrap_or(DEFAULT_LISTEN)
         )
     })?;
+    // `node start` has no `<data-dir>/config.json` wiring yet (only
+    // `participate` loads it) — default every REST/API field (issue #751)
+    // to go's own defaults rather than inventing different ones here.
+    let default_rest_config = algo_config::Local::default();
     let api_config = ApiServerConfig {
         listen_addr,
         data_dir: Some(data_dir.to_path_buf()),
         api_token: None,
         admin_token: None,
-        // `node start` has no `<data-dir>/config.json` wiring yet (only
-        // `participate` loads it) — default to go's own default (auth
-        // enabled) rather than inventing a different one here.
         disable_api_auth: false,
+        enable_private_network_access_header: false,
+        rest_read_timeout_seconds: default_rest_config.rest_read_timeout_seconds,
+        rest_write_timeout_seconds: default_rest_config.rest_write_timeout_seconds,
+        rest_connections_soft_limit: default_rest_config.rest_connections_soft_limit,
+        rest_connections_hard_limit: default_rest_config.rest_connections_hard_limit,
     };
     let shutdown_future = {
         let token = shutdown_token.clone();

@@ -2533,6 +2533,23 @@ pub struct RestOptions {
     /// issue #748). There is no CLI flag for this (matching go, which has
     /// none either) — `config.json` is the only source.
     pub disable_api_auth: bool,
+    /// `config.json`'s `EndpointAddress` (issue #751) — the headline fix:
+    /// go always defaults this to `"127.0.0.1:0"` and always starts REST.
+    /// Consulted only when neither `--rest-listen` nor `[rest].listen` is
+    /// set; an explicit empty string is treated as an algod-rust-only
+    /// "disable REST" affordance (see [`ENDPOINT_ADDRESS`](algo_config)'s
+    /// doc comment for the full decision record).
+    pub endpoint_address: String,
+    /// `config.json`'s `EnablePrivateNetworkAccessHeader` (issue #751).
+    pub enable_private_network_access_header: bool,
+    /// `config.json`'s `RestReadTimeoutSeconds` (issue #751).
+    pub rest_read_timeout_seconds: i64,
+    /// `config.json`'s `RestWriteTimeoutSeconds` (issue #751).
+    pub rest_write_timeout_seconds: i64,
+    /// `config.json`'s `RestConnectionsSoftLimit` (issue #751).
+    pub rest_connections_soft_limit: u64,
+    /// `config.json`'s `RestConnectionsHardLimit` (issue #751).
+    pub rest_connections_hard_limit: u64,
 }
 
 /// Fully-resolved REST configuration, ready to hand to [`ApiServer`].
@@ -2545,18 +2562,29 @@ struct ResolvedRest {
     genesis_path: Option<PathBuf>,
     async_backlog_size: Option<usize>,
     disable_api_auth: bool,
+    enable_private_network_access_header: bool,
+    rest_read_timeout_seconds: i64,
+    rest_write_timeout_seconds: i64,
+    rest_connections_soft_limit: u64,
+    rest_connections_hard_limit: u64,
 }
 
 impl RestOptions {
     /// Merge CLI flags, `[rest]` TOML fields, and a sensible
     /// `data_dir` default so the caller gets a concrete socket
     /// address + auxiliary paths. Returns `Ok(None)` when REST is
-    /// disabled (no `--rest-listen`, no `[rest].listen`).
+    /// disabled: no `--rest-listen`, no `[rest].listen`, and either no
+    /// `config.json` `EndpointAddress` override or an explicit empty one
+    /// (issue #751 — go itself always defaults `EndpointAddress` to
+    /// `"127.0.0.1:0"` and always starts REST; algod-rust aligns with that
+    /// default while keeping an explicit empty string as its own opt-out).
     fn resolve(&self, default_data_dir: Option<&Path>) -> anyhow::Result<Option<ResolvedRest>> {
         let listen_str = self
             .listen
             .clone()
-            .or_else(|| self.file_rest.as_ref().and_then(|r| r.listen.clone()));
+            .or_else(|| self.file_rest.as_ref().and_then(|r| r.listen.clone()))
+            .or_else(|| Some(self.endpoint_address.clone()))
+            .filter(|s| !s.is_empty());
         let Some(listen_str) = listen_str else {
             return Ok(None);
         };
@@ -2595,6 +2623,11 @@ impl RestOptions {
             genesis_path,
             async_backlog_size,
             disable_api_auth: self.disable_api_auth,
+            enable_private_network_access_header: self.enable_private_network_access_header,
+            rest_read_timeout_seconds: self.rest_read_timeout_seconds,
+            rest_write_timeout_seconds: self.rest_write_timeout_seconds,
+            rest_connections_soft_limit: self.rest_connections_soft_limit,
+            rest_connections_hard_limit: self.rest_connections_hard_limit,
         }))
     }
 }
@@ -3555,12 +3588,16 @@ pub async fn run(
     // -----------------------------------------------------------------------
     // 3c. Optional: start the REST API server.
     //
-    // When the operator passes `--rest-listen` (or sets `[rest].listen`
-    // in `algod-rust.toml`), we build an `AlgodNodeInterface` adapter
-    // around the ledger + pool + broadcaster and hand it to
-    // `ApiServer::serve`. Shutdown is coordinated through a shared
-    // `CancellationToken` that the Ctrl-C handler cancels (see step 7
-    // below).
+    // REST starts by default (issue #751 — matching go-algorand, which
+    // always starts its REST API on `EndpointAddress`, defaulting to an
+    // ephemeral `127.0.0.1:0`): `--rest-listen`, `[rest].listen` in
+    // `algod-rust.toml`, and `config.json`'s `EndpointAddress` are
+    // consulted in that priority order, and only an explicit empty string
+    // from one of those sources disables it. When enabled, we build an
+    // `AlgodNodeInterface` adapter around the ledger + pool + broadcaster
+    // and hand it to `ApiServer::serve`. Shutdown is coordinated through a
+    // shared `CancellationToken` that the Ctrl-C handler cancels (see step
+    // 7 below).
     // -----------------------------------------------------------------------
     let shutdown_token = CancellationToken::new();
 
@@ -3581,7 +3618,7 @@ pub async fn run(
                 synthesize_genesis_json(&resolved_genesis_id, network, CONSENSUS_V41)
             });
 
-        let node_config = NodeInterfaceConfig {
+        let iface_config = NodeInterfaceConfig {
             genesis_id: resolved_genesis_id.clone(),
             genesis_hash: Digest(genesis_hash),
             genesis_json,
@@ -3589,7 +3626,7 @@ pub async fn run(
             default_protocol: CONSENSUS_V41.into(),
         };
 
-        let mut adapter = AlgodNodeInterface::new(ledger.clone(), node_config)
+        let mut adapter = AlgodNodeInterface::new(ledger.clone(), iface_config)
             .with_pool(pool.clone())
             .with_broadcaster(broadcaster.clone())
             .with_shutdown_token(shutdown_token.clone())
@@ -3598,7 +3635,15 @@ pub async fn run(
             // always constructed (even in P2P-only mode it just reports no
             // connections — the "no leak" guarantee above), so it's always
             // safe to attach here.
-            .with_ws_network(gossip_node.clone() as Arc<dyn algo_network::GossipNode>);
+            .with_ws_network(gossip_node.clone() as Arc<dyn algo_network::GossipNode>)
+            // `config.json`'s `EnableDeveloperAPI`/`EnableExperimentalAPI`/
+            // `MaxAPIResourcesPerAccount`/`MaxAPIBoxPerApplication` (issue
+            // #751) — see `AlgodNodeInterface::enable_developer_api`'s doc
+            // comment for the `dev_mode`-conflation fix these wire past.
+            .with_enable_developer_api(node_config.enable_developer_api)
+            .with_enable_experimental_api(node_config.enable_experimental_api)
+            .with_max_api_resources_per_account(node_config.max_api_resources_per_account)
+            .with_max_api_box_per_application(node_config.max_api_box_per_application);
         if let Some(p2p) = &p2p_transport {
             adapter = adapter.with_p2p_network(p2p.clone() as Arc<dyn algo_network::GossipNode>);
         }
@@ -3613,6 +3658,11 @@ pub async fn run(
             api_token: cfg.api_token.clone(),
             admin_token: cfg.admin_token.clone(),
             disable_api_auth: cfg.disable_api_auth,
+            enable_private_network_access_header: cfg.enable_private_network_access_header,
+            rest_read_timeout_seconds: cfg.rest_read_timeout_seconds,
+            rest_write_timeout_seconds: cfg.rest_write_timeout_seconds,
+            rest_connections_soft_limit: cfg.rest_connections_soft_limit,
+            rest_connections_hard_limit: cfg.rest_connections_hard_limit,
         };
 
         info!(
@@ -4602,6 +4652,72 @@ mod tests {
         assert!(resolved.is_none());
     }
 
+    /// Issue #751, the headline fix: with no `--rest-listen`/`[rest].listen`
+    /// but `config.json`'s real (go-matching) `EndpointAddress` default
+    /// present, REST must resolve enabled on that ephemeral address —
+    /// aligning with go-algorand's always-on-by-default REST server.
+    #[test]
+    fn rest_options_endpoint_address_enables_rest_by_default() {
+        let opts = RestOptions {
+            endpoint_address: "127.0.0.1:0".to_string(),
+            ..RestOptions::default()
+        };
+        let resolved = opts
+            .resolve(None)
+            .expect("resolve ok")
+            .expect("REST must be enabled by EndpointAddress alone");
+        assert_eq!(resolved.listen.ip().to_string(), "127.0.0.1");
+        assert_eq!(resolved.listen.port(), 0);
+    }
+
+    /// `--rest-listen` still wins over `config.json`'s `EndpointAddress`.
+    #[test]
+    fn rest_options_cli_listen_overrides_endpoint_address() {
+        let opts = RestOptions {
+            listen: Some("127.0.0.1:9999".to_string()),
+            endpoint_address: "127.0.0.1:0".to_string(),
+            ..RestOptions::default()
+        };
+        let resolved = opts.resolve(None).expect("resolve ok").expect("enabled");
+        assert_eq!(resolved.listen.to_string(), "127.0.0.1:9999");
+    }
+
+    /// An explicit empty `EndpointAddress` is algod-rust's own "disable
+    /// REST" affordance (go itself has no real off switch — its own
+    /// empty-string fallback just binds port 80).
+    #[test]
+    fn rest_options_explicit_empty_endpoint_address_disables_rest() {
+        let opts = RestOptions {
+            endpoint_address: String::new(),
+            ..RestOptions::default()
+        };
+        let resolved = opts.resolve(None).expect("resolve ok");
+        assert!(resolved.is_none());
+    }
+
+    /// `RestReadTimeoutSeconds`/`RestWriteTimeoutSeconds`/
+    /// `RestConnectionsSoftLimit`/`RestConnectionsHardLimit`/
+    /// `EnablePrivateNetworkAccessHeader` all flow through to
+    /// `ResolvedRest` unchanged.
+    #[test]
+    fn rest_options_new_751_fields_flow_through_resolve() {
+        let opts = RestOptions {
+            listen: Some("127.0.0.1:4001".into()),
+            enable_private_network_access_header: true,
+            rest_read_timeout_seconds: 5,
+            rest_write_timeout_seconds: 10,
+            rest_connections_soft_limit: 11,
+            rest_connections_hard_limit: 22,
+            ..RestOptions::default()
+        };
+        let resolved = opts.resolve(None).expect("resolve ok").expect("enabled");
+        assert!(resolved.enable_private_network_access_header);
+        assert_eq!(resolved.rest_read_timeout_seconds, 5);
+        assert_eq!(resolved.rest_write_timeout_seconds, 10);
+        assert_eq!(resolved.rest_connections_soft_limit, 11);
+        assert_eq!(resolved.rest_connections_hard_limit, 22);
+    }
+
     #[test]
     fn rest_options_cli_listen_overrides_toml_listen() {
         let opts = RestOptions {
@@ -4613,6 +4729,7 @@ mod tests {
                 ..RestConfig::default()
             }),
             disable_api_auth: false,
+            ..RestOptions::default()
         };
         let resolved = opts
             .resolve(None)
@@ -4655,6 +4772,7 @@ mod tests {
             genesis_path: None,
             file_rest: None,
             disable_api_auth: false,
+            ..RestOptions::default()
         };
         let ledger_parent = std::path::Path::new("/srv/algod");
         let resolved = opts.resolve(Some(ledger_parent)).unwrap().unwrap();
@@ -4673,6 +4791,7 @@ mod tests {
             genesis_path: None,
             file_rest: None,
             disable_api_auth: false,
+            ..RestOptions::default()
         };
         let resolved = opts
             .resolve(Some(std::path::Path::new("/srv/algod")))

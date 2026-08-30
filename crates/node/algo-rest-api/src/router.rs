@@ -33,7 +33,6 @@ use tower_http::compression::CompressionLayer;
 use tower_http::CompressionLevel;
 
 use crate::auth;
-use crate::cors::cors_layer;
 use crate::error_envelope::{json_envelope_layer, unmatched_route_fallback};
 use crate::handlers;
 use crate::node::NodeInterface;
@@ -70,6 +69,12 @@ pub struct TokenConfig {
     /// (`config/localTemplate.go:649`) scopes it to "public (non-admin)"
     /// endpoints.
     pub disable_api_auth: bool,
+
+    /// `config.json`'s `EnablePrivateNetworkAccessHeader` (issue #751).
+    /// Mirrors go-algorand's `Config().EnablePrivateNetworkAccessHeader`,
+    /// which adds `Access-Control-Allow-Private-Network: true` to a CORS
+    /// preflight response that asked for it.
+    pub enable_private_network_access_header: bool,
 }
 
 /// Build the complete API router.
@@ -372,7 +377,10 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
     // browser never sends the real request at all). See `crate::cors` for
     // why this is a hand-written middleware rather than
     // `tower_http::cors::CorsLayer`.
-    router = router.layer(middleware::from_fn(cors_layer));
+    let enable_private_network_access_header = tokens.enable_private_network_access_header;
+    router = router.layer(middleware::from_fn(move |req, next| async move {
+        crate::cors::cors_layer_with_options(req, next, enable_private_network_access_header).await
+    }));
 
     // Response compression, outermost of all — matches go-algorand's
     // middleware order, where `middleware.Gzip()` is registered before CORS

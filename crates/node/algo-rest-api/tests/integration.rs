@@ -1226,6 +1226,7 @@ impl TestServer {
             admin_token: admin_token.clone(),
             enable_experimental_api,
             disable_api_auth,
+            enable_private_network_access_header: false,
         };
 
         let router = build_router(Arc::new(node), tokens);

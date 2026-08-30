@@ -540,11 +540,25 @@ pub enum Commands {
         #[arg(long)]
         genesis_hash: Option<String>,
 
-        /// Address to bind the REST API (e.g. "127.0.0.1:8080"). When
-        /// set via this flag or the `rest.listen` field in the config
-        /// file, the node starts the algod v2 REST API server
-        /// alongside consensus. Unset means "no REST API", preserving
-        /// the pre-TASK-79 behavior.
+        /// Address to bind the REST API (e.g. "127.0.0.1:8080"). Priority
+        /// order: this flag, then the `rest.listen` field in
+        /// `algod-rust.toml`, then `<data-dir>/config.json`'s
+        /// `EndpointAddress`.
+        ///
+        /// **Decision recorded (issue #751):** REST now starts by default,
+        /// matching go-algorand exactly — go's `EndpointAddress` always
+        /// defaults to `"127.0.0.1:0"` (an ephemeral local port) and the
+        /// REST API server is unconditionally started
+        /// (`daemon/algod/server.go`; there is no "off" switch upstream).
+        /// This flag previously defaulted to `None`, meaning "no REST API"
+        /// was algod-rust's out-of-the-box behavior — a divergence with no
+        /// documented rationale beyond pre-TASK-79 migration inertia (no
+        /// deliberate operational-safety argument was ever recorded for
+        /// it). As an algod-rust-only affordance beyond go (which has no
+        /// real "off" switch — its own empty-`EndpointAddress` fallback
+        /// just binds port 80), an *explicit* empty string from any of the
+        /// three sources above still disables REST entirely, for
+        /// deployments that genuinely want none.
         #[arg(long)]
         rest_listen: Option<String>,
 
@@ -656,6 +670,23 @@ pub enum Commands {
     },
 
     /// Follow mode: continuously validate new blocks as they arrive.
+    ///
+    /// **Architectural decision recorded (issue #751):** go-algorand's
+    /// `EnableFollowMode` is a `config.json` flag on its single node
+    /// binary that turns off the agreement service while still serving
+    /// the REST API. algod-rust instead implements follower behavior as
+    /// this separate subcommand. Investigated whether to unify it into a
+    /// `participate --follow` mode flag instead: concluded unification is
+    /// not clearly the right call — `follow` has no agreement service, no
+    /// participation keys, no transaction pool, and a different
+    /// network-attachment path entirely, so collapsing it into
+    /// `participate::run` would require threading "agreement service
+    /// absent" through code paths that currently assume one exists, for
+    /// no behavioral gain (`algod-rust follow` already does everything
+    /// `EnableFollowMode` does). `config.json`'s `EnableFollowMode` field
+    /// itself round-trips (`algo_config::Local::enable_follow_mode`) for
+    /// forward/inspection compatibility but is a documented no-op — this
+    /// subcommand remains the one way to run in follower mode.
     Follow {
         /// Base URL of the algod REST API.
         #[arg(long, default_value = "http://localhost:4001")]

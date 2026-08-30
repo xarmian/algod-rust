@@ -451,6 +451,13 @@ async fn main() -> anyhow::Result<()> {
                 genesis_path,
                 file_rest: file_config.rest().cloned(),
                 disable_api_auth: node_config.disable_api_auth,
+                endpoint_address: node_config.endpoint_address.clone(),
+                enable_private_network_access_header: node_config
+                    .enable_private_network_access_header,
+                rest_read_timeout_seconds: node_config.rest_read_timeout_seconds,
+                rest_write_timeout_seconds: node_config.rest_write_timeout_seconds,
+                rest_connections_soft_limit: node_config.rest_connections_soft_limit,
+                rest_connections_hard_limit: node_config.rest_connections_hard_limit,
             };
             let p2p_opts = commands::p2p_transport::P2pOptions {
                 enable_p2p,
