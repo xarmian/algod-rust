@@ -198,6 +198,7 @@ validate-api-up:
 	@cargo test --release -p algod-rust --test live_state_delta_parity --no-run
 	@cargo test --release -p algod-rust --test live_longpoll_parity --no-run
 	@cargo test --release -p algod-rust --test live_online_circulation_expiry --no-run
+	@cargo test --release -p algod-rust --test live_state_proof_voters_parity --no-run
 	@echo "==> Starting algod-rust natively on :4002..."
 	@rm -rf $(VALIDATE_API_RUST_DATA)
 	@mkdir -p $(VALIDATE_API_RUST_DATA)
@@ -254,7 +255,8 @@ validate-api-logs:
 ## live_auth_parity.rs, live_headers_parity.rs, live_endpoint_sweep.rs,
 ## live_txn_cross_verification.rs, live_varint_branch_parity.rs,
 ## live_box_pagination_parity.rs, live_longpoll_parity.rs,
-## live_online_circulation_expiry.rs), and tear down even if a suite fails
+## live_online_circulation_expiry.rs, live_state_proof_voters_parity.rs),
+## and tear down even if a suite fails
 ## — matching algokey-e2e's pattern. Reuses the same `target/release`
 ## build that validate-api-up already produced, so the harness process
 ## and the test binaries are never compiled twice.
@@ -295,6 +297,13 @@ validate-api-logs:
 ## filler transactions to cross MaxBalLookback, ~1-2 minutes per node) and,
 ## unlike the others, doesn't assume anything about the round it starts
 ## from.
+##
+## live_state_proof_voters_parity (issue #780's remaining acceptance
+## criteria) runs last of all: it advances each node to the next
+## StateProofInterval (256) boundary, wherever that chain's round happens
+## to be after every earlier suite -- also doesn't assume a starting
+## round, and is the one place a real state-proof voters commitment gets
+## exercised.
 validate-api:
 	$(MAKE) validate-api-up
 	@echo "==> Running live dual-node parity suites..."
@@ -309,7 +318,8 @@ validate-api:
 	 cargo test --release -p algod-rust --test live_box_pagination_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_state_delta_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_longpoll_parity -- --ignored --nocapture --test-threads=1 && \
-	 cargo test --release -p algod-rust --test live_online_circulation_expiry -- --ignored --nocapture --test-threads=1; \
+	 cargo test --release -p algod-rust --test live_online_circulation_expiry -- --ignored --nocapture --test-threads=1 && \
+	 cargo test --release -p algod-rust --test live_state_proof_voters_parity -- --ignored --nocapture --test-threads=1; \
 	  STATUS=$$?; \
 	  $(MAKE) validate-api-down; \
 	  exit $$STATUS
