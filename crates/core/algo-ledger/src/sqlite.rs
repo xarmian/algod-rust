@@ -2013,11 +2013,18 @@ pub struct SqliteLedger {
     /// In-memory rolling window of recent [`crate::state_delta::StateDelta`]s,
     /// keyed by round. Populated by [`Self::apply_block_caching_delta`] (used
     /// by the live sync driver in `bin/algod-rust`) and served by the REST API
-    /// adapter's `get_state_delta_for_round`. Window size is
-    /// [`crate::delta_cache::DEFAULT_WINDOW_SIZE`] (320 rounds), matching
-    /// go-algorand's in-memory delta retention in `accountUpdates.deltas`
-    /// (`../go-algorand/ledger/acctupdates.go` @ `v4.6.0-stable`). The cache is
-    /// in-memory only — it does not survive a restart, matching Go.
+    /// adapter's `get_state_delta_for_round`. Window size defaults to
+    /// [`crate::delta_cache::DEFAULT_WINDOW_SIZE`] (320 rounds -- issue
+    /// #755 investigated go-algorand's `config.Local.MaxAcctLookback`
+    /// default of 4 as a replacement and found it unsafe: go's field is a
+    /// *minimum* beneath a lazily-batched commit process, not a hard
+    /// ceiling, so go's real retained depth is usually much larger than 4
+    /// -- see `DEFAULT_WINDOW_SIZE`'s doc comment for the full writeup and
+    /// the CI regression that proved it). Extendable via
+    /// [`Self::set_delta_cache_window`], which applies
+    /// `config.Local.MaxAcctLookback` as a *floor* on top of this default,
+    /// matching go's own "minimum" framing -- never below it. The cache is
+    /// in-memory only -- it does not survive a restart, matching Go.
     /// PLAN-36 TASK-128.
     delta_cache: crate::delta_cache::DeltaCache,
 
@@ -2786,6 +2793,26 @@ impl SqliteLedger {
     pub fn set_lru_cache_disabled(&mut self, disabled: bool) {
         self.lru_cache_disabled = disabled;
         self.apply_trie_cache_target();
+    }
+
+    /// Extend the in-memory delta-cache retention window — go's
+    /// `MaxAcctLookback` (`config.Local`, issue #755). Applied as a
+    /// **floor** on top of [`crate::delta_cache::DEFAULT_WINDOW_SIZE`]
+    /// (320 rounds), never below it: `window_size` only takes effect when
+    /// it is *larger* than the compiled-in default. This mirrors go's own
+    /// doc comment for `MaxAcctLookback` -- "sets the **minimum** deltas
+    /// size to keep in memory" (`ledger/acctupdates.go:224`) -- and avoids
+    /// the real regression an earlier version of this change caused by
+    /// treating go's literal default (4) as a ceiling instead: go's
+    /// tracker commits lazily/in batches, so it retains far more than 4
+    /// rounds in practice, while algod-rust's `DeltaCache` is a hard
+    /// ceiling with no equivalent lazy-commit-lag mechanism (see
+    /// `DEFAULT_WINDOW_SIZE`'s doc comment). Applies lazily on the next
+    /// cache insert/advance, same as [`Self::set_lru_cache_disabled`]'s
+    /// trie-cache application.
+    pub fn set_delta_cache_window(&mut self, window_size: usize) {
+        self.delta_cache
+            .set_window_size(window_size.max(crate::delta_cache::DEFAULT_WINDOW_SIZE));
     }
 
     /// Apply the configured `trie_cache_target` (or
@@ -6047,6 +6074,33 @@ mod tests {
 
         ledger.set_lru_cache_disabled(false);
         assert!(!ledger.trie.as_ref().unwrap().lru_disabled());
+    }
+
+    /// Issue #755: `set_delta_cache_window` applies go's `MaxAcctLookback`
+    /// as a floor, never below `DEFAULT_WINDOW_SIZE` (320) -- go's own
+    /// literal default (4) would be an unsafe ceiling for algod-rust's
+    /// hard-window `DeltaCache` (see `DEFAULT_WINDOW_SIZE`'s doc comment;
+    /// CI's live dual-node parity suite caught the regression from
+    /// treating it as a ceiling in an earlier version of this change).
+    #[test]
+    fn set_delta_cache_window_is_a_floor_not_a_ceiling() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        assert_eq!(
+            ledger.delta_cache.window_size(),
+            crate::delta_cache::DEFAULT_WINDOW_SIZE
+        );
+
+        // go's own default (4) must not shrink the window below the safe
+        // compiled-in default.
+        ledger.set_delta_cache_window(4);
+        assert_eq!(
+            ledger.delta_cache.window_size(),
+            crate::delta_cache::DEFAULT_WINDOW_SIZE
+        );
+
+        // An operator explicitly asking for a *larger* window is honored.
+        ledger.set_delta_cache_window(1000);
+        assert_eq!(ledger.delta_cache.window_size(), 1000);
     }
 
     #[test]

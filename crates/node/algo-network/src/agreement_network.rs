@@ -70,13 +70,19 @@ pub const DEFAULT_VOTE_QUEUE_LEN: usize = 20_000;
 
 /// Default channel capacity for proposal payload messages.
 ///
-/// Mirrors Go's `config.Local.AgreementIncomingProposalsQueueLength` (default 25).
-pub const DEFAULT_PROPOSAL_QUEUE_LEN: usize = 25;
+/// Mirrors Go's `config.Local.AgreementIncomingProposalsQueueLength`
+/// (`version[21]:"25" version[27]:"50"` in `config/localTemplate.go` --
+/// issue #755: this was stuck at the pre-v27 value of 25 even though the
+/// v27+ default (current at this project's v5.0.0-stable pin) is 50).
+pub const DEFAULT_PROPOSAL_QUEUE_LEN: usize = 50;
 
 /// Default channel capacity for vote bundle messages.
 ///
-/// Mirrors Go's `config.Local.AgreementIncomingBundlesQueueLength` (default 7).
-pub const DEFAULT_BUNDLE_QUEUE_LEN: usize = 7;
+/// Mirrors Go's `config.Local.AgreementIncomingBundlesQueueLength`
+/// (`version[21]:"7" version[27]:"15"` in `config/localTemplate.go` --
+/// issue #755: this was stuck at the pre-v27 value of 7 even though the
+/// v27+ default (current at this project's v5.0.0-stable pin) is 15).
+pub const DEFAULT_BUNDLE_QUEUE_LEN: usize = 15;
 
 // ---------------------------------------------------------------------------
 // PeerRef — lightweight Peer wrapper for message handles
@@ -838,5 +844,25 @@ mod tests {
         assert_eq!(config.vote_queue_len, DEFAULT_VOTE_QUEUE_LEN);
         assert_eq!(config.proposal_queue_len, DEFAULT_PROPOSAL_QUEUE_LEN);
         assert_eq!(config.bundle_queue_len, DEFAULT_BUNDLE_QUEUE_LEN);
+    }
+
+    /// Issue #755: `DEFAULT_PROPOSAL_QUEUE_LEN`/`DEFAULT_BUNDLE_QUEUE_LEN`
+    /// were stuck at go-algorand's pre-v27 `AgreementIncomingProposalsQueueLength`/
+    /// `AgreementIncomingBundlesQueueLength` defaults (25/7). go bumped both
+    /// at version 27 (`config/localTemplate.go`:
+    /// `AgreementIncomingProposalsQueueLength uint64 version[21]:"25" version[27]:"50"`,
+    /// `AgreementIncomingBundlesQueueLength uint64 version[21]:"7" version[27]:"15"`)
+    /// — algod-rust's constants must track the *current* (v27+) default,
+    /// matching `DEFAULT_VOTE_QUEUE_LEN`'s already-correct 20_000.
+    #[test]
+    fn default_proposal_and_bundle_queue_lengths_match_current_go_defaults() {
+        assert_eq!(
+            DEFAULT_PROPOSAL_QUEUE_LEN, 50,
+            "go's AgreementIncomingProposalsQueueLength default is 50 as of version 27"
+        );
+        assert_eq!(
+            DEFAULT_BUNDLE_QUEUE_LEN, 15,
+            "go's AgreementIncomingBundlesQueueLength default is 15 as of version 27"
+        );
     }
 }

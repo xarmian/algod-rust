@@ -3120,6 +3120,13 @@ pub async fn run(
         .set_synchronous_mode(node_config.ledger_synchronous_mode)
         .map_err(|e| anyhow::anyhow!("set ledger synchronous mode: {e}"))?;
     sqlite_ledger.set_lru_cache_disabled(node_config.disable_ledger_lru_cache);
+    // `MaxAcctLookback` (issue #755): applied as a *floor* on top of
+    // `algo_ledger::delta_cache::DEFAULT_WINDOW_SIZE` (320 rounds), never
+    // below it -- go's own default (4) would be an unsafe ceiling for
+    // algod-rust's hard-window `DeltaCache` (see `set_delta_cache_window`'s
+    // doc comment), so this is a no-op at go's default and only extends
+    // the window when the operator explicitly asks for more than 320.
+    sqlite_ledger.set_delta_cache_window(node_config.max_acct_lookback as usize);
 
     // `OptimizeAccountsDatabaseOnStartup` (issue #749): run SQLite `VACUUM`
     // on the accounts DB once, mirroring go's
@@ -3712,8 +3719,19 @@ pub async fn run(
     // whichever transport(s) `network_mode` has active (#559) — in
     // `WsOnly` mode this is exactly `gossip_node`, unchanged from before.
     let rt_handle = tokio::runtime::Handle::current();
-    let agreement_network =
-        AgreementNetworkBridge::with_defaults(p2p_active_gossip_node.clone(), rt_handle.clone());
+    // `AgreementIncomingVotesQueueLength`/`...ProposalsQueueLength`/
+    // `...BundlesQueueLength` (issue #755): threaded from `node_config`
+    // rather than left at `AgreementNetworkConfig::default()`.
+    let agreement_network_config = algo_network::AgreementNetworkConfig {
+        vote_queue_len: node_config.agreement_incoming_votes_queue_length as usize,
+        proposal_queue_len: node_config.agreement_incoming_proposals_queue_length as usize,
+        bundle_queue_len: node_config.agreement_incoming_bundles_queue_length as usize,
+    };
+    let agreement_network = AgreementNetworkBridge::new(
+        p2p_active_gossip_node.clone(),
+        rt_handle.clone(),
+        agreement_network_config,
+    );
 
     // Network advancer: wraps the active gossip node(s) so the ledger
     // bridge can signal network progress when certificates arrive.
@@ -3968,7 +3986,16 @@ pub async fn run(
         signing_keys,
     };
 
-    let service = Service::new(params).with_metrics(participation_metrics.clone());
+    // `EnableAgreementReporting`/`EnableAgreementTimeMetrics` (issue #755):
+    // threaded into `Tracer::new` rather than left at `Tracer::default()`
+    // (always false/false).
+    let agreement_tracer = algo_agreement::Tracer::new(
+        node_config.enable_agreement_reporting,
+        node_config.enable_agreement_time_metrics,
+    );
+    let service = Service::new(params)
+        .with_metrics(participation_metrics.clone())
+        .with_tracer(agreement_tracer);
     let handle = service.start();
 
     info!(

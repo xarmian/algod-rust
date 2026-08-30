@@ -55,7 +55,7 @@ use crate::events::ConsensusVersionView;
 use crate::ledger_reader::LedgerReader;
 use crate::metrics::ParticipationMetrics;
 use crate::persistence::{self, AsyncPersistenceLoop, ClockState, PersistentRequest};
-use crate::player::Player;
+use crate::player::{Player, Tracer};
 use crate::pseudonode::{AccountSigningKeys, AsyncPseudonode, Pseudonode};
 use crate::router::RootRouter;
 use crate::step::{Period, Step, PROPOSE, SOFT};
@@ -201,6 +201,13 @@ where
     /// the REST adapter it starts *before* agreement) injects its own via
     /// [`Service::with_metrics`] or takes a handle with [`Service::metrics`].
     metrics: Arc<ParticipationMetrics>,
+    /// go's `s.tracer` (`agreement/service.go:52`), constructed from
+    /// `EnableAgreementReporting`/`EnableAgreementTimeMetrics`
+    /// (`config.Local`, issue #755). Defaults to `Tracer::default()`
+    /// (both flags false, matching go's own default), overridden via
+    /// [`Service::with_tracer`]. Driven every dispatch via
+    /// `RootRouter::submit_top`'s `tracer` argument.
+    tracer: Tracer,
 }
 
 impl<N, L, K, BF, BV, R, M, C> Service<N, L, K, BF, BV, R, M, C>
@@ -221,6 +228,7 @@ where
         Self {
             params,
             metrics: Arc::new(ParticipationMetrics::new()),
+            tracer: Tracer::default(),
         }
     }
 
@@ -239,6 +247,21 @@ where
         self.metrics.clone()
     }
 
+    /// Use a caller-supplied tracer instead of the default
+    /// (both-flags-false) one `Service::new` created. Lets the node build
+    /// its `Tracer` from `EnableAgreementReporting`/
+    /// `EnableAgreementTimeMetrics` (`config.Local`, issue #755) before
+    /// starting the service.
+    pub fn with_tracer(mut self, tracer: Tracer) -> Self {
+        self.tracer = tracer;
+        self
+    }
+
+    /// This service's tracer, as configured (test/introspection use).
+    pub fn tracer(&self) -> &Tracer {
+        &self.tracer
+    }
+
     /// Start executing the agreement protocol.
     ///
     /// This:
@@ -251,6 +274,7 @@ where
     pub fn start(self) -> ServiceHandle {
         let quit = Arc::new(AtomicBool::new(false));
         let metrics = self.metrics.clone();
+        let tracer = self.tracer.clone();
 
         // Signal the network that the agreement service is ready.
         self.params.network.start();
@@ -374,6 +398,7 @@ where
                     restored_state,
                     signing_keys,
                     metrics_main,
+                    tracer,
                 );
             })
             .expect("failed to spawn agreement main loop thread");
@@ -445,6 +470,7 @@ fn main_loop<L, K, BF, R>(
     restored_state: Option<(RootRouter, Player, ClockState, Vec<Action>)>,
     signing_keys: HashMap<Address, AccountSigningKeys>,
     metrics: Arc<ParticipationMetrics>,
+    mut tracer: Tracer,
 ) where
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
     K: AgreementKeyManager + Send + 'static,
@@ -658,7 +684,8 @@ fn main_loop<L, K, BF, R>(
         let event = event.attach_consensus_version(version_view);
 
         // Step 6: Drive the state machine.
-        let (new_player, new_actions) = router.submit_top(player, event.event, &params);
+        let (new_player, new_actions) =
+            router.submit_top(player, event.event, &params, Some(&mut tracer));
         player = new_player;
         actions = new_actions;
 
