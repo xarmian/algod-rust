@@ -642,6 +642,14 @@ impl PeerHandle {
     /// uses a different stream type than `tokio-tungstenite`, this constructor
     /// spawns its own read/write loops that work with axum's API.
     ///
+    /// `incoming_filter`/`outgoing_filter` mirror [`WsPeerConfig`]'s fields of
+    /// the same name (see that struct's docs): the incoming filter drops
+    /// already-seen dedup-safe (`AV`/`TX`) messages and honours `MsgDigestSkip`
+    /// notifications from the remote peer; the outgoing filter suppresses
+    /// re-sending a large dedup-safe message the peer has already told us it
+    /// has. Both are `None` for callers that don't need dedup (matches
+    /// `WsPeerConfig::default()`'s all-`None` behaviour).
+    ///
     /// The returned handle is compatible with the peer registry and supports
     /// broadcast, send, and close operations.
     pub fn new_inbound(
@@ -649,6 +657,8 @@ impl PeerHandle {
         remote_addr: String,
         version: String,
         closing: CancellationToken,
+        incoming_filter: Option<Arc<MessageFilter>>,
+        outgoing_filter: Option<Arc<MessageFilter>>,
     ) -> Self {
         use futures_util::{SinkExt, StreamExt};
 
@@ -661,6 +671,7 @@ impl PeerHandle {
 
         let read_closing = closing.clone();
         let read_addr = remote_addr.clone();
+        let read_outgoing_filter = outgoing_filter.clone();
 
         // Read loop: reads from axum WebSocket and dispatches to incoming channel.
         let read_handle = tokio::spawn(async move {
@@ -704,6 +715,49 @@ impl PeerHandle {
                                     } else {
                                         payload.to_vec()
                                     };
+
+                                    // --- MsgDigestSkip handling ---
+                                    // The peer is telling us it already has a
+                                    // message with this digest; remember that
+                                    // in our outgoing filter so a later
+                                    // broadcast doesn't re-send it. Reference:
+                                    // Go's handleFilterMessage() in wsPeer.go.
+                                    if tag == Tag::MsgDigestSkip {
+                                        if let Some(ref of) = read_outgoing_filter {
+                                            if payload.len() == 32 {
+                                                let mut digest = [0u8; 32];
+                                                digest.copy_from_slice(&payload);
+                                                of.check_digest(&digest, true, true);
+                                            } else {
+                                                tracing::warn!(
+                                                    addr = %read_addr,
+                                                    size = payload.len(),
+                                                    "inbound read loop: bad MsgDigestSkip size"
+                                                );
+                                            }
+                                        }
+                                        continue;
+                                    }
+
+                                    // --- Incoming dedup ---
+                                    // For dedup-safe tags (AV, TX), drop
+                                    // messages already seen by this network's
+                                    // incoming filter rather than handing them
+                                    // to the multiplexer for reprocessing.
+                                    if dedup_safe_tag(&tag) && !payload.is_empty() {
+                                        if let Some(ref inf) = incoming_filter {
+                                            if inf.check_incoming_message(&tag, &payload, true, true)
+                                            {
+                                                tracing::trace!(
+                                                    addr = %read_addr,
+                                                    tag = %tag,
+                                                    "inbound read loop: dropping incoming duplicate"
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    }
+
                                     let now_ns = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
@@ -751,6 +805,9 @@ impl PeerHandle {
                     cmd = send_high_prio_rx.recv() => {
                         match cmd {
                             Some(WriteCommand::Data(sm)) => {
+                                if outgoing_filter_suppresses(&sm.msg, &outgoing_filter) {
+                                    continue;
+                                }
                                 let frame = match encode_inbound_frame(&sm.msg) {
                                     Ok(f) => f,
                                     Err(_) => continue,
@@ -771,6 +828,9 @@ impl PeerHandle {
                     cmd = send_bulk_rx.recv() => {
                         match cmd {
                             Some(WriteCommand::Data(sm)) => {
+                                if outgoing_filter_suppresses(&sm.msg, &outgoing_filter) {
+                                    continue;
+                                }
                                 let frame = match encode_inbound_frame(&sm.msg) {
                                     Ok(f) => f,
                                     Err(_) => continue,
@@ -816,6 +876,28 @@ impl PeerHandle {
             _keepalive_handle: keepalive_handle,
         }
     }
+}
+
+/// Returns `true` if `msg` should be suppressed rather than sent, because the
+/// outgoing filter shows the peer has already told us (via a prior
+/// `MsgDigestSkip`) that it has this exact dedup-safe (`AV`/`TX`) message.
+///
+/// Mirrors the outgoing-dedup check in [`process_write_command`] (used by
+/// the outbound/`tokio-tungstenite` write loop) for the inbound/axum write
+/// loop, which has its own implementation since axum's `WebSocket` sink is a
+/// different type.  Reference: Go's `writeNonBlock()` in `wsPeer.go`.
+fn outgoing_filter_suppresses(
+    msg: &OutgoingMessage,
+    outgoing_filter: &Option<Arc<MessageFilter>>,
+) -> bool {
+    let Some(of) = outgoing_filter else {
+        return false;
+    };
+    if !dedup_safe_tag(&msg.tag) || msg.payload.len() < MESSAGE_FILTER_SIZE {
+        return false;
+    }
+    let digest = generate_message_digest(&msg.tag, &msg.payload);
+    of.check_digest(&digest, false, false)
 }
 
 /// Encode an outgoing message for an inbound (server-side) peer connection.
