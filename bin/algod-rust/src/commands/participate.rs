@@ -3120,9 +3120,12 @@ pub async fn run(
         .set_synchronous_mode(node_config.ledger_synchronous_mode)
         .map_err(|e| anyhow::anyhow!("set ledger synchronous mode: {e}"))?;
     sqlite_ledger.set_lru_cache_disabled(node_config.disable_ledger_lru_cache);
-    // `MaxAcctLookback` (issue #755): `open` already started the delta
-    // cache at `algo_ledger::delta_cache::DEFAULT_WINDOW_SIZE` (4 rounds,
-    // go's real default), so this is a no-op unless overridden.
+    // `MaxAcctLookback` (issue #755): applied as a *floor* on top of
+    // `algo_ledger::delta_cache::DEFAULT_WINDOW_SIZE` (320 rounds), never
+    // below it -- go's own default (4) would be an unsafe ceiling for
+    // algod-rust's hard-window `DeltaCache` (see `set_delta_cache_window`'s
+    // doc comment), so this is a no-op at go's default and only extends
+    // the window when the operator explicitly asks for more than 320.
     sqlite_ledger.set_delta_cache_window(node_config.max_acct_lookback as usize);
 
     // `OptimizeAccountsDatabaseOnStartup` (issue #749): run SQLite `VACUUM`

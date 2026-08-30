@@ -698,17 +698,27 @@ static MAX_BLOCK_HISTORY_LOOKBACK: VersionedDefault<u64> = VersionedDefault::new
 //   see `crates/node/algo-network/src/agreement_network.rs`'s
 //   `DEFAULT_PROPOSAL_QUEUE_LEN`/`DEFAULT_BUNDLE_QUEUE_LEN`.
 // - `MaxAcctLookback` is wired into `SqliteLedger::set_delta_cache_window`
-//   (issue #755 **also fixes a real behavioral-divergence bug**: the
-//   ledger's actual in-memory delta-cache window,
-//   `crate::delta_cache::DEFAULT_WINDOW_SIZE`, was hardcoded to 320 rounds
-//   -- 80x go's real `MaxAcctLookback` default of 4
-//   (`ledger/acctupdates.go:294`). Investigated and found no algod-rust
-//   architectural reason for 320: it does not correspond to any other
-//   consensus constant this crate needs a 320-round window for (the
-//   *unrelated* balance/seed lookback constant that happens to also equal
-//   320, `BALANCE_LOOKBACK` in `algo-ledger/src/apply.rs`, governs online
-//   participation/stake accounting, not delta-cache retention). The
-//   constant is now go-matching (4) and independently configurable.
+//   as a *floor* on top of `crate::delta_cache::DEFAULT_WINDOW_SIZE` (320
+//   rounds), never below it. An earlier version of this change set
+//   `DEFAULT_WINDOW_SIZE` itself to go's literal default of 4
+//   (`ledger/acctupdates.go:294`), reasoning that 320 -- 80x go's default
+//   -- had no algod-rust architectural justification (the *unrelated*
+//   balance/seed-lookback constant that happens to also equal 320,
+//   `BALANCE_LOOKBACK` in `algo-ledger/src/apply.rs`, governs online
+//   participation/stake accounting, not delta-cache retention). **CI's
+//   live dual-node parity suite caught a real regression from that**:
+//   go's `MaxAcctLookback` is documented as a *minimum* beneath a
+//   lazily-batched commit process (`ledger/acctupdates.go:224`,
+//   `accountUpdates.produceCommittingTask`), so go's real retained depth
+//   is routinely much larger than 4 in practice; algod-rust's `DeltaCache`
+//   has no equivalent lazy-commit-lag mechanism and is a hard ceiling, so
+//   matching go's literal minimum evicted deltas go itself still served.
+//   Reverted `DEFAULT_WINDOW_SIZE` to 320 and instead apply this field as
+//   a floor (`window_size.max(DEFAULT_WINDOW_SIZE)`), faithful to go's own
+//   "minimum" framing without algod-rust's differently-shaped cache
+//   inheriting go's differently-shaped safety margin. See
+//   `algo_ledger::delta_cache::DEFAULT_WINDOW_SIZE`'s doc comment for the
+//   full writeup.
 // - `EnableAgreementReporting`/`EnableAgreementTimeMetrics` are wired into
 //   `algo_agreement::Tracer::new` via `Service::with_tracer`, constructed
 //   from these two config bools at agreement-service startup
@@ -743,8 +753,8 @@ static AGREEMENT_INCOMING_BUNDLES_QUEUE_LENGTH: VersionedDefault<u64> =
     VersionedDefault::new(&[(21, || 7), (27, || 15)]);
 
 /// Go: `MaxAcctLookback uint64` `version[23]:"4"` (`localTemplate.go:563-565`).
-/// Wired into `SqliteLedger::set_delta_cache_window`. **Fixes a real
-/// behavioral divergence** -- see the module-level note above.
+/// Wired into `SqliteLedger::set_delta_cache_window` as a floor, not a
+/// ceiling -- see the module-level note above.
 static MAX_ACCT_LOOKBACK: VersionedDefault<u64> = VersionedDefault::new(&[(23, || 4)]);
 
 /// Go: `EnableAgreementReporting bool` `version[3]:"false"`
@@ -1453,10 +1463,9 @@ pub struct Local {
     pub agreement_incoming_bundles_queue_length: u64,
 
     /// Go: `MaxAcctLookback`. Wired into
-    /// `SqliteLedger::set_delta_cache_window` (issue #755) — **fixes a
-    /// real behavioral-divergence bug** (algod-rust's delta-cache window
-    /// was hardcoded 80x too large), see [`MAX_ACCT_LOOKBACK`]'s doc
-    /// comment.
+    /// `SqliteLedger::set_delta_cache_window` as a *floor*, not a ceiling
+    /// (issue #755) — see [`MAX_ACCT_LOOKBACK`]'s doc comment for why a
+    /// literal ceiling regressed CI's live parity suite.
     #[serde(rename = "MaxAcctLookback", default = "default_max_acct_lookback")]
     pub max_acct_lookback: u64,
 

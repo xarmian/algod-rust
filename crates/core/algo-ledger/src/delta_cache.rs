@@ -29,17 +29,30 @@ use crate::state_delta::StateDelta;
 
 /// Default number of rounds to keep in the in-memory cache.
 ///
-/// Matches go-algorand's `config.Local.MaxAcctLookback` default (4 rounds,
-/// `config/localTemplate.go:563-565`, consumed by `accountUpdates.deltas`
-/// at `ledger/acctupdates.go:294`). Issue #755: this was previously
-/// hardcoded to 320 -- 80x go's real default and not derived from any
-/// go-algorand constant (the *unrelated* consensus balance/seed-lookback
-/// constant that also happens to equal 320,
-/// `algo_ledger::apply::BALANCE_LOOKBACK`, governs online-participation
-/// accounting, not delta-cache retention). Configurable via
-/// `algo_config::Local::max_acct_lookback` /
-/// `SqliteLedger::set_delta_cache_window`.
-pub const DEFAULT_WINDOW_SIZE: usize = 4;
+/// Issue #755 investigated go-algorand's `config.Local.MaxAcctLookback`
+/// (default 4 rounds, `config/localTemplate.go:563-565`) as a candidate
+/// replacement for this constant, and initially shrank it to 4 to match.
+/// **CI's live dual-node parity suite caught a real regression from that
+/// change and it was reverted** -- go's `MaxAcctLookback` is documented as
+/// "the *minimum* deltas size to keep in memory"
+/// (`ledger/acctupdates.go:224`), not a hard ceiling: go's tracker commits
+/// balances lazily/in batches (`accountUpdates.produceCommittingTask`,
+/// `committedUpTo`), so in practice go retains many more than 4 rounds of
+/// in-memory deltas between flushes -- confirmed empirically by this
+/// project's own `live_state_delta_parity` test, which queries
+/// `/v2/deltas/{round}` several rounds behind the tip against a real
+/// go-algorand node with zero special configuration and gets a 200.
+/// algod-rust's `DeltaCache` has no equivalent lazy-commit-lag mechanism:
+/// it is a hard, fixed-size ceiling. Setting it to go's literal minimum
+/// (4) therefore evicts recent, still-relevant deltas that go's own
+/// reference behavior keeps -- a real functional regression on
+/// `/v2/deltas` and the historical-round box/kv lookup path, not a
+/// parity improvement. Kept at 320 (algod-rust's original, live-tested
+/// value) for this reason; `MaxAcctLookback`/`SqliteLedger::
+/// set_delta_cache_window` is wired as a *floor* on top of this default
+/// (matching go's own "minimum" framing), never below it -- see
+/// `set_delta_cache_window`'s doc comment.
+pub const DEFAULT_WINDOW_SIZE: usize = 320;
 
 /// In-memory rolling window cache for recent round deltas.
 pub struct DeltaCache {
@@ -189,14 +202,16 @@ mod tests {
         assert!(cache.is_empty());
     }
 
-    /// Issue #755: `DEFAULT_WINDOW_SIZE` must match go-algorand's real
-    /// `MaxAcctLookback` default of 4 rounds
-    /// (`config/localTemplate.go:563-565`), not the previous hardcoded 320
-    /// (which was 80x too large and did not correspond to any go-algorand
-    /// constant governing delta-cache retention).
+    /// Issue #755: `DEFAULT_WINDOW_SIZE` was investigated against
+    /// go-algorand's `MaxAcctLookback` default (4 rounds) and deliberately
+    /// kept at algod-rust's original 320 -- go's field is a *minimum*
+    /// beneath a lazily-batched commit process algod-rust's `DeltaCache`
+    /// has no equivalent of (see this constant's doc comment; CI's live
+    /// dual-node parity suite caught the regression from an earlier
+    /// attempt to shrink this to 4).
     #[test]
-    fn default_window_size_matches_go_max_acct_lookback() {
-        assert_eq!(DEFAULT_WINDOW_SIZE, 4);
+    fn default_window_size_kept_at_algod_rust_safe_value() {
+        assert_eq!(DEFAULT_WINDOW_SIZE, 320);
     }
 
     #[test]
