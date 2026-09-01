@@ -68,6 +68,40 @@ pub fn check_program_version_allowed(
     Ok(())
 }
 
+/// Reject a program whose declared version byte is below the minimum AVM
+/// version required by its transaction group.
+///
+/// This matches go-algorand's `cx.version < cx.EvalParams.minAvmVersion`
+/// check in `(*EvalContext).begin` (`data/transactions/logic/eval.go`), fed
+/// by `computeMinAvmVersion`: a group containing a `RekeyTo` (rekeying)
+/// transaction or an `ApplicationCall` transaction raises the minimum
+/// required AVM version for every LogicSig signature in that group, because
+/// those transaction fields/types postdate AVM v1 and older-version programs
+/// must not be exposed to groups using them.
+///
+/// # Parameters
+/// - `declared_version`: the first byte of the program (the AVM version).
+/// - `min_avm_version`: the group's minimum required AVM version, from
+///   [`crate::context::AvmContext::min_avm_version`].
+///
+/// # Returns
+/// - `Ok(())` if the declared version meets the floor.
+/// - `Err(AlgoError::Avm { .. })` if the declared version is below the floor,
+///   with a message matching go-algorand's error text exactly:
+///   `"program version must be >= {min} for this transaction group, but have
+///   version {declared}"`.
+pub fn check_min_avm_version(declared_version: u8, min_avm_version: u64) -> Result<(), AlgoError> {
+    let declared_version = declared_version as u64;
+    if declared_version < min_avm_version {
+        return Err(AlgoError::Avm {
+            message: format!(
+                "program version must be >= {min_avm_version} for this transaction group, but have version {declared_version}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Maximum stack depth allowed by the AVM.
 const MAX_STACK_DEPTH: i32 = 1000;
 
@@ -457,6 +491,35 @@ mod tests {
         let mut p = vec![version];
         p.extend_from_slice(code);
         p
+    }
+
+    #[test]
+    fn test_min_avm_version_accepts_program_at_floor() {
+        assert!(check_min_avm_version(2, 2).is_ok());
+    }
+
+    #[test]
+    fn test_min_avm_version_accepts_program_above_floor() {
+        assert!(check_min_avm_version(5, 2).is_ok());
+    }
+
+    #[test]
+    fn test_min_avm_version_rejects_program_below_floor() {
+        let result = check_min_avm_version(1, 2);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(
+                "program version must be >= 2 for this transaction group, but have version 1"
+            ),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_min_avm_version_zero_floor_accepts_v1() {
+        // A group with no RekeyTo/ApplicationCall has no floor at all.
+        assert!(check_min_avm_version(1, 0).is_ok());
     }
 
     #[test]

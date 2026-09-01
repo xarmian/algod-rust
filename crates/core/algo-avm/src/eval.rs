@@ -331,6 +331,11 @@ pub fn run_logicsig_program(
     if let (Some(ceiling), Some(&version)) = (ctx.consensus_logic_sig_version(), program.first()) {
         crate::validator::check_program_version_allowed(version, ceiling)?;
     }
+    // Reject programs below the group's minimum required AVM version
+    // (go-algorand's computeMinAvmVersion floor; see AvmContext::min_avm_version).
+    if let Some(&version) = program.first() {
+        crate::validator::check_min_avm_version(version, ctx.min_avm_version())?;
+    }
 
     let parsed = bytecode::parse(program)?;
     let budget_before = budget.remaining();
@@ -539,6 +544,15 @@ pub fn run_logicsig_program_with_tracer(
     // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
     if let (Some(ceiling), Some(&version)) = (ctx.consensus_logic_sig_version(), program.first()) {
         if let Err(e) = crate::validator::check_program_version_allowed(version, ceiling) {
+            tracer.before_program(ProgramType::LogicSig, program_trace_hash(program));
+            tracer.after_program(ProgramType::LogicSig, false, Some(&e.to_string()));
+            return Err(e);
+        }
+    }
+    // Reject programs below the group's minimum required AVM version
+    // (go-algorand's computeMinAvmVersion floor; see AvmContext::min_avm_version).
+    if let Some(&version) = program.first() {
+        if let Err(e) = crate::validator::check_min_avm_version(version, ctx.min_avm_version()) {
             tracer.before_program(ProgramType::LogicSig, program_trace_hash(program));
             tracer.after_program(ProgramType::LogicSig, false, Some(&e.to_string()));
             return Err(e);

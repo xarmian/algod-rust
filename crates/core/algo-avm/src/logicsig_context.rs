@@ -27,7 +27,7 @@
 
 use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
-use algo_types::{SignedTransaction, TealValue};
+use algo_types::{SignedTransaction, TealValue, TxnType};
 use sha2::{Digest, Sha512_256};
 
 use crate::context::AvmContext;
@@ -36,6 +36,38 @@ use crate::txn_fields::read_txn_field;
 
 /// Domain separation prefix for program hashing.
 const PROGRAM_PREFIX: &[u8] = b"Program";
+
+/// AVM version at which `RekeyTo` functionality was introduced.
+/// Matches go-algorand's `rekeyingEnabledVersion`
+/// (`data/transactions/logic/opcodes.go`).
+const REKEYING_ENABLED_VERSION: u64 = 2;
+
+/// AVM version at which `ApplicationCall` transactions were introduced.
+/// Matches go-algorand's `appsEnabledVersion`
+/// (`data/transactions/logic/opcodes.go`).
+const APPS_ENABLED_VERSION: u64 = 2;
+
+/// Compute the minimum safe AVM version that may be used by a program
+/// evaluated against this transaction group.
+///
+/// Matches go-algorand's `computeMinAvmVersion`
+/// (`data/transactions/logic/eval.go`): a group containing a `RekeyTo`
+/// (rekeying) transaction or an `ApplicationCall` transaction raises the
+/// minimum required version for every LogicSig signature in the group, so
+/// that older-version programs can't be exposed to transaction fields/types
+/// they predate.
+fn compute_min_avm_version(group: &[SignedTransaction]) -> u64 {
+    let mut min_version = 0u64;
+    for stx in group {
+        if stx.txn.rekey_to.as_ref().is_some_and(|a| !a.is_zero()) {
+            min_version = min_version.max(REKEYING_ENABLED_VERSION);
+        }
+        if stx.txn.txn_type == TxnType::Appl {
+            min_version = min_version.max(APPS_ENABLED_VERSION);
+        }
+    }
+    min_version
+}
 
 /// AVM execution context for LogicSig programs.
 ///
@@ -105,6 +137,10 @@ impl<'a> LogicSigAvmContext<'a> {
 impl<'a> AvmContext for LogicSigAvmContext<'a> {
     fn consensus_logic_sig_version(&self) -> Option<u64> {
         Some(self.consensus.logic_sig_version)
+    }
+
+    fn min_avm_version(&self) -> u64 {
+        compute_min_avm_version(self.group)
     }
 
     // ---- Global fields ----
@@ -244,6 +280,56 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn min_avm_version_zero_for_plain_group() {
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
+        assert_eq!(ctx.min_avm_version(), 0);
+    }
+
+    #[test]
+    fn min_avm_version_raised_by_rekey_to() {
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.rekey_to = Some(Address([0x30; 32]));
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
+        assert_eq!(ctx.min_avm_version(), 2);
+    }
+
+    #[test]
+    fn min_avm_version_zero_address_rekey_to_does_not_raise_floor() {
+        // A RekeyTo set to the zero address is a no-op rekey (matches
+        // go-algorand's txn.RekeyTo.IsZero() check) and must not raise the
+        // floor.
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.rekey_to = Some(Address([0x00; 32]));
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
+        assert_eq!(ctx.min_avm_version(), 0);
+    }
+
+    #[test]
+    fn min_avm_version_raised_by_application_call() {
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.txn_type = algo_types::TxnType::Appl;
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
+        assert_eq!(ctx.min_avm_version(), 2);
+    }
+
+    #[test]
+    fn min_avm_version_raised_by_sibling_in_group() {
+        // The floor applies to every LogicSig in the group, not just the
+        // transaction that carries the RekeyTo/ApplicationCall itself.
+        let pay = make_pay_stxn([0x10; 32]);
+        let mut appl = make_pay_stxn([0x20; 32]);
+        appl.txn.txn_type = algo_types::TxnType::Appl;
+        let group = vec![pay, appl];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
+        assert_eq!(ctx.min_avm_version(), 2);
     }
 
     #[test]
