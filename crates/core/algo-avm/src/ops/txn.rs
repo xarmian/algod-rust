@@ -25,6 +25,7 @@ use algo_error::AlgoError;
 
 use crate::bytecode::Instruction;
 use crate::context::AvmContext;
+use crate::fields::TxnField;
 use crate::machine::{AvmMachine, AvmValue};
 
 use super::helpers::{get_uint8, get_uint8_pair, get_uint8_triple, teal_to_avm};
@@ -32,6 +33,24 @@ use super::helpers::{get_uint8, get_uint8_pair, get_uint8_triple, teal_to_avm};
 // ---------------------------------------------------------------------------
 // Transaction field opcodes
 // ---------------------------------------------------------------------------
+
+/// Enforce per-field version gating shared by every `txn`/`gtxn`/`txna`/etc.
+/// opcode. Matches go-algorand's shared `(*EvalContext).fetchField`
+/// (`data/transactions/logic/eval.go`): `fs.version > cx.version`.
+fn check_txn_field_version(field_byte: u8, machine_version: u8) -> Result<(), AlgoError> {
+    match TxnField::from_u8(field_byte) {
+        Ok(field) if field.version() <= machine_version => Ok(()),
+        Ok(field) => Err(AlgoError::Avm {
+            message: format!("invalid txn field {field}"),
+        }),
+        Err(_) => Err(AlgoError::Avm {
+            message: format!(
+                "invalid txn field {}",
+                TxnField::unknown_display(field_byte)
+            ),
+        }),
+    }
+}
 
 /// `txn f` (0x31): push Txn.Fields[f] for the current transaction.
 /// 1 immediate: field byte.
@@ -41,6 +60,7 @@ pub fn op_txn(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field = get_uint8(instruction)?;
+    check_txn_field_version(field, machine.version)?;
     let group_index = ctx.group_index();
     let val = ctx.txn_field(group_index, field, None)?;
     machine.push(teal_to_avm(val))
@@ -54,6 +74,7 @@ pub fn op_gtxn(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let (group_index, field) = get_uint8_pair(instruction)?;
+    check_txn_field_version(field, machine.version)?;
     let val = ctx.txn_field(group_index as usize, field, None)?;
     machine.push(teal_to_avm(val))
 }
@@ -66,6 +87,7 @@ pub fn op_txna(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let (field, array_index) = get_uint8_pair(instruction)?;
+    check_txn_field_version(field, machine.version)?;
     let group_index = ctx.group_index();
     let val = ctx.txn_field(group_index, field, Some(array_index as usize))?;
     machine.push(teal_to_avm(val))
@@ -79,6 +101,7 @@ pub fn op_gtxna(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let (group_index, field, array_index) = get_uint8_triple(instruction)?;
+    check_txn_field_version(field, machine.version)?;
     let val = ctx.txn_field(group_index as usize, field, Some(array_index as usize))?;
     machine.push(teal_to_avm(val))
 }
@@ -91,6 +114,7 @@ pub fn op_gtxns(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field = get_uint8(instruction)?;
+    check_txn_field_version(field, machine.version)?;
     let group_index = machine.pop_uint()? as usize;
     let val = ctx.txn_field(group_index, field, None)?;
     machine.push(teal_to_avm(val))
@@ -104,6 +128,7 @@ pub fn op_gtxnsa(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let (field, array_index) = get_uint8_pair(instruction)?;
+    check_txn_field_version(field, machine.version)?;
     let group_index = machine.pop_uint()? as usize;
     let val = ctx.txn_field(group_index, field, Some(array_index as usize))?;
     machine.push(teal_to_avm(val))
@@ -117,6 +142,7 @@ pub fn op_txnas(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field = get_uint8(instruction)?;
+    check_txn_field_version(field, machine.version)?;
     let array_index = machine.pop_uint()? as usize;
     let group_index = ctx.group_index();
     let val = ctx.txn_field(group_index, field, Some(array_index))?;
@@ -131,6 +157,7 @@ pub fn op_gtxnas(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let (group_index, field) = get_uint8_pair(instruction)?;
+    check_txn_field_version(field, machine.version)?;
     let array_index = machine.pop_uint()? as usize;
     let val = ctx.txn_field(group_index as usize, field, Some(array_index))?;
     machine.push(teal_to_avm(val))
@@ -145,6 +172,7 @@ pub fn op_gtxnsas(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field = get_uint8(instruction)?;
+    check_txn_field_version(field, machine.version)?;
     let array_index = machine.pop_uint()? as usize;
     let group_index = machine.pop_uint()? as usize;
     let val = ctx.txn_field(group_index, field, Some(array_index))?;
@@ -560,5 +588,81 @@ mod tests {
         let program = bytecode::parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
         assert!(m.run(&mut ctx).is_err());
+    }
+
+    // --- Per-field version gating (issue #810) ---
+    //
+    // Matches go-algorand's shared `fetchField` check (`fs.version >
+    // cx.version`), exercised here via `txn`/`gtxn` (0x31/0x33) directly
+    // against representative fields spanning each version boundary in
+    // `txnFieldSpecs`.
+
+    fn txn_field_at_version(version: u8, field: u8) -> Result<AvmMachine, AlgoError> {
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        run_with_ctx(version, &[0x31, field], &mut ctx)
+    }
+
+    #[test]
+    fn test_txn_field_version_application_id_gated_at_v2() {
+        // ApplicationID (field 24) requires v2.
+        assert!(txn_field_at_version(1, 24).is_err());
+        assert!(txn_field_at_version(2, 24).is_ok());
+    }
+
+    #[test]
+    fn test_txn_field_version_assets_gated_at_v3() {
+        // Assets (field 48) requires v3.
+        assert!(txn_field_at_version(2, 48).is_err());
+        assert!(txn_field_at_version(3, 48).is_ok());
+    }
+
+    #[test]
+    fn test_txn_field_version_extra_program_pages_gated_at_v4() {
+        // ExtraProgramPages (field 56) requires v4.
+        assert!(txn_field_at_version(3, 56).is_err());
+        assert!(txn_field_at_version(4, 56).is_ok());
+    }
+
+    #[test]
+    fn test_txn_field_version_nonparticipation_gated_at_v5() {
+        // Nonparticipation (field 57) requires v5.
+        assert!(txn_field_at_version(4, 57).is_err());
+        assert!(txn_field_at_version(5, 57).is_ok());
+    }
+
+    #[test]
+    fn test_txn_field_version_last_log_gated_at_v6() {
+        // LastLog (field 62) requires v6.
+        assert!(txn_field_at_version(5, 62).is_err());
+        assert!(txn_field_at_version(6, 62).is_ok());
+    }
+
+    #[test]
+    fn test_txn_field_version_first_valid_time_gated_at_v7() {
+        // FirstValidTime (field 3) requires v7 (randomnessVersion).
+        assert!(txn_field_at_version(6, 3).is_err());
+        assert!(txn_field_at_version(7, 3).is_ok());
+    }
+
+    #[test]
+    fn test_txn_field_version_reject_version_gated_at_v12() {
+        // RejectVersion (field 68) requires v12.
+        assert!(txn_field_at_version(11, 68).is_err());
+        assert!(txn_field_at_version(12, 68).is_ok());
+    }
+
+    #[test]
+    fn test_txn_field_version_sender_available_since_v1() {
+        // Sender (field 0) has version 0 -- always available.
+        assert!(txn_field_at_version(1, 0).is_ok());
+    }
+
+    #[test]
+    fn test_gtxn_field_version_gating_applies_too() {
+        // gtxn (0x33) shares the same per-field version check as txn.
+        let mut ctx = TestTxnContext::new(0, 2, vec![]);
+        // ApplicationID (field 24) requires v2; gtxn target=0.
+        assert!(run_with_ctx(1, &[0x33, 0x00, 24], &mut ctx).is_err());
+        assert!(run_with_ctx(2, &[0x33, 0x00, 24], &mut ctx).is_ok());
     }
 }

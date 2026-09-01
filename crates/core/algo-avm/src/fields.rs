@@ -93,6 +93,34 @@ field_enum! {
     }
 }
 
+impl GlobalField {
+    /// Returns the AVM version in which this field became readable via
+    /// `global`. Values match go-algorand's `globalFieldSpecs[].version`
+    /// (`data/transactions/logic/fields.go`), enforced by go's `opGlobal`
+    /// (`fs.version > cx.version`).
+    pub fn version(&self) -> u8 {
+        match self {
+            Self::MinTxnFee
+            | Self::MinBalance
+            | Self::MaxTxnLife
+            | Self::ZeroAddress
+            | Self::GroupSize => 0,
+            Self::LogicSigVersion | Self::Round | Self::LatestTimestamp => 2,
+            Self::CurrentApplicationID => 2,
+            Self::CreatorAddress => 3,
+            Self::CurrentApplicationAddress | Self::GroupID => 5,
+            Self::OpcodeBudget | Self::CallerApplicationID | Self::CallerApplicationAddress => 6,
+            Self::AssetCreateMinBalance | Self::AssetOptInMinBalance | Self::GenesisHash => 10,
+            // incentiveVersion (data/transactions/logic/opcodes.go).
+            Self::PayoutsEnabled
+            | Self::PayoutsGoOnlineFee
+            | Self::PayoutsPercent
+            | Self::PayoutsMinBalance
+            | Self::PayoutsMaxBalance => 11,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TxnField — `txn`/`gtxn`/`txna`/`gtxna`/`gtxns`/`gtxnsa`/`itxn`/`itxn_field`
 //             opcodes (0x31, 0x33, 0x36, 0x37, 0x38, 0x39, 0xb2, 0xb4, etc.)
@@ -209,6 +237,19 @@ field_enum! {
         AssetFreeze = 9,
         AssetClawback = 10,
         AssetCreator = 11,
+    }
+}
+
+impl AssetParamsField {
+    /// Returns the AVM version in which this field became readable via
+    /// `asset_params_get`. Values match go-algorand's
+    /// `assetParamsFieldSpecs[].version` (`data/transactions/logic/fields.go`),
+    /// enforced by go's `opAssetParamsGet` (`fs.version > cx.version`).
+    pub fn version(&self) -> u8 {
+        match self {
+            Self::AssetCreator => 5,
+            _ => 2,
+        }
     }
 }
 
@@ -329,6 +370,30 @@ field_enum! {
     }
 }
 
+impl AcctParamsField {
+    /// Returns the AVM version in which this field became readable via
+    /// `acct_params_get`. Values match go-algorand's
+    /// `acctParamsFieldSpecs[].version` (`data/transactions/logic/fields.go`),
+    /// enforced by go's `opAcctParamsGet` (`fs.version > cx.version`).
+    pub fn version(&self) -> u8 {
+        match self {
+            Self::AcctBalance | Self::AcctMinBalance | Self::AcctAuthAddr => 6,
+            Self::AcctTotalNumUint
+            | Self::AcctTotalNumByteSlice
+            | Self::AcctTotalExtraAppPages
+            | Self::AcctTotalAppsCreated
+            | Self::AcctTotalAppsOptedIn
+            | Self::AcctTotalAssetsCreated
+            | Self::AcctTotalAssets => 8,
+            // go's `boxVersion` (data/transactions/logic/opcodes.go) --
+            // distinct from `FOREIGN_BOX_VERSION`/`foreignBoxVersion` (13).
+            Self::AcctTotalBoxes | Self::AcctTotalBoxBytes => 8,
+            // incentiveVersion (data/transactions/logic/opcodes.go).
+            Self::AcctIncentiveEligible | Self::AcctLastProposed | Self::AcctLastHeartbeat => 11,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TxnField — Display and itx_version helpers (matching go-algorand exactly)
 // ---------------------------------------------------------------------------
@@ -413,6 +478,84 @@ impl std::fmt::Display for TxnField {
 }
 
 impl TxnField {
+    /// Returns the AVM version in which this field became readable via
+    /// `txn`/`gtxn`/`txna`/`gtxna`/etc. Values match go-algorand's
+    /// `txnFieldSpecs[].version` (`data/transactions/logic/fields.go`),
+    /// enforced by go's shared `fetchField` (`fs.version > cx.version`).
+    pub fn version(&self) -> u8 {
+        match self {
+            Self::Sender
+            | Self::Fee
+            | Self::FirstValid
+            | Self::LastValid
+            | Self::Note
+            | Self::Lease
+            | Self::Receiver
+            | Self::Amount
+            | Self::CloseRemainderTo
+            | Self::VotePK
+            | Self::SelectionPK
+            | Self::VoteFirst
+            | Self::VoteLast
+            | Self::VoteKeyDilution
+            | Self::Type
+            | Self::TypeEnum
+            | Self::XferAsset
+            | Self::AssetAmount
+            | Self::AssetSender
+            | Self::AssetReceiver
+            | Self::AssetCloseTo
+            | Self::GroupIndex
+            | Self::TxID => 0,
+            // FirstValidTime: go's randomnessVersion (data/transactions/logic/opcodes.go).
+            Self::FirstValidTime => 7,
+            Self::ApplicationID
+            | Self::OnCompletion
+            | Self::ApplicationArgs
+            | Self::NumAppArgs
+            | Self::Accounts
+            | Self::NumAccounts
+            | Self::ApprovalProgram
+            | Self::ClearStateProgram
+            | Self::RekeyTo
+            | Self::ConfigAsset
+            | Self::ConfigAssetTotal
+            | Self::ConfigAssetDecimals
+            | Self::ConfigAssetDefaultFrozen
+            | Self::ConfigAssetUnitName
+            | Self::ConfigAssetName
+            | Self::ConfigAssetURL
+            | Self::ConfigAssetMetadataHash
+            | Self::ConfigAssetManager
+            | Self::ConfigAssetReserve
+            | Self::ConfigAssetFreeze
+            | Self::ConfigAssetClawback
+            | Self::FreezeAsset
+            | Self::FreezeAssetAccount
+            | Self::FreezeAssetFrozen => 2,
+            Self::Assets
+            | Self::NumAssets
+            | Self::Applications
+            | Self::NumApplications
+            | Self::GlobalNumUint
+            | Self::GlobalNumByteSlice
+            | Self::LocalNumUint
+            | Self::LocalNumByteSlice => 3,
+            Self::ExtraProgramPages => 4,
+            Self::Nonparticipation
+            | Self::Logs
+            | Self::NumLogs
+            | Self::CreatedAssetID
+            | Self::CreatedApplicationID => 5,
+            Self::LastLog | Self::StateProofPK => 6,
+            Self::ApprovalProgramPages
+            | Self::NumApprovalProgramPages
+            | Self::ClearStateProgramPages
+            | Self::NumClearStateProgramPages => 7,
+            Self::RejectVersion => 12,
+        }
+    }
+
     /// Returns the AVM version in which this field became settable via
     /// `itxn_field`. Returns 0 if the field can never be set in an inner
     /// transaction. Values match go-algorand's `txnFieldSpecs[].itxVersion`.
@@ -578,6 +721,32 @@ field_enum! {
         URLEncoding = 0,
         /// Standard base64 encoding (RFC 4648).
         StdEncoding = 1,
+    }
+}
+
+impl BlockField {
+    /// Returns the AVM version in which this field became readable via
+    /// `block`. Values match go-algorand's `blockFieldSpecs[].version`
+    /// (`data/transactions/logic/fields.go`), enforced by go's `opBlock`
+    /// (`fs.version > cx.version`). Note: go-algorand v5.0.0-stable also
+    /// defines 4 further block fields (v13+: `BlkBranch512`,
+    /// `BlkSha512_256TxnCommitment`, `BlkSha256TxnCommitment`,
+    /// `BlkSha512TxnCommitment`) that this enum does not yet model at all
+    /// -- a separate not-implemented gap, tracked outside this method.
+    pub fn version(&self) -> u8 {
+        match self {
+            // randomnessVersion (data/transactions/logic/opcodes.go).
+            Self::BlkSeed | Self::BlkTimestamp => 7,
+            // incentiveVersion (data/transactions/logic/opcodes.go).
+            Self::BlkProposer
+            | Self::BlkFeesCollected
+            | Self::BlkBonus
+            | Self::BlkBranch
+            | Self::BlkFeeSink
+            | Self::BlkProtocol
+            | Self::BlkTxnCounter
+            | Self::BlkProposerPayout => 11,
+        }
     }
 }
 

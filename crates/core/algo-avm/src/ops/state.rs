@@ -296,7 +296,13 @@ pub fn op_asset_params_get(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field_byte = get_uint8(instruction)?;
-    let _field = AssetParamsField::from_u8(field_byte)?;
+    let field = AssetParamsField::from_u8(field_byte)?;
+    // Matches go-algorand's opAssetParamsGet: `fs.version > cx.version`.
+    if field.version() > machine.version {
+        return Err(AlgoError::Avm {
+            message: format!("invalid asset_params_get field {field_byte}"),
+        });
+    }
     let asset_id_raw = machine.pop_uint()?;
     let asset_id = ctx.resolve_asset(asset_id_raw)?;
     let (value, exists) = ctx.asset_params_get(asset_id, field_byte)?;
@@ -381,7 +387,13 @@ pub fn op_acct_params_get(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field_byte = get_uint8(instruction)?;
-    let _field = AcctParamsField::from_u8(field_byte)?;
+    let field = AcctParamsField::from_u8(field_byte)?;
+    // Matches go-algorand's opAcctParamsGet: `fs.version > cx.version`.
+    if field.version() > machine.version {
+        return Err(AlgoError::Avm {
+            message: format!("invalid acct_params_get field {field_byte}"),
+        });
+    }
     let acct_val = machine.pop()?;
     let addr = resolve_account(acct_val, ctx)?;
     let (value, exists) = ctx.acct_params_get(&addr, field_byte)?;
@@ -489,7 +501,13 @@ pub fn op_block(
 ) -> Result<(), AlgoError> {
     let field_byte = get_uint8(instruction)?;
     // Validate the field index is a known BlockField
-    let _field = crate::fields::BlockField::from_u8(field_byte)?;
+    let field = crate::fields::BlockField::from_u8(field_byte)?;
+    // Matches go-algorand's opBlock: `fs.version > cx.version`.
+    if field.version() > machine.version {
+        return Err(AlgoError::Avm {
+            message: format!("invalid block field {field_byte}"),
+        });
+    }
     let round = machine.pop_uint()?;
     let value = ctx.block_field(round, field_byte)?;
     machine.push(value)
@@ -1895,6 +1913,28 @@ mod tests {
     }
 
     #[test]
+    fn test_asset_params_get_creator_field_version_gated_at_v5() {
+        // AssetCreator (field 11) requires v5; the opcode itself only
+        // requires v2, so a v4 program can use asset_params_get for other
+        // fields but must be rejected for AssetCreator specifically.
+        let mut ctx = TestStateContext::new(100);
+        ctx.asset_params
+            .insert((99, 11), (TealValue::Bytes(vec![0xAA; 32]), true));
+        let code = vec![0x81, 99, 0x71, 11];
+
+        let raw_v4 = prog(4, &code);
+        let program_v4 = bytecode::parse(&raw_v4).unwrap();
+        let mut m4 = AvmMachine::new(program_v4, ExecMode::Application, 20000);
+        m4.step(&mut ctx).unwrap(); // pushint
+        assert!(m4.step(&mut ctx).is_err());
+
+        let raw_v5 = prog(5, &code);
+        let program_v5 = bytecode::parse(&raw_v5).unwrap();
+        let mut m5 = AvmMachine::new(program_v5, ExecMode::Application, 20000);
+        assert!(step_n(&mut m5, &mut ctx, 2).is_ok());
+    }
+
+    #[test]
     fn test_app_params_get() {
         let mut ctx = TestStateContext::new(100);
         // field 7 = AppCreator
@@ -2066,6 +2106,53 @@ mod tests {
         assert_eq!(m.stack.len(), 2);
         assert_eq!(m.stack[0], AvmValue::Uint64(9_000_000));
         assert_eq!(m.stack[1], AvmValue::Uint64(1));
+    }
+
+    #[test]
+    fn test_acct_params_get_total_num_uint_field_version_gated_at_v8() {
+        // AcctTotalNumUint (field 3) requires v8; the opcode itself only
+        // requires v6.
+        let addr = test_addr(0x0F);
+        let mut ctx = TestStateContext::new(100);
+        ctx.acct_params
+            .insert((addr, 3), (TealValue::Uint(2), true));
+        let mut code = vec![0x80, 0x20];
+        code.extend_from_slice(&addr);
+        code.extend_from_slice(&[0x73, 3]); // acct_params_get AcctTotalNumUint
+
+        let raw_v7 = prog(7, &code);
+        let program_v7 = bytecode::parse(&raw_v7).unwrap();
+        let mut m7 = AvmMachine::new(program_v7, ExecMode::Application, 20000);
+        m7.step(&mut ctx).unwrap(); // pushbytes addr
+        assert!(m7.step(&mut ctx).is_err());
+
+        let raw_v8 = prog(8, &code);
+        let program_v8 = bytecode::parse(&raw_v8).unwrap();
+        let mut m8 = AvmMachine::new(program_v8, ExecMode::Application, 20000);
+        assert!(step_n(&mut m8, &mut ctx, 2).is_ok());
+    }
+
+    #[test]
+    fn test_acct_params_get_incentive_eligible_field_version_gated_at_v11() {
+        // AcctIncentiveEligible (field 12) requires incentiveVersion (v11).
+        let addr = test_addr(0x10);
+        let mut ctx = TestStateContext::new(100);
+        ctx.acct_params
+            .insert((addr, 12), (TealValue::Uint(1), true));
+        let mut code = vec![0x80, 0x20];
+        code.extend_from_slice(&addr);
+        code.extend_from_slice(&[0x73, 12]); // acct_params_get AcctIncentiveEligible
+
+        let raw_v10 = prog(10, &code);
+        let program_v10 = bytecode::parse(&raw_v10).unwrap();
+        let mut m10 = AvmMachine::new(program_v10, ExecMode::Application, 20000);
+        m10.step(&mut ctx).unwrap();
+        assert!(m10.step(&mut ctx).is_err());
+
+        let raw_v11 = prog(11, &code);
+        let program_v11 = bytecode::parse(&raw_v11).unwrap();
+        let mut m11 = AvmMachine::new(program_v11, ExecMode::Application, 20000);
+        assert!(step_n(&mut m11, &mut ctx, 2).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -2369,6 +2456,27 @@ mod tests {
             msg.contains("block field access not available"),
             "got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_block_proposer_field_version_gated_at_v11() {
+        // BlkProposer (field 2) requires incentiveVersion (v11); the
+        // opcode itself only requires v7 (randomnessVersion).
+        let mut ctx = TestStateContext::new(100);
+        ctx.block_fields
+            .insert((99, 2), AvmValue::Bytes(vec![0xEE; 32]));
+        let code = vec![0x81, 99, 0xd1, 2];
+
+        let raw_v10 = prog(10, &code);
+        let program_v10 = bytecode::parse(&raw_v10).unwrap();
+        let mut m10 = AvmMachine::new(program_v10, ExecMode::Application, 20000);
+        m10.step(&mut ctx).unwrap(); // pushint round
+        assert!(m10.step(&mut ctx).is_err());
+
+        let raw_v11 = prog(11, &code);
+        let program_v11 = bytecode::parse(&raw_v11).unwrap();
+        let mut m11 = AvmMachine::new(program_v11, ExecMode::Application, 20000);
+        assert!(step_n(&mut m11, &mut ctx, 2).is_ok());
     }
 
     // -----------------------------------------------------------------------
