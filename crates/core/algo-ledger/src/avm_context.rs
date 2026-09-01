@@ -7733,6 +7733,85 @@ mod tests {
     }
 
     #[test]
+    fn resource_availability_group_sharing_v9_plus() {
+        // Two sibling txns: the executing appl (index 1) references nothing
+        // itself, but its sibling pay txn (index 0) names an account, and a
+        // sibling axfer/acfg-style transaction shares an asset. At v9+ these
+        // become available to the appl via group-wide sharing (issue #808).
+        let shared_account = [77u8; 32];
+        let pay = make_pay_txn([10u8; 32], shared_account, 5000);
+        let appl = make_appl_txn([20u8; 32], 42, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![pay, appl]);
+        ctx.group_index = 1;
+        ctx.set_program_version(9);
+
+        assert!(
+            ctx.is_account_available(&shared_account),
+            "v9+ program should see the sibling pay txn's receiver via group sharing"
+        );
+    }
+
+    #[test]
+    fn resource_availability_group_sharing_gated_below_v9() {
+        // The same setup, but the executing program is v8: group-wide
+        // sharing must not apply yet (matches go's
+        // `cx.version >= sharedResourcesVersion` gate).
+        let shared_account = [78u8; 32];
+        let pay = make_pay_txn([10u8; 32], shared_account, 5000);
+        let appl = make_appl_txn([20u8; 32], 42, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![pay, appl]);
+        ctx.group_index = 1;
+        ctx.set_program_version(8);
+
+        assert!(
+            !ctx.is_account_available(&shared_account),
+            "below v9, a sibling txn's account must not be available via group sharing"
+        );
+    }
+
+    #[test]
+    fn resource_availability_account_own_sender_and_accounts_array() {
+        let sender = [10u8; 32];
+        let named = [11u8; 32];
+        let stranger = [12u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![Address(named)], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.set_program_version(8);
+
+        assert!(ctx.is_account_available(&sender));
+        assert!(ctx.is_account_available(&named));
+        assert!(!ctx.is_account_available(&stranger));
+        // The current app's own address is always available.
+        assert!(ctx.is_account_available(&app_address(42)));
+    }
+
+    #[test]
+    fn fill_group_resources_covers_pay_acfg_axfer_afrz_appl() {
+        let receiver = [21u8; 32];
+        let close = [22u8; 32];
+        let pay = {
+            let mut t = make_pay_txn([20u8; 32], receiver, 1000);
+            t.txn.close_remainder_to = Address(close);
+            t
+        };
+        let appl = make_appl_txn([30u8; 32], 0, vec![Address([31u8; 32])], vec![55], vec![66]);
+        let group = vec![pay, appl];
+        let resources = fill_group_resources(&group);
+
+        assert!(resources.shared_accounts.contains(&receiver));
+        assert!(resources.shared_accounts.contains(&close));
+        assert!(resources.shared_accounts.contains(&[20u8; 32]));
+        assert!(resources.shared_accounts.contains(&[30u8; 32]));
+        assert!(resources.shared_accounts.contains(&[31u8; 32]));
+        assert!(resources.shared_apps.contains(&55));
+        assert!(resources.shared_accounts.contains(&app_address(55)));
+        assert!(resources.shared_asas.contains(&66));
+    }
+
+    #[test]
     fn gitxn_reads_correct_fields_from_inner_group() {
         // Submit a group of 2 inner txns (pay + acfg create),
         // then use gitxn to read specific fields from each.

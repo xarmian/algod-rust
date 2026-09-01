@@ -32,9 +32,9 @@ statically validated.
 ## Sub-issues (priority-first within each group)
 
 **Correctness bugs:**
-- [ ] #808 — avm: implement transaction-group resource-availability enforcement — **highest priority**
+- [x] #808 — avm: implement transaction-group resource-availability enforcement (foreign-array-style sharing + raw-address gate) — **highest priority**; holding/local-state cross-product sharing and tx.Access resolution split to #841
 - [x] #809 — avm/ledger: fix app-call guard correctness bugs — merged via PR #838
-- [ ] #810 — avm: add per-field version gating for global/txn/gtxn/asset_params_get/acct_params_get/block
+- [x] #810 — avm: add per-field version gating for global/txn/gtxn/asset_params_get/acct_params_get/block — merged via PR #840; found gap in v13+ block fields split to #839
 - [x] #811 — avm: implement RekeyTo/ApplicationCall minimum-AVM-version rule — merged via PR #831
 - [x] #812 — validate: add per-type WellFormed() mempool validation — merged via PR #837
 - [x] #813 — consensus: reconcile Falcon-512 vs Falcon-1024 parameter-set naming — resolved-by-investigation, no bug found (false alarm from audit test-name grepping)
@@ -42,6 +42,8 @@ statically validated.
 - [ ] #833 — ledger: implement block-proposal-side absentee/suspension list computation (split from #815)
 - [x] #816 — rest-api: add PQ authorizer/LogicSig-curve compliance checks and stateproof-for-round polling — merged via PR #836; simulate placeholder-PQ-sig moved to #835
 - [x] #822 — crypto: enforce decode-time allocation bounds in merklearray proof decoder — merged via PR #832
+- [ ] #839 — avm: implement missing v13+ block opcode fields (BlkBranch512, BlkSha512_256/256/512TxnCommitment) (split from #810)
+- [ ] #841 — avm: implement holding/local-state cross-product resource sharing and tx.Access-list resolution (split from #808)
 
 **Net-new subsystems:**
 - [ ] #814 — stateproof: implement a signing/proving worker
