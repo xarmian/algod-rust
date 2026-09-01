@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+#
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+#
 # List every Go test function in the pinned go-algorand reference checkout
 # (../go-algorand relative to this repo), as a TSV:
 #   package<TAB>test_name<TAB>file<TAB>line
