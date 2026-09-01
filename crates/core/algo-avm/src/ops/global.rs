@@ -59,6 +59,14 @@ pub fn op_global(
     // Validate the field index is known.
     let field = GlobalField::from_u8(field_byte)?;
 
+    // Enforce per-field version gating (Go: `opGlobal`'s
+    // `fs.version > cx.version` check, `data/transactions/logic/eval.go`).
+    if field.version() > machine.version {
+        return Err(AlgoError::Avm {
+            message: format!("invalid global field {field_byte}"),
+        });
+    }
+
     // Enforce per-field mode restrictions (Go: `if (cx.runMode & fs.mode) == 0`).
     if is_app_mode_only(field) && machine.mode == ExecMode::LogicSig {
         return Err(AlgoError::Avm {
@@ -126,7 +134,10 @@ mod tests {
                 GlobalField::Round => Ok(TealValue::Uint(42)),
                 GlobalField::LatestTimestamp => Ok(TealValue::Uint(1_700_000_000)),
                 GlobalField::CurrentApplicationID => Ok(TealValue::Uint(123)),
+                GlobalField::CreatorAddress => Ok(TealValue::Bytes(vec![0xCC; 32])),
+                GlobalField::GroupID => Ok(TealValue::Bytes(vec![0xDD; 32])),
                 GlobalField::GenesisHash => Ok(TealValue::Bytes(vec![0xAB; 32])),
+                GlobalField::PayoutsEnabled => Ok(TealValue::Uint(1)),
                 _ => NullContext.global_field(field),
             }
         }
@@ -191,8 +202,8 @@ mod tests {
 
     #[test]
     fn global_genesis_hash() {
-        // Program: global GenesisHash (field 17)
-        let raw = prog(2, &[0x32, 0x11]);
+        // Program: global GenesisHash (field 17), which requires v10+.
+        let raw = prog(10, &[0x32, 0x11]);
         let program = parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
         m.step(&mut TestGlobalContext).unwrap();
@@ -283,5 +294,66 @@ mod tests {
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
         let result = m.run(&mut TestGlobalContext).unwrap();
         assert!(result);
+    }
+
+    // --- Per-field version gating (issue #810) ---
+    //
+    // Matches go-algorand's `opGlobal`'s `fs.version > cx.version` check,
+    // exercised against representative fields spanning each version
+    // boundary in `globalFieldSpecs`.
+
+    fn global_field_at_version(version: u8, field: u8) -> Result<(), AlgoError> {
+        let raw = prog(version, &[0x32, field]);
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
+        m.step(&mut TestGlobalContext).map(|_| ())
+    }
+
+    #[test]
+    fn test_global_field_version_min_txn_fee_available_since_v1() {
+        // MinTxnFee (field 0) has version 0 -- always available.
+        assert!(global_field_at_version(1, 0).is_ok());
+    }
+
+    #[test]
+    fn test_global_field_version_round_gated_at_v2() {
+        // Round (field 6) requires v2.
+        assert!(global_field_at_version(1, 6).is_err());
+        assert!(global_field_at_version(2, 6).is_ok());
+    }
+
+    #[test]
+    fn test_global_field_version_creator_address_gated_at_v3() {
+        // CreatorAddress (field 9) requires v3.
+        assert!(global_field_at_version(2, 9).is_err());
+        assert!(global_field_at_version(3, 9).is_ok());
+    }
+
+    #[test]
+    fn test_global_field_version_group_id_gated_at_v5() {
+        // GroupID (field 11) requires v5.
+        assert!(global_field_at_version(4, 11).is_err());
+        assert!(global_field_at_version(5, 11).is_ok());
+    }
+
+    #[test]
+    fn test_global_field_version_opcode_budget_gated_at_v6() {
+        // OpcodeBudget (field 12) requires v6.
+        assert!(global_field_at_version(5, 12).is_err());
+        assert!(global_field_at_version(6, 12).is_ok());
+    }
+
+    #[test]
+    fn test_global_field_version_genesis_hash_gated_at_v10() {
+        // GenesisHash (field 17) requires v10.
+        assert!(global_field_at_version(9, 17).is_err());
+        assert!(global_field_at_version(10, 17).is_ok());
+    }
+
+    #[test]
+    fn test_global_field_version_payouts_enabled_gated_at_v11() {
+        // PayoutsEnabled (field 18) requires incentiveVersion (v11).
+        assert!(global_field_at_version(10, 18).is_err());
+        assert!(global_field_at_version(11, 18).is_ok());
     }
 }
