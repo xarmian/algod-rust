@@ -1935,6 +1935,50 @@ fn reset_expired_online_accounts<L: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
+/// Factor controlling how many rounds of silence are tolerated before an
+/// online account becomes eligible for absentee suspension, scaled by the
+/// account's share of total online stake (go-algorand's `absentFactor`,
+/// `ledger/eval/eval.go`).
+#[allow(dead_code)]
+const ABSENT_FACTOR: u64 = 20;
+
+/// Whether an online account should be considered absent (silent for
+/// suspiciously long, relative to its stake) as of `current`, mirroring
+/// go-algorand's `isAbsent` (`ledger/eval/eval.go`). Pure function; the
+/// block-assembly-time loop that computes `total_online_stake`/`acct_stake`/
+/// `last_seen` for every online account and calls this is tracked
+/// separately (issue #833's remaining block-proposal-side scope, split to
+/// a follow-up issue) -- until that lands, this is only exercised by its
+/// own unit tests, hence the `allow`.
+#[allow(dead_code)]
+pub(crate) fn is_absent(
+    total_online_stake: u64,
+    acct_stake: u64,
+    last_seen: u64,
+    current: u64,
+) -> bool {
+    // Don't consider accounts that were online when payouts went into effect
+    // as absent -- they get noticed the next time they propose or keyreg.
+    if last_seen == 0 || acct_stake == 0 {
+        return false;
+    }
+    // allowable_lag = ABSENT_FACTOR * total_online_stake / acct_stake,
+    // computed in u128 so the multiply can never itself overflow (unlike
+    // go's `Muldiv`, which multiplies via two u64 words and can overflow a
+    // u64 quotient). The `> u32::MAX` bound below is strictly tighter than
+    // that u64-quotient-overflow case, so it's checked either way -- a
+    // dedicated overflow flag isn't needed.
+    let allowable_lag =
+        (ABSENT_FACTOR as u128) * (total_online_stake as u128) / (acct_stake as u128);
+    // Just return false for a huge allowable_lag: it implies the lag is
+    // longer than any network could be around, and computing with
+    // wraparound is annoying.
+    if allowable_lag > u32::MAX as u128 {
+        return false;
+    }
+    last_seen.saturating_add(allowable_lag as u64) < current
+}
+
 /// Validate absent participation accounts at end of block.
 ///
 /// Mirrors go-algorand's `validateAbsentOnlineAccounts`. Gated on the
@@ -1943,9 +1987,13 @@ fn reset_expired_online_accounts<L: crate::store_trait::LedgerStore>(
 /// Checks: count <= max, no duplicate addresses, each account is Online
 /// with non-zero balance and IncentiveEligible.
 ///
-/// Note: Go also checks isAbsent (via online stake / voting stake) and
-/// challenge failure (via FindChallenge + ch.Failed). Those require
-/// agreement-level data not yet available here — deferred to Phase 6.
+/// Note: Go also checks isAbsent (via online stake / voting stake, see
+/// [`is_absent`] above) and challenge failure (via FindChallenge +
+/// ch.Failed, see `heartbeat::find_challenge`/`Challenge::failed`). Wiring
+/// those into this validation path -- and into block-assembly-time
+/// computation of the list in the first place -- requires new plumbing in
+/// `algo-pool`/`algo-agreement` not yet in place; tracked as the remaining
+/// scope of issue #833.
 fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
     store: &L,
     block: &Block,
@@ -4740,6 +4788,47 @@ pub struct BoxBudgetState {
 mod tests {
     use super::*;
     use crate::state::LedgerState;
+
+    // ── isAbsent (issue #833) ───────────────────────────────────────
+    // Ported directly from go-algorand's TestIsAbsent
+    // (ledger/eval/eval_test.go), which calls `isAbsent` with raw
+    // `basics.Algos(n)`-scaled values; since `is_absent` only ever
+    // consumes `total_online_stake`/`acct_stake` as a ratio, using the
+    // same unscaled integers here is behavior-equivalent.
+
+    #[test]
+    fn is_absent_matches_go_test_vectors() {
+        // 1% of stake, absent for 1000 rounds -- not yet absent.
+        assert!(!is_absent(1000, 10, 5000, 6000));
+        // 1% of stake, absent for 2000 rounds -- still not yet absent
+        // (allowable_lag == 2000, and the check is strict `<`).
+        assert!(!is_absent(1000, 10, 5000, 7000));
+        // One round past the allowable lag -- now absent.
+        assert!(is_absent(1000, 10, 5000, 7001));
+        // More acct stake drives the allowable lag down, making it absent
+        // at the same `current` that 10 wasn't.
+        assert!(is_absent(1000, 11, 5000, 7000));
+        // Less acct stake raises the allowable lag -- not absent.
+        assert!(!is_absent(1000, 9, 5000, 7001));
+        // More online stake also raises the allowable lag -- not absent.
+        assert!(!is_absent(1001, 10, 5000, 7001));
+        // Never seen (last_seen == 0) is never absent.
+        assert!(!is_absent(1000, 10, 0, 2001));
+        assert!(is_absent(1000, 10, 1, 2002));
+    }
+
+    #[test]
+    fn is_absent_false_when_acct_stake_zero() {
+        assert!(!is_absent(1000, 0, 5000, 1_000_000));
+    }
+
+    #[test]
+    fn is_absent_false_on_huge_allowable_lag() {
+        // A vanishingly small acct_stake relative to total_online_stake
+        // drives allowable_lag far past u32::MAX -- must return false
+        // rather than compute a bogus (wrapped or absurd) result.
+        assert!(!is_absent(u64::MAX, 1, 1, u64::MAX));
+    }
 
     fn make_state_with_accounts(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
         let mut state = LedgerState::new();
