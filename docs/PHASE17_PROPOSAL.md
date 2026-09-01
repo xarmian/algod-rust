@@ -5,8 +5,8 @@ test, across the entire pinned `v5.0.0-stable` reference — not scoped
 to any single subsystem or version delta — and closes the real gaps it
 finds.
 
-Tracking epic: see `docs/PHASE17_TEST_PARITY.md` for the full evidence
-map; the epic issue number is recorded there once filed.
+Tracking epic: [#830](https://github.com/xarmian/algod-rust/issues/830).
+See `docs/PHASE17_TEST_PARITY.md` for the full evidence map.
 
 ## Motivation
 

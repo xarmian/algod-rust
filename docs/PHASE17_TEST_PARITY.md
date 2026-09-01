@@ -8,6 +8,8 @@ This document is the test-level evidence map for
 `func TestXxx` in the pinned go-algorand checkout: does algod-rust have a
 test proving the same behavior, and if not, why not.
 
+Tracking epic: [#830](https://github.com/xarmian/algod-rust/issues/830).
+
 ## How this was built
 
 1. [`scripts/list_go_tests.sh`](../scripts/list_go_tests.sh) walks the
