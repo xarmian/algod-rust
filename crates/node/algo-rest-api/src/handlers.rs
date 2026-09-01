@@ -2533,6 +2533,16 @@ fn application_boxes_max_keys(requested_max: u64, algod_max: u64) -> u64 {
 // POST /v2/transactions
 // ---------------------------------------------------------------------------
 
+/// Query parameters for the raw-transaction submission endpoints.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RawTransactionParams {
+    /// When `true`, bypasses the PQ-authorizer-compliance and on-curve
+    /// escrow-LogicSig checks. Matches go-algorand's `skip-pq-address-check`
+    /// query parameter.
+    #[serde(rename = "skip-pq-address-check")]
+    pub skip_pq_address_check: Option<bool>,
+}
+
 /// Submit a raw transaction (or transaction group) to the network.
 ///
 /// Accepts a msgpack-encoded `SignedTxn` (or concatenated group of SignedTxns)
@@ -2543,6 +2553,7 @@ fn application_boxes_max_keys(requested_max: u64, algod_max: u64) -> u64 {
 /// Matches go-algorand's `Handlers.RawTransaction`.
 pub async fn raw_transaction<N: NodeInterface>(
     State(node): State<AppState<N>>,
+    Query(params): Query<RawTransactionParams>,
     body: axum::body::Bytes,
 ) -> Response {
     // Check catchpoint status
@@ -2575,6 +2586,12 @@ pub async fn raw_transaction<N: NodeInterface>(
 
     if txgroup.is_empty() {
         return error::bad_request("empty txgroup");
+    }
+
+    if let Err(e) =
+        crate::pq_compliance::enforce_pq_compliance(&txgroup, params.skip_pq_address_check)
+    {
+        return error::bad_request(e);
     }
 
     // Compute txid of first transaction before broadcasting
@@ -4620,6 +4637,7 @@ pub async fn account_applications_information<N: NodeInterface>(
 /// Matches go-algorand's `Handlers.RawTransactionAsync`.
 pub async fn raw_transaction_async<N: NodeInterface>(
     State(node): State<AppState<N>>,
+    Query(params): Query<RawTransactionParams>,
     body: axum::body::Bytes,
 ) -> Response {
     if !node.enable_experimental_api() {
@@ -4655,6 +4673,12 @@ pub async fn raw_transaction_async<N: NodeInterface>(
 
     if txgroup.is_empty() {
         return error::bad_request("empty txgroup");
+    }
+
+    if let Err(e) =
+        crate::pq_compliance::enforce_pq_compliance(&txgroup, params.skip_pq_address_check)
+    {
+        return error::bad_request(e);
     }
 
     if let Err(e) = node.async_broadcast_signed_tx_group(txgroup).await {

@@ -40,6 +40,12 @@ use serde::Serialize;
 
 use crate::models;
 
+/// Maximum number of rounds [`NodeInterface::get_state_proof_transaction_for_round`]'s
+/// default implementation will scan forward before giving up. See that
+/// method's doc comment for why this bound exists instead of a threaded
+/// cancellation token.
+const STATE_PROOF_SCAN_ROUND_LIMIT: u64 = 1_000_000;
+
 /// Typed error enum for `NodeInterface` methods.
 ///
 /// Replaces `Box<dyn std::error::Error + Send + Sync>` to enable type-safe
@@ -677,13 +683,65 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// Returns an error if no state proof is found or state proofs are
     /// not enabled for this round's protocol version.
     ///
-    /// Mirrors go-algorand's `GetStateProofTransactionForRound`.
+    /// Mirrors go-algorand's `GetStateProofTransactionForRound`
+    /// (`daemon/algod/api/server/v2/handlers.go`): scans blocks from
+    /// `round + 1` up to the node's latest round, looking for a
+    /// `StateProofSender`-authored state-proof transaction whose attested
+    /// range covers `round`. Returns `NodeError::NotImplemented` immediately
+    /// if state proofs aren't enabled for `round`'s consensus version
+    /// (matching go's `ErrNoStateProofForRound` short-circuit), and
+    /// `NodeError::NotFound` if the scan completes without finding one
+    /// (matching go's final `ErrNoStateProofForRound`).
+    ///
+    /// Bounded by [`STATE_PROOF_SCAN_ROUND_LIMIT`] rounds to guarantee
+    /// termination on a request for a very old round with no state proof
+    /// ever covering it, mirroring the intent (not the exact mechanism) of
+    /// go's caller-supplied `ctx`/`stop` cancellation -- this trait has no
+    /// cancellation parameter, so a fixed scan bound is used instead of
+    /// threading a cancellation token through every `NodeInterface`
+    /// implementor for what is, in practice, a bounded local block scan.
     async fn get_state_proof_transaction_for_round(
         &self,
-        _round: u64,
+        round: u64,
     ) -> Result<(u64, u64), NodeError> {
-        Err(NodeError::NotImplemented(
-            "get_state_proof_transaction_for_round",
+        let hdr = self.get_block_header(round).await?;
+        let consensus = algo_types::consensus::consensus_params_for_version(&hdr.current_protocol)
+            .ok_or_else(|| {
+                NodeError::Internal(format!(
+                    "unknown consensus version {}",
+                    hdr.current_protocol
+                ))
+            })?;
+        if consensus.state_proof_interval == 0 {
+            return Err(NodeError::NotFound(
+                "no state proof can be found for that round".to_string(),
+            ));
+        }
+
+        let status = self.status().await?;
+        let latest_round = status.last_round;
+        let scan_end = latest_round.min(round.saturating_add(STATE_PROOF_SCAN_ROUND_LIMIT));
+
+        for r in (round + 1)..=scan_end {
+            let block = match self.get_block(r).await {
+                Ok(b) => b,
+                Err(NodeError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            for stxn in &block.payset {
+                if stxn.txn.sender != Address::STATE_PROOF_SENDER {
+                    continue;
+                }
+                let Some(msg) = &stxn.txn.state_proof_message else {
+                    continue;
+                };
+                if msg.first_attested_round <= round && round <= msg.last_attested_round {
+                    return Ok((msg.first_attested_round, msg.last_attested_round));
+                }
+            }
+        }
+        Err(NodeError::NotFound(
+            "no state proof can be found for that round".to_string(),
         ))
     }
 
@@ -1146,4 +1204,231 @@ pub struct AppResourceWithIDs {
     /// The app params, present only when the app still exists AND the
     /// caller requested `include-params`.
     pub app_params: Option<AppParams>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Minimal `NodeInterface` double exercising only the *default* trait
+    /// methods -- specifically `get_state_proof_transaction_for_round` --
+    /// unlike the integration-test `MockNode`, which overrides that method
+    /// with a canned lookup table for its own (unrelated) test needs.
+    struct MinimalNode {
+        last_round: u64,
+        blocks: BTreeMap<u64, Block>,
+        block_headers: BTreeMap<u64, BlockHeader>,
+    }
+
+    fn base_status(last_round: u64) -> NodeStatus {
+        NodeStatus {
+            last_round,
+            time_since_last_round: 0,
+            catchup_time: 0,
+            last_version: algo_types::consensus::CONSENSUS_CURRENT_VERSION.to_string(),
+            next_version: algo_types::consensus::CONSENSUS_CURRENT_VERSION.to_string(),
+            next_version_round: 0,
+            next_version_supported: true,
+            stopped_at_unsupported_round: false,
+            catchpoint: String::new(),
+            last_catchpoint: String::new(),
+            catchpoint_total_accounts: 0,
+            catchpoint_processed_accounts: 0,
+            catchpoint_verified_accounts: 0,
+            catchpoint_total_kvs: 0,
+            catchpoint_processed_kvs: 0,
+            catchpoint_verified_kvs: 0,
+            catchpoint_total_blocks: 0,
+            catchpoint_acquired_blocks: 0,
+            next_protocol_vote_before: 0,
+            next_protocol_approvals: 0,
+            upgrade_approve: false,
+            upgrade_delay: 0,
+        }
+    }
+
+    fn header_at(round: u64) -> BlockHeader {
+        BlockHeader {
+            round: algo_types::Round(round),
+            current_protocol: algo_types::consensus::CONSENSUS_CURRENT_VERSION.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[async_trait]
+    impl NodeInterface for MinimalNode {
+        fn genesis_id(&self) -> &str {
+            "test-v1.0"
+        }
+        fn genesis_hash(&self) -> &Digest {
+            static ZERO: Digest = Digest([0u8; 32]);
+            &ZERO
+        }
+        fn genesis_json(&self) -> &str {
+            "{}"
+        }
+        async fn status(&self) -> Result<NodeStatus, NodeError> {
+            Ok(base_status(self.last_round))
+        }
+        async fn suggested_fee(&self) -> u64 {
+            1000
+        }
+        async fn min_txn_fee(&self) -> u64 {
+            1000
+        }
+        fn build_version(&self) -> &BuildVersion {
+            static V: std::sync::OnceLock<BuildVersion> = std::sync::OnceLock::new();
+            V.get_or_init(|| BuildVersion {
+                major: 0,
+                minor: 0,
+                build_number: 0,
+                commit_hash: String::new(),
+                branch: String::new(),
+                channel: String::new(),
+            })
+        }
+        fn upgrade_vote_rounds(&self) -> u64 {
+            0
+        }
+        fn upgrade_threshold(&self) -> u64 {
+            0
+        }
+        async fn wait_for_round(&self, _round: u64) -> Result<(), NodeError> {
+            Ok(())
+        }
+        async fn latest_block_header_protocol_info(&self) -> Result<ProtocolSwitchInfo, NodeError> {
+            Ok(ProtocolSwitchInfo {
+                next_protocol: String::new(),
+                next_protocol_supported: true,
+                next_protocol_switch_on: 0,
+            })
+        }
+        async fn get_block(&self, round: u64) -> Result<Block, NodeError> {
+            self.blocks
+                .get(&round)
+                .cloned()
+                .ok_or_else(|| NodeError::NotFound(format!("block {round} not found")))
+        }
+        async fn get_block_header(&self, round: u64) -> Result<BlockHeader, NodeError> {
+            self.block_headers
+                .get(&round)
+                .cloned()
+                .ok_or_else(|| NodeError::NotFound(format!("header {round} not found")))
+        }
+    }
+
+    fn state_proof_txn(sender: Address, first: u64, last: u64) -> SignedTransaction {
+        SignedTransaction {
+            txn: algo_types::Transaction {
+                txn_type: algo_types::TxnType::Stpf,
+                sender,
+                fee: 0,
+                first_valid: algo_types::Round(1),
+                last_valid: algo_types::Round(1000),
+                state_proof_message: Some(algo_types::StateProofMessage {
+                    first_attested_round: first,
+                    last_attested_round: last,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn get_state_proof_transaction_for_round_finds_covering_state_proof() {
+        let mut node = MinimalNode {
+            last_round: 100,
+            blocks: BTreeMap::new(),
+            block_headers: BTreeMap::new(),
+        };
+        for r in 0..=100 {
+            node.block_headers.insert(r, header_at(r));
+        }
+        // A state proof at round 20 attesting to rounds 1..=16.
+        let block20 = Block {
+            round: algo_types::Round(20),
+            payset: vec![state_proof_txn(Address::STATE_PROOF_SENDER, 1, 16)],
+            ..Default::default()
+        };
+        node.blocks.insert(20, block20);
+
+        let result = node.get_state_proof_transaction_for_round(10).await;
+        assert_eq!(result.unwrap(), (1, 16));
+    }
+
+    #[tokio::test]
+    async fn get_state_proof_transaction_for_round_not_found_when_no_covering_proof() {
+        let mut node = MinimalNode {
+            last_round: 100,
+            blocks: BTreeMap::new(),
+            block_headers: BTreeMap::new(),
+        };
+        for r in 0..=100 {
+            node.block_headers.insert(r, header_at(r));
+            node.blocks.insert(
+                r,
+                Block {
+                    round: algo_types::Round(r),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let result = node.get_state_proof_transaction_for_round(10).await;
+        assert!(matches!(result, Err(NodeError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn get_state_proof_transaction_for_round_short_circuits_when_state_proofs_disabled() {
+        let mut node = MinimalNode {
+            last_round: 100,
+            blocks: BTreeMap::new(),
+            block_headers: BTreeMap::new(),
+        };
+        // v7 predates state proofs (state_proof_interval == 0).
+        node.block_headers.insert(
+            10,
+            BlockHeader {
+                round: algo_types::Round(10),
+                current_protocol: algo_types::consensus::CONSENSUS_V7.to_string(),
+                ..Default::default()
+            },
+        );
+
+        let result = node.get_state_proof_transaction_for_round(10).await;
+        assert!(matches!(result, Err(NodeError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn get_state_proof_transaction_for_round_ignores_non_matching_sender_and_range() {
+        let mut node = MinimalNode {
+            last_round: 100,
+            blocks: BTreeMap::new(),
+            block_headers: BTreeMap::new(),
+        };
+        for r in 0..=100 {
+            node.block_headers.insert(r, header_at(r));
+        }
+        // A state-proof-shaped txn from the WRONG sender must be ignored.
+        let block20 = Block {
+            round: algo_types::Round(20),
+            payset: vec![state_proof_txn(Address([9u8; 32]), 1, 16)],
+            ..Default::default()
+        };
+        node.blocks.insert(20, block20);
+        // A real state proof, but attesting to a range that doesn't cover
+        // the requested round.
+        let block40 = Block {
+            round: algo_types::Round(40),
+            payset: vec![state_proof_txn(Address::STATE_PROOF_SENDER, 30, 35)],
+            ..Default::default()
+        };
+        node.blocks.insert(40, block40);
+
+        let result = node.get_state_proof_transaction_for_round(10).await;
+        assert!(matches!(result, Err(NodeError::NotFound(_))));
+    }
 }
