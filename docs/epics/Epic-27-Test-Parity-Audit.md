@@ -38,7 +38,8 @@ statically validated.
 - [x] #811 — avm: implement RekeyTo/ApplicationCall minimum-AVM-version rule — merged via PR #831
 - [ ] #812 — validate: add per-type WellFormed() mempool validation
 - [x] #813 — consensus: reconcile Falcon-512 vs Falcon-1024 parameter-set naming — resolved-by-investigation, no bug found (false alarm from audit test-name grepping)
-- [ ] #815 — ledger: implement absentee/suspension computation and FirstValidTime
+- [x] #815 — ledger: FirstValidTime + block_field implemented via PR #834; absentee computation split to #833 (needs new block-proposal-time online-stake infrastructure)
+- [ ] #833 — ledger: implement block-proposal-side absentee/suspension list computation (split from #815)
 - [ ] #816 — rest-api: add PQ authorizer/LogicSig-curve compliance checks and stateproof-for-round polling
 - [x] #822 — crypto: enforce decode-time allocation bounds in merklearray proof decoder — merged via PR #832
 
