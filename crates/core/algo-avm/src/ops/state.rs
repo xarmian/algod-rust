@@ -45,6 +45,15 @@ fn resolve_account(value: AvmValue, ctx: &dyn AvmContext) -> Result<[u8; 32], Al
         AvmValue::Bytes(b) if b.len() == 32 => {
             let mut addr = [0u8; 32];
             addr.copy_from_slice(&b);
+            // Matches go-algorand's `availableAccount`
+            // (`data/transactions/logic/eval.go`): a raw address supplied
+            // directly on the stack must be a member of the group's
+            // resource-availability set, not accepted unconditionally.
+            if !ctx.is_account_available(&addr) {
+                return Err(AlgoError::Avm {
+                    message: format!("unavailable Account {}", algo_types::Address(addr)),
+                });
+            }
             Ok(addr)
         }
         _ => Err(AlgoError::Avm {
@@ -875,6 +884,11 @@ mod tests {
         /// The `app_id` argument most recently passed to any `app_box_*`
         /// method, for assembler/stack-order assertions.
         last_app_box_app_id: Option<u64>,
+        /// Raw addresses that `is_account_available` should reject, for
+        /// testing the resource-availability gate on `resolve_account`.
+        /// Empty by default (permissive, matching the trait's default) so
+        /// existing tests are unaffected.
+        unavailable_raw_accounts: std::collections::HashSet<[u8; 32]>,
     }
 
     impl TestStateContext {
@@ -903,6 +917,7 @@ mod tests {
                 family_box_access: HashMap::new(),
                 app_boxes: HashMap::new(),
                 last_app_box_app_id: None,
+                unavailable_raw_accounts: std::collections::HashSet::new(),
             }
         }
     }
@@ -923,6 +938,10 @@ mod tests {
                 .ok_or_else(|| AlgoError::Avm {
                     message: format!("account index {} out of range", index),
                 })
+        }
+
+        fn is_account_available(&self, addr: &[u8; 32]) -> bool {
+            !self.unavailable_raw_accounts.contains(addr)
         }
 
         fn resolve_asset(&self, index: u64) -> Result<u64, AlgoError> {
@@ -1769,6 +1788,45 @@ mod tests {
     fn resolve_mutable_account_rejects_out_of_range_index() {
         let ctx = TestStateContext::new(100);
         assert!(super::resolve_mutable_account(AvmValue::Uint64(5), &ctx).is_err());
+    }
+
+    // ── resolve_account availability gate (issue #808) ────────────
+
+    #[test]
+    fn resolve_account_accepts_available_raw_address() {
+        // A raw address the context reports as available (e.g. group-wide
+        // resource sharing) must still resolve.
+        let addr = test_addr(0x0D);
+        let ctx = TestStateContext::new(100);
+        let resolved = super::resolve_account(AvmValue::Bytes(addr.to_vec()), &ctx).unwrap();
+        assert_eq!(resolved, addr);
+    }
+
+    #[test]
+    fn resolve_account_rejects_unavailable_raw_address() {
+        // Matches go-algorand's `availableAccount`: a raw address supplied
+        // directly on the stack must be checked against the group's
+        // resource-availability set, not accepted unconditionally.
+        let addr = test_addr(0x0E);
+        let mut ctx = TestStateContext::new(100);
+        ctx.unavailable_raw_accounts.insert(addr);
+        let err = super::resolve_account(AvmValue::Bytes(addr.to_vec()), &ctx).unwrap_err();
+        assert!(
+            err.to_string().contains("unavailable Account"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_account_index_based_ignores_availability() {
+        // Index-based resolution (`Accounts[]`/sender) is inherently
+        // available regardless of the raw-address availability set.
+        let addr = test_addr(0x0F);
+        let mut ctx = TestStateContext::new(100);
+        ctx.accounts.push(addr);
+        ctx.unavailable_raw_accounts.insert(addr);
+        let resolved = super::resolve_account(AvmValue::Uint64(0), &ctx).unwrap();
+        assert_eq!(resolved, addr);
     }
 
     #[test]

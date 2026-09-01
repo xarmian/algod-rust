@@ -4003,6 +4003,11 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         ctx.genesis_hash,
                         ctx.consensus.clone(),
                     );
+                    avm_ctx.set_program_version(
+                        algo_avm::bytecode::parse(&clear_program)
+                            .map(|p| p.version)
+                            .unwrap_or(0),
+                    );
                     avm_ctx.fee_sink = ctx.fee_sink;
                     avm_ctx.txn_counter = ctx.txn_counter.get();
                     avm_ctx.fee_credit = ctx.fee_credit.get();
@@ -4161,6 +4166,11 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     ph,
                     ctx.genesis_hash,
                     ctx.consensus.clone(),
+                );
+                avm_ctx.set_program_version(
+                    algo_avm::bytecode::parse(&approval_program)
+                        .map(|p| p.version)
+                        .unwrap_or(0),
                 );
                 avm_ctx.fee_sink = ctx.fee_sink;
                 avm_ctx.txn_counter = ctx.txn_counter.get();

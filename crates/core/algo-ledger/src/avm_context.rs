@@ -890,6 +890,15 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// pre-mutation value wins for `old_data` per key — see
     /// [`record_kv_mod`](Self::record_kv_mod).
     pub kv_mods_recorder: Option<KvModsRecorder>,
+    /// The AVM version of the program currently executing in this context.
+    /// Used to gate group-wide resource sharing behind
+    /// `SHARED_RESOURCES_VERSION` (matches go-algorand's `cx.version >=
+    /// sharedResourcesVersion` checks in `availableAccount`/`availableAsset`/
+    /// `availableApp`).
+    pub program_version: u8,
+    /// Resources (accounts/assets/apps) shared by sibling transactions in
+    /// `group`, computed once at construction. See [`GroupResources`].
+    pub(crate) group_resources: GroupResources,
 }
 
 /// Shared accumulator type for per-round box deltas. See
@@ -1183,6 +1192,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         consensus: ConsensusParams,
     ) -> Self {
         let group_len = group.len();
+        let group_resources = fill_group_resources(&group);
         Self {
             store,
             group,
@@ -1230,7 +1240,24 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             log_size: 0,
             unnamed_tracking: None,
             kv_mods_recorder: None,
+            // Defaults to 0 (sharing inactive) until the caller sets the
+            // real executing program version via `set_program_version`.
+            // The two production call sites (`apply.rs`) do so immediately
+            // after construction, once the program bytes are parsed.
+            program_version: 0,
+            group_resources,
         }
+    }
+
+    /// Set the AVM version of the program about to execute in this context,
+    /// activating group-wide resource sharing once it reaches
+    /// `SHARED_RESOURCES_VERSION`. Must be called before evaluation begins;
+    /// `LedgerAvmContext::new` can't take this directly because the calling
+    /// program's version generally isn't known until after the program
+    /// bytes are parsed, which happens after context construction at every
+    /// call site.
+    pub fn set_program_version(&mut self, version: u8) {
+        self.program_version = version;
     }
 
     /// Override the per-program log limits (simulation `allow_more_logging`).
@@ -2634,6 +2661,11 @@ fn execute_inner_appl<L: LedgerStore>(
         genesis_hash,
         consensus.clone(),
     );
+    inner_ctx.set_program_version(
+        algo_avm::bytecode::parse(&program)
+            .map(|p| p.version)
+            .unwrap_or(0),
+    );
     inner_ctx.caller_app_id_val = caller_app_id;
     inner_ctx.caller_app_address_val = app_address(caller_app_id);
     inner_ctx.depth = caller_depth + 1;
@@ -2834,16 +2866,114 @@ fn execute_inner_appl<L: LedgerStore>(
 // ---------------------------------------------------------------------------
 // Block-round availability window (`block` opcode, `FirstValidTime` field)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Group-wide resource availability (issue #808)
+// ---------------------------------------------------------------------------
 
-/// Check that `round` falls within the window of block history the
-/// currently-executing transaction is allowed to access, matching
-/// go-algorand's `(*EvalContext).availableRound`
-/// (`data/transactions/logic/eval.go`).
+/// AVM version at which apps can access resources shared by other
+/// transactions in the group (go-algorand's `sharedResourcesVersion`,
+/// `data/transactions/logic/opcodes.go`).
+const SHARED_RESOURCES_VERSION: u8 = 9;
+
+/// Accounts/assets/apps made available to the currently-executing
+/// transaction by its *sibling* transactions in the group, mirroring
+/// go-algorand's `resources` struct (`data/transactions/logic/resources.go`).
 ///
-/// The window is `[firstAvail, lastAvail]` where `firstAvail` is bounded by
-/// `LastValid - MaxTxnLife - 1` (clamped to `1` early in the chain's life)
-/// and `lastAvail` is `FirstValid - 1` (clamped to `0`, meaning nothing is
-/// available, if `FirstValid == 0`).
+/// Scope note: this covers only the foreign-array-style resource sharing
+/// (`fillPayment`/`fillKeyRegistration`/`fillAssetConfig`/
+/// `fillAssetTransfer`/`fillAssetFreeze`/`fillApplicationCallForeign`).
+/// go's cross-product "Holding"/"Local State" sharing
+/// (`sharedHoldings`/`sharedLocals`, `allowsHolding`/`allowsLocals`) and the
+/// `tx.Access`-list-based fill path (`fillApplicationCallAccess`) are a
+/// distinct, larger piece of work tracked separately (see the issue this
+/// const block was introduced for).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct GroupResources {
+    shared_accounts: std::collections::HashSet<[u8; 32]>,
+    shared_asas: std::collections::HashSet<u64>,
+    shared_apps: std::collections::HashSet<u64>,
+}
+
+/// Compute the set of resources every sibling transaction in `group` makes
+/// available to the others, matching go-algorand's `resources.fill` walk
+/// over the group (`data/transactions/logic/resources.go`).
+pub(crate) fn fill_group_resources(group: &[SignedTransaction]) -> GroupResources {
+    let mut r = GroupResources::default();
+    for stxn in group {
+        let txn = &stxn.txn;
+        match txn.txn_type.as_str() {
+            "pay" => {
+                r.shared_accounts.insert(txn.sender.0);
+                r.shared_accounts.insert(txn.receiver.0);
+                if !txn.close_remainder_to.is_zero() {
+                    r.shared_accounts.insert(txn.close_remainder_to.0);
+                }
+            }
+            "keyreg" => {
+                r.shared_accounts.insert(txn.sender.0);
+            }
+            "acfg" => {
+                r.shared_accounts.insert(txn.sender.0);
+                if txn.config_asset != 0 {
+                    r.shared_asas.insert(txn.config_asset);
+                }
+            }
+            "axfer" => {
+                r.shared_asas.insert(txn.xaid);
+                r.shared_accounts.insert(txn.sender.0);
+                if let Some(addr) = &txn.asset_receiver {
+                    r.shared_accounts.insert(addr.0);
+                }
+                if let Some(addr) = &txn.asset_sender {
+                    if !addr.is_zero() {
+                        r.shared_accounts.insert(addr.0);
+                    }
+                }
+                if let Some(addr) = &txn.asset_close_to {
+                    if !addr.is_zero() {
+                        r.shared_accounts.insert(addr.0);
+                    }
+                }
+            }
+            "afrz" => {
+                r.shared_accounts.insert(txn.sender.0);
+                r.shared_asas.insert(txn.freeze_asset);
+                if let Some(addr) = &txn.freeze_account {
+                    r.shared_accounts.insert(addr.0);
+                }
+            }
+            "appl" => {
+                // fillApplicationCallForeign (the tx.Access list variant is
+                // not yet modeled here -- see the struct doc comment).
+                r.shared_accounts.insert(txn.sender.0);
+                if let Some(assets) = &txn.foreign_assets {
+                    r.shared_asas.extend(assets.iter().copied());
+                }
+                if txn.application_id != 0 {
+                    r.shared_accounts.insert(app_address(txn.application_id));
+                    r.shared_apps.insert(txn.application_id);
+                }
+                if let Some(apps) = &txn.foreign_apps {
+                    for &id in apps {
+                        r.shared_accounts.insert(app_address(id));
+                        r.shared_apps.insert(id);
+                    }
+                }
+                if let Some(accounts) = &txn.accounts {
+                    for addr in accounts {
+                        r.shared_accounts.insert(addr.0);
+                    }
+                }
+            }
+            _ => {
+                // State proof, heartbeat, and unknown types add nothing to
+                // availability (matches go's `resources.fill` default arm).
+            }
+        }
+    }
+    r
+}
+
 /// Disallow an inner app call from re-entering the currently-executing app
 /// (direct self-call) or any ancestor in its caller chain (an indirect
 /// A->B->A cycle across inner app calls). Matches go-algorand's
@@ -2905,6 +3035,15 @@ fn check_state_schema_counts(
     Ok(())
 }
 
+/// Check that `round` falls within the window of block history the
+/// currently-executing transaction is allowed to access, matching
+/// go-algorand's `(*EvalContext).availableRound`
+/// (`data/transactions/logic/eval.go`).
+///
+/// The window is `[firstAvail, lastAvail]` where `firstAvail` is bounded by
+/// `LastValid - MaxTxnLife - 1` (clamped to `1` early in the chain's life)
+/// and `lastAvail` is `FirstValid - 1` (clamped to `0`, meaning nothing is
+/// available, if `FirstValid == 0`).
 fn check_available_round(
     round: u64,
     first_valid: u64,
@@ -4677,6 +4816,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         if self.created_assets.contains(&asset_id) {
             return true;
         }
+        // Group-wide resource sharing (v9+): some other txn in the group
+        // mentioned this asset. Matches go-algorand's `availableAsset`'s
+        // `cx.version >= sharedResourcesVersion` branch.
+        if self.program_version >= SHARED_RESOURCES_VERSION
+            && self.group_resources.shared_asas.contains(&asset_id)
+        {
+            return true;
+        }
         false
     }
 
@@ -4697,6 +4844,66 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         }
         // Check apps created by inner transactions.
         if self.created_apps.contains(&app_id) {
+            return true;
+        }
+        // Group-wide resource sharing (v9+): some other txn in the group
+        // mentioned this app. Matches go-algorand's `availableApp`'s
+        // `cx.version >= sharedResourcesVersion` branch.
+        if self.program_version >= SHARED_RESOURCES_VERSION
+            && self.group_resources.shared_apps.contains(&app_id)
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Matches go-algorand's `availableAccount`
+    /// (`data/transactions/logic/eval.go`): a raw address is available if
+    /// it's the current transaction's own sender/`Accounts[]` entry, the
+    /// address of an app created earlier in the group, some other
+    /// transaction in the group mentioned it (v9+), the address of an app
+    /// in the current transaction's foreign-apps array (v7+), or the
+    /// current app's own address.
+    fn is_account_available(&self, addr: &[u8; 32]) -> bool {
+        // Unnamed-resource relaxation (simulation `allow_unnamed_resources`):
+        // every account is available, and the access is tracked and reported
+        // to the tracer for the simulate response's `unnamed-resources-accessed`.
+        if self.unnamed_tracking.is_some() {
+            self.note_account_access(addr);
+            return true;
+        }
+        let txn = &self.group[self.group_index].txn;
+        // The current transaction's own sender is index 0 (`IndexByAddress`),
+        // always available regardless of version.
+        if txn.sender.0 == *addr {
+            return true;
+        }
+        if let Some(ref accounts) = txn.accounts {
+            if accounts.iter().any(|a| a.0 == *addr) {
+                return true;
+            }
+        }
+        // Address of an app created earlier in the group.
+        if self.created_apps.iter().any(|&id| app_address(id) == *addr) {
+            return true;
+        }
+        // Group-wide resource sharing (v9+).
+        if self.program_version >= SHARED_RESOURCES_VERSION
+            && self.group_resources.shared_accounts.contains(addr)
+        {
+            return true;
+        }
+        // Address of an app in the current transaction's foreign-apps array
+        // (v7+, go's `appAddressAvailableVersion`).
+        if self.program_version >= 7 {
+            if let Some(ref apps) = txn.foreign_apps {
+                if apps.iter().any(|&id| app_address(id) == *addr) {
+                    return true;
+                }
+            }
+        }
+        // The current app's own address is always available.
+        if app_address(self.app_id) == *addr {
             return true;
         }
         false
@@ -7523,6 +7730,85 @@ mod tests {
         // Zero is never available.
         assert!(!ctx.is_app_available(0));
         assert!(!ctx.is_asset_available(0));
+    }
+
+    #[test]
+    fn resource_availability_group_sharing_v9_plus() {
+        // Two sibling txns: the executing appl (index 1) references nothing
+        // itself, but its sibling pay txn (index 0) names an account, and a
+        // sibling axfer/acfg-style transaction shares an asset. At v9+ these
+        // become available to the appl via group-wide sharing (issue #808).
+        let shared_account = [77u8; 32];
+        let pay = make_pay_txn([10u8; 32], shared_account, 5000);
+        let appl = make_appl_txn([20u8; 32], 42, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![pay, appl]);
+        ctx.group_index = 1;
+        ctx.set_program_version(9);
+
+        assert!(
+            ctx.is_account_available(&shared_account),
+            "v9+ program should see the sibling pay txn's receiver via group sharing"
+        );
+    }
+
+    #[test]
+    fn resource_availability_group_sharing_gated_below_v9() {
+        // The same setup, but the executing program is v8: group-wide
+        // sharing must not apply yet (matches go's
+        // `cx.version >= sharedResourcesVersion` gate).
+        let shared_account = [78u8; 32];
+        let pay = make_pay_txn([10u8; 32], shared_account, 5000);
+        let appl = make_appl_txn([20u8; 32], 42, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![pay, appl]);
+        ctx.group_index = 1;
+        ctx.set_program_version(8);
+
+        assert!(
+            !ctx.is_account_available(&shared_account),
+            "below v9, a sibling txn's account must not be available via group sharing"
+        );
+    }
+
+    #[test]
+    fn resource_availability_account_own_sender_and_accounts_array() {
+        let sender = [10u8; 32];
+        let named = [11u8; 32];
+        let stranger = [12u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![Address(named)], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.set_program_version(8);
+
+        assert!(ctx.is_account_available(&sender));
+        assert!(ctx.is_account_available(&named));
+        assert!(!ctx.is_account_available(&stranger));
+        // The current app's own address is always available.
+        assert!(ctx.is_account_available(&app_address(42)));
+    }
+
+    #[test]
+    fn fill_group_resources_covers_pay_acfg_axfer_afrz_appl() {
+        let receiver = [21u8; 32];
+        let close = [22u8; 32];
+        let pay = {
+            let mut t = make_pay_txn([20u8; 32], receiver, 1000);
+            t.txn.close_remainder_to = Address(close);
+            t
+        };
+        let appl = make_appl_txn([30u8; 32], 0, vec![Address([31u8; 32])], vec![55], vec![66]);
+        let group = vec![pay, appl];
+        let resources = fill_group_resources(&group);
+
+        assert!(resources.shared_accounts.contains(&receiver));
+        assert!(resources.shared_accounts.contains(&close));
+        assert!(resources.shared_accounts.contains(&[20u8; 32]));
+        assert!(resources.shared_accounts.contains(&[30u8; 32]));
+        assert!(resources.shared_accounts.contains(&[31u8; 32]));
+        assert!(resources.shared_apps.contains(&55));
+        assert!(resources.shared_accounts.contains(&app_address(55)));
+        assert!(resources.shared_asas.contains(&66));
     }
 
     #[test]
