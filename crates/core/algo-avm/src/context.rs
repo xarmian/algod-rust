@@ -668,6 +668,22 @@ pub trait AvmContext {
         false
     }
 
+    /// Check if a raw 32-byte address (as opposed to a foreign-array index)
+    /// is available under the transaction group's resource-availability
+    /// rules. Matches go-algorand's `availableAccount`
+    /// (`data/transactions/logic/eval.go`).
+    ///
+    /// Defaults to `true` (no restriction) for contexts that don't track
+    /// group resources at all -- e.g. `LogicSigAvmContext`, which already
+    /// rejects every account-state read via its other trait-default
+    /// "context unavailable" implementations, so this default never
+    /// actually grants access to anything a LogicSig context can act on.
+    /// `LedgerAvmContext` overrides this with the real check.
+    fn is_account_available(&self, addr: &[u8; 32]) -> bool {
+        let _ = addr;
+        true
+    }
+
     // ---- Voter / stake queries ----
 
     /// Get voter parameters for an account (from balance round, 320 rounds back).
