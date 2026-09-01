@@ -291,7 +291,11 @@ pub fn op_switch(machine: &mut AvmMachine, instruction: &Instruction) -> Result<
     Ok(())
 }
 
-/// `match` (0x8e): pop n values and a target, branch to first matching label.
+/// `match` (0x8e): pop a target and n case values, branch to first matching
+/// label. Matches go-algorand's stack effect exactly: `"[A1, A2, ..., AN],
+/// B" -> ""` -- the target `B` is pushed LAST (top of stack, popped
+/// first), with the `N` case values `A1..AN` pushed before it in the same
+/// left-to-right order as the opcode's label list.
 pub fn op_match(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(), AlgoError> {
     let offsets = if let Immediates::Labels(ref labels) = instruction.immediates {
         labels.clone()
@@ -302,15 +306,16 @@ pub fn op_match(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(
     };
 
     let n = offsets.len();
-    // Pop n match values (in reverse order since they were pushed first-to-last).
+
+    // Pop the target value (top of stack).
+    let target_val = machine.pop()?;
+
+    // Pop n case values (in reverse order since they were pushed first-to-last).
     let mut match_values = Vec::with_capacity(n);
     for _ in 0..n {
         match_values.push(machine.pop()?);
     }
     match_values.reverse(); // Now match_values[i] corresponds to offsets[i].
-
-    // Pop the target value.
-    let target_val = machine.pop()?;
 
     // Find first match.
     for (i, val) in match_values.iter().enumerate() {
