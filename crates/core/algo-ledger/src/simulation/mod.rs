@@ -55,8 +55,9 @@ use algo_error::AlgoError;
 use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{Address, Round, SignedTransaction};
 use algo_validate::{
-    check_txn_group, is_free_heartbeat, validate_transaction_wellformed,
-    verify_transaction_signature, verify_transaction_signature_with_tracer, SpecialAddresses,
+    check_txn_group, is_free_heartbeat, validate_pqsig_envelope, validate_pqsig_scheme,
+    validate_transaction_wellformed, verify_transaction_signature,
+    verify_transaction_signature_with_tracer, SpecialAddresses,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -417,6 +418,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         let (logicsig_traces, logicsig_budgets) = match self.check(
             &eval_group,
             request.allow_empty_signatures,
+            request.fix_signers,
             &consensus,
             &request.trace_config,
         ) {
@@ -636,6 +638,22 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }
         }
 
+        // Full (public-key-set) PQ placeholders need the final `auth_addr`
+        // after `fix_signers` has run through evaluation: `check()`'s
+        // placeholder validation used a possibly-not-final `auth_addr` (or
+        // was scheme-only, since `fix_signers` was set), so re-validate the
+        // full envelope now that `auth_addr` is settled. Matches go's
+        // `validateFixedPlaceholderPQEnvelopes` call after `s.evaluate`
+        // succeeds (`ledger/simulation/simulator.go`, issue #835).
+        if request.allow_empty_signatures && request.fix_signers && failure_message.is_none() {
+            if let Err((idx, msg)) =
+                validate_fixed_placeholder_pq_envelopes(&apply_ctx.consensus, &eval_group)
+            {
+                failure_message = Some(msg);
+                failed_at = Some(vec![idx]);
+            }
+        }
+
         group_result.failure_message = failure_message;
         group_result.failed_at = failed_at;
 
@@ -736,6 +754,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         &self,
         txn_group: &[SignedTransaction],
         allow_empty_signatures: bool,
+        fix_signers: bool,
         consensus: &ConsensusParams,
         trace_config: &ExecTraceConfig,
     ) -> Result<(Vec<Option<TransactionTrace>>, Vec<u64>), SimulatorError> {
@@ -783,7 +802,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             let has_sig = stx.sig != [0u8; 64];
             let has_msig = stx.msig.is_some();
             let has_lsig = stx.lsig.is_some();
-            if allow_empty_signatures && !has_sig && !has_msig && !has_lsig {
+            let has_pqsig = stx.pqsig.as_ref().is_some_and(|p| !p.blank());
+            if allow_empty_signatures && !has_sig && !has_msig && !has_lsig && !has_pqsig {
                 // Proxy-sign: create a valid ed25519 signature so verification
                 // passes. Mirrors go-algorand's `Transaction.Sign()` which
                 // sets `AuthAddr` to the signing key's public key when it
@@ -800,6 +820,61 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 let proxy_pub = proxy_key.verifying_key().to_bytes();
                 if proxy_pub != stx.txn.sender.0 {
                     stx.auth_addr = Some(Address(proxy_pub));
+                }
+            } else if allow_empty_signatures && is_placeholder_pqsig(stx) {
+                // Full or scheme-only top-level PQSig placeholder (issue
+                // #835): if it validates, proxy-sign the same way as the
+                // fully-unsigned case above (mirrors go's
+                // `stxn.Txn.Sign(proxySignerSecrets)`, which discards the
+                // placeholder envelope entirely). If it doesn't validate,
+                // leave the transaction untouched so real verification below
+                // fails with a clear error.
+                let pqsig = stx
+                    .pqsig
+                    .clone()
+                    .expect("is_placeholder_pqsig implies Some");
+                let authorizer = stx.auth_addr.unwrap_or(stx.txn.sender);
+                if validate_placeholder_pqsig(&pqsig, &authorizer, consensus, fix_signers).is_ok() {
+                    let canonical = canonical_encode_transaction(&stx.txn);
+                    let mut msg = Vec::with_capacity(2 + canonical.len());
+                    msg.extend_from_slice(b"TX");
+                    msg.extend_from_slice(&canonical);
+                    let sig = proxy_key.sign(&msg);
+                    stx.sig = sig.to_bytes();
+                    stx.pqsig = None;
+
+                    let proxy_pub = proxy_key.verifying_key().to_bytes();
+                    if proxy_pub != stx.txn.sender.0 {
+                        stx.auth_addr = Some(Address(proxy_pub));
+                    }
+                }
+            } else if allow_empty_signatures && is_placeholder_delegated_pqsig(stx) {
+                // Delegated (LogicSig-nested) PQSig placeholder (issue #835):
+                // unlike the top-level cases, the LogicSig's program must
+                // still be evaluated and traced, so it cannot be swapped for
+                // a proxy-signed bare transaction. If the placeholder
+                // validates, drop it and authorize via the program hash
+                // instead -- treating it as a contract-only (escrow) account
+                // and running the program without a real Falcon signature.
+                // Mirrors go's `check()` delegated-placeholder branch.
+                let lsig_pqsig = stx
+                    .lsig
+                    .as_ref()
+                    .and_then(|l| l.pqsig.clone())
+                    .expect("is_placeholder_delegated_pqsig implies Some");
+                let authorizer = stx.auth_addr.unwrap_or(stx.txn.sender);
+                if validate_placeholder_pqsig(&lsig_pqsig, &authorizer, consensus, fix_signers)
+                    .is_ok()
+                {
+                    let escrow_addr = stx
+                        .lsig
+                        .as_ref()
+                        .map(|l| algo_validate::hash_program(&l.logic))
+                        .expect("is_placeholder_delegated_pqsig implies Some(lsig)");
+                    if let Some(lsig) = stx.lsig.as_mut() {
+                        lsig.pqsig = None;
+                    }
+                    set_fixed_auth_addr(stx, escrow_addr);
                 }
             }
         }
@@ -904,7 +979,124 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 /// Whether a signed transaction carries no signature of any kind
 /// (go-algorand's `txnHasNoSignature`).
 fn txn_has_no_signature(stx: &SignedTransaction) -> bool {
-    stx.sig == [0u8; 64] && stx.msig.is_none() && stx.lsig.is_none()
+    stx.sig == [0u8; 64]
+        && stx.msig.is_none()
+        && stx.lsig.is_none()
+        && stx.pqsig.as_ref().map(|p| p.blank()).unwrap_or(true)
+}
+
+/// Whether `stx` carries a placeholder top-level `PQSig`: a non-blank PQ
+/// envelope with an empty signature and no other signature category set.
+/// Matches go-algorand's `isPlaceholderPQSig` (`ledger/simulation/
+/// simulator.go`, issue #835) -- used for fee/budget-estimation simulation
+/// without a real Falcon-1024 signature.
+fn is_placeholder_pqsig(stx: &SignedTransaction) -> bool {
+    let has_sig = stx.sig != [0u8; 64];
+    let has_msig = stx.msig.is_some();
+    let has_lsig = stx.lsig.is_some();
+    match &stx.pqsig {
+        Some(pq) if !pq.blank() && pq.signature.is_empty() => !has_sig && !has_msig && !has_lsig,
+        _ => false,
+    }
+}
+
+/// Whether `stx` carries a placeholder PQ signature nested in its
+/// LogicSig: a program with a non-blank nested PQ envelope with an empty
+/// signature and no other signature category set on either the transaction
+/// or the LogicSig. Matches go-algorand's `isPlaceholderDelegatedPQSig`
+/// (`ledger/simulation/simulator.go`, issue #835).
+fn is_placeholder_delegated_pqsig(stx: &SignedTransaction) -> bool {
+    let has_sig = stx.sig != [0u8; 64];
+    let has_msig = stx.msig.is_some();
+    let has_top_pqsig = stx.pqsig.as_ref().is_some_and(|p| !p.blank());
+    if has_sig || has_msig || has_top_pqsig {
+        return false;
+    }
+    match &stx.lsig {
+        Some(lsig)
+            if !lsig.logic.is_empty()
+                && lsig.sig == [0u8; 64]
+                && lsig.msig.is_none()
+                && lsig.lmsig.is_none() =>
+        {
+            matches!(&lsig.pqsig, Some(pq) if !pq.blank() && pq.signature.is_empty())
+        }
+        _ => false,
+    }
+}
+
+/// Whether `stx` needs a synthetic (proxy/placeholder-derived) signature or
+/// `auth_addr` correction under `allow_empty_signatures`/`fix_signers`.
+/// Matches go-algorand's `txnNeedsSyntheticSignature` (`ledger/simulation/
+/// simulator.go`): fully unsigned, or carrying a (possibly delegated)
+/// placeholder PQ signature.
+fn txn_needs_synthetic_signature(stx: &SignedTransaction) -> bool {
+    txn_has_no_signature(stx) || is_placeholder_pqsig(stx) || is_placeholder_delegated_pqsig(stx)
+}
+
+/// Post-evaluation validation of "full" (public-key-set) PQ placeholder
+/// envelopes against their FINAL `auth_addr` -- which `fix_signers` may
+/// have corrected during evaluation (e.g. via a preceding app call's
+/// rekey). `check()`'s own placeholder validation ran before evaluation and
+/// either used a not-yet-final `auth_addr` or was scheme-only (when
+/// `fix_signers` is set); this pass re-validates the full envelope once
+/// `auth_addr` is settled, so a caller can't submit a placeholder whose
+/// public key doesn't actually derive the final authorizer. Matches
+/// go-algorand's `validateFixedPlaceholderPQEnvelopes` (`ledger/simulation/
+/// simulator.go`, issue #835). Returns the failing transaction's index and
+/// an error message on failure.
+fn validate_fixed_placeholder_pq_envelopes(
+    consensus: &ConsensusParams,
+    group: &[SignedTransaction],
+) -> Result<(), (usize, String)> {
+    for (i, stx) in group.iter().enumerate() {
+        let authorizer = stx.auth_addr.unwrap_or(stx.txn.sender);
+        if is_placeholder_pqsig(stx) {
+            let pqsig = stx
+                .pqsig
+                .as_ref()
+                .expect("is_placeholder_pqsig implies Some");
+            if !pqsig.public_key.is_empty() {
+                validate_pqsig_envelope(pqsig, &authorizer, consensus)
+                    .map_err(|e| (i, format!("pq signature validation failed: {e}")))?;
+            }
+        }
+        if is_placeholder_delegated_pqsig(stx) {
+            let pqsig = stx
+                .lsig
+                .as_ref()
+                .and_then(|l| l.pqsig.as_ref())
+                .expect("is_placeholder_delegated_pqsig implies Some");
+            if !pqsig.public_key.is_empty() {
+                validate_pqsig_envelope(pqsig, &authorizer, consensus).map_err(|e| {
+                    (
+                        i,
+                        format!("pq delegated logic signature validation failed: {e}"),
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a placeholder `PQSig` envelope, matching go-algorand's
+/// `validatePlaceholderPQSig` (`ledger/simulation/simulator.go`): a
+/// scheme-only placeholder (empty public key) or a `fix_signers` request
+/// (whose `authorizer` isn't final yet) only needs the scheme validated;
+/// a full placeholder (public key set) needs the whole envelope, including
+/// the public-key-derived authorizer address, validated.
+fn validate_placeholder_pqsig(
+    pqsig: &algo_types::PQSig,
+    authorizer: &Address,
+    consensus: &ConsensusParams,
+    fix_signers: bool,
+) -> Result<(), AlgoError> {
+    if pqsig.public_key.is_empty() || fix_signers {
+        validate_pqsig_scheme(pqsig, consensus)
+    } else {
+        validate_pqsig_envelope(pqsig, authorizer, consensus)
+    }
 }
 
 /// The sender's current auth addr in the ledger, or the zero address when the
@@ -937,7 +1129,7 @@ fn fix_unsigned_signers_pre_eval<L: LedgerStore>(store: &L, group: &mut [SignedT
     let mut static_rekeys: HashMap<Address, Address> = HashMap::new();
     for stx in group.iter_mut() {
         let sender = stx.txn.sender;
-        if txn_has_no_signature(stx) {
+        if txn_needs_synthetic_signature(stx) {
             let auth = match static_rekeys.get(&sender) {
                 Some(a) => *a,
                 None => ledger_auth_addr(store, &sender),
@@ -976,7 +1168,7 @@ fn fix_unsigned_signers_after_app<L: LedgerStore>(
             .entry(sender)
             .or_insert_with(|| ledger_auth_addr(store, &sender));
 
-        if txn_has_no_signature(stx) {
+        if txn_needs_synthetic_signature(stx) {
             set_fixed_auth_addr(stx, auth);
         }
 
@@ -1029,6 +1221,117 @@ mod tests {
             message: "test error".to_string(),
         });
         assert!(err.to_string().contains("test error"));
+    }
+
+    // ── Placeholder PQ signature detection (issue #835) ────────────
+
+    fn minimal_pay_txn() -> algo_types::Transaction {
+        algo_types::Transaction {
+            txn_type: "pay".into(),
+            sender: Address([0xAA; 32]),
+            receiver: Address([0xBB; 32]),
+            fee: 1000,
+            first_valid: 0.into(),
+            last_valid: 1000.into(),
+            ..Default::default()
+        }
+    }
+
+    fn placeholder_pqsig() -> algo_types::PQSig {
+        algo_types::PQSig {
+            scheme: algo_types::PQ_SCHEME_FALCON1024,
+            salt: algo_types::PQAddressSalt(0),
+            public_key: serde_bytes::ByteBuf::new(),
+            signature: serde_bytes::ByteBuf::new(),
+        }
+    }
+
+    #[test]
+    fn is_placeholder_pqsig_detects_scheme_only_placeholder() {
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(),
+            pqsig: Some(placeholder_pqsig()),
+            ..Default::default()
+        };
+        assert!(is_placeholder_pqsig(&stx));
+        assert!(!is_placeholder_delegated_pqsig(&stx));
+    }
+
+    #[test]
+    fn is_placeholder_pqsig_false_when_signature_present() {
+        let mut pqsig = placeholder_pqsig();
+        pqsig.signature = serde_bytes::ByteBuf::from(vec![1u8; 4]);
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(),
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+        assert!(!is_placeholder_pqsig(&stx));
+    }
+
+    #[test]
+    fn is_placeholder_pqsig_false_when_other_signature_present() {
+        let mut stx = SignedTransaction {
+            txn: minimal_pay_txn(),
+            pqsig: Some(placeholder_pqsig()),
+            ..Default::default()
+        };
+        stx.sig = [1u8; 64];
+        assert!(!is_placeholder_pqsig(&stx));
+    }
+
+    #[test]
+    fn is_placeholder_delegated_pqsig_detects_lsig_nested_placeholder() {
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(),
+            lsig: Some(algo_types::LogicSig {
+                logic: serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01, 0x43]),
+                pqsig: Some(placeholder_pqsig()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(is_placeholder_delegated_pqsig(&stx));
+        assert!(!is_placeholder_pqsig(&stx));
+    }
+
+    #[test]
+    fn is_placeholder_delegated_pqsig_false_without_program() {
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(),
+            lsig: Some(algo_types::LogicSig {
+                logic: serde_bytes::ByteBuf::new(), // no program
+                pqsig: Some(placeholder_pqsig()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!is_placeholder_delegated_pqsig(&stx));
+    }
+
+    #[test]
+    fn txn_needs_synthetic_signature_covers_unsigned_and_placeholders() {
+        let unsigned = SignedTransaction {
+            txn: minimal_pay_txn(),
+            ..Default::default()
+        };
+        assert!(txn_needs_synthetic_signature(&unsigned));
+
+        let placeholder = SignedTransaction {
+            txn: minimal_pay_txn(),
+            pqsig: Some(placeholder_pqsig()),
+            ..Default::default()
+        };
+        assert!(txn_needs_synthetic_signature(&placeholder));
+
+        let mut real_pqsig = placeholder_pqsig();
+        real_pqsig.signature = serde_bytes::ByteBuf::from(vec![1u8; 4]);
+        let genuinely_signed = SignedTransaction {
+            txn: minimal_pay_txn(),
+            pqsig: Some(real_pqsig),
+            ..Default::default()
+        };
+        assert!(!txn_needs_synthetic_signature(&genuinely_signed));
     }
 
     #[test]

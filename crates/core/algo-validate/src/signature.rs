@@ -40,6 +40,22 @@ const MSIG_ADDR_PREFIX: &[u8] = b"MultisigAddr";
 /// Domain separation prefix for logic signature / program hashing.
 const PROGRAM_PREFIX: &[u8] = b"Program";
 
+/// The contract-account address for a LogicSig program: `SHA512/256("Program"
+/// || logic)`. Mirrors go's `logic.HashProgram` (`data/transactions/logic/
+/// program.go`) -- used both by the escrow (no-delegation-signature)
+/// LogicSig dispatch and by simulation's placeholder-delegated-PQ-signature
+/// fallback (issue #835), which converts a validated placeholder into an
+/// escrow account authorized by the program hash.
+pub fn hash_program(logic: &[u8]) -> Address {
+    let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + logic.len());
+    program_msg.extend_from_slice(PROGRAM_PREFIX);
+    program_msg.extend_from_slice(logic);
+    let hash = Sha512_256::digest(&program_msg);
+    let mut expected = [0u8; 32];
+    expected.copy_from_slice(&hash);
+    Address(expected)
+}
+
 /// Domain separation prefix for logic multisig program (lmsig) hashing.
 /// Used when verifying LMsig delegation: `"MsigProgram" || addr || program`.
 const MSIG_PROGRAM_PREFIX: &[u8] = b"MsigProgram";
@@ -110,12 +126,11 @@ pub fn verify_single_sig(stx: &SignedTransaction) -> Result<(), AlgoError> {
 /// prepended, not hashed in). Callers build this via
 /// [`canonical_encode_transaction`] prefixed with `"TX"` (top-level PQSig)
 /// or [`PQDelegatedProgram::to_be_signed`] (PQ-delegated LogicSig).
-fn verify_pqsig_bytes(
-    pqsig: &PQSig,
-    message: &[u8],
-    authorizer: &Address,
-    consensus: &ConsensusParams,
-) -> Result<(), AlgoError> {
+/// Validate that a `PQSig` carries a known, consensus-enabled scheme,
+/// without checking the public-key-derived authorizer or signature bytes.
+/// Mirrors go's `PQSig.ValidateScheme` (`data/transactions/pqsig.go`) —
+/// used for the simulation "scheme-only" placeholder (see issue #835).
+pub fn validate_pqsig_scheme(pqsig: &PQSig, consensus: &ConsensusParams) -> Result<(), AlgoError> {
     if pqsig.blank() {
         return Err(AlgoError::Validation {
             message: "pq signature is blank".into(),
@@ -131,6 +146,20 @@ fn verify_pqsig_bytes(
             message: "pq signature scheme not enabled".into(),
         });
     }
+    Ok(())
+}
+
+/// Validate the stateless, consensus-relevant PQ authorization envelope
+/// (scheme + public-key-derived authorizer address), excluding the
+/// signature bytes. Mirrors go's `PQSig.ValidateEnvelope`
+/// (`data/transactions/pqsig.go`) — used for the simulation "full"
+/// placeholder (public key set, signature empty; see issue #835).
+pub fn validate_pqsig_envelope(
+    pqsig: &PQSig,
+    authorizer: &Address,
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    validate_pqsig_scheme(pqsig, consensus)?;
 
     // Reject an oversized public key BEFORE hashing it for address
     // derivation. `public_key` is attacker-controlled wire input (bounded
@@ -160,6 +189,17 @@ fn verify_pqsig_bytes(
             ),
         });
     }
+
+    Ok(())
+}
+
+fn verify_pqsig_bytes(
+    pqsig: &PQSig,
+    message: &[u8],
+    authorizer: &Address,
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    validate_pqsig_envelope(pqsig, authorizer, consensus)?;
 
     if pqsig.signature.is_empty() {
         return Err(AlgoError::Validation {
