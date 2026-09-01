@@ -453,6 +453,22 @@ pub trait AvmContext {
         None
     }
 
+    /// Minimum AVM version required for the program under evaluation, given
+    /// the rest of its transaction group.
+    ///
+    /// Matches go-algorand's `computeMinAvmVersion`
+    /// (`data/transactions/logic/eval.go`): a group containing a `RekeyTo`
+    /// (rekeying) transaction or an `ApplicationCall` transaction raises the
+    /// minimum required AVM version for every LogicSig signature in that
+    /// group, because those transaction fields/types postdate AVM v1 and
+    /// older-version programs must not be exposed to groups using them.
+    ///
+    /// Defaults to `0` (no floor) for contexts that don't carry a
+    /// transaction group — e.g. [`NullContext`] used in unit tests.
+    fn min_avm_version(&self) -> u64 {
+        0
+    }
+
     // ---- Box storage ----
 
     /// Get a box's contents. Returns `(value, exists)`.
