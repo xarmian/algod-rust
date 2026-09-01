@@ -33,14 +33,14 @@ statically validated.
 
 **Correctness bugs:**
 - [ ] #808 — avm: implement transaction-group resource-availability enforcement — **highest priority**
-- [ ] #809 — avm/ledger: fix app-call guard correctness bugs
+- [x] #809 — avm/ledger: fix app-call guard correctness bugs — merged via PR #838
 - [ ] #810 — avm: add per-field version gating for global/txn/gtxn/asset_params_get/acct_params_get/block
 - [x] #811 — avm: implement RekeyTo/ApplicationCall minimum-AVM-version rule — merged via PR #831
-- [ ] #812 — validate: add per-type WellFormed() mempool validation
+- [x] #812 — validate: add per-type WellFormed() mempool validation — merged via PR #837
 - [x] #813 — consensus: reconcile Falcon-512 vs Falcon-1024 parameter-set naming — resolved-by-investigation, no bug found (false alarm from audit test-name grepping)
 - [x] #815 — ledger: FirstValidTime + block_field implemented via PR #834; absentee computation split to #833 (needs new block-proposal-time online-stake infrastructure)
 - [ ] #833 — ledger: implement block-proposal-side absentee/suspension list computation (split from #815)
-- [ ] #816 — rest-api: add PQ authorizer/LogicSig-curve compliance checks and stateproof-for-round polling
+- [x] #816 — rest-api: add PQ authorizer/LogicSig-curve compliance checks and stateproof-for-round polling — merged via PR #836; simulate placeholder-PQ-sig moved to #835
 - [x] #822 — crypto: enforce decode-time allocation bounds in merklearray proof decoder — merged via PR #832
 
 **Net-new subsystems:**
@@ -52,6 +52,7 @@ statically validated.
 - [ ] #821 — pool/networking: implement application-call excessive-rate-limiter (ERL) subsystem
 - [ ] #820 — tools: add algokey pq CLI, autonomous heartbeat service, and libgoal app-call resource resolution
 - [ ] #828 — util: consider porting db Accessor/Migration framework, pagedqueue, and rateLimit ElasticRateLimiter
+- [ ] #835 — ledger/simulation: implement placeholder PQ signature validation in the simulator (split from #816)
 
 **Test-gap sweeps:**
 - [ ] #823 — testing: close AVM/assembler missing-test gaps
