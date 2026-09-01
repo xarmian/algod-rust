@@ -35,12 +35,12 @@ statically validated.
 - [ ] #808 — avm: implement transaction-group resource-availability enforcement — **highest priority**
 - [ ] #809 — avm/ledger: fix app-call guard correctness bugs
 - [ ] #810 — avm: add per-field version gating for global/txn/gtxn/asset_params_get/acct_params_get/block
-- [ ] #811 — avm: implement RekeyTo/ApplicationCall minimum-AVM-version rule
+- [x] #811 — avm: implement RekeyTo/ApplicationCall minimum-AVM-version rule — merged via PR #831
 - [ ] #812 — validate: add per-type WellFormed() mempool validation
-- [ ] #813 — consensus: reconcile Falcon-512 vs Falcon-1024 parameter-set naming
+- [x] #813 — consensus: reconcile Falcon-512 vs Falcon-1024 parameter-set naming — resolved-by-investigation, no bug found (false alarm from audit test-name grepping)
 - [ ] #815 — ledger: implement absentee/suspension computation and FirstValidTime
 - [ ] #816 — rest-api: add PQ authorizer/LogicSig-curve compliance checks and stateproof-for-round polling
-- [ ] #822 — crypto: enforce decode-time allocation bounds in merklearray proof decoder
+- [x] #822 — crypto: enforce decode-time allocation bounds in merklearray proof decoder — merged via PR #832
 
 **Net-new subsystems:**
 - [ ] #814 — stateproof: implement a signing/proving worker
