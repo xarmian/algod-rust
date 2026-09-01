@@ -54,7 +54,7 @@ statically validated.
 - [ ] #821 — pool/networking: implement application-call excessive-rate-limiter (ERL) subsystem
 - [ ] #820 — tools: add algokey pq CLI, autonomous heartbeat service, and libgoal app-call resource resolution
 - [ ] #828 — util: consider porting db Accessor/Migration framework, pagedqueue, and rateLimit ElasticRateLimiter
-- [ ] #835 — ledger/simulation: implement placeholder PQ signature validation in the simulator (split from #816)
+- [x] #835 — ledger/simulation: implement placeholder PQ signature validation in the simulator (split from #816)
 
 **Test-gap sweeps:**
 - [ ] #823 — testing: close AVM/assembler missing-test gaps
