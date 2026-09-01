@@ -3884,6 +3884,12 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             BlockField::BlkProtocol => Ok(AvmValue::Bytes(hdr.current_protocol.into_bytes())),
             BlockField::BlkTxnCounter => Ok(AvmValue::Uint64(hdr.txn_counter)),
             BlockField::BlkProposerPayout => Ok(AvmValue::Uint64(hdr.proposer_payout)),
+            BlockField::BlkBranch512 => Ok(AvmValue::Bytes(hdr.prev512.to_vec())),
+            BlockField::BlkSha512_256TxnCommitment => {
+                Ok(AvmValue::Bytes(hdr.txn_commitment.to_vec()))
+            }
+            BlockField::BlkSha256TxnCommitment => Ok(AvmValue::Bytes(hdr.txn256.to_vec())),
+            BlockField::BlkSha512TxnCommitment => Ok(AvmValue::Bytes(hdr.txn512.to_vec())),
         }
     }
 
@@ -5322,6 +5328,36 @@ mod tests {
 
         let ts = ctx.block_field(50, 1).unwrap(); // BlkTimestamp
         assert_eq!(ts, algo_avm::machine::AvmValue::Uint64(42));
+    }
+
+    #[test]
+    fn block_field_v13_hash_fields() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        use algo_types::BlockHeader;
+        let hdr = BlockHeader {
+            round: algo_types::Round(50),
+            prev512: [8u8; 64],
+            txn_commitment: [9u8; 32],
+            txn256: [10u8; 32],
+            txn512: [11u8; 64],
+            ..BlockHeader::default()
+        };
+        let hdrdata = algo_codec::canonical_encode_block_header(&hdr);
+        store.put_block(50, "v41", &hdrdata, &[]).unwrap();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        let branch512 = ctx.block_field(50, 10).unwrap(); // BlkBranch512
+        assert_eq!(branch512, algo_avm::machine::AvmValue::Bytes(vec![8u8; 64]));
+        let sha512_256 = ctx.block_field(50, 11).unwrap(); // BlkSha512_256TxnCommitment
+        assert_eq!(
+            sha512_256,
+            algo_avm::machine::AvmValue::Bytes(vec![9u8; 32])
+        );
+        let sha256 = ctx.block_field(50, 12).unwrap(); // BlkSha256TxnCommitment
+        assert_eq!(sha256, algo_avm::machine::AvmValue::Bytes(vec![10u8; 32]));
+        let sha512 = ctx.block_field(50, 13).unwrap(); // BlkSha512TxnCommitment
+        assert_eq!(sha512, algo_avm::machine::AvmValue::Bytes(vec![11u8; 64]));
     }
 
     #[test]

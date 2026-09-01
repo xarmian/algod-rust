@@ -728,11 +728,7 @@ impl BlockField {
     /// Returns the AVM version in which this field became readable via
     /// `block`. Values match go-algorand's `blockFieldSpecs[].version`
     /// (`data/transactions/logic/fields.go`), enforced by go's `opBlock`
-    /// (`fs.version > cx.version`). Note: go-algorand v5.0.0-stable also
-    /// defines 4 further block fields (v13+: `BlkBranch512`,
-    /// `BlkSha512_256TxnCommitment`, `BlkSha256TxnCommitment`,
-    /// `BlkSha512TxnCommitment`) that this enum does not yet model at all
-    /// -- a separate not-implemented gap, tracked outside this method.
+    /// (`fs.version > cx.version`).
     pub fn version(&self) -> u8 {
         match self {
             // randomnessVersion (data/transactions/logic/opcodes.go).
@@ -746,6 +742,13 @@ impl BlockField {
             | Self::BlkProtocol
             | Self::BlkTxnCounter
             | Self::BlkProposerPayout => 11,
+            // v13 (data/transactions/logic/fields.go: `{BlkBranch512, ..., 13}` etc.
+            // -- not `foreignBoxVersion`/`poseidon2Version`; those are unrelated
+            // features that happen to share the same numeric version).
+            Self::BlkBranch512
+            | Self::BlkSha512_256TxnCommitment
+            | Self::BlkSha256TxnCommitment
+            | Self::BlkSha512TxnCommitment => 13,
         }
     }
 }
@@ -805,6 +808,14 @@ field_enum! {
         BlkTxnCounter = 8,
         /// Actual amount moved from fee sink to proposer.
         BlkProposerPayout = 9,
+        /// SHA-512 hash of the previous block header (wider than `BlkBranch`).
+        BlkBranch512 = 10,
+        /// "Algorand Native" (SHA-512/256) txn merkle root.
+        BlkSha512_256TxnCommitment = 11,
+        /// SHA-256 txn merkle root.
+        BlkSha256TxnCommitment = 12,
+        /// SHA-512 txn merkle root.
+        BlkSha512TxnCommitment = 13,
     }
 }
 
@@ -1669,7 +1680,28 @@ mod tests {
             BlockField::from_u8(9).unwrap(),
             BlockField::BlkProposerPayout,
         );
-        assert!(BlockField::from_u8(10).is_err());
+        assert_eq!(BlockField::from_u8(10).unwrap(), BlockField::BlkBranch512);
+        assert_eq!(
+            BlockField::from_u8(11).unwrap(),
+            BlockField::BlkSha512_256TxnCommitment,
+        );
+        assert_eq!(
+            BlockField::from_u8(12).unwrap(),
+            BlockField::BlkSha256TxnCommitment,
+        );
+        assert_eq!(
+            BlockField::from_u8(13).unwrap(),
+            BlockField::BlkSha512TxnCommitment,
+        );
+        assert!(BlockField::from_u8(14).is_err());
+    }
+
+    #[test]
+    fn block_field_v13_fields_version_gated() {
+        assert_eq!(BlockField::BlkBranch512.version(), 13);
+        assert_eq!(BlockField::BlkSha512_256TxnCommitment.version(), 13);
+        assert_eq!(BlockField::BlkSha256TxnCommitment.version(), 13);
+        assert_eq!(BlockField::BlkSha512TxnCommitment.version(), 13);
     }
 
     #[test]

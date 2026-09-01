@@ -42,7 +42,7 @@ statically validated.
 - [ ] #833 — ledger: implement block-proposal-side absentee/suspension list computation (split from #815)
 - [x] #816 — rest-api: add PQ authorizer/LogicSig-curve compliance checks and stateproof-for-round polling — merged via PR #836; simulate placeholder-PQ-sig moved to #835
 - [x] #822 — crypto: enforce decode-time allocation bounds in merklearray proof decoder — merged via PR #832
-- [ ] #839 — avm: implement missing v13+ block opcode fields (BlkBranch512, BlkSha512_256/256/512TxnCommitment) (split from #810)
+- [x] #839 — avm: implement missing v13+ block opcode fields (BlkBranch512, BlkSha512_256/256/512TxnCommitment) (split from #810)
 - [ ] #841 — avm: implement holding/local-state cross-product resource sharing and tx.Access-list resolution (split from #808)
 
 **Net-new subsystems:**
