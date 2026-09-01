@@ -1,6 +1,6 @@
 # algod-rust
 
-Full Rust reimplementation of go-algorand — a production-grade Algorand node. Phases 0–6 are complete (conformance harness, block sync, AVM execution, ledger apply, validation, REST API, consensus participation). Phases 9–14 (go-algorand version-upgrade parity sweeps — `v4.6.0-stable` → `v4.7.0-stable` plus a new libp2p P2P transport, then `v4.7.0-stable` → `v4.7.2-stable`, then `v4.7.2-stable` → `v4.7.3-stable`, then `v4.7.3-stable` → `v4.7.4-stable`, then `v4.7.4-stable` → `v5.0.0-stable`) are also complete — see epics #650 and #678. Phase 15 (licensing and legal-framework compliance — AGPL-3.0-or-later as a whole with MIT-eligible files, `Algod DAO` as the legal entity) is also complete — see epic #732 and `docs/PHASE15_VALIDATION.md`. Phase 16 (node configuration and consensus-parameter parity audit — a from-scratch field-by-field audit of `config.json`/`ConsensusParams` against go-algorand, independent of any version-delta sweep) is also complete — see epic #745 and `docs/PHASE16_VALIDATION.md`. The reference pin is `v5.0.0-stable`. See `docs/PROJECT_SCOPE.md` for full scope, `docs/PHASE6_VALIDATION.md` for the Layer-9 consensus evidence map, `docs/PHASE10_VALIDATION.md` for the v4.7.0-stable version-upgrade/P2P-transport evidence map, `docs/PHASE11_VALIDATION.md` for the v4.7.2-stable sweep evidence map, `docs/PHASE12_VALIDATION.md` for the v4.7.3-stable sweep evidence map, `docs/PHASE13_VALIDATION.md` for the v4.7.4-stable sweep evidence map, `docs/PHASE14_VALIDATION.md` for the v5.0.0-stable sweep evidence map, `docs/PHASE15_VALIDATION.md` for the licensing-compliance evidence map, and `docs/PHASE16_VALIDATION.md` for the configuration/consensus-parameter parity evidence map (which test/tool proves which criterion).
+Full Rust reimplementation of go-algorand — a production-grade Algorand node. Phases 0–6 are complete (conformance harness, block sync, AVM execution, ledger apply, validation, REST API, consensus participation). Phases 9–14 (go-algorand version-upgrade parity sweeps — `v4.6.0-stable` → `v4.7.0-stable` plus a new libp2p P2P transport, then `v4.7.0-stable` → `v4.7.2-stable`, then `v4.7.2-stable` → `v4.7.3-stable`, then `v4.7.3-stable` → `v4.7.4-stable`, then `v4.7.4-stable` → `v5.0.0-stable`) are also complete — see epics #650 and #678. Phase 15 (licensing and legal-framework compliance — AGPL-3.0-or-later as a whole with MIT-eligible files, `Algod DAO` as the legal entity) is also complete — see epic #732 and `docs/PHASE15_VALIDATION.md`. Phase 16 (node configuration and consensus-parameter parity audit — a from-scratch field-by-field audit of `config.json`/`ConsensusParams` against go-algorand, independent of any version-delta sweep) is also complete — see epic #745 and `docs/PHASE16_VALIDATION.md`. Phase 17 (go-algorand ↔ algod-rust **test parity** audit — every go-algorand test mapped to its algod-rust equivalent or explained as a gap, independent of any version-delta sweep) is in progress — see epic #830 and `docs/PHASE17_TEST_PARITY.md`. The reference pin is `v5.0.0-stable`. See `docs/PROJECT_SCOPE.md` for full scope, `docs/PHASE6_VALIDATION.md` for the Layer-9 consensus evidence map, `docs/PHASE10_VALIDATION.md` for the v4.7.0-stable version-upgrade/P2P-transport evidence map, `docs/PHASE11_VALIDATION.md` for the v4.7.2-stable sweep evidence map, `docs/PHASE12_VALIDATION.md` for the v4.7.3-stable sweep evidence map, `docs/PHASE13_VALIDATION.md` for the v4.7.4-stable sweep evidence map, `docs/PHASE14_VALIDATION.md` for the v5.0.0-stable sweep evidence map, `docs/PHASE15_VALIDATION.md` for the licensing-compliance evidence map, `docs/PHASE16_VALIDATION.md` for the configuration/consensus-parameter parity evidence map (which test/tool proves which criterion), and `docs/PHASE17_TEST_PARITY.md` for the full go-algorand↔algod-rust test-parity map.
 
 ## Shell Environment
 
@@ -92,6 +92,31 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
 ## Bash Tool Constraints
 
 - Do NOT chain test runs hoping for different results. If a test fails, diagnose the issue first.
+
+## Phase 17 test-parity tracking (docs/PHASE17_TEST_PARITY.md)
+
+- `docs/PHASE17_TEST_PARITY.md` (index/aggregate table) and the 15 per-area
+  files under `docs/phase17/parity_*.md` (one row per go-algorand test,
+  classified `matched-1:1` / `matched-1:many` / `matched-many:1` / `partial`
+  / `missing-test` / `not-implemented` / `out-of-scope`) are the live,
+  authoritative record of go-algorand↔algod-rust test parity — not a
+  point-in-time snapshot. Whenever a Phase 17 issue (or any fix that adds a
+  test proving parity with a go-algorand test named in these files) is
+  merged, update the corresponding row(s) in the relevant
+  `docs/phase17/parity_<area>.md` file to reflect the new status (typically
+  `missing-test`/`not-implemented` → `matched-1:1`/`matched-1:many`/
+  `partial`, with a working link to the new Rust test), then refresh
+  `docs/PHASE17_TEST_PARITY.md`'s aggregate/per-area status-count table to
+  match. This is part of finishing the fix, not a separate follow-up —
+  include it in the same PR (or a same-day docs commit) so the tracking
+  file never drifts from what main actually has test coverage for.
+- `scripts/list_go_tests.sh` and `scripts/list_rust_tests.sh` regenerate the
+  raw inputs (`docs/phase17/go_tests.tsv`, `docs/phase17/rust_tests.tsv`) if
+  a fuller re-sweep is ever needed — re-run after a future go-algorand
+  version bump, or whenever the counts look stale.
+- `docs/epics/Epic-27-Test-Parity-Audit.md` and epic issue #830 track
+  which of the 22 Phase 17 sub-issues are open/closed — check that box too
+  when a sub-issue's PR merges.
 
 ## Autonomous merge authorization (algod-issue-fix / algod-version-upgrade)
 
