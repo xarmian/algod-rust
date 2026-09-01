@@ -45,6 +45,7 @@ statically validated.
 - [x] #839 — avm: implement missing v13+ block opcode fields (BlkBranch512, BlkSha512_256/256/512TxnCommitment) (split from #810)
 - [ ] #841 — avm: implement holding/local-state cross-product resource sharing and tx.Access-list resolution (split from #808)
 - [ ] #845 — ledger/pool/agreement: wire isAbsent-based absentee-account computation into block assembly (split from #833)
+- [ ] #847 — avm: assembler treats ';' as a comment delimiter instead of a statement separator (found while working #823)
 
 **Net-new subsystems:**
 - [ ] #814 — stateproof: implement a signing/proving worker
@@ -58,7 +59,7 @@ statically validated.
 - [x] #835 — ledger/simulation: implement placeholder PQ signature validation in the simulator (split from #816)
 
 **Test-gap sweeps:**
-- [ ] #823 — testing: close AVM/assembler missing-test gaps
+- [ ] #823 — testing: close AVM/assembler missing-test gaps; theme 1 (match opcode execution-level tests, also fixed a real op_match bug) via PR #848; themes 2-5 remain
 - [ ] #824 — testing: close ledger missing-test gaps
 - [ ] #825 — testing: close agreement missing-test gaps
 - [ ] #826 — testing: close crypto missing-test gaps
