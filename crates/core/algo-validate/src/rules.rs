@@ -375,6 +375,270 @@ pub fn validate_transaction_wellformed(
         validate_application_call_wellformed(txn, params)?;
     }
 
+    // ── Payment well-formedness (Go: PaymentTxnFields.wellFormed, payment.go) ──
+    if txn.txn_type == "pay" {
+        if txn.sender == txn.close_remainder_to {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "transaction cannot close account to its sender {}",
+                    txn.sender
+                ),
+            });
+        }
+        if let Some(sp) = spec {
+            if txn.sender == sp.fee_sink {
+                if params.payouts_enabled {
+                    return Err(AlgoError::Validation {
+                        message: format!("cannot spend from fee sink address {}", txn.sender),
+                    });
+                }
+                if txn.receiver != sp.rewards_pool {
+                    return Err(AlgoError::Validation {
+                        message: format!(
+                            "cannot spend from fee sink's address {} to non incentive pool address {}",
+                            txn.sender, txn.receiver
+                        ),
+                    });
+                }
+                if !txn.close_remainder_to.is_zero() {
+                    return Err(AlgoError::Validation {
+                        message: format!(
+                            "cannot close fee sink {} to {}",
+                            txn.sender, txn.close_remainder_to
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Asset config well-formedness (Go: AssetConfigTxnFields.wellFormed, asset.go) ──
+    if txn.txn_type == "acfg" {
+        if let Some(ap) = &txn.asset_params {
+            if ap.asset_name.len() > params.max_asset_name_bytes {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "transaction asset name too big: {} > {}",
+                        ap.asset_name.len(),
+                        params.max_asset_name_bytes
+                    ),
+                });
+            }
+            if ap.unit_name.len() > params.max_asset_unit_name_bytes {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "transaction asset unit name too big: {} > {}",
+                        ap.unit_name.len(),
+                        params.max_asset_unit_name_bytes
+                    ),
+                });
+            }
+            if ap.url.len() > params.max_asset_url_bytes {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "transaction asset url too big: {} > {}",
+                        ap.url.len(),
+                        params.max_asset_url_bytes
+                    ),
+                });
+            }
+            if ap.decimals > params.max_asset_decimals {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "transaction asset decimals is too high (max is {})",
+                        params.max_asset_decimals
+                    ),
+                });
+            }
+        }
+    }
+
+    // ── Asset transfer well-formedness (Go: AssetTransferTxnFields.wellFormed, asset.go) ──
+    if txn.txn_type == "axfer" {
+        if txn.xaid == 0 && txn.asset_amount != 0 {
+            return Err(AlgoError::Validation {
+                message: "asset ID cannot be zero".to_string(),
+            });
+        }
+        if txn.asset_sender.as_ref().is_some_and(|a| !a.is_zero())
+            && txn.asset_close_to.as_ref().is_some_and(|a| !a.is_zero())
+        {
+            return Err(AlgoError::Validation {
+                message: "cannot close asset by clawback".to_string(),
+            });
+        }
+    }
+
+    // ── Asset freeze well-formedness (Go: AssetFreezeTxnFields.wellFormed, asset.go) ──
+    if txn.txn_type == "afrz" {
+        if txn.freeze_asset == 0 {
+            return Err(AlgoError::Validation {
+                message: "asset ID cannot be zero".to_string(),
+            });
+        }
+        if txn
+            .freeze_account
+            .as_ref()
+            .map(|a| a.is_zero())
+            .unwrap_or(true)
+        {
+            return Err(AlgoError::Validation {
+                message: "freeze account cannot be empty".to_string(),
+            });
+        }
+    }
+
+    // ── Keyreg well-formedness (Go: KeyregTxnFields.wellFormed, keyreg.go) ──
+    if txn.txn_type == "keyreg" {
+        if let Some(sp) = spec {
+            if txn.sender == sp.fee_sink {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "cannot register participation key for fee sink's address {}",
+                        txn.sender
+                    ),
+                });
+            }
+        }
+
+        if params.enable_keyreg_coherency_check {
+            if txn.vote_first > txn.vote_last {
+                return Err(AlgoError::Validation {
+                    message:
+                        "transaction first voting round need to be less than its last voting round"
+                            .to_string(),
+                });
+            }
+
+            let vote_pk_empty = txn
+                .vote_pk
+                .as_ref()
+                .map(|k| *k == [0u8; 32])
+                .unwrap_or(true);
+            let selection_pk_empty = txn
+                .selection_pk
+                .as_ref()
+                .map(|k| *k == [0u8; 32])
+                .unwrap_or(true);
+            let coherent = (vote_pk_empty && selection_pk_empty && txn.vote_key_dilution == 0)
+                || (!vote_pk_empty && !selection_pk_empty && txn.vote_key_dilution != 0);
+            if !coherent {
+                return Err(AlgoError::Validation {
+                    message: "the following transaction fields need to be clear/set together : votekey, selkey, votekd".to_string(),
+                });
+            }
+
+            if txn.vote_key_dilution == 0 {
+                // Going offline: no VoteFirst/VoteLast.
+                if txn.vote_first != 0 || txn.vote_last != 0 {
+                    return Err(AlgoError::Validation {
+                        message: "on going offline key registration transaction, the vote first and vote last fields should not be set".to_string(),
+                    });
+                }
+            } else {
+                // Going online.
+                if txn.vote_last == 0 {
+                    return Err(AlgoError::Validation {
+                        message: "transaction tries to register keys to go online, but vote last is set to zero".to_string(),
+                    });
+                }
+                if txn.vote_first > txn.last_valid.0 + 1 {
+                    return Err(AlgoError::Validation {
+                        message: "transaction tries to register keys to go online, but first voting round is beyond the round after last valid round".to_string(),
+                    });
+                }
+            }
+        }
+
+        if txn.non_participation {
+            if !params.support_become_non_participating_transactions {
+                return Err(AlgoError::Validation {
+                    message: "transaction tries to mark an account as nonparticipating, but that transaction is not supported".to_string(),
+                });
+            }
+            let vote_pk_empty = txn
+                .vote_pk
+                .as_ref()
+                .map(|k| *k == [0u8; 32])
+                .unwrap_or(true);
+            let selection_pk_empty = txn
+                .selection_pk
+                .as_ref()
+                .map(|k| *k == [0u8; 32])
+                .unwrap_or(true);
+            if !(vote_pk_empty || selection_pk_empty) {
+                return Err(AlgoError::Validation {
+                    message: "transaction tries to register keys to go online, but nonparticipatory flag is set".to_string(),
+                });
+            }
+        }
+
+        // stateProofPKWellFormed (Go: keyreg.go).
+        let state_proof_pk_empty = txn
+            .state_proof_pk
+            .as_ref()
+            .map(|k| *k == [0u8; 64])
+            .unwrap_or(true);
+        if !params.enable_state_proof_keyreg_check {
+            if !state_proof_pk_empty {
+                return Err(AlgoError::Validation {
+                    message:
+                        "transaction field StateProofPK should be empty in this consensus version"
+                            .to_string(),
+                });
+            }
+        } else {
+            let going_online = txn.vote_key_dilution != 0;
+            if !going_online && !state_proof_pk_empty {
+                return Err(AlgoError::Validation {
+                    message: "offline keyreg transactions should contain empty stateProofPK"
+                        .to_string(),
+                });
+            }
+            if txn.non_participation && !state_proof_pk_empty {
+                return Err(AlgoError::Validation {
+                    message:
+                        "non participation keyreg transactions should contain empty stateProofPK"
+                            .to_string(),
+                });
+            }
+        }
+    }
+
+    // ── State proof well-formedness (Go: StateProofTxnFields.wellFormed, stateproof.go) ──
+    if txn.txn_type == "stpf" {
+        if txn.sender != algo_types::Address::STATE_PROOF_SENDER {
+            return Err(AlgoError::Validation {
+                message: "sender must be the state-proof sender".to_string(),
+            });
+        }
+        if txn.fee != 0 {
+            return Err(AlgoError::Validation {
+                message: "fee must be zero in state-proof transaction".to_string(),
+            });
+        }
+        if !txn.note.is_empty() {
+            return Err(AlgoError::Validation {
+                message: "note must be empty in state-proof transaction".to_string(),
+            });
+        }
+        if txn.group != [0u8; 32] {
+            return Err(AlgoError::Validation {
+                message: "group must be zero in state-proof transaction".to_string(),
+            });
+        }
+        if txn.rekey_to.as_ref().is_some_and(|a| !a.is_zero()) {
+            return Err(AlgoError::Validation {
+                message: "rekey must be zero in state-proof transaction".to_string(),
+            });
+        }
+        if txn.lease != [0u8; 32] {
+            return Err(AlgoError::Validation {
+                message: "lease must be zero in state-proof transaction".to_string(),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -3371,5 +3635,486 @@ mod tests {
             name: Some(ByteBuf::from(vec![0u8; v36.max_app_key_len + 1])),
         }]);
         assert!(validate_transaction_wellformed(&txn, false, &v36, None).is_ok());
+    }
+
+    // ── Payment well-formedness (issue #812) ─────────────────────
+
+    #[test]
+    fn test_payment_close_to_self_rejected() {
+        let mut txn = make_valid_txn();
+        txn.receiver = Address([0x20; 32]);
+        txn.close_remainder_to = txn.sender;
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot close account to its sender"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_payment_fee_sink_spend_to_non_rewards_pool_rejected() {
+        let mut txn = make_valid_txn();
+        let fee_sink = Address([0x30; 32]);
+        let rewards_pool = Address([0x40; 32]);
+        txn.sender = fee_sink;
+        txn.receiver = Address([0x50; 32]); // not the rewards pool
+        let mut params = v42_params();
+        params.payouts_enabled = false;
+        let spec = SpecialAddresses {
+            fee_sink,
+            rewards_pool,
+        };
+        let err = validate_transaction_wellformed(&txn, false, &params, Some(&spec)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot spend from fee sink's address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_payment_fee_sink_spend_to_rewards_pool_ok() {
+        let mut txn = make_valid_txn();
+        let fee_sink = Address([0x30; 32]);
+        let rewards_pool = Address([0x40; 32]);
+        txn.sender = fee_sink;
+        txn.receiver = rewards_pool;
+        let mut params = v42_params();
+        params.payouts_enabled = false;
+        let spec = SpecialAddresses {
+            fee_sink,
+            rewards_pool,
+        };
+        assert!(validate_transaction_wellformed(&txn, false, &params, Some(&spec)).is_ok());
+    }
+
+    // ── Asset config well-formedness (issue #812) ────────────────
+
+    fn make_acfg_txn() -> Transaction {
+        Transaction {
+            txn_type: "acfg".into(),
+            ..make_valid_txn()
+        }
+    }
+
+    #[test]
+    fn test_acfg_asset_name_too_long_rejected() {
+        let mut txn = make_acfg_txn();
+        let params = v42_params();
+        txn.asset_params = Some(algo_types::AssetParams {
+            asset_name: "x".repeat(params.max_asset_name_bytes + 1),
+            ..Default::default()
+        });
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("asset name too big"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_acfg_decimals_too_high_rejected() {
+        let mut txn = make_acfg_txn();
+        let params = v42_params();
+        txn.asset_params = Some(algo_types::AssetParams {
+            decimals: params.max_asset_decimals + 1,
+            ..Default::default()
+        });
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("decimals is too high"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_acfg_within_limits_ok() {
+        let mut txn = make_acfg_txn();
+        let params = v42_params();
+        txn.asset_params = Some(algo_types::AssetParams {
+            asset_name: "x".repeat(params.max_asset_name_bytes),
+            unit_name: "u".repeat(params.max_asset_unit_name_bytes),
+            url: "h".repeat(params.max_asset_url_bytes),
+            decimals: params.max_asset_decimals,
+            ..Default::default()
+        });
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    // ── Asset transfer well-formedness (issue #812) ──────────────
+
+    fn make_axfer_txn() -> Transaction {
+        Transaction {
+            txn_type: "axfer".into(),
+            xaid: 1,
+            ..make_valid_txn()
+        }
+    }
+
+    #[test]
+    fn test_axfer_zero_asset_id_with_nonzero_amount_rejected() {
+        let mut txn = make_axfer_txn();
+        txn.xaid = 0;
+        txn.asset_amount = 100;
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("asset ID cannot be zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_axfer_close_by_clawback_rejected() {
+        let mut txn = make_axfer_txn();
+        txn.asset_sender = Some(Address([0x21; 32]));
+        txn.asset_close_to = Some(Address([0x22; 32]));
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot close asset by clawback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_axfer_valid_ok() {
+        let txn = make_axfer_txn();
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    // ── Asset freeze well-formedness (issue #812) ────────────────
+
+    fn make_afrz_txn() -> Transaction {
+        Transaction {
+            txn_type: "afrz".into(),
+            freeze_asset: 1,
+            freeze_account: Some(Address([0x21; 32])),
+            ..make_valid_txn()
+        }
+    }
+
+    #[test]
+    fn test_afrz_zero_asset_id_rejected() {
+        let mut txn = make_afrz_txn();
+        txn.freeze_asset = 0;
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("asset ID cannot be zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_afrz_empty_freeze_account_rejected() {
+        let mut txn = make_afrz_txn();
+        txn.freeze_account = None;
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("freeze account cannot be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_afrz_valid_ok() {
+        let txn = make_afrz_txn();
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    // ── Keyreg well-formedness (issue #812) ───────────────────────
+
+    fn make_keyreg_txn() -> Transaction {
+        Transaction {
+            txn_type: "keyreg".into(),
+            vote_pk: Some([1u8; 32]),
+            selection_pk: Some([2u8; 32]),
+            vote_first: 1000,
+            vote_last: 2000,
+            vote_key_dilution: 100,
+            ..make_valid_txn()
+        }
+    }
+
+    #[test]
+    fn test_keyreg_fee_sink_rejected() {
+        let fee_sink = Address([0x30; 32]);
+        let mut txn = make_keyreg_txn();
+        txn.sender = fee_sink;
+        let params = v42_params();
+        let spec = SpecialAddresses {
+            fee_sink,
+            rewards_pool: Address([0x40; 32]),
+        };
+        let err = validate_transaction_wellformed(&txn, false, &params, Some(&spec)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot register participation key for fee sink"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_vote_first_after_vote_last_rejected() {
+        let mut txn = make_keyreg_txn();
+        txn.vote_first = 2000;
+        txn.vote_last = 1000;
+        let params = v42_params();
+        assert!(params.enable_keyreg_coherency_check);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("first voting round need to be less than its last voting round"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_non_coherent_keys_rejected() {
+        let mut txn = make_keyreg_txn();
+        txn.selection_pk = None; // vote_pk set but selection_pk empty
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("need to be clear/set together"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_going_offline_with_vote_rounds_rejected() {
+        let mut txn = make_keyreg_txn();
+        txn.vote_pk = None;
+        txn.selection_pk = None;
+        txn.vote_key_dilution = 0;
+        // vote_first/vote_last still set from make_keyreg_txn -- offline
+        // transactions must not carry them.
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("vote first and vote last fields should not be set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_going_online_zero_vote_last_rejected() {
+        let mut txn = make_keyreg_txn();
+        // vote_first must also be 0 so the earlier vote_first>vote_last
+        // coherency check doesn't fire before this one.
+        txn.vote_first = 0;
+        txn.vote_last = 0;
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("vote last is set to zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_going_online_vote_first_beyond_last_valid_rejected() {
+        let mut txn = make_keyreg_txn();
+        txn.vote_first = txn.last_valid.0 + 100;
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("first voting round is beyond the round after last valid round"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_going_online_valid_ok() {
+        let txn = make_keyreg_txn();
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_keyreg_going_offline_valid_ok() {
+        let mut txn = make_keyreg_txn();
+        txn.vote_pk = None;
+        txn.selection_pk = None;
+        txn.vote_key_dilution = 0;
+        txn.vote_first = 0;
+        txn.vote_last = 0;
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_keyreg_nonparticipation_unsupported_rejected() {
+        let mut txn = make_keyreg_txn();
+        txn.vote_pk = None;
+        txn.selection_pk = None;
+        txn.vote_key_dilution = 0;
+        txn.vote_first = 0;
+        txn.vote_last = 0;
+        txn.non_participation = true;
+        let mut params = v42_params();
+        params.support_become_non_participating_transactions = false;
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_nonparticipation_with_keys_rejected() {
+        let mut txn = make_keyreg_txn();
+        txn.non_participation = true;
+        // vote_pk/selection_pk still set from make_keyreg_txn -- must be
+        // empty when marking nonparticipating.
+        let params = v42_params();
+        assert!(params.support_become_non_participating_transactions);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("nonparticipatory flag is set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_nonparticipation_valid_ok() {
+        let mut txn = make_keyreg_txn();
+        txn.vote_pk = None;
+        txn.selection_pk = None;
+        txn.vote_key_dilution = 0;
+        txn.vote_first = 0;
+        txn.vote_last = 0;
+        txn.non_participation = true;
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_keyreg_state_proof_pk_set_when_disabled_rejected() {
+        let mut txn = make_keyreg_txn();
+        txn.state_proof_pk = Some([1u8; 64]);
+        let mut params = v42_params();
+        params.enable_state_proof_keyreg_check = false;
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("StateProofPK should be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_state_proof_pk_offline_rejected() {
+        let mut txn = make_keyreg_txn();
+        txn.vote_pk = None;
+        txn.selection_pk = None;
+        txn.vote_key_dilution = 0;
+        txn.vote_first = 0;
+        txn.vote_last = 0;
+        txn.state_proof_pk = Some([1u8; 64]);
+        let params = v42_params();
+        assert!(params.enable_state_proof_keyreg_check);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("offline keyreg transactions should contain empty stateProofPK"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_state_proof_pk_going_online_ok() {
+        let mut txn = make_keyreg_txn();
+        txn.state_proof_pk = Some([1u8; 64]);
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    // ── State proof well-formedness (issue #812) ──────────────────
+
+    fn make_stpf_txn() -> Transaction {
+        Transaction {
+            txn_type: "stpf".into(),
+            sender: algo_types::Address::STATE_PROOF_SENDER,
+            fee: 0,
+            first_valid: Round(1000),
+            last_valid: Round(1100),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_stpf_wrong_sender_rejected() {
+        let mut txn = make_stpf_txn();
+        txn.sender = Address([0x99; 32]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("sender must be the state-proof sender"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_stpf_nonzero_fee_rejected() {
+        let mut txn = make_stpf_txn();
+        txn.fee = 1;
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("fee must be zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_stpf_nonempty_note_rejected() {
+        let mut txn = make_stpf_txn();
+        txn.note = ByteBuf::from(vec![1u8]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("note must be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_stpf_nonzero_lease_rejected() {
+        let mut txn = make_stpf_txn();
+        txn.lease = [1u8; 32];
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("lease must be zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_stpf_rekey_to_set_rejected() {
+        let mut txn = make_stpf_txn();
+        txn.rekey_to = Some(Address([0x21; 32]));
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("rekey must be zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_stpf_valid_ok() {
+        let txn = make_stpf_txn();
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
     }
 }

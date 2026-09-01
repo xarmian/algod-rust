@@ -454,6 +454,8 @@ pub struct ConsensusParams {
     pub max_asset_name_bytes: usize,
     /// Max asset unit name bytes (Go: `MaxAssetUnitNameBytes`).
     pub max_asset_unit_name_bytes: usize,
+    /// Max asset decimals (Go: `MaxAssetDecimals`, v20+; 0 pre-v20).
+    pub max_asset_decimals: u32,
 
     // ── Expired account removal (v31+) ───────────────────────────
     /// Max online accounts a proposer can take offline for expired voting keys
@@ -903,6 +905,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         max_asset_url_bytes: 0,
         max_asset_name_bytes: 0,
         max_asset_unit_name_bytes: 0,
+        max_asset_decimals: 0,
         max_proposed_expired_online_accounts: 0,
         payouts_enabled: false,
         payouts_go_online_fee: 0,
@@ -1103,8 +1106,9 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
 
     // ── v20 ─────────────────────────────────────────────────────
     let mut v20 = v19.clone();
-    // v20 adds MaxAssetDecimals (not modeled) and changes DefaultUpgradeWaitRounds
+    // v20 adds MaxAssetDecimals and changes DefaultUpgradeWaitRounds
     v20.default_upgrade_wait_rounds = 140_000;
+    v20.max_asset_decimals = 19;
     if version == CONSENSUS_V20 {
         return Some(v20);
     }
@@ -1683,6 +1687,7 @@ pub struct ConsensusParamsOverride {
     pub max_asset_url_bytes: usize,
     pub max_asset_name_bytes: usize,
     pub max_asset_unit_name_bytes: usize,
+    pub max_asset_decimals: u32,
     pub max_proposed_expired_online_accounts: usize,
     #[serde(rename = "Payouts")]
     pub payouts: PayoutsOverride,
@@ -1871,6 +1876,7 @@ impl ConsensusParamsOverride {
             max_asset_url_bytes: self.max_asset_url_bytes,
             max_asset_name_bytes: self.max_asset_name_bytes,
             max_asset_unit_name_bytes: self.max_asset_unit_name_bytes,
+            max_asset_decimals: self.max_asset_decimals,
             max_proposed_expired_online_accounts: self.max_proposed_expired_online_accounts,
             payouts_enabled: self.payouts.enabled,
             payouts_go_online_fee: self.payouts.go_online_fee,
