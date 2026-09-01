@@ -54,6 +54,38 @@ fn resolve_account(value: AvmValue, ctx: &dyn AvmContext) -> Result<[u8; 32], Al
     }
 }
 
+/// Resolve an account reference for a *mutating* local-state operation
+/// (`app_local_put`/`app_local_del`).
+///
+/// Matches go-algorand's `mutableAccountReference`
+/// (`data/transactions/logic/eval.go`): unlike the general
+/// [`resolve_account`], a raw 32-byte address is rejected outright here,
+/// even though it may be perfectly resolvable for reads. A write must be
+/// encodable in the transaction's `EvalDelta.LocalDeltas`, which is indexed
+/// by position in the txn's `Accounts` array (`Sender` is index 0); a raw
+/// address supplied directly on the stack has no such position and so
+/// cannot be the target of a local-state mutation, even if the account
+/// happens to be readable for other purposes.
+fn resolve_mutable_account(value: AvmValue, ctx: &dyn AvmContext) -> Result<[u8; 32], AlgoError> {
+    match value {
+        AvmValue::Uint64(idx) => ctx.resolve_account(idx),
+        AvmValue::Bytes(b) if b.len() == 32 => {
+            let mut addr = [0u8; 32];
+            addr.copy_from_slice(&b);
+            Err(AlgoError::Avm {
+                message: format!(
+                    "invalid Account reference for mutation {}",
+                    algo_types::Address(addr)
+                ),
+            })
+        }
+        _ => Err(AlgoError::Avm {
+            message: "invalid account reference: expected uint64 index or 32-byte address"
+                .to_string(),
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Balance / min_balance
 // ---------------------------------------------------------------------------
@@ -192,7 +224,7 @@ pub fn op_app_local_put(
     let value = machine.pop()?;
     let key = machine.pop_bytes()?;
     let acct_val = machine.pop()?;
-    let addr = resolve_account(acct_val, ctx)?;
+    let addr = resolve_mutable_account(acct_val, ctx)?;
     let app_id = ctx.current_app_id();
     ctx.app_local_put(&addr, app_id, &key, avm_to_teal(value))
 }
@@ -217,7 +249,7 @@ pub fn op_app_local_del(
 ) -> Result<(), AlgoError> {
     let key = machine.pop_bytes()?;
     let acct_val = machine.pop()?;
-    let addr = resolve_account(acct_val, ctx)?;
+    let addr = resolve_mutable_account(acct_val, ctx)?;
     let app_id = ctx.current_app_id();
     ctx.app_local_del(&addr, app_id, &key)
 }
@@ -1688,12 +1720,72 @@ mod tests {
         assert_eq!(m.stack[0], AvmValue::Uint64(0));
     }
 
+    // ── resolve_mutable_account (issue #809) ──────────────────────
+
+    #[test]
+    fn resolve_mutable_account_accepts_valid_index() {
+        let addr = test_addr(0x01);
+        let mut ctx = TestStateContext::new(100);
+        ctx.accounts.push(addr);
+        let resolved = super::resolve_mutable_account(AvmValue::Uint64(0), &ctx).unwrap();
+        assert_eq!(resolved, addr);
+    }
+
+    #[test]
+    fn resolve_mutable_account_rejects_raw_address() {
+        // A raw 32-byte address is resolvable for reads (see
+        // `resolve_account`) but must be rejected for a write -- it has no
+        // position in the txn's Accounts array to encode a mutation
+        // against, matching go-algorand's `mutableAccountReference`.
+        let addr = test_addr(0x02);
+        let ctx = TestStateContext::new(100);
+        let err = super::resolve_mutable_account(AvmValue::Bytes(addr.to_vec()), &ctx).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid Account reference for mutation"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_mutable_account_rejects_out_of_range_index() {
+        let ctx = TestStateContext::new(100);
+        assert!(super::resolve_mutable_account(AvmValue::Uint64(5), &ctx).is_err());
+    }
+
+    #[test]
+    fn app_local_put_rejects_raw_address_account() {
+        let addr = test_addr(0x0C);
+        // pushbytes addr, pushbytes "key", pushint 1, app_local_put
+        let mut code = vec![0x80, 0x20];
+        code.extend_from_slice(&addr);
+        code.extend_from_slice(&[0x80, 0x03]);
+        code.extend_from_slice(b"key");
+        code.extend_from_slice(&[0x81, 1]);
+        code.push(0x66); // app_local_put
+        let raw = prog(5, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        let result = step_n(&mut m, &mut ctx, 4);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid Account reference for mutation"),
+            "unexpected error"
+        );
+    }
+
     #[test]
     fn test_app_local_put_and_get() {
         let addr = test_addr(0x0A);
-        // pushbytes addr, pushbytes "key", pushint 77, app_local_put
-        let mut code = vec![0x80, 0x20];
-        code.extend_from_slice(&addr);
+        // A mutating op (app_local_put) requires an accounts-array index,
+        // not a raw address (see resolve_mutable_account); a read
+        // (app_local_get) accepts either, so index 0 works for both here.
+        // pushint 0, pushbytes "key", pushint 77, app_local_put
+        let mut code = vec![0x81, 0]; // pushint 0
         code.extend_from_slice(&[0x80, 0x03]);
         code.extend_from_slice(b"key");
         code.extend_from_slice(&[0x81, 77]);
@@ -1708,6 +1800,7 @@ mod tests {
         let program = bytecode::parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
         let mut ctx = TestStateContext::new(100);
+        ctx.accounts.push(addr);
         step_n(&mut m, &mut ctx, 7).unwrap();
         assert_eq!(m.stack.len(), 1);
         assert_eq!(m.stack[0], AvmValue::Uint64(77));
@@ -1717,11 +1810,13 @@ mod tests {
     fn test_app_local_del() {
         let addr = test_addr(0x0B);
         let mut ctx = TestStateContext::new(100);
+        ctx.accounts.push(addr);
         ctx.local_state
             .insert((addr, 100, b"x".to_vec()), TealValue::Uint(50));
-        // pushbytes addr, pushbytes "x", app_local_del
-        let mut code = vec![0x80, 0x20];
-        code.extend_from_slice(&addr);
+        // A mutating op (app_local_del) requires an accounts-array index,
+        // not a raw address (see resolve_mutable_account).
+        // pushint 0, pushbytes "x", app_local_del
+        let mut code = vec![0x81, 0]; // pushint 0
         code.extend_from_slice(&[0x80, 0x01]);
         code.push(b'x');
         code.push(0x68); // app_local_del

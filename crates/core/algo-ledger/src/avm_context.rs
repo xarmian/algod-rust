@@ -2844,6 +2844,67 @@ fn execute_inner_appl<L: LedgerStore>(
 /// `LastValid - MaxTxnLife - 1` (clamped to `1` early in the chain's life)
 /// and `lastAvail` is `FirstValid - 1` (clamped to `0`, meaning nothing is
 /// available, if `FirstValid == 0`).
+/// Disallow an inner app call from re-entering the currently-executing app
+/// (direct self-call) or any ancestor in its caller chain (an indirect
+/// A->B->A cycle across inner app calls). Matches go-algorand's
+/// `data/transactions/logic/eval.go`: the direct `cx.appID ==
+/// subtxn.ApplicationID` check, followed by `for parent := cx.caller; parent
+/// != nil; parent = parent.caller`. `family_chain` already carries every
+/// ancestor's app_id (see [`FamilyFrame`]), so no separate ancestor tracking
+/// is needed here.
+fn check_reentrancy(
+    self_app_id: u64,
+    family_chain: &[FamilyFrame],
+    called_app_id: u64,
+) -> Result<(), AlgoError> {
+    if called_app_id == self_app_id {
+        return Err(AlgoError::Avm {
+            message: "attempt to self-call".to_string(),
+        });
+    }
+    if let Some(ancestor) = family_chain.iter().find(|f| f.app_id == called_app_id) {
+        return Err(AlgoError::Avm {
+            message: format!("attempt to re-enter {}", ancestor.app_id),
+        });
+    }
+    Ok(())
+}
+
+/// Check that the live key/value counts in `state` do not exceed `schema`'s
+/// declared `NumUint`/`NumByteSlice` bounds, matching go-algorand's
+/// `storageDelta.checkCounts` (`ledger/eval/appcow.go`), which runs after
+/// every state write.
+fn check_state_schema_counts(
+    state: &std::collections::BTreeMap<Vec<u8>, TealValue>,
+    schema: &algo_types::StateSchema,
+) -> Result<(), AlgoError> {
+    let mut num_uint = 0u64;
+    let mut num_byte_slice = 0u64;
+    for v in state.values() {
+        match v {
+            TealValue::Uint(_) => num_uint += 1,
+            TealValue::Bytes(_) => num_byte_slice += 1,
+        }
+    }
+    if num_uint > schema.num_uint {
+        return Err(AlgoError::Avm {
+            message: format!(
+                "store integer count {num_uint} exceeds schema integer count {}",
+                schema.num_uint
+            ),
+        });
+    }
+    if num_byte_slice > schema.num_byte_slice {
+        return Err(AlgoError::Avm {
+            message: format!(
+                "store bytes count {num_byte_slice} exceeds schema bytes count {}",
+                schema.num_byte_slice
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn check_available_round(
     round: u64,
     first_valid: u64,
@@ -3181,6 +3242,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             Some(value.clone()),
         );
         local.key_value.insert(key.to_vec(), value.clone());
+        check_state_schema_counts(&local.key_value, &local.schema)?;
         self.store.set_app_local_state(&addr, app_id, local);
         // Track delta for EvalDelta comparison.
         if app_id == self.app_id {
@@ -3244,6 +3306,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             Some(value.clone()),
         );
         p.global_state.insert(key.to_vec(), value.clone());
+        check_state_schema_counts(&p.global_state, &p.global_state_schema)?;
         self.store.set_app_params(app_id, p);
         // Track delta for EvalDelta comparison.
         if app_id == self.app_id {
@@ -3852,12 +3915,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 "appl" => {
                     let called_app_id = stxn.txn.application_id;
 
-                    // Disallow self-call (reentrancy on the same app).
-                    if called_app_id == self.app_id {
-                        return Err(AlgoError::Avm {
-                            message: "attempt to self-call".to_string(),
-                        });
-                    }
+                    check_reentrancy(self.app_id, &self.family_chain, called_app_id)?;
 
                     // Check depth limit: count ancestors (matching go-algorand
                     // which walks the `caller` chain). Our `self.depth` is 0 for
@@ -5069,6 +5127,126 @@ mod tests {
         // (it's the txn's own FirstValid round, not yet in history).
         let result = ctx.block_field(100, 1);
         assert!(result.is_err());
+    }
+
+    // ── Reentrancy guard (issue #809) ─────────────────────────────
+
+    #[test]
+    fn check_reentrancy_allows_unrelated_call() {
+        assert!(check_reentrancy(100, &[], 200).is_ok());
+    }
+
+    #[test]
+    fn check_reentrancy_rejects_direct_self_call() {
+        let err = check_reentrancy(100, &[], 100).unwrap_err();
+        assert!(
+            err.to_string().contains("attempt to self-call"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_reentrancy_rejects_indirect_ancestor_cycle() {
+        // A (100) called B (200), which is now trying to call A (100) again
+        // -- an indirect A->B->A cycle, not a direct self-call.
+        let family_chain = vec![FamilyFrame {
+            app_id: 100,
+            creator: [0u8; 32],
+            touched_family_shared: false,
+        }];
+        let err = check_reentrancy(200, &family_chain, 100).unwrap_err();
+        assert!(
+            err.to_string().contains("attempt to re-enter 100"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_reentrancy_allows_calling_a_sibling_not_an_ancestor() {
+        // A (100) called B (200); B calling C (300), which is not anywhere
+        // in the ancestor chain, must be allowed.
+        let family_chain = vec![FamilyFrame {
+            app_id: 100,
+            creator: [0u8; 32],
+            touched_family_shared: false,
+        }];
+        assert!(check_reentrancy(200, &family_chain, 300).is_ok());
+    }
+
+    // ── StateSchema write-limit enforcement (issue #809) ──────────
+
+    #[test]
+    fn check_state_schema_counts_within_bounds_ok() {
+        let mut state = std::collections::BTreeMap::new();
+        state.insert(b"a".to_vec(), TealValue::Uint(1));
+        state.insert(b"b".to_vec(), TealValue::Bytes(vec![1]));
+        let schema = algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 1,
+        };
+        assert!(check_state_schema_counts(&state, &schema).is_ok());
+    }
+
+    #[test]
+    fn check_state_schema_counts_rejects_too_many_uints() {
+        let mut state = std::collections::BTreeMap::new();
+        state.insert(b"a".to_vec(), TealValue::Uint(1));
+        state.insert(b"b".to_vec(), TealValue::Uint(2));
+        let schema = algo_types::StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        };
+        let err = check_state_schema_counts(&state, &schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("store integer count 2 exceeds schema integer count 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_state_schema_counts_rejects_too_many_bytes() {
+        let mut state = std::collections::BTreeMap::new();
+        state.insert(b"a".to_vec(), TealValue::Bytes(vec![1]));
+        state.insert(b"b".to_vec(), TealValue::Bytes(vec![2]));
+        let schema = algo_types::StateSchema {
+            num_uint: 0,
+            num_byte_slice: 1,
+        };
+        let err = check_state_schema_counts(&state, &schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("store bytes count 2 exceeds schema bytes count 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn app_global_put_rejects_write_exceeding_schema() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.set_app_params(
+            42,
+            algo_types::AppParams {
+                creator: Address([10u8; 32]),
+                global_state_schema: algo_types::StateSchema {
+                    num_uint: 1,
+                    num_byte_slice: 0,
+                },
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 42;
+
+        assert!(ctx.app_global_put(42, b"a", TealValue::Uint(1)).is_ok());
+        let err = ctx
+            .app_global_put(42, b"b", TealValue::Uint(2))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds schema integer count"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

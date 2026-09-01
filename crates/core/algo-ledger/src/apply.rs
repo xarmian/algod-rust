@@ -3787,10 +3787,45 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
                         app_id,
                     )));
                 }
+                // go-algorand `transactions.CheckContractVersions`
+                // (`data/transactions/transaction.go`): once a program
+                // version reaches `MinInnerApplVersion` (callable as an
+                // inner-app target), it must not be downgraded below that
+                // version on update -- an app A that opted its account into
+                // this app's account (requiring a callable ClearStateProgram)
+                // must always be able to ClearState back out.
                 if let Some(ref approval) = txn.approval_program {
+                    let prev_version = algo_avm::bytecode::parse(&app.approval_program)
+                        .map(|p| p.version as u64)
+                        .unwrap_or(0);
+                    let new_version = algo_avm::bytecode::parse(approval)
+                        .map(|p| p.version as u64)
+                        .unwrap_or(0);
+                    if prev_version >= consensus.min_inner_appl_version
+                        && new_version < prev_version
+                    {
+                        return Err(err_ctx.error(format!(
+                            "approval program version downgrade: {} < {}",
+                            new_version, prev_version
+                        )));
+                    }
                     app.approval_program = approval.to_vec();
                 }
                 if let Some(ref clear) = txn.clear_state_program {
+                    let prev_version = algo_avm::bytecode::parse(&app.clear_state_program)
+                        .map(|p| p.version as u64)
+                        .unwrap_or(0);
+                    let new_version = algo_avm::bytecode::parse(clear)
+                        .map(|p| p.version as u64)
+                        .unwrap_or(0);
+                    if prev_version >= consensus.min_inner_appl_version
+                        && new_version < prev_version
+                    {
+                        return Err(err_ctx.error(format!(
+                            "clearstate program version downgrade: {} < {}",
+                            new_version, prev_version
+                        )));
+                    }
                     app.clear_state_program = clear.to_vec();
                 }
                 // go-algorand `ledger/apply/application.go`'s `updateApplication`:
@@ -9973,6 +10008,132 @@ mod tests {
                 && msg.contains(&format!("updating app {app_id}")),
             "expected a write-budget-exceeded rejection for the oversized update, got: {msg}"
         );
+    }
+
+    // ---- Issue #809: app-version downgrade must be rejected once the
+    // program has reached MinInnerApplVersion (matches go-algorand's
+    // CheckContractVersions, data/transactions/transaction.go) ----
+
+    #[test]
+    fn issue_809_app_approval_program_downgrade_is_rejected() {
+        let creator = Address([7u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        // Round 1: create an app with a v6 approval program.
+        // v41's MinInnerApplVersion is 4, so a v6 program is already
+        // downgrade-protected.
+        let v6_approval = trivial_clear_program();
+        let v6_clear = trivial_clear_program();
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(v6_approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(v6_clear));
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let &app_id = delta1
+            .creatables
+            .keys()
+            .next()
+            .expect("app create must register a creatable");
+
+        // Round 2: attempt to update it with a v2 approval program -- a
+        // downgrade from v6, which must be rejected.
+        let v2_approval =
+            algo_avm::assembler::assemble_string("#pragma version 2\nint 1\nreturn\n")
+                .expect("v2 program must assemble")
+                .program;
+        let v6_clear_again = trivial_clear_program();
+        let mut update = SignedTransaction::default();
+        update.txn.txn_type = "appl".into();
+        update.txn.sender = creator;
+        update.txn.fee = 10_000;
+        update.txn.application_id = app_id;
+        update.txn.on_completion = ON_COMPLETION_UPDATE;
+        update.txn.approval_program = Some(serde_bytes::ByteBuf::from(v2_approval));
+        update.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(v6_clear_again));
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![update],
+            ..Block::default()
+        };
+
+        let err = apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("approval program version downgrade: 2 < 6"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn issue_809_app_approval_program_upgrade_is_allowed() {
+        let creator = Address([8u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        let v6_approval = trivial_clear_program();
+        let v6_clear = trivial_clear_program();
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(v6_approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(v6_clear));
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let &app_id = delta1
+            .creatables
+            .keys()
+            .next()
+            .expect("app create must register a creatable");
+
+        // An upgrade (v6 -> v8) must be allowed.
+        let v8_approval =
+            algo_avm::assembler::assemble_string("#pragma version 8\nint 1\nreturn\n")
+                .expect("v8 program must assemble")
+                .program;
+        let v6_clear_again = trivial_clear_program();
+        let mut update = SignedTransaction::default();
+        update.txn.txn_type = "appl".into();
+        update.txn.sender = creator;
+        update.txn.fee = 10_000;
+        update.txn.application_id = app_id;
+        update.txn.on_completion = ON_COMPLETION_UPDATE;
+        update.txn.approval_program = Some(serde_bytes::ByteBuf::from(v8_approval));
+        update.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(v6_clear_again));
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![update],
+            ..Block::default()
+        };
+
+        apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute)
+            .expect("upgrading the approval program version must be allowed");
     }
 
     // ---- Issue #725: box read-I/O-budget check must run eagerly for every
