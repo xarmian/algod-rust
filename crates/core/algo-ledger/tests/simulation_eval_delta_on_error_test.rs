@@ -65,7 +65,14 @@ fn register_app(state: &mut LedgerState, creator: Address, app_id: u64, approval
         clear_state_program: vec![0x06, 0x81, 0x01, 0x43], // v6: pushint 1; return
         global_state: BTreeMap::new(),
         local_state_schema: StateSchema::default(),
-        global_state_schema: StateSchema::default(),
+        // NumUint: 1 -- global_put_then_err_program() writes one uint key
+        // before erroring; a schema declaring 0 uints would (correctly,
+        // per issue #809's StateSchema write-limit enforcement) reject
+        // that write itself, which isn't what these tests are about.
+        global_state_schema: StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        },
         extra_program_pages: 0,
         ..Default::default()
     };
