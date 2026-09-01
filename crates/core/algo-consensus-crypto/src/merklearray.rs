@@ -43,6 +43,31 @@ pub const MAX_ENCODED_TREE_DEPTH: usize = 16;
 /// Maximum number of leaves on an encoded tree.
 pub const MAX_NUM_LEAVES_ON_ENCODED_TREE: usize = 1 << MAX_ENCODED_TREE_DEPTH;
 
+/// Decode-time allocation bound for `Proof.path` / `SingleLeafProof.path`,
+/// matching go-algorand's `crypto/merklearray/proof.go`:
+/// `Path []crypto.GenericDigest `codec:"pth,allocbound=MaxNumLeavesOnEncodedTree/2"``.
+///
+/// This is a hard upper bound on the number of sibling-hash elements a
+/// decoded proof may contain — a proof claiming more than this is
+/// structurally impossible for any tree bounded by `MAX_ENCODED_TREE_DEPTH`,
+/// so it must be rejected before allocating space for it.
+pub const MAX_PROOF_PATH_LEN: usize = MAX_NUM_LEAVES_ON_ENCODED_TREE / 2;
+
+/// Decode-time allocation bound for `Tree.levels`, matching go-algorand's
+/// `crypto/merklearray/merkle.go`: `Levels []Layer `codec:"lvls,allocbound=MaxEncodedTreeDepth+1"``.
+pub const MAX_TREE_LEVELS: usize = MAX_ENCODED_TREE_DEPTH + 1;
+
+/// Decode-time allocation bound for each `Layer` (one level's worth of
+/// digests) within a decoded `Tree`, matching go-algorand's
+/// `crypto/merklearray/layer.go`: `//msgp:allocbound Layer MaxNumLeavesOnEncodedTree`.
+pub const MAX_LAYER_LEN: usize = MAX_NUM_LEAVES_ON_ENCODED_TREE;
+
+/// Decode-time allocation bound for a single `GenericDigest`, matching
+/// go-algorand's `crypto/digest.go`: `//msgp:allocbound GenericDigest MaxHashDigestSize`,
+/// where `MaxHashDigestSize = SumhashDigestSize` (the largest digest this
+/// repo's hash types produce).
+pub const MAX_HASH_DIGEST_SIZE: usize = crate::sumhash::SUMHASH512_DIGEST_SIZE;
+
 /// Domain separation prefix for Merkle array internal nodes.
 const MA_PREFIX: &[u8] = b"MA";
 
@@ -191,12 +216,27 @@ pub enum MerkleError {
     ProofIsNil,
     NonEmptyProofForEmptyElements,
     UnexpectedTreeDepth,
-    PosOutOfBound { pos: u64, bound: u64 },
+    PosOutOfBound {
+        pos: u64,
+        bound: u64,
+    },
     ProofLengthDigestSizeMismatch,
     NoMoreSiblingHints,
-    LevelBeyondTreeHeight { level: u64, height: usize },
+    LevelBeyondTreeHeight {
+        level: u64,
+        height: usize,
+    },
     InternalError(String),
     ArrayError(String),
+    /// A decoded length prefix exceeded the field's allocation bound
+    /// (matching go-algorand's msgp `allocbound` decode-time checks).
+    /// Rejected before allocating, so a malicious length prefix can't be
+    /// used to force a huge allocation from a small message.
+    DecodeBoundExceeded {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for MerkleError {
@@ -221,6 +261,10 @@ impl std::fmt::Display for MerkleError {
             }
             Self::InternalError(msg) => write!(f, "internal error: {msg}"),
             Self::ArrayError(msg) => write!(f, "array error: {msg}"),
+            Self::DecodeBoundExceeded { field, len, max } => write!(
+                f,
+                "decoded length {len} for field {field} exceeds allocation bound {max}"
+            ),
         }
     }
 }
@@ -1090,6 +1134,13 @@ impl Proof {
                     let (arr_len, bytes_read) = read_array_header(&data[offset..])
                         .map_err(|e| MerkleError::InternalError(format!("Proof pth: {e}")))?;
                     offset += bytes_read;
+                    if arr_len > MAX_PROOF_PATH_LEN {
+                        return Err(MerkleError::DecodeBoundExceeded {
+                            field: "Proof.path",
+                            len: arr_len,
+                            max: MAX_PROOF_PATH_LEN,
+                        });
+                    }
                     let mut path = Vec::with_capacity(arr_len);
                     for _ in 0..arr_len {
                         let (digest, bytes_read) =
@@ -1155,11 +1206,25 @@ impl Tree {
                     let (arr_len, bytes_read) = read_array_header(&data[offset..])
                         .map_err(|e| MerkleError::InternalError(format!("Tree lvls: {e}")))?;
                     offset += bytes_read;
+                    if arr_len > MAX_TREE_LEVELS {
+                        return Err(MerkleError::DecodeBoundExceeded {
+                            field: "Tree.levels",
+                            len: arr_len,
+                            max: MAX_TREE_LEVELS,
+                        });
+                    }
                     let mut levels = Vec::with_capacity(arr_len);
                     for _ in 0..arr_len {
                         let (inner_len, bytes_read) = read_array_header(&data[offset..])
                             .map_err(|e| MerkleError::InternalError(format!("Tree layer: {e}")))?;
                         offset += bytes_read;
+                        if inner_len > MAX_LAYER_LEN {
+                            return Err(MerkleError::DecodeBoundExceeded {
+                                field: "Tree.levels[].layer",
+                                len: inner_len,
+                                max: MAX_LAYER_LEN,
+                            });
+                        }
                         let mut layer = Vec::with_capacity(inner_len);
                         for _ in 0..inner_len {
                             let (digest, bytes_read) =
@@ -1263,6 +1328,11 @@ fn read_bin_or_nil(data: &[u8]) -> Result<(Vec<u8>, usize), String> {
         }
         _ => return Err(format!("expected bin or nil, got 0x{b:02x}")),
     };
+    if len > MAX_HASH_DIGEST_SIZE {
+        return Err(format!(
+            "digest length {len} exceeds allocation bound {MAX_HASH_DIGEST_SIZE}"
+        ));
+    }
     if data.len() < hdr_size + len {
         return Err("bin truncated".into());
     }
@@ -2034,5 +2104,112 @@ mod tests {
             let result = verify(&root, &[(idx, &elem)], &slp.proof);
             assert!(result.is_ok(), "failed at idx {idx}: {:?}", result.err());
         }
+    }
+
+    // ── Decode-time allocation-bound enforcement ─────────────────────
+    //
+    // A malicious/corrupted proof (e.g. arriving over gossip or in a
+    // catchpoint file) must be rejected before the decoder attempts to
+    // allocate space for a claimed element count, not after.
+
+    #[test]
+    fn test_proof_path_decode_rejects_oversized_length_prefix() {
+        // msgpack: map{"pth": array32(u32::MAX)} — a length prefix claiming
+        // far more elements than any tree bounded by MAX_ENCODED_TREE_DEPTH
+        // could ever produce, with no actual element bytes following (if the
+        // bound check didn't fire first, this would need gigabytes of
+        // "digest" bytes that aren't present).
+        let mut data = vec![0x81u8]; // fixmap, 1 entry
+        data.push(0xa3); // fixstr, len 3
+        data.extend_from_slice(b"pth");
+        data.push(0xdd); // array32
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let result = Proof::decode_msgpack(&data);
+        assert!(
+            matches!(
+                result,
+                Err(MerkleError::DecodeBoundExceeded {
+                    field: "Proof.path",
+                    ..
+                })
+            ),
+            "expected DecodeBoundExceeded for Proof.path, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_tree_levels_decode_rejects_oversized_length_prefix() {
+        // msgpack: map{"lvls": array32(u32::MAX)}
+        let mut data = vec![0x81u8]; // fixmap, 1 entry
+        data.push(0xa4); // fixstr, len 4
+        data.extend_from_slice(b"lvls");
+        data.push(0xdd); // array32
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let result = Tree::decode_msgpack(&data);
+        assert!(
+            matches!(
+                result,
+                Err(MerkleError::DecodeBoundExceeded {
+                    field: "Tree.levels",
+                    ..
+                })
+            ),
+            "expected DecodeBoundExceeded for Tree.levels, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_tree_layer_decode_rejects_oversized_length_prefix() {
+        // msgpack: map{"lvls": array(1)[ array32(u32::MAX) ]} — one level
+        // whose inner layer claims far more digests than MAX_LAYER_LEN.
+        let mut data = vec![0x81u8]; // fixmap, 1 entry
+        data.push(0xa4); // fixstr, len 4
+        data.extend_from_slice(b"lvls");
+        data.push(0x91); // fixarray, 1 entry (one level)
+        data.push(0xdd); // array32 (the layer itself)
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let result = Tree::decode_msgpack(&data);
+        assert!(
+            matches!(
+                result,
+                Err(MerkleError::DecodeBoundExceeded {
+                    field: "Tree.levels[].layer",
+                    ..
+                })
+            ),
+            "expected DecodeBoundExceeded for Tree.levels[].layer, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_digest_decode_rejects_oversized_length_prefix() {
+        // A "bin" field whose length prefix exceeds MAX_HASH_DIGEST_SIZE
+        // must be rejected before allocating, via read_bin_or_nil.
+        let mut data = vec![0xc6u8]; // bin32
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let result = read_bin_or_nil(&data);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("exceeds allocation bound"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_proof_path_decode_accepts_in_bound_length() {
+        // A small, valid proof (empty path, tree depth 0) still round-trips
+        // through the new bound check without being rejected.
+        let mut data = vec![0x81u8]; // fixmap, 1 entry
+        data.push(0xa3); // fixstr, len 3
+        data.extend_from_slice(b"pth");
+        data.push(0x90); // fixarray, 0 entries
+
+        let (proof, _) = Proof::decode_msgpack(&data).expect("in-bound empty path must decode");
+        assert!(proof.path.is_empty());
     }
 }
