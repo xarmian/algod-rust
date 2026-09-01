@@ -2537,6 +2537,27 @@ mod tests {
         assert!(step_n(&mut m11, &mut ctx, 2).is_ok());
     }
 
+    #[test]
+    fn test_block_branch512_field_version_gated_at_v13() {
+        // BlkBranch512 (field 10, issue #839) requires v13; the opcode
+        // itself only requires v7 (randomnessVersion).
+        let mut ctx = TestStateContext::new(100);
+        ctx.block_fields
+            .insert((99, 10), AvmValue::Bytes(vec![0xEEu8; 64]));
+        let code = vec![0x81, 99, 0xd1, 10];
+
+        let raw_v12 = prog(12, &code);
+        let program_v12 = bytecode::parse(&raw_v12).unwrap();
+        let mut m12 = AvmMachine::new(program_v12, ExecMode::Application, 20000);
+        m12.step(&mut ctx).unwrap(); // pushint round
+        assert!(m12.step(&mut ctx).is_err());
+
+        let raw_v13 = prog(13, &code);
+        let program_v13 = bytecode::parse(&raw_v13).unwrap();
+        let mut m13 = AvmMachine::new(program_v13, ExecMode::Application, 20000);
+        assert!(step_n(&mut m13, &mut ctx, 2).is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // Box storage opcode tests
     // -----------------------------------------------------------------------
