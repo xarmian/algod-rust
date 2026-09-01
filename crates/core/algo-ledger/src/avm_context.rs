@@ -2832,6 +2832,43 @@ fn execute_inner_appl<L: LedgerStore>(
 }
 
 // ---------------------------------------------------------------------------
+// Block-round availability window (`block` opcode, `FirstValidTime` field)
+// ---------------------------------------------------------------------------
+
+/// Check that `round` falls within the window of block history the
+/// currently-executing transaction is allowed to access, matching
+/// go-algorand's `(*EvalContext).availableRound`
+/// (`data/transactions/logic/eval.go`).
+///
+/// The window is `[firstAvail, lastAvail]` where `firstAvail` is bounded by
+/// `LastValid - MaxTxnLife - 1` (clamped to `1` early in the chain's life)
+/// and `lastAvail` is `FirstValid - 1` (clamped to `0`, meaning nothing is
+/// available, if `FirstValid == 0`).
+fn check_available_round(
+    round: u64,
+    first_valid: u64,
+    last_valid: u64,
+    max_txn_life: u64,
+) -> Result<u64, AlgoError> {
+    let mut first_avail = last_valid.saturating_sub(max_txn_life).saturating_sub(1);
+    if first_avail > last_valid || first_avail == 0 {
+        first_avail = 1;
+    }
+    let mut last_avail = first_valid.saturating_sub(1);
+    if last_avail > first_valid {
+        last_avail = 0;
+    }
+    if first_avail > round || round > last_avail {
+        return Err(AlgoError::Avm {
+            message: format!(
+                "round {round} is not available. It's outside [{first_avail}-{last_avail}]"
+            ),
+        });
+    }
+    Ok(round)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers for reading transaction fields
 // ---------------------------------------------------------------------------
 
@@ -2906,6 +2943,25 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             });
         }
         let stxn = &self.group[group_index];
+        // FirstValidTime (field 3): timestamp of block(FirstValid-1), which
+        // requires block-history access via block_field -- not reachable
+        // from the free `read_txn_field` helper (no `self`), so handle it
+        // here. Matches go-algorand's `data/transactions/logic/eval.go`
+        // opTxn FirstValidTime case, including its FirstValid==0 saturation
+        // (go's `basics.Round` subtraction wraps; here we clamp to 0, which
+        // `check_available_round`'s lastAvail==0 handling treats the same
+        // way -- nothing in that window is ever available).
+        if field == 3 {
+            let round = stxn.txn.first_valid.0.saturating_sub(1);
+            let value =
+                self.block_field(round, algo_avm::fields::BlockField::BlkTimestamp as u8)?;
+            return match value {
+                algo_avm::machine::AvmValue::Uint64(ts) => Ok(TealValue::Uint(ts)),
+                algo_avm::machine::AvmValue::Bytes(_) => Err(AlgoError::Avm {
+                    message: "internal error: BlkTimestamp returned Bytes".to_string(),
+                }),
+            };
+        }
         read_txn_field(stxn, field, array_index, group_index)
     }
 
@@ -3590,14 +3646,43 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     // ---- Block field access ----
 
     fn block_field(&self, round: u64, field: u8) -> Result<algo_avm::machine::AvmValue, AlgoError> {
-        // Block field access requires block history which is not yet available
-        // in this implementation. Return a descriptive error.
-        Err(AlgoError::Avm {
-            message: format!(
-                "block field access not yet supported (round={}, field={})",
-                round, field
-            ),
-        })
+        let txn = &self.group[self.group_index].txn;
+        let checked_round = check_available_round(
+            round,
+            txn.first_valid.0,
+            txn.last_valid.0,
+            self.consensus.max_txn_life,
+        )?;
+
+        let hdr = self
+            .store
+            .get_block_header(checked_round)?
+            .ok_or_else(|| AlgoError::Avm {
+                message: format!("block header for round {checked_round} not found"),
+            })?;
+
+        use algo_avm::fields::BlockField;
+        use algo_avm::machine::AvmValue;
+        let bf = BlockField::from_u8(field)?;
+        match bf {
+            BlockField::BlkSeed => Ok(AvmValue::Bytes(hdr.seed.to_vec())),
+            BlockField::BlkTimestamp => {
+                if hdr.timestamp < 0 {
+                    return Err(AlgoError::Avm {
+                        message: format!("block({checked_round}) timestamp {} < 0", hdr.timestamp),
+                    });
+                }
+                Ok(AvmValue::Uint64(hdr.timestamp as u64))
+            }
+            BlockField::BlkProposer => Ok(AvmValue::Bytes(hdr.proposer.0.to_vec())),
+            BlockField::BlkFeesCollected => Ok(AvmValue::Uint64(hdr.fees_collected)),
+            BlockField::BlkBonus => Ok(AvmValue::Uint64(hdr.bonus)),
+            BlockField::BlkBranch => Ok(AvmValue::Bytes(hdr.branch.to_vec())),
+            BlockField::BlkFeeSink => Ok(AvmValue::Bytes(hdr.fee_sink.0.to_vec())),
+            BlockField::BlkProtocol => Ok(AvmValue::Bytes(hdr.current_protocol.into_bytes())),
+            BlockField::BlkTxnCounter => Ok(AvmValue::Uint64(hdr.txn_counter)),
+            BlockField::BlkProposerPayout => Ok(AvmValue::Uint64(hdr.proposer_payout)),
+        }
     }
 
     // ---- Inner transactions ----
@@ -4885,6 +4970,105 @@ mod tests {
 
         let note = ctx.txn_field(0, 5, None).unwrap(); // Note
         assert_eq!(note, TealValue::Bytes(b"hello".to_vec()));
+    }
+
+    // ---- block_field / FirstValidTime tests ----
+
+    fn seed_block_header(store: &mut LedgerState, round: u64, timestamp: i64) {
+        use algo_types::BlockHeader;
+        let hdr = BlockHeader {
+            round: algo_types::Round(round),
+            timestamp,
+            ..BlockHeader::default()
+        };
+        let hdrdata = algo_codec::canonical_encode_block_header(&hdr);
+        store.put_block(round, "v41", &hdrdata, &[]).unwrap();
+    }
+
+    #[test]
+    fn txn_field_first_valid_time_reads_block_timestamp() {
+        // make_pay_txn's FirstValid=100, LastValid=200 (see make_pay_txn).
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        seed_block_header(&mut store, 99, 1_700_000_000);
+        let ctx = make_context(&mut store, vec![txn]);
+
+        let ts = ctx.txn_field(0, 3, None).unwrap(); // FirstValidTime
+        assert_eq!(ts, TealValue::Uint(1_700_000_000));
+    }
+
+    #[test]
+    fn txn_field_first_valid_time_errors_when_header_missing() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        // No header seeded at round 99.
+        let ctx = make_context(&mut store, vec![txn]);
+
+        let result = ctx.txn_field(0, 3, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn txn_field_first_valid_time_errors_when_round_outside_availability_window() {
+        // FirstValid=100 with a header at round 99 present, but MaxTxnLife=0
+        // and a LastValid far below 99 makes round 99 fall outside the
+        // availability window, so this must error even though a header
+        // exists at that round.
+        let mut txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        txn.txn.first_valid = algo_types::Round(100);
+        txn.txn.last_valid = algo_types::Round(100); // window: [max(1, 100-0-1)=99? no: last_avail=99]
+        let mut store = LedgerState::new();
+        seed_block_header(&mut store, 99, 1_700_000_000);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.consensus.max_txn_life = 0;
+
+        // With FirstValid=100, LastValid=100, MaxTxnLife=0:
+        // firstAvail = max(1, 100-0-1) = 99, lastAvail = 100-1 = 99, so 99
+        // IS available -- this positive case should succeed.
+        let ts = ctx.txn_field(0, 3, None).unwrap();
+        assert_eq!(ts, TealValue::Uint(1_700_000_000));
+
+        // Now push FirstValid further out so round 99 falls below the
+        // firstAvail floor.
+        ctx.group[0].txn.first_valid = algo_types::Round(1000);
+        ctx.group[0].txn.last_valid = algo_types::Round(1000);
+        let result = ctx.txn_field(0, 3, None);
+        assert!(result.is_err(), "round 99 should be outside [999-999]");
+    }
+
+    #[test]
+    fn block_field_seed_and_timestamp() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        use algo_types::BlockHeader;
+        let hdr = BlockHeader {
+            round: algo_types::Round(50),
+            timestamp: 42,
+            seed: [7u8; 32],
+            ..BlockHeader::default()
+        };
+        let hdrdata = algo_codec::canonical_encode_block_header(&hdr);
+        store.put_block(50, "v41", &hdrdata, &[]).unwrap();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        // round 50 is within [1, 99] for a FirstValid=100 txn.
+        let seed = ctx.block_field(50, 0).unwrap(); // BlkSeed
+        assert_eq!(seed, algo_avm::machine::AvmValue::Bytes(vec![7u8; 32]));
+
+        let ts = ctx.block_field(50, 1).unwrap(); // BlkTimestamp
+        assert_eq!(ts, algo_avm::machine::AvmValue::Uint64(42));
+    }
+
+    #[test]
+    fn block_field_rejects_round_above_last_avail() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        // FirstValid=100 -> lastAvail=99; round 100 itself is not available
+        // (it's the txn's own FirstValid round, not yet in history).
+        let result = ctx.block_field(100, 1);
+        assert!(result.is_err());
     }
 
     #[test]
