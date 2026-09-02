@@ -2448,6 +2448,42 @@ fn seed_avm_scratch_from_group<L: crate::store_trait::LedgerStore>(
     }
 }
 
+/// Seed `avm_ctx.created_apps`/`created_assets` with the creatable IDs of
+/// EARLIER top-level siblings in this atomic group (issue #824), matching
+/// go-algorand's "pending creates are available" rule (see
+/// `TestParentGlobals`/`TestCheckHoldingNewApp` in go's `ledger/
+/// apptxn_test.go`): an app/asset created by an earlier group member is a
+/// legal `app_params_get`/`asset_params_get`/`asset_holding_get` target for
+/// a later member even without being explicitly listed in that later
+/// member's `ForeignApps`/`ForeignAssets` -- exactly the same
+/// `created_apps`/`created_assets` allowance `apply_itxn_submit` already
+/// grants for INNER transaction creates (see the loop over `txns` a few
+/// hundred lines below this one). `gaid`/`created_id`
+/// (`LedgerAvmContext::created_id`) already reads a sibling's
+/// `apply_data_config_asset`/`apply_data_application_id` directly off the
+/// group array for the *explicit-index* lookup; this does the same for the
+/// *implicit resource-availability* check that `resolve_app_unchecked`/
+/// `resolve_asset_unchecked` perform via `self.created_apps`/
+/// `self.created_assets`. Only siblings at an index STRICTLY BEFORE the
+/// current one are included, matching `gaid`'s own "can't reference a txn
+/// ahead of the current one" rule -- a later sibling's not-yet-applied
+/// create is not available yet.
+fn seed_avm_created_resources_from_group<L: crate::store_trait::LedgerStore>(
+    avm_ctx: &mut LedgerAvmContext<'_, L>,
+    group_info: Option<&GroupInfo<'_>>,
+) {
+    if let Some(gi) = group_info {
+        for sibling in gi.txns.iter().take(gi.index) {
+            if sibling.apply_data_config_asset != 0 {
+                avm_ctx.created_assets.push(sibling.apply_data_config_asset);
+            }
+            if sibling.apply_data_application_id != 0 {
+                avm_ctx.created_apps.push(sibling.apply_data_application_id);
+            }
+        }
+    }
+}
+
 /// Mark the current group member as having started running its program, per
 /// the shared `ran_program` record. Mirrors go-algorand's
 /// `cx.pastScratch[cx.groupIndex] = &cx.Scratch` in `EvalContract`
@@ -4105,6 +4141,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     avm_ctx.fee_residue = ctx.fee_residue.get();
                     ctx.configure_avm_ctx(&mut avm_ctx);
                     seed_avm_scratch_from_group(&mut avm_ctx, group_info);
+                    seed_avm_created_resources_from_group(&mut avm_ctx, group_info);
                     if let Some(ref mut t) = tracer {
                         avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
                     }
@@ -4269,6 +4306,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 avm_ctx.fee_residue = ctx.fee_residue.get();
                 ctx.configure_avm_ctx(&mut avm_ctx);
                 seed_avm_scratch_from_group(&mut avm_ctx, group_info);
+                seed_avm_created_resources_from_group(&mut avm_ctx, group_info);
                 if let Some(ref mut t) = tracer {
                     avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
                 }

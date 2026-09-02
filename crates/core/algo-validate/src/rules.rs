@@ -2926,6 +2926,49 @@ mod tests {
         );
     }
 
+    // Mirrors go-algorand's `TestGarbageClearState`
+    // (`ledger/apptxn_test.go`): an app creation whose `ClearStateProgram` is
+    // present but malformed bytecode (not merely absent) must still be
+    // rejected by the same `parse_program_version` path exercised by
+    // `test_appl_creation_missing_clear_state_program_rejected` above.
+    // Empty-but-`Some` bytecode hits `parse_program_version`'s
+    // empty-slice branch ("invalid program (empty)"), matching go's
+    // `ClearStateProgram: []byte{}` case exactly (as opposed to a `None`
+    // field, which is caught earlier by a different, "unset" check).
+    #[test]
+    fn test_appl_creation_empty_clear_state_program_bytes_rejected() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        txn.approval_program = Some(ByteBuf::from(vec![6]));
+        txn.clear_state_program = Some(ByteBuf::from(vec![]));
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("bad ClearStateProgram")
+                && err.to_string().contains("invalid program (empty)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // Second half of `TestGarbageClearState`: a single 0xfe byte sets the
+    // uvarint continuation bit with no following byte to complete it, so
+    // `parse_program_version` must hit its "ran off the end" branch
+    // ("invalid version"), not silently accept or panic.
+    #[test]
+    fn test_appl_creation_bad_uvarint_clear_state_program_rejected() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        txn.approval_program = Some(ByteBuf::from(vec![6]));
+        txn.clear_state_program = Some(ByteBuf::from(vec![0xfe]));
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("bad ClearStateProgram")
+                && err.to_string().contains("invalid version"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_appl_creation_mismatched_program_versions_rejected() {
         // Both >= syncProgramsVersion (6), but different: must match.
