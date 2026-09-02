@@ -45,7 +45,7 @@ statically validated.
 - [x] #839 — avm: implement missing v13+ block opcode fields (BlkBranch512, BlkSha512_256/256/512TxnCommitment) (split from #810)
 - [ ] #841 — avm: implement holding/local-state cross-product resource sharing and tx.Access-list resolution (split from #808)
 - [ ] #845 — ledger/pool/agreement: wire isAbsent-based absentee-account computation into block assembly (split from #833)
-- [ ] #847 — avm: assembler treats ';' as a comment delimiter instead of a statement separator (found while working #823)
+- [x] #847 — avm: assembler treats ';' as a comment delimiter instead of a statement separator (found while working #823) — merged via PR #849
 
 **Net-new subsystems:**
 - [ ] #814 — stateproof: implement a signing/proving worker
