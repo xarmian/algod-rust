@@ -59,10 +59,10 @@ statically validated.
 - [x] #835 — ledger/simulation: implement placeholder PQ signature validation in the simulator (split from #816)
 
 **Test-gap sweeps:**
-- [ ] #823 — testing: close AVM/assembler missing-test gaps; theme 1 (match opcode execution-level tests, also fixed a real op_match bug) via PR #848; theme 2 (JSON parser edge cases) via PR #851; theme 3 (box write-budget/dirty-tracking core scenarios) via PR #852; theme 5 partial (hash/ecdsa cost tests) via PR #853; theme 4, theme 3's remaining scenarios, and theme 5's BLS12-381 gaps remain
+- [ ] #823 — testing: close AVM/assembler missing-test gaps; theme 1 (match opcode execution-level tests, also fixed a real op_match bug) via PR #848; theme 2 (JSON parser edge cases) via PR #851; theme 3 (box write-budget/dirty-tracking core scenarios) via PR #852; theme 5 partial (hash/ecdsa cost tests) via PR #853; theme 4 partial (duplicate-label/branch-args/arg/several-errors) via PR #854; theme 3's remaining scenarios, theme 4's remaining scenarios (found a likely real txn/gtxn multi-arity assembler gap — `TestAssembleTxna` — not just a test gap), and theme 5's BLS12-381 gaps remain
 - [ ] #824 — testing: close ledger missing-test gaps; PQ-rekeying theme's core security gap (authorizer-vs-AuthAddr check was entirely unenforced) fixed via PR #850, other 5 themes remain
 - [ ] #825 — testing: close agreement missing-test gaps
-- [ ] #826 — testing: close crypto missing-test gaps
+- [ ] #826 — testing: close crypto missing-test gaps; theme 1 (merkle-signature-scheme tamper vectors) via PR #855; theme 2 (golden/KAT vector coverage) and theme 3 (randomized-encoding property tests) remain
 - [ ] #827 — testing: close REST/kmd/multi-node-cluster negative-path missing-test gaps
 
 ## Reproducing this audit
