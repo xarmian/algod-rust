@@ -834,6 +834,61 @@ mod tests {
             .is_none());
     }
 
+    /// Analogous to go's `TestStateProofVerificationTracker_StateProofIntervalChange`:
+    /// a protocol upgrade can change `StateProofInterval` mid-chain. Contexts
+    /// recorded under the old interval must still resolve at their
+    /// old-interval-derived round key, and contexts recorded after the
+    /// change must resolve at their (different) new-interval-derived key --
+    /// neither interval's bookkeeping corrupts or overwrites the other's.
+    #[test]
+    fn record_state_proof_verification_context_handles_an_interval_change_mid_chain() {
+        let mut store = LedgerState::new();
+        const OLD_INTERVAL: u64 = 256;
+        const NEW_INTERVAL: u64 = 512;
+
+        // Voters round 256 under the old (256) interval -> serves last
+        // attested round 512.
+        record_state_proof_verification_context(
+            &mut store,
+            256,
+            CONSENSUS_V41,
+            &tracking_value(0, &[1u8; 32], 100),
+            OLD_INTERVAL,
+        )
+        .unwrap();
+
+        // A subsequent voters round, now reporting the new (512) interval
+        // (as if a protocol upgrade took effect at round 512) -> serves
+        // last attested round 512 + 512 = 1024, a different key from the
+        // old-interval entry above.
+        record_state_proof_verification_context(
+            &mut store,
+            512,
+            CONSENSUS_V41,
+            &tracking_value(0, &[2u8; 32], 200),
+            NEW_INTERVAL,
+        )
+        .unwrap();
+
+        // Both entries resolve independently at their own keys.
+        let old_ctx = resolve_verification_context(&store, 512).unwrap();
+        assert_eq!(old_ctx.voters_commitment, vec![1u8; 32]);
+        assert_eq!(old_ctx.online_total_weight, 100);
+
+        let new_ctx = resolve_verification_context(&store, 1024).unwrap();
+        assert_eq!(new_ctx.voters_commitment, vec![2u8; 32]);
+        assert_eq!(new_ctx.online_total_weight, 200);
+
+        // A round that only existed under the old interval's cadence and
+        // was never recorded under the new one must still cleanly report
+        // "not found" via the header-fallback failing (no header present
+        // either) rather than accidentally resolving to the wrong entry.
+        assert!(store
+            .get_state_proof_verification_context(768)
+            .unwrap()
+            .is_none());
+    }
+
     /// Genuine, end-to-end accept case: real Falcon-1024 keys/signatures and
     /// real merkle vector-commitment trees, verified through the full
     /// `apply_state_proof` path (round matching, block-header-based
