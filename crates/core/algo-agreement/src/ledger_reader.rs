@@ -33,7 +33,16 @@ use crate::step::Period;
 ///
 /// Mirrors Go's `basics.OnlineAccountData` (embedded in `committee.BalanceRecord`).
 /// Contains the voting-related fields needed for committee membership checks.
-#[derive(Debug, Clone)]
+///
+/// `Default` is the all-zero value go's own
+/// `data/basics/testing/userBalance.go::OnlineAccountData` helper returns
+/// for a non-`Online` account -- "if the account is not Online and
+/// agreement requests it for some reason, clear it out". Real lookups
+/// (`AgreementLedgerBridge::lookup_agreement`) must return exactly this for
+/// an offline/not-participating account, matching go's real
+/// `onlineAccounts.lookupOnlineAccountData`, which only ever has rows for
+/// accounts that were online.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnlineAccountData {
     /// The account's online stake (microAlgos), used for sortition weight.
     /// Go: `MicroAlgosWithRewards`.
@@ -65,6 +74,26 @@ pub struct OnlineAccountData {
     /// The state proof ID (Merkle signature commitment, 64 bytes).
     /// Go: `StateProofID` (`merklesignature.Commitment`, 64 bytes).
     pub state_proof_id: [u8; 64],
+}
+
+impl Default for OnlineAccountData {
+    // Manual impl: `[u8; 64]` has no `Default` (the standard library only
+    // derives array `Default` up to length 32), so `#[derive(Default)]`
+    // isn't available here.
+    fn default() -> Self {
+        Self {
+            micro_algos: 0,
+            vote_id: [0u8; 32],
+            selection_id: [0u8; 32],
+            vote_first_valid: Round::default(),
+            vote_last_valid: Round::default(),
+            vote_key_dilution: 0,
+            incentive_eligible: false,
+            last_proposed: Round::default(),
+            last_heartbeat: Round::default(),
+            state_proof_id: [0u8; 64],
+        }
+    }
 }
 
 /// A balance record pairing an address with its online account data.

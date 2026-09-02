@@ -304,6 +304,20 @@ impl LedgerReader for AgreementLedgerBridge {
             }
         };
 
+        // Go's real online-accounts tracker only ever has rows for accounts
+        // that are (or were, historically) `Online` -- an offline/
+        // not-participating account's agreement lookup returns the
+        // all-zero `basics.OnlineAccountData{}` (see
+        // `data/basics/testing/userBalance.go::OnlineAccountData`, the
+        // exact oracle `TestLookupAgreement` checks against). The account
+        // state fallback above reads the raw account row regardless of
+        // status, so it must be gated here -- otherwise an offline
+        // account's real balance/stale voting-key material would leak
+        // into agreement's stake/committee-membership calculations.
+        if acct.status != algo_types::AccountStatus::Online {
+            return Ok(OnlineAccountData::default());
+        }
+
         Ok(OnlineAccountData {
             micro_algos: acct.micro_algos,
             vote_id: acct.vote_id.unwrap_or([0u8; 32]),
@@ -772,6 +786,87 @@ mod tests {
     #[test]
     fn extract_seed_from_empty_returns_none() {
         assert!(extract_seed_from_header(&[]).is_none());
+    }
+
+    // -- LookupAgreement (issue #824 theme 6 — go's `TestLookupAgreement`) --
+
+    #[test]
+    fn lookup_agreement_returns_online_accounts_voting_data() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let addr = Address([1u8; 32]);
+        {
+            let mut l = ledger.lock().unwrap();
+            l.set_account(
+                &addr,
+                algo_types::AccountData {
+                    micro_algos: 1_000_000,
+                    status: algo_types::AccountStatus::Online,
+                    vote_id: Some([7u8; 32]),
+                    selection_id: Some([8u8; 32]),
+                    vote_first_valid: 0,
+                    vote_last_valid: 1_000_000,
+                    vote_key_dilution: 100,
+                    ..Default::default()
+                },
+            );
+        }
+        let bridge = AgreementLedgerBridge::new(ledger);
+
+        let oad = bridge.lookup_agreement(Round(0), &addr).unwrap();
+        assert_eq!(oad.micro_algos, 1_000_000);
+        assert_eq!(oad.vote_id, [7u8; 32]);
+        assert_eq!(oad.selection_id, [8u8; 32]);
+        assert_eq!(oad.vote_key_dilution, 100);
+    }
+
+    #[test]
+    fn lookup_agreement_returns_empty_for_offline_account() {
+        // Regression: go's `TestLookupAgreement` asserts an offline
+        // account's agreement lookup is the all-zero `OnlineAccountData{}`
+        // (`data/basics/testing/userBalance.go::OnlineAccountData` clears
+        // non-Online accounts out entirely) -- even though the account
+        // itself has a real balance and (stale) voting-key material on
+        // file. Before this fix, `lookup_agreement`'s fallback path read
+        // the raw account row regardless of status, leaking an offline
+        // account's balance/keys into agreement's stake/committee
+        // calculations.
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let addr = Address([2u8; 32]);
+        {
+            let mut l = ledger.lock().unwrap();
+            l.set_account(
+                &addr,
+                algo_types::AccountData {
+                    micro_algos: 5_000_000,
+                    status: algo_types::AccountStatus::Offline,
+                    // Stale voting key material left over from when the
+                    // account was last online -- must not leak through.
+                    vote_id: Some([9u8; 32]),
+                    selection_id: Some([9u8; 32]),
+                    vote_last_valid: 1_000_000,
+                    ..Default::default()
+                },
+            );
+        }
+        let bridge = AgreementLedgerBridge::new(ledger);
+
+        let oad = bridge.lookup_agreement(Round(0), &addr).unwrap();
+        assert_eq!(
+            oad,
+            OnlineAccountData::default(),
+            "an offline account's agreement lookup must be entirely empty, not just its \
+             balance zeroed"
+        );
+    }
+
+    #[test]
+    fn lookup_agreement_returns_empty_for_unknown_account() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(ledger);
+        let oad = bridge
+            .lookup_agreement(Round(0), &Address([3u8; 32]))
+            .unwrap();
+        assert_eq!(oad, OnlineAccountData::default());
     }
 
     // -- Helper: tracking network advancer --
