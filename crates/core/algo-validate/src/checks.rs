@@ -161,7 +161,8 @@ pub fn check_txn_group(group: &[SignedTransaction]) -> Result<(), AlgoError> {
 /// group (a zero-group txn is its own singleton run) and runs
 /// [`check_txn_group`] over each run.
 pub fn check_payset(payset: &[SignedTransaction]) -> Result<(), AlgoError> {
-    for group in crate::block::detect_validation_groups(payset) {
+    let groups = crate::block::detect_validation_groups(payset).map_err(err)?;
+    for group in groups {
         let members: Vec<SignedTransaction> = group.iter().map(|&(_, stx)| stx.clone()).collect();
         check_txn_group(&members)?;
     }
@@ -406,6 +407,35 @@ mod tests {
         let bad = signed(base_txn("bogus"));
         let err = check_payset(&[good, bad]).unwrap_err();
         assert!(err.to_string().contains("unknown"), "got: {err}");
+    }
+
+    #[test]
+    fn check_payset_rejects_a_group_larger_than_the_max_group_size() {
+        // TestProposalCarriesOversizedTxnGroup (go: agreement/message_test.go),
+        // via go's Block.PaysetGroups: a run of MAX_GROUP_SIZE+1 consecutive
+        // same-group transactions must be rejected, not silently grouped and
+        // passed on to check_txn_group.
+        let group_hash = [0x42u8; 32];
+        let mut txns = Vec::new();
+        for _ in 0..=crate::rules::MAX_GROUP_SIZE {
+            let mut txn = base_txn("pay");
+            txn.group = group_hash;
+            txns.push(signed(txn));
+        }
+        let err = check_payset(&txns).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"), "got: {err}");
+    }
+
+    #[test]
+    fn check_payset_accepts_a_group_at_exactly_the_max_group_size() {
+        let group_hash = [0x42u8; 32];
+        let mut txns = Vec::new();
+        for _ in 0..crate::rules::MAX_GROUP_SIZE {
+            let mut txn = base_txn("pay");
+            txn.group = group_hash;
+            txns.push(signed(txn));
+        }
+        check_payset(&txns).unwrap();
     }
 
     #[test]

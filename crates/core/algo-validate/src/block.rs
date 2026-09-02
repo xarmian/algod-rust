@@ -292,7 +292,18 @@ pub fn validate_block(
     // Detect transaction groups for per-group LogicSig budget pooling.
     // go-algorand isolates LogicSig budget per transaction group — each group
     // gets its own pool of `group_size * LOGICSIG_BUDGET` opcodes.
-    let groups = detect_validation_groups(&restored_payset);
+    //
+    // An oversized group (go: `Block.PaysetGroups`) fails the whole payset
+    // the way go drops the entire proposal on this screen — record it and
+    // skip further per-group/per-txn validation rather than processing a
+    // payset whose group structure is already known to be malformed.
+    let groups = match detect_validation_groups(&restored_payset) {
+        Ok(groups) => groups,
+        Err(e) => {
+            errors.push(BlockValidationError::GroupValidationFailed { error: e });
+            Vec::new()
+        }
+    };
 
     for group in &groups {
         let mut lsig_budget = GroupBudget::for_logicsig(group.len());
@@ -648,9 +659,15 @@ pub fn contents_match_header(
 /// `TxGroup` contains the individual transaction hashes (each unique), so a
 /// collision would require breaking SHA-512/256. Merging adjacent runs with
 /// the same hash is therefore correct.
+///
+/// Rejects a run of more than [`crate::rules::MAX_GROUP_SIZE`] consecutive
+/// same-group transactions, matching go-algorand's `Block.PaysetGroups`
+/// (`data/bookkeeping/block.go`), which errors once a group's accumulated
+/// length reaches `bounds.MaxTxGroupSize` rather than silently accepting an
+/// oversized group.
 pub(crate) fn detect_validation_groups(
     payset: &[SignedTransaction],
-) -> Vec<Vec<(usize, &SignedTransaction)>> {
+) -> Result<Vec<Vec<(usize, &SignedTransaction)>>, String> {
     let mut groups: Vec<Vec<(usize, &SignedTransaction)>> = Vec::new();
     let mut i = 0;
     while i < payset.len() {
@@ -663,13 +680,20 @@ pub(crate) fn detect_validation_groups(
             let mut group = vec![(i, stx)];
             i += 1;
             while i < payset.len() && payset[i].txn.group == *group_hash {
+                if group.len() >= crate::rules::MAX_GROUP_SIZE {
+                    return Err(format!(
+                        "group size {} exceeds maximum {}",
+                        group.len() + 1,
+                        crate::rules::MAX_GROUP_SIZE
+                    ));
+                }
                 group.push((i, &payset[i]));
                 i += 1;
             }
             groups.push(group);
         }
     }
-    groups
+    Ok(groups)
 }
 
 #[cfg(test)]
@@ -969,6 +993,40 @@ mod tests {
         assert!(
             result.errors.len() >= 2,
             "expected multiple errors, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn group_larger_than_max_group_size_is_rejected() {
+        // TestProposalCarriesOversizedTxnGroup (go: agreement/message_test.go),
+        // via go's Block.PaysetGroups: a block whose payset contains a run of
+        // MAX_GROUP_SIZE+1 consecutive same-group transactions must be
+        // rejected as a whole, not silently processed with an oversized
+        // group's LogicSig budget/signature checks.
+        let group_hash = [0x42u8; 32];
+        let mut block = empty_block();
+        block.payset = (0..=crate::rules::MAX_GROUP_SIZE)
+            .map(|i| SignedTransaction {
+                txn: Transaction {
+                    txn_type: "pay".into(),
+                    sender: Address([i as u8 + 1; 32]),
+                    group: group_hash,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .collect();
+
+        let result = validate_block(&block, None, "test-v1", &test_genesis_hash(), None);
+        assert!(!result.is_valid);
+        assert!(
+            result.errors.iter().any(|e| matches!(
+                e,
+                BlockValidationError::GroupValidationFailed { error }
+                    if error.contains("exceeds maximum")
+            )),
+            "expected a GroupValidationFailed(\"exceeds maximum\") error, got: {:?}",
             result.errors
         );
     }
