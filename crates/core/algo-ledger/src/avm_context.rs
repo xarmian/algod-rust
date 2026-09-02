@@ -10467,6 +10467,143 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Box write-budget / dirty-byte tracking (issue #823 theme 3), ported
+    // from go-algorand's TestDirtyTracking/TestBoxRepeatedCreate
+    // (data/transactions/logic/box_test.go). go's tests chain multiple box
+    // opcodes within a *single* program run (one `TestApp` call = one
+    // eval, one dirty_bytes accumulator); each Rust test below mirrors one
+    // such program as a sequence of direct method calls against one fresh
+    // `LedgerAvmContext`, matching `MakeSampleEnv()`'s 200-byte budget
+    // (2 box refs).
+    // -------------------------------------------------------------------
+
+    /// Build a `LedgerAvmContext` for `app_id` with `io_budget` and both
+    /// `"self"`/`"other"` pre-marked available (not yet dirty).
+    fn make_box_budget_context(
+        store: &mut LedgerState,
+        app_id: u64,
+        io_budget: u64,
+    ) -> LedgerAvmContext<'_, LedgerState> {
+        let mut ctx = make_box_context(store, app_id, b"self");
+        ctx.available_boxes
+            .insert((app_id, b"other".to_vec()), false);
+        ctx.io_budget = io_budget;
+        ctx
+    }
+
+    #[test]
+    fn dirty_tracking_create_at_exact_budget_succeeds() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_create(b"self", 200).unwrap();
+    }
+
+    #[test]
+    fn dirty_tracking_resize_over_budget_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_create(b"self", 200).unwrap();
+        let err = ctx.box_resize(b"self", 201).unwrap_err();
+        assert!(
+            err.to_string().contains("write budget"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dirty_tracking_create_second_box_over_budget_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_create(b"self", 200).unwrap();
+        let err = ctx.box_create(b"other", 201).unwrap_err();
+        assert!(
+            err.to_string().contains("write budget"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dirty_tracking_deleting_self_does_not_free_budget_for_oversized_other() {
+        // "deleting self doesn't give extra write budget to create big other"
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_create(b"self", 200).unwrap();
+        ctx.box_del(b"self").unwrap();
+        let err = ctx.box_create(b"other", 201).unwrap_err();
+        assert!(
+            err.to_string().contains("write budget"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dirty_tracking_create_delete_create_cancels_out() {
+        // "though it cancels out a creation that happened here"
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_create(b"self", 200).unwrap();
+        ctx.box_del(b"self").unwrap();
+        ctx.box_create(b"other", 200).unwrap();
+    }
+
+    #[test]
+    fn dirty_tracking_shrink_frees_exactly_enough_budget() {
+        // create self(200); resize self to 150; create other(50) -> fits
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_create(b"self", 200).unwrap();
+        ctx.box_resize(b"self", 150).unwrap();
+        ctx.box_create(b"other", 50).unwrap();
+    }
+
+    #[test]
+    fn dirty_tracking_shrink_frees_exactly_enough_budget_off_by_one_rejected() {
+        // Same, but other=51 -> one byte over budget.
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_create(b"self", 200).unwrap();
+        ctx.box_resize(b"self", 150).unwrap();
+        let err = ctx.box_create(b"other", 51).unwrap_err();
+        assert!(
+            err.to_string().contains("write budget"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dirty_tracking_double_delete_is_a_noop_not_an_extra_credit() {
+        // "no funny business by trying to del twice!"
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_create(b"self", 200).unwrap();
+        assert!(ctx.box_del(b"self").unwrap());
+        // Second delete of an already-deleted box reports "not found",
+        // matching go's `box_del; !` idiom (bool result, not error).
+        assert!(!ctx.box_del(b"self").unwrap());
+        let err = ctx.box_create(b"self", 201).unwrap_err();
+        assert!(
+            err.to_string().contains("write budget"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn box_repeated_create_same_size_is_a_noop() {
+        // TestBoxRepeatedCreate: creating a box that already exists with
+        // the same size is a cheap no-op, not a second write-budget charge.
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        assert!(ctx.box_create(b"self", 200).unwrap());
+        // Second create call for the same box/size: reports "already
+        // existed" (false) without re-charging the write budget.
+        assert!(!ctx.box_create(b"self", 200).unwrap());
+        assert_eq!(
+            ctx.dirty_bytes, 200,
+            "size-matching re-create must not double-charge"
+        );
+    }
+
+    // -------------------------------------------------------------------
     // Foreign box authorization / family reentrancy (issue #662)
     //
     // These are the security-critical tests: they pin the exact go-algorand
