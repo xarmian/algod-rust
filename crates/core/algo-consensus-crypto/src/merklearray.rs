@@ -343,7 +343,7 @@ impl SingleLeafProof {
 /// A Merkle tree, stored as layers of digests bottom-up.
 ///
 /// Serialized with msgpack field ordering: `hsh`, `lvls`, `nl`, `vc` (alphabetical).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tree {
     /// Layers of the tree. `levels[0]` = leaves, `levels[len-1]` = root.
     pub levels: Vec<Layer>,
