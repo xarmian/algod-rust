@@ -1184,6 +1184,7 @@ mod tests {
             seed_proof: [0x55; 80],
             original_period: Period(0),
             original_proposer: Address([0x42; 32]),
+            received_at: std::time::Duration::ZERO,
         }
     }
 
