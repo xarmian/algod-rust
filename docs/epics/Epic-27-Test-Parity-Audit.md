@@ -53,7 +53,7 @@ statically validated.
 
 **Net-new subsystems:**
 - [ ] #814 — stateproof: implement a signing/proving worker
-- [ ] #817 — networking: implement vpack vote-compression codec
+- [ ] #817 — networking: implement vpack vote-compression codec; stateless codec done via PR #885 (verified against 7 real byte-vector fixtures captured from go-algorand's own source — genuine wire-level interop evidence); stateful mode (LRU reference table) and live websocket/P2P wiring remain open — the latter deliberately deferred as needing dedicated live multi-node interop testing, not a background-agent task
 - [ ] #818 — networking: implement libp2p stream manager, p2pMetainfo exchange, and IdentityTracker
 - [ ] #819 — sync: implement catchup peer-selection/ranking layer
 - [ ] #829 — avm: implement static stack-type-tracking pass in the TEAL assembler; first incremental slice (straight-line/branch-free tracking, safe-by-construction — disables itself rather than guessing on branches/labels/arity-dependent opcodes) via PR #883, covering TestSwapTypeCheck/TestEqualsTypeCheck/TestDupTypeCheck/TestSelectTypeCheck/TestSetBitTypeCheck + TestTypeTracking's first case; branch-merge unification, scratch-slot tracking, and several other sub-tests remain as documented follow-up work
