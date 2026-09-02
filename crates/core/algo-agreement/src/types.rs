@@ -136,6 +136,20 @@ pub const DYNAMIC_FILTER_TIMEOUT_LOWER_BOUND: Duration = Duration::from_millis(2
 /// Mirrors Go's `dynamicFilterTimeoutCredentialArrivalHistoryIdx`.
 pub const DYNAMIC_FILTER_TIMEOUT_CREDENTIAL_ARRIVAL_HISTORY_IDX: usize = 37;
 
+// TestSampleIndexIsValid / TestLowerBound (go:
+// agreement/dynamicFilterTimeoutParams_test.go): compile-time sanity checks
+// on the dynamic-filter-timeout constants themselves, guarding against a
+// future edit accidentally breaking the relationships the algorithm
+// (`CredentialArrivalHistory::order_statistics`, `player.rs`'s
+// `next_filter_timeout`) depends on.
+const _: () = assert!(
+    DYNAMIC_FILTER_CREDENTIAL_ARRIVAL_HISTORY == 0
+        || DYNAMIC_FILTER_TIMEOUT_CREDENTIAL_ARRIVAL_HISTORY_IDX
+            < DYNAMIC_FILTER_CREDENTIAL_ARRIVAL_HISTORY
+);
+const _: () =
+    assert!(DYNAMIC_FILTER_TIMEOUT_LOWER_BOUND.as_millis() > Duration::from_millis(20).as_millis());
+
 /// Additional time extension atop the one calculated based on credential
 /// arrival history.
 ///
