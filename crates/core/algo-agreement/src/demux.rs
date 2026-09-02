@@ -1407,6 +1407,71 @@ mod tests {
     }
 
     #[test]
+    fn demux_raw_proposal_with_oversized_txn_group_is_dropped_not_disconnected() {
+        // TestProposalCarriesOversizedTxnGroup (go: agreement/message_test.go):
+        // a proposal whose payset contains a run of more than
+        // MAX_GROUP_SIZE consecutive same-group transactions must be
+        // dropped at this same early screen (`check_payset`), not just
+        // during full block validation.
+        use crate::stubs::StubNetwork;
+        use algo_types::{SignedTransaction, Transaction, TxnType};
+
+        let (mut demux, _av_tx, pp_tx, _vb_tx, _vv_tx, _vp_tx, _vb_res_tx, _lr_tx, quit_tx) =
+            make_test_demux();
+
+        let stub = Arc::new(StubNetwork::new());
+        demux.set_network(stub.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
+
+        let group_hash = [7u8; 32];
+        let payset: Vec<SignedTransaction> = (0..=algo_validate::rules::MAX_GROUP_SIZE)
+            .map(|i| SignedTransaction {
+                txn: Transaction {
+                    txn_type: TxnType::from("pay"),
+                    sender: Address([i as u8 + 1; 32]),
+                    group: group_hash,
+                    ..Transaction::default()
+                },
+                ..SignedTransaction::default()
+            })
+            .collect();
+        let compound = CompoundMessage {
+            vote: UnauthenticatedVote::default(),
+            proposal: crate::proposal::UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(1),
+                    payset,
+                    ..algo_types::Block::default()
+                },
+                seed_proof: [0u8; crate::VRF_PROOF_SIZE],
+                original_period: crate::step::Period(0),
+                original_proposer: Address([0u8; 32]),
+            },
+        };
+        let encoded = codec::encode_compound_message(&compound);
+        pp_tx
+            .send(Message {
+                data: encoded,
+                handle: None,
+            })
+            .unwrap();
+        // Quit so `next()` returns after retrying past the dropped message,
+        // rather than blocking forever waiting for a next event.
+        quit_tx.send(()).unwrap();
+
+        let signals = default_signals();
+        let result = demux.next(&signals, None);
+
+        assert!(
+            result.is_none(),
+            "a proposal with a group larger than MAX_GROUP_SIZE must be dropped"
+        );
+        assert!(
+            stub.disconnected.lock().unwrap().is_empty(),
+            "an oversized-group proposal must be dropped, not disconnect the peer"
+        );
+    }
+
+    #[test]
     fn demux_garbage_data_does_not_crash() {
         let (mut demux, av_tx, _pp_tx, _vb_tx, _vv_tx, _vp_tx, _vb_res_tx, _lr_tx, quit_tx) =
             make_test_demux();
