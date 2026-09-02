@@ -49,7 +49,7 @@ statically validated.
 - [x] ledger/agreement: `detect_validation_groups` had no transaction-group-size upper bound at all (found while working #825) — merged via PR #857; filed #856 for unrelated pre-existing test failures found while verifying no regressions
 - [x] #856 — bin/algod-rust: 3 stale `participate.rs` tests predating PR #837's tightened per-type wellFormed rules (afrz missing freeze_asset/freeze_account; a close-to-self test asserting acceptance of a scenario go-algorand rejects) — merged via PR #870
 - [x] #866 — avm: `pre-sharedResources program cannot be invoked with tx.Access` version-gate (go's `sharedResourcesVersion`, `eval.go:1612-1621`) was entirely unimplemented (found while working #824 theme 1) — merged via PR #871
-- [ ] #877 — avm: `txn`/`gtxn`/`gtxns` lack go-algorand's pseudo-op multi-arity dispatch (`txna`/`gtxna`/`gtxnsa` sugar) (found while working #823 theme 4) — open
+- [x] #877 — avm: `txn`/`gtxn`/`gtxns` lack go-algorand's pseudo-op multi-arity dispatch (`txna`/`gtxna`/`gtxnsa` sugar) (found while working #823 theme 4) — merged via PR #881
 
 **Net-new subsystems:**
 - [ ] #814 — stateproof: implement a signing/proving worker
@@ -58,7 +58,7 @@ statically validated.
 - [ ] #819 — sync: implement catchup peer-selection/ranking layer
 - [ ] #829 — avm: implement static stack-type-tracking pass in the TEAL assembler
 - [ ] #821 — pool/networking: implement application-call excessive-rate-limiter (ERL) subsystem
-- [ ] #820 — tools: add algokey pq CLI, autonomous heartbeat service, and libgoal app-call resource resolution
+- [ ] #820 — tools: add algokey pq CLI, autonomous heartbeat service, and libgoal app-call resource resolution; heartbeat service done via PR #882 (also fixed a real bug: `hb` transactions were blanket-rejected from the pool, which would have silently discarded the new service's own submissions); algokey pq CLI and libgoal resource resolution remain open
 - [ ] #828 — util: consider porting db Accessor/Migration framework, pagedqueue, and rateLimit ElasticRateLimiter
 - [x] #835 — ledger/simulation: implement placeholder PQ signature validation in the simulator (split from #816)
 
