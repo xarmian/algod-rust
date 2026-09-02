@@ -78,7 +78,7 @@ pub fn commitment_is_empty(c: &Commitment) -> bool {
 /// and provides canonical msgpack encoding matching Go's `crypto.FalconSigner`.
 ///
 /// Codec tags: `"pk"` (public key), `"sk"` (private key).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FalconSigner {
     /// Falcon-1024 public key (1793 bytes).
     pub pk: [u8; FALCON_DET1024_PUBKEY_SIZE],
@@ -261,7 +261,7 @@ pub fn decode_state_proof_keys(data: &[u8]) -> Result<Vec<(u64, FalconSigner)>, 
 /// Wrapper around a Falcon-1024 public key for verification and serialization.
 ///
 /// Distinct from the FFI in `algo-falcon`. Codec tag: `"k"`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FalconVerifier {
     /// Falcon-1024 public key (1793 bytes).
     pub k: [u8; FALCON_DET1024_PUBKEY_SIZE],
@@ -508,7 +508,7 @@ impl Verifier {
 /// and the ephemeral verifying key.
 ///
 /// Codec tags: `"sig"`, `"idx"`, `"prf"`, `"vkey"`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Signature {
     /// Falcon signature bytes (variable-length compressed format).
     pub signature: Vec<u8>,
@@ -691,7 +691,7 @@ impl Signature {
 /// Contains the first valid round, key lifetime, and the merkle tree.
 ///
 /// Codec tags: `"fv"`, `"iv"`, `"tree"`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SignerContext {
     /// First valid round for this key set.
     pub first_valid: u64,
@@ -816,7 +816,7 @@ impl SignerContext {
 /// Contains the `SignerContext` (serialized) and ephemeral keys (not serialized).
 /// Go's `Secrets.MarshalMsg` serializes only the embedded `SignerContext` fields;
 /// `ephemeralKeys` are stored separately via SQLite.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Secrets {
     /// Ephemeral falcon signing keys — NOT serialized.
     pub ephemeral_keys: Vec<FalconSigner>,
