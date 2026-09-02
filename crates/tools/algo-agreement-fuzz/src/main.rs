@@ -679,6 +679,7 @@ async fn run_malformed_proposal(cli: &Cli, algod: &Algod, transport: &Transport)
         seed_proof: [0u8; 80],
         original_period: Period(0),
         original_proposer: Address([0u8; 32]),
+        received_at: Duration::ZERO,
     }
     .block_digest();
     report.committed_block_digest = Some(committed_digest.to_string());

@@ -26,6 +26,7 @@ pub mod catchpoint;
 pub mod catchpoint_sync;
 pub mod dual_gossip_node;
 pub mod follow;
+pub mod heartbeat_service;
 pub mod loadgen;
 pub mod network_common;
 pub mod node;

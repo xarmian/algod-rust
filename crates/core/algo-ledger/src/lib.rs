@@ -33,6 +33,7 @@ pub mod eval_compare;
 pub mod eval_delta;
 pub mod genesis;
 pub mod heartbeat;
+pub mod heartbeat_builder;
 pub mod lease;
 pub mod merkle_cache;
 pub mod merkle_committer;
@@ -74,8 +75,12 @@ pub use genesis::{
     GenesisAllocation, GenesisJson,
 };
 pub use heartbeat::{
-    bits_match, find_challenge, last_seen, Challenge, ChallengePeriod, HeaderProvider,
-    StoreHeaderProvider,
+    bits_match, find_challenge, last_seen, needs_heartbeat, Challenge, ChallengePeriod,
+    HeaderProvider, StoreHeaderProvider,
+};
+pub use heartbeat_builder::{
+    accepting_sender, build_heartbeat_transaction, sign_heartbeat_proof, HeartbeatParams,
+    HB_LIFETIME,
 };
 pub use lease::LeaseTable;
 pub use params::min_balance;

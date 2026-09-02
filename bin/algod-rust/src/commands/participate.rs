@@ -891,18 +891,33 @@ impl SimpleBlockEvaluator {
         let round = self.hdr.round;
 
         // 1. Reject consensus-injected transaction types.
-        // State proof (stpf) and heartbeat (hb) transactions are injected by
-        // the consensus layer, not submitted by users through the pool.
+        // State proof (stpf) transactions are injected directly into the
+        // block by the proposer's stateproof worker, not submitted by users
+        // through the pool -- there is no such side channel for it here
+        // (state-proof block assembly is unimplemented in this binary), so
+        // any stpf txn reaching the pool is necessarily bogus.
+        //
+        // Heartbeat (hb) transactions are, by contrast, ordinary pool
+        // transactions in go-algorand: `data/transactions/verify/txn.go`
+        // and `ledger/eval/eval.go`'s `applyTransaction` dispatch on
+        // `protocol.HeartbeatTx` exactly like any other type, with no
+        // pool-admission special case, and go's own heartbeat service
+        // (`heartbeat/service.go`) submits them via the same
+        // `BroadcastInternalSignedTxGroup` path any locally-originated
+        // transaction uses. Issue #820: this used to reject `hb` here too,
+        // which meant algod-rust could never itself propose a block
+        // containing a heartbeat -- even one its own heartbeat service had
+        // submitted to the pool moments earlier. Heartbeat's own
+        // correctness gates (proof verification, challenge eligibility,
+        // free-fee eligibility) are enforced elsewhere: LogicSig signature
+        // verification a few lines below (this account's accepting
+        // program), `block.rs`'s block-level `verify_heartbeat_proof` call,
+        // and `apply::apply_heartbeat`'s challenge/vote-ID/seed checks.
         for stx in txgroup {
             if stx.txn.txn_type == TxnType::Stpf {
                 return Err(algo_error::AlgoError::Validation {
                     message: "state proof transactions (stpf) cannot be submitted via the pool"
                         .into(),
-                });
-            }
-            if stx.txn.txn_type == TxnType::Hb {
-                return Err(algo_error::AlgoError::Validation {
-                    message: "heartbeat transactions (hb) cannot be submitted via the pool".into(),
                 });
             }
         }
@@ -3284,6 +3299,22 @@ pub async fn run(
         }
     }
 
+    // A second connection to the same participation-key database, for the
+    // autonomous heartbeat service (issue #820). `part_store` itself is
+    // moved into `AgreementKeyManagerBridge` below, so the heartbeat
+    // service -- which only ever reads (`get_for_voting_round`,
+    // `get_for_round`), never writes -- gets its own handle rather than
+    // sharing that one. Opened here (after the go-algorand `.partkey`
+    // import above) so it sees the fully-migrated database.
+    let heartbeat_part_store = ParticipationStore::open(partkey_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open a second participation key store handle (for the heartbeat \
+             service) at {}: {}",
+            partkey_path.display(),
+            e
+        )
+    })?;
+
     // -----------------------------------------------------------------------
     // 3. Build the gossip network node.
     //
@@ -4108,6 +4139,37 @@ pub async fn run(
     };
 
     // -----------------------------------------------------------------------
+    // 5b. Start the autonomous heartbeat service (issue #820).
+    //
+    // Mirrors go-algorand's `heartbeat.Service`: watches every locally-held
+    // participation key each round and, if the account it participates for
+    // is under an active challenge and hasn't been seen since before it,
+    // proactively submits a fee-exempt `hb` transaction through the same
+    // local-submission path (`broadcaster`) any other locally-originated
+    // transaction uses. See `crate::commands::heartbeat_service` for the
+    // decision logic and `algo_ledger::heartbeat`/`heartbeat_builder` for
+    // the challenge-detection and transaction-construction primitives it's
+    // built from.
+    //
+    // Reuses the same `round_advanced` condvar as the pool-block-follower
+    // above (both are woken by `AgreementLedgerBridge::ensure_block`'s
+    // `notify_all` after each committed block) and the same `rt_handle`
+    // used elsewhere in this function for bridging sync ledger/participation
+    // reads to the one async call this service needs
+    // (`LocalTxBroadcaster::submit_group`).
+    // -----------------------------------------------------------------------
+    let (heartbeat_service_stop, heartbeat_service_join) =
+        crate::commands::heartbeat_service::spawn(
+            ledger.clone(),
+            heartbeat_part_store,
+            broadcaster.clone(),
+            Arc::clone(&pool_follower_round_advanced),
+            rt_handle.clone(),
+            crate::commands::heartbeat_service::DEFAULT_POLL_INTERVAL,
+        );
+    info!("heartbeat service started");
+
+    // -----------------------------------------------------------------------
     // 6. Build and start the agreement Service.
     // -----------------------------------------------------------------------
     let params = Parameters {
@@ -4164,6 +4226,8 @@ pub async fn run(
     catchup_service.stop();
     pool_follower_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = pool_follower.join();
+    heartbeat_service_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = heartbeat_service_join.join();
     // Stop the tx-sync pull loop before tearing down gossip — it samples
     // peers from `gossip_node`, so stopping it first avoids a
     // last-second round starting against a network that's mid-shutdown.
@@ -5790,7 +5854,7 @@ mod tests {
     }
 
     // ====================================================================
-    // 2. stpf / heartbeat rejection tests
+    // 2. stpf rejection / heartbeat acceptance tests (issue #820)
     // ====================================================================
 
     #[test]
@@ -5812,22 +5876,80 @@ mod tests {
         );
     }
 
+    /// Issue #820: a well-formed, fee-exempt heartbeat transaction (as the
+    /// autonomous heartbeat service would construct via
+    /// `algo_ledger::build_heartbeat_transaction`, signed with the
+    /// accepting LogicSig) must be accepted by the block evaluator, NOT
+    /// blanket-rejected by transaction type. Before this fix, `hb` was
+    /// rejected here unconditionally (mirroring `stpf`'s rejection above),
+    /// which meant a node's own heartbeat service could never get its
+    /// heartbeat into a block it proposed itself -- see the doc comment on
+    /// `validate_group_stateless_inner`'s type-rejection block for why
+    /// `hb`, unlike `stpf`, is a genuine pool-eligible transaction in
+    /// go-algorand.
     #[test]
-    fn reject_heartbeat_from_pool() {
+    fn accept_heartbeat_from_pool() {
         let ledger = test_ledger();
         let params = v41_params();
-        let (sender, key) = test_keypair(1);
-        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[]);
 
-        let mut stx = make_signed_pay(&key, &sender, &Address([2; 32]), 0, 1000, 100);
-        stx.txn.txn_type = TxnType::Hb;
-        // Re-sign after mutation
-        stx.sig = sign_txn(&stx.txn, &key);
+        let first_id = algo_consensus_crypto::one_time_id_for_round(0, 10);
+        let last_id = algo_consensus_crypto::one_time_id_for_round(2000, 10);
+        let num_batches = last_id.batch - first_id.batch + 1;
+        let voting =
+            algo_consensus_crypto::OneTimeSignatureSecrets::generate(first_id.batch, num_batches);
+        let vote_id = voting.verifier();
+
+        let stx = algo_ledger::build_heartbeat_transaction(algo_ledger::HeartbeatParams {
+            hb_address: Address([7u8; 32]),
+            voting: &voting,
+            vote_id,
+            key_dilution: 10,
+            genesis_hash: [0xAA; 32], // matches make_evaluator's block header
+            latest_round: Round(90),
+            latest_seed: [0x55u8; 32],
+            challenge_discount: false, // pre-v42: zero fee alone signals the claim
+        });
+
+        eval.transaction_group(&[stx])
+            .expect("a well-formed accepting-LogicSig heartbeat must be admitted");
+        assert_eq!(eval.pay_set_size(), 1);
+    }
+
+    /// A heartbeat whose LogicSig sets `RekeyTo` fails the accepting
+    /// program's own check (`txn RekeyTo == global ZeroAddress`) --
+    /// confirming that removing the blanket `hb` rejection does not mean
+    /// "accept any heartbeat unconditionally"; ordinary signature
+    /// verification (LogicSig execution) still gates admission.
+    #[test]
+    fn reject_heartbeat_with_rekey_from_pool() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let mut eval = make_evaluator(&ledger, &params, 100, &[]);
+
+        let first_id = algo_consensus_crypto::one_time_id_for_round(0, 10);
+        let last_id = algo_consensus_crypto::one_time_id_for_round(2000, 10);
+        let num_batches = last_id.batch - first_id.batch + 1;
+        let voting =
+            algo_consensus_crypto::OneTimeSignatureSecrets::generate(first_id.batch, num_batches);
+        let vote_id = voting.verifier();
+
+        let mut stx = algo_ledger::build_heartbeat_transaction(algo_ledger::HeartbeatParams {
+            hb_address: Address([7u8; 32]),
+            voting: &voting,
+            vote_id,
+            key_dilution: 10,
+            genesis_hash: [0xAA; 32],
+            latest_round: Round(90),
+            latest_seed: [0x55u8; 32],
+            challenge_discount: false,
+        });
+        stx.txn.rekey_to = Some(Address([9u8; 32]));
 
         let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
-            err.to_string().contains("hb") || err.to_string().contains("heartbeat"),
-            "expected heartbeat rejection, got: {err}"
+            !err.to_string().contains("cannot be submitted via the pool"),
+            "must not be rejected by blanket type check anymore, got: {err}"
         );
     }
 

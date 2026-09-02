@@ -5828,7 +5828,11 @@ mod tests {
                 .lookup_kv(app_id, name)
                 .await
                 .unwrap_or_else(|e| panic!("lookup_kv for {name:?}: {e}"));
-            assert_eq!(value, Some(b"v".to_vec()), "kv lookup mismatch for {name:?}");
+            assert_eq!(
+                value,
+                Some(b"v".to_vec()),
+                "kv lookup mismatch for {name:?}"
+            );
         }
 
         // Delete every box and confirm no trace remains (both the raw KV
