@@ -1300,6 +1300,41 @@ fn collect_txn_addresses(
 /// real ledger store or a group-scoped [`crate::recording_store::RecordingStore`]
 /// wrapper, without duplicating it -- the caller picks which by choosing
 /// what `S` is instantiated with at the call site.
+/// Check that the address that actually authorized `stx` (via a valid
+/// signature -- `stx.auth_addr` if set, else the sender) matches whatever
+/// address the sender has been rekeyed to per the ledger's account state.
+/// Matches go-algorand's authorizer-vs-`AuthAddr` check
+/// (`ledger/eval/eval.go:1264-1277`, run only when `eval.validate`): the
+/// signature itself was already checked against `txn.Authorizer()`
+/// upstream (this repo: `algo_validate::verify_transaction_signature`,
+/// using the wire-declared `stx.auth_addr`) -- this is the separate,
+/// ledger-state-aware check that the wire-declared authorizer is actually
+/// the one the sender's account has rekeyed to, not an attacker-chosen
+/// address with its own valid key. Run only when `ctx.validate` (block
+/// validation of a newly-received block), not replay/re-execution of an
+/// already-certified block.
+fn check_authorizer<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    stx: &SignedTransaction,
+) -> Result<(), AlgoError> {
+    let sender = stx.txn.sender;
+    let correct_authorizer = store
+        .get_account(&sender)
+        .and_then(|a| a.auth_addr)
+        .unwrap_or(sender);
+    let actual_authorizer = stx.auth_addr.unwrap_or(sender);
+    if actual_authorizer != correct_authorizer {
+        let txid = algo_codec::compute_txn_id(&stx.txn);
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "transaction {}: should have been authorized by {} but was actually authorized by {}",
+                txid, correct_authorizer, actual_authorizer
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     store: &mut S,
@@ -1319,6 +1354,9 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     let scratch = RefCell::new(vec![None; group.len()]);
     for (gi_idx, stx) in group.iter().enumerate() {
         ctx.txn_index.set(*global_txn_idx);
+        if ctx.validate {
+            check_authorizer(store, stx)?;
+        }
         let gi = GroupInfo {
             txns: group,
             index: gi_idx,
@@ -1465,6 +1503,11 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
             ApplyMode::Replay => {
                 // Replay mode: process transactions individually (no AVM execution).
                 for stx in &block.payset {
+                    if ctx.validate {
+                        if let Err(e) = check_authorizer(store, stx) {
+                            break 'block Err(e);
+                        }
+                    }
                     match apply_transaction(store, stx, &ctx, 0) {
                         Ok(ad) => {
                             if let Some(out) = apply_data_out.as_deref_mut() {
@@ -4989,6 +5032,127 @@ mod tests {
 
         apply_transaction(&mut state, &stx2, &ctx, 0).unwrap();
         assert_eq!(state.get_account(&sender).unwrap().auth_addr, None);
+    }
+
+    // ── Authorizer-vs-AuthAddr enforcement (issue #824, ported from
+    // go-algorand's TestPQRekeyedAddressAuthorization semantics, minus the
+    // Falcon crypto -- the check itself is authorization-scheme-agnostic:
+    // it only compares Address values, not signatures) ─────────────────
+
+    #[test]
+    fn check_authorizer_rejects_spend_with_stale_authorizer_after_rekey() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let new_auth = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (receiver, 100_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        // Round 1: rekey `sender` to `new_auth` (self-authorized: no
+        // stx.auth_addr needed yet, since the account hasn't rekeyed at
+        // the start of this block).
+        let mut rekey_stx = pay_txn(sender, sender, 0, 1_000);
+        rekey_stx.txn.rekey_to = Some(new_auth);
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![rekey_stx],
+            ..Block::default()
+        };
+        apply_block_validating(&mut state, &block1).expect("rekey should succeed");
+        assert_eq!(
+            state.get_account(&sender).unwrap().auth_addr,
+            Some(new_auth)
+        );
+
+        // Round 2: a spend from `sender` that does NOT declare
+        // `auth_addr = new_auth` (i.e. claims to be authorized by the
+        // sender's own, now-stale key) must be rejected -- this is exactly
+        // the gap go's `eval.go:1264-1277` check exists to close.
+        let stale_spend = pay_txn(sender, receiver, 1_000, 1_000);
+        let block2_bad = Block {
+            round: Round(2),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stale_spend],
+            ..Block::default()
+        };
+        let err = apply_block_validating(&mut state, &block2_bad).unwrap_err();
+        assert!(
+            err.to_string().contains("should have been authorized by"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_authorizer_accepts_spend_declaring_correct_authorizer_after_rekey() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let new_auth = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (receiver, 100_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        let mut rekey_stx = pay_txn(sender, sender, 0, 1_000);
+        rekey_stx.txn.rekey_to = Some(new_auth);
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![rekey_stx],
+            ..Block::default()
+        };
+        apply_block_validating(&mut state, &block1).expect("rekey should succeed");
+
+        // Correctly declares the new authorizer -- must be accepted.
+        let mut correct_spend = pay_txn(sender, receiver, 1_000, 1_000);
+        correct_spend.auth_addr = Some(new_auth);
+        let block2_good = Block {
+            round: Round(2),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![correct_spend],
+            ..Block::default()
+        };
+        apply_block_validating(&mut state, &block2_good)
+            .expect("spend declaring the correct post-rekey authorizer should succeed");
+    }
+
+    #[test]
+    fn check_authorizer_skipped_outside_validate_mode() {
+        // Replay (validate=false) must not cross-check the authorizer at
+        // all -- an already-certified block is trusted as-is, matching
+        // go's `if eval.validate` gate.
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let new_auth = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (receiver, 100_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        state.get_or_default_account_mut(&sender).auth_addr = Some(new_auth);
+
+        // Does NOT declare auth_addr = new_auth, but validate=false via
+        // plain `apply_block` (Replay mode, validate=false).
+        let stale_spend = pay_txn(sender, receiver, 1_000, 1_000);
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stale_spend],
+            ..Block::default()
+        };
+        apply_block(&mut state, &block)
+            .expect("replay (validate=false) must not enforce the authorizer check");
     }
 
     #[test]
