@@ -620,6 +620,7 @@ pub fn decode_compound_message(bytes: &[u8]) -> Result<CompoundMessage, CodecErr
             seed_proof,
             original_period,
             original_proposer,
+            ..UnauthenticatedProposal::default()
         },
     })
 }
@@ -1693,6 +1694,7 @@ pub fn decode_unauthenticated_proposal(
         seed_proof,
         original_period,
         original_proposer,
+        ..UnauthenticatedProposal::default()
     })
 }
 
@@ -2330,6 +2332,7 @@ mod tests {
                 seed_proof: [0xab; VRF_PROOF_SIZE],
                 original_period: Period(1),
                 original_proposer: Address([0x01; 32]),
+                ..UnauthenticatedProposal::default()
             },
         };
 
@@ -2375,6 +2378,7 @@ mod tests {
                 seed_proof: [0xdd; VRF_PROOF_SIZE],
                 original_period: Period(0),
                 original_proposer: Address([0x99; 32]),
+                ..UnauthenticatedProposal::default()
             },
         };
 
@@ -2416,6 +2420,7 @@ mod tests {
                 seed_proof: [0u8; VRF_PROOF_SIZE],
                 original_period: Period(0),
                 original_proposer: Address([0u8; 32]),
+                ..UnauthenticatedProposal::default()
             },
         };
         let encoded = encode_compound_message(&cm);

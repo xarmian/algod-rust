@@ -798,6 +798,7 @@ fn proposal_for_block(
         seed_proof,
         original_period: period,
         original_proposer: *address,
+        ..UnauthenticatedProposal::default()
     };
 
     let encoding_digest = crate::hashable::hash_obj(&uprop);
