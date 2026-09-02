@@ -2479,6 +2479,83 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── Assembler-time error-message parity (issue #823 theme 4), ported
+    // from go-algorand's assembler_test.go ─────────────────────────────
+
+    /// `assemble_string` should fail for `source`; return the collected
+    /// errors. `OpStream` isn't `Debug`, so this avoids `.unwrap_err()`.
+    fn expect_errors(source: &str) -> Vec<AssemblyError> {
+        match assemble_string(source) {
+            Err(errs) => errs,
+            Ok(_) => panic!("expected assembly to fail for {source:?}"),
+        }
+    }
+
+    #[test]
+    fn test_error_duplicate_label() {
+        // TestAssembleRejectDupLabel: a second definition of the same
+        // label is rejected, with the label name in the message.
+        let source = "#pragma version 8\nXXX: int 1; pop\nXXX: int 1; pop\nint 1\n";
+        let errs = expect_errors(source);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("duplicate label") && e.message.contains("XXX")),
+            "expected a duplicate-label error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_error_branch_args_wrong_immediate_count() {
+        // TestBranchArgs: `b`/`bz`/`bnz`/`callsub` each require exactly one
+        // immediate argument (a single label).
+        for (source, mnemonic) in [
+            ("#pragma version 8\nb\n", "b"),
+            ("#pragma version 8\nb lab1 lab2\n", "b"),
+            ("#pragma version 8\nint 1; bz\n", "bz"),
+            ("#pragma version 8\nint 1; bz a b\n", "bz"),
+            ("#pragma version 8\nint 1; bnz\n", "bnz"),
+            ("#pragma version 8\nint 1; bnz c d\n", "bnz"),
+            ("#pragma version 8\ncallsub\n", "callsub"),
+            ("#pragma version 8\ncallsub one two\n", "callsub"),
+        ] {
+            let errs = expect_errors(source);
+            let expected = format!("{mnemonic} expects 1 immediate argument");
+            assert!(
+                errs.iter().any(|e| e.message == expected),
+                "source {source:?}: expected {expected:?}, got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_error_arg_wrong_immediate_count() {
+        // TestAssembleArg: `arg` with no immediate is rejected up front.
+        let errs = expect_errors("#pragma version 8\narg\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "arg expects 1 immediate argument"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_several_errors_all_reported() {
+        // TestSeveralErrors: an undefined-label reference and an unknown
+        // txn field on separate lines are BOTH reported in one pass, not
+        // just the first one encountered.
+        let source = "#pragma version 8\nint 1\nbnz nowhere\ntxn XYZ\nint 2\n";
+        let errs = expect_errors(source);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("undefined label") && e.message.contains("nowhere")),
+            "missing undefined-label error: {errs:?}"
+        );
+        assert!(
+            errs.len() > 1,
+            "expected multiple errors to be collected, got: {errs:?}"
+        );
+    }
+
     #[test]
     fn test_parse_string_literal_escapes() {
         let result = parse_string_literal(r#""hello\nworld""#).unwrap();
