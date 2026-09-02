@@ -233,6 +233,56 @@ pub fn last_seen(last_proposed: u64, last_heartbeat: u64) -> u64 {
     std::cmp::max(last_proposed, last_heartbeat)
 }
 
+/// Decide whether a locally-held participation key needs to proactively send
+/// a heartbeat transaction for the account it participates for.
+///
+/// Mirrors the per-account body of Go's `heartbeat.Service.findChallenged`
+/// (`heartbeat/service.go`):
+///
+/// ```go
+/// if acct.VoteID != pr.Voting.OneTimeSignatureVerifier {
+///     continue
+/// }
+/// if acct.IncentiveEligible {
+///     if ch.Failed(pr.Account, max(acct.LastHeartbeat, acct.LastProposed)) {
+///         found = append(found, pr)
+///     }
+/// }
+/// ```
+///
+/// `account_vote_id` is the *current* on-chain `VoteID` for the address
+/// (`AccountData::vote_id`, `None` if the account has never registered
+/// online); `record_vote_id` is the `OneTimeSignatureVerifier` of the
+/// locally-held participation key being considered. These must match --
+/// otherwise the local key is a stale/rotated-out key and heartbeating with
+/// it would fail `apply_heartbeat`'s vote-ID check for no benefit (and,
+/// worse, `account.IncentiveEligible`/`LastHeartbeat` observed here would
+/// belong to whichever key actually IS registered, not this one).
+///
+/// Only accounts obtained via an online lookup are expected to reach this
+/// function (Go's `LookupAgreement` only ever returns online accounts, so
+/// its caller doesn't re-check `Status == Online`); this function does not
+/// re-verify `AccountStatus::Online` itself, matching that upstream
+/// contract precisely.
+pub fn needs_heartbeat(
+    challenge: &Challenge,
+    address: &[u8; 32],
+    account_vote_id: Option<[u8; 32]>,
+    record_vote_id: [u8; 32],
+    incentive_eligible: bool,
+    last_proposed: u64,
+    last_heartbeat: u64,
+) -> bool {
+    if account_vote_id != Some(record_vote_id) {
+        return false;
+    }
+    if !incentive_eligible {
+        return false;
+    }
+    let seen = last_seen(last_proposed, last_heartbeat);
+    challenge.failed(address, seen)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +630,145 @@ mod tests {
         assert!(!ch.failed(&matching_addr, 2000));
         // Non-matching account — never fails.
         assert!(!ch.failed(&non_matching_addr, 0));
+    }
+
+    // ── needs_heartbeat tests ─────────────────────────────────────
+
+    /// A challenge whose first 5 bits match `matching_addr` below.
+    fn matching_challenge(round: u64) -> Challenge {
+        Challenge {
+            round,
+            seed: [0xF8; 32], // 1111_1000...
+            bits: 5,
+        }
+    }
+
+    const MATCHING_ADDR: [u8; 32] = [0xFF; 32]; // 1111_1111... — first 5 bits match.
+    const NON_MATCHING_ADDR: [u8; 32] = [0x00; 32];
+
+    #[test]
+    fn needs_heartbeat_true_when_challenged_eligible_and_stale() {
+        let ch = matching_challenge(1000);
+        let vote_id = [7u8; 32];
+        assert!(needs_heartbeat(
+            &ch,
+            &MATCHING_ADDR,
+            Some(vote_id),
+            vote_id,
+            true, // incentive_eligible
+            0,    // last_proposed
+            0,    // last_heartbeat
+        ));
+    }
+
+    #[test]
+    fn needs_heartbeat_false_when_vote_id_mismatch() {
+        // Go: `acct.VoteID != pr.Voting.OneTimeSignatureVerifier` — stale/
+        // rotated-out local key, must not heartbeat under someone else's
+        // registered key.
+        let ch = matching_challenge(1000);
+        assert!(!needs_heartbeat(
+            &ch,
+            &MATCHING_ADDR,
+            Some([7u8; 32]),
+            [8u8; 32], // different record vote_id
+            true,
+            0,
+            0,
+        ));
+    }
+
+    #[test]
+    fn needs_heartbeat_false_when_account_never_registered() {
+        // `account_vote_id: None` (account has no VotingData at all) can
+        // never match a concrete `record_vote_id`.
+        let ch = matching_challenge(1000);
+        assert!(!needs_heartbeat(
+            &ch,
+            &MATCHING_ADDR,
+            None,
+            [7u8; 32],
+            true,
+            0,
+            0,
+        ));
+    }
+
+    #[test]
+    fn needs_heartbeat_false_when_not_incentive_eligible() {
+        let ch = matching_challenge(1000);
+        let vote_id = [7u8; 32];
+        assert!(!needs_heartbeat(
+            &ch,
+            &MATCHING_ADDR,
+            Some(vote_id),
+            vote_id,
+            false, // not incentive_eligible
+            0,
+            0,
+        ));
+    }
+
+    #[test]
+    fn needs_heartbeat_false_when_already_recently_heartbeated() {
+        // last_heartbeat >= challenge round -> challenge.failed() is false.
+        let ch = matching_challenge(1000);
+        let vote_id = [7u8; 32];
+        assert!(!needs_heartbeat(
+            &ch,
+            &MATCHING_ADDR,
+            Some(vote_id),
+            vote_id,
+            true,
+            0,
+            1000, // last_heartbeat == challenge round
+        ));
+    }
+
+    #[test]
+    fn needs_heartbeat_false_when_already_recently_proposed() {
+        // last_proposed dominates last_heartbeat via max() -- a recent
+        // block proposal also counts as "seen".
+        let ch = matching_challenge(1000);
+        let vote_id = [7u8; 32];
+        assert!(!needs_heartbeat(
+            &ch,
+            &MATCHING_ADDR,
+            Some(vote_id),
+            vote_id,
+            true,
+            1500, // last_proposed after the challenge round
+            0,
+        ));
+    }
+
+    #[test]
+    fn needs_heartbeat_false_when_address_does_not_match_challenge_bits() {
+        let ch = matching_challenge(1000);
+        let vote_id = [7u8; 32];
+        assert!(!needs_heartbeat(
+            &ch,
+            &NON_MATCHING_ADDR,
+            Some(vote_id),
+            vote_id,
+            true,
+            0,
+            0,
+        ));
+    }
+
+    #[test]
+    fn needs_heartbeat_false_when_no_challenge() {
+        let ch = Challenge::default();
+        let vote_id = [7u8; 32];
+        assert!(!needs_heartbeat(
+            &ch,
+            &MATCHING_ADDR,
+            Some(vote_id),
+            vote_id,
+            true,
+            0,
+            0,
+        ));
     }
 }

@@ -51,17 +51,17 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `partial` | 711 | 22% |
-| `matched-1:1` | 563 | 18% |
-| `not-implemented` | 520 | 16% |
-| `matched-1:many` | 501 | 16% |
+| `partial` | 712 | 22% |
+| `matched-1:1` | 564 | 18% |
+| `not-implemented` | 517 | 16% |
+| `matched-1:many` | 502 | 16% |
 | `out-of-scope` | 379 | 12% |
 | `missing-test` | 298 | 9% |
 | `matched-many:1` | 205 | 6% |
 
-**818 rows (`not-implemented` + `missing-test`, 26%) are real, actionable
+**815 rows (`not-implemented` + `missing-test`, 26%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
-implements but never tests. `partial` (711, 22%) is coverage that exists
+implements but never tests. `partial` (712, 22%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
 most are diminishing-returns edge cases. See
 [`docs/PHASE17_PROPOSAL.md`](PHASE17_PROPOSAL.md) for how the real gaps
@@ -83,8 +83,8 @@ were triaged into tracked issues.
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 75 | 15 | 45 | 67 | 40 | 25 | 7 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 15 | 17 | 0 | 18 | 59 | 6 | 4 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 5 | 6 | 0 | 19 | 28 | 0 | 60 |
-| Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 4 | 2 | 7 | 13 | 102 | 3 | 42 |
+| Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 5 | 3 | 7 | 14 | 99 | 3 | 42 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 55 | 2 | 7 | 0 | 13 | 28 | 4 | 1 |
-| **Total** | | **3,177** | **563** | **501** | **205** | **711** | **520** | **298** | **379** |
+| **Total** | | **3,177** | **564** | **502** | **205** | **712** | **517** | **298** | **379** |
 
