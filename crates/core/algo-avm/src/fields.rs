@@ -1410,6 +1410,59 @@ pub fn field_name_for_opcode(mnemonic: &str, imm_index: usize, value: u8) -> Opt
     }
 }
 
+/// Returns `true` when `mnemonic`'s immediate at `imm_index` is resolved
+/// through a named field group (mirrors the match arms of
+/// [`field_name_for_opcode`] above, without evaluating `value`). Lets a
+/// caller distinguish "this byte doesn't name any known field" (an error)
+/// from "this immediate position holds a plain number, not a field" (no
+/// field validation applies). Used by the disassembler (issue #823 theme 4)
+/// to reproduce go-algorand's `Disassemble` "invalid immediate %s for %s"
+/// rejection (`data/transactions/logic/assembler.go`) instead of silently
+/// printing an unresolvable field byte as a raw number.
+pub fn opcode_immediate_is_field(mnemonic: &str, imm_index: usize) -> bool {
+    matches!(
+        (mnemonic, imm_index),
+        ("txn", 0)
+            | ("txna", 0)
+            | ("txnas", 0)
+            | ("itxn", 0)
+            | ("itxna", 0)
+            | ("itxnas", 0)
+            | ("itxn_field", 0)
+            | ("gtxn", 1)
+            | ("gtxna", 1)
+            | ("gtxns", 0)
+            | ("gtxnsa", 0)
+            | ("gtxnas", 1)
+            | ("gtxnsas", 0)
+            | ("gitxn", 1)
+            | ("gitxna", 1)
+            | ("gitxnas", 1)
+            | ("global", 0)
+            | ("asset_holding_get", 0)
+            | ("asset_params_get", 0)
+            | ("app_params_get", 0)
+            | ("app_params_set", 0)
+            | ("acct_params_get", 0)
+            | ("voter_params_get", 0)
+            | ("ecdsa_verify", 0)
+            | ("ecdsa_pk_decompress", 0)
+            | ("ecdsa_pk_recover", 0)
+            | ("ec_add", 0)
+            | ("ec_scalar_mul", 0)
+            | ("ec_pairing_check", 0)
+            | ("ec_multi_scalar_mul", 0)
+            | ("ec_subgroup_check", 0)
+            | ("ec_map_to", 0)
+            | ("base64_decode", 0)
+            | ("json_ref", 0)
+            | ("vrf_verify", 0)
+            | ("block", 0)
+            | ("mimc", 0)
+            | ("poseidon2", 0)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
