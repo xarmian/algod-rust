@@ -58,6 +58,7 @@ pub mod tx_sync_pool_adapter;
 pub mod tx_sync_service;
 pub mod tx_syncer;
 pub mod tx_tag_handler;
+pub mod vpack;
 pub mod ws_network;
 
 // ---------------------------------------------------------------------------

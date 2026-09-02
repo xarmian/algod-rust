@@ -411,6 +411,7 @@ version = "0.1.0"
 dependencies = [
  "algo-agreement",
  "algo-codec",
+ "algo-consensus-crypto",
  "algo-error",
  "algo-pool",
  "algo-types",

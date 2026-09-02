@@ -54,3 +54,4 @@ serde_json.workspace = true
 rmpv.workspace = true
 tower.workspace = true
 tracing-subscriber.workspace = true
+algo-consensus-crypto.workspace = true
