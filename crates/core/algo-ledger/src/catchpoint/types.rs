@@ -190,29 +190,50 @@ pub struct CatchpointLabel {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlgoCount {
     /// Sum of algos (in microAlgos) of all accounts in this class.
-    #[serde(rename = "mon", default)]
+    #[serde(rename = "mon", default, skip_serializing_if = "is_zero_u64")]
     pub money: u64,
 
     /// Total number of whole reward units in accounts.
-    #[serde(rename = "rwd", default)]
+    #[serde(rename = "rwd", default, skip_serializing_if = "is_zero_u64")]
     pub reward_units: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// Mirrors go's `AlgoCount.MsgIsZero()`-driven omitempty check used inside
+/// `AccountTotals.MarshalMsg` (`((*z).Online.Money.MsgIsZero()) &&
+/// ((*z).Online.RewardUnits == 0)`, and likewise for `Offline`/
+/// `NotParticipating`): an `AlgoCount` field of `AccountTotals` is omitted
+/// from the wire only when *both* of its own fields are zero.
+fn is_zero_algo_count(v: &AlgoCount) -> bool {
+    v.money == 0 && v.reward_units == 0
 }
 
 /// Totals of algos in the system grouped by account status.
 /// Corresponds to Go `ledgercore.AccountTotals`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountTotals {
-    #[serde(rename = "online", default)]
+    #[serde(rename = "online", default, skip_serializing_if = "is_zero_algo_count")]
     pub online: AlgoCount,
 
-    #[serde(rename = "offline", default)]
+    #[serde(
+        rename = "offline",
+        default,
+        skip_serializing_if = "is_zero_algo_count"
+    )]
     pub offline: AlgoCount,
 
-    #[serde(rename = "notpart", default)]
+    #[serde(
+        rename = "notpart",
+        default,
+        skip_serializing_if = "is_zero_algo_count"
+    )]
     pub not_participating: AlgoCount,
 
     /// Total number of algos received per reward unit since genesis.
-    #[serde(rename = "rwdlvl", default)]
+    #[serde(rename = "rwdlvl", default, skip_serializing_if = "is_zero_u64")]
     pub rewards_level: u64,
 }
 
@@ -760,6 +781,175 @@ mod tests {
         assert_eq!(totals.online.money, 0);
         assert_eq!(totals.offline.reward_units, 0);
         assert_eq!(totals.rewards_level, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // AlgoCount / AccountTotals / CatchpointFileHeader msgpack round-trip
+    // (issue #824 theme 5)
+    // -----------------------------------------------------------------
+    //
+    // Port of go-algorand's `ledger/ledgercore/totals_test.go`
+    // (`TestAlgoCountMarshalMsg`, `TestAccountTotalsMarshalMsgUnique`) and
+    // `ledger/msgp_gen_test.go`'s `TestMarshalUnmarshalCatchpointFileHeader`,
+    // applied to this crate's separate catchpoint-file `AlgoCount`/
+    // `AccountTotals`/`CatchpointFileHeader` types (distinct Rust types from
+    // `crate::state_delta::{AlgoCount, AccountTotals}`, which mirror the
+    // same underlying go-algorand type for the `StateDelta`/REST-API wire
+    // format instead).
+
+    #[test]
+    fn algo_count_marshal_unmarshal_msgpack_roundtrip() {
+        let ac = AlgoCount {
+            money: 0x4321_4321_4321_4321,
+            reward_units: 0x1234_1234_1234_1234,
+        };
+        let bytes = rmp_serde::to_vec_named(&ac).expect("msgpack serialize");
+        assert!(!bytes.is_empty());
+        let round_tripped: AlgoCount = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, ac);
+
+        let zero = AlgoCount::default();
+        let bytes = rmp_serde::to_vec_named(&zero).expect("msgpack serialize");
+        let round_tripped: AlgoCount = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, zero);
+    }
+
+    #[test]
+    fn algo_count_zero_value_omits_both_fields_from_msgpack() {
+        // Mirrors `ledgercore.(*AlgoCount).MarshalMsg`'s omitempty logic:
+        // a zero `AlgoCount{}` marshals to an empty msgpack map.
+        let zero = AlgoCount::default();
+        let bytes = rmp_serde::to_vec_named(&zero).expect("msgpack serialize");
+        let decoded: rmpv::Value =
+            rmpv::decode::read_value(&mut &bytes[..]).expect("decode as rmpv");
+        let map = decoded.as_map().expect("AlgoCount must encode as a map");
+        assert!(
+            map.is_empty(),
+            "a zero-value AlgoCount must omit both fields: {map:?}"
+        );
+    }
+
+    #[test]
+    fn account_totals_zero_value_omits_all_fields_from_msgpack() {
+        // Regression for the same conformance bug fixed in
+        // `crate::state_delta::AccountTotals` (issue #824 theme 5): before
+        // this fix, `online`/`offline`/`notpart` had no
+        // `skip_serializing_if`, so a zero `AccountTotals` serialized to
+        // `{"online":{},"offline":{},"notpart":{}}` instead of `{}`.
+        let zero = AccountTotals::default();
+        let bytes = rmp_serde::to_vec_named(&zero).expect("msgpack serialize");
+        let decoded: rmpv::Value =
+            rmpv::decode::read_value(&mut &bytes[..]).expect("decode as rmpv");
+        let map = decoded
+            .as_map()
+            .expect("AccountTotals must encode as a map");
+        assert!(
+            map.is_empty(),
+            "a zero-value AccountTotals must omit all fields: {map:?}"
+        );
+
+        let round_tripped: AccountTotals = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, zero);
+    }
+
+    #[test]
+    fn account_totals_marshal_msg_unique() {
+        // Port of go's `TestAccountTotalsMarshalMsgUnique`.
+        fn base() -> AccountTotals {
+            AccountTotals {
+                online: AlgoCount {
+                    money: 0x1234_1234_1234_0000,
+                    reward_units: 0x1234_1234_1234_0000,
+                },
+                offline: AlgoCount {
+                    money: 0x1234_1234_1234_0000,
+                    reward_units: 0x1234_1234_1234_0000,
+                },
+                not_participating: AlgoCount {
+                    money: 0x1234_1234_1234_0000,
+                    reward_units: 0x1234_1234_1234_0000,
+                },
+                rewards_level: 0x1234_1234_1234_0000,
+            }
+        }
+
+        let mut samples = vec![base()];
+        let mut v = base();
+        v.online.money = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.online.reward_units = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.offline.money = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.offline.reward_units = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.not_participating.money = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.not_participating.reward_units = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.rewards_level = 0x1234_1234_1234_0001;
+        samples.push(v);
+
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for at in &samples {
+            let bytes = rmp_serde::to_vec_named(at).expect("msgpack serialize");
+            assert!(
+                seen.insert(bytes.clone()),
+                "duplicate msgpack encoding for distinct AccountTotals value: {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catchpoint_file_header_marshal_unmarshal_msgpack_roundtrip() {
+        // Port of go's `TestMarshalUnmarshalCatchpointFileHeader`: a
+        // zero-value header must round-trip cleanly through marshal/
+        // unmarshal with no leftover bytes.
+        let header = CatchpointFileHeader::default();
+        let bytes = rmp_serde::to_vec_named(&header).expect("msgpack serialize");
+        let round_tripped: CatchpointFileHeader =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, header);
+
+        // Also verify a fully-populated header round-trips byte-for-byte
+        // equal after decode.
+        let populated = CatchpointFileHeader {
+            version: 131,
+            balances_round: 12345,
+            blocks_round: 12345,
+            totals: AccountTotals {
+                online: AlgoCount {
+                    money: 111,
+                    reward_units: 222,
+                },
+                offline: AlgoCount {
+                    money: 333,
+                    reward_units: 444,
+                },
+                not_participating: AlgoCount {
+                    money: 555,
+                    reward_units: 666,
+                },
+                rewards_level: 777,
+            },
+            total_accounts: 10,
+            total_chunks: 2,
+            total_kvs: 3,
+            total_online_accounts: 4,
+            total_online_round_params: 5,
+            catchpoint: "12345#ABCDEF".to_string(),
+            block_header_digest: ByteBuf::from(vec![7u8; 32]),
+        };
+        let bytes = rmp_serde::to_vec_named(&populated).expect("msgpack serialize");
+        let round_tripped: CatchpointFileHeader =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, populated);
     }
 
     #[test]

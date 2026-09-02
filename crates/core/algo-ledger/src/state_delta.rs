@@ -37,6 +37,15 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
+/// Mirrors go's `AlgoCount.MsgIsZero()`-driven omitempty check used inside
+/// `AccountTotals.MarshalMsg` (`((*z).Online.Money.MsgIsZero()) &&
+/// ((*z).Online.RewardUnits == 0)`, and likewise for `Offline`/
+/// `NotParticipating`): an `AlgoCount` field of `AccountTotals` is omitted
+/// from the wire only when *both* of its own fields are zero.
+fn is_zero_algo_count(v: &AlgoCount) -> bool {
+    v.money == 0 && v.reward_units == 0
+}
+
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
@@ -235,15 +244,23 @@ pub struct AlgoCount {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountTotals {
     /// Totals for online accounts.
-    #[serde(rename = "online", default)]
+    #[serde(rename = "online", default, skip_serializing_if = "is_zero_algo_count")]
     pub online: AlgoCount,
 
     /// Totals for offline accounts.
-    #[serde(rename = "offline", default)]
+    #[serde(
+        rename = "offline",
+        default,
+        skip_serializing_if = "is_zero_algo_count"
+    )]
     pub offline: AlgoCount,
 
     /// Totals for non-participating accounts.
-    #[serde(rename = "notpart", default)]
+    #[serde(
+        rename = "notpart",
+        default,
+        skip_serializing_if = "is_zero_algo_count"
+    )]
     pub not_participating: AlgoCount,
 
     /// Current rewards level.
@@ -2337,6 +2354,166 @@ mod issue_576_never_omit_tests {
 
         let round_tripped: StateDelta = rmp_serde::from_slice(&bytes).expect("msgpack decode");
         assert_eq!(round_tripped, delta);
+    }
+
+    // -----------------------------------------------------------------
+    // AlgoCount / AccountTotals msgpack round-trip (issue #824 theme 5)
+    // -----------------------------------------------------------------
+    //
+    // Port of go-algorand's `ledger/ledgercore/totals_test.go`
+    // `TestAlgoCountMarshalMsg` / `TestAccountTotalsMarshalMsg` and
+    // `ledger/ledgercore/msgp_gen_test.go`'s `TestMarshalUnmarshalAlgoCount`.
+
+    #[test]
+    fn algo_count_marshal_unmarshal_msgpack_roundtrip() {
+        let ac = AlgoCount {
+            money: 0x4321_4321_4321_4321,
+            reward_units: 0x1234_1234_1234_1234,
+        };
+        let bytes = rmp_serde::to_vec_named(&ac).expect("msgpack serialize");
+        assert!(!bytes.is_empty());
+        let round_tripped: AlgoCount = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, ac);
+
+        // A zero-value AlgoCount must also round-trip (mirrors go's
+        // `TestMarshalUnmarshalAlgoCount`, which marshals/unmarshals a bare
+        // `AlgoCount{}`).
+        let zero = AlgoCount::default();
+        let bytes = rmp_serde::to_vec_named(&zero).expect("msgpack serialize");
+        let round_tripped: AlgoCount = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, zero);
+    }
+
+    #[test]
+    fn algo_count_zero_value_omits_both_fields_from_msgpack() {
+        // go's `AlgoCount` carries `_struct codec:",omitempty,
+        // omitemptyarray"`, so a zero `AlgoCount{}` marshals to an empty
+        // msgpack map (see `ledgercore.(*AlgoCount).MarshalMsg`'s
+        // `zb0001Len` omitempty logic) -- not a map with "mon"/"rwd" keys
+        // present at their zero values.
+        let zero = AlgoCount::default();
+        let bytes = rmp_serde::to_vec_named(&zero).expect("msgpack serialize");
+        let decoded: rmpv::Value =
+            rmpv::decode::read_value(&mut &bytes[..]).expect("decode as rmpv");
+        let map = decoded.as_map().expect("AlgoCount must encode as a map");
+        assert!(
+            map.is_empty(),
+            "a zero-value AlgoCount must omit both fields: {map:?}"
+        );
+    }
+
+    #[test]
+    fn account_totals_marshal_unmarshal_msgpack_roundtrip() {
+        // Port of go's `TestAccountTotalsMarshalMsg`.
+        let at = AccountTotals {
+            online: AlgoCount {
+                money: 0x1234_1234_1234_0001,
+                reward_units: 0x1234_1234_1234_0002,
+            },
+            offline: AlgoCount {
+                money: 0x1234_1234_1234_0003,
+                reward_units: 0x1234_1234_1234_0004,
+            },
+            not_participating: AlgoCount {
+                money: 0x1234_1234_1234_0005,
+                reward_units: 0x1234_1234_1234_0006,
+            },
+            rewards_level: 0x1234_1234_1234_0007,
+        };
+        let bytes = rmp_serde::to_vec_named(&at).expect("msgpack serialize");
+        assert!(!bytes.is_empty());
+        let round_tripped: AccountTotals = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, at);
+    }
+
+    #[test]
+    fn account_totals_zero_value_omits_all_fields_from_msgpack() {
+        // Regression for a real conformance bug (issue #824 theme 5):
+        // go's `AccountTotals.MarshalMsg` treats each of `Online`/`Offline`/
+        // `NotParticipating` as empty (and thus omits the key entirely) when
+        // *both* of that `AlgoCount`'s own fields are zero -- see
+        // `ledgercore.(*AccountTotals).MarshalMsg`'s
+        // `((*z).Online.Money.MsgIsZero()) && ((*z).Online.RewardUnits == 0)`
+        // check. Before this fix, `AccountTotals`'s `online`/`offline`/
+        // `notpart` fields had no `skip_serializing_if`, so a zero
+        // `AccountTotals` (the overwhelmingly common case before a round's
+        // rewards are known) serialized to `{"online":{},"offline":{},
+        // "notpart":{}}` instead of `{}` -- a byte-level divergence from
+        // go's canonical encoding of the exact same logical value.
+        let zero = AccountTotals::default();
+        let bytes = rmp_serde::to_vec_named(&zero).expect("msgpack serialize");
+        let decoded: rmpv::Value =
+            rmpv::decode::read_value(&mut &bytes[..]).expect("decode as rmpv");
+        let map = decoded
+            .as_map()
+            .expect("AccountTotals must encode as a map");
+        assert!(
+            map.is_empty(),
+            "a zero-value AccountTotals must omit all fields: {map:?}"
+        );
+
+        let round_tripped: AccountTotals = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, zero);
+    }
+
+    #[test]
+    fn account_totals_marshal_msg_unique() {
+        // Port of go's `TestAccountTotalsMarshalMsgUnique`: eight
+        // `AccountTotals` values, each differing from the "all 0x...0000"
+        // baseline in exactly one leaf field, must all marshal to distinct
+        // msgpack byte strings (a stand-in for go's `crypto.Hash`-based
+        // uniqueness check -- comparing the raw bytes directly is at least
+        // as strong a check here).
+        fn base() -> AccountTotals {
+            AccountTotals {
+                online: AlgoCount {
+                    money: 0x1234_1234_1234_0000,
+                    reward_units: 0x1234_1234_1234_0000,
+                },
+                offline: AlgoCount {
+                    money: 0x1234_1234_1234_0000,
+                    reward_units: 0x1234_1234_1234_0000,
+                },
+                not_participating: AlgoCount {
+                    money: 0x1234_1234_1234_0000,
+                    reward_units: 0x1234_1234_1234_0000,
+                },
+                rewards_level: 0x1234_1234_1234_0000,
+            }
+        }
+
+        let mut samples = Vec::new();
+        let mut v = base();
+        v.online.money = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.online.reward_units = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.offline.money = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.offline.reward_units = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.not_participating.money = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.not_participating.reward_units = 0x1234_1234_1234_0001;
+        samples.push(v);
+        let mut v = base();
+        v.rewards_level = 0x1234_1234_1234_0001;
+        samples.push(v);
+        samples.push(base());
+
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for at in &samples {
+            let bytes = rmp_serde::to_vec_named(at).expect("msgpack serialize");
+            assert!(
+                seen.insert(bytes.clone()),
+                "duplicate msgpack encoding for distinct AccountTotals value: {bytes:?}"
+            );
+        }
     }
 
     #[test]
