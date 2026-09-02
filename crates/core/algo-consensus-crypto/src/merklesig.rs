@@ -2250,6 +2250,140 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── Tamper vectors, ported from go's merkleSignatureScheme_test.go
+    // (issue #826 theme 1) ──────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_wrong_round_fails() {
+        // TestBadRound: a signature made for one round must not verify at
+        // an adjacent round in either direction. Uses key_lifetime=1 (as
+        // go's generateTestSignerAux does) so each round has a distinct
+        // key — with a longer lifetime, adjacent rounds legitimately share
+        // a key and verification at either round would correctly succeed.
+        let secrets = Secrets::new(50, 100, 1).expect("Secrets::new should succeed");
+        let verifier = secrets.get_verifier();
+        let msg = b"round tamper test";
+
+        let sig = secrets
+            .get_signer(50)
+            .sign_bytes(msg)
+            .expect("sign_bytes should succeed");
+        assert!(verifier.verify_bytes(51, msg, &sig).is_err());
+
+        let sig = secrets
+            .get_signer(51)
+            .sign_bytes(msg)
+            .expect("sign_bytes should succeed");
+        assert!(verifier.verify_bytes(50, msg, &sig).is_err());
+        assert!(verifier.verify_bytes(52, msg, &sig).is_err());
+    }
+
+    #[test]
+    fn test_verify_truncated_merkle_proof_fails() {
+        // TestBadMerkleProofInSignature (part 1): dropping the last sibling
+        // hash from the proof path must be rejected, not silently accepted
+        // as a shorter-but-valid proof.
+        let secrets = Secrets::new(256, 512, 256).expect("Secrets::new should succeed");
+        let verifier = secrets.get_verifier();
+        let msg = b"truncated proof test";
+
+        let mut sig = secrets
+            .get_signer(256)
+            .sign_bytes(msg)
+            .expect("sign_bytes should succeed");
+        assert!(
+            !sig.proof.proof.path.is_empty(),
+            "test needs a non-empty proof path to truncate"
+        );
+        sig.proof.proof.path.pop();
+
+        assert!(verifier.verify_bytes(256, msg, &sig).is_err());
+    }
+
+    #[test]
+    fn test_verify_corrupted_merkle_proof_fails() {
+        // TestBadMerkleProofInSignature (part 2): substituting a random
+        // sibling hash into the proof path must be rejected.
+        let secrets = Secrets::new(256, 512, 256).expect("Secrets::new should succeed");
+        let verifier = secrets.get_verifier();
+        let msg = b"corrupted proof test";
+
+        let mut sig = secrets
+            .get_signer(256)
+            .sign_bytes(msg)
+            .expect("sign_bytes should succeed");
+        assert!(
+            !sig.proof.proof.path.is_empty(),
+            "test needs a non-empty proof path to corrupt"
+        );
+        let len = sig.proof.proof.path[0].len();
+        sig.proof.proof.path[0] = vec![0xAB; len];
+
+        assert!(verifier.verify_bytes(256, msg, &sig).is_err());
+    }
+
+    #[test]
+    fn test_verify_corrupted_signature_bytes_fails() {
+        // TestIncorrectByteSignature: flipping a single byte of the raw
+        // Falcon signature must invalidate it.
+        let secrets = Secrets::new(256, 512, 256).expect("Secrets::new should succeed");
+        let verifier = secrets.get_verifier();
+        let msg = b"signature byte tamper test";
+
+        let mut sig = secrets
+            .get_signer(256)
+            .sign_bytes(msg)
+            .expect("sign_bytes should succeed");
+        sig.signature[0] ^= 0xFF;
+
+        assert!(verifier.verify_bytes(256, msg, &sig).is_err());
+    }
+
+    #[test]
+    fn test_verify_wrong_vector_commitment_index_fails() {
+        // TestIncorrectMerkleIndex: a signature carrying the wrong vector
+        // commitment index must fail verification, whether the index is
+        // shifted to another valid position or set to a wildly wrong value.
+        let secrets = Secrets::new(8, 100, 5).expect("Secrets::new should succeed");
+        let verifier = secrets.get_verifier();
+        let msg = b"vector commitment index tamper test";
+
+        let mut sig = secrets
+            .get_signer(20)
+            .sign_bytes(msg)
+            .expect("sign_bytes should succeed");
+
+        sig.vector_commitment_index = 0;
+        assert!(verifier.verify_bytes(20, msg, &sig).is_err());
+
+        sig.vector_commitment_index = u64::MAX;
+        assert!(verifier.verify_bytes(20, msg, &sig).is_err());
+    }
+
+    #[test]
+    fn test_verify_different_round_key_fails() {
+        // TestAttemptToUseDifferentKey: substituting the verifying key from
+        // a different (valid) round's key onto a signature must be
+        // rejected, even though both keys belong to the same signer.
+        // key_lifetime=1 (as go's generateTestSignerAux does) ensures round
+        // 50 and round 51 genuinely have distinct keys.
+        let secrets = Secrets::new(50, 100, 1).expect("Secrets::new should succeed");
+        let verifier = secrets.get_verifier();
+        let msg = b"different key tamper test";
+
+        let mut sig = secrets
+            .get_signer(51)
+            .sign_bytes(msg)
+            .expect("sign_bytes should succeed");
+        let other_key = secrets
+            .get_key(50)
+            .expect("round 50 should have a key")
+            .get_verifying_key();
+        sig.verifying_key = other_key;
+
+        assert!(verifier.verify_bytes(51, msg, &sig).is_err());
+    }
+
     #[test]
     fn test_sign_no_key_for_round_fails() {
         let secrets = Secrets::new(256, 512, 256).expect("Secrets::new should succeed");
