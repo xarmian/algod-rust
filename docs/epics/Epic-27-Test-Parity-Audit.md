@@ -59,7 +59,7 @@ statically validated.
 - [x] #835 — ledger/simulation: implement placeholder PQ signature validation in the simulator (split from #816)
 
 **Test-gap sweeps:**
-- [ ] #823 — testing: close AVM/assembler missing-test gaps; theme 1 (match opcode execution-level tests, also fixed a real op_match bug) via PR #848; theme 2 (JSON parser edge cases) via PR #851; theme 3 (box write-budget/dirty-tracking core scenarios) via PR #852; themes 4-5 and theme 3's remaining scenarios remain
+- [ ] #823 — testing: close AVM/assembler missing-test gaps; theme 1 (match opcode execution-level tests, also fixed a real op_match bug) via PR #848; theme 2 (JSON parser edge cases) via PR #851; theme 3 (box write-budget/dirty-tracking core scenarios) via PR #852; theme 5 partial (hash/ecdsa cost tests) via PR #853; theme 4, theme 3's remaining scenarios, and theme 5's BLS12-381 gaps remain
 - [ ] #824 — testing: close ledger missing-test gaps; PQ-rekeying theme's core security gap (authorizer-vs-AuthAddr check was entirely unenforced) fixed via PR #850, other 5 themes remain
 - [ ] #825 — testing: close agreement missing-test gaps
 - [ ] #826 — testing: close crypto missing-test gaps
