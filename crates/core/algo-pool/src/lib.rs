@@ -24,6 +24,7 @@
 //! prioritises pending transactions for block assembly.  It mirrors the
 //! behaviour of go-algorand's `data/pools` package.
 
+pub mod app_rate_limiter;
 pub mod broadcast;
 pub mod config;
 pub mod error;
@@ -32,6 +33,7 @@ pub mod pool;
 pub mod status_cache;
 pub mod traits;
 
+pub use app_rate_limiter::AppRateLimiter;
 pub use broadcast::{DrainIterator, NoOpBroadcaster, TransactionBroadcaster};
 pub use config::PoolConfig;
 pub use error::{PoolError, PoolErrorTag};
