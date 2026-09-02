@@ -1646,6 +1646,61 @@ mod tests {
         assert!(m.pass);
     }
 
+    /// Encode `v` as a ULEB128 varuint, matching `pushint`'s immediate
+    /// encoding (`data/transactions/logic/opcodes.go`'s `pushint`).
+    fn varuint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if v == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Assert that a JSONUint64 `json_ref` on `json`'s `"num"` key produces
+    /// exactly `expected` -- a full-precision comparison via `==`/`return`,
+    /// not just a truthiness check, so no digit of a large value can be
+    /// silently lost (e.g. via an accidental f64 round-trip somewhere in
+    /// the parse path).
+    fn assert_json_ref_uint64(json: &[u8], expected: u64) {
+        let key = b"num";
+        let mut code = vec![0x80, json.len() as u8];
+        code.extend_from_slice(json);
+        code.extend_from_slice(&[0x80, key.len() as u8]);
+        code.extend_from_slice(key);
+        code.push(0x5f); // json_ref
+        code.push(0x01); // JSONUint64
+
+        code.push(0x81); // pushint
+        code.extend_from_slice(&varuint(expected));
+        code.extend_from_slice(&[0x12, 0x43]); // ==, return
+        let m = run_prog(7, &code).unwrap();
+        assert!(
+            m.pass,
+            "json_ref({:?}) should equal {expected}",
+            String::from_utf8_lossy(json)
+        );
+    }
+
+    #[test]
+    fn test_json_ref_uint64_parses_full_precision_big_numbers() {
+        // Ported from go-algorand's TestParseBigNum
+        // (data/transactions/logic/jsonspec_test.go): values across the
+        // full uint64 range must round-trip through JSON parsing with no
+        // precision loss, most notably right at 2^64-1 -- a value a naive
+        // f64-based JSON number parser would silently corrupt.
+        assert_json_ref_uint64(br#"{"num":0}"#, 0);
+        assert_json_ref_uint64(br#"{"num":123456789}"#, 123456789);
+        assert_json_ref_uint64(br#"{"num":18446744073709551615}"#, u64::MAX);
+    }
+
     #[test]
     fn test_json_ref_object() {
         let json = br#"{"obj": {"inner": 1}}"#;
@@ -1762,6 +1817,112 @@ mod tests {
     fn test_parse_json_object_duplicate_keys() {
         let json = br#"{"a": 1, "a": 2}"#;
         assert!(parse_json_object(json).is_err());
+    }
+
+    // ── JSON parser edge-case parity (issue #823 theme 2), ported from
+    // go-algorand's jsonspec_test.go ────────────────────────────────
+
+    #[test]
+    fn test_parse_json_trailing_commas_rejected() {
+        // TestParseTrailingCommas: any number of trailing commas before
+        // the closing brace is invalid JSON.
+        for n in 1..=3 {
+            let commas = ",".repeat(n);
+            let int_scalar = format!(r#"{{"key0": 4160{commas}}}"#);
+            assert!(
+                parse_json_object(int_scalar.as_bytes()).is_err(),
+                "{n} trailing comma(s) after a number should be rejected"
+            );
+            let str_scalar = format!(r#"{{"key0": "algo"{commas}}}"#);
+            assert!(
+                parse_json_object(str_scalar.as_bytes()).is_err(),
+                "{n} trailing comma(s) after a string should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_json_comments_rejected() {
+        // TestParseComments: JSON has no comment syntax.
+        assert!(parse_json_object(br#"{"key0": /*comment*/"algo"}"#).is_err());
+        assert!(parse_json_object(br#"{"key0": [1,/*comment*/,3]}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_json_special_numeric_values() {
+        // TestParseSpecialValues: NaN/+Inf/-Inf are not valid JSON numbers;
+        // null/true/false are valid literals.
+        assert!(parse_json_object(br#"{"key0": NaN}"#).is_err());
+        assert!(parse_json_object(br#"{"key0": +Inf}"#).is_err());
+        assert!(parse_json_object(br#"{"key0": -Inf}"#).is_err());
+        assert!(parse_json_object(br#"{"key0": null}"#).is_ok());
+        assert!(parse_json_object(br#"{"key0": true}"#).is_ok());
+        assert!(parse_json_object(br#"{"key0": false}"#).is_ok());
+    }
+
+    #[test]
+    fn test_parse_json_hex_values_rejected() {
+        // TestParseHexValue: JSON numbers are decimal only.
+        assert!(parse_json_object(br#"{"key0": 0x1}"#).is_err());
+        assert!(parse_json_object(br#"{"key0": 0xFF}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_json_unclosed_containers_rejected() {
+        // TestParseUnclosed: mismatched/missing closing brackets/braces.
+        assert!(parse_json_object(br#"{"key0": ["algo"}"#).is_err());
+        assert!(parse_json_object(br#"{"key0": ["algo"]]}"#).is_err());
+        assert!(parse_json_object(br#"{"key0": ["algo"],"key1":{}"#).is_err());
+        assert!(parse_json_object(br#"{"key0": [1,}]}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_json_whitespace_rules() {
+        // TestParseWhiteSpace: space/tab/newline/CR are allowed inside an
+        // array; form feed is not a valid JSON whitespace character.
+        assert!(parse_json_object(b"").is_err());
+        assert!(parse_json_object(b"{\"key0\": [\t]\n\r}").is_ok());
+        assert!(parse_json_object(b"{\"key0\": [\x0c]}").is_err());
+    }
+
+    #[test]
+    fn test_parse_json_byte_order_mark_rejected() {
+        // TestParseByteOrderMark: a leading BOM is not valid JSON.
+        let text = "\u{FEFF}{\"key0\": 1}";
+        assert!(parse_json_object(text.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_parse_json_control_chars_must_be_escaped() {
+        // TestParseControlChar: raw control characters (U+0000-U+001F) are
+        // only valid inside a string when escaped as \uXXXX.
+        for i in 0x00u32..=0x1f {
+            let text = format!("{{\"key0\":\"\\u{i:04X}\"}}");
+            assert!(
+                parse_json_object(text.as_bytes()).is_ok(),
+                "escaped control char U+{i:04X} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_json_incomplete_escapes_rejected() {
+        // TestParseEscapeChar: a truncated \u escape, or a string with an
+        // unescaped trailing backslash/extra quote, is invalid.
+        assert!(parse_json_object(br#"{"key0": ["\u00A"]}"#).is_err());
+        assert!(parse_json_object(br#"{"key0": "\"}"#).is_err());
+        assert!(parse_json_object(br#"{"key0": """}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_json_utf16_encoded_text_rejected() {
+        // TestParseFileEncoding: JSON text must be UTF-8; a UTF-16LE
+        // encoding of the same logical text is not valid UTF-8 and must be
+        // rejected outright.
+        assert!(parse_json_object(br#"{"key0": "algo"}"#).is_ok());
+        let utf16le: Vec<u8> =
+            r#"{"key0": "algo"}"#.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        assert!(parse_json_object(&utf16le).is_err());
     }
 
     #[test]
