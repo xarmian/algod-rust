@@ -19,13 +19,18 @@ e2e = []
 clap = { workspace = true }
 algo-codec.workspace = true
 algo-consensus-crypto.workspace = true
+algo-falcon.workspace = true
 algo-ledger.workspace = true
 algo-types.workspace = true
+base64.workspace = true
 data-encoding = { workspace = true }
 ed25519-dalek.workspace = true
 rand.workspace = true
+rmp.workspace = true
 rmp-serde = { workspace = true }
 serde = { workspace = true }
+serde_bytes.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
