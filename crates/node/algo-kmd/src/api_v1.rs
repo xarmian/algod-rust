@@ -1331,6 +1331,29 @@ mod tests {
         (router(state), tmp)
     }
 
+    /// Like [`make_router`], but with a caller-supplied session
+    /// lifetime — used to exercise wallet-handle expiry without
+    /// waiting a full 60s (mirrors go-algorand's `TestWalletSessionExpiry`,
+    /// which configures `session_lifetime_secs: 1`).
+    fn make_router_with_lifetime(lifetime: Duration) -> (Router, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let driver = WalletDriver::new(WalletDriverConfig {
+            wallets_dir: tmp.path().to_path_buf(),
+            scrypt_params: ScryptParams {
+                scrypt_n: 2,
+                scrypt_r: 1,
+                scrypt_p: 1,
+            },
+            allow_unsafe_scrypt: true,
+        })
+        .unwrap();
+        let state = AppState {
+            session_manager: Arc::new(SessionManager::new(lifetime)),
+            wallet_driver: Arc::new(driver),
+        };
+        (router(state), tmp)
+    }
+
     async fn post(
         router: &Router,
         path: &str,
@@ -1503,6 +1526,63 @@ mod tests {
         assert!(
             body["message"].as_str().unwrap().contains("decrypt"),
             "message: {}",
+            body["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_handle_expires_after_session_lifetime() {
+        // Mirrors go-algorand's TestWalletSessionExpiry
+        // (test/e2e-go/kmd/e2e_kmd_wallet_test.go): configure a 1s
+        // session lifetime, confirm the freshly-issued handle works,
+        // wait past expiry, then confirm the same handle is rejected.
+        let (router, _tmp) = make_router_with_lifetime(Duration::from_secs(1));
+        let (s, body) = post(
+            &router,
+            "/wallet",
+            json!({"wallet_name": "expiring", "wallet_driver_name": "sqlite", "wallet_password": "pw"}),
+        )
+        .await;
+        assert_eq!(s, 200, "create: {body}");
+        let id = body["wallet"]["id"].as_str().unwrap().to_string();
+
+        let (s, body) = post(
+            &router,
+            "/wallet/init",
+            json!({"wallet_id": id, "wallet_password": "pw"}),
+        )
+        .await;
+        assert_eq!(s, 200, "init: {body}");
+        let token = body["wallet_handle_token"].as_str().unwrap().to_string();
+
+        // The freshly-issued token works.
+        let (s, body) = post(
+            &router,
+            "/wallet/info",
+            json!({"wallet_handle_token": token}),
+        )
+        .await;
+        assert_eq!(s, 200, "info before expiry: {body}");
+
+        // Wait for the token to expire.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Using the same token again must now fail.
+        let (s, body) = post(
+            &router,
+            "/wallet/info",
+            json!({"wallet_handle_token": token}),
+        )
+        .await;
+        assert_ne!(s, 200, "expired token must be rejected: {body}");
+        assert_eq!(body["error"], true);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("expired"),
+            "message should mention expiry: {}",
             body["message"]
         );
     }
@@ -2367,6 +2447,68 @@ mod tests {
             .filter(|s| s.signature != [0u8; 64])
             .count();
         assert_eq!(signed_count, 2, "two subsigs should be filled");
+    }
+
+    #[tokio::test]
+    async fn multisig_sign_rejects_signer_outside_msig_preimage() {
+        // Mirrors go-algorand's TestMultisigSignWithWrongSigner
+        // (test/e2e-go/kmd/e2e_kmd_wallet_multisig_test.go): a
+        // 2-of-3 multisig is created from three public keys, two of
+        // which (pk1, pk2) are generated in this wallet; signing
+        // with a public key that was never part of the preimage
+        // (pk3, not imported) must be rejected rather than silently
+        // producing a signature.
+        let pwd = "pw";
+        let (router, _tmp, token) = make_unlocked(pwd).await;
+
+        let (_, body) = post(&router, "/key", json!({"wallet_handle_token": token})).await;
+        let pk1 = Address::from_algorand_string(body["address"].as_str().unwrap())
+            .unwrap()
+            .0;
+        let (_, body) = post(&router, "/key", json!({"wallet_handle_token": token})).await;
+        let pk2 = Address::from_algorand_string(body["address"].as_str().unwrap())
+            .unwrap()
+            .0;
+        // Some public key we haven't imported — mirrors Go's
+        // `pk3 := crypto.PublicKey{1, 1, ..., 1}`.
+        let pk3 = [1u8; 32];
+
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let pks_b64 = vec![B64.encode(pk1), B64.encode(pk2), B64.encode(pk3)];
+        let (_, body) = post(
+            &router,
+            "/multisig/import",
+            json!({
+                "wallet_handle_token": token,
+                "multisig_version": 1,
+                "threshold": 2,
+                "pks": pks_b64,
+            }),
+        )
+        .await;
+        let msig_addr = body["address"].as_str().unwrap().to_string();
+        let msig_pk = Address::from_algorand_string(&msig_addr).unwrap().0;
+
+        // Sender is the multisig address itself, matching Go's test.
+        let txn = make_pay_txn(&msig_pk);
+        let txn_bytes = rmp_serde::to_vec_named(&txn).unwrap();
+
+        // Attempt to sign with pk3 — never imported into this wallet, so
+        // it has no private key material here even though it's part of
+        // the multisig preimage. Must fail, not silently no-op sign.
+        let (s, body) = post(
+            &router,
+            "/multisig/sign",
+            json!({
+                "wallet_handle_token": token,
+                "transaction": B64.encode(&txn_bytes),
+                "public_key": B64.encode(pk3),
+                "wallet_password": pwd,
+            }),
+        )
+        .await;
+        assert_ne!(s, 200, "signing with an unimported key must fail: {body}");
+        assert_eq!(body["error"], true);
     }
 
     #[tokio::test]

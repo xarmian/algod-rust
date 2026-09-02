@@ -138,6 +138,7 @@ pub struct ApiAssetParams {
     /// \[am\] A commitment to some unspecified asset metadata.
     #[serde(
         rename = "metadata-hash",
+        default,
         skip_serializing_if = "Option::is_none",
         with = "optional_base64_bytes"
     )]
@@ -150,6 +151,7 @@ pub struct ApiAssetParams {
     /// Base64 encoded name of this asset, as supplied by the creator.
     #[serde(
         rename = "name-b64",
+        default,
         skip_serializing_if = "Option::is_none",
         with = "optional_base64_bytes"
     )]
@@ -169,6 +171,7 @@ pub struct ApiAssetParams {
     /// Base64 encoded name of a unit of this asset, as supplied by the creator.
     #[serde(
         rename = "unit-name-b64",
+        default,
         skip_serializing_if = "Option::is_none",
         with = "optional_base64_bytes"
     )]
@@ -181,6 +184,7 @@ pub struct ApiAssetParams {
     /// Base64 encoded URL where more information about the asset can be retrieved.
     #[serde(
         rename = "url-b64",
+        default,
         skip_serializing_if = "Option::is_none",
         with = "optional_base64_bytes"
     )]
@@ -350,6 +354,7 @@ pub struct ApiAccountParticipation {
     /// \[stprf\] Root of the state proof key (if any).
     #[serde(
         rename = "state-proof-key",
+        default,
         skip_serializing_if = "Option::is_none",
         with = "optional_base64_bytes"
     )]
@@ -697,6 +702,7 @@ pub struct BoxDescriptor {
     /// Base64 encoded box value. Present only when the `values` query
     /// parameter is set to true (pagination mode only).
     #[serde(
+        default,
         skip_serializing_if = "Option::is_none",
         with = "optional_base64_bytes"
     )]
@@ -1645,6 +1651,7 @@ pub struct SimulateRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvmValue {
     #[serde(
+        default,
         skip_serializing_if = "Option::is_none",
         with = "optional_base64_bytes"
     )]
@@ -1727,6 +1734,7 @@ pub struct SimulationOpcodeTraceUnit {
 pub struct SimulationTransactionExecTrace {
     #[serde(
         rename = "approval-program-hash",
+        default,
         skip_serializing_if = "Option::is_none",
         with = "optional_base64_bytes"
     )]
@@ -1740,6 +1748,7 @@ pub struct SimulationTransactionExecTrace {
 
     #[serde(
         rename = "clear-state-program-hash",
+        default,
         skip_serializing_if = "Option::is_none",
         with = "optional_base64_bytes"
     )]
@@ -1768,6 +1777,7 @@ pub struct SimulationTransactionExecTrace {
 
     #[serde(
         rename = "logic-sig-hash",
+        default,
         skip_serializing_if = "Option::is_none",
         with = "optional_base64_bytes"
     )]
