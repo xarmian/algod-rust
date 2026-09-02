@@ -642,4 +642,149 @@ mod tests {
             "round-trip bytecode mismatch\ndisassembly:\n{text}"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Ported from go-algorand's `TestDisassembleBadMultiOp`
+    // (data/transactions/logic/assembler_test.go): a clean error for a
+    // multi-byte "prefix opcode" (the `app_box_*` family at 0xd4) whose
+    // sub-opcode byte is missing or unrecognized, at the `disassemble()`
+    // entry point rather than just the underlying `opcode::resolve` unit.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_disassemble_bad_multi_op_missing_sub_opcode() {
+        let err = disassemble(&[crate::opcode::FOREIGN_BOX_VERSION, 0xd4]).unwrap_err();
+        assert!(
+            err.contains("0xd4 missing sub-opcode"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_disassemble_bad_multi_op_improper_sub_opcode() {
+        let err = disassemble(&[crate::opcode::FOREIGN_BOX_VERSION, 0xd4, 0x00]).unwrap_err();
+        assert!(
+            err.contains("0xd4 with improper sub-opcode"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_disassemble_bad_multi_op_valid_sub_opcode() {
+        let text = disassemble(&[crate::opcode::FOREIGN_BOX_VERSION, 0xd4, 0x01]).unwrap();
+        assert!(
+            text.contains("app_box_create"),
+            "expected app_box_create in disassembly:\n{text}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Ported from go-algorand's `TestDisassembleBadBranch`: a branch
+    // (`bnz`/`bz`/`b`) with a missing or truncated offset must be a clean
+    // error; a branch that decodes fine but targets past the end of the
+    // program, or a negative (back-jump) offset, must NOT error at
+    // disassemble time -- go-algorand explicitly documents both as "would
+    // be reasonable to error here" but doesn't, and algod-rust's
+    // `bytecode::parse` likewise only validates that the two offset bytes
+    // are physically present, not that the resulting target is in range.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_disassemble_bad_branch() {
+        for br in [0x40u8, 0x41, 0x42] {
+            // Bare opcode, no offset bytes at all.
+            assert!(
+                disassemble(&[2, br]).is_err(),
+                "opcode 0x{br:02x} with no offset should error"
+            );
+            // Only one of the two offset bytes present.
+            assert!(
+                disassemble(&[2, br, 0x01]).is_err(),
+                "opcode 0x{br:02x} with 1 offset byte should error"
+            );
+            // Full offset, target jumps past the end of the program: go
+            // does not error here, and neither does algod-rust (bounds are
+            // not validated at parse/disassemble time).
+            assert!(
+                disassemble(&[2, br, 0x00, 0x05]).is_ok(),
+                "opcode 0x{br:02x} jumping past program end should not error at disassemble time"
+            );
+            // Negative (back) offset: also not an error at disassemble time.
+            assert!(
+                disassemble(&[2, br, 0xff, 0x02]).is_ok(),
+                "opcode 0x{br:02x} with a negative offset should not error at disassemble time"
+            );
+            // Full offset followed by a trailing instruction byte: fine.
+            assert!(
+                disassemble(&[2, br, 0x00, 0x01, 0x00]).is_ok(),
+                "opcode 0x{br:02x} with a trailing instruction should not error"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Ported from go-algorand's `TestDisassembleBadSwitch`/
+    // `TestDisassembleBadMatch`: a `switch`/`match` program whose label
+    // list is truncated must report a clean, name-specific decode error
+    // (see `bytecode::parse_immediates`'s `ImmKind::Labels` handling) when
+    // routed through `disassemble()`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_disassemble_bad_switch() {
+        let source = "\nint 1\nswitch label1 label2\nlabel1:\nlabel2:\n";
+        let full = format!("#pragma version 8\n{source}");
+        let ops = assemble_string(&full).unwrap();
+
+        // The full program disassembles cleanly.
+        assert!(disassemble(&ops.program).is_ok());
+
+        // Chop off all the labels, but keep the label count.
+        let truncated = &ops.program[..ops.program.len() - 4];
+        let err = disassemble(truncated).unwrap_err();
+        assert!(
+            err.contains("could not decode labels for switch"),
+            "unexpected error: {err}"
+        );
+
+        // Chop off before the label count.
+        let truncated = &ops.program[..ops.program.len() - 5];
+        let err = disassemble(truncated).unwrap_err();
+        assert!(
+            err.contains("could not decode label count for switch"),
+            "unexpected error: {err}"
+        );
+
+        // Chop off half of a label.
+        let truncated = &ops.program[..ops.program.len() - 1];
+        let err = disassemble(truncated).unwrap_err();
+        assert!(
+            err.contains("could not decode labels for switch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_disassemble_bad_match() {
+        let source = "\nint 40\nint 45\nint 40\nmatch label1 label2\nlabel1:\nlabel2:\n";
+        let full = format!("#pragma version 8\n{source}");
+        let ops = assemble_string(&full).unwrap();
+
+        assert!(disassemble(&ops.program).is_ok());
+
+        // Return the label count, but chop off the labels themselves.
+        let truncated = &ops.program[..ops.program.len() - 5];
+        let err = disassemble(truncated).unwrap_err();
+        assert!(
+            err.contains("could not decode label count for match"),
+            "unexpected error: {err}"
+        );
+
+        let truncated = &ops.program[..ops.program.len() - 1];
+        let err = disassemble(truncated).unwrap_err();
+        assert!(
+            err.contains("could not decode labels for match"),
+            "unexpected error: {err}"
+        );
+    }
 }

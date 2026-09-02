@@ -1336,6 +1336,21 @@ fn demux_loop<N, L, BV, C, M>(
                         &historical_clocks,
                     )
                 });
+                // Attach the proposal-payload received-at timestamp,
+                // mirroring Go's `demux.next()` deferred
+                // `AttachReceivedAt(clockForRound(currentRound, s.Clock,
+                // s.historicalClocks))` (agreement/demux.go:217-218). Must
+                // happen before the event reaches the main loop, since
+                // `blockAssembler.bind` reads `pipeline.received_at` off
+                // the proposal-store's pending payload.
+                let e = e.attach_received_at(|event_round| {
+                    crate::clock::clock_for_round(
+                        event_round,
+                        next_round,
+                        &clock,
+                        &historical_clocks,
+                    )
+                });
                 if input.send(Some(e)).is_err() {
                     break;
                 }

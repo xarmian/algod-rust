@@ -259,7 +259,7 @@ pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
             spec.imm
         };
 
-        let (immediates, consumed) = parse_immediates(code, pc, imm_kind)?;
+        let (immediates, consumed) = parse_immediates(code, pc, imm_kind, spec.name)?;
         pc += consumed;
 
         // go-algorand PR #6692 ("avm: improve byte constant immediate
@@ -313,6 +313,7 @@ fn parse_immediates(
     code: &[u8],
     pos: usize,
     kind: ImmKind,
+    op_name: &str,
 ) -> Result<(Immediates, usize), AlgoError> {
     match kind {
         ImmKind::None => Ok((Immediates::None, 0)),
@@ -432,7 +433,26 @@ fn parse_immediates(
         }
 
         ImmKind::Labels => {
-            let count = read_byte(code, pos)? as usize;
+            // Mirrors go-algorand's `parseLabels` (`assembler.go`) bounds
+            // checking and error wording exactly: a single up-front check
+            // that the whole label list fits, rather than per-item checks,
+            // so a truncated switch/match reports "could not decode label
+            // count for <op>" (count byte itself missing) or "could not
+            // decode labels for <op>" (count byte present but the offset
+            // list runs past the end of the program) -- see
+            // `TestDisassembleBadSwitch`/`TestDisassembleBadMatch`.
+            if pos >= code.len() {
+                return Err(AlgoError::Avm {
+                    message: format!("could not decode label count for {op_name}"),
+                });
+            }
+            let count = code[pos] as usize;
+            let end = pos + 1 + 2 * count;
+            if end > code.len() {
+                return Err(AlgoError::Avm {
+                    message: format!("could not decode labels for {op_name}"),
+                });
+            }
             let mut offsets = Vec::with_capacity(count);
             for i in 0..count {
                 let label_pos = pos + 1 + i * 2;
@@ -724,6 +744,87 @@ mod tests {
         assert_eq!(
             p.instructions[1].immediates,
             Immediates::Labels(vec![1, 2, -2])
+        );
+    }
+
+    /// Port of go-algorand's `TestDisassembleBadSwitch`
+    /// (`data/transactions/logic/assembler_test.go`): a truncated `switch`
+    /// label list must report a clean, name-specific decode error rather
+    /// than a generic bounds message.
+    #[test]
+    fn test_switch_truncated_label_count_missing() {
+        // switch opcode is the very last byte -- no count byte follows.
+        let raw = prog(8, &[0x81, 0x00 /* pushint 0 */, 0x8d /* switch */]);
+        let err = parse(&raw).unwrap_err().to_string();
+        assert!(
+            err.contains("could not decode label count for switch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_switch_truncated_labels_list_short() {
+        // count says 2 labels, but only 1 offset (2 bytes) follows.
+        let raw = prog(
+            8,
+            &[
+                0x81, 0x00, // pushint 0
+                0x8d, // switch
+                0x02, // count = 2
+                0x00, 0x01, // offset +1 (only one of the two present)
+            ],
+        );
+        let err = parse(&raw).unwrap_err().to_string();
+        assert!(
+            err.contains("could not decode labels for switch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_switch_truncated_labels_list_all_missing() {
+        // count says 2 labels, but zero offset bytes follow.
+        let raw = prog(
+            8,
+            &[
+                0x81, 0x00, // pushint 0
+                0x8d, // switch
+                0x02, // count = 2
+            ],
+        );
+        let err = parse(&raw).unwrap_err().to_string();
+        assert!(
+            err.contains("could not decode labels for switch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Port of go-algorand's `TestDisassembleBadMatch`.
+    #[test]
+    fn test_match_truncated_label_count_missing() {
+        let raw = prog(8, &[0x81, 0x00 /* pushint 0 */, 0x8e /* match */]);
+        let err = parse(&raw).unwrap_err().to_string();
+        assert!(
+            err.contains("could not decode label count for match"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_match_truncated_labels_list_short() {
+        let raw = prog(
+            8,
+            &[
+                0x81, 0x00, // pushint 0
+                0x8e, // match
+                0x02, // count = 2
+                0x00, 0x01, // offset +1 (only one of the two present)
+            ],
+        );
+        let err = parse(&raw).unwrap_err().to_string();
+        assert!(
+            err.contains("could not decode labels for match"),
+            "unexpected error: {err}"
         );
     }
 

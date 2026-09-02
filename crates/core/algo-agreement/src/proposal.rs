@@ -27,6 +27,8 @@
 //
 // `ProposalValue` is defined in vote.rs and re-exported from lib.rs.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use algo_codec::{canonical_encode_unauthenticated_proposal, compute_block_digest};
@@ -53,6 +55,11 @@ use crate::VRF_PROOF_SIZE;
 ///     SeedProof crypto.VrfProof `codec:"sdpf"`
 ///     OriginalPeriod   period         `codec:"oper"`
 ///     OriginalProposer basics.Address `codec:"oprop"`
+///
+///     // receivedAt indicates the time at which this proposal was
+///     // delivered to the agreement package (as a messageEvent),
+///     // relative to the zero of that round.
+///     receivedAt time.Duration
 /// }
 /// ```
 ///
@@ -68,6 +75,21 @@ pub struct UnauthenticatedProposal {
     pub original_period: Period,
     /// The address of the original proposer.
     pub original_proposer: Address,
+    /// Time at which this proposal was delivered to the agreement package
+    /// (relative to the zero of its round), attached at the demux boundary
+    /// via `MessageEvent::attach_received_at`.
+    ///
+    /// Mirrors Go's `unauthenticatedProposal.receivedAt`. In Go this field
+    /// is unexported and carries no `codec` tag, so it is never part of the
+    /// wire encoding, the canonical hash, or persisted checkpoint state —
+    /// it is purely ephemeral in-memory bookkeeping. `#[serde(skip)]`
+    /// mirrors that: it is excluded from `to_be_hashed` (which uses
+    /// `canonical_encode_unauthenticated_proposal`, not `#[derive(Serialize)]`,
+    /// for the consensus-critical encoding) and from any serde-based
+    /// persistence, and defaults to `Duration::ZERO` on deserialize —
+    /// matching Go, where a restarted node also loses this value.
+    #[serde(skip)]
+    pub received_at: Duration,
 }
 
 impl Default for UnauthenticatedProposal {
@@ -77,6 +99,7 @@ impl Default for UnauthenticatedProposal {
             seed_proof: [0u8; VRF_PROOF_SIZE],
             original_period: Period(0),
             original_proposer: Address([0u8; 32]),
+            received_at: Duration::ZERO,
         }
     }
 }
@@ -494,6 +517,7 @@ mod tests {
             seed_proof: [0xaa; VRF_PROOF_SIZE],
             original_period: Period(0),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
         let d1 = hash_obj(&prop);
         let d2 = hash_obj(&prop);
@@ -507,12 +531,14 @@ mod tests {
             seed_proof: [0xaa; VRF_PROOF_SIZE],
             original_period: Period(0),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
         let prop2 = UnauthenticatedProposal {
             block: make_test_block(),
             seed_proof: [0xaa; VRF_PROOF_SIZE],
             original_period: Period(1),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
         assert_ne!(hash_obj(&prop1), hash_obj(&prop2));
     }
@@ -524,6 +550,7 @@ mod tests {
             seed_proof: [0xaa; VRF_PROOF_SIZE],
             original_period: Period(3),
             original_proposer: Address([0x22; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         let value = prop.value();
@@ -546,6 +573,7 @@ mod tests {
             seed_proof: [0xaa; VRF_PROOF_SIZE],
             original_period: Period(1),
             original_proposer: Address([0x33; 32]),
+            ..UnauthenticatedProposal::default()
         };
         let v1 = prop.value();
         let v2 = prop.value();
@@ -559,6 +587,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(0),
             original_proposer: Address([0; 32]),
+            ..UnauthenticatedProposal::default()
         };
         assert_eq!(prop.round(), Round(100));
     }
@@ -570,6 +599,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(0),
             original_proposer: Address([0; 32]),
+            ..UnauthenticatedProposal::default()
         };
         assert_eq!(prop.seed(), Seed([0x42; 32]));
     }
@@ -582,6 +612,7 @@ mod tests {
             seed_proof: [0xbb; VRF_PROOF_SIZE],
             original_period: Period(0),
             original_proposer: Address([0; 32]),
+            ..UnauthenticatedProposal::default()
         };
         let encoded = prop.to_be_hashed();
         // The encoded bytes should contain "sdpf" as a field key
@@ -596,6 +627,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(5),
             original_proposer: Address([0; 32]),
+            ..UnauthenticatedProposal::default()
         };
         let encoded = prop.to_be_hashed();
         let has_oper = encoded.windows(4).any(|w| w == b"oper");
@@ -609,6 +641,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(0),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
         let encoded = prop.to_be_hashed();
         let has_oprop = encoded.windows(5).any(|w| w == b"oprop");
@@ -644,6 +677,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(0),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         let (ledger, _) = make_ledger_with_proposer([0; 32], Seed([0; 32]), false, 0);
@@ -664,6 +698,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(0),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         let (ledger, _) = make_ledger_with_proposer([0; 32], Seed([0; 32]), false, 0);
@@ -684,6 +719,7 @@ mod tests {
             seed_proof: [0xff; VRF_PROOF_SIZE], // Invalid proof
             original_period: Period(0),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         let (ledger, _) = make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
@@ -715,6 +751,7 @@ mod tests {
             seed_proof: *proof.as_bytes(),
             original_period: Period(0),
             original_proposer: proposer,
+            ..UnauthenticatedProposal::default()
         };
 
         let (ledger, _) = make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
@@ -737,6 +774,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(1),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, false, 0);
@@ -758,6 +796,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(1),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, false, 0);
@@ -785,6 +824,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(2),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, false, 0);
@@ -816,6 +856,7 @@ mod tests {
             seed_proof: *proof.as_bytes(),
             original_period: Period(0),
             original_proposer: proposer,
+            ..UnauthenticatedProposal::default()
         };
 
         let (ledger, _) = make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
@@ -847,6 +888,7 @@ mod tests {
             seed_proof: *proof.as_bytes(),
             original_period: Period(0),
             original_proposer: proposer,
+            ..UnauthenticatedProposal::default()
         };
 
         let (ledger, _) = make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
@@ -880,6 +922,7 @@ mod tests {
             seed_proof: *proof.as_bytes(),
             original_period: Period(0),
             original_proposer: proposer,
+            ..UnauthenticatedProposal::default()
         };
 
         // Eligible: incentive_eligible=true, balance within range
@@ -909,6 +952,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(1),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         // Not eligible: incentive_eligible=false
@@ -938,6 +982,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(1),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, false, 50_000_000_000);
@@ -962,6 +1007,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(1),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         // incentive_eligible=true but balance below MinBalance (30_000_000_000)
@@ -991,6 +1037,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(1),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         // incentive_eligible=true but balance above MaxBalance (70_000_000_000_000)
@@ -1028,6 +1075,7 @@ mod tests {
             seed_proof: *proof.as_bytes(),
             original_period: Period(0),
             original_proposer: proposer,
+            ..UnauthenticatedProposal::default()
         };
 
         // Register with the correct selection key from the ledger
@@ -1164,6 +1212,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(1),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, false, 50_000_000_000);
@@ -1235,6 +1284,7 @@ mod tests {
             seed_proof: [0; VRF_PROOF_SIZE],
             original_period: Period(1),
             original_proposer: Address([0x11; 32]),
+            ..UnauthenticatedProposal::default()
         };
 
         let mut ledger = MockLedgerReader::new(params).with_seed(prev_seed);
@@ -1284,6 +1334,7 @@ mod tests {
             seed_proof: *proof.as_bytes(),
             original_period: Period(0),
             original_proposer: proposer,
+            ..UnauthenticatedProposal::default()
         };
 
         let mut ledger = MockLedgerReader::new(params).with_seed(prev_seed);

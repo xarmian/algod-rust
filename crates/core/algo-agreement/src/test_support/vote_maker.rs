@@ -98,6 +98,7 @@ pub fn make_random_proposal_payload(r: Round) -> Proposal {
         seed_proof: [0u8; VRF_PROOF_SIZE],
         original_period: Period(0),
         original_proposer: Address([0u8; 32]),
+        ..UnauthenticatedProposal::default()
     };
     Proposal {
         unauthenticated_proposal: unauth,
