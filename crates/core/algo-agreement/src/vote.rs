@@ -83,6 +83,30 @@ impl ProposalValue {
     pub fn is_bottom(&self) -> bool {
         *self == BOTTOM
     }
+
+    /// Canonical ordering predicate used to sort `ProposalValue`s for
+    /// deterministic map-key iteration.
+    ///
+    /// Mirrors Go's `SortProposalValue.Less` (`agreement/sort.go`), which
+    /// backs `//msgp:sort proposalValue SortProposalValue` — the canonical
+    /// ordering go-algorand's generated msgpack encoder uses when it
+    /// serializes a `map[proposalValue]...`. The comparison order is
+    /// significant and intentionally mirrored field-for-field rather than
+    /// derived: original period first, then original proposer, then block
+    /// digest, then encoding digest — each subsequent field only breaks
+    /// ties left by the previous one.
+    pub fn sort_less(&self, other: &ProposalValue) -> bool {
+        if self.original_period != other.original_period {
+            return self.original_period < other.original_period;
+        }
+        if self.original_proposer.0 != other.original_proposer.0 {
+            return self.original_proposer.0 < other.original_proposer.0;
+        }
+        if self.block_digest.0 != other.block_digest.0 {
+            return self.block_digest.0 < other.block_digest.0;
+        }
+        self.encoding_digest.0 < other.encoding_digest.0
+    }
 }
 
 /// Canonical msgpack encoding of a `ProposalValue`, matching Go's
@@ -1377,6 +1401,94 @@ mod tests {
         assert_eq!(
             uv.verify(&params).unwrap_err(),
             VoteError::BottomNotAllowed { step: CERT },
+        );
+    }
+
+    // ── ProposalValue::sort_less ─────────────────────────────────────────
+    //
+    // Port of go-algorand's `TestSortProposalValueLess`
+    // (agreement/sort_test.go). The test is intentionally tied to the
+    // implementation because it pins the canonical order of checks used
+    // by go-algorand's `//msgp:sort proposalValue SortProposalValue`
+    // (agreement/sort.go): original period, then original proposer, then
+    // block digest, then encoding digest.
+
+    #[test]
+    fn sort_proposal_value_less_matches_go_ordering() {
+        // Initialize a new digest with all bytes being 'a'.
+        let d1 = Digest([b'a'; 32]);
+        let p1 = ProposalValue {
+            original_period: Period(1),
+            original_proposer: Address(d1.0),
+            block_digest: d1,
+            encoding_digest: d1,
+        };
+        let mut sp = [p1, p1];
+
+        // They are both equal, so less() should return false regardless of
+        // order.
+        assert!(
+            !sp[0].sort_less(&sp[1]),
+            "{:?} < {:?} is true for equal values",
+            sp[0],
+            sp[1]
+        );
+        assert!(
+            !sp[1].sort_less(&sp[0]),
+            "{:?} < {:?} is true for equal values",
+            sp[1],
+            sp[0]
+        );
+
+        // Working our way backwards from the order of checks in
+        // sort_less() — the test is tied to the implementation because it
+        // defines what the canonical order of checks is.
+        sp[1].encoding_digest.0[3] = b'b';
+        assert!(
+            sp[0].sort_less(&sp[1]),
+            "expected {:?} < {:?}",
+            sp[0],
+            sp[1]
+        );
+
+        sp[0].block_digest.0[3] = b'b';
+        assert!(
+            !sp[0].sort_less(&sp[1]),
+            "expected {:?} >= {:?}",
+            sp[0],
+            sp[1]
+        );
+
+        sp[1].block_digest.0[3] = b'c';
+        assert!(
+            sp[0].sort_less(&sp[1]),
+            "expected {:?} < {:?}",
+            sp[0],
+            sp[1]
+        );
+
+        sp[0].original_proposer.0[3] = b'b';
+        assert!(
+            !sp[0].sort_less(&sp[1]),
+            "expected {:?} >= {:?}",
+            sp[0],
+            sp[1]
+        );
+
+        sp[1].original_proposer.0[3] = b'c';
+        assert!(
+            sp[0].sort_less(&sp[1]),
+            "expected {:?} < {:?}",
+            sp[0],
+            sp[1]
+        );
+
+        sp[0].original_period = Period(2);
+        assert!(
+            !sp[0].sort_less(&sp[1]),
+            "expected {:?} >= {:?}",
+            sp[0],
+            sp[1]
         );
     }
 
