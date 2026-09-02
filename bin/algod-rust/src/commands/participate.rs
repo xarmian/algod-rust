@@ -7125,43 +7125,43 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn close_remainder_to_self_zeros_sender() {
+    fn close_remainder_to_self_is_rejected() {
+        // `PaymentTxnFields.wellFormed` (go-algorand
+        // data/transactions/payment.go) rejects a payment whose
+        // close_remainder_to equals its own sender ("transaction cannot
+        // close account to its sender"); algod-rust enforces the same rule
+        // in `validate_transaction_wellformed` (crates/core/algo-validate/
+        // src/rules.rs, added in #837 — see also that crate's
+        // `test_payment_close_to_self_rejected`). Such a transaction can
+        // therefore never reach the balance-apply layer this test targets.
+        //
+        // This replaces the former `close_remainder_to_self_zeros_sender`
+        // test, which predates #837 and expected the (now provably
+        // unreachable) self-close to succeed and zero the sender's
+        // balance. The apply-layer close-to-a-third-party path is already
+        // covered by `close_remainder_zeros_sender_and_credits_close_addr`.
         let ledger = test_ledger();
         let params = v41_params();
         let (sender, key) = test_keypair(200);
         let (receiver, _) = test_keypair(201);
-        // Sender: 1_000_000, fee=1000, amount=100_000
-        // close_remainder_to = sender (self-close)
-        // After fee + amount: 1_000_000 - 1000 - 100_000 = 899_000
-        // Close to self: remaining goes to sender... but sender is set to 0.
-        // Net result: sender ends at 0, receiver gets 100_000.
-        // The close-to-self should NOT double-credit because the code
-        // skips the credit when close_addr == sender.
-        let initial_receiver_balance = 100_000u64;
         let mut eval = make_evaluator(
             &ledger,
             &params,
             100,
-            &[(sender, 1_000_000), (receiver, initial_receiver_balance)],
+            &[(sender, 1_000_000), (receiver, 100_000)],
         );
 
         let mut stx = make_signed_pay(&key, &sender, &receiver, 100_000, 1000, 100);
-        stx.txn.close_remainder_to = sender; // close to self
+        stx.txn.close_remainder_to = sender; // close to self: rejected
         stx.sig = sign_txn(&stx.txn, &key);
 
-        assert!(eval.transaction_group(&[stx]).is_ok());
-
-        // Sender should be zero (closed)
-        assert_eq!(
-            eval.effective_balance(&sender),
-            0,
-            "sender should be zero after self-close"
-        );
-        // Receiver should get the amount
-        assert_eq!(
-            eval.effective_balance(&receiver),
-            initial_receiver_balance + 100_000,
-            "receiver should get the payment amount"
+        let err = eval
+            .transaction_group(&[stx])
+            .expect_err("close_remainder_to == sender must be rejected");
+        assert!(
+            err.to_string()
+                .contains("cannot close account to its sender"),
+            "unexpected error: {err}"
         );
     }
 
@@ -7772,12 +7772,24 @@ mod tests {
     #[test]
     fn afrz_only_deducts_fee() {
         // Asset freeze transactions should only deduct the fee.
+        //
+        // `AssetFreezeTxnFields.wellFormed` (go-algorand
+        // data/transactions/asset.go) requires FreezeAsset != 0 and
+        // FreezeAccount non-empty; algod-rust enforces the same in
+        // `validate_transaction_wellformed` (crates/core/algo-validate/src/
+        // rules.rs, added in #837). A bare-default afrz txn (freeze_asset=0,
+        // freeze_account=None) is therefore correctly rejected, so this
+        // fixture must set both fields to reach the balance-apply logic
+        // under test.
         let ledger = test_ledger();
         let params = v41_params();
         let (sender, key) = test_keypair(112);
         let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 1_000_000)]);
 
-        let stx = make_signed_txn(&key, &sender, TxnType::Afrz, 1000, 100);
+        let mut stx = make_signed_txn(&key, &sender, TxnType::Afrz, 1000, 100);
+        stx.txn.freeze_asset = 1;
+        stx.txn.freeze_account = Some(sender);
+        stx.sig = sign_txn(&stx.txn, &key);
         assert!(
             eval.transaction_group(&[stx]).is_ok(),
             "afrz transaction should be accepted"
@@ -7971,7 +7983,13 @@ mod tests {
         // to produce unique txids.
         let stx1 = make_signed_txn(&key, &sender, TxnType::Keyreg, 1000, 100);
         let stx2 = make_signed_txn(&key, &sender, TxnType::Acfg, 2000, 100);
-        let stx3 = make_signed_txn(&key, &sender, TxnType::Afrz, 1500, 100);
+        // afrz well-formedness requires freeze_asset != 0 and a non-empty
+        // freeze_account (go-algorand AssetFreezeTxnFields.wellFormed,
+        // enforced since #837) — see afrz_only_deducts_fee above.
+        let mut stx3 = make_signed_txn(&key, &sender, TxnType::Afrz, 1500, 100);
+        stx3.txn.freeze_asset = 1;
+        stx3.txn.freeze_account = Some(sender);
+        stx3.sig = sign_txn(&stx3.txn, &key);
 
         eval.transaction_group(&[stx1])
             .expect("stx1 keyreg should succeed");
