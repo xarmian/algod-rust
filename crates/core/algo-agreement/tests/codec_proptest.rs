@@ -184,6 +184,7 @@ fn arb_authenticated_vote() -> impl Strategy<Value = Vote> {
         raw_vote,
         cred,
         sig,
+        validated_at: std::time::Duration::ZERO,
     })
 }
 

@@ -24,6 +24,8 @@
 // unauthenticatedVote wraps rawVote with a VRF credential and OTS signature.
 // Vote is the verified form with a proven Credential and weight.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use algo_consensus_crypto::{one_time_id_for_round, verify_one_time_signature, OneTimeSignature};
@@ -34,6 +36,7 @@ use crate::credential::{Credential, Membership, UnauthenticatedCredential};
 use crate::hashable::hash_obj;
 use crate::hashable::Hashable;
 use crate::step::{Period, Step, CERT, PROPOSE, SOFT};
+use crate::types::duration_serde;
 
 // ── ProposalValue ──────────────────────────────────────────────────────────
 
@@ -306,6 +309,14 @@ pub struct Vote {
     pub cred: Credential,
     /// The one-time signature.
     pub sig: OneTimeSignature,
+    /// The time at which this vote was verified (as a `voteVerified`
+    /// message event), relative to the zero of that round. Only
+    /// meaningfully set for step 0 (proposal-votes); mirrors Go's
+    /// `vote.validatedAt`. Not part of the network wire format — always
+    /// zero on decode, populated by `MessageEvent::attach_validated_at`
+    /// mirroring Go's `messageEvent.AttachValidatedAt`.
+    #[serde(with = "duration_serde")]
+    pub validated_at: Duration,
 }
 
 impl Default for Vote {
@@ -333,6 +344,7 @@ impl Default for Vote {
                 pk1_sig: [0u8; 64],
                 pk2_sig: [0u8; 64],
             },
+            validated_at: Duration::ZERO,
         }
     }
 }
@@ -513,6 +525,11 @@ impl UnauthenticatedVote {
             raw_vote: rv.clone(),
             cred,
             sig: self.sig.clone(),
+            // Not set here — mirrors Go's `unauthenticatedVote.verify()`,
+            // which also leaves `validatedAt` zero. It is populated later
+            // via `MessageEvent::attach_validated_at` when the resulting
+            // `voteVerified` event is dispatched.
+            validated_at: Duration::ZERO,
         })
     }
 }
