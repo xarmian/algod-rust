@@ -8392,7 +8392,10 @@ mod tests {
                     },
                     ResourceRef {
                         // Holding for (Access[0]=other_acct, Access[1]=asset 950).
-                        holding: Some(HoldingRef { address: 1, asset: 2 }),
+                        holding: Some(HoldingRef {
+                            address: 1,
+                            asset: 2,
+                        }),
                         ..Default::default()
                     },
                     ResourceRef {

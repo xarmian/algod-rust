@@ -2104,7 +2104,10 @@ mod tests {
         let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains(&format!("unavailable Local State 500+{}", algo_types::Address(addr))),
+            msg.contains(&format!(
+                "unavailable Local State 500+{}",
+                algo_types::Address(addr)
+            )),
             "unexpected: {msg}"
         );
     }
@@ -2207,7 +2210,10 @@ mod tests {
         let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains(&format!("unavailable Holding 200+{}", algo_types::Address(addr))),
+            msg.contains(&format!(
+                "unavailable Holding 200+{}",
+                algo_types::Address(addr)
+            )),
             "unexpected: {msg}"
         );
     }
@@ -2272,7 +2278,7 @@ mod tests {
         let mut ctx = TestStateContext::new(100);
         ctx.accounts.push(addr);
         ctx.unavailable_locals.insert((addr, 100)); // app_id == ctx.app_id
-                                                     // pushint 0, pushbytes "key", pushint 1, app_local_put
+                                                    // pushint 0, pushbytes "key", pushint 1, app_local_put
         let mut code = vec![0x81, 0];
         code.extend_from_slice(&[0x80, 0x03]);
         code.extend_from_slice(b"key");
@@ -2283,8 +2289,10 @@ mod tests {
         let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
         let err = step_n(&mut m, &mut ctx, 4).unwrap_err();
         assert!(
-            err.to_string()
-                .contains(&format!("unavailable Local State 100+{}", algo_types::Address(addr))),
+            err.to_string().contains(&format!(
+                "unavailable Local State 100+{}",
+                algo_types::Address(addr)
+            )),
             "unexpected: {err}"
         );
     }
@@ -2305,8 +2313,10 @@ mod tests {
         let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
         let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
         assert!(
-            err.to_string()
-                .contains(&format!("unavailable Local State 100+{}", algo_types::Address(addr))),
+            err.to_string().contains(&format!(
+                "unavailable Local State 100+{}",
+                algo_types::Address(addr)
+            )),
             "unexpected: {err}"
         );
     }
