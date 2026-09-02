@@ -684,6 +684,29 @@ pub trait AvmContext {
         true
     }
 
+    /// Check if an asset holding (account+asset cross-product) is available
+    /// under the transaction group's resource-sharing rules (AVM v9+,
+    /// `sharedResourcesVersion`). Matches go-algorand's `allowsHolding`
+    /// (`data/transactions/logic/resources.go`).
+    ///
+    /// Defaults to `true` (no restriction), matching
+    /// [`Self::is_account_available`]'s rationale: contexts that don't
+    /// track group resources at all don't restrict. Callers must
+    /// independently gate on the AVM version before consulting this --
+    /// `LedgerAvmContext` overrides it with the real cross-product check.
+    fn is_holding_available(&self, addr: &[u8; 32], asset_id: u64) -> bool {
+        let _ = (addr, asset_id);
+        true
+    }
+
+    /// Check if an app local state (account+app cross-product) is
+    /// available. Matches go-algorand's `allowsLocals`. See
+    /// [`Self::is_holding_available`] for the shared rationale.
+    fn is_local_available(&self, addr: &[u8; 32], app_id: u64) -> bool {
+        let _ = (addr, app_id);
+        true
+    }
+
     // ---- Voter / stake queries ----
 
     /// Get voter parameters for an account (from balance round, 320 rounds back).
