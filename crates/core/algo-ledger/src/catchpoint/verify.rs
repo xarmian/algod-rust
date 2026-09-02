@@ -2584,4 +2584,60 @@ mod tests {
         assert!(table.check(&sender_a, &lease_a, current_round).is_err());
         assert!(table.check(&sender_b, &lease_b, current_round).is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // verify_catchpoint error paths
+    //
+    // Port of go-algorand's `TestVerifyCatchpoint`
+    // (`ledger/catchupaccessor_test.go`): `VerifyCatchpoint` called before
+    // any catchpoint has been staged/imported (an empty/uninitialized
+    // database) must fail cleanly rather than panicking. The success path
+    // (a real imported catchpoint whose label recomputes correctly) is
+    // already covered end-to-end by
+    // `catchpoint_export_test.rs::export_then_import_round_trips_state_and_label`
+    // and friends.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_catchpoint_fails_on_empty_database() {
+        // A freshly-opened, completely empty connection has none of the
+        // catchpointstate/acctrounds/accountbase tables that
+        // verify_catchpoint reads from.
+        let conn = Connection::open_in_memory().unwrap();
+        let digest = [0u8; 32];
+
+        let result = verify_catchpoint(&conn, &digest);
+        assert!(
+            result.is_err(),
+            "verify_catchpoint on an empty database must fail, not panic or succeed"
+        );
+        match result.unwrap_err() {
+            CatchpointError::VerificationError(_) => {}
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_catchpoint_fails_when_staged_but_not_cut_over() {
+        // Mirrors go's second assertion in TestVerifyCatchpoint: even after
+        // "ResetStagingBalances" (here: creating the staging tables via
+        // prepare_staging), VerifyCatchpoint must still fail because the
+        // live tables (accountbase, catchpointstate, acctrounds) that
+        // verify_catchpoint reads from don't exist yet — only the
+        // catchpointbalances/etc. staging tables do.
+        let conn = Connection::open_in_memory().unwrap();
+        let mut importer = crate::catchpoint::importer::CatchpointImporter::new(
+            &conn,
+            "test#label".to_string(),
+            crate::rewards::REWARD_UNITS,
+        );
+        importer.prepare_staging().unwrap();
+
+        let digest = [0u8; 32];
+        let result = verify_catchpoint(&conn, &digest);
+        assert!(
+            result.is_err(),
+            "verify_catchpoint before atomic_cutover must fail"
+        );
+    }
 }
