@@ -54,12 +54,12 @@ per-area split of the former).
 | `partial` | 719 | 23% |
 | `not-implemented` | 520 | 16% |
 | `matched-1:1` | 513 | 16% |
-| `matched-1:many` | 478 | 15% |
-| `missing-test` | 379 | 12% |
+| `matched-1:many` | 480 | 15% |
+| `missing-test` | 377 | 12% |
 | `out-of-scope` | 367 | 12% |
 | `matched-many:1` | 201 | 6% |
 
-**899 rows (`not-implemented` + `missing-test`, 28%) are real, actionable
+**897 rows (`not-implemented` + `missing-test`, 28%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
 implements but never tests. `partial` (719, 23%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
@@ -71,7 +71,7 @@ were triaged into tracked issues.
 
 | area | file | total | 1:1 | 1:many | many:1 | partial | not-impl | missing-test | out-of-scope |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 68 | 136 | 6 | 123 | 28 | 65 | 23 |
+| AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 68 | 138 | 6 | 123 | 28 | 63 | 23 |
 | Transactions core (`data/transactions`) | [parity_txn_core.md](phase17/parity_txn_core.md) | 173 | 31 | 32 | 0 | 68 | 31 | 10 | 1 |
 | Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 38 | 91 | 40 | 131 | 40 | 37 | 126 |
 | Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 6 | 16 | 0 | 19 | 9 | 17 | 1 |
@@ -86,5 +86,5 @@ were triaged into tracked issues.
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 4 | 2 | 7 | 13 | 102 | 3 | 42 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 55 | 2 | 7 | 0 | 13 | 28 | 4 | 1 |
-| **Total** | | **3,177** | **513** | **478** | **201** | **719** | **520** | **379** | **367** |
+| **Total** | | **3,177** | **513** | **480** | **201** | **719** | **520** | **377** | **367** |
 

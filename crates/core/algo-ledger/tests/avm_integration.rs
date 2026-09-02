@@ -602,6 +602,13 @@ fn app_local_get_preloaded() {
         .insert(b"mykey".to_vec(), TealValue::Uint(99));
 
     let mut ctx = make_context(&mut store, vec![txn]);
+    // app_local_get's implied-current-app resolution (issue #841) now goes
+    // through the same AppForbidLowResources-gated `resolve_app` as an
+    // explicit reference (matching go's `resolveApp`/`appReference`, whose
+    // low-id defer check fires even for the ref==0 "current app" shortcut).
+    // This fixture's app id (42) predates that flag -- see
+    // `pre_app_forbid_low_resources_consensus`'s doc comment.
+    ctx.consensus = pre_app_forbid_low_resources_consensus();
 
     let code: &[u8] = &[
         0x81, 0x00, // pushint 0  (sender)
@@ -1089,6 +1096,11 @@ fn combined_global_and_local_state() {
     seed_app(&mut store);
     opt_in_account(&mut store, Address(sender));
     let mut ctx = make_context(&mut store, vec![txn]);
+    // See `app_local_get_preloaded`'s comment: this fixture's low app id
+    // (42) needs the pre-AppForbidLowResources consensus now that
+    // app_local_get's implied-current-app resolution goes through
+    // `resolve_app` (issue #841).
+    ctx.consensus = pre_app_forbid_low_resources_consensus();
 
     let code: &[u8] = &[
         // Global put: "gk" = 10
