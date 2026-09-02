@@ -36,6 +36,7 @@ pub mod cli_state;
 pub mod cmd;
 pub mod data_dir;
 pub mod groups;
+pub mod resource_resolution;
 
 /// goal-rust — CLI for interacting with Algorand.
 ///
