@@ -2471,4 +2471,115 @@ mod tests {
         assert_eq!(all_keys[1].round, 512);
         assert_eq!(all_keys[2].round, 768);
     }
+
+    // ── Known-answer-test (KAT) shape parity ───────────────────────────
+    //
+    // go-algorand's `crypto/merklesignature/kats_test.go` `TestGenerateKat`
+    // is a KAT *generator*, not a KAT *checker*: it is `t.Skip`ped unless
+    // `GEN_KATS` is set, and even then it only prints a JSON blob to stdout
+    // rather than asserting against a pinned value — go-algorand does not
+    // itself commit fixed byte vectors for this test the way
+    // `TestMerkleTreeKATs`/`TestVCKATs` do. Its own key material is also
+    // freshly randomized per run (`crypto.RandBytes`/Falcon keygen), so
+    // there is no fixed byte string to reproduce even by running the Go
+    // test — two runs of `generateMssKat` do not agree with each other.
+    //
+    // Building go-algorand locally to actually run `GEN_KATS=x go test`
+    // was attempted and is not available in this environment: it requires
+    // cgo (for `algorand/falcon` and `mattn/go-sqlite3`), and this Windows
+    // checkout has no C compiler on PATH (`CGO_ENABLED=0`, no `gcc`/mingw),
+    // so `go build` fails before reaching the test.
+    //
+    // What *is* pinned by go-algorand's spec (and load-bearing for the
+    // SNARK verifier `generateMssKat` feeds) is the exact byte *layout* and
+    // *fixed lengths* `generateMssKat`/`extractMssSignatureParts` rely on:
+    // `crypto.FalconSignature.GetFixedLengthHashableRepresentation` (CT
+    // form), `crypto.FalconVerifier.GetFixedLengthHashableRepresentation`
+    // (raw pubkey), and `SingleLeafProof.GetFixedLengthHashableRepresentation`
+    // (`1 + MaxEncodedTreeDepth*digestSize` bytes, leading zero-padded,
+    // first byte = tree depth). This test reproduces `generateMssKat`'s
+    // exact call sequence (`New(256, 256+256*9-1, 256)`, `GetSigner(512)`,
+    // `SignBytes("test")`) and asserts every one of those fixed sizes and
+    // the proof-depth/index invariants the Go spec pins — the strongest
+    // check available without go-derived byte vectors — plus an end-to-end
+    // verify to prove the extracted parts are actually a valid signature.
+    #[test]
+    fn test_generate_kat_shape() {
+        const SP_INTERVAL: u64 = 256;
+        const NUM_OF_KEYS: u64 = 9;
+        const START_ROUND: u64 = 256;
+        const AT_ROUND: u64 = 512;
+        let end_round = START_ROUND + (SP_INTERVAL * NUM_OF_KEYS) - 1; // 2559
+
+        let secrets = Secrets::new(START_ROUND, end_round, SP_INTERVAL)
+            .expect("generateMssKat: Secrets::new should succeed");
+        assert_eq!(secrets.ephemeral_keys.len(), NUM_OF_KEYS as usize);
+
+        let signer = secrets.get_signer(AT_ROUND);
+        let message = b"test";
+        let signature = signer
+            .sign_bytes(message)
+            .expect("generateMssKat: SignBytes should succeed");
+
+        let verifier = secrets.get_verifier();
+        verifier
+            .verify_bytes(AT_ROUND, message, &signature)
+            .expect("generateMssKat: the produced signature must itself verify");
+
+        // ctSignature = signature.Signature.GetFixedLengthHashableRepresentation()
+        let ct_signature = algo_falcon::falcon_convert_compressed_to_ct(&signature.signature)
+            .expect("generateMssKat: CT signature conversion should succeed");
+        assert_eq!(
+            ct_signature.len(),
+            algo_falcon::FALCON_DET1024_SIG_CT_SIZE,
+            "ctSignature must be the fixed CT-form Falcon-1024 signature size"
+        );
+
+        // pk = signature.VerifyingKey.GetFixedLengthHashableRepresentation()
+        let pk = signature
+            .verifying_key
+            .get_fixed_length_hashable_representation();
+        assert_eq!(
+            pk.len(),
+            algo_falcon::FALCON_DET1024_PUBKEY_SIZE,
+            "pk must be the fixed Falcon-1024 public key size"
+        );
+
+        // proof := signature.Proof.GetFixedLengthHashableRepresentation()
+        // proofDepth := proof[0]; proof = proof[1:]
+        let proof_repr = signature.proof.get_fixed_length_hashable_representation();
+        let digest_size = signature.proof.proof.hash_factory.digest_size();
+        assert_eq!(
+            proof_repr.len(),
+            1 + merklearray::MAX_ENCODED_TREE_DEPTH * digest_size,
+            "proof representation must be 1 + MaxEncodedTreeDepth*digestSize bytes"
+        );
+        let proof_depth = proof_repr[0];
+        let proof_bytes = &proof_repr[1..];
+        assert_eq!(
+            proof_bytes.len(),
+            merklearray::MAX_ENCODED_TREE_DEPTH * digest_size,
+            "proof bytes (after stripping the depth byte) must be MaxEncodedTreeDepth*digestSize"
+        );
+
+        // 9 keys pad the vector-commitment tree to 16 leaves => depth 4,
+        // matching go-algorand's VectorCommitmentArray path-length formula
+        // (bits.Len64(arrayLen-1)) for arrayLen=9.
+        assert_eq!(
+            proof_depth, 4,
+            "proof depth for a 9-key VC tree must be 4 (padded to 16 leaves)"
+        );
+        assert_eq!(signature.proof.proof.tree_depth, proof_depth);
+
+        // VcIndex must address a real leaf slot in the padded (16-leaf) tree.
+        assert!(signature.vector_commitment_index < 16);
+
+        // CorrespondingRound / Message are pass-through inputs in generateMssKat.
+        assert_eq!(AT_ROUND, 512);
+        assert_eq!(message.as_slice(), b"test");
+
+        // PublicKey (verifier commitment) is fixed-size per the merkle
+        // signature scheme's root size (Sumhash-512 digest).
+        assert_eq!(verifier.commitment.len(), MERKLE_SIGNATURE_SCHEME_ROOT_SIZE);
+    }
 }
