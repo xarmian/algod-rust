@@ -34,6 +34,186 @@ use super::helpers::{avm_to_teal, get_uint8, get_uint8_pair, teal_to_avm};
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// AVM version at which apps can access resources shared by other
+/// transactions in the group, and the holding/local-state cross-product
+/// gate below applies (go-algorand's `sharedResourcesVersion`,
+/// `data/transactions/logic/opcodes.go`). Duplicated from
+/// `algo_ledger::avm_context::SHARED_RESOURCES_VERSION` since this crate
+/// (algo-avm) cannot depend on algo-ledger.
+const SHARED_RESOURCES_VERSION: u8 = 9;
+
+/// Resolve a stack value to raw address bytes *without* checking
+/// availability, mirroring go-algorand's `resolveAccount`
+/// (`data/transactions/logic/eval.go`) as called from
+/// `holdingReference`/`localsReference` at `sharedResourcesVersion`+:
+/// index-based values are looked up via [`AvmContext::resolve_account`]
+/// (bounds-checked only, no availability gate); raw 32-byte addresses are
+/// accepted unconditionally -- availability is checked separately by the
+/// caller (via `is_account_available`/`is_holding_available`/
+/// `is_local_available`), so it can build go's more specific compound error
+/// messages.
+fn resolve_account_bytes(value: AvmValue, ctx: &dyn AvmContext) -> Result<[u8; 32], AlgoError> {
+    match value {
+        AvmValue::Uint64(idx) => ctx.resolve_account(idx),
+        AvmValue::Bytes(b) if b.len() == 32 => {
+            let mut addr = [0u8; 32];
+            addr.copy_from_slice(&b);
+            Ok(addr)
+        }
+        _ => Err(AlgoError::Avm {
+            message: "invalid account reference: expected uint64 index or 32-byte address"
+                .to_string(),
+        }),
+    }
+}
+
+/// Extract the bare message text of an [`AlgoError`], for building go-style
+/// compound error strings that don't want to embed our own `AlgoError`
+/// variant prefixes (e.g. "AVM: ").
+fn err_text(e: &AlgoError) -> String {
+    match e {
+        AlgoError::Avm { message } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Resolve `(address, asset_id)` for a holding-touching opcode
+/// (`asset_holding_get`), applying go-algorand's `holdingReference` group-
+/// sharing / cross-product gate (`data/transactions/logic/eval.go`) for AVM
+/// `sharedResourcesVersion`+ (v9). Below that version, falls back to the
+/// simple pre-sharing behavior (account and asset each independently
+/// available, no cross-product check).
+fn holding_reference(
+    version: u8,
+    ctx: &dyn AvmContext,
+    acct_val: AvmValue,
+    asset_ref_raw: u64,
+) -> Result<([u8; 32], u64), AlgoError> {
+    if version >= SHARED_RESOURCES_VERSION {
+        let addr = resolve_account_bytes(acct_val, ctx)?;
+        let asset_result = ctx.resolve_asset(asset_ref_raw);
+        if let Ok(aid) = asset_result {
+            if ctx.is_holding_available(&addr, aid) {
+                return Ok((addr, aid));
+            }
+        }
+        // Do an extra check to give a better error. The asset is definitely
+        // available (or asset_result carries its own specific problem). If
+        // the address is too, then the trouble is they must have come from
+        // different transactions, and the HOLDING is the problem.
+        let acct_ok = ctx.is_account_available(&addr);
+        let aid_for_msg = asset_result.as_ref().copied().unwrap_or(0);
+        return Err(match (asset_result, acct_ok) {
+            (Err(e), true) => e,
+            (Ok(_), true) => AlgoError::Avm {
+                message: format!(
+                    "unavailable Holding {aid_for_msg}+{}",
+                    algo_types::Address(addr)
+                ),
+            },
+            (Err(e), false) => AlgoError::Avm {
+                message: format!(
+                    "unavailable Account {}, {}",
+                    algo_types::Address(addr),
+                    err_text(&e)
+                ),
+            },
+            (Ok(_), false) => AlgoError::Avm {
+                message: format!("unavailable Account {}", algo_types::Address(addr)),
+            },
+        });
+    }
+    // Pre-v9: the rule is just that account and asset are each available.
+    let addr = resolve_account(acct_val, ctx)?;
+    let asset = ctx.resolve_asset(asset_ref_raw)?;
+    Ok((addr, asset))
+}
+
+/// Resolve `(address, app_id)` for a locals-touching read opcode
+/// (`app_opted_in`/`app_local_get`/`app_local_get_ex`), applying
+/// go-algorand's `localsReference` group-sharing / cross-product gate for
+/// AVM `sharedResourcesVersion`+ (v9). See [`holding_reference`] for the
+/// shared structure.
+fn locals_reference(
+    version: u8,
+    ctx: &dyn AvmContext,
+    acct_val: AvmValue,
+    app_ref_raw: u64,
+) -> Result<([u8; 32], u64), AlgoError> {
+    if version >= SHARED_RESOURCES_VERSION {
+        let addr = resolve_account_bytes(acct_val, ctx)?;
+        let app_result = ctx.resolve_app(app_ref_raw);
+        if let Ok(aid) = app_result {
+            if ctx.is_local_available(&addr, aid) {
+                return Ok((addr, aid));
+            }
+        }
+        let acct_ok = ctx.is_account_available(&addr);
+        let aid_for_msg = app_result.as_ref().copied().unwrap_or(0);
+        let locals_err = format!(
+            "unavailable Local State {aid_for_msg}+{}",
+            algo_types::Address(addr)
+        );
+        return Err(match (app_result, acct_ok) {
+            (Err(e), true) => e,
+            (Ok(_), true) => AlgoError::Avm {
+                message: locals_err,
+            },
+            (Err(e), false) => AlgoError::Avm {
+                message: format!(
+                    "unavailable Account {}, {}, {}",
+                    algo_types::Address(addr),
+                    err_text(&e),
+                    locals_err
+                ),
+            },
+            (Ok(_), false) => AlgoError::Avm {
+                message: format!(
+                    "unavailable Account {}, {}",
+                    algo_types::Address(addr),
+                    locals_err
+                ),
+            },
+        });
+    }
+    // Pre-v9: the rule is just that account and app are each available.
+    let addr = resolve_account(acct_val, ctx)?;
+    let app_id = ctx.resolve_app(app_ref_raw)?;
+    Ok((addr, app_id))
+}
+
+/// Gate for the mutating local-state opcodes (`app_local_put`/
+/// `app_local_del`), matching go-algorand's inline check in
+/// `opAppLocalPut`/`opAppLocalDel` (`data/transactions/logic/eval.go`):
+///
+/// ```go
+/// if cx.version >= sharedResourcesVersion && !cx.allowsLocals(addr, cx.appID) {
+///     return fmt.Errorf("unavailable Local State %d+%s", cx.appID, addr)
+/// }
+/// ```
+///
+/// Unlike the read-side [`locals_reference`], there is no compound
+/// "unavailable Account" branch here: `addr` was already resolved via
+/// [`resolve_mutable_account`], which only ever yields the sender or a
+/// `txn.Accounts`/`txn.Access` slot -- always independently available -- so
+/// only the LOCALS half of the cross-product can be missing.
+fn check_locals_available(
+    version: u8,
+    ctx: &dyn AvmContext,
+    addr: &[u8; 32],
+    app_id: u64,
+) -> Result<(), AlgoError> {
+    if version >= SHARED_RESOURCES_VERSION && !ctx.is_local_available(addr, app_id) {
+        return Err(AlgoError::Avm {
+            message: format!(
+                "unavailable Local State {app_id}+{}",
+                algo_types::Address(*addr)
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Resolve an account from a stack value.
 ///
 /// Per go-algorand, if the value is a uint64 it is treated as an index into
@@ -136,8 +316,7 @@ pub fn op_app_opted_in(
 ) -> Result<(), AlgoError> {
     let app_id_raw = machine.pop_uint()?;
     let acct_val = machine.pop()?;
-    let addr = resolve_account(acct_val, ctx)?;
-    let app_id = ctx.resolve_app(app_id_raw)?;
+    let (addr, app_id) = locals_reference(machine.version, ctx, acct_val, app_id_raw)?;
     let opted_in = ctx.app_opted_in(&addr, app_id)?;
     machine.push(AvmValue::Uint64(if opted_in { 1 } else { 0 }))
 }
@@ -151,8 +330,7 @@ pub fn op_app_local_get(
 ) -> Result<(), AlgoError> {
     let key = machine.pop_bytes()?;
     let acct_val = machine.pop()?;
-    let addr = resolve_account(acct_val, ctx)?;
-    let app_id = ctx.current_app_id();
+    let (addr, app_id) = locals_reference(machine.version, ctx, acct_val, 0)?;
     match ctx.app_local_get(&addr, app_id, &key)? {
         Some(tv) => machine.push(teal_to_avm(tv)),
         None => machine.push(AvmValue::Uint64(0)),
@@ -169,8 +347,7 @@ pub fn op_app_local_get_ex(
     let key = machine.pop_bytes()?;
     let app_id_raw = machine.pop_uint()?;
     let acct_val = machine.pop()?;
-    let addr = resolve_account(acct_val, ctx)?;
-    let app_id = ctx.resolve_app(app_id_raw)?;
+    let (addr, app_id) = locals_reference(machine.version, ctx, acct_val, app_id_raw)?;
     match ctx.app_local_get(&addr, app_id, &key)? {
         Some(tv) => {
             machine.push(teal_to_avm(tv))?;
@@ -235,6 +412,7 @@ pub fn op_app_local_put(
     let acct_val = machine.pop()?;
     let addr = resolve_mutable_account(acct_val, ctx)?;
     let app_id = ctx.current_app_id();
+    check_locals_available(machine.version, ctx, &addr, app_id)?;
     ctx.app_local_put(&addr, app_id, &key, avm_to_teal(value))
 }
 
@@ -260,6 +438,7 @@ pub fn op_app_local_del(
     let acct_val = machine.pop()?;
     let addr = resolve_mutable_account(acct_val, ctx)?;
     let app_id = ctx.current_app_id();
+    check_locals_available(machine.version, ctx, &addr, app_id)?;
     ctx.app_local_del(&addr, app_id, &key)
 }
 
@@ -290,8 +469,7 @@ pub fn op_asset_holding_get(
     let _field = AssetHoldingField::from_u8(field_byte)?;
     let asset_id_raw = machine.pop_uint()?;
     let acct_val = machine.pop()?;
-    let addr = resolve_account(acct_val, ctx)?;
-    let asset_id = ctx.resolve_asset(asset_id_raw)?;
+    let (addr, asset_id) = holding_reference(machine.version, ctx, acct_val, asset_id_raw)?;
     let (value, exists) = ctx.asset_holding_get(&addr, asset_id, field_byte)?;
     machine.push(teal_to_avm(value))?;
     machine.push(AvmValue::Uint64(if exists { 1 } else { 0 }))
@@ -889,6 +1067,21 @@ mod tests {
         /// Empty by default (permissive, matching the trait's default) so
         /// existing tests are unaffected.
         unavailable_raw_accounts: std::collections::HashSet<[u8; 32]>,
+        /// (account, asset_id) pairs that `is_holding_available` should
+        /// reject, for testing the holding cross-product gate (issue #841).
+        /// Empty by default (permissive, matching the trait's default).
+        unavailable_holdings: std::collections::HashSet<([u8; 32], u64)>,
+        /// (account, app_id) pairs that `is_local_available` should reject.
+        /// Empty by default (permissive, matching the trait's default).
+        unavailable_locals: std::collections::HashSet<([u8; 32], u64)>,
+        /// Asset ids that `resolve_asset` should fail to resolve (simulating
+        /// go's "unavailable Asset N" from `resolveAsset` itself), for
+        /// testing `holding_reference`'s compound-error branches.
+        resolve_asset_fail: std::collections::HashSet<u64>,
+        /// App ids that `resolve_app` should fail to resolve (simulating
+        /// go's "unavailable App N"), for testing `locals_reference`'s
+        /// compound-error branches.
+        resolve_app_fail: std::collections::HashSet<u64>,
     }
 
     impl TestStateContext {
@@ -918,6 +1111,10 @@ mod tests {
                 app_boxes: HashMap::new(),
                 last_app_box_app_id: None,
                 unavailable_raw_accounts: std::collections::HashSet::new(),
+                unavailable_holdings: std::collections::HashSet::new(),
+                unavailable_locals: std::collections::HashSet::new(),
+                resolve_asset_fail: std::collections::HashSet::new(),
+                resolve_app_fail: std::collections::HashSet::new(),
             }
         }
     }
@@ -944,16 +1141,33 @@ mod tests {
             !self.unavailable_raw_accounts.contains(addr)
         }
 
+        fn is_holding_available(&self, addr: &[u8; 32], asset_id: u64) -> bool {
+            !self.unavailable_holdings.contains(&(*addr, asset_id))
+        }
+
+        fn is_local_available(&self, addr: &[u8; 32], app_id: u64) -> bool {
+            !self.unavailable_locals.contains(&(*addr, app_id))
+        }
+
         fn resolve_asset(&self, index: u64) -> Result<u64, AlgoError> {
+            if self.resolve_asset_fail.contains(&index) {
+                return Err(AlgoError::Avm {
+                    message: format!("unavailable Asset {index}"),
+                });
+            }
             Ok(index) // identity for tests
         }
 
         fn resolve_app(&self, index: u64) -> Result<u64, AlgoError> {
             if index == 0 {
-                Ok(self.app_id) // 0 = current app
-            } else {
-                Ok(index) // identity for tests
+                return Ok(self.app_id); // 0 = current app
             }
+            if self.resolve_app_fail.contains(&index) {
+                return Err(AlgoError::Avm {
+                    message: format!("unavailable App {index}"),
+                });
+            }
+            Ok(index) // identity for tests
         }
 
         fn app_opted_in(&self, account: &[u8; 32], app_id: u64) -> Result<bool, AlgoError> {
@@ -1827,6 +2041,301 @@ mod tests {
         ctx.unavailable_raw_accounts.insert(addr);
         let resolved = super::resolve_account(AvmValue::Uint64(0), &ctx).unwrap();
         assert_eq!(resolved, addr);
+    }
+
+    // ── Holding/local cross-product availability gate (issue #841) ────
+
+    /// Build `pushbytes addr; pushint app_or_asset_id; <opcode>` for the
+    /// two-account-and-a-uint opcodes exercised below.
+    fn addr_and_uint_prog(addr: [u8; 32], id: u64, opcode: u8, version: u8) -> Vec<u8> {
+        let mut code = vec![0x80, 0x20];
+        code.extend_from_slice(&addr);
+        code.push(0x81); // pushint
+        code.extend_from_slice(&encode_uvarint(id));
+        code.push(opcode);
+        prog(version, &code)
+    }
+
+    /// Minimal LEB128 encoder for the `pushint` immediate, sufficient for
+    /// the small test ids used here (matches the assembler's varint
+    /// encoding, but we don't depend on it to keep these tests
+    /// self-contained).
+    fn encode_uvarint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out
+    }
+
+    #[test]
+    fn locals_reference_app_error_and_account_available() {
+        // go's `localsReference` case `err != nil && acctOK`: the App
+        // resolution error is returned as-is, no "unavailable Account"
+        // prefix.
+        let addr = test_addr(0x20);
+        let raw = addr_and_uint_prog(addr, 500, 0x61 /* app_opted_in */, 9);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.resolve_app_fail.insert(500);
+        let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unavailable App 500"), "unexpected: {msg}");
+        assert!(!msg.contains("unavailable Account"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn locals_reference_app_and_account_resolved_but_local_unavailable() {
+        // go's case `err == nil && acctOK`: both halves resolve/are
+        // available, but the cross-product (LOCALS) isn't.
+        let addr = test_addr(0x21);
+        let raw = addr_and_uint_prog(addr, 500, 0x61, 9);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.unavailable_locals.insert((addr, 500));
+        let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "unavailable Local State 500+{}",
+                algo_types::Address(addr)
+            )),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn locals_reference_app_error_and_account_unavailable() {
+        // go's case `err != nil && !acctOK`: three-part combined message
+        // (account, app-specific problem, and the locals problem).
+        let addr = test_addr(0x22);
+        let raw = addr_and_uint_prog(addr, 500, 0x61, 9);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.resolve_app_fail.insert(500);
+        ctx.unavailable_raw_accounts.insert(addr);
+        let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
+        let msg = err.to_string();
+        let addr_str = algo_types::Address(addr).to_string();
+        assert!(
+            msg.contains(&format!("unavailable Account {addr_str}")),
+            "unexpected: {msg}"
+        );
+        assert!(msg.contains("unavailable App 500"), "unexpected: {msg}");
+        assert!(msg.contains("unavailable Local State"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn locals_reference_app_resolved_and_account_unavailable() {
+        // go's case `err == nil && !acctOK`: two-part message (account,
+        // locals problem).
+        let addr = test_addr(0x23);
+        let raw = addr_and_uint_prog(addr, 500, 0x61, 9);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.unavailable_raw_accounts.insert(addr);
+        ctx.unavailable_locals.insert((addr, 500));
+        let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
+        let msg = err.to_string();
+        let addr_str = algo_types::Address(addr).to_string();
+        assert!(
+            msg.contains(&format!("unavailable Account {addr_str}")),
+            "unexpected: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("unavailable Local State 500+{addr_str}")),
+            "unexpected: {msg}"
+        );
+        assert!(!msg.contains("unavailable App"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn locals_reference_pre_v9_ignores_cross_product_gate() {
+        // Below sharedResourcesVersion (9), the cross-product gate must not
+        // apply at all -- matches go's pre-sharing `localsReference` path.
+        let addr = test_addr(0x24);
+        let raw = addr_and_uint_prog(addr, 500, 0x61, 8);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.unavailable_locals.insert((addr, 500));
+        // No availability restriction pre-v9 on raw address either (that
+        // gate only exists via `is_account_available`, whose default is
+        // permissive and unaffected by this test).
+        step_n(&mut m, &mut ctx, 3).unwrap();
+    }
+
+    #[test]
+    fn holding_reference_asset_error_and_account_available() {
+        let addr = test_addr(0x25);
+        let mut code = vec![0x80, 0x20];
+        code.extend_from_slice(&addr);
+        code.push(0x81);
+        code.extend_from_slice(&encode_uvarint(200));
+        code.extend_from_slice(&[0x70, 0x00]); // asset_holding_get AssetBalance
+        let raw = prog(9, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.resolve_asset_fail.insert(200);
+        let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unavailable Asset 200"), "unexpected: {msg}");
+        assert!(!msg.contains("unavailable Account"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn holding_reference_asset_and_account_resolved_but_holding_unavailable() {
+        let addr = test_addr(0x26);
+        let mut code = vec![0x80, 0x20];
+        code.extend_from_slice(&addr);
+        code.push(0x81);
+        code.extend_from_slice(&encode_uvarint(200));
+        code.extend_from_slice(&[0x70, 0x00]);
+        let raw = prog(9, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.unavailable_holdings.insert((addr, 200));
+        let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "unavailable Holding 200+{}",
+                algo_types::Address(addr)
+            )),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn holding_reference_asset_error_and_account_unavailable() {
+        let addr = test_addr(0x27);
+        let mut code = vec![0x80, 0x20];
+        code.extend_from_slice(&addr);
+        code.push(0x81);
+        code.extend_from_slice(&encode_uvarint(200));
+        code.extend_from_slice(&[0x70, 0x00]);
+        let raw = prog(9, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.resolve_asset_fail.insert(200);
+        ctx.unavailable_raw_accounts.insert(addr);
+        let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
+        let msg = err.to_string();
+        let addr_str = algo_types::Address(addr).to_string();
+        assert!(
+            msg.contains(&format!("unavailable Account {addr_str}")),
+            "unexpected: {msg}"
+        );
+        assert!(msg.contains("unavailable Asset 200"), "unexpected: {msg}");
+        // Holdings' compound message is only account+asset-err (2-part),
+        // unlike locals' 3-part message -- no extra "unavailable Holding".
+        assert!(!msg.contains("unavailable Holding"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn holding_reference_asset_resolved_and_account_unavailable() {
+        let addr = test_addr(0x28);
+        let mut code = vec![0x80, 0x20];
+        code.extend_from_slice(&addr);
+        code.push(0x81);
+        code.extend_from_slice(&encode_uvarint(200));
+        code.extend_from_slice(&[0x70, 0x00]);
+        let raw = prog(9, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.unavailable_raw_accounts.insert(addr);
+        // The holding itself must also be marked unavailable, or the
+        // short-circuit `is_holding_available` check (which this mock
+        // doesn't derive from account availability) would return early
+        // before the account-availability fallback is even consulted --
+        // matching how `LedgerAvmContext::is_holding_available` really
+        // does depend on `is_account_available` in its own cross-product
+        // logic, unlike this decoupled mock.
+        ctx.unavailable_holdings.insert((addr, 200));
+        let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
+        let msg = err.to_string();
+        let addr_str = algo_types::Address(addr).to_string();
+        assert_eq!(msg, format!("AVM: unavailable Account {addr_str}"));
+    }
+
+    #[test]
+    fn check_locals_available_rejects_unavailable_pair_on_put() {
+        let addr = test_addr(0x29);
+        let mut ctx = TestStateContext::new(100);
+        ctx.accounts.push(addr);
+        ctx.unavailable_locals.insert((addr, 100)); // app_id == ctx.app_id
+                                                    // pushint 0, pushbytes "key", pushint 1, app_local_put
+        let mut code = vec![0x81, 0];
+        code.extend_from_slice(&[0x80, 0x03]);
+        code.extend_from_slice(b"key");
+        code.extend_from_slice(&[0x81, 1]);
+        code.push(0x66); // app_local_put
+        let raw = prog(9, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let err = step_n(&mut m, &mut ctx, 4).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "unavailable Local State 100+{}",
+                algo_types::Address(addr)
+            )),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn check_locals_available_rejects_unavailable_pair_on_del() {
+        let addr = test_addr(0x2A);
+        let mut ctx = TestStateContext::new(100);
+        ctx.accounts.push(addr);
+        ctx.unavailable_locals.insert((addr, 100));
+        // pushint 0, pushbytes "x", app_local_del
+        let mut code = vec![0x81, 0];
+        code.extend_from_slice(&[0x80, 0x01]);
+        code.push(b'x');
+        code.push(0x68); // app_local_del
+        let raw = prog(9, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "unavailable Local State 100+{}",
+                algo_types::Address(addr)
+            )),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn check_locals_available_allows_available_pair_on_put() {
+        let addr = test_addr(0x2B);
+        let mut ctx = TestStateContext::new(100);
+        ctx.accounts.push(addr);
+        // Not marked unavailable -> default permissive.
+        let mut code = vec![0x81, 0];
+        code.extend_from_slice(&[0x80, 0x03]);
+        code.extend_from_slice(b"key");
+        code.extend_from_slice(&[0x81, 1]);
+        code.push(0x66);
+        let raw = prog(9, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 4).unwrap();
     }
 
     #[test]
