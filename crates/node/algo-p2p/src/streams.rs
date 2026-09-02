@@ -450,7 +450,10 @@ mod tests {
         let first = sm.end_peer_attempt(remote);
         let second = sm.end_peer_attempt(remote);
 
-        assert!(!first, "first of two concurrent attempts must not unprotect alone");
+        assert!(
+            !first,
+            "first of two concurrent attempts must not unprotect alone"
+        );
         assert!(second, "second (final) attempt must unprotect");
         assert!(!sm.has_stream(&remote));
     }
