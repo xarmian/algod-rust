@@ -3114,6 +3114,54 @@ async fn account_info_invalid_address_returns_400() {
     );
 }
 
+/// A mutated/tampered address: same length (58 chars) and valid base32
+/// alphabet as `TEST_ADDR`, but with the first payload character flipped
+/// (`A` -> `B`), which changes the encoded public key without updating the
+/// trailing 4-byte checksum. This must be rejected exactly like a
+/// structurally malformed address (issue #827 theme 1): go-algorand's
+/// generated router binds the `address` path param via
+/// `runtime.BindStyledParameterWithOptions` -> `basics.Address.UnmarshalText`
+/// -> `UnmarshalChecksumAddress`, which recomputes
+/// `SHA512/256(pubkey)[28..32]` and compares it to the trailing 4 bytes
+/// (`daemon/algod/api/server/v2/generated/.../routes.go` +
+/// `data/basics/address.go`), returning 400
+/// "Invalid format for parameter address: ..." on any mismatch -- it does
+/// not distinguish "garbage string" from "right shape, wrong checksum".
+/// algod-rust's `Address::from_str` (`crates/core/algo-types/src/address.rs`)
+/// performs the identical checksum recomputation and is exercised by the
+/// same handler-level parse-failure path as `account_info_invalid_address_returns_400`.
+#[tokio::test]
+async fn account_info_mutated_checksum_address_returns_400() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let mut mutated: Vec<char> = TEST_ADDR.chars().collect();
+    assert_eq!(mutated.len(), 58, "TEST_ADDR must be a full-length address");
+    mutated[0] = if mutated[0] == 'A' { 'B' } else { 'A' };
+    let mutated_addr: String = mutated.into_iter().collect();
+    assert_ne!(mutated_addr, TEST_ADDR);
+    // Sanity check: the mutation really does break the checksum, not just
+    // the test's own bookkeeping.
+    assert!(
+        mutated_addr.parse::<Address>().is_err(),
+        "mutated address should fail checksum validation"
+    );
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", mutated_addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "failed to parse the address"
+    );
+}
+
 #[tokio::test]
 async fn account_info_msgpack_format_returns_msgpack_content_type() {
     let server = TestServer::start(MockNode::synced()).await;
@@ -5833,6 +5881,159 @@ async fn raw_transaction_broadcast_error_returns_400() {
             .unwrap()
             .contains("transaction already in pool"),
         "error should contain broadcast error message, got: {}",
+        json["message"]
+    );
+}
+
+/// An oversized transaction group: go-algorand's `decodeTxGroup`
+/// (`daemon/algod/api/server/v2/handlers.go`) decodes concatenated msgpack
+/// `SignedTxn`s one at a time and rejects as soon as the running count
+/// exceeds `proto.MaxTxGroupSize` (16 for the current consensus version),
+/// with the exact message `fmt.Errorf("max group size is %d", maxTxGroupSize)`
+/// -- byte-identical to algod-rust's `raw_transaction` handler
+/// (`crates/node/algo-rest-api/src/handlers.rs`:
+/// `error::bad_request(format!("max group size is {}", max_group_size))`).
+/// `MockNode` doesn't override `max_tx_group_size()`, so the
+/// `NodeInterface` default (16, matching go-algorand's consensus default)
+/// applies -- 17 valid, independently-encoded transactions must trip it.
+#[tokio::test]
+async fn raw_transaction_oversized_group_returns_400() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let mut body = Vec::new();
+    for i in 0..17u64 {
+        let mut stxn = make_test_signed_txn();
+        stxn.txn.fee = 1000 + i; // distinct txids, not that it matters here
+        body.extend_from_slice(&encode_signed_txn_for_post(&stxn));
+    }
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["message"].as_str().unwrap(), "max group size is 16");
+}
+
+/// A transaction group at exactly the group-size limit (16) must still be
+/// accepted at the decode stage -- the boundary go-algorand draws is
+/// `len(txgroup) > maxTxGroupSize`, i.e. 16 is fine and 17 is not.
+#[tokio::test]
+async fn raw_transaction_at_group_size_limit_is_accepted() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let mut body = Vec::new();
+    for i in 0..16u64 {
+        let mut stxn = make_test_signed_txn();
+        stxn.txn.fee = 1000 + i;
+        body.extend_from_slice(&encode_signed_txn_for_post(&stxn));
+    }
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    // Decoding succeeds (16 == limit); MockNode's default broadcast then
+    // accepts, returning the txid of the first transaction in the group.
+    assert_eq!(resp.status(), 200);
+}
+
+/// A transaction whose fee is below `MinTxnFee` must be rejected as a
+/// broadcast (pool/validation) error, surfaced as 400 with the underlying
+/// message intact -- exactly like go-algorand's `RawTransaction` handler,
+/// which wraps any `Node.BroadcastSignedTxGroup` error as
+/// `badRequest(ctx, err, err.Error(), ...)` (`handlers.go`:1273-1276) with
+/// no special-casing of *which* validation rule failed. In algod-rust the
+/// real (non-mock) fee check lives in
+/// `crates/core/algo-validate/src/rules.rs` (`validate_transaction_wellformed`),
+/// which produces `"transaction fee {fee} is below minimum {required}"` --
+/// this test pins that the REST layer forwards such an error verbatim as
+/// 400, using `MockNode.broadcast_result` to stand in for the real
+/// pool/validate rejection without needing a live ledger.
+#[tokio::test]
+async fn raw_transaction_fee_below_minimum_returns_400() {
+    let mut node = MockNode::synced();
+    node.broadcast_result = Some("transaction fee 1 is below minimum 1000".to_string());
+    let server = TestServer::start(node).await;
+
+    let mut stxn = make_test_signed_txn();
+    stxn.txn.fee = 1; // well below MinTxnFee (1000)
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"].as_str().unwrap().contains("below minimum"),
+        "error should mention the fee being below minimum, got: {}",
+        json["message"]
+    );
+}
+
+/// A transaction from an account without enough balance to cover the
+/// payment (and/or fee) must be rejected as a broadcast error, surfaced as
+/// 400 -- matching go-algorand's `ledgercore.OverspendError`
+/// (`ledger/ledgercore/error.go`: `"overspend (account %v, data %+v, tried
+/// to spend %v)"`), which bubbles out of `Node.BroadcastSignedTxGroup` the
+/// same way any other pool-remember error does. algod-rust's real ledger
+/// apply layer (`crates/core/algo-ledger/src/apply.rs`) produces
+/// `"sender {} has insufficient balance {} for payment {}"` for the
+/// equivalent case; this test pins that the REST layer forwards that
+/// message verbatim as 400 (same passthrough mechanism as the fee-too-low
+/// and group-size tests above -- there is no special HTTP status or body
+/// shape for insufficient balance specifically, in either implementation).
+#[tokio::test]
+async fn raw_transaction_insufficient_balance_returns_400() {
+    let mut node = MockNode::synced();
+    node.broadcast_result = Some(format!(
+        "sender {TEST_ADDR} has insufficient balance 0 for payment 5000000"
+    ));
+    let server = TestServer::start(node).await;
+
+    let stxn = make_test_signed_txn();
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("insufficient balance"),
+        "error should mention insufficient balance, got: {}",
         json["message"]
     );
 }
