@@ -5118,6 +5118,86 @@ async fn get_transaction_proof_requires_auth() {
     assert_eq!(resp.status(), 401);
 }
 
+// Mirrors go-algorand's TestTxnMerkleProof, which — in addition to the
+// default sha512_256 proof (covered by get_transaction_proof_happy_path
+// above) — requests a `?hashtype=sha256` proof and verifies it against
+// `merklearray.VerifyVectorCommitment`. At the algod-rust reference pin
+// (v5.0.0-stable / consensus V42), `EnableSHA256TxnCommitmentHeader` has
+// been true since V34, so this is a happy-path 200, not a rejection.
+#[tokio::test]
+async fn get_transaction_proof_sha256_happy_path() {
+    let mut node = MockNode::synced();
+
+    let stxn = make_test_signed_txn();
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+
+    let block = make_test_block(1, vec![stxn]);
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+
+    let url = format!(
+        "/v2/blocks/1/transactions/{}/proof?hashtype=sha256",
+        txid_str
+    );
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["idx"].as_u64().unwrap(), 0);
+    assert!(body.get("proof").is_some(), "should have 'proof' field");
+    assert_eq!(body["hashtype"].as_str().unwrap(), "sha256");
+}
+
+// Mirrors go-algorand's TestTxnMerkleProofSHA256, which uses an older
+// network template (pre-V34 consensus, before EnableSHA256TxnCommitmentHeader
+// existed) and asserts the block's Sha256Commitment stays empty. The
+// closest algod-rust equivalent is requesting `?hashtype=sha256` against a
+// block on a consensus version that predates V34 and confirming the
+// handler rejects it (`proto.enable_sha256_txn_commitment_header == false`).
+#[tokio::test]
+async fn get_transaction_proof_sha256_rejected_on_pre_v34_protocol() {
+    let mut node = MockNode::synced();
+
+    let stxn = make_test_signed_txn();
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+
+    let mut block = make_test_block(1, vec![stxn]);
+    block.current_protocol = algo_types::consensus::CONSENSUS_V32.to_string();
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+
+    let url = format!(
+        "/v2/blocks/1/transactions/{}/proof?hashtype=sha256",
+        txid_str
+    );
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("sha256 vector commitment"),
+        "message: {}",
+        body["message"]
+    );
+}
+
 // ===========================================================================
 // Light block header proof endpoint tests: GET /v2/blocks/{round}/lightheader/proof
 // ===========================================================================
