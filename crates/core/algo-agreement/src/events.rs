@@ -561,6 +561,41 @@ impl MessageEvent {
         }
         self
     }
+
+    /// Looks for an unauthenticated proposal inside a `payloadPresent` or
+    /// `votePresent` message event, and attaches the given time to the
+    /// proposal's `received_at` field.
+    ///
+    /// Mirrors Go's `messageEvent.AttachReceivedAt` (`agreement/events.go:1050`).
+    /// `get_clock` is called with the event's own round
+    /// (`Input.UnauthenticatedProposal.round()`) and should return the
+    /// duration elapsed since that round's zero — see `clock_for_round` in
+    /// `demux.rs` for the production implementation and
+    /// `test_support::setup::test_clock_for_round` for the white-box-test
+    /// equivalent of Go's `testClockForRound`.
+    pub fn attach_received_at(mut self, get_clock: impl Fn(Round) -> Duration) -> Self {
+        match self.t {
+            EventType::PayloadPresent => {
+                let round = self.input.unauthenticated_proposal.round();
+                self.input.unauthenticated_proposal.received_at = get_clock(round);
+            }
+            EventType::VotePresent => {
+                // Check for a non-`None` tail, indicating this `votePresent`
+                // event contains a synthetic `payloadPresent` event that was
+                // attached to it by `setup_compound_message` (the tail
+                // carries the payload half of a `PP`/`AVPP` compound
+                // message, serialized alongside the proposal-vote).
+                if let Some(ref mut tail) = self.tail {
+                    if tail.t == EventType::PayloadPresent {
+                        let round = tail.input.unauthenticated_proposal.round();
+                        tail.input.unauthenticated_proposal.received_at = get_clock(round);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self
+    }
 }
 
 impl fmt::Display for MessageEvent {

@@ -99,17 +99,20 @@ impl BlockAssembler {
     /// Adds the given validated proposal to the blockAssembler, returning an
     /// error if a validated proposal has already been received.
     ///
-    /// Mirrors Go's `blockAssembler.bind`.
-    pub fn bind(mut self, p: Proposal) -> Result<BlockAssembler, String> {
+    /// Mirrors Go's `blockAssembler.bind`, including the "remember when the
+    /// original unauthenticatedProposal was received" step: `received_at`
+    /// is copied from `self.pipeline` (populated when the `payloadPresent`
+    /// event was pipelined, with `received_at` attached at the demux
+    /// boundary — see `MessageEvent::attach_received_at`) into the bound
+    /// `Proposal`, overwriting whatever the crypto verifier set (always
+    /// `Duration::ZERO`, mirroring Go's zero-valued `proposal` before
+    /// `bind`).
+    pub fn bind(mut self, mut p: Proposal) -> Result<BlockAssembler, String> {
         if self.assembled {
             return Err("blockAssembler.pipeline: already assembled".to_string());
         }
 
-        // In Go, `receivedAt` is copied from the pipeline's
-        // unauthenticatedProposal into the bound proposal. In our Rust
-        // implementation, `received_at` lives on the authenticated `Proposal`
-        // type (in events.rs), not on `UnauthenticatedProposal`. The caller
-        // is responsible for setting `received_at` before calling `bind`.
+        p.received_at = self.pipeline.received_at;
         self.payload = Some(p);
         self.assembled = true;
 

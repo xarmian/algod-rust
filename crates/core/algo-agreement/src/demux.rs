@@ -133,6 +133,21 @@ impl ExternalEvent {
         }
         self
     }
+
+    /// Returns a new ExternalEvent with a received-at timestamp attached,
+    /// if it wraps a `payloadPresent`/`votePresent` `MessageEvent`. No-op
+    /// for every other event shape.
+    ///
+    /// Mirrors the `payloadPresent, votePresent` branch of Go's
+    /// `demux.next()` deferred attach (`agreement/demux.go:217-218`); see
+    /// `MessageEvent::attach_received_at` for the field-level logic.
+    pub fn attach_received_at(mut self, get_clock: impl Fn(Round) -> Duration) -> Self {
+        if let Event::Message(ref mut me) = self.event {
+            let owned = std::mem::take(me);
+            *me = owned.attach_received_at(get_clock);
+        }
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,6 +1277,7 @@ mod tests {
                 seed_proof: [0u8; crate::VRF_PROOF_SIZE],
                 original_period: crate::step::Period(0),
                 original_proposer: Address([0u8; 32]),
+                ..crate::proposal::UnauthenticatedProposal::default()
             },
         };
         let encoded = codec::encode_compound_message(&compound);
@@ -1318,6 +1334,7 @@ mod tests {
                 seed_proof: [0u8; crate::VRF_PROOF_SIZE],
                 original_period: crate::step::Period(0),
                 original_proposer: Address([0u8; 32]),
+                ..crate::proposal::UnauthenticatedProposal::default()
             },
         };
         let encoded = codec::encode_compound_message(&compound);
@@ -1395,6 +1412,7 @@ mod tests {
                 seed_proof: [0u8; crate::VRF_PROOF_SIZE],
                 original_period: crate::step::Period(0),
                 original_proposer: Address([0u8; 32]),
+                ..crate::proposal::UnauthenticatedProposal::default()
             },
         };
         let encoded = codec::encode_compound_message(&compound);
@@ -1460,6 +1478,7 @@ mod tests {
                 seed_proof: [0u8; crate::VRF_PROOF_SIZE],
                 original_period: crate::step::Period(0),
                 original_proposer: Address([0u8; 32]),
+                ..crate::proposal::UnauthenticatedProposal::default()
             },
         };
         let encoded = codec::encode_compound_message(&compound);

@@ -1990,6 +1990,7 @@ mod tests {
                 seed_proof: [0x77; crate::VRF_PROOF_SIZE],
                 original_period: Period(0),
                 original_proposer: Address([0x44; 32]),
+                ..UnauthenticatedProposal::default()
             },
             filled: true,
             ..BlockAssembler::default()

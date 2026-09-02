@@ -20,28 +20,26 @@
 
 // Helpers for driving `player.lowestCredentialArrivals` scenarios through
 // `IoAutomataConcretePlayer`, mirroring the `sendVoteVerified`,
-// `sendPayloadPresent`, `moveToRound`, `testClockForRound`, and
-// `assertSingleCredentialArrival` helpers in go-algorand's
-// `agreement/player_test.go`.
+// `sendPayloadPresent`, `sendCompoundMessage`, `moveToRound`,
+// `testClockForRound`, `assertSingleCredentialArrival`, and
+// `assertPayloadTimings` helpers in go-algorand's `agreement/player_test.go`.
 //
-// ## Known gap: `receivedAt` is not ported
-//
-// Go's `unauthenticatedProposal` carries a `receivedAt time.Duration` field
-// that `AttachReceivedAt`/`blockAssembler.bind` thread through to the
-// ensured `EnsureAction.Payload.receivedAt`. algod-rust's
-// `UnauthenticatedProposal` does not have an equivalent field (tracked as a
-// follow-up — see the PR/issue this module was introduced in), so
-// `send_payload_present` below does not attempt to attach or verify a
-// `receivedAt` timing, unlike Go's `sendPayloadPresent`/`assertPayloadTimings`.
-// Only `validated_at` (on `Vote` and `Proposal`, both of which already carry
-// the field) is threaded through, which is sufficient for the
-// credential-arrival-history behavior these helpers exist to exercise.
+// `received_at` (mirroring Go's `unauthenticatedProposal.receivedAt`) is
+// threaded through via `UnauthenticatedProposal::received_at` +
+// `MessageEvent::attach_received_at`, wired at the demux boundary in
+// `service.rs` and at `BlockAssembler::bind` in `proposal_store.rs` —
+// see those sites for the field-level plumbing. `send_payload_present`
+// (no timing) is kept for the five existing tests that don't check
+// `received_at`; `send_payload_present_at` and `send_compound_message*`
+// below are the timing-aware counterparts needed by the `OneSample`/`PP`/
+// `AVPP` scenarios.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use algo_types::Round;
 
+use crate::actions::Action;
 use crate::events::EventType;
 use crate::events::{Event, InternalMessage, MessageEvent, Proposal, PIPELINED_MESSAGE_TIMESTAMP};
 use crate::step::{Period, CERT, PROPOSE};
@@ -129,10 +127,41 @@ pub fn send_vote_verified_for_vote(
         .expect("voteVerified transition should not panic");
 }
 
+/// Fabricate a fresh proposal-vote for `(vote_round, vote_period, value)`
+/// and dispatch it as a standalone `votePresent` event (no tail), returning
+/// the fabricated `Vote` so callers can later verify it.
+///
+/// Mirrors Go's `sendVotePresent` (`agreement/player_test.go:3878`).
+pub fn send_vote_present(
+    machine: &mut IoAutomataConcretePlayer,
+    helper: &mut VoteMakerHelper,
+    addr_index: usize,
+    vote_round: Round,
+    vote_period: Period,
+    value: ProposalValue,
+) -> Vote {
+    let vote = helper.make_verified_vote(addr_index, vote_round, vote_period, PROPOSE, value);
+    let msg = MessageEvent {
+        t: EventType::VotePresent,
+        input: InternalMessage {
+            unauthenticated_vote: vote.to_unauthenticated(),
+            ..InternalMessage::default()
+        },
+        ..MessageEvent::default()
+    };
+    machine
+        .transition(Event::Message(msg))
+        .expect("votePresent transition should not panic");
+    vote
+}
+
 /// Dispatch a `payloadPresent` event carrying `proposal`'s unauthenticated
-/// payload. Mirrors Go's `sendPayloadPresent`
-/// (`agreement/player_test.go:3889`) **except** it does not attach a
-/// `receivedAt` timing — see the module-level doc comment.
+/// payload, without attaching a `received_at` timing (left at
+/// `Duration::ZERO`). Mirrors Go's `sendPayloadPresent`
+/// (`agreement/player_test.go:3889`) for callers that don't need to assert
+/// `received_at` — use [`send_payload_present_at`] when the test needs a
+/// specific timing (mirroring Go's non-nil `receivedAt`/`historicalClocks`
+/// arguments).
 pub fn send_payload_present(machine: &mut IoAutomataConcretePlayer, proposal: &Proposal) {
     let msg = MessageEvent {
         t: EventType::PayloadPresent,
@@ -145,6 +174,113 @@ pub fn send_payload_present(machine: &mut IoAutomataConcretePlayer, proposal: &P
     machine
         .transition(Event::Message(msg))
         .expect("payloadPresent transition should not panic");
+}
+
+/// Dispatch a `payloadPresent` event carrying `proposal`'s unauthenticated
+/// payload, with `received_at` resolved via `test_clock_for_round(received_at,
+/// cur_round, historical_clocks)` and attached through
+/// `MessageEvent::attach_received_at` — mirroring the real demux boundary.
+///
+/// Mirrors Go's `sendPayloadPresent` (`agreement/player_test.go:3889`) in
+/// full (including its `receivedAt`/`historicalClocks` parameters).
+pub fn send_payload_present_at(
+    machine: &mut IoAutomataConcretePlayer,
+    cur_round: Round,
+    proposal: &Proposal,
+    received_at: Duration,
+    historical_clocks: HashMap<Round, Duration>,
+) {
+    let msg = MessageEvent {
+        t: EventType::PayloadPresent,
+        input: InternalMessage {
+            unauthenticated_proposal: proposal.unauthenticated_proposal.clone(),
+            ..InternalMessage::default()
+        },
+        ..MessageEvent::default()
+    };
+    let msg = msg.attach_received_at(test_clock_for_round(
+        received_at,
+        cur_round,
+        historical_clocks,
+    ));
+    machine
+        .transition(Event::Message(msg))
+        .expect("payloadPresent transition should not panic");
+}
+
+/// Fabricate a fresh proposal-vote for `(vote_round, vote_period, value)`
+/// and dispatch it as a `votePresent` event with a synthetic `payloadPresent`
+/// tail carrying `proposal`'s unauthenticated payload (a `PP`/compound
+/// message, as used on the wire for `protocol.ProposalPayloadTag`), with
+/// `received_at` attached to the tail via `attach_received_at`.
+///
+/// Mirrors Go's `sendCompoundMessage` (`agreement/player_test.go:3899`).
+/// Returns the fabricated `Vote` so callers can later verify it (mirroring
+/// Go returning the `vote` for use in `verifyVoteAction`/`sendVoteVerifiedForVote`
+/// assertions).
+#[allow(clippy::too_many_arguments)]
+pub fn send_compound_message(
+    machine: &mut IoAutomataConcretePlayer,
+    helper: &mut VoteMakerHelper,
+    cur_round: Round,
+    vote_round: Round,
+    vote_period: Period,
+    proposal: &Proposal,
+    value: ProposalValue,
+    received_at: Duration,
+    historical_clocks: HashMap<Round, Duration>,
+) -> Vote {
+    let vote = helper.make_verified_vote(0, vote_round, vote_period, PROPOSE, value);
+    send_compound_message_for_vote(
+        machine,
+        vote.clone(),
+        cur_round,
+        proposal,
+        received_at,
+        historical_clocks,
+    );
+    vote
+}
+
+/// Dispatch an already-fabricated `Vote` as a `votePresent` event with a
+/// synthetic `payloadPresent` tail carrying `proposal`'s unauthenticated
+/// payload, with `received_at` attached to the tail via
+/// `attach_received_at`.
+///
+/// Mirrors Go's `sendCompoundMessageForVote` (`agreement/player_test.go:3905`).
+pub fn send_compound_message_for_vote(
+    machine: &mut IoAutomataConcretePlayer,
+    vote: Vote,
+    cur_round: Round,
+    proposal: &Proposal,
+    received_at: Duration,
+    historical_clocks: HashMap<Round, Duration>,
+) {
+    let tail = MessageEvent {
+        t: EventType::PayloadPresent,
+        input: InternalMessage {
+            unauthenticated_proposal: proposal.unauthenticated_proposal.clone(),
+            ..InternalMessage::default()
+        },
+        ..MessageEvent::default()
+    };
+    let msg = MessageEvent {
+        t: EventType::VotePresent,
+        input: InternalMessage {
+            unauthenticated_vote: vote.to_unauthenticated(),
+            ..InternalMessage::default()
+        },
+        tail: Some(Box::new(tail)),
+        ..MessageEvent::default()
+    };
+    let msg = msg.attach_received_at(test_clock_for_round(
+        received_at,
+        cur_round,
+        historical_clocks,
+    ));
+    machine
+        .transition(Event::Message(msg))
+        .expect("votePresent transition should not panic");
 }
 
 /// Submit a `payloadVerified` message for `proposal` (with `validated_at`
@@ -233,4 +369,38 @@ pub fn assert_single_credential_arrival(machine: &IoAutomataConcretePlayer, expe
         "history should not be full after a single sample"
     );
     assert_eq!(history.raw_history()[0], expected);
+}
+
+/// Inspect the trace for an `EnsureAction` whose payload is for round `r`,
+/// and assert its certificate proposal equals `value` and its payload's
+/// `received_at`/`validated_at` equal `received_at`/`validated_at`.
+///
+/// Mirrors Go's `assertPayloadTimings` (`agreement/player_test.go:3988`).
+pub fn assert_payload_timings(
+    machine: &IoAutomataConcretePlayer,
+    r: Round,
+    value: ProposalValue,
+    received_at: Duration,
+    validated_at: Duration,
+) {
+    let mut found = None;
+    for action in machine.trace().actions() {
+        if let Action::Ensure(ea) = action {
+            if ea.payload.unauthenticated_proposal.round() == r {
+                assert!(found.is_none(), "found more than one EnsureAction for round {r:?}");
+                found = Some(ea.clone());
+            }
+        }
+    }
+    let ea = found.unwrap_or_else(|| panic!("expected an EnsureAction for round {r:?}"));
+    assert_eq!(ea.certificate.proposal, value);
+    assert_eq!(ea.payload.unauthenticated_proposal.round(), r);
+    assert_eq!(
+        ea.payload.validated_at, validated_at,
+        "unexpected validated_at"
+    );
+    assert_eq!(
+        ea.payload.received_at, received_at,
+        "unexpected received_at"
+    );
 }
