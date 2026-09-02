@@ -9661,6 +9661,74 @@ mod tests {
         );
     }
 
+    /// Issue #828 (Phase 17 `util/db` audit) — go-algorand's `db.Accessor`
+    /// wraps a WAL-mode sqlite connection so that readers observe a
+    /// point-in-time snapshot rather than blocking on (or seeing partial
+    /// results from) a concurrent, uncommitted writer
+    /// (`util/db/dbutil_test.go`'s `TestReadingWhileWriting` and
+    /// `TestLockingTableWhileWritingWAL`). algod-rust has no generic
+    /// `Accessor` wrapper — it talks to `rusqlite` directly — but it relies
+    /// on exactly this WAL concurrent-read guarantee in production via
+    /// [`SqliteLedger::open_read_snapshot`] (see that method's doc comment:
+    /// "SQLite WAL allows concurrent readers"). This test exercises the raw
+    /// WAL semantics algod-rust actually depends on, using two independent
+    /// connections against the same on-disk tracker file `open_with_prefix`
+    /// produces (which is always opened in WAL mode — see `open_split`).
+    #[test]
+    fn wal_mode_allows_concurrent_read_during_uncommitted_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+
+        // Create the schema (in WAL mode) and release the ledger's own
+        // connection so the two connections below are the only handles.
+        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("open prefix");
+        drop(ledger);
+
+        let tracker_path = tracker_path_for_prefix(&prefix);
+        let writer = Connection::open(&tracker_path).unwrap();
+        let reader = Connection::open(&tracker_path).unwrap();
+
+        // Writer starts a transaction and inserts a row, but does not
+        // commit yet.
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        writer
+            .execute(
+                "INSERT INTO accountbase (address, normalizedonlinebalance, data) VALUES (?1, ?2, ?3)",
+                params![vec![7u8; 32], 0i64, Vec::<u8>::new()],
+            )
+            .unwrap();
+
+        // A concurrent reader must be able to open its own read transaction
+        // and query the table without blocking or erroring (WAL readers
+        // never contend with a single writer), and must see the
+        // pre-transaction state (0 rows) — the uncommitted insert is
+        // isolated from it.
+        reader.execute_batch("BEGIN DEFERRED").unwrap();
+        let count_before_commit: i64 = reader
+            .query_row("SELECT COUNT(*) FROM accountbase", [], |row| row.get(0))
+            .expect("concurrent read must not block or error under WAL");
+        assert_eq!(
+            count_before_commit, 0,
+            "reader snapshot must not observe the writer's uncommitted insert"
+        );
+        reader.execute_batch("COMMIT").unwrap();
+
+        // Now the writer commits...
+        writer.execute_batch("COMMIT").unwrap();
+
+        // ...and a fresh read (fresh transaction, same connection) observes
+        // the committed row.
+        reader.execute_batch("BEGIN DEFERRED").unwrap();
+        let count_after_commit: i64 = reader
+            .query_row("SELECT COUNT(*) FROM accountbase", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count_after_commit, 1,
+            "a new read transaction must observe the writer's committed insert"
+        );
+        reader.execute_batch("COMMIT").unwrap();
+    }
+
     #[test]
     fn tracker_schema_declares_go_catchpoint_tables() {
         // G3 — verify the three tracker tables that go-algorand's
