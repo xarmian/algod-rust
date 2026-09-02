@@ -98,6 +98,13 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
                 } else if name == "frame_dig" || name == "frame_bury" {
                     // int8 immediate
                     line.push_str(&format!(" {}", *b as i8));
+                } else if fields::opcode_immediate_is_field(name, 0) {
+                    // This position resolves through a named field group,
+                    // but the byte doesn't name any known field -- matches
+                    // go-algorand's `Disassemble` ("invalid immediate %s
+                    // for %s", assembler.go) instead of silently printing
+                    // the raw byte.
+                    return Err(format!("invalid immediate f for {}", name));
                 } else {
                     line.push_str(&format!(" {}", b));
                 }
@@ -113,12 +120,16 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
                 // First immediate
                 if let Some(field_name) = fields::field_name_for_opcode(name, 0, *a) {
                     line.push_str(&format!(" {}", field_name));
+                } else if fields::opcode_immediate_is_field(name, 0) {
+                    return Err(format!("invalid immediate f for {}", name));
                 } else {
                     line.push_str(&format!(" {}", a));
                 }
                 // Second immediate
                 if let Some(field_name) = fields::field_name_for_opcode(name, 1, *b) {
                     line.push_str(&format!(" {}", field_name));
+                } else if fields::opcode_immediate_is_field(name, 1) {
+                    return Err(format!("invalid immediate f for {}", name));
                 } else {
                     line.push_str(&format!(" {}", b));
                 }
@@ -127,12 +138,16 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
                 // First immediate
                 if let Some(field_name) = fields::field_name_for_opcode(name, 0, *a) {
                     line.push_str(&format!(" {}", field_name));
+                } else if fields::opcode_immediate_is_field(name, 0) {
+                    return Err(format!("invalid immediate f for {}", name));
                 } else {
                     line.push_str(&format!(" {}", a));
                 }
                 // Second immediate
                 if let Some(field_name) = fields::field_name_for_opcode(name, 1, *b) {
                     line.push_str(&format!(" {}", field_name));
+                } else if fields::opcode_immediate_is_field(name, 1) {
+                    return Err(format!("invalid immediate f for {}", name));
                 } else {
                     line.push_str(&format!(" {}", b));
                 }

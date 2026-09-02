@@ -765,14 +765,31 @@ pub fn op_ec_map_to(machine: &mut AvmMachine, instruction: &Instruction) -> Resu
 }
 
 /// Map a field element to BLS12-381 G1 using the WB map.
+///
+/// `WBMap::map_to_curve` alone only lands on *the curve*, not necessarily
+/// in the prime-order (`r`-order) subgroup that `ec_subgroup_check` and
+/// every other `ec_*` opcode expect points to live in -- BLS12-381 G1 has a
+/// large non-trivial cofactor
+/// (`0x396c8c005555e1568c00aaab0000aaab`), unlike BN254 G1 (cofactor 1,
+/// where no clearing is needed). Cofactor clearing (`AffineRepr::
+/// clear_cofactor`, matching gnark-crypto's `MapToG1`, which always clears
+/// the cofactor as the final hash-to-curve step) is required to land in the
+/// subgroup, matching go-algorand's `bls12381.G1Affine.MapToCurve`.
 fn bls12_map_to_g1(fp_bytes: &[u8]) -> Result<Vec<u8>, AlgoError> {
     let fp = bytes_to_bls12_field(fp_bytes)?;
     let point = WBMap::<ark_bls12_381::g1::Config>::map_to_curve(fp)
         .map_err(|e| avm_err(format!("map_to_curve: {e}")))?;
-    Ok(bls12_g1_to_bytes(&point))
+    let cleared = point.clear_cofactor();
+    Ok(bls12_g1_to_bytes(&cleared))
 }
 
 /// Map an Fp2 element to BLS12-381 G2 using the WB map.
+///
+/// As with [`bls12_map_to_g1`], `WBMap::map_to_curve` alone doesn't land in
+/// the prime-order subgroup -- BLS12-381 G2's cofactor is even larger than
+/// G1's. Cofactor clearing is required here too, matching go-algorand's
+/// `bls12381.G2Affine.MapToCurve` (and this crate's own `bn254_map_to_g2`,
+/// which already clears BN254 G2's cofactor the same way).
 fn bls12_map_to_g2(fp_bytes: &[u8]) -> Result<Vec<u8>, AlgoError> {
     if fp_bytes.len() != BLS12_FP2_SIZE {
         return Err(avm_err(format!(
@@ -785,7 +802,8 @@ fn bls12_map_to_g2(fp_bytes: &[u8]) -> Result<Vec<u8>, AlgoError> {
     let fp2 = BLS12Fq2::new(a0, a1);
     let point = WBMap::<ark_bls12_381::g2::Config>::map_to_curve(fp2)
         .map_err(|e| avm_err(format!("map_to_curve: {e}")))?;
-    Ok(bls12_g2_to_bytes(&point))
+    let cleared = point.clear_cofactor();
+    Ok(bls12_g2_to_bytes(&cleared))
 }
 
 /// Map a field element to BN254 G1 using the SWU map.
@@ -1555,6 +1573,156 @@ mod tests {
             m.stack[0],
             AvmValue::Uint64(1),
             "e(G1,G2)*e(-G1,G2) should be identity"
+        );
+    }
+
+    #[test]
+    fn test_ec_pairing_check_bls12_trivial() {
+        // issue #823 theme 5: TestPairCheck's "bls12-381" sub-test --
+        // e(G1, G2) * e(-G1, G2) = 1, mirroring the BN254 trivial-pairing
+        // test above but for BLS12_381g1 (sub-opcode 0x02).
+        let g1 = BLS12G1Affine::generator();
+        let neg_g1: BLS12G1Affine = -g1;
+        let g2 = BLS12G2Affine::generator();
+
+        let mut g1_bytes = bls12_g1_to_bytes(&g1);
+        g1_bytes.extend_from_slice(&bls12_g1_to_bytes(&neg_g1));
+
+        let mut g2_bytes = bls12_g2_to_bytes(&g2);
+        g2_bytes.extend_from_slice(&bls12_g2_to_bytes(&g2));
+
+        let mut code = Vec::new();
+        push_bytes(&mut code, &g1_bytes);
+        push_bytes(&mut code, &g2_bytes);
+        code.extend_from_slice(&[0xe2, 0x02]); // ec_pairing_check BLS12_381g1
+
+        let raw = prog(10, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700_000);
+        step_n(&mut m, &mut NullContext, 3).unwrap();
+
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(
+            m.stack[0],
+            AvmValue::Uint64(1),
+            "e(G1,G2)*e(-G1,G2) should be identity"
+        );
+    }
+
+    #[test]
+    fn test_ec_multi_scalar_mul_bls12_g1() {
+        // issue #823 theme 5: TestEcMultiExp's BLS12_381g1 case -- mirrors
+        // test_ec_multi_scalar_mul_bn254_g1 above: 2*G + 3*G = 5*G.
+        let g = BLS12G1Affine::generator();
+        let two_points = {
+            let mut v = bls12_g1_to_bytes(&g);
+            v.extend_from_slice(&bls12_g1_to_bytes(&g));
+            v
+        };
+        let scalars = {
+            let mut v = vec![0u8; 32];
+            v[31] = 2;
+            let mut v2 = vec![0u8; 32];
+            v2[31] = 3;
+            v.extend_from_slice(&v2);
+            v
+        };
+        let expected = {
+            let five_g: BLS12G1Affine = (g + g + g + g + g).into_affine();
+            bls12_g1_to_bytes(&five_g)
+        };
+
+        let mut code = Vec::new();
+        push_bytes(&mut code, &two_points);
+        push_bytes(&mut code, &scalars);
+        code.extend_from_slice(&[0xe3, 0x02]); // ec_multi_scalar_mul BLS12_381g1
+
+        let raw = prog(10, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700_000);
+        step_n(&mut m, &mut NullContext, 3).unwrap();
+
+        assert_eq!(m.stack.len(), 1);
+        if let AvmValue::Bytes(result) = &m.stack[0] {
+            assert_eq!(result, &expected, "2*G + 3*G should equal 5*G");
+        } else {
+            panic!("expected bytes on stack");
+        }
+    }
+
+    #[test]
+    fn test_bls12_g1_map_to_int27_lands_in_subgroup() {
+        // issue #823 theme 5: TestMapTo's BLS12_381g1 case -- like go's
+        // property-based test (no fixed gnark oracle vector), this only
+        // pins that mapping an arbitrary value onto the curve produces a
+        // point that passes the subgroup check, not a specific byte vector.
+        let mut code = Vec::new();
+        push_bytes(&mut code, &27u64.to_be_bytes()); // "int 27; itob"
+        code.extend_from_slice(&[0xe5, 0x02]); // ec_map_to BLS12_381g1
+        code.extend_from_slice(&[0xe4, 0x02]); // ec_subgroup_check BLS12_381g1
+
+        let raw = prog(10, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700_000);
+        step_n(&mut m, &mut NullContext, 3).unwrap();
+
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(
+            m.stack[0],
+            AvmValue::Uint64(1),
+            "mapped BLS12-381 G1 point must be in the prime-order subgroup"
+        );
+    }
+
+    #[test]
+    fn test_bls12_g2_map_to_bad_length_rejected() {
+        // issue #823 theme 5: TestSlowMapTo's "bad encoded element length"
+        // case for BLS12_381g2 -- a G2 map_to needs a full Fp2 element
+        // (2 * 48 bytes), not the 8-byte `itob` used for G1.
+        let mut code = Vec::new();
+        push_bytes(&mut code, &27u64.to_be_bytes());
+        code.extend_from_slice(&[0xe5, 0x03]); // ec_map_to BLS12_381g2
+
+        let raw = prog(10, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700_000);
+        let err = step_n(&mut m, &mut NullContext, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("bad encoded element length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_bls12_g2_map_to_67_2783_lands_in_subgroup() {
+        // issue #823 theme 5: TestSlowMapTo's accepting BLS12_381g2 case --
+        // a full 96-byte Fp2 element (48-byte-padded 67 || 48-byte-padded
+        // 2783) maps to a point that passes the subgroup check.
+        let mut a0 = vec![0u8; 48];
+        a0[47] = 67; // last byte = 67 (value fits in one byte)
+        let mut a1 = vec![0u8; 48];
+        // 2783 = 0x0ADF
+        a1[46] = 0x0a;
+        a1[47] = 0xdf;
+        let mut fp2 = a0;
+        fp2.append(&mut a1);
+        assert_eq!(fp2.len(), 96);
+
+        let mut code = Vec::new();
+        push_bytes(&mut code, &fp2);
+        code.extend_from_slice(&[0xe5, 0x03]); // ec_map_to BLS12_381g2
+        code.extend_from_slice(&[0xe4, 0x03]); // ec_subgroup_check BLS12_381g2
+
+        let raw = prog(10, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700_000);
+        step_n(&mut m, &mut NullContext, 3).unwrap();
+
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(
+            m.stack[0],
+            AvmValue::Uint64(1),
+            "mapped BLS12-381 G2 point must be in the prime-order subgroup"
         );
     }
 

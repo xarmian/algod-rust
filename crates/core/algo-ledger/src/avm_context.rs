@@ -11367,6 +11367,328 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Box write-budget / cross-txn / ClearState-unavailability (issue #823
+    // theme 3 remainder), ported from go-algorand's TestBoxWriteBudget,
+    // TestWriteBudgetPut, TestIOBudgetGrow, TestBoxUnavailableWithClearState,
+    // TestBoxAcrossTxns (data/transactions/logic/box_test.go). As above,
+    // each Rust test decomposes one go `TestApp`/`TestApps` call (one fresh
+    // eval) into direct method calls against a fresh `LedgerAvmContext`
+    // rather than replaying an entire stateful go test function verbatim.
+    // -------------------------------------------------------------------
+
+    /// TestBoxAcrossTxns: a box created by one top-level call is visible
+    /// (initially empty) to a later call against the same underlying store,
+    /// and a later call's modification is visible to one after that --
+    /// pinning that box content lives in the shared `Store`, not anything
+    /// scoped to a single `LedgerAvmContext`.
+    #[test]
+    fn box_across_txns_visible_and_mutable_across_separate_contexts() {
+        let mut store = LedgerState::new();
+        store.set_app_params(
+            888,
+            algo_types::AppParams {
+                creator: Address([1u8; 32]),
+                ..Default::default()
+            },
+        );
+
+        // First "txn": create box "self", size 64 (all zero).
+        {
+            let mut ctx = make_box_context(&mut store, 888, b"self");
+            assert!(ctx.box_create(b"self", 64).unwrap());
+        }
+        // Second "txn" (fresh context, same store): can read it, even
+        // though it's still empty.
+        {
+            let mut ctx = make_box_context(&mut store, 888, b"self");
+            let data = ctx.box_extract(b"self", 10, 4).unwrap();
+            assert_eq!(data, vec![0u8; 4]);
+        }
+        // Third "txn": re-create at the same size is a no-op (already
+        // exists).
+        {
+            let mut ctx = make_box_context(&mut store, 888, b"self");
+            assert!(!ctx.box_create(b"self", 64).unwrap());
+        }
+        // Fourth "txn": modify it.
+        {
+            let mut ctx = make_box_context(&mut store, 888, b"self");
+            ctx.box_replace(b"self", 2, b"hi").unwrap();
+        }
+        // Fifth "txn": the modification is visible -- "\0hi\0".
+        {
+            let mut ctx = make_box_context(&mut store, 888, b"self");
+            let data = ctx.box_extract(b"self", 1, 4).unwrap();
+            assert_eq!(data, vec![0u8, b'h', b'i', 0u8]);
+        }
+    }
+
+    /// TestBoxUnavailableWithClearState: every box opcode must reject with
+    /// "boxes may not be accessed from ClearState program" when the current
+    /// transaction's `OnCompletion` is ClearState, regardless of whether the
+    /// box is otherwise available.
+    #[test]
+    fn box_unavailable_with_clear_state_rejects_every_op() {
+        const MSG: &str = "boxes may not be accessed from ClearState program";
+
+        macro_rules! check {
+            ($name:expr, $body:expr) => {{
+                let mut store = LedgerState::new();
+                let mut ctx = make_box_context(&mut store, 888, b"self");
+                ctx.group[0].txn.on_completion = ON_COMPLETION_CLEAR_STATE;
+                let err = $body(&mut ctx).unwrap_err();
+                assert!(
+                    err.to_string().contains(MSG),
+                    "{}: unexpected error: {err}",
+                    $name
+                );
+            }};
+        }
+
+        check!("box_create", |ctx: &mut LedgerAvmContext<
+            '_,
+            LedgerState,
+        >| ctx.box_create(b"self", 64));
+        check!("box_del", |ctx: &mut LedgerAvmContext<'_, LedgerState>| ctx
+            .box_del(b"self"));
+        check!("box_extract", |ctx: &mut LedgerAvmContext<
+            '_,
+            LedgerState,
+        >| ctx.box_extract(b"self", 0, 7));
+        check!("box_get", |ctx: &mut LedgerAvmContext<'_, LedgerState>| ctx
+            .box_get(b"self"));
+        check!("box_len", |ctx: &mut LedgerAvmContext<'_, LedgerState>| ctx
+            .box_len(b"self"));
+        check!("box_put", |ctx: &mut LedgerAvmContext<'_, LedgerState>| ctx
+            .box_put(b"self", b"hello"));
+        check!("box_replace", |ctx: &mut LedgerAvmContext<
+            '_,
+            LedgerState,
+        >| ctx
+            .box_replace(b"self", 0, b"new"));
+        check!("box_resize", |ctx: &mut LedgerAvmContext<
+            '_,
+            LedgerState,
+        >| ctx.box_resize(b"self", 10));
+    }
+
+    /// TestBoxWriteBudget: a single create right at, and one over, the
+    /// write budget.
+    #[test]
+    fn box_write_budget_single_create_at_and_over_budget() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_create(b"self", 200).unwrap();
+
+        let mut store2 = LedgerState::new();
+        let mut ctx2 = make_box_budget_context(&mut store2, 888, 200);
+        let err = ctx2.box_create(b"self", 201).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "AVM: write budget exceeded (201 > 200) while creating box 0x73656c66"
+        );
+    }
+
+    /// TestBoxWriteBudget: two different boxes created together, exactly at
+    /// and one byte over, the combined write budget.
+    #[test]
+    fn box_write_budget_two_creates_summing_to_and_over_budget() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_create(b"self", 4).unwrap();
+        ctx.box_create(b"other", 196).unwrap(); // sums to exactly 200
+
+        let mut store2 = LedgerState::new();
+        let mut ctx2 = make_box_budget_context(&mut store2, 888, 200);
+        ctx2.box_create(b"self", 6).unwrap();
+        let err = ctx2.box_create(b"other", 196).unwrap_err(); // sums to 202
+        assert!(
+            err.to_string()
+                .contains("write budget exceeded (202 > 200)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// TestBoxWriteBudget: `box_replace` on an *existing* box charges the
+    /// box's full current size (not just the bytes actually touched) to the
+    /// write budget on first touch -- so replacing two pre-existing
+    /// 101-byte boxes exceeds a 200-byte budget even though only 2 bytes of
+    /// each are actually written.
+    #[test]
+    fn box_write_budget_replace_on_two_101_byte_boxes_charges_full_size() {
+        let mut store = LedgerState::new();
+        store.set_box(888, b"self", vec![0u8; 101]);
+        store.set_box(888, b"other", vec![0u8; 101]);
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_replace(b"self", 0, b"\x33\x33").unwrap();
+        let err = ctx.box_replace(b"other", 0, b"\x33\x33").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("write budget exceeded (202 > 200)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// TestBoxWriteBudget ("writing twice is no problem (even though it's
+    /// the big one)"): replacing the same box's content multiple times only
+    /// charges its size to the write budget once, not once per replace.
+    #[test]
+    fn box_write_budget_repeated_replace_on_same_box_not_double_charged() {
+        let mut store = LedgerState::new();
+        store.set_box(888, b"self", vec![0u8; 51]);
+        store.set_box(888, b"other", vec![0u8; 10]);
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_replace(b"self", 0, b"\x33\x33").unwrap();
+        ctx.box_replace(b"self", 10, b"\x33\x33").unwrap();
+        ctx.box_replace(b"other", 0, b"\x33\x33").unwrap();
+        assert_eq!(
+            ctx.dirty_bytes, 61,
+            "repeated writes to the same box must charge its size once (51 + 10), not per write"
+        );
+    }
+
+    /// TestWriteBudgetPut ("ensure box_put does not double debit when
+    /// creating"): `box_put` on a brand-new box charges its size to the
+    /// write budget exactly once.
+    #[test]
+    fn write_budget_put_on_new_box_charges_size_once() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_budget_context(&mut store, 888, 200);
+        ctx.box_put(b"self", &[0u8; 150]).unwrap();
+        assert_eq!(ctx.dirty_bytes, 150);
+    }
+
+    /// TestWriteBudgetPut: two `box_put`s to the *same* name (different
+    /// content, same size) don't go over budget, but puts to two
+    /// *different* names summing over budget do.
+    #[test]
+    fn write_budget_put_same_name_twice_ok_different_names_over_budget() {
+        let mut store = LedgerState::new();
+        {
+            let mut ctx = make_box_budget_context(&mut store, 888, 200);
+            ctx.box_put(b"self", &[0u8; 150]).unwrap();
+            let mut second = vec![0u8; 149];
+            second.push(b'x');
+            ctx.box_put(b"self", &second).unwrap();
+            assert_eq!(
+                ctx.dirty_bytes, 150,
+                "two puts to the same name must not double-charge"
+            );
+        }
+
+        let mut store2 = LedgerState::new();
+        let mut ctx2 = make_box_budget_context(&mut store2, 888, 200);
+        ctx2.box_put(b"self", &[0u8; 150]).unwrap();
+        let mut other_content = vec![0u8; 149];
+        other_content.push(b'x');
+        let err = ctx2.box_put(b"other", &other_content).unwrap_err();
+        assert!(
+            err.to_string().contains("write budget"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Build a `LedgerAvmContext` whose I/O budget is derived from the real
+    /// `ensure_boxes_initialized` box-ref-counting path (V41 consensus, with
+    /// `bytes_per_box_reference` overridden to 100 to match go-algorand's
+    /// own test fixture, `data/transactions/logic/eval_test.go:130`), rather
+    /// than a manually-assigned `io_budget`. `box_refs` lists the txn's box
+    /// refs in order; `None` produces an empty (unnamed) ref.
+    fn make_io_budget_context<'a>(
+        store: &'a mut LedgerState,
+        app_id: u64,
+        box_refs: Vec<Option<&[u8]>>,
+    ) -> LedgerAvmContext<'a, LedgerState> {
+        if !store.has_app_params(app_id) {
+            store.set_app_params(
+                app_id,
+                algo_types::AppParams {
+                    creator: Address([1u8; 32]),
+                    ..Default::default()
+                },
+            );
+        }
+        let mut txn = make_appl_txn([9u8; 32], app_id, vec![], vec![], vec![]);
+        txn.txn.boxes = Some(
+            box_refs
+                .into_iter()
+                .map(|n| algo_types::BoxRef {
+                    index: 0,
+                    name: n.map(|b| serde_bytes::ByteBuf::from(b.to_vec())),
+                })
+                .collect(),
+        );
+        let mut consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .expect("V41 consensus params must exist");
+        consensus.bytes_per_box_reference = 100;
+        LedgerAvmContext::new(
+            store,
+            vec![txn],
+            0,
+            1000,
+            12345,
+            app_id,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            consensus,
+        )
+    }
+
+    /// TestIOBudgetGrow: with the sample env's two box refs (self, other),
+    /// each a pre-existing 101-byte box, the eager read-budget check (which
+    /// sums the sizes of *every* available box up front, not just touched
+    /// ones) rejects the very first box access -- both boxes together are
+    /// 202 bytes against a 200-byte budget.
+    #[test]
+    fn io_budget_grow_two_box_refs_101_bytes_each_exceeds_budget() {
+        let mut store = LedgerState::new();
+        store.set_box(888, b"self", vec![0u8; 101]);
+        store.set_box(888, b"other", vec![0u8; 101]);
+        let mut ctx = make_io_budget_context(&mut store, 888, vec![Some(b"self"), Some(b"other")]);
+        let err = ctx.box_replace(b"self", 0, b"\x33\x33").unwrap_err();
+        assert_eq!(err.to_string(), "AVM: read budget exceeded (202 > 200)");
+    }
+
+    /// TestIOBudgetGrow: adding one extra *empty* box ref bumps the budget
+    /// from 200 to 300, letting a program that reads both 101-byte boxes
+    /// (202 bytes total) succeed.
+    #[test]
+    fn io_budget_grow_extra_empty_ref_grows_budget_to_300() {
+        let mut store = LedgerState::new();
+        store.set_box(888, b"self", vec![0u8; 101]);
+        store.set_box(888, b"other", vec![0u8; 101]);
+        let mut ctx =
+            make_io_budget_context(&mut store, 888, vec![Some(b"self"), Some(b"other"), None]);
+        ctx.box_extract(b"self", 1, 7).unwrap();
+        ctx.box_extract(b"other", 1, 7).unwrap();
+        // Writes fit too (202 <= 300).
+        ctx.box_replace(b"self", 0, b"\x33\x33").unwrap();
+        ctx.box_replace(b"other", 0, b"\x33\x33").unwrap();
+    }
+
+    /// TestIOBudgetGrow: with a fourth (named) box ref, the budget grows to
+    /// 400 -- enough to read the two existing 101-byte boxes (202 bytes)
+    /// *and* create a new, much larger 350-byte box in the same call.
+    #[test]
+    fn io_budget_grow_fourth_ref_allows_reading_202_and_creating_350() {
+        let mut store = LedgerState::new();
+        store.set_box(888, b"self", vec![0u8; 101]);
+        store.set_box(888, b"other", vec![0u8; 101]);
+        let mut ctx = make_io_budget_context(
+            &mut store,
+            888,
+            vec![Some(b"self"), Some(b"other"), None, Some(b"another")],
+        );
+        ctx.box_extract(b"self", 1, 7).unwrap();
+        ctx.box_extract(b"other", 1, 7).unwrap();
+        ctx.box_create(b"another", 350).unwrap();
+    }
+
+    // -------------------------------------------------------------------
     // Foreign box authorization / family reentrancy (issue #662)
     //
     // These are the security-critical tests: they pin the exact go-algorand

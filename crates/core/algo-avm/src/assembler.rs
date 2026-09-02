@@ -1544,6 +1544,29 @@ fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
             if let Some(val) = resolve_field_immediate(ops, mnemonic, args[0]) {
                 ops.pending.push(val);
             } else if let Ok(val) = parse_uint8_or_int8(args[0], mnemonic) {
+                // TestAssembleConstants: a direct `intc N`/`bytec N`
+                // reference to an index past the end of the constant pool
+                // built so far (by any preceding `intcblock`/`bytecblock`)
+                // is rejected at assembly time, matching go-algorand's
+                // `writeIntc`/`writeBytec` (`assembler.go:447-448,
+                // 500-501`): `"intc %d is not defined"` /
+                // `"bytec %d is not defined"`.
+                let pool_len = match mnemonic {
+                    "intc" => Some(ops.intc.len()),
+                    "bytec" => Some(ops.bytec.len()),
+                    _ => None,
+                };
+                if let Some(len) = pool_len {
+                    if val as usize >= len {
+                        ops.record_error(
+                            ops.source_line,
+                            0,
+                            format!("{} {} is not defined", mnemonic, val),
+                        );
+                        ops.pending.pop();
+                        return;
+                    }
+                }
                 ops.pending.push(val);
             } else {
                 ops.record_error(
@@ -2553,6 +2576,114 @@ mod tests {
         assert!(
             errs.len() > 1,
             "expected multiple errors to be collected, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_assemble_constants_intc_bytec_out_of_range_rejected() {
+        // TestAssembleConstants: a direct `intc N`/`bytec N` reference past
+        // the end of the pool built so far is rejected at assembly time
+        // (no `intcblock`/`bytecblock` precedes these, so the pool is
+        // empty).
+        let errs = expect_errors("#pragma version 8\nintc 1\n");
+        assert!(
+            errs.iter().any(|e| e.message == "intc 1 is not defined"),
+            "unexpected errors: {errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nbytec 1\n");
+        assert!(
+            errs.iter().any(|e| e.message == "bytec 1 is not defined"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_assemble_constants_intc_bytec_in_range_ok() {
+        // Companion positive case: once the pool has enough entries, the
+        // same index assembles cleanly.
+        let ops = assemble_string("#pragma version 8\nintcblock 1 2\nintc 1\n").unwrap();
+        assert!(!ops.program.is_empty());
+
+        let ops = assemble_string("#pragma version 8\nbytecblock 0x01 0x02\nbytec 1\n").unwrap();
+        assert!(!ops.program.is_empty());
+    }
+
+    #[test]
+    fn test_assemble_branch_too_far() {
+        // TestAssembleBranchTooFar: a `b done` whose target sits far enough
+        // away (> ~2^20 bytes) that the 3-byte varint branch-offset
+        // placeholder can't encode it must be a hard assembly error, not a
+        // silent wraparound/truncation.
+        const CHUNK_DATA: usize = 4096; // maxStringSize
+        const CHUNKS: usize = 260;
+
+        let mut src = String::with_capacity(CHUNKS * (2 * CHUNK_DATA + 32));
+        src.push_str("#pragma version 8\n");
+        src.push_str("b done\n");
+        for _ in 0..CHUNKS {
+            src.push_str("pushbytes 0x");
+            for _ in 0..CHUNK_DATA {
+                src.push_str("00");
+            }
+            src.push_str("\npop\n");
+        }
+        src.push_str("done:\nint 1\n");
+
+        let errs = expect_errors(&src);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("too far away") && e.message.contains("done")),
+            "expected a branch-too-far error, got {} errors (first: {:?})",
+            errs.len(),
+            errs.first()
+        );
+    }
+
+    // ── Disassembler error diagnostics (issue #823 theme 4), ported from
+    // go-algorand's TestAssembleDisassembleErrors ───────────────────────
+
+    #[test]
+    fn test_disassemble_invalid_field_byte_rejected() {
+        // Corrupting a txn/txna/gtxn/gtxna/global field-immediate byte to a
+        // value that names no known field must be a disassembly error
+        // ("invalid immediate f for X"), not a silent raw-number fallback.
+        for (source, opcode_byte_index_from_end, mnemonic) in [
+            ("#pragma version 8\ntxn Sender\n", 1, "txn"),
+            ("#pragma version 8\ntxna Accounts 0\n", 2, "txna"),
+            ("#pragma version 8\ngtxn 0 Sender\n", 1, "gtxn"),
+            ("#pragma version 8\ngtxna 0 Accounts 0\n", 2, "gtxna"),
+            ("#pragma version 8\nglobal MinTxnFee\n", 1, "global"),
+        ] {
+            let ops = assemble_string(source).unwrap();
+            let mut program = ops.program.clone();
+            let len = program.len();
+            program[len - opcode_byte_index_from_end] = 0x50; // not a valid field byte
+            let err = crate::disassembler::disassemble(&program).unwrap_err();
+            assert!(
+                err.contains(&format!("invalid immediate f for {mnemonic}")),
+                "source {source:?}: unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_disassemble_illegal_opcode_and_unsupported_version() {
+        // 0xff is not (currently) assigned to any opcode.
+        let err = crate::disassembler::disassemble(&[8, 0xff]).unwrap_err();
+        assert!(
+            err.contains("illegal opcode") || err.contains("0xff") || err.contains("unknown"),
+            "unexpected error: {err}"
+        );
+
+        // Version 0x11 (17) is unsupported.
+        let ops = assemble_string("#pragma version 8\nint 1\n").unwrap();
+        let mut program = ops.program.clone();
+        program[0] = 0x11;
+        let err = crate::disassembler::disassemble(&program).unwrap_err();
+        assert!(
+            err.contains("unsupported") || err.to_lowercase().contains("version"),
+            "unexpected error: {err}"
         );
     }
 
