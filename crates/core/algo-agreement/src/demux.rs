@@ -118,6 +118,21 @@ impl ExternalEvent {
         }
         self
     }
+
+    /// Returns a new ExternalEvent with a validated-at timestamp attached,
+    /// if it wraps a `voteVerified`/`payloadVerified` `MessageEvent`.
+    /// No-op for every other event shape.
+    ///
+    /// Mirrors the `messageEvent`-only branch of Go's `demux.next()`
+    /// deferred attach (`agreement/demux.go:214-224`); see
+    /// `MessageEvent::attach_validated_at` for the field-level logic.
+    pub fn attach_validated_at(mut self, get_clock: impl Fn(Round) -> Duration) -> Self {
+        if let Event::Message(ref mut me) = self.event {
+            let owned = std::mem::take(me);
+            *me = owned.attach_validated_at(get_clock);
+        }
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------

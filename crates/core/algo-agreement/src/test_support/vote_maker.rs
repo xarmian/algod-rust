@@ -212,6 +212,12 @@ impl VoteMakerHelper {
                 proof: [0u8; VRF_PROOF_SIZE],
             },
             sig: zero_one_time_signature(),
+            // Mirrors Go's `MakeVerifiedVote`, which also leaves
+            // `validatedAt` zero — timing is attached separately via
+            // `MessageEvent::attach_validated_at` at the point a
+            // `voteVerified` event is dispatched, mirroring demux's
+            // real behavior.
+            validated_at: std::time::Duration::ZERO,
         }
     }
 

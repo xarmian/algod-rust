@@ -44,9 +44,13 @@
 //     `ClockState` (see `persistence.rs`), not via the `Clock` trait. We'll
 //     revisit if cadaver replay lands in a future task.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
+
+use algo_types::Round;
 
 use crate::types::TimeoutType;
 
@@ -88,4 +92,73 @@ pub trait Clock: Send + Sync {
     /// interior mutability so both the main loop and demux loop observe the
     /// change through their shared `Arc<dyn Clock>` without an Arc swap.
     fn zero(&self);
+}
+
+/// Resolve the wall-clock duration-since-round-zero to attach to a message
+/// event for `event_round`, given the player's `current_round` and its
+/// live `current_clock`, falling back to `historical_clocks` for rounds
+/// that have already advanced past (late-arriving votes/payloads) and to
+/// `Duration::ZERO` for rounds with no recorded zero at all.
+///
+/// Mirrors Go's `clockForRound` (`agreement/events.go:1019`). `historical_clocks`
+/// maps a round to the `Instant` its clock was zeroed (recorded by
+/// `do_rezero_action`); `Since()` there becomes `Instant::elapsed()`.
+///
+/// Used by `MessageEvent::attach_validated_at` at the point a `voteVerified`/
+/// `payloadVerified` event leaves the demux loop for the main loop —
+/// mirrors Go's `demux.next()` deferred attach (`agreement/demux.go:216-223`).
+pub fn clock_for_round(
+    event_round: Round,
+    current_round: Round,
+    current_clock: &Arc<dyn Clock>,
+    historical_clocks: &HashMap<Round, Instant>,
+) -> Duration {
+    if event_round.0 > current_round.0 {
+        return crate::events::PIPELINED_MESSAGE_TIMESTAMP;
+    }
+    if event_round == current_round {
+        return current_clock.since();
+    }
+    if let Some(instant) = historical_clocks.get(&event_round) {
+        return instant.elapsed();
+    }
+    Duration::ZERO
+}
+
+#[cfg(test)]
+mod clock_for_round_tests {
+    use super::*;
+    use crate::system_clock::SystemClock;
+
+    #[test]
+    fn future_round_returns_pipelined_timestamp() {
+        let clock = SystemClock::new();
+        let d = clock_for_round(Round(11), Round(10), &clock, &HashMap::new());
+        assert_eq!(d, crate::events::PIPELINED_MESSAGE_TIMESTAMP);
+    }
+
+    #[test]
+    fn current_round_reads_live_clock() {
+        let clock = SystemClock::new();
+        std::thread::sleep(Duration::from_millis(5));
+        let d = clock_for_round(Round(10), Round(10), &clock, &HashMap::new());
+        assert!(d >= Duration::from_millis(5));
+    }
+
+    #[test]
+    fn past_round_with_recorded_zero_reads_historical_clock() {
+        let clock = SystemClock::new();
+        let mut historical = HashMap::new();
+        // A round whose zero was recorded 20ms ago.
+        historical.insert(Round(9), Instant::now() - Duration::from_millis(20));
+        let d = clock_for_round(Round(9), Round(10), &clock, &historical);
+        assert!(d >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn past_round_without_recorded_zero_returns_zero() {
+        let clock = SystemClock::new();
+        let d = clock_for_round(Round(9), Round(10), &clock, &HashMap::new());
+        assert_eq!(d, Duration::ZERO);
+    }
 }

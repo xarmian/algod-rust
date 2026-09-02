@@ -609,11 +609,8 @@ impl Player {
             return Duration::ZERO;
         }
 
-        if let Some(ref _lowest) = re.lowest_including_late {
-            // In the Go implementation, validatedAt is stored on the vote.
-            // Here we use Duration::ZERO as a placeholder since we don't
-            // have the validated_at field on Vote yet.
-            let validated_at = Duration::ZERO;
+        if let Some(ref lowest) = re.lowest_including_late {
+            let validated_at = lowest.validated_at;
             self.lowest_credential_arrivals.store(validated_at);
             return validated_at;
         }
