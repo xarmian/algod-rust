@@ -1402,6 +1402,88 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // sha512 / sumhash512 dynamic-cost tests (issue #823 theme 5), ported
+    // from go-algorand's TestHashCosts (data/transactions/logic/crypto_test.go)
+    // -----------------------------------------------------------------------
+
+    /// Run `pushbytes <size zero bytes>; <opcode>` and return the total
+    /// opcode cost charged for just the hash opcode (program cost minus
+    /// `pushbytes`'s fixed cost of 1).
+    fn hash_opcode_cost(version: u8, opcode: u8, size: usize) -> u64 {
+        let mut code = vec![0x80]; // pushbytes
+        code.extend_from_slice(&varuint(size as u64));
+        code.extend(std::iter::repeat(0u8).take(size));
+        code.push(opcode);
+        let raw = prog(version, &code);
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
+        m.step(&mut NullContext).unwrap(); // pushbytes
+        m.step(&mut NullContext).unwrap(); // hash opcode
+        m.cost - 1 // subtract pushbytes' fixed cost of 1
+    }
+
+    #[test]
+    fn test_hash_costs_sha512_matches_go_test_vectors() {
+        // sha512: baseCost=15, chunkCost=2, chunkSize=32
+        for (size, expected) in [(0usize, 15u64), (1, 17), (64, 19), (1000, 79)] {
+            assert_eq!(
+                hash_opcode_cost(13, 0x87, size),
+                expected,
+                "sha512 cost for {size}-byte input"
+            );
+        }
+    }
+
+    /// Run `ecdsa_verify` with 5 all-zero 32-byte stack args and return the
+    /// cost charged for it alone. The result of the verification itself is
+    /// irrelevant -- only that the curve-dependent cost is charged before
+    /// verification proceeds.
+    fn ecdsa_verify_cost(curve_byte: u8) -> u64 {
+        let mut code = Vec::new();
+        for _ in 0..5 {
+            code.push(0x80); // pushbytes
+            code.push(0x20); // 32 bytes follow
+            code.extend_from_slice(&[0u8; 32]);
+        }
+        code.push(0x05); // ecdsa_verify
+        code.push(curve_byte);
+        let raw = prog(7, &code);
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
+        for _ in 0..5 {
+            m.step(&mut NullContext).unwrap(); // pushbytes
+        }
+        let before = m.cost;
+        // Ignore the result: an all-zero point may fail curve validation
+        // after the cost is charged, which is fine -- charge_cost runs
+        // first, matching go's "doesn't matter if actual verify returns
+        // true or false" comment in TestEcdsaCostVariation.
+        let _ = m.step(&mut NullContext);
+        m.cost - before // cost charged by ecdsa_verify alone
+    }
+
+    #[test]
+    fn test_ecdsa_verify_cost_varies_by_curve() {
+        // Ported from go-algorand's TestEcdsaCostVariation
+        // (data/transactions/logic/crypto_test.go): Secp256k1 costs 1700,
+        // Secp256r1 costs 2500.
+        assert_eq!(ecdsa_verify_cost(0), 1700, "Secp256k1 cost");
+        assert_eq!(ecdsa_verify_cost(1), 2500, "Secp256r1 cost");
+    }
+
+    #[test]
+    fn test_hash_costs_sumhash512_matches_go_test_vectors() {
+        // sumhash512: baseCost=150, chunkCost=4, chunkSize=7
+        for (size, expected) in [(0usize, 150u64), (1, 154), (64, 190), (1000, 722)] {
+            assert_eq!(
+                hash_opcode_cost(13, 0x86, size),
+                expected,
+                "sumhash512 cost for {size}-byte input"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // SHA-256 tests
     // -----------------------------------------------------------------------
 
