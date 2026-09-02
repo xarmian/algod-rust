@@ -52,14 +52,14 @@ per-area split of the former).
 | status | count | share |
 |---|---|---|
 | `partial` | 714 | 22% |
-| `not-implemented` | 551 | 17% |
+| `not-implemented` | 520 | 16% |
 | `matched-1:1` | 508 | 16% |
-| `matched-1:many` | 472 | 15% |
+| `matched-1:many` | 476 | 15% |
 | `missing-test` | 396 | 12% |
-| `out-of-scope` | 336 | 11% |
+| `out-of-scope` | 363 | 11% |
 | `matched-many:1` | 200 | 6% |
 
-**947 rows (`not-implemented` + `missing-test`, 30%) are real, actionable
+**916 rows (`not-implemented` + `missing-test`, 29%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
 implements but never tests. `partial` (714, 22%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
@@ -82,9 +82,9 @@ were triaged into tracked issues.
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 33 | 44 | 0 | 15 | 17 | 25 | 10 |
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 75 | 15 | 45 | 67 | 40 | 25 | 7 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 15 | 17 | 0 | 18 | 59 | 6 | 4 |
-| Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 5 | 2 | 0 | 19 | 59 | 0 | 33 |
+| Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 5 | 6 | 0 | 19 | 28 | 0 | 60 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 4 | 2 | 7 | 13 | 102 | 3 | 42 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 55 | 2 | 7 | 0 | 13 | 28 | 4 | 1 |
-| **Total** | | **3,177** | **508** | **472** | **200** | **714** | **551** | **396** | **336** |
+| **Total** | | **3,177** | **508** | **476** | **200** | **714** | **520** | **396** | **363** |
 
