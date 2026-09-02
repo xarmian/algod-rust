@@ -128,6 +128,44 @@ fn account_blob(micro_algos: u64) -> Vec<u8> {
     blob
 }
 
+/// `baseAccountData` with `MicroAlgos` plus declared resource totals:
+/// `{"b": micro_algos, "i": total_asset_params, "j": total_assets,
+///   "k": total_app_params, "l": total_app_local_states}`.
+///
+/// The importer's `processStagingBalances` cross-checks these totals
+/// against the resources actually attached to the account (mirroring
+/// go-algorand's `catchupaccessor.go` resource-count check — see
+/// `TestCatchupAccessorResourceCountMismatch`), so any account with
+/// resources in this fixture must declare matching totals here.
+fn account_blob_with_resource_totals(
+    micro_algos: u64,
+    total_asset_params: u8,
+    total_assets: u8,
+    total_app_params: u8,
+    total_app_local_states: u8,
+) -> Vec<u8> {
+    let mut fields: Vec<(u8, Vec<u8>)> = vec![(b'b', uint(micro_algos))];
+    if total_asset_params != 0 {
+        fields.push((b'i', uint(total_asset_params as u64)));
+    }
+    if total_assets != 0 {
+        fields.push((b'j', uint(total_assets as u64)));
+    }
+    if total_app_params != 0 {
+        fields.push((b'k', uint(total_app_params as u64)));
+    }
+    if total_app_local_states != 0 {
+        fields.push((b'l', uint(total_app_local_states as u64)));
+    }
+    let mut blob = vec![0x80 | fields.len() as u8];
+    for (key, value) in fields {
+        blob.push(0xa1); // fixstr(1)
+        blob.push(key);
+        blob.extend_from_slice(&value);
+    }
+    blob
+}
+
 /// Owned asset `resourcesData`: `{"a": total, "y": OWNERSHIP}`.
 fn asset_blob(total: u8) -> Vec<u8> {
     vec![
@@ -180,12 +218,20 @@ fn build_source_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(SOURCE_SCHEMA).unwrap();
 
-    // 5 accounts; #2 owns two assets, #4 owns an app.
+    // 5 accounts; #2 owns two assets (both owned+held), #4 owns an app
+    // (owned+held). Their declared resource totals below must match, or the
+    // importer's resource-count cross-check (TestCatchupAccessorResourceCountMismatch
+    // parity) rejects the catchpoint.
     for i in 1u8..=5 {
+        let data = match i {
+            2 => account_blob_with_resource_totals(1_000 * i as u64, 2, 2, 0, 0),
+            4 => account_blob_with_resource_totals(1_000 * i as u64, 0, 0, 1, 1),
+            _ => account_blob(1_000 * i as u64),
+        };
         conn.execute(
             "INSERT INTO accountbase(addrid, address, data, normalizedonlinebalance) \
              VALUES(?1, ?2, ?3, 0)",
-            params![i as i64, addr(i).to_vec(), account_blob(1_000 * i as u64)],
+            params![i as i64, addr(i).to_vec(), data],
         )
         .unwrap();
     }
@@ -437,6 +483,13 @@ fn export_splits_oversized_account_resources() {
         )
         .unwrap();
     }
+    // Declare matching resource totals on account #5 (6 owned+held asset
+    // resources) — the importer's resource-count cross-check requires it.
+    src.execute(
+        "UPDATE accountbase SET data = ?1 WHERE addrid = 5",
+        params![account_blob_with_resource_totals(5_000, 6, 6, 0, 0)],
+    )
+    .unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("oversized.tar.gz");

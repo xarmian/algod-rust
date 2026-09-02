@@ -116,9 +116,29 @@ pub struct CatchpointImporter<'a> {
     total_online_accounts: u64,
     total_online_round_params: u64,
     reward_unit: u64,
+    /// Running per-account resource counters, accumulated across a run of
+    /// `BalanceRecordV6` entries that share an address while
+    /// `expecting_more_entries` is set (an account whose resources spill
+    /// across multiple chunk records). Reset once the final record for the
+    /// account (`expecting_more_entries == false`) has been checked.
+    ///
+    /// Mirrors go-algorand's `catchpointAccountResourceCounter` in
+    /// `ledger/catchupaccessor.go`.
+    acct_res_cnt: AcctResourceCounter,
     /// In-memory progress checkpoint. Updated after every batch commit;
     /// reset to default on every new importer instance. Not persisted.
     checkpoint: ImportCheckpoint,
+}
+
+/// Running counters of resources seen so far for the account currently being
+/// imported, split by (creatable-type, ownership-vs-holding) — matches Go's
+/// `catchpointAccountResourceCounter`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AcctResourceCounter {
+    total_app_params: u64,
+    total_app_local_states: u64,
+    total_asset_params: u64,
+    total_assets: u64,
 }
 
 impl<'a> CatchpointImporter<'a> {
@@ -144,6 +164,7 @@ impl<'a> CatchpointImporter<'a> {
             total_online_accounts: 0,
             total_online_round_params: 0,
             reward_unit,
+            acct_res_cnt: AcctResourceCounter::default(),
             checkpoint,
         }
     }
@@ -202,6 +223,7 @@ impl<'a> CatchpointImporter<'a> {
 
         // Reset in-memory progress in case this importer is being reused.
         self.chunk_ordinal = 0;
+        self.acct_res_cnt = AcctResourceCounter::default();
         self.checkpoint = ImportCheckpoint {
             last_chunk_ordinal: 0,
             total_chunks: 0,
@@ -490,7 +512,7 @@ impl<'a> CatchpointImporter<'a> {
 
     /// Insert a balance record into `catchpointbalances` + resources +
     /// asset creators.
-    fn import_balance_record(&self, record: &BalanceRecordV6) -> Result<(), CatchpointError> {
+    fn import_balance_record(&mut self, record: &BalanceRecordV6) -> Result<(), CatchpointError> {
         // Decode account data to compute normalizedonlinebalance.
         let acct_data = decode_base_account_data(&record.account_data)
             .map_err(|e| CatchpointError::ImportError(format!("decode account data: {e}")))?;
@@ -557,7 +579,8 @@ impl<'a> CatchpointImporter<'a> {
                 rusqlite::params![addrid, aidx as i64, resource_data.as_ref(), ctype],
             )?;
 
-            if is_owning(rd.resource_flags) {
+            let owning = is_owning(rd.resource_flags);
+            if owning {
                 if resource_is_asset {
                     self.conn.execute(
                         "INSERT INTO catchpointassetcreators(asset, creator, ctype) VALUES(?1, ?2, ?3)",
@@ -570,6 +593,54 @@ impl<'a> CatchpointImporter<'a> {
                         rusqlite::params![aidx as i64, record.address.as_ref(), CTYPE_APP],
                     )?;
                 }
+            }
+
+            // Accumulate per-account resource counters, matching go-algorand's
+            // catchupaccessor.go per-record accounting (`c.acctResCnt.*++`).
+            let holding = is_holding(rd.resource_flags);
+            if resource_is_app && owning {
+                self.acct_res_cnt.total_app_params += 1;
+            }
+            if resource_is_app && holding {
+                self.acct_res_cnt.total_app_local_states += 1;
+            }
+            if resource_is_asset && owning {
+                self.acct_res_cnt.total_asset_params += 1;
+            }
+            if resource_is_asset && holding {
+                self.acct_res_cnt.total_assets += 1;
+            }
+        }
+
+        // If this is the final record for the account (no more overflow
+        // entries to come), verify that the accumulated resource counters
+        // match the account's declared totals. This mirrors go-algorand's
+        // `processStagingBalances` resource-count cross-check
+        // (`ledger/catchupaccessor.go`), which is exercised by
+        // `TestCatchupAccessorResourceCountMismatch`.
+        if !record.expecting_more_entries {
+            let mismatch = self.acct_res_cnt.total_app_params != acct_data.total_app_params
+                || self.acct_res_cnt.total_app_local_states != acct_data.total_app_local_states
+                || self.acct_res_cnt.total_asset_params != acct_data.total_asset_params
+                || self.acct_res_cnt.total_assets != acct_data.total_assets;
+
+            let counted = self.acct_res_cnt;
+            self.acct_res_cnt = AcctResourceCounter::default();
+
+            if mismatch {
+                return Err(CatchpointError::ImportError(format!(
+                    "processStagingBalances received {} appParams, {} appLocalStates, \
+                     {} assetParams, {} assets for account {:?}, expected {}, {}, {}, {}",
+                    counted.total_app_params,
+                    counted.total_app_local_states,
+                    counted.total_asset_params,
+                    counted.total_assets,
+                    record.address.as_ref(),
+                    acct_data.total_app_params,
+                    acct_data.total_app_local_states,
+                    acct_data.total_asset_params,
+                    acct_data.total_assets,
+                )));
             }
         }
 
@@ -811,6 +882,15 @@ fn is_owning(flags: u8) -> bool {
     (flags & RESOURCE_FLAGS_OWNERSHIP) == RESOURCE_FLAGS_OWNERSHIP
 }
 
+/// Returns `true` if the resource represents a holding (i.e. the "not
+/// holding" bit is clear). Matches Go's `ResourcesData.IsHolding`:
+/// `(flags & ResourceFlagsNotHolding) == ResourceFlagsHolding`, where
+/// `ResourceFlagsHolding == 0`, so holding is the *default* unless the
+/// not-holding bit is explicitly set.
+fn is_holding(flags: u8) -> bool {
+    (flags & super::types::RESOURCE_FLAGS_NOT_HOLDING) == super::types::RESOURCE_FLAGS_HOLDING
+}
+
 /// Returns `true` if the resource is an asset resource.
 ///
 /// Matches Go logic: either the `EmptyAsset` flag is set, or the asset fields
@@ -900,6 +980,40 @@ mod tests {
     fn empty_account_data_blob() -> Vec<u8> {
         // fixmap with 0 entries: 0x80
         vec![0x80]
+    }
+
+    /// msgpack-encoded baseAccountData with only the resource-total fields
+    /// set (all other fields default). Values must be <= 127 to stay within
+    /// positive-fixint encoding.
+    ///
+    /// Keys: "i"=total_asset_params, "j"=total_assets, "k"=total_app_params,
+    /// "l"=total_app_local_states.
+    fn account_data_totals_blob(
+        total_asset_params: u8,
+        total_assets: u8,
+        total_app_params: u8,
+        total_app_local_states: u8,
+    ) -> Vec<u8> {
+        let mut fields: Vec<(u8, u8)> = Vec::new();
+        if total_asset_params != 0 {
+            fields.push((b'i', total_asset_params));
+        }
+        if total_assets != 0 {
+            fields.push((b'j', total_assets));
+        }
+        if total_app_params != 0 {
+            fields.push((b'k', total_app_params));
+        }
+        if total_app_local_states != 0 {
+            fields.push((b'l', total_app_local_states));
+        }
+        let mut buf = vec![0x80 | fields.len() as u8];
+        for (key, value) in fields {
+            buf.push(0xa1); // fixstr(1)
+            buf.push(key);
+            buf.push(value); // positive fixint (value <= 127)
+        }
+        buf
     }
 
     /// Minimal msgpack-encoded resourcesData with ownership flag set.
@@ -1005,7 +1119,10 @@ mod tests {
         let mut resources = HashMap::new();
         resources.insert(42u64, ByteBuf::from(owned_asset_resource_blob()));
 
-        let record = make_balance_record(addr, empty_account_data_blob(), resources);
+        // owned_asset_resource_blob has flags=OWNERSHIP only, so IsHolding()
+        // is also true (holding is the default absent the not-holding bit):
+        // 1 owned asset param + 1 held asset.
+        let record = make_balance_record(addr, account_data_totals_blob(1, 1, 0, 0), resources);
 
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         importer.import_balance_record(&record).unwrap();
@@ -1041,7 +1158,9 @@ mod tests {
         let mut resources = HashMap::new();
         resources.insert(99u64, ByteBuf::from(owned_app_resource_blob()));
 
-        let record = make_balance_record(addr, empty_account_data_blob(), resources);
+        // owned_app_resource_blob has flags=OWNERSHIP only, so IsHolding()
+        // is also true: 1 owned app param + 1 held app local state.
+        let record = make_balance_record(addr, account_data_totals_blob(0, 0, 1, 1), resources);
 
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         importer.import_balance_record(&record).unwrap();
@@ -1056,6 +1175,113 @@ mod tests {
             .unwrap();
         assert_eq!(asset, 99);
         assert_eq!(ctype, CTYPE_APP);
+    }
+
+    /// Port of go-algorand's `TestCatchupAccessorResourceCountMismatch`
+    /// (`ledger/catchupaccessor_test.go`): an account whose declared
+    /// `TotalAppParams`/`TotalAssetParams`/etc. don't match the resources
+    /// actually present in the balance record must be rejected during
+    /// import, not silently accepted.
+    #[test]
+    fn import_balance_record_rejects_resource_count_mismatch() {
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+
+        let addr = [7u8; 32];
+        let mut resources = HashMap::new();
+        // One owned+held asset resource is present, but account_data claims
+        // TotalAppParams=1 (an app, not an asset) and no asset totals at
+        // all — a genuine mismatch that go-algorand's
+        // processStagingBalances rejects.
+        resources.insert(55u64, ByteBuf::from(owned_asset_resource_blob()));
+        let record = make_balance_record(addr, account_data_totals_blob(0, 0, 1, 0), resources);
+
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let result = importer.import_balance_record(&record);
+        conn.execute_batch("COMMIT").unwrap();
+
+        let err = result.expect_err("resource count mismatch must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resource count mismatch") || msg.contains("appParams"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// Counterpart: matching totals must import cleanly (regression guard
+    /// against an overly strict check).
+    #[test]
+    fn import_balance_record_accepts_matching_resource_counts() {
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+
+        let addr = [8u8; 32];
+        let mut resources = HashMap::new();
+        resources.insert(56u64, ByteBuf::from(owned_asset_resource_blob()));
+        resources.insert(57u64, ByteBuf::from(owned_app_resource_blob()));
+        let record = make_balance_record(addr, account_data_totals_blob(1, 1, 1, 1), resources);
+
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        importer.import_balance_record(&record).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+
+        let rsc_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM catchpointresources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rsc_count, 2);
+    }
+
+    /// A balance record chain split across multiple chunks
+    /// (`expecting_more_entries = true` on all but the last) must
+    /// accumulate resource counters across the whole chain before checking,
+    /// not reset per-record.
+    #[test]
+    fn import_balance_record_accumulates_counters_across_overflow_records() {
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+
+        let addr = [9u8; 32];
+
+        // First (overflow) record: one owned asset resource, more to come.
+        let mut resources1 = HashMap::new();
+        resources1.insert(60u64, ByteBuf::from(owned_asset_resource_blob()));
+        let record1 = BalanceRecordV6 {
+            address: ByteBuf::from(addr.to_vec()),
+            account_data: ByteBuf::from(account_data_totals_blob(1, 1, 1, 1)),
+            resources: resources1,
+            expecting_more_entries: true,
+        };
+
+        // Final record: one owned app resource, no more entries. Combined
+        // with record1 this now matches the declared totals (1 asset + 1
+        // app).
+        let mut resources2 = HashMap::new();
+        resources2.insert(61u64, ByteBuf::from(owned_app_resource_blob()));
+        let record2 = BalanceRecordV6 {
+            address: ByteBuf::from(addr.to_vec()),
+            account_data: ByteBuf::from(account_data_totals_blob(1, 1, 1, 1)),
+            resources: resources2,
+            expecting_more_entries: false,
+        };
+
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        importer.import_balance_record(&record1).unwrap();
+        let result = importer.import_balance_record(&record2);
+        conn.execute_batch("COMMIT").unwrap();
+
+        result.expect("accumulated counts across overflow records should match declared totals");
+
+        let rsc_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM catchpointresources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rsc_count, 2);
     }
 
     #[test]
@@ -1197,6 +1423,82 @@ mod tests {
             .unwrap();
         assert_eq!(rnd, 500);
         assert_eq!(data, vec![0x80]);
+    }
+
+    /// Port of go-algorand's `TestCatchupAccessorStateProofVerificationContext`
+    /// (`ledger/catchupaccessor_test.go`): a non-empty state proof
+    /// verification wrapper must be persisted into
+    /// `catchpointstateproofverification`, keyed by `lastattestedround`, and
+    /// round-trip decode back to the same context.
+    #[test]
+    fn import_state_proof_verification_persists_contexts() {
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+
+        let ctx = super::super::types::StateProofVerificationContext {
+            last_attested_round: 120,
+            voters_commitment: ByteBuf::from(Vec::new()),
+            online_total_weight: 100,
+            ..Default::default()
+        };
+        let wrapper = CatchpointStateProofVerificationWrapper {
+            data: vec![ctx.clone()],
+        };
+        let raw = rmp_serde::to_vec_named(&wrapper).unwrap();
+
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        importer.import_state_proof_verification(&raw).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM catchpointstateproofverification",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let (rnd, blob): (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT lastattestedround, verificationContext FROM catchpointstateproofverification",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rnd, 120);
+        let decoded: super::super::types::StateProofVerificationContext =
+            rmp_serde::from_slice(&blob).unwrap();
+        assert_eq!(decoded.last_attested_round, ctx.last_attested_round);
+        assert_eq!(decoded.online_total_weight, ctx.online_total_weight);
+    }
+
+    /// Port of go-algorand's
+    /// `TestCatchupAccessorEmptyStateProofVerificationContext`: an empty
+    /// wrapper (no contexts) must be a no-op — the table stays empty and no
+    /// error is returned.
+    #[test]
+    fn import_state_proof_verification_empty_is_noop() {
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+
+        let wrapper = CatchpointStateProofVerificationWrapper { data: vec![] };
+        let raw = rmp_serde::to_vec_named(&wrapper).unwrap();
+
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        importer.import_state_proof_verification(&raw).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM catchpointstateproofverification",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

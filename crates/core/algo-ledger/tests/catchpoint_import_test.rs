@@ -83,6 +83,43 @@ fn empty_account_data_blob() -> Vec<u8> {
     vec![0x80]
 }
 
+/// msgpack-encoded baseAccountData with only the resource-total fields set
+/// (all other fields default). Values must be <= 127 to stay within
+/// positive-fixint encoding.
+///
+/// Keys: "i"=total_asset_params, "j"=total_assets, "k"=total_app_params,
+/// "l"=total_app_local_states. The importer cross-checks these against the
+/// actual resources found for the account (see
+/// `TestCatchupAccessorResourceCountMismatch` parity coverage below), so
+/// fixtures with owned/held resources must declare matching totals here.
+fn account_data_totals_blob(
+    total_asset_params: u8,
+    total_assets: u8,
+    total_app_params: u8,
+    total_app_local_states: u8,
+) -> Vec<u8> {
+    let mut fields: Vec<(u8, u8)> = Vec::new();
+    if total_asset_params != 0 {
+        fields.push((b'i', total_asset_params));
+    }
+    if total_assets != 0 {
+        fields.push((b'j', total_assets));
+    }
+    if total_app_params != 0 {
+        fields.push((b'k', total_app_params));
+    }
+    if total_app_local_states != 0 {
+        fields.push((b'l', total_app_local_states));
+    }
+    let mut buf = vec![0x80 | fields.len() as u8];
+    for (key, value) in fields {
+        buf.push(0xa1); // fixstr(1)
+        buf.push(key);
+        buf.push(value); // positive fixint (value <= 127)
+    }
+    buf
+}
+
 /// Build a BalanceRecordV6 with the given address, account data, and resources.
 fn make_balance_record(
     addr_bytes: [u8; 32],
@@ -186,8 +223,12 @@ fn test_full_import_populates_all_tables() {
     let mut resources2 = HashMap::new();
     resources2.insert(app_aidx, app_blob);
 
-    let balance1 = make_balance_record(addr1, empty_account_data_blob(), resources1);
-    let balance2 = make_balance_record(addr2, empty_account_data_blob(), resources2);
+    // make_asset_resource/make_app_resource set flags=OWNERSHIP only, so
+    // IsHolding() is also true (holding is the default absent the
+    // not-holding bit): 1 owned+held asset resource, 1 owned+held app
+    // resource.
+    let balance1 = make_balance_record(addr1, account_data_totals_blob(1, 1, 0, 0), resources1);
+    let balance2 = make_balance_record(addr2, account_data_totals_blob(0, 0, 1, 1), resources2);
 
     let kv = make_kv_record(b"box-key-1", b"box-value-1");
 
@@ -650,10 +691,14 @@ fn test_creator_table_population() {
     resources4.insert(asset_aidx2, asset_blob2);
     resources4.insert(app_aidx2, app_blob2);
 
-    let balance1 = make_balance_record(addr1, empty_account_data_blob(), resources1);
-    let balance2 = make_balance_record(addr2, empty_account_data_blob(), resources2);
+    // addr1: 1 owned+held asset resource. addr2: 1 owned+held app resource.
+    // addr3: a non-owning resource with no set fields, which counts as
+    // neither an asset nor an app resource (see is_empty_asset_fields /
+    // is_empty_app_fields), so its totals stay all-zero. addr4: one of each.
+    let balance1 = make_balance_record(addr1, account_data_totals_blob(1, 1, 0, 0), resources1);
+    let balance2 = make_balance_record(addr2, account_data_totals_blob(0, 0, 1, 1), resources2);
     let balance3 = make_balance_record(addr3, empty_account_data_blob(), resources3);
-    let balance4 = make_balance_record(addr4, empty_account_data_blob(), resources4);
+    let balance4 = make_balance_record(addr4, account_data_totals_blob(1, 1, 1, 1), resources4);
 
     let chunk = CatchpointSnapshotChunkV6 {
         balances: vec![balance1, balance2, balance3, balance4],
