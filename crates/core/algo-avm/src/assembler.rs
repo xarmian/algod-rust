@@ -35,6 +35,7 @@ use sha2::{Digest, Sha512_256};
 
 use crate::fields;
 use crate::opcode::{self, ImmKind, Mode, MAX_AVM_VERSION};
+use crate::type_track;
 
 /// The first AVM version where constant optimization is enabled.
 const OPTIMIZE_CONSTANTS_ENABLED_VERSION: u8 = 4;
@@ -227,7 +228,7 @@ pub struct OpStream {
     cnt_bytec_block: usize,
     has_pseudo_byte: bool,
 
-    source_line: usize,
+    pub(crate) source_line: usize,
 
     /// Set once any assembled opcode is `Mode::Application`-only. Mirrors
     /// go-algorand's `OpStream.HasStatefulOps`; gates auto-salt (which only
@@ -241,6 +242,19 @@ pub struct OpStream {
     /// warnings to the pragma line, matching go-algorand's
     /// `OpStream.autoSaltToken`.
     auto_salt_line: usize,
+
+    /// Static stack-type-tracking state (issue #829). Mirrors a slice of
+    /// go-algorand's `ProgramKnowledge.stack` -- the types statically known
+    /// to be on the value stack at the current point in a straight-line
+    /// instruction sequence. See the `type_track` module docs for exactly
+    /// what this incremental pass covers.
+    pub(crate) type_stack: Vec<type_track::StackType>,
+    /// Once set, `type_track::track_instruction` stops tracking (and
+    /// stops reporting type errors) for the rest of the program. Set on
+    /// hitting a label, a branch/subroutine opcode, or any opcode this
+    /// slice doesn't model precisely enough to keep the tracked stack
+    /// height in sync with the real one.
+    pub(crate) type_track_disabled: bool,
 }
 
 impl OpStream {
@@ -266,10 +280,12 @@ impl OpStream {
             has_stateful_ops: false,
             auto_salt: AutoSaltMode::Unset,
             auto_salt_line: 0,
+            type_stack: Vec::new(),
+            type_track_disabled: false,
         }
     }
 
-    fn record_error(&mut self, line: usize, col: usize, msg: String) {
+    pub(crate) fn record_error(&mut self, line: usize, col: usize, msg: String) {
         self.errors.push(AssemblyError {
             line,
             col,
@@ -1109,6 +1125,18 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
                 } else {
                     ops.labels.insert(label.to_string(), ops.pending.len());
                 }
+                // A label is a possible entry point from elsewhere in the
+                // program (a branch target), so the straight-line stack-type
+                // knowledge accumulated so far no longer reliably describes
+                // what's actually on the stack here. go-algorand re-opens
+                // analysis with permissive "any" knowledge after a label
+                // (`ProgramKnowledge.label`/`reset`, assembler.go:364-380);
+                // this incremental slice doesn't yet implement branch-merge
+                // unification, so it conservatively stops tracking for the
+                // rest of the program instead of risking a false type error
+                // across a basic-block boundary (see the `type_track`
+                // module docs for what's covered vs. deferred).
+                ops.type_track_disabled = true;
                 tok_idx = 1;
                 if tok_idx >= tokens.len() {
                     continue;
@@ -1119,6 +1147,7 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
             let args: Vec<&str> = tokens[tok_idx + 1..].to_vec();
 
             ops.record_source_location(ops.source_line, 0);
+            type_track::track_instruction(&mut ops, mnemonic, &args);
             assemble_instruction(&mut ops, mnemonic, &args);
         }
     }
@@ -3425,5 +3454,194 @@ mod tests {
         // it.
         let source = "#pragma version 8\npushbytess 0xaa 0xbb\npushint 1\nmatch\nconcat\n";
         assemble_string(source).unwrap();
+    }
+
+    // ── Static stack-type tracking (issue #829), ported from
+    // go-algorand's assembler_test.go straight-line (branch-free) type
+    // tracking tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_type_tracking_stack_height_error() {
+        // TestTypeTracking, first case: `+` alone on an empty stack.
+        let errs = expect_errors("#pragma version 8\n+\n");
+        assert!(
+            errs.iter().any(|e| e
+                .message
+                .contains("+ expects 2 stack arguments but stack height is 0")),
+            "{:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_swap_type_check() {
+        // TestSwapTypeCheck.
+        let errs = expect_errors("#pragma version 8\nint 1\nbyte 0x1234\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 1")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nint 1\nbyte 0x1234\nswap\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 0")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nbyte 0x1234\nint 1\nswap\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 1")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_equals_type_check() {
+        // TestEqualsTypeCheck.
+        for op in ["==", "!="] {
+            let errs = expect_errors(&format!("#pragma version 8\nint 1\nbyte 0x1234\n{op}\n"));
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains(&format!("{op} arg 0"))),
+                "{op}: {errs:?}"
+            );
+            let errs = expect_errors(&format!("#pragma version 8\nbyte 0x1234\nint 1\n{op}\n"));
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains(&format!("{op} arg 0"))),
+                "{op}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dup_type_check() {
+        // TestDupTypeCheck.
+        let errs = expect_errors("#pragma version 8\nbyte 0x1234\ndup\nint 1\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 0")),
+            "{errs:?}"
+        );
+
+        assemble_string("#pragma version 8\nbyte 0x1234\nint 1\ndup\n+\n").unwrap();
+
+        let errs = expect_errors("#pragma version 8\nbyte 0x1234\nint 1\ndup2\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 0")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nint 1\nbyte 0x1234\ndup2\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 1")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nbyte 0x1234\nint 1\ndup\ndig 1\nlen\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("len arg 0")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nint 1\nbyte 0x1234\ndup\ndig 1\n!\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("! arg 0")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_select_type_check() {
+        // TestSelectTypeCheck.
+        let errs = expect_errors("#pragma version 8\nint 1\nint 2\nint 3\nselect\nlen\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("len arg 0")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nbyte 0x1234\nbyte 0x5678\nint 3\nselect\n!\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("! arg 0")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_setbit_type_check() {
+        // TestSetBitTypeCheck.
+        let errs = expect_errors("#pragma version 8\nint 1\nint 2\nint 3\nsetbit\nlen\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("len arg 0")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nbyte 0x1234\nint 2\nint 3\nsetbit\n!\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("! arg 0")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_type_tracking_stops_at_first_branch_or_label() {
+        // Not a direct go-test port, but pins the "incremental" boundary
+        // this slice deliberately draws (see the `type_track` module docs'
+        // "what's deferred" section): go-algorand's TestTypeTracking keeps
+        // analyzing a basic block *after* a branch/label by unifying
+        // tracked types across every predecessor. This slice doesn't
+        // implement that yet, so it conservatively stops tracking for good
+        // the first time it sees a branch or a label -- meaning a type
+        // mistake located after one (like the `byte`/`int`/`+` below, which
+        // go-algorand's real analysis *would* flag) is simply not detected
+        // by this slice. That's a known, documented gap, not a silent
+        // miscompile: the program still assembles to exactly the bytecode
+        // the source describes, just without the extra compile-time
+        // diagnostic.
+        assemble_string(
+            "#pragma version 8\nint 1\nb confusion\nlabel:\nbyte 0x1234\nint 2\n+\npop\nconfusion:\nb label\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_type_tracking_stops_at_txn() {
+        // txn/gtxn/gtxns resolve to a different real opcode (with a
+        // different pop count) depending on how many immediates were
+        // written (txn vs. txna); this slice doesn't model that dispatch,
+        // so it must disable tracking rather than mistrack the stack height
+        // and risk a false positive on legitimate code further down.
+        assemble_string("#pragma version 8\ntxn Sender\nbyte 0x1234\nint 1\n+\npop\npop\n")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_type_tracking_does_not_reject_valid_programs() {
+        // A grab-bag of legitimately-typed straight-line programs across
+        // this slice's covered opcodes must keep assembling cleanly.
+        let sources = [
+            "#pragma version 8\nint 1\nint 2\n+\nint 3\n*\npop\n",
+            "#pragma version 8\nbyte 0x1234\nbyte 0x5678\nconcat\nlen\npop\n",
+            "#pragma version 8\nint 1\nint 2\nmulw\npop\npop\n",
+            "#pragma version 8\nint 1\nint 2\naddw\npop\npop\n",
+            "#pragma version 8\nint 1\nint 2\nint 3\nint 4\ndivmodw\npop\npop\npop\npop\n",
+            "#pragma version 8\nint 1\nint 2\n==\npop\n",
+            "#pragma version 8\nbyte 0x1234\nbyte 0x1234\n==\npop\n",
+            "#pragma version 8\nint 1\nint 2\nswap\n-\npop\n",
+            "#pragma version 8\nint 7\ndup\n+\npop\n",
+            "#pragma version 8\nint 1\nint 2\ndup2\n+\n+\n+\npop\n",
+            "#pragma version 8\nint 1\nint 2\nint 3\ndig 2\npop\npop\npop\npop\n",
+            "#pragma version 8\nint 1\nint 0\nint 1\nselect\npop\n",
+            "#pragma version 8\nbyte 0x1234\nint 0\nint 1\nsetbit\npop\n",
+            "#pragma version 8\nint 1\nreturn\n",
+            "#pragma version 8\nint 1\nassert\nint 1\nreturn\n",
+        ];
+        for source in sources {
+            assemble_string(source).unwrap_or_else(|errs| {
+                panic!(
+                    "expected {source:?} to assemble cleanly, got: {:?}",
+                    errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+                )
+            });
+        }
     }
 }

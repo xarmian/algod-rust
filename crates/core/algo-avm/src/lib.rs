@@ -38,6 +38,7 @@ pub mod ops;
 pub mod sourcemap;
 pub mod tracer;
 pub mod txn_fields;
+mod type_track;
 pub mod validator;
 
 // Re-export key types for convenience.
