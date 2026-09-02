@@ -36,7 +36,9 @@ use algo_avm::tracer::{AppStateAccess, AppStateOp, AppStateType, UnnamedResource
 use algo_avm::txn_fields;
 use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
-use algo_types::{Address, SignedTransaction, TealValue, Transaction};
+use algo_types::{
+    Address, HoldingRef, LocalsRef, ResourceRef, SignedTransaction, TealValue, Transaction,
+};
 use sha2::{Digest, Sha512_256};
 
 use crate::apply::{
@@ -1073,7 +1075,20 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 .foreign_assets
                 .as_deref()
                 .is_some_and(|assets| assets.contains(&index));
+            // Named directly in `tx.Access` (AVM v10+) -- matches go's
+            // `availableAsset`'s `slices.ContainsFunc(Access, ...)` check.
+            let in_access = txn
+                .access
+                .as_deref()
+                .is_some_and(|access| access.iter().any(|rr| rr.asset == index));
+            // Group-wide resource sharing (v9+): some other txn in the group
+            // mentioned this asset. Matches go's `availableAsset`'s
+            // `cx.version >= sharedResourcesVersion` branch.
+            let shared = self.program_version >= SHARED_RESOURCES_VERSION
+                && self.group_resources.shared_asas.contains(&index);
             if in_foreign
+                || in_access
+                || shared
                 || txn.xaid == index
                 || txn.config_asset == index
                 || txn.freeze_asset == index
@@ -1102,16 +1117,25 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         let assets = txn.foreign_assets.as_deref().unwrap_or(&[]);
         let i = (index - 1) as usize;
         if i < assets.len() {
-            Ok(assets[i])
-        } else {
-            Err(AlgoError::Avm {
-                message: format!(
-                    "resolve_asset: index {} out of range (foreign_assets len={})",
-                    index,
-                    assets.len() + 1
-                ),
-            })
+            return Ok(assets[i]);
         }
+        // Matches go-algorand's `resolveAsset` fallback slot lookup into
+        // `tx.Access` (`Access[ref-1].Asset != 0`), tried after the legacy
+        // `ForeignAssets` slot lookup.
+        if let Some(access) = &txn.access {
+            if let Some(rr) = access.get(i) {
+                if rr.asset != 0 {
+                    return Ok(rr.asset);
+                }
+            }
+        }
+        Err(AlgoError::Avm {
+            message: format!(
+                "resolve_asset: index {} out of range (foreign_assets len={})",
+                index,
+                assets.len() + 1
+            ),
+        })
     }
 
     /// Core app-reference resolution, matching go-algorand's `resolveApp`
@@ -1132,7 +1156,19 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 .foreign_apps
                 .as_deref()
                 .is_some_and(|apps| apps.contains(&index));
+            // Named directly in `tx.Access` (AVM v10+) -- matches go's
+            // `availableApp`'s `slices.ContainsFunc(Access, ...)` check.
+            let in_access = txn
+                .access
+                .as_deref()
+                .is_some_and(|access| access.iter().any(|rr| rr.app == index));
+            // Group-wide resource sharing (v9+), matching go's `availableApp`'s
+            // `cx.version >= sharedResourcesVersion` branch.
+            let shared = self.program_version >= SHARED_RESOURCES_VERSION
+                && self.group_resources.shared_apps.contains(&index);
             if in_foreign
+                || in_access
+                || shared
                 || index == self.app_id
                 || txn.application_id == index
                 || self.created_apps.contains(&index)
@@ -1144,16 +1180,24 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         let apps = txn.foreign_apps.as_deref().unwrap_or(&[]);
         let i = (index - 1) as usize;
         if i < apps.len() {
-            Ok(apps[i])
-        } else {
-            Err(AlgoError::Avm {
-                message: format!(
-                    "resolve_app: index {} out of range (foreign_apps len={})",
-                    index,
-                    apps.len() + 1
-                ),
-            })
+            return Ok(apps[i]);
         }
+        // Matches go-algorand's `resolveApp` fallback slot lookup into
+        // `tx.Access` (`Access[ref-1].App != 0`).
+        if let Some(access) = &txn.access {
+            if let Some(rr) = access.get(i) {
+                if rr.app != 0 {
+                    return Ok(rr.app);
+                }
+            }
+        }
+        Err(AlgoError::Avm {
+            message: format!(
+                "resolve_app: index {} out of range (foreign_apps len={})",
+                index,
+                apps.len() + 1
+            ),
+        })
     }
 
     /// `AppForbidLowResources` (go-algorand v38+, `config/consensus.go`):
@@ -2879,19 +2923,182 @@ const SHARED_RESOURCES_VERSION: u8 = 9;
 /// transaction by its *sibling* transactions in the group, mirroring
 /// go-algorand's `resources` struct (`data/transactions/logic/resources.go`).
 ///
-/// Scope note: this covers only the foreign-array-style resource sharing
+/// Covers both the foreign-array-style resource sharing
 /// (`fillPayment`/`fillKeyRegistration`/`fillAssetConfig`/
-/// `fillAssetTransfer`/`fillAssetFreeze`/`fillApplicationCallForeign`).
-/// go's cross-product "Holding"/"Local State" sharing
-/// (`sharedHoldings`/`sharedLocals`, `allowsHolding`/`allowsLocals`) and the
-/// `tx.Access`-list-based fill path (`fillApplicationCallAccess`) are a
-/// distinct, larger piece of work tracked separately (see the issue this
-/// const block was introduced for).
+/// `fillAssetTransfer`/`fillAssetFreeze`/`fillApplicationCallForeign`) and,
+/// as of issue #841, the cross-product "Holding"/"Local State" sharing
+/// (`shared_holdings`/`shared_locals`, consulted by `allowsHolding`/
+/// `allowsLocals` -- see [`LedgerAvmContext::is_holding_available`]/
+/// [`LedgerAvmContext::is_local_available`]) and the `tx.Access`-list-based
+/// fill path (`fillApplicationCallAccess`).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct GroupResources {
     shared_accounts: std::collections::HashSet<[u8; 32]>,
     shared_asas: std::collections::HashSet<u64>,
     shared_apps: std::collections::HashSet<u64>,
+    /// Account+asset cross products made available by some single sibling
+    /// transaction. Matches go's `resources.sharedHoldings`.
+    shared_holdings: std::collections::HashSet<([u8; 32], u64)>,
+    /// Account+app cross products made available by some single sibling
+    /// transaction. Matches go's `resources.sharedLocals`.
+    shared_locals: std::collections::HashSet<([u8; 32], u64)>,
+}
+
+impl GroupResources {
+    /// Matches go-algorand's `resources.shareAccountAndHolding`.
+    fn share_account_and_holding(&mut self, addr: [u8; 32], asset_id: u64) {
+        self.shared_accounts.insert(addr);
+        if asset_id != 0 {
+            self.shared_holdings.insert((addr, asset_id));
+        }
+    }
+
+    /// Matches go-algorand's `resources.shareLocal`.
+    fn share_local(&mut self, addr: [u8; 32], app_id: u64) {
+        self.shared_locals.insert((addr, app_id));
+    }
+
+    /// Matches go-algorand's `resources.fillApplicationCallForeign`
+    /// (`data/transactions/logic/resources.go`): the legacy per-type
+    /// foreign-array fill path, used when `txn.access` is absent.
+    fn fill_application_call_foreign(&mut self, txn: &Transaction) {
+        let mut tx_accounts: Vec<[u8; 32]> = vec![txn.sender.0];
+        if let Some(accounts) = &txn.accounts {
+            tx_accounts.extend(accounts.iter().map(|a| a.0));
+        }
+        if let Some(assets) = &txn.foreign_assets {
+            self.shared_asas.extend(assets.iter().copied());
+        }
+        if txn.application_id != 0 {
+            tx_accounts.push(app_address(txn.application_id));
+            self.shared_apps.insert(txn.application_id);
+        }
+        if let Some(apps) = &txn.foreign_apps {
+            for &id in apps {
+                tx_accounts.push(app_address(id));
+                self.shared_apps.insert(id);
+            }
+        }
+        for addr in tx_accounts {
+            self.shared_accounts.insert(addr);
+            if let Some(assets) = &txn.foreign_assets {
+                for &id in assets {
+                    self.shared_holdings.insert((addr, id));
+                }
+            }
+            if txn.application_id != 0 {
+                self.shared_locals.insert((addr, txn.application_id));
+            }
+            if let Some(apps) = &txn.foreign_apps {
+                for &id in apps {
+                    self.shared_locals.insert((addr, id));
+                }
+            }
+        }
+    }
+
+    /// Matches go-algorand's `resources.fillApplicationCallAccess`
+    /// (`data/transactions/logic/resources.go`): the `tx.Access`-list fill
+    /// path (AVM v10+), used when `txn.access` is present.
+    fn fill_application_call_access(&mut self, txn: &Transaction, access: &[ResourceRef]) {
+        // The only implicitly available things are the sender, the app, and
+        // the sender's locals.
+        self.shared_accounts.insert(txn.sender.0);
+        if txn.application_id != 0 {
+            self.shared_apps.insert(txn.application_id);
+            self.share_local(txn.sender.0, txn.application_id);
+        }
+        for rr in access {
+            if !rr.address.is_zero() {
+                self.shared_accounts.insert(rr.address.0);
+            } else if rr.asset != 0 {
+                self.shared_asas.insert(rr.asset);
+            } else if rr.app != 0 {
+                self.shared_apps.insert(rr.app);
+            } else if rr.holding.as_ref().is_some_and(|h| !h.is_empty()) {
+                // `ApplicationCallTxnFields.wellFormed` (algo-validate)
+                // ensures no error here; a malformed entry is skipped,
+                // matching go's `_ = err` after `wellFormed` has already run.
+                if let Some((addr, asset)) =
+                    resolve_access_holding_ref(rr.holding.as_ref().unwrap(), access, txn.sender.0)
+                {
+                    self.shared_holdings.insert((addr, asset));
+                }
+            } else if rr.locals.as_ref().is_some_and(|l| !l.is_empty()) {
+                if let Some((addr, app)) = resolve_access_locals_ref(
+                    rr.locals.as_ref().unwrap(),
+                    access,
+                    txn.sender.0,
+                    txn.application_id,
+                ) {
+                    self.share_local(addr, app);
+                }
+            }
+            // BoxRef entries and fully-empty entries only affect the box
+            // read/write quota (`unnamedAccess`), not resource availability
+            // -- out of scope here.
+        }
+    }
+}
+
+/// Resolve a `HoldingRef`'s address/asset against the `Access` list,
+/// mirroring go-algorand's `HoldingRef.Resolve`
+/// (`data/transactions/application.go`). Returns `None` on any malformed
+/// index; static validation (`algo_validate`) already rejects malformed
+/// `tx.Access` before AVM evaluation runs, matching go's own
+/// "wellFormed ensures no error here" comment at its call site.
+fn resolve_access_holding_ref(
+    hr: &HoldingRef,
+    access: &[ResourceRef],
+    sender: [u8; 32],
+) -> Option<([u8; 32], u64)> {
+    let address = if hr.address == 0 {
+        sender
+    } else {
+        let rr = access.get((hr.address - 1) as usize)?;
+        if rr.address.is_zero() {
+            return None;
+        }
+        rr.address.0
+    };
+    if hr.asset == 0 {
+        return None;
+    }
+    let rr = access.get((hr.asset - 1) as usize)?;
+    if rr.asset == 0 {
+        return None;
+    }
+    Some((address, rr.asset))
+}
+
+/// Resolve a `LocalsRef`'s address/app against the `Access` list, mirroring
+/// go-algorand's `LocalsRef.Resolve`. See [`resolve_access_holding_ref`]'s
+/// doc for the "malformed entry is skipped" rationale.
+fn resolve_access_locals_ref(
+    lr: &LocalsRef,
+    access: &[ResourceRef],
+    sender: [u8; 32],
+    current_app: u64,
+) -> Option<([u8; 32], u64)> {
+    let address = if lr.address == 0 {
+        sender
+    } else {
+        let rr = access.get((lr.address - 1) as usize)?;
+        if rr.address.is_zero() {
+            return None;
+        }
+        rr.address.0
+    };
+    let app = if lr.app == 0 {
+        current_app
+    } else {
+        let rr = access.get((lr.app - 1) as usize)?;
+        if rr.app == 0 {
+            return None;
+        }
+        rr.app
+    };
+    Some((address, app))
 }
 
 /// Compute the set of resources every sibling transaction in `group` makes
@@ -2919,19 +3126,20 @@ pub(crate) fn fill_group_resources(group: &[SignedTransaction]) -> GroupResource
                 }
             }
             "axfer" => {
-                r.shared_asas.insert(txn.xaid);
-                r.shared_accounts.insert(txn.sender.0);
+                let id = txn.xaid;
+                r.shared_asas.insert(id);
+                r.share_account_and_holding(txn.sender.0, id);
                 if let Some(addr) = &txn.asset_receiver {
-                    r.shared_accounts.insert(addr.0);
+                    r.share_account_and_holding(addr.0, id);
                 }
                 if let Some(addr) = &txn.asset_sender {
                     if !addr.is_zero() {
-                        r.shared_accounts.insert(addr.0);
+                        r.share_account_and_holding(addr.0, id);
                     }
                 }
                 if let Some(addr) = &txn.asset_close_to {
                     if !addr.is_zero() {
-                        r.shared_accounts.insert(addr.0);
+                        r.share_account_and_holding(addr.0, id);
                     }
                 }
             }
@@ -2939,30 +3147,14 @@ pub(crate) fn fill_group_resources(group: &[SignedTransaction]) -> GroupResource
                 r.shared_accounts.insert(txn.sender.0);
                 r.shared_asas.insert(txn.freeze_asset);
                 if let Some(addr) = &txn.freeze_account {
-                    r.shared_accounts.insert(addr.0);
+                    r.share_account_and_holding(addr.0, txn.freeze_asset);
                 }
             }
             "appl" => {
-                // fillApplicationCallForeign (the tx.Access list variant is
-                // not yet modeled here -- see the struct doc comment).
-                r.shared_accounts.insert(txn.sender.0);
-                if let Some(assets) = &txn.foreign_assets {
-                    r.shared_asas.extend(assets.iter().copied());
-                }
-                if txn.application_id != 0 {
-                    r.shared_accounts.insert(app_address(txn.application_id));
-                    r.shared_apps.insert(txn.application_id);
-                }
-                if let Some(apps) = &txn.foreign_apps {
-                    for &id in apps {
-                        r.shared_accounts.insert(app_address(id));
-                        r.shared_apps.insert(id);
-                    }
-                }
-                if let Some(accounts) = &txn.accounts {
-                    for addr in accounts {
-                        r.shared_accounts.insert(addr.0);
-                    }
+                if let Some(access) = &txn.access {
+                    r.fill_application_call_access(txn, access);
+                } else {
+                    r.fill_application_call_foreign(txn);
                 }
             }
             _ => {
@@ -3273,6 +3465,26 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         let txn = &self.current_txn().txn;
         if index == 0 {
             return Ok(txn.sender.0);
+        }
+        // Matches go-algorand's `ApplicationCallTxnFields.AddressByIndex`
+        // (`data/transactions/application.go`): when `tx.Access` is present
+        // (AVM v10+), indices > 0 resolve into it instead of the legacy
+        // `Accounts` array (only one of the two is ever populated).
+        if let Some(access) = &txn.access {
+            let i = (index - 1) as usize;
+            return match access.get(i) {
+                Some(rr) if !rr.address.is_zero() => Ok(rr.address.0),
+                Some(_) => Err(AlgoError::Avm {
+                    message: format!("address reference {index} is not an Address in tx.Access"),
+                }),
+                None => Err(AlgoError::Avm {
+                    message: format!(
+                        "invalid Account reference {} exceeds length of tx.Access {}",
+                        index,
+                        access.len()
+                    ),
+                }),
+            };
         }
         let accounts = txn.accounts.as_deref().unwrap_or(&[]);
         let i = (index - 1) as usize;
@@ -4809,6 +5021,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         }
         // Check the current transaction's foreign assets array.
         let txn = &self.group[self.group_index].txn;
+        // Named directly in `tx.Access` (AVM v10+). Matches go-algorand's
+        // `availableAsset`'s `slices.ContainsFunc(Access, ...)` check.
+        if let Some(ref access) = txn.access {
+            if access.iter().any(|rr| rr.asset == asset_id) {
+                return true;
+            }
+        }
         if let Some(ref assets) = txn.foreign_assets {
             if assets.contains(&asset_id) {
                 return true;
@@ -4841,8 +5060,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         if app_id == self.app_id {
             return true;
         }
-        // Check the current transaction's foreign apps array.
+        // Named directly in `tx.Access` (AVM v10+). Matches go-algorand's
+        // `availableApp`'s `slices.ContainsFunc(Access, ...)` check.
         let txn = &self.group[self.group_index].txn;
+        if let Some(ref access) = txn.access {
+            if access.iter().any(|rr| rr.app == app_id) {
+                return true;
+            }
+        }
+        // Check the current transaction's foreign apps array.
         if let Some(ref apps) = txn.foreign_apps {
             if apps.contains(&app_id) {
                 return true;
@@ -4884,6 +5110,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         if txn.sender.0 == *addr {
             return true;
         }
+        // Matches go-algorand's `IndexByAddress`: tries `tx.Access` first
+        // (AVM v10+; only one of `Access`/`Accounts` is ever populated).
+        if let Some(ref access) = txn.access {
+            if access.iter().any(|rr| rr.address.0 == *addr) {
+                return true;
+            }
+        }
         if let Some(ref accounts) = txn.accounts {
             if accounts.iter().any(|a| a.0 == *addr) {
                 return true;
@@ -4910,6 +5143,73 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         }
         // The current app's own address is always available.
         if app_address(self.app_id) == *addr {
+            return true;
+        }
+        false
+    }
+
+    /// Matches go-algorand's `allowsHolding`
+    /// (`data/transactions/logic/resources.go`): an account+asset holding
+    /// cross-product is available if some single sibling transaction named
+    /// both together (`shared_holdings`), if the asset was created earlier
+    /// in the group (any available account's holding of it is then
+    /// available), if the account is the address of an app created earlier
+    /// in the group (any available asset's holding for it is then
+    /// available), or -- under simulation's `allow_unnamed_resources` --
+    /// unconditionally (bypass + track, not reject).
+    ///
+    /// Callers must independently gate on `program_version >=
+    /// SHARED_RESOURCES_VERSION` before consulting this, exactly matching
+    /// go's own `holdingReference`/`requireHolding`, which never call
+    /// `allowsHolding` below that version.
+    fn is_holding_available(&self, addr: &[u8; 32], asset_id: u64) -> bool {
+        if self
+            .group_resources
+            .shared_holdings
+            .contains(&(*addr, asset_id))
+        {
+            return true;
+        }
+        if self.created_assets.contains(&asset_id) {
+            return self.is_account_available(addr);
+        }
+        if self.created_apps.iter().any(|&id| app_address(id) == *addr) {
+            return self.is_asset_available(asset_id);
+        }
+        // Simulation's `allow_unnamed_resources`: bypass unconditionally
+        // (the account/asset-name access is tracked and reported via
+        // `note_holding_access`, called separately by the real accessors --
+        // matches `is_account_available`'s own unconditional-bypass
+        // pattern, not `is_asset_available`'s stricter one, which has no
+        // such bypass and would otherwise wrongly reject here).
+        if self.unnamed_tracking.is_some() {
+            return true;
+        }
+        false
+    }
+
+    /// Matches go-algorand's `allowsLocals`
+    /// (`data/transactions/logic/resources.go`). See
+    /// [`Self::is_holding_available`] for the shared rationale; the same
+    /// caller-side version gate applies.
+    fn is_local_available(&self, addr: &[u8; 32], app_id: u64) -> bool {
+        if self
+            .group_resources
+            .shared_locals
+            .contains(&(*addr, app_id))
+        {
+            return true;
+        }
+        if self.created_apps.contains(&app_id) {
+            return self.is_account_available(addr);
+        }
+        if self.created_apps.iter().any(|&id| app_address(id) == *addr) {
+            return self.is_app_available(app_id);
+        }
+        // See `is_holding_available`'s comment: unconditional bypass under
+        // simulation's `allow_unnamed_resources`, not gated through
+        // `is_app_available` (which has no such bypass).
+        if self.unnamed_tracking.is_some() {
             return true;
         }
         false
@@ -5707,6 +6007,143 @@ mod tests {
         assert_eq!(ctx.resolve_account(2).unwrap(), acct2.0);
         // Out of range
         assert!(ctx.resolve_account(3).is_err());
+    }
+
+    // ── tx.Access-list resolution (issue #841) ──────────────────────────
+
+    #[test]
+    fn resolve_account_uses_access_list_when_present() {
+        // Matches go-algorand's `AddressByIndex`: when `tx.Access` is
+        // present, indices > 0 resolve into it instead of `Accounts`.
+        let sender = [10u8; 32];
+        let acct1 = Address([30u8; 32]);
+        let mut txn = make_appl_txn(sender, 42, vec![], vec![], vec![]);
+        txn.txn.access = Some(vec![
+            ResourceRef {
+                address: acct1,
+                ..Default::default()
+            },
+            ResourceRef {
+                asset: 1050,
+                ..Default::default()
+            },
+        ]);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        assert_eq!(ctx.resolve_account(0).unwrap(), sender);
+        assert_eq!(ctx.resolve_account(1).unwrap(), acct1.0);
+        // Access[1] is an Asset entry, not an Address -- must error, not
+        // silently return a zero address.
+        let err = ctx.resolve_account(2).unwrap_err();
+        assert!(
+            err.to_string().contains("is not an Address in tx.Access"),
+            "unexpected: {err}"
+        );
+        // Out of range.
+        assert!(ctx.resolve_account(3).is_err());
+    }
+
+    #[test]
+    fn is_account_available_consults_access_list() {
+        let sender = [10u8; 32];
+        let named = [11u8; 32];
+        let stranger = [12u8; 32];
+        let mut txn = make_appl_txn(sender, 42, vec![], vec![], vec![]);
+        txn.txn.access = Some(vec![ResourceRef {
+            address: Address(named),
+            ..Default::default()
+        }]);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        assert!(ctx.is_account_available(&sender));
+        assert!(ctx.is_account_available(&named));
+        assert!(!ctx.is_account_available(&stranger));
+    }
+
+    #[test]
+    fn is_asset_available_and_resolve_asset_consult_access_list() {
+        let sender = [10u8; 32];
+        let mut txn = make_appl_txn(sender, 1042, vec![], vec![], vec![]);
+        txn.txn.access = Some(vec![ResourceRef {
+            asset: 1050,
+            ..Default::default()
+        }]);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        assert!(ctx.is_asset_available(1050));
+        assert!(!ctx.is_asset_available(1060));
+        // A direct-reference resolve (the id itself, named via Access) must
+        // succeed even though it's not in a legacy `ForeignAssets` array.
+        assert_eq!(ctx.resolve_asset(1050).unwrap(), 1050);
+    }
+
+    #[test]
+    fn is_app_available_and_resolve_app_consult_access_list() {
+        let sender = [10u8; 32];
+        let mut txn = make_appl_txn(sender, 1042, vec![], vec![], vec![]);
+        txn.txn.access = Some(vec![ResourceRef {
+            app: 1100,
+            ..Default::default()
+        }]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 1042;
+
+        assert!(ctx.is_app_available(1100));
+        assert!(!ctx.is_app_available(1200));
+        assert_eq!(ctx.resolve_app(1100).unwrap(), 1100);
+    }
+
+    #[test]
+    fn resolve_asset_and_resolve_app_fall_back_to_access_slot() {
+        // Matches go's `resolveAsset`/`resolveApp` fallback slot lookup into
+        // `tx.Access` (`Access[ref-1].Asset/App != 0`), tried when the
+        // integer isn't itself a directly-available id.
+        let sender = [10u8; 32];
+        let mut txn = make_appl_txn(sender, 1042, vec![], vec![], vec![]);
+        txn.txn.access = Some(vec![ResourceRef {
+            asset: 1050,
+            ..Default::default()
+        }]);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn.clone()]);
+        // ref=1 is not itself an available asset id (1 != 1050), but slot 1
+        // (1-based) in Access names asset 1050.
+        assert_eq!(ctx.resolve_asset(1).unwrap(), 1050);
+
+        let mut txn2 = txn;
+        txn2.txn.access = Some(vec![ResourceRef {
+            app: 1100,
+            ..Default::default()
+        }]);
+        let mut store2 = LedgerState::new();
+        let mut ctx2 = make_context(&mut store2, vec![txn2]);
+        ctx2.app_id = 1042;
+        assert_eq!(ctx2.resolve_app(1).unwrap(), 1100);
+    }
+
+    #[test]
+    fn resolve_asset_and_resolve_app_consult_group_wide_sharing() {
+        // Matches go's `resolveAsset`/`resolveApp` calling `availableAsset`/
+        // `availableApp`, which include the v9+ group-sharing set -- a gap
+        // fixed alongside the Access-list work (issue #841), since both are
+        // consulted through the same "direct reference" availability check.
+        let sender = [10u8; 32];
+        let sibling = make_appl_txn([99u8; 32], 1042, vec![], vec![], vec![1050]);
+        let mut txn = make_appl_txn(sender, 1042, vec![], vec![], vec![]);
+        txn.txn.foreign_apps = Some(vec![1100]);
+        let group = vec![sibling, txn];
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, group);
+        ctx.set_program_version(9);
+        ctx.group_index = 1;
+
+        // Asset 1050 is only in the *sibling's* ForeignAssets, not this
+        // txn's own -- available only via v9+ group sharing.
+        assert_eq!(ctx.resolve_asset(1050).unwrap(), 1050);
     }
 
     #[test]
@@ -7845,6 +8282,237 @@ mod tests {
         assert!(resources.shared_apps.contains(&55));
         assert!(resources.shared_accounts.contains(&app_address(55)));
         assert!(resources.shared_asas.contains(&66));
+    }
+
+    // ── Holding/local cross-product sharing (issue #841) ────────────────
+
+    #[test]
+    fn fill_group_resources_covers_axfer_and_afrz_holdings() {
+        use serde_bytes::ByteBuf;
+        let sender = [40u8; 32];
+        let receiver = [41u8; 32];
+        let asset_sender = [42u8; 32];
+        let asset_close_to = [43u8; 32];
+        let axfer = SignedTransaction {
+            txn: Transaction {
+                txn_type: "axfer".into(),
+                sender: Address(sender),
+                fee: 1000,
+                xaid: 900,
+                asset_receiver: Some(Address(receiver)),
+                asset_sender: Some(Address(asset_sender)),
+                asset_close_to: Some(Address(asset_close_to)),
+                note: ByteBuf::from(Vec::new()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let freeze_account = [44u8; 32];
+        let afrz = SignedTransaction {
+            txn: Transaction {
+                txn_type: "afrz".into(),
+                sender: Address([45u8; 32]),
+                fee: 1000,
+                freeze_asset: 901,
+                freeze_account: Some(Address(freeze_account)),
+                note: ByteBuf::from(Vec::new()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let resources = fill_group_resources(&[axfer, afrz]);
+
+        // axfer: sender, receiver, AssetSender, and AssetCloseTo all share
+        // the holding of asset 900 (go's `shareAccountAndHolding`).
+        assert!(resources.shared_holdings.contains(&(sender, 900)));
+        assert!(resources.shared_holdings.contains(&(receiver, 900)));
+        assert!(resources.shared_holdings.contains(&(asset_sender, 900)));
+        assert!(resources.shared_holdings.contains(&(asset_close_to, 900)));
+        // afrz: FreezeAccount shares the holding of FreezeAsset.
+        assert!(resources.shared_holdings.contains(&(freeze_account, 901)));
+        // A different (account, asset) pair from either txn is not shared.
+        assert!(!resources.shared_holdings.contains(&(sender, 901)));
+    }
+
+    #[test]
+    fn fill_group_resources_covers_appl_foreign_cross_products() {
+        // A single appl's own Accounts x ForeignAssets/ForeignApps/
+        // ApplicationID cross product is shared -- matches go's
+        // `fillApplicationCallForeign`, which iterates ep.TxnGroup
+        // (including the executing txn's own fields).
+        let sender = [50u8; 32];
+        let other_acct = [51u8; 32];
+        let appl = make_appl_txn(sender, 900, vec![Address(other_acct)], vec![901], vec![950]);
+        let resources = fill_group_resources(&[appl]);
+
+        // Every account named by this txn (sender, Accounts[], the called
+        // app's address, and ForeignApps' addresses) is crossed with every
+        // named asset/app.
+        assert!(resources.shared_holdings.contains(&(sender, 950)));
+        assert!(resources.shared_holdings.contains(&(other_acct, 950)));
+        assert!(resources.shared_holdings.contains(&(app_address(900), 950)));
+        assert!(resources.shared_holdings.contains(&(app_address(901), 950)));
+        assert!(resources.shared_locals.contains(&(sender, 900)));
+        assert!(resources.shared_locals.contains(&(other_acct, 900)));
+        assert!(resources.shared_locals.contains(&(sender, 901)));
+        assert!(resources.shared_locals.contains(&(other_acct, 901)));
+        // A holding/local for an unrelated asset/app is not shared.
+        assert!(!resources.shared_holdings.contains(&(sender, 999)));
+        assert!(!resources.shared_locals.contains(&(sender, 999)));
+    }
+
+    #[test]
+    fn fill_group_resources_covers_access_list() {
+        // Matches go's `fillApplicationCallAccess`: the sender, the called
+        // app, and the sender's locals for it are implicitly available;
+        // Access entries name everything else, including resolved
+        // Holding/Locals cross-product refs.
+        let sender = [60u8; 32];
+        let other_acct = Address([61u8; 32]);
+        let txn = SignedTransaction {
+            txn: Transaction {
+                txn_type: "appl".into(),
+                sender: Address(sender),
+                fee: 1000,
+                application_id: 900,
+                access: Some(vec![
+                    ResourceRef {
+                        address: other_acct,
+                        ..Default::default()
+                    },
+                    ResourceRef {
+                        asset: 950,
+                        ..Default::default()
+                    },
+                    ResourceRef {
+                        app: 901,
+                        ..Default::default()
+                    },
+                    ResourceRef {
+                        // Holding for (Access[0]=other_acct, Access[1]=asset 950).
+                        holding: Some(HoldingRef { address: 1, asset: 2 }),
+                        ..Default::default()
+                    },
+                    ResourceRef {
+                        // Locals for (sender (0), Access[2]=app 901).
+                        locals: Some(LocalsRef { address: 0, app: 3 }),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resources = fill_group_resources(&[txn]);
+
+        assert!(resources.shared_accounts.contains(&sender));
+        assert!(resources.shared_accounts.contains(&other_acct.0));
+        assert!(resources.shared_asas.contains(&950));
+        assert!(resources.shared_apps.contains(&901));
+        assert!(resources.shared_apps.contains(&900)); // implicit: the called app
+        assert!(resources.shared_locals.contains(&(sender, 900))); // implicit: sender's own locals
+        assert!(resources.shared_holdings.contains(&(other_acct.0, 950)));
+        assert!(resources.shared_locals.contains(&(sender, 901)));
+    }
+
+    // ── allowsHolding / allowsLocals cross-product gate (issue #841) ────
+
+    #[test]
+    fn is_holding_available_group_shared_pair() {
+        let sender = [70u8; 32];
+        let other = [71u8; 32];
+        let mut txn = make_appl_txn(sender, 900, vec![], vec![], vec![950]);
+        txn.txn.accounts = Some(vec![Address(other)]);
+        let group = vec![txn];
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, group);
+        ctx.set_program_version(9);
+
+        // sender/other x asset 950 is shared via this txn's own foreign
+        // arrays (fillApplicationCallForeign cross product).
+        assert!(ctx.is_holding_available(&sender, 950));
+        assert!(ctx.is_holding_available(&other, 950));
+        // A holding never named by any txn in the group is not available.
+        assert!(!ctx.is_holding_available(&sender, 999));
+    }
+
+    #[test]
+    fn is_local_available_group_shared_pair() {
+        let sender = [72u8; 32];
+        let other = [73u8; 32];
+        let mut txn = make_appl_txn(sender, 900, vec![], vec![901], vec![]);
+        txn.txn.accounts = Some(vec![Address(other)]);
+        let group = vec![txn];
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, group);
+        ctx.set_program_version(9);
+
+        assert!(ctx.is_local_available(&sender, 901));
+        assert!(ctx.is_local_available(&other, 901));
+        assert!(!ctx.is_local_available(&sender, 999));
+    }
+
+    #[test]
+    fn is_holding_available_created_asset_any_available_account() {
+        let sender = [74u8; 32];
+        let txn = make_appl_txn(sender, 900, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.set_program_version(9);
+        ctx.created_assets.push(1234);
+
+        // An asset created earlier in the group is available for the
+        // holding of any *available* account (here, the sender).
+        assert!(ctx.is_holding_available(&sender, 1234));
+        // But not for an account this group never made available.
+        assert!(!ctx.is_holding_available(&[99u8; 32], 1234));
+    }
+
+    #[test]
+    fn is_local_available_created_app_any_available_account() {
+        let sender = [75u8; 32];
+        let txn = make_appl_txn(sender, 900, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.set_program_version(9);
+        ctx.created_apps.push(1234);
+
+        assert!(ctx.is_local_available(&sender, 1234));
+        assert!(!ctx.is_local_available(&[99u8; 32], 1234));
+    }
+
+    #[test]
+    fn is_holding_available_created_app_address_any_available_asset() {
+        let sender = [76u8; 32];
+        let txn = make_appl_txn(sender, 900, vec![], vec![], vec![950]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.set_program_version(9);
+        ctx.created_apps.push(1234);
+        let created_app_addr = app_address(1234);
+
+        // The address of an app created earlier in the group is treated
+        // like an "available account" for holdings of any *available*
+        // asset.
+        assert!(ctx.is_holding_available(&created_app_addr, 950));
+        assert!(!ctx.is_holding_available(&created_app_addr, 999));
+    }
+
+    #[test]
+    fn is_holding_available_and_is_local_available_bypass_under_unnamed_tracking() {
+        // Simulation's `allow_unnamed_resources`: bypass + track, not
+        // reject, for both halves and the cross-product itself.
+        let sender = [77u8; 32];
+        let txn = make_appl_txn(sender, 900, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.set_program_version(9);
+        ctx.enable_unnamed_resource_tracking(Arc::new(NamedGroupResources::default()));
+
+        assert!(ctx.is_holding_available(&[88u8; 32], 12345));
+        assert!(ctx.is_local_available(&[88u8; 32], 12345));
     }
 
     #[test]
