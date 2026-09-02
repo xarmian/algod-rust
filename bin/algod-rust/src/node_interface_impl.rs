@@ -5526,6 +5526,60 @@ mod tests {
         );
     }
 
+    /// Issue #824 theme 2, mirroring go-algorand's
+    /// `TestLookupAppResourcesParamsOnlyDeletion`
+    /// (`../go-algorand/ledger/acctdeltas_test.go`): go's incremental
+    /// `lookupApplicationResources` pagination counts a "params-only"
+    /// app (a creator who never opted into its own app, so the row has
+    /// ownership but no local state) that later has its params deleted as a
+    /// removed row that must not shrink the page below `limit` when other
+    /// apps remain. algod-rust has no equivalent delta-count staging layer
+    /// (see the note on `lookup_applications_pagination_has_no_gap_after_a_deletion`
+    /// above) — `lookup_applications` recomputes the id set fresh each call
+    /// from `created_apps_for_addr` UNION `app_local_states_for_addr`, and
+    /// `remove_app_params` deletes a params-only row outright (sqlite.rs) —
+    /// so the scenario cannot gap by construction. This pins that outcome:
+    /// four apps created by one address (app 3000 params-only, apps
+    /// 3001-3003 with both params and local state), then app 3000's params
+    /// are deleted; a page with `limit=3` must still return exactly
+    /// [3001, 3002, 3003], not a short page.
+    #[tokio::test]
+    async fn lookup_applications_params_only_deletion_does_not_shrink_page() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let creator = Address([0x30; 32]);
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            // 3000: params only, creator never opted in.
+            ledger.set_app_params(3000, app_params(creator));
+            // 3001-3003: params + local state (creator opted in).
+            for app_id in 3001u64..=3003 {
+                ledger.set_app_params(app_id, app_params(creator));
+                ledger.set_app_local_state(
+                    &creator,
+                    app_id,
+                    AppLocalState {
+                        schema: StateSchema::default(),
+                        key_value: Default::default(),
+                    },
+                );
+            }
+            // Delete app 3000's params (it has no local state, so this
+            // removes the row entirely rather than merely stripping the
+            // ownership flag).
+            ledger.remove_app_params(3000);
+        }
+
+        let (page, _) = adapter
+            .lookup_applications(&creator, 0, 3, true)
+            .await
+            .expect("page after params-only deletion");
+        assert_eq!(
+            page.iter().map(|r| r.app_id).collect::<Vec<_>>(),
+            vec![3001, 3002, 3003],
+            "params-only deletion must not cause a short page: {page:?}"
+        );
+    }
+
     /// Issue #505 correctness rule 3, mirroring go-algorand's
     /// `TestLookupApplicationResourcesEmptyPageDoesNotError`
     /// (`../go-algorand/ledger/acctdeltas_test.go`): looking up an address
@@ -5713,6 +5767,91 @@ mod tests {
         // Unknown app → zero, not an error.
         let (zero, _) = adapter.total_boxes(777).await.expect("total boxes empty");
         assert_eq!(zero, 0);
+    }
+
+    /// Issue #824 theme 2, mirroring go-algorand's `TestBoxNamesByAppIDs`
+    /// (`../go-algorand/ledger/acctupdates_test.go`): box names are
+    /// arbitrary bytes, not text, and must round-trip through box storage
+    /// and prefix lookup byte-exactly even when they look like SQL
+    /// fragments, contain embedded NUL bytes, or are non-ASCII/non-UTF8-safe
+    /// text. `make_box_key`/`box_keys_for_app` use parameterized rusqlite
+    /// BLOB comparisons (sqlite.rs), so there is no SQL-injection vector to
+    /// begin with, but the byte-exact round trip (including delete leaving
+    /// no trace) is still worth pinning directly, as go's test does. Each
+    /// name gets its own app ID (as go's test does) so a prefix lookup with
+    /// an empty suffix isolates exactly one box per app.
+    #[tokio::test]
+    async fn box_names_with_special_characters_round_trip() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+
+        let box_names: Vec<&[u8]> = vec![
+            b" ",
+            b"     \t",
+            b" % ",
+            b" ? = % ;",
+            b"; DROP *;",
+            b"OR 1 = 1;",
+            b"\"      ;  SELECT * FROM kvstore; DROP acctrounds; ",
+            b"; SELECT key from kvstore WHERE key LIKE %;",
+            b"?&%!=",
+            b"b64:APj/AA==",
+            b"str:123.3/aa\\\\0",
+            &[0u8, 255, 254, 254],
+            &[0u8, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF],
+            &[b'%', b'a', b'b', b'c', 0, 0, b'%', b'a', b'!'],
+            "\u{2122}\u{a3}\u{b4}\u{b4}\u{2202}\u{192}".as_bytes(),
+            "背负青天而莫之夭阏者".as_bytes(),
+        ];
+
+        // Assign each box name its own app ID, insert it, and confirm a
+        // full (empty-prefix) lookup finds exactly that one name back,
+        // byte-for-byte.
+        let app_ids: Vec<u64> = (9000..9000 + box_names.len() as u64).collect();
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            for (&app_id, &name) in app_ids.iter().zip(box_names.iter()) {
+                ledger.set_box(app_id, name, b"v".to_vec());
+            }
+        }
+        for (&app_id, &name) in app_ids.iter().zip(box_names.iter()) {
+            let (found, _) = adapter
+                .lookup_keys_by_prefix(app_id, &[])
+                .await
+                .unwrap_or_else(|e| panic!("lookup_keys_by_prefix for {name:?}: {e}"));
+            assert_eq!(
+                found,
+                vec![name.to_vec()],
+                "box name round trip mismatch for {name:?}"
+            );
+
+            let (value, _) = adapter
+                .lookup_kv(app_id, name)
+                .await
+                .unwrap_or_else(|e| panic!("lookup_kv for {name:?}: {e}"));
+            assert_eq!(value, Some(b"v".to_vec()), "kv lookup mismatch for {name:?}");
+        }
+
+        // Delete every box and confirm no trace remains (both the raw KV
+        // lookup and the prefix listing).
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            for (&app_id, &name) in app_ids.iter().zip(box_names.iter()) {
+                assert!(
+                    ledger.delete_box(app_id, name),
+                    "delete_box must report an existing box removed for {name:?}"
+                );
+            }
+        }
+        for (&app_id, &name) in app_ids.iter().zip(box_names.iter()) {
+            let (found, _) = adapter
+                .lookup_keys_by_prefix(app_id, &[])
+                .await
+                .unwrap_or_else(|e| panic!("post-delete lookup_keys_by_prefix for {name:?}: {e}"));
+            assert!(
+                found.is_empty(),
+                "deleted box name must not remain in prefix listing: {name:?}"
+            );
+        }
     }
 
     // ---- Operational getters (TASK-267) ----
