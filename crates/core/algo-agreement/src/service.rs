@@ -1879,6 +1879,112 @@ mod tests {
         assert!(quit.load(Ordering::SeqCst));
     }
 
+    /// Port of go-algorand's `TestAgreementServiceStartDeadline`
+    /// (`agreement/service_test.go:2513`) — theme 3 of issue #825
+    /// ("service-level fast-recovery and regression scenarios").
+    ///
+    /// Drives `main_loop` directly (bypassing `Service::start`'s spawned
+    /// demux thread, exactly as Go's test calls `s.mainLoop(...)` directly
+    /// on the test goroutine) with a closed `input` channel so the loop
+    /// bootstraps, emits exactly one `ExternalDemuxSignals` on `ready`, then
+    /// exits on the very next (disconnected) `input.recv()`.
+    ///
+    /// Asserts the first `ready` signal reports:
+    ///   - `deadline.duration` == `AgreementFilterTimeoutPeriod0` (period 0's
+    ///     filter timeout — `bootstrap_fresh` seeds `player.deadline` from
+    ///     `filter_timeout(Period(0), cparams)`), using a params fixture
+    ///     whose period-0 filter timeout has been scaled 100x from the
+    ///     default so a bug that instead used the steady-state
+    ///     `agreement_filter_timeout` would be caught.
+    ///   - `current_round` == the ledger's `next_round()`.
+    ///
+    /// A background thread stands in for the demux thread that
+    /// `Service::start` would normally spawn: it drains `output` and acks
+    /// each batch on `actions_done`, satisfying the handshake `main_loop`
+    /// blocks on before it can reach the `ready.send(...)` call (see the
+    /// "Step 1"/"Step 2" comments above `main_loop`'s body) — without this,
+    /// `main_loop` would deadlock waiting for `actions_done.recv()`.
+    #[test]
+    fn main_loop_start_deadline_uses_period0_filter_timeout() {
+        // Scale AgreementFilterTimeoutPeriod0 100x off the v41 default so a
+        // regression that fell back to the steady-state filter timeout (or
+        // any other duration) would fail this assertion, mirroring Go's
+        // `testConsensusParams.AgreementFilterTimeoutPeriod0 *= 100`.
+        let mut cparams = v41_params();
+        cparams.agreement_filter_timeout_period0 *= 100;
+        let expected_deadline = cparams.agreement_filter_timeout_period0;
+
+        let next_round = Round(100);
+        let ledger = Arc::new(StubLedger::new(cparams, next_round));
+
+        let quit = Arc::new(AtomicBool::new(false));
+        // Immediately-closed input channel: main_loop's first `input.recv()`
+        // (after sending the bootstrap batch + the first ready signal)
+        // observes a disconnected sender and breaks out of the loop, mirroring
+        // Go's `close(inputCh)` before `s.mainLoop(...)` is called.
+        let (input_tx, input_rx) = mpsc::channel::<Option<crate::demux::ExternalEvent>>();
+        drop(input_tx);
+
+        let (output_tx, output_rx) = mpsc::channel::<Vec<Action>>();
+        let (actions_done_tx, actions_done_rx) = mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = mpsc::channel::<ExternalDemuxSignals>();
+        let (pseudo_events_tx, _pseudo_events_rx) =
+            mpsc::channel::<Vec<crate::demux::ExternalEvent>>();
+
+        // Stand-in for the demux thread: ack every action batch so main_loop's
+        // `actions_done.recv()` handshake unblocks and the loop can proceed to
+        // send the ready signal.
+        let drain_handle = thread::Builder::new()
+            .name("test-drain-output".into())
+            .spawn(move || {
+                while output_rx.recv().is_ok() {
+                    if actions_done_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn drain thread");
+
+        main_loop(
+            ledger,
+            TestKeyManager,
+            StubBlockFactory::new(),
+            StubRandomSource::constant(0),
+            quit,
+            input_rx,
+            output_tx,
+            actions_done_rx,
+            ready_tx,
+            pseudo_events_tx,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            Arc::new(ParticipationMetrics::new()),
+            Tracer::default(),
+        );
+
+        drain_handle.join().expect("drain thread should not panic");
+
+        let signals = ready_rx
+            .try_recv()
+            .expect("main_loop must send exactly one ready signal before observing closed input");
+        assert_eq!(
+            signals.deadline.duration, expected_deadline,
+            "bootstrap deadline must be period 0's filter timeout, not the steady-state one"
+        );
+        assert_eq!(
+            signals.current_round, next_round,
+            "bootstrap ready signal must report the ledger's next round"
+        );
+
+        // Exactly one signal — main_loop must exit on the next input.recv()
+        // (disconnected) rather than looping again.
+        assert!(
+            ready_rx.try_recv().is_err(),
+            "main_loop must exit after the input channel disconnects, not send a second signal"
+        );
+    }
+
     #[test]
     fn do_rezero_action_records_clock() {
         let mut clocks = HashMap::new();
