@@ -22,43 +22,83 @@
 //!
 //! Mirrors a deliberately incremental slice of go-algorand's compile-time
 //! stack-type inference: `data/transactions/logic/assembler.go`'s
-//! `ProgramKnowledge` (the tracked `stack` of [`StackType`]s), `trackStack`
-//! (arg/return checking against the tracked stack), and the handful of
-//! `type*` "refine" functions (`typeSwap`, `typeDup`, `typeDupTwo`,
-//! `typeSelect`, `typeSetBit`, `typeDig`, `typeEquals`) whose return type
-//! depends on what's actually tracked on the stack rather than a fixed
-//! per-opcode proto.
+//! `ProgramKnowledge` (the tracked `stack` of [`StackType`]s, plus its
+//! `deadcode`/`bottom` fields -- see below), `trackStack` (arg/return
+//! checking against the tracked stack), and the handful of `type*` "refine"
+//! functions (`typeSwap`, `typeDup`, `typeDupTwo`, `typeSelect`,
+//! `typeSetBit`, `typeDig`, `typeEquals`) whose return type depends on
+//! what's actually tracked on the stack rather than a fixed per-opcode
+//! proto.
 //!
 //! # What this slice covers
 //!
-//! Straight-line (branch-free) instruction sequences: arithmetic/logic/
-//! comparison opcodes with a fixed uint64/bytes proto, literal pushes
-//! (`int`, `byte`, `pushint`, `pushbytes`, `intc*`, `bytec*`, `addr`,
-//! `arg*`, `method`), and the stack-shuffling opcodes above whose return
-//! type is data-dependent. On a type mismatch it reports the same
-//! diagnostic shape as go-algorand's `typeErrorf` calls in `trackStack`:
-//! `"<instr> arg <i> wanted type <want> got <got>"` or `"<instr> expects
-//! <n> stack arguments but stack height is <h>"`.
+//! - Straight-line (branch-free) instruction sequences: arithmetic/logic/
+//!   comparison opcodes with a fixed uint64/bytes proto, literal pushes
+//!   (`int`, `byte`, `pushint`, `pushbytes`, `intc*`, `bytec*`, `addr`,
+//!   `arg*`, `method`), and the stack-shuffling opcodes above whose return
+//!   type is data-dependent.
+//! - **Branch-merge unification** (`TestBranchAssemblyTypeCheck`,
+//!   `TestTypeTracking`, `TestTypeTrackingRegression`): mirrors go's actual
+//!   algorithm exactly, which turns out to be simpler than a full
+//!   per-predecessor CFG merge. go tracks two extra bits of state
+//!   alongside the stack (`ProgramKnowledge.deadcode`/`bottom`,
+//!   `assembler.go:307-380`):
+//!   - `b`/`callsub`/`retsub`/`err`/`return` (`OpSpec.deadens`,
+//!     `opcodes.go:520-527`) mark everything until the next label as dead
+//!     code: no type checks or stack-effect tracking happen there (the
+//!     tracked stack is left empty), so a real type mistake inside dead
+//!     code is never reported. `callsub` additionally reopens analysis
+//!     immediately (its own target is a label-like entry point, since
+//!     `retsub` returns right after it), rather than waiting for a
+//!     textual label.
+//!   - Reaching a label after dead code reopens analysis with a
+//!     *permissive* stack: further underflow (asking for more stack
+//!     arguments than are currently tracked) is silently satisfied by an
+//!     implicit, unlimited supply of [`StackType::Any`] rather than
+//!     reported as a height error, mirroring `bottom` becoming `StackAny`.
+//!   - Critically, a label reached *without* preceding dead code (e.g.
+//!     immediately after a conditional `bnz`/`bz`, which does not deaden)
+//!     does **not** reset anything -- go simply trusts that whatever's
+//!     tracked along the fallthrough path also describes the state at any
+//!     jump into that label, and keeps analyzing with it unchanged. This is
+//!     asymmetric and not a true meet-over-all-predecessors dataflow
+//!     join, but it is exactly go's real behavior, confirmed against
+//!     `TestBranchAssemblyTypeCheck`/`TestTypeTracking`.
+//!
+//! `switch` was moved out of the old "permanently disable" set into the
+//! normal-tracking path in this slice: like `bnz`/`bz`, go's `switch`
+//! does not deaden (index-out-of-range falls through), and it already
+//! had a fixed, exact proto (`Uint64` pop, no push) in [`TYPE_TABLE`].
+//!
+//! On a type mismatch this reports the same diagnostic shape as
+//! go-algorand's `typeErrorf` calls in `trackStack`: `"<instr> arg <i>
+//! wanted type <want> got <got>"` or `"<instr> expects <n> stack arguments
+//! but stack height is <h>"`.
 //!
 //! # What's deferred (tracked as follow-up work under issue #829)
 //!
-//! - **Branch-merge unification** (`TestBranchAssemblyTypeCheck`): go
-//!   unifies tracked types across every predecessor of a label and keeps
-//!   analyzing past it. This slice instead permanently stops tracking (see
-//!   [`OpStream::type_track_disabled`](crate::assembler::OpStream)) the
-//!   first time it sees a label, a branch/subroutine opcode (`b`, `bz`,
-//!   `bnz`, `callsub`, `retsub`, `err`, `return`, `switch`), or `match`/
-//!   `txn`/`gtxn`/`gtxns`/`popn`/`dupn`/`cover`/`uncover`/`pushbytess`/
-//!   `pushints` (dynamic- or arity-dependent stack effects this slice
-//!   doesn't model precisely enough to keep the tracked stack height in
-//!   sync with the real one). This is conservative by construction: it can
-//!   only *lose* precision (miss a real type error past that point), never
-//!   *fabricate* one, so it cannot make a currently-valid program newly
-//!   fail to assemble.
 //! - **Scratch-slot type tracking** (`TestScratchTypeCheck`,
 //!   `TestScratchBounds`): `load`/`loads`/`store`/`stores` are tracked only
 //!   for their generic pop/push counts, not the per-slot type go tracks via
-//!   `ProgramKnowledge.scratchSpace`.
+//!   `ProgramKnowledge.scratchSpace`. (`TestTypeTrackingRegression`
+//!   happens to pass anyway: it only exercises `load`/`store` typing as
+//!   `Any`, which this slice already produces generically, without needing
+//!   go's `scratchSpace[i]`-specific type refinement.)
+//! - **`#pragma typetrack false`/`true`** (part of `TestTypeTracking`):
+//!   go supports manually toggling tracking off/on mid-program
+//!   (`assembler.go:2513-2517`); this slice has no equivalent pragma at
+//!   all, so it isn't modeled -- unrelated to (and safely orthogonal to)
+//!   the deadcode/label handling above, since it's a distinct on/off
+//!   switch rather than part of the label-driven state machine.
+//! - **Dynamic- or arity-dependent stack effects** this slice still can't
+//!   model precisely enough to keep the tracked stack height in sync with
+//!   the real one -- unchanged from before: `match`/`txn`/`gtxn`/`gtxns`/
+//!   `popn`/`dupn`/`cover`/`uncover`/`pushbytess`/`pushints` permanently
+//!   disable tracking for the rest of the program (see
+//!   [`hard_disables_tracking`] and the dynamic-arity fallback in
+//!   [`track_instruction`]). This remains conservative by construction: it
+//!   can only *lose* precision, never *fabricate* an error, so it cannot
+//!   make a currently-valid program newly fail to assemble.
 //! - **Bounds-refined types** (`TestMatchTyping`, `TestArgType`,
 //!   `TestTypeComplaints`, sized-type diagnostics like `[32]byte`):
 //!   go's `StackType` also carries a `[min, max]` length/value bound
@@ -67,9 +107,8 @@
 //!   these opcodes (bounds only ever narrow the plain-`StackUint64`/
 //!   `StackBytes` case, which is what every opcode here uses) but not
 //!   reproducing go's `[N]byte`/`(<= N)`-style diagnostic text.
-//! - `TestTypeTracking`, `TestTypeTrackingRegression`, `TestTxTypes`,
-//!   `TestDupPopNTyping`: exercise the deferred branch-merge/scratch/`txn`
-//!   behavior above.
+//! - `TestTxTypes`, `TestDupPopNTyping`: exercise the deferred
+//!   dynamic-arity/`txn` behavior above.
 //!
 //! See `docs/phase17/parity_txn_logic.md` for the full go-test mapping.
 
@@ -187,8 +226,10 @@ const TYPE_TABLE: &[(&str, &[StackType], &[StackType])] = &[
     ("arg_1", &[], &[Bytes]),
     ("arg_2", &[], &[Bytes]),
     ("arg_3", &[], &[Bytes]),
-    // ---- Branch/exit condition types (still checked before this
-    // instruction disables further tracking; see `disables_tracking`). ----
+    // ---- Branch/exit condition types. `bnz`/`bz`/`switch` don't deaden
+    // (go's `OpSpec.deadens`, `opcodes.go:520-527` -- execution may fall
+    // through past any of them), so tracking continues normally after
+    // them; `return` does deaden (see `deadens_tracking`). ----
     ("bnz", &[Uint64], &[]),
     ("bz", &[Uint64], &[]),
     ("switch", &[Uint64], &[]),
@@ -217,15 +258,16 @@ fn literal_push_type(mnemonic: &str) -> Option<StackType> {
     }
 }
 
-/// Mnemonics that stop tracking for the rest of the program *after* still
-/// checking this instruction's own declared args (branches, subroutine
-/// calls, and anything that unconditionally ends or diverts control flow).
-/// See the module docs' "what's deferred" section.
-fn disables_tracking(mnemonic: &str) -> bool {
-    matches!(
-        mnemonic,
-        "bnz" | "bz" | "b" | "callsub" | "retsub" | "err" | "return" | "switch"
-    )
+/// Mnemonics that unconditionally end or divert control flow, marking
+/// everything until the next label as dead code. Mirrors go's
+/// `OpSpec.deadens` (`opcodes.go:520-527`) exactly: `bnz`/`bz`/`switch` are
+/// deliberately *not* included here (a conditional branch, or an
+/// out-of-range `switch` index, can fall through to the next instruction),
+/// unlike this module's previous "permanently disable on any branch" logic.
+/// See [`OpStream::type_track_deadcode`](crate::assembler::OpStream) and
+/// the module docs' branch-merge section.
+fn deadens_tracking(mnemonic: &str) -> bool {
+    matches!(mnemonic, "b" | "callsub" | "retsub" | "err" | "return")
 }
 
 /// Mnemonics whose stack effect is dispatch- or arity-dependent in a way
@@ -354,6 +396,15 @@ fn rejoin(mnemonic: &str, args: &[&str]) -> String {
 /// to still push `return_types` even after an arg-count/type mismatch --
 /// this avoids one reported mistake cascading into a wall of unrelated
 /// height errors for the rest of the program.
+///
+/// When [`OpStream::type_track_bottom_permissive`] is set (analysis has
+/// resumed after a label following dead code -- see the module docs), an
+/// arg count exceeding the tracked stack's real height is *not* reported as
+/// an error: go's `ProgramKnowledge.pop` returns `bottom` (`StackAny`) for
+/// any position past the top of the real stack (`assembler.go:345-353`),
+/// so missing entries are treated as an implicit, always-overlapping `Any`
+/// rather than a height mismatch. This is what [`StackType::Any`]'s
+/// `.unwrap_or(Any)` fallback below reproduces for each individual pop.
 fn apply_stack_effect(
     ops: &mut OpStream,
     mnemonic: &str,
@@ -362,7 +413,7 @@ fn apply_stack_effect(
     return_types: &[StackType],
 ) {
     let argcount = arg_types.len();
-    if argcount > ops.type_stack.len() {
+    if argcount > ops.type_stack.len() && !ops.type_track_bottom_permissive {
         ops.record_error(
             ops.source_line,
             0,
@@ -376,10 +427,12 @@ fn apply_stack_effect(
     } else {
         for i in (0..argcount).rev() {
             let want = arg_types[i];
-            let got = ops
-                .type_stack
-                .pop()
-                .expect("argcount was checked against type_stack.len() above");
+            // Any position past the top of the real tracked stack is
+            // treated as an implicit `Any` (see doc comment above) rather
+            // than popped -- this only actually happens when
+            // `type_track_bottom_permissive` let the height check above
+            // through with too few real entries.
+            let got = ops.type_stack.pop().unwrap_or(Any);
             if !got.overlaps(want) {
                 ops.record_error(
                     ops.source_line,
@@ -407,6 +460,19 @@ fn apply_stack_effect(
 /// [`OpStream::type_track_disabled`] is set. See the module docs for scope.
 pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
     if ops.type_track_disabled {
+        return;
+    }
+
+    // Mirrors go's `trackStack`'s `if ops.known.deadcode { return }`
+    // (assembler.go:2058-2060): no type checks or stack-effect tracking
+    // happen for an instruction reached only through dead code -- the
+    // tracked stack stays exactly as [`deadens_tracking`] left it (empty)
+    // until the next label reopens analysis. This deliberately skips
+    // `hard_disables_tracking` too: an opcode this slice can't model
+    // precisely (e.g. `txn`) appearing in unreachable code has no stack
+    // effect to get wrong, so it must not spend the *permanent* disable on
+    // dead code.
+    if ops.type_track_deadcode {
         return;
     }
 
@@ -457,8 +523,20 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
 
     apply_stack_effect(ops, mnemonic, args, &arg_types, &return_types);
 
-    if disables_tracking(mnemonic) {
-        ops.type_track_disabled = true;
+    if deadens_tracking(mnemonic) {
+        ops.type_stack.clear();
+        ops.type_track_deadcode = true;
+        if mnemonic == "callsub" {
+            // Mirrors go's assemble loop: `callsub` deadens (its own
+            // `retsub` returns from an arbitrary caller, so nothing about
+            // the stack past this point is known from *this* call site),
+            // but is immediately followed by `ops.known.label()`
+            // (assembler.go:2234-2237) rather than waiting for a textual
+            // label -- `retsub` returns right after the `callsub`, making
+            // it an entry point like any other label.
+            ops.type_track_deadcode = false;
+            ops.type_track_bottom_permissive = true;
+        }
     }
 }
 
