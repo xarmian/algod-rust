@@ -3317,6 +3317,17 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         Some(self.consensus.logic_sig_version)
     }
 
+    // Matches go-algorand's `cx.txn.Txn.Access` non-empty check in
+    // `(*EvalContext).begin` (`data/transactions/logic/eval.go`); see
+    // `AvmContext::txn_has_access`'s doc for the full rationale.
+    fn txn_has_access(&self) -> bool {
+        self.group[self.group_index]
+            .txn
+            .access
+            .as_deref()
+            .is_some_and(|access| !access.is_empty())
+    }
+
     // ---- Transaction access ----
 
     fn txn_field(
@@ -8241,6 +8252,87 @@ mod tests {
         assert!(
             !ctx.is_account_available(&shared_account),
             "below v9, a sibling txn's account must not be available via group sharing"
+        );
+    }
+
+    // ---- Pre-sharedResources tx.Access gating (issue #866) ----
+    //
+    // Mirrors go-algorand's `TestAppCallCheckProgramsWithAccess`
+    // (`ledger/apply/application_test.go`) via the same enforcement point:
+    // `(*EvalContext).begin` (`data/transactions/logic/eval.go`) rejects an
+    // Application-mode program below `sharedResourcesVersion` (9) whose
+    // transaction's `Access` array is non-empty, with the exact error text
+    // `"pre-sharedResources program cannot be invoked with tx.Access"`.
+
+    /// Helper: an `appl` transaction carrying a non-empty `Access` array.
+    fn make_appl_txn_with_access(sender: [u8; 32], app_id: u64) -> SignedTransaction {
+        let mut txn = make_appl_txn(sender, app_id, vec![], vec![], vec![]);
+        txn.txn.access = Some(vec![algo_types::ResourceRef {
+            asset: 99,
+            ..Default::default()
+        }]);
+        txn
+    }
+
+    #[test]
+    fn approval_program_below_shared_resources_version_rejects_txn_access() {
+        use algo_avm::eval::run_approval_program;
+        use algo_avm::group::GroupBudget;
+
+        let sender = [30u8; 32];
+        let appl = make_appl_txn_with_access(sender, 42);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![appl]);
+
+        // v8 program (< sharedResourcesVersion=9): pushint 1 (would approve
+        // if run).
+        let program = vec![8u8, 0x81, 0x01];
+        let mut budget = GroupBudget::new(1);
+        let err =
+            run_approval_program(&program, &mut ctx, &mut budget).expect_err("must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("pre-sharedResources program cannot be invoked with tx.Access"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn approval_program_at_shared_resources_version_accepts_txn_access() {
+        use algo_avm::eval::run_approval_program;
+        use algo_avm::group::GroupBudget;
+
+        let sender = [31u8; 32];
+        let appl = make_appl_txn_with_access(sender, 42);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![appl]);
+
+        // v9 program (== sharedResourcesVersion): pushint 1 (approves).
+        let program = vec![9u8, 0x81, 0x01];
+        let mut budget = GroupBudget::new(1);
+        let result =
+            run_approval_program(&program, &mut ctx, &mut budget).expect("must not be rejected");
+        assert!(result.approved, "v9 program with tx.Access should approve");
+    }
+
+    #[test]
+    fn clear_state_program_below_shared_resources_version_rejects_txn_access() {
+        use algo_avm::eval::run_clear_state_program;
+
+        let sender = [32u8; 32];
+        let appl = make_appl_txn_with_access(sender, 42);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![appl]);
+
+        // v8 program (< sharedResourcesVersion=9): pushint 1 (would approve
+        // if run). Per this repo's ClearState-error semantics (CLAUDE.md),
+        // a ClearState rejection returns an empty `AvmResult` rather than
+        // propagating `Err`, so assert on `approved`/`error` instead.
+        let program = vec![8u8, 0x81, 0x01];
+        let result = run_clear_state_program(&program, &mut ctx, &ConsensusParams::default());
+        assert!(
+            !result.approved,
+            "pre-sharedResources clear-state program with tx.Access must not approve"
         );
     }
 

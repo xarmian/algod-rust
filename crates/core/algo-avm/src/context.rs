@@ -469,6 +469,22 @@ pub trait AvmContext {
         0
     }
 
+    /// Whether the currently-executing transaction's unified `Access`
+    /// (resource-sharing) array is non-empty.
+    ///
+    /// Used by `run_approval_program`/`run_clear_state_program` to reject a
+    /// pre-`sharedResourcesVersion` program invoked with `tx.Access` set,
+    /// matching go-algorand's `(*EvalContext).begin` check
+    /// (`data/transactions/logic/eval.go`):
+    /// `version < sharedResourcesVersion && cx.runMode == ModeApp &&
+    /// len(cx.txn.Txn.Access) > 0`.
+    ///
+    /// Defaults to `false` for contexts that don't carry a transaction
+    /// (e.g. [`NullContext`] used in unit tests).
+    fn txn_has_access(&self) -> bool {
+        false
+    }
+
     // ---- Box storage ----
 
     /// Get a box's contents. Returns `(value, exists)`.

@@ -157,6 +157,12 @@ pub fn run_approval_program(
     if let (Some(ceiling), Some(&version)) = (ctx.consensus_logic_sig_version(), program.first()) {
         crate::validator::check_program_version_allowed(version, ceiling)?;
     }
+    // Reject a pre-sharedResources program (version < 9) invoked with a
+    // non-empty tx.Access array (go-algorand eval.go `begin()`; see
+    // `check_pre_shared_resources_access` doc for the exact go source).
+    if let Some(&version) = program.first() {
+        crate::validator::check_pre_shared_resources_access(version, ctx.txn_has_access())?;
+    }
 
     let parsed = bytecode::parse(program)?;
     let budget_before = budget.remaining();
@@ -235,6 +241,15 @@ pub fn run_clear_state_program(
     // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
     if !program.is_empty()
         && crate::validator::check_program_version_allowed(program[0], consensus.logic_sig_version)
+            .is_err()
+    {
+        return AvmResult::empty();
+    }
+    // Reject a pre-sharedResources program (version < 9) invoked with a
+    // non-empty tx.Access array (go-algorand eval.go `begin()`; see
+    // `check_pre_shared_resources_access` doc for the exact go source).
+    if !program.is_empty()
+        && crate::validator::check_pre_shared_resources_access(program[0], ctx.txn_has_access())
             .is_err()
     {
         return AvmResult::empty();
