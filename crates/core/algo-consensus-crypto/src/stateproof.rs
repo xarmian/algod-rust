@@ -590,6 +590,95 @@ fn verify_state_proof_trees_depth(s: &StateProof) -> Result<(), StateProofError>
 mod tests {
     use super::*;
 
+    // ── Coin-hash known-answer test (KAT) ───────────────────────────────
+    //
+    // go-algorand's `crypto/stateproof/coinGenerator_test.go` `TestGenerateCoinHashKATs`
+    // is (like merklesignature's `TestGenerateKat`) a KAT *generator*, not a
+    // checker: it is `t.Skip`ped unless `GEN_KATS` is set, and prints its
+    // output rather than asserting against a value go-algorand commits to
+    // source. Its inputs are also freshly randomized per run
+    // (`crypto.RandBytes`), so there is no fixed go-algorand byte string to
+    // reproduce even by running the Go test.
+    //
+    // Running the Go test directly was attempted and is unavailable in this
+    // environment: `crypto/stateproof` transitively depends on cgo-only
+    // packages (`algorand/falcon`, `mattn/go-sqlite3`) and this Windows
+    // checkout has no C compiler on PATH (`CGO_ENABLED=0`, no `gcc`/mingw),
+    // so `go build`/`go test` fails before the coin generator ever runs.
+    //
+    // Unlike the merklesignature KAT, though, `coinChoiceSeed`/
+    // `coinGenerator` involve no randomly-generated key material of their
+    // own — `getNextCoin` is a pure function of its (attacker-controlled)
+    // seed bytes: `SHAKE256("spc" || version || partCommitment ||
+    // lnProvenWeight_LE64 || sigCommitment || signedWeight_LE64 || data)`,
+    // squeezed 8 bytes at a time with rejection sampling against
+    // `floor(2^64/signedWeight)*signedWeight`. That means a *real*
+    // cross-implementation KAT is available without go-algorand at all: fix
+    // the seed's byte inputs and independently compute the expected SHAKE256
+    // squeeze sequence via Python's `hashlib.shake_256` (an independent
+    // FIPS-202 implementation from both Rust's `sha3` crate and go's
+    // `golang.org/x/crypto/sha3` — all three are required to agree with the
+    // same standard, so agreement is genuine evidence of correctness, not
+    // just self-consistency). The vector below was computed by:
+    //
+    // ```python
+    // import hashlib
+    // part_commitment = bytes(range(64))
+    // sig_commitment = bytes((i * 7 + 3) % 256 for i in range(64))
+    // data = bytes((i * 11 + 5) % 256 for i in range(32))
+    // ln_proven_weight = 454197
+    // signed_weight = 37  # not a power of two, to exercise the mod-bias path
+    // payload = bytes([0]) + part_commitment + ln_proven_weight.to_bytes(8, "little") \
+    //     + sig_commitment + signed_weight.to_bytes(8, "little") + data
+    // shake = hashlib.shake_256(b"spc" + payload)
+    // threshold = (1 << 64) // signed_weight * signed_weight
+    // # squeeze 8-byte little-endian chunks, rejecting z >= threshold, until
+    // # 30 coins are produced: z % signed_weight is the coin.
+    // ```
+    //
+    // which produced the `coins` sequence pinned below with zero rejections
+    // (threshold is within 2^-59 of 2^64 for signed_weight=37, so rejection
+    // essentially never fires for a run this short — consistent with
+    // go-algorand's own real-world usage, where signedWeight is far smaller
+    // than 2^64).
+    #[test]
+    fn test_generate_coin_hash_kat() {
+        let part_commitment: GenericDigest = (0u16..64).map(|i| i as u8).collect();
+        let sig_commitment: GenericDigest = (0u16..64).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+        let mut data: MessageHash = [0u8; 32];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i * 11 + 5) % 256) as u8;
+        }
+        let ln_proven_weight: u64 = 454197;
+        let signed_weight: u64 = 37;
+
+        let choice = CoinChoiceSeed {
+            part_commitment: &part_commitment,
+            ln_proven_weight,
+            sig_commitment: &sig_commitment,
+            signed_weight,
+            data,
+        };
+        let mut coin_gen = make_coin_generator(&choice);
+
+        const EXPECTED_COINS: [u64; 30] = [
+            14, 6, 6, 27, 7, 11, 20, 30, 24, 7, 31, 19, 28, 10, 3, 18, 29, 4, 9, 16, 0, 24, 5, 31,
+            9, 13, 31, 30, 20, 19,
+        ];
+
+        for (idx, &expected) in EXPECTED_COINS.iter().enumerate() {
+            let coin = coin_gen.get_next_coin();
+            assert!(
+                coin < signed_weight,
+                "coin {idx} = {coin} must be < signed_weight ({signed_weight})"
+            );
+            assert_eq!(
+                coin, expected,
+                "coin {idx} mismatched independently-computed SHAKE256 KAT vector"
+            );
+        }
+    }
+
     #[test]
     fn ln_int_approximation_matches_known_values() {
         // ln(1) = 0
