@@ -251,10 +251,34 @@ pub struct OpStream {
     pub(crate) type_stack: Vec<type_track::StackType>,
     /// Once set, `type_track::track_instruction` stops tracking (and
     /// stops reporting type errors) for the rest of the program. Set on
-    /// hitting a label, a branch/subroutine opcode, or any opcode this
-    /// slice doesn't model precisely enough to keep the tracked stack
-    /// height in sync with the real one.
+    /// any opcode this slice doesn't model precisely enough to keep the
+    /// tracked stack height in sync with the real one (e.g. `txn`'s
+    /// arity-dependent dispatch, `match`'s dynamic label count). Unlike
+    /// [`Self::type_track_deadcode`], this never turns back off.
     pub(crate) type_track_disabled: bool,
+    /// Mirrors go-algorand's `ProgramKnowledge.deadcode`
+    /// (`assembler.go:323-325`): set after an opcode that unconditionally
+    /// ends or diverts control flow (`b`, `retsub`, `err`, `return`, or
+    /// `callsub` before it immediately reopens analysis -- see
+    /// [`type_track::track_instruction`]). While set, `track_instruction`
+    /// skips all type checking and stack-effect tracking (the tracked
+    /// stack is left empty), matching go's `trackStack`'s
+    /// `if ops.known.deadcode { return }`. Cleared -- along with setting
+    /// [`Self::type_track_bottom_permissive`] -- the next time a label is
+    /// reached, mirroring `ProgramKnowledge.label`/`reset`.
+    pub(crate) type_track_deadcode: bool,
+    /// Mirrors go-algorand's `ProgramKnowledge.bottom` becoming `StackAny`
+    /// after a `reset()` (`assembler.go:314-321,371-380`): once set, a
+    /// stack-height/arg-count check that would otherwise fail because the
+    /// tracked stack doesn't (yet) have enough real entries is treated as
+    /// satisfied by an implicit, unlimited supply of
+    /// [`type_track::StackType::Any`] underneath it, instead of being
+    /// reported as a "wrong number of stack arguments" error. This is what
+    /// lets analysis safely resume after a label or `callsub` without
+    /// knowing what the incoming stack actually looked like. Never cleared
+    /// once set (matches go: `bottom` only ever moves from `StackNone` to
+    /// `StackAny`, never back).
+    pub(crate) type_track_bottom_permissive: bool,
 }
 
 impl OpStream {
@@ -282,6 +306,8 @@ impl OpStream {
             auto_salt_line: 0,
             type_stack: Vec::new(),
             type_track_disabled: false,
+            type_track_deadcode: false,
+            type_track_bottom_permissive: false,
         }
     }
 
@@ -1126,17 +1152,25 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
                     ops.labels.insert(label.to_string(), ops.pending.len());
                 }
                 // A label is a possible entry point from elsewhere in the
-                // program (a branch target), so the straight-line stack-type
-                // knowledge accumulated so far no longer reliably describes
-                // what's actually on the stack here. go-algorand re-opens
-                // analysis with permissive "any" knowledge after a label
-                // (`ProgramKnowledge.label`/`reset`, assembler.go:364-380);
-                // this incremental slice doesn't yet implement branch-merge
-                // unification, so it conservatively stops tracking for the
-                // rest of the program instead of risking a false type error
-                // across a basic-block boundary (see the `type_track`
-                // module docs for what's covered vs. deferred).
-                ops.type_track_disabled = true;
+                // program (a branch target). Mirrors go-algorand's
+                // `ProgramKnowledge.label`/`reset` (assembler.go:364-380),
+                // called from `createLabel` (assembler.go:390): if the
+                // instructions since the last label unconditionally
+                // diverted control flow (`type_track_deadcode`), the
+                // knowledge accumulated up to here doesn't describe what's
+                // actually on the stack at this label, so analysis reopens
+                // with permissive "any" knowledge instead. Otherwise (a
+                // label reached by ordinary fallthrough, e.g. right after a
+                // conditional `bnz`/`bz`) go does *not* reset -- it simply
+                // trusts that whatever's tracked from the fallthrough path
+                // also describes any jump into this label, and keeps
+                // analyzing with the tracked stack as-is. See the
+                // `type_track` module docs for what's still deferred
+                // (scratch-slot per-index types, `#pragma typetrack`).
+                if !ops.type_track_disabled && ops.type_track_deadcode {
+                    ops.type_track_deadcode = false;
+                    ops.type_track_bottom_permissive = true;
+                }
                 tok_idx = 1;
                 if tok_idx >= tokens.len() {
                     continue;
@@ -3583,24 +3617,116 @@ mod tests {
     }
 
     #[test]
-    fn test_type_tracking_stops_at_first_branch_or_label() {
-        // Not a direct go-test port, but pins the "incremental" boundary
-        // this slice deliberately draws (see the `type_track` module docs'
-        // "what's deferred" section): go-algorand's TestTypeTracking keeps
-        // analyzing a basic block *after* a branch/label by unifying
-        // tracked types across every predecessor. This slice doesn't
-        // implement that yet, so it conservatively stops tracking for good
-        // the first time it sees a branch or a label -- meaning a type
-        // mistake located after one (like the `byte`/`int`/`+` below, which
-        // go-algorand's real analysis *would* flag) is simply not detected
-        // by this slice. That's a known, documented gap, not a silent
-        // miscompile: the program still assembles to exactly the bytecode
-        // the source describes, just without the extra compile-time
-        // diagnostic.
-        assemble_string(
+    fn test_branch_assembly_type_check() {
+        // TestBranchAssemblyTypeCheck: a label reached by ordinary
+        // fallthrough (right after a conditional `bnz`, which doesn't
+        // deaden) does not reset tracking -- the bytes value still
+        // underneath the (uint64) branch condition is still known to be
+        // bytes right after the label.
+        assemble_string("#pragma version 8\nbyte 0x1234\nint 0\nbnz flip\nflip:\nbtoi\n").unwrap();
+    }
+
+    #[test]
+    fn test_type_tracking_branch_confuses_old_analysis_but_reports_locally() {
+        // TestTypeTracking: "Branching would have confused the old
+        // analysis, but the problem is local to a basic block, so it makes
+        // sense to report it." `b confusion` deadens; `label:` is reached
+        // through dead code, so it reopens analysis permissively -- but the
+        // mistyped `byte "john"; int 2; +` right after that label is still
+        // live code within its own basic block and must still be caught.
+        let errs = expect_errors(
             "#pragma version 8\nint 1\nb confusion\nlabel:\nbyte 0x1234\nint 2\n+\npop\nconfusion:\nb label\n",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("+ arg 0 wanted type uint64")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_type_tracking_error_in_dead_code_is_not_reported() {
+        // TestTypeTracking: "Unless that same error is in dead code." --
+        // an `err` right after the label deadens everything until the next
+        // label, so the mistyped `byte "john"; int 2; +` past it is never
+        // checked.
+        assemble_string(
+            "#pragma version 8\nint 1\nb confusion\nlabel:\nerr\nbyte 0x1234\nint 2\n+\nconfusion:\nb label\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_type_tracking_unconditional_branch_deadens() {
+        // TestTypeTracking: "Unconditional branches also deaden." -- the
+        // `b done` right after `label:` deadens the mistyped code that
+        // follows it, same shape as the `err` case above but via `b`.
+        assemble_string(
+            "#pragma version 8\nint 1\nb confusion\nlabel:\nb done\nbyte 0x1234\nint 2\n+\nconfusion:\nb label\ndone:\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_type_tracking_callsub_wipes_and_reopens() {
+        // TestTypeTracking: `callsub A` deadens, then immediately reopens
+        // analysis permissively (it's the entry point `retsub` returns to)
+        // -- both call-site and subroutine-body sides are exercised.
+        //
+        // "callsub also wipes our stack knowledge, this tests shows why:
+        // it's properly typed" -- `+` right after `callsub A` sees a
+        // permissive (post-reset) stack, so no height error even though
+        // nothing was actually pushed at the call site.
+        assemble_string("#pragma version 8\ncallsub A\n+\nreturn\nA:\nint 1\nint 2\nretsub\n")
+            .unwrap();
+
+        // "but we do want to ensure we're not just treating the code after
+        // callsub as dead" -- `concat` still gets its own args checked.
+        let errs = expect_errors(
+            "#pragma version 8\ncallsub A\nint 1\nconcat\nreturn\nA:\nint 1\nint 2\nretsub\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("concat arg 1")),
+            "{errs:?}"
+        );
+
+        // "retsub deadens code, like any unconditional branch" -- the
+        // `concat` after `retsub` (with no intervening label) is dead code
+        // and must not be reported despite having only one operand type on
+        // the (permissive, post-reset) stack.
+        assemble_string(
+            "#pragma version 8\ncallsub A\n+\nreturn\nA:\nint 1\nint 2\nretsub\nconcat\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_type_tracking_regression_scratch_after_callsub() {
+        // TestTypeTrackingRegression: exercises that a permissive stack
+        // established by `callsub`'s reset doesn't get "stuck" at a
+        // particular type on repeated `load`/`store` (this slice tracks
+        // `load`/`store` generically as `Any`, so it was never at risk of
+        // the specific bug go regression-tests here, but the shape is
+        // ported for parity coverage of the same source program).
+        assemble_string(
+            "#pragma version 8\ncallsub end\nlabel1:\nload 1\nbyte 0x01\nstores\nload 0\nload 0\n+\nend:\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_switch_type_check_does_not_permanently_disable() {
+        // Not a direct go-test port, but pins that `switch` (unlike the
+        // dynamic-arity opcodes that still hard-disable) keeps tracking
+        // live afterward, since go's `switch` doesn't deaden (an
+        // out-of-range index falls through) and always has a fixed,
+        // single-uint64-pop proto regardless of how many labels follow.
+        let errs = expect_errors("#pragma version 8\nbyte 0x1234\nswitch flip\nflip:\nconcat\n");
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("switch")
+                && e.message.contains("arg 0 wanted type uint64")),
+            "{errs:?}"
+        );
     }
 
     #[test]
