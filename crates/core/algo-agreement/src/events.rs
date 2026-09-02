@@ -522,6 +522,45 @@ impl MessageEvent {
         self.proto = v;
         self
     }
+
+    /// Looks for a validated proposal or vote inside a `payloadVerified` or
+    /// `voteVerified` message event, and attaches the given time to the
+    /// proposal's/vote's `validated_at` field.
+    ///
+    /// Mirrors Go's `messageEvent.AttachValidatedAt`
+    /// (`agreement/events.go:1037`). `get_clock` is called with the
+    /// event's own round (`Input.Proposal.round()` /
+    /// `Input.Vote.raw_vote.round`) and should return the duration elapsed
+    /// since that round's zero — see `clock_for_round` in `demux.rs` for
+    /// the production implementation and
+    /// `test_support::setup::test_clock_for_round` for the white-box-test
+    /// equivalent of Go's `testClockForRound`.
+    pub fn attach_validated_at(mut self, get_clock: impl Fn(Round) -> Duration) -> Self {
+        match self.t {
+            EventType::PayloadVerified => {
+                if let Some(ref mut p) = self.input.proposal {
+                    let round = p.unauthenticated_proposal.round();
+                    p.validated_at = get_clock(round);
+                }
+            }
+            EventType::VoteVerified => {
+                // Only proposal-votes (step 0) carry a meaningful
+                // validated_at — mirrors Go's `demux.next()` guard
+                // `Input.Vote.R.Step == 0` (agreement/demux.go:221),
+                // which restricts this to the credential-arrival-history
+                // sample that `player.updateCredentialArrivalHistory`
+                // later reads.
+                if let Some(ref mut v) = self.input.vote {
+                    if v.raw_vote.step == Step(0) {
+                        let round = v.raw_vote.round;
+                        v.validated_at = get_clock(round);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self
+    }
 }
 
 impl fmt::Display for MessageEvent {
@@ -1614,6 +1653,111 @@ mod tests {
         assert!(
             decoded.validated_block.is_none(),
             "validated_block must be None after serde round-trip (crash recovery)"
+        );
+    }
+
+    // ---- attach_validated_at ----
+
+    fn zero_vote(round: Round, step: Step) -> Vote {
+        Vote {
+            raw_vote: RawVote {
+                sender: algo_types::Address([0u8; 32]),
+                round,
+                period: Period(0),
+                step,
+                proposal: BOTTOM,
+            },
+            ..Vote::default()
+        }
+    }
+
+    #[test]
+    fn attach_validated_at_sets_vote_timing_for_step_zero() {
+        let vote = zero_vote(Round(10), Step(0));
+        let me = MessageEvent {
+            t: EventType::VoteVerified,
+            input: InternalMessage {
+                vote: Some(vote),
+                ..InternalMessage::default()
+            },
+            ..MessageEvent::default()
+        };
+        let me = me.attach_validated_at(|r| {
+            assert_eq!(r, Round(10));
+            Duration::from_millis(777)
+        });
+        assert_eq!(
+            me.input.vote.expect("vote present").validated_at,
+            Duration::from_millis(777)
+        );
+    }
+
+    #[test]
+    fn attach_validated_at_ignores_non_propose_step_votes() {
+        // Mirrors Go's `demux.next()` guard restricting AttachValidatedAt to
+        // step-0 (proposal) votes — cert/soft/next votes never contribute
+        // to lowestCredentialArrivals.
+        let vote = zero_vote(Round(10), crate::step::CERT);
+        let me = MessageEvent {
+            t: EventType::VoteVerified,
+            input: InternalMessage {
+                vote: Some(vote),
+                ..InternalMessage::default()
+            },
+            ..MessageEvent::default()
+        };
+        let me = me.attach_validated_at(|_| Duration::from_millis(777));
+        assert_eq!(
+            me.input.vote.expect("vote present").validated_at,
+            Duration::ZERO,
+            "non-propose-step votes must not have validated_at attached"
+        );
+    }
+
+    #[test]
+    fn attach_validated_at_sets_proposal_timing_for_payload_verified() {
+        let proposal = Proposal {
+            unauthenticated_proposal: crate::proposal::UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(11),
+                    ..algo_types::Block::default()
+                },
+                ..crate::proposal::UnauthenticatedProposal::default()
+            },
+            ..Proposal::default()
+        };
+        let me = MessageEvent {
+            t: EventType::PayloadVerified,
+            input: InternalMessage {
+                proposal: Some(proposal),
+                ..InternalMessage::default()
+            },
+            ..MessageEvent::default()
+        };
+        let me = me.attach_validated_at(|r| {
+            assert_eq!(r, Round(11));
+            Duration::from_millis(999)
+        });
+        assert_eq!(
+            me.input.proposal.expect("proposal present").validated_at,
+            Duration::from_millis(999)
+        );
+    }
+
+    #[test]
+    fn attach_validated_at_no_op_for_other_event_types() {
+        let me = MessageEvent {
+            t: EventType::PayloadPresent,
+            input: InternalMessage {
+                vote: Some(zero_vote(Round(10), Step(0))),
+                ..InternalMessage::default()
+            },
+            ..MessageEvent::default()
+        };
+        let me = me.attach_validated_at(|_| Duration::from_millis(1));
+        assert_eq!(
+            me.input.vote.expect("vote present").validated_at,
+            Duration::ZERO
         );
     }
 }

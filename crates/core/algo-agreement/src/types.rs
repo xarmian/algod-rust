@@ -491,6 +491,24 @@ impl CredentialArrivalHistory {
         sorted.sort();
         sorted[idx]
     }
+
+    /// Returns the raw (insertion-order, unsorted) circular buffer.
+    ///
+    /// Mirrors direct access to Go's `credentialArrivalHistory.history`
+    /// field, used by `player_test.go`'s
+    /// `TestPlayerRetains*ReceivedValidatedAt*ForHistoryWindow*` tests to
+    /// assert the exact slot each sample landed in.
+    pub fn raw_history(&self) -> &[Duration] {
+        &self.history
+    }
+
+    /// Returns the current write position in the circular buffer.
+    ///
+    /// Mirrors direct access to Go's `credentialArrivalHistory.writePtr`
+    /// field.
+    pub fn write_ptr(&self) -> usize {
+        self.write_ptr
+    }
 }
 
 impl Default for CredentialArrivalHistory {

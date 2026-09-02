@@ -370,6 +370,7 @@ mod tests {
                 pk1_sig: [0u8; 64],
                 pk2_sig: [0u8; 64],
             },
+            validated_at: std::time::Duration::ZERO,
         }
     }
 

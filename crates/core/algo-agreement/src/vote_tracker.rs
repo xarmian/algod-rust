@@ -84,6 +84,7 @@ impl EquivocationVote {
             },
             cred: self.cred.clone(),
             sig: self.sigs[0].clone(),
+            validated_at: std::time::Duration::ZERO,
         }
     }
 
@@ -101,6 +102,7 @@ impl EquivocationVote {
             },
             cred: self.cred.clone(),
             sig: self.sigs[1].clone(),
+            validated_at: std::time::Duration::ZERO,
         }
     }
 }
@@ -542,6 +544,7 @@ mod tests {
                 pk1_sig: [0u8; 64],
                 pk2_sig: [0u8; 64],
             },
+            validated_at: std::time::Duration::ZERO,
         }
     }
 

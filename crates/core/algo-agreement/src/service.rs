@@ -1320,6 +1320,22 @@ fn demux_loop<N, L, BV, C, M>(
                 if let Ok(m) = monitor.lock() {
                     m.update_events_queue(crate::demux::EVENT_QUEUE_DEMUX, 1);
                 }
+                // Attach the credential/proposal validated-at timestamp,
+                // mirroring Go's `demux.next()` deferred
+                // `AttachValidatedAt(clockForRound(currentRound, s.Clock,
+                // s.historicalClocks))` (agreement/demux.go:216-223). Must
+                // happen before the event reaches the main loop, since
+                // `player.updateCredentialArrivalHistory` reads
+                // `Vote.validated_at` off the proposal-vote stored by the
+                // proposal tracker.
+                let e = e.attach_validated_at(|event_round| {
+                    crate::clock::clock_for_round(
+                        event_round,
+                        next_round,
+                        &clock,
+                        &historical_clocks,
+                    )
+                });
                 if input.send(Some(e)).is_err() {
                     break;
                 }
