@@ -102,6 +102,56 @@ pub fn check_min_avm_version(declared_version: u8, min_avm_version: u64) -> Resu
     Ok(())
 }
 
+/// AVM version at which apps can access resources shared by other
+/// transactions in the group, and below which a transaction's unified
+/// `Access` array must not be used (go-algorand's `sharedResourcesVersion`,
+/// `data/transactions/logic/opcodes.go:73`). Duplicated per-module in this
+/// crate -- see `crate::ops::state`'s copy of this constant for why
+/// (algo-avm cannot depend on algo-ledger, and this crate doesn't have a
+/// single shared "constants" module for values like this).
+const SHARED_RESOURCES_VERSION: u8 = 9;
+
+/// Reject a pre-`sharedResourcesVersion` Application program (approval or
+/// clear-state) whose transaction carries a non-empty unified `Access`
+/// array.
+///
+/// This matches go-algorand's `(*EvalContext).begin` check in
+/// `data/transactions/logic/eval.go`:
+/// ```go
+/// if version < sharedResourcesVersion && cx.runMode == ModeApp && len(cx.txn.Txn.Access) > 0 {
+///     return fmt.Errorf("pre-sharedResources program cannot be invoked with tx.Access")
+/// }
+/// ```
+/// A program written before the `Access`-based resource-sharing model
+/// existed must not be handed implicit access to resources it was never
+/// designed to expect -- worse, a pre-sharing program could otherwise see an
+/// account and an ASA available without the corresponding holding, a new
+/// situation this gate exists specifically to prevent. LogicSig programs are
+/// exempt (go only applies this check in `ModeApp`) since they can't access
+/// ledger state anyway -- callers must only invoke this for approval/
+/// clear-state program evaluation, not `run_logicsig_program`.
+///
+/// # Parameters
+/// - `declared_version`: the first byte of the program (the AVM version).
+/// - `has_access`: whether the transaction's `Access` array is non-empty.
+///
+/// # Returns
+/// - `Ok(())` if the program is at/above `sharedResourcesVersion`, or the
+///   `Access` array is empty.
+/// - `Err(AlgoError::Avm { .. })` otherwise, with go's exact error text:
+///   `"pre-sharedResources program cannot be invoked with tx.Access"`.
+pub fn check_pre_shared_resources_access(
+    declared_version: u8,
+    has_access: bool,
+) -> Result<(), AlgoError> {
+    if declared_version < SHARED_RESOURCES_VERSION && has_access {
+        return Err(AlgoError::Avm {
+            message: "pre-sharedResources program cannot be invoked with tx.Access".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Maximum stack depth allowed by the AVM.
 const MAX_STACK_DEPTH: i32 = 1000;
 
@@ -794,6 +844,33 @@ mod tests {
     fn test_program_v1_ceiling_0_rejected() {
         // Pre-logicsig consensus (LogicSigVersion=0) rejects any logicsig.
         assert!(check_program_version_allowed(1, 0).is_err());
+    }
+
+    // ---- Pre-sharedResources tx.Access gating (go-algorand eval.go begin()) ----
+
+    #[test]
+    fn test_pre_shared_resources_access_rejects_below_version_with_access() {
+        let err = check_pre_shared_resources_access(8, true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("pre-sharedResources program cannot be invoked with tx.Access"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_pre_shared_resources_access_accepts_below_version_without_access() {
+        assert!(check_pre_shared_resources_access(8, false).is_ok());
+    }
+
+    #[test]
+    fn test_pre_shared_resources_access_accepts_at_version_with_access() {
+        assert!(check_pre_shared_resources_access(9, true).is_ok());
+    }
+
+    #[test]
+    fn test_pre_shared_resources_access_accepts_above_version_with_access() {
+        assert!(check_pre_shared_resources_access(12, true).is_ok());
     }
 
     #[test]
