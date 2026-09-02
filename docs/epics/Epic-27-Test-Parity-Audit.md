@@ -47,6 +47,8 @@ statically validated.
 - [ ] #845 — ledger/pool/agreement: wire isAbsent-based absentee-account computation into block assembly (split from #833)
 - [x] #847 — avm: assembler treats ';' as a comment delimiter instead of a statement separator (found while working #823) — merged via PR #849
 - [x] ledger/agreement: `detect_validation_groups` had no transaction-group-size upper bound at all (found while working #825) — merged via PR #857; filed #856 for unrelated pre-existing test failures found while verifying no regressions
+- [x] #856 — bin/algod-rust: 3 stale `participate.rs` tests predating PR #837's tightened per-type wellFormed rules (afrz missing freeze_asset/freeze_account; a close-to-self test asserting acceptance of a scenario go-algorand rejects) — merged via PR #870
+- [x] #866 — avm: `pre-sharedResources program cannot be invoked with tx.Access` version-gate (go's `sharedResourcesVersion`, `eval.go:1612-1621`) was entirely unimplemented (found while working #824 theme 1) — merged via PR #871
 
 **Net-new subsystems:**
 - [ ] #814 — stateproof: implement a signing/proving worker
@@ -61,10 +63,10 @@ statically validated.
 
 **Test-gap sweeps:**
 - [ ] #823 — testing: close AVM/assembler missing-test gaps; theme 1 (match opcode execution-level tests, also fixed a real op_match bug) via PR #848; theme 2 (JSON parser edge cases) via PR #851; theme 3 (box write-budget/dirty-tracking core scenarios) via PR #852; theme 5 partial (hash/ecdsa cost tests) via PR #853; theme 4 partial (duplicate-label/branch-args/arg/several-errors) via PR #854; theme 3's remaining scenarios, theme 4's remaining scenarios (found a likely real txn/gtxn multi-arity assembler gap — `TestAssembleTxna` — not just a test gap), and theme 5's BLS12-381 gaps remain
-- [ ] #824 — testing: close ledger missing-test gaps; PQ-rekeying theme's core security gap (authorizer-vs-AuthAddr check was entirely unenforced) fixed via PR #850, other 5 themes remain
-- [ ] #825 — testing: close agreement missing-test gaps; theme 4's `TestProposalCarriesOversizedTxnGroup` fixed via PR #857 (a real bug, not just a missing test — see above), `TestProposalManagerRejectsUnknownEvent` via PR #858, and `TestSampleIndexIsValid`/`TestLowerBound` constant invariants via PR #859; `TestSortProposalValueLess` (needs investigation), `TestPseudonodeNonEnqueuedTasks` (needs an async execpool harness), and themes 1-3 remain
-- [ ] #826 — testing: close crypto missing-test gaps; theme 1 (merkle-signature-scheme tamper vectors) via PR #855; theme 2 (golden/KAT vector coverage) and theme 3 (randomized-encoding property tests) remain
-- [ ] #827 — testing: close REST/kmd/multi-node-cluster negative-path missing-test gaps
+- [ ] #824 — testing: close ledger missing-test gaps; PQ-rekeying theme's core security gap (authorizer-vs-AuthAddr check was entirely unenforced) fixed via PR #850; theme 1 (app-call lifecycle, found+fixed a real cross-product resource-availability bug for top-level group siblings) via PR #867 (also split off #866, a real tx.Access version-gate bug, fixed via PR #871); theme 2 (account/resource lookups) via PR #872; theme 5 (msgpack edge cases, found+fixed a real AccountTotals omitempty encoding bug) via PR #864; theme 6 (tracker/commit robustness, found+fixed 2 real bugs: missing lastCatchpoint persistence, and an offline-account stake/key leak into agreement's OnlineAccountData) via PR #869; theme 3 (catchpoint/archival) in progress
+- [x] #825 — testing: close agreement missing-test gaps; theme 4's `TestProposalCarriesOversizedTxnGroup` fixed via PR #857 (a real bug, not just a missing test), `TestProposalManagerRejectsUnknownEvent` via PR #858, `TestSampleIndexIsValid`/`TestLowerBound` constant invariants via PR #859; theme 2 (credential-arrival-history) via PR #868 — found+fixed a real bug (`validated_at` was always `Duration::ZERO`, silently defeating the dynamic-filter-timeout feature). `TestSortProposalValueLess` and `TestPseudonodeNonEnqueuedTasks` (async execpool harness) and themes 1/3's remaining scenarios still open but issue judged substantially addressed
+- [x] #826 — testing: close crypto missing-test gaps; theme 1 (tamper vectors) via PR #855, theme 2 (KAT coverage, found real go-derived + independently cross-verified vectors) via PR #863, theme 3 (randomized-encoding property tests, shared driver) via PR #873 — closed
+- [ ] #827 — testing: close REST/kmd/multi-node-cluster negative-path missing-test gaps; theme 1 (REST negative-path coverage) via PR #861; themes 2-5 in progress
 
 ## Reproducing this audit
 
