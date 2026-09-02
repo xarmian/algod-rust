@@ -3115,4 +3115,103 @@ mod tests {
         let ops2 = assemble_string(&text).unwrap();
         assert_eq!(ops2.program, program);
     }
+
+    // ── Ported from go-algorand's `TestAssembleMatch` (issue #823 theme 1
+    // remainder). Covers assembler-time acceptance/rejection of `match`'s
+    // label-list syntax. go's version also asserts a final case -- an
+    // empty `match` at the top of an otherwise-empty program must fail
+    // with "match expects 1 stack argument..." -- which requires go's
+    // static compile-time stack-type-tracking pass; algod-rust's assembler
+    // performs no such analysis at all (see docs/phase17/parity_txn_logic.md's
+    // "Static type-tracking pass is entirely absent" note, tracked as its
+    // own gap covering ~15 go tests), so that sub-case is intentionally not
+    // ported here. ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_assemble_match_undefined_label() {
+        let source = "#pragma version 8\npushints 1 1 1\nmatch label1 label2\nlabel1:\n";
+        let errs = expect_errors(source);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("undefined label") && e.message.contains("label2")),
+            "expected an undefined-label error for label2, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_assemble_match_no_labels_is_a_noop() {
+        // No labels is degenerate but legal -- match just consumes the
+        // stack top and always falls through.
+        let source = "#pragma version 8\nint 0\nmatch\nint 1\n";
+        assemble_string(source).unwrap();
+    }
+
+    #[test]
+    fn test_assemble_match_two_labels_program_length() {
+        let source = "#pragma version 8\npushints 1 2 1\nmatch label1 label2\nlabel1:\nlabel2:\n";
+        let ops = assemble_string(source).unwrap();
+        // version(1) + pushints (5) + match opcode(1) + count(1) + labels(2*2)
+        assert_eq!(ops.program.len(), 1 + 5 + 1 + 1 + 4);
+    }
+
+    #[test]
+    fn test_assemble_match_byte_array_args() {
+        let source = "#pragma version 8\npushbytess \"1\" \"2\" \"1\"\nmatch label1 label2\nlabel1:\nlabel2:\n";
+        assemble_string(source).unwrap();
+    }
+
+    #[test]
+    fn test_assemble_match_255_labels_ok() {
+        let labels: Vec<String> = (0..255).map(|i| format!("label{i}")).collect();
+        let source = format!(
+            "#pragma version {v}\n{pushints}\nmatch {targets}\n{defs}\n",
+            v = MAX_AVM_VERSION,
+            pushints = "pushint 1\n".repeat(256), // 255 labels, and the match value
+            targets = labels.join(" "),
+            defs = labels.iter().map(|l| format!("{l}:\n")).collect::<String>(),
+        );
+        let ops = assemble_string(&source).unwrap();
+        // version(1) + pushints (2*256) + match opcode(1) + count(1) + labels(2*255)
+        assert_eq!(ops.program.len(), 1 + 2 * 256 + 1 + 1 + 2 * 255);
+    }
+
+    #[test]
+    fn test_assemble_match_256_labels_too_many() {
+        let labels: Vec<String> = (0..256).map(|i| format!("label{i}")).collect();
+        let source = format!(
+            "#pragma version {v}\n{pushints}\nmatch {targets} extra\n{defs}\n",
+            v = MAX_AVM_VERSION,
+            pushints = "pushint 1\n".repeat(257), // 256 labels, and the match value
+            targets = labels.join(" "),
+            defs = labels.iter().map(|l| format!("{l}:\n")).collect::<String>(),
+        );
+        let errs = expect_errors(&source);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("match cannot take more than 255 labels")),
+            "expected a too-many-labels error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_assemble_match_allows_duplicate_label_reference() {
+        let source = "#pragma version 8\npushints 1 2 1\nmatch label1 label1\nlabel1:\n";
+        assemble_string(source).unwrap();
+    }
+
+    #[test]
+    fn test_assemble_match_empty_match_ok() {
+        let source = "#pragma version 8\npushints 1\nmatch\n";
+        assemble_string(source).unwrap();
+    }
+
+    #[test]
+    fn test_assemble_match_empty_match_tracks_stack_through() {
+        // Even without static type-tracking, this shape (a match with no
+        // labels, followed by an instruction consuming what was under it)
+        // must still assemble -- there's nothing match-specific blocking
+        // it.
+        let source = "#pragma version 8\npushbytess 0xaa 0xbb\npushint 1\nmatch\nconcat\n";
+        assemble_string(source).unwrap();
+    }
 }
