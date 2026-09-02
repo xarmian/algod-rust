@@ -2212,4 +2212,234 @@ mod tests {
         let (proof, _) = Proof::decode_msgpack(&data).expect("in-bound empty path must decode");
         assert!(proof.path.is_empty());
     }
+
+    // ── Known-answer tests (KATs) ─────────────────────────────────────
+    //
+    // These vectors are copied verbatim from go-algorand's
+    // `crypto/merklearray/merkle_test.go` (`KATsSHA256`, `KATsSUMHASH`,
+    // `KATsSHA512_256`, `VCKATs`, pinned at v5.0.0-stable). Each entry's
+    // `elements` are hex-encoded 32-byte `crypto.Digest` values wrapped
+    // with the `protocol.Message` ("MX") HashID exactly like the Go
+    // `TestData`/`TestArray` helper types this file's own `TestMessage`/
+    // `TestArray` mirror, so these are genuine byte-exact go-algorand
+    // known-answer vectors, not internally-derived round-trip checks.
+
+    struct Kat {
+        expected_root: &'static str,
+        elements: &'static [&'static str],
+    }
+
+    fn kat_array(elements: &[&str]) -> TestArray {
+        TestArray(
+            elements
+                .iter()
+                .map(|hex_str| {
+                    let bytes = hex::decode(hex_str).expect("valid hex in KAT vector");
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&bytes);
+                    out
+                })
+                .collect(),
+        )
+    }
+
+    const KATS_SHA256: &[Kat] = &[
+        Kat {
+            expected_root: "5a7fb9d3fb8976d942feac36d762b8d0530476c022c297582123eca18ad8c7b8",
+            elements: &["d43c6748520a76f81fb8250aa9e1a656f073fff1e551562fad43e9fffb1ab88b"],
+        },
+        Kat {
+            expected_root: "c9bc24bd5fc8961a8721458fd93044871c9009fe4c66b9614744dd6e9216d93f",
+            elements: &[
+                "27a9011335fc96dc095f348a6c9347d3c7cdd56c57c650297d87df95d13f770b",
+                "5878453e4d5bce024b4ee07f6c57186868f3410348f5a7d601c0d9ce1efed239",
+            ],
+        },
+        Kat {
+            expected_root: "ad1828b8460ec541fdbeee2eb4f9d37cfad9da54c0c3a98b1eb20d24de9af6ce",
+            elements: &[
+                "44b5606ae49d81bc7f3451c4ff803998a8fe0057e22d6367080e5a155b661008",
+                "70ce7df8bda42920f5e75ae788ee7b9809826a92701a4e0e490138380ea60f44",
+                "77b439e99f764a1f6749e669b1361fe3bb5ce41beac4b5cd55fe51aa9efe3c67",
+            ],
+        },
+        Kat {
+            expected_root: "d78b0c411d1360bd6d49c755a60f9ada519942911411269637287bd0b5c19bab",
+            elements: &[
+                "faae213dd72151728a24c36f9aa3e07efbe326c058f85f6822c1dc2175e09d99",
+                "29e90fcc4b1c9513bc155c018db796d07e97c7a5009bd7a5eed4281e93de9413",
+                "f93c340847344999651c1bd71949cb974c7cad7bd421ccc677670f686ae520cc",
+                "76a8ebfe26a3353c2702937191dd766215689e5a07bda60fffd48ecfc22084d4",
+            ],
+        },
+        Kat {
+            expected_root: "f8744f4648d1974c38fca858873006126d93f1a150f0eb7da1072fef83e66341",
+            elements: &[
+                "fc2d600b2e43457221e35fcf4275221f66d6ce250b8696879d7ce7a4974f975d",
+                "a3fa0c2e13151fd3c3d002a5450819ae7150a1172decad45e2aa93056ab245b6",
+                "eb0e437994a16b1c3b8dfee99b6e8630c7bbb12f88759eb774b4e3935c551106",
+                "3a44dce2fba3f26f0e0ae2c47483e8cb1d815f9d9981f030edc380d4efac4f57",
+                "52c4079055e96c3ef3114ca93188410e8a8a08aa7e53dfb2bb18c301756faf9e",
+            ],
+        },
+    ];
+
+    const KATS_SUMHASH: &[Kat] = &[
+        Kat {
+            expected_root: "a1951e9ec9d630a975fbbdf5fa290f66bf2c55fbf5ec5ad5de08d281a971d97a64a0475d6d93ddda4480b1dbaaf33f7d72f79f9076da029e148fca0ba354b58c",
+            elements: &["d43c6748520a76f81fb8250aa9e1a656f073fff1e551562fad43e9fffb1ab88b"],
+        },
+        Kat {
+            expected_root: "8b60182211195e366021236b8bd26b004f0773f41de837dff8c483357d26aff1c06c8692b96df11fe30b2c87e6400a005d7f6e71e9b3b1f39207fe4525719cd2",
+            elements: &[
+                "27a9011335fc96dc095f348a6c9347d3c7cdd56c57c650297d87df95d13f770b",
+                "5878453e4d5bce024b4ee07f6c57186868f3410348f5a7d601c0d9ce1efed239",
+            ],
+        },
+        Kat {
+            expected_root: "8c427bfa1723d733b20ac58e2ce6c9791a25e9bdd57e1dc252e98b6b909a089e1c9077cea3852df6495cacbe750f41a777c593e5ce5d132d49b354b2790ae9a8",
+            elements: &[
+                "44b5606ae49d81bc7f3451c4ff803998a8fe0057e22d6367080e5a155b661008",
+                "70ce7df8bda42920f5e75ae788ee7b9809826a92701a4e0e490138380ea60f44",
+                "77b439e99f764a1f6749e669b1361fe3bb5ce41beac4b5cd55fe51aa9efe3c67",
+            ],
+        },
+        Kat {
+            expected_root: "09b34fb15d43b16a22e7830ede8df4f84f4b63f46af2f6843aaf36a08c5652bcdf033162e2002c658265f4395058af1b4cef13dee70ebef4ca2cd8e870bd50c6",
+            elements: &[
+                "faae213dd72151728a24c36f9aa3e07efbe326c058f85f6822c1dc2175e09d99",
+                "29e90fcc4b1c9513bc155c018db796d07e97c7a5009bd7a5eed4281e93de9413",
+                "f93c340847344999651c1bd71949cb974c7cad7bd421ccc677670f686ae520cc",
+                "76a8ebfe26a3353c2702937191dd766215689e5a07bda60fffd48ecfc22084d4",
+            ],
+        },
+        Kat {
+            expected_root: "6a55c0f451c211e1c961871cc0bb640c103768f0d25ddfa0b1c1d054e92adcd1480cdca21af805da887540d343fe78a3a515c761becc7e66371b740f6ff13b6b",
+            elements: &[
+                "fc2d600b2e43457221e35fcf4275221f66d6ce250b8696879d7ce7a4974f975d",
+                "a3fa0c2e13151fd3c3d002a5450819ae7150a1172decad45e2aa93056ab245b6",
+                "eb0e437994a16b1c3b8dfee99b6e8630c7bbb12f88759eb774b4e3935c551106",
+                "3a44dce2fba3f26f0e0ae2c47483e8cb1d815f9d9981f030edc380d4efac4f57",
+                "52c4079055e96c3ef3114ca93188410e8a8a08aa7e53dfb2bb18c301756faf9e",
+            ],
+        },
+    ];
+
+    const KATS_SHA512_256: &[Kat] = &[
+        Kat {
+            expected_root: "dfa54c2b7683cd5397b032bbec11ec1b77b9fbec5a56c9e9420f6b9980784034",
+            elements: &["d43c6748520a76f81fb8250aa9e1a656f073fff1e551562fad43e9fffb1ab88b"],
+        },
+        Kat {
+            expected_root: "75cf3a3659502f9326dffa72da5166ebde1d13f6529c922324874644f4b7616e",
+            elements: &[
+                "27a9011335fc96dc095f348a6c9347d3c7cdd56c57c650297d87df95d13f770b",
+                "5878453e4d5bce024b4ee07f6c57186868f3410348f5a7d601c0d9ce1efed239",
+            ],
+        },
+        Kat {
+            expected_root: "07b13353277a9ccb6b424f573ab4fc9e268a0127cebc4996529240b5e29b6de9",
+            elements: &[
+                "44b5606ae49d81bc7f3451c4ff803998a8fe0057e22d6367080e5a155b661008",
+                "70ce7df8bda42920f5e75ae788ee7b9809826a92701a4e0e490138380ea60f44",
+                "77b439e99f764a1f6749e669b1361fe3bb5ce41beac4b5cd55fe51aa9efe3c67",
+            ],
+        },
+        Kat {
+            expected_root: "32fb55ce4b38bef49a608ab2e2750cff16321af6222be11497e91af9fc92a53f",
+            elements: &[
+                "faae213dd72151728a24c36f9aa3e07efbe326c058f85f6822c1dc2175e09d99",
+                "29e90fcc4b1c9513bc155c018db796d07e97c7a5009bd7a5eed4281e93de9413",
+                "f93c340847344999651c1bd71949cb974c7cad7bd421ccc677670f686ae520cc",
+                "76a8ebfe26a3353c2702937191dd766215689e5a07bda60fffd48ecfc22084d4",
+            ],
+        },
+        Kat {
+            expected_root: "1758e2c625df2b3c6285b78b667bdd7b0056cd351cf5e4b67834ce941b0154c2",
+            elements: &[
+                "fc2d600b2e43457221e35fcf4275221f66d6ce250b8696879d7ce7a4974f975d",
+                "a3fa0c2e13151fd3c3d002a5450819ae7150a1172decad45e2aa93056ab245b6",
+                "eb0e437994a16b1c3b8dfee99b6e8630c7bbb12f88759eb774b4e3935c551106",
+                "3a44dce2fba3f26f0e0ae2c47483e8cb1d815f9d9981f030edc380d4efac4f57",
+                "52c4079055e96c3ef3114ca93188410e8a8a08aa7e53dfb2bb18c301756faf9e",
+            ],
+        },
+    ];
+
+    const VC_KATS: &[Kat] = &[
+        Kat {
+            expected_root: "dfa54c2b7683cd5397b032bbec11ec1b77b9fbec5a56c9e9420f6b9980784034",
+            elements: &["d43c6748520a76f81fb8250aa9e1a656f073fff1e551562fad43e9fffb1ab88b"],
+        },
+        Kat {
+            expected_root: "75cf3a3659502f9326dffa72da5166ebde1d13f6529c922324874644f4b7616e",
+            elements: &[
+                "27a9011335fc96dc095f348a6c9347d3c7cdd56c57c650297d87df95d13f770b",
+                "5878453e4d5bce024b4ee07f6c57186868f3410348f5a7d601c0d9ce1efed239",
+            ],
+        },
+        Kat {
+            expected_root: "38f50a41de0aec7fe0e4f4f78f1f540d5dc611d190a0cece6f0128ea2a027f5e",
+            elements: &[
+                "44b5606ae49d81bc7f3451c4ff803998a8fe0057e22d6367080e5a155b661008",
+                "70ce7df8bda42920f5e75ae788ee7b9809826a92701a4e0e490138380ea60f44",
+                "77b439e99f764a1f6749e669b1361fe3bb5ce41beac4b5cd55fe51aa9efe3c67",
+            ],
+        },
+        Kat {
+            expected_root: "95b34f1dfc41fed48115ca31bd43225dff93f540387c230acfa643e267f88d78",
+            elements: &[
+                "faae213dd72151728a24c36f9aa3e07efbe326c058f85f6822c1dc2175e09d99",
+                "29e90fcc4b1c9513bc155c018db796d07e97c7a5009bd7a5eed4281e93de9413",
+                "f93c340847344999651c1bd71949cb974c7cad7bd421ccc677670f686ae520cc",
+                "76a8ebfe26a3353c2702937191dd766215689e5a07bda60fffd48ecfc22084d4",
+            ],
+        },
+        Kat {
+            expected_root: "97772675fdec70b3010ef08b57f3cbf1e6f7b23f41115076bcc34add8d8c0a1b",
+            elements: &[
+                "fc2d600b2e43457221e35fcf4275221f66d6ce250b8696879d7ce7a4974f975d",
+                "a3fa0c2e13151fd3c3d002a5450819ae7150a1172decad45e2aa93056ab245b6",
+                "eb0e437994a16b1c3b8dfee99b6e8630c7bbb12f88759eb774b4e3935c551106",
+                "3a44dce2fba3f26f0e0ae2c47483e8cb1d815f9d9981f030edc380d4efac4f57",
+                "52c4079055e96c3ef3114ca93188410e8a8a08aa7e53dfb2bb18c301756faf9e",
+            ],
+        },
+    ];
+
+    fn run_merkle_tree_kats(kats: &[Kat], hash_type: HashType) {
+        for (idx, kat) in kats.iter().enumerate() {
+            let arr = kat_array(kat.elements);
+            let tree = build(&arr, HashFactory::new(hash_type))
+                .unwrap_or_else(|e| panic!("KAT {idx} ({hash_type:?}) failed to build: {e:?}"));
+            let root_hex = hex::encode(tree.root());
+            assert_eq!(
+                root_hex, kat.expected_root,
+                "mismatched root on KAT {idx} for {hash_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merkle_tree_kats() {
+        // Mirrors go-algorand's TestMerkleTreeKATs (merkle_test.go).
+        run_merkle_tree_kats(KATS_SHA512_256, HashType::Sha512_256);
+        run_merkle_tree_kats(KATS_SUMHASH, HashType::Sumhash);
+        run_merkle_tree_kats(KATS_SHA256, HashType::Sha256);
+    }
+
+    #[test]
+    fn test_vc_kats() {
+        // Mirrors go-algorand's TestVCKATs (merkle_test.go).
+        for (idx, kat) in VC_KATS.iter().enumerate() {
+            let arr = kat_array(kat.elements);
+            let tree = build_vector_commitment_tree(&arr, HashFactory::new(HashType::Sha512_256))
+                .unwrap_or_else(|e| panic!("VC KAT {idx} failed to build: {e:?}"));
+            let root_hex = hex::encode(tree.root());
+            assert_eq!(
+                root_hex, kat.expected_root,
+                "mismatched root on VC KAT {idx}"
+            );
+        }
+    }
 }
