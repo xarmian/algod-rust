@@ -58,7 +58,7 @@ statically validated.
 - [ ] #819 — sync: implement catchup peer-selection/ranking layer
 - [ ] #829 — avm: implement static stack-type-tracking pass in the TEAL assembler; first incremental slice (straight-line/branch-free tracking, safe-by-construction — disables itself rather than guessing on branches/labels/arity-dependent opcodes) via PR #883, covering TestSwapTypeCheck/TestEqualsTypeCheck/TestDupTypeCheck/TestSelectTypeCheck/TestSetBitTypeCheck + TestTypeTracking's first case; branch-merge unification, scratch-slot tracking, and several other sub-tests remain as documented follow-up work
 - [ ] #821 — pool/networking: implement application-call excessive-rate-limiter (ERL) subsystem
-- [ ] #820 — tools: add algokey pq CLI, autonomous heartbeat service, and libgoal app-call resource resolution; heartbeat service done via PR #882 (also fixed a real bug: `hb` transactions were blanket-rejected from the pool, which would have silently discarded the new service's own submissions); algokey pq CLI and libgoal resource resolution remain open
+- [ ] #820 — tools: add algokey pq CLI, autonomous heartbeat service, and libgoal app-call resource resolution; heartbeat service done via PR #882 (also fixed a real bug: `hb` transactions were blanket-rejected from the pool, which would have silently discarded the new service's own submissions); algokey pq CLI done via PR #884 (22/30 upstream tests matched); libgoal app-call resource resolution remains open
 - [ ] #828 — util: consider porting db Accessor/Migration framework, pagedqueue, and rateLimit ElasticRateLimiter
 - [x] #835 — ledger/simulation: implement placeholder PQ signature validation in the simulator (split from #816)
 
