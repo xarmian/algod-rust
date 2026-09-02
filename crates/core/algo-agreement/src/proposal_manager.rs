@@ -597,6 +597,23 @@ mod tests {
         assert_eq!(result.event_type(), EventType::VoteMalformed);
     }
 
+    /// TestProposalManagerRejectsUnknownEvent (go: agreement/proposalManager_test.go):
+    /// an event type the manager doesn't recognize (`bundleVerified` is
+    /// valid for the vote/bundle machinery but not for the proposal
+    /// manager) must panic rather than be silently accepted. Mirrors go's
+    /// `t.errorf`-then-panic ("bad event type") behavior in `handle`'s
+    /// default arm above.
+    #[test]
+    #[should_panic(expected = "bad event type")]
+    fn proposal_manager_rejects_unknown_event() {
+        let mut mgr = ProposalManager::default();
+        let ev = Event::Message(MessageEvent {
+            t: EventType::BundleVerified,
+            ..MessageEvent::default()
+        });
+        mgr.handle(Round(1), Period(0), ev);
+    }
+
     #[test]
     fn proposal_manager_payload_verified_cancelled() {
         let mut mgr = ProposalManager::default();
