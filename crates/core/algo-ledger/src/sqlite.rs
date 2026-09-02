@@ -2064,7 +2064,18 @@ pub struct SqliteLedger {
     /// export is skipped (rather than started concurrently) while the
     /// previous one hasn't finished, since both would otherwise write the
     /// same-shaped file set from an overlapping snapshot.
-    catchpoint_worker: Option<std::thread::JoinHandle<()>>,
+    ///
+    /// The thread's return value is `Some(label)` on a successful export
+    /// (`""` is a valid label only for a corrupt/empty export and never
+    /// actually produced by [`crate::catchpoint::export_catchpoint_file`]),
+    /// `None` on failure — read back by whichever join site
+    /// (`wait_for_pending_catchpoint_export`, or the overlap guard in
+    /// [`Self::maybe_spawn_automatic_catchpoint`]) reaps this handle, so it
+    /// can persist the label via [`Self::set_last_catchpoint_label`] on the
+    /// main thread's writable connection (issue #824 theme 6 /
+    /// `Ledger.GetLastCatchpointLabel`) — the spawned thread itself only
+    /// holds a read-only snapshot connection and cannot write it directly.
+    catchpoint_worker: Option<std::thread::JoinHandle<Option<String>>>,
 }
 
 /// In-memory accumulator for the per-round change to the `accounttotals`
@@ -3434,6 +3445,45 @@ impl SqliteLedger {
         Ok(())
     }
 
+    /// Persist the label of the most recently successfully exported
+    /// catchpoint under the Go-canonical `catchpointstate` key
+    /// `lastCatchpoint` (issue #824 theme 6 — go:
+    /// `catchpointTracker.lastCatchpointLabel`,
+    /// `trackerdb.CatchpointStateLastCatchpoint`). Survives a restart, so
+    /// [`Self::last_catchpoint_label`] keeps reporting the newest
+    /// successful export's label without needing to re-scan for
+    /// catchpoint files on disk.
+    pub fn set_last_catchpoint_label(&self, label: &str) -> Result<(), AlgoError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO catchpointstate(id, strval) VALUES(?1, ?2)",
+                params![crate::catchpoint::state_keys::LAST_CATCHPOINT, label],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("set_last_catchpoint_label: {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// Read the label of the most recently successfully exported
+    /// catchpoint, or `""` if none has ever been recorded — matches go's
+    /// `Ledger.GetLastCatchpointLabel` (`ledger/ledger.go`), whose backing
+    /// `catchpointTracker.lastCatchpointLabel` field defaults to the
+    /// empty string until the first successful export.
+    pub fn last_catchpoint_label(&self) -> Result<String, AlgoError> {
+        match self.conn.query_row(
+            "SELECT strval FROM catchpointstate WHERE id = ?1",
+            params![crate::catchpoint::state_keys::LAST_CATCHPOINT],
+            |row| row.get(0),
+        ) {
+            Ok(label) => Ok(label),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
+            Err(e) => Err(AlgoError::Ledger {
+                message: format!("last_catchpoint_label: {e}"),
+            }),
+        }
+    }
+
     /// Configure (or disable, with `None`) automatic interval-driven
     /// catchpoint generation (issue #770). Callers resolve
     /// `enabled`/`interval`/`file_history_length`/`dir` from
@@ -3459,8 +3509,26 @@ impl SqliteLedger {
     /// is known to be short.
     pub fn wait_for_pending_catchpoint_export(&mut self) {
         if let Some(handle) = self.catchpoint_worker.take() {
-            if let Err(e) = handle.join() {
-                tracing::warn!("automatic catchpoint export thread panicked: {e:?}");
+            match handle.join() {
+                Ok(label) => self.record_joined_catchpoint_label(label),
+                Err(e) => {
+                    tracing::warn!("automatic catchpoint export thread panicked: {e:?}");
+                }
+            }
+        }
+    }
+
+    /// Persist a just-joined export thread's label (issue #824 theme 6),
+    /// if it succeeded. Shared by every `catchpoint_worker` join site so
+    /// [`Self::last_catchpoint_label`] reflects the most recent
+    /// *successful* export, matching go's `Ledger.GetLastCatchpointLabel`
+    /// (a failed export leaves the previously recorded label in place,
+    /// exactly as go's `lastCatchpointLabel` field is only ever
+    /// overwritten by `finishFirstStage` on success).
+    fn record_joined_catchpoint_label(&self, label: Option<String>) {
+        if let Some(label) = label {
+            if let Err(e) = self.set_last_catchpoint_label(&label) {
+                tracing::warn!(error = %e, "failed to persist last catchpoint label");
             }
         }
     }
@@ -3596,8 +3664,11 @@ impl SqliteLedger {
             }
         }
         if let Some(handle) = self.catchpoint_worker.take() {
-            if let Err(e) = handle.join() {
-                tracing::warn!("automatic catchpoint export thread panicked: {e:?}");
+            match handle.join() {
+                Ok(label) => self.record_joined_catchpoint_label(label),
+                Err(e) => {
+                    tracing::warn!("automatic catchpoint export thread panicked: {e:?}");
+                }
             }
         }
 
@@ -3662,7 +3733,7 @@ impl SqliteLedger {
         let spawned = std::thread::Builder::new()
             .name(format!("catchpoint-export-{round}"))
             .spawn(move || {
-                match crate::catchpoint::export_catchpoint_file(&conn, &out_path, &opts) {
+                let label = match crate::catchpoint::export_catchpoint_file(&conn, &out_path, &opts) {
                     Ok(result) => {
                         tracing::info!(
                             round,
@@ -3671,6 +3742,7 @@ impl SqliteLedger {
                             accounts = result.total_accounts,
                             "automatic catchpoint export complete"
                         );
+                        Some(result.label)
                     }
                     Err(e) => {
                         tracing::warn!(round, error = %e, "automatic catchpoint export failed");
@@ -3678,11 +3750,13 @@ impl SqliteLedger {
                         // catchpoint set shouldn't accumulate unboundedly
                         // just because the newest generation attempt
                         // failed.
+                        None
                     }
-                }
+                };
                 if let Err(e) = crate::catchpoint::prune_catchpoint_files(&dir, history_length) {
                     tracing::warn!(round, error = %e, "automatic catchpoint: pruning old files failed");
                 }
+                label
             });
         match spawned {
             Ok(handle) => self.catchpoint_worker = Some(handle),
@@ -6407,6 +6481,7 @@ mod tests {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         ledger.catchpoint_worker = Some(std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(150));
+            None
         }));
 
         let start = std::time::Instant::now();
@@ -6428,6 +6503,7 @@ mod tests {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         ledger.catchpoint_worker = Some(std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(5));
+            None
         }));
 
         let start = std::time::Instant::now();
@@ -6441,6 +6517,67 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(1),
             "must not have blocked past the bounded timeout"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Last-catchpoint-label persistence (issue #824 theme 6 — go's
+    // `TestGetLastCatchpointLabel` / `Ledger.GetLastCatchpointLabel`)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn last_catchpoint_label_defaults_to_empty_string() {
+        // Matches go: `catchpointTracker.lastCatchpointLabel`'s zero value
+        // before any successful export, read back by
+        // `Ledger.GetLastCatchpointLabel`.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        assert_eq!(ledger.last_catchpoint_label().unwrap(), "");
+    }
+
+    #[test]
+    fn set_last_catchpoint_label_round_trips_and_survives_overwrite() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_last_catchpoint_label("47000000#ABCD").unwrap();
+        assert_eq!(ledger.last_catchpoint_label().unwrap(), "47000000#ABCD");
+
+        // A later export's label replaces the earlier one (INSERT OR
+        // REPLACE keyed on the single `lastCatchpoint` row).
+        ledger.set_last_catchpoint_label("48000000#WXYZ").unwrap();
+        assert_eq!(ledger.last_catchpoint_label().unwrap(), "48000000#WXYZ");
+    }
+
+    #[test]
+    fn wait_for_pending_catchpoint_export_persists_the_joined_labelled_export() {
+        // A finished export thread's `Some(label)` return value must be
+        // written to `catchpointstate` when its handle is joined — the
+        // background thread itself only holds a read-only snapshot
+        // connection and cannot persist it directly (see
+        // `catchpoint_worker`'s doc comment).
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        assert_eq!(ledger.last_catchpoint_label().unwrap(), "");
+
+        ledger.catchpoint_worker = Some(std::thread::spawn(|| Some("100#REALLABEL".to_string())));
+        ledger.wait_for_pending_catchpoint_export();
+
+        assert_eq!(
+            ledger.last_catchpoint_label().unwrap(),
+            "100#REALLABEL",
+            "a successfully joined export's label must be persisted"
+        );
+    }
+
+    #[test]
+    fn wait_for_pending_catchpoint_export_leaves_label_unchanged_on_failed_export() {
+        // A failed export (`None`) must not clobber whatever label the
+        // previous successful export recorded — matches go's
+        // `lastCatchpointLabel` only ever being overwritten by
+        // `finishFirstStage` on success.
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_last_catchpoint_label("50#PRIOR").unwrap();
+
+        ledger.catchpoint_worker = Some(std::thread::spawn(|| None));
+        ledger.wait_for_pending_catchpoint_export();
+
+        assert_eq!(ledger.last_catchpoint_label().unwrap(), "50#PRIOR");
     }
 
     #[test]
@@ -8039,6 +8176,73 @@ mod tests {
         // Chain state should be flushed.
         let round = ledger.last_committed_round().unwrap();
         assert_eq!(round, Some(1));
+    }
+
+    #[test]
+    fn commit_block_propagates_a_write_failure_instead_of_swallowing_it() {
+        // Analogous to go's `TestTrackers_CommitRoundIOError`: a failure
+        // while writing out a round's commit must surface as a real
+        // `Err` to the caller, not be silently swallowed (which would
+        // let the caller believe the round committed when nothing was
+        // actually persisted, wedging the ledger's round-tracking out of
+        // sync with the on-disk DB). This crate commits synchronously
+        // (`commit_block` returns `Result`, unlike go's background
+        // `commitSyncer` goroutine that must instead `Fatal`-log), so
+        // the equivalent, in-scope assertion is that the error
+        // propagates rather than commit_block reporting success.
+        //
+        // `PRAGMA query_only` stands in for a genuine disk I/O fault
+        // (this crate has no fault-injection VFS, and the task's own
+        // guidance allows a reasonable substitute here) -- it makes
+        // every subsequent write on the connection fail exactly the way
+        // an unwritable/corrupt database file would.
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.begin_block().unwrap();
+        ledger.set_account(
+            &Address([9u8; 32]),
+            AccountData {
+                micro_algos: 100,
+                ..Default::default()
+            },
+        );
+
+        ledger
+            .conn
+            .execute_batch("PRAGMA query_only = ON;")
+            .unwrap();
+
+        let err = ledger.commit_block().unwrap_err();
+        assert!(
+            format!("{err}").contains("acctrounds flush error"),
+            "expected the write failure to propagate from flush_chain_state, got: {err}"
+        );
+
+        // The round must not have been recorded as committed -- the
+        // caller-visible state must match the real (failed) outcome.
+        ledger
+            .conn
+            .execute_batch("PRAGMA query_only = OFF;")
+            .unwrap();
+        assert_eq!(
+            ledger.last_committed_round().unwrap(),
+            None,
+            "a failed commit must not silently advance the committed round"
+        );
+    }
+
+    #[test]
+    fn empty_block_db_reports_no_blocks_without_erroring() {
+        // Analogous to go's `TestBlockDBEmpty`: a freshly initialized,
+        // never-written block DB must behave predictably empty -- every
+        // lookup returns `Ok(None)`/`Ok(0)`, never an `Err` (there is
+        // nothing pathological about "no blocks yet") and never a panic.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+
+        assert_eq!(ledger.get_block_header(0).unwrap(), None);
+        assert_eq!(ledger.get_block_header(100).unwrap(), None);
+        assert_eq!(ledger.get_block_cert(0).unwrap(), None);
+        assert_eq!(ledger.max_block_round_in_blockdb().unwrap(), None);
     }
 
     #[test]
