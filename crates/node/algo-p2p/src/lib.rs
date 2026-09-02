@@ -48,6 +48,7 @@ pub mod dnsaddr;
 pub mod errors;
 pub mod host;
 pub mod identity;
+pub mod identity_tracker;
 pub mod peerstore;
 pub mod pubsub;
 pub mod streams;
@@ -62,10 +63,15 @@ pub use host::{
     DIAL_TIMEOUT,
 };
 pub use identity::{get_or_create_keypair, IdentityConfig, DEFAULT_PRIV_KEY_FILENAME};
+pub use identity_tracker::IdentityTracker;
 pub use peerstore::{PersistentPeerStore, DEFAULT_PEERSTORE_FILENAME};
 pub use pubsub::{
     ident_topic, topic_name_for_tag_code, AGREEMENT_VOTE_TOPIC, ALL_TOPICS, PROPOSAL_PAYLOAD_TOPIC,
     TX_TOPIC, VOTE_BUNDLE_TOPIC,
+};
+pub use streams::{
+    find_handler, should_initiate_stream, DispatchError, HandlerEntry, LogLevel, StreamHandlers,
+    StreamManager,
 };
 pub use wsproto::{
     build_headers, handshake_inbound, handshake_outbound, read_frame, write_frame, PeerMeta,
