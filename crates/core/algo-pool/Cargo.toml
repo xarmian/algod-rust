@@ -11,6 +11,8 @@ algo-codec.workspace = true
 algo-error.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
+blake2.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

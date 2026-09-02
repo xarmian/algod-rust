@@ -479,8 +479,10 @@ dependencies = [
  "algo-codec",
  "algo-error",
  "algo-types",
+ "blake2",
  "hex",
  "parking_lot",
+ "rand 0.8.5",
  "serde_bytes",
  "thiserror 2.0.18",
 ]
