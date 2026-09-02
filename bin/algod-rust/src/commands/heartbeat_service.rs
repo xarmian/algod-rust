@@ -220,17 +220,13 @@ fn run_loop(
     let mut suppress: HashMap<Address, Round> = HashMap::new();
 
     while !stop.load(Ordering::Relaxed) {
-        let current = match ledger.lock() {
-            Ok(l) => l.current_round(),
-            Err(_) => break, // poisoned -- nothing sane left to do
-        };
-
-        let candidates = {
+        let (current, candidates) = {
             let l = match ledger.lock() {
                 Ok(l) => l,
-                Err(_) => break,
+                Err(_) => break, // poisoned -- nothing sane left to do
             };
-            find_and_build_heartbeats(&*l, part_store, current)
+            let current = l.current_round();
+            (current, find_and_build_heartbeats(&*l, part_store, current))
         };
 
         for (address, stx) in candidates {
