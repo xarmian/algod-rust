@@ -39,12 +39,12 @@ statically validated.
 - [x] #812 — validate: add per-type WellFormed() mempool validation — merged via PR #837
 - [x] #813 — consensus: reconcile Falcon-512 vs Falcon-1024 parameter-set naming — resolved-by-investigation, no bug found (false alarm from audit test-name grepping)
 - [x] #815 — ledger: FirstValidTime + block_field implemented via PR #834; absentee computation split to #833 (needs new block-proposal-time online-stake infrastructure)
-- [ ] #833 — ledger: implement block-proposal-side absentee/suspension list computation (split from #815); isAbsent pure function implemented via PR #846, block-assembly wiring split to #845
+- [x] #833 — ledger: implement block-proposal-side absentee/suspension list computation (split from #815); isAbsent pure function implemented via PR #846, block-assembly wiring split to #845 — closed as superseded by #845
 - [x] #816 — rest-api: add PQ authorizer/LogicSig-curve compliance checks and stateproof-for-round polling — merged via PR #836; simulate placeholder-PQ-sig moved to #835
 - [x] #822 — crypto: enforce decode-time allocation bounds in merklearray proof decoder — merged via PR #832
 - [x] #839 — avm: implement missing v13+ block opcode fields (BlkBranch512, BlkSha512_256/256/512TxnCommitment) (split from #810)
 - [ ] #841 — avm: implement holding/local-state cross-product resource sharing and tx.Access-list resolution (split from #808)
-- [ ] #845 — ledger/pool/agreement: wire isAbsent-based absentee-account computation into block assembly (split from #833)
+- [ ] #845 — ledger/pool/agreement: wire isAbsent-based absentee-account computation into block assembly (split from #833); validation-side done via PR #886 (`validate_absent_online_accounts` now checks isAbsent/challenge-failure for a received block's claimed-absent list, rejecting a falsely-claimed absentee — a real security-relevant gap); proposal-side (`assemble_block` producing its own `ParticipationUpdates.AbsentParticipationAccounts`) confirmed to need genuinely new plumbing (grep-verified: zero `ParticipationUpdates` usage in `algo-pool`/`algo-agreement` today) and remains open
 - [x] #847 — avm: assembler treats ';' as a comment delimiter instead of a statement separator (found while working #823) — merged via PR #849
 - [x] ledger/agreement: `detect_validation_groups` had no transaction-group-size upper bound at all (found while working #825) — merged via PR #857; filed #856 for unrelated pre-existing test failures found while verifying no regressions
 - [x] #856 — bin/algod-rust: 3 stale `participate.rs` tests predating PR #837's tightened per-type wellFormed rules (afrz missing freeze_asset/freeze_account; a close-to-self test asserting acceptance of a scenario go-algorand rejects) — merged via PR #870
