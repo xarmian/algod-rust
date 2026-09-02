@@ -1183,7 +1183,115 @@ fn assemble_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
         "method" => asm_method(ops, args),
         "intcblock" => asm_intc_block(ops, args),
         "bytecblock" => asm_bytec_block(ops, args),
+        "txn" | "gtxn" | "gtxns" => asm_pseudo_txn(ops, mnemonic, args),
         _ => asm_regular(ops, mnemonic, args),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `txn`/`gtxn`/`gtxns` pseudo-op arity dispatch
+// ---------------------------------------------------------------------------
+//
+// go-algorand's assembler treats these three mnemonics as "pseudo-ops": the
+// *number of immediates supplied* (not the mnemonic itself) picks the real
+// opcode to assemble -- `txn Field` (1 immediate) is the real `txn` opcode,
+// while `txn Field i` (2 immediates) transparently assembles as `txna`
+// (assembler.go:1804-1816's `pseudoOps` table):
+//
+//   "txn":   {1: OpSpec{Name: "txn"},   2: OpSpec{Name: "txna"}},
+//   "gtxn":  {2: OpSpec{Name: "gtxn"},  3: OpSpec{Name: "gtxna"}},
+//   "gtxns": {1: OpSpec{Name: "gtxns"}, 2: OpSpec{Name: "gtxnsa"}},
+//
+// go-algorand's `getSpec` (assembler.go:1735-1773) resolves the target spec
+// by arity, but keeps reporting diagnostics under the *pseudo* mnemonic
+// (`pseudo.Name = name` at assembler.go:1755) rather than the dispatched-to
+// opcode's own name -- e.g. `txn Accounts 0 1` (3 immediates, no arity
+// matches) is `"txn expects 1 or 2 immediate arguments"`, not a `txna`-named
+// error. `asm_pseudo_txn` mirrors that: it looks up the dispatched-to
+// opcode's `OpSpec` to borrow its opcode byte/`ImmKind`/version, but always
+// reports errors under the original pseudo mnemonic.
+
+/// The `(immediate count -> real opcode name)` arity table for one
+/// pseudo-op mnemonic, mirroring a single entry of go-algorand's
+/// `pseudoOps` map (assembler.go:1804-1816).
+fn pseudo_txn_table(mnemonic: &str) -> &'static [(usize, &'static str)] {
+    match mnemonic {
+        "txn" => &[(1, "txn"), (2, "txna")],
+        "gtxn" => &[(2, "gtxn"), (3, "gtxna")],
+        "gtxns" => &[(1, "gtxns"), (2, "gtxnsa")],
+        _ => &[],
+    }
+}
+
+/// go-algorand's `joinIntsOnOr("immediate argument", counts...)`
+/// (assembler.go:1699-1720), specialized to the small immediate-count lists
+/// `pseudoImmediatesError` builds from a `pseudoOps` arity table.
+fn join_immediate_counts(counts: &[usize]) -> String {
+    if counts.len() == 1 {
+        return match counts[0] {
+            0 => "no immediate arguments".to_string(),
+            1 => "1 immediate argument".to_string(),
+            n => format!("{n} immediate arguments"),
+        };
+    }
+    let mut sorted = counts.to_vec();
+    sorted.sort_unstable();
+    let mut msg = String::new();
+    for (i, val) in sorted.iter().enumerate() {
+        if i + 1 < sorted.len() {
+            msg.push_str(&format!("{val} or "));
+        } else {
+            msg.push_str(&format!("{val} "));
+        }
+    }
+    msg.push_str("immediate arguments");
+    msg
+}
+
+/// Assemble `txn`/`gtxn`/`gtxns`, dispatching by immediate count to the real
+/// scalar opcode or its array-indexed (`txna`/`gtxna`/`gtxnsa`) sibling, per
+/// go-algorand's `pseudoOps` table (assembler.go:1804-1816).
+fn asm_pseudo_txn(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
+    let table = pseudo_txn_table(mnemonic);
+    match table.iter().find(|(n, _)| *n == args.len()) {
+        Some(&(_, target)) => {
+            let spec = match opcode::lookup_by_name(target) {
+                Some(s) => s,
+                None => {
+                    ops.record_error(ops.source_line, 0, format!("unknown opcode: {:?}", target));
+                    return;
+                }
+            };
+            // go's getSpec (assembler.go:1756-1759): version-gate under the
+            // pseudo mnemonic, citing the immediate count that was used --
+            // e.g. "txn opcode with 2 immediates was introduced in v2".
+            if spec.version > ops.version {
+                let phrase = if args.len() == 1 {
+                    "1 immediate".to_string()
+                } else {
+                    format!("{} immediates", args.len())
+                };
+                ops.record_error(
+                    ops.source_line,
+                    0,
+                    format!(
+                        "{mnemonic} opcode with {phrase} was introduced in v{}",
+                        spec.version
+                    ),
+                );
+                return;
+            }
+            asm_regular_named(ops, target, mnemonic, args);
+        }
+        None => {
+            // go's pseudoImmediatesError (assembler.go:1722-1730).
+            let counts: Vec<usize> = table.iter().map(|(n, _)| *n).collect();
+            ops.record_error(
+                ops.source_line,
+                0,
+                format!("{mnemonic} expects {}", join_immediate_counts(&counts)),
+            );
+        }
     }
 }
 
@@ -1483,13 +1591,27 @@ fn asm_bytec_block(ops: &mut OpStream, args: &[&str]) {
 }
 
 fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
-    let spec = match opcode::lookup_by_name(mnemonic) {
+    asm_regular_named(ops, mnemonic, mnemonic, args);
+}
+
+/// Assemble a "regular" (non-pseudo, non-`int`/`byte`/`addr`/`method`) opcode,
+/// looking up the opcode spec under `lookup_name` but reporting every
+/// diagnostic and resolving every field immediate under `display_name`.
+///
+/// These differ only when called from `asm_pseudo_txn`: `txn`/`gtxn`/`gtxns`
+/// dispatch by arity to the real opcode (`lookup_name`, e.g. `"txna"`) but
+/// keep reporting errors under the pseudo mnemonic the user actually wrote
+/// (`display_name`, e.g. `"txn"`), matching go-algorand's `getSpec`
+/// (`pseudo.Name = name`, assembler.go:1755). Every other caller passes the
+/// same string for both, so behavior for non-pseudo opcodes is unchanged.
+fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args: &[&str]) {
+    let spec = match opcode::lookup_by_name(lookup_name) {
         Some(s) => s,
         None => {
             ops.record_error(
                 ops.source_line,
                 0,
-                format!("unknown opcode: {:?}", mnemonic),
+                format!("unknown opcode: {:?}", lookup_name),
             );
             return;
         }
@@ -2576,6 +2698,96 @@ mod tests {
         assert!(
             errs.len() > 1,
             "expected multiple errors to be collected, got: {errs:?}"
+        );
+    }
+
+    // ── `txn`/`gtxn`/`gtxns` pseudo-op arity dispatch (issue #877), ported
+    // from go-algorand's TestAssembleTxna (assembler_test.go:1063) ──────
+
+    #[test]
+    fn test_txn_pseudo_arity_dispatches_to_array_opcode() {
+        // `txn Field i` (2 immediates) assembles identically to
+        // `txna Field i` -- go-algorand's pseudoOps table dispatches "txn"
+        // to the real `txna` opcode based purely on immediate count
+        // (assembler.go:1811).
+        let txn = assemble_string("#pragma version 8\ntxn Accounts 0\n").unwrap();
+        let txna = assemble_string("#pragma version 8\ntxna Accounts 0\n").unwrap();
+        assert_eq!(txn.program, txna.program);
+
+        // `gtxn t Field i` (3 immediates) -> `gtxna` (assembler.go:1812).
+        let gtxn = assemble_string("#pragma version 8\ngtxn 0 Accounts 1\n").unwrap();
+        let gtxna = assemble_string("#pragma version 8\ngtxna 0 Accounts 1\n").unwrap();
+        assert_eq!(gtxn.program, gtxna.program);
+
+        // `gtxns Field i` (2 immediates) -> `gtxnsa` (assembler.go:1813).
+        let gtxns = assemble_string("#pragma version 8\ngtxns Accounts 0\n").unwrap();
+        let gtxnsa = assemble_string("#pragma version 8\ngtxnsa Accounts 0\n").unwrap();
+        assert_eq!(gtxns.program, gtxnsa.program);
+    }
+
+    #[test]
+    fn test_txn_pseudo_arity_scalar_form_still_works() {
+        // The 1-/2-/1-immediate scalar forms (real `txn`/`gtxn`/`gtxns`)
+        // must keep working unchanged once the pseudo-op dispatch is added.
+        let txn = assemble_string("#pragma version 8\ntxn Sender\n").unwrap();
+        assert!(!txn.program.is_empty());
+
+        let gtxn = assemble_string("#pragma version 8\ngtxn 0 Sender\n").unwrap();
+        assert!(!gtxn.program.is_empty());
+
+        let gtxns = assemble_string("#pragma version 8\ngtxns Sender\n").unwrap();
+        assert!(!gtxns.program.is_empty());
+    }
+
+    #[test]
+    fn test_txn_pseudo_arity_wrong_immediate_count_errors() {
+        // TestAssembleTxna: an immediate count matching neither arity in the
+        // pseudoOps table is rejected with a combined "N or M" message
+        // (go's joinIntsOnOr, assembler.go:1699-1730).
+        for (source, expected) in [
+            (
+                "#pragma version 8\ntxn\n",
+                "txn expects 1 or 2 immediate arguments",
+            ),
+            (
+                "#pragma version 8\ntxn Accounts 0 1\n",
+                "txn expects 1 or 2 immediate arguments",
+            ),
+            (
+                "#pragma version 8\ngtxn 0 Sender 1 2\n",
+                "gtxn expects 2 or 3 immediate arguments",
+            ),
+            (
+                "#pragma version 8\ngtxn 0 Accounts 1 2\n",
+                "gtxn expects 2 or 3 immediate arguments",
+            ),
+        ] {
+            let errs = expect_errors(source);
+            assert!(
+                errs.iter().any(|e| e.message == expected),
+                "source {source:?}: expected {expected:?}, got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_txn_pseudo_arity_version_gating() {
+        // TestAssembleTxna: the array-form dispatch target is only
+        // available once its own opcode version is reached, and the error
+        // names the *pseudo* mnemonic plus how many immediates were given
+        // (assembler.go:1756-1759).
+        let errs = expect_errors("#pragma version 1\ntxn Accounts 0\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "txn opcode with 2 immediates was introduced in v2"),
+            "unexpected errors: {errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 1\ngtxn 0 Sender 0\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "gtxn opcode with 3 immediates was introduced in v2"),
+            "unexpected errors: {errs:?}"
         );
     }
 
