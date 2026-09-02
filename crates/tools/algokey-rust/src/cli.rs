@@ -68,6 +68,8 @@ pub enum Command {
     Multisig(MultisigCli),
     /// Manage participation keys.
     Part(PartCli),
+    /// Manage post-quantum account keys.
+    Pq(PqCli),
 }
 
 // ---------------------------------------------------------------------------
@@ -302,4 +304,138 @@ pub struct KeyregArgs {
     /// account offline.
     #[arg(long = "account")]
     pub account: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// pq
+// ---------------------------------------------------------------------------
+
+/// `pq` command tree (`pq.go:84-153`). Go's `pqCmd.Run` (`pq.go:88-90`)
+/// falls back to printing help when invoked with no subcommand.
+#[derive(Debug, Args)]
+pub struct PqCli {
+    #[command(subcommand)]
+    pub command: Option<PqSub>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PqSub {
+    /// Generate a post-quantum account key.
+    Generate(PqGenerateArgs),
+    /// Print post-quantum key information.
+    Info(PqInfoArgs),
+    /// Import a post-quantum private key from a mnemonic.
+    Import(PqImportArgs),
+    /// Sign transactions with a post-quantum private key.
+    Sign(PqSignArgs),
+    /// Sign a LogicSig program with a post-quantum private key.
+    #[command(name = "sign-program")]
+    SignProgram(PqSignProgramArgs),
+    /// Check that an address is PQ compliant.
+    #[command(name = "check-address")]
+    CheckAddress(PqCheckAddressArgs),
+}
+
+/// The only currently supported PQ scheme name (`pqSchemeFalcon1024Name`,
+/// `pq_scheme.go:29`).
+pub const PQ_SCHEME_FALCON1024_NAME: &str = "falcon-1024";
+
+/// Flags for `algokey pq generate` — matches `pq.go:155-157`.
+///
+/// `--keyfile` is required (matches `MarkFlagRequired("keyfile")`).
+#[derive(Debug, Args)]
+pub struct PqGenerateArgs {
+    /// Post-quantum signature scheme: falcon-1024 (f1).
+    #[arg(short = 'S', long = "scheme", default_value = PQ_SCHEME_FALCON1024_NAME)]
+    pub scheme: String,
+    /// Private key filename.
+    #[arg(short = 'k', long = "keyfile", required = true)]
+    pub keyfile: PathBuf,
+}
+
+/// Flags for `algokey pq info` — matches `pq.go:159-160`.
+///
+/// `--keyfile` is required.
+#[derive(Debug, Args)]
+pub struct PqInfoArgs {
+    /// Private key filename.
+    #[arg(short = 'k', long = "keyfile", required = true)]
+    pub keyfile: PathBuf,
+}
+
+/// Flags for `algokey pq import` — matches `pq.go:162-166`.
+///
+/// `--mnemonic` and `--keyfile` are both required.
+#[derive(Debug, Args)]
+pub struct PqImportArgs {
+    /// Private key mnemonic.
+    #[arg(short = 'm', long = "mnemonic", required = true)]
+    pub mnemonic: String,
+    /// Post-quantum signature scheme: falcon-1024 (f1).
+    #[arg(short = 'S', long = "scheme", default_value = PQ_SCHEME_FALCON1024_NAME)]
+    pub scheme: String,
+    /// Private key filename.
+    #[arg(short = 'k', long = "keyfile", required = true)]
+    pub keyfile: PathBuf,
+}
+
+/// Flags for `algokey pq sign` — matches `pq.go:168-176`.
+///
+/// `--txfile` and `--outfile` are required; `--keyfile`/`--mnemonic` are
+/// mutually exclusive and neither is clap-required — Go enforces "exactly
+/// one" at runtime (`resolvePQSigningContext`), which we mirror.
+#[derive(Debug, Args)]
+pub struct PqSignArgs {
+    /// Private key filename.
+    #[arg(short = 'k', long = "keyfile")]
+    pub keyfile: Option<PathBuf>,
+    /// Private key mnemonic.
+    #[arg(short = 'm', long = "mnemonic")]
+    pub mnemonic: Option<String>,
+    /// Post-quantum signature scheme: falcon-1024 (f1); used with
+    /// --mnemonic.
+    #[arg(short = 'S', long = "scheme", default_value = PQ_SCHEME_FALCON1024_NAME)]
+    pub scheme: String,
+    /// Transaction input filename.
+    #[arg(short = 't', long = "txfile", required = true)]
+    pub txfile: PathBuf,
+    /// Transaction output filename.
+    #[arg(short = 'o', long = "outfile", required = true)]
+    pub outfile: PathBuf,
+    /// Overwrite any existing signature category.
+    #[arg(long = "overwrite", default_value_t = false)]
+    pub overwrite: bool,
+}
+
+/// Flags for `algokey pq sign-program` — matches `pq.go:177-183`.
+///
+/// `--program` and `--outfile` are required; `--keyfile`/`--mnemonic` are
+/// mutually exclusive and neither is clap-required (same runtime rule as
+/// `pq sign`).
+#[derive(Debug, Args)]
+pub struct PqSignProgramArgs {
+    /// Private key filename.
+    #[arg(short = 'k', long = "keyfile")]
+    pub keyfile: Option<PathBuf>,
+    /// Private key mnemonic.
+    #[arg(short = 'm', long = "mnemonic")]
+    pub mnemonic: Option<String>,
+    /// Post-quantum signature scheme: falcon-1024 (f1); used with
+    /// --mnemonic.
+    #[arg(short = 'S', long = "scheme", default_value = PQ_SCHEME_FALCON1024_NAME)]
+    pub scheme: String,
+    /// Compiled LogicSig program input filename.
+    #[arg(short = 'p', long = "program", required = true)]
+    pub program: PathBuf,
+    /// LogicSig output filename.
+    #[arg(short = 'o', long = "outfile", required = true)]
+    pub outfile: PathBuf,
+}
+
+/// Flags for `algokey pq check-address` — matches `pq.go:138-145`.
+/// The address is a positional argument (`cobra.ExactArgs(1)`).
+#[derive(Debug, Args)]
+pub struct PqCheckAddressArgs {
+    /// Address to check for PQ compliance.
+    pub address: String,
 }

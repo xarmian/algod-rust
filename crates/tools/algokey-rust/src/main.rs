@@ -34,7 +34,7 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 
-use crate::cli::{Cli, Command, MultisigSub, PartSub};
+use crate::cli::{Cli, Command, MultisigSub, PartSub, PqSub};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -65,6 +65,25 @@ fn main() -> ExitCode {
             Some(PartSub::Info(args)) => commands::part::info::run(args),
             Some(PartSub::Generate(args)) => commands::part::generate::run(args),
             Some(PartSub::Reparent(args)) => commands::part::reparent::run(args),
+        },
+        Command::Pq(p) => match p.command {
+            // Go's `pqCmd.Run` (pq.go:88-90) prints help when `pq` is
+            // invoked with no subcommand. Mirror that exactly.
+            None => {
+                let mut root = Cli::command();
+                let pq = root
+                    .find_subcommand_mut("pq")
+                    .expect("`pq` is a registered subcommand");
+                let _ = pq.print_help();
+                println!();
+                ExitCode::SUCCESS
+            }
+            Some(PqSub::Generate(args)) => commands::pq::generate::run(args),
+            Some(PqSub::Info(args)) => commands::pq::info::run(args),
+            Some(PqSub::Import(args)) => commands::pq::import::run(args),
+            Some(PqSub::Sign(args)) => commands::pq::sign::run(args),
+            Some(PqSub::SignProgram(args)) => commands::pq::sign_program::run(args),
+            Some(PqSub::CheckAddress(args)) => commands::pq::check_address::run(args),
         },
     }
 }
