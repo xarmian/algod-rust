@@ -1982,18 +1982,20 @@ fn reset_expired_online_accounts<L: crate::store_trait::LedgerStore>(
 /// online account becomes eligible for absentee suspension, scaled by the
 /// account's share of total online stake (go-algorand's `absentFactor`,
 /// `ledger/eval/eval.go`).
-#[allow(dead_code)]
 const ABSENT_FACTOR: u64 = 20;
 
 /// Whether an online account should be considered absent (silent for
 /// suspiciously long, relative to its stake) as of `current`, mirroring
-/// go-algorand's `isAbsent` (`ledger/eval/eval.go`). Pure function; the
-/// block-assembly-time loop that computes `total_online_stake`/`acct_stake`/
-/// `last_seen` for every online account and calls this is tracked
-/// separately (issue #833's remaining block-proposal-side scope, split to
-/// a follow-up issue) -- until that lands, this is only exercised by its
-/// own unit tests, hence the `allow`.
-#[allow(dead_code)]
+/// go-algorand's `isAbsent` (`ledger/eval/eval.go`). Pure function.
+///
+/// Used on the validation side by [`validate_absent_online_accounts`] to
+/// check a *received* block's claimed absentee list (issue #845). The
+/// block-*assembly*-time loop that computes this same list when proposing a
+/// block (go's `generateKnockOfflineAccountsList`) is separate, larger
+/// scope -- it needs `assemble_block` to iterate online accounts and build
+/// a `ParticipationUpdates` struct, which doesn't exist yet in
+/// `algo-pool`/`algo-agreement`; tracked as issue #845's remaining
+/// proposal-side scope.
 pub(crate) fn is_absent(
     total_online_stake: u64,
     acct_stake: u64,
@@ -2022,21 +2024,53 @@ pub(crate) fn is_absent(
     last_seen.saturating_add(allowable_lag as u64) < current
 }
 
+/// Sum of rewards-adjusted balances of every currently `Online` account.
+///
+/// Mirrors go-algorand's `roundCowBase.onlineStake()` (`ledger/eval/eval.go`),
+/// which reports the online-circulation total (`AccountTotals.Online.Money`,
+/// rewards-extrapolated to the current round) used as the denominator-side
+/// input to `isAbsent`'s stake ratio. Built generically over [`LedgerStore`]
+/// from [`LedgerStore::online_accounts`] plus [`rewards::compute_pending_rewards`],
+/// the same pattern already used by `voters_tracker::total_online_stake` for
+/// state-proof voter selection.
+///
+/// Accumulates in `u128` and saturates into `u64` at the end, matching this
+/// crate's existing `saturating_*` style for aggregate-money arithmetic
+/// rather than treating an overflow as fatal.
+///
+/// [`LedgerStore`]: crate::store_trait::LedgerStore
+/// [`LedgerStore::online_accounts`]: crate::store_trait::LedgerStore::online_accounts
+fn total_online_voting_stake<L: crate::store_trait::LedgerStore>(store: &L) -> u64 {
+    let rewards_level = store.rewards_level();
+    let mut total: u128 = 0;
+    for (_, acct) in store.online_accounts() {
+        let pending = crate::rewards::compute_pending_rewards(&acct, rewards_level);
+        total += acct.micro_algos as u128 + pending as u128;
+    }
+    total.min(u64::MAX as u128) as u64
+}
+
 /// Validate absent participation accounts at end of block.
 ///
-/// Mirrors go-algorand's `validateAbsentOnlineAccounts`. Gated on the
-/// `validate` flag (matching Go's `if !eval.validate { return nil }`).
+/// Mirrors go-algorand's `validateAbsentOnlineAccounts` (`ledger/eval/eval.go`).
+/// Gated on the `validate` flag (matching Go's `if !eval.validate { return nil }`).
 ///
-/// Checks: count <= max, no duplicate addresses, each account is Online
-/// with non-zero balance and IncentiveEligible.
+/// Checks, in Go's exact order, for every claimed address:
+/// 1. count <= max (also handles max==0 disabling the feature)
+/// 2. no duplicate addresses
+/// 3. the account is `Online`, has non-zero balance, and is `IncentiveEligible`
+/// 4. the account is *actually* absent: either [`is_absent`] (silent for
+///    longer than its stake-scaled allowance, computed against
+///    [`total_online_voting_stake`]) or it failed the currently-active
+///    challenge (`heartbeat::find_challenge` with
+///    [`heartbeat::ChallengePeriod::Active`] + [`heartbeat::Challenge::failed`])
 ///
-/// Note: Go also checks isAbsent (via online stake / voting stake, see
-/// [`is_absent`] above) and challenge failure (via FindChallenge +
-/// ch.Failed, see `heartbeat::find_challenge`/`Challenge::failed`). Wiring
-/// those into this validation path -- and into block-assembly-time
-/// computation of the list in the first place -- requires new plumbing in
-/// `algo-pool`/`algo-agreement` not yet in place; tracked as the remaining
-/// scope of issue #833.
+/// Check 4 is the security-relevant one this function used to skip (per its
+/// old doc comment): without it, a malicious or buggy proposer could claim
+/// an online, actively-participating account is "absent" and have it
+/// wrongly suspended by every validating node. A proposed absent account
+/// that satisfies neither condition is rejected, matching Go's
+/// `"proposed absent account %v is not absent in %d, %d"` error.
 fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
     store: &L,
     block: &Block,
@@ -2063,6 +2097,24 @@ fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
             ),
         });
     }
+
+    // Total online stake and the currently-active challenge (go's
+    // `FindChallenge(..., ChActive)`) are only needed when there's at least
+    // one candidate to check them against -- skip the store scan for the
+    // common case of an empty absentee list.
+    let (total_online_stake, challenge) = if absent.is_empty() {
+        (0, crate::heartbeat::Challenge::default())
+    } else {
+        let total = total_online_voting_stake(store);
+        let provider = crate::heartbeat::StoreHeaderProvider { store };
+        let ch = crate::heartbeat::find_challenge(
+            consensus,
+            block.round.0,
+            &provider,
+            crate::heartbeat::ChallengePeriod::Active,
+        );
+        (total, ch)
+    };
 
     // Check for duplicates and basic account eligibility for suspension.
     let mut seen = std::collections::HashSet::with_capacity(absent.len());
@@ -2093,6 +2145,27 @@ fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
                 message: format!("proposed absent account {} not IncentiveEligible", addr),
             });
         }
+
+        let last_seen = crate::heartbeat::last_seen(acct.last_proposed, acct.last_heartbeat);
+        let acct_stake = acct
+            .micro_algos
+            .saturating_add(crate::rewards::compute_pending_rewards(
+                &acct,
+                store.rewards_level(),
+            ));
+
+        if is_absent(total_online_stake, acct_stake, last_seen, block.round.0) {
+            continue; // ok. it's "normal absent"
+        }
+        if challenge.failed(&addr.0, last_seen) {
+            continue; // ok. it's "challenge absent"
+        }
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "proposed absent account {} is not absent in {}, {}",
+                addr, acct.last_proposed, acct.last_heartbeat
+            ),
+        });
     }
 
     Ok(())
@@ -9295,14 +9368,46 @@ mod tests {
             let acct = state.get_or_default_account_mut(&absent_addr);
             acct.status = AccountStatus::Online;
             acct.incentive_eligible = true;
+            // Make the account genuinely absent (per the new isAbsent check)
+            // so the *first* occurrence passes every eligibility check and
+            // the test actually exercises the duplicate-detection branch on
+            // the second occurrence, rather than failing earlier on
+            // "is not absent". total_online_stake == 2x this account's own
+            // stake (there's a second online account below), so
+            // allowable_lag = ABSENT_FACTOR * 2 = 40; last_heartbeat=1 and
+            // block round=100 puts it well past that.
+            acct.last_heartbeat = 1;
+        }
+        // A second online account of equal stake, just to give
+        // total_online_stake a realistic (>1x) denominator.
+        {
+            use crate::store_trait::LedgerStore;
+            let whale = Address([12u8; 32]);
+            state.set_account(
+                &whale,
+                algo_types::AccountData {
+                    micro_algos: 5_000_000,
+                    status: AccountStatus::Online,
+                    incentive_eligible: true,
+                    ..Default::default()
+                },
+            );
         }
 
-        let block = make_empty_block_with_protocol(
+        // Round monotonicity is checked before end-of-block processing, so
+        // advance the store's current round to make round 100 valid next.
+        {
+            use crate::store_trait::LedgerStore;
+            state.set_current_round(Round(99));
+        }
+
+        let mut block = make_empty_block_with_protocol(
             fee_sink,
             algo_types::consensus::CONSENSUS_V41,
             None,
             Some(vec![absent_addr, absent_addr]), // duplicate!
         );
+        block.round = Round(100);
 
         let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
@@ -9338,6 +9443,162 @@ mod tests {
 
         // Replay mode: no validation, apply succeeds.
         apply_block(&mut state, &block).unwrap();
+    }
+
+    // ── isAbsent / challenge-failure validation (issue #845) ────────────
+    //
+    // TDD oracle: go-algorand's `TestAbsenteeChecks` (`ledger/eval/eval_test.go`)
+    // and `validateAbsentOnlineAccounts` (`ledger/eval/eval.go`). These call
+    // `validate_absent_online_accounts` directly rather than going through
+    // `apply_block_validating`, since it's a pure function of `(store, block,
+    // consensus, validate)` and testing it directly keeps each scenario
+    // focused on the isAbsent/challenge decision rather than unrelated
+    // block-apply plumbing (round sequencing, fee sink, etc).
+
+    #[test]
+    fn test_absent_validation_accepts_genuinely_absent_account() {
+        // Account claimed absent really has been silent far longer than its
+        // stake-scaled allowance -- validation must accept it.
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+        {
+            let acct = state.get_or_default_account_mut(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.incentive_eligible = true;
+            acct.last_heartbeat = 1; // last seen at round 1
+        }
+        // A second online account of equal stake: total_online_stake == 2x
+        // this account's own stake, so allowable_lag = ABSENT_FACTOR * 2 =
+        // 40. Round 100 is well past last_heartbeat(1) + 40.
+        {
+            use crate::store_trait::LedgerStore;
+            state.set_account(
+                &Address([12u8; 32]),
+                algo_types::AccountData {
+                    micro_algos: 5_000_000,
+                    status: AccountStatus::Online,
+                    incentive_eligible: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let mut block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![absent_addr]),
+        );
+        block.round = Round(100);
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+
+        validate_absent_online_accounts(&state, &block, &consensus, true)
+            .expect("genuinely absent account must validate");
+    }
+
+    #[test]
+    fn test_absent_validation_rejects_when_not_absent_and_no_challenge() {
+        // Security-relevant direction: a proposer falsely claims an online,
+        // actively-participating account is absent. It satisfies every
+        // basic-eligibility check (Online, funded, IncentiveEligible) but
+        // neither isAbsent (it was seen very recently, well within its
+        // stake-scaled allowance) nor an active challenge -- validation must
+        // REJECT the block, matching go's
+        // "proposed absent account %v is not absent in %d, %d".
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+        {
+            let acct = state.get_or_default_account_mut(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.incentive_eligible = true;
+            // Seen one round ago -- nowhere near any plausible allowance.
+            acct.last_heartbeat = 99;
+        }
+
+        let mut block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![absent_addr]),
+        );
+        block.round = Round(100);
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+
+        let result = validate_absent_online_accounts(&state, &block, &consensus, true);
+        assert!(
+            result.is_err(),
+            "falsely-claimed absent account must be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("is not absent"),
+            "expected 'is not absent' error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_absent_validation_accepts_challenge_failed_account() {
+        // Account does NOT satisfy isAbsent (never seen -- is_absent's
+        // "last_seen == 0" short-circuit) but DOES fail an active challenge
+        // (its address matches the challenge seed's leading bits, and it
+        // has been silent since before the challenge round) -- validation
+        // must accept it via the challenge-failure branch.
+        //
+        // V41 challenge params: interval=1000, grace=200, bits=5. Challenge
+        // round = 2000 for rounds in [2000, 3000). Active window:
+        // (2000 + 200, 2000 + 400] = (2200, 2400].
+        let seed = [0xF8u8; 32]; // first 5 bits: 1111_1
+        let challenged_addr = Address([0xFFu8; 32]); // first 5 bits match seed
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(challenged_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+        {
+            let acct = state.get_or_default_account_mut(&challenged_addr);
+            acct.status = AccountStatus::Online;
+            acct.incentive_eligible = true;
+            // Never heartbeated/proposed -- last_seen == 0, so is_absent is
+            // always false regardless of stake ratio; only the challenge
+            // path can accept this account.
+        }
+
+        // Store the challenge-round block header (round 2000) with the
+        // matching seed.
+        {
+            use crate::store_trait::LedgerStore;
+            let hdr = make_challenge_header_data(&seed, algo_types::consensus::CONSENSUS_V41);
+            state
+                .put_block(2000, algo_types::consensus::CONSENSUS_V41, &hdr, &[])
+                .unwrap();
+        }
+
+        let mut block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![challenged_addr]),
+        );
+        block.round = Round(2250); // inside the Active window
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+
+        validate_absent_online_accounts(&state, &block, &consensus, true)
+            .expect("challenge-failed account must validate via the challenge path");
     }
 
     // Fix #4: Gate keyreg last_heartbeat/incentive_eligible on payouts_enabled
