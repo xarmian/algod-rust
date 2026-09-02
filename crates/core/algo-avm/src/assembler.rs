@@ -994,143 +994,133 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
     let lines: Vec<&str> = text.lines().collect();
     let mut version_set = false;
 
-    for (line_idx, line_text) in lines.iter().enumerate() {
+    for (line_idx, &line_text) in lines.iter().enumerate() {
         ops.source_line = line_idx + 1; // 1-based
-        let trimmed = line_text.trim();
 
-        // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with(';') {
-            continue;
-        }
-
-        // Strip inline comments
-        let code = strip_comment(trimmed);
-        if code.is_empty() {
-            continue;
-        }
-
-        // Handle pragma
-        if code.starts_with('#') {
-            if code.starts_with("#pragma") {
-                let parts: Vec<&str> = code.split_whitespace().collect();
-                if parts.len() == 1 {
-                    // #pragma with no keyword
-                    ops.record_error(ops.source_line, 0, "empty pragma".into());
-                } else if parts[1] == "version" {
-                    if parts.len() == 2 {
-                        // #pragma version (no number)
-                        ops.record_error(ops.source_line, 0, "no version value".into());
-                    } else if parts.len() > 3 {
-                        // #pragma version N extra
-                        ops.record_error(
-                            ops.source_line,
-                            0,
-                            "unexpected tokens after version value".into(),
-                        );
-                    } else {
-                        // #pragma version N
-                        if !ops.pending.is_empty() {
+        for code in split_statements(line_text) {
+            // Handle pragma
+            if code.starts_with('#') {
+                if code.starts_with("#pragma") {
+                    let parts: Vec<&str> = code.split_whitespace().collect();
+                    if parts.len() == 1 {
+                        // #pragma with no keyword
+                        ops.record_error(ops.source_line, 0, "empty pragma".into());
+                    } else if parts[1] == "version" {
+                        if parts.len() == 2 {
+                            // #pragma version (no number)
+                            ops.record_error(ops.source_line, 0, "no version value".into());
+                        } else if parts.len() > 3 {
+                            // #pragma version N extra
                             ops.record_error(
                                 ops.source_line,
                                 0,
-                                "#pragma version is only allowed before instructions".into(),
+                                "unexpected tokens after version value".into(),
                             );
-                        }
-                        if let Ok(v) = parts[2].parse::<u8>() {
-                            if v == 0 || v > MAX_AVM_VERSION {
+                        } else {
+                            // #pragma version N
+                            if !ops.pending.is_empty() {
                                 ops.record_error(
                                     ops.source_line,
                                     0,
-                                    format!("unsupported version: {v}"),
+                                    "#pragma version is only allowed before instructions".into(),
                                 );
-                            } else {
-                                ops.version = v;
-                                version_set = true;
                             }
+                            if let Ok(v) = parts[2].parse::<u8>() {
+                                if v == 0 || v > MAX_AVM_VERSION {
+                                    ops.record_error(
+                                        ops.source_line,
+                                        0,
+                                        format!("unsupported version: {v}"),
+                                    );
+                                } else {
+                                    ops.version = v;
+                                    version_set = true;
+                                }
+                            } else {
+                                ops.record_error(
+                                    ops.source_line,
+                                    0,
+                                    format!("invalid version: {}", parts[2]),
+                                );
+                            }
+                        }
+                    } else if parts[1] == "autosalt" {
+                        if parts.len() == 2 {
+                            // #pragma autosalt (no value)
+                            ops.record_error(ops.source_line, 0, "no autosalt value".into());
+                        } else if parts.len() > 3 {
+                            // #pragma autosalt VALUE extra
+                            ops.record_error(
+                                ops.source_line,
+                                0,
+                                "unexpected tokens after autosalt value".into(),
+                            );
+                        } else if !ops.pending.is_empty() {
+                            ops.record_error(
+                                ops.source_line,
+                                0,
+                                "#pragma autosalt is only allowed before instructions".into(),
+                            );
+                        } else if let Some(on) = parse_pragma_bool(parts[2]) {
+                            ops.auto_salt = if on {
+                                AutoSaltMode::On
+                            } else {
+                                AutoSaltMode::Off
+                            };
+                            ops.auto_salt_line = ops.source_line;
                         } else {
                             ops.record_error(
                                 ops.source_line,
                                 0,
-                                format!("invalid version: {}", parts[2]),
+                                format!("bad #pragma autosalt: {:?}", parts[2]),
                             );
                         }
-                    }
-                } else if parts[1] == "autosalt" {
-                    if parts.len() == 2 {
-                        // #pragma autosalt (no value)
-                        ops.record_error(ops.source_line, 0, "no autosalt value".into());
-                    } else if parts.len() > 3 {
-                        // #pragma autosalt VALUE extra
-                        ops.record_error(
-                            ops.source_line,
-                            0,
-                            "unexpected tokens after autosalt value".into(),
-                        );
-                    } else if !ops.pending.is_empty() {
-                        ops.record_error(
-                            ops.source_line,
-                            0,
-                            "#pragma autosalt is only allowed before instructions".into(),
-                        );
-                    } else if let Some(on) = parse_pragma_bool(parts[2]) {
-                        ops.auto_salt = if on {
-                            AutoSaltMode::On
-                        } else {
-                            AutoSaltMode::Off
-                        };
-                        ops.auto_salt_line = ops.source_line;
                     } else {
+                        // #pragma <unknown>
                         ops.record_error(
                             ops.source_line,
                             0,
-                            format!("bad #pragma autosalt: {:?}", parts[2]),
+                            format!("unsupported pragma directive: {}", parts[1]),
                         );
                     }
-                } else {
-                    // #pragma <unknown>
-                    ops.record_error(
-                        ops.source_line,
-                        0,
-                        format!("unsupported pragma directive: {}", parts[1]),
-                    );
                 }
-            }
-            continue;
-        }
-
-        // If no version set yet, default
-        if !version_set && ops.version == 0 {
-            ops.version = ASSEMBLER_DEFAULT_VERSION;
-            version_set = true;
-        }
-
-        // Tokenize the line
-        let tokens = tokenize(code);
-        if tokens.is_empty() {
-            continue;
-        }
-
-        let mut tok_idx = 0;
-
-        // Handle labels
-        if tokens[0].ends_with(':') {
-            let label = &tokens[0][..tokens[0].len() - 1];
-            if ops.labels.contains_key(label) {
-                ops.record_error(ops.source_line, 0, format!("duplicate label {:?}", label));
-            } else {
-                ops.labels.insert(label.to_string(), ops.pending.len());
-            }
-            tok_idx = 1;
-            if tok_idx >= tokens.len() {
                 continue;
             }
+
+            // If no version set yet, default
+            if !version_set && ops.version == 0 {
+                ops.version = ASSEMBLER_DEFAULT_VERSION;
+                version_set = true;
+            }
+
+            // Tokenize the line
+            let tokens = tokenize(code);
+            if tokens.is_empty() {
+                continue;
+            }
+
+            let mut tok_idx = 0;
+
+            // Handle labels
+            if tokens[0].ends_with(':') {
+                let label = &tokens[0][..tokens[0].len() - 1];
+                if ops.labels.contains_key(label) {
+                    ops.record_error(ops.source_line, 0, format!("duplicate label {:?}", label));
+                } else {
+                    ops.labels.insert(label.to_string(), ops.pending.len());
+                }
+                tok_idx = 1;
+                if tok_idx >= tokens.len() {
+                    continue;
+                }
+            }
+
+            let mnemonic = &tokens[tok_idx];
+            let args: Vec<&str> = tokens[tok_idx + 1..].to_vec();
+
+            ops.record_source_location(ops.source_line, 0);
+            assemble_instruction(&mut ops, mnemonic, &args);
         }
-
-        let mnemonic = &tokens[tok_idx];
-        let args: Vec<&str> = tokens[tok_idx + 1..].to_vec();
-
-        ops.record_source_location(ops.source_line, 0);
-        assemble_instruction(&mut ops, mnemonic, &args);
     }
 
     if !version_set && ops.version == 0 {
@@ -2137,35 +2127,63 @@ fn decode_algorand_address(addr: &str) -> Result<Vec<u8>, String> {
     Ok(pubkey.to_vec())
 }
 
-/// Strip inline comments (// and ;) from a line.
-fn strip_comment(line: &str) -> &str {
-    // Need to handle string literals containing // or ;
+/// Split a source line into `;`-separated statements and strip trailing
+/// `//` comments, matching go-algorand's assembler (`data/transactions/
+/// logic/assembler.go`): `;` is a genuine statement separator (its
+/// tokenizer's `tokenSeparators` includes `;` alongside whitespace, and
+/// `tokensFromLine` emits an explicit `;` token that the statement loop
+/// treats like a newline) -- NOT a comment delimiter. A `//` comment
+/// (outside a string literal) ends the whole line, including any further
+/// `;`-delimited statements that would have followed it, mirroring go's
+/// `tokensFromLine` returning immediately on an unescaped `//`.
+fn split_statements(line: &str) -> Vec<&str> {
+    let mut result = Vec::new();
     let mut in_string = false;
     let mut escape = false;
     let bytes = line.as_bytes();
-    for i in 0..bytes.len() {
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
         if escape {
             escape = false;
+            i += 1;
             continue;
         }
         if bytes[i] == b'\\' && in_string {
             escape = true;
+            i += 1;
             continue;
         }
         if bytes[i] == b'"' {
             in_string = !in_string;
+            i += 1;
             continue;
         }
         if !in_string {
             if bytes[i] == b';' {
-                return line[..i].trim_end();
+                let seg = line[start..i].trim();
+                if !seg.is_empty() {
+                    result.push(seg);
+                }
+                start = i + 1;
+                i += 1;
+                continue;
             }
             if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-                return line[..i].trim_end();
+                let seg = line[start..i].trim();
+                if !seg.is_empty() {
+                    result.push(seg);
+                }
+                return result;
             }
         }
+        i += 1;
     }
-    line
+    let seg = line[start..].trim();
+    if !seg.is_empty() {
+        result.push(seg);
+    }
+    result
 }
 
 /// Tokenize a TEAL source line into whitespace-separated tokens,
@@ -2480,13 +2498,34 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_comment() {
-        assert_eq!(strip_comment("int 1 // comment"), "int 1");
-        assert_eq!(strip_comment("int 1 ; comment"), "int 1");
+    fn test_split_statements() {
+        // A `//` comment strips the trailing text (single statement).
+        assert_eq!(split_statements("int 1 // comment"), vec!["int 1"]);
+        // `;` separates statements -- it is not a comment delimiter
+        // (issue #847: this assembler previously, incorrectly, treated it
+        // as one, matching go-algorand's `assembler.go` tokenizer instead).
+        assert_eq!(split_statements("int 1 ; return"), vec!["int 1", "return"]);
         assert_eq!(
-            strip_comment(r#"byte "hello // world""#),
-            r#"byte "hello // world""#
+            split_statements("zero: int 1; return"),
+            vec!["zero: int 1", "return"]
         );
+        // `//` and `;` inside a string literal are not separators.
+        assert_eq!(
+            split_statements(r#"byte "hello // world""#),
+            vec![r#"byte "hello // world""#]
+        );
+        assert_eq!(split_statements(r#"byte "a;b""#), vec![r#"byte "a;b""#]);
+        // A `//` comment after some `;`-separated statements ends the
+        // whole line -- statements after the `//` are dropped, matching
+        // go's `tokensFromLine` returning immediately on an unescaped `//`.
+        assert_eq!(
+            split_statements("int 1; int 2 // int 3; int 4"),
+            vec!["int 1", "int 2"]
+        );
+        // Empty statements (leading/trailing/doubled `;`) are dropped.
+        assert_eq!(split_statements(";int 1;;"), vec!["int 1"]);
+        assert_eq!(split_statements(""), Vec::<&str>::new());
+        assert_eq!(split_statements("// only a comment"), Vec::<&str>::new());
     }
 
     #[test]
@@ -2784,9 +2823,8 @@ mod tests {
         // (no salting would be needed anyway), so no warning should fire.
         let mut found = None;
         for v in 0u64..64 {
-            let src = format!(
-                "#pragma version 13\n#pragma autosalt false\nint {v}\nint {v}\nreturn\n"
-            );
+            let src =
+                format!("#pragma version 13\n#pragma autosalt false\nint {v}\nint {v}\nreturn\n");
             let ops = assemble_string(&src).unwrap();
             if !program_hash_is_edwards25519_point(&ops.program) {
                 found = Some(ops);
