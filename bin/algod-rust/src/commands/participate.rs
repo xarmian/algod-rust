@@ -3581,11 +3581,24 @@ pub async fn run(
     // `TxSyncer`'s own `PendingTxAggregate` — same pool, same snapshot
     // semantics.
     let tx_sync_pool_aggregate = Arc::new(algo_network::PoolPendingTxAggregate::new(pool.clone()));
+    // Peer-fairness servicing gate (issues #821, #860): guards how much of
+    // this node's own tx-sync servicing capacity each requesting peer can
+    // consume, so one peer polling aggressively cannot starve another
+    // peer's pull requests. See `algo_network::TxSyncPeerLimiter`'s doc
+    // comment for the full design; this is the pull-based mirror image of
+    // go's ElasticRateLimiter/RED inbound-admission gate, which has no
+    // reachable equivalent point on algod-rust's pull architecture.
+    let tx_sync_peer_limiter = Arc::new(algo_network::TxSyncPeerLimiter::new(
+        tx_syncer_config.server_max_concurrent_requests,
+        tx_syncer_config.server_capacity_per_peer,
+        std::time::Duration::from_secs(10),
+    ));
     let tx_sync_service = algo_network::TxSyncService::new(
         tx_sync_pool_aggregate.clone(),
         resolved_genesis_id.clone(),
         tx_syncer_config.server_response_size,
-    );
+    )
+    .with_peer_limiter(tx_sync_peer_limiter);
     gossip_node.register_http_handler("/", tx_sync_service.http_router());
 
     let mut gossip_handlers = vec![algo_network::handler::TaggedMessageHandler {

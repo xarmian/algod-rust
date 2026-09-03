@@ -50,19 +50,33 @@
 //! overhead — an explicit call per #792's own acceptance criteria, not a
 //! silent decision.
 //!
+//! ## Peer-fairness servicing gate (issues #821, #860)
+//!
+//! See [`TxSyncPeerLimiter`]'s doc comment for the full design: an optional
+//! [`ElasticRateLimiter`]`<IpAddr>` guarding how much of *this* node's own
+//! servicing capacity each requesting peer's `POST .../txsync` calls may
+//! consume, keyed by the peer's source IP (available via axum's
+//! `ConnectInfo<SocketAddr>` extractor once the router is served through
+//! [`crate::ws_network::WebsocketNetwork`]'s connect-info-aware listener,
+//! exactly as [`crate::block_service`]'s sibling endpoint could adopt too).
+//!
 //! [`TxSyncer`]: crate::tx_syncer::TxSyncer
 
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use http::{HeaderMap, StatusCode};
+use tracing::debug;
 
 use algo_codec::{canonical_encode_signed_transaction, compute_txn_id};
+use algo_pool::{CapacityGuard, ElasticRateLimiter, ElasticRateLimiterError};
 use algo_types::SignedTransaction;
 
 use crate::bloom::Filter;
@@ -93,6 +107,150 @@ const TX_SYNC_HTTP_PATH: &str = "/v1/:genesis_id/txsync";
 /// comfortably tight against an actually-oversized body).
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Peer-fairness gate for [`TxSyncService`]'s own servicing capacity
+/// (issues #821, #860).
+///
+/// ## Why this exists
+///
+/// go-algorand's `ElasticRateLimiter`/RED pair (`util/rateLimit.go`,
+/// wired in `data/txHandler.go`) protects a **push-based** admission
+/// point: peers unsolicitedly relay transactions to this node, and the
+/// gate decides whether to admit each one onto the shared backlog queue
+/// *before* it consumes local resources, so one noisy or malicious peer
+/// cannot flood the backlog and starve everyone else's transactions from
+/// ever being processed.
+///
+/// algod-rust's actual peer-to-peer transaction path
+/// ([`crate::tx_syncer::TxSyncer`]) is **pull-based**: this node polls
+/// each peer's synced-transaction set on a timer, so there is no
+/// reachable "unsolicited incoming transaction" admission point the way
+/// go's gate has (see `algo_pool::elastic_rate_limiter`'s module doc for
+/// the full architectural trace). The mirror image of go's gate on a
+/// pull architecture is fairness across *which peer's pull request this
+/// node services first* when this node's own servicing capacity (pool
+/// snapshot + msgpack encoding + response bandwidth) is under pressure —
+/// exactly the design this issue's own body sketches. `TxSyncPeerLimiter`
+/// applies [`ElasticRateLimiter`]'s per-client capacity-reservation model
+/// to that servicing capacity, keyed by the requesting peer's source IP:
+///
+/// * Each peer gets a small guaranteed reservation
+///   (`capacity_per_peer`) out of a shared pool (`max_capacity`) sized to
+///   this node's total concurrent tx-sync servicing budget — so one peer
+///   issuing many pull requests back-to-back cannot exhaust capacity that
+///   another, already-active peer has already reserved for itself (see
+///   this module's `peer_reservation_isolates_fairness` test).
+/// * Once a peer's reservation is empty, further requests draw from the
+///   shared pool, optionally gated by [`RedCongestionManager`] exactly as
+///   go's does: requests are dropped with probability proportional to how
+///   far a peer's arrival rate exceeds its fair per-peer share of this
+///   node's service rate.
+/// * Congestion control is toggled dynamically based on shared-pool
+///   utilization, mirroring go's `TxHandler.incomingMsgErlCheck`
+///   (`data/txHandler.go`): go enables it once the backlog queue crosses
+///   a configured congestion threshold and disables it once the queue
+///   has drained back below that threshold (hysteresis so it doesn't
+///   flap at the boundary); this port uses free shared-pool capacity as
+///   the equivalent congestion signal (below `CONGESTION_THRESHOLD_PCT`
+///   free triggers it, matching go's own default 50% framing), since a
+///   synchronous request-serving path has no separate backlog-queue
+///   depth to sample.
+///
+/// ## Honest limitation (inherited from the algorithm, not a wiring bug)
+///
+/// Reservations are opened lazily, on a peer's first request. A flood
+/// from a brand-new peer that arrives *before* other peers have made
+/// their own first request can still claim the entire shared pool (there
+/// is nothing yet reserved for peers the node has never heard from) —
+/// this matches go's own `capacityQueue` semantics exactly (the shared
+/// pool is genuinely first-come while unclaimed) and is not something
+/// this wiring, or go's original algorithm, tries to prevent. What the
+/// mechanism *does* guarantee is that a peer who has already reserved
+/// capacity keeps access to that reservation regardless of how hard any
+/// other peer floods the shared pool afterward.
+///
+/// [`RedCongestionManager`]: algo_pool::RedCongestionManager
+pub struct TxSyncPeerLimiter {
+    erl: Mutex<ElasticRateLimiter<IpAddr>>,
+    max_capacity: usize,
+}
+
+/// Free-shared-capacity threshold (as a percentage of `max_capacity`)
+/// below which congestion control is enabled, and at/above which it is
+/// disabled again. Mirrors the framing of go's
+/// `TxBacklogRateLimitingCongestionPct` default (50%) — see
+/// [`TxSyncPeerLimiter`]'s doc comment.
+const CONGESTION_THRESHOLD_PCT: usize = 50;
+
+impl TxSyncPeerLimiter {
+    /// Creates a peer-fairness limiter with `max_capacity` total
+    /// concurrently-servicable tx-sync requests, of which `capacity_per_peer`
+    /// units are set aside as a guaranteed reservation for each distinct
+    /// requesting peer (by source IP) the first time it is seen.
+    /// `service_rate_window` sizes the sliding window
+    /// [`RedCongestionManager`](algo_pool::RedCongestionManager) uses to
+    /// estimate arrival/service rates once congestion control is enabled.
+    #[must_use]
+    pub fn new(
+        max_capacity: usize,
+        capacity_per_peer: usize,
+        service_rate_window: Duration,
+    ) -> Self {
+        let max_capacity = max_capacity.max(1);
+        Self {
+            erl: Mutex::new(ElasticRateLimiter::new(
+                max_capacity,
+                capacity_per_peer,
+                service_rate_window,
+            )),
+            max_capacity,
+        }
+    }
+
+    /// Attempts to admit one tx-sync request from `peer`. On success,
+    /// returns a guard the caller must pass to [`Self::complete`] once the
+    /// request has been serviced (the equivalent of go's
+    /// `ErlCapacityGuard.Served` + `Release`).
+    fn admit(&self, peer: IpAddr) -> Result<CapacityGuard<IpAddr>, ElasticRateLimiterError> {
+        let mut erl = self.erl.lock().expect("TxSyncPeerLimiter mutex poisoned");
+        let was_congested =
+            Self::shared_pool_congested(erl.shared_capacity_len(), self.max_capacity);
+        let (is_cm_enabled, res) = erl.consume_capacity(&peer);
+        // Mirrors go's `TxHandler.incomingMsgErlCheck` hysteresis: a failed
+        // vend is itself the strongest possible congestion signal (force
+        // it on, regardless of `is_cm_enabled`); otherwise flip based on
+        // the pre-request utilization reading, matching go reading
+        // `congestedERL` before consuming.
+        if res.is_err() || (!is_cm_enabled && was_congested) {
+            erl.enable_congestion_control();
+        } else if !was_congested {
+            erl.disable_congestion_control();
+        }
+        res
+    }
+
+    /// Marks the request the guard was admitting as fully serviced,
+    /// informing the congestion manager's service-rate estimate, then
+    /// returns the guard's capacity unit to its origin queue. Mirrors go's
+    /// `ErlCapacityGuard.Served()` followed by `Release()`.
+    fn complete(&self, mut guard: CapacityGuard<IpAddr>) {
+        let mut erl = self.erl.lock().expect("TxSyncPeerLimiter mutex poisoned");
+        erl.served(Instant::now());
+        let _ = erl.release(&mut guard);
+    }
+
+    fn shared_pool_congested(free: usize, max_capacity: usize) -> bool {
+        free.saturating_mul(100) / max_capacity.max(1) < CONGESTION_THRESHOLD_PCT
+    }
+}
+
+impl std::fmt::Debug for TxSyncPeerLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxSyncPeerLimiter")
+            .field("max_capacity", &self.max_capacity)
+            .finish()
+    }
+}
+
 /// Read-only view of the pool's locally-pending transaction groups.
 ///
 /// Narrow on purpose (mirrors [`crate::block_service::LedgerForBlockService`]'s
@@ -119,6 +277,11 @@ pub struct TxSyncService {
     /// including on the very first group — go does not special-case an
     /// otherwise-empty response).
     response_size_limit: usize,
+    /// Optional peer-fairness servicing gate (issues #821, #860). `None`
+    /// (the default from [`Self::new`]) means every well-formed request is
+    /// serviced unconditionally, matching this endpoint's original
+    /// behavior.
+    peer_limiter: Option<Arc<TxSyncPeerLimiter>>,
 }
 
 #[derive(Clone)]
@@ -126,6 +289,7 @@ struct TxSyncServiceState {
     pool: Arc<dyn PendingTxGroupsSource>,
     genesis_id: String,
     response_size_limit: usize,
+    peer_limiter: Option<Arc<TxSyncPeerLimiter>>,
 }
 
 impl TxSyncService {
@@ -134,6 +298,9 @@ impl TxSyncService {
     /// `response_size_limit` of `0` is treated as `1` — a zero-sized
     /// response cap would silently drop every response, which is never
     /// the intent of a misconfigured `TxSyncServeResponseSize: 0`.
+    ///
+    /// No peer-fairness gate is installed by default — call
+    /// [`Self::with_peer_limiter`] to opt in.
     #[must_use]
     pub fn new(
         pool: Arc<dyn PendingTxGroupsSource>,
@@ -144,18 +311,35 @@ impl TxSyncService {
             pool,
             genesis_id,
             response_size_limit: response_size_limit.max(1),
+            peer_limiter: None,
         }
+    }
+
+    /// Installs a [`TxSyncPeerLimiter`] gating how much of this node's
+    /// servicing capacity each requesting peer's `POST .../txsync` calls
+    /// may consume (issues #821, #860). See [`TxSyncPeerLimiter`]'s doc
+    /// comment for the fairness design.
+    #[must_use]
+    pub fn with_peer_limiter(mut self, limiter: Arc<TxSyncPeerLimiter>) -> Self {
+        self.peer_limiter = Some(limiter);
+        self
     }
 
     /// Build an [`axum::Router`] for the HTTP tx-sync endpoint.
     ///
     /// Registers `POST /v1/:genesis_id/txsync` — go's real path
-    /// (`TxServiceHTTPPath`).
+    /// (`TxServiceHTTPPath`). When a [`TxSyncPeerLimiter`] is installed,
+    /// requests are identified by the caller's source IP via axum's
+    /// `ConnectInfo<SocketAddr>` extractor — the router must therefore be
+    /// served through a listener that supplies connect info (as
+    /// [`crate::ws_network::WebsocketNetwork`]'s relay server does for
+    /// every handler registered via `register_http_handler`).
     pub fn http_router(&self) -> Router {
         let state = TxSyncServiceState {
             pool: Arc::clone(&self.pool),
             genesis_id: self.genesis_id.clone(),
             response_size_limit: self.response_size_limit,
+            peer_limiter: self.peer_limiter.clone(),
         };
 
         Router::new()
@@ -168,6 +352,7 @@ impl TxSyncService {
 async fn serve_tx_sync(
     State(state): State<TxSyncServiceState>,
     Path(genesis_id): Path<String>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -206,11 +391,36 @@ async fn serve_tx_sync(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
+    // Peer-fairness servicing gate (issues #821, #860) — applied only now,
+    // after the request is known well-formed and immediately before the
+    // real servicing work (reading the pool + encoding the response), so
+    // a malformed request never consumes a peer's fairness budget. See
+    // `TxSyncPeerLimiter`'s doc comment for the design.
+    let guard = match &state.peer_limiter {
+        Some(limiter) => match limiter.admit(remote_addr.ip()) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                debug!(
+                    peer = %remote_addr.ip(),
+                    error = %e,
+                    "tx-sync request throttled: this node's own servicing capacity is under \
+                     pressure and this peer's fair share is exhausted",
+                );
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        },
+        None => None,
+    };
+
     let payload = build_response_body(
         state.pool.pending_tx_groups(),
         &filter,
         state.response_size_limit,
     );
+
+    if let (Some(limiter), Some(guard)) = (&state.peer_limiter, guard) {
+        limiter.complete(guard);
+    }
 
     Response::builder()
         .status(StatusCode::OK)
@@ -326,18 +536,36 @@ mod tests {
         f
     }
 
+    /// Default remote address used by [`post`] for tests that don't care
+    /// about peer identity.
+    fn default_remote_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 0)
+    }
+
     async fn post(router: Router, path: &str, content_type: &str, body: Vec<u8>) -> Response {
-        router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(path)
-                    .header("Content-Type", content_type)
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
+        post_from(router, path, content_type, body, default_remote_addr()).await
+    }
+
+    /// Like [`post`], but from an explicit peer address — the `oneshot`
+    /// harness bypasses axum's connect-info-aware listener plumbing (see
+    /// `TxSyncService::http_router`'s doc comment), so tests must insert
+    /// `ConnectInfo` into the request extensions themselves, exactly as
+    /// `into_make_service_with_connect_info` would at the real listener.
+    async fn post_from(
+        router: Router,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        remote_addr: SocketAddr,
+    ) -> Response {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("Content-Type", content_type)
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(remote_addr));
+        router.oneshot(req).await.unwrap()
     }
 
     async fn decode_response_txns(resp: Response) -> Vec<SignedTransaction> {
@@ -529,5 +757,285 @@ mod tests {
         .await;
         let txns = decode_response_txns(resp).await;
         assert_eq!(txns.len(), 1, "response should stop after the cap is hit");
+    }
+
+    // ── TxSyncPeerLimiter: fairness algorithm (issues #821, #860) ──────
+
+    fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::from([a, b, c, d])
+    }
+
+    /// Core fairness property required by the issue: a peer that has
+    /// already reserved capacity keeps access to *its own* reservation
+    /// regardless of how hard another peer floods the shared pool
+    /// afterward. This is the guarantee that stands in for RED's "no
+    /// single peer can starve others" property on the pull-based side.
+    #[test]
+    fn peer_reservation_isolates_fairness_from_a_flooding_peer() {
+        let quiet = ip(10, 0, 0, 1);
+        let noisy = ip(10, 0, 0, 2);
+        let limiter = TxSyncPeerLimiter::new(4, 1, Duration::from_secs(10));
+
+        // `quiet` shows up first and reserves its 1 guaranteed unit but
+        // does not (yet) consume it -- simulating a peer that has been
+        // active before the flood starts.
+        let quiet_guard = limiter
+            .admit(quiet)
+            .expect("quiet peer's first request opens a reservation");
+        limiter.complete(quiet_guard);
+
+        // `noisy` now floods: first request opens its own reservation (1
+        // unit, drawn from the shared pool) and consumes it; every
+        // subsequent request drains the shared pool directly. Never
+        // completed, simulating many requests still in flight.
+        let mut noisy_guards = Vec::new();
+        for _ in 0..10 {
+            if let Ok(g) = limiter.admit(noisy) {
+                noisy_guards.push(g);
+            }
+        }
+        // Shared pool (4) minus quiet's reservation (1) minus noisy's
+        // reservation (1) leaves 2 shared units for noisy to drain -- so
+        // noisy should have successfully admitted exactly 3 requests
+        // (1 from its own reservation + 2 from the shared pool) before
+        // running out of capacity entirely.
+        assert_eq!(
+            noisy_guards.len(),
+            3,
+            "noisy peer should exhaust its reservation plus all remaining shared capacity"
+        );
+
+        // Despite the flood having fully drained the shared pool, `quiet`
+        // can still draw from its own untouched reservation.
+        let quiet_guard2 = limiter.admit(quiet);
+        assert!(
+            quiet_guard2.is_ok(),
+            "quiet peer's own reservation must survive another peer's flood, got {quiet_guard2:?}"
+        );
+        assert_eq!(limiter.erl.lock().unwrap().client_capacity_len(&quiet), 0);
+    }
+
+    /// A brand-new peer arriving while the shared pool is already fully
+    /// claimed by other peers' reservations legitimately gets no capacity
+    /// -- documented as an honest limitation inherited from the algorithm
+    /// (a reservation can only be guaranteed for a peer the node has
+    /// already heard from), not a wiring bug.
+    #[test]
+    fn brand_new_peer_can_be_denied_once_all_capacity_is_reserved() {
+        let a = ip(10, 0, 1, 1);
+        let b = ip(10, 0, 1, 2);
+        let limiter = TxSyncPeerLimiter::new(2, 1, Duration::from_secs(10));
+
+        let a_guard = limiter.admit(a).expect("first peer opens a reservation");
+        limiter.complete(a_guard);
+        let b_guard = limiter.admit(b).expect("second peer opens a reservation");
+        limiter.complete(b_guard);
+
+        // Both units of the 2-unit pool are now committed as reservations
+        // (1 each); a third, never-seen peer cannot open one.
+        let c = ip(10, 0, 1, 3);
+        let res = limiter.admit(c);
+        assert!(
+            matches!(
+                res,
+                Err(ElasticRateLimiterError::InsufficientCapacity { .. })
+            ),
+            "expected InsufficientCapacity, got {res:?}"
+        );
+    }
+
+    /// Pure threshold check backing the dynamic congestion-control
+    /// hysteresis: fewer than `CONGESTION_THRESHOLD_PCT`% of `max_capacity`
+    /// free counts as congested.
+    #[test]
+    fn shared_pool_congested_threshold() {
+        assert!(!TxSyncPeerLimiter::shared_pool_congested(4, 4), "100% free");
+        assert!(
+            !TxSyncPeerLimiter::shared_pool_congested(2, 4),
+            "50% free: not below threshold"
+        );
+        assert!(
+            TxSyncPeerLimiter::shared_pool_congested(1, 4),
+            "25% free: congested"
+        );
+        assert!(
+            TxSyncPeerLimiter::shared_pool_congested(0, 4),
+            "0% free: congested"
+        );
+    }
+
+    /// A congestion manager that always recommends dropping -- mirrors
+    /// `algo_pool::elastic_rate_limiter`'s own test-only
+    /// `MockCongestionControl`, redeclared here since that one is private
+    /// to its module.
+    struct AlwaysDropCongestionManager;
+    impl algo_pool::CongestionManager<IpAddr> for AlwaysDropCongestionManager {
+        fn consumed(&mut self, _client: IpAddr, _t: std::time::Instant) {}
+        fn served(&mut self, _t: std::time::Instant) {}
+        fn should_drop(&mut self, _client: &IpAddr) -> bool {
+            true
+        }
+    }
+
+    /// End-to-end proof that `admit()` actually drives go's
+    /// `TxHandler.incomingMsgErlCheck` hysteresis, not just computes the
+    /// threshold: congestion control starts disabled, so a client is not
+    /// gated by the (always-drop) mock while the pool has capacity; once a
+    /// call observes the shared pool below the free-capacity threshold,
+    /// congestion control is switched on as a side effect, and the very
+    /// next request from any client is dropped by the mock without ever
+    /// touching the (by-then-exhausted) shared pool.
+    #[test]
+    fn admit_auto_enables_congestion_control_once_shared_pool_crosses_threshold() {
+        let peer = ip(10, 0, 2, 1);
+        // capacity_per_peer = 0 so every consume draws straight from the
+        // shared pool, keeping the utilization arithmetic simple.
+        let limiter = TxSyncPeerLimiter::new(4, 0, Duration::from_secs(10));
+        limiter
+            .erl
+            .lock()
+            .unwrap()
+            .set_congestion_manager(Some(Box::new(AlwaysDropCongestionManager)));
+
+        // Drain 3/4 units. Each call's *pre*-call utilization is still at
+        // or above the 50% threshold (100%, 75%, 50% free respectively),
+        // so congestion control is never switched on for these, and the
+        // mock (which isn't consulted while congestion control is off) is
+        // never in the way.
+        let _g1 = limiter.admit(peer).expect("1/4, pre-call 100% free");
+        let _g2 = limiter.admit(peer).expect("2/4, pre-call 75% free");
+        let _g3 = limiter.admit(peer).expect("3/4, pre-call 50% free");
+
+        // 4th call: pre-call utilization is 25% free (congested). Congestion
+        // control's *is_cm_enabled* snapshot is taken at the very top of
+        // this same call (still `false`), so this call itself still draws
+        // from the shared pool successfully; only *after* it succeeds does
+        // the wrapper switch congestion control on for subsequent calls.
+        let _g4 = limiter
+            .admit(peer)
+            .expect("4/4, still succeeds -- CM flips on only as a side effect of this call");
+
+        // 5th call: congestion control is now enabled, so the mock's
+        // always-drop verdict is consulted (and honored) *before* the
+        // (already-empty) shared pool would have rejected it anyway.
+        let g5 = limiter.admit(peer);
+        assert!(
+            matches!(g5, Err(ElasticRateLimiterError::CongestionDropped)),
+            "expected CongestionDropped once congestion control auto-enabled, got {g5:?}"
+        );
+    }
+
+    // ── TxSyncPeerLimiter: wired into the HTTP endpoint ─────────────────
+
+    #[tokio::test]
+    async fn http_endpoint_returns_503_once_peer_fairness_budget_is_exhausted() {
+        let limiter = Arc::new(TxSyncPeerLimiter::new(1, 1, Duration::from_secs(10)));
+        let addr = SocketAddr::new(ip(10, 1, 0, 1), 12345);
+
+        // Externally exhaust this peer's own capacity via a request that
+        // never completes -- simulating an in-flight request still being
+        // serviced (e.g. this node's own servicing capacity is
+        // saturated). With max_capacity == capacity_per_peer == 1, this
+        // single reservation *is* the entire pool.
+        let occupying_guard = limiter
+            .admit(addr.ip())
+            .expect("first request opens this peer's reservation");
+
+        let service = TxSyncService::new(Arc::new(FakePool(vec![])), "g".to_string(), 1_000_000)
+            .with_peer_limiter(limiter.clone());
+        let router = service.http_router();
+        let resp = post_from(
+            router,
+            "/v1/g/txsync",
+            TX_SYNC_REQUEST_CONTENT_TYPE,
+            bf_form_body(&empty_filter()),
+            addr,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Once the occupying request completes and its capacity unit is
+        // released back to this peer's own reservation, the peer's next
+        // request succeeds.
+        limiter.complete(occupying_guard);
+        let service2 = TxSyncService::new(Arc::new(FakePool(vec![])), "g".to_string(), 1_000_000)
+            .with_peer_limiter(limiter);
+        let router2 = service2.http_router();
+        let resp2 = post_from(
+            router2,
+            "/v1/g/txsync",
+            TX_SYNC_REQUEST_CONTENT_TYPE,
+            bf_form_body(&empty_filter()),
+            addr,
+        )
+        .await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+    }
+
+    /// A malformed request (wrong content-type here) must never consume a
+    /// peer's fairness budget -- the gate sits after validation, not
+    /// before it.
+    #[tokio::test]
+    async fn http_endpoint_malformed_request_never_consumes_fairness_budget() {
+        let limiter = Arc::new(TxSyncPeerLimiter::new(1, 1, Duration::from_secs(10)));
+        let addr = SocketAddr::new(ip(10, 1, 1, 1), 1);
+        let service = TxSyncService::new(Arc::new(FakePool(vec![])), "g".to_string(), 1_000_000)
+            .with_peer_limiter(limiter.clone());
+        let router = service.http_router();
+
+        let resp = post_from(
+            router,
+            "/v1/g/txsync",
+            "application/octet-stream", // wrong content-type -- 400, before the gate
+            bf_form_body(&empty_filter()),
+            addr,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // The peer's reservation is untouched -- a well-formed follow-up
+        // request from the same peer still succeeds.
+        let service2 = TxSyncService::new(Arc::new(FakePool(vec![])), "g".to_string(), 1_000_000)
+            .with_peer_limiter(limiter);
+        let router2 = service2.http_router();
+        let resp2 = post_from(
+            router2,
+            "/v1/g/txsync",
+            TX_SYNC_REQUEST_CONTENT_TYPE,
+            bf_form_body(&empty_filter()),
+            addr,
+        )
+        .await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+    }
+
+    /// Two distinct peers are serviced independently through the real HTTP
+    /// path -- a busy peer occupying its own reservation does not block a
+    /// second peer's request.
+    #[tokio::test]
+    async fn http_endpoint_isolates_distinct_peers() {
+        let limiter = Arc::new(TxSyncPeerLimiter::new(4, 1, Duration::from_secs(10)));
+        let peer_a_addr = SocketAddr::new(ip(10, 2, 0, 1), 1);
+        let peer_b_addr = SocketAddr::new(ip(10, 2, 0, 2), 1);
+
+        // peer A opens (and holds, unreleased) its own reservation.
+        let _a_guard = limiter.admit(peer_a_addr.ip()).expect("peer A reserves");
+
+        let service = TxSyncService::new(Arc::new(FakePool(vec![])), "g".to_string(), 1_000_000)
+            .with_peer_limiter(limiter);
+        let router = service.http_router();
+        let resp = post_from(
+            router,
+            "/v1/g/txsync",
+            TX_SYNC_REQUEST_CONTENT_TYPE,
+            bf_form_body(&empty_filter()),
+            peer_b_addr,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "peer B must be serviced independently of peer A's outstanding reservation"
+        );
     }
 }

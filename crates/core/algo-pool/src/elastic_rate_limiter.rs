@@ -101,56 +101,55 @@
 //!   is unexported and only ever driven by tests plus the `OnClose` hook
 //!   this port omits).
 //!
-//! # Wiring into algod-rust's pull-based architecture (NOT implemented here)
+//! # Wiring into algod-rust's pull-based architecture (issues #821, #860)
 //!
-//! This module is intentionally **not** wired into any live transaction
-//! admission path. go-algorand's `ElasticRateLimiter`/RED pair guards
-//! `data/txHandler.go`'s incoming-transaction backlog queue, which is fed by
-//! its push-based gossip layer (peers unsolicitedly relay transactions to
-//! this node, and the RED manager decides whether to admit each one *before*
-//! it reaches the shared backlog channel). algod-rust's closest analogue
-//! today is `bin/algod-rust/src/node_interface_impl.rs`'s
-//! `async_backlog_permits` (a single flat `tokio::sync::Semaphore` guarding
-//! `NodeInterface::async_broadcast_signed_tx_group`) — but that path is
-//! REST-client submission admission, not peer-gossip admission, and
-//! algod-rust's actual peer-to-peer transaction path
-//! (`crates/node/algo-network/src/tx_syncer.rs`) is pull-based (this node
-//! polls each peer's synced-transaction set on a timer via `TxSyncer`/
-//! `SolicitedTxHandler`, mirroring the architectural note already recorded
-//! in `app_rate_limiter.rs` for issue #821) rather than being pushed
-//! transactions unsolicited. A pull-based node decides *when* and *from
-//! whom* to ask for transactions in the first place, so there is no
-//! reachable point in the current sync loop that receives an unsolicited,
-//! not-yet-admitted transaction the way go's RED gate does — the congestion
-//! this algorithm exists to shed (an inbound flood this node did not ask
-//! for) cannot occur on a pull-based ingestion path by construction.
+//! go-algorand's `ElasticRateLimiter`/RED pair guards `data/txHandler.go`'s
+//! incoming-transaction backlog queue, which is fed by its push-based
+//! gossip layer (peers unsolicitedly relay transactions to this node, and
+//! the RED manager decides whether to admit each one *before* it reaches
+//! the shared backlog channel). algod-rust's actual peer-to-peer
+//! transaction path (`crates/node/algo-network/src/tx_syncer.rs`) is
+//! pull-based (this node polls each peer's synced-transaction set on a
+//! timer via `TxSyncer`/`SolicitedTxHandler`, mirroring the architectural
+//! note already recorded in `app_rate_limiter.rs` for issue #821) rather
+//! than being pushed transactions unsolicited. A pull-based node decides
+//! *when* and *from whom* to ask for transactions in the first place, so
+//! there is no reachable point in the sync loop's own request-issuing side
+//! that receives an unsolicited, not-yet-admitted transaction the way go's
+//! RED gate does — the congestion this algorithm exists to shed (an inbound
+//! flood this node did not ask for) cannot occur on that side by
+//! construction.
 //!
-//! A plausible design for a future wiring PR to evaluate (not to implement
-//! blindly here) looks like:
+//! Two wiring points were evaluated:
 //!
-//! 1. Own one [`ElasticRateLimiter`]`<PeerId>` per node, sized from a config
-//!    knob analogous to go's `TxBacklogSize` (`max_capacity`) and a
-//!    per-peer reservation slice (`capacity_per_reservation`), shared (e.g.
-//!    behind an `Arc<Mutex<..>>`) between the REST-submission path and the
-//!    tx-syncer.
-//! 2. Replace `AlgodNodeInterface::reserve_async_backlog_permit`'s flat
-//!    `tokio::sync::Semaphore::try_acquire_owned` with
-//!    `ElasticRateLimiter::consume_capacity` keyed by the submitting
-//!    client's identity (for the REST path, that's naturally "the
-//!    unauthenticated public" as a single client — the flat-cliff behavior
-//!    barely changes there) — this is the one part of the current admission
-//!    path that *is* push-style (an external actor calls the REST endpoint
-//!    unsolicited) and so is a legitimate, direct RED application today,
-//!    independent of the pull-vs-push tx-syncer question above.
-//! 3. For the pull-based peer path, the natural integration point is
-//!    fairness across *which peer's pull request this node services first*
-//!    when its own local resources (DB read capacity, outgoing bandwidth)
-//!    are under pressure — i.e. an `ElasticRateLimiter<PeerId>` guarding how
-//!    much of *this* node's serving capacity each peer's `sync()` request
-//!    can consume, the mirror image of go's inbound-admission RED gate
-//!    rather than a direct port of it. This is exactly the kind of
-//!    behavioral redesign the issue title ("needs pull-based architecture
-//!    redesign") anticipates and is left for a follow-up.
+//! 1. **REST submission admission** (`AlgodNodeInterface::reserve_async_backlog_permit`).
+//!    Investigated and **rejected**: tracing go-algorand's actual
+//!    `RawTransaction`/`RawTransactionAsync` handlers
+//!    (`daemon/algod/api/server/v2/handlers.go`) confirms neither ever
+//!    reaches `TxHandler.processIncomingTxn` — REST submission is a trusted
+//!    local-client boundary go never rate-limits with RED or any other
+//!    mechanism, categorically different from the untrusted peer-gossip
+//!    boundary RED exists to protect. Wiring RED here would invent
+//!    behavior go-algorand doesn't have, not port it.
+//! 2. **Fairness across which peer's pull request this node services
+//!    first**, when this node's own servicing capacity (pool
+//!    snapshot/encoding/response bandwidth) is under pressure — the mirror
+//!    image of go's inbound-admission gate rather than a direct port of
+//!    it. This *is* implemented: see `TxSyncPeerLimiter`
+//!    in `crates/node/algo-network/src/tx_sync_service.rs`, wired into
+//!    `TxSyncService`'s HTTP endpoint (the server side that answers a
+//!    peer's `POST .../txsync` pull request). It applies this module's
+//!    per-client capacity-reservation model, keyed by the requesting
+//!    peer's source IP, to that servicing capacity — so one peer polling
+//!    aggressively cannot starve another peer's already-reserved share of
+//!    this node's own resources — and dynamically toggles
+//!    [`RedCongestionManager`] the same way go's
+//!    `TxHandler.incomingMsgErlCheck` does (on when free shared capacity
+//!    drops below a threshold, off on recovery). See that module's doc
+//!    comment for the full fairness-property mapping and honest
+//!    limitations, and its test module for coverage (peer-reservation
+//!    isolation under a flooding peer, congestion-control auto-toggle, and
+//!    end-to-end HTTP wiring).
 //!
 //! # References
 //!
@@ -287,16 +286,16 @@ impl<C> CapacityGuard<C> {
 /// `C` is the client-identity type (go's `ErlClient` interface, here just a
 /// hashable/cloneable key — see the module-level "Deliberate deviations"
 /// note on why `OnClose` is not ported).
-pub struct ElasticRateLimiter<C: Eq + Hash + Clone + 'static> {
+pub struct ElasticRateLimiter<C: Eq + Hash + Clone + Send + 'static> {
     max_capacity: usize,
     capacity_per_reservation: usize,
     shared_capacity: CapacityQueue,
     capacity_by_client: HashMap<C, CapacityQueue>,
-    cm: Option<Box<dyn CongestionManager<C>>>,
+    cm: Option<Box<dyn CongestionManager<C> + Send>>,
     enable_cm: bool,
 }
 
-impl<C: Eq + Hash + Clone + 'static> ElasticRateLimiter<C> {
+impl<C: Eq + Hash + Clone + Send + 'static> ElasticRateLimiter<C> {
     /// Creates an `ElasticRateLimiter` with a fresh [`RedCongestionManager`]
     /// (`window`-second sliding window). Mirrors go's
     /// `NewElasticRateLimiter`. Congestion control is *disabled* by default
@@ -349,7 +348,7 @@ impl<C: Eq + Hash + Clone + 'static> ElasticRateLimiter<C> {
 
     /// Replaces the congestion manager (test hook — go's tests assign
     /// `erl.cm = mockCongestionControl{}` directly).
-    pub fn set_congestion_manager(&mut self, cm: Option<Box<dyn CongestionManager<C>>>) {
+    pub fn set_congestion_manager(&mut self, cm: Option<Box<dyn CongestionManager<C> + Send>>) {
         self.cm = cm;
     }
 
