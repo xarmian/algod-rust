@@ -1270,9 +1270,27 @@ mod tests {
     //   verifier tests, not the pseudonode.
     // * **`serializedPseudonode` equivalence** — Rust does not have a
     //   synchronous serialization wrapper type.
-    // * **`TestPseudonodeNonEnqueuedTasks`** — depends on the async vote
-    //   verifier exec pool and its log output; covered separately by the
-    //   crypto_verifier tests.
+    // * **`TestPseudonodeNonEnqueuedTasks`**'s literal mechanism (a bounded
+    //   `incomingTasks` channel plus a broken `AsyncVoteVerifier` exec pool
+    //   that always fails `EnqueueBacklog`, asserting one `Infof` per
+    //   account) — Rust's `AsyncPseudonode` has no equivalent pre-
+    //   verification queue to break: `make_proposals`/`make_votes` call
+    //   `proposal_for_block`/`make_vote`/`verify_vote_from_ledger`
+    //   synchronously inline, so there is no separate async-enqueue step
+    //   that can fail independently of verification itself. The demux's
+    //   real backpressure equivalent for *incoming network* votes/
+    //   proposals/bundles is `CryptoVerifier::channel_full` (see
+    //   `crypto_verifier.rs`'s `channel_full_vote_bounded` /
+    //   `backpressure_channel_full_tags` tests and `demux.rs::next`, which
+    //   skips reading from a raw channel — rather than blocking — whenever
+    //   `channel_full` is true for its tag). The behavioral property the
+    //   Go test is actually pinning — "many participants fail the
+    //   verification pipeline; the caller does not block/hang and simply
+    //   keeps going" — is ported below at
+    //   `pseudonode_verification_backlog`-scale (2x, matching Go's loop
+    //   bound) against the real `make_proposals`/`make_votes` entry points:
+    //   see `make_proposals_gracefully_skips_all_failing_accounts_at_scale`
+    //   and `make_votes_gracefully_skips_all_failing_accounts_at_scale`.
     // * **Event-shape happy path** (Go lines 196-232: `make_proposals`
     //   returning `VoteVerified`+`PayloadVerified` pairs, `make_votes`
     //   returning only `VoteVerified`) — requires a full fixture stack
@@ -1441,6 +1459,88 @@ mod tests {
             );
             rnd = Round(rnd.0 + 43);
         }
+    }
+
+    /// Port of the behavioral property `TestPseudonodeNonEnqueuedTasks`
+    /// pins in go-algorand (agreement/pseudonode_test.go:475): overwhelm
+    /// the pipeline with `pseudonodeVerificationBacklog*2` participants
+    /// that all fail verification, and confirm the caller does not block
+    /// forever — it gets a prompt, graceful, empty result instead.
+    ///
+    /// Go achieves this by breaking the async vote verifier's exec pool
+    /// (`expiredExecPool`) so every enqueue fails, then asserting on the
+    /// resulting `Infof` log count. Rust's `AsyncPseudonode` has no
+    /// separate async-enqueue step to break (see the block comment above),
+    /// so this drives the same failure mode the Go test actually exercises
+    /// — every participant fails the verification/build step — directly
+    /// against `make_votes`: with no account data on the ledger,
+    /// `membership_from_ledger` fails for every one of the 64 (2x backlog)
+    /// participants inside `create_votes`, and each failure is silently
+    /// skipped (`continue`) rather than aborting or blocking the call.
+    #[test]
+    fn make_votes_gracefully_skips_all_failing_accounts_at_scale() {
+        let factory = crate::stubs::StubBlockFactory::new();
+        let n = PSEUDONODE_VERIFICATION_BACKLOG * 2;
+        let keys: Vec<_> = (0..n).map(|i| participation_record(i as u8)).collect();
+        let key_manager = TestKeyManager::new(keys);
+        // Empty ledger: no account data registered for any of the
+        // participants, so every membership lookup in `create_votes` fails.
+        let ledger = crate::stubs::StubLedger::new(v41_params(), Round(100));
+        let mut pn = AsyncPseudonode::new(factory, key_manager, ledger);
+
+        let proposal = ProposalValue {
+            original_period: Period(0),
+            original_proposer: Address([0x01; 32]),
+            block_digest: Digest([0xaa; 32]),
+            encoding_digest: Digest([0xbb; 32]),
+        };
+
+        // If this call ever blocked waiting on a verification backlog, the
+        // test would hang and time out rather than reach this assertion —
+        // there is no separate thread/queue involved, so a timely `Ok`
+        // return here is itself the "didn't wait forever" proof.
+        let result = pn.make_votes(Round(100), Period(0), crate::step::SOFT, proposal, None);
+
+        assert!(
+            result.is_ok(),
+            "make_votes must not error out just because every account \
+             failed verification: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "no participant had ledger account data, so no vote should verify"
+        );
+    }
+
+    /// Companion to the above for `make_proposals`: every one of the 64
+    /// participants fails to build a proposal (the ledger has no seed
+    /// configured for the round), and `create_proposals`'s per-account loop
+    /// must skip each failure and return promptly rather than blocking.
+    #[test]
+    fn make_proposals_gracefully_skips_all_failing_accounts_at_scale() {
+        let mut factory = crate::stubs::StubBlockFactory::new();
+        let round = Round(100);
+        factory.set_block(round, algo_types::Block::default());
+
+        let n = PSEUDONODE_VERIFICATION_BACKLOG * 2;
+        let keys: Vec<_> = (0..n).map(|i| participation_record(i as u8)).collect();
+        let key_manager = TestKeyManager::new(keys);
+        // No seed configured for the round, so `proposal_for_block` fails
+        // for every participant inside `create_proposals`.
+        let ledger = crate::stubs::StubLedger::new(v41_params(), round);
+        let mut pn = AsyncPseudonode::new(factory, key_manager, ledger);
+
+        let result = pn.make_proposals(round, Period(0));
+
+        assert!(
+            result.is_ok(),
+            "make_proposals must not error out just because every account \
+             failed to build a proposal: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "no participant had a usable seed, so no proposal should be produced"
+        );
     }
 
     // Go test scenarios at lines 196-212 (`make_proposals` returns
