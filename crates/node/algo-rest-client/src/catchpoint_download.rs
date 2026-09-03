@@ -395,6 +395,48 @@ impl CatchpointDownloader {
         })
     }
 
+    /// Send a HEAD request to the catchpoint (ledger) endpoint to check
+    /// whether `round`'s catchpoint file is available from this peer,
+    /// without downloading the body.
+    ///
+    /// Mirrors go's `ledgerFetcher.headLedger` (`catchup/ledgerFetcher.go`),
+    /// used by `CatchpointCatchupService.checkLedgerDownload` as a
+    /// pre-flight availability probe stage ahead of the real download
+    /// (issue #917). A 404 response is reported as [`AlgoError::NotFound`]
+    /// (the peer doesn't have this round's catchpoint, matching go's
+    /// `peerRankNoCatchpointForRound` classification), any other
+    /// non-success status as [`AlgoError::RestClient`], and a transport
+    /// failure (connection refused, timeout, etc.) is also surfaced as
+    /// [`AlgoError::RestClient`] — this method does not retry, since it is
+    /// only ever used to rank a peer, not to fetch data callers depend on.
+    pub async fn probe_availability(&self, genesis_id: &str, round: u64) -> Result<()> {
+        let round_b36 = radix_fmt(round, 36);
+        let path = format!("/v1/{genesis_id}/ledger/{round_b36}");
+        let url = format!("{}{}", self.base_url, path);
+
+        let mut request = self.http.head(&url);
+        if !self.token.is_empty() {
+            request = request.header("X-Algo-API-Token", &self.token);
+        }
+
+        let response = request.send().await.map_err(|e| AlgoError::RestClient {
+            source: Box::new(e),
+            context: format!("catchpoint HEAD {path}"),
+        })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(AlgoError::NotFound(format!("catchpoint HEAD {path}")));
+        }
+        Err(AlgoError::RestClient {
+            source: Box::new(std::io::Error::other(format!("HTTP {status}"))),
+            context: format!("catchpoint HEAD {path}"),
+        })
+    }
+
     /// Execute a GET request with retry and exponential backoff.
     ///
     /// Follows the same pattern as `AlgodClient::get_with_retry`.
@@ -784,5 +826,104 @@ mod tests {
     fn test_constructor_no_trailing_slash() {
         let dl = CatchpointDownloader::new("http://localhost:4001", "mytoken");
         assert_eq!(dl.base_url, "http://localhost:4001");
+    }
+
+    // -- probe_availability (issue #917's checkLedgerDownload-equivalent
+    //    pre-flight probe, go's ledgerFetcher.headLedger) --
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_availability_succeeds_on_200() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let method_seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let method_seen_clone = Arc::clone(&method_seen);
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request_line = String::from_utf8_lossy(&buf[..n]);
+                *method_seen_clone.lock().unwrap() = request_line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        let dl = CatchpointDownloader::new(&format!("http://{addr}"), "");
+        let result = dl.probe_availability("test-v1.0", 42).await;
+
+        assert!(
+            result.is_ok(),
+            "a 200 response must be treated as available"
+        );
+        assert_eq!(
+            method_seen.lock().unwrap().as_str(),
+            "HEAD",
+            "probe_availability must send a HEAD request, not a full GET"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_availability_maps_404_to_not_found() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        let dl = CatchpointDownloader::new(&format!("http://{addr}"), "");
+        let result = dl.probe_availability("test-v1.0", 1).await;
+
+        assert!(matches!(result, Err(AlgoError::NotFound(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_availability_maps_server_error_to_rest_client_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        let dl = CatchpointDownloader::new(&format!("http://{addr}"), "");
+        let result = dl.probe_availability("test-v1.0", 1).await;
+
+        assert!(matches!(result, Err(AlgoError::RestClient { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_availability_reports_connection_refused_as_rest_client_error() {
+        // No listener bound at this address — connection should fail.
+        let dl = CatchpointDownloader::new("http://127.0.0.1:1", "");
+        let result = dl.probe_availability("test-v1.0", 1).await;
+
+        assert!(matches!(result, Err(AlgoError::RestClient { .. })));
     }
 }
