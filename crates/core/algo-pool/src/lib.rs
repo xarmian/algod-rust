@@ -27,6 +27,7 @@
 pub mod app_rate_limiter;
 pub mod broadcast;
 pub mod config;
+pub mod elastic_rate_limiter;
 pub mod error;
 pub mod fee;
 pub mod pool;
@@ -36,6 +37,10 @@ pub mod traits;
 pub use app_rate_limiter::AppRateLimiter;
 pub use broadcast::{DrainIterator, NoOpBroadcaster, TransactionBroadcaster};
 pub use config::PoolConfig;
+pub use elastic_rate_limiter::{
+    CapacityGuard, CongestionManager, ElasticRateLimiter, ElasticRateLimiterError,
+    RedCongestionManager,
+};
 pub use error::{PoolError, PoolErrorTag};
 pub use pool::TransactionPool;
 pub use status_cache::StatusCache;
