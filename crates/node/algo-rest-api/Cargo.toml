@@ -11,6 +11,7 @@ algo-codec.workspace = true
 algo-avm.workspace = true
 algo-ledger.workspace = true
 algo-consensus-crypto.workspace = true
+algo-abi.workspace = true
 algo-error.workspace = true
 sha2.workspace = true
 axum.workspace = true
