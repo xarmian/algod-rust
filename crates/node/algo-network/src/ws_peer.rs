@@ -82,7 +82,9 @@ use crate::request_response::{
 };
 use crate::tag::Tag;
 use crate::topics::{Topic, Topics};
-use crate::vpack::{self, StatefulDecoder, StatefulEncoder, VpackError, VOTE_COMPRESSION_ABORT_BYTE};
+use crate::vpack::{
+    self, StatefulDecoder, StatefulEncoder, VpackError, VOTE_COMPRESSION_ABORT_BYTE,
+};
 use crate::NetworkError;
 
 // ---------------------------------------------------------------------------
@@ -1388,6 +1390,53 @@ fn decompress_incoming_vote(
     send_high_prio_tx: &mpsc::Sender<WriteCommand>,
     remote_addr: &str,
 ) -> Option<Vec<u8>> {
+    let (result, need_abort) = decompress_incoming_vote_core(
+        tag,
+        payload,
+        features,
+        vote_table_size,
+        stateful_decoder,
+        stateful_vote_enabled,
+        remote_addr,
+    );
+    if need_abort {
+        let _ = send_high_prio_tx.try_send(WriteCommand::VpAbort);
+    }
+    result
+}
+
+/// Sink/channel-agnostic core of [`decompress_incoming_vote`]: applies vpack
+/// vote (de)compression to a just-decoded incoming frame without touching
+/// any transport-specific abort-signaling channel.
+///
+/// Factored out so a transport other than the `WriteCommand`-based
+/// WS-gossip write loop (e.g. `bin/algod-rust`'s P2P `/algorand-ws/2.2.0`
+/// stream — see `crates/node/algo-p2p`'s issue #925 — which has no
+/// `WriteCommand` type of its own) can reuse the exact same
+/// stateless/stateful vpack state machine and disable-on-abort semantics,
+/// sending the abort control frame on whatever channel/sink type it has
+/// when this returns `need_abort: true`.
+///
+/// Returns `(payload_to_dispatch, need_abort)`:
+/// * `payload_to_dispatch` mirrors [`decompress_incoming_vote`]'s return
+///   value — `Some` with the (possibly decompressed) payload to continue
+///   dispatching, `None` if the caller should drop this message.
+/// * `need_abort` is `true` exactly when a stateful decode/init failure
+///   just disabled `stateful_vote_enabled` for this connection and the
+///   caller must send a `VP` + [`VOTE_COMPRESSION_ABORT_BYTE`] control
+///   frame to the peer — mirroring [`compress_outgoing_vote`]'s identical
+///   `need_abort` contract on the encode side.
+///
+/// Mirrors go-algorand's `wsPeerMsgCodec.decompress()` (`network/msgCompressor.go`).
+pub fn decompress_incoming_vote_core(
+    tag: &mut Tag,
+    payload: Vec<u8>,
+    features: PeerFeatureFlags,
+    vote_table_size: u32,
+    stateful_decoder: &mut Option<StatefulDecoder>,
+    stateful_vote_enabled: &Arc<AtomicBool>,
+    remote_addr: &str,
+) -> (Option<Vec<u8>>, bool) {
     if *tag == Tag::VotePacked {
         // A VP frame is either a control message (the single-byte abort
         // signal) or a stateful-vpack-compressed vote. Either way it never
@@ -1399,7 +1448,7 @@ fn decompress_incoming_vote(
                 "read_loop: received VP abort message, disabling stateful vote compression"
             );
             stateful_vote_enabled.store(false, Ordering::Release);
-            return None;
+            return (None, false);
         }
 
         if !stateful_vote_enabled.load(Ordering::Acquire) {
@@ -1407,7 +1456,7 @@ fn decompress_incoming_vote(
                 peer = %remote_addr,
                 "read_loop: dropping VP message, stateful decompression disabled"
             );
-            return None;
+            return (None, false);
         }
 
         if stateful_decoder.is_none() {
@@ -1420,8 +1469,7 @@ fn decompress_incoming_vote(
                         "read_loop: failed to init stateful vote decoder, disabling"
                     );
                     stateful_vote_enabled.store(false, Ordering::Release);
-                    let _ = send_high_prio_tx.try_send(WriteCommand::VpAbort);
-                    return None;
+                    return (None, true);
                 }
             }
         }
@@ -1438,8 +1486,7 @@ fn decompress_incoming_vote(
                     "read_loop: stateful vote decompression failed, disabling"
                 );
                 stateful_vote_enabled.store(false, Ordering::Release);
-                let _ = send_high_prio_tx.try_send(WriteCommand::VpAbort);
-                return None;
+                return (None, true);
             }
         };
 
@@ -1455,7 +1502,7 @@ fn decompress_incoming_vote(
                 // Re-tag as AV so downstream dispatch (MI/dedup/
                 // multiplexer) sees a normal decoded vote.
                 *tag = Tag::AgreementVote;
-                Some(raw)
+                (Some(raw), false)
             }
             Err(e) => {
                 tracing::warn!(
@@ -1464,8 +1511,7 @@ fn decompress_incoming_vote(
                     "read_loop: stateless vote decompression failed after stateful, disabling"
                 );
                 stateful_vote_enabled.store(false, Ordering::Release);
-                let _ = send_high_prio_tx.try_send(WriteCommand::VpAbort);
-                None
+                (None, true)
             }
         }
     } else if *tag == Tag::AgreementVote
@@ -1473,12 +1519,12 @@ fn decompress_incoming_vote(
         && !payload.is_empty()
     {
         match vpack::decompress_vote(&payload) {
-            Ok(raw) => Some(raw),
+            Ok(raw) => (Some(raw), false),
             Err(VpackError::LikelyUncompressed(_)) => {
                 // Peer claims avvpack support but sent a plain
                 // uncompressed vote; pass it through silently
                 // (matches Go's `ErrLikelyUncompressed` handling).
-                Some(payload)
+                (Some(payload), false)
             }
             Err(e) => {
                 tracing::warn!(
@@ -1486,11 +1532,11 @@ fn decompress_incoming_vote(
                     error = %e,
                     "read_loop: vote decompress error, passing through raw"
                 );
-                Some(payload)
+                (Some(payload), false)
             }
         }
     } else {
-        Some(payload)
+        (Some(payload), false)
     }
 }
 
@@ -2328,7 +2374,12 @@ where
 ///   its own sink type (this function cannot do so itself, having no sink).
 ///
 /// Mirrors go-algorand's `wsPeerMsgCodec.compress()` (`network/msgCompressor.go`).
-fn compress_outgoing_vote(
+///
+/// `pub` (not just `pub(crate)`): reused as-is by `bin/algod-rust`'s P2P
+/// `/algorand-ws/2.2.0` stream write path (issue #925), which has no
+/// `WriteCommand`/sink type of its own — see [`decompress_incoming_vote_core`]'s
+/// doc comment for the read-side counterpart of this same reuse.
+pub fn compress_outgoing_vote(
     payload: &[u8],
     vote_table_size: u32,
     stateful_vote_enabled: &Arc<AtomicBool>,
