@@ -18,11 +18,13 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `vpack`: stateless vote msgpack compression codec.
+//! `vpack`: stateless + stateful vote msgpack compression codec.
 //!
 //! Ports go-algorand's `network/vpack` package (`network/vpack/vpack.go`,
-//! `network/vpack/msgp.go`, `network/vpack/parse.go`, pinned at
-//! `v5.0.0-stable`), covering **stateless mode only**.
+//! `network/vpack/msgp.go`, `network/vpack/parse.go` for the stateless
+//! layer; `network/vpack/dynamic_vpack.go`, `network/vpack/lru_table.go`,
+//! `network/vpack/proposal_window.go` for the stateful layer, pinned at
+//! `v5.0.0-stable`).
 //!
 //! `vpack` is a specialized, schema-aware compressor for the msgpack
 //! encoding of `agreement.UnauthenticatedVote` (this crate's
@@ -33,30 +35,40 @@
 //! well-known field structure of a vote to compress far better than
 //! generic msgpack ever could.
 //!
-//! # Scope: stateless only, not wired into any network path
+//! # Two compression layers
 //!
-//! go-algorand's `vpack` package also has a **stateful** mode
-//! (`StatefulEncoder`/`StatefulDecoder` in `network/vpack/dynamic_vpack.go`)
-//! that further compresses votes using per-connection LRU reference tables
-//! and an 8-slot HPACK-style proposal window. That mode is **not**
-//! implemented here — it is materially more complex (shared mutable
-//! encoder/decoder state, LRU eviction, round-delta encoding) and is left
-//! as a documented follow-up (see the issue tracking this module).
+//! 1. **Stateless** ([`compress_vote`]/[`decompress_vote`]): always
+//!    applied, no memory overhead. Strips msgpack formatting/field names.
+//! 2. **Stateful** ([`StatefulEncoder`]/[`StatefulDecoder`]): optional,
+//!    per-connection layer that further compresses by replacing frequently
+//!    repeated field values (sender address, the two `(pubkey, signature)`
+//!    pairs, and the proposal bundle) with short references into LRU
+//!    tables / a small sliding window, and delta-encodes `r.rnd` against
+//!    the previous vote's round. It operates on the *output* of the
+//!    stateless layer, i.e. `StatefulEncoder::compress` takes
+//!    [`compress_vote`]'s output and [`StatefulDecoder::decompress`]
+//!    produces input suitable for [`decompress_vote`]. See
+//!    go-algorand's `network/vpack/README.md` §2.2 and §3 for the exact
+//!    per-field reference/delta rules mirrored here.
 //!
-//! This module is also **intentionally not wired into any live network
-//! code path** (no changes to `peer_features.rs`'s handshake negotiation,
+//! # Scope: standalone codec only, not wired into any network path
+//!
+//! This module is **intentionally not wired into any live network code
+//! path** (no changes to `peer_features.rs`'s handshake negotiation,
 //! `ws_peer.rs`, or any connection-handling code). Wiring a new wire-format
-//! codec into live peer negotiation is a network-protocol-compatibility
-//! change that needs live multi-node interop testing beyond what this
-//! standalone codec's test suite can provide. `avvpack`/`avvpack<N>` peer
-//! feature bits are already advertised in `peer_features.rs`, but nothing
-//! in the live handshake/connection paths calls into this module.
+//! codec into live peer negotiation — including the stateful layer's
+//! abort/renegotiation handshake (go-algorand's
+//! `network/msgCompressor.go` `wsPeerMsgCodec`) — is a
+//! network-protocol-compatibility change that needs live multi-node
+//! interop testing beyond what this standalone codec's test suite can
+//! provide. `avvpack`/`avvpack<N>` peer feature bits are already
+//! advertised in `peer_features.rs`, but nothing in the live
+//! handshake/connection paths calls into this module.
 //!
 //! # Wire format
 //!
 //! See go-algorand's `network/vpack/README.md` for the full specification.
-//! Byte-for-byte layout (stateless bytes only; byte 1 of the header is
-//! reserved for the stateful layer and is always `0` here):
+//! Byte-for-byte layout:
 //!
 //! ```text
 //! +---------+-----------------+----------------+---------------------------+
@@ -67,7 +79,10 @@
 //!
 //! Header byte 0 is a presence bitmask for six optional `rawVote` fields
 //! (`r.per`, `r.prop.dig`, `r.prop.encdig`, `r.prop.oper`, `r.prop.oprop`,
-//! `r.step`); header byte 1 is always `0x00` in stateless-only output.
+//! `r.step`) and is always present, whether or not the stateful layer is
+//! used. Header byte 1 is `0x00` when only the stateless layer is used;
+//! when the stateful layer is also applied it becomes a bitmask of
+//! reference/delta flags (see [`StatefulEncoder::compress`]).
 
 use std::fmt;
 
@@ -211,6 +226,9 @@ pub enum VpackError {
     /// Decompression failed on data that looks like it might actually be
     /// uncompressed msgpack sent by a peer that claimed vpack support.
     LikelyUncompressed(String),
+    /// [`StatefulEncoder::new`]/[`StatefulDecoder::new`] was given a table
+    /// size that is not a power of two, or is smaller than 16.
+    InvalidTableSize(String),
 }
 
 impl fmt::Display for VpackError {
@@ -223,6 +241,7 @@ impl fmt::Display for VpackError {
             Self::LikelyUncompressed(msg) => {
                 write!(f, "vpack: data appears to be uncompressed msgpack: {msg}")
             }
+            Self::InvalidTableSize(msg) => write!(f, "vpack: invalid table size: {msg}"),
         }
     }
 }
@@ -808,6 +827,712 @@ pub fn decompress_to_unauthenticated_vote(
         .map_err(|e| VpackError::Decompress(format!("decode_vote: {e}")))
 }
 
+// ── stateful (dynamic-table) compression ────────────────────────────────
+//
+// Mirrors go-algorand's `network/vpack/lru_table.go`,
+// `network/vpack/proposal_window.go`, and `network/vpack/dynamic_vpack.go`.
+// Operates on the *output* of the stateless layer above: `Compress` takes
+// [`compress_vote`]'s output and produces a further-compressed buffer;
+// `Decompress` reverses that back into stateless-layer output suitable for
+// [`decompress_vote`].
+
+const PF_SIZE: usize = 80; // committee.VrfProof
+const DIGEST_SIZE: usize = 32; // crypto.Digest (and basics.Address)
+const SIG_SIZE: usize = 64; // crypto.Signature
+const PK_SIZE: usize = 32; // crypto.PublicKey
+
+// hdr1 (byte 1 of the header) bit layout: see the module doc / README.md §2.2.
+const HDR1_RND_MASK: u8 = 0b0000_0011;
+const HDR1_RND_DELTA_PLUS1: u8 = 0b01;
+const HDR1_RND_DELTA_MINUS1: u8 = 0b10;
+const HDR1_RND_DELTA_SAME: u8 = 0b11;
+const HDR1_RND_LITERAL: u8 = 0b00;
+
+const HDR1_PROP_SHIFT: u8 = 2;
+const HDR1_PROP_MASK: u8 = 0b0001_1100;
+
+const HDR1_SND_REF: u8 = 1 << 5;
+const HDR1_PK_REF: u8 = 1 << 6;
+const HDR1_PK2_REF: u8 = 1 << 7;
+
+// ── LRU table (mirrors lru_table.go) ────────────────────────────────────
+
+/// Reference ID for a key in an [`LruTable`]: `(bucket << 1) | slot`.
+type LruTableReferenceId = u16;
+
+/// A fixed-size, 2-way set-associative hash table. Mirrors go-algorand's
+/// `lruTable[K]`: `numBuckets = n/2` buckets, each holding 2 slots, with a
+/// 1-bit-per-bucket MRU flag driving LRU eviction on collision.
+#[derive(Debug)]
+struct LruTable<K> {
+    num_buckets: u32,
+    buckets: Vec<[K; 2]>,
+    mru: Vec<u8>, // 1 bit per bucket
+}
+
+impl<K: Copy + Default + PartialEq> LruTable<K> {
+    /// `n` is the total entry count (power of two, at least 16); the table
+    /// has `n/2` buckets of 2 slots each.
+    fn new(n: u32) -> Result<Self, VpackError> {
+        if n < 16 || (n & (n - 1)) != 0 {
+            return Err(VpackError::InvalidTableSize(
+                "lruTable size must be a power of 2 and at least 16".into(),
+            ));
+        }
+        let num_buckets = n / 2;
+        Ok(Self {
+            num_buckets,
+            buckets: vec![[K::default(); 2]; num_buckets as usize],
+            mru: vec![0u8; (num_buckets / 8) as usize],
+        })
+    }
+
+    fn mru_bitmask(&self, b: u32) -> (usize, u8) {
+        ((b >> 3) as usize, 1 << (b & 7))
+    }
+
+    /// Returns the index (0 or 1) of the LRU slot in bucket `b`.
+    fn lru_slot(&self, b: u32) -> u8 {
+        let (byte_idx, mask) = self.mru_bitmask(b);
+        if (self.mru[byte_idx] & mask) == 0 {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn set_mru_slot(&mut self, b: u32, slot: u8) {
+        let (byte_idx, mask) = self.mru_bitmask(b);
+        if slot == 0 {
+            self.mru[byte_idx] &= !mask;
+        } else {
+            self.mru[byte_idx] |= mask;
+        }
+    }
+
+    fn hash_to_bucket_index(&self, h: u64) -> u32 {
+        (h & u64::from(self.num_buckets - 1)) as u32
+    }
+
+    /// Looks up `k` (using precomputed hash `h`); marks it MRU if found.
+    fn lookup(&mut self, k: K, h: u64) -> Option<LruTableReferenceId> {
+        let b = self.hash_to_bucket_index(h);
+        let slots = self.buckets[b as usize];
+        if slots[0] == k {
+            self.set_mru_slot(b, 0);
+            return Some((b << 1) as LruTableReferenceId);
+        }
+        if slots[1] == k {
+            self.set_mru_slot(b, 1);
+            return Some(((b << 1) | 1) as LruTableReferenceId);
+        }
+        None
+    }
+
+    /// Inserts `k` (evicting the LRU slot in its bucket) and returns its
+    /// new reference ID. The inserted key becomes MRU.
+    fn insert(&mut self, k: K, h: u64) -> LruTableReferenceId {
+        let b = self.hash_to_bucket_index(h);
+        let evict = self.lru_slot(b);
+        self.buckets[b as usize][evict as usize] = k;
+        self.set_mru_slot(b, evict);
+        ((b as LruTableReferenceId) << 1) | LruTableReferenceId::from(evict)
+    }
+
+    /// Returns the key for `id`, marking it MRU. `None` if `id` is
+    /// out-of-range (bucket index `>= num_buckets`).
+    fn fetch(&mut self, id: LruTableReferenceId) -> Option<K> {
+        let b = u32::from(id) >> 1;
+        let slot = (id & 1) as u8;
+        if b >= self.num_buckets {
+            return None;
+        }
+        self.set_mru_slot(b, slot);
+        Some(self.buckets[b as usize][slot as usize])
+    }
+}
+
+// ── proposal sliding window (mirrors proposal_window.go) ───────────────
+
+/// All values inside a vote's `r.prop` map, plus a mask of which optional
+/// fields were present. Mirrors go-algorand's `proposalEntry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ProposalEntry {
+    dig: [u8; DIGEST_SIZE],
+    encdig: [u8; DIGEST_SIZE],
+    oprop: [u8; DIGEST_SIZE],
+    oper_enc: [u8; MAX_MSGP_VARUINT_SIZE],
+    oper_len: u8,
+    mask: u8,
+}
+
+/// Fixed at 7 because hdr1 holds only 3 bits for the reference code
+/// (0 = literal, 1-7 = index).
+const PROPOSAL_WINDOW_SIZE: usize = 7;
+
+/// A 7-entry HPACK-style (RFC 7541) sliding window of recent proposal
+/// bundles. Mirrors go-algorand's `propWindow`.
+#[derive(Default)]
+struct PropWindow {
+    entries: [ProposalEntry; PROPOSAL_WINDOW_SIZE],
+    head: usize,
+    size: usize,
+}
+
+impl PropWindow {
+    /// Returns the 1-based HPACK index of `pv` (0 if not found); walks
+    /// oldest-to-newest, worst case 7 comparisons.
+    fn lookup(&self, pv: &ProposalEntry) -> usize {
+        for i in 0..self.size {
+            let slot = (self.head + i) % PROPOSAL_WINDOW_SIZE;
+            if self.entries[slot] == *pv {
+                return self.size - i;
+            }
+        }
+        0
+    }
+
+    /// Returns the entry at HPACK index `idx` (1..=size), `None` if out of
+    /// range.
+    fn by_ref(&self, idx: usize) -> Option<ProposalEntry> {
+        if idx < 1 || idx > self.size {
+            return None;
+        }
+        let physical = (self.head + self.size - idx) % PROPOSAL_WINDOW_SIZE;
+        Some(self.entries[physical])
+    }
+
+    /// Inserts `pv` as the newest entry (HPACK index 1), evicting the
+    /// oldest entry once the window is full.
+    fn insert_new(&mut self, pv: ProposalEntry) {
+        if self.size == PROPOSAL_WINDOW_SIZE {
+            self.entries[self.head] = pv;
+            self.head = (self.head + 1) % PROPOSAL_WINDOW_SIZE;
+        } else {
+            let pos = (self.head + self.size) % PROPOSAL_WINDOW_SIZE;
+            self.entries[pos] = pv;
+            self.size += 1;
+        }
+    }
+}
+
+// ── dynamic-table state shared by StatefulEncoder/StatefulDecoder ──────
+
+/// 32-byte address, keyed in the `snd` LRU table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct AddressValue([u8; DIGEST_SIZE]);
+
+impl AddressValue {
+    /// Addresses are fairly uniformly distributed, so a simple XOR of
+    /// four 8-byte little-endian chunks is a good hash.
+    fn hash(&self) -> u64 {
+        u64::from_le_bytes(self.0[0..8].try_into().unwrap())
+            ^ u64::from_le_bytes(self.0[8..16].try_into().unwrap())
+            ^ u64::from_le_bytes(self.0[16..24].try_into().unwrap())
+            ^ u64::from_le_bytes(self.0[24..32].try_into().unwrap())
+    }
+}
+
+/// A 32-byte public key + 64-byte signature, keyed in the `pk`/`pk2` LRU
+/// tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PkSigPair {
+    pk: [u8; PK_SIZE],
+    sig: [u8; SIG_SIZE],
+}
+
+impl Default for PkSigPair {
+    // `[u8; 64]` has no `Default` impl (only arrays up to length 32 do), so
+    // this can't be derived.
+    fn default() -> Self {
+        Self {
+            pk: [0; PK_SIZE],
+            sig: [0; SIG_SIZE],
+        }
+    }
+}
+
+impl PkSigPair {
+    /// `pk` and `sig` should already be uniformly distributed, so XOR the
+    /// first 8 bytes of each. Malicious values causing hash collisions
+    /// only affect the sending peer's own per-peer compression state.
+    fn hash(&self) -> u64 {
+        u64::from_le_bytes(self.pk[0..8].try_into().unwrap())
+            ^ u64::from_le_bytes(self.sig[0..8].try_into().unwrap())
+    }
+}
+
+/// State shared by [`StatefulEncoder`] and [`StatefulDecoder`]: the three
+/// LRU tables (`snd`, `pk`, `pk2`), the proposal sliding window, and the
+/// last-seen round number (for `r.rnd` delta encoding). Mirrors
+/// go-algorand's `dynamicTableState`.
+struct DynamicTableState {
+    snd_table: LruTable<AddressValue>,
+    pk_table: LruTable<PkSigPair>,
+    pk2_table: LruTable<PkSigPair>,
+    proposal_window: PropWindow,
+    last_rnd: u64,
+}
+
+impl DynamicTableState {
+    fn new(table_size: u32) -> Result<Self, VpackError> {
+        Ok(Self {
+            snd_table: LruTable::new(table_size)?,
+            pk_table: LruTable::new(table_size)?,
+            pk2_table: LruTable::new(table_size)?,
+            proposal_window: PropWindow::default(),
+            last_rnd: 0,
+        })
+    }
+}
+
+// ── stateful-layer reader (mirrors statefulReader) ──────────────────────
+
+struct StatefulReader<'a> {
+    src: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> StatefulReader<'a> {
+    fn read_fixed(&mut self, n: usize, field: &str) -> Result<&'a [u8], VpackError> {
+        if self.pos + n > self.src.len() {
+            return Err(VpackError::Decompress(format!("truncated {field}")));
+        }
+        let data = &self.src[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(data)
+    }
+
+    fn read_varuint_bytes(&mut self, field: &str) -> Result<&'a [u8], VpackError> {
+        if self.pos + 1 > self.src.len() {
+            return Err(VpackError::Decompress(format!("truncated {field} marker")));
+        }
+        let more = msgp_varuint_remaining(self.src[self.pos])
+            .map_err(|_| VpackError::Decompress(format!("invalid {field} marker")))?;
+        let total = 1 + more;
+        if self.pos + total > self.src.len() {
+            return Err(VpackError::Decompress(format!("truncated {field}")));
+        }
+        let data = &self.src[self.pos..self.pos + total];
+        self.pos += total;
+        Ok(data)
+    }
+
+    fn read_varuint(&mut self, field: &str) -> Result<(&'a [u8], u64), VpackError> {
+        let data = self.read_varuint_bytes(field)?;
+        let value = match data.len() {
+            1 => u64::from(data[0]),
+            2 => u64::from(data[1]),
+            3 => u64::from(u16::from_be_bytes(data[1..3].try_into().unwrap())),
+            5 => u64::from(u32::from_be_bytes(data[1..5].try_into().unwrap())),
+            9 => u64::from_be_bytes(data[1..9].try_into().unwrap()),
+            n => {
+                return Err(VpackError::Decompress(format!(
+                    "readVaruint: {field} unexpected length {n}"
+                )))
+            }
+        };
+        Ok((data, value))
+    }
+
+    fn read_dynamic_ref(&mut self, field: &str) -> Result<LruTableReferenceId, VpackError> {
+        if self.pos + 2 > self.src.len() {
+            return Err(VpackError::Decompress(format!("truncated {field}")));
+        }
+        let id = u16::from_be_bytes(self.src[self.pos..self.pos + 2].try_into().unwrap());
+        self.pos += 2;
+        Ok(id)
+    }
+}
+
+fn append_dynamic_ref(out: &mut Vec<u8>, id: LruTableReferenceId) {
+    out.extend_from_slice(&id.to_be_bytes());
+}
+
+/// Appends the canonical msgpack encoding of `v` to `out` (mirrors the
+/// subset of `github.com/algorand/msgp/msgp`'s `AppendUint64` used by
+/// go-algorand's `StatefulDecoder.Decompress` to re-synthesize a delta
+/// -decoded round number).
+fn append_msgp_uint64(out: &mut Vec<u8>, v: u64) {
+    match v {
+        0..=0x7f => out.push(v as u8),
+        0x80..=0xff => {
+            out.push(MSGP_UINT8);
+            out.push(v as u8);
+        }
+        0x100..=0xffff => {
+            out.push(MSGP_UINT16);
+            out.extend_from_slice(&(v as u16).to_be_bytes());
+        }
+        0x10000..=0xffff_ffff => {
+            out.push(MSGP_UINT32);
+            out.extend_from_slice(&(v as u32).to_be_bytes());
+        }
+        _ => {
+            out.push(MSGP_UINT64);
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+}
+
+/// Compresses votes (previously compressed by the stateless layer) by
+/// replacing frequently repeated field values with references to
+/// previously-seen values. Mirrors go-algorand's `vpack.StatefulEncoder`.
+///
+/// Not thread-safe; not wired into any live network path (see the module
+/// docs).
+pub struct StatefulEncoder {
+    state: DynamicTableState,
+}
+
+impl StatefulEncoder {
+    /// `table_size` is the total entry count for each of the three LRU
+    /// tables (must be a power of two, at least 16).
+    pub fn new(table_size: u32) -> Result<Self, VpackError> {
+        Ok(Self {
+            state: DynamicTableState::new(table_size)?,
+        })
+    }
+
+    /// Compresses `src` (the output of [`compress_vote`]) using dynamic
+    /// references to previously seen values. Mirrors go-algorand's
+    /// `StatefulEncoder.Compress`.
+    pub fn compress(&mut self, src: &[u8]) -> Result<Vec<u8>, VpackError> {
+        let mut r = StatefulReader { src, pos: 0 };
+
+        if src.len() < 2 {
+            return Err(VpackError::Decompress("src too short".into()));
+        }
+        let hdr0 = src[0];
+        let mut hdr1: u8 = 0;
+        r.pos = 2;
+
+        let mut out = Vec::with_capacity(src.len());
+        out.push(hdr0);
+        out.push(0); // filled in with hdr1 below
+
+        let pf = r.read_fixed(PF_SIZE, "pf")?;
+        out.extend_from_slice(pf);
+
+        if (hdr0 & BIT_PER) != 0 {
+            let per = r.read_varuint_bytes("r.per")?;
+            out.extend_from_slice(per);
+        }
+
+        let mut prop = ProposalEntry::default();
+        if (hdr0 & BIT_DIG) != 0 {
+            let dig = r.read_fixed(DIGEST_SIZE, "dig")?;
+            prop.dig.copy_from_slice(dig);
+        }
+        if (hdr0 & BIT_ENC_DIG) != 0 {
+            let encdig = r.read_fixed(DIGEST_SIZE, "encdig")?;
+            prop.encdig.copy_from_slice(encdig);
+        }
+        if (hdr0 & BIT_OPER) != 0 {
+            let oper = r.read_varuint_bytes("oper")?;
+            prop.oper_enc[..oper.len()].copy_from_slice(oper);
+            prop.oper_len = oper.len() as u8;
+        }
+        if (hdr0 & BIT_OPROP) != 0 {
+            let oprop = r.read_fixed(DIGEST_SIZE, "oprop")?;
+            prop.oprop.copy_from_slice(oprop);
+        }
+        prop.mask = hdr0 & PROP_FIELDS_MASK;
+
+        let idx = self.state.proposal_window.lookup(&prop);
+        if idx != 0 {
+            hdr1 |= (idx as u8) << HDR1_PROP_SHIFT;
+        } else {
+            self.state.proposal_window.insert_new(prop);
+            if (hdr0 & BIT_DIG) != 0 {
+                out.extend_from_slice(&prop.dig);
+            }
+            if (hdr0 & BIT_ENC_DIG) != 0 {
+                out.extend_from_slice(&prop.encdig);
+            }
+            if (hdr0 & BIT_OPER) != 0 {
+                out.extend_from_slice(&prop.oper_enc[..prop.oper_len as usize]);
+            }
+            if (hdr0 & BIT_OPROP) != 0 {
+                out.extend_from_slice(&prop.oprop);
+            }
+        }
+
+        let (rnd_data, rnd) = r.read_varuint("rnd")?;
+        let last_rnd = self.state.last_rnd;
+        if rnd == last_rnd {
+            hdr1 |= HDR1_RND_DELTA_SAME;
+        } else if last_rnd < u64::MAX && rnd == last_rnd + 1 {
+            hdr1 |= HDR1_RND_DELTA_PLUS1;
+        } else if last_rnd > 0 && rnd == last_rnd - 1 {
+            hdr1 |= HDR1_RND_DELTA_MINUS1;
+        } else {
+            out.extend_from_slice(rnd_data);
+        }
+        self.state.last_rnd = rnd;
+
+        let snd_data = r.read_fixed(DIGEST_SIZE, "sender")?;
+        let mut snd = AddressValue::default();
+        snd.0.copy_from_slice(snd_data);
+        let snd_h = snd.hash();
+        if let Some(id) = self.state.snd_table.lookup(snd, snd_h) {
+            hdr1 |= HDR1_SND_REF;
+            append_dynamic_ref(&mut out, id);
+        } else {
+            out.extend_from_slice(&snd.0);
+            self.state.snd_table.insert(snd, snd_h);
+        }
+
+        if (hdr0 & BIT_STEP) != 0 {
+            let step = r.read_varuint_bytes("step")?;
+            out.extend_from_slice(step);
+        }
+
+        let pk_bundle = r.read_fixed(PK_SIZE + SIG_SIZE, "pk bundle")?;
+        let mut pk = PkSigPair::default();
+        pk.pk.copy_from_slice(&pk_bundle[..PK_SIZE]);
+        pk.sig.copy_from_slice(&pk_bundle[PK_SIZE..]);
+        let pk_h = pk.hash();
+        if let Some(id) = self.state.pk_table.lookup(pk, pk_h) {
+            hdr1 |= HDR1_PK_REF;
+            append_dynamic_ref(&mut out, id);
+        } else {
+            out.extend_from_slice(&pk.pk);
+            out.extend_from_slice(&pk.sig);
+            self.state.pk_table.insert(pk, pk_h);
+        }
+
+        let pk2_bundle = r.read_fixed(PK_SIZE + SIG_SIZE, "pk2 bundle")?;
+        let mut pk2 = PkSigPair::default();
+        pk2.pk.copy_from_slice(&pk2_bundle[..PK_SIZE]);
+        pk2.sig.copy_from_slice(&pk2_bundle[PK_SIZE..]);
+        let pk2_h = pk2.hash();
+        if let Some(id) = self.state.pk2_table.lookup(pk2, pk2_h) {
+            hdr1 |= HDR1_PK2_REF;
+            append_dynamic_ref(&mut out, id);
+        } else {
+            out.extend_from_slice(&pk2.pk);
+            out.extend_from_slice(&pk2.sig);
+            self.state.pk2_table.insert(pk2, pk2_h);
+        }
+
+        let sigs = r.read_fixed(SIG_SIZE, "sig.s")?;
+        out.extend_from_slice(sigs);
+
+        if r.pos != src.len() {
+            return Err(VpackError::Decompress(format!(
+                "length mismatch: expected {}, got {}",
+                src.len(),
+                r.pos
+            )));
+        }
+
+        out[1] = hdr1;
+        Ok(out)
+    }
+}
+
+/// Decompresses votes compressed by [`StatefulEncoder`], reversing it back
+/// into valid stateless-vpack-format bytes (pass the result to
+/// [`decompress_vote`]). Mirrors go-algorand's `vpack.StatefulDecoder`.
+///
+/// Not thread-safe; not wired into any live network path (see the module
+/// docs).
+pub struct StatefulDecoder {
+    state: DynamicTableState,
+}
+
+impl StatefulDecoder {
+    /// `table_size` is the total entry count for each of the three LRU
+    /// tables (must be a power of two, at least 16).
+    pub fn new(table_size: u32) -> Result<Self, VpackError> {
+        Ok(Self {
+            state: DynamicTableState::new(table_size)?,
+        })
+    }
+
+    /// Reverses [`StatefulEncoder::compress`], producing stateless-vpack
+    /// bytes suitable for [`decompress_vote`].
+    pub fn decompress(&mut self, src: &[u8]) -> Result<Vec<u8>, VpackError> {
+        let mut r = StatefulReader { src, pos: 0 };
+
+        if src.len() < 2 {
+            return Err(VpackError::Decompress(
+                "input shorter than header".into(),
+            ));
+        }
+        let hdr0 = src[0];
+        let hdr1 = src[1];
+        r.pos = 2;
+
+        let mut out = Vec::with_capacity(src.len());
+        out.push(hdr0);
+        out.push(0);
+
+        let pf = r.read_fixed(PF_SIZE, "pf")?;
+        out.extend_from_slice(pf);
+
+        if (hdr0 & BIT_PER) != 0 {
+            let per = r.read_varuint_bytes("per")?;
+            out.extend_from_slice(per);
+        }
+
+        let prop_ref = (hdr1 & HDR1_PROP_MASK) >> HDR1_PROP_SHIFT;
+        let prop = if prop_ref == 0 {
+            let mut prop = ProposalEntry::default();
+            if (hdr0 & BIT_DIG) != 0 {
+                let dig = r.read_fixed(DIGEST_SIZE, "digest")?;
+                prop.dig.copy_from_slice(dig);
+            }
+            if (hdr0 & BIT_ENC_DIG) != 0 {
+                let encdig = r.read_fixed(DIGEST_SIZE, "encdig")?;
+                prop.encdig.copy_from_slice(encdig);
+            }
+            if (hdr0 & BIT_OPER) != 0 {
+                let oper = r.read_varuint_bytes("oper")?;
+                prop.oper_enc[..oper.len()].copy_from_slice(oper);
+                prop.oper_len = oper.len() as u8;
+            }
+            if (hdr0 & BIT_OPROP) != 0 {
+                let oprop = r.read_fixed(DIGEST_SIZE, "oprop")?;
+                prop.oprop.copy_from_slice(oprop);
+            }
+            prop.mask = hdr0 & PROP_FIELDS_MASK;
+            self.state.proposal_window.insert_new(prop);
+            prop
+        } else {
+            self.state
+                .proposal_window
+                .by_ref(prop_ref as usize)
+                .ok_or_else(|| VpackError::Decompress(format!("bad proposal ref: {prop_ref}")))?
+        };
+
+        if (prop.mask & BIT_DIG) != 0 {
+            out.extend_from_slice(&prop.dig);
+        }
+        if (prop.mask & BIT_ENC_DIG) != 0 {
+            out.extend_from_slice(&prop.encdig);
+        }
+        if (prop.mask & BIT_OPER) != 0 {
+            out.extend_from_slice(&prop.oper_enc[..prop.oper_len as usize]);
+        }
+        if (prop.mask & BIT_OPROP) != 0 {
+            out.extend_from_slice(&prop.oprop);
+        }
+
+        let rnd = match hdr1 & HDR1_RND_MASK {
+            HDR1_RND_DELTA_SAME => {
+                let rnd = self.state.last_rnd;
+                append_msgp_uint64(&mut out, rnd);
+                rnd
+            }
+            HDR1_RND_DELTA_PLUS1 => {
+                if self.state.last_rnd == u64::MAX {
+                    return Err(VpackError::Decompress(format!(
+                        "round overflow: lastRnd {}",
+                        self.state.last_rnd
+                    )));
+                }
+                let rnd = self.state.last_rnd + 1;
+                append_msgp_uint64(&mut out, rnd);
+                rnd
+            }
+            HDR1_RND_DELTA_MINUS1 => {
+                if self.state.last_rnd == 0 {
+                    return Err(VpackError::Decompress(format!(
+                        "round underflow: lastRnd {}",
+                        self.state.last_rnd
+                    )));
+                }
+                let rnd = self.state.last_rnd - 1;
+                append_msgp_uint64(&mut out, rnd);
+                rnd
+            }
+            _ => {
+                // HDR1_RND_LITERAL (0b00); `debug_assert!` keeps the
+                // constant demonstrably load-bearing for this arm.
+                debug_assert_eq!(hdr1 & HDR1_RND_MASK, HDR1_RND_LITERAL);
+                let (rnd_data, rnd_val) = r.read_varuint("rnd")?;
+                out.extend_from_slice(rnd_data);
+                rnd_val
+            }
+        };
+        self.state.last_rnd = rnd;
+
+        if (hdr1 & HDR1_SND_REF) != 0 {
+            let id = r.read_dynamic_ref("snd ref")?;
+            let addr = self
+                .state
+                .snd_table
+                .fetch(id)
+                .ok_or_else(|| VpackError::Decompress(format!("bad sender ref: {id}")))?;
+            out.extend_from_slice(&addr.0);
+        } else {
+            let snd_data = r.read_fixed(DIGEST_SIZE, "sender")?;
+            let mut addr = AddressValue::default();
+            addr.0.copy_from_slice(snd_data);
+            out.extend_from_slice(&addr.0);
+            self.state.snd_table.insert(addr, addr.hash());
+        }
+
+        if (hdr0 & BIT_STEP) != 0 {
+            let step = r.read_varuint_bytes("step")?;
+            out.extend_from_slice(step);
+        }
+
+        if (hdr1 & HDR1_PK_REF) != 0 {
+            let id = r.read_dynamic_ref("pk ref")?;
+            let pkb = self
+                .state
+                .pk_table
+                .fetch(id)
+                .ok_or_else(|| VpackError::Decompress(format!("bad pk ref: {id}")))?;
+            out.extend_from_slice(&pkb.pk);
+            out.extend_from_slice(&pkb.sig);
+        } else {
+            let pk_bundle = r.read_fixed(PK_SIZE + SIG_SIZE, "pk bundle")?;
+            let mut pkb = PkSigPair::default();
+            pkb.pk.copy_from_slice(&pk_bundle[..PK_SIZE]);
+            pkb.sig.copy_from_slice(&pk_bundle[PK_SIZE..]);
+            out.extend_from_slice(&pkb.pk);
+            out.extend_from_slice(&pkb.sig);
+            self.state.pk_table.insert(pkb, pkb.hash());
+        }
+
+        if (hdr1 & HDR1_PK2_REF) != 0 {
+            let id = r.read_dynamic_ref("pk2 ref")?;
+            let pk2b = self
+                .state
+                .pk2_table
+                .fetch(id)
+                .ok_or_else(|| VpackError::Decompress(format!("bad pk2 ref: {id}")))?;
+            out.extend_from_slice(&pk2b.pk);
+            out.extend_from_slice(&pk2b.sig);
+        } else {
+            let pk2_bundle = r.read_fixed(PK_SIZE + SIG_SIZE, "pk2 bundle")?;
+            let mut pk2b = PkSigPair::default();
+            pk2b.pk.copy_from_slice(&pk2_bundle[..PK_SIZE]);
+            pk2b.sig.copy_from_slice(&pk2_bundle[PK_SIZE..]);
+            out.extend_from_slice(&pk2b.pk);
+            out.extend_from_slice(&pk2b.sig);
+            self.state.pk2_table.insert(pk2b, pk2b.hash());
+        }
+
+        let sigs = r.read_fixed(SIG_SIZE, "sig.s")?;
+        out.extend_from_slice(sigs);
+
+        if r.pos != src.len() {
+            return Err(VpackError::Decompress(format!(
+                "length mismatch: expected {}, got {}",
+                src.len(),
+                r.pos
+            )));
+        }
+
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1306,6 +2031,733 @@ mod tests {
                 "83a46372656481a27066c4500102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50a17283a470726f7081a3646967c420e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeffa3726e64cd3039a3736e64c420101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2fa373696786a170c420202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3fa3703173c440303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6fa27032c420404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5fa3703273c440505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8fa27073c44000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a173c440606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
                 "02000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeffcd3039101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
             );
+        }
+    }
+
+    // ── stateful (dynamic-table) layer tests ────────────────────────────
+
+    mod stateful {
+        use super::*;
+
+        // ── LRU table (mirrors network/vpack/lru_table_test.go) ─────────
+
+        #[test]
+        fn lru_table_size_validation() {
+            let err = LruTable::<i32>::new(100).unwrap_err();
+            assert!(matches!(err, VpackError::InvalidTableSize(_)));
+            let err = LruTable::<i32>::new(8).unwrap_err();
+            assert!(matches!(err, VpackError::InvalidTableSize(_)));
+
+            for size in [16u32, 32, 64, 128, 256, 512, 1024, 2048] {
+                assert!(LruTable::<i32>::new(size).is_ok());
+                assert!(StatefulEncoder::new(size).is_ok());
+                assert!(StatefulDecoder::new(size).is_ok());
+            }
+        }
+
+        #[test]
+        fn lru_table_invalid_id_fetch() {
+            let mut table = LruTable::<PkSigPair>::new(1024).unwrap();
+            let invalid_id: LruTableReferenceId = 1024; // >= num_buckets (512)
+            assert_eq!(table.fetch(invalid_id), None);
+        }
+
+        #[test]
+        fn lru_table_insert_lookup_fetch() {
+            let mut tab = LruTable::<i32>::new(1024).unwrap();
+            let bucket_hash: u64 = 42;
+            let base_id: LruTableReferenceId = (bucket_hash as LruTableReferenceId) << 1;
+
+            // first insert on empty table: slot 1 gets used (MRU bit starts 0)
+            let id1 = tab.insert(100, bucket_hash);
+            assert_eq!(id1, base_id | 1);
+            assert_eq!(tab.lru_slot(bucket_hash as u32), 0);
+
+            assert_eq!(tab.lookup(100, bucket_hash), Some(id1));
+            assert_eq!(tab.lru_slot(bucket_hash as u32), 0);
+
+            let id2 = tab.insert(200, bucket_hash);
+            assert_eq!(id2, base_id);
+            assert_eq!(tab.lru_slot(bucket_hash as u32), 1);
+
+            assert!(tab.lookup(100, bucket_hash).is_some());
+            assert_eq!(tab.lru_slot(bucket_hash as u32), 0);
+
+            assert!(tab.lookup(200, bucket_hash).is_some());
+            assert_eq!(tab.lru_slot(bucket_hash as u32), 1);
+
+            let id3 = tab.insert(300, bucket_hash);
+            assert_eq!(id3, base_id | 1);
+            assert_eq!(tab.lru_slot(bucket_hash as u32), 0);
+
+            assert_eq!(tab.fetch(id3), Some(300));
+            assert_eq!(tab.lru_slot(bucket_hash as u32), 0);
+
+            let id4 = tab.insert(400, bucket_hash);
+            assert_eq!(id4, base_id);
+            assert_eq!(tab.lru_slot(bucket_hash as u32), 1);
+
+            assert_eq!(tab.fetch(id3), Some(300));
+            assert_eq!(tab.lru_slot(bucket_hash as u32), 0);
+            assert_eq!(tab.fetch(id4), Some(400));
+            assert_eq!(tab.lru_slot(bucket_hash as u32), 1);
+        }
+
+        #[test]
+        fn lru_eviction_order() {
+            let mut tab = LruTable::<i32>::new(1024).unwrap();
+            let h: u64 = 42;
+
+            let id1 = tab.insert(100, h);
+            assert_eq!(tab.fetch(id1), Some(100));
+            let id2 = tab.insert(200, h);
+            assert_eq!(tab.fetch(id2), Some(200));
+
+            assert_eq!(tab.lookup(100, h), Some(id1));
+            assert_eq!(tab.lookup(200, h), Some(id2));
+            // make 100 MRU
+            assert_eq!(tab.lookup(100, h), Some(id1));
+
+            // 200 is now LRU; inserting evicts it
+            let id3 = tab.insert(300, h);
+            assert_eq!(tab.fetch(id3), Some(300));
+            assert_eq!(tab.lookup(100, h), Some(id1));
+            assert_eq!(tab.lookup(200, h), None);
+            assert_eq!(tab.lookup(300, h), Some(id3));
+
+            // make 300 MRU, then insert evicts 100 (now LRU)
+            assert_eq!(tab.lookup(300, h), Some(id3));
+            let id4 = tab.insert(400, h);
+            assert_eq!(tab.fetch(id4), Some(400));
+            assert_eq!(tab.lookup(100, h), None);
+            assert_eq!(tab.lookup(300, h), Some(id3));
+            assert_eq!(tab.lookup(400, h), Some(id4));
+        }
+
+        #[test]
+        fn lru_ref_id_consistency() {
+            let mut tab = LruTable::<i32>::new(1024).unwrap();
+            let h: u64 = 42;
+
+            let id1 = tab.insert(100, h);
+            assert_eq!(tab.lookup(100, h), Some(id1));
+            assert_eq!(tab.fetch(id1), Some(100));
+
+            let id2 = tab.insert(200, h);
+            assert_ne!(id1, id2);
+            assert_eq!(tab.fetch(id1), Some(100));
+            assert_eq!(tab.fetch(id2), Some(200));
+        }
+
+        // ── proposal sliding window (mirrors proposal_window_test.go) ───
+
+        fn make_test_prop_bundle(seed: u8) -> ProposalEntry {
+            let mut p = ProposalEntry {
+                dig: [seed; DIGEST_SIZE],
+                mask: BIT_DIG | BIT_OPER,
+                oper_len: 1,
+                ..Default::default()
+            };
+            p.oper_enc[0] = seed;
+            p
+        }
+
+        #[test]
+        fn prop_window_hpack() {
+            let mut w = PropWindow::default();
+
+            for i in 0..PROPOSAL_WINDOW_SIZE {
+                let pb = make_test_prop_bundle(i as u8);
+                w.insert_new(pb);
+                assert_eq!(w.size, i + 1);
+                assert_eq!(w.lookup(&pb), 1, "newly inserted entry must be HPACK index 1");
+            }
+
+            for idx in 1..=PROPOSAL_WINDOW_SIZE {
+                let prop = w.by_ref(idx).unwrap();
+                let expected_seed = (PROPOSAL_WINDOW_SIZE - idx) as u8;
+                assert_eq!(prop, make_test_prop_bundle(expected_seed));
+            }
+
+            let evicted = make_test_prop_bundle(0);
+            let new_entry = make_test_prop_bundle(7);
+            w.insert_new(new_entry);
+            assert_eq!(w.size, PROPOSAL_WINDOW_SIZE);
+            assert_eq!(w.lookup(&evicted), 0, "evicted entry must not be found");
+            assert_eq!(w.lookup(&new_entry), 1);
+
+            assert_eq!(w.by_ref(1).unwrap(), new_entry);
+            assert_eq!(w.by_ref(PROPOSAL_WINDOW_SIZE).unwrap(), make_test_prop_bundle(1));
+        }
+
+        // ── header-bit sync + reference-id size (mirrors
+        // TestStatefulEncoderHeaderBits / TestStatefulEncodeRef) ─────────
+
+        #[test]
+        fn header_bits_stay_in_sync() {
+            let got = (HDR1_PROP_MASK >> HDR1_PROP_SHIFT) as usize;
+            assert_eq!(got, PROPOSAL_WINDOW_SIZE);
+            assert_eq!(HDR1_RND_LITERAL, 0);
+        }
+
+        #[test]
+        fn ref_id_fits_in_u16() {
+            assert_eq!(std::mem::size_of::<LruTableReferenceId>(), 2);
+            // max supported table size is 2048 -> 1024 buckets, last bucket
+            // 1023, last slot 1 -> maxID = (1023<<1)|1 = 2047
+            let max_table_size: u32 = 2048;
+            let max_bucket_index = (max_table_size / 2) - 1;
+            let max_id: LruTableReferenceId = ((max_bucket_index << 1) | 1) as LruTableReferenceId;
+            assert!(u32::from(max_id) <= u32::from(u16::MAX));
+        }
+
+        // ── round-trip sequence + reuse (mirrors
+        // TestStatefulEncoderDecoderSequence / TestStatefulEncoderReuse) ─
+
+        fn stateful_vote_spec(i: usize) -> VoteSpec {
+            let mut v = base_spec();
+            v.snd = seq(32, 0x10u8.wrapping_add(i as u8));
+            v.p = seq(32, 0x20u8.wrapping_add(i as u8));
+            v.p1s = seq(64, 0x30u8.wrapping_add(i as u8));
+            v.p2 = seq(32, 0x40u8.wrapping_add(i as u8));
+            v.p2s = seq(64, 0x50u8.wrapping_add(i as u8));
+            v.s = seq(64, 0x60u8.wrapping_add(i as u8));
+            v.rnd = 1000 + i as u64;
+            if i % 3 == 0 {
+                v.dig = Some(seq(32, 0x70));
+            } else if i % 3 == 1 {
+                v.dig = Some(seq(32, 0x71));
+            } else {
+                v.dig = None;
+                v.encdig = Some(seq(32, 0x72));
+            }
+            if i % 2 == 0 {
+                v.step = Some(i as u64);
+            }
+            v
+        }
+
+        #[test]
+        fn stateful_encoder_decoder_sequence_round_trip() {
+            let mut enc = StatefulEncoder::new(1024).unwrap();
+            let mut dec = StatefulDecoder::new(1024).unwrap();
+
+            for i in 0..30 {
+                let v = stateful_vote_spec(i);
+                let msgp = build_msgp_vote(&v);
+                let stateless = compress_vote(&msgp).unwrap();
+
+                let stateful = enc.compress(&stateless).unwrap();
+                // compressed output must never exceed the stateless input
+                assert!(stateful.len() <= stateless.len());
+
+                let stateless_out = dec.decompress(&stateful).unwrap();
+                assert_eq!(stateless_out, stateless, "vote {i} stateful round-trip");
+
+                let msgp_out = decompress_vote(&stateless_out).unwrap();
+                assert_eq!(msgp_out, msgp, "vote {i} full round-trip");
+            }
+        }
+
+        #[test]
+        fn stateful_rnd_delta() {
+            let rounds = [10u64, 10, 11, 10, 11, 11, 20];
+            let expected = [
+                HDR1_RND_LITERAL,
+                HDR1_RND_DELTA_SAME,
+                HDR1_RND_DELTA_PLUS1,
+                HDR1_RND_DELTA_MINUS1,
+                HDR1_RND_DELTA_PLUS1,
+                HDR1_RND_DELTA_SAME,
+                HDR1_RND_LITERAL,
+            ];
+
+            let mut enc = StatefulEncoder::new(1024).unwrap();
+            let mut dec = StatefulDecoder::new(1024).unwrap();
+
+            for (i, &rnd) in rounds.iter().enumerate() {
+                let mut v = base_spec();
+                v.rnd = rnd;
+                let msgp = build_msgp_vote(&v);
+                let stateless = compress_vote(&msgp).unwrap();
+
+                let stateful = enc.compress(&stateless).unwrap();
+                assert!(stateful.len() >= 2);
+                assert_eq!(stateful[1] & HDR1_RND_MASK, expected[i], "vote {i}");
+
+                let decompressed = dec.decompress(&stateful).unwrap();
+                assert_eq!(decompressed, stateless);
+            }
+        }
+
+        // ── error paths (mirrors TestStatefulDecoderErrors /
+        // TestStatefulEncoderErrors) ──────────────────────────────────
+
+        fn zeros(n: usize) -> Vec<u8> {
+            vec![0u8; n]
+        }
+
+        #[test]
+        fn stateful_decoder_error_paths() {
+            let mut full_vote = Vec::new();
+            full_vote.push(BIT_PER | BIT_DIG | BIT_STEP | BIT_ENC_DIG | BIT_OPER | BIT_OPROP);
+            full_vote.push(0x00);
+            full_vote.extend(zeros(PF_SIZE));
+            full_vote.push(MSGP_UINT32);
+            full_vote.extend([0x01, 0x02, 0x03, 0x04]); // per
+            full_vote.extend(zeros(DIGEST_SIZE)); // dig
+            full_vote.extend(zeros(DIGEST_SIZE)); // encdig
+            full_vote.push(MSGP_UINT32);
+            full_vote.extend([0x01, 0x02, 0x03, 0x04]); // oper
+            full_vote.extend(zeros(DIGEST_SIZE)); // oprop
+            full_vote.push(MSGP_UINT32);
+            full_vote.extend([0x01, 0x02, 0x03, 0x04]); // rnd
+            full_vote.extend(zeros(DIGEST_SIZE)); // sender
+            full_vote.push(MSGP_UINT32);
+            full_vote.extend([0x01, 0x02, 0x03, 0x04]); // step
+            full_vote.extend(zeros(PK_SIZE + SIG_SIZE)); // pk bundle
+            full_vote.extend(zeros(PK_SIZE + SIG_SIZE)); // pk2 bundle
+            full_vote.extend(zeros(SIG_SIZE)); // sig.s
+
+            let mut ref_vote = Vec::new();
+            ref_vote.push(0x00);
+            ref_vote.push(HDR1_SND_REF | HDR1_PK_REF | HDR1_PK2_REF | HDR1_RND_LITERAL);
+            ref_vote.extend(zeros(PF_SIZE));
+            ref_vote.push(0x07); // rnd literal (fixint)
+            ref_vote.extend([0x01, 0x02]); // snd ref id
+            ref_vote.extend([0x03, 0x04]); // pk ref id
+            ref_vote.extend([0x05, 0x06]); // pk2 ref id
+            ref_vote.extend(zeros(SIG_SIZE)); // sig.s
+
+            let cases: Vec<(&str, Vec<u8>)> = vec![
+                ("input shorter than header", full_vote[..1].to_vec()),
+                ("truncated pf", full_vote[..2].to_vec()),
+                ("truncated per marker", full_vote[..82].to_vec()),
+                ("truncated per", full_vote[..83].to_vec()),
+                ("truncated digest", full_vote[..87].to_vec()),
+                ("truncated encdig", full_vote[..119].to_vec()),
+                ("truncated oper marker", full_vote[..151].to_vec()),
+                ("truncated oper", full_vote[..152].to_vec()),
+                ("truncated oprop", full_vote[..160].to_vec()),
+                ("truncated rnd marker", full_vote[..188].to_vec()),
+                ("truncated rnd", full_vote[..189].to_vec()),
+                ("truncated sender", full_vote[..193].to_vec()),
+                ("truncated step marker", full_vote[..225].to_vec()),
+                ("truncated step", full_vote[..226].to_vec()),
+                ("truncated pk bundle", full_vote[..234].to_vec()),
+                ("truncated pk2 bundle", full_vote[..334].to_vec()),
+                ("truncated sig.s", full_vote[..422].to_vec()),
+                ("truncated snd ref", ref_vote[..84].to_vec()),
+                ("truncated pk ref", ref_vote[..86].to_vec()),
+                ("truncated pk2 ref", ref_vote[..88].to_vec()),
+                ("bad sender ref", {
+                    let mut b = ref_vote[..83].to_vec();
+                    b.extend([0xFF, 0xFF]);
+                    b
+                }),
+                ("bad pk ref", {
+                    let mut b = ref_vote[..85].to_vec();
+                    b.extend([0xFF, 0xFF]);
+                    b
+                }),
+                ("bad pk2 ref", {
+                    let mut b = ref_vote[..87].to_vec();
+                    b.extend([0xFF, 0xFF]);
+                    b
+                }),
+                ("bad proposal ref", {
+                    let mut b = vec![0x00u8, 3 << HDR1_PROP_SHIFT];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(0x01);
+                    b
+                }),
+                ("length mismatch: expected", {
+                    let mut b = full_vote.clone();
+                    b.extend([0xFF, 0xFF]);
+                    b
+                }),
+            ];
+
+            for (want, buf) in cases {
+                let mut dec = StatefulDecoder::new(1024).unwrap();
+                let err = dec.decompress(&buf).unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(want),
+                    "case {want:?}: got error {msg:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn stateful_encoder_error_paths() {
+            let mut enc = StatefulEncoder::new(1024).unwrap();
+
+            let err = enc.compress(&[0x00]).unwrap_err();
+            assert!(err.to_string().contains("src too short"));
+
+            let v = base_spec();
+            let msgp = build_msgp_vote(&v);
+            let stateless = compress_vote(&msgp).unwrap();
+
+            let mut bad_buf = stateless.clone();
+            bad_buf.push(0xFF);
+            let err = enc.compress(&bad_buf).unwrap_err();
+            assert!(err.to_string().contains("length mismatch"));
+
+            let compressed = enc.compress(&stateless).unwrap();
+            assert!(!compressed.is_empty());
+
+            let cases: Vec<(&str, Vec<u8>)> = vec![
+                ("truncated pf", {
+                    vec![0x00, 0x00]
+                }),
+                ("truncated r.per marker", {
+                    let mut b = vec![BIT_PER, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b
+                }),
+                ("truncated r.per", {
+                    let mut b = vec![BIT_PER, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(MSGP_UINT32);
+                    b
+                }),
+                ("truncated dig", {
+                    let mut b = vec![BIT_DIG, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b
+                }),
+                ("truncated encdig", {
+                    let mut b = vec![BIT_ENC_DIG, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b
+                }),
+                ("truncated oper marker", {
+                    let mut b = vec![BIT_OPER, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b
+                }),
+                ("truncated oper", {
+                    let mut b = vec![BIT_OPER, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(MSGP_UINT32);
+                    b
+                }),
+                ("truncated oprop", {
+                    let mut b = vec![BIT_OPROP, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b
+                }),
+                ("truncated rnd marker", {
+                    let mut b = vec![0x00, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b
+                }),
+                ("truncated rnd", {
+                    let mut b = vec![0x00, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(MSGP_UINT32);
+                    b
+                }),
+                ("truncated sender", {
+                    let mut b = vec![0x00, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(0x07);
+                    b
+                }),
+                ("truncated step marker", {
+                    let mut b = vec![BIT_STEP, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(0x07);
+                    b.extend(zeros(DIGEST_SIZE));
+                    b
+                }),
+                ("truncated step", {
+                    let mut b = vec![BIT_STEP, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(0x07);
+                    b.extend(zeros(DIGEST_SIZE));
+                    b.push(MSGP_UINT32);
+                    b
+                }),
+                ("truncated pk bundle", {
+                    let mut b = vec![0x00, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(0x07);
+                    b.extend(zeros(DIGEST_SIZE));
+                    b
+                }),
+                ("truncated pk2 bundle", {
+                    let mut b = vec![0x00, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(0x07);
+                    b.extend(zeros(DIGEST_SIZE));
+                    b.extend(zeros(PK_SIZE + SIG_SIZE));
+                    b
+                }),
+                ("truncated sig.s", {
+                    let mut b = vec![0x00, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(0x07);
+                    b.extend(zeros(DIGEST_SIZE));
+                    b.extend(zeros(PK_SIZE + SIG_SIZE));
+                    b.extend(zeros(PK_SIZE + SIG_SIZE));
+                    b
+                }),
+                ("invalid r.per marker", {
+                    let mut b = vec![BIT_PER, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(0xFF);
+                    b
+                }),
+                ("invalid oper marker", {
+                    let mut b = vec![BIT_OPER, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(0xFF);
+                    b
+                }),
+                ("invalid rnd marker", {
+                    let mut b = vec![0x00, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(0xFF);
+                    b
+                }),
+                ("invalid step marker", {
+                    let mut b = vec![BIT_STEP, 0x00];
+                    b.extend(zeros(PF_SIZE));
+                    b.push(0x07);
+                    b.extend(zeros(DIGEST_SIZE));
+                    b.push(0xFF);
+                    b
+                }),
+            ];
+
+            for (want, buf) in cases {
+                let mut enc = StatefulEncoder::new(1024).unwrap();
+                let err = enc.compress(&buf).unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains(want), "case {want:?}: got error {msg:?}");
+            }
+        }
+
+        // ── pinned interop fixtures (stateful layer) ─────────────────────
+        //
+        // Captured the same way as the stateless `interop_fixtures` above:
+        // by running go-algorand's actual, unmodified `network/vpack`
+        // source (`vpack.go`, `msgp.go`, `parse.go`, `lru_table.go`,
+        // `proposal_window.go`, `dynamic_vpack.go`, copied verbatim from
+        // `../go-algorand/network/vpack/` at the repo's `v5.0.0-stable`
+        // pin) against a small Go driver (not checked into either repo)
+        // that feeds a sequence of votes through `StatelessEncoder` then
+        // `StatefulEncoder`, printing hex. These byte vectors prove
+        // genuine wire-level interop with real go-algorand `vpack`
+        // stateful output, not just Rust self-consistency.
+        mod interop_fixtures {
+            use super::*;
+
+            /// Feeds `votes` through a fresh `StatefulEncoder`/`StatefulDecoder`
+            /// pair (persistent across the sequence, matching how a real
+            /// connection would use them), and checks vote `pin_at[i]`'s
+            /// stateful-compressed bytes against `expected_hex[i]`.
+            fn check_sequence(
+                table_size: u32,
+                votes: &[VoteSpec],
+                pins: &[(usize, &str)],
+            ) {
+                let mut enc = StatefulEncoder::new(table_size).unwrap();
+                let mut dec = StatefulDecoder::new(table_size).unwrap();
+
+                for (i, v) in votes.iter().enumerate() {
+                    let msgp = build_msgp_vote(v);
+                    let stateless = compress_vote(&msgp).unwrap();
+                    let stateful = enc.compress(&stateless).unwrap();
+
+                    // every vote must round-trip, whether pinned or not
+                    let stateless_out = dec.decompress(&stateful).unwrap();
+                    assert_eq!(stateless_out, stateless, "vote {i} stateful round-trip");
+                    let msgp_out = decompress_vote(&stateless_out).unwrap();
+                    assert_eq!(msgp_out, msgp, "vote {i} full round-trip");
+
+                    if let Some(&(_, expected_hex)) = pins.iter().find(|&&(idx, _)| idx == i) {
+                        assert_eq!(
+                            hex(&stateful),
+                            expected_hex,
+                            "vote {i} must byte-match real go-algorand StatefulEncoder output"
+                        );
+                    }
+                }
+            }
+
+            /// Mirrors the Go driver's `votesA` sequence: same proposal/round
+            /// reused across votes, exercising literal->reference transitions
+            /// for `snd`/`pk`/`pk2`/`prop` and all four `r.rnd` delta cases.
+            #[test]
+            fn mixed_literal_and_reference() {
+                let pf = seq(80, 0x01);
+                let dig_a = seq(32, 0x70);
+                let dig_b = seq(32, 0x71);
+                let snd_s1 = seq(32, 0x10);
+                let snd_s2 = seq(32, 0x11);
+                let pk_p1 = seq(32, 0x20);
+                let p1s_sig1 = seq(64, 0x30);
+                let pk2_p1 = seq(32, 0x40);
+                let p2s_sig1 = seq(64, 0x50);
+
+                let votes = vec![
+                    VoteSpec {
+                        pf: pf.clone(),
+                        dig: Some(dig_a.clone()),
+                        rnd: 100,
+                        snd: snd_s1.clone(),
+                        p: pk_p1.clone(),
+                        p1s: p1s_sig1.clone(),
+                        p2: pk2_p1.clone(),
+                        p2s: p2s_sig1.clone(),
+                        s: seq(64, 0x60),
+                        step: Some(1),
+                        ..Default::default()
+                    },
+                    VoteSpec {
+                        pf: pf.clone(),
+                        dig: Some(dig_a.clone()),
+                        rnd: 101,
+                        snd: snd_s1.clone(),
+                        p: pk_p1.clone(),
+                        p1s: p1s_sig1.clone(),
+                        p2: pk2_p1.clone(),
+                        p2s: p2s_sig1.clone(),
+                        s: seq(64, 0x61),
+                        step: Some(2),
+                        ..Default::default()
+                    },
+                    VoteSpec {
+                        pf: pf.clone(),
+                        dig: Some(dig_b.clone()),
+                        rnd: 101,
+                        snd: snd_s1.clone(),
+                        p: pk_p1.clone(),
+                        p1s: p1s_sig1.clone(),
+                        p2: pk2_p1.clone(),
+                        p2s: p2s_sig1.clone(),
+                        s: seq(64, 0x62),
+                        step: Some(3),
+                        ..Default::default()
+                    },
+                    VoteSpec {
+                        pf: pf.clone(),
+                        dig: Some(dig_a.clone()),
+                        rnd: 100,
+                        snd: snd_s2.clone(),
+                        p: pk_p1.clone(),
+                        p1s: p1s_sig1.clone(),
+                        p2: pk2_p1.clone(),
+                        p2s: p2s_sig1.clone(),
+                        s: seq(64, 0x63),
+                        step: Some(4),
+                        ..Default::default()
+                    },
+                    VoteSpec {
+                        pf: pf.clone(),
+                        dig: Some(dig_b.clone()),
+                        rnd: 100,
+                        snd: snd_s1.clone(),
+                        p: pk_p1.clone(),
+                        p1s: p1s_sig1.clone(),
+                        p2: pk2_p1.clone(),
+                        p2s: p2s_sig1.clone(),
+                        s: seq(64, 0x64),
+                        step: Some(5),
+                        ..Default::default()
+                    },
+                    VoteSpec {
+                        pf: pf.clone(),
+                        rnd: 500,
+                        snd: seq(32, 0x12),
+                        p: seq(32, 0x21),
+                        p1s: seq(64, 0x31),
+                        p2: seq(32, 0x41),
+                        p2s: seq(64, 0x51),
+                        s: seq(64, 0x65),
+                        ..Default::default()
+                    },
+                ];
+
+                let pins: [(usize, &str); 6] = [
+                    (0, "22000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f64101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f01202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"),
+                    (1, "22e50102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50000102002100216162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0"),
+                    (2, "22e30102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f507172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f900001030021002162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1"),
+                    (3, "22ca0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f501112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f300400210021636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2"),
+                    (4, "22e70102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50000105002100216465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3"),
+                    (5, "00000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50cd01f412131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30312122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f403132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f704142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f605152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f9065666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4"),
+                ];
+
+                check_sequence(1024, &votes, &pins);
+            }
+
+            /// Mirrors the Go driver's `votesB` sequence: table size 16
+            /// forces LRU eviction of the `snd` table after 20 distinct
+            /// senders are inserted, so the 22nd vote's reference to the
+            /// very first sender must fall back to a literal re-insert
+            /// (`sndRef` bit clear in hdr1, unlike `pk`/`pk2`/`prop` which
+            /// stay unevicted references throughout).
+            #[test]
+            fn small_table_eviction() {
+                let pf = seq(80, 0x01);
+                let dig_a = seq(32, 0x70);
+                let pk_p1 = seq(32, 0x20);
+                let p1s_sig1 = seq(64, 0x30);
+                let pk2_p1 = seq(32, 0x40);
+                let p2s_sig1 = seq(64, 0x50);
+                let first_snd = seq(32, 0xA0);
+
+                let mut votes = vec![VoteSpec {
+                    pf: pf.clone(),
+                    dig: Some(dig_a.clone()),
+                    rnd: 1,
+                    snd: first_snd.clone(),
+                    p: pk_p1.clone(),
+                    p1s: p1s_sig1.clone(),
+                    p2: pk2_p1.clone(),
+                    p2s: p2s_sig1.clone(),
+                    s: seq(64, 0x70),
+                    ..Default::default()
+                }];
+                for i in 0u8..20 {
+                    votes.push(VoteSpec {
+                        pf: pf.clone(),
+                        dig: Some(dig_a.clone()),
+                        rnd: 1 + u64::from(i) + 1,
+                        snd: seq(32, 0xB0u8.wrapping_add(i)),
+                        p: pk_p1.clone(),
+                        p1s: p1s_sig1.clone(),
+                        p2: pk2_p1.clone(),
+                        p2s: p2s_sig1.clone(),
+                        s: seq(64, 0x71u8.wrapping_add(i)),
+                        ..Default::default()
+                    });
+                }
+                votes.push(VoteSpec {
+                    pf: pf.clone(),
+                    dig: Some(dig_a.clone()),
+                    rnd: 100,
+                    snd: first_snd.clone(),
+                    p: pk_p1.clone(),
+                    p1s: p1s_sig1.clone(),
+                    p2: pk2_p1.clone(),
+                    p2s: p2s_sig1.clone(),
+                    s: seq(64, 0x99),
+                    ..Default::default()
+                });
+                assert_eq!(votes.len(), 22);
+
+                let pins: [(usize, &str); 2] = [
+                    (0, "02010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"),
+                    (21, "02c40102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f5064a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf00010001999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8"),
+                ];
+
+                check_sequence(16, &votes, &pins);
+            }
         }
     }
 }
