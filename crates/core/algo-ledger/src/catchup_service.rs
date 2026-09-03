@@ -1722,14 +1722,21 @@ mod tests {
         tx.send(make_pending_cert_with_digest(1, agreement_digest))
             .unwrap();
 
-        // Poll until the fetcher has been called at least once (the service
-        // retries on digest mismatch), rather than using a fixed sleep.
-        let fetcher_poll = Arc::clone(&fetcher);
+        // Poll until the fork counter itself has been incremented, rather
+        // than polling on `fetch_count` (incremented at the *start* of
+        // `fetch_block`, well before the digest comparison and fork_count
+        // increment later in the service's retry loop) and then
+        // immediately asserting on `fork_count`. Polling on fetch_count
+        // races the very increment the assertion below depends on: under
+        // scheduling contention (e.g. full-workspace parallel test runs)
+        // poll_until can observe fetch_count >= 1 and return before the
+        // service has gotten around to incrementing fork_count, causing
+        // the assertion to fail spuriously (see issue #905).
         poll_until(
-            move || fetcher_poll.fetch_count() >= 1,
+            || svc.fork_count() >= 1,
             Duration::from_millis(50),
             Duration::from_secs(5),
-            "fetcher should have been called at least once",
+            "fork_count should have been incremented after digest mismatch with cert",
         );
 
         // Verify that the fork counter was incremented.
