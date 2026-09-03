@@ -2019,6 +2019,52 @@ async fn gossip_upgrade_handler(
         network.node_random.parse().expect("valid header value"),
     );
 
+    // vpack vote compression negotiation (issue #817's inbound-path wiring).
+    //
+    // Mirrors go-algorand's server-side flow (`network/wsNetwork.go`
+    // `ServeHTTP`): decode the client's request `X-Algorand-Peer-Features`
+    // header against the just-matched protocol version, and always send
+    // back our own full advertised feature set on the response header
+    // (`setHeaders(responseHeader, matchingVersion, wn)`), regardless of
+    // what the client sent.
+    //
+    // The feature set actually applied to this connection's read/write
+    // loops is the intersection of the client's declaration and our own
+    // advertised set — following the same established deviation as the
+    // outbound path's `connect.rs::try_connect`
+    // (`remote_features.intersection(config.our_features)`) and its
+    // `peer_features::stateful_table_size` doc comment: go-algorand instead
+    // trusts the client's raw declaration for the stateless bit and takes
+    // `min(ourConfiguredSize, peerAdvertisedSize)` for the stateful table
+    // size independently. Using a single intersected value here keeps the
+    // inbound and outbound paths in this crate consistent with each other,
+    // and is behaviourally identical to go's approach whenever both sides
+    // use the same (default 2048) table size.
+    let our_features = crate::peer_features::advertise_vote_compression(
+        true,
+        DEFAULT_VOTE_COMPRESSION_TABLE_SIZE,
+    );
+    let client_features_header = headers
+        .get(HeaderName::from_static("x-algorand-peer-features"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let client_features =
+        crate::peer_features::decode_peer_features(&matched_version, client_features_header);
+    let negotiated_features = client_features.intersection(our_features);
+    tracing::debug!(
+        addr = %remote_addr,
+        features_raw = %client_features_header,
+        features_client = ?client_features,
+        features_negotiated = ?negotiated_features,
+        "inbound: negotiated peer features"
+    );
+    response_headers.insert(
+        HeaderName::from_static("x-algorand-peer-features"),
+        crate::peer_features::encode_peer_features(&our_features)
+            .parse()
+            .expect("valid header value"),
+    );
+
     // Perform the WebSocket upgrade and attach the response headers
     // to the 101 Switching Protocols response.
     let network_clone = Arc::clone(&network);
@@ -2027,7 +2073,14 @@ async fn gossip_upgrade_handler(
 
     let mut response = ws
         .on_upgrade(move |socket| {
-            handle_gossip_websocket(network_clone, socket, addr_str, version_clone, remote_ip)
+            handle_gossip_websocket(
+                network_clone,
+                socket,
+                addr_str,
+                version_clone,
+                remote_ip,
+                negotiated_features,
+            )
         })
         .into_response();
 
@@ -2054,6 +2107,7 @@ async fn handle_gossip_websocket(
     remote_addr: String,
     version: String,
     remote_ip: std::net::IpAddr,
+    features: crate::peer_features::PeerFeatureFlags,
 ) {
     // Connection is already tracked by validate_incoming_connection().
 
@@ -2084,6 +2138,7 @@ async fn handle_gossip_websocket(
         network.cancel.child_token(),
         network.incoming_message_filter().cloned(),
         outgoing_filter.clone(),
+        features,
     );
 
     // Register the inbound peer in the peer map via add_peer, which
@@ -3011,5 +3066,288 @@ mod tests {
     fn default_block_service_mem_cap_matches_go_byte_count_exactly() {
         let config = WebsocketNetworkConfig::default();
         assert_eq!(config.block_service_mem_cap, 500_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #817: vpack vote compression on the inbound (axum) path.
+    //
+    // These tests exercise a *real* accepted connection end-to-end: a real
+    // `WebsocketNetwork` relay server (the new inbound path under test) is
+    // dialed by a real outbound client via `connect.rs::try_connect` (the
+    // already-verified PR #915 outbound path). Because both sides are real,
+    // independently-implemented read/write loops, a vote surviving the round
+    // trip byte-for-byte is only possible if the inbound side's negotiation
+    // and (de)compression genuinely work — it cannot pass by accident the
+    // way a "does the raw payload still arrive" test could (an uncompressed
+    // passthrough would also satisfy that weaker check).
+    // -----------------------------------------------------------------------
+
+    use crate::handler::MessageHandler;
+    use crate::message::IncomingMessage;
+    use crate::peer_features::{advertise_vote_compression, PeerFeatureFlags};
+
+    /// Builds a realistic, deterministic `UnauthenticatedVote` msgpack
+    /// payload for compression round-trip tests. Mirrors `ws_peer.rs`'s
+    /// private `sample_vote_msgpack` test helper (not reusable across
+    /// modules), but a `round` argument keeps successive stateful votes
+    /// distinct.
+    fn sample_vote_msgpack(round: u64) -> Vec<u8> {
+        use algo_agreement::{
+            Period, ProposalValue, RawVote, Step, UnauthenticatedCredential, UnauthenticatedVote,
+        };
+        use algo_consensus_crypto::OneTimeSignature;
+        use algo_types::{Address, Digest, Round};
+
+        let vote = UnauthenticatedVote {
+            raw_vote: RawVote {
+                sender: Address([0x11; 32]),
+                round: Round(round),
+                period: Period(0),
+                step: Step(1),
+                proposal: ProposalValue {
+                    original_period: Period(0),
+                    original_proposer: Address([0u8; 32]),
+                    block_digest: Digest([0x22; 32]),
+                    encoding_digest: Digest([0u8; 32]),
+                },
+            },
+            cred: UnauthenticatedCredential::new([0x33; 80]),
+            sig: OneTimeSignature {
+                sig: [0x44; 64],
+                pk: [0x55; 32],
+                pk_sig_old: [0u8; 64],
+                pk2: [0x66; 32],
+                pk1_sig: [0x77; 64],
+                pk2_sig: [0x88; 64],
+            },
+        };
+        algo_agreement::codec::encode_vote(&vote)
+    }
+
+    /// Test message handler that forwards every received payload onto an
+    /// mpsc channel for the test to assert on, and takes no further action
+    /// (`ForwardingPolicy::Ignore`) — this is what lets a test observe
+    /// exactly what the inbound read loop decoded from the wire.
+    struct CaptureHandler {
+        tx: mpsc::Sender<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl MessageHandler for CaptureHandler {
+        async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+            let _ = self.tx.try_send(msg.data.clone());
+            OutgoingMessage {
+                action: ForwardingPolicy::Ignore,
+                tag: msg.tag,
+                payload: Vec::new(),
+                topics: None,
+            }
+        }
+    }
+
+    /// Spins up a relay `WebsocketNetwork` (server) listening on
+    /// `127.0.0.1:0`, registers a [`CaptureHandler`] for `AgreementVote` so
+    /// the test can observe what the inbound read loop decoded, and returns
+    /// the network plus the capture channel's receiver.
+    async fn start_capturing_relay(genesis_id: &str) -> (Arc<WebsocketNetwork>, mpsc::Receiver<Vec<u8>>) {
+        let config = WebsocketNetworkConfig {
+            genesis_id: genesis_id.to_string(),
+            network_id: "testnet".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+
+        let (tx, rx) = mpsc::channel(8);
+        net.register_handlers(vec![TaggedMessageHandler {
+            tag: Tag::AgreementVote,
+            handler: Arc::new(CaptureHandler { tx }),
+        }]);
+
+        net.start_relay_server().await.expect("relay server starts");
+        (net, rx)
+    }
+
+    /// Full bidirectional round trip with stateful vote compression
+    /// negotiated on both sides (client advertises `avvpack`+`avvpack2048`,
+    /// matching the server's own default).
+    ///
+    /// - **Read direction** (client → server, exercising the new inbound
+    ///   read loop): the client's already-verified outbound `write_loop`
+    ///   (PR #915) stateful-compresses the vote to a `VP` frame; only a
+    ///   correct inbound `decompress_incoming_vote` wiring can recover the
+    ///   original bytes for the `CaptureHandler` to observe.
+    /// - **Write direction** (server → client, exercising the new inbound
+    ///   write loop): `net.broadcast` sends the vote to the inbound peer's
+    ///   send channel; only a correct inbound `compress_outgoing_vote`
+    ///   wiring produces a `VP` frame the client's already-verified
+    ///   outbound `read_loop` can decompress back to the original bytes.
+    #[tokio::test]
+    async fn inbound_peer_negotiates_and_round_trips_stateful_vote_compression() {
+        let (server_net, mut captured) = start_capturing_relay("testnet-v1.0").await;
+        let (addr, _) = server_net.address();
+
+        let connect_config = ConnectConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            our_features: advertise_vote_compression(true, 2048),
+            ..ConnectConfig::default()
+        };
+        let client_handle = try_connect(&addr, &connect_config)
+            .await
+            .expect("client connects to inbound relay");
+
+        // The response header wiring (this issue's core fix) must have
+        // negotiated the full stateful tier, since both sides advertise
+        // the same (2048) table size.
+        let features = client_handle.features();
+        assert!(
+            features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK),
+            "stateless vpack must be negotiated: {features:?}"
+        );
+        assert!(
+            features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_2048),
+            "stateful vpack (2048) must be negotiated: {features:?}"
+        );
+
+        // --- Read direction: client -> server ---
+        let vote_to_server = sample_vote_msgpack(1000);
+        client_handle
+            .send(OutgoingMessage::new(
+                Tag::AgreementVote,
+                vote_to_server.clone(),
+            ))
+            .expect("send from client");
+
+        let received = tokio::time::timeout(Duration::from_secs(5), captured.recv())
+            .await
+            .expect("server captured a vote before timeout")
+            .expect("capture channel open");
+        assert_eq!(
+            received, vote_to_server,
+            "inbound read loop must decompress the client's stateful (VP) vote exactly"
+        );
+
+        // --- Write direction: server -> client ---
+        let vote_to_client = sample_vote_msgpack(2000);
+        server_net
+            .broadcast(Tag::AgreementVote, vote_to_client.clone(), false, None)
+            .await
+            .expect("server broadcast succeeds");
+
+        let mut client_handle = client_handle;
+        let incoming = tokio::time::timeout(Duration::from_secs(5), client_handle.recv())
+            .await
+            .expect("client received a message before timeout")
+            .expect("client incoming channel open");
+        assert_eq!(incoming.tag, Tag::AgreementVote);
+        assert_eq!(
+            incoming.data, vote_to_client,
+            "outbound (client) read loop must decompress the server's stateful (VP) vote exactly"
+        );
+
+        client_handle.close();
+        server_net.stop().await;
+    }
+
+    /// Same round trip, but the client advertises only the stateless
+    /// (`avvpack`) feature, not any stateful tier — the negotiated table
+    /// size must be `0` and votes must travel as plain `AV` frames (still
+    /// vpack-stateless-compressed, but never re-tagged to `VP`). Verifies
+    /// the inbound path's negotiation correctly falls back to
+    /// stateless-only, not just the "everything advertised" happy path.
+    #[tokio::test]
+    async fn inbound_peer_negotiates_stateless_only_when_client_omits_stateful_tier() {
+        let (server_net, mut captured) = start_capturing_relay("testnet-v1.0").await;
+        let (addr, _) = server_net.address();
+
+        let connect_config = ConnectConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            // table_size = 0 -> advertise_vote_compression sets only the
+            // stateless COMPRESSED_VOTE_VPACK bit, no stateful tier.
+            our_features: advertise_vote_compression(true, 0),
+            ..ConnectConfig::default()
+        };
+        let client_handle = try_connect(&addr, &connect_config)
+            .await
+            .expect("client connects to inbound relay");
+
+        let features = client_handle.features();
+        assert!(features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK));
+        assert!(
+            !features.has_stateful_vpack(),
+            "no stateful tier should be negotiated: {features:?}"
+        );
+
+        let vote_to_server = sample_vote_msgpack(3000);
+        client_handle
+            .send(OutgoingMessage::new(
+                Tag::AgreementVote,
+                vote_to_server.clone(),
+            ))
+            .expect("send from client");
+
+        let received = tokio::time::timeout(Duration::from_secs(5), captured.recv())
+            .await
+            .expect("server captured a vote before timeout")
+            .expect("capture channel open");
+        assert_eq!(received, vote_to_server);
+
+        server_net.stop().await;
+    }
+
+    /// The server's 101 response must always carry the server's own full
+    /// advertised feature set on `X-Algorand-Peer-Features`, regardless of
+    /// what the client requested — mirrors go-algorand's `ServeHTTP`
+    /// (`setHeaders(responseHeader, matchingVersion, wn)`), which is
+    /// unconditional on the client's own header. Performs the raw WebSocket
+    /// handshake directly (rather than via `try_connect`, which only
+    /// exposes the already-intersected feature set) so the response
+    /// header's raw content can be inspected.
+    #[tokio::test]
+    async fn inbound_response_always_advertises_full_server_feature_set() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let (server_net, _captured) = start_capturing_relay("testnet-v1.0").await;
+        let (addr, _) = server_net.address();
+
+        // Client advertises nothing (no `X-Algorand-Peer-Features` header
+        // at all) — the server's response must still advertise its own
+        // full set unconditionally.
+        let url = crate::connect::build_gossip_url(&addr, "testnet-v1.0");
+        let mut request = url.into_client_request().expect("valid request");
+        request.headers_mut().insert(
+            HeaderName::from_static("x-algorand-version"),
+            "2.2".parse().unwrap(),
+        );
+        request.headers_mut().insert(
+            HeaderName::from_static("x-algorand-noderandom"),
+            "12345".parse().unwrap(),
+        );
+        request.headers_mut().insert(
+            HeaderName::from_static("x-algorand-genesis"),
+            "testnet-v1.0".parse().unwrap(),
+        );
+
+        let (_ws_stream, response) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("raw handshake succeeds");
+
+        let features_header = response
+            .headers()
+            .get(HeaderName::from_static("x-algorand-peer-features"))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let expected = crate::peer_features::encode_peer_features(&advertise_vote_compression(
+            true,
+            DEFAULT_VOTE_COMPRESSION_TABLE_SIZE,
+        ));
+        assert_eq!(
+            features_header, expected,
+            "server response must advertise its own full feature set unconditionally"
+        );
+
+        server_net.stop().await;
     }
 }

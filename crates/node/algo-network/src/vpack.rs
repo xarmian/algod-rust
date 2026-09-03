@@ -66,9 +66,13 @@
 //! handshake used when stateful decompression fails partway through a
 //! connection's lifetime (see [`VOTE_COMPRESSION_ABORT_BYTE`]).
 //!
-//! The inbound (axum-based `PeerHandle::new_inbound`) path does not yet
-//! negotiate or apply vpack compression — see that constructor's doc
-//! comment for the current state and rationale.
+//! The inbound (axum-based `PeerHandle::new_inbound`) path negotiates and
+//! applies the same stateless/stateful compression and abort handshake as
+//! the outbound path (issue #817), sharing the sink-agnostic
+//! `decompress_incoming_vote`/`compress_outgoing_vote` helpers in
+//! `ws_peer.rs` — see that constructor's doc comment for the negotiation
+//! flow. The separate `algo-p2p` libp2p gossip transport remains
+//! unwired.
 //!
 //! # Wire format
 //!
