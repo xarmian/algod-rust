@@ -44,7 +44,7 @@ rmpv.workspace = true
 rmp-serde.workspace = true
 rmp.workspace = true
 rusqlite.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["compat"] }
 toml = "0.8"
 reqwest.workspace = true
 rand.workspace = true

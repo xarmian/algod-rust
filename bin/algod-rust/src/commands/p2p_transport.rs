@@ -60,12 +60,19 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use algo_network::gossip_node::UnicastPeer;
 use algo_network::handler::{Multiplexer, TaggedMessageHandler, TaggedMessageValidatorHandler};
+use algo_network::peer_features::{
+    advertise_vote_compression, decode_peer_features, encode_peer_features, stateful_table_size,
+    PeerFeatureFlags,
+};
 use algo_network::topics::{Topic, Topics};
+use algo_network::vpack::{StatefulDecoder, StatefulEncoder, VOTE_COMPRESSION_ABORT_BYTE};
+use algo_network::ws_peer::{compress_outgoing_vote, decompress_incoming_vote_core};
 use algo_network::{
     encode_uvarint, hash_topics, ForwardingPolicy, GossipNode, IncomingMessage, Peer, PeerError,
     PeerOption, RequestTracker, Router, Tag, DEFAULT_REQUEST_TIMEOUT, RESPONSE_HASH_FIELD,
@@ -91,6 +98,31 @@ use crate::config::P2pConfig;
 /// `algo_p2p::wsproto`'s doc comment).
 const ALGORAND_WS_SUPPORTED_VERSIONS: &[&str] = &["2.2"];
 
+/// Default stateful vpack vote-compression table size this P2P transport
+/// advertises during the `/algorand-ws/2.2.0` handshake, alongside stateless
+/// compression.
+///
+/// Matches go-algorand's `config.Local` defaults (`EnableVoteCompression:
+/// true`, `StatefulVoteCompressionTableSize: 2048`) — the *same*
+/// hardcoded-not-yet-configurable value `algo_network::ws_network`'s
+/// `DEFAULT_VOTE_COMPRESSION_TABLE_SIZE` already uses for the classic
+/// WS-gossip transport (issue #817), for the identical reason: not yet
+/// exposed as a configurable knob on this crate's side.
+///
+/// Go: `network/p2pNetwork.go` threads `cfg.EnableVoteCompression` into the
+/// P2P transport's per-peer `wsPeer` construction exactly as it does for
+/// the classic transport (`network/p2pNetwork.go:1014`'s
+/// `enableVoteCompression`/`voteCompressionTableSize` fields on the `wsPeer`
+/// literal at `baseWsStreamHandler`) — go's P2P transport reuses the
+/// *identical* `wsPeer`/`wsPeerMsgCodec` compression machinery as the
+/// classic transport, not a separate implementation (verified by reading
+/// `network/p2pNetwork.go`'s `baseWsStreamHandler`, which wraps every
+/// libp2p stream in a real `wsPeer{conn: &wsPeerConnP2P{stream: stream},
+/// ...}`), which is why this module reuses `algo_network::ws_peer`'s
+/// `compress_outgoing_vote`/`decompress_incoming_vote_core` verbatim below
+/// rather than reimplementing the vpack state machine.
+const DEFAULT_VOTE_COMPRESSION_TABLE_SIZE: u32 = 2048;
+
 /// Everything [`P2pTransport`] tracks for one currently-established
 /// `/algorand-ws/2.2.0` stream peer: the outgoing frame sender
 /// [`P2pTransport::stream_broadcast`] fans agreement traffic out to, and
@@ -100,12 +132,31 @@ const ALGORAND_WS_SUPPORTED_VERSIONS: &[&str] = &["2.2"];
 /// `request_tracker`, since a P2P `/algorand-ws` stream is a
 /// request/response-capable channel exactly like a WS peer connection.
 struct StreamPeerHandle {
-    /// Sends a pre-framed (tag+payload) byte string to this peer's writer
-    /// task, mirroring `algo_network::framing::encode_frame`'s output.
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Sends an (unframed, uncompressed) `(tag, payload)` pair to this
+    /// peer's writer task. Framing (`algo_network::framing::encode_frame`)
+    /// and, for `AgreementVote`, vpack compression now happen inside the
+    /// writer task itself (issue #925) rather than at the call site, since
+    /// vote compression state (the stateful encoder's LRU table) is
+    /// per-peer — a single pre-framed/pre-compressed buffer can no longer
+    /// be computed once and cloned out to every peer, mirroring
+    /// `ws_peer.rs`'s `write_loop`, which frames+compresses per outgoing
+    /// message, per peer.
+    tx: mpsc::UnboundedSender<(Tag, Vec<u8>)>,
     /// Correlates outbound unicast requests (see [`P2pTransport::unicast_peers`])
     /// to this peer's `TopicMsgResp` replies.
     request_tracker: Arc<RequestTracker>,
+    /// This stream's negotiated vote-compression feature set (issue #925):
+    /// the intersection of both peers' advertised `PeerFeatureFlags`,
+    /// computed once from the `/algorand-ws/2.2.0` handshake's peer-meta
+    /// headers — mirrors `algo_network::connect`'s
+    /// `remote_features.intersection(config.our_features)`. Read-only after
+    /// construction; exposed for tests via
+    /// [`P2pTransport::stream_peer_vote_compression`]. `cfg(test)`-only:
+    /// production code already gets the equivalent visibility from
+    /// `spawn_ws_peer`'s own `tracing::debug!` at negotiation time, so this
+    /// field would otherwise sit unused in a release build.
+    #[cfg(test)]
+    negotiated_features: PeerFeatureFlags,
 }
 
 /// Registry of currently-established `/algorand-ws/2.2.0` streams, keyed by
@@ -131,12 +182,14 @@ fn spawn_ws_peer(
     stream: P2pRawStream,
     mux: Arc<Multiplexer>,
     stream_peers: StreamPeers,
+    negotiated_features: PeerFeatureFlags,
 ) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<(Tag, Vec<u8>)>();
     let request_tracker = Arc::new(RequestTracker::new());
     // A clone of `tx` outlives the map insertion below so the reader half
-    // (see the `Respond` handling further down) can still queue a reply
-    // frame onto this same peer's writer task.
+    // (see the `Respond` handling further down, and the VP-abort send on a
+    // stateful vpack decode failure) can still queue a message onto this
+    // same peer's writer task.
     let reply_tx = tx.clone();
     stream_peers
         .lock()
@@ -146,26 +199,110 @@ fn spawn_ws_peer(
             StreamPeerHandle {
                 tx,
                 request_tracker: Arc::clone(&request_tracker),
+                #[cfg(test)]
+                negotiated_features,
             },
         );
 
     tokio::spawn(async move {
         let (mut read_half, mut write_half) = stream.split();
+        let remote_addr = peer_id.to_string();
+
+        // Vote-compression negotiation (issue #925): reuses
+        // `algo_network::ws_peer`'s exact stateless/stateful vpack state
+        // machine (see `DEFAULT_VOTE_COMPRESSION_TABLE_SIZE`'s doc comment
+        // for why this stream reuses rather than reimplements it) — a
+        // stateful tier is enabled only when both sides' advertised
+        // feature bits intersected to a shared table-size tier, mirroring
+        // go's `wsPeerMsgCodec.statefulVoteEnabled`. Shared between the
+        // reader and writer tasks below so either side's decode/encode
+        // failure (or a received abort) disables both directions for the
+        // rest of this stream's lifetime.
+        let vote_table_size = stateful_table_size(negotiated_features);
+        let stateful_vote_enabled = Arc::new(AtomicBool::new(vote_table_size > 0));
+        tracing::debug!(
+            peer = %remote_addr,
+            features = ?negotiated_features,
+            stateless_vote_compression =
+                negotiated_features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK),
+            stateful_vote_table_size = vote_table_size,
+            "P2P algorand-ws stream: vpack vote compression negotiated"
+        );
 
         let writer = async {
-            while let Some(frame) = rx.recv().await {
+            // vpack stateful encoder state, owned exclusively by this task
+            // — mirrors `ws_peer.rs`'s `write_loop`.
+            let mut stateful_encoder: Option<StatefulEncoder> = None;
+            while let Some((tag, payload)) = rx.recv().await {
+                // Optionally vpack-compress AV (AgreementVote) tag
+                // payloads. Mirrors go-algorand's `wsPeerMsgCodec.compress()`
+                // via the exact same shared core `ws_peer.rs` uses for the
+                // classic transport.
+                let vote_compressed = if tag == Tag::AgreementVote
+                    && negotiated_features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK)
+                    && !payload.is_empty()
+                {
+                    let (frame, need_abort) = compress_outgoing_vote(
+                        &payload,
+                        vote_table_size,
+                        &stateful_vote_enabled,
+                        &mut stateful_encoder,
+                        &remote_addr,
+                    );
+                    if need_abort {
+                        match algo_network::framing::encode_frame(
+                            &Tag::VotePacked,
+                            &[VOTE_COMPRESSION_ABORT_BYTE],
+                        ) {
+                            Ok(abort_frame) => {
+                                if write_frame(&mut write_half, &abort_frame).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                %peer_id,
+                                error = %e,
+                                "P2P algorand-ws stream: failed to encode VP abort frame"
+                            ),
+                        }
+                    }
+                    frame
+                } else {
+                    None
+                };
+
+                let frame = if let Some(frame) = vote_compressed {
+                    frame
+                } else {
+                    match algo_network::framing::encode_frame(&tag, &payload) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::warn!(
+                                %peer_id,
+                                %tag,
+                                error = %e,
+                                "P2P algorand-ws stream: dropping oversized outbound message"
+                            );
+                            continue;
+                        }
+                    }
+                };
+
                 if write_frame(&mut write_half, &frame).await.is_err() {
                     break;
                 }
             }
         };
         let reader = async {
+            // vpack decompression state, owned exclusively by this task —
+            // mirrors `ws_peer.rs`'s `read_loop`.
+            let mut stateful_decoder: Option<StatefulDecoder> = None;
             loop {
                 let body = match read_frame(&mut read_half).await {
                     Ok(b) => b,
                     Err(_) => break,
                 };
-                if let Ok((tag, payload)) = algo_network::framing::decode_frame(&body) {
+                if let Ok((mut tag, raw_payload)) = algo_network::framing::decode_frame(&body) {
                     // Request/response correlation (issue #591): a
                     // `TopicMsgResp` reply to one of *our* outbound unicast
                     // requests (see [`P2pUnicastPeer::request`]) is routed to
@@ -173,7 +310,7 @@ fn spawn_ws_peer(
                     // `mux` — mirrors `ws_peer.rs`'s read loop step "(c)
                     // Request/response correlation".
                     if tag == Tag::TopicMsgResp {
-                        if let Err(e) = request_tracker.handle_response(payload).await {
+                        if let Err(e) = request_tracker.handle_response(raw_payload).await {
                             tracing::debug!(
                                 %peer_id,
                                 error = %e,
@@ -182,6 +319,34 @@ fn spawn_ws_peer(
                         }
                         continue;
                     }
+
+                    // vpack vote (de)compression (issue #925): AV
+                    // (stateless) and VP (stateful) frames both go through
+                    // the shared core, which also re-tags a decoded VP
+                    // frame to AV in place. Mirrors go-algorand's
+                    // `wsPeerMsgCodec.decompress()`.
+                    let vpack_result = if tag == Tag::AgreementVote || tag == Tag::VotePacked {
+                        let (result, need_abort) = decompress_incoming_vote_core(
+                            &mut tag,
+                            raw_payload.to_vec(),
+                            negotiated_features,
+                            vote_table_size,
+                            &mut stateful_decoder,
+                            &stateful_vote_enabled,
+                            &remote_addr,
+                        );
+                        if need_abort {
+                            let _ =
+                                reply_tx.send((Tag::VotePacked, vec![VOTE_COMPRESSION_ABORT_BYTE]));
+                        }
+                        match result {
+                            Some(p) => p,
+                            None => continue,
+                        }
+                    } else {
+                        raw_payload.to_vec()
+                    };
+
                     // Decompress PP (proposal) payloads that carry the zstd
                     // frame magic — go-algorand compresses *every* proposal
                     // broadcast unconditionally once the wsnet protocol
@@ -201,10 +366,10 @@ fn spawn_ws_peer(
                     // found live while proving out issue #589's
                     // stake-holding P2P consensus participant.
                     let payload = if tag == Tag::ProposalPayload
-                        && algo_network::compression::is_zstd_compressed(payload)
+                        && algo_network::compression::is_zstd_compressed(&vpack_result)
                     {
                         match algo_network::compression::zstd_decompress(
-                            payload,
+                            &vpack_result,
                             algo_network::compression::MAX_DECOMPRESSED_MESSAGE_SIZE,
                         ) {
                             Ok(decompressed) => decompressed,
@@ -218,7 +383,7 @@ fn spawn_ws_peer(
                             }
                         }
                     } else {
-                        payload.to_vec()
+                        vpack_result
                     };
                     // The response-hash correlation (below) is computed over
                     // the exact bytes the requester hashed on their side —
@@ -253,18 +418,7 @@ fn spawn_ws_peer(
                             encode_uvarint(request_hash),
                         ));
                         let serialized = response_topics.marshal();
-                        match algo_network::framing::encode_frame(&Tag::TopicMsgResp, &serialized) {
-                            Ok(frame) => {
-                                let _ = reply_tx.send(frame);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    %peer_id,
-                                    error = %e,
-                                    "P2P algorand-ws stream: failed to encode TopicMsgResp reply"
-                                );
-                            }
-                        }
+                        let _ = reply_tx.send((Tag::TopicMsgResp, serialized));
                     }
                 }
             }
@@ -287,11 +441,16 @@ async fn handle_inbound_ws_stream(
     peer_id: PeerId,
     mut stream: P2pRawStream,
     our_headers: PeerMetaHeaders,
+    our_features: PeerFeatureFlags,
     mux: Arc<Multiplexer>,
     stream_peers: StreamPeers,
 ) {
     match handshake_inbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS).await {
-        Ok(_meta) => spawn_ws_peer(peer_id, stream, mux, stream_peers),
+        Ok(meta) => {
+            let negotiated =
+                decode_peer_features(&meta.version, &meta.features).intersection(our_features);
+            spawn_ws_peer(peer_id, stream, mux, stream_peers, negotiated)
+        }
         Err(e) => {
             tracing::debug!(%peer_id, error = %e, "P2P algorand-ws inbound handshake failed")
         }
@@ -305,11 +464,16 @@ async fn handle_outbound_ws_stream(
     peer_id: PeerId,
     mut stream: P2pRawStream,
     our_headers: PeerMetaHeaders,
+    our_features: PeerFeatureFlags,
     mux: Arc<Multiplexer>,
     stream_peers: StreamPeers,
 ) {
     match handshake_outbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS).await {
-        Ok(_meta) => spawn_ws_peer(peer_id, stream, mux, stream_peers),
+        Ok(meta) => {
+            let negotiated =
+                decode_peer_features(&meta.version, &meta.features).intersection(our_features);
+            spawn_ws_peer(peer_id, stream, mux, stream_peers, negotiated)
+        }
         Err(e) => {
             tracing::debug!(%peer_id, error = %e, "P2P algorand-ws outbound handshake failed")
         }
@@ -373,9 +537,11 @@ struct P2pUnicastPeer {
     /// [`Peer::get_address`] returns `&str` and `PeerId::to_string()`
     /// allocates.
     peer_id_str: String,
-    /// Sends a pre-framed (tag+payload) byte string to this peer's writer
-    /// task — the same channel [`P2pTransport::stream_broadcast`] uses.
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Sends an unframed `(tag, payload)` pair to this peer's writer task —
+    /// the same channel [`P2pTransport::stream_broadcast`] uses. See
+    /// [`StreamPeerHandle::tx`]'s doc comment for why framing/compression
+    /// now happen in the writer task rather than at the call site.
+    tx: mpsc::UnboundedSender<(Tag, Vec<u8>)>,
     request_tracker: Arc<RequestTracker>,
     request_timeout: Duration,
 }
@@ -404,10 +570,7 @@ impl UnicastPeer for P2pUnicastPeer {
     async fn request(&self, tag: Tag, topics: Topics) -> Result<Topics, PeerError> {
         let (serialized, hash, rx) = self.request_tracker.prepare_request(topics).await;
 
-        let frame = algo_network::framing::encode_frame(&tag, &serialized).map_err(|e| {
-            PeerError::WriteError(format!("failed to encode P2P unicast request: {e}"))
-        })?;
-        if self.tx.send(frame).is_err() {
+        if self.tx.send((tag, serialized)).is_err() {
             self.request_tracker.cancel_request(hash).await;
             return Err(PeerError::ConnectionClosed);
         }
@@ -435,9 +598,9 @@ impl UnicastPeer for P2pUnicastPeer {
             encode_uvarint(request_hash),
         ));
         let serialized = response_topics.marshal();
-        let frame = algo_network::framing::encode_frame(&Tag::TopicMsgResp, &serialized)
-            .map_err(|e| PeerError::WriteError(format!("failed to encode P2P response: {e}")))?;
-        self.tx.send(frame).map_err(|_| PeerError::ConnectionClosed)
+        self.tx
+            .send((Tag::TopicMsgResp, serialized))
+            .map_err(|_| PeerError::ConnectionClosed)
     }
 }
 
@@ -693,11 +856,20 @@ impl P2pTransport {
         let mut incoming_ws_streams = stream_control
             .accept(ALGORAND_WS_PROTOCOL_V22)
             .map_err(|e| anyhow::anyhow!("failed to register algorand-ws stream acceptor: {e}"))?;
+        // Vote-compression advertisement (issue #925): always offer
+        // stateless + stateful (table size 2048) vpack compression, exactly
+        // as `algo_network::ws_network`'s classic WS-gossip transport does
+        // (see `DEFAULT_VOTE_COMPRESSION_TABLE_SIZE`'s doc comment for the
+        // go-source citation on why this is hardcoded-on rather than a
+        // config knob). `our_features` is threaded into both the accept
+        // and dial loops below so each side's handshake can compute the
+        // intersection with whatever the peer actually advertised back.
+        let our_features = advertise_vote_compression(true, DEFAULT_VOTE_COMPRESSION_TABLE_SIZE);
         let our_ws_headers = build_headers(
             &cfg.network_id,
             "",
             "algod-rust",
-            "",
+            &encode_peer_features(&our_features),
             ALGORAND_WS_SUPPORTED_VERSIONS,
         );
 
@@ -719,6 +891,7 @@ impl P2pTransport {
                         peer_id,
                         stream,
                         headers.clone(),
+                        our_features,
                         Arc::clone(&mux),
                         Arc::clone(&sp),
                     ));
@@ -754,7 +927,7 @@ impl P2pTransport {
                                     tokio::spawn(async move {
                                         match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V22).await {
                                             Ok(stream) => {
-                                                handle_outbound_ws_stream(peer_id, stream, headers, mux, sp).await;
+                                                handle_outbound_ws_stream(peer_id, stream, headers, our_features, mux, sp).await;
                                             }
                                             Err(e) => tracing::debug!(
                                                 %peer_id, error = %e,
@@ -934,24 +1107,47 @@ impl P2pTransport {
             .map_err(|_| anyhow::anyhow!("P2P transport task has stopped"))
     }
 
-    /// Fan a tag+payload frame out to every currently-established
+    /// Fan a `(tag, payload)` message out to every currently-established
     /// `/algorand-ws/2.2.0` stream peer. Best-effort: a peer whose writer
     /// task has already exited (connection dropped) simply drops the send.
+    ///
+    /// Framing and compression are applied per-peer, inside each peer's own
+    /// writer task (see [`StreamPeerHandle::tx`]'s doc comment) — vote
+    /// compression state is per-connection, so (unlike before issue #925) a
+    /// single pre-framed buffer can no longer be computed once here and
+    /// cloned out to every peer.
     fn stream_broadcast(&self, tag: Tag, data: &[u8]) {
-        match algo_network::framing::encode_frame(&tag, data) {
-            Ok(frame) => {
-                let peers = self
-                    .stream_peers
-                    .lock()
-                    .expect("stream_peers mutex poisoned");
-                for handle in peers.values() {
-                    let _ = handle.tx.send(frame.clone());
-                }
-            }
-            Err(e) => {
-                tracing::debug!(%tag, error = %e, "failed to encode P2P algorand-ws stream frame")
-            }
+        let peers = self
+            .stream_peers
+            .lock()
+            .expect("stream_peers mutex poisoned");
+        for handle in peers.values() {
+            let _ = handle.tx.send((tag, data.to_vec()));
         }
+    }
+
+    /// Whether stateless/stateful vpack vote compression is currently
+    /// negotiated with `peer_id`'s `/algorand-ws/2.2.0` stream (issue
+    /// #925), and the negotiated stateful table size (`0` if only the
+    /// stateless tier, or neither, negotiated). `None` if no stream is
+    /// currently established with that peer.
+    ///
+    /// Exposed for tests — proves negotiation actually happened independent
+    /// of (and prior to) any functional round-trip assertion. `cfg(test)`-
+    /// only: see [`StreamPeerHandle::negotiated_features`]'s doc comment.
+    #[cfg(test)]
+    pub fn stream_peer_vote_compression(&self, peer_id: PeerId) -> Option<(bool, u32)> {
+        self.stream_peers
+            .lock()
+            .expect("stream_peers mutex poisoned")
+            .get(&peer_id)
+            .map(|h| {
+                (
+                    h.negotiated_features
+                        .contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK),
+                    stateful_table_size(h.negotiated_features),
+                )
+            })
     }
 }
 
@@ -1712,5 +1908,299 @@ mod tests {
             .publish(Tag::UniEnsBlockReq, vec![1, 2, 3])
             .expect_err("UniEnsBlockReq has no P2P gossipsub topic");
         assert!(err.to_string().contains("no P2P gossipsub topic"));
+    }
+
+    // -----------------------------------------------------------------------
+    // vpack vote-compression wiring (issue #925) — TDD anchors.
+    //
+    // go-algorand's P2P transport (`network/p2pNetwork.go`'s
+    // `baseWsStreamHandler`) wraps every `/algorand-ws/2.2.0` libp2p stream
+    // in a real `wsPeer{conn: &wsPeerConnP2P{...}, enableVoteCompression:
+    // n.config.EnableVoteCompression, voteCompressionTableSize:
+    // n.voteCompressionTableSize}` — the *identical* struct and
+    // `wsPeerMsgCodec` compression machinery the classic WS-gossip
+    // transport uses, not a separate implementation. These tests prove the
+    // Rust side's equivalent wiring: (1) real `/algorand-ws/2.2.0` peers
+    // negotiate vpack vote compression during the handshake, exactly as
+    // `algo_network::connect`'s classic-transport negotiation does
+    // (`remote_features.intersection(config.our_features)`), and (2) the
+    // production write/read-loop code paths (`compress_outgoing_vote`/
+    // `decompress_incoming_vote_core`, reused verbatim from
+    // `algo_network::ws_peer` — see `DEFAULT_VOTE_COMPRESSION_TABLE_SIZE`'s
+    // doc comment) actually apply that negotiated compression to the raw
+    // bytes placed on the wire, not just that data eventually arrives
+    // correctly (which could also happen if compression silently never
+    // engaged, since `AgreementVote`-tag decompression tolerates a plain
+    // uncompressed fallback — see `VpackError::LikelyUncompressed`).
+    // -----------------------------------------------------------------------
+
+    /// Builds a real, canonically msgpack-encoded `UnauthenticatedVote` for
+    /// use as an outgoing `AgreementVoteTag` payload — mirrors
+    /// `algo_network::ws_peer`'s own `sample_vote_msgpack` test helper
+    /// (issue #817), reproduced here since `algo-network`'s test-only
+    /// helpers aren't part of its public API surface.
+    fn sample_vote_msgpack(round: u64) -> Vec<u8> {
+        use algo_agreement::{
+            Period, ProposalValue, RawVote, Step, UnauthenticatedCredential, UnauthenticatedVote,
+        };
+        use algo_consensus_crypto::OneTimeSignature;
+        use algo_types::{Address, Digest, Round};
+
+        let vote = UnauthenticatedVote {
+            raw_vote: RawVote {
+                sender: Address([0x11; 32]),
+                round: Round(round),
+                period: Period(0),
+                step: Step(1),
+                proposal: ProposalValue {
+                    original_period: Period(0),
+                    original_proposer: Address([0u8; 32]),
+                    block_digest: Digest([0x22; 32]),
+                    encoding_digest: Digest([0u8; 32]),
+                },
+            },
+            cred: UnauthenticatedCredential::new([0x33; 80]),
+            sig: OneTimeSignature {
+                sig: [0x44; 64],
+                pk: [0x55; 32],
+                pk_sig_old: [0u8; 64],
+                pk2: [0x66; 32],
+                pk1_sig: [0x77; 64],
+                pk2_sig: [0x88; 64],
+            },
+        };
+        algo_agreement::codec::encode_vote(&vote)
+    }
+
+    /// TDD anchor for #925, part 1: two real `P2pTransport`s (each backed
+    /// by a real `algo_p2p::P2pHost`) dial over a genuine loopback TCP+Noise
+    /// libp2p connection and complete the real `/algorand-ws/2.2.0`
+    /// handshake. Both sides advertise stateless + stateful (table size
+    /// 2048) vpack vote compression unconditionally
+    /// (`DEFAULT_VOTE_COMPRESSION_TABLE_SIZE`), so both directions of the
+    /// resulting stream must negotiate the full stateful tier — proven
+    /// directly via [`P2pTransport::stream_peer_vote_compression`], not
+    /// inferred from data eventually decoding correctly.
+    #[tokio::test]
+    async fn real_p2p_peers_negotiate_stateful_vote_compression_over_loopback() {
+        let (listener, dialer) = connected_pair().await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (listener.stream_peer_count() == 0 || dialer.stream_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let listener_view = listener
+            .stream_peer_vote_compression(dialer.peer_id())
+            .expect("listener should have an established stream to the dialer");
+        let dialer_view = dialer
+            .stream_peer_vote_compression(listener.peer_id())
+            .expect("dialer should have an established stream to the listener");
+
+        assert_eq!(
+            listener_view,
+            (true, 2048),
+            "listener->dialer stream should negotiate stateless + stateful(2048) vpack"
+        );
+        assert_eq!(
+            dialer_view,
+            (true, 2048),
+            "dialer->listener stream should negotiate stateless + stateful(2048) vpack"
+        );
+    }
+
+    /// TDD anchor for #925, part 2: with real negotiation established (part
+    /// 1), agreement votes broadcast over `P2pTransport::publish` actually
+    /// round-trip correctly through the compressed `/algorand-ws/2.2.0`
+    /// stream path for a sequence of distinct votes (stressing the stateful
+    /// encoder/decoder's shared LRU reference table across multiple
+    /// messages on the same connection, not just a single one).
+    #[tokio::test]
+    async fn agreement_votes_round_trip_correctly_over_compressed_p2p_stream() {
+        use algo_agreement::traits::{AgreementNetwork, Tag as AgreementTag, AGREEMENT_VOTE_TAG};
+        use algo_network::AgreementNetworkBridge;
+
+        let (listener, dialer) = connected_pair().await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (listener.stream_peer_count() == 0 || dialer.stream_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            dialer.stream_peer_vote_compression(listener.peer_id()),
+            Some((true, 2048)),
+            "precondition: stateful vote compression negotiated"
+        );
+
+        let listener: Arc<dyn GossipNode> = Arc::new(listener);
+        let dialer: Arc<dyn GossipNode> = Arc::new(dialer);
+
+        let rt_handle = tokio::runtime::Handle::current();
+        let receiver_bridge =
+            AgreementNetworkBridge::with_defaults(listener.clone(), rt_handle.clone());
+        receiver_bridge.start();
+        let sender_bridge = Arc::new(AgreementNetworkBridge::with_defaults(
+            dialer.clone(),
+            rt_handle,
+        ));
+
+        let vote_rx = receiver_bridge.messages(&AgreementTag(AGREEMENT_VOTE_TAG));
+
+        // Several distinct real votes on the same connection: the stateful
+        // vpack encoder/decoder share an LRU reference table across
+        // messages, so this exercises the table's cross-message state, not
+        // just a single independent compress/decompress call.
+        let votes: Vec<Vec<u8>> = (0..5).map(sample_vote_msgpack).collect();
+        for vote in &votes {
+            let vote = vote.clone();
+            tokio::task::spawn_blocking({
+                let sender_bridge = Arc::clone(&sender_bridge);
+                move || {
+                    sender_bridge
+                        .broadcast(&AgreementTag(AGREEMENT_VOTE_TAG), &vote)
+                        .expect("broadcast a vote over the compressed P2P stream")
+                }
+            })
+            .await
+            .expect("broadcast task join");
+        }
+
+        // `P2pTransport::publish` fans an AV-tagged message out over *both*
+        // the compressed `/algorand-ws/2.2.0` stream and gossipsub (the
+        // latter a harmless no-op against a real go-algorand peer, but a
+        // real second delivery path between two algod-rust transports —
+        // see this module's doc comment). So a given vote's *content* may
+        // legitimately arrive twice; keep draining until every distinct
+        // vote sent has been observed at least once (deduping by exact
+        // byte content, which is itself part of what's being proven: each
+        // delivery — via either path — decompresses back to the exact
+        // original bytes), bounded by a generous receive-attempt ceiling
+        // so a genuine wiring regression still fails fast rather than
+        // hanging.
+        let mut received: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut attempts = 0;
+        while received.len() < votes.len() && attempts < votes.len() * 4 {
+            attempts += 1;
+            let msg = tokio::task::spawn_blocking({
+                let vote_rx = vote_rx.clone();
+                move || vote_rx.recv_timeout(std::time::Duration::from_secs(10))
+            })
+            .await
+            .expect("recv task join")
+            .expect("timed out waiting for a vote to round-trip over the compressed P2P stream");
+            received.insert(msg.data);
+        }
+
+        let sent: std::collections::HashSet<Vec<u8>> = votes.iter().cloned().collect();
+        assert_eq!(
+            received, sent,
+            "every vote should round-trip byte-for-byte through the compressed P2P stream"
+        );
+    }
+
+    /// TDD anchor for #925, part 3: exercises the *exact* production
+    /// compression functions `spawn_ws_peer`'s writer/reader loops call
+    /// (`algo_network::ws_peer::{compress_outgoing_vote,
+    /// decompress_incoming_vote_core}`) directly over a real, genuinely
+    /// async duplex byte stream — the same shape a raw libp2p `Stream`
+    /// exposes (`futures::AsyncRead`/`AsyncWrite`) — to prove *byte-for-byte
+    /// on the wire* that stateful vpack compression is actually applied,
+    /// not merely that end-to-end delivery happens to still work (which
+    /// would also pass if compression were silently a no-op, since AV-tag
+    /// decompression tolerates an uncompressed fallback).
+    ///
+    /// This is the P2P-transport counterpart of
+    /// `algo_network::ws_peer`'s own `write_command_compresses_agreement_vote_stateful`
+    /// (issue #817) — same assertions (wire tag becomes `VP`, decompressing
+    /// the captured wire bytes recovers the exact original vote), adapted
+    /// to the P2P raw-stream framing (`algo_p2p::wsproto::{read_frame,
+    /// write_frame}`) instead of a WebSocket sink/stream, since the two
+    /// transports share the compression core but not the outer transport
+    /// framing.
+    #[tokio::test]
+    async fn p2p_stream_wire_bytes_are_vpack_compressed_for_agreement_votes() {
+        use std::sync::atomic::AtomicBool;
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+
+        let (client_half, server_half) = tokio::io::duplex(64 * 1024);
+        let (client_read, mut client_write) = client_half.compat().split();
+        let (mut server_read, _server_write) = server_half.compat().split();
+
+        // Both sides negotiated stateful (table size 2048), matching what
+        // `real_p2p_peers_negotiate_stateful_vote_compression_over_loopback`
+        // proves happens for a real handshake.
+        let negotiated = advertise_vote_compression(true, DEFAULT_VOTE_COMPRESSION_TABLE_SIZE);
+        let vote_table_size = stateful_table_size(negotiated);
+        assert_eq!(vote_table_size, 2048);
+        let stateful_vote_enabled = Arc::new(AtomicBool::new(true));
+        let mut stateful_encoder: Option<StatefulEncoder> = None;
+
+        let raw_vote = sample_vote_msgpack(42);
+
+        // Exactly what `spawn_ws_peer`'s writer loop does for an
+        // `AgreementVote`-tag message once vpack compression is negotiated.
+        let (frame, need_abort) = compress_outgoing_vote(
+            &raw_vote,
+            vote_table_size,
+            &stateful_vote_enabled,
+            &mut stateful_encoder,
+            "test-peer",
+        );
+        assert!(
+            !need_abort,
+            "compression must not fail against a fresh encoder"
+        );
+        let frame = frame.expect("stateless vpack compression should succeed for a real vote");
+        write_frame(&mut client_write, &frame)
+            .await
+            .expect("write compressed frame to the duplex stream");
+
+        let body = read_frame(&mut server_read)
+            .await
+            .expect("read the frame back off the wire");
+        let (tag, wire_payload) =
+            algo_network::framing::decode_frame(&body).expect("decode tag+payload");
+
+        // The wire tag must be VP (stateful), not AV — proof the stateful
+        // tier actually engaged for this outgoing vote, not just the
+        // stateless layer.
+        assert_eq!(
+            tag,
+            Tag::VotePacked,
+            "first vote on a stateful-negotiated connection should already be sent as VP"
+        );
+        assert_ne!(
+            wire_payload, raw_vote,
+            "the bytes on the wire must not be the plain uncompressed vote"
+        );
+
+        // Decompress exactly what a real peer's reader loop would, via the
+        // same production core function `spawn_ws_peer`'s reader uses.
+        let mut stateful_decoder: Option<StatefulDecoder> = None;
+        let mut decode_tag = tag;
+        let (decoded, need_abort) = decompress_incoming_vote_core(
+            &mut decode_tag,
+            wire_payload.to_vec(),
+            negotiated,
+            vote_table_size,
+            &mut stateful_decoder,
+            &Arc::new(AtomicBool::new(true)),
+            "test-peer",
+        );
+        assert!(!need_abort);
+        assert_eq!(
+            decoded.expect("VP frame should decode to a payload"),
+            raw_vote,
+            "decompressing the exact wire bytes must recover the original vote"
+        );
+        // decompress_incoming_vote_core re-tags a decoded VP frame to AV
+        // for downstream dispatch, mirroring go's wsPeerMsgCodec.decompress().
+        assert_eq!(decode_tag, Tag::AgreementVote);
+
+        drop(client_read);
     }
 }
