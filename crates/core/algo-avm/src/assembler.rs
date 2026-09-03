@@ -3933,6 +3933,123 @@ mod tests {
         );
     }
 
+    // ── Fixed-immediate-arity opcodes (issue #829, slice 5): `popn`,
+    // `dupn`, `cover`, `uncover` all read a single immediate byte directly
+    // from the bytecode at assembly time, so (unlike `match`/`txn`/
+    // `pushbytess`) their pop/push counts are fully known statically --
+    // ported from go-algorand's `TestDupPopNTyping` (`frames_test.go`) plus
+    // new cover/uncover coverage for the same shape ─────────────────────
+
+    #[test]
+    fn test_dup_popn_typing() {
+        // TestDupPopNTyping: `dupn 2` leaves 3 copies of the pushed `int 8`
+        // on top; `+` (uint64) is happy, `concat` (bytes) is not.
+        assemble_string("#pragma version 8\nint 8\ndupn 2\n+\npop\n").unwrap();
+
+        let errs = expect_errors("#pragma version 8\nint 8\ndupn 2\nconcat\npop\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("wanted type []byte")),
+            "{errs:?}"
+        );
+
+        // `popn 1` on an empty stack is a height error, same shape as any
+        // other fixed-arg opcode's height check.
+        let errs = expect_errors("#pragma version 8\npopn 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("expects 1 stack argument")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_popn_pops_exactly_n_and_type_tracking_continues() {
+        // `popn 2` must consume exactly two tracked values and leave
+        // tracking live afterward (unlike the hard-disabled dynamic-arity
+        // opcodes) -- a mistyped instruction further down is still caught.
+        assemble_string("#pragma version 8\nint 1\nint 2\npopn 2\nint 3\npop\n").unwrap();
+
+        let errs =
+            expect_errors("#pragma version 8\nint 1\nint 2\npopn 2\nbyte 0x1234\nint 1\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 0")),
+            "{errs:?}"
+        );
+
+        // Too few values on the stack for `popn 3` is a height error, and
+        // the immediate (3), not the opcode's own base arity, drives it.
+        let errs = expect_errors("#pragma version 8\nint 1\nint 2\npopn 3\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("expects 3 stack arguments but stack height is 2")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_cover_rotates_tracked_types() {
+        // Stack (bottom -> top) before `cover 1`: [uint64, bytes]. `cover 1`
+        // moves the top value (bytes) down one position, so afterward the
+        // stack is [bytes, uint64] -- the uint64 that was underneath is now
+        // on top, and `btoi` (wants bytes) must fail on it.
+        let errs = expect_errors("#pragma version 8\nint 1\nbyte 0x1234\ncover 1\nbtoi\n");
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("btoi arg 0")
+                && e.message.contains("wanted type []byte")),
+            "{errs:?}"
+        );
+
+        // Popping that same rearranged stack down to nothing and pushing
+        // two fresh ints must still assemble cleanly -- `cover` itself
+        // didn't desync the tracked height.
+        assemble_string(
+            "#pragma version 8\nint 1\nbyte 0x1234\ncover 1\npop\npop\nint 2\nint 3\n+\npop\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_uncover_rotates_tracked_types() {
+        // Stack (bottom -> top) before `uncover 1`: [uint64, bytes].
+        // `uncover 1` brings the value one position down (uint64) up to the
+        // top, leaving [bytes, uint64] -- `len` (wants bytes) must now fail
+        // on the uint64 that ended up on top.
+        let errs = expect_errors("#pragma version 8\nint 1\nbyte 0x1234\nuncover 1\nlen\n");
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("len arg 0")
+                && e.message.contains("wanted type []byte")),
+            "{errs:?}"
+        );
+
+        // `cover 1` then `uncover 1` is an exact round trip: the tracked
+        // stack ends up back in its original order ([uint64, bytes]), so
+        // `len` on the still-bytes top succeeds.
+        assemble_string(
+            "#pragma version 8\nint 1\nbyte 0x1234\ncover 1\nuncover 1\nlen\npop\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_cover_uncover_unknown_depth_falls_back_to_any() {
+        // When the covered/uncovered depth exceeds what's currently
+        // tracked -- here, right after a `callsub`'s permissive reset (see
+        // `test_type_tracking_callsub_wipes_and_reopens`) -- the pushed
+        // types fall back to `Any` (matching go's `typeCover`/`typeUncover`
+        // leaving `idx < 0` unresolved), and the height check itself is
+        // satisfied by the implicit permissive `Any` supply rather than
+        // reporting a spurious error.
+        assemble_string(
+            "#pragma version 8\ncallsub next\ncover 2\npop\npop\npop\nreturn\nnext:\nint 1\nretsub\n",
+        )
+        .unwrap();
+        assemble_string(
+            "#pragma version 8\ncallsub next\nuncover 2\npop\npop\npop\nreturn\nnext:\nint 1\nretsub\n",
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_type_tracking_stops_at_txn() {
         // txn/gtxn/gtxns resolve to a different real opcode (with a

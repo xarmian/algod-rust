@@ -110,17 +110,32 @@
 //!   the `#pragma typetrack` handling in
 //!   [`assemble_string`](crate::assembler::assemble_string).
 //!
+//! - **Fixed-immediate-arity opcodes** (`TestDupPopNTyping`): `popn n`,
+//!   `dupn n`, `cover n`, and `uncover n` all read a single immediate byte
+//!   directly from the bytecode at assembly time, so (unlike `match`/`txn`/
+//!   `pushbytess`/below) their pop/push counts are fully known statically.
+//!   Ports go's `typePopN`/`typeDupN`/`typeCover`/`typeUncover`
+//!   (`assembler.go:1486-1524,1621-1646`) directly -- see the `"popn"` /
+//!   `"dupn"` / `"cover"` / `"uncover"` arms of [`refined_types`]. `popn n`
+//!   pops `n` opaque (`Any`) values with no return; `dupn n` leaves `n+1`
+//!   copies of the popped value's actual tracked type on top; `cover n` /
+//!   `uncover n` rotate the top `n+1` stack slots (`Any` going in, the
+//!   actual tracked types coming back out in the rotated order, whenever
+//!   that many slots are currently tracked).
+//!
 //! # What's deferred (tracked as follow-up work under issue #829)
 //!
-//! - **Dynamic- or arity-dependent stack effects** this slice still can't
-//!   model precisely enough to keep the tracked stack height in sync with
-//!   the real one -- unchanged from before: `match`/`txn`/`gtxn`/`gtxns`/
-//!   `popn`/`dupn`/`cover`/`uncover`/`pushbytess`/`pushints` permanently
-//!   disable tracking for the rest of the program (see
-//!   [`hard_disables_tracking`] and the dynamic-arity fallback in
-//!   [`track_instruction`]). This remains conservative by construction: it
-//!   can only *lose* precision, never *fabricate* an error, so it cannot
-//!   make a currently-valid program newly fail to assemble.
+//! - **Dispatch- or variable-length-immediate stack effects** this slice
+//!   still can't model precisely enough to keep the tracked stack height in
+//!   sync with the real one -- unchanged from before: `match` (label-count
+//!   dependent), `txn`/`gtxn`/`gtxns` (dispatch to a different real opcode
+//!   depending on immediate count), and `pushbytess`/`pushints` (a
+//!   variable-length immediate array) permanently disable tracking for the
+//!   rest of the program (see [`hard_disables_tracking`] and the
+//!   dynamic-arity fallback in [`track_instruction`]). This remains
+//!   conservative by construction: it can only *lose* precision, never
+//!   *fabricate* an error, so it cannot make a currently-valid program newly
+//!   fail to assemble.
 //! - **Bounds-refined types** (`TestMatchTyping`, `TestArgType`,
 //!   `TestTypeComplaints`, sized-type diagnostics like `[32]byte`, and
 //!   `TestScratchBounds`'s direct `os.known.scratchSpace[i].Bound`
@@ -135,8 +150,7 @@
 //!   AVMType-level mismatch -- is covered; see [`OpStream::type_stack_const`]
 //!   for the narrow, purpose-built constant-tracking this slice does
 //!   instead of general bound propagation).
-//! - `TestTxTypes`, `TestDupPopNTyping`: exercise the deferred
-//!   dynamic-arity/`txn` behavior above.
+//! - `TestTxTypes`: exercises the deferred `txn` dispatch behavior above.
 //!
 //! See `docs/phase17/parity_txn_logic.md` for the full go-test mapping.
 
@@ -501,6 +515,55 @@ fn refined_types(
             let uniform = scratch.iter().all(|&t| t == first);
             Some((None, uniform.then(|| vec![first]), None))
         }
+        // typePopN (assembler.go:1621-1627): `popn n` pops exactly `n`
+        // values, each accepting any type -- there's no return.
+        "popn" => {
+            let n: usize = args.first()?.parse().ok()?;
+            Some((Some(vec![Any; n]), Some(vec![]), None))
+        }
+        // typeDupN (assembler.go:1629-1646): `dupn n` (base proto `"a:"`
+        // already supplies the single fixed `Any` pop, so args isn't
+        // overridden here) leaves `n+1` copies of the popped value on top --
+        // typed as whatever's actually on top of the tracked stack (read
+        // before the pop happens), or `Any` when that's unknown.
+        "dupn" => {
+            let n: usize = args.first()?.parse().ok()?;
+            let top = if len >= 1 { stack[len - 1] } else { Any };
+            Some((None, Some(vec![top; n + 1]), None))
+        }
+        // typeCover (assembler.go:1486-1506): `cover n` moves the top value
+        // down `n` positions, i.e. rotates the top `depth = n+1` stack slots
+        // (the top value plus the `n` items below it). Every value in that
+        // range is accepted as `Any` on the way in (args is always the
+        // opaque `anyTypes(depth)`); the pushed types mirror the actual
+        // rotation, refined to the real tracked types whenever the full
+        // `depth` is currently known (falling back to `Any` for any slot
+        // that isn't).
+        "cover" => {
+            let n: usize = args.first()?.parse().ok()?;
+            let depth = n + 1;
+            let mut returns = vec![Any; depth];
+            if len >= depth {
+                let idx = len - depth;
+                returns[0] = stack[len - 1];
+                returns[1..depth].copy_from_slice(&stack[idx..len - 1]);
+            }
+            Some((Some(vec![Any; depth]), Some(returns), None))
+        }
+        // typeUncover (assembler.go:1508-1524): `uncover n` moves the value
+        // `n` positions down the stack up to the top -- the same `depth =
+        // n+1` window as `cover`, rotated the opposite way.
+        "uncover" => {
+            let n: usize = args.first()?.parse().ok()?;
+            let depth = n + 1;
+            let mut returns = vec![Any; depth];
+            if len >= depth {
+                let idx = len - depth;
+                returns[depth - 1] = stack[idx];
+                returns[..depth - 1].copy_from_slice(&stack[idx + 1..len]);
+            }
+            Some((Some(vec![Any; depth]), Some(returns), None))
+        }
         _ => None,
     }
 }
@@ -697,9 +760,11 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
     let (arg_types, return_types) = match (arg_types, return_types) {
         (Some(a), Some(r)) => (a, r),
         // Dynamic pop/push count with no refine function and no explicit
-        // table entry (e.g. `popn`, `dupn`, `cover`, `uncover`,
-        // `pushbytess`, `pushints`, `match`) -- this slice can't keep the
-        // tracked stack height in sync, so stop rather than guess.
+        // table entry (e.g. `pushbytess`, `pushints`, `match`, or `popn`/
+        // `dupn`/`cover`/`uncover` with an immediate that failed to parse --
+        // which normally can't happen, since a bad immediate there is
+        // already a separate assembly error on its own) -- this slice can't
+        // keep the tracked stack height in sync, so stop rather than guess.
         _ => {
             ops.type_track_disabled = true;
             return;
