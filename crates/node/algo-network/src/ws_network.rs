@@ -98,6 +98,20 @@ const DEFAULT_GOSSIP_FANOUT: usize = 4;
 /// Matches Go's `meshThreadInterval` of 1 minute.
 const DEFAULT_MESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Default stateful vpack vote-compression table size, advertised on every
+/// outbound connection alongside stateless vote compression.
+///
+/// Matches go-algorand's `config.Local` defaults
+/// (`EnableVoteCompression: true`, `StatefulVoteCompressionTableSize: 2048`
+/// in `config/local_defaults.go`). Not yet exposed as a configurable knob
+/// on this crate's side (see `algo-config`'s deliberate omission of
+/// `EnableVoteCompression`/`StatefulVoteCompressionTableSize` pending this
+/// exact wiring, `crates/node/algo-config/src/lib.rs`); hardcoded to match
+/// Go's own default, the same treatment already given to
+/// [`crate::peer_features::PeerFeatureFlags::COMPRESSED_PROPOSAL`] (also
+/// unconditionally advertised, not config-gated).
+const DEFAULT_VOTE_COMPRESSION_TABLE_SIZE: u32 = 2048;
+
 /// Default maximum peer inactivity before disconnection.
 ///
 /// Matches Go's `maxPeerInactivityDuration` of 5 minutes.
@@ -869,6 +883,10 @@ impl WebsocketNetwork {
             let outgoing_filter = self.new_outgoing_message_filter();
             let connect_config = ConnectConfig {
                 genesis_id: self.config.genesis_id.clone(),
+                our_features: crate::peer_features::advertise_vote_compression(
+                    true,
+                    DEFAULT_VOTE_COMPRESSION_TABLE_SIZE,
+                ),
                 peer_config: Some(crate::ws_peer::WsPeerConfig {
                     incoming_filter: self.incoming_message_filter.clone(),
                     outgoing_filter: outgoing_filter.clone(),
@@ -1502,6 +1520,10 @@ impl ConnectFn for NetworkConnectFn {
             let recv_outgoing_message_filter = outgoing_message_filter.clone();
             let connect_config = ConnectConfig {
                 genesis_id,
+                our_features: crate::peer_features::advertise_vote_compression(
+                    true,
+                    DEFAULT_VOTE_COMPRESSION_TABLE_SIZE,
+                ),
                 peer_config: Some(WsPeerConfig {
                     request_timeout: Some(Duration::from_secs(5)),
                     incoming_filter: incoming_message_filter,
