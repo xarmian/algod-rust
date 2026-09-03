@@ -43,6 +43,7 @@
 //! `capabilities.go`).
 
 pub mod capabilities;
+pub mod conn_limits;
 pub mod dht;
 pub mod dnsaddr;
 pub mod errors;
@@ -55,6 +56,10 @@ pub mod streams;
 pub mod wsproto;
 
 pub use capabilities::Capability;
+pub use conn_limits::{
+    address_filter, derive_conn_limits, is_ip_unspecified, needs_address_filter,
+    net_address_to_listen_address, ConnLimitConfig,
+};
 pub use dht::{dht_protocol_name, resolve_dht_mode};
 pub use dnsaddr::{resolve_multiaddrs, DnsaddrError, DnsaddrResolver, HickoryDnsaddrResolver};
 pub use errors::P2pError;
@@ -66,8 +71,9 @@ pub use identity::{get_or_create_keypair, IdentityConfig, DEFAULT_PRIV_KEY_FILEN
 pub use identity_tracker::IdentityTracker;
 pub use peerstore::{PersistentPeerStore, DEFAULT_PEERSTORE_FILENAME};
 pub use pubsub::{
-    ident_topic, topic_name_for_tag_code, AGREEMENT_VOTE_TOPIC, ALL_TOPICS, PROPOSAL_PAYLOAD_TOPIC,
-    TX_TOPIC, VOTE_BUNDLE_TOPIC,
+    derive_algorand_gossipsub_params, ident_topic, topic_name_for_tag_code, GossipsubMeshParams,
+    AGREEMENT_VOTE_TOPIC, ALL_TOPICS, DIRECT_CONNECT_INITIAL_DELAY, IWANT_FOLLOWUP_TIME,
+    PROPOSAL_PAYLOAD_TOPIC, TX_TOPIC, VOTE_BUNDLE_TOPIC,
 };
 pub use streams::{
     find_handler, should_initiate_stream, DispatchError, HandlerEntry, LogLevel, StreamHandlers,
