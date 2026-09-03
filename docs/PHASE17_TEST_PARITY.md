@@ -51,17 +51,17 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `partial` | 735 | 23% |
-| `matched-1:1` | 651 | 20% |
-| `matched-1:many` | 516 | 16% |
-| `not-implemented` | 391 | 12% |
+| `partial` | 748 | 24% |
+| `matched-1:1` | 653 | 21% |
+| `matched-1:many` | 523 | 16% |
 | `out-of-scope` | 381 | 12% |
+| `not-implemented` | 369 | 12% |
 | `missing-test` | 298 | 9% |
 | `matched-many:1` | 205 | 6% |
 
-**689 rows (`not-implemented` + `missing-test`, 22%) are real, actionable
+**667 rows (`not-implemented` + `missing-test`, 21%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
-implements but never tests. `partial` (735, 23%) is coverage that exists
+implements but never tests. `partial` (748, 24%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
 most are diminishing-returns edge cases. See
 [`docs/PHASE17_PROPOSAL.md`](PHASE17_PROPOSAL.md) for how the real gaps
@@ -78,13 +78,13 @@ were triaged into tracked issues.
 | Agreement protocol (`agreement`) | [parity_agreement.md](phase17/parity_agreement.md) | 326 | 125 | 28 | 77 | 47 | 6 | 40 | 3 |
 | e2e integration (`test/e2e-go`) | [parity_e2e.md](phase17/parity_e2e.md) | 195 | 30 | 18 | 0 | 64 | 0 | 57 | 26 |
 | Networking (`network`, `network/p2p`, ...) | [parity_network.md](phase17/parity_network.md) | 263 | 70 | 47 | 11 | 70 | 42 | 20 | 3 |
-| Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 74 | 26 | 16 | 60 | 47 | 32 | 21 |
+| Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 75 | 31 | 16 | 62 | 39 | 32 | 21 |
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 37 | 45 | 0 | 10 | 17 | 25 | 10 |
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 86 | 15 | 45 | 67 | 29 | 25 | 7 |
-| Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 15 | 17 | 0 | 18 | 59 | 6 | 4 |
+| Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 16 | 19 | 0 | 29 | 45 | 6 | 4 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 15 | 6 | 0 | 19 | 18 | 0 | 60 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 19 | 14 | 7 | 21 | 66 | 4 | 42 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 55 | 19 | 7 | 0 | 16 | 8 | 4 | 1 |
-| **Total** | | **3,177** | **651** | **516** | **205** | **735** | **391** | **298** | **381** |
+| **Total** | | **3,177** | **653** | **523** | **205** | **748** | **369** | **298** | **381** |
 

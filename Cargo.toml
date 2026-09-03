@@ -132,6 +132,7 @@ algo-kmd-client = { path = "crates/node/algo-kmd-client" }
 algo-txn-pipeline = { path = "crates/node/algo-txn-pipeline" }
 algo-bench = { path = "crates/tools/algo-bench" }
 num-bigint = "0.4"
+num-traits = "0.2"
 statrs = "0.18"
 
 # Elliptic curves (for AVM ec_* opcodes)
