@@ -112,9 +112,9 @@
 //!
 //! - **Fixed-immediate-arity opcodes** (`TestDupPopNTyping`): `popn n`,
 //!   `dupn n`, `cover n`, and `uncover n` all read a single immediate byte
-//!   directly from the bytecode at assembly time, so (unlike `match`/`txn`/
-//!   `pushbytess`/below) their pop/push counts are fully known statically.
-//!   Ports go's `typePopN`/`typeDupN`/`typeCover`/`typeUncover`
+//!   directly from the bytecode at assembly time, so their pop/push counts
+//!   are fully known statically. Ports go's
+//!   `typePopN`/`typeDupN`/`typeCover`/`typeUncover`
 //!   (`assembler.go:1486-1524,1621-1646`) directly -- see the `"popn"` /
 //!   `"dupn"` / `"cover"` / `"uncover"` arms of [`refined_types`]. `popn n`
 //!   pops `n` opaque (`Any`) values with no return; `dupn n` leaves `n+1`
@@ -123,34 +123,87 @@
 //!   actual tracked types coming back out in the rotated order, whenever
 //!   that many slots are currently tracked).
 //!
+//! - **`txn`/`gtxn`/`gtxns` and their `txna`/`gtxna`/`gtxnsa` array-index
+//!   siblings** (part of `TestMatchTyping`; see [`TYPE_TABLE`]'s dedicated
+//!   section): go's assembler does *not* look up the accessed field's
+//!   actual runtime type here at all -- every one of these six opcodes has
+//!   a fixed proto that always pushes a single opaque `StackAny`
+//!   (`opcodes.go:608-617`; none of them carry a `.typed(...)` refine
+//!   function), so there is no per-field lookup table to reuse. The only
+//!   real modeling work is arity: `txn`/`gtxn`/`gtxns` are pseudo-ops whose
+//!   *immediate count* (not the mnemonic) picks the real dispatched-to
+//!   opcode (`txn` vs. `txna`, etc. -- see `asm_pseudo_txn`); this happens
+//!   to be moot for type tracking specifically, because within each pseudo
+//!   mnemonic's dispatch table every arity shares the exact same proto
+//!   (`txn`/`txna` both pop 0 push 1; `gtxn`/`gtxna` both pop 0 push 1;
+//!   `gtxns`/`gtxnsa` both pop 1 push 1) -- so looking up the pseudo
+//!   mnemonic itself in [`TYPE_TABLE`] (before dispatch is even resolved)
+//!   already gives the right answer regardless of how many immediates were
+//!   actually written. `gtxns`/`gtxnsa` pop a dynamic uint64 transaction
+//!   index off the stack (proto `"i:a"`); the other four take every
+//!   selector as an assembler immediate instead, so they pop nothing
+//!   (proto `":a"`).
+//!
+//! - **`pushbytess`/`pushints`** (part of `TestMatchTyping`): a `varuint`
+//!   count immediate followed by that many typed literal values. Ports go's
+//!   `typePushBytess`/`typePushInts` (`assembler.go:1648-1664`) directly --
+//!   see the `"pushbytess"`/`"pushints"` arms of [`refined_types`]: one
+//!   `Bytes`/`Uint64` push per raw immediate token (`args.len()`), no pops
+//!   (the fixed zero-pop base proto already applies). Like go's own refine
+//!   functions (which are handed the same unparsed `[]token` this slice's
+//!   `args` mirrors), this counts *raw tokens*, not decoded values -- a
+//!   multi-token byte-literal form (`base64 <arg>`, two tokens for one
+//!   value) over-counts the push by one in both implementations. This is
+//!   harmless for the "never fabricate an error" guarantee: the extra push
+//!   is still correctly typed, and can only make a later height check more
+//!   permissive, never less.
+//!
+//! - **`match`** (`TestMatchTyping`): pops `N+1` opaque values, where `N` is
+//!   the number of branch-target labels written (`args.len()`) -- the `N`
+//!   case values pushed earlier (one per label) plus the switched-on value
+//!   on top -- and pushes nothing. Ports go's `typeMatch`
+//!   (`assembler.go:1693-1697`) directly; the label *targets* themselves
+//!   (and the varuint-length jump table they assemble into) are irrelevant
+//!   to type tracking, only the immediate token *count* matters, so this
+//!   needed no bytecode-length parsing despite initially looking like the
+//!   hardest of the four remaining opcodes.
+//!
 //! # What's deferred (tracked as follow-up work under issue #829)
 //!
-//! - **Dispatch- or variable-length-immediate stack effects** this slice
-//!   still can't model precisely enough to keep the tracked stack height in
-//!   sync with the real one -- unchanged from before: `match` (label-count
-//!   dependent), `txn`/`gtxn`/`gtxns` (dispatch to a different real opcode
-//!   depending on immediate count), and `pushbytess`/`pushints` (a
-//!   variable-length immediate array) permanently disable tracking for the
-//!   rest of the program (see [`hard_disables_tracking`] and the
-//!   dynamic-arity fallback in [`track_instruction`]). This remains
-//!   conservative by construction: it can only *lose* precision, never
-//!   *fabricate* an error, so it cannot make a currently-valid program newly
-//!   fail to assemble.
-//! - **Bounds-refined types** (`TestMatchTyping`, `TestArgType`,
-//!   `TestTypeComplaints`, sized-type diagnostics like `[32]byte`, and
+//! - **Bounds-refined types** (sized-type diagnostics like `[32]byte`, and
 //!   `TestScratchBounds`'s direct `os.known.scratchSpace[i].Bound`
 //!   assertions): go's `StackType` also carries a `[min, max]` length/value
 //!   bound (`NewStackType`, `eval.go`); this slice's [`StackType`] is
 //!   bound-free (`Uint64` / `Bytes` / `Any`), matching go's `overlaps`
-//!   exactly for these opcodes (bounds only ever narrow the plain-
-//!   `StackUint64`/`StackBytes` case, which is what every opcode here uses)
-//!   but not reproducing go's `[N]byte`/`(<= N)`-style diagnostic text, nor
-//!   `TestScratchBounds`'s exact numeric `Bound` values (only its one
-//!   message-observable assertion -- the final `testProg` call, an
-//!   AVMType-level mismatch -- is covered; see [`OpStream::type_stack_const`]
-//!   for the narrow, purpose-built constant-tracking this slice does
-//!   instead of general bound propagation).
-//! - `TestTxTypes`: exercises the deferred `txn` dispatch behavior above.
+//!   exactly for every opcode this slice models (bounds only ever narrow
+//!   the plain-`StackUint64`/`StackBytes` case, which is what every opcode
+//!   here uses) but not reproducing go's `[N]byte`/`(<= N)`-style
+//!   diagnostic text, nor `TestScratchBounds`'s exact numeric `Bound`
+//!   values (only its one message-observable assertion -- the final
+//!   `testProg` call, an AVMType-level mismatch -- is covered; see
+//!   [`OpStream::type_stack_const`] for the narrow, purpose-built
+//!   constant-tracking this slice does instead of general bound
+//!   propagation). A full port of go's `overlaps`/bound-arithmetic would be
+//!   a substantial redesign of [`StackType`] from a 3-way enum to a
+//!   tagged bound pair for comparatively little additional
+//!   diagnostic-message precision (no currently-modeled opcode's
+//!   *accept/reject* verdict depends on it, only the wording of some
+//!   messages) -- left as a follow-up rather than folded into this slice.
+//! - Two of the issue's originally cited "still needs bounds" tests turned
+//!   out, on inspection of `eval_test.go`, not to describe a `type_track`
+//!   gap at all: `TestArgType` is a runtime `stackValue.avmType()` unit
+//!   test with no assembler/type-tracking involvement whatsoever, and
+//!   `TestTypeComplaints` (`"err; store 0"`, `"int 1; return; store 0"`) is
+//!   already covered by this module's existing dead-code handling (slice
+//!   2) -- both cases are `store` reached only after `err`/`return`
+//!   deadens, so [`track_instruction`]'s `type_track_deadcode` early return
+//!   already skips them with no type error, matching go exactly. Likewise
+//!   `TestTxTypes` (`assembler_test.go:3373-3384`) turned out to
+//!   exclusively exercise `itxn_field`'s `typeTxField` refine function
+//!   (`opcodes.go:753`), not the `txn`/`gtxn`/`gtxns` *read* opcodes this
+//!   slice now models -- `itxn_field`'s own field-type-aware refinement is
+//!   a distinct, still-open piece of work, tracked separately (see the
+//!   issue's slice 6 progress note).
 //!
 //! See `docs/phase17/parity_txn_logic.md` for the full go-test mapping.
 
@@ -286,6 +339,26 @@ const TYPE_TABLE: &[(&str, &[StackType], &[StackType])] = &[
     ("store", &[Any], &[]),
     ("loads", &[Uint64], &[Any]),
     ("stores", &[Uint64, Any], &[]),
+    // ---- `txn`/`gtxn`/`txna`/`gtxna`/`gtxns`/`gtxnsa` field access
+    // (opcodes.go:608-617): every one of these pushes a single `StackAny`
+    // regardless of the field's own runtime type ("StackType" is `a` in
+    // every one of these opcodes' proto strings) -- go's assembler does
+    // *not* look up the accessed field's actual type to refine this, unlike
+    // this table's other entries (see the `hard_disables_tracking` removal
+    // note in the module docs). `gtxns`/`gtxnsa` additionally pop the
+    // dynamic transaction-group index off the stack (proto "i:a"); the
+    // other four take every selector as an assembler immediate instead, so
+    // they pop nothing (proto ":a"). This applies identically regardless of
+    // which of a pseudo-op's dispatch arities was used to reach here (see
+    // `asm_pseudo_txn`'s doc comment): `txn`'s 1- and 2-immediate forms
+    // (`txn` vs `txna`) share this exact proto, and likewise for
+    // `gtxn`/`gtxna` and `gtxns`/`gtxnsa`. ----
+    ("txn", &[], &[Any]),
+    ("gtxn", &[], &[Any]),
+    ("txna", &[], &[Any]),
+    ("gtxna", &[], &[Any]),
+    ("gtxns", &[Uint64], &[Any]),
+    ("gtxnsa", &[Uint64], &[Any]),
 ];
 
 fn table_lookup(mnemonic: &str) -> Option<(&'static [StackType], &'static [StackType])> {
@@ -319,28 +392,6 @@ fn literal_push_type(mnemonic: &str) -> Option<StackType> {
 /// the module docs' branch-merge section.
 fn deadens_tracking(mnemonic: &str) -> bool {
     matches!(mnemonic, "b" | "callsub" | "retsub" | "err" | "return")
-}
-
-/// Mnemonics whose stack effect is dispatch- or arity-dependent in a way
-/// this slice doesn't model (`txn`/`gtxn`/`gtxns` resolve to a different
-/// real opcode -- with a different pop count -- depending on how many
-/// immediates were written; see `asm_pseudo_txn`). Tracking these using the
-/// wrong arity would desynchronize the tracked stack height from the real
-/// one and risk a false type error on unrelated, legitimate code further
-/// down the program, so this slice disables tracking *before* touching
-/// them at all, rather than best-effort checking them like
-/// [`disables_tracking`]'s set. The `*a`/`gtxnsa` real-opcode forms are
-/// included too (not just the pseudo mnemonics that dispatch to them):
-/// they pop a field-array index off the stack that go-algorand's own
-/// `TestTxTypes` models as `uint64` (deferred here, see module docs), and
-/// this repo's own array-index-immediate tests (e.g.
-/// `test_txn_pseudo_arity_dispatches_to_array_opcode`) assemble them
-/// standalone with no preceding push, purely to compare bytecode shape.
-fn hard_disables_tracking(mnemonic: &str) -> bool {
-    matches!(
-        mnemonic,
-        "txn" | "gtxn" | "gtxns" | "txna" | "gtxna" | "gtxnsa"
-    )
 }
 
 /// A side effect a refine function has on [`OpStream::scratch_space`]
@@ -564,6 +615,29 @@ fn refined_types(
             }
             Some((Some(vec![Any; depth]), Some(returns), None))
         }
+        // typePushBytess (assembler.go:1648-1655): `pushbytess` pushes one
+        // `StackBytes` per raw immediate token following the mnemonic --
+        // `args` here is exactly that raw token list (mirroring go's
+        // `refineFunc`, which is likewise handed the unparsed `[]token`
+        // rather than the count of successfully-decoded byte-literal
+        // values; a multi-token literal form like `base64 <arg>` therefore
+        // over-counts by one push relative to the real encoded value count
+        // in both implementations -- harmless here since every extra push
+        // is still correctly typed `Bytes` and can only make a later height
+        // check more permissive, never fabricate a spurious error). No args
+        // override: the base proto's fixed zero pops already applies.
+        "pushbytess" => Some((None, Some(vec![Bytes; args.len()]), None)),
+        // typePushInts (assembler.go:1657-1664): same shape as
+        // `pushbytess`, one `StackUint64` per raw immediate token.
+        "pushints" => Some((None, Some(vec![Uint64; args.len()]), None)),
+        // typeMatch (assembler.go:1693-1697): `match label1 .. labelN` pops
+        // `N+1` opaque values -- the `N` case values pushed earlier (one per
+        // label, matched positionally) plus the switched-on value on top --
+        // and pushes nothing. `args` is the label-token list, so `N =
+        // args.len()`; go deliberately doesn't try to unify the popped
+        // types the way `typeEquals` does ("it is legal to mix types"), so
+        // every popped slot is `Any`.
+        "match" => Some((Some(vec![Any; args.len() + 1]), None, None)),
         _ => None,
     }
 }
@@ -698,17 +772,12 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
     // (assembler.go:2058-2060): no type checks or stack-effect tracking
     // happen for an instruction reached only through dead code -- the
     // tracked stack stays exactly as [`deadens_tracking`] left it (empty)
-    // until the next label reopens analysis. This deliberately skips
-    // `hard_disables_tracking` too: an opcode this slice can't model
-    // precisely (e.g. `txn`) appearing in unreachable code has no stack
-    // effect to get wrong, so it must not spend the *permanent* disable on
-    // dead code.
+    // until the next label reopens analysis. This deliberately skips the
+    // dynamic-arity permanent-disable fallback at the bottom of this
+    // function too: an opcode this slice can't model precisely (e.g.
+    // `match`) appearing in unreachable code has no stack effect to get
+    // wrong, so it must not spend the *permanent* disable on dead code.
     if ops.type_track_deadcode {
-        return;
-    }
-
-    if hard_disables_tracking(mnemonic) {
-        ops.type_track_disabled = true;
         return;
     }
 

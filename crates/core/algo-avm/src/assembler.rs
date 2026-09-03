@@ -2894,8 +2894,16 @@ mod tests {
         assert_eq!(gtxn.program, gtxna.program);
 
         // `gtxns Field i` (2 immediates) -> `gtxnsa` (assembler.go:1813).
-        let gtxns = assemble_string("#pragma version 8\ngtxns Accounts 0\n").unwrap();
-        let gtxnsa = assemble_string("#pragma version 8\ngtxnsa Accounts 0\n").unwrap();
+        // `gtxns`/`gtxnsa` both pop a dynamic uint64 transaction index off
+        // the stack (issue #829, slice 6's `TYPE_TABLE` entry), so a
+        // priming `int 0` is needed here -- without it, either form is
+        // itself a genuine type error at program start (go's own
+        // `bottom.AVMType == avmNone` height check; see `testLine`'s
+        // `"int 1\n" + line + "\nint 1\n"` wrapping in `assembler_test.go`,
+        // which every real go-algorand single-line test relies on for the
+        // same reason).
+        let gtxns = assemble_string("#pragma version 8\nint 0\ngtxns Accounts 0\npop\n").unwrap();
+        let gtxnsa = assemble_string("#pragma version 8\nint 0\ngtxnsa Accounts 0\npop\n").unwrap();
         assert_eq!(gtxns.program, gtxnsa.program);
     }
 
@@ -2909,7 +2917,9 @@ mod tests {
         let gtxn = assemble_string("#pragma version 8\ngtxn 0 Sender\n").unwrap();
         assert!(!gtxn.program.is_empty());
 
-        let gtxns = assemble_string("#pragma version 8\ngtxns Sender\n").unwrap();
+        // `gtxns` (proto "i:a") pops a dynamic uint64 index -- see the
+        // priming-value note on `test_txn_pseudo_arity_dispatches_to_array_opcode`.
+        let gtxns = assemble_string("#pragma version 8\nint 0\ngtxns Sender\npop\n").unwrap();
         assert!(!gtxns.program.is_empty());
     }
 
@@ -3506,12 +3516,10 @@ mod tests {
     // remainder). Covers assembler-time acceptance/rejection of `match`'s
     // label-list syntax. go's version also asserts a final case -- an
     // empty `match` at the top of an otherwise-empty program must fail
-    // with "match expects 1 stack argument..." -- which requires go's
-    // static compile-time stack-type-tracking pass; algod-rust's assembler
-    // performs no such analysis at all (see docs/phase17/parity_txn_logic.md's
-    // "Static type-tracking pass is entirely absent" note, tracked as its
-    // own gap covering ~15 go tests), so that sub-case is intentionally not
-    // ported here. ──────────────────────────────────────────────────────
+    // with "match expects 1 stack argument..." -- which needed the static
+    // stack-type-tracking pass this file didn't have yet at the time;
+    // that gap has since been closed for `match` (issue #829, slice 6, see
+    // `test_assemble_match_alone_is_a_height_error` below). ─────────────
 
     #[test]
     fn test_assemble_match_undefined_label() {
@@ -3981,8 +3989,9 @@ mod tests {
         // the immediate (3), not the opcode's own base arity, drives it.
         let errs = expect_errors("#pragma version 8\nint 1\nint 2\npopn 3\n");
         assert!(
-            errs.iter()
-                .any(|e| e.message.contains("expects 3 stack arguments but stack height is 2")),
+            errs.iter().any(|e| e
+                .message
+                .contains("expects 3 stack arguments but stack height is 2")),
             "{errs:?}"
         );
     }
@@ -3995,8 +4004,9 @@ mod tests {
         // on top, and `btoi` (wants bytes) must fail on it.
         let errs = expect_errors("#pragma version 8\nint 1\nbyte 0x1234\ncover 1\nbtoi\n");
         assert!(
-            errs.iter().any(|e| e.message.starts_with("btoi arg 0")
-                && e.message.contains("wanted type []byte")),
+            errs.iter()
+                .any(|e| e.message.starts_with("btoi arg 0")
+                    && e.message.contains("wanted type []byte")),
             "{errs:?}"
         );
 
@@ -4017,18 +4027,17 @@ mod tests {
         // on the uint64 that ended up on top.
         let errs = expect_errors("#pragma version 8\nint 1\nbyte 0x1234\nuncover 1\nlen\n");
         assert!(
-            errs.iter().any(|e| e.message.starts_with("len arg 0")
-                && e.message.contains("wanted type []byte")),
+            errs.iter()
+                .any(|e| e.message.starts_with("len arg 0")
+                    && e.message.contains("wanted type []byte")),
             "{errs:?}"
         );
 
         // `cover 1` then `uncover 1` is an exact round trip: the tracked
         // stack ends up back in its original order ([uint64, bytes]), so
         // `len` on the still-bytes top succeeds.
-        assemble_string(
-            "#pragma version 8\nint 1\nbyte 0x1234\ncover 1\nuncover 1\nlen\npop\n",
-        )
-        .unwrap();
+        assemble_string("#pragma version 8\nint 1\nbyte 0x1234\ncover 1\nuncover 1\nlen\npop\n")
+            .unwrap();
     }
 
     #[test]
@@ -4051,14 +4060,29 @@ mod tests {
     }
 
     #[test]
-    fn test_type_tracking_stops_at_txn() {
-        // txn/gtxn/gtxns resolve to a different real opcode (with a
-        // different pop count) depending on how many immediates were
-        // written (txn vs. txna); this slice doesn't model that dispatch,
-        // so it must disable tracking rather than mistrack the stack height
-        // and risk a false positive on legitimate code further down.
-        assemble_string("#pragma version 8\ntxn Sender\nbyte 0x1234\nint 1\n+\npop\npop\n")
-            .unwrap();
+    fn test_type_tracking_continues_through_txn() {
+        // Issue #829, slice 6: unlike the earlier hard-disable, `txn` (and
+        // its `gtxn`/`gtxns`/`txna`/`gtxna`/`gtxnsa` siblings) no longer
+        // disables tracking -- go's assembler always pushes an opaque
+        // `StackAny` here regardless of the accessed field's actual type
+        // (see the `type_track` module docs), so `txn Sender`'s pushed
+        // value overlaps anything and legitimate code afterward keeps
+        // being tracked and checked normally.
+        assemble_string(
+            "#pragma version 8\ntxn Sender\npop\nbyte 0x1234\nint 1\nint 2\n+\npop\npop\n",
+        )
+        .unwrap();
+
+        // A genuine type mistake further down the program is still caught
+        // -- tracking never got permanently disabled by `txn`.
+        let errs =
+            expect_errors("#pragma version 8\ntxn Sender\npop\nbyte 0x1234\nint 1\n+\npop\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.starts_with("+ arg 0")
+                    && e.message.contains("wanted type uint64")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -4200,5 +4224,136 @@ mod tests {
                 && e.message.contains("arg 1 wanted type []byte")),
             "{errs:?}"
         );
+    }
+
+    // ── Dispatch-/variable-arity opcodes (issue #829, slice 6): `txn`/
+    // `gtxn`/`gtxns` (and `txna`/`gtxna`/`gtxnsa`), `pushbytess`/
+    // `pushints`, and `match` all used to permanently disable tracking for
+    // the rest of the program; this slice models all four precisely
+    // instead ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_match_typing_ported_from_go() {
+        // TestMatchTyping (assembler_test.go:4377-4392): a straight-line
+        // program mixing `pushint`/`pushbytes`/`txna` (all pushing known or
+        // opaque types) into a `match` must assemble cleanly end to end --
+        // exercises `txna`'s new `Any` push (see `TYPE_TABLE`) together
+        // with `match`'s `N+1` pop.
+        let source = "#pragma version 8\n\
+             pushint 0\n\
+             pushbytes 0xb17ea35d\n\
+             txna ApplicationArgs 0\n\
+             match done\n\
+             dup\n\
+             !\n\
+             return\n\
+             done:\n";
+        assemble_string(source).unwrap();
+    }
+
+    #[test]
+    fn test_assemble_match_alone_is_a_height_error() {
+        // TestAssembleMatch's final sub-case (assembler_test.go:4116-4117):
+        // even a label-less `match` still pops 1 (the switched-on value),
+        // so a bare `match` at the very start of the program -- nothing
+        // tracked on the stack yet -- is a genuine height error, not the
+        // no-op `test_assemble_match_empty_match_ok`'s shape (which primes
+        // the stack with `pushints 1` first).
+        let errs = expect_errors("#pragma version 8\nmatch\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.starts_with("match expects 1 stack argument")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_match_height_error_uses_label_count_plus_one() {
+        // `match` pops `N+1` values (N = number of labels); with only 1
+        // value tracked and 2 labels written, that's a height error against
+        // 3, not the base proto's single `a` pop.
+        let errs =
+            expect_errors("#pragma version 8\nint 1\nmatch label1 label2\nlabel1:\nlabel2:\n");
+        assert!(
+            errs.iter().any(|e| e
+                .message
+                .contains("match label1 label2 expects 3 stack arguments")
+                && e.message.contains("stack height is 1")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_pushbytess_pushes_one_bytes_per_literal() {
+        // typePushBytess: each of `pushbytess`'s literals is tracked as
+        // `Bytes`, so a following arithmetic opcode that wants `Uint64`
+        // must fail on it.
+        let errs = expect_errors("#pragma version 8\npushbytess 0xaa 0xbb\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("+ arg")
+                && e.message.contains("wanted type uint64 got []byte")),
+            "{errs:?}"
+        );
+
+        // The correctly-typed use (two bytes values, concatenated) keeps
+        // assembling cleanly.
+        assemble_string("#pragma version 8\npushbytess 0xaa 0xbb\nconcat\npop\n").unwrap();
+    }
+
+    #[test]
+    fn test_pushints_pushes_one_uint64_per_literal() {
+        // typePushInts: mirror of the `pushbytess` case above, `Uint64`
+        // instead of `Bytes`.
+        let errs = expect_errors("#pragma version 8\npushints 1 2\nconcat\n");
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("concat arg 0")
+                && e.message.contains("wanted type []byte")),
+            "{errs:?}"
+        );
+
+        assemble_string("#pragma version 8\npushints 1 2\n+\npop\n").unwrap();
+    }
+
+    #[test]
+    fn test_txn_family_pushes_any_type() {
+        // go's assembler does not look up the accessed field's actual
+        // type for `txn`/`gtxn`/`gtxns`/`txna`/`gtxna`/`gtxnsa` -- every
+        // one of them always pushes an opaque `StackAny` (see the
+        // `type_track` module docs' "`txn`/`gtxn`/`gtxns`..." section), so
+        // the pushed value is happily consumed by either a uint64- or a
+        // bytes-wanting opcode.
+        assemble_string("#pragma version 8\ntxn Sender\nint 1\n+\npop\n").unwrap();
+        assemble_string("#pragma version 8\ntxn Fee\nbyte 0x1234\nconcat\npop\n").unwrap();
+    }
+
+    #[test]
+    fn test_gtxns_pops_a_typed_uint64_index() {
+        // Unlike `txn`/`gtxn`/`txna`/`gtxna` (which take every selector as
+        // an assembler immediate and pop nothing), `gtxns`/`gtxnsa` pop a
+        // *dynamic* transaction-group index off the stack, and that pop is
+        // typed `Uint64` -- a `Bytes` value underneath is a genuine type
+        // mismatch, matching go's fixed `"i:a"` proto for these two exactly
+        // (see `TYPE_TABLE`).
+        let errs = expect_errors("#pragma version 8\nbyte 0x1234\ngtxns Sender\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.starts_with("gtxns Sender arg 0")
+                    && e.message.contains("wanted type uint64")),
+            "{errs:?}"
+        );
+
+        assemble_string("#pragma version 8\nint 0\ngtxns Sender\npop\n").unwrap();
+    }
+
+    #[test]
+    fn test_type_complaints_ported_from_go() {
+        // TestTypeComplaints (eval_test.go:5979-5985): `store 0` reached
+        // only after `err`/`return` has already deadened tracking must not
+        // itself be flagged, even though a bare `store` needs a stack
+        // value and there wouldn't be one live at that point -- already
+        // covered by slice 2's dead-code handling, pinned here as a direct
+        // port rather than only incidentally exercised elsewhere.
+        assemble_string("#pragma version 8\nerr\nstore 0\n").unwrap();
+        assemble_string("#pragma version 8\nint 1\nreturn\nstore 0\n").unwrap();
     }
 }
