@@ -4465,6 +4465,134 @@ impl SqliteLedger {
         Ok(out)
     }
 
+    /// Select up to `consensus.payouts_max_mark_absent` currently-online,
+    /// incentive-eligible accounts (`accountbase`, `normalizedonlinebalance
+    /// > 0`) that should be suspended for absenteeism as of `current_round`
+    /// -- candidates for a self-produced block's
+    /// `absent_participation_accounts` header field.
+    ///
+    /// Mirrors the absentee half of go-algorand's
+    /// `generateKnockOfflineAccountsList` (`ledger/eval/eval.go`, v41): for
+    /// every `Online && IncentiveEligible` candidate not in `exclude`, this
+    /// computes `lastSeen = max(LastProposed, LastHeartbeat)` and the
+    /// account's rewards-adjusted stake, then includes the address when
+    /// [`crate::apply::is_absent`] holds (silent for longer than its
+    /// stake-scaled allowance, against
+    /// [`crate::apply::total_online_voting_stake`]) or the account failed
+    /// the currently-active heartbeat challenge
+    /// ([`crate::heartbeat::find_challenge`] +
+    /// [`crate::heartbeat::Challenge::failed`]).
+    ///
+    /// `exclude` is the union of go's two independent skip conditions --
+    /// `partAddrs.Contains(accountAddr)` (this node's own participation
+    /// addresses, passed in by the caller) and "already added to
+    /// `ExpiredParticipationAccounts` this round, so don't also suspend it"
+    /// (`continue // if marking expired, do not consider suspension`) --
+    /// which the caller (`generate_block`) folds together before calling
+    /// this, since both are simple set-membership skips over the same
+    /// candidate loop.
+    ///
+    /// Selection order among more candidates than the cap is not
+    /// consensus-significant (see `expired_participation_account_candidates`'s
+    /// doc comment on Go's randomized map iteration) -- this returns
+    /// addresses in ascending byte order for reproducible tests, exactly
+    /// like that function.
+    pub fn absent_participation_account_candidates(
+        &self,
+        current_round: u64,
+        consensus: &algo_types::ConsensusParams,
+        exclude: &std::collections::HashSet<Address>,
+    ) -> Result<Vec<Address>, AlgoError> {
+        let max_count = consensus.payouts_max_mark_absent;
+        if max_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let total_online_stake = crate::apply::total_online_voting_stake(self);
+        let provider = crate::heartbeat::StoreHeaderProvider { store: self };
+        let challenge = crate::heartbeat::find_challenge(
+            consensus,
+            current_round,
+            &provider,
+            crate::heartbeat::ChallengePeriod::Active,
+        );
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT address, data FROM accountbase WHERE normalizedonlinebalance > 0 \
+                 ORDER BY address",
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!(
+                    "prepare absent_participation_account_candidates query error: {e}"
+                ),
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query absent_participation_account_candidates error: {e}"),
+            })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (addr_bytes, data) = row.map_err(|e| AlgoError::Ledger {
+                message: format!("read absent_participation_account_candidates row error: {e}"),
+            })?;
+            let addr_arr: [u8; 32] =
+                addr_bytes
+                    .clone()
+                    .try_into()
+                    .map_err(|v: Vec<u8>| AlgoError::Ledger {
+                        message: format!(
+                            "absent_participation_account_candidates: bad address length {} \
+                             (expected 32)",
+                            v.len()
+                        ),
+                    })?;
+            let addr = Address(addr_arr);
+
+            if exclude.contains(&addr) {
+                continue;
+            }
+
+            let account = decode_account_data(&data).map_err(|e| AlgoError::Ledger {
+                message: format!(
+                    "decode absent_participation_account_candidates account error: {e}"
+                ),
+            })?;
+
+            if account.micro_algos == 0 {
+                continue; // don't check accounts that are being closed
+            }
+            if account.status != AccountStatus::Online || !account.incentive_eligible {
+                continue;
+            }
+
+            let last_seen =
+                crate::heartbeat::last_seen(account.last_proposed, account.last_heartbeat);
+            let acct_stake =
+                account
+                    .micro_algos
+                    .saturating_add(crate::rewards::compute_pending_rewards(
+                        &account,
+                        self.rewards_level,
+                    ));
+
+            if crate::apply::is_absent(total_online_stake, acct_stake, last_seen, current_round)
+                || challenge.failed(&addr.0, last_seen)
+            {
+                out.push(addr);
+                if out.len() >= max_count {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Look up an account's online data at a specific round from the
     /// `onlineaccounts` table.
     ///
@@ -11095,5 +11223,153 @@ mod tests {
         // Confirm the two files actually exist where we expect.
         assert!(tracker.exists());
         assert!(block.exists());
+    }
+
+    // ---------------------------------------------------------------------
+    // absent_participation_account_candidates (issue #845): proposal-side
+    // absentee computation, mirroring go-algorand's
+    // generateKnockOfflineAccountsList absentee half.
+    // ---------------------------------------------------------------------
+
+    fn consensus_v41() -> algo_types::ConsensusParams {
+        algo_types::consensus::consensus_params_for_version(algo_types::CONSENSUS_V41)
+            .expect("v41 consensus params")
+    }
+
+    #[test]
+    fn absent_candidates_includes_genuinely_absent_online_account() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                incentive_eligible: true,
+                last_heartbeat: 1,
+                ..AccountData::default()
+            },
+        );
+
+        // Single online account: total_online_voting_stake == its own
+        // stake, so is_absent's allowable_lag is exactly ABSENT_FACTOR
+        // (20). last_seen(1) + 20 = 21 < 101.
+        let candidates = ledger
+            .absent_participation_account_candidates(
+                101,
+                &consensus_v41(),
+                &std::collections::HashSet::new(),
+            )
+            .expect("absent_participation_account_candidates");
+        assert_eq!(candidates, vec![addr]);
+    }
+
+    #[test]
+    fn absent_candidates_excludes_recently_seen_account() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                incentive_eligible: true,
+                last_heartbeat: 100,
+                ..AccountData::default()
+            },
+        );
+
+        // last_seen(100) + 20 = 120, not < 101.
+        let candidates = ledger
+            .absent_participation_account_candidates(
+                101,
+                &consensus_v41(),
+                &std::collections::HashSet::new(),
+            )
+            .expect("absent_participation_account_candidates");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn absent_candidates_excludes_addresses_in_exclude_set() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                incentive_eligible: true,
+                last_heartbeat: 1,
+                ..AccountData::default()
+            },
+        );
+
+        let mut exclude = std::collections::HashSet::new();
+        exclude.insert(addr);
+        let candidates = ledger
+            .absent_participation_account_candidates(101, &consensus_v41(), &exclude)
+            .expect("absent_participation_account_candidates");
+        assert!(
+            candidates.is_empty(),
+            "excluded address (own participation / already-expired) must never appear"
+        );
+    }
+
+    #[test]
+    fn absent_candidates_respects_max_mark_absent_cap() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut consensus = consensus_v41();
+        consensus.payouts_max_mark_absent = 1;
+
+        for i in 0..3u8 {
+            let addr = Address([i + 1; 32]);
+            ledger.set_account(
+                &addr,
+                AccountData {
+                    micro_algos: 5_000_000,
+                    status: AccountStatus::Online,
+                    incentive_eligible: true,
+                    last_heartbeat: 1,
+                    ..AccountData::default()
+                },
+            );
+        }
+
+        let candidates = ledger
+            .absent_participation_account_candidates(
+                101,
+                &consensus,
+                &std::collections::HashSet::new(),
+            )
+            .expect("absent_participation_account_candidates");
+        assert_eq!(candidates.len(), 1, "capped at payouts_max_mark_absent");
+    }
+
+    #[test]
+    fn absent_candidates_empty_when_cap_is_zero() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut consensus = consensus_v41();
+        consensus.payouts_max_mark_absent = 0;
+        let addr = Address([9u8; 32]);
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                incentive_eligible: true,
+                last_heartbeat: 1,
+                ..AccountData::default()
+            },
+        );
+
+        let candidates = ledger
+            .absent_participation_account_candidates(
+                101,
+                &consensus,
+                &std::collections::HashSet::new(),
+            )
+            .expect("absent_participation_account_candidates");
+        assert!(candidates.is_empty());
     }
 }

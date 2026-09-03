@@ -1764,7 +1764,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
 
     fn generate_block(
         &mut self,
-        _voting_accounts: &[algo_types::Address],
+        voting_accounts: &[algo_types::Address],
     ) -> Result<algo_types::Block, algo_error::AlgoError> {
         let txn_count = self.included_txns.len() as u64;
 
@@ -1797,6 +1797,44 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             }
         } else {
             None
+        };
+
+        // Compute the absent-participation-accounts sweep list (issue #845).
+        // Mirrors go's `generateKnockOfflineAccountsList`'s absentee half
+        // (`ledger/eval/eval.go`): for every `Online && IncentiveEligible`
+        // account not among this node's own participating addresses or
+        // already listed as expired above, check `isAbsent` (silent for
+        // longer than its stake-scaled allowance) or an active-challenge
+        // failure, and list it for suspension. Without this, a self-produced
+        // block's `ParticipationUpdates.AbsentParticipationAccounts` was
+        // always empty (`hdr.absent_participation_accounts.clone()` below
+        // just carried forward the previous header's -- always `None` --
+        // value), so this node never proposed suspending a genuinely absent
+        // online account; the apply-side sweep
+        // (`algo_ledger::apply::validate_absent_online_accounts`, the
+        // consumer/validator side) was already correct.
+        let mut absent_exclude: std::collections::HashSet<algo_types::Address> =
+            voting_accounts.iter().copied().collect();
+        if let Some(expired) = &expired {
+            absent_exclude.extend(expired.iter().copied());
+        }
+        let absent = {
+            let candidates = self
+                .ledger
+                .lock()
+                .map_err(|e| algo_error::AlgoError::Ledger {
+                    message: format!("ledger lock poisoned: {e}"),
+                })?
+                .absent_participation_account_candidates(
+                    self.hdr.round.0,
+                    &self.consensus_params,
+                    &absent_exclude,
+                )?;
+            if candidates.is_empty() {
+                None
+            } else {
+                Some(candidates)
+            }
         };
 
         // Build the block by propagating ALL header fields from self.hdr,
@@ -1834,7 +1872,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             upgrade_delay: hdr.upgrade_delay,
             upgrade_approve: hdr.upgrade_approve,
             expired_participation_accounts: expired,
-            absent_participation_accounts: hdr.absent_participation_accounts.clone(),
+            absent_participation_accounts: absent,
             // CongestionTax was already advanced from prev round's Load/Tax by
             // make_next_block_header (go's MakeBlock → NextCongestionTax).
             // Load, however, depends on THIS round's own final payset size, so
@@ -4465,6 +4503,230 @@ mod tests {
         assert!(
             block.expired_participation_accounts.is_none(),
             "no account has expired -- the list must stay empty/omitted"
+        );
+    }
+
+    // ── dev-mode absentee-account sweep (issue #845) ─────────────────
+
+    #[test]
+    fn dev_block_lists_and_suspends_absent_online_account() {
+        use algo_ledger::apply::apply_block;
+        use algo_pool::traits::PoolLedger;
+        use algo_types::AccountStatus;
+
+        let ledger = test_ledger();
+
+        // Seed a single online, incentive-eligible account that hasn't
+        // proposed or heartbeated since round 1. With only one online
+        // account, total_online_voting_stake == this account's own stake,
+        // so is_absent's allowable_lag collapses to exactly ABSENT_FACTOR
+        // (20): last_seen(1) + 20 = 21 < 101 (the round being built), so
+        // this account must be listed absent.
+        let absent_addr = Address([9u8; 32]);
+        {
+            let mut l = ledger.lock().expect("ledger lock");
+            l.set_account(
+                &absent_addr,
+                AccountData {
+                    micro_algos: 5_000_000,
+                    status: AccountStatus::Online,
+                    incentive_eligible: true,
+                    last_heartbeat: 1,
+                    ..AccountData::default()
+                },
+            );
+        }
+
+        let adapter = PoolLedgerAdapter::new(ledger.clone());
+        let prev = BlockHeader {
+            round: Round(100),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            fee_sink: Address([1u8; 32]),
+            rewards_pool: Address([2u8; 32]),
+            genesis_id: "net-x".to_string(),
+            timestamp: 1000,
+            ..BlockHeader::default()
+        };
+
+        let mut eval = adapter
+            .start_evaluator(prev, 0, 0)
+            .expect("start_evaluator");
+        let block = eval.generate_block(&[]).expect("generate_block");
+
+        // The self-produced block must carry the absent account, mirroring
+        // go's generateKnockOfflineAccountsList populating
+        // block.ParticipationUpdates.AbsentParticipationAccounts at
+        // proposal time -- without this, the apply-side suspend sweep
+        // (`algo_ledger::apply::suspend_absent_accounts`, the consumer
+        // side, already correct) never fires for algod-rust's own
+        // self-produced blocks.
+        assert_eq!(
+            block.absent_participation_accounts.as_deref(),
+            Some(&[absent_addr][..]),
+            "dev-mode block must list the genuinely-absent online account"
+        );
+
+        // Applying the block suspends the account (apply.rs's consumer
+        // side, already correct prior to this fix).
+        let mut l = ledger.lock().expect("ledger lock");
+        l.set_current_round(Round(100));
+        apply_block(&mut *l, &block).expect("apply_block");
+        let acct = l.get_account(&absent_addr).expect("account exists");
+        assert_eq!(
+            acct.status,
+            AccountStatus::Offline,
+            "absent account suspended (Offline) after applying the self-produced block"
+        );
+        assert!(
+            !acct.incentive_eligible,
+            "absent account loses incentive eligibility once suspended"
+        );
+    }
+
+    #[test]
+    fn dev_block_omits_absent_list_when_no_accounts_absent() {
+        use algo_pool::traits::PoolLedger;
+        use algo_types::AccountStatus;
+
+        let ledger = test_ledger();
+
+        // Same single-online-account setup as the positive case, but with
+        // a recent last_heartbeat: last_seen(100) + allowable_lag(20) =
+        // 120, which is NOT < 101, so this account is not absent.
+        let online_addr = Address([9u8; 32]);
+        {
+            let mut l = ledger.lock().expect("ledger lock");
+            l.set_account(
+                &online_addr,
+                AccountData {
+                    micro_algos: 5_000_000,
+                    status: AccountStatus::Online,
+                    incentive_eligible: true,
+                    last_heartbeat: 100,
+                    ..AccountData::default()
+                },
+            );
+        }
+
+        let adapter = PoolLedgerAdapter::new(ledger.clone());
+        let prev = BlockHeader {
+            round: Round(100),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            fee_sink: Address([1u8; 32]),
+            rewards_pool: Address([2u8; 32]),
+            genesis_id: "net-x".to_string(),
+            timestamp: 1000,
+            ..BlockHeader::default()
+        };
+
+        let mut eval = adapter
+            .start_evaluator(prev, 0, 0)
+            .expect("start_evaluator");
+        let block = eval.generate_block(&[]).expect("generate_block");
+
+        assert!(
+            block.absent_participation_accounts.is_none(),
+            "no account is absent -- the list must stay empty/omitted"
+        );
+    }
+
+    #[test]
+    fn dev_block_excludes_not_incentive_eligible_account_from_absent_list() {
+        use algo_pool::traits::PoolLedger;
+        use algo_types::AccountStatus;
+
+        let ledger = test_ledger();
+
+        // An account that would otherwise trip is_absent (very stale
+        // last_heartbeat), but is not IncentiveEligible -- go's
+        // generateKnockOfflineAccountsList only considers
+        // `Status == Online && IncentiveEligible` candidates for the
+        // absentee check at all.
+        let addr = Address([9u8; 32]);
+        {
+            let mut l = ledger.lock().expect("ledger lock");
+            l.set_account(
+                &addr,
+                AccountData {
+                    micro_algos: 5_000_000,
+                    status: AccountStatus::Online,
+                    incentive_eligible: false,
+                    last_heartbeat: 1,
+                    ..AccountData::default()
+                },
+            );
+        }
+
+        let adapter = PoolLedgerAdapter::new(ledger.clone());
+        let prev = BlockHeader {
+            round: Round(100),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            fee_sink: Address([1u8; 32]),
+            rewards_pool: Address([2u8; 32]),
+            genesis_id: "net-x".to_string(),
+            timestamp: 1000,
+            ..BlockHeader::default()
+        };
+
+        let mut eval = adapter
+            .start_evaluator(prev, 0, 0)
+            .expect("start_evaluator");
+        let block = eval.generate_block(&[]).expect("generate_block");
+
+        assert!(
+            block.absent_participation_accounts.is_none(),
+            "a non-IncentiveEligible account must never be listed absent"
+        );
+    }
+
+    #[test]
+    fn dev_block_excludes_own_participating_account_from_absent_list() {
+        use algo_pool::traits::PoolLedger;
+        use algo_types::AccountStatus;
+
+        let ledger = test_ledger();
+
+        // Same stale-heartbeat setup that would otherwise trip is_absent,
+        // but this address is passed as one of the node's own
+        // `voting_accounts` -- go's generateKnockOfflineAccountsList never
+        // proposes suspending an address the proposer itself holds keys
+        // for ("This function is passed a list of participating addresses
+        // so a node will not propose a block that suspends or expires
+        // itself").
+        let own_addr = Address([9u8; 32]);
+        {
+            let mut l = ledger.lock().expect("ledger lock");
+            l.set_account(
+                &own_addr,
+                AccountData {
+                    micro_algos: 5_000_000,
+                    status: AccountStatus::Online,
+                    incentive_eligible: true,
+                    last_heartbeat: 1,
+                    ..AccountData::default()
+                },
+            );
+        }
+
+        let adapter = PoolLedgerAdapter::new(ledger.clone());
+        let prev = BlockHeader {
+            round: Round(100),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            fee_sink: Address([1u8; 32]),
+            rewards_pool: Address([2u8; 32]),
+            genesis_id: "net-x".to_string(),
+            timestamp: 1000,
+            ..BlockHeader::default()
+        };
+
+        let mut eval = adapter
+            .start_evaluator(prev, 0, 0)
+            .expect("start_evaluator");
+        let block = eval.generate_block(&[own_addr]).expect("generate_block");
+
+        assert!(
+            block.absent_participation_accounts.is_none(),
+            "the proposer's own participating address must never be self-suspended"
         );
     }
 
