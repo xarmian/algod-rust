@@ -15,6 +15,7 @@ members = [
     "crates/core/algo-consensus-crypto",
     "crates/core/algo-agreement",
     "crates/core/algo-pool",
+    "crates/core/algo-abi",
     "crates/node/algo-network",
     "crates/node/algo-p2p",
     "crates/node/algo-rest-api",
@@ -120,6 +121,7 @@ algo-avm = { path = "crates/core/algo-avm" }
 algo-consensus-crypto = { path = "crates/core/algo-consensus-crypto" }
 algo-agreement = { path = "crates/core/algo-agreement" }
 algo-pool = { path = "crates/core/algo-pool" }
+algo-abi = { path = "crates/core/algo-abi" }
 algo-falcon = { path = "crates/core/algo-falcon" }
 algo-network = { path = "crates/node/algo-network" }
 algo-p2p = { path = "crates/node/algo-p2p" }

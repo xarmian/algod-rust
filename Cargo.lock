@@ -65,6 +65,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-abi"
+version = "0.1.0"
+dependencies = [
+ "algo-types",
+ "base64",
+ "num-bigint",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "algo-agreement"
 version = "0.1.0"
 dependencies = [
@@ -492,6 +504,7 @@ dependencies = [
 name = "algo-rest-api"
 version = "0.1.0"
 dependencies = [
+ "algo-abi",
  "algo-avm",
  "algo-codec",
  "algo-consensus-crypto",

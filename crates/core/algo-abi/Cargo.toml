@@ -1,0 +1,14 @@
+[package]
+name = "algo-abi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+algo-types = { workspace = true }
+base64 = { workspace = true }
+num-bigint = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
