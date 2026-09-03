@@ -28,13 +28,42 @@
 // (`dropAllSoftVotes`/`dropAllSlowNextVotes`/`dropAllVotes`/`repairAll`)
 // used by the fast-recovery scenarios in `agreement/service_test.go`.
 //
-// Scope: this port carries the subset of go's testingNetwork actually
-// exercised by the theme-3 scenarios ported so far (`DownEarly`/`DownMiss`):
-// selective vote drop + repair. `pocketAllCertVotes`/`pocketAllSoftVotes`/
-// `partition`/`crown`/`makeRelays`/`intercept` are not yet ported — a
-// follow-up can add them the same way (see the go source comment on each
-// hook below) once a scenario needs them (e.g. `Late`/`Redo`/
-// `RecoverBothWorlds`).
+// Scope: this port carries the subset of go's testingNetwork exercised by
+// the theme-3 scenarios ported so far. `dropAllSoftVotes`/
+// `dropAllSlowNextVotes`/`dropAllVotes`/`repairAll` (selective vote drop)
+// landed with the `DownEarly`/`DownMiss` ports (PR #910/#913).
+// `pocketAllCertVotes`/`pocketAllSoftVotes`/`pocketAllCompound` (payload
+// pocketing — intercept-and-collect instead of deliver, with a later replay
+// via direct `multicast`) and `partition` (two-group delivery filter) are
+// ported here for `Late`/`Redo`/`LateCertBug`/`LargePeriods`.
+// `crown`/`makeRelays`/`intercept` (relay/star topology, and arbitrary
+// message rewriting) are still not ported — no scenario landed in this pass
+// needed them; a follow-up can add them the same way once one does (e.g.
+// `RecoverBothVAndBotQuorums`'s `crown`, `CertificateDoesNotStallSingleRelay`'s
+// `makeRelays`).
+//
+// A real limitation found while porting, NOT fixed here:
+// `pocketAllCompound` (used by go's `TestAgreementSlowPayloadsPreDeadline`/
+// `PostDeadline`) composes badly with this harness's real-thread timing.
+// Unlike a vote (generated continuously for as long as a round stays
+// unresolved), a node only broadcasts a round/period's proposal payload
+// ONCE, automatically, the instant it enters that round/period — including
+// immediately as part of the very same settle cascade that
+// `AgreementCluster::wait_for_quiet` blocks on after a round commits or a
+// period bumps. There is no test-driver-observable point between "the
+// round/period transition happened" and "its proposal already went out" at
+// which `pocket_all_compound()` can be armed — so unlike
+// `pocket_all_cert_votes` (proven reliable by `TestAgreementLateCertBug`'s
+// port), `pocket_all_compound` could not be made to reliably intercept a
+// specific, predictable proposal broadcast in this harness without also
+// either (a) a synchronization hook to pause proposal generation until the
+// driver arms pocketing (go's synchronous single-goroutine model gets this
+// for free; this harness's real `AsyncPseudonode` threads do not), or (b) a
+// suspendable block validator like go's `TestAgreementRegression_
+// WrongPeriodPayloadVerificationCancellation_8ba23942` uses for a related
+// purpose. Both are out of scope for this pass; `pocket_all_compound` is
+// left in place (it is real, working interception logic, and the fix above
+// is additive) but no test in this file depends on it.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -44,9 +73,30 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 
 use algo_agreement::codec;
 use algo_agreement::{
-    AgreementError, AgreementNetwork, Message, MessageHandle, Tag, AGREEMENT_VOTE_TAG, DOWN, LATE,
-    NEXT, PROPOSAL_PAYLOAD_TAG, REDO, SOFT, VOTE_BUNDLE_TAG,
+    AgreementError, AgreementNetwork, Message, MessageHandle, Tag, AGREEMENT_VOTE_TAG, CERT, DOWN,
+    LATE, NEXT, PROPOSAL_PAYLOAD_TAG, REDO, SOFT, VOTE_BUNDLE_TAG,
 };
+
+/// One pocketed (intercepted-instead-of-delivered) message, captured with
+/// enough to replay it later via [`TestingNetwork::replay`]. Mirrors go's
+/// `multicastParams`.
+#[derive(Clone)]
+pub struct PocketedMessage {
+    tag: &'static str,
+    data: Vec<u8>,
+    source: usize,
+    exclude: usize,
+}
+
+impl PocketedMessage {
+    /// The raw, still-encoded message payload (a vote or proposal-payload
+    /// blob depending on which pocket this came from) — decode with
+    /// `algo_agreement::codec::decode_vote` or the payload-equivalent as
+    /// needed at the call site.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
 
 /// A single node's three per-tag inbound channels (sender kept by the
 /// network, receiver handed out via [`TestingNetworkEndpoint::messages`]).
@@ -70,6 +120,19 @@ struct NetworkState {
     drop_soft_votes: bool,
     drop_slow_next_votes: bool,
     drop_votes: bool,
+
+    /// `Some` while pocketing is active; mirrors go's
+    /// `certVotePocket`/`softVotePocket`/`compoundPocket` channel fields
+    /// (a plain `Vec` here rather than a channel — the harness never needs
+    /// to stream-consume while messages are still arriving).
+    cert_vote_pocket: Option<Vec<PocketedMessage>>,
+    soft_vote_pocket: Option<Vec<PocketedMessage>>,
+    compound_pocket: Option<Vec<PocketedMessage>>,
+
+    /// `Some(flags)` while a two-group partition is active: `flags[i]`
+    /// is the group membership of node `i`; a message is only delivered
+    /// between nodes in the same group. Mirrors go's `partitionedNodes`.
+    partitioned: Option<Vec<bool>>,
 }
 
 /// Shared multi-node network. Construct once, then hand each node its own
@@ -109,6 +172,10 @@ impl TestingNetwork {
                 drop_soft_votes: false,
                 drop_slow_next_votes: false,
                 drop_votes: false,
+                cert_vote_pocket: None,
+                soft_vote_pocket: None,
+                compound_pocket: None,
+                partitioned: None,
             }),
         })
     }
@@ -162,13 +229,126 @@ impl TestingNetwork {
             .drop_votes = true;
     }
 
-    /// Mirrors go's `testingNetwork.repairAll` (the subset of drop state this
-    /// port tracks — see the module doc for what's not yet ported).
+    /// Mirrors go's `testingNetwork.repairAll` (the subset of drop/pocket/
+    /// partition state this port tracks — see the module doc for what's not
+    /// yet ported).
     pub fn repair_all(&self) {
         let mut state = self.state.lock().expect("TestingNetwork poisoned");
         state.drop_soft_votes = false;
         state.drop_slow_next_votes = false;
         state.drop_votes = false;
+        state.cert_vote_pocket = None;
+        state.soft_vote_pocket = None;
+        state.compound_pocket = None;
+        state.partitioned = None;
+    }
+
+    /// Mirrors go's `testingNetwork.pocketAllCertVotes`: from now on, every
+    /// CERT-step vote is intercepted (never delivered) and collected instead
+    /// — read them back via [`Self::stop_pocketing_cert_votes`].
+    pub fn pocket_all_cert_votes(&self) {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .cert_vote_pocket = Some(Vec::new());
+    }
+
+    /// Number of cert votes pocketed so far (without stopping) — lets a
+    /// caller poll for "enough" before calling
+    /// [`Self::stop_pocketing_cert_votes`]. No go equivalent (go's
+    /// synchronous single-goroutine model guarantees every node has voted
+    /// after one fire; this harness's real threads sometimes need more).
+    pub fn cert_vote_pocket_len(&self) -> usize {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .cert_vote_pocket
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
+    /// Mirrors go's `closeFn` returned by `pocketAllCertVotes`, plus
+    /// draining the channel (`for msg := range pocket`) in one step: stops
+    /// pocketing and returns everything collected since
+    /// [`Self::pocket_all_cert_votes`].
+    pub fn stop_pocketing_cert_votes(&self) -> Vec<PocketedMessage> {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .cert_vote_pocket
+            .take()
+            .unwrap_or_default()
+    }
+
+    /// Mirrors go's `testingNetwork.pocketAllSoftVotes`.
+    pub fn pocket_all_soft_votes(&self) {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .soft_vote_pocket = Some(Vec::new());
+    }
+
+    /// Mirrors the `closeFn` returned by `pocketAllSoftVotes`.
+    pub fn stop_pocketing_soft_votes(&self) -> Vec<PocketedMessage> {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .soft_vote_pocket
+            .take()
+            .unwrap_or_default()
+    }
+
+    /// Mirrors go's `testingNetwork.pocketAllCompound`: intercepts every
+    /// `ProposalPayloadTag` message (proposal payloads) instead of
+    /// delivering it.
+    pub fn pocket_all_compound(&self) {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .compound_pocket = Some(Vec::new());
+    }
+
+    /// Mirrors the `closeFn` returned by `pocketAllCompound`.
+    pub fn stop_pocketing_compound(&self) -> Vec<PocketedMessage> {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .compound_pocket
+            .take()
+            .unwrap_or_default()
+    }
+
+    /// Replay a previously-pocketed message through the normal routing path
+    /// (subject to whatever drop/pocket/partition state is active NOW, same
+    /// as go's direct `baseNetwork.multicast(p.tag, p.data, p.source,
+    /// p.exclude)` calls in `TestAgreementLateCertBug`/
+    /// `TestAgreementSlowPayloads*`).
+    pub fn replay(&self, msg: &PocketedMessage) {
+        multicast(self, msg.tag, &msg.data, msg.source, msg.exclude);
+    }
+
+    /// Replay every message in `msgs`, in order. Convenience for the common
+    /// "release everything I pocketed" call sites.
+    pub fn replay_all(&self, msgs: &[PocketedMessage]) {
+        for msg in msgs {
+            self.replay(msg);
+        }
+    }
+
+    /// Mirrors go's `testingNetwork.partition(part...)`: from now on, a
+    /// message is only delivered between two nodes that are BOTH in `group`
+    /// or BOTH outside it — heals whatever previous partition existed
+    /// (matching go's "different mechanism than n.connected" comment: this
+    /// is independent of [`Self::endpoint`]'s per-pair `disconnect`).
+    pub fn partition(&self, group: &[usize]) {
+        let mut state = self.state.lock().expect("TestingNetwork poisoned");
+        let n = state.channels.len();
+        let mut flags = vec![false; n];
+        for &i in group {
+            flags[i] = true;
+        }
+        state.partitioned = Some(flags);
     }
 
     /// Total number of messages currently sitting unconsumed in every node's
@@ -244,7 +424,7 @@ fn source_of(network: &Arc<TestingNetwork>, handle: &MessageHandle) -> Option<us
 /// Core routing + selective-drop logic. Mirrors go's
 /// `testingNetwork.multicast(tag, data, source, exclude)`.
 fn multicast(
-    network: &Arc<TestingNetwork>,
+    network: &TestingNetwork,
     tag: &'static str,
     data: &[u8],
     source: usize,
@@ -252,7 +432,25 @@ fn multicast(
 ) {
     let mut state = network.state.lock().expect("TestingNetwork poisoned");
 
-    if (state.drop_soft_votes || state.drop_slow_next_votes || state.drop_votes)
+    let pocketing_active = state.cert_vote_pocket.is_some()
+        || state.soft_vote_pocket.is_some()
+        || state.compound_pocket.is_some();
+
+    if tag == PROPOSAL_PAYLOAD_TAG && state.compound_pocket.is_some() {
+        state
+            .compound_pocket
+            .as_mut()
+            .expect("just checked is_some")
+            .push(PocketedMessage {
+                tag,
+                data: data.to_vec(),
+                source,
+                exclude,
+            });
+        return;
+    }
+
+    if (state.drop_soft_votes || state.drop_slow_next_votes || state.drop_votes || pocketing_active)
         && tag == AGREEMENT_VOTE_TAG
     {
         let Ok(uv) = codec::decode_vote(data) else {
@@ -263,6 +461,30 @@ fn multicast(
             return;
         };
         let step = uv.raw_vote.step;
+
+        if step == CERT {
+            if let Some(pocket) = state.cert_vote_pocket.as_mut() {
+                pocket.push(PocketedMessage {
+                    tag,
+                    data: data.to_vec(),
+                    source,
+                    exclude,
+                });
+                return;
+            }
+        }
+        if step == SOFT {
+            if let Some(pocket) = state.soft_vote_pocket.as_mut() {
+                pocket.push(PocketedMessage {
+                    tag,
+                    data: data.to_vec(),
+                    source,
+                    exclude,
+                });
+                return;
+            }
+        }
+
         if state.drop_votes {
             return;
         }
@@ -291,6 +513,11 @@ fn multicast(
         }
         if !state.connected[source][peer] {
             continue;
+        }
+        if let Some(part) = &state.partitioned {
+            if part[source] != part[peer] {
+                continue;
+            }
         }
         let msg = Message {
             handle: handle.clone(),
