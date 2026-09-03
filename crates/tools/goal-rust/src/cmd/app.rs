@@ -381,7 +381,10 @@ pub fn run_call(args: CallArgs, wallet: Option<String>) -> ExitCode {
 }
 
 fn run_call_inner(args: CallArgs, wallet: Option<String>) -> Result<ExitCode, String> {
-    let on_completion = parse_on_completion(&args.on_completion)?;
+    // Go's `callAppCmd` always builds a NoOp call (`client.MakeUnsignedAppNoOpTx`,
+    // `application.go:870`) — there is no `--on-completion` flag on `app call`
+    // at all (see `CallArgs`'s struct docs).
+    const ON_COMPLETION_NOOP: u64 = 0;
 
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
@@ -418,7 +421,7 @@ fn run_call_inner(args: CallArgs, wallet: Option<String>) -> Result<ExitCode, St
         .transpose()?;
 
     let mut txn =
-        algo_txn_pipeline::ApplicationCallBuilder::new(from_addr, args.app_id, on_completion)
+        algo_txn_pipeline::ApplicationCallBuilder::new(from_addr, args.app_id, ON_COMPLETION_NOOP)
             .app_arguments(app_arguments)
             .reject_version(args.reject_version)
             .fee(header.fee)

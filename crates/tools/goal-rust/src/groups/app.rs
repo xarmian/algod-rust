@@ -163,13 +163,15 @@ pub struct AppTxnArgs {
     pub password: Option<String>,
 }
 
-/// `app call -f <from> --app-id <id> [--app-arg ...] [--on-completion oc]
-/// [refs] [txn]`.
+/// `app call -f <from> --app-id <id> [--app-arg ...] [refs] [txn]`.
 ///
-/// Mirrors Go's `callAppCmd` (`application.go:611-621` for the flag surface,
-/// the shared `Run` body around `application.go:606-690`): submit an
-/// application-call transaction with raw (non-ABI) `apps.AppCallBytes`-form
-/// arguments.
+/// Mirrors Go's `callAppCmd` (`application.go:860-870` for the flag surface
+/// and `MakeUnsignedAppNoOpTx` call): submit a **NoOp** application-call
+/// transaction with raw (non-ABI) `apps.AppCallBytes`-form arguments. Unlike
+/// `app method`, `app call` has no `--on-completion` flag at all — Go's
+/// `callAppCmd` always builds a NoOp call; `optin`/`closeout`/`clear`/
+/// `update`/`delete` are Go's separate leaves for the other `OnCompletion`
+/// values (not yet implemented here — see the issue).
 #[derive(Args, Debug)]
 pub struct CallArgs {
     /// Account to call the app from (Go `-f/--from`). Required.
@@ -178,11 +180,6 @@ pub struct CallArgs {
     /// Application ID (Go `--app-id`). Required.
     #[arg(long = "app-id")]
     pub app_id: u64,
-    /// On-completion action for the application transaction (Go
-    /// `--on-completion`; one of NoOp/OptIn/CloseOut/ClearState/
-    /// UpdateApplication/DeleteApplication, case-insensitive).
-    #[arg(long = "on-completion", default_value = "NoOp")]
-    pub on_completion: String,
     /// Args to encode for the application call, `encoding:value` form (Go
     /// `--app-arg`, repeatable): `int:1234`, `b64:A==`, `str:hello`,
     /// `addr:XYZ...`, `b32:...`, or `abi:<type>:<json-value>`.
