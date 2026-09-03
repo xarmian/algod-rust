@@ -22,11 +22,13 @@
 //!
 //! Mirrors a deliberately incremental slice of go-algorand's compile-time
 //! stack-type inference: `data/transactions/logic/assembler.go`'s
-//! `ProgramKnowledge` (the tracked `stack` of [`StackType`]s, plus its
-//! `deadcode`/`bottom` fields -- see below), `trackStack` (arg/return
-//! checking against the tracked stack), and the handful of `type*` "refine"
-//! functions (`typeSwap`, `typeDup`, `typeDupTwo`, `typeSelect`,
-//! `typeSetBit`, `typeDig`, `typeEquals`) whose return type depends on
+//! `ProgramKnowledge` (the tracked `stack` of [`StackType`]s, its
+//! `deadcode`/`bottom` fields, and its `scratchSpace` -- see below),
+//! `trackStack` (arg/return checking against the tracked stack), and the
+//! handful of `type*` "refine" functions (`typeSwap`, `typeDup`,
+//! `typeDupTwo`, `typeSelect`, `typeSetBit`, `typeDig`, `typeEquals`,
+//! `typeStore`, `typeLoad`, `typeStores`, `typeLoads`) whose return type (or,
+//! for the scratch-space four, a side effect on `scratchSpace`) depends on
 //! what's actually tracked on the stack rather than a fixed per-opcode
 //! proto.
 //!
@@ -70,6 +72,24 @@
 //! does not deaden (index-out-of-range falls through), and it already
 //! had a fixed, exact proto (`Uint64` pop, no push) in [`TYPE_TABLE`].
 //!
+//! - **Scratch-slot per-index type tracking** (`TestScratchTypeCheck`, and
+//!   the message-observable case of `TestScratchBounds`): mirrors go's
+//!   `ProgramKnowledge.scratchSpace` (see [`OpStream::scratch_space`]) --
+//!   `store i`/`load i` (a fixed immediate slot) read/write that slot's
+//!   exact type; `stores`/`loads` (a *dynamic* slot index popped from the
+//!   stack at runtime) resolve the slot exactly only when the index is a
+//!   compile-time-constant `int` literal sitting right underneath (tracked
+//!   via [`OpStream::type_stack_const`], mirroring go's narrow
+//!   `StackType.constInt()` use in `typeStores`/`typeLoads`); otherwise
+//!   `stores` conservatively unions *every* slot with the stored value's
+//!   type (go can't know which slot was actually written), and `loads`
+//!   falls back to a shared type only if literally every slot currently
+//!   agrees, else `Any`. All four slots start as `Uint64` (an untouched
+//!   scratch slot reads as zero at runtime) and reset to `Any` -- never back
+//!   to `Uint64` -- wherever [`OpStream::type_track_bottom_permissive`] is
+//!   set (a label reached through dead code, or a `callsub`), mirroring
+//!   go's `ProgramKnowledge.reset`.
+//!
 //! On a type mismatch this reports the same diagnostic shape as
 //! go-algorand's `typeErrorf` calls in `trackStack`: `"<instr> arg <i>
 //! wanted type <want> got <got>"` or `"<instr> expects <n> stack arguments
@@ -77,13 +97,6 @@
 //!
 //! # What's deferred (tracked as follow-up work under issue #829)
 //!
-//! - **Scratch-slot type tracking** (`TestScratchTypeCheck`,
-//!   `TestScratchBounds`): `load`/`loads`/`store`/`stores` are tracked only
-//!   for their generic pop/push counts, not the per-slot type go tracks via
-//!   `ProgramKnowledge.scratchSpace`. (`TestTypeTrackingRegression`
-//!   happens to pass anyway: it only exercises `load`/`store` typing as
-//!   `Any`, which this slice already produces generically, without needing
-//!   go's `scratchSpace[i]`-specific type refinement.)
 //! - **`#pragma typetrack false`/`true`** (part of `TestTypeTracking`):
 //!   go supports manually toggling tracking off/on mid-program
 //!   (`assembler.go:2513-2517`); this slice has no equivalent pragma at
@@ -100,13 +113,19 @@
 //!   can only *lose* precision, never *fabricate* an error, so it cannot
 //!   make a currently-valid program newly fail to assemble.
 //! - **Bounds-refined types** (`TestMatchTyping`, `TestArgType`,
-//!   `TestTypeComplaints`, sized-type diagnostics like `[32]byte`):
-//!   go's `StackType` also carries a `[min, max]` length/value bound
-//!   (`NewStackType`, `eval.go`); this slice's [`StackType`] is bound-free
-//!   (`Uint64` / `Bytes` / `Any`), matching go's `overlaps` exactly for
-//!   these opcodes (bounds only ever narrow the plain-`StackUint64`/
-//!   `StackBytes` case, which is what every opcode here uses) but not
-//!   reproducing go's `[N]byte`/`(<= N)`-style diagnostic text.
+//!   `TestTypeComplaints`, sized-type diagnostics like `[32]byte`, and
+//!   `TestScratchBounds`'s direct `os.known.scratchSpace[i].Bound`
+//!   assertions): go's `StackType` also carries a `[min, max]` length/value
+//!   bound (`NewStackType`, `eval.go`); this slice's [`StackType`] is
+//!   bound-free (`Uint64` / `Bytes` / `Any`), matching go's `overlaps`
+//!   exactly for these opcodes (bounds only ever narrow the plain-
+//!   `StackUint64`/`StackBytes` case, which is what every opcode here uses)
+//!   but not reproducing go's `[N]byte`/`(<= N)`-style diagnostic text, nor
+//!   `TestScratchBounds`'s exact numeric `Bound` values (only its one
+//!   message-observable assertion -- the final `testProg` call, an
+//!   AVMType-level mismatch -- is covered; see [`OpStream::type_stack_const`]
+//!   for the narrow, purpose-built constant-tracking this slice does
+//!   instead of general bound propagation).
 //! - `TestTxTypes`, `TestDupPopNTyping`: exercise the deferred
 //!   dynamic-arity/`txn` behavior above.
 //!
@@ -235,6 +254,15 @@ const TYPE_TABLE: &[(&str, &[StackType], &[StackType])] = &[
     ("switch", &[Uint64], &[]),
     ("return", &[Uint64], &[]),
     ("assert", &[Uint64], &[]),
+    // ---- Scratch-space load/store base protos (opcodes.go:611-627):
+    // `load`/`store` take a fixed immediate slot index (not a stack arg);
+    // `loads`/`stores` take a dynamic uint64 index off the stack. All four
+    // push/pop an `Any` value, refined to the tracked slot's exact type (or
+    // used to update it) by `refined_types` below. ----
+    ("load", &[], &[Any]),
+    ("store", &[Any], &[]),
+    ("loads", &[Uint64], &[Any]),
+    ("stores", &[Uint64, Any], &[]),
 ];
 
 fn table_lookup(mnemonic: &str) -> Option<(&'static [StackType], &'static [StackType])> {
@@ -292,19 +320,53 @@ fn hard_disables_tracking(mnemonic: &str) -> bool {
     )
 }
 
+/// A side effect a refine function has on [`OpStream::scratch_space`]
+/// (go's `pgm.scratchSpace[i] = ...` assignments inside `typeStore`/
+/// `typeStores`, `assembler.go:1543-1576` -- unlike every other refine
+/// function, these two mutate `ProgramKnowledge` rather than just
+/// overriding the args/returns passed to `trackStack`).
+#[derive(Debug, Clone, Copy)]
+enum ScratchEffect {
+    /// `store i` / `stores` with a known-constant index: set exactly one
+    /// slot to the stored value's type (`typeStore`; `typeStores`'s
+    /// `isConst` branch).
+    Set(usize, StackType),
+    /// `stores` with a non-constant index: mirrors `typeStores`'s fallback
+    /// (`assembler.go:1570-1574`) -- since the actual written slot isn't
+    /// known, every slot is conservatively widened to the union of its
+    /// current type and the stored value's type, rather than picked
+    /// arbitrarily or left untouched.
+    UnionAll(StackType),
+}
+
 /// Refine functions for opcodes whose args and/or returns depend on the
 /// types currently tracked on the stack rather than a fixed proto. Mirrors
-/// go's `refineFunc`s (`assembler.go:1323-1484`). Returns `None` when this
-/// mnemonic has no refine function; returns `Some((args_override,
-/// returns_override))` otherwise, where either side being `None` means
-/// "use the [`TYPE_TABLE`]/default proto for that side" (matching go's
-/// `nargs`/`nreturns` being `nil`).
+/// go's `refineFunc`s (`assembler.go:1323-1484,1543-1619`). Returns `None`
+/// when this mnemonic has no refine function; returns `Some((args_override,
+/// returns_override, scratch_effect))` otherwise, where either of the first
+/// two being `None` means "use the [`TYPE_TABLE`]/default proto for that
+/// side" (matching go's `nargs`/`nreturns` being `nil`).
+///
+/// `consts` is [`OpStream::type_stack_const`] (parallel to `stack`): the
+/// compile-time-constant value of each tracked entry, when known -- used by
+/// `loads`/`stores` to resolve a dynamic scratch-slot index exactly when
+/// it's a literal, mirroring go's `StackType.constInt()` (see
+/// [`OpStream::type_stack_const`]'s doc comment for what this narrow slice
+/// of go's real bound-tracking does and doesn't reproduce). `scratch` is
+/// [`OpStream::scratch_space`], read (not mutated) here; the caller applies
+/// any returned [`ScratchEffect`] afterward.
 #[allow(clippy::type_complexity)]
 fn refined_types(
     stack: &[StackType],
+    consts: &[Option<u64>],
+    scratch: &[StackType; 256],
     mnemonic: &str,
     args: &[&str],
-) -> Option<(Option<Vec<StackType>>, Option<Vec<StackType>>)> {
+) -> Option<(
+    Option<Vec<StackType>>,
+    Option<Vec<StackType>>,
+    Option<ScratchEffect>,
+)> {
     let len = stack.len();
     match mnemonic {
         // typeSwap (assembler.go:1323-1333): returns become whatever was on
@@ -317,12 +379,12 @@ fn refined_types(
                     swapped[1] = stack[len - 2];
                 }
             }
-            Some((None, Some(swapped.to_vec())))
+            Some((None, Some(swapped.to_vec()), None))
         }
         // typeDup (assembler.go:1450-1456).
         "dup" => {
             let top = if len >= 1 { stack[len - 1] } else { Any };
-            Some((None, Some(vec![top, top])))
+            Some((None, Some(vec![top, top]), None))
         }
         // typeDupTwo (assembler.go:1458-1468): duplicates the top two.
         "dup2" => {
@@ -333,7 +395,7 @@ fn refined_types(
                     two[0] = stack[len - 2];
                 }
             }
-            Some((None, Some(vec![two[0], two[1], two[0], two[1]])))
+            Some((None, Some(vec![two[0], two[1], two[0], two[1]]), None))
         }
         // typeSelect (assembler.go:1470-1476): result is the union of the
         // two non-selector operands.
@@ -343,13 +405,13 @@ fn refined_types(
             } else {
                 Any
             };
-            Some((None, Some(vec![result])))
+            Some((None, Some(vec![result]), None))
         }
         // typeSetBit (assembler.go:1478-1484): result keeps the target's
         // (bottom arg's) type.
         "setbit" => {
             let result = if len >= 3 { stack[len - 3] } else { Any };
-            Some((None, Some(vec![result])))
+            Some((None, Some(vec![result]), None))
         }
         // typeEquals (assembler.go:1439-1448): both operands must be the
         // same avm type as whatever's on top; return type is the fixed
@@ -360,7 +422,7 @@ fn refined_types(
             } else {
                 Any
             };
-            Some((Some(vec![top, top]), None))
+            Some((Some(vec![top, top]), None, None))
         }
         // typeDig (assembler.go:1335-1350): pops/returns `n+1` items,
         // duplicating the one at depth `n`.
@@ -373,10 +435,90 @@ fn refined_types(
                 returns[..depth].copy_from_slice(&stack[idx..]);
                 returns[depth] = stack[idx];
             }
-            Some((Some(vec![Any; depth]), Some(returns)))
+            Some((Some(vec![Any; depth]), Some(returns), None))
+        }
+        // typeStore (assembler.go:1543-1553): a known slot index (`store`
+        // always has a literal immediate, never a stack arg) gets set to
+        // whatever type is currently on top of the tracked stack -- the
+        // value `store` is about to pop. No args/returns override (the
+        // fixed `Any` pop from [`TYPE_TABLE`] applies).
+        "store" => {
+            let idx = scratch_slot_immediate(args);
+            let effect = match (idx, stack.last()) {
+                (Some(i), Some(&top)) => Some(ScratchEffect::Set(i, top)),
+                _ => None,
+            };
+            Some((None, None, effect))
+        }
+        // typeLoad (assembler.go:1578-1584): pushes the tracked type of the
+        // known slot index instead of the default `Any`.
+        "load" => {
+            let ret = scratch_slot_immediate(args).map(|i| vec![scratch[i]]);
+            Some((None, ret, None))
+        }
+        // typeStores (assembler.go:1555-1576): the index is a *dynamic*
+        // stack value (second from top; the value being stored is on top --
+        // proto `"ia:"`). When it's a compile-time constant (pushed by a
+        // literal `int`, tracked via `consts`), exactly that slot is set;
+        // otherwise every slot is conservatively unioned with the stored
+        // value's type, since the real target slot isn't known statically.
+        "stores" => {
+            if len == 0 {
+                return Some((None, None, None));
+            }
+            let value_ty = stack[len - 1];
+            if len >= 2 {
+                if let Some(i) = const_scratch_index(consts, len - 2) {
+                    return Some((None, None, Some(ScratchEffect::Set(i, value_ty))));
+                }
+            }
+            Some((None, None, Some(ScratchEffect::UnionAll(value_ty))))
+        }
+        // typeLoads (assembler.go:1601-1619): the index (top of stack) is
+        // dynamic. When it's a compile-time constant, pushes exactly that
+        // slot's type; otherwise, mirrors go's fallback of pushing a known
+        // type only if *every* scratch slot currently shares one (still
+        // useful after a plain `store` to every slot, or the all-`Uint64`/
+        // all-`Any` initial/post-reset states), else falls back to the
+        // default `Any`.
+        "loads" => {
+            if len == 0 {
+                return Some((None, None, None));
+            }
+            if let Some(i) = const_scratch_index(consts, len - 1) {
+                return Some((None, Some(vec![scratch[i]]), None));
+            }
+            let first = scratch[0];
+            let uniform = scratch.iter().all(|&t| t == first);
+            Some((None, uniform.then(|| vec![first]), None))
         }
         _ => None,
     }
+}
+
+/// Parses `load`/`store`'s single immediate-slot-index argument, mirroring
+/// go's `getImm(args, 0, false)` (`assembler.go:1289-...`) used by
+/// `typeStore`/`typeLoad`: `None` for a missing or unparsable argument (the
+/// rest of assembly reports its own diagnostic for that; nothing to refine
+/// here), or an out-of-range index (there are only 256 scratch slots).
+fn scratch_slot_immediate(args: &[&str]) -> Option<usize> {
+    args.first()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&i| i < 256)
+}
+
+/// Reads `consts[pos]` (the compile-time-constant value of the tracked
+/// stack entry at `pos`, if any -- see [`OpStream::type_stack_const`]) as a
+/// scratch-slot index, mirroring go's `StackType.constInt()` calls in
+/// `typeStores`/`typeLoads`. `None` when the entry isn't a known constant,
+/// or the constant is out of the 256-slot range.
+fn const_scratch_index(consts: &[Option<u64>], pos: usize) -> Option<usize> {
+    consts
+        .get(pos)
+        .copied()
+        .flatten()
+        .map(|v| v as usize)
+        .filter(|&i| i < 256)
 }
 
 /// Join an instruction's mnemonic with its immediate-argument tokens for
@@ -433,6 +575,11 @@ fn apply_stack_effect(
             // `type_track_bottom_permissive` let the height check above
             // through with too few real entries.
             let got = ops.type_stack.pop().unwrap_or(Any);
+            // Keep `type_stack_const` in lockstep with `type_stack` (see its
+            // doc comment) -- popping past the tracked stack's real height
+            // (the `bottom_permissive` case above) is safe: `Vec::pop` on an
+            // empty vec is a no-op `None`, same as `type_stack`'s.
+            ops.type_stack_const.pop();
             if !got.overlaps(want) {
                 ops.record_error(
                     ops.source_line,
@@ -451,6 +598,11 @@ fn apply_stack_effect(
 
     if !return_types.is_empty() {
         ops.type_stack.extend_from_slice(return_types);
+        // None of the pushed values are themselves known constants -- a
+        // fresh literal is only ever tracked via the `literal_push_type`
+        // path in `track_instruction`, not through a `trackStack` return.
+        ops.type_stack_const
+            .extend(std::iter::repeat(None).take(return_types.len()));
     }
 }
 
@@ -482,7 +634,18 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
     }
 
     if let Some(pushed) = literal_push_type(mnemonic) {
+        // Mirrors go's `typePushInt` (`assembler.go:1666-1677`): an `int`
+        // literal's compile-time value is tracked (base-10-parseable
+        // only -- a named constant or non-decimal literal falls back to
+        // `None`, same as go's `strconv.ParseUint` failure) so a later
+        // `loads`/`stores` sitting right on top of it can resolve its
+        // scratch-slot index exactly. `byte`/`addr`/`method` never carry a
+        // usable scratch index, so they're never const-tracked.
+        let konst = (mnemonic == "int")
+            .then(|| args.first().and_then(|s| s.parse::<u64>().ok()))
+            .flatten();
         ops.type_stack.push(pushed);
+        ops.type_stack_const.push(konst);
         return;
     }
 
@@ -495,17 +658,23 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
         Some(s) => s,
     };
 
-    let refine = refined_types(&ops.type_stack, mnemonic, args);
+    let refine = refined_types(
+        &ops.type_stack,
+        &ops.type_stack_const,
+        &ops.scratch_space,
+        mnemonic,
+        args,
+    );
     let table = table_lookup(mnemonic);
 
     let arg_types = refine
         .as_ref()
-        .and_then(|(a, _)| a.clone())
+        .and_then(|(a, _, _)| a.clone())
         .or_else(|| table.map(|(a, _)| a.to_vec()))
         .or_else(|| (spec.stack_pops >= 0).then(|| vec![Any; spec.stack_pops as usize]));
     let return_types = refine
         .as_ref()
-        .and_then(|(_, r)| r.clone())
+        .and_then(|(_, r, _)| r.clone())
         .or_else(|| table.map(|(_, r)| r.to_vec()))
         .or_else(|| (spec.stack_pushes >= 0).then(|| vec![Any; spec.stack_pushes as usize]));
 
@@ -521,10 +690,28 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
         }
     };
 
+    // Apply `store`/`stores`' scratch-space side effect (mirrors go setting
+    // `pgm.scratchSpace[...]` directly inside `typeStore`/`typeStores`,
+    // unconditionally and *before* `trackStack` pops/checks the args --
+    // see `refined_types`' doc comment). Unlike the args/returns override,
+    // this always takes effect regardless of any type mismatch reported by
+    // `apply_stack_effect` below, matching go exactly.
+    if let Some(effect) = refine.and_then(|(_, _, e)| e) {
+        match effect {
+            ScratchEffect::Set(i, ty) => ops.scratch_space[i] = ty,
+            ScratchEffect::UnionAll(ty) => {
+                for slot in ops.scratch_space.iter_mut() {
+                    *slot = union(*slot, ty);
+                }
+            }
+        }
+    }
+
     apply_stack_effect(ops, mnemonic, args, &arg_types, &return_types);
 
     if deadens_tracking(mnemonic) {
         ops.type_stack.clear();
+        ops.type_stack_const.clear();
         ops.type_track_deadcode = true;
         if mnemonic == "callsub" {
             // Mirrors go's assemble loop: `callsub` deadens (its own
@@ -533,9 +720,14 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
             // but is immediately followed by `ops.known.label()`
             // (assembler.go:2234-2237) rather than waiting for a textual
             // label -- `retsub` returns right after the `callsub`, making
-            // it an entry point like any other label.
+            // it an entry point like any other label. `label()` resets
+            // `scratchSpace` to all-`Any` too when called on deadcode
+            // (`assembler.go:364-380`), which is always true here (`b`/
+            // `callsub`/etc. above just set it) -- see
+            // `OpStream::scratch_space`'s doc comment.
             ops.type_track_deadcode = false;
             ops.type_track_bottom_permissive = true;
+            ops.scratch_space = [Any; 256];
         }
     }
 }

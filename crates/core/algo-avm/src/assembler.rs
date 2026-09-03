@@ -249,6 +249,34 @@ pub struct OpStream {
     /// instruction sequence. See the `type_track` module docs for exactly
     /// what this incremental pass covers.
     pub(crate) type_stack: Vec<type_track::StackType>,
+    /// Parallel to [`Self::type_stack`] (always the same length): the
+    /// compile-time-constant `u64` value of the corresponding tracked stack
+    /// entry, when known. Mirrors the narrow slice of go-algorand's
+    /// `StackType.Bound`/`constInt()` (`eval.go:944-1024`) this pass needs --
+    /// just enough to recognize a literal `int N` value sitting under
+    /// `loads`/`stores` so their scratch-slot index can be resolved exactly
+    /// (`typeLoads`/`typeStores`, `assembler.go:1555-1619`), not go's full
+    /// `[min,max]` bound propagation through arithmetic (that remains
+    /// deferred -- see the `type_track` module docs' "Bounds-refined types"
+    /// section). `Some(v)` only for a value just pushed by a literal `int v`
+    /// (base-10-parseable, mirroring `typePushInt`'s
+    /// `strconv.ParseUint(..., 10, 64)`); `None` for everything else,
+    /// including every opcode's *result* (this pass never re-derives a
+    /// constant from an operation, only from the literal push itself).
+    pub(crate) type_stack_const: Vec<Option<u64>>,
+    /// The statically known type of each of the 256 scratch slots. Mirrors
+    /// go-algorand's `ProgramKnowledge.scratchSpace` (`assembler.go:334`).
+    /// Starts as [`type_track::StackType::Uint64`] for every slot (mirrors
+    /// `newOpStream`'s `o.known.scratchSpace[i] = StackZeroUint64`,
+    /// `assembler.go:300-302` -- an untouched scratch slot reads as the
+    /// zero-valued uint64 at runtime) and is reset to
+    /// [`type_track::StackType::Any`] for every slot -- never back to
+    /// `Uint64` -- at the same points [`Self::type_track_bottom_permissive`]
+    /// is set (mirrors `ProgramKnowledge.reset`, `assembler.go:371-380`,
+    /// called from `label()`/the `callsub` reopening -- see
+    /// [`type_track::track_instruction`] and the label-handling code in
+    /// [`assemble_string`]).
+    pub(crate) scratch_space: [type_track::StackType; 256],
     /// Once set, `type_track::track_instruction` stops tracking (and
     /// stops reporting type errors) for the rest of the program. Set on
     /// any opcode this slice doesn't model precisely enough to keep the
@@ -305,6 +333,8 @@ impl OpStream {
             auto_salt: AutoSaltMode::Unset,
             auto_salt_line: 0,
             type_stack: Vec::new(),
+            type_stack_const: Vec::new(),
+            scratch_space: [type_track::StackType::Uint64; 256],
             type_track_disabled: false,
             type_track_deadcode: false,
             type_track_bottom_permissive: false,
@@ -1166,10 +1196,14 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
                 // also describes any jump into this label, and keeps
                 // analyzing with the tracked stack as-is. See the
                 // `type_track` module docs for what's still deferred
-                // (scratch-slot per-index types, `#pragma typetrack`).
+                // (`#pragma typetrack`). Mirrors go's `ProgramKnowledge.reset`
+                // (`assembler.go:371-380`) resetting `scratchSpace` to
+                // `StackAny` for every slot alongside `bottom`/`deadcode` --
+                // see `Self::scratch_space`'s doc comment.
                 if !ops.type_track_disabled && ops.type_track_deadcode {
                     ops.type_track_deadcode = false;
                     ops.type_track_bottom_permissive = true;
+                    ops.scratch_space = [type_track::StackType::Any; 256];
                 }
                 tok_idx = 1;
                 if tok_idx >= tokens.len() {
@@ -3704,14 +3738,107 @@ mod tests {
     fn test_type_tracking_regression_scratch_after_callsub() {
         // TestTypeTrackingRegression: exercises that a permissive stack
         // established by `callsub`'s reset doesn't get "stuck" at a
-        // particular type on repeated `load`/`store` (this slice tracks
-        // `load`/`store` generically as `Any`, so it was never at risk of
-        // the specific bug go regression-tests here, but the shape is
-        // ported for parity coverage of the same source program).
+        // particular type on repeated `load`/`store`. `callsub` resets
+        // every scratch slot to `Any` (see `OpStream::scratch_space`), so
+        // `load 1`'s index (used by `stores`) and both `load 0`s type as
+        // `Any` throughout -- `Any` overlaps `stores`' `Uint64` index arg
+        // and `+`'s `Uint64` operands alike, so this must still assemble
+        // cleanly even with real per-slot scratch tracking now in place.
         assemble_string(
             "#pragma version 8\ncallsub end\nlabel1:\nload 1\nbyte 0x01\nstores\nload 0\nload 0\n+\nend:\n",
         )
         .unwrap();
+    }
+
+    // ── Scratch-slot per-index type tracking (issue #829, follow-up
+    // slice), ported from go-algorand's `TestScratchTypeCheck` and the
+    // message-observable case of `TestScratchBounds` in
+    // `assembler_test.go` ──────────────────────────────────────────────
+
+    #[test]
+    fn test_scratch_type_check() {
+        // TestScratchTypeCheck.
+
+        // All scratch slots should start as uint64.
+        assemble_string("#pragma version 8\nload 0\nint 1\n+\n").unwrap();
+
+        // Check load and store accurately using the scratch space.
+        let errs = expect_errors("#pragma version 8\nbyte 0x01\nstore 0\nload 0\nint 1\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("+ arg 0")),
+            "{errs:?}"
+        );
+
+        // Loads should know the type it's loading if all the slots are the
+        // same type.
+        let errs = expect_errors("#pragma version 8\nint 0\nloads\nbtoi\n");
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("btoi arg 0")),
+            "{errs:?}"
+        );
+
+        // Loads only knows the type when the slot index is a const.
+        let errs = expect_errors("#pragma version 8\nbyte 0x01\nstore 0\nint 1\nloads\nbtoi\n");
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("btoi arg 0")),
+            "{errs:?}"
+        );
+
+        // Loads doesn't know the type if it's the result of some other
+        // expression where we lose information.
+        assemble_string("#pragma version 8\nbyte 0x01\nstore 0\nload 0\nbtoi\nloads\nbtoi\n")
+            .unwrap();
+
+        // Stores should only set slots to StackAny if they are not the same
+        // type as what is being stored.
+        let errs = expect_errors(
+            "#pragma version 8\nbyte 0x01\nstore 0\nint 3\nbyte 0x01\nstores\nload 0\nint 1\n+\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("+ arg 0")),
+            "{errs:?}"
+        );
+
+        // ScratchSpace should reset after hitting a label in dead code.
+        assemble_string(
+            "#pragma version 8\nbyte 0x01\nstore 0\nb label1\nlabel1:\nload 0\nint 1\n+\n",
+        )
+        .unwrap();
+
+        // But it should reset to StackAny, not uint64.
+        assemble_string("#pragma version 8\nint 1\nstore 0\nb label1\nlabel1:\nload 0\nbtoi\n")
+            .unwrap();
+
+        // Callsubs should also reset the scratch space.
+        assemble_string(
+            "#pragma version 8\ncallsub A\nload 0\nbtoi\nreturn\nA:\nbyte 0x01\nstore 0\nretsub\n",
+        )
+        .unwrap();
+
+        // But the scratchspace should still be tracked after the callsub.
+        let errs = expect_errors(
+            "#pragma version 8\ncallsub A\nint 1\nstore 0\nload 0\nbtoi\nreturn\nA:\nretsub\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("btoi arg 0")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_scratch_bounds_type_mismatch() {
+        // TestScratchBounds's one message-observable assertion (its other
+        // assertions inspect go's internal `os.known.scratchSpace[i].Bound`
+        // directly -- exact numeric bound tracking remains deferred, see
+        // the `type_track` module docs' "Bounds-refined types" section):
+        // `store 1` records slot 1 as `Bytes`, so `load 1` feeding `return`
+        // (which needs `Uint64`) is a type mismatch.
+        let errs = expect_errors("#pragma version 8\nbyte 0xff\nstore 1\nload 1\nreturn\n");
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("return arg 0")
+                && e.message.contains("wanted type uint64")),
+            "{errs:?}"
+        );
     }
 
     #[test]
