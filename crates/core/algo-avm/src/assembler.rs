@@ -4356,4 +4356,74 @@ mod tests {
         assemble_string("#pragma version 8\nerr\nstore 0\n").unwrap();
         assemble_string("#pragma version 8\nint 1\nreturn\nstore 0\n").unwrap();
     }
+
+    // ── `itxn_field`'s field-type-aware refinement (issue #829, slice 7):
+    // TestTxTypes (assembler_test.go:3373-3384) ─────────────────────────
+
+    #[test]
+    fn test_itxn_field_type_checks_ported_from_go() {
+        // TestTxTypes: `itxn_field Sender` refines its popped-value type
+        // to `Sender`'s own type (`Bytes`, an address in go's bounds-aware
+        // model -- see `itxn_field_type`'s doc comment on why the
+        // bound-free `Bytes` match here is exactly as precise as go's for
+        // this verdict). An `int` value is a genuine type mismatch.
+        let errs = expect_errors("#pragma version 8\nitxn_begin\nint 1\nitxn_field Sender\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.starts_with("itxn_field Sender arg 0")
+                    && e.message.contains("wanted type []byte got uint64")),
+            "{errs:?}"
+        );
+
+        // A `byte` value is correctly typed for `Sender`.
+        assemble_string(
+            "#pragma version 8\nitxn_begin\nbyte 0x0102030405060708091011121314151617181920212223242526272829303132\nitxn_field Sender\n",
+        )
+        .unwrap();
+
+        // `itxn_field Amount` refines to `Uint64` -- a `byte` value is a
+        // genuine mismatch, the reverse of the `Sender` case above.
+        let errs = expect_errors("#pragma version 8\nitxn_begin\nbyte 0x1234\nitxn_field Amount\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.starts_with("itxn_field Amount arg 0")
+                    && e.message.contains("wanted type uint64 got []byte")),
+            "{errs:?}"
+        );
+
+        // An `int` value is correctly typed for `Amount`.
+        assemble_string("#pragma version 8\nitxn_begin\nint 1\nitxn_field Amount\n").unwrap();
+    }
+
+    #[test]
+    fn test_itxn_field_missing_arg_is_a_height_error_not_a_type_error() {
+        // TestTxTypes: `itxn_field Sender` with nothing on the stack is
+        // still just the base proto's ordinary height error -- the field
+        // refinement only changes the *type* checked once an argument is
+        // actually there to check, matching go's `typeTxField` being
+        // consulted only after `trackStack`'s height check passes.
+        let errs = expect_errors("#pragma version 8\nitxn_begin\nitxn_field Sender\n");
+        assert!(
+            errs.iter().any(|e| e
+                .message
+                .starts_with("itxn_field Sender expects 1 stack argument")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_itxn_field_unrecognized_field_name_falls_back_to_any() {
+        // typeTxField's `!ok` early return (assembler.go:1536-1539): an
+        // unrecognized field name leaves the base proto's opaque `Any` pop
+        // untouched, so any value type is accepted here -- the unknown
+        // field name is reported as its own, unrelated assembly error
+        // elsewhere, not as a type mismatch.
+        let errs = expect_errors("#pragma version 8\nitxn_begin\nint 1\nitxn_field NotAField\n");
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.message.contains("wanted type") && e.message.contains("NotAField")),
+            "{errs:?}"
+        );
+    }
 }

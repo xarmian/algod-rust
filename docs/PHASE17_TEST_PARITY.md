@@ -53,13 +53,13 @@ per-area split of the former).
 |---|---|---|
 | `partial` | 749 | 24% |
 | `matched-1:1` | 675 | 21% |
-| `matched-1:many` | 543 | 17% |
+| `matched-1:many` | 544 | 17% |
 | `out-of-scope` | 381 | 12% |
-| `not-implemented` | 333 | 10% |
+| `not-implemented` | 332 | 10% |
 | `missing-test` | 293 | 9% |
 | `matched-many:1` | 205 | 6% |
 
-**626 rows (`not-implemented` + `missing-test`, 20%) are real, actionable
+**625 rows (`not-implemented` + `missing-test`, 20%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
 implements but never tests. `partial` (749, 24%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
@@ -71,7 +71,7 @@ were triaged into tracked issues.
 
 | area | file | total | 1:1 | 1:many | many:1 | partial | not-impl | missing-test | out-of-scope |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 84 | 151 | 6 | 121 | 16 | 47 | 24 |
+| AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 84 | 152 | 6 | 121 | 15 | 47 | 24 |
 | Transactions core (`data/transactions`) | [parity_txn_core.md](phase17/parity_txn_core.md) | 173 | 31 | 32 | 0 | 68 | 31 | 10 | 1 |
 | Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 42 | 99 | 43 | 133 | 39 | 10 | 137 |
 | Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 6 | 16 | 0 | 19 | 9 | 17 | 1 |
@@ -86,5 +86,5 @@ were triaged into tracked issues.
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 19 | 19 | 7 | 21 | 61 | 4 | 42 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 22 | 9 | 0 | 16 | 5 | 4 | 1 |
-| **Total** | | **3,179** | **675** | **543** | **205** | **749** | **333** | **293** | **381** |
+| **Total** | | **3,179** | **675** | **544** | **205** | **749** | **332** | **293** | **381** |
 
