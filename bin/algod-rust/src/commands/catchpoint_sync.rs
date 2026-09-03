@@ -28,7 +28,7 @@ use algo_error::AlgoError;
 use algo_ledger::sync::{SyncBackend, SyncConfig, SyncOrchestrator};
 use algo_rest_client::{
     AlgodClient, BlockSource, CatchpointDownloader, GossipBlockSource, HttpBlockFetcher,
-    ParallelBlockFetcher,
+    ParallelBlockFetcher, RankedCatchpointSource,
 };
 use algo_types::{Block, Round};
 use tokio_util::sync::CancellationToken;
@@ -38,14 +38,23 @@ use tracing::{debug, info, warn};
 // AlgodSyncBackend — real SyncBackend using AlgodClient
 // ---------------------------------------------------------------------------
 
-/// A real [`SyncBackend`] implementation backed by [`AlgodClient`] and
-/// [`CatchpointDownloader`].
+/// A real [`SyncBackend`] implementation backed by [`AlgodClient`] and a
+/// [`RankedCatchpointSource`].
 ///
 /// This bridges the gap between `algo-ledger` (which cannot depend on
 /// `algo-rest-client`) and the actual network operations needed for sync.
+///
+/// Catchpoint downloads route through [`RankedCatchpointSource`] (issue
+/// #901) rather than a single fixed [`CatchpointDownloader`): the primary
+/// `algod_url` plus any additional `catchpoint_peer_urls` are all ranked by
+/// historical download performance, mirroring go's
+/// `CatchpointCatchupService.blocksDownloadPeerSelector`. With no extra
+/// peers configured (the common case today) this is behaviorally identical
+/// to the old single-source downloader — ranking with exactly one
+/// candidate always selects that candidate.
 struct AlgodSyncBackend {
     client: AlgodClient,
-    downloader: CatchpointDownloader,
+    catchpoint_source: RankedCatchpointSource,
     /// Tokio runtime handle for running async operations from sync context.
     rt: tokio::runtime::Handle,
     /// Stored URL for constructing parallel fetchers.
@@ -55,13 +64,34 @@ struct AlgodSyncBackend {
 }
 
 impl AlgodSyncBackend {
-    fn new(algod_url: &str, algod_token: &str) -> Self {
+    /// Ranks the catchpoint file download across `algod_url` plus
+    /// `extra_catchpoint_peer_urls` instead of using `algod_url` alone
+    /// (issue #901's peer-ranked catchpoint source selection).
+    /// Block/status/certificate operations still go through `algod_url`
+    /// only — only the catchpoint-file fetch benefits from multiple
+    /// candidate peers today. An empty `extra_catchpoint_peer_urls` is
+    /// behaviorally identical to the old single-source downloader: ranking
+    /// with exactly one candidate always selects that candidate.
+    fn with_catchpoint_peers(
+        algod_url: &str,
+        algod_token: &str,
+        extra_catchpoint_peer_urls: &[String],
+    ) -> Self {
         let client = AlgodClient::new(algod_url, algod_token);
-        let downloader = CatchpointDownloader::new(algod_url, algod_token);
+        let mut peers = vec![(algod_url.to_string(), algod_token.to_string())];
+        peers.extend(
+            extra_catchpoint_peer_urls
+                .iter()
+                .map(|u| (u.clone(), algod_token.to_string())),
+        );
+        let catchpoint_source = RankedCatchpointSource::new(
+            &peers,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+        );
         let rt = tokio::runtime::Handle::current();
         Self {
             client,
-            downloader,
+            catchpoint_source,
             rt,
             algod_url: algod_url.to_string(),
             algod_token: algod_token.to_string(),
@@ -82,10 +112,8 @@ impl SyncBackend for AlgodSyncBackend {
     ) -> Result<(), AlgoError> {
         tokio::task::block_in_place(|| {
             self.rt.block_on(async {
-                self.downloader
-                    .download::<fn(algo_rest_client::DownloadProgress)>(
-                        genesis_id, round, dest_path, None,
-                    )
+                self.catchpoint_source
+                    .download(genesis_id, round, dest_path, None)
                     .await
             })
         })
@@ -933,6 +961,7 @@ pub async fn run(
     fail_fast: bool,
     end: Option<u64>,
     accounts_rebuild_synchronous_mode: i64,
+    catchpoint_peer_urls: &[String],
 ) -> anyhow::Result<()> {
     // Determine the catchpoint label to use.
     let label = match (catchpoint_label, catchpoint_auto) {
@@ -995,8 +1024,12 @@ pub async fn run(
         cancel_clone.cancel();
     });
 
-    // Create the real backend and orchestrator.
-    let backend = AlgodSyncBackend::new(algod_url, algod_token);
+    // Create the real backend and orchestrator. Extra catchpoint peer URLs
+    // (issue #901) add ranked candidates for the catchpoint-file download
+    // alongside the primary algod_url; block/status calls still use
+    // algod_url only.
+    let backend =
+        AlgodSyncBackend::with_catchpoint_peers(algod_url, algod_token, catchpoint_peer_urls);
     let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
     orchestrator.set_cancel(cancel);
     orchestrator.set_progress_callback(Box::new(|progress| {

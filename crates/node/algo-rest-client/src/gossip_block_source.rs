@@ -36,8 +36,8 @@
 //! 4. Decode each payload from msgpack into `Block` and cert `Value`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use algo_codec::decode_block;
 use algo_error::{AlgoError, Result};
@@ -47,9 +47,46 @@ use tracing::{debug, warn};
 
 use algo_network::block_fetcher::{make_block_request_topics, parse_block_response};
 use algo_network::gossip_node::UnicastPeer;
+use algo_network::peer_ranker::{
+    create_peer_selector, ClassBasedPeerSelector, PeerClassKind, PeerSelector, PeersRetriever,
+    PEER_RANK_DOWNLOAD_FAILED,
+};
 use algo_network::tag::Tag;
 
 use crate::{BlockSource, NodeStatus};
+
+// ---------------------------------------------------------------------------
+// Peer-ranking wiring
+// ---------------------------------------------------------------------------
+
+/// Feeds [`GossipBlockSource`]'s live peer-address list into the
+/// [`ClassBasedPeerSelector`] ranker.
+///
+/// All configured peers are reported under the `ConnectedOut` class (the
+/// class go-algorand uses for a node's own outbound connections in
+/// `catchup/service.go`'s `createPeerSelector`), since `GossipBlockSource`'s
+/// flat `Arc<dyn UnicastPeer>` list carries no phonebook-relay/archival/
+/// inbound distinction at this layer. Every other class always reports no
+/// peers, so [`ClassBasedPeerSelector`] falls straight through to
+/// `ConnectedOut` — the same class ordering `create_peer_selector` uses,
+/// preserved here for topology parity with go's real wiring rather than
+/// collapsing to a single flat [`PeerRanker`].
+struct GossipPeersRetriever {
+    addrs: StdMutex<Vec<String>>,
+}
+
+impl PeersRetriever for GossipPeersRetriever {
+    fn get_peers(&self, class: PeerClassKind) -> Vec<String> {
+        if class == PeerClassKind::ConnectedOut {
+            self.addrs
+                .lock()
+                .expect("peer address list lock poisoned")
+                .clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -95,14 +132,25 @@ impl Default for GossipBlockSourceConfig {
 
 /// A [`BlockSource`] that fetches blocks from peers via WebSocket unicast.
 ///
-/// Peers are tried in round-robin order. On failure, the next peer is
+/// Peer selection is delegated to a [`ClassBasedPeerSelector`] (issue #901),
+/// so that a peer which has recently been slow or unreliable is
+/// deprioritized in favor of a better-ranked one — mirroring go-algorand's
+/// `catchup/service.go` `fetchAndWrite`, which calls
+/// `peerSelector.getNextPeer()`/`rankPeer()` around each block fetch rather
+/// than cycling peers in a fixed order. On failure, the next-ranked peer is
 /// attempted up to [`GossipBlockSourceConfig::max_peer_attempts`] times.
 pub struct GossipBlockSource {
     /// The set of unicast peers available for block requests.
     peers: Vec<Arc<dyn UnicastPeer>>,
 
-    /// Round-robin index into `peers` (wraps around).
-    next_peer: AtomicU64,
+    /// Live peer-address list backing `peer_selector`'s retriever, kept in
+    /// sync with `peers` (including across `set_peers`).
+    peer_addrs: Arc<GossipPeersRetriever>,
+
+    /// Ranks peers by historical download performance and picks the next
+    /// peer to try. Guarded by a std `Mutex` since selection/ranking are
+    /// synchronous, in-memory operations never held across an `.await`.
+    peer_selector: StdMutex<ClassBasedPeerSelector>,
 
     /// The last round successfully fetched (used for `get_status`).
     last_fetched_round: AtomicU64,
@@ -119,9 +167,16 @@ impl GossipBlockSource {
 
     /// Create a new `GossipBlockSource` with the given peers and custom config.
     pub fn with_config(peers: Vec<Arc<dyn UnicastPeer>>, config: GossipBlockSourceConfig) -> Self {
+        let peer_addrs = Arc::new(GossipPeersRetriever {
+            addrs: StdMutex::new(peers.iter().map(|p| p.get_address().to_string()).collect()),
+        });
+        let peer_selector = StdMutex::new(create_peer_selector(
+            peer_addrs.clone() as Arc<dyn PeersRetriever>
+        ));
         Self {
             peers,
-            next_peer: AtomicU64::new(0),
+            peer_addrs,
+            peer_selector,
             last_fetched_round: AtomicU64::new(0),
             config,
         }
@@ -129,24 +184,18 @@ impl GossipBlockSource {
 
     /// Replace the peer set (e.g. after a phonebook refresh).
     pub fn set_peers(&mut self, peers: Vec<Arc<dyn UnicastPeer>>) {
+        *self
+            .peer_addrs
+            .addrs
+            .lock()
+            .expect("peer address list lock poisoned") =
+            peers.iter().map(|p| p.get_address().to_string()).collect();
         self.peers = peers;
-        self.next_peer.store(0, Ordering::SeqCst);
     }
 
     /// Returns the number of peers currently configured.
     pub fn peer_count(&self) -> usize {
         self.peers.len()
-    }
-
-    /// Select the next peer in round-robin order.
-    ///
-    /// Returns `None` if there are no peers.
-    fn select_peer(&self) -> Option<Arc<dyn UnicastPeer>> {
-        if self.peers.is_empty() {
-            return None;
-        }
-        let idx = self.next_peer.fetch_add(1, Ordering::Relaxed) as usize % self.peers.len();
-        Some(Arc::clone(&self.peers[idx]))
     }
 
     /// Fetch a block from a single peer via WS unicast, returning both the
@@ -215,16 +264,46 @@ impl GossipBlockSource {
             });
         }
 
-        let attempts = self.config.max_peer_attempts.min(self.peers.len());
+        // Unlike round-robin (where each attempt was guaranteed a distinct
+        // peer, so capping attempts at `peers.len()` made sense), ranked
+        // selection offers no such guarantee: the ranker can legitimately
+        // return the same (currently best-ranked, or only-untried-enough)
+        // peer more than once before a failing peer's rank has moved far
+        // enough to fall behind a reliable one — e.g. two peers landing in
+        // the same rank bucket and being tie-broken at random. Capping
+        // attempts at the peer count risked exhausting the retry budget on
+        // the same bad peer twice while a good one sat untried. Use the
+        // full configured attempt budget instead, decoupled from peer
+        // count — closer to go's `catchupRetryLimit`, which is likewise
+        // independent of how many peers are available.
+        let attempts = self.config.max_peer_attempts;
         let mut last_err = None;
 
         for attempt in 0..attempts {
-            let peer = match self.select_peer() {
-                Some(p) => p,
+            // Ask the ranker for the next peer to try (lowest-rank
+            // non-empty pool, ties broken at random) rather than cycling
+            // through `peers` in a fixed order.
+            let psp = {
+                let mut selector = self
+                    .peer_selector
+                    .lock()
+                    .expect("peer selector lock poisoned");
+                selector.get_next_peer()
+            };
+            let psp = match psp {
+                Ok(psp) => psp,
+                Err(_) => {
+                    // No peer pools available at all (e.g. every peer has
+                    // been dropped from the retriever's live list).
+                    break;
+                }
+            };
+            let peer = match self.peers.iter().find(|p| p.get_address() == psp.peer_id) {
+                Some(p) => Arc::clone(p),
                 None => {
-                    return Err(AlgoError::Network {
-                        message: "no peers available for block fetch".into(),
-                    })
+                    // Stale entry (peer removed since the selector last
+                    // refreshed its pools) — try the next-ranked peer.
+                    continue;
                 }
             };
 
@@ -233,11 +312,25 @@ impl GossipBlockSource {
                 peer = peer.get_address(),
                 attempt = attempt + 1,
                 max_attempts = attempts,
-                "requesting block via WS unicast"
+                "requesting block via WS unicast (ranked selection)"
             );
 
+            let started = Instant::now();
             match self.fetch_from_peer(peer.as_ref(), round).await {
                 Ok((response, raw_block_data)) => {
+                    // Mirrors go's `peerSelector.peerDownloadDurationToRank`
+                    // + `rankPeer` call in `fetchAndWrite` on success: feed
+                    // the observed download duration back into the ranker
+                    // so a consistently fast peer is preferred next time.
+                    let elapsed = started.elapsed();
+                    let mut selector = self
+                        .peer_selector
+                        .lock()
+                        .expect("peer selector lock poisoned");
+                    let rank = selector.peer_download_duration_to_rank(&psp, elapsed);
+                    selector.rank_peer(&psp, rank);
+                    drop(selector);
+
                     self.last_fetched_round
                         .fetch_max(round.0, Ordering::Relaxed);
                     return Ok((response, raw_block_data));
@@ -248,8 +341,16 @@ impl GossipBlockSource {
                         peer = peer.get_address(),
                         attempt = attempt + 1,
                         error = %e,
-                        "WS block fetch failed, trying next peer"
+                        "WS block fetch failed, ranking peer down and trying next"
                     );
+                    // Mirrors go's `peerSelector.rankPeer(psp,
+                    // peerRankDownloadFailed)` on a failed fetch.
+                    let mut selector = self
+                        .peer_selector
+                        .lock()
+                        .expect("peer selector lock poisoned");
+                    selector.rank_peer(&psp, PEER_RANK_DOWNLOAD_FAILED);
+                    drop(selector);
                     last_err = Some(e);
                 }
             }
@@ -376,6 +477,7 @@ mod tests {
     use super::*;
     use algo_network::errors::PeerError;
     use algo_network::topics::{Topic, Topics, BLOCK_DATA_KEY, CERT_DATA_KEY, ERROR_KEY};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -386,6 +488,12 @@ mod tests {
         addr: String,
         /// Responses to serve, keyed by round. Each entry is consumed on use.
         responses: Mutex<std::collections::HashMap<u64, MockResponse>>,
+        /// Number of times `request()` was invoked on this peer — used to
+        /// assert which peer the ranked selector actually chose.
+        request_count: AtomicUsize,
+        /// If `true`, every request fails with `ConnectionClosed` regardless
+        /// of `responses`, simulating a consistently unreliable peer.
+        always_fail: bool,
     }
 
     enum MockResponse {
@@ -405,6 +513,8 @@ mod tests {
             Self {
                 addr: addr.to_string(),
                 responses: Mutex::new(std::collections::HashMap::new()),
+                request_count: AtomicUsize::new(0),
+                always_fail: false,
             }
         }
 
@@ -434,6 +544,18 @@ mod tests {
                 .insert(round, MockResponse::RequestError(err));
             self
         }
+
+        /// Marks this peer as consistently unreliable: every `request()`
+        /// call fails, regardless of which round is requested or what's in
+        /// `responses`.
+        fn always_failing(mut self) -> Self {
+            self.always_fail = true;
+            self
+        }
+
+        fn request_count(&self) -> usize {
+            self.request_count.load(Ordering::Relaxed)
+        }
     }
 
     impl algo_network::gossip_node::Peer for MockPeer {
@@ -457,6 +579,12 @@ mod tests {
             _tag: Tag,
             topics: Topics,
         ) -> std::result::Result<Topics, PeerError> {
+            self.request_count.fetch_add(1, Ordering::Relaxed);
+
+            if self.always_fail {
+                return Err(PeerError::ConnectionClosed);
+            }
+
             // Extract the round from the request topics.
             let round_bytes = topics
                 .get_value("roundKey")
@@ -579,7 +707,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round_robin_peer_selection() {
+    async fn ranked_selection_fails_over_when_the_chosen_peer_lacks_the_round() {
+        // Each peer only has one of the two rounds configured. Ranked
+        // selection (unlike a fixed index order) may pick either peer
+        // first, but with `max_peer_attempts >= 2` it must fail over to
+        // the peer that actually has the requested round.
         let block1 = make_block_msgpack(1);
         let block2 = make_block_msgpack(2);
         let cert = make_cert_msgpack();
@@ -591,13 +723,74 @@ mod tests {
 
         let src = GossipBlockSource::new(vec![peer_a, peer_b]);
 
-        // First fetch goes to peer_a (index 0).
         let r1 = src.get_block(Round(1)).await.unwrap();
         assert_eq!(r1.block.round.0, 1);
 
-        // Second fetch goes to peer_b (index 1).
         let r2 = src.get_block(Round(2)).await.unwrap();
         assert_eq!(r2.block.round.0, 2);
+    }
+
+    #[tokio::test]
+    async fn ranked_selector_prefers_the_reliable_peer_after_the_unreliable_one_fails() {
+        // TDD regression for issue #901: GossipBlockSource must route block
+        // fetches through the peer_ranker's ClassBasedPeerSelector rather
+        // than plain round-robin, and must feed fetch outcomes back into
+        // it, so a peer that fails is deprioritized in favor of a
+        // consistently reliable one for subsequent fetches.
+        //
+        // This must fail against the old round-robin `select_peer()`
+        // (which alternates peers on a fixed index regardless of past
+        // outcomes, so the unreliable peer would still be picked roughly
+        // half the time) and pass once ranked selection with feedback is
+        // wired in.
+        let cert = make_cert_msgpack();
+        let bad: Arc<MockPeer> = Arc::new(MockPeer::new("bad-peer:4160").always_failing());
+        let good: Arc<MockPeer> = Arc::new(MockPeer::new("good-peer:4160"));
+
+        // Configure the reliable peer to serve every round used below.
+        const ROUNDS: u64 = 10;
+        {
+            let mut good_ref = good.responses.lock().unwrap();
+            for round in 1..=ROUNDS {
+                good_ref.insert(
+                    round,
+                    MockResponse::Success {
+                        block_data: make_block_msgpack(round),
+                        cert_data: cert.clone(),
+                    },
+                );
+            }
+        }
+
+        let src = GossipBlockSource::new(vec![
+            bad.clone() as Arc<dyn UnicastPeer>,
+            good.clone() as Arc<dyn UnicastPeer>,
+        ]);
+
+        for round in 1..=ROUNDS {
+            let resp = src
+                .get_block(Round(round))
+                .await
+                .unwrap_or_else(|e| panic!("round {round} fetch failed: {e}"));
+            assert_eq!(resp.block.round.0, round);
+        }
+
+        // Both peers start tied, so the bad peer may unavoidably be tried
+        // once (or, worst case, twice within a single round's two allowed
+        // attempts) before the ranker learns it always fails. After that
+        // it must be consistently deprioritized: across 10 rounds it
+        // should be touched only in that initial settling window, while
+        // the reliable peer should serve nearly every fetch.
+        assert!(
+            bad.request_count() <= 2,
+            "unreliable peer should be deprioritized after failing, but was retried {} times",
+            bad.request_count()
+        );
+        assert!(
+            good.request_count() >= ROUNDS as usize - 2,
+            "reliable peer should be preferred for almost every fetch, got {} of {ROUNDS} requests",
+            good.request_count()
+        );
     }
 
     #[tokio::test]

@@ -770,6 +770,70 @@ impl PeerSelector for ClassBasedPeerSelector {
     }
 }
 
+/// Returns the [`ClassBasedPeerSelector`] used for ordinary block-fetch
+/// catchup: outbound-connected peers first (tolerance 3), then phonebook
+/// relays (tolerance 3), then phonebook archival nodes (tolerance 10), then
+/// inbound-connected peers (tolerance 3).
+///
+/// Mirrors Go's `catchup/service.go`'s `createPeerSelector`, whose class
+/// order and tolerance factors are load-bearing (asserted by
+/// `TestCreatePeerSelector` in go and its Rust port below) — a peer that
+/// keeps failing in one class is skipped in favor of the next class only
+/// after exceeding that class's tolerance, not immediately.
+pub fn create_peer_selector(net: Arc<dyn PeersRetriever>) -> ClassBasedPeerSelector {
+    let wrapped = vec![
+        WrappedPeerSelector {
+            peer_class: PeerClassKind::ConnectedOut,
+            selector: Box::new(PeerRanker::new(
+                net.clone(),
+                vec![PeerClass {
+                    initial_rank: PEER_RANK_INITIAL_FIRST_PRIORITY,
+                    class: PeerClassKind::ConnectedOut,
+                }],
+            )),
+            tolerance_factor: 3,
+            download_failures: 0,
+        },
+        WrappedPeerSelector {
+            peer_class: PeerClassKind::PhonebookRelays,
+            selector: Box::new(PeerRanker::new(
+                net.clone(),
+                vec![PeerClass {
+                    initial_rank: PEER_RANK_INITIAL_FIRST_PRIORITY,
+                    class: PeerClassKind::PhonebookRelays,
+                }],
+            )),
+            tolerance_factor: 3,
+            download_failures: 0,
+        },
+        WrappedPeerSelector {
+            peer_class: PeerClassKind::PhonebookArchivalNodes,
+            selector: Box::new(PeerRanker::new(
+                net.clone(),
+                vec![PeerClass {
+                    initial_rank: PEER_RANK_INITIAL_FIRST_PRIORITY,
+                    class: PeerClassKind::PhonebookArchivalNodes,
+                }],
+            )),
+            tolerance_factor: 10,
+            download_failures: 0,
+        },
+        WrappedPeerSelector {
+            peer_class: PeerClassKind::ConnectedIn,
+            selector: Box::new(PeerRanker::new(
+                net,
+                vec![PeerClass {
+                    initial_rank: PEER_RANK_INITIAL_FIRST_PRIORITY,
+                    class: PeerClassKind::ConnectedIn,
+                }],
+            )),
+            tolerance_factor: 3,
+            download_failures: 0,
+        },
+    ];
+    ClassBasedPeerSelector::new(wrapped)
+}
+
 /// Returns a [`ClassBasedPeerSelector`] preferring relay nodes (tolerance 3)
 /// before falling back to archival nodes (tolerance 10) — the preferred
 /// configuration for the catchpoint service.
@@ -1655,5 +1719,32 @@ mod tests {
         let psp = cps.get_next_peer().unwrap();
         assert_eq!(psp.peer_id, "p2");
         assert_eq!(psp.peer_class, PeerClassKind::PhonebookArchivalNodes);
+    }
+
+    // -- create_peer_selector topology matches go's createPeerSelector
+    //    (TestCreatePeerSelector, catchup/service_test.go) --
+
+    #[test]
+    fn create_peer_selector_matches_go_topology() {
+        let net: Arc<dyn PeersRetriever> = Arc::new(StubRetriever(|_| Vec::new()));
+        let cps = create_peer_selector(net);
+
+        assert_eq!(cps.selectors().len(), 4);
+
+        assert_eq!(cps.selectors()[0].peer_class, PeerClassKind::ConnectedOut);
+        assert_eq!(
+            cps.selectors()[1].peer_class,
+            PeerClassKind::PhonebookRelays
+        );
+        assert_eq!(
+            cps.selectors()[2].peer_class,
+            PeerClassKind::PhonebookArchivalNodes
+        );
+        assert_eq!(cps.selectors()[3].peer_class, PeerClassKind::ConnectedIn);
+
+        assert_eq!(cps.selectors()[0].tolerance_factor, 3);
+        assert_eq!(cps.selectors()[1].tolerance_factor, 3);
+        assert_eq!(cps.selectors()[2].tolerance_factor, 10);
+        assert_eq!(cps.selectors()[3].tolerance_factor, 3);
     }
 }

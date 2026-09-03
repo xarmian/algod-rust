@@ -286,6 +286,17 @@ pub enum Commands {
         /// go-matching defaults.
         #[arg(long)]
         data_dir: Option<PathBuf>,
+
+        /// Additional algod REST base URL(s) to consider as candidate
+        /// sources for the catchpoint-file download (can be repeated).
+        /// Catchpoint mode only. When given, the catchpoint download is
+        /// ranked across `--algod-url` plus these peers by historical
+        /// download performance (issue #901) instead of using
+        /// `--algod-url` alone — a peer that fails is deprioritized in
+        /// favor of a better-ranked one on the next retry. Block/status
+        /// fetches are unaffected and continue to use `--algod-url`.
+        #[arg(long)]
+        catchpoint_peer_url: Vec<String>,
     },
 
     /// Catchpoint operations: import, verify, export, and download catchpoint files.
