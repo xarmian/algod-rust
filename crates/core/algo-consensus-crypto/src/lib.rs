@@ -30,6 +30,7 @@
 
 mod f128;
 pub mod kdf;
+pub mod light_block_header;
 pub mod merklearray;
 pub mod merklesig;
 pub mod merklesignature;

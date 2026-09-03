@@ -579,29 +579,39 @@ pub trait LedgerStore {
     // bounds go's *in-memory* prover cache, not disk retention -- does not
     // apply here).
 
-    /// Store the full participant array selected for the voters snapshot at
-    /// `round`, alongside the compact commitment [`Self::put_voters_snapshot`]
-    /// stores. Called at the same point, in the same transaction, as
-    /// [`Self::put_voters_snapshot`] -- see `crate::voters_tracker::
-    /// record_voters_snapshot`.
+    /// Store the full, address-tagged participant array selected for the
+    /// voters snapshot at `round`, alongside the compact commitment
+    /// [`Self::put_voters_snapshot`] stores. Called at the same point, in
+    /// the same transaction, as [`Self::put_voters_snapshot`] -- see
+    /// `crate::voters_tracker::record_voters_snapshot`.
+    ///
+    /// The address tag on each participant (issue #814's live-daemon-wiring
+    /// scope, extending issue #912's original participant-only persistence)
+    /// is what lets a signing/proving daemon build `Address -> position`
+    /// (go: `voters.AddrToPos`) for a signature it receives over gossip,
+    /// long after the snapshot round's own live account state may be gone.
     fn put_voters_participants(
         &mut self,
         round: u64,
-        participants: &[algo_consensus_crypto::stateproof::Participant],
+        participants: &[(algo_types::Address, algo_consensus_crypto::stateproof::Participant)],
     ) -> Result<(), AlgoError> {
         let _ = (round, participants);
         Ok(())
     }
 
-    /// Retrieve the full participant array recorded for the voters snapshot
-    /// at `round`, if any. The vector-commitment tree itself is not stored
-    /// -- `crate::voters::commit_participants` deterministically rebuilds
-    /// it (byte-for-byte, including the root) from this array alone; see
-    /// `crate::voters_tracker::voters_participants_and_tree`.
+    /// Retrieve the full, address-tagged participant array recorded for the
+    /// voters snapshot at `round`, if any. The vector-commitment tree itself
+    /// is not stored -- `crate::voters::commit_participants` deterministically
+    /// rebuilds it (byte-for-byte, including the root) from the participant
+    /// half of this array alone; see `crate::voters_tracker::
+    /// voters_participants_and_tree`.
     fn get_voters_participants(
         &self,
         round: u64,
-    ) -> Result<Option<Vec<algo_consensus_crypto::stateproof::Participant>>, AlgoError> {
+    ) -> Result<
+        Option<Vec<(algo_types::Address, algo_consensus_crypto::stateproof::Participant)>>,
+        AlgoError,
+    > {
         let _ = round;
         Ok(None)
     }

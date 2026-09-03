@@ -280,11 +280,19 @@ pub fn record_voters_snapshot<L: LedgerStore>(
     );
 
     store.put_voters_snapshot(round, root, total_weight)?;
-    // Full participant array (issue #912): persisted alongside the compact
-    // commitment above, at the same round key, so a state-proof
-    // signing/proving daemon can later rebuild the vector-commitment tree
-    // and a `stateproof::Prover` -- see `voters_participants_and_tree`.
-    store.put_voters_participants(round, &participants)
+    // Full, address-tagged participant array (issue #912, extended by
+    // issue #814 to carry each participant's address): persisted alongside
+    // the compact commitment above, at the same round key, so a
+    // state-proof signing/proving daemon can later rebuild the
+    // vector-commitment tree, a `stateproof::Prover`, and (via the address
+    // tag) an `Address -> position` map for signatures received over
+    // gossip -- see `voters_participants_and_tree`.
+    let addressed: Vec<(algo_types::Address, crypto_sp::Participant)> = selected
+        .iter()
+        .map(|c| c.address)
+        .zip(participants)
+        .collect();
+    store.put_voters_participants(round, &addressed)
 }
 
 /// Prune voters snapshots no longer needed, given the block just applied at
@@ -344,12 +352,41 @@ pub fn voters_participants_and_tree<L: LedgerStore>(
     store: &L,
     round: u64,
 ) -> Result<Option<(Vec<crypto_sp::Participant>, merklearray::Tree)>, AlgoError> {
-    let Some(participants) = store.get_voters_participants(round)? else {
+    let Some(addressed) = store.get_voters_participants(round)? else {
         return Ok(None);
     };
+    let participants: Vec<crypto_sp::Participant> =
+        addressed.into_iter().map(|(_, p)| p).collect();
     let tree = commit_participants(&participants)
         .map_err(|e| ledger_err(format!("voters_participants_and_tree: {e}")))?;
     Ok(Some((participants, tree)))
+}
+
+/// `Address -> vector-commitment position` for the voters snapshot recorded
+/// at `round` (go: `voters.AddrToPos`) -- issue #814's live-daemon-wiring
+/// scope: a signing/proving daemon needs this to map an arbitrary signer's
+/// address (from its own participation keys, or from a peer's gossiped
+/// `StateProofSig`) to its position in the [`voters_participants_and_tree`]
+/// array, without needing the live account state that selected it in the
+/// first place (which may no longer be queryable by the time signing/
+/// gathering happens -- see this module's doc comment).
+///
+/// Returns `None` under the same conditions as
+/// [`voters_participants_and_tree`] (no snapshot recorded for `round`).
+pub fn voters_addr_to_pos<L: LedgerStore>(
+    store: &L,
+    round: u64,
+) -> Result<Option<std::collections::BTreeMap<algo_types::Address, u64>>, AlgoError> {
+    let Some(addressed) = store.get_voters_participants(round)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        addressed
+            .into_iter()
+            .enumerate()
+            .map(|(pos, (addr, _))| (addr, pos as u64))
+            .collect(),
+    ))
 }
 
 /// Resolve `(voters_commitment, online_total_weight)` for the block being

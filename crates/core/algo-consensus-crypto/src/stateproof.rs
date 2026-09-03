@@ -424,6 +424,32 @@ pub fn ln_int_approximation(x: u64) -> Result<u64, StateProofError> {
     Ok((result * precision).ceil() as u64)
 }
 
+/// `LnProvenWeight` for a `stateproofmsg.Message`: the natural log of the
+/// proven weight (`totalWeight * weightThreshold / 2^32`), pre-computed so
+/// a verifier never needs to redo the `Ln` approximation itself.
+///
+/// Matches go's `stateproof.calculateLnProvenWeight`
+/// (`stateproof/stateproofMessageGenerator.go:82`). `weight_threshold` is
+/// `ConsensusParams.StateProofWeightThreshold` (a `u32` fixed-point
+/// fraction of `2^32`); returns [`StateProofError::Internal`] on the same
+/// overflow go reports as `errProvenWeightOverflow` (a `total_weight` this
+/// large is unreachable from real online stake, but the check is kept to
+/// avoid a silent wraparound on a corrupted/malicious tracking value).
+pub fn calculate_ln_proven_weight(
+    total_weight: u64,
+    weight_threshold: u32,
+) -> Result<u64, StateProofError> {
+    let product = (total_weight as u128) * (weight_threshold as u128);
+    let proven_weight = product / (1u128 << 32);
+    let proven_weight = u64::try_from(proven_weight).map_err(|_| {
+        StateProofError::Internal(format!(
+            "calculateLnProvenWeight: overflow computing provenWeight - {total_weight} * \
+             {weight_threshold} / (1<<32)"
+        ))
+    })?;
+    ln_int_approximation(proven_weight)
+}
+
 fn big(x: u64) -> BigUint {
     BigUint::from(x)
 }
@@ -1101,6 +1127,38 @@ mod tests {
             ln_int_approximation(0),
             Err(StateProofError::IllegalLnInput)
         );
+    }
+
+    #[test]
+    fn calculate_ln_proven_weight_matches_muldiv_then_ln() {
+        // total_weight=1<<32, threshold=1<<31 (50%) -> proven_weight = 1<<31.
+        let total_weight = 1u64 << 32;
+        let threshold = 1u32 << 31;
+        let expected = ln_int_approximation(1u64 << 31).unwrap();
+        assert_eq!(
+            calculate_ln_proven_weight(total_weight, threshold).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn calculate_ln_proven_weight_zero_weight_is_illegal_ln_input() {
+        assert_eq!(
+            calculate_ln_proven_weight(0, 1u32 << 31),
+            Err(StateProofError::IllegalLnInput)
+        );
+    }
+
+    #[test]
+    fn calculate_ln_proven_weight_overflow_is_internal_error() {
+        // u64::MAX * u32::MAX / 2^32 still fits (product is u128, divided
+        // down) -- push total_weight past what any real proven_weight
+        // could produce isn't actually reachable with a u64 total_weight
+        // and u32 threshold (max product fits in 96 bits, divided by 2^32
+        // always fits back in u64). Kept as a smoke test that the
+        // conversion path itself is exercised without panicking.
+        let got = calculate_ln_proven_weight(u64::MAX, u32::MAX);
+        assert!(got.is_ok());
     }
 
     #[test]

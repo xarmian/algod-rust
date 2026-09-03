@@ -3353,6 +3353,21 @@ pub async fn run(
         )
     })?;
 
+    // A third connection to the same participation-key database, for the
+    // autonomous state-proof signing/proving service (issue #814), opened
+    // unconditionally alongside the heartbeat store's own extra handle --
+    // cheap, and keeps this block colocated with its sibling above. The
+    // service itself is only spawned when `enable_state_proof_worker`
+    // opts in (see near the heartbeat-service spawn point below).
+    let stateproof_part_store = ParticipationStore::open(partkey_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open a third participation key store handle (for the state-proof \
+             service) at {}: {}",
+            partkey_path.display(),
+            e
+        )
+    })?;
+
     // -----------------------------------------------------------------------
     // 3. Build the gossip network node.
     //
@@ -3591,6 +3606,34 @@ pub async fn run(
             }),
         });
     }
+
+    // Autonomous state-proof signing/proving service (issue #814):
+    // register the `Tag::StateProofSig` gossip handler unconditionally
+    // (harmless when the background loop below isn't spawned -- an
+    // unspawned service just never signs anything, so incoming
+    // signatures would only ever be inserted into an empty runtime and
+    // ignored) but only when the operator has opted in
+    // (`EnableStateProofWorker`), since a node with the handler
+    // registered but never verified live is exactly the state this
+    // service must not silently be in by default. See
+    // `crate::commands::stateproof_service`'s module doc comment for the
+    // full opt-in rationale.
+    let stateproof_sig_conn = if node_config.enable_state_proof_worker {
+        Some(Arc::new(std::sync::Mutex::new(
+            crate::commands::stateproof_service::open_sig_db(None).map_err(|e| {
+                anyhow::anyhow!("failed to open state-proof signature database: {e}")
+            })?,
+        )))
+    } else {
+        None
+    };
+    let stateproof_runtime = stateproof_sig_conn.as_ref().map(|sig_conn| {
+        let (handler, runtime) =
+            crate::commands::stateproof_service::build_handler(ledger.clone(), Arc::clone(sig_conn));
+        gossip_handlers.push(handler);
+        runtime
+    });
+
     gossip_node.multiplexer().register_handlers(gossip_handlers);
 
     // -------------------------------------------------------------------
@@ -4208,6 +4251,33 @@ pub async fn run(
     info!("heartbeat service started");
 
     // -----------------------------------------------------------------------
+    // 5c. Start the autonomous state-proof signing/proving service (issue
+    // #814), only when opted in via `EnableStateProofWorker`. See
+    // `crate::commands::stateproof_service`'s module doc comment for the
+    // full rationale and scope. Shares the same `round_advanced` condvar
+    // and `rt_handle` as the heartbeat service above.
+    // -----------------------------------------------------------------------
+    let stateproof_service_handle = if let (Some(sig_conn), Some(runtime)) =
+        (stateproof_sig_conn.clone(), stateproof_runtime.clone())
+    {
+        info!("state-proof worker enabled (EnableStateProofWorker) -- starting service");
+        Some(crate::commands::stateproof_service::spawn(
+            ledger.clone(),
+            stateproof_part_store,
+            sig_conn,
+            runtime,
+            Arc::clone(&gossip_node) as Arc<dyn algo_network::GossipNode>,
+            broadcaster.clone(),
+            genesis_hash,
+            Arc::clone(&pool_follower_round_advanced),
+            rt_handle.clone(),
+            crate::commands::stateproof_service::DEFAULT_POLL_INTERVAL,
+        ))
+    } else {
+        None
+    };
+
+    // -----------------------------------------------------------------------
     // 6. Build and start the agreement Service.
     // -----------------------------------------------------------------------
     let params = Parameters {
@@ -4266,6 +4336,10 @@ pub async fn run(
     let _ = pool_follower.join();
     heartbeat_service_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = heartbeat_service_join.join();
+    if let Some((stateproof_service_stop, stateproof_service_join)) = stateproof_service_handle {
+        stateproof_service_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = stateproof_service_join.join();
+    }
     // Stop the tx-sync pull loop before tearing down gossip — it samples
     // peers from `gossip_node`, so stopping it first avoids a
     // last-second round starting against a network that's mid-shutdown.

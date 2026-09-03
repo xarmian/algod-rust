@@ -52,14 +52,14 @@ per-area split of the former).
 | status | count | share |
 |---|---|---|
 | `partial` | 750 | 24% |
-| `matched-1:1` | 671 | 21% |
-| `matched-1:many` | 539 | 17% |
+| `matched-1:1` | 673 | 21% |
+| `matched-1:many` | 541 | 17% |
 | `out-of-scope` | 381 | 12% |
-| `not-implemented` | 338 | 11% |
+| `not-implemented` | 334 | 11% |
 | `missing-test` | 295 | 9% |
 | `matched-many:1` | 205 | 6% |
 
-**633 rows (`not-implemented` + `missing-test`, 20%) are real, actionable
+**629 rows (`not-implemented` + `missing-test`, 20%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
 implements but never tests. `partial` (750, 24%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
@@ -81,10 +81,10 @@ were triaged into tracked issues.
 | Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 75 | 31 | 16 | 62 | 39 | 32 | 21 |
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 37 | 45 | 0 | 10 | 17 | 25 | 10 |
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 86 | 15 | 45 | 67 | 29 | 25 | 7 |
-| Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 16 | 19 | 0 | 30 | 44 | 6 | 4 |
+| Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 18 | 21 | 0 | 30 | 40 | 6 | 4 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 15 | 6 | 0 | 19 | 18 | 0 | 60 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 19 | 19 | 7 | 21 | 61 | 4 | 42 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 22 | 7 | 0 | 17 | 6 | 4 | 1 |
-| **Total** | | **3,179** | **671** | **539** | **205** | **750** | **338** | **295** | **381** |
+| **Total** | | **3,179** | **673** | **541** | **205** | **750** | **334** | **295** | **381** |
 

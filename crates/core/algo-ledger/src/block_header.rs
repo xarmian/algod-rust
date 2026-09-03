@@ -379,7 +379,10 @@ fn saturating_mul_micros(a: u128, b: u128) -> u128 {
 /// field under map key `0`) out of an encoded `"spt"` value, defaulting to 0
 /// when absent — mirroring go's zero-value map lookup at
 /// `ledger/eval/eval.go:770`.
-pub(crate) fn state_proof_next_round(tracking: &Option<rmpv::Value>) -> u64 {
+/// `pub` (not `pub(crate)`) since issue #814's `bin/algod-rust`
+/// `stateproof_service` needs this to resolve its own signer-loop starting
+/// round (go: `Worker.nextStateProofRound`) from outside this crate.
+pub fn state_proof_next_round(tracking: &Option<rmpv::Value>) -> u64 {
     let Some(rmpv::Value::Map(types)) = tracking.as_ref() else {
         return 0;
     };
