@@ -165,6 +165,86 @@ impl PeerFeatureFlags {
     }
 }
 
+/// Given a (already-negotiated, i.e. intersected with our own advertised
+/// bits) feature set, returns the stateful vpack table size both sides
+/// agree on, or `0` if neither a matching stateful tier survived the
+/// intersection.
+///
+/// # Deviation from go-algorand
+///
+/// Go's `wsPeer.getBestVpackTableSize()` (`network/wsPeer.go`) computes
+/// `min(ourConfiguredSize, peerAdvertisedMaxSize)` from two independent
+/// integers, so two peers configured with *different* nonzero table sizes
+/// still converge on the smaller one. This function instead reads the
+/// table size off a single already-intersected [`PeerFeatureFlags`] value
+/// (see `connect.rs`'s `peer_features = remote_features.intersection(config.our_features)`),
+/// so it only recovers a nonzero size when both sides advertised the
+/// *same* tier bit. In the common case — every node using the matching
+/// (typically default 2048) table size — this is exactly equivalent to
+/// Go's min(); when two real nodes are configured with different nonzero
+/// sizes, this conservatively disables stateful compression instead of
+/// negotiating the smaller common size (falling back to the always-safe
+/// stateless-only path, never to a wrong result).
+pub const fn stateful_table_size(features: PeerFeatureFlags) -> u32 {
+    if features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_2048) {
+        2048
+    } else if features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_1024) {
+        1024
+    } else if features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_512) {
+        512
+    } else if features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_256) {
+        256
+    } else if features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_128) {
+        128
+    } else if features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_64) {
+        64
+    } else if features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_32) {
+        32
+    } else if features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_16) {
+        16
+    } else {
+        0
+    }
+}
+
+/// Builds the [`PeerFeatureFlags`] this node should advertise during the
+/// handshake, given whether stateless vote compression is enabled and
+/// (if so) the normalized stateful table size (`0` disables the stateful
+/// tier; must otherwise be one of `16, 32, 64, 128, 256, 512, 1024, 2048`
+/// — matching go-algorand's `config.Local.NormalizedVoteCompressionTableSize`).
+///
+/// Always includes [`PeerFeatureFlags::COMPRESSED_PROPOSAL`], matching this
+/// crate's existing default of always supporting zstd proposal compression.
+///
+/// Mirrors go-algorand's `network/wsNetwork.go` `setHeaders()`.
+pub const fn advertise_vote_compression(enabled: bool, table_size: u32) -> PeerFeatureFlags {
+    let mut flags = PeerFeatureFlags::COMPRESSED_PROPOSAL;
+    if !enabled {
+        return flags;
+    }
+    flags = flags.union(PeerFeatureFlags::COMPRESSED_VOTE_VPACK);
+    let stateful = if table_size >= 2048 {
+        PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_2048
+    } else if table_size >= 1024 {
+        PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_1024
+    } else if table_size >= 512 {
+        PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_512
+    } else if table_size >= 256 {
+        PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_256
+    } else if table_size >= 128 {
+        PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_128
+    } else if table_size >= 64 {
+        PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_64
+    } else if table_size >= 32 {
+        PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_32
+    } else if table_size >= 16 {
+        PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_16
+    } else {
+        PeerFeatureFlags::empty()
+    };
+    flags.union(stateful)
+}
+
 impl std::ops::BitOr for PeerFeatureFlags {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
@@ -585,6 +665,72 @@ mod tests {
         assert_eq!(parse_version("2"), None);
         assert_eq!(parse_version("1.2.3"), None);
         assert_eq!(parse_version("a.b"), None);
+    }
+
+    // -- advertise_vote_compression / stateful_table_size --------------------
+
+    #[test]
+    fn advertise_vote_compression_disabled() {
+        let flags = advertise_vote_compression(false, 2048);
+        assert_eq!(flags, PeerFeatureFlags::COMPRESSED_PROPOSAL);
+        assert_eq!(stateful_table_size(flags), 0);
+    }
+
+    #[test]
+    fn advertise_vote_compression_stateless_only() {
+        let flags = advertise_vote_compression(true, 0);
+        assert!(flags.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK));
+        assert!(!flags.has_stateful_vpack());
+        assert_eq!(stateful_table_size(flags), 0);
+    }
+
+    #[test]
+    fn advertise_vote_compression_stateful_default_2048() {
+        let flags = advertise_vote_compression(true, 2048);
+        assert!(flags.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK));
+        assert!(flags.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_2048));
+        assert_eq!(stateful_table_size(flags), 2048);
+    }
+
+    #[test]
+    fn advertise_vote_compression_all_tiers() {
+        let cases: &[(u32, u32)] = &[
+            (16, 16),
+            (32, 32),
+            (64, 64),
+            (128, 128),
+            (256, 256),
+            (512, 512),
+            (1024, 1024),
+            (2048, 2048),
+            (4096, 2048), // above max clamps to 2048, matching go's `>= 2048` case
+        ];
+        for &(configured, expected) in cases {
+            let flags = advertise_vote_compression(true, configured);
+            assert_eq!(
+                stateful_table_size(flags),
+                expected,
+                "configured={configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn stateful_table_size_no_stateful_bits() {
+        assert_eq!(
+            stateful_table_size(PeerFeatureFlags::COMPRESSED_VOTE_VPACK),
+            0
+        );
+        assert_eq!(stateful_table_size(PeerFeatureFlags::empty()), 0);
+    }
+
+    #[test]
+    fn stateful_table_size_highest_tier_wins() {
+        // If somehow multiple tier bits are set, the highest one wins
+        // (matches Go's switch-statement ordering from largest to smallest).
+        let flags = PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_16
+            | PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_256;
+        assert_eq!(stateful_table_size(flags), 256);
     }
 
     // -- version_supports_features helper ------------------------------------

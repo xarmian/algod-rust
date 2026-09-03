@@ -51,19 +51,24 @@
 //!    go-algorand's `network/vpack/README.md` §2.2 and §3 for the exact
 //!    per-field reference/delta rules mirrored here.
 //!
-//! # Scope: standalone codec only, not wired into any network path
+//! # Wiring into the live network path
 //!
-//! This module is **intentionally not wired into any live network code
-//! path** (no changes to `peer_features.rs`'s handshake negotiation,
-//! `ws_peer.rs`, or any connection-handling code). Wiring a new wire-format
-//! codec into live peer negotiation — including the stateful layer's
-//! abort/renegotiation handshake (go-algorand's
-//! `network/msgCompressor.go` `wsPeerMsgCodec`) — is a
-//! network-protocol-compatibility change that needs live multi-node
-//! interop testing beyond what this standalone codec's test suite can
-//! provide. `avvpack`/`avvpack<N>` peer feature bits are already
-//! advertised in `peer_features.rs`, but nothing in the live
-//! handshake/connection paths calls into this module.
+//! This module is wired into the outbound (`connect.rs`/`ws_peer.rs`
+//! tokio-tungstenite) websocket peer path: `ws_peer.rs`'s `write_loop`
+//! calls [`compress_vote`] (and, if the stateful tier was negotiated,
+//! [`StatefulEncoder::compress`]) on outgoing `AgreementVoteTag` payloads,
+//! and its `read_loop` calls [`decompress_vote`] (and
+//! [`StatefulDecoder::decompress`]) on incoming `AgreementVoteTag`/
+//! `VotePackedTag` payloads. Negotiation — deciding whether stateless
+//! and/or stateful compression applies to a given connection — mirrors
+//! go-algorand's `network/msgCompressor.go` `wsPeerMsgCodec`/
+//! `makeWsPeerMsgCodec`, including the `VP`+`0xFF` abort/renegotiation
+//! handshake used when stateful decompression fails partway through a
+//! connection's lifetime (see [`VOTE_COMPRESSION_ABORT_BYTE`]).
+//!
+//! The inbound (axum-based `PeerHandle::new_inbound`) path does not yet
+//! negotiate or apply vpack compression — see that constructor's doc
+//! comment for the current state and rationale.
 //!
 //! # Wire format
 //!
@@ -210,6 +215,16 @@ pub const MAX_COMPRESSED_VOTE_SIZE: usize = HEADER_SIZE
     + MAX_MSGP_VARUINT_SIZE * 4 // r.rnd, r.per, r.step, r.prop.oper
     + 32 * 6 // r.prop.dig, r.prop.encdig, r.prop.oprop, r.snd, sig.p, sig.p2
     + 64 * 3; // sig.p1s, sig.p2s, sig.s (sig.ps is omitted)
+
+/// Single-byte `VotePackedTag` payload signalling that stateful vote
+/// compression should be disabled for this connection.
+///
+/// When either the encoder or the decoder on a connection encounters an
+/// error, it sends `VP` + this byte to notify the peer, then both sides
+/// disable stateful compression and fall back to plain (stateless-only)
+/// `AV` traffic. Mirrors go-algorand's `network/msgCompressor.go`
+/// `voteCompressionAbortMessage`.
+pub const VOTE_COMPRESSION_ABORT_BYTE: u8 = 0xFF;
 
 /// Errors that can occur during vpack compression or decompression.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1179,7 +1194,8 @@ fn append_msgp_uint64(out: &mut Vec<u8>, v: u64) {
 /// replacing frequently repeated field values with references to
 /// previously-seen values. Mirrors go-algorand's `vpack.StatefulEncoder`.
 ///
-/// Not thread-safe; not wired into any live network path (see the module
+/// Not thread-safe: one instance per connection, owned exclusively by that
+/// connection's write (encoder) or read (decoder) loop task (see the module
 /// docs).
 pub struct StatefulEncoder {
     state: DynamicTableState,
@@ -1336,7 +1352,8 @@ impl StatefulEncoder {
 /// into valid stateless-vpack-format bytes (pass the result to
 /// [`decompress_vote`]). Mirrors go-algorand's `vpack.StatefulDecoder`.
 ///
-/// Not thread-safe; not wired into any live network path (see the module
+/// Not thread-safe: one instance per connection, owned exclusively by that
+/// connection's write (encoder) or read (decoder) loop task (see the module
 /// docs).
 pub struct StatefulDecoder {
     state: DynamicTableState,
