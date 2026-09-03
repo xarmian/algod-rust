@@ -168,6 +168,20 @@
 //!   needed no bytecode-length parsing despite initially looking like the
 //!   hardest of the four remaining opcodes.
 //!
+//! - **`itxn_field`'s field-type-aware refinement** (`TestTxTypes`; slice
+//!   7): ports go's `typeTxField` (`assembler.go:1532-1541`) directly --
+//!   see [`itxn_field_type`] and the `"itxn_field"` arm of
+//!   [`refined_types`]. `itxn_field`'s base proto (`opcodes.go:753`, `"a:"`)
+//!   pops one opaque value; when the single immediate token is a
+//!   recognized `txn`-family field name, the popped value's expected type
+//!   is refined to that field's own type (e.g. `Sender` expects `Bytes`,
+//!   `Amount` expects `Uint64`) instead of accepting anything. Unlike this
+//!   module's other refine functions, go's `typeTxField` doesn't filter by
+//!   `itxVersion` (whether a field is *settable* via `itxn_field` at all is
+//!   a separate, unrelated assembly-time check outside this module), so
+//!   [`itxn_field_type`] covers every recognized field name. Fixes
+//!   `TestTxTypes`.
+//!
 //! # What's deferred (tracked as follow-up work under issue #829)
 //!
 //! - **Bounds-refined types** (sized-type diagnostics like `[32]byte`, and
@@ -189,6 +203,15 @@
 //!   diagnostic-message precision (no currently-modeled opcode's
 //!   *accept/reject* verdict depends on it, only the wording of some
 //!   messages) -- left as a follow-up rather than folded into this slice.
+//!   **Re-verified in slice 7** with `itxn_field` now modeled too (the
+//!   issue's other remaining item): go's `overlaps` (`eval.go:1030-1051`)
+//!   is a *range* intersection, not an exact-bound match, so a generic
+//!   `StackBytes` argument (e.g. a `byte` literal of any length) always
+//!   overlaps a field's narrower bound (e.g. `StackAddress`'s `[32,32]`)
+//!   regardless of the literal's actual length -- the real length
+//!   enforcement happens elsewhere, not in type tracking. `itxn_field`
+//!   confirms rather than overturns slice 6's conclusion: still no
+//!   currently-modeled opcode's accept/reject verdict depends on bounds.
 //! - Two of the issue's originally cited "still needs bounds" tests turned
 //!   out, on inspection of `eval_test.go`, not to describe a `type_track`
 //!   gap at all: `TestArgType` is a runtime `stackValue.avmType()` unit
@@ -197,13 +220,7 @@
 //!   already covered by this module's existing dead-code handling (slice
 //!   2) -- both cases are `store` reached only after `err`/`return`
 //!   deadens, so [`track_instruction`]'s `type_track_deadcode` early return
-//!   already skips them with no type error, matching go exactly. Likewise
-//!   `TestTxTypes` (`assembler_test.go:3373-3384`) turned out to
-//!   exclusively exercise `itxn_field`'s `typeTxField` refine function
-//!   (`opcodes.go:753`), not the `txn`/`gtxn`/`gtxns` *read* opcodes this
-//!   slice now models -- `itxn_field`'s own field-type-aware refinement is
-//!   a distinct, still-open piece of work, tracked separately (see the
-//!   issue's slice 6 progress note).
+//!   already skips them with no type error, matching go exactly.
 //!
 //! See `docs/phase17/parity_txn_logic.md` for the full go-test mapping.
 
@@ -359,6 +376,11 @@ const TYPE_TABLE: &[(&str, &[StackType], &[StackType])] = &[
     ("gtxna", &[], &[Any]),
     ("gtxns", &[Uint64], &[Any]),
     ("gtxnsa", &[Uint64], &[Any]),
+    // ---- `itxn_field` (opcodes.go:753, proto "a:"): pops one opaque value
+    // by default, refined below by `refined_types` to the assigned field's
+    // actual expected type (`typeTxField`) whenever the field name is
+    // recognized. ----
+    ("itxn_field", &[Any], &[]),
 ];
 
 fn table_lookup(mnemonic: &str) -> Option<(&'static [StackType], &'static [StackType])> {
@@ -638,8 +660,119 @@ fn refined_types(
         // types the way `typeEquals` does ("it is legal to mix types"), so
         // every popped slot is `Any`.
         "match" => Some((Some(vec![Any; args.len() + 1]), None, None)),
+        // typeTxField (assembler.go:1532-1541): refines the popped value's
+        // expected type to the assigned field's own type (`itxn_field`'s
+        // single immediate token is the field name) instead of the default
+        // opaque `Any` from `TYPE_TABLE`. `None` when the field name isn't
+        // recognized (mirrors go's `!ok` early return) -- args then falls
+        // back to `TYPE_TABLE`'s default `[Any]`, same as go's `nargs ==
+        // nil` leaving `spec.Arg.Types` untouched.
+        "itxn_field" => Some((
+            args.first()
+                .and_then(|f| itxn_field_type(f))
+                .map(|ty| vec![ty]),
+            None,
+            None,
+        )),
         _ => None,
     }
+}
+
+/// Mirrors go's `txnFieldSpecs[].ftype`'s `AVMType` (`fields.go:290-378`),
+/// used by `typeTxField` (`assembler.go:1532-1541`) to refine `itxn_field`'s
+/// popped-argument type to the field actually being assigned. Covers every
+/// recognized `txn`-family field name -- `typeTxField` doesn't filter by
+/// `itxVersion` (whether the field is *settable* via `itxn_field` at all is
+/// a separate, unrelated assembly-time check, out of this module's scope),
+/// so an unsettable-but-real field name (e.g. `FirstValid`) still refines
+/// here; `None` only for a name `txnFieldSpecByName` wouldn't recognize
+/// either.
+///
+/// Every go `ftype` collapses to `Uint64` or `Bytes` at the `AVMType`
+/// level: `StackAddress`/`StackBytes32`/`StackBytes64` (`eval.go:883-889`)
+/// are all bound-refined `Bytes`, and `StackBoolean` is a bound-refined
+/// `Uint64`. Confirms the module docs' "bounds don't change any verdict"
+/// conclusion extends to `itxn_field` too: go's `overlaps` (`eval.go:1030-
+/// 1051`) is a *range* intersection, not an exact-bound match, so e.g. a
+/// generic `StackBytes` (`bound(0, maxStringSize)`) argument always
+/// overlaps the narrower `StackAddress` (`bound(32, 32)`) regardless of the
+/// actual byte-literal length -- the real 32-byte-length enforcement for an
+/// address field happens elsewhere (at `itxn_field` assembly/eval, not in
+/// type tracking), so this slice's bound-free `Bytes`/`Bytes` match is
+/// exactly as precise as go's own type-tracking pass here.
+fn itxn_field_type(field_name: &str) -> Option<StackType> {
+    Some(match field_name {
+        "Sender"
+        | "Note"
+        | "Lease"
+        | "Receiver"
+        | "CloseRemainderTo"
+        | "VotePK"
+        | "SelectionPK"
+        | "Type"
+        | "AssetSender"
+        | "AssetReceiver"
+        | "AssetCloseTo"
+        | "TxID"
+        | "ApplicationArgs"
+        | "Accounts"
+        | "ApprovalProgram"
+        | "ClearStateProgram"
+        | "RekeyTo"
+        | "ConfigAssetUnitName"
+        | "ConfigAssetName"
+        | "ConfigAssetURL"
+        | "ConfigAssetMetadataHash"
+        | "ConfigAssetManager"
+        | "ConfigAssetReserve"
+        | "ConfigAssetFreeze"
+        | "ConfigAssetClawback"
+        | "FreezeAssetAccount"
+        | "Logs"
+        | "LastLog"
+        | "StateProofPK"
+        | "ApprovalProgramPages"
+        | "ClearStateProgramPages" => Bytes,
+        "Fee"
+        | "FirstValid"
+        | "FirstValidTime"
+        | "LastValid"
+        | "Amount"
+        | "VoteFirst"
+        | "VoteLast"
+        | "VoteKeyDilution"
+        | "TypeEnum"
+        | "XferAsset"
+        | "AssetAmount"
+        | "GroupIndex"
+        | "ApplicationID"
+        | "OnCompletion"
+        | "NumAppArgs"
+        | "NumAccounts"
+        | "ConfigAsset"
+        | "ConfigAssetTotal"
+        | "ConfigAssetDecimals"
+        | "ConfigAssetDefaultFrozen"
+        | "FreezeAsset"
+        | "FreezeAssetFrozen"
+        | "Assets"
+        | "NumAssets"
+        | "Applications"
+        | "NumApplications"
+        | "GlobalNumUint"
+        | "GlobalNumByteSlice"
+        | "LocalNumUint"
+        | "LocalNumByteSlice"
+        | "ExtraProgramPages"
+        | "Nonparticipation"
+        | "NumLogs"
+        | "CreatedAssetID"
+        | "CreatedApplicationID"
+        | "NumApprovalProgramPages"
+        | "NumClearStateProgramPages"
+        | "RejectVersion" => Uint64,
+        _ => return None,
+    })
 }
 
 /// Parses `load`/`store`'s single immediate-slot-index argument, mirroring
