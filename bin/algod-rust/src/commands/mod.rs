@@ -35,6 +35,7 @@ pub mod p2p_transport;
 pub mod participate;
 pub mod relay;
 pub mod replay;
+pub mod stateproof_service;
 pub mod sync;
 pub mod validate;
 

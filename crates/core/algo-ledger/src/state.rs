@@ -137,7 +137,8 @@ pub struct LedgerState {
     /// Full participant-array cache for the voters snapshot (issue #912):
     /// `round -> participants`. See `store_trait::LedgerStore`'s "Voters
     /// snapshot: full participant array" section.
-    voters_participants_store: HashMap<u64, Vec<algo_consensus_crypto::stateproof::Participant>>,
+    voters_participants_store:
+        HashMap<u64, Vec<(Address, algo_consensus_crypto::stateproof::Participant)>>,
 }
 
 impl LedgerState {
@@ -1671,7 +1672,7 @@ impl crate::store_trait::LedgerStore for LedgerState {
     fn put_voters_participants(
         &mut self,
         round: u64,
-        participants: &[algo_consensus_crypto::stateproof::Participant],
+        participants: &[(Address, algo_consensus_crypto::stateproof::Participant)],
     ) -> Result<(), algo_error::AlgoError> {
         self.voters_participants_store
             .insert(round, participants.to_vec());
@@ -1681,8 +1682,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
     fn get_voters_participants(
         &self,
         round: u64,
-    ) -> Result<Option<Vec<algo_consensus_crypto::stateproof::Participant>>, algo_error::AlgoError>
-    {
+    ) -> Result<
+        Option<Vec<(Address, algo_consensus_crypto::stateproof::Participant)>>,
+        algo_error::AlgoError,
+    > {
         Ok(self.voters_participants_store.get(&round).cloned())
     }
 

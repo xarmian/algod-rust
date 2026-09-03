@@ -47,6 +47,7 @@ pub mod simulation;
 pub mod sqlite;
 pub mod state;
 pub mod state_delta;
+pub mod stateproof_message;
 pub mod stateproof_worker;
 pub mod store_trait;
 pub mod sync;

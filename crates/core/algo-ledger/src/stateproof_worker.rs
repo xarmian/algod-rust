@@ -65,9 +65,21 @@
 
 use std::collections::BTreeMap;
 
+use algo_consensus_crypto::merklearray;
 use algo_consensus_crypto::merklesig;
-use algo_consensus_crypto::stateproof::{MessageHash, Prover, StateProofError};
-use algo_types::Address;
+use algo_consensus_crypto::stateproof::{self as crypto_sp, MessageHash, Prover, StateProofError};
+use algo_error::AlgoError;
+use algo_types::consensus::consensus_params_for_version;
+use algo_types::{Address, StateProofBody, StateProofMessage};
+use serde_bytes::ByteBuf;
+
+use crate::store_trait::LedgerStore;
+
+fn ledger_err(message: impl Into<String>) -> AlgoError {
+    AlgoError::Ledger {
+        message: message.into(),
+    }
+}
 
 // ── Round eligibility (stateproof/signer.go, stateproof/builder.go) ────
 
@@ -150,6 +162,96 @@ pub struct SigFromAddr {
     pub signer_address: Address,
     pub round: u64,
     pub sig: merklesig::Signature,
+}
+
+impl SigFromAddr {
+    /// Canonical msgpack encoding for gossip transmission over
+    /// `Tag::StateProofSig` -- matches go's `sigFromAddr` codec tags
+    /// exactly: `"a"` (SignerAddress), `"r"` (Round), `"s"` (Sig),
+    /// omitempty, sorted lexicographically ("a" < "r" < "s").
+    pub fn to_msgpack(&self) -> Vec<u8> {
+        let addr_zero = self.signer_address.is_zero();
+        let sig_bytes = self.sig.to_msgpack();
+        let sig_empty = sig_bytes == [0x80];
+
+        let mut field_count: u8 = 0;
+        if !addr_zero {
+            field_count += 1;
+        }
+        if self.round != 0 {
+            field_count += 1;
+        }
+        if !sig_empty {
+            field_count += 1;
+        }
+
+        let mut buf = Vec::with_capacity(8 + sig_bytes.len());
+        buf.push(0x80 | field_count);
+        if !addr_zero {
+            write_fixstr(&mut buf, "a");
+            rmp::encode::write_bin(&mut buf, &self.signer_address.0).unwrap();
+        }
+        if self.round != 0 {
+            write_fixstr(&mut buf, "r");
+            rmp::encode::write_uint(&mut buf, self.round).unwrap();
+        }
+        if !sig_empty {
+            write_fixstr(&mut buf, "s");
+            buf.extend_from_slice(&sig_bytes);
+        }
+        buf
+    }
+
+    /// Decode a [`SigFromAddr`] previously produced by [`Self::to_msgpack`]
+    /// (or by a real go peer, whose canonical encoder produces the
+    /// identical field set/ordering). Unknown map keys are ignored,
+    /// matching this crate's other forward-compatible msgpack readers.
+    pub fn from_msgpack(data: &[u8]) -> Result<Self, String> {
+        let value = rmpv::decode::read_value(&mut std::io::Cursor::new(data))
+            .map_err(|e| format!("SigFromAddr: decode: {e}"))?;
+        let rmpv::Value::Map(fields) = value else {
+            return Err("SigFromAddr: expected a msgpack map".to_string());
+        };
+
+        let mut signer_address = Address::default();
+        let mut round = 0u64;
+        let mut sig = merklesig::Signature::default();
+
+        for (key, val) in fields {
+            match key.as_str() {
+                Some("a") => {
+                    if let Some(bytes) = val.as_slice() {
+                        let mut addr = [0u8; 32];
+                        let n = bytes.len().min(32);
+                        addr[..n].copy_from_slice(&bytes[..n]);
+                        signer_address = Address(addr);
+                    }
+                }
+                Some("r") => round = val.as_u64().unwrap_or(0),
+                Some("s") => {
+                    let mut sig_buf = Vec::new();
+                    rmpv::encode::write_value(&mut sig_buf, &val)
+                        .map_err(|e| format!("SigFromAddr: re-encode sig: {e}"))?;
+                    let (decoded, _) = merklesig::Signature::from_msgpack(&sig_buf)
+                        .map_err(|e| format!("SigFromAddr: sig: {e}"))?;
+                    sig = decoded;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(SigFromAddr {
+            signer_address,
+            round,
+            sig,
+        })
+    }
+}
+
+fn write_fixstr(buf: &mut Vec<u8>, s: &str) {
+    debug_assert!(s.len() <= 31, "fixstr supports up to 31 bytes");
+    buf.push(0xa0 | s.len() as u8);
+    buf.extend_from_slice(s.as_bytes());
 }
 
 /// One participation account's state-proof signing key material for a
@@ -479,6 +581,411 @@ pub mod db {
                 Address(addr)
             })
         })
+    }
+}
+
+// ── Autonomous daemon runtime (issue #814's live-daemon-wiring scope) ──
+//
+// The pieces above (round eligibility, per-account signing, [`SigCollector`],
+// the `db` persistence module) are the algorithmic core PR #898 landed.
+// What follows wraps them into the per-round orchestration a live
+// `bin/algod-rust` background service needs: lazily building/caching a
+// [`SigCollector`] per state-proof round from the ledger's persisted
+// voters snapshot ([`crate::voters_tracker::voters_participants_and_tree`]/
+// [`crate::voters_tracker::voters_addr_to_pos`], issue #912 extended by
+// #814 to carry addresses), gathering signatures into it (mirroring go's
+// `Worker.handleSig`, `builder.go:343`), and building the final
+// `StateProof` once ready (mirroring `tryBroadcast`, `builder.go:641`).
+//
+// Deliberately simplified relative to go's `Worker`:
+// - No disk-persisted `provers` table (go's `stateproof/db.go`'s `provers`
+//   table, `persistProver`/`getProver`) -- [`StateProofRuntime`] is
+//   in-memory only, rebuilt from the `sigs` table (this module's `db`
+//   submodule) and the ledger's own voters-snapshot persistence on daemon
+//   restart. A restart therefore re-verifies every already-gathered
+//   signature once (cheap) rather than trusting a cached prover object.
+// - [`StateProofRuntime::try_build`] always targets the *final*,
+//   full-`ProvenWeight` proof rather than go's `AcceptableStateProofWeight`
+//   incremental schedule (`stateproof/verify/stateproof.go`), which lets a
+//   real node accept smaller (cheaper-to-verify) proofs early in a round's
+//   signing window and only fall back to the full threshold once enough
+//   time has passed. Skipping that schedule is strictly safe (a proof this
+//   runtime submits always meets the *full* proven-weight bar, a strict
+//   superset of what any smaller acceptable-weight proof would need) --
+//   just potentially slower to produce the very first proof of a round.
+
+use crate::apply_stateproof::state_proof_message_hash;
+use crate::stateproof_message::generate_state_proof_message;
+use crate::voters_tracker::{voters_addr_to_pos, voters_participants_and_tree};
+
+/// `a*b/d`, matching go's `basics.Muldiv` usage for `provenWeight = total *
+/// WeightThreshold / (1<<32)`. Returns `None` on overflow.
+fn muldiv_u64_u32(a: u64, b: u32, d: u64) -> Option<u64> {
+    let product = (a as u128) * (b as u128);
+    u64::try_from(product / (d as u128)).ok()
+}
+
+/// One state-proof round's in-memory prover state plus the message it was
+/// built to sign, mirroring go's `spProver` (`builder.go:45`) minus the
+/// `VotersHdr` field (not needed by this simplified implementation's
+/// `try_build`, which skips go's `AcceptableStateProofWeight` schedule --
+/// see this section's doc comment) and disk persistence.
+pub struct ProverEntry {
+    pub collector: SigCollector,
+    pub message: StateProofMessage,
+}
+
+/// Build a fresh [`ProverEntry`] for `round`, mirroring go's `createProver`
+/// (`builder.go:181`): resolve the voters round/lookback, retrieve the
+/// persisted participant array + address map for it, resolve the proven
+/// weight from the voters header's online total weight, build the message,
+/// and construct the [`Prover`]/[`SigCollector`] pair.
+fn create_prover_entry<L: LedgerStore>(store: &L, round: u64) -> Result<ProverEntry, AlgoError> {
+    let hdr = store.get_block_header(round)?.ok_or_else(|| {
+        ledger_err(format!("create_prover_entry: no block header for round {round}"))
+    })?;
+    let params = consensus_params_for_version(&hdr.current_protocol).ok_or_else(|| {
+        ledger_err(format!(
+            "create_prover_entry: unknown consensus protocol '{}'",
+            hdr.current_protocol
+        ))
+    })?;
+    if params.state_proof_interval == 0 {
+        return Err(ledger_err(
+            "create_prover_entry: state proofs are not enabled for this protocol",
+        ));
+    }
+
+    let voters_round = round.saturating_sub(params.state_proof_interval);
+    let lookback = voters_round.saturating_sub(params.state_proof_voters_lookback);
+
+    let (participants, tree) = voters_participants_and_tree(store, lookback)?.ok_or_else(|| {
+        ledger_err(format!(
+            "create_prover_entry: no voters snapshot recorded for lookback round {lookback} \
+             (round {round}'s state proof cannot be built yet)"
+        ))
+    })?;
+    let addr_to_pos = voters_addr_to_pos(store, lookback)?.ok_or_else(|| {
+        ledger_err(format!(
+            "create_prover_entry: no address map recorded for lookback round {lookback}"
+        ))
+    })?;
+
+    let voters_hdr = store.get_block_header(voters_round)?.ok_or_else(|| {
+        ledger_err(format!(
+            "create_prover_entry: no block header for voters round {voters_round}"
+        ))
+    })?;
+    let online_total_weight =
+        crate::block_header::state_proof_online_total_weight(&voters_hdr.state_proof_tracking);
+    let proven_weight = muldiv_u64_u32(
+        online_total_weight,
+        params.state_proof_weight_threshold,
+        1u64 << 32,
+    )
+    .ok_or_else(|| ledger_err("create_prover_entry: overflow computing provenWeight"))?;
+
+    let message = generate_state_proof_message(store, round)?;
+    let msg_hash = state_proof_message_hash(&message);
+
+    let prover = Prover::make_prover(
+        msg_hash,
+        round,
+        proven_weight,
+        participants,
+        tree,
+        params.state_proof_strength_target,
+    )
+    .map_err(|e| ledger_err(format!("create_prover_entry: {e}")))?;
+
+    Ok(ProverEntry {
+        collector: SigCollector::new(prover, addr_to_pos),
+        message,
+    })
+}
+
+/// Outcome of [`StateProofRuntime::handle_sig`], mirroring the two
+/// dispositions of go's `network.ForwardingPolicy` this daemon actually
+/// needs (`Worker.handleSig`, `builder.go:343`): a genuinely new, valid
+/// signature should be gossiped onward; anything already known is safe to
+/// silently drop. (Go's third disposition, `Disconnect`, is left to the
+/// caller: the gossip-handling layer decides what to do with a
+/// cryptographically invalid or off-voters-list signature, since that's a
+/// network-policy decision, not an algorithmic one.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigOutcome {
+    Broadcast,
+    Ignore,
+}
+
+/// Errors from [`StateProofRuntime::handle_sig`].
+#[derive(Debug, thiserror::Error)]
+pub enum HandleSigError {
+    #[error("ledger: {0}")]
+    Ledger(#[from] AlgoError),
+    #[error(transparent)]
+    InsertSig(#[from] InsertSigError),
+}
+
+/// Lazily-populated per-round prover cache plus submitted-round bookkeeping
+/// for the autonomous signing/proving daemon. Pure/synchronous and
+/// independent of any network/thread machinery, so it is unit-testable
+/// directly -- mirrors go's `Worker.provers` map plus the "already built
+/// and submitted" half of `tryBroadcast`'s loop-break behavior.
+#[derive(Default)]
+pub struct StateProofRuntime {
+    provers: BTreeMap<u64, ProverEntry>,
+    submitted: std::collections::BTreeSet<u64>,
+}
+
+impl StateProofRuntime {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get (creating if needed) the prover entry for `round`.
+    fn ensure_prover<L: LedgerStore>(&mut self, store: &L, round: u64) -> Result<(), AlgoError> {
+        match self.provers.entry(round) {
+            std::collections::btree_map::Entry::Occupied(_) => {}
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(create_prover_entry(store, round)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// The message a round's prover is signing over, if a prover has been
+    /// built for it yet.
+    pub fn message_for(&self, round: u64) -> Option<&StateProofMessage> {
+        self.provers.get(&round).map(|e| &e.message)
+    }
+
+    pub fn has_prover(&self, round: u64) -> bool {
+        self.provers.contains_key(&round)
+    }
+
+    pub fn signed_weight(&self, round: u64) -> Option<u64> {
+        self.provers.get(&round).map(|e| e.collector.prover.signed_weight())
+    }
+
+    pub fn is_submitted(&self, round: u64) -> bool {
+        self.submitted.contains(&round)
+    }
+
+    pub fn mark_submitted(&mut self, round: u64) {
+        self.submitted.insert(round);
+    }
+
+    /// Insert one signature into `sfa.round`'s prover, lazily creating the
+    /// prover entry first if needed. Mirrors the insertion half of go's
+    /// `Worker.handleSig` (`builder.go:343`): an already-present signature
+    /// is a harmless [`SigOutcome::Ignore`], not an error.
+    pub fn handle_sig<L: LedgerStore>(
+        &mut self,
+        store: &L,
+        sfa: &SigFromAddr,
+    ) -> Result<SigOutcome, HandleSigError> {
+        self.ensure_prover(store, sfa.round)?;
+        let entry = self
+            .provers
+            .get_mut(&sfa.round)
+            .expect("ensure_prover just inserted this round's entry");
+        match entry
+            .collector
+            .insert_sig(sfa.signer_address, sfa.sig.clone(), true)
+        {
+            Ok(()) => Ok(SigOutcome::Broadcast),
+            Err(InsertSigError::AlreadyPresent) => Ok(SigOutcome::Ignore),
+            Err(e) => Err(HandleSigError::InsertSig(e)),
+        }
+    }
+
+    /// For every not-yet-submitted round (in ascending order) whose prover
+    /// has gathered enough signed weight, build the `StateProof` and
+    /// return it alongside the message it attests to -- the caller
+    /// constructs and broadcasts the `StateProofTx`, then calls
+    /// [`Self::mark_submitted`]. Mirrors go's `tryBroadcast`
+    /// (`builder.go:641`): stops at the first round that isn't ready yet,
+    /// since `StateProofNext` only ever advances sequentially -- a later
+    /// round's proof can't be submitted before an earlier one is.
+    pub fn try_build(&mut self) -> Vec<(u64, crypto_sp::StateProof, StateProofMessage)> {
+        let mut out = Vec::new();
+        let rounds: Vec<u64> = self.provers.keys().copied().collect();
+        for round in rounds {
+            if self.submitted.contains(&round) {
+                continue;
+            }
+            let entry = self.provers.get_mut(&round).expect("round from provers keys");
+            if !entry.collector.prover.ready() {
+                break;
+            }
+            match entry.collector.prover.create_proof() {
+                Ok(proof) => out.push((round, proof, entry.message.clone())),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// Discard cached provers/submitted-markers below `retain_round` --
+    /// mirrors go's `trimProversCache`/`deleteStaleProver` retention
+    /// (simplified: no special-cased "keep the latest round too" slot,
+    /// since this runtime has no historical-replay path that would need
+    /// it).
+    pub fn prune(&mut self, retain_round: u64) {
+        self.provers.retain(|&r, _| r >= retain_round);
+        self.submitted.retain(|&r| r >= retain_round);
+    }
+}
+
+// ── Wire conversion: crypto StateProof -> StateProofBody (issue #814) ──
+//
+// The inverse of `apply_stateproof.rs`'s private `convert_state_proof`
+// (wire -> crypto, used to verify an already-built proof). This direction
+// is needed once, here, to embed a freshly-*built* proof into the
+// `StateProofTx` this daemon submits.
+//
+// Every substructure is wrapped in `Some(..)` unconditionally rather than
+// hand-replicating go's per-field omitempty detection: `algo_codec`'s
+// `canonical_encode_state_proof_body`/`canonical_encode_merkle_proof`/etc.
+// already omit a zero-valued field (or an entirely empty nested map, via
+// `CanonicalMap::add_map`'s empty-map check) regardless of whether the
+// intermediate Rust value was wrapped in `Some` or left as `None` -- so a
+// `Some(zero-value)` here still round-trips to the same canonical bytes a
+// hand-tuned `None` would have produced.
+
+fn wire_hash_factory(hf: &merklearray::HashFactory) -> Option<algo_types::HashFactory> {
+    Some(algo_types::HashFactory {
+        hash_type: hf.hash_type as u16,
+    })
+}
+
+fn wire_merkle_proof(p: &merklearray::Proof) -> Option<algo_types::MerkleProof> {
+    let path = if p.path.is_empty() {
+        None
+    } else {
+        Some(
+            p.path
+                .iter()
+                .map(|d| {
+                    if d.is_empty() {
+                        None
+                    } else {
+                        Some(ByteBuf::from(d.clone()))
+                    }
+                })
+                .collect(),
+        )
+    };
+    Some(algo_types::MerkleProof {
+        path,
+        hash_factory: wire_hash_factory(&p.hash_factory),
+        tree_depth: p.tree_depth,
+    })
+}
+
+fn wire_falcon_verifier(fv: &merklesig::FalconVerifier) -> Option<algo_types::FalconVerifier> {
+    Some(algo_types::FalconVerifier {
+        public_key: ByteBuf::from(fv.k.to_vec()),
+    })
+}
+
+fn wire_merkle_signature(sig: &merklesig::Signature) -> Option<algo_types::MerkleSignature> {
+    Some(algo_types::MerkleSignature {
+        signature: ByteBuf::from(sig.signature.clone()),
+        vector_commitment_index: sig.vector_commitment_index,
+        proof: wire_merkle_proof(&sig.proof.proof),
+        verifying_key: wire_falcon_verifier(&sig.verifying_key),
+    })
+}
+
+fn wire_sig_slot(slot: &crypto_sp::SigSlotCommit) -> Option<algo_types::SigSlotCommit> {
+    Some(algo_types::SigSlotCommit {
+        sig: wire_merkle_signature(&slot.sig),
+        l: slot.l,
+    })
+}
+
+fn wire_participant(p: &crypto_sp::Participant) -> Option<algo_types::Participant> {
+    Some(algo_types::Participant {
+        pk: Some(algo_types::MerkleSignatureVerifier {
+            commitment: p.pk.commitment,
+            key_lifetime: p.pk.key_lifetime,
+        }),
+        weight: p.weight,
+    })
+}
+
+fn wire_reveal(r: &crypto_sp::Reveal) -> algo_types::Reveal {
+    algo_types::Reveal {
+        sig_slot: wire_sig_slot(&r.sig_slot),
+        part: wire_participant(&r.part),
+    }
+}
+
+/// Convert a freshly-built `crypto_sp::StateProof` into the wire
+/// `StateProofBody` a `StateProofTx` embeds.
+pub fn state_proof_body_from_crypto(sp: &crypto_sp::StateProof) -> StateProofBody {
+    let reveals = if sp.reveals.is_empty() {
+        None
+    } else {
+        Some(
+            sp.reveals
+                .iter()
+                .map(|(pos, r)| (*pos, wire_reveal(r)))
+                .collect(),
+        )
+    };
+    let positions_to_reveal = if sp.positions_to_reveal.is_empty() {
+        None
+    } else {
+        Some(sp.positions_to_reveal.clone())
+    };
+    StateProofBody {
+        sig_commit: ByteBuf::from(sp.sig_commit.clone()),
+        signed_weight: sp.signed_weight,
+        sig_proofs: wire_merkle_proof(&sp.sig_proofs),
+        part_proofs: wire_merkle_proof(&sp.part_proofs),
+        merkle_signature_salt_version: sp.merkle_signature_salt_version,
+        reveals,
+        positions_to_reveal,
+    }
+}
+
+/// Build the (unsigned -- `STATE_PROOF_SENDER` needs no signature)
+/// `StateProofTx` `SignedTransaction` for a just-built proof, ready for
+/// `LocalTxBroadcaster::submit_group`.
+///
+/// Matches go's `Worker.tryBroadcast` transaction construction
+/// (`builder.go:676-684`): `FirstValid` is the *current* ledger tip at
+/// submission time (not the state-proof round itself), `LastValid =
+/// FirstValid + MaxTxnLife`, zero fee (the sender's zero-signature-category
+/// bypass exempts it from the fee floor -- see `algo_pool::fee`), and no
+/// `lsig`/`sig`/`msig` at all (go's `stxn.Txn` has no signature fields set
+/// either -- `verify/txn.go:344`'s zero-signature-category check is what
+/// allows this).
+pub fn build_state_proof_transaction(
+    latest_round: u64,
+    max_txn_life: u64,
+    genesis_hash: [u8; 32],
+    proof: &crypto_sp::StateProof,
+    message: &StateProofMessage,
+) -> algo_types::SignedTransaction {
+    let txn = algo_types::Transaction {
+        txn_type: algo_types::TxnType::Stpf,
+        sender: Address::STATE_PROOF_SENDER,
+        fee: 0,
+        first_valid: algo_types::Round(latest_round),
+        last_valid: algo_types::Round(latest_round + max_txn_life),
+        genesis_hash,
+        state_proof_type: 0,
+        state_proof: Some(state_proof_body_from_crypto(proof)),
+        state_proof_message: Some(message.clone()),
+        ..algo_types::Transaction::default()
+    };
+    algo_types::SignedTransaction {
+        txn,
+        ..algo_types::SignedTransaction::default()
     }
 }
 
@@ -921,6 +1428,69 @@ mod tests {
         assert_eq!(
             got[0].sig.vector_commitment_index,
             sig.vector_commitment_index
+        );
+    }
+
+    // ── SigFromAddr wire encoding ────────────────────────────────────
+
+    #[test]
+    fn sig_from_addr_round_trips_through_msgpack() {
+        let sig = dummy_sig();
+        let sfa = SigFromAddr {
+            signer_address: Address([9u8; 32]),
+            round: 512,
+            sig: sig.clone(),
+        };
+        let wire = sfa.to_msgpack();
+        let decoded = SigFromAddr::from_msgpack(&wire).unwrap();
+        assert_eq!(decoded.signer_address, sfa.signer_address);
+        assert_eq!(decoded.round, sfa.round);
+        assert_eq!(decoded.sig.signature, sig.signature);
+        assert_eq!(
+            decoded.sig.vector_commitment_index,
+            sig.vector_commitment_index
+        );
+    }
+
+    #[test]
+    fn sig_from_addr_rejects_garbage() {
+        assert!(SigFromAddr::from_msgpack(&[0xFF, 0xFF]).is_err());
+    }
+
+    // ── build_state_proof_transaction ────────────────────────────────
+
+    #[test]
+    fn build_state_proof_transaction_is_fee_exempt_and_unsigned() {
+        let sp = crypto_sp::StateProof {
+            sig_commit: vec![1, 2, 3],
+            signed_weight: 100,
+            sig_proofs: merklearray::Proof::default(),
+            part_proofs: merklearray::Proof::default(),
+            merkle_signature_salt_version: 0,
+            reveals: BTreeMap::new(),
+            positions_to_reveal: vec![],
+        };
+        let msg = StateProofMessage {
+            first_attested_round: 1,
+            last_attested_round: 512,
+            ..Default::default()
+        };
+        let stx = build_state_proof_transaction(1000, 1000, [7u8; 32], &sp, &msg);
+        assert_eq!(stx.txn.txn_type, algo_types::TxnType::Stpf);
+        assert_eq!(stx.txn.sender, Address::STATE_PROOF_SENDER);
+        assert_eq!(stx.txn.fee, 0, "state proofs are fee-exempt");
+        assert_eq!(stx.txn.first_valid, algo_types::Round(1000));
+        assert_eq!(stx.txn.last_valid, algo_types::Round(2000));
+        assert_eq!(stx.txn.genesis_hash, [7u8; 32]);
+        assert_eq!(stx.sig, [0u8; 64]);
+        assert!(stx.msig.is_none() && stx.lsig.is_none());
+        assert_eq!(
+            stx.txn.state_proof.as_ref().unwrap().signed_weight,
+            100
+        );
+        assert_eq!(
+            stx.txn.state_proof_message.as_ref().unwrap().last_attested_round,
+            512
         );
     }
 }

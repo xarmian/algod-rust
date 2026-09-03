@@ -6594,7 +6594,7 @@ impl LedgerStore for SqliteLedger {
     fn put_voters_participants(
         &mut self,
         round: u64,
-        participants: &[algo_consensus_crypto::stateproof::Participant],
+        participants: &[(algo_types::Address, algo_consensus_crypto::stateproof::Participant)],
     ) -> Result<(), AlgoError> {
         let encoded = crate::voters::encode_participants(participants);
         self.conn
@@ -6611,7 +6611,10 @@ impl LedgerStore for SqliteLedger {
     fn get_voters_participants(
         &self,
         round: u64,
-    ) -> Result<Option<Vec<algo_consensus_crypto::stateproof::Participant>>, AlgoError> {
+    ) -> Result<
+        Option<Vec<(algo_types::Address, algo_consensus_crypto::stateproof::Participant)>>,
+        AlgoError,
+    > {
         let blob: Option<Vec<u8>> = self
             .conn
             .query_row(

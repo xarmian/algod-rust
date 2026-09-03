@@ -1817,6 +1817,20 @@ pub struct Local {
     )]
     pub enable_developer_api: bool,
 
+    /// **algod-rust-specific — no go-algorand equivalent.** go's
+    /// `stateproof.Worker` is unconditionally started by every node
+    /// (`node/node.go`'s `NewWorker`/`Start` calls are not gated behind any
+    /// config flag); algod-rust's own state-proof signing/proving daemon
+    /// (issue #814, `bin/algod-rust`'s `stateproof_service`) is
+    /// deliberately opt-in instead, since it introduces a new gossip wire
+    /// message type (`Tag::StateProofSig`) and autonomous transaction
+    /// construction/broadcast that has not yet accumulated the same
+    /// production mileage as the rest of this node's participation path.
+    /// Defaults to `false`; set `"EnableStateProofWorker": true` in
+    /// `config.json` to opt in.
+    #[serde(rename = "EnableStateProofWorker", default)]
+    pub enable_state_proof_worker: bool,
+
     /// Go: `CatchupParallelBlocks`. Wired into
     /// `CatchupService::start_with_parallelism` (issue #753 fixed a real
     /// behavioral gap: the periodic catchup path previously fetched blocks
@@ -2272,6 +2286,7 @@ impl Local {
             enable_txn_eval_tracer: ENABLE_TXN_EVAL_TRACER.at(version),
             tx_incoming_filter_max_size: TX_INCOMING_FILTER_MAX_SIZE.at(version),
             enable_developer_api: ENABLE_DEVELOPER_API.at(version),
+            enable_state_proof_worker: false,
             catchup_parallel_blocks: CATCHUP_PARALLEL_BLOCKS.at(version),
             catchup_failure_peer_refresh_rate: CATCHUP_FAILURE_PEER_REFRESH_RATE.at(version),
             catchup_http_block_fetch_timeout_sec: CATCHUP_HTTP_BLOCK_FETCH_TIMEOUT_SEC.at(version),

@@ -335,20 +335,27 @@ pub fn build_voters_tree_and_participants(
 // (e.g. `stateproof_worker::db`'s `Signature::to_msgpack`/`from_msgpack`
 // usage).
 
-/// Encode a participant array for storage. See the section doc above for
-/// the exact format.
-pub fn encode_participants(participants: &[crypto_sp::Participant]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + participants.len() * 80);
+/// Encode an address-tagged participant array for storage. Each entry is
+/// `(address: [u8; 32], participant.pk: msgpack, participant.weight: u64
+/// LE)` -- the address prefix (issue #814) lets a signing/proving daemon
+/// map an arbitrary signer's address to its vector-commitment position
+/// (go: `voters.AddrToPos`) after retrieving the array long after the
+/// snapshot round's own live account state is gone -- see the section doc
+/// above for the rest of the format.
+pub fn encode_participants(participants: &[(Address, crypto_sp::Participant)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + participants.len() * 112);
     buf.extend_from_slice(&(participants.len() as u32).to_le_bytes());
-    for p in participants {
+    for (addr, p) in participants {
+        buf.extend_from_slice(&addr.0);
         buf.extend_from_slice(&p.pk.to_msgpack());
         buf.extend_from_slice(&p.weight.to_le_bytes());
     }
     buf
 }
 
-/// Decode a participant array previously produced by [`encode_participants`].
-pub fn decode_participants(data: &[u8]) -> Result<Vec<crypto_sp::Participant>, String> {
+/// Decode an address-tagged participant array previously produced by
+/// [`encode_participants`].
+pub fn decode_participants(data: &[u8]) -> Result<Vec<(Address, crypto_sp::Participant)>, String> {
     if data.len() < 4 {
         return Err(format!(
             "decode_participants: buffer too short for count prefix: {} bytes",
@@ -359,6 +366,16 @@ pub fn decode_participants(data: &[u8]) -> Result<Vec<crypto_sp::Participant>, S
     let mut rest = &data[4..];
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
+        if rest.len() < 32 {
+            return Err(format!(
+                "decode_participants: participant {i}: buffer too short for address"
+            ));
+        }
+        let mut addr_bytes = [0u8; 32];
+        addr_bytes.copy_from_slice(&rest[..32]);
+        let addr = Address(addr_bytes);
+        rest = &rest[32..];
+
         let (pk, after_pk) = merklesig::Verifier::from_msgpack(rest)
             .map_err(|e| format!("decode_participants: participant {i} pk: {e}"))?;
         if after_pk.len() < 8 {
@@ -368,7 +385,7 @@ pub fn decode_participants(data: &[u8]) -> Result<Vec<crypto_sp::Participant>, S
         }
         let weight = u64::from_le_bytes(after_pk[0..8].try_into().unwrap());
         rest = &after_pk[8..];
-        out.push(crypto_sp::Participant { pk, weight });
+        out.push((addr, crypto_sp::Participant { pk, weight }));
     }
     Ok(out)
 }
@@ -616,16 +633,22 @@ mod tests {
         let mut b = candidate(addr(2), 3_000_000);
         b.state_proof_id = [0xABu8; 64];
         let (_, _, participants) =
-            build_voters_tree_and_participants(&[a, b], 3, REWARD_UNIT).unwrap();
+            build_voters_tree_and_participants(&[a.clone(), b.clone()], 3, REWARD_UNIT).unwrap();
+        let addressed: Vec<(Address, crypto_sp::Participant)> = [a.address, b.address]
+            .into_iter()
+            .zip(participants.iter().cloned())
+            .collect();
 
-        let encoded = encode_participants(&participants);
+        let encoded = encode_participants(&addressed);
         let decoded = decode_participants(&encoded).unwrap();
-        assert_eq!(decoded, participants);
+        assert_eq!(decoded, addressed);
 
         // The rebuilt tree from the round-tripped array must still commit
         // to the same root.
+        let decoded_participants: Vec<crypto_sp::Participant> =
+            decoded.iter().map(|(_, p)| p.clone()).collect();
         let root_before = commit_participants(&participants).unwrap().root();
-        let root_after = commit_participants(&decoded).unwrap().root();
+        let root_after = commit_participants(&decoded_participants).unwrap().root();
         assert_eq!(root_before, root_after);
     }
 
