@@ -509,3 +509,158 @@ fn fast_recovery_down_miss_two_node() {
     cluster.shutdown();
     sanity_check(&cluster, start_round, 3);
 }
+
+/// Adapted port of go-algorand's `TestAgreementLateCertBug`
+/// (`agreement/service_test.go`) — the regression this pins at player level
+/// via `TestPlayerRegression_EnsuresCertThreshFromOldPeriod_8ba23942` /
+/// `TestPlayer_RejectsCertThresholdFromPreviousRound`
+/// (`player_edge_cases_test.rs`), now exercised through the real multi-node
+/// `Service`: period 0's cert votes are pocketed (never delivered) so period
+/// 0 never reaches its own threshold and the cluster moves on to period 1
+/// via the deadline timeout. The pocketed, now stale-period cert votes are
+/// then replayed with NO further clock fire — the round must still commit
+/// on period 0's proposal purely from that vote delivery, even though every
+/// node has already rezeroed into period 1.
+#[test]
+fn late_cert_bug_five_node() {
+    let cluster = setup_agreement(5);
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    // Delay cert votes to force period 1. Divergence from go's literal
+    // structure, noted once here: go closes the pocket right after the
+    // FIRST (filter-timeout) fire, relying on its single-goroutine
+    // synchronous model to guarantee every node has already cert-voted by
+    // then. Under this harness's real threads that isn't reliable (see this
+    // file's module doc comment on occasional real-vote-cascade timing) —
+    // too few nodes may have reached cert-vote-readiness after just one or
+    // two fires, so keep pocketing (and keep firing the deadline timeout,
+    // which forces successive period bumps) until a quorum's worth of
+    // period-0 cert votes has actually been captured, bounded the same way
+    // `pump_until_new_round` is.
+    cluster.network.pocket_all_cert_votes();
+    trigger_global_timeout(&cluster, TimeoutType::Deadline); // filter timeout: cert votes pocketed, no round
+    round = expect_no_new_round(&cluster, round);
+    for _ in 0..20 {
+        if cluster.network.cert_vote_pocket_len() >= 4 {
+            break;
+        }
+        // Deadline timeout: period 0 (then 1, 2, ...) fails to terminate
+        // (no cert quorum arrived — pocketed), every node moves on.
+        trigger_global_timeout(&cluster, TimeoutType::Deadline);
+        round = expect_no_new_round(&cluster, round);
+    }
+    let pocketed = cluster.network.stop_pocketing_cert_votes();
+    cluster.network.repair_all();
+    assert!(
+        pocketed.len() >= 4,
+        "expected a quorum's worth of period-0 cert votes to have been pocketed, got {}",
+        pocketed.len()
+    );
+
+    // Terminate on period 0 in period 1: replaying the pocketed cert votes,
+    // with no further timeout fire, must still commit the round.
+    {
+        cluster.network.replay_all(&pocketed);
+        cluster.wait_for_quiet();
+        let advanced = current_round(&cluster);
+        assert!(
+            advanced.0 > round.0,
+            "replaying the late (period-0) cert votes must still commit the round \
+             even though every node already moved on to period 1"
+        );
+        round = advanced;
+    }
+
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+    let _ = round;
+
+    cluster.shutdown();
+    sanity_check(&cluster, start_round, 5);
+}
+
+// `TestAgreementFastRecoveryLate` and `TestAgreementFastRecoveryRedo`
+// (`agreement/service_test.go`) were both attempted here — fast partition
+// recovery into a real proposal VALUE (not bottom): cert votes are pocketed
+// and decoded to confirm every node's recovery converges on the identical
+// proposal, then (unlike `DownEarly`/`DownMiss`, which recover straight
+// into a round commit) a second fast-recovery fire bumps the PERIOD only
+// (the recovered value becomes the new period's starting value), with a
+// separate, subsequent filter timeout actually terminating the round;
+// `Redo` additionally forces period 1 to fail AGAIN (total vote loss) and
+// asserts the SAME recovered value is what the round eventually commits
+// after a second forced partition-recovery cascade, without ever being
+// re-derived.
+//
+// Real finding, NOT fixed here: `Late`'s port was solid across 9
+// consecutive standalone runs, but FAILED when run as part of the full
+// `service_multi_node_test` suite (all tests executing concurrently) — the
+// committed block's digest differed from the pocketed/derived `expected`
+// value. `Redo`'s port (structurally the same "second fast-recovery fire
+// bumps the period onto a pinned value" mechanic, just exercised twice) was
+// independently flaky even standalone (2 failures in 5 consecutive
+// attempts), same symptom. Both point at the same narrow mechanic: the
+// SECOND fast-recovery fire's period bump doesn't reliably preserve the
+// already-recovered starting value under real (not lock-step synchronous)
+// thread scheduling and CPU contention — exactly the class of behavior
+// `TestPlayerAlwaysResynchsPinnedValue` (still open per issue #825's theme
+// 1) probes at the player level. Whether this is a genuine algod-rust
+// starting-value-propagation bug under load, or an artifact of this
+// harness's `drop_all_votes` + subset-`FastRecovery`-fire choreography not
+// perfectly reproducing the timing go's synchronous model guarantees, needs
+// dedicated investigation (starting with `AlwaysResynchsPinnedValue`'s own
+// still-open port) rather than being forced through in this already-large
+// pass. Neither test is landed; both are tracked as follow-up in
+// `docs/phase17/parity_agreement.md`.
+
+/// Full 5-node port of go-algorand's `TestAgreementLargePeriods`
+/// (`agreement/service_test.go`): partitions a 3-of-5 minority (nodes 0-2)
+/// away from the network for 60 consecutive periods (filter timeout fails
+/// to reach quorum while partitioned; healing + a deadline timeout forces
+/// the next period), then heals for good and terminates — proving the
+/// `Player`/`Service` state machine handles unbounded period growth (large
+/// `Period` values, repeated rezero-without-round-advance) without drifting
+/// or overflowing.
+#[test]
+fn large_periods_five_node() {
+    let cluster = setup_agreement(5);
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    for _ in 0..60 {
+        cluster.network.partition(&[0, 1, 2]);
+        trigger_global_timeout(&cluster, TimeoutType::Deadline); // filter timeout: partitioned, no quorum
+        round = expect_no_new_round(&cluster, round);
+
+        cluster.network.repair_all();
+        trigger_global_timeout(&cluster, TimeoutType::Deadline); // deadline timeout: advances to the next period
+        round = expect_no_new_round(&cluster, round);
+    }
+
+    // Terminate.
+    round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+    let _ = round;
+
+    cluster.shutdown();
+    sanity_check(&cluster, start_round, 5);
+}
