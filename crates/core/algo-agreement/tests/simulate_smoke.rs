@@ -37,6 +37,12 @@
 
 #![deny(unsafe_code)]
 
+// The shared simulate test-support module carries more machinery than this
+// binary consumes on its own (e.g. the multi-node testing_clock/
+// testing_network/setup_agreement pieces added for issue #825/#827) —
+// silence the per-binary dead-code lint the unused parts would otherwise
+// trip.
+#[allow(dead_code, unused_imports)]
 mod simulate;
 
 use std::sync::Arc;
