@@ -123,6 +123,61 @@
 //!    delta that needs a deliberate design call, not a blind 1:1 port,
 //!    per the parity audit that opened this issue.
 //!
+//! ## Investigated and rejected: wiring into the REST submission path
+//!
+//! A natural-looking candidate is algod-rust's REST transaction-submission
+//! admission point (`bin/algod-rust/src/node_interface_impl.rs`'s
+//! `AlgodNodeInterface::reserve_async_backlog_permit`, a flat
+//! `tokio::sync::Semaphore` guarding
+//! `NodeInterface::async_broadcast_signed_tx_group`) — unlike the tx-syncer,
+//! it *is* a push-style entry point (an external caller hits `/v2/transactions`
+//! unsolicited). It was investigated for this reason and rejected: it would
+//! not be a faithful port, because go-algorand itself never applies
+//! `appRateLimiter` (or the sibling `ElasticRateLimiter`/RED gate, see issue
+//! #860) to REST-submitted transactions.
+//!
+//! Tracing go-algorand's own code confirms this:
+//! * `daemon/algod/api/server/v2/handlers.go`'s `RawTransaction` (sync
+//!   `POST /v2/transactions`) calls `node.BroadcastSignedTxGroup` →
+//!   `node/node.go`'s `broadcastSignedTxGroup`, which calls
+//!   `node.transactionPool.Remember` directly — it never touches
+//!   `TxHandler` at all, so `appLimiter`/`erl` cannot apply.
+//! * `RawTransactionAsync` (`POST /v2/transactions/async`) calls
+//!   `node.AsyncBroadcastSignedTxGroup` → `data/txHandler.go`'s
+//!   `TxHandler.LocalTransaction`, which pushes straight onto
+//!   `handler.backlogQueue` with `rawmsg: &network.IncomingMessage{}`
+//!   (`Sender == nil`) — bypassing `processIncomingTxn` entirely. Only
+//!   `processIncomingTxn` calls `incomingTxGroupAppRateLimit`
+//!   (`shouldDrop`) and the ERL capacity-guard check
+//!   (`incomingMsgErlCheck`); `LocalTransaction`'s backlog item is
+//!   processed straight to `postProcessCheckedTxn`, and even the
+//!   eval-error *penalty* hook there is explicitly guarded by
+//!   `wi.rawmsg.Sender != nil`, so a locally-submitted transaction can
+//!   never penalize or be penalized by the app rate limiter.
+//! * There is no rate-limiting middleware anywhere under
+//!   `daemon/algod/api/` — a grep for `RateLimit`/`rateLimit` under
+//!   `daemon/` in go-algorand @ v5.0.0-stable returns nothing.
+//!
+//! In other words, go-algorand treats a transaction submitted through its
+//! own node's REST API as a **trusted local-client boundary**, categorically
+//! different from an **untrusted peer-gossip boundary** — ARL/ERL exist
+//! specifically to shed load and penalize misbehavior from the latter, and
+//! go deliberately never subjects the former to either. Reusing
+//! `AppRateLimiter::should_drop`/`penalize_eval_error` to gate
+//! `reserve_async_backlog_permit` would therefore invent rate-limiting
+//! behavior go-algorand does not have, not port behavior it does. The flat
+//! `Semaphore` in `reserve_async_backlog_permit` remains the correct,
+//! faithful analogue of go's un-gated `broadcastSignedTxGroup`/
+//! `LocalTransaction` paths and is intentionally left unchanged.
+//!
+//! No other push-style, unsolicited-external-input entry point currently
+//! exists in algod-rust outside the REST layer, so as of this writing there
+//! is **no legitimate wiring point** for `AppRateLimiter` in algod-rust: the
+//! only architecturally-correct point (mirroring go's actual gate) is the
+//! pull-based tx-syncer peer path sketched above, which requires the
+//! deliberate pull-vs-push redesign this issue and issue #860 both already
+//! flag as future, separately-scoped work.
+//!
 //! # References
 //!
 //! * `data/appRateLimiter.go` (`makeAppRateLimiter`, `entry`, `interval`,
