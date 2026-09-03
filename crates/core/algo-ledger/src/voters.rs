@@ -212,24 +212,33 @@ fn create_state_proof_participant(state_proof_id: [u8; 64], weight: u64) -> cryp
     }
 }
 
-/// go's `votersForRound.LoadTree` (`ledger/ledgercore/votersForRound.go:122`):
-/// turn a selected top-N account slice (already in commitment order -- see
-/// [`select_top_online_accounts`]) into the `basics.Participant` array and
-/// build the vector-commitment Merkle tree over it, using
-/// `stateproof.HashType` (`crypto.Sumhash`).
+/// go's `votersForRound.LoadTree` (`ledger/ledgercore/votersForRound.go:122`)
+/// -- the `basics.Participant` array construction half only (see
+/// [`commit_participants`] for the vector-commitment tree half, and
+/// [`build_voters_tree`]/[`build_voters_tree_and_participants`] for callers
+/// that need both).
 ///
 /// `rewards_level` is the block header's `RewardsLevel` at the snapshot
 /// round (go: `hdr.RewardsLevel`); `reward_unit` is `params.RewardUnit`.
 ///
-/// Returns `(root, total_weight)` where `total_weight` is the sum of the
-/// *selected* participants' rewards-adjusted balances -- see the module
-/// doc's "known gap" for how this differs from go's
-/// `StateProofOnlineTotalWeight`.
-pub fn build_voters_tree(
+/// Returns `(participants, total_weight)` where `total_weight` is the sum
+/// of the *selected* participants' rewards-adjusted balances -- see the
+/// module doc's "known gap" for how this differs from go's
+/// `StateProofOnlineTotalWeight`. `participants` is already in commitment
+/// order (index == vector-commitment array position), matching `selected`'s
+/// order.
+///
+/// Split out from [`build_voters_tree`] by issue #912: a state-proof
+/// signing/proving daemon needs the participant array itself (to rebuild a
+/// `stateproof::Prover`), not just the commitment root -- see
+/// `algo_ledger::voters_tracker::record_voters_snapshot`, which persists
+/// this return value's `participants` alongside the existing compact
+/// `(root, total_weight)` snapshot.
+pub fn build_participants(
     selected: &[OnlineAccountCandidate],
     rewards_level: u64,
     reward_unit: u64,
-) -> Result<(Vec<u8>, u64), VotersError> {
+) -> Result<(Vec<crypto_sp::Participant>, u64), VotersError> {
     let mut participants = Vec::with_capacity(selected.len());
     let mut total_weight: u64 = 0;
 
@@ -257,12 +266,111 @@ pub fn build_voters_tree(
         participants.push(create_state_proof_participant(acct.state_proof_id, money));
     }
 
-    let array = crypto_sp::ParticipantsArray(participants);
-    let factory = merklearray::HashFactory::new(merklearray::HashType::Sumhash);
-    let tree = merklearray::build_vector_commitment_tree(&array, factory)
-        .map_err(|e| VotersError::Merkle(e.to_string()))?;
+    Ok((participants, total_weight))
+}
 
-    Ok((tree.root(), total_weight))
+/// Build the vector-commitment Merkle tree over an already-constructed
+/// participant array, using `stateproof.HashType` (`crypto.Sumhash`) --
+/// matches the tree-construction half of go's `votersForRound.LoadTree`.
+///
+/// Deterministic in the participant array's order/content only (see
+/// `tree_is_deterministic_for_the_same_input`/`commitment_is_order_sensitive`
+/// below) -- callers may rebuild this from a persisted `Vec<Participant>`
+/// (issue #912) and reproduce byte-for-byte the same tree, including its
+/// root, that was computed at snapshot time.
+pub fn commit_participants(
+    participants: &[crypto_sp::Participant],
+) -> Result<merklearray::Tree, VotersError> {
+    let array = crypto_sp::ParticipantsArray(participants.to_vec());
+    let factory = merklearray::HashFactory::new(merklearray::HashType::Sumhash);
+    merklearray::build_vector_commitment_tree(&array, factory)
+        .map_err(|e| VotersError::Merkle(e.to_string()))
+}
+
+/// go's `votersForRound.LoadTree` (`ledger/ledgercore/votersForRound.go:122`):
+/// turn a selected top-N account slice (already in commitment order -- see
+/// [`select_top_online_accounts`]) into the `basics.Participant` array and
+/// build the vector-commitment Merkle tree over it.
+///
+/// Returns `(root, total_weight)` only -- see
+/// [`build_voters_tree_and_participants`] for a variant that also returns
+/// the participant array itself (needed to persist a full voters snapshot,
+/// issue #912).
+pub fn build_voters_tree(
+    selected: &[OnlineAccountCandidate],
+    rewards_level: u64,
+    reward_unit: u64,
+) -> Result<(Vec<u8>, u64), VotersError> {
+    let (root, total_weight, _participants) =
+        build_voters_tree_and_participants(selected, rewards_level, reward_unit)?;
+    Ok((root, total_weight))
+}
+
+/// Like [`build_voters_tree`], but also returns the constructed
+/// `Vec<Participant>` array itself -- the shape
+/// `algo_ledger::voters_tracker::record_voters_snapshot` needs to persist a
+/// full voters snapshot (issue #912), not just its compact commitment.
+pub fn build_voters_tree_and_participants(
+    selected: &[OnlineAccountCandidate],
+    rewards_level: u64,
+    reward_unit: u64,
+) -> Result<(Vec<u8>, u64, Vec<crypto_sp::Participant>), VotersError> {
+    let (participants, total_weight) = build_participants(selected, rewards_level, reward_unit)?;
+    let tree = commit_participants(&participants)?;
+    Ok((tree.root(), total_weight, participants))
+}
+
+// ── Participant-array persistence codec (issue #912) ───────────────────
+//
+// `LedgerStore::put_voters_participants`/`get_voters_participants` persist
+// the full `Vec<Participant>` array a voters snapshot selected, so it
+// round-trips through storage byte-for-byte: `Participant` is `(pk:
+// merklesig::Verifier { commitment: [u8; 64], key_lifetime: u64 }, weight:
+// u64)`. `Verifier` already has a self-delimiting `to_msgpack`/
+// `from_msgpack` pair (`merklesig.rs`); this format concatenates a
+// little-endian `u32` count with each participant's `Verifier` msgpack
+// followed by its `weight` as little-endian `u64` -- deterministic and
+// simple enough not to need a full msgpack array wrapper, matching this
+// crate's existing hand-rolled encodings for fixed-shape internal blobs
+// (e.g. `stateproof_worker::db`'s `Signature::to_msgpack`/`from_msgpack`
+// usage).
+
+/// Encode a participant array for storage. See the section doc above for
+/// the exact format.
+pub fn encode_participants(participants: &[crypto_sp::Participant]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + participants.len() * 80);
+    buf.extend_from_slice(&(participants.len() as u32).to_le_bytes());
+    for p in participants {
+        buf.extend_from_slice(&p.pk.to_msgpack());
+        buf.extend_from_slice(&p.weight.to_le_bytes());
+    }
+    buf
+}
+
+/// Decode a participant array previously produced by [`encode_participants`].
+pub fn decode_participants(data: &[u8]) -> Result<Vec<crypto_sp::Participant>, String> {
+    if data.len() < 4 {
+        return Err(format!(
+            "decode_participants: buffer too short for count prefix: {} bytes",
+            data.len()
+        ));
+    }
+    let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let mut rest = &data[4..];
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let (pk, after_pk) = merklesig::Verifier::from_msgpack(rest)
+            .map_err(|e| format!("decode_participants: participant {i} pk: {e}"))?;
+        if after_pk.len() < 8 {
+            return Err(format!(
+                "decode_participants: participant {i}: buffer too short for weight"
+            ));
+        }
+        let weight = u64::from_le_bytes(after_pk[0..8].try_into().unwrap());
+        rest = &after_pk[8..];
+        out.push(crypto_sp::Participant { pk, weight });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -471,5 +579,69 @@ mod tests {
         assert!(!root.is_empty());
         // 5_000_000 + 4_000_000 (top 2 by balance, addr(5) and addr(4)).
         assert_eq!(total_weight, 9_000_000);
+    }
+
+    // ── build_voters_tree_and_participants / codec (issue #912) ────────
+
+    #[test]
+    fn build_voters_tree_and_participants_matches_build_voters_tree() {
+        let a = candidate(addr(1), 5_000_000);
+        let b = candidate(addr(2), 3_000_000);
+        let (root, weight) = build_voters_tree(&[a.clone(), b.clone()], 0, REWARD_UNIT).unwrap();
+        let (root2, weight2, participants) =
+            build_voters_tree_and_participants(&[a, b], 0, REWARD_UNIT).unwrap();
+        assert_eq!(root, root2, "must produce the identical commitment root");
+        assert_eq!(weight, weight2);
+        assert_eq!(participants.len(), 2);
+    }
+
+    #[test]
+    fn commit_participants_rebuilds_the_same_root_as_build_voters_tree() {
+        // The whole point of persisting only the participant array (issue
+        // #912) rather than the tree itself: rebuilding the tree from the
+        // persisted array must reproduce the exact root computed at
+        // snapshot time.
+        let a = candidate(addr(1), 5_000_000);
+        let mut b = candidate(addr(2), 3_000_000);
+        b.state_proof_id = [0x77u8; 64];
+        let (root, _weight, participants) =
+            build_voters_tree_and_participants(&[a, b], 7, REWARD_UNIT).unwrap();
+        let rebuilt = commit_participants(&participants).unwrap();
+        assert_eq!(root, rebuilt.root());
+    }
+
+    #[test]
+    fn participants_codec_round_trips_byte_for_byte() {
+        let a = candidate(addr(1), 5_000_000);
+        let mut b = candidate(addr(2), 3_000_000);
+        b.state_proof_id = [0xABu8; 64];
+        let (_, _, participants) =
+            build_voters_tree_and_participants(&[a, b], 3, REWARD_UNIT).unwrap();
+
+        let encoded = encode_participants(&participants);
+        let decoded = decode_participants(&encoded).unwrap();
+        assert_eq!(decoded, participants);
+
+        // The rebuilt tree from the round-tripped array must still commit
+        // to the same root.
+        let root_before = commit_participants(&participants).unwrap().root();
+        let root_after = commit_participants(&decoded).unwrap().root();
+        assert_eq!(root_before, root_after);
+    }
+
+    #[test]
+    fn participants_codec_round_trips_empty_array() {
+        let encoded = encode_participants(&[]);
+        let decoded = decode_participants(&encoded).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn decode_participants_rejects_truncated_buffer() {
+        assert!(decode_participants(&[0u8; 2]).is_err());
+        // A count prefix claiming one participant but no payload.
+        let mut buf = 1u32.to_le_bytes().to_vec();
+        buf.extend_from_slice(&[0u8; 3]);
+        assert!(decode_participants(&buf).is_err());
     }
 }

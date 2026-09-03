@@ -554,4 +554,63 @@ pub trait LedgerStore {
         let _ = round;
         Ok(())
     }
+
+    // ---- Voters snapshot: full participant array (issue #912) ----
+    //
+    // The compact `(voters_commitment, online_total_weight)` pair above is
+    // sufficient to *verify* a state-proof transaction that already exists
+    // in a block (`apply_stateproof.rs`), but building/signing one requires
+    // the full selected voters-round participant array -- go's
+    // `ledgercore.VotersForRound.Participants`/`.Tree`, fetched via
+    // `Ledger.VotersForStateProof(lookback)` (`stateproof/abstractions.go:44`)
+    // and persisted (once the state-proof round is actually reached) in the
+    // `stateproof` package's own `provers` table (`stateproof/db.go`,
+    // `persistProver`/`getProver`) -- see `crate::voters_tracker`'s module
+    // doc and issue #912 for the full root-cause writeup.
+    //
+    // Retained at the *same* round key and pruned on the *same* schedule as
+    // the compact snapshot above (`crate::voters_tracker::
+    // prune_voters_snapshots`) -- go's `deleteStaleProver` retention
+    // (`stateproof/builder.go:593`) tracks `StateProofNextRound`, which is
+    // already what `should_remove_voters_snapshot`'s existing recovery-
+    // window arithmetic bounds, so no separate pruning schedule is needed
+    // (see this crate's `voters_tracker.rs` module doc, and issue #912's PR
+    // description, for why `stateproof_worker::PROVERS_CACHE_LENGTH` -- which
+    // bounds go's *in-memory* prover cache, not disk retention -- does not
+    // apply here).
+
+    /// Store the full participant array selected for the voters snapshot at
+    /// `round`, alongside the compact commitment [`Self::put_voters_snapshot`]
+    /// stores. Called at the same point, in the same transaction, as
+    /// [`Self::put_voters_snapshot`] -- see `crate::voters_tracker::
+    /// record_voters_snapshot`.
+    fn put_voters_participants(
+        &mut self,
+        round: u64,
+        participants: &[algo_consensus_crypto::stateproof::Participant],
+    ) -> Result<(), AlgoError> {
+        let _ = (round, participants);
+        Ok(())
+    }
+
+    /// Retrieve the full participant array recorded for the voters snapshot
+    /// at `round`, if any. The vector-commitment tree itself is not stored
+    /// -- `crate::voters::commit_participants` deterministically rebuilds
+    /// it (byte-for-byte, including the root) from this array alone; see
+    /// `crate::voters_tracker::voters_participants_and_tree`.
+    fn get_voters_participants(
+        &self,
+        round: u64,
+    ) -> Result<Option<Vec<algo_consensus_crypto::stateproof::Participant>>, AlgoError> {
+        let _ = round;
+        Ok(None)
+    }
+
+    /// Delete the participant array recorded at `round`, if any. Called
+    /// alongside [`Self::delete_voters_snapshot`] by
+    /// `crate::voters_tracker::prune_voters_snapshots`.
+    fn delete_voters_participants(&mut self, round: u64) -> Result<(), AlgoError> {
+        let _ = round;
+        Ok(())
+    }
 }

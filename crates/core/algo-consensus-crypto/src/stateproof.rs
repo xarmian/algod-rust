@@ -231,7 +231,7 @@ pub struct Reveal {
 }
 
 /// A participant corresponds to an online account (go: `basics.Participant`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Participant {
     /// Merkle-signature-scheme verifier for this participant.
     pub pk: merklesig::Verifier,

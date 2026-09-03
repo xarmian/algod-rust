@@ -50,6 +50,25 @@
 //! sizes involved (`StateProofTopVoters` truncates the tree to at most 1024
 //! participants).
 //!
+//! # Full participant retention (issue #912)
+//!
+//! [`record_voters_snapshot`] persists **both** the compact
+//! `(voters_commitment, online_total_weight)` pair (via
+//! `LedgerStore::put_voters_snapshot`, sufficient to verify a state-proof
+//! transaction already in a block, `apply_stateproof.rs`) **and** the full
+//! `Vec<Participant>` array itself (via
+//! `LedgerStore::put_voters_participants`), under the same round key. The
+//! latter is what a state-proof signing/proving daemon needs to *build* a
+//! proof: go's equivalent is `ledgercore.VotersForRound.Participants`/
+//! `.Tree`, fetched via `Ledger.VotersForStateProof(lookback)`
+//! (`stateproof/abstractions.go:44`) and persisted by the `stateproof`
+//! package's own `provers` table (`stateproof/db.go`) once the state-proof
+//! round is reached. algod-rust collapses this into one persistence point
+//! at snapshot time instead of two (see [`voters_participants_and_tree`] for
+//! retrieval) -- the vector-commitment tree itself is never stored, since
+//! `crate::voters::commit_participants` deterministically rebuilds it
+//! byte-for-byte from the persisted array alone.
+//!
 //! # Retention
 //!
 //! [`prune_voters_snapshots`] mirrors go's `removeOldVoters`: a snapshot at
@@ -57,8 +76,18 @@
 //! StateProofInterval` (the state-proof round it serves) falls below the
 //! oldest state proof round the ledger still expects
 //! (`stateproof.GetOldestExpectedStateProof`, ported here as
-//! [`get_oldest_expected_state_proof`]).
+//! [`get_oldest_expected_state_proof`]). The full participant array (issue
+//! #912) is pruned on the identical schedule, alongside the compact
+//! snapshot -- matching go's `deleteStaleProver` (`stateproof/builder.go:593`),
+//! which likewise retains a persisted prover only until
+//! `StateProofNextRound` (the same bound `get_oldest_expected_state_proof`
+//! computes) has advanced past it. `stateproof_worker::PROVERS_CACHE_LENGTH`
+//! (go's `proversCacheLength`) is a *different* bound -- it caps how many
+//! provers a signing/proving daemon keeps in its own *in-memory* map
+//! (`stateproof/worker.go:40`), not how long this disk-persisted array is
+//! retained, so it is deliberately not reused here.
 
+use algo_consensus_crypto::{merklearray, stateproof as crypto_sp};
 use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
 use algo_types::AccountData;
@@ -66,7 +95,10 @@ use algo_types::AccountData;
 use crate::block_header::state_proof_next_round;
 use crate::rewards::compute_pending_rewards;
 use crate::store_trait::LedgerStore;
-use crate::voters::{build_voters_tree, select_top_online_accounts, OnlineAccountCandidate};
+use crate::voters::{
+    build_voters_tree_and_participants, commit_participants, select_top_online_accounts,
+    OnlineAccountCandidate,
+};
 
 fn ledger_err(message: impl Into<String>) -> AlgoError {
     AlgoError::Ledger {
@@ -233,8 +265,8 @@ pub fn record_voters_snapshot<L: LedgerStore>(
         vote_rnd,
         params.reward_unit,
     );
-    let (root, _selected_only_weight) =
-        build_voters_tree(&selected, rewards_level, params.reward_unit)
+    let (root, _selected_only_weight, participants) =
+        build_voters_tree_and_participants(&selected, rewards_level, params.reward_unit)
             .map_err(|e| ledger_err(format!("record_voters_snapshot: {e}")))?;
 
     // The real `StateProofOnlineTotalWeight` is the network-wide online
@@ -247,7 +279,12 @@ pub fn record_voters_snapshot<L: LedgerStore>(
         params.exclude_expired_circulation,
     );
 
-    store.put_voters_snapshot(round, root, total_weight)
+    store.put_voters_snapshot(round, root, total_weight)?;
+    // Full participant array (issue #912): persisted alongside the compact
+    // commitment above, at the same round key, so a state-proof
+    // signing/proving daemon can later rebuild the vector-commitment tree
+    // and a `stateproof::Prover` -- see `voters_participants_and_tree`.
+    store.put_voters_participants(round, &participants)
 }
 
 /// Prune voters snapshots no longer needed, given the block just applied at
@@ -277,9 +314,42 @@ pub fn prune_voters_snapshots<L: LedgerStore>(
     for r in store.voters_snapshot_rounds()? {
         if should_remove_voters_snapshot(r, lowest, lookback, interval) {
             store.delete_voters_snapshot(r)?;
+            // The full participant array (issue #912) is retained under the
+            // same round key and is no longer needed once its compact
+            // snapshot counterpart is pruned -- both exist to serve the
+            // same state-proof round, per `record_voters_snapshot`.
+            store.delete_voters_participants(r)?;
         }
     }
     Ok(())
+}
+
+/// Retrieve the full participant array + rebuilt vector-commitment tree for
+/// the voters snapshot recorded at `round` (a *snapshot* round, i.e. the
+/// key [`record_voters_snapshot`] stored under -- not the consuming
+/// state-proof round). Lets a state-proof signing/proving daemon
+/// reconstruct exactly what `record_voters_snapshot` computed, without the
+/// ledger needing to retain the `merklearray::Tree` value itself:
+/// `crate::voters::commit_participants` is a pure, deterministic function of
+/// the participant array's order/content (see `voters.rs`'s
+/// `tree_is_deterministic_for_the_same_input`/`commit_participants_rebuilds_
+/// the_same_root_as_build_voters_tree` tests), so rebuilding it here from the
+/// persisted `Vec<Participant>` reproduces byte-for-byte the same tree --
+/// including its root -- that was computed and committed at snapshot time.
+///
+/// Returns `None` when no participant array was recorded for `round` (state
+/// proofs disabled at the time, `round` wasn't a snapshot round, or the
+/// snapshot has since been pruned).
+pub fn voters_participants_and_tree<L: LedgerStore>(
+    store: &L,
+    round: u64,
+) -> Result<Option<(Vec<crypto_sp::Participant>, merklearray::Tree)>, AlgoError> {
+    let Some(participants) = store.get_voters_participants(round)? else {
+        return Ok(None);
+    };
+    let tree = commit_participants(&participants)
+        .map_err(|e| ledger_err(format!("voters_participants_and_tree: {e}")))?;
+    Ok(Some((participants, tree)))
 }
 
 /// Resolve `(voters_commitment, online_total_weight)` for the block being
@@ -473,6 +543,75 @@ mod tests {
             store.voters_snapshot_rounds().unwrap(),
             vec![240],
             "snapshot still needed for its state proof round must survive"
+        );
+    }
+
+    // ── Full participant array persistence (issue #912) ─────────────────
+
+    #[test]
+    fn record_voters_snapshot_persists_full_participant_array() {
+        let params = v41(); // interval 256, lookback 16
+        let mut store = LedgerState::new();
+        store.set_account(&Address([9u8; 32]), online_account(10_000_000));
+        store.set_account(&Address([8u8; 32]), online_account(5_000_000));
+
+        record_voters_snapshot(&mut store, 240, 0, &params).unwrap();
+
+        let (participants, tree) = voters_participants_and_tree(&store, 240)
+            .unwrap()
+            .expect("full participant array must be retrievable at the snapshot round");
+        assert_eq!(participants.len(), 2, "both online accounts were selected");
+
+        // The rebuilt tree's root must byte-for-byte match the compact
+        // commitment root recorded alongside it -- proving the array
+        // round-trips through storage equivalent to what
+        // `voters::build_voters_tree` computed at snapshot time.
+        let (commitment_root, _weight) = store.get_voters_snapshot(240).unwrap().unwrap();
+        assert_eq!(tree.root(), commitment_root);
+    }
+
+    #[test]
+    fn voters_participants_and_tree_is_none_without_a_snapshot() {
+        let store = LedgerState::new();
+        assert!(voters_participants_and_tree(&store, 240).unwrap().is_none());
+    }
+
+    #[test]
+    fn record_voters_snapshot_ignoring_non_snapshot_rounds_stores_no_participants() {
+        let params = v41();
+        let mut store = LedgerState::new();
+        store.set_account(&Address([9u8; 32]), online_account(10_000_000));
+        record_voters_snapshot(&mut store, 241, 0, &params).unwrap();
+        assert!(voters_participants_and_tree(&store, 241).unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_voters_snapshots_also_prunes_the_participant_array() {
+        let params = v41();
+        let mut store = LedgerState::new();
+        store.set_account(&Address([9u8; 32]), online_account(10_000_000));
+        record_voters_snapshot(&mut store, 240, 0, &params).unwrap();
+        assert!(voters_participants_and_tree(&store, 240).unwrap().is_some());
+
+        let far_round = 512 + 256 * 10 + 1000;
+        prune_voters_snapshots(&mut store, far_round, &None, &params).unwrap();
+        assert!(
+            voters_participants_and_tree(&store, 240).unwrap().is_none(),
+            "the full participant array must be pruned alongside the compact snapshot"
+        );
+    }
+
+    #[test]
+    fn prune_voters_snapshots_keeps_the_participant_array_within_window() {
+        let params = v41();
+        let mut store = LedgerState::new();
+        store.set_account(&Address([9u8; 32]), online_account(10_000_000));
+        record_voters_snapshot(&mut store, 240, 0, &params).unwrap();
+
+        prune_voters_snapshots(&mut store, 300, &None, &params).unwrap();
+        assert!(
+            voters_participants_and_tree(&store, 240).unwrap().is_some(),
+            "still within the retention window -- must survive alongside the compact snapshot"
         );
     }
 }
