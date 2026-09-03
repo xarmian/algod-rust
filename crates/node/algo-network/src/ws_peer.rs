@@ -687,20 +687,19 @@ impl PeerHandle {
     /// The returned handle is compatible with the peer registry and supports
     /// broadcast, send, and close operations.
     ///
-    /// # vpack vote compression: not negotiated for inbound peers
+    /// # vpack vote compression
     ///
-    /// Unlike the outbound path (`connect.rs`'s `try_connect` /
-    /// `WsPeer::with_config`), this constructor does not read the
-    /// client's `X-Algorand-Peer-Features` request header, does not send
-    /// one back, and always sets `features: PeerFeatureFlags::empty()`
-    /// below — so an inbound connection never negotiates vpack vote
-    /// compression (issue #817's wiring only covers the outbound
-    /// tokio-tungstenite path). This mirrors this constructor's pre-existing
-    /// behaviour for every other feature-gated capability (there was no
-    /// feature negotiation of any kind for inbound peers before this
-    /// change either), so it is not a regression, but it does mean a
-    /// relay accepting inbound connections gets no compression benefit on
-    /// them today.
+    /// `features` is the already-negotiated (intersected) feature set for
+    /// this connection: the caller (`ws_network.rs`'s
+    /// `gossip_upgrade_handler`) decodes the client's
+    /// `X-Algorand-Peer-Features` request header and intersects it with
+    /// this node's own advertised features, mirroring the outbound path's
+    /// `connect.rs::try_connect` (`remote_features.intersection(config.our_features)`).
+    /// The read and write loops below negotiate/apply stateless (`AV`-tag)
+    /// and stateful (`VP`-tag) vote compression exactly like the outbound
+    /// tokio-tungstenite path's `read_loop`/`write_loop`, sharing the
+    /// sink-agnostic `decompress_incoming_vote`/`compress_outgoing_vote`
+    /// helpers so the wire behaviour is identical in both directions.
     pub fn new_inbound(
         socket: axum::extract::ws::WebSocket,
         remote_addr: String,
@@ -708,6 +707,7 @@ impl PeerHandle {
         closing: CancellationToken,
         incoming_filter: Option<Arc<MessageFilter>>,
         outgoing_filter: Option<Arc<MessageFilter>>,
+        features: PeerFeatureFlags,
     ) -> Self {
         use futures_util::{SinkExt, StreamExt};
 
@@ -718,12 +718,29 @@ impl PeerHandle {
         let (send_bulk_tx, mut send_bulk_rx) = mpsc::channel::<WriteCommand>(SEND_BUFFER_LENGTH);
         let (incoming_tx, incoming_rx) = mpsc::channel(MSGS_IN_READ_BUFFER_PER_PEER);
 
+        // Stateful vote compression negotiation, shared between the read and
+        // write loops below — see `WsPeer::start`'s identical setup for the
+        // outbound path.
+        let negotiated_table_size = peer_features::stateful_table_size(features);
+        let stateful_vote_enabled = Arc::new(AtomicBool::new(negotiated_table_size > 0));
+        tracing::debug!(
+            peer = %remote_addr,
+            features = ?features,
+            stateless_vote_compression = features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK),
+            stateful_vote_table_size = negotiated_table_size,
+            "inbound: vpack vote compression negotiated for this connection"
+        );
+
         let read_closing = closing.clone();
         let read_addr = remote_addr.clone();
         let read_outgoing_filter = outgoing_filter.clone();
+        let read_send_high_prio_tx = send_high_prio_tx.clone();
+        let read_stateful_vote_enabled = stateful_vote_enabled.clone();
 
         // Read loop: reads from axum WebSocket and dispatches to incoming channel.
         let read_handle = tokio::spawn(async move {
+            let vote_table_size = negotiated_table_size;
+            let mut stateful_decoder: Option<StatefulDecoder> = None;
             loop {
                 tokio::select! {
                     _ = read_closing.cancelled() => {
@@ -733,7 +750,7 @@ impl PeerHandle {
                     msg = ws_reader.next() => {
                         match msg {
                             Some(Ok(axum::extract::ws::Message::Binary(data))) => {
-                                if let Ok((tag, payload)) = crate::framing::decode_frame(&data) {
+                                if let Ok((mut tag, payload)) = crate::framing::decode_frame(&data) {
                                     // go-algorand compresses every proposal
                                     // broadcast unconditionally at wsnet 2.2
                                     // (`msgBroadcaster.preparePeerData`,
@@ -763,6 +780,25 @@ impl PeerHandle {
                                         }
                                     } else {
                                         payload.to_vec()
+                                    };
+
+                                    // --- vpack vote (de)compression: VP
+                                    // (stateful) and AV (stateless) tags.
+                                    // Shares the exact same logic as the
+                                    // outbound path's `read_loop` via
+                                    // `decompress_incoming_vote`.
+                                    let payload = match decompress_incoming_vote(
+                                        &mut tag,
+                                        payload,
+                                        features,
+                                        vote_table_size,
+                                        &mut stateful_decoder,
+                                        &read_stateful_vote_enabled,
+                                        &read_send_high_prio_tx,
+                                        &read_addr,
+                                    ) {
+                                        Some(p) => p,
+                                        None => continue,
                                     };
 
                                     // --- MsgDigestSkip handling ---
@@ -843,6 +879,8 @@ impl PeerHandle {
 
         // Write loop: drains high-prio and bulk channels, writes to axum WebSocket.
         let write_handle = tokio::spawn(async move {
+            let vote_table_size = negotiated_table_size;
+            let mut stateful_encoder: Option<StatefulEncoder> = None;
             loop {
                 // Prefer high-priority messages.
                 tokio::select! {
@@ -854,14 +892,16 @@ impl PeerHandle {
                     cmd = send_high_prio_rx.recv() => {
                         match cmd {
                             Some(WriteCommand::Data(sm)) => {
-                                if outgoing_filter_suppresses(&sm.msg, &outgoing_filter) {
-                                    continue;
-                                }
-                                let frame = match encode_inbound_frame(&sm.msg) {
-                                    Ok(f) => f,
-                                    Err(_) => continue,
-                                };
-                                if ws_writer.send(axum::extract::ws::Message::Binary(frame)).await.is_err() {
+                                if write_inbound_data_message(
+                                    sm,
+                                    &mut ws_writer,
+                                    &outgoing_filter,
+                                    features,
+                                    vote_table_size,
+                                    &stateful_vote_enabled,
+                                    &mut stateful_encoder,
+                                    &write_addr,
+                                ).await.is_err() {
                                     break;
                                 }
                             }
@@ -871,25 +911,25 @@ impl PeerHandle {
                                 }
                             }
                             Some(WriteCommand::UpdateFilter(_)) => { /* no-op for inbound */ }
-                            // Inbound connections don't negotiate/apply vpack
-                            // compression yet (see `new_inbound`'s doc
-                            // comment), so there is never a stateful
-                            // encoder/decoder to abort here.
-                            Some(WriteCommand::VpAbort) => {}
+                            Some(WriteCommand::VpAbort) => {
+                                send_vp_abort_axum(&mut ws_writer, &write_addr).await;
+                            }
                             None => break,
                         }
                     }
                     cmd = send_bulk_rx.recv() => {
                         match cmd {
                             Some(WriteCommand::Data(sm)) => {
-                                if outgoing_filter_suppresses(&sm.msg, &outgoing_filter) {
-                                    continue;
-                                }
-                                let frame = match encode_inbound_frame(&sm.msg) {
-                                    Ok(f) => f,
-                                    Err(_) => continue,
-                                };
-                                if ws_writer.send(axum::extract::ws::Message::Binary(frame)).await.is_err() {
+                                if write_inbound_data_message(
+                                    sm,
+                                    &mut ws_writer,
+                                    &outgoing_filter,
+                                    features,
+                                    vote_table_size,
+                                    &stateful_vote_enabled,
+                                    &mut stateful_encoder,
+                                    &write_addr,
+                                ).await.is_err() {
                                     break;
                                 }
                             }
@@ -899,7 +939,9 @@ impl PeerHandle {
                                 }
                             }
                             Some(WriteCommand::UpdateFilter(_)) => {}
-                            Some(WriteCommand::VpAbort) => {}
+                            Some(WriteCommand::VpAbort) => {
+                                send_vp_abort_axum(&mut ws_writer, &write_addr).await;
+                            }
                             None => break,
                         }
                     }
@@ -922,7 +964,7 @@ impl PeerHandle {
             remote_addr,
             identity_key: None,
             identity_verified: false,
-            features: PeerFeatureFlags::empty(),
+            features,
             version,
             request_tracker: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -930,6 +972,95 @@ impl PeerHandle {
             _write_handle: write_handle,
             _keepalive_handle: keepalive_handle,
         }
+    }
+}
+
+/// Sends a single outgoing data message on the axum inbound write loop:
+/// applies the outgoing dedup filter, vpack-compresses `AgreementVote`
+/// payloads (mirroring [`compress_outgoing_vote`]/`try_compress_vote` on the
+/// outbound path), falls back to [`encode_inbound_frame`] for everything
+/// else (including an AV message whose stateless compression failed), and
+/// writes the resulting frame to `ws_writer`.
+///
+/// Returns `Err(())` only on a fatal WebSocket send error (caller should
+/// close the connection); a dropped/suppressed/oversized message is `Ok(())`.
+#[allow(clippy::too_many_arguments)]
+async fn write_inbound_data_message(
+    sm: SendMessage,
+    ws_writer: &mut SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>,
+    outgoing_filter: &Option<Arc<MessageFilter>>,
+    features: PeerFeatureFlags,
+    vote_table_size: u32,
+    stateful_vote_enabled: &Arc<AtomicBool>,
+    stateful_encoder: &mut Option<StatefulEncoder>,
+    remote_addr: &str,
+) -> Result<(), ()> {
+    use futures_util::SinkExt;
+
+    if outgoing_filter_suppresses(&sm.msg, outgoing_filter) {
+        return Ok(());
+    }
+
+    let tag = sm.msg.tag;
+    let vote_compressed = if tag == Tag::AgreementVote
+        && features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK)
+        && !sm.msg.payload.is_empty()
+        && sm.msg.topics.is_none()
+    {
+        let (frame, need_abort) = compress_outgoing_vote(
+            &sm.msg.payload,
+            vote_table_size,
+            stateful_vote_enabled,
+            stateful_encoder,
+            remote_addr,
+        );
+        if need_abort {
+            send_vp_abort_axum(ws_writer, remote_addr).await;
+        }
+        frame
+    } else {
+        None
+    };
+
+    let frame = match vote_compressed {
+        Some(f) => f,
+        None => match encode_inbound_frame(&sm.msg) {
+            Ok(f) => f,
+            Err(_) => return Ok(()),
+        },
+    };
+
+    if ws_writer
+        .send(axum::extract::ws::Message::Binary(frame))
+        .await
+        .is_err()
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Writes a `VP` + [`VOTE_COMPRESSION_ABORT_BYTE`] control frame directly to
+/// the axum WebSocket sink, bypassing the message-of-interest filter — the
+/// axum-sink counterpart of [`send_vp_abort`] for the inbound write loop.
+async fn send_vp_abort_axum(
+    ws_writer: &mut SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>,
+    remote_addr: &str,
+) {
+    use futures_util::SinkExt;
+
+    let mut frame = Vec::with_capacity(3);
+    frame.extend_from_slice(&Tag::VotePacked.as_bytes());
+    frame.push(VOTE_COMPRESSION_ABORT_BYTE);
+    if ws_writer
+        .send(axum::extract::ws::Message::Binary(frame))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            peer = %remote_addr,
+            "inbound write_loop: failed to send VP abort message"
+        );
     }
 }
 
@@ -1225,6 +1356,144 @@ impl PeerHandle {
 // read_loop
 // ---------------------------------------------------------------------------
 
+/// Applies vpack vote (de)compression to a just-decoded incoming frame.
+///
+/// Sink-agnostic (pure over `tag`/`payload`/decoder state) so it can be
+/// shared between the tokio-tungstenite outbound `read_loop` and the
+/// axum-based inbound read loop (`PeerHandle::new_inbound`) — the two
+/// connection types use different WebSocket sink/stream types, but the
+/// vpack wire logic itself does not touch the sink at all (a stateful
+/// decode failure or a received abort byte only needs to flip
+/// `stateful_vote_enabled` and best-effort-enqueue a
+/// [`WriteCommand::VpAbort`] for the corresponding write loop to send,
+/// which both write loops already drain from `send_high_prio_tx`).
+///
+/// `tag` is mutated in place: a decoded stateful (`VP`) vote is re-tagged
+/// to `AgreementVote` so downstream dispatch (MI/dedup/multiplexer) sees a
+/// normal decoded vote, mirroring go-algorand's
+/// `wsPeerMsgCodec.decompress()` (`network/msgCompressor.go`).
+///
+/// Returns `Some(payload)` — the (possibly decompressed) payload to
+/// continue dispatching — or `None` if the caller should drop this
+/// message and `continue` its read loop (a control frame, or decompression
+/// is currently disabled for this connection).
+#[allow(clippy::too_many_arguments)]
+fn decompress_incoming_vote(
+    tag: &mut Tag,
+    payload: Vec<u8>,
+    features: PeerFeatureFlags,
+    vote_table_size: u32,
+    stateful_decoder: &mut Option<StatefulDecoder>,
+    stateful_vote_enabled: &Arc<AtomicBool>,
+    send_high_prio_tx: &mpsc::Sender<WriteCommand>,
+    remote_addr: &str,
+) -> Option<Vec<u8>> {
+    if *tag == Tag::VotePacked {
+        // A VP frame is either a control message (the single-byte abort
+        // signal) or a stateful-vpack-compressed vote. Either way it never
+        // reaches the normal dispatch pipeline below with tag VP — it's
+        // either dropped here or re-tagged to AV once decoded.
+        if payload.len() == 1 && payload[0] == VOTE_COMPRESSION_ABORT_BYTE {
+            tracing::info!(
+                peer = %remote_addr,
+                "read_loop: received VP abort message, disabling stateful vote compression"
+            );
+            stateful_vote_enabled.store(false, Ordering::Release);
+            return None;
+        }
+
+        if !stateful_vote_enabled.load(Ordering::Acquire) {
+            tracing::debug!(
+                peer = %remote_addr,
+                "read_loop: dropping VP message, stateful decompression disabled"
+            );
+            return None;
+        }
+
+        if stateful_decoder.is_none() {
+            match StatefulDecoder::new(vote_table_size) {
+                Ok(dec) => *stateful_decoder = Some(dec),
+                Err(e) => {
+                    tracing::warn!(
+                        peer = %remote_addr,
+                        error = %e,
+                        "read_loop: failed to init stateful vote decoder, disabling"
+                    );
+                    stateful_vote_enabled.store(false, Ordering::Release);
+                    let _ = send_high_prio_tx.try_send(WriteCommand::VpAbort);
+                    return None;
+                }
+            }
+        }
+        let dec = stateful_decoder
+            .as_mut()
+            .expect("stateful_decoder just initialized above");
+
+        let stateless = match dec.decompress(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    peer = %remote_addr,
+                    error = %e,
+                    "read_loop: stateful vote decompression failed, disabling"
+                );
+                stateful_vote_enabled.store(false, Ordering::Release);
+                let _ = send_high_prio_tx.try_send(WriteCommand::VpAbort);
+                return None;
+            }
+        };
+
+        match vpack::decompress_vote(&stateless) {
+            Ok(raw) => {
+                tracing::debug!(
+                    peer = %remote_addr,
+                    vp_len = payload.len(),
+                    stateless_len = stateless.len(),
+                    raw_len = raw.len(),
+                    "read_loop: received stateful (VP) vote compression"
+                );
+                // Re-tag as AV so downstream dispatch (MI/dedup/
+                // multiplexer) sees a normal decoded vote.
+                *tag = Tag::AgreementVote;
+                Some(raw)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    peer = %remote_addr,
+                    error = %e,
+                    "read_loop: stateless vote decompression failed after stateful, disabling"
+                );
+                stateful_vote_enabled.store(false, Ordering::Release);
+                let _ = send_high_prio_tx.try_send(WriteCommand::VpAbort);
+                None
+            }
+        }
+    } else if *tag == Tag::AgreementVote
+        && features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK)
+        && !payload.is_empty()
+    {
+        match vpack::decompress_vote(&payload) {
+            Ok(raw) => Some(raw),
+            Err(VpackError::LikelyUncompressed(_)) => {
+                // Peer claims avvpack support but sent a plain
+                // uncompressed vote; pass it through silently
+                // (matches Go's `ErrLikelyUncompressed` handling).
+                Some(payload)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    peer = %remote_addr,
+                    error = %e,
+                    "read_loop: vote decompress error, passing through raw"
+                );
+                Some(payload)
+            }
+        }
+    } else {
+        Some(payload)
+    }
+}
+
 /// Reads WebSocket frames, parses tag + payload, handles MI messages locally,
 /// and dispatches everything else to the incoming channel.
 ///
@@ -1365,110 +1634,20 @@ async fn read_loop<St>(
                 // --- vpack vote (de)compression: VP (stateful) and AV
                 // (stateless) tags. Mirrors go-algorand's
                 // `wsPeerMsgCodec.decompress()` (`network/msgCompressor.go`).
-                let payload = if tag == Tag::VotePacked {
-                    // A VP frame is either a control message (the
-                    // single-byte abort signal) or a stateful-vpack-
-                    // compressed vote. Either way it never reaches the
-                    // normal dispatch pipeline below with tag VP — it's
-                    // either dropped here or re-tagged to AV once decoded.
-                    if payload.len() == 1 && payload[0] == VOTE_COMPRESSION_ABORT_BYTE {
-                        tracing::info!(
-                            peer = %remote_addr,
-                            "read_loop: received VP abort message, disabling stateful vote compression"
-                        );
-                        stateful_vote_enabled.store(false, Ordering::Release);
-                        continue;
-                    }
-
-                    if !stateful_vote_enabled.load(Ordering::Acquire) {
-                        tracing::debug!(
-                            peer = %remote_addr,
-                            "read_loop: dropping VP message, stateful decompression disabled"
-                        );
-                        continue;
-                    }
-
-                    if stateful_decoder.is_none() {
-                        match StatefulDecoder::new(vote_table_size) {
-                            Ok(dec) => stateful_decoder = Some(dec),
-                            Err(e) => {
-                                tracing::warn!(
-                                    peer = %remote_addr,
-                                    error = %e,
-                                    "read_loop: failed to init stateful vote decoder, disabling"
-                                );
-                                stateful_vote_enabled.store(false, Ordering::Release);
-                                let _ = send_high_prio_tx.try_send(WriteCommand::VpAbort);
-                                continue;
-                            }
-                        }
-                    }
-                    let dec = stateful_decoder
-                        .as_mut()
-                        .expect("stateful_decoder just initialized above");
-
-                    let stateless = match dec.decompress(&payload) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!(
-                                peer = %remote_addr,
-                                error = %e,
-                                "read_loop: stateful vote decompression failed, disabling"
-                            );
-                            stateful_vote_enabled.store(false, Ordering::Release);
-                            let _ = send_high_prio_tx.try_send(WriteCommand::VpAbort);
-                            continue;
-                        }
-                    };
-
-                    match vpack::decompress_vote(&stateless) {
-                        Ok(raw) => {
-                            tracing::debug!(
-                                peer = %remote_addr,
-                                vp_len = payload.len(),
-                                stateless_len = stateless.len(),
-                                raw_len = raw.len(),
-                                "read_loop: received stateful (VP) vote compression"
-                            );
-                            // Re-tag as AV so downstream dispatch (MI/dedup/
-                            // multiplexer) sees a normal decoded vote.
-                            tag = Tag::AgreementVote;
-                            raw
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                peer = %remote_addr,
-                                error = %e,
-                                "read_loop: stateless vote decompression failed after stateful, disabling"
-                            );
-                            stateful_vote_enabled.store(false, Ordering::Release);
-                            let _ = send_high_prio_tx.try_send(WriteCommand::VpAbort);
-                            continue;
-                        }
-                    }
-                } else if tag == Tag::AgreementVote
-                    && features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK)
-                    && !payload.is_empty()
-                {
-                    match vpack::decompress_vote(&payload) {
-                        Ok(raw) => raw,
-                        Err(VpackError::LikelyUncompressed(_)) => {
-                            // Peer claims avvpack support but sent a plain
-                            // uncompressed vote; pass it through silently
-                            // (matches Go's `ErrLikelyUncompressed` handling).
-                            payload
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                peer = %remote_addr,
-                                error = %e,
-                                "read_loop: vote decompress error, passing through raw"
-                            );
-                            payload
-                        }
-                    }
-                } else {
-                    payload
+                // Shared with the axum-based inbound read loop (`new_inbound`)
+                // via `decompress_incoming_vote` — see that function's docs.
+                let payload = match decompress_incoming_vote(
+                    &mut tag,
+                    payload,
+                    features,
+                    vote_table_size,
+                    &mut stateful_decoder,
+                    &stateful_vote_enabled,
+                    &send_high_prio_tx,
+                    &remote_addr,
+                ) {
+                    Some(p) => p,
+                    None => continue,
                 };
 
                 // Handle MI (MsgOfInterest) messages: update the send filter.
@@ -2119,6 +2298,43 @@ async fn try_compress_vote<Sk>(
 where
     Sk: futures_util::Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
+    let (frame, need_abort) = compress_outgoing_vote(
+        payload,
+        vote_table_size,
+        stateful_vote_enabled,
+        stateful_encoder,
+        remote_addr,
+    );
+    if need_abort {
+        send_vp_abort(sink, remote_addr).await;
+    }
+    frame
+}
+
+/// Applies vpack vote compression to an outgoing `AgreementVote` payload.
+///
+/// Sink-agnostic core of [`try_compress_vote`], factored out so the axum
+/// inbound write loop (`PeerHandle::new_inbound`) can share the exact same
+/// stateless/stateful compression logic without depending on
+/// tokio-tungstenite's sink type. Returns `(frame, need_abort)`:
+///
+/// * `frame` mirrors `try_compress_vote`'s return value — `Some` with an
+///   already-tag-prefixed frame (`AV` stateless or `VP` stateful) on
+///   success, `None` if the stateless layer itself failed (caller should
+///   fall back to a plain uncompressed `AV` frame).
+/// * `need_abort` is `true` when a stateful encode/init failure just
+///   disabled `stateful_vote_enabled` for this connection — the caller
+///   must send a `VP` + [`VOTE_COMPRESSION_ABORT_BYTE`] control frame on
+///   its own sink type (this function cannot do so itself, having no sink).
+///
+/// Mirrors go-algorand's `wsPeerMsgCodec.compress()` (`network/msgCompressor.go`).
+fn compress_outgoing_vote(
+    payload: &[u8],
+    vote_table_size: u32,
+    stateful_vote_enabled: &Arc<AtomicBool>,
+    stateful_encoder: &mut Option<StatefulEncoder>,
+    remote_addr: &str,
+) -> (Option<Vec<u8>>, bool) {
     let stateless = match vpack::compress_vote(payload) {
         Ok(c) => c,
         Err(e) => {
@@ -2127,7 +2343,7 @@ where
                 error = %e,
                 "write_loop: vpack stateless vote compression failed, sending uncompressed"
             );
-            return None;
+            return (None, false);
         }
     };
 
@@ -2139,7 +2355,7 @@ where
     };
 
     if vote_table_size == 0 || !stateful_vote_enabled.load(Ordering::Acquire) {
-        return Some(stateless_frame(&stateless));
+        return (Some(stateless_frame(&stateless)), false);
     }
 
     if stateful_encoder.is_none() {
@@ -2159,8 +2375,7 @@ where
                     "write_loop: failed to init stateful vote encoder, disabling"
                 );
                 stateful_vote_enabled.store(false, Ordering::Release);
-                send_vp_abort(sink, remote_addr).await;
-                return Some(stateless_frame(&stateless));
+                return (Some(stateless_frame(&stateless)), true);
             }
         }
     }
@@ -2180,7 +2395,7 @@ where
             let mut f = Vec::with_capacity(2 + vp_bytes.len());
             f.extend_from_slice(&Tag::VotePacked.as_bytes());
             f.extend_from_slice(&vp_bytes);
-            Some(f)
+            (Some(f), false)
         }
         Err(e) => {
             tracing::warn!(
@@ -2189,8 +2404,7 @@ where
                 "write_loop: stateful vote compression failed, disabling"
             );
             stateful_vote_enabled.store(false, Ordering::Release);
-            send_vp_abort(sink, remote_addr).await;
-            Some(stateless_frame(&stateless))
+            (Some(stateless_frame(&stateless)), true)
         }
     }
 }
