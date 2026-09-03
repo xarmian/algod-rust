@@ -1989,13 +1989,11 @@ const ABSENT_FACTOR: u64 = 20;
 /// go-algorand's `isAbsent` (`ledger/eval/eval.go`). Pure function.
 ///
 /// Used on the validation side by [`validate_absent_online_accounts`] to
-/// check a *received* block's claimed absentee list (issue #845). The
-/// block-*assembly*-time loop that computes this same list when proposing a
-/// block (go's `generateKnockOfflineAccountsList`) is separate, larger
-/// scope -- it needs `assemble_block` to iterate online accounts and build
-/// a `ParticipationUpdates` struct, which doesn't exist yet in
-/// `algo-pool`/`algo-agreement`; tracked as issue #845's remaining
-/// proposal-side scope.
+/// check a *received* block's claimed absentee list, and reused on the
+/// proposal side by
+/// [`SqliteLedger::absent_participation_account_candidates`](crate::sqlite::SqliteLedger::absent_participation_account_candidates)
+/// to compute this node's own block-assembly-time absentee list, mirroring
+/// go's `generateKnockOfflineAccountsList` (issue #845).
 pub(crate) fn is_absent(
     total_online_stake: u64,
     acct_stake: u64,
@@ -2040,7 +2038,7 @@ pub(crate) fn is_absent(
 ///
 /// [`LedgerStore`]: crate::store_trait::LedgerStore
 /// [`LedgerStore::online_accounts`]: crate::store_trait::LedgerStore::online_accounts
-fn total_online_voting_stake<L: crate::store_trait::LedgerStore>(store: &L) -> u64 {
+pub(crate) fn total_online_voting_stake<L: crate::store_trait::LedgerStore>(store: &L) -> u64 {
     let rewards_level = store.rewards_level();
     let mut total: u128 = 0;
     for (_, acct) in store.online_accounts() {
