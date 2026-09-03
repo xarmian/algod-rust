@@ -30,7 +30,7 @@
 //! driven single-block fetches.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -210,6 +210,20 @@ pub struct CatchupService {
     /// Callers can query this via [`CatchupService::fork_count`] for
     /// monitoring / alerting purposes.
     fork_count: Arc<AtomicU64>,
+    /// Nanosecond `UNIX_EPOCH` timestamp at which the current periodic
+    /// sync pass ([`Self::sync_pass`]) started, or `0` when no pass is
+    /// currently running.
+    ///
+    /// Mirrors Go's `Service.syncStartNS` (`catchup/service.go`), read by
+    /// [`Self::synchronizing_time`] (go's `SynchronizingTime()`). Unlike
+    /// Go's `sync()`, which covers both the certificate-driven and
+    /// periodic-timer entry points into the same function, this only wraps
+    /// [`Self::sync_pass`] — the periodic (certificate-less) pass that
+    /// mirrors go's `sync()`/`pipelinedFetch`. `sync_cert`'s single-round
+    /// certificate-driven fetch has no `sync()`-equivalent wrapper in Go
+    /// either (`syncCert` never touches `syncStartNS`), so it is
+    /// intentionally excluded here too.
+    syncing_since_ns: Arc<AtomicI64>,
 }
 
 /// Outcome of a single worker's fetch attempt in [`CatchupService::sync_pass`],
@@ -275,6 +289,8 @@ impl CatchupService {
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
         let fork_count = Arc::new(AtomicU64::new(0));
         let fork_count_inner = Arc::clone(&fork_count);
+        let syncing_since_ns = Arc::new(AtomicI64::new(0));
+        let syncing_since_ns_inner = Arc::clone(&syncing_since_ns);
         let parallel_blocks = parallel_blocks.clamp(1, Self::MAX_BLOCKS_PER_SYNC_PASS);
 
         let join_handle = thread::Builder::new()
@@ -286,6 +302,7 @@ impl CatchupService {
                     ledger,
                     fetcher,
                     fork_count_inner,
+                    syncing_since_ns_inner,
                     parallel_blocks,
                 );
             })
@@ -295,7 +312,27 @@ impl CatchupService {
             shutdown_tx: Some(shutdown_tx),
             join_handle: Some(join_handle),
             fork_count,
+            syncing_since_ns,
         }
+    }
+
+    /// Returns how long the periodic (certificate-less) sync path has been
+    /// actively running its current pass, or [`Duration::ZERO`] if it is
+    /// not currently mid-pass.
+    ///
+    /// Mirrors Go's `Service.SynchronizingTime()` (`catchup/service.go`):
+    /// `time.Duration(0)` when `syncStartNS` is unset, else the elapsed
+    /// time since it was set.
+    pub fn synchronizing_time(&self) -> Duration {
+        let start_ns = self.syncing_since_ns.load(Ordering::SeqCst);
+        if start_ns == 0 {
+            return Duration::ZERO;
+        }
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(start_ns);
+        Duration::from_nanos(now_ns.saturating_sub(start_ns).max(0) as u64)
     }
 
     /// Returns the number of fork detections observed so far.
@@ -336,6 +373,7 @@ impl CatchupService {
         ledger: Arc<dyn CatchupLedger>,
         fetcher: Arc<dyn BlockFetcher>,
         fork_count: Arc<AtomicU64>,
+        syncing_since_ns: Arc<AtomicI64>,
         parallel_blocks: u64,
     ) {
         info!("catchup service started");
@@ -343,7 +381,13 @@ impl CatchupService {
         // Mirrors Go's `periodicSync`, which runs one `sync()` immediately
         // on startup before entering its select loop
         // (`catchup/service.go:611-619`).
-        Self::sync_pass(&ledger, &fetcher, &shutdown_rx, parallel_blocks);
+        Self::sync_pass(
+            &ledger,
+            &fetcher,
+            &shutdown_rx,
+            &syncing_since_ns,
+            parallel_blocks,
+        );
 
         let mut last_round = ledger.next_round();
 
@@ -379,7 +423,13 @@ impl CatchupService {
                         last_round = now;
                         continue;
                     }
-                    Self::sync_pass(&ledger, &fetcher, &shutdown_rx, parallel_blocks);
+                    Self::sync_pass(
+                        &ledger,
+                        &fetcher,
+                        &shutdown_rx,
+                        &syncing_since_ns,
+                        parallel_blocks,
+                    );
                     last_round = ledger.next_round();
                     continue;
                 }
@@ -455,6 +505,36 @@ impl CatchupService {
     /// certificate, or supplies one that does not carry a quorum for the
     /// block, is not trusted and the pass stops.
     fn sync_pass(
+        ledger: &Arc<dyn CatchupLedger>,
+        fetcher: &Arc<dyn BlockFetcher>,
+        shutdown_rx: &Receiver<()>,
+        syncing_since_ns: &Arc<AtomicI64>,
+        parallel_blocks: u64,
+    ) {
+        // Mirrors Go's `sync()`: `syncStartNS.CompareAndSwap(0, timeInNS)`.
+        // A CAS (not an unconditional store) so a pass that starts while
+        // `synchronizing_time()` observers are mid-read never resets the
+        // start instant they're measuring against — matching Go's comment
+        // that a nonzero `syncStartNS` means "resuming previous sync".
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(1);
+        let _ =
+            syncing_since_ns.compare_exchange(0, now_ns.max(1), Ordering::SeqCst, Ordering::SeqCst);
+
+        Self::sync_pass_inner(ledger, fetcher, shutdown_rx, parallel_blocks);
+
+        // Mirrors Go's `s.syncStartNS.Store(0)` at the end of `sync()`
+        // (algod-rust has no `suspendForLedgerOps`-equivalent state that
+        // would keep the timer running across a pass, so this always
+        // clears it).
+        syncing_since_ns.store(0, Ordering::SeqCst);
+    }
+
+    /// The actual periodic-sync fetch/apply work, wrapped by
+    /// [`Self::sync_pass`]'s `syncing_since_ns` bookkeeping.
+    fn sync_pass_inner(
         ledger: &Arc<dyn CatchupLedger>,
         fetcher: &Arc<dyn BlockFetcher>,
         shutdown_rx: &Receiver<()>,
@@ -1994,5 +2074,75 @@ mod tests {
         );
 
         svc.stop();
+    }
+
+    // -- synchronizing_time (issue #917, TestSynchronizingTime port) --
+
+    /// Direct port of go's `TestSynchronizingTime`
+    /// (`catchup/service_test.go`): before any sync pass has run,
+    /// `synchronizing_time()` must be zero, and once a pass is in flight it
+    /// must report nonzero elapsed time.
+    ///
+    /// Unlike go's test — which pokes `syncStartNS` directly since it lives
+    /// in the same package — this drives the real state transition through
+    /// a slow fetcher so `sync_pass`'s own start/reset logic is exercised,
+    /// not just the getter.
+    #[test]
+    fn synchronizing_time_is_zero_before_any_sync_and_nonzero_during_one() {
+        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger = Arc::new(PermissiveCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        // A fetcher slow enough that the startup sync_pass is still running
+        // well after the service has spawned, giving the test a reliable
+        // window to observe a nonzero synchronizing_time().
+        let fetcher = Arc::new(ConcurrencyTrackingFetcher::new(
+            3,
+            Duration::from_millis(200),
+        ));
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+
+        let mut svc = CatchupService::start_with_parallelism(rx, ledger_dyn, fetcher_dyn, 1);
+
+        poll_until(
+            || svc.synchronizing_time() > Duration::ZERO,
+            Duration::from_millis(5),
+            Duration::from_secs(5),
+            "synchronizing_time() should become nonzero once the startup sync pass begins",
+        );
+
+        poll_until(
+            || ledger.next_round() == Round(4),
+            Duration::from_millis(20),
+            Duration::from_secs(10),
+            "periodic sync should have pulled rounds 1..=3",
+        );
+
+        // Mirrors go's `SynchronizingTime()` doc: 0 once no sync is active.
+        poll_until(
+            || svc.synchronizing_time() == Duration::ZERO,
+            Duration::from_millis(5),
+            Duration::from_secs(5),
+            "synchronizing_time() should reset to zero once the sync pass completes",
+        );
+
+        svc.stop();
+    }
+
+    /// A freshly constructed service that never gets a chance to run its
+    /// startup pass (immediately stopped) still reports zero — mirrors go's
+    /// initial `require.Equal(t, time.Duration(0), s.SynchronizingTime())`
+    /// assertion against a service that has not yet called `sync()`.
+    #[test]
+    fn synchronizing_time_is_zero_immediately_after_stop() {
+        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(MockBlockFetcher::new(None));
+
+        let mut svc = CatchupService::start(rx, ledger, fetcher);
+        svc.stop();
+
+        assert_eq!(svc.synchronizing_time(), Duration::ZERO);
     }
 }

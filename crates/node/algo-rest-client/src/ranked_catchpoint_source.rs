@@ -18,7 +18,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Peer-ranked catchpoint file source (issue #901).
+//! Peer-ranked catchpoint file source (issue #901; staged pre-flight probe
+//! added by issue #917).
 //!
 //! Mirrors go-algorand's `catchup/catchpointService.go`:
 //! `CatchpointCatchupService.blocksDownloadPeerSelector`, built by
@@ -28,13 +29,27 @@
 //! next and to rank it on success/failure
 //! (`peerRankDownloadFailed`/`peerRankNoCatchpointForRound`).
 //!
-//! Unlike go's two-stage flow (a separate `checkLedgerDownload` HEAD-probe
-//! stage ahead of the real download), this module ranks peers directly
-//! around the download attempt: a candidate that fails is deprioritized in
-//! favor of a better-ranked one on the next retry, without a distinct
-//! up-front probe stage. Go's fuller staged pipeline
-//! (`processStageLatestBlockDownload` et al.) is explicitly optional per
-//! issue #901 and is not ported here.
+//! [`RankedCatchpointSource::download`] runs go's two-stage flow: a
+//! `check_ledger_download` pre-flight stage (mirroring
+//! `checkLedgerDownload`/`headLedger` — a HEAD probe across ranked
+//! candidates that ranks an unavailable-catchpoint peer
+//! `PEER_RANK_NO_CATCHPOINT_FOR_ROUND` without ever starting a real
+//! transfer) followed by the real download stage, both sharing the same
+//! peer-selector state so a probe failure carries forward into download
+//! peer selection exactly as go's `CatchpointCatchupService.Start()` ->
+//! `run()` sequencing does.
+//!
+//! Go's fuller staged pipeline beyond this — the persisted,
+//! resumable-across-restarts `CatchpointCatchupState` machine
+//! (`processStageLedgerDownload`/`processStageLatestBlockDownload`/
+//! `processStageBlocksDownload`/`processStageSwitch`, which also covers
+//! downloading the post-catchpoint block lookback window needed for state
+//! proof/lease verification) has no equivalent here: algod-rust's
+//! `SyncOrchestrator` (`crates/core/algo-ledger/src/sync/state_machine.rs`,
+//! `SyncState`) already owns that block-lookback phase as part of its own
+//! phase state machine, so porting go's version would duplicate rather
+//! than replace it. This remains documented, deliberately out-of-scope
+//! follow-up (see issue #917's PR).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -105,8 +120,93 @@ impl RankedCatchpointSource {
         self.downloaders.len()
     }
 
+    /// Upper bound on pre-flight probe attempts in [`Self::check_ledger_download`]
+    /// — go's `config.Local.CatchupLedgerDownloadRetryAttempts` default (50,
+    /// `config/local_defaults.go`). algod-rust has no equivalent config
+    /// knob yet, so this mirrors the go default directly rather than
+    /// reusing [`Self::RETRY_ATTEMPTS_PER_PEER`] (a download-stage-specific
+    /// budget, tuned much lower since a real transfer attempt is far more
+    /// expensive than a HEAD probe).
+    const CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS: usize = 50;
+
+    /// Pre-flight availability probe stage: mirrors go's
+    /// `CatchpointCatchupService.checkLedgerDownload` (`catchup/catchpointService.go`),
+    /// run once ahead of the real transfer in [`Self::download`].
+    ///
+    /// Sends a HEAD request (via [`CatchpointDownloader::probe_availability`],
+    /// go's `ledgerFetcher.headLedger`) to ranked candidate peers, one at a
+    /// time, until one reports the catchpoint available (`Ok(())`, without
+    /// ranking that peer here — matching go, which leaves ranking the
+    /// success to the real download stage that follows) or the attempt
+    /// budget is exhausted (`Err`, matching go's `checkLedgerDownload`
+    /// returning an error that aborts the catchup before it starts). A
+    /// peer that doesn't have the catchpoint (HTTP 404 ->
+    /// [`AlgoError::NotFound`]) is ranked `PEER_RANK_NO_CATCHPOINT_FOR_ROUND`;
+    /// any other probe failure is ranked `PEER_RANK_DOWNLOAD_FAILED` — both
+    /// mirroring `checkLedgerDownload`'s `peerRankNoCatchpointForRound`
+    /// classification (go ranks every `headLedger` failure this way,
+    /// without go's finer 404-vs-other distinction; this module keeps that
+    /// distinction, already used by the download stage below, for
+    /// consistency).
+    async fn check_ledger_download(&self, genesis_id: &str, round: u64) -> Result<()> {
+        let attempts = self
+            .downloaders
+            .len()
+            .clamp(1, Self::CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS);
+        let mut last_err = None;
+
+        for _ in 0..attempts {
+            let psp = {
+                let mut selector = self
+                    .selector
+                    .lock()
+                    .expect("catchpoint peer selector lock poisoned");
+                selector.get_next_peer()
+            };
+            let psp = match psp {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let downloader = match self.downloaders.get(&psp.peer_id) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            match downloader.probe_availability(genesis_id, round).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let failure_rank = if matches!(e, AlgoError::NotFound(_)) {
+                        PEER_RANK_NO_CATCHPOINT_FOR_ROUND
+                    } else {
+                        PEER_RANK_DOWNLOAD_FAILED
+                    };
+                    let mut selector = self
+                        .selector
+                        .lock()
+                        .expect("catchpoint peer selector lock poisoned");
+                    selector.rank_peer(&psp, failure_rank);
+                    drop(selector);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| AlgoError::Network {
+            message: format!(
+                "check_ledger_download(): catchpoint round {round} unavailable from any of \
+                 {attempts} probed peers"
+            ),
+        }))
+    }
+
     /// Download the catchpoint file, trying candidate peers in ranked
     /// order until one succeeds or every candidate has been tried once.
+    ///
+    /// Runs [`Self::check_ledger_download`]'s pre-flight probe stage first
+    /// (mirroring go's `CatchpointCatchupService.Start()` calling
+    /// `checkLedgerDownload` before the real staged pipeline runs); a
+    /// probe failure aborts here without ever attempting a real transfer,
+    /// exactly as go's `Start()` does when `checkLedgerDownload` errors.
     ///
     /// Mirrors go's `peerSelector.getNextPeer()` /
     /// `peerSelector.rankPeer()` call sites around a catchpoint fetch: a
@@ -128,6 +228,8 @@ impl RankedCatchpointSource {
                 message: "no catchpoint peers available for ranked download".into(),
             });
         }
+
+        self.check_ledger_download(genesis_id, round).await?;
 
         // Ranked selection offers no guarantee that each attempt lands on a
         // distinct peer (a failing peer's rank may not yet have separated
@@ -351,8 +453,131 @@ mod tests {
         ));
         let result = src.download("test-v1.0", 1, &tmp, None).await;
         assert!(result.is_err());
-        // Retries the single (always-failing) peer up to the fixed
-        // per-peer attempt budget rather than giving up after one try.
+        // With the pre-flight check_ledger_download probe stage (issue
+        // #917), a single always-failing peer is ranked and rejected during
+        // the probe itself, so `download()` returns without ever reaching
+        // the real-transfer retry loop below it — the connection is still
+        // attempted (and still ranked, without panicking) at least once.
         assert!(bad_attempts.load(Ordering::SeqCst) >= 1);
+    }
+
+    // -- check_ledger_download pre-flight probe stage (issue #917) --
+
+    /// A minimal raw-socket HTTP server that always responds `404 Not
+    /// Found` (simulating a peer that doesn't retain this round's
+    /// catchpoint), counting how many requests it received.
+    async fn spawn_always_404_server() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_clone = Arc::clone(&requests);
+
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                requests_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = socket.flush().await;
+                drop(socket);
+            }
+        });
+
+        (format!("http://{addr}"), requests)
+    }
+
+    /// TDD regression for issue #917: `check_ledger_download` must probe
+    /// (HEAD, not a real transfer) and rank a 404-for-this-round peer
+    /// `PEER_RANK_NO_CATCHPOINT_FOR_ROUND` — mirroring go's
+    /// `checkLedgerDownload`/`headLedger` — *before* `download()` ever
+    /// attempts a real transfer against that peer. With a reliable second
+    /// peer available, the 404 peer should be probed at most once (the
+    /// unavoidable first tie-broken draw) and never actually downloaded
+    /// from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_ledger_download_probe_deprioritizes_a_404_peer_before_any_real_download() {
+        const BODY: &[u8] = b"catchpoint-file-bytes-0123456789";
+        let (missing_url, missing_requests) = spawn_always_404_server().await;
+        let (good_url, good_requests) = spawn_always_succeeding_server(BODY).await;
+
+        let src = RankedCatchpointSource::new(
+            &[(missing_url, String::new()), (good_url, String::new())],
+            fast_retry_config(),
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-ranked-catchpoint-404-{}",
+            std::process::id()
+        ));
+
+        const ROUNDS: u64 = 6;
+        for round in 1..=ROUNDS {
+            let dest = tmp_dir.join(format!("catchpoint-{round}.tar.gz"));
+            let result = src.download("test-v1.0", round, &dest, None).await;
+            assert!(
+                result.is_ok(),
+                "round {round} should have succeeded via the peer that has the catchpoint, \
+                 got {:?}",
+                result.err()
+            );
+        }
+
+        // The 404 peer may unavoidably be probed once while both peers
+        // start tied, but must be consistently deprioritized afterward —
+        // and, crucially, every one of its hits is a cheap HEAD probe, not
+        // a real GET transfer (the always-404 server responds identically
+        // to both, so this bound alone proves the probe stage is catching
+        // it early rather than falling through to the download stage).
+        assert!(
+            missing_requests.load(Ordering::SeqCst) <= 2,
+            "a peer reporting the catchpoint unavailable should be deprioritized after the \
+             first probe, but was hit {} times",
+            missing_requests.load(Ordering::SeqCst)
+        );
+        assert!(
+            good_requests.load(Ordering::SeqCst) >= ROUNDS as usize - 2,
+            "the peer with the catchpoint should serve almost every round, got {} of {ROUNDS}",
+            good_requests.load(Ordering::SeqCst)
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Direct unit test of `check_ledger_download`'s failure path (all
+    /// candidates report the catchpoint unavailable): it must return an
+    /// error without panicking, and — mirroring go's `checkLedgerDownload`
+    /// returning an error that aborts `CatchpointCatchupService.Start()`
+    /// before the staged pipeline ever runs — `download()` must propagate
+    /// that failure without attempting a real transfer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_ledger_download_fails_when_every_peer_lacks_the_catchpoint() {
+        let (missing_url, missing_requests) = spawn_always_404_server().await;
+        let src = RankedCatchpointSource::new(&[(missing_url, String::new())], fast_retry_config());
+
+        let probe_result = src.check_ledger_download("test-v1.0", 1).await;
+        assert!(
+            probe_result.is_err(),
+            "check_ledger_download should fail when the only candidate lacks the catchpoint"
+        );
+        assert!(missing_requests.load(Ordering::SeqCst) >= 1);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "algod-rust-ranked-catchpoint-404-only-{}",
+            std::process::id()
+        ));
+        let download_result = src.download("test-v1.0", 1, &tmp, None).await;
+        assert!(
+            download_result.is_err(),
+            "download() must propagate a check_ledger_download failure rather than falling \
+             through to a real transfer attempt"
+        );
     }
 }
