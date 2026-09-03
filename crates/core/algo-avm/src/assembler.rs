@@ -307,6 +307,19 @@ pub struct OpStream {
     /// once set (matches go: `bottom` only ever moves from `StackNone` to
     /// `StackAny`, never back).
     pub(crate) type_track_bottom_permissive: bool,
+    /// Whether a type mismatch found by [`type_track::track_instruction`]
+    /// is actually *reported* as an assembly error. Mirrors go-algorand's
+    /// `OpStream.typeTracking` (`assembler.go:256,294`, default `true`),
+    /// toggled by `#pragma typetrack true|false`. Unlike
+    /// [`Self::type_track_disabled`], this does **not** stop the pass from
+    /// running -- the tracked stack (and scratch-space state) keeps
+    /// evolving underneath even while reporting is off, exactly like go's
+    /// `trackStack` unconditionally popping/pushing `ops.known.stack`
+    /// (`assembler.go:2056-2096`) and only `typeErrorf`
+    /// (`assembler.go:2039-2043`) checking this flag before recording
+    /// anything. See the `#pragma typetrack` handling in
+    /// [`assemble_string`] for the off-to-on reset behavior.
+    pub(crate) type_track_reporting: bool,
 }
 
 impl OpStream {
@@ -338,6 +351,7 @@ impl OpStream {
             type_track_disabled: false,
             type_track_deadcode: false,
             type_track_bottom_permissive: false,
+            type_track_reporting: true,
         }
     }
 
@@ -1147,6 +1161,66 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
                                 format!("bad #pragma autosalt: {:?}", parts[2]),
                             );
                         }
+                    } else if parts[1] == "typetrack" {
+                        if parts.len() == 2 {
+                            // #pragma typetrack (no value)
+                            ops.record_error(ops.source_line, 0, "no typetrack value".into());
+                        } else if parts.len() > 3 {
+                            // #pragma typetrack VALUE extra
+                            ops.record_error(
+                                ops.source_line,
+                                0,
+                                "unexpected tokens after typetrack value".into(),
+                            );
+                        } else if let Some(on) = parse_pragma_bool(parts[2]) {
+                            // Mirrors go's `#pragma typetrack` handling
+                            // (`assembler.go:2501-2519`): unlike `version`/
+                            // `autosalt`, this pragma has no "only allowed
+                            // before instructions" restriction -- it can
+                            // toggle mid-program, any number of times
+                            // (`TestTypeTracking`'s "Turning type tracking
+                            // off and then back on" cases).
+                            //
+                            // Note this only gates whether a mismatch is
+                            // *reported* -- the tracked stack itself keeps
+                            // evolving underneath even while reporting is
+                            // off, exactly like go's `trackStack` still
+                            // popping/pushing `ops.known.stack` regardless
+                            // of `ops.typeTracking` and only `typeErrorf`
+                            // checking the flag (`assembler.go:2039-2043,
+                            // 2056-2096`). See
+                            // `type_track::track_instruction`/
+                            // `apply_stack_effect`.
+                            let was_reporting = ops.type_track_reporting;
+                            ops.type_track_reporting = on;
+                            // Mirrors `assembler.go:2513-2517`: toggling
+                            // from off to on resets tracked knowledge to a
+                            // permissive "unknown incoming stack" state
+                            // (`ops.known.reset()`), exactly like reaching a
+                            // label after dead code -- whatever was tracked
+                            // while reporting was off (which may have
+                            // silently drifted from reality, since
+                            // mismatched pops/pushes still happened without
+                            // being reported) is discarded rather than
+                            // trusted. Toggling off, or declaring the
+                            // already-current state again (on-to-on or
+                            // off-to-off), does *not* reset --
+                            // `TestTypeTracking`'s "consecutively does _not_
+                            // reset" case.
+                            if !was_reporting && on {
+                                ops.type_stack.clear();
+                                ops.type_stack_const.clear();
+                                ops.scratch_space = [type_track::StackType::Any; 256];
+                                ops.type_track_deadcode = false;
+                                ops.type_track_bottom_permissive = true;
+                            }
+                        } else {
+                            ops.record_error(
+                                ops.source_line,
+                                0,
+                                format!("bad #pragma typetrack: {:?}", parts[2]),
+                            );
+                        }
                     } else {
                         // #pragma <unknown>
                         ops.record_error(
@@ -1195,8 +1269,11 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
                 // trusts that whatever's tracked from the fallthrough path
                 // also describes any jump into this label, and keeps
                 // analyzing with the tracked stack as-is. See the
-                // `type_track` module docs for what's still deferred
-                // (`#pragma typetrack`). Mirrors go's `ProgramKnowledge.reset`
+                // `type_track` module docs for what's still deferred, and
+                // the `#pragma typetrack` handling above for the other spot
+                // this same reset shape (minus `type_track_disabled`, which
+                // the pragma never touches -- see its handling above) is
+                // triggered. Mirrors go's `ProgramKnowledge.reset`
                 // (`assembler.go:371-380`) resetting `scratchSpace` to
                 // `StackAny` for every slot alongside `bottom`/`deadcode` --
                 // see `Self::scratch_space`'s doc comment.
@@ -3896,5 +3973,115 @@ mod tests {
                 )
             });
         }
+    }
+
+    // ── `#pragma typetrack` (issue #829, "Slice 4") -- ported from go's
+    // `TestPragmas`/`TestTypeTracking` (`assembler_test.go:2981-2988,3007,
+    // 3466-3491`) ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pragma_typetrack_no_value() {
+        // go: `testProg(t, "#pragma typetrack", assemblerNoVersion,
+        // exp(1, "no typetrack value"))` (assembler_test.go:2981-2982).
+        let errs = expect_errors("#pragma typetrack\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.line == 1 && e.message == "no typetrack value"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_pragma_typetrack_bad_value() {
+        // go: `testProg(t, "#pragma typetrack blah", assemblerNoVersion,
+        // exp(1, `bad #pragma typetrack: "blah"`))` (assembler_test.go:2984-2985).
+        let errs = expect_errors("#pragma typetrack blah\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.line == 1 && e.message == "bad #pragma typetrack: \"blah\""),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_pragma_typetrack_extra_tokens() {
+        // go: `testProg(t, "#pragma typetrack false blah", assemblerNoVersion,
+        // exp(1, "unexpected extra tokens: blah"))` (assembler_test.go:2987-2988).
+        // This repo's version/autosalt pragmas already use a differently
+        // worded (but equivalent) message for this case -- matched here for
+        // consistency rather than go's exact wording (see
+        // `unexpected tokens after autosalt value`/`after version value`).
+        let errs = expect_errors("#pragma typetrack false blah\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.line == 1 && e.message == "unexpected tokens after typetrack value"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_pragma_typetrack_false_suppresses_reported_mismatch() {
+        // go: "#pragma typetrack false\n concat" assembles cleanly despite
+        // `concat` getting two `uint64`s (`assembler_test.go:3466-3472`).
+        let source = "#pragma version 8\nint 1\nint 2\n#pragma typetrack false\nconcat\n";
+        assemble_string(source).unwrap_or_else(|errs| {
+            panic!("expected {source:?} to assemble cleanly, got: {errs:?}")
+        });
+    }
+
+    #[test]
+    fn test_pragma_typetrack_off_then_on_resets_and_allows_follow_on_code() {
+        // go: "Turning type tracking off and then back on, allows any
+        // follow-on code." (assembler_test.go:3466-3481) -- the first
+        // `concat` (tracking off) leaves a bogus `[]byte` on the tracked
+        // stack; re-enabling resets to a permissive state, so the second
+        // `concat` (now with tracking on) doesn't see that bogus state and
+        // also assembles cleanly.
+        let source =
+            "#pragma version 8\nint 1\nint 2\n#pragma typetrack false\nconcat\n#pragma typetrack true\nconcat\n";
+        assemble_string(source).unwrap_or_else(|errs| {
+            panic!("expected {source:?} to assemble cleanly, got: {errs:?}")
+        });
+    }
+
+    #[test]
+    fn test_pragma_typetrack_true_consecutively_does_not_reset() {
+        // go: "Declaring type tracking on consecutively does _not_ reset
+        // type tracking state." (assembler_test.go:3483-3491): the second
+        // `#pragma typetrack true` is a no-op (tracking was already on), so
+        // the first `concat`'s real type mismatch is reported.
+        let source =
+            "#pragma version 8\nint 1\nint 2\n#pragma typetrack true\nconcat\n#pragma typetrack true\nconcat\n";
+        let errs = expect_errors(source);
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("concat")
+                && e.message.contains("arg 1 wanted type []byte")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_pragma_typetrack_toggle_mid_program_allowed() {
+        // Unlike `#pragma version`/`#pragma autosalt`, go's `typetrack`
+        // pragma has no "only allowed before instructions" restriction
+        // (`assembler.go:2501-2519` has no `ops.pending.Len() > 0` guard,
+        // unlike the `version`/`autosalt` cases right above/below it) --
+        // toggling after real instructions have already been assembled must
+        // not itself be an error.
+        assemble_string("#pragma version 8\nint 1\npop\n#pragma typetrack false\nint 2\npop\n")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_pragma_typetrack_default_is_on() {
+        // No pragma at all -> tracking behaves as if `#pragma typetrack
+        // true` (go's `newOpStream`'s `typeTracking: true`,
+        // `assembler.go:294`) -- a genuine mismatch is still reported.
+        let errs = expect_errors("#pragma version 8\nint 1\nint 2\nconcat\n");
+        assert!(
+            errs.iter().any(|e| e.message.starts_with("concat")
+                && e.message.contains("arg 1 wanted type []byte")),
+            "{errs:?}"
+        );
     }
 }

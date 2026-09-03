@@ -95,14 +95,23 @@
 //! wanted type <want> got <got>"` or `"<instr> expects <n> stack arguments
 //! but stack height is <h>"`.
 //!
+//! - **`#pragma typetrack false`/`true`** (part of `TestTypeTracking`):
+//!   mirrors go's manual off/on toggle mid-program (`assembler.go:2501-2519`,
+//!   `OpStream.typeTracking`/`typeErrorf`, `assembler.go:256,294,2039-2043`).
+//!   This gates only whether a mismatch is *reported* -- the tracked stack
+//!   (and scratch-space) keeps evolving underneath regardless, exactly like
+//!   go's `trackStack` unconditionally popping/pushing `ops.known.stack`
+//!   and only `typeErrorf` checking the flag. Toggling from off back to on
+//!   resets tracked knowledge to a permissive state (mirrors
+//!   `ops.known.reset()`, called from the pragma handler,
+//!   `assembler.go:2513-2517`), exactly like reaching a label after dead
+//!   code; toggling off, or re-declaring the current state, does not reset.
+//!   See [`OpStream::type_track_reporting`](crate::assembler::OpStream) and
+//!   the `#pragma typetrack` handling in
+//!   [`assemble_string`](crate::assembler::assemble_string).
+//!
 //! # What's deferred (tracked as follow-up work under issue #829)
 //!
-//! - **`#pragma typetrack false`/`true`** (part of `TestTypeTracking`):
-//!   go supports manually toggling tracking off/on mid-program
-//!   (`assembler.go:2513-2517`); this slice has no equivalent pragma at
-//!   all, so it isn't modeled -- unrelated to (and safely orthogonal to)
-//!   the deadcode/label handling above, since it's a distinct on/off
-//!   switch rather than part of the label-driven state machine.
 //! - **Dynamic- or arity-dependent stack effects** this slice still can't
 //!   model precisely enough to keep the tracked stack height in sync with
 //!   the real one -- unchanged from before: `match`/`txn`/`gtxn`/`gtxns`/
@@ -556,16 +565,23 @@ fn apply_stack_effect(
 ) {
     let argcount = arg_types.len();
     if argcount > ops.type_stack.len() && !ops.type_track_bottom_permissive {
-        ops.record_error(
-            ops.source_line,
-            0,
-            format!(
-                "{} expects {} stack arguments but stack height is {}",
-                rejoin(mnemonic, args),
-                argcount,
-                ops.type_stack.len(),
-            ),
-        );
+        // Mirrors go's `typeErrorf` (`assembler.go:2039-2043`): a mismatch
+        // is only *recorded* while `#pragma typetrack` reporting is on --
+        // see `OpStream::type_track_reporting`'s doc comment. The
+        // bookkeeping above/below (the height check itself, and the
+        // pop/push loop) runs unconditionally either way.
+        if ops.type_track_reporting {
+            ops.record_error(
+                ops.source_line,
+                0,
+                format!(
+                    "{} expects {} stack arguments but stack height is {}",
+                    rejoin(mnemonic, args),
+                    argcount,
+                    ops.type_stack.len(),
+                ),
+            );
+        }
     } else {
         for i in (0..argcount).rev() {
             let want = arg_types[i];
@@ -580,7 +596,7 @@ fn apply_stack_effect(
             // (the `bottom_permissive` case above) is safe: `Vec::pop` on an
             // empty vec is a no-op `None`, same as `type_stack`'s.
             ops.type_stack_const.pop();
-            if !got.overlaps(want) {
+            if !got.overlaps(want) && ops.type_track_reporting {
                 ops.record_error(
                     ops.source_line,
                     0,
