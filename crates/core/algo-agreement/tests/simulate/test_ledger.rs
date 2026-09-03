@@ -46,6 +46,8 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use algo_agreement::{
     Certificate, LedgerError, LedgerReader, LedgerWriter, OnlineAccountData, Seed, ValidatedBlock,
@@ -54,6 +56,22 @@ use algo_types::{Address, Block, ConsensusParams, Digest, Round};
 use crossbeam_channel::Sender;
 
 use super::test_account::TestAccount;
+
+/// Cluster-wide registry of committed `(Block, Certificate)` pairs, keyed by
+/// round, shared by every node's [`TestLedger`] in a multi-node cluster.
+///
+/// This is what makes [`TestLedger::ensure_digest`] a real (if simplified)
+/// catch-up path instead of a no-op: when a node reaches vote quorum for a
+/// round but hasn't itself received/staged that round's proposal payload
+/// (a real possibility — proposal broadcasts can race a slower node's round
+/// transition, or simply be dropped in flight, exactly as on a real
+/// network), go-algorand's production code calls `EnsureDigest` to fetch the
+/// block from a peer via the ledger's catchup service and commit it that
+/// way instead of via its own vote tally. Single-`TestLedger` tests (that
+/// don't go through this path) are unaffected: each `TestLedger::new` call
+/// still gets its own private, empty registry unless explicitly shared via
+/// [`TestLedger::share_commits`].
+pub type SharedCommits = Arc<Mutex<HashMap<Round, (Block, Certificate)>>>;
 
 /// Inner mutable state for the test ledger — guarded by a single mutex so
 /// the read + write paths can race safely.
@@ -97,6 +115,12 @@ pub struct TestLedgerState {
 #[derive(Clone)]
 pub struct TestLedger {
     state: Arc<Mutex<TestLedgerState>>,
+    /// Cluster-wide committed-block registry — see [`SharedCommits`]. Each
+    /// `TestLedger::new` call gets its own private, empty registry by
+    /// default; multi-node callers wire every node's ledger to the same
+    /// one via [`TestLedger::share_commits`] so `ensure_digest` can
+    /// actually catch a lagging node up.
+    shared_commits: SharedCommits,
 }
 
 impl TestLedger {
@@ -162,7 +186,20 @@ impl TestLedger {
         };
         Self {
             state: Arc::new(Mutex::new(state)),
+            shared_commits: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Wire this ledger's committed-block registry to `shared` — call once
+    /// per node right after construction, all with the SAME `shared`
+    /// handle, so [`LedgerWriter::ensure_digest`] can serve a lagging
+    /// node's catch-up fetch from whichever peer's ledger already committed
+    /// that round. Mirrors go-algorand's real ledger catchup fetcher, at
+    /// the granularity this in-memory harness needs (no wire encoding: the
+    /// `Block`/`Certificate` values are shared directly rather than
+    /// serialized and re-verified).
+    pub fn share_commits(&mut self, shared: SharedCommits) {
+        self.shared_commits = shared;
     }
 
     /// Snapshot the current `next_round` (advances on every `ensure_block`).
@@ -304,16 +341,194 @@ impl LedgerWriter for TestLedger {
     fn ensure_block(&self, block: &Block, cert: &Certificate) {
         let mut s = self.state.lock().unwrap();
         TestLedger::record_block_locked(&mut s, block.clone(), cert.clone());
+        drop(s);
+        self.publish_commit(block.clone(), cert.clone());
     }
 
     fn ensure_validated_block(&self, vb: &dyn ValidatedBlock, cert: &Certificate) {
         let mut s = self.state.lock().unwrap();
         TestLedger::record_block_locked(&mut s, vb.block().clone(), cert.clone());
+        drop(s);
+        self.publish_commit(vb.block().clone(), cert.clone());
     }
 
-    fn ensure_digest(&self, _cert: &Certificate, _verifier: &algo_agreement::AsyncVoteVerifier) {
-        // The simulate harness never goes through the EnsureDigest path
-        // (no fork / catch-up scenarios), so this is a no-op. Mirroring
-        // `StubLedger::ensure_digest` for completeness.
+    /// Mirrors go-algorand's `EnsureDigest`: the player reached vote quorum
+    /// for `cert.round` but doesn't have that round's proposal payload
+    /// staged locally (see `player::handle_threshold_event`'s "we don't
+    /// have the block" branch), so it hints the ledger to fetch the block
+    /// out-of-band instead of via its own vote tally.
+    ///
+    /// A real ledger's catchup fetcher pulls the block from a peer over the
+    /// network and authenticates it against `cert` (`verifier` is the hook
+    /// for that authentication in production). This harness has no
+    /// separate block-fetch network, so it serves the fetch directly from
+    /// [`SharedCommits`] — whichever peer's `TestLedger` already committed
+    /// this round (via `ensure_block`/`ensure_validated_block` above)
+    /// published it there. Polls with a bounded retry/timeout (like a real
+    /// async fetch that may need to wait for the block to actually arrive
+    /// at a peer first) rather than a single lookup, since `ensure_digest`
+    /// can legitimately fire before any peer has committed the round yet.
+    fn ensure_digest(&self, cert: &Certificate, _verifier: &algo_agreement::AsyncVoteVerifier) {
+        let round = cert.round;
+        // Already have it (e.g. a race with our own vote-driven commit) —
+        // nothing to fetch.
+        if self.state.lock().unwrap().next_rnd.0 > round.0 {
+            return;
+        }
+        let digest = cert.proposal.block_digest;
+        let shared = self.shared_commits.clone();
+        let state = self.state.clone();
+        let cert = cert.clone();
+        // Mirrors the real ledger's async catchup fetch: retry until the
+        // block turns up (or we give up), off the demux thread that fired
+        // this action, so it never blocks agreement's own event loop.
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some((block, source_cert)) = shared.lock().unwrap().get(&round).cloned() {
+                    if source_cert.proposal.block_digest == digest {
+                        let mut s = state.lock().unwrap();
+                        if s.next_rnd.0 <= round.0 {
+                            TestLedger::record_block_locked(&mut s, block, cert);
+                        }
+                        return;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+    }
+}
+
+impl TestLedger {
+    /// Publish a just-committed block into the cluster-wide registry so a
+    /// lagging peer's `ensure_digest` catch-up fetch can find it. A no-op
+    /// (writes to this ledger's own private, unshared registry) unless
+    /// [`TestLedger::share_commits`] wired every node's ledger to the same
+    /// `SharedCommits` handle.
+    fn publish_commit(&self, block: Block, cert: Certificate) {
+        self.shared_commits
+            .lock()
+            .unwrap()
+            .insert(block.round, (block, cert));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulate::test_account::generate_n_accounts;
+    use algo_agreement::AsyncVoteVerifier;
+    use algo_types::CONSENSUS_V41;
+
+    fn new_ledger() -> TestLedger {
+        let accounts = generate_n_accounts(1, Round(0), Round(1000), 10_000, 0xC0FFEE);
+        let params = algo_types::consensus::consensus_params_for_version(CONSENSUS_V41)
+            .expect("v41 consensus params available");
+        TestLedger::new(&accounts, 1_000_000, params, CONSENSUS_V41.to_string())
+    }
+
+    /// Regression test for issue #911: before this fix, `ensure_digest` was
+    /// a no-op, so a node that reached vote quorum for a round without
+    /// having that round's proposal payload staged locally had NO way to
+    /// ever commit it — it would call `ensure_digest` and simply never
+    /// catch up, staying parked forever (this is exactly what the 5-node
+    /// convergence stall investigated in #911 turned out to be: a harness
+    /// gap, not a `Service`/`Player` liveness bug — see
+    /// `service_multi_node_test.rs`'s `fast_recovery_down_early_five_node`
+    /// doc comment).
+    ///
+    /// Deterministic, race-free reproduction of the fix: two ledgers share
+    /// one `SharedCommits` registry (mirroring `setup_agreement`'s
+    /// cluster wiring). Ledger A commits round 1 via `ensure_block` (as it
+    /// would after winning its own local vote quorum with the payload in
+    /// hand); ledger B never receives the payload directly, but calling
+    /// `ensure_digest` with the SAME certificate must still bring ledger
+    /// B's `next_round`/`block(1)` in line with ledger A's, by fetching the
+    /// block A already published into the shared registry.
+    #[test]
+    fn ensure_digest_catches_up_from_shared_commits() {
+        let shared = SharedCommits::default();
+
+        let mut ledger_a = new_ledger();
+        ledger_a.share_commits(shared.clone());
+        let mut ledger_b = new_ledger();
+        ledger_b.share_commits(shared);
+
+        let block = Block {
+            round: Round(1),
+            ..Block::default()
+        };
+        let cert = Certificate {
+            round: Round(1),
+            proposal: algo_agreement::ProposalValue {
+                block_digest: Digest([0x11u8; 32]),
+                ..Default::default()
+            },
+            ..Certificate::default()
+        };
+
+        // Ledger A commits normally (it has the payload in hand).
+        ledger_a.ensure_block(&block, &cert);
+        assert_eq!(ledger_a.next_round(), Round(2));
+
+        // Ledger B never got the payload, but reached the SAME cert's vote
+        // quorum — mirrors `player::handle_threshold_event`'s
+        // `Action::StageDigest` path calling `LedgerWriter::ensure_digest`.
+        assert_eq!(ledger_b.next_round(), Round(1), "B hasn't caught up yet");
+        let verifier = AsyncVoteVerifier::new();
+        ledger_b.ensure_digest(&cert, &verifier);
+
+        // The catch-up fetch runs on a background thread (mirrors a real
+        // async block fetch); poll briefly for it to land rather than
+        // asserting immediately.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ledger_b.next_round().0 <= Round(1).0 {
+            assert!(
+                Instant::now() < deadline,
+                "ensure_digest did not catch B up within 2s"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(ledger_b.next_round(), Round(2));
+        assert_eq!(
+            ledger_b.block(Round(1)).map(|b| b.round),
+            Some(Round(1)),
+            "B must have actually recorded A's block, not just advanced next_round"
+        );
+        assert_eq!(
+            ledger_b.cert(Round(1)).map(|c| c.proposal.block_digest),
+            Some(cert.proposal.block_digest)
+        );
+    }
+
+    /// Without ever sharing a `SharedCommits` registry (the single-ledger,
+    /// pre-#911 default), `ensure_digest` has nothing to fetch from and
+    /// must not silently advance the round — it should just give up after
+    /// its bounded retry window, exactly as go-algorand's real fetcher
+    /// would if the block genuinely never became available.
+    #[test]
+    fn ensure_digest_without_shared_commits_does_not_advance() {
+        let ledger = new_ledger();
+        let cert = Certificate {
+            round: Round(1),
+            proposal: algo_agreement::ProposalValue {
+                block_digest: Digest([0x22u8; 32]),
+                ..Default::default()
+            },
+            ..Certificate::default()
+        };
+
+        let verifier = AsyncVoteVerifier::new();
+        ledger.ensure_digest(&cert, &verifier);
+
+        // Give the (doomed) background fetch a moment to have committed
+        // something, then confirm it didn't.
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(ledger.next_round(), Round(1));
     }
 }

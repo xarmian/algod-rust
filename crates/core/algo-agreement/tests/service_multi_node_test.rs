@@ -313,6 +313,141 @@ fn fast_recovery_down_early_two_node() {
     sanity_check(&cluster, start_round, 3);
 }
 
+/// Full 5-node port of go-algorand's `TestAgreementFastRecoveryDownEarly`
+/// (`agreement/service_test.go`) — same scenario as
+/// `fast_recovery_down_early_two_node` above, but at go's actual cluster
+/// size. This is the scenario issue #911 investigated: with the harness's
+/// original `TestLedger::ensure_digest` as a no-op, a node that reached
+/// vote quorum for a round without having that round's proposal payload
+/// staged locally (a real possibility once there are enough independently-
+/// scheduled peers for one delivery to race a slower node's round
+/// transition) had NO way to ever recover — it would call `ensure_digest`
+/// to fetch the block and simply never get it, staying parked forever
+/// despite continuing to service every subsequent timeout fire. That isn't
+/// a `Service`/`Player` liveness bug: go-algorand's production code relies
+/// on exactly this `EnsureDigest` catch-up path for this situation, backed
+/// by a real ledger fetcher; only the test-only `TestLedger` was missing
+/// the fetch implementation. See `simulate/test_ledger.rs`'s `SharedCommits`
+/// doc comment for the fix (every node's `TestLedger` now shares one
+/// cluster-wide committed-block registry, so a lagging node's
+/// `ensure_digest` can actually serve the fetch from a peer that already
+/// has the block).
+#[test]
+fn fast_recovery_down_early_five_node() {
+    let cluster = setup_agreement(5);
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    // Run two ordinary rounds (go's version runs two before forcing
+    // recovery).
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    // Force fast partition recovery into bottom.
+    {
+        cluster.network.drop_all_soft_votes();
+        cluster.network.drop_all_slow_next_votes();
+
+        trigger_global_timeout(&cluster, TimeoutType::Deadline); // filter timeout: no soft quorum (dropped)
+        round = expect_no_new_round(&cluster, round);
+
+        trigger_global_timeout(&cluster, TimeoutType::Deadline); // soft-step deadline timeout: still no commit
+        round = expect_no_new_round(&cluster, round);
+
+        trigger_global_timeout(&cluster, TimeoutType::FastRecovery); // arms the fast-recovery timer
+        round = expect_no_new_round(&cluster, round);
+
+        trigger_global_timeout(&cluster, TimeoutType::FastRecovery); // fast-recovery fires -> bottom
+        round = expect_no_new_round(&cluster, round);
+    }
+
+    // Heal the network and terminate on period 1.
+    {
+        cluster.network.repair_all();
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    // Run two more ordinary rounds.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+    let _ = round;
+
+    cluster.shutdown();
+    sanity_check(&cluster, start_round, 5);
+}
+
+/// Full 5-node port of go-algorand's `TestAgreementFastRecoveryDownMiss`,
+/// using the same 4/1 clock-firing split go's version uses
+/// (`firstClocks := clocks[:4]`, `restClocks := clocks[4:]`): the first four
+/// nodes fire fast-recovery while votes are still dropped (their recovery
+/// votes are lost — the "miss"), then the network heals and the fifth node
+/// fires its own fast-recovery timer, still not enough fresh recovery votes
+/// alone for quorum. See `fast_recovery_down_early_five_node`'s doc comment
+/// for why this needed the `SharedCommits` harness fix (issue #911) to
+/// converge reliably at this scale.
+#[test]
+fn fast_recovery_down_miss_five_node() {
+    let cluster = setup_agreement(5);
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    // Force fast partition recovery into bottom via total vote loss.
+    {
+        cluster.network.drop_all_votes();
+
+        trigger_global_timeout(&cluster, TimeoutType::Deadline); // filter timeout: nothing reaches quorum
+        round = expect_no_new_round(&cluster, round);
+
+        trigger_global_timeout(&cluster, TimeoutType::Deadline); // deadline timeout: still nothing
+        round = expect_no_new_round(&cluster, round);
+
+        trigger_global_timeout(&cluster, TimeoutType::FastRecovery); // arms the fast-recovery timer
+        round = expect_no_new_round(&cluster, round);
+
+        // First four nodes fire fast-recovery while votes are still
+        // dropped — their recovery votes are lost ("miss").
+        trigger_subset_timeout(&cluster, &[0, 1, 2, 3], TimeoutType::FastRecovery);
+        round = expect_no_new_round(&cluster, round);
+
+        // Heal the network, then the fifth node fires its fast-recovery
+        // timer — still not enough fresh recovery votes for quorum on its
+        // own.
+        cluster.network.repair_all();
+        trigger_subset_timeout(&cluster, &[4], TimeoutType::FastRecovery);
+        round = expect_no_new_round(&cluster, round);
+
+        // Second fast-recovery timeout, followed by period 1 terminating
+        // normally: every node now has a quorum of recovery votes, the
+        // network is already healed, and the round commits.
+        round = pump_until_new_round_multi(
+            &cluster,
+            round,
+            &[TimeoutType::FastRecovery, TimeoutType::Deadline],
+            20,
+        );
+    }
+
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+    let _ = round;
+
+    cluster.shutdown();
+    sanity_check(&cluster, start_round, 5);
+}
+
 /// Adapted port of go-algorand's `TestAgreementFastRecoveryDownMiss`
 /// (`agreement/service_test.go`) — see this file's module doc comment for
 /// why this runs at 2 nodes rather than go's 5. The split-4/1 clock firing
