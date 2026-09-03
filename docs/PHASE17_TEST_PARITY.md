@@ -47,21 +47,21 @@ per-area split of the former).
 | `not-implemented` | the underlying feature/opcode/mechanism does not exist in algod-rust at all — a real functionality gap, not just a test gap |
 | `out-of-scope` | genuinely not applicable to algod-rust (Go-runtime specifics, CLI tooling with no Rust equivalent concept, structural differences that make the go test meaningless in Rust) |
 
-## Aggregate totals (3,177 go-algorand tests)
+## Aggregate totals (3,179 go-algorand tests)
 
 | status | count | share |
 |---|---|---|
-| `partial` | 749 | 24% |
-| `matched-1:1` | 668 | 21% |
+| `partial` | 750 | 24% |
+| `matched-1:1` | 671 | 21% |
 | `matched-1:many` | 539 | 17% |
 | `out-of-scope` | 381 | 12% |
-| `not-implemented` | 340 | 11% |
+| `not-implemented` | 338 | 11% |
 | `missing-test` | 295 | 9% |
 | `matched-many:1` | 205 | 6% |
 
-**635 rows (`not-implemented` + `missing-test`, 20%) are real, actionable
+**633 rows (`not-implemented` + `missing-test`, 20%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
-implements but never tests. `partial` (749, 24%) is coverage that exists
+implements but never tests. `partial` (750, 24%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
 most are diminishing-returns edge cases. See
 [`docs/PHASE17_PROPOSAL.md`](PHASE17_PROPOSAL.md) for how the real gaps
@@ -85,6 +85,6 @@ were triaged into tracked issues.
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 15 | 6 | 0 | 19 | 18 | 0 | 60 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 19 | 19 | 7 | 21 | 61 | 4 | 42 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
-| Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 55 | 19 | 7 | 0 | 16 | 8 | 4 | 1 |
-| **Total** | | **3,177** | **668** | **539** | **205** | **749** | **340** | **295** | **381** |
+| Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 22 | 7 | 0 | 17 | 6 | 4 | 1 |
+| **Total** | | **3,179** | **671** | **539** | **205** | **750** | **338** | **295** | **381** |
 

@@ -142,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
             relay_addr,
             dns_bootstrap,
             data_dir,
+            catchpoint_peer_url,
         } => {
             let (resolved_url, resolved_token, net_name) =
                 commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
@@ -177,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
                     fail_fast,
                     end,
                     node_config.accounts_rebuild_synchronous_mode,
+                    &catchpoint_peer_url,
                 )
                 .await?;
             } else {
