@@ -149,10 +149,21 @@ impl RankedCatchpointSource {
     /// distinction, already used by the download stage below, for
     /// consistency).
     async fn check_ledger_download(&self, genesis_id: &str, round: u64) -> Result<()> {
-        let attempts = self
-            .downloaders
-            .len()
-            .clamp(1, Self::CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS);
+        // Fixed budget, matching go's `for i := 0; i <
+        // cs.config.CatchupLedgerDownloadRetryAttempts; i++` exactly — go
+        // never scales this down for a small candidate-peer count, and
+        // neither must this: `get_next_peer()` breaks ties between
+        // equally-ranked peers at random (`PeerRanker::get_next_peer`), and
+        // a single probe failure's post-failure rank can land in the same
+        // bucket as another peer's post-success rank (both are bounded into
+        // the same `[lower_bound..upper_bound]` class range by
+        // `HistoricStats::push`), so two peers can still draw as a tie
+        // *after* one of them has already failed once. A budget capped at
+        // `downloaders.len()` gives zero slack for that unlucky redraw and
+        // can exhaust itself on the same already-known-bad peer while a
+        // working peer sits untried in the very same tied pool (see issue
+        // #928).
+        let attempts = Self::CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS;
         let mut last_err = None;
 
         for _ in 0..attempts {
@@ -549,6 +560,75 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// TDD regression for issue #928: a probe-stage retry budget capped at
+    /// `downloaders.len()` (rather than go's fixed
+    /// `CatchupLedgerDownloadRetryAttempts`, 50) has essentially zero slack
+    /// for `get_next_peer`'s random tie-breaking, and this repo's
+    /// `HistoricStats::push` maps *both* a single probe failure's new rank
+    /// and a fast real-download success's new rank into the same
+    /// `[lower_bound..upper_bound]` bucket for a class — so two peers can
+    /// still draw as a tie *after* one of them has already failed once.
+    ///
+    /// This reproduces the exact sequence observed causing the flake before
+    /// the fix: round 1's `download()` moves the reliable peer's rank from
+    /// its pristine initial rank into the post-success bucket, then round
+    /// 2's `check_ledger_download` probe can draw the already-known-bad
+    /// peer twice in a row (a peer-count-sized budget of 2 gives no slack
+    /// for that), returning `NotFound` and failing the round even though
+    /// the reliable peer was available in the very same tied pool the whole
+    /// time. Run many independent trials (fresh source/servers each time,
+    /// so no state leaks between them) to make this a deterministic pin
+    /// rather than a coin flip: the peer-count-capped budget failed this
+    /// scenario about 1 in 8 trials locally, so 100 trials essentially
+    /// never pass by chance, while the fixed 50-attempt budget makes
+    /// failure astronomically unlikely even under repeated unlucky ties.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_ledger_download_retry_budget_is_not_capped_by_peer_count() {
+        const BODY: &[u8] = b"catchpoint-file-bytes-0123456789";
+        const TRIALS: usize = 100;
+
+        for trial in 0..TRIALS {
+            let (missing_url, _missing_requests) = spawn_always_404_server().await;
+            let (good_url, _good_requests) = spawn_always_succeeding_server(BODY).await;
+
+            let src = RankedCatchpointSource::new(
+                &[(missing_url, String::new()), (good_url, String::new())],
+                fast_retry_config(),
+            );
+
+            let tmp_dir = std::env::temp_dir().join(format!(
+                "algod-rust-ranked-catchpoint-budget-{}-{trial}",
+                std::process::id()
+            ));
+            let dest = tmp_dir.join("catchpoint-1.tar.gz");
+
+            // Round 1: a full download, elevating the reliable peer's rank
+            // out of its pristine initial rank into the post-success
+            // bucket, exactly as in the original flake's setup.
+            let round1 = src.download("test-v1.0", 1, &dest, None).await;
+            assert!(
+                round1.is_ok(),
+                "trial {trial}: round 1 download should have succeeded via the peer that has \
+                 the catchpoint, got {:?}",
+                round1.err()
+            );
+
+            // Round 2: the probe stage alone, where the original flake
+            // manifested — the reliable peer's rank may now tie with the
+            // 404 peer's post-first-failure rank, so this must survive
+            // more than one unlucky redraw of the known-bad peer.
+            let round2 = src.check_ledger_download("test-v1.0", 2).await;
+            assert!(
+                round2.is_ok(),
+                "trial {trial}: round 2 probe should have succeeded via the peer that has the \
+                 catchpoint even under an unlucky peer-selector tie, got {:?}",
+                round2.err()
+            );
+
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
     }
 
     /// Direct unit test of `check_ledger_download`'s failure path (all
