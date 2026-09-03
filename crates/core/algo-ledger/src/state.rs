@@ -134,6 +134,10 @@ pub struct LedgerState {
     /// online_total_weight)`. See `store_trait::LedgerStore`'s "Voters
     /// snapshot cache" section.
     voters_snapshot_store: HashMap<u64, (Vec<u8>, u64)>,
+    /// Full participant-array cache for the voters snapshot (issue #912):
+    /// `round -> participants`. See `store_trait::LedgerStore`'s "Voters
+    /// snapshot: full participant array" section.
+    voters_participants_store: HashMap<u64, Vec<algo_consensus_crypto::stateproof::Participant>>,
 }
 
 impl LedgerState {
@@ -165,6 +169,7 @@ impl LedgerState {
             txtail_store: HashMap::new(),
             state_proof_verification_store: HashMap::new(),
             voters_snapshot_store: HashMap::new(),
+            voters_participants_store: HashMap::new(),
         }
     }
 
@@ -1658,6 +1663,31 @@ impl crate::store_trait::LedgerStore for LedgerState {
 
     fn delete_voters_snapshot(&mut self, round: u64) -> Result<(), algo_error::AlgoError> {
         self.voters_snapshot_store.remove(&round);
+        Ok(())
+    }
+
+    // ---- Voters snapshot: full participant array (issue #912) ----
+
+    fn put_voters_participants(
+        &mut self,
+        round: u64,
+        participants: &[algo_consensus_crypto::stateproof::Participant],
+    ) -> Result<(), algo_error::AlgoError> {
+        self.voters_participants_store
+            .insert(round, participants.to_vec());
+        Ok(())
+    }
+
+    fn get_voters_participants(
+        &self,
+        round: u64,
+    ) -> Result<Option<Vec<algo_consensus_crypto::stateproof::Participant>>, algo_error::AlgoError>
+    {
+        Ok(self.voters_participants_store.get(&round).cloned())
+    }
+
+    fn delete_voters_participants(&mut self, round: u64) -> Result<(), algo_error::AlgoError> {
+        self.voters_participants_store.remove(&round);
         Ok(())
     }
 }

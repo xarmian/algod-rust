@@ -231,6 +231,23 @@ CREATE TABLE IF NOT EXISTS votersnapshot (
     voterscommitment BLOB NOT NULL,
     onlinetotalweight INTEGER NOT NULL
 );
+
+-- Full participant-array cache for the voters snapshot (issue #912): the
+-- `Vec<Participant>` selected at a voters round (state-proof key commitment
+-- + weight, per `voters::encode_participants`), retained so a future
+-- state-proof signing/proving daemon can rebuild the vector-commitment tree
+-- and build/verify a `StateProofSig` -- go persists the equivalent data in
+-- the `stateproof` package's own `provers` table (`stateproof/db.go`,
+-- built from the ledger's in-memory `votersForRoundCache` at
+-- `OnPrepareVoterCommit` time). algod-rust has no separate in-memory
+-- ledger-side voters cache to draw from later, so the full array is
+-- persisted here instead, in the *same* tracker database/transaction as
+-- `votersnapshot` above, at snapshot time -- same round key, same
+-- retention lifecycle (`crate::voters_tracker::prune_voters_snapshots`).
+CREATE TABLE IF NOT EXISTS votersparticipants (
+    round INTEGER PRIMARY KEY NOT NULL,
+    participants BLOB NOT NULL
+);
 ";
 
 /// DDL run on the attached `blockdb` schema. Mirrors
@@ -6568,6 +6585,64 @@ impl LedgerStore for SqliteLedger {
             )
             .map_err(|e| AlgoError::Ledger {
                 message: format!("delete_voters_snapshot error: {e}"),
+            })?;
+        Ok(())
+    }
+
+    // ---- Voters snapshot: full participant array (issue #912) ----
+
+    fn put_voters_participants(
+        &mut self,
+        round: u64,
+        participants: &[algo_consensus_crypto::stateproof::Participant],
+    ) -> Result<(), AlgoError> {
+        let encoded = crate::voters::encode_participants(participants);
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO votersparticipants (round, participants) VALUES (?1, ?2)",
+                params![round as i64, encoded],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("put_voters_participants error: {e}"),
+            })?;
+        Ok(())
+    }
+
+    fn get_voters_participants(
+        &self,
+        round: u64,
+    ) -> Result<Option<Vec<algo_consensus_crypto::stateproof::Participant>>, AlgoError> {
+        let blob: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT participants FROM votersparticipants WHERE round = ?1",
+                params![round as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("get_voters_participants error: {e}"),
+            })?;
+        match blob {
+            Some(bytes) => {
+                let participants =
+                    crate::voters::decode_participants(&bytes).map_err(|e| AlgoError::Ledger {
+                        message: format!("get_voters_participants: decode error: {e}"),
+                    })?;
+                Ok(Some(participants))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn delete_voters_participants(&mut self, round: u64) -> Result<(), AlgoError> {
+        self.conn
+            .execute(
+                "DELETE FROM votersparticipants WHERE round = ?1",
+                params![round as i64],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("delete_voters_participants error: {e}"),
             })?;
         Ok(())
     }
