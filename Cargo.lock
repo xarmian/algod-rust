@@ -571,6 +571,7 @@ dependencies = [
  "algo-rest-client",
  "algo-types",
  "base64",
+ "serde_bytes",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -2233,6 +2234,7 @@ dependencies = [
 name = "goal-rust"
 version = "0.1.0"
 dependencies = [
+ "algo-abi",
  "algo-avm",
  "algo-codec",
  "algo-consensus-crypto",
@@ -2247,6 +2249,7 @@ dependencies = [
  "clap",
  "data-encoding",
  "ed25519-dalek",
+ "hex",
  "rand 0.8.5",
  "reqwest",
  "rmp",

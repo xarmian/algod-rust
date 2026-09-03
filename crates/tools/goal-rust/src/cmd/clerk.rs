@@ -407,7 +407,7 @@ fn run_send_inner(
 /// The label Go uses in LogicSig sanity-check errors: the output filename, or an
 /// empty string when broadcasting (Go's `outFilename`, clerk.go:478). Matches
 /// Go's `"%s: txn error %s"` formatting for both the `-o` and broadcast cases.
-fn out_label(out: Option<&Path>) -> String {
+pub(crate) fn out_label(out: Option<&Path>) -> String {
     out.map(|p| p.display().to_string()).unwrap_or_default()
 }
 
@@ -495,7 +495,7 @@ fn resolve_send_lsig(
 
 /// Resolve the note field: `--noteb64` (base64) wins, then `--note` text,
 /// otherwise 8 random bytes (clerk.go:314-331).
-fn parse_note(note_b64: Option<&str>, note: Option<&str>) -> Result<Vec<u8>, String> {
+pub(crate) fn parse_note(note_b64: Option<&str>, note: Option<&str>) -> Result<Vec<u8>, String> {
     if let Some(b64) = note_b64 {
         return base64::engine::general_purpose::STANDARD
             .decode(b64)
@@ -511,7 +511,7 @@ fn parse_note(note_b64: Option<&str>, note: Option<&str>) -> Result<Vec<u8>, Str
 }
 
 /// Parse the optional base64 lease, requiring exactly 32 bytes (clerk.go:333-346).
-fn parse_lease(lease: Option<&str>) -> Result<[u8; 32], String> {
+pub(crate) fn parse_lease(lease: Option<&str>) -> Result<[u8; 32], String> {
     let Some(raw) = lease else {
         return Ok([0u8; 32]);
     };
@@ -532,7 +532,7 @@ fn parse_lease(lease: Option<&str>) -> Result<[u8; 32], String> {
 /// Compute a transaction's `[first_valid, last_valid]` window, mirroring
 /// go-algorand's `computeValidityRounds` (libgoal.go:525) with the full
 /// `validRounds` resolution table.
-fn compute_validity(
+pub(crate) fn compute_validity(
     first_valid: Option<u64>,
     last_valid: Option<u64>,
     valid_rounds: Option<u64>,
@@ -1638,7 +1638,7 @@ fn to_kmd_msig(msig: Option<&algo_types::MultisigSig>) -> algo_kmd_api_types::co
 /// Write `data` to `path` with `0600` perms, mirroring Go's `writeFile(..,
 /// 0600)` (commands.go:510) used by the signing paths. As in Go, the path
 /// `-` (`stdoutFilenameValue`) writes to stdout instead of a file.
-fn write_file_0600(path: &Path, data: &[u8]) -> Result<(), String> {
+pub(crate) fn write_file_0600(path: &Path, data: &[u8]) -> Result<(), String> {
     if path.as_os_str() == STDIN_STDOUT {
         use std::io::Write;
         return std::io::stdout()
@@ -2146,13 +2146,15 @@ fn build_algod_endpoint(data_dir_path: &Path) -> Option<(String, String)> {
     Some((base, tok))
 }
 
-fn build_algod_client_for_dir(dd: &Path) -> Result<algo_rest_client::AlgodClient, String> {
+pub(crate) fn build_algod_client_for_dir(
+    dd: &Path,
+) -> Result<algo_rest_client::AlgodClient, String> {
     let (base, token) = build_algod_endpoint(dd)
         .ok_or_else(|| "Could not contact algod: algod.net/algod.token missing".to_string())?;
     Ok(algo_rest_client::AlgodClient::new(&base, &token))
 }
 
-fn build_kmd_client(
+pub(crate) fn build_kmd_client(
     data_dir_path: &Path,
     kmd_dir_flag: Option<&Path>,
 ) -> Result<KmdClient, String> {
@@ -2172,7 +2174,7 @@ fn build_kmd_client(
 
 /// Mirrors `getWalletHandleMaybePassword(true)` (commands.go:342-410); a port
 /// of the same helper in `crate::cmd::account`. Returns (handle, name, pw).
-fn resolve_wallet_and_init(
+pub(crate) fn resolve_wallet_and_init(
     rt: &tokio::runtime::Runtime,
     client: &KmdClient,
     accounts: &mut AccountsList,
@@ -2272,7 +2274,7 @@ fn read_password_for(wallet_name: &str) -> Result<String, String> {
     }
 }
 
-fn kmd_msg(e: &KmdError) -> String {
+pub(crate) fn kmd_msg(e: &KmdError) -> String {
     match e {
         KmdError::Api { message, .. } => message.clone(),
         other => other.to_string(),

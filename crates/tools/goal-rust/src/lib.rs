@@ -106,6 +106,10 @@ pub enum RootCommand {
 
     /// Manage applications.
     App {
+        /// Wallet to use for the operation. Mirrors Go's *persistent* `-w`
+        /// flag on the `app` command group (`application.go:116`).
+        #[arg(short = 'w', long = "wallet", global = true)]
+        wallet: Option<String>,
         #[command(subcommand)]
         cmd: Option<groups::app::AppCmd>,
     },
@@ -219,8 +223,11 @@ pub fn run() -> ExitCode {
     match command {
         RootCommand::Account { cmd: Some(c) } => groups::account::run(c),
         RootCommand::Account { cmd: None } => print_group_help(&["account"]),
-        RootCommand::App { cmd: Some(c) } => groups::app::run(c),
-        RootCommand::App { cmd: None } => print_group_help(&["app"]),
+        RootCommand::App {
+            cmd: Some(c),
+            wallet,
+        } => groups::app::run(c, wallet),
+        RootCommand::App { cmd: None, .. } => print_group_help(&["app"]),
         RootCommand::Asset { cmd: Some(c) } => groups::asset::run(c),
         RootCommand::Asset { cmd: None } => print_group_help(&["asset"]),
         RootCommand::Clerk {

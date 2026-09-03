@@ -13,6 +13,7 @@ algo-kmd-client.workspace = true
 algo-error.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+serde_bytes.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
