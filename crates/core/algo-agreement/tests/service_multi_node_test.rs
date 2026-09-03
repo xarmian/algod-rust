@@ -589,38 +589,86 @@ fn late_cert_bug_five_node() {
 }
 
 // `TestAgreementFastRecoveryLate` and `TestAgreementFastRecoveryRedo`
-// (`agreement/service_test.go`) were both attempted here — fast partition
-// recovery into a real proposal VALUE (not bottom): cert votes are pocketed
-// and decoded to confirm every node's recovery converges on the identical
-// proposal, then (unlike `DownEarly`/`DownMiss`, which recover straight
-// into a round commit) a second fast-recovery fire bumps the PERIOD only
-// (the recovered value becomes the new period's starting value), with a
-// separate, subsequent filter timeout actually terminating the round;
-// `Redo` additionally forces period 1 to fail AGAIN (total vote loss) and
-// asserts the SAME recovered value is what the round eventually commits
-// after a second forced partition-recovery cascade, without ever being
-// re-derived.
+// (`agreement/service_test.go`): fast partition recovery into a real
+// proposal VALUE (not bottom), then (`Redo` only) a second forced failure
+// and recovery of the SAME period, asserting the pinned value survives both.
 //
-// Real finding, NOT fixed here: `Late`'s port was solid across 9
-// consecutive standalone runs, but FAILED when run as part of the full
-// `service_multi_node_test` suite (all tests executing concurrently) — the
-// committed block's digest differed from the pocketed/derived `expected`
-// value. `Redo`'s port (structurally the same "second fast-recovery fire
-// bumps the period onto a pinned value" mechanic, just exercised twice) was
-// independently flaky even standalone (2 failures in 5 consecutive
-// attempts), same symptom. Both point at the same narrow mechanic: the
-// SECOND fast-recovery fire's period bump doesn't reliably preserve the
-// already-recovered starting value under real (not lock-step synchronous)
-// thread scheduling and CPU contention — exactly the class of behavior
-// `TestPlayerAlwaysResynchsPinnedValue` (still open per issue #825's theme
-// 1) probes at the player level. Whether this is a genuine algod-rust
-// starting-value-propagation bug under load, or an artifact of this
-// harness's `drop_all_votes` + subset-`FastRecovery`-fire choreography not
-// perfectly reproducing the timing go's synchronous model guarantees, needs
-// dedicated investigation (starting with `AlwaysResynchsPinnedValue`'s own
-// still-open port) rather than being forced through in this already-large
-// pass. Neither test is landed; both are tracked as follow-up in
-// `docs/phase17/parity_agreement.md`.
+// Issue #920 investigated this in depth (see the issue for the full
+// writeup) and found — and fixed — two genuine harness bugs along the way:
+//
+//   1. The cert-vote-pocketing loop ported from `late_cert_bug_five_node`
+//      (which only needs a vote *count* and tolerates spanning periods)
+//      could fire more than one deadline timeout while pocketing stayed
+//      armed, mixing period-0 and period-1 proposals into what `Late`/`Redo`
+//      assert is a single-period, single-value quorum. Fixed by pocketing
+//      with a single fire only.
+//   2. `AgreementCluster::wait_for_quiet`'s `extra_pending` hook (the
+//      crypto-verifier-backlog term its own doc comment claimed to check)
+//      was stubbed to `|| 0`. Fixed via a new `CryptoVerifier for Arc<C>`
+//      blanket impl (`traits.rs`) so the driver can keep a second handle to
+//      each node's verifier and fold its output-channel backlog into the
+//      quiescence check — see `setup_agreement.rs`'s `AgreementCluster::
+//      wait_for_quiet` doc comment.
+//
+// Both fixes are real and independently valuable (the second especially:
+// it makes `wait_for_quiet` do what its own comment always claimed).
+// Neither, however, fully eliminates the flakiness. With both applied, a
+// residual, LOWER-frequency failure mode remains, root-caused precisely via
+// targeted `tracing`/`eprintln` instrumentation of `Player::issue_fast_vote`
+// during this investigation (not left in the tree):
+//
+//   `enter_period` (`player.rs`) correctly implements go's "always resynch
+//   the pinned value" mechanic — ported and verified independently via
+//   `player_always_resynchs_pinned_value` (`player_edge_cases_test.rs`),
+//   which passes reliably. A period entered via a non-bottom `NextThreshold`
+//   issues a `Repropose` pseudonode action carrying the pinned proposal
+//   VALUE. But `Repropose` (`service.rs`'s `ActionType::Repropose` handler)
+//   only calls `pseudonode.make_votes(..., PROPOSE, ...)` — it re-asserts a
+//   PROPOSE-step VOTE, not the payload itself (matching go: a repropose is a
+//   vote, not a fresh proposal broadcast). A node that never received the
+//   ORIGINAL proposal-payload broadcast (round 0's, from whichever node
+//   first proposed it) therefore has no way to ever locally stage it and
+//   reach `committable == true` at the new period — `partition_policy`, the
+//   ONLY mechanic in this codebase that re-transmits a pinned PAYLOAD, is
+//   gated on `Player::partitioned()` (`step >= PARTITION_STEP || period >=
+//   3`), which never holds this early (period 0 or 1). Observed directly:
+//   in one captured failure, 3 of 5 nodes printed `committable == false`
+//   for the SAME pinned value across 10+ consecutive fast-recovery fires
+//   spanning the entire test — not a transient race, a persistent stall for
+//   those 3 nodes specifically. Enough of them then correctly fall back to
+//   a DOWN (bottom) fast-vote (per `issue_fast_vote`'s own, CORRECT logic
+//   for a node that isn't yet committable and sees no cached non-bottom
+//   status for the previous period), and if THOSE reach quorum first, the
+//   cluster safely (every node still agrees with every other node — this
+//   is not a fork) recovers into BOTTOM/a freshly-assembled proposal
+//   instead of the pinned value `Late`/`Redo` expect.
+//
+// This is the SAME class of gap this file's own `fast_recovery_down_early_
+// five_node` doc comment already flags from an earlier investigation (issue
+// #911): "one node out of five intermittently falls behind its peers and
+// never catches back up... a genuine liveness gap this harness cannot paper
+// over by waiting longer." That earlier case was fixed by teaching
+// `TestLedger` to serve `ensure_digest` fetches from `SharedCommits` once a
+// round is ready to COMMIT. No equivalent catch-up path exists for a node
+// that's still missing a proposal PAYLOAD mid-period (before any cert
+// threshold, so `ensure_digest` never fires) — that would need either a
+// real payload-request/relay protocol in `TestingNetwork` (this harness has
+// none; go's real network layer does), or extending `partition_policy`'s
+// pin-relay mechanic to also run below `Player::partitioned()`'s threshold
+// (a production-code behavior change that would need its own dedicated,
+// go-conformance-checked investigation, not a harness-only fix — go's own
+// `partitioned()` gate looks identical, so go likely has the SAME
+// theoretical gap and simply never exercises it at these low periods in
+// its synchronous test model).
+//
+// Conclusion: this residual flakiness is a harness-payload-propagation
+// limitation, not a `Player`/`Service` correctness bug — `enter_period` and
+// `issue_fast_vote` both behave correctly given what each node has actually
+// received. `fast_recovery_late_five_node`/`fast_recovery_redo_five_node`
+// are therefore NOT landed here (an early version failed ~1/10 standalone
+// even with both fixes above applied — well short of the reliability bar
+// this file's other scenarios meet). See issue #920 for the full
+// investigation and `docs/phase17/parity_agreement.md` for the tracked row.
 
 /// Full 5-node port of go-algorand's `TestAgreementLargePeriods`
 /// (`agreement/service_test.go`): partitions a 3-of-5 minority (nodes 0-2)

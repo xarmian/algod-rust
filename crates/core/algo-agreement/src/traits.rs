@@ -641,6 +641,46 @@ pub trait CryptoVerifier: Send + 'static {
     fn quit(&self);
 }
 
+/// Blanket impl so an `Arc<C>` can be used anywhere a `C: CryptoVerifier` is
+/// expected (e.g. as `Parameters::crypto`), while a second `Arc` clone stays
+/// with the caller for out-of-band inspection (queue lengths, etc.) — no go
+/// equivalent needed, since go's `cryptoVerifier` is always used through a
+/// pointer already. Added for issue #920: the multi-node test harness
+/// (`crates/core/algo-agreement/tests/simulate/`) needs a live handle to
+/// each node's verifier to fold its output-channel backlog into
+/// `ActivityMonitor::wait_for_quiet`'s quiescence check (previously stubbed
+/// to `|| 0`, unable to detect a verified-but-not-yet-drained proposal or
+/// vote sitting in the verifier's output channel between polls).
+impl<C: CryptoVerifier + Send + Sync + ?Sized> CryptoVerifier for std::sync::Arc<C> {
+    fn verify_vote(&self, request: CryptoVoteRequest) {
+        (**self).verify_vote(request)
+    }
+
+    fn verify_proposal(&self, request: CryptoProposalRequest) {
+        (**self).verify_proposal(request)
+    }
+
+    fn verify_bundle(&self, request: CryptoBundleRequest) {
+        (**self).verify_bundle(request)
+    }
+
+    fn verified_votes(&self) -> &crossbeam_channel::Receiver<CryptoVoteVerifyResult> {
+        (**self).verified_votes()
+    }
+
+    fn verified(&self, tag: &str) -> &crossbeam_channel::Receiver<CryptoResult> {
+        (**self).verified(tag)
+    }
+
+    fn channel_full(&self, tag: &str) -> bool {
+        (**self).channel_full(tag)
+    }
+
+    fn quit(&self) {
+        (**self).quit()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

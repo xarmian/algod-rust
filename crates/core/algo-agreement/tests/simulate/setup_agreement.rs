@@ -43,9 +43,12 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use algo_agreement::crypto_verifier::AsyncCryptoVerifier;
 use algo_agreement::stubs::StubBlockValidator;
-use algo_agreement::{AccountSigningKeys, Clock, Parameters, RandomSource, Service, ServiceHandle};
+use algo_agreement::{
+    AccountSigningKeys, AsyncCryptoVerifier, Clock, CryptoVerifier, NoOpValidator, Parameters,
+    RandomSource, Service, ServiceHandle, AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG,
+    VOTE_BUNDLE_TAG,
+};
 use algo_types::{ConsensusParams, Round};
 
 use super::activity_monitor::ActivityMonitor;
@@ -79,17 +82,50 @@ pub struct AgreementCluster {
     pub clocks: Vec<Arc<TestingClock>>,
     pub ledgers: Vec<TestLedger>,
     pub monitor: Arc<ActivityMonitor>,
+    /// Per-node handle to the SAME `AsyncCryptoVerifier` instance each
+    /// `Service` is actually running against (a second `Arc` clone of what
+    /// was handed to `Parameters::crypto`, made possible by the
+    /// `CryptoVerifier for Arc<C>` blanket impl added for this — see
+    /// `wait_for_quiet`'s doc comment for why this is needed).
+    verifiers: Vec<Arc<AsyncCryptoVerifier<TestLedger, NoOpValidator>>>,
     handles: Cell<Vec<ServiceHandle>>,
 }
 
 impl AgreementCluster {
-    /// Block until every node's demux/pseudonode-reported queues and every
-    /// network channel are empty and stay empty for the debounce window.
-    /// Thin wrapper over `ActivityMonitor::wait_for_quiet` so call sites
-    /// don't need to know about the network-pending-count plumbing.
+    /// Block until every node's demux/pseudonode-reported queues, every
+    /// network channel, AND every node's crypto-verifier output channels
+    /// (votes/proposals/bundles verified but not yet drained by that node's
+    /// demux thread) are empty and stay empty for the debounce window.
+    ///
+    /// Root-cause note (issue #920): this previously folded in a stubbed
+    /// `|| 0` for the verifier-backlog term, even though
+    /// `ActivityMonitor::wait_for_quiet`'s own doc comment claimed to check
+    /// it. Under real-thread scheduling, a proposal payload can finish
+    /// async verification (landing in `AsyncCryptoVerifier`'s output
+    /// channel) in the same narrow window the poll sees every OTHER queue
+    /// at zero, so `wait_for_quiet` returned before that node's demux
+    /// thread actually drained and processed the result — i.e. before
+    /// `staged_value` reflected it. `fast_recovery_late_five_node`/
+    /// `fast_recovery_redo_five_node` (multi-fire fast-recovery scenarios
+    /// spanning several settle points in quick succession) hit this gap
+    /// often enough to be genuinely flaky; folding the verifiers' output
+    /// channels into the quiescence check closes it.
     pub fn wait_for_quiet(&self) {
         self.monitor
-            .wait_for_quiet(&self.network, &self.clocks, || 0);
+            .wait_for_quiet(&self.network, &self.clocks, || {
+                self.verifiers
+                    .iter()
+                    .map(|v| {
+                        v.verified_votes().len()
+                            + v.verified(PROPOSAL_PAYLOAD_TAG).len()
+                            + v.verified(VOTE_BUNDLE_TAG).len()
+                            + (v.channel_full(AGREEMENT_VOTE_TAG)
+                                || v.channel_full(PROPOSAL_PAYLOAD_TAG)
+                                || v.channel_full(VOTE_BUNDLE_TAG))
+                                as usize
+                    })
+                    .sum()
+            });
     }
 
     /// Shut down every node: release each `TestingClock`'s pending
@@ -148,6 +184,7 @@ pub fn setup_agreement(n: usize) -> AgreementCluster {
 
     let mut clocks = Vec::with_capacity(n);
     let mut handles = Vec::with_capacity(n);
+    let mut verifiers = Vec::with_capacity(n);
 
     for (i, account) in accounts.drain(..).enumerate() {
         // Node `i` only ever votes/proposes as its own account — mirrors
@@ -161,7 +198,15 @@ pub fn setup_agreement(n: usize) -> AgreementCluster {
 
         let clock = TestingClock::new();
         let ledger = ledgers[i].clone();
-        let crypto = AsyncCryptoVerifier::new(Arc::new(ledger.clone()));
+        // Wrapped in `Arc` (rather than handed to `Parameters::crypto` by
+        // value) so the driver keeps a second handle to the SAME verifier
+        // instance the `Service` runs against — needed by `wait_for_quiet`
+        // to fold the verifier's output-channel backlog into its
+        // quiescence check (issue #920). `Arc<AsyncCryptoVerifier<..>>`
+        // satisfies `Parameters`'s `C: CryptoVerifier` bound via the
+        // blanket `impl<C: CryptoVerifier> CryptoVerifier for Arc<C>`.
+        let crypto = Arc::new(AsyncCryptoVerifier::new(Arc::new(ledger.clone())));
+        verifiers.push(Arc::clone(&crypto));
 
         let this_params = Parameters {
             network: network.endpoint(i),
@@ -188,6 +233,7 @@ pub fn setup_agreement(n: usize) -> AgreementCluster {
         clocks,
         ledgers,
         monitor,
+        verifiers,
         handles: Cell::new(handles),
     }
 }

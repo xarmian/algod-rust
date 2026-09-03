@@ -43,11 +43,6 @@
 // - ISV/ICV sub-cases, pipelined-threshold and verification-request tests
 //   (`TestPlayerISV*`, `TestPlayerICV*`, `TestPlayerRequests*Verification`,
 //   `TestPlayerHandlesPipelinedThresholds`, `TestPlayerRequestsPipelinedPayloadVerification`).
-// - `TestPlayerAlwaysResynchsPinnedValue` — not attempted in this pass. It
-//   needs a multi-hop trace assertion (rezero + relay-bundle + relay-payload
-//   all in one transition) that's meaningfully more involved than the other
-//   scenarios here; left open rather than rushed, per this issue's guidance
-//   to prioritize verified-correct coverage over breadth.
 //
 // Ported scenarios (see also `docs/phase17/parity_agreement.md`):
 // - `TestPlayerProposesBottomBundle`
@@ -58,6 +53,17 @@
 // - `TestPlayer_CertThresholdDoesNotBlockFuturePeriod`
 // - `TestPlayer_CertThresholdCommitsFuturePeriodIfAlreadyHasBlock`
 // - `TestPlayer_PayloadAfterCertThresholdCommits`
+// - `TestPlayerAlwaysResynchsPinnedValue` (`player_always_resynchs_pinned_value`)
+//   ported for issue #920's investigation of the 5-node
+//   `fast_recovery_late_five_node`/`fast_recovery_redo_five_node` flakiness
+//   (see `service_multi_node_test.rs`'s module doc comment). Passes
+//   reliably: the `enter_period`/`partition_policy` "always resynch the
+//   pinned value" mechanic this white-box test probes is correctly
+//   implemented. Issue #920's residual multi-node flakiness traces to a
+//   different gap (the 5-node harness's `TestingNetwork` has no
+//   payload-catch-up path below `Player::partitioned()`'s period-3
+//   threshold, where `partition_policy` -- the only pin-payload-relay
+//   mechanic -- is gated off), not to anything this test exercises.
 
 use algo_agreement::test_support::{
     override_consensus_with_dynamic_filter, setup_p, IoAutomataConcretePlayer, VoteMakerHelper,
@@ -641,6 +647,120 @@ fn player_payload_after_cert_threshold_commits() {
             payload.unauthenticated_proposal.block_digest()
         ),
         "player should have committed but didn't; trace:\n{}",
+        machine.trace()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A pinned value must be relayed (both its freshest bundle AND its payload)
+// even across a multi-hop fast-forward where it wasn't re-staged in the
+// intermediate period. Mirrors Go's `TestPlayerAlwaysResynchsPinnedValue`
+// (`player_test.go:3139`) — previously deferred (see this file's module doc
+// comment); ported now for issue #920's investigation of whether the
+// 5-node `fast_recovery_redo_five_node`/`fast_recovery_late_five_node`
+// flakiness traces back to this exact "always resynchs pinned value"
+// mechanic.
+//
+// White-box trace: a payload is staged for period p-2 (soft step). A
+// next-value bundle for that SAME value at period p-2 fast-forwards the
+// player into period p-1 (no payload re-staged there). A SECOND next-value
+// bundle for the SAME value, now at period p-1, fast-forwards into period p
+// in one transition. The player must have relayed both the freshest bundle
+// (the period p-1 one that triggered the final hop) AND the original
+// payload (still only staged from period p-2), proving the pinned value
+// survives a hop where it wasn't restaged, not just a same-period resync.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn player_always_resynchs_pinned_value() {
+    let r = Round(209);
+    let p = algo_agreement::Period(12);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(
+        r,
+        algo_agreement::Period(p.0 - 2),
+        algo_agreement::SOFT,
+        &params,
+    );
+
+    let payload = algo_agreement::test_support::make_random_proposal_payload(r);
+    let pv = payload.unauthenticated_proposal.value();
+
+    // Store a payload for period p-2: one propose-step vote for `pv`,
+    // followed by the verified payload itself.
+    send_votes(
+        &mut machine,
+        &mut helper,
+        1,
+        r,
+        algo_agreement::Period(p.0 - 2),
+        PROPOSE,
+        pv,
+    );
+    send_payload_verified(&mut machine, &payload);
+
+    // Next-value bundle at period p-2 fast-forwards into period p-1.
+    send_bundle_verified(
+        &mut machine,
+        &mut helper,
+        r,
+        algo_agreement::Period(p.0 - 2),
+        NEXT,
+        pv,
+    );
+
+    // Second next-value bundle, now at period p-1 (which has no staged
+    // payload of its own), fast-forwards into period p in one transition.
+    // Only this final transition's trace is asserted on, mirroring Go's
+    // `pM.resetTrace()` right before it.
+    let final_bundle_period = algo_agreement::Period(p.0 - 1);
+    machine.reset_trace();
+    send_bundle_verified(&mut machine, &mut helper, r, final_bundle_period, NEXT, pv);
+
+    assert_eq!(
+        machine.player().period,
+        p,
+        "player did not fast forward to new period"
+    );
+
+    let rezeroed = machine
+        .trace()
+        .contains_action_fn(|a| matches!(a, Action::Rezero(ra) if ra.round == r));
+    assert!(
+        rezeroed,
+        "player should reset clock; trace:\n{}",
+        machine.trace()
+    );
+
+    let resynched_bundle = machine.trace().contains_action_fn(|a| match a {
+        Action::Network(na) => {
+            na.t == ActionType::Broadcast
+                && na.tag == algo_agreement::VOTE_BUNDLE_TAG
+                && na.unauthenticated_bundle.round == r
+                && na.unauthenticated_bundle.period == final_bundle_period
+                && na.unauthenticated_bundle.step == NEXT
+                && na.unauthenticated_bundle.proposal == pv
+        }
+        _ => false,
+    });
+    assert!(
+        resynched_bundle,
+        "player should relay freshest bundle = next value bundle; trace:\n{}",
+        machine.trace()
+    );
+
+    let expected_digest = payload.unauthenticated_proposal.block_digest();
+    let resynched_payload = machine.trace().contains_action_fn(|a| match a {
+        Action::Network(na) => {
+            na.t == ActionType::Broadcast
+                && na.tag == algo_agreement::PROPOSAL_PAYLOAD_TAG
+                && na.compound_message.proposal.block_digest() == expected_digest
+        }
+        _ => false,
+    });
+    assert!(
+        resynched_payload,
+        "player should relay payload even if not staged in previous period; trace:\n{}",
         machine.trace()
     );
 }
