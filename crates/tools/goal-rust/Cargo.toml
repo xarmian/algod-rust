@@ -22,11 +22,13 @@ algo-codec = { workspace = true }
 algo-avm = { workspace = true }
 algo-validate = { workspace = true }
 algo-types = { workspace = true }
+algo-abi = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 serde_bytes = { workspace = true }
 data-encoding = { workspace = true }
+hex = { workspace = true }
 rmpv = { workspace = true }
 rusqlite = { workspace = true }
 algo-error = { workspace = true }

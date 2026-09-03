@@ -343,9 +343,13 @@ pub struct SuggestedParams {
 /// blocks, as returned by `GET /v2/transactions/pending/{txid}`.
 ///
 /// Ported reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go:1486`
-/// (`PreEncodedTxInfo`). This Rust mirror decodes only the fields the e2e
-/// harness needs (confirmation tracking + pool-error surface); inner txns,
-/// state deltas, logs, and asset/app indices are intentionally omitted.
+/// (`PreEncodedTxInfo`). This Rust mirror decodes the fields the e2e harness
+/// needs (confirmation tracking + pool-error surface) plus `logs` and
+/// `application-index` (needed by `goal-rust app method`'s
+/// `"method ... succeeded with output: ..."` return-value reporting, mirroring
+/// go's `methodAppCmd` reading `resp.Logs`/`resp.ApplicationIndex` off the same
+/// endpoint — `cmd/goal/application.go`); inner txns and state deltas are still
+/// intentionally omitted.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PendingTxnInfo {
     /// Set when the transaction has been included in a block; `None` while
@@ -357,6 +361,16 @@ pub struct PendingTxnInfo {
     /// Empty string (the default) means the transaction is healthy.
     #[serde(rename = "pool-error", default)]
     pub pool_error: String,
+
+    /// Logs emitted by application execution, in order. `None`/empty when
+    /// the transaction didn't call an app or the app logged nothing.
+    #[serde(default)]
+    pub logs: Option<Vec<Vec<u8>>>,
+
+    /// The application ID created by an `app create` (or method call with
+    /// `--create`) transaction. `None` for every other transaction.
+    #[serde(rename = "application-index", default)]
+    pub application_index: Option<u64>,
 }
 
 impl PendingTxnInfo {

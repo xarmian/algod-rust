@@ -32,11 +32,13 @@
 //! asset-transfer / asset-config / asset-freeze / application builders, each a
 //! small follow-on against this same surface.
 
+mod application_call;
 mod error;
 mod keyreg;
 mod payment;
 mod pipeline;
 
+pub use application_call::ApplicationCallBuilder;
 pub use error::{PipelineError, Result};
 pub use keyreg::KeyregBuilder;
 pub use payment::PaymentBuilder;

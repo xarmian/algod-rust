@@ -22,6 +22,7 @@
 //! body from `../go-algorand/cmd/goal/`.
 
 pub mod account;
+pub mod app;
 pub mod clerk;
 pub mod clerk_sign;
 pub mod node;
