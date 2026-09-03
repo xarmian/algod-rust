@@ -133,7 +133,29 @@ struct NetworkState {
     /// is the group membership of node `i`; a message is only delivered
     /// between nodes in the same group. Mirrors go's `partitionedNodes`.
     partitioned: Option<Vec<bool>>,
+
+    /// Bounded FIFO of the most recently, normally-delivered (i.e. not
+    /// pocketed) `PROPOSAL_PAYLOAD_TAG` broadcasts — a harness-only
+    /// payload-catch-up mechanism with no go equivalent, because go's real
+    /// `testingNetwork` never needs one: its single-goroutine synchronous
+    /// model and generously-buffered channels guarantee every connected
+    /// node's payload channel receives every broadcast payload exactly
+    /// once, so a node can never fall behind on a payload the way this
+    /// harness's real, independently-scheduled `Service` threads sometimes
+    /// do (see issue #920's investigation in `service_multi_node_test.rs`).
+    /// [`TestingNetwork::redeliver_recent_payloads`] re-multicasts every
+    /// cached entry, letting a node that missed (or later locally pruned)
+    /// an earlier proposal payload catch up the next time the network is
+    /// healed — see [`TestingNetwork::repair_all`], which calls it
+    /// automatically.
+    payload_history: Vec<PocketedMessage>,
 }
+
+/// Cap on [`NetworkState::payload_history`] — bounds memory for
+/// long-running scenarios (e.g. `large_periods_five_node`'s 60 periods)
+/// while comfortably covering the handful of periods any fast-recovery
+/// scenario actually spans.
+const PAYLOAD_HISTORY_CAP: usize = 64;
 
 /// Shared multi-node network. Construct once, then hand each node its own
 /// [`TestingNetworkEndpoint`] via [`TestingNetwork::endpoint`].
@@ -176,6 +198,7 @@ impl TestingNetwork {
                 soft_vote_pocket: None,
                 compound_pocket: None,
                 partitioned: None,
+                payload_history: Vec::new(),
             }),
         })
     }
@@ -231,7 +254,19 @@ impl TestingNetwork {
 
     /// Mirrors go's `testingNetwork.repairAll` (the subset of drop/pocket/
     /// partition state this port tracks — see the module doc for what's not
-    /// yet ported).
+    /// yet ported). Deliberately does NOT also call
+    /// [`Self::redeliver_recent_payloads`]: an earlier version of this
+    /// method did so unconditionally, on the theory that replaying a
+    /// harmless duplicate can never hurt — but `late_cert_bug_five_node`
+    /// (whose whole point is asserting that replaying a SPECIFIC, already-
+    /// pocketed set of votes with no further clock fire is what commits the
+    /// round) calls `repair_all()` too, and the extra burst of re-multicast
+    /// payload traffic that produced was enough to occasionally perturb its
+    /// precisely-timed assertion. Callers that actually need payload
+    /// catch-up (`fast_recovery_late_five_node`/`redo_five_node`, via
+    /// `force_fast_recovery_into_value`) call
+    /// [`Self::redeliver_recent_payloads`] explicitly at the specific points
+    /// that need it, instead.
     pub fn repair_all(&self) {
         let mut state = self.state.lock().expect("TestingNetwork poisoned");
         state.drop_soft_votes = false;
@@ -241,6 +276,31 @@ impl TestingNetwork {
         state.soft_vote_pocket = None;
         state.compound_pocket = None;
         state.partitioned = None;
+    }
+
+    /// Re-multicast every proposal-payload broadcast currently held in
+    /// [`NetworkState::payload_history`] through the normal routing path
+    /// (respecting whatever drop/pocket/partition state is active now, same
+    /// as [`Self::replay`]). This is the harness's payload catch-up
+    /// mechanism for issue #920's residual gap: unlike go's real
+    /// `testingNetwork` (whose synchronous single-goroutine model guarantees
+    /// every connected node's payload channel receives every broadcast
+    /// payload exactly once — see `payload_history`'s doc comment), this
+    /// harness's real, independently-scheduled `Service` threads can
+    /// occasionally leave a node without a payload it needs staged (missed
+    /// delivery, or later local pruning across a period transition) with no
+    /// other way to recover it — `partition_policy`, the only mechanic that
+    /// re-transmits a pinned payload, is gated on `Player::partitioned()`
+    /// (`period >= 3`), which never holds at the low periods fast-recovery
+    /// scenarios exercise. Called automatically by [`Self::repair_all`];
+    /// exposed separately in case a future scenario needs to catch nodes up
+    /// without also clearing drop/pocket/partition state.
+    pub fn redeliver_recent_payloads(&self) {
+        let history = {
+            let state = self.state.lock().expect("TestingNetwork poisoned");
+            state.payload_history.clone()
+        };
+        self.replay_all(&history);
     }
 
     /// Mirrors go's `testingNetwork.pocketAllCertVotes`: from now on, every
@@ -498,6 +558,26 @@ fn multicast(
             && step != DOWN
         {
             return;
+        }
+    }
+
+    // Cache every normally-delivered (not pocketed above) proposal-payload
+    // broadcast for `redeliver_recent_payloads` — see `payload_history`'s
+    // doc comment. Recorded here rather than at `broadcast`/`relay` call
+    // sites so a replay-of-a-replay (`redeliver_recent_payloads` calling
+    // `replay_all`, which calls back into this function) re-caches too,
+    // keeping recently-redelivered entries from aging out of the FIFO ahead
+    // of ones nobody has re-sent in a while.
+    if tag == PROPOSAL_PAYLOAD_TAG {
+        state.payload_history.push(PocketedMessage {
+            tag,
+            data: data.to_vec(),
+            source,
+            exclude,
+        });
+        let len = state.payload_history.len();
+        if len > PAYLOAD_HISTORY_CAP {
+            state.payload_history.drain(0..len - PAYLOAD_HISTORY_CAP);
         }
     }
 

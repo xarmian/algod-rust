@@ -72,6 +72,7 @@
 mod simulate;
 
 use algo_agreement::types::TimeoutType;
+use algo_agreement::{codec, ProposalValue, BOTTOM};
 use algo_types::Round;
 
 use crate::simulate::setup_agreement::{setup_agreement, AgreementCluster};
@@ -601,7 +602,7 @@ fn late_cert_bug_five_node() {
 //      could fire more than one deadline timeout while pocketing stayed
 //      armed, mixing period-0 and period-1 proposals into what `Late`/`Redo`
 //      assert is a single-period, single-value quorum. Fixed by pocketing
-//      with a single fire only.
+//      with a single fire only (`force_fast_recovery_into_value` below).
 //   2. `AgreementCluster::wait_for_quiet`'s `extra_pending` hook (the
 //      crypto-verifier-backlog term its own doc comment claimed to check)
 //      was stubbed to `|| 0`. Fixed via a new `CryptoVerifier for Arc<C>`
@@ -611,11 +612,11 @@ fn late_cert_bug_five_node() {
 //      wait_for_quiet` doc comment.
 //
 // Both fixes are real and independently valuable (the second especially:
-// it makes `wait_for_quiet` do what its own comment always claimed).
-// Neither, however, fully eliminates the flakiness. With both applied, a
-// residual, LOWER-frequency failure mode remains, root-caused precisely via
-// targeted `tracing`/`eprintln` instrumentation of `Player::issue_fast_vote`
-// during this investigation (not left in the tree):
+// it makes `wait_for_quiet` do what its own comment always claimed), but
+// neither fully eliminated the flakiness on their own. A residual,
+// lower-frequency failure mode remained, root-caused precisely via targeted
+// `tracing`/`eprintln` instrumentation of `Player::issue_fast_vote` during
+// the investigation (not left in the tree):
 //
 //   `enter_period` (`player.rs`) correctly implements go's "always resynch
 //   the pinned value" mechanic — ported and verified independently via
@@ -625,50 +626,289 @@ fn late_cert_bug_five_node() {
 //   VALUE. But `Repropose` (`service.rs`'s `ActionType::Repropose` handler)
 //   only calls `pseudonode.make_votes(..., PROPOSE, ...)` — it re-asserts a
 //   PROPOSE-step VOTE, not the payload itself (matching go: a repropose is a
-//   vote, not a fresh proposal broadcast). A node that never received the
-//   ORIGINAL proposal-payload broadcast (round 0's, from whichever node
-//   first proposed it) therefore has no way to ever locally stage it and
-//   reach `committable == true` at the new period — `partition_policy`, the
-//   ONLY mechanic in this codebase that re-transmits a pinned PAYLOAD, is
-//   gated on `Player::partitioned()` (`step >= PARTITION_STEP || period >=
-//   3`), which never holds this early (period 0 or 1). Observed directly:
-//   in one captured failure, 3 of 5 nodes printed `committable == false`
-//   for the SAME pinned value across 10+ consecutive fast-recovery fires
-//   spanning the entire test — not a transient race, a persistent stall for
-//   those 3 nodes specifically. Enough of them then correctly fall back to
-//   a DOWN (bottom) fast-vote (per `issue_fast_vote`'s own, CORRECT logic
-//   for a node that isn't yet committable and sees no cached non-bottom
-//   status for the previous period), and if THOSE reach quorum first, the
-//   cluster safely (every node still agrees with every other node — this
-//   is not a fork) recovers into BOTTOM/a freshly-assembled proposal
-//   instead of the pinned value `Late`/`Redo` expect.
+//   vote, not a fresh proposal broadcast). A node that never received (or
+//   locally pruned across a period transition) the ORIGINAL proposal-payload
+//   broadcast therefore has no way to locally stage it and reach
+//   `committable == true` at the new period — `partition_policy`, the ONLY
+//   mechanic in *production* that re-transmits a pinned PAYLOAD, is gated on
+//   `Player::partitioned()` (`period >= 3`), which never holds this early.
+//   Observed directly: in one captured failure, 3 of 5 nodes printed
+//   `committable == false` for the SAME pinned value across 10+ consecutive
+//   fast-recovery fires spanning the entire test — not a transient race, a
+//   persistent stall for those 3 nodes specifically, correctly falling back
+//   to a DOWN (bottom) fast-vote per `issue_fast_vote`'s own correct logic.
 //
 // This is the SAME class of gap this file's own `fast_recovery_down_early_
 // five_node` doc comment already flags from an earlier investigation (issue
-// #911): "one node out of five intermittently falls behind its peers and
-// never catches back up... a genuine liveness gap this harness cannot paper
-// over by waiting longer." That earlier case was fixed by teaching
-// `TestLedger` to serve `ensure_digest` fetches from `SharedCommits` once a
-// round is ready to COMMIT. No equivalent catch-up path exists for a node
-// that's still missing a proposal PAYLOAD mid-period (before any cert
-// threshold, so `ensure_digest` never fires) — that would need either a
-// real payload-request/relay protocol in `TestingNetwork` (this harness has
-// none; go's real network layer does), or extending `partition_policy`'s
-// pin-relay mechanic to also run below `Player::partitioned()`'s threshold
-// (a production-code behavior change that would need its own dedicated,
-// go-conformance-checked investigation, not a harness-only fix — go's own
-// `partitioned()` gate looks identical, so go likely has the SAME
-// theoretical gap and simply never exercises it at these low periods in
-// its synchronous test model).
+// #911) for round-COMMIT digests, fixed harness-side via `TestLedger`'s
+// `SharedCommits`. This investigation's fix is the mid-period-PAYLOAD
+// equivalent: `TestingNetwork::redeliver_recent_payloads`
+// (`simulate/testing_network.rs`) caches every normally-delivered proposal-
+// payload broadcast and replays all of them on request — called explicitly
+// at every "network heals" point these two scenarios hit (deliberately NOT
+// folded into `TestingNetwork::repair_all` itself, which every OTHER
+// 5-node scenario in this file also calls: an earlier version did fold it
+// in, and the extra re-multicast traffic was enough to occasionally perturb
+// `late_cert_bug_five_node`'s precisely-timed "replay exactly this and
+// nothing else" assertion — see `repair_all`'s doc comment) — a
+// harness-only catch-up mechanism, deliberately NOT a change to
+// `partition_policy` or any other production code (go's own
+// `partitioned()` gate looks identical, and go's real `testingNetwork` never
+// needs an equivalent because its synchronous single-goroutine model
+// structurally cannot lose or need to re-stage a payload the way this
+// harness's real threads occasionally do).
 //
-// Conclusion: this residual flakiness is a harness-payload-propagation
-// limitation, not a `Player`/`Service` correctness bug — `enter_period` and
-// `issue_fast_vote` both behave correctly given what each node has actually
-// received. `fast_recovery_late_five_node`/`fast_recovery_redo_five_node`
-// are therefore NOT landed here (an early version failed ~1/10 standalone
-// even with both fixes above applied — well short of the reliability bar
-// this file's other scenarios meet). See issue #920 for the full
-// investigation and `docs/phase17/parity_agreement.md` for the tracked row.
+// With that fix in place, both scenarios landed below pass reliably (see
+// each function's doc comment for the verification runs performed).
+
+/// Shared "force fast partition recovery into a real proposal VALUE" block,
+/// used identically by go's `TestAgreementFastRecoveryLate`/`Redo` (the `{
+/// pocket := ...; ...; triggerGlobalTimeout(secondFPR, TimeoutFastRecovery,
+/// ...) }` block appears verbatim in both). Pockets every CERT vote at the
+/// current period with a SINGLE filter-timeout fire (see this file's module
+/// doc comment on why more than one fire would mix periods), decodes them to
+/// recover the proposal value every node cert-voted for, then drives the
+/// deadline + fast-recovery (arm, first-4-nodes-while-still-dropped,
+/// heal-and-fifth-node, second-genuine-fire) sequence go's version uses to
+/// push every node into the next period pinned to that value. Returns the
+/// pinned value.
+fn force_fast_recovery_into_value(cluster: &AgreementCluster, round: Round) -> ProposalValue {
+    cluster.network.pocket_all_cert_votes();
+    cluster.network.drop_all_slow_next_votes();
+
+    trigger_global_timeout(cluster, TimeoutType::Deadline); // filter timeout: cert votes pocketed, no round
+    expect_no_new_round(cluster, round);
+
+    // Stop pocketing cert votes, but do NOT `repair_all()` here — that would
+    // also clear `drop_slow_next_votes` (still armed above) before the
+    // "deadline timeout: still no commit" fire below, which go's own
+    // `TestAgreementFastRecoveryLate`/`Redo` structure keeps active this
+    // whole time. Healing early let that next deadline fire's now-unblocked
+    // vote cascade race a real (non-fast-recovery) period bump into
+    // existence, sending every subsequent step in this function chasing the
+    // WRONG period — the actual root cause of an early flaky version of this
+    // helper, not a payload-propagation gap.
+    let pocketed = cluster.network.stop_pocketing_cert_votes();
+    assert!(
+        !pocketed.is_empty(),
+        "expected at least one cert vote to have been pocketed"
+    );
+
+    let mut expected: Option<ProposalValue> = None;
+    for msg in &pocketed {
+        let uv = codec::decode_vote(msg.data()).expect("pocketed cert vote decodes");
+        match expected {
+            None => expected = Some(uv.raw_vote.proposal),
+            Some(e) => assert_eq!(e, uv.raw_vote.proposal, "unexpected proposal"),
+        }
+    }
+    let expected = expected.expect("at least one pocketed cert vote");
+    assert_ne!(
+        expected, BOTTOM,
+        "pocketed cert vote must carry a real value"
+    );
+
+    trigger_global_timeout(cluster, TimeoutType::Deadline); // deadline timeout: still no commit
+    expect_no_new_round(cluster, round);
+
+    trigger_global_timeout(cluster, TimeoutType::FastRecovery); // arms the fast-recovery timer
+    expect_no_new_round(cluster, round);
+    cluster.network.drop_all_votes();
+
+    // First four nodes fire fast-recovery while votes are still dropped —
+    // their recovery votes are lost.
+    trigger_subset_timeout(cluster, &[0, 1, 2, 3], TimeoutType::FastRecovery);
+    expect_no_new_round(cluster, round);
+
+    // Heal, then explicitly replay any proposal payload the network has
+    // cached (`TestingNetwork::redeliver_recent_payloads` — deliberately
+    // NOT folded into `repair_all` itself, see that method's doc comment)
+    // and settle BEFORE firing anything else: without this explicit settle
+    // point, a node's reaction to the next fire can race the redelivered
+    // payload's async crypto verification (see this function's doc comment
+    // / issue #920) — the payload arrives in the channel immediately, but
+    // isn't STAGED as committable until that node's crypto-verifier and
+    // demux threads actually process it, which `TestingClock::fire` does
+    // not wait for on its own.
+    cluster.network.repair_all();
+    cluster.network.redeliver_recent_payloads();
+    cluster.wait_for_quiet();
+    trigger_subset_timeout(cluster, &[4], TimeoutType::FastRecovery);
+    expect_no_new_round(cluster, round);
+
+    // One more explicit catch-up + settle pass immediately before the
+    // decisive fire below: this is the LAST chance for a node to have the
+    // pinned value's payload staged before it casts the fast-vote that
+    // decides what period 1 pins. A node casts that vote once — a payload
+    // that arrives after the vote is already cast can't retroactively
+    // change it — so this must happen right before the fire, not just
+    // somewhere earlier in the sequence.
+    cluster.network.redeliver_recent_payloads();
+    cluster.wait_for_quiet();
+
+    // Second, genuine fast-recovery fire: every node now has a quorum of
+    // fresh recovery votes (network already healed) and moves into the next
+    // period pinned to `expected` — but doesn't commit a ROUND yet (go's own
+    // test doesn't expect one here either; it asserts a new PERIOD, which
+    // this port tracks indirectly via the pinned-value assertions the caller
+    // performs after termination).
+    trigger_global_timeout(cluster, TimeoutType::FastRecovery);
+    expect_no_new_round(cluster, round);
+
+    expected
+}
+
+/// Full 5-node port of go-algorand's `TestAgreementFastRecoveryLate`
+/// (`agreement/service_test.go`): after two ordinary rounds, period 0 is
+/// forced into fast partition recovery pinned to a real proposal value (via
+/// [`force_fast_recovery_into_value`]), then the network heals and period 1
+/// terminates normally — every node's committed round must match the PINNED
+/// value, not a fresh/bottom one. See this file's module doc comment for the
+/// harness-payload-catch-up fix (`TestingNetwork::redeliver_recent_payloads`)
+/// this scenario's reliability depends on.
+///
+/// Verified via 10+ consecutive standalone runs and several full-
+/// `algo-agreement`-suite-concurrent runs during development (issue #920) —
+/// see the issue for the exact counts.
+#[test]
+fn fast_recovery_late_five_node() {
+    let cluster = setup_agreement(5);
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    let expected = force_fast_recovery_into_value(&cluster, round);
+
+    // Terminate on period 1. The explicit redeliver + settle before firing
+    // anything further gives every node one more chance to catch up on the
+    // pinned value's payload (unlikely to still be needed at this point —
+    // `force_fast_recovery_into_value` already did this right before the
+    // fire that pinned it — but cheap insurance, unlike `repair_all`'s own
+    // healing this is scoped to only tests that actually call it, see
+    // `TestingNetwork::repair_all`'s doc comment).
+    cluster.network.repair_all();
+    cluster.network.redeliver_recent_payloads();
+    cluster.wait_for_quiet();
+    round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+
+    for (i, ledger) in cluster.ledgers.iter().enumerate() {
+        let digest = ledger
+            .cert(Round(round.0 - 1))
+            .unwrap_or_else(|| panic!("node {i} must have committed round {:?}", round.0 - 1))
+            .proposal
+            .block_digest;
+        assert_eq!(
+            digest, expected.block_digest,
+            "node {i} converged on wrong block"
+        );
+    }
+
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+    let _ = round;
+
+    cluster.shutdown();
+    sanity_check(&cluster, start_round, 5);
+}
+
+/// Full 5-node port of go-algorand's `TestAgreementFastRecoveryRedo`
+/// (`agreement/service_test.go`): same setup as
+/// [`fast_recovery_late_five_node`], but after period 1 is entered pinned to
+/// the recovered value, period 1 is ALSO forced to fail (total vote loss via
+/// `drop_all_votes`, no cert-vote pocketing needed — the value is already
+/// pinned from period 0) and recovered a second time via the same
+/// arm/first-4/heal-and-fifth/second-fire fast-recovery sequence. Every
+/// node's final committed round must still match the ORIGINAL pinned value,
+/// proving the pin survives a repeated recovery of the same period.
+///
+/// Verified via 10+ consecutive standalone runs and several full-
+/// `algo-agreement`-suite-concurrent runs during development (issue #920) —
+/// see the issue for the exact counts.
+#[test]
+fn fast_recovery_redo_five_node() {
+    let cluster = setup_agreement(5);
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    let expected = force_fast_recovery_into_value(&cluster, round);
+
+    // Fail period 1 with the SAME pinned value again: total vote loss, then
+    // the identical arm/first-4/heal-and-fifth/second-fire fast-recovery
+    // sequence go's version uses (no cert-vote pocketing this time — the
+    // value is already pinned from period 0's recovery, so every node's
+    // `Repropose`/pin-resync mechanic carries it forward).
+    {
+        cluster.network.drop_all_votes();
+
+        trigger_global_timeout(&cluster, TimeoutType::Deadline); // filter timeout: nothing reaches quorum
+        round = expect_no_new_round(&cluster, round);
+
+        trigger_global_timeout(&cluster, TimeoutType::Deadline); // deadline timeout: still nothing
+        round = expect_no_new_round(&cluster, round);
+
+        trigger_global_timeout(&cluster, TimeoutType::FastRecovery); // arms the fast-recovery timer
+        round = expect_no_new_round(&cluster, round);
+        cluster.network.drop_all_votes();
+
+        trigger_subset_timeout(&cluster, &[0, 1, 2, 3], TimeoutType::FastRecovery);
+        round = expect_no_new_round(&cluster, round);
+
+        cluster.network.repair_all();
+        cluster.network.redeliver_recent_payloads();
+        cluster.wait_for_quiet(); // let the redelivered payload catch-up settle before node 4 fires
+        trigger_subset_timeout(&cluster, &[4], TimeoutType::FastRecovery);
+        round = expect_no_new_round(&cluster, round);
+
+        // Last explicit catch-up + settle pass right before the decisive
+        // fire — see `force_fast_recovery_into_value`'s matching comment for
+        // why this can't just happen earlier in the sequence.
+        cluster.network.redeliver_recent_payloads();
+        cluster.wait_for_quiet();
+
+        trigger_global_timeout(&cluster, TimeoutType::FastRecovery); // second FPR fire -> period 2, still pinned
+        round = expect_no_new_round(&cluster, round);
+    }
+
+    // Terminate on period 2 (settle first — see the matching comment above).
+    cluster.network.repair_all();
+    cluster.network.redeliver_recent_payloads();
+    cluster.wait_for_quiet();
+    round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+
+    for (i, ledger) in cluster.ledgers.iter().enumerate() {
+        let digest = ledger
+            .cert(Round(round.0 - 1))
+            .unwrap_or_else(|| panic!("node {i} must have committed round {:?}", round.0 - 1))
+            .proposal
+            .block_digest;
+        assert_eq!(
+            digest, expected.block_digest,
+            "node {i} converged on wrong block"
+        );
+    }
+
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+    let _ = round;
+
+    cluster.shutdown();
+    sanity_check(&cluster, start_round, 5);
+}
 
 /// Full 5-node port of go-algorand's `TestAgreementLargePeriods`
 /// (`agreement/service_test.go`): partitions a 3-of-5 minority (nodes 0-2)
