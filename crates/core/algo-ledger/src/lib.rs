@@ -47,6 +47,7 @@ pub mod simulation;
 pub mod sqlite;
 pub mod state;
 pub mod state_delta;
+pub mod stateproof_worker;
 pub mod store_trait;
 pub mod sync;
 pub mod trie_hash;
@@ -94,6 +95,11 @@ pub use sqlite::{
     CrossFileState, ReadSnapshot, SqliteLedger, BLOCK_SUFFIX, TRACKER_SUFFIX,
 };
 pub use state::{schema_min_balance, LedgerState, StateSnapshot};
+pub use stateproof_worker::{
+    is_eligible_signing_round, meets_broadcast_policy, next_state_proof_round,
+    online_provers_threshold, sign_state_proof_message, InsertSigError, SigCollector, SigFromAddr,
+    StateProofSigningKey, PROVERS_CACHE_LENGTH,
+};
 pub use store_trait::LedgerStore;
 pub use txn_group_delta_tracer::{TxnGroupDelta, TxnGroupDeltaTracer};
 pub use voters_tracker::{
