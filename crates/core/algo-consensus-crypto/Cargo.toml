@@ -18,6 +18,7 @@ thiserror.workspace = true
 rand.workspace = true
 rmp.workspace = true
 num-bigint.workspace = true
+num-traits.workspace = true
 statrs.workspace = true
 zeroize.workspace = true
 scrypt.workspace = true

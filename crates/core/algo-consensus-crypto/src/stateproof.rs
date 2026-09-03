@@ -38,6 +38,7 @@
 use std::collections::BTreeMap;
 
 use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake256;
 
@@ -81,6 +82,14 @@ const STATE_PROOF_COIN: &[u8] = b"spc";
 /// SHA-256 digest of the `stateproofmsg.Message`).
 pub type MessageHash = [u8; 32];
 
+/// Current salt version of the merkle signature scheme (go:
+/// `merklesignature.SchemeSaltVersion`, `crypto/merklesignature/const.go:33`).
+pub const MERKLE_SIGNATURE_SCHEME_SALT_VERSION: u8 = 0;
+
+/// `VotersAllocBound` (go: `crypto/stateproof/prover.go:38`) — should equal
+/// `config.Consensus[...].StateProofTopVoters`.
+pub const VOTERS_ALLOC_BOUND: usize = 1024;
+
 // ── Errors ───────────────────────────────────────────────────────────────
 
 /// Errors from state-proof cryptographic verification.
@@ -116,6 +125,28 @@ pub enum StateProofError {
     /// Underlying Falcon/merkle-signature error while building a committable
     /// signature slot.
     Internal(String),
+
+    // ── Prover-side errors (crypto/stateproof/prover.go) ────────────────
+    /// `Present`/`IsValid`/`Add`: `pos` is out of bounds for the prover's
+    /// `sigs`/`Participants` array. Matches go's `ErrPositionOutOfBound`.
+    PositionOutOfBound { pos: u64, bound: u64 },
+    /// `Add`: a signature is already present at this position. Matches
+    /// go's `ErrPositionAlreadyPresent`.
+    PositionAlreadyPresent,
+    /// `IsValid`: the participant at `pos` has zero weight. Matches go's
+    /// `ErrPositionWithZeroWeight`.
+    PositionWithZeroWeight { pos: u64 },
+    /// `coinIndex`: binary search found no position whose weight range
+    /// contains `coin`. Matches go's `ErrCoinIndexError`.
+    CoinIndexError { lo: u64, hi: u64, coin: u64 },
+    /// `CreateProof`: not enough signed weight has been gathered yet
+    /// (`signedWeight <= ProvenWeight`). Matches go's
+    /// `ErrSignedWeightLessThanProvenWeight`.
+    SignedWeightLessThanProvenWeight { signed: u64, proven: u64 },
+    /// `numReveals`: the search denominator is non-positive, so no reveal
+    /// count can satisfy the verification inequality. Matches go's
+    /// `ErrNegativeNumOfRevealsEquation`.
+    NegativeNumOfRevealsEquation,
 }
 
 impl std::fmt::Display for StateProofError {
@@ -154,6 +185,26 @@ impl std::fmt::Display for StateProofError {
                 "coin is not within slot weight range: for reveal pos {pos} and coin {coin}"
             ),
             Self::Internal(msg) => write!(f, "internal state-proof error: {msg}"),
+            Self::PositionOutOfBound { pos, bound } => write!(
+                f,
+                "requested position is out of bounds: pos {pos} >= bound {bound}"
+            ),
+            Self::PositionAlreadyPresent => write!(f, "requested position is already present"),
+            Self::PositionWithZeroWeight { pos } => {
+                write!(f, "position has zero weight: position = {pos}")
+            }
+            Self::CoinIndexError { lo, hi, coin } => write!(
+                f,
+                "could not find corresponding index for a given coin: lo {lo} >= hi {hi} and coin {coin}"
+            ),
+            Self::SignedWeightLessThanProvenWeight { signed, proven } => write!(
+                f,
+                "signed weight is less than or equal to proven weight: {signed} <= {proven}"
+            ),
+            Self::NegativeNumOfRevealsEquation => write!(
+                f,
+                "state proof creation failed: weights will not be able to satisfy the verification equation"
+            ),
         }
     }
 }
@@ -435,6 +486,50 @@ fn verify_weights(
     Ok(())
 }
 
+/// Compute the smallest reveal count that satisfies [`verify_weights`]'s
+/// inequality for the given `signed_weight`/`ln_proven_weight`/
+/// `strength_target` — the number of reveals a [`Prover`] must include in
+/// the [`StateProof`] it builds.
+///
+/// Matches go's `numReveals` (`weights.go:119`) exactly, including its
+/// `+1` fudge to compensate for integer-division truncation.
+fn num_reveals(
+    signed_weight: u64,
+    ln_proven_weight: u64,
+    strength_target: u64,
+) -> Result<u64, StateProofError> {
+    let (y, x, w) = get_sub_expressions(signed_weight);
+
+    // numerator = strengthTarget * ln2IntApproximation * y
+    let numerator = big(strength_target) * big(LN2_INT_APPROXIMATION) * &y;
+
+    // denom = x + (w - lnProvenWeight) * y. Unlike verify_weights (where w
+    // is always added), this subtraction can legitimately go negative --
+    // computed via an unsigned comparison rather than pulling in a signed
+    // bigint type, since `BigUint` can't represent negative intermediates.
+    let ln_pw = big(ln_proven_weight);
+    let denom = if w >= ln_pw {
+        &x + (&w - &ln_pw) * &y
+    } else {
+        let sub = (&ln_pw - &w) * &y;
+        if sub >= x {
+            return Err(StateProofError::NegativeNumOfRevealsEquation);
+        }
+        &x - &sub
+    };
+    if denom == BigUint::from(0u32) {
+        return Err(StateProofError::NegativeNumOfRevealsEquation);
+    }
+
+    // numReveals = (numerator / denom) + 1
+    let res = &numerator / &denom + BigUint::from(1u32);
+    let res_u64 = res.to_u64().ok_or(StateProofError::TooManyReveals)?;
+    if res_u64 > MAX_REVEALS {
+        return Err(StateProofError::TooManyReveals);
+    }
+    Ok(res_u64)
+}
+
 // ── Verifier (verifier.go) ───────────────────────────────────────────────
 
 /// Verifies a [`StateProof`] against trusted commitment data.
@@ -584,6 +679,317 @@ fn verify_state_proof_trees_depth(s: &StateProof) -> Result<(), StateProofError>
         return Err(StateProofError::TreeDepthTooLarge);
     }
     Ok(())
+}
+
+// ── Prover (prover.go) ───────────────────────────────────────────────────
+//
+// The signing-side counterpart to `Verifier` above: accumulates
+// per-participant merkle signatures over rounds as they arrive, then builds
+// a `StateProof` once enough weight has signed. This is the cryptographic
+// core `algo-ledger`'s state-proof signing worker (issue #814) drives —
+// round-eligibility, network gathering, and disk persistence of pending
+// signatures are all ledger-level concerns layered on top of this type,
+// mirroring go's split between `crypto/stateproof` (this package) and the
+// `stateproof` worker package (`spProver` wraps a `*Prover`).
+
+/// A single tracked signature slot, indexed by participant position.
+///
+/// Distinct from [`SigSlotCommit`] (the wire/reveal shape) in that it
+/// additionally carries the participant's `weight`, mirroring go's
+/// `sigslot` (`crypto/stateproof/structs.go`), which embeds
+/// `sigslotCommit` (`l`/`sig`) plus its own `Weight` field. `l` (the
+/// cumulative weight of all lower-numbered slots) starts at 0 for every
+/// slot and is only filled in during [`Prover::create_proof`]'s pass over
+/// the array, exactly as in go.
+#[derive(Debug, Clone, Default)]
+struct ProverSigSlot {
+    weight: u64,
+    commit: SigSlotCommit,
+}
+
+/// Keeps track of signatures on a message and eventually produces a state
+/// proof for that message.
+///
+/// Matches go's `stateproof.Prover` (`prover.go:54`); the persisted fields
+/// (`ProverPersistedFields`) are inlined here rather than split into a
+/// nested struct, since algod-rust doesn't yet have a wire encoder for this
+/// type — `algo-ledger`'s persistence layer serializes whatever subset of
+/// these fields it needs directly.
+#[derive(Debug, Clone)]
+pub struct Prover {
+    /// The message hash this prover is collecting signatures over.
+    pub data: MessageHash,
+    /// The round of the block being signed.
+    pub round: u64,
+    /// The selected voting participants for this state-proof round, in
+    /// commitment-tree order (index == array position).
+    pub participants: Vec<Participant>,
+    /// The vector-commitment tree built over `participants` (go:
+    /// `Parttree`).
+    pub part_tree: merklearray::Tree,
+    /// `ln(proven_weight)`, precomputed at construction time.
+    pub ln_proven_weight: u64,
+    /// The minimum weight the state proof must exceed.
+    pub proven_weight: u64,
+    /// The desired cryptographic strength target (bits), governing how
+    /// many reveals `create_proof` must include.
+    pub strength_target: u64,
+
+    sigs: Vec<ProverSigSlot>,
+    signed_weight: u64,
+    cached_proof: Option<StateProof>,
+}
+
+impl Prover {
+    /// Construct an empty prover. After adding enough signatures and signed
+    /// weight, it can be used to create a state proof.
+    ///
+    /// Matches go's `MakeProver` (`prover.go:62`).
+    pub fn make_prover(
+        data: MessageHash,
+        round: u64,
+        proven_weight: u64,
+        participants: Vec<Participant>,
+        part_tree: merklearray::Tree,
+        strength_target: u64,
+    ) -> Result<Self, StateProofError> {
+        let npart = participants.len();
+        let ln_proven_weight = ln_int_approximation(proven_weight)?;
+        Ok(Self {
+            data,
+            round,
+            participants,
+            part_tree,
+            ln_proven_weight,
+            proven_weight,
+            strength_target,
+            sigs: vec![ProverSigSlot::default(); npart],
+            signed_weight: 0,
+            cached_proof: None,
+        })
+    }
+
+    /// Check if the prover already contains a signature at `pos`.
+    ///
+    /// Matches go's `Prover.Present` (`prover.go:90`).
+    pub fn present(&self, pos: u64) -> Result<bool, StateProofError> {
+        let bound = self.sigs.len() as u64;
+        if pos >= bound {
+            return Err(StateProofError::PositionOutOfBound { pos, bound });
+        }
+        Ok(self.sigs[pos as usize].weight != 0)
+    }
+
+    /// Verify that the participant at `pos`, together with `sig`, can be
+    /// inserted into the prover. Pass `verify_sig = false` when the
+    /// signature was already verified once (e.g. loaded back from a local
+    /// database).
+    ///
+    /// Matches go's `Prover.IsValid` (`prover.go:100`).
+    pub fn is_valid(
+        &self,
+        pos: u64,
+        sig: &merklesig::Signature,
+        verify_sig: bool,
+    ) -> Result<(), StateProofError> {
+        let bound = self.participants.len() as u64;
+        if pos >= bound {
+            return Err(StateProofError::PositionOutOfBound { pos, bound });
+        }
+
+        let p = &self.participants[pos as usize];
+        if p.weight == 0 {
+            return Err(StateProofError::PositionWithZeroWeight { pos });
+        }
+
+        if verify_sig {
+            sig.validate_salt_version(MERKLE_SIGNATURE_SCHEME_SALT_VERSION)
+                .map_err(|_| StateProofError::SaltVersionMismatch)?;
+            p.pk
+                .verify_bytes(self.round, &self.data[..], sig)
+                .map_err(|e| StateProofError::SignatureVerificationFailed {
+                    pos,
+                    reason: e.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Add a signature to the set of signatures available for building a
+    /// proof. Callers must have already confirmed [`Prover::is_valid`] for
+    /// `pos`/`sig`.
+    ///
+    /// Matches go's `Prover.Add` (`prover.go:124`).
+    pub fn add(&mut self, pos: u64, sig: merklesig::Signature) -> Result<(), StateProofError> {
+        if self.present(pos)? {
+            return Err(StateProofError::PositionAlreadyPresent);
+        }
+
+        let weight = self.participants[pos as usize].weight;
+        let slot = &mut self.sigs[pos as usize];
+        slot.weight = weight;
+        slot.commit.sig = sig;
+        self.signed_weight += weight;
+        self.cached_proof = None; // can rebuild a more optimized state proof
+        Ok(())
+    }
+
+    /// Whether the state proof is ready to be built.
+    ///
+    /// Matches go's `Prover.Ready` (`prover.go:144`).
+    pub fn ready(&self) -> bool {
+        self.cached_proof.is_some() || self.signed_weight > self.proven_weight
+    }
+
+    /// Total weight of signatures added so far.
+    ///
+    /// Matches go's `Prover.SignedWeight` (`prover.go:149`).
+    pub fn signed_weight(&self) -> u64 {
+        self.signed_weight
+    }
+
+    /// Binary search for the position `pos` such that the cumulative
+    /// weight of all lower-numbered slots (`l`) is `<= coin_weight <
+    /// l + weight`.
+    ///
+    /// Matches go's `Prover.coinIndex` (`prover.go:159`).
+    fn coin_index(&self, coin_weight: u64) -> Result<u64, StateProofError> {
+        let mut lo = 0u64;
+        let mut hi = self.sigs.len() as u64;
+        loop {
+            if lo >= hi {
+                return Err(StateProofError::CoinIndexError {
+                    lo,
+                    hi,
+                    coin: coin_weight,
+                });
+            }
+            let mid = (lo + hi) / 2;
+            let slot = &self.sigs[mid as usize];
+            if coin_weight < slot.commit.l {
+                hi = mid;
+                continue;
+            }
+            if coin_weight < slot.commit.l + slot.weight {
+                return Ok(mid);
+            }
+            lo = mid + 1;
+        }
+    }
+
+    /// Build a [`StateProof`], if enough signatures have been accumulated.
+    ///
+    /// Matches go's `Prover.CreateProof` (`prover.go:184`) exactly,
+    /// including using [`merklearray::HashType::Sumhash`] for the
+    /// signature-commitment tree (go: `stateproof.HashType`).
+    pub fn create_proof(&mut self) -> Result<StateProof, StateProofError> {
+        if let Some(cached) = &self.cached_proof {
+            return Ok(cached.clone());
+        }
+        if !self.ready() {
+            return Err(StateProofError::SignedWeightLessThanProvenWeight {
+                signed: self.signed_weight,
+                proven: self.proven_weight,
+            });
+        }
+
+        // Commit to the sigs array: fill in each slot's cumulative-weight
+        // prefix sum `l`.
+        for i in 1..self.sigs.len() {
+            let prev_l = self.sigs[i - 1].commit.l;
+            let prev_weight = self.sigs[i - 1].weight;
+            self.sigs[i].commit.l = prev_l + prev_weight;
+        }
+
+        struct ProverSigArray<'a>(&'a [ProverSigSlot]);
+        impl<'a> merklearray::Array for ProverSigArray<'a> {
+            fn length(&self) -> u64 {
+                self.0.len() as u64
+            }
+            fn marshal(&self, pos: u64) -> Result<Box<dyn Hashable>, MerkleError> {
+                let slot = build_committable_signature(&self.0[pos as usize].commit)
+                    .map_err(|e| MerkleError::ArrayError(e.to_string()))?;
+                Ok(Box::new(slot))
+            }
+        }
+
+        let hfactory = merklearray::HashFactory::new(merklearray::HashType::Sumhash);
+        let sig_tree = merklearray::build_vector_commitment_tree(&ProverSigArray(&self.sigs), hfactory)
+            .map_err(|e| StateProofError::Internal(e.to_string()))?;
+
+        let mut s = StateProof {
+            sig_commit: sig_tree.root(),
+            signed_weight: self.signed_weight,
+            merkle_signature_salt_version: MERKLE_SIGNATURE_SCHEME_SALT_VERSION,
+            ..Default::default()
+        };
+
+        let nr = num_reveals(self.signed_weight, self.ln_proven_weight, self.strength_target)?;
+
+        let part_commitment = self.part_tree.root();
+        let choice = CoinChoiceSeed {
+            part_commitment: &part_commitment,
+            ln_proven_weight: self.ln_proven_weight,
+            sig_commitment: &s.sig_commit,
+            signed_weight: s.signed_weight,
+            data: self.data,
+        };
+        let mut coin_gen = make_coin_generator(&choice);
+
+        let mut proof_positions: Vec<u64> = Vec::new();
+        let mut reveals_sequence: Vec<u64> = Vec::with_capacity(nr as usize);
+        for _ in 0..nr {
+            let coin = coin_gen.get_next_coin();
+            let pos = self.coin_index(coin)?;
+
+            let bound = self.participants.len() as u64;
+            if pos >= bound {
+                return Err(StateProofError::PositionOutOfBound { pos, bound });
+            }
+
+            reveals_sequence.push(pos);
+
+            // If we already revealed pos, no need to do it again.
+            if s.reveals.contains_key(&pos) {
+                continue;
+            }
+
+            s.reveals.insert(
+                pos,
+                Reveal {
+                    sig_slot: self.sigs[pos as usize].commit.clone(),
+                    part: self.participants[pos as usize].clone(),
+                },
+            );
+            proof_positions.push(pos);
+        }
+
+        let sig_proofs = sig_tree
+            .prove(&proof_positions)
+            .map_err(|e| StateProofError::Internal(e.to_string()))?;
+        let part_proofs = self
+            .part_tree
+            .prove(&proof_positions)
+            .map_err(|e| StateProofError::Internal(e.to_string()))?;
+
+        s.sig_proofs = sig_proofs;
+        s.part_proofs = part_proofs;
+        s.positions_to_reveal = reveals_sequence;
+
+        self.cached_proof = Some(s.clone());
+        Ok(s)
+    }
+
+    /// Re-allocate the (unexported-equivalent) `sigs` array after loading a
+    /// persisted prover back from disk, before replaying any previously
+    /// gathered signatures into it via repeated [`Prover::add`] calls.
+    ///
+    /// Matches go's `Prover.AllocSigs` (`prover.go:275`), which exists
+    /// because `sigs` isn't part of go's serialized `ProverPersistedFields`
+    /// either.
+    pub fn alloc_sigs(&mut self) {
+        self.sigs = vec![ProverSigSlot::default(); self.participants.len()];
+    }
 }
 
 #[cfg(test)]
@@ -963,5 +1369,231 @@ mod tests {
             err,
             StateProofError::PartVectorCommitmentFailed(_)
         ));
+    }
+
+    // ── Prover tests (prover.go's TestBuilder family) ───────────────────
+    //
+    // Mirrors go's `TestBuilder`/`TestBuildValid` (`crypto/stateproof/
+    // prover_test.go`): construct a real multi-participant prover with
+    // genuine Falcon/merkle-signature-scheme keys, add signatures from only
+    // a subset of participants (exercising the "not everyone signs" path
+    // real state-proof rounds always hit), and confirm the resulting
+    // `StateProof` verifies end-to-end against `Verifier`.
+
+    /// Build `n` participants with real Falcon-backed MSS keys valid at
+    /// `round`, each with `weight`, plus the real Sumhash vector-commitment
+    /// tree over them (go: `HashType = crypto.Sumhash`, used for the
+    /// participants tree by `ledger/voters.go`'s `LoadTree` and mirrored by
+    /// this crate's `algo-ledger::voters::build_voters_tree`).
+    fn build_prover_participants(
+        n: usize,
+        round: u64,
+        weight: u64,
+    ) -> (Vec<merklesig::Secrets>, Vec<Participant>, merklearray::Tree) {
+        let mut secrets_list = Vec::with_capacity(n);
+        let mut participants = Vec::with_capacity(n);
+        for _ in 0..n {
+            let secrets = merklesig::Secrets::new(round, round, 1).expect("secrets");
+            participants.push(Participant {
+                pk: secrets.get_verifier(),
+                weight,
+            });
+            secrets_list.push(secrets);
+        }
+
+        let factory = merklearray::HashFactory::new(merklearray::HashType::Sumhash);
+        let part_tree =
+            merklearray::build_vector_commitment_tree(&PartArray(participants.clone()), factory)
+                .expect("part tree");
+
+        (secrets_list, participants, part_tree)
+    }
+
+    #[test]
+    fn prover_builds_a_state_proof_that_verifies_with_partial_signers() {
+        let round = 0u64;
+        let msg = [9u8; 32];
+        let weight = 1000u64;
+        let n = 5;
+        let (secrets_list, participants, part_tree) = build_prover_participants(n, round, weight);
+        let part_commit = part_tree.root();
+
+        // proven_weight = 2000 needs > 2 participants signed (2 * 1000 = 2000
+        // is not > proven_weight, 3 * 1000 = 3000 is).
+        let proven_weight = 2000u64;
+        let strength_target = 0u64; // trivially satisfiable, keeps reveal count small
+
+        let mut prover = Prover::make_prover(
+            msg,
+            round,
+            proven_weight,
+            participants.clone(),
+            part_tree,
+            strength_target,
+        )
+        .expect("make_prover");
+
+        // Only 3 of 5 participants sign.
+        for pos in [0u64, 2, 4] {
+            let signer = secrets_list[pos as usize].get_signer(round);
+            let sig = signer.sign_bytes(&msg).expect("sign");
+            prover.is_valid(pos, &sig, true).expect("is_valid");
+            prover.add(pos, sig).expect("add");
+        }
+
+        assert_eq!(prover.signed_weight(), 3 * weight);
+        assert!(prover.ready(), "3000 > proven_weight 2000 must be ready");
+
+        let proof = prover.create_proof().expect("create_proof");
+        assert_eq!(proof.signed_weight, 3 * weight);
+        assert!(!proof.positions_to_reveal.is_empty());
+
+        let verifier =
+            Verifier::new(part_commit, proven_weight, strength_target).expect("verifier");
+        verifier
+            .verify(round, msg, &proof)
+            .expect("prover-built proof must verify");
+    }
+
+    #[test]
+    fn prover_create_proof_is_idempotent_and_cached() {
+        let round = 5u64;
+        let msg = [1u8; 32];
+        let weight = 100u64;
+        let (secrets_list, participants, part_tree) = build_prover_participants(2, round, weight);
+
+        let mut prover =
+            Prover::make_prover(msg, round, 50, participants, part_tree, 0).expect("make_prover");
+        let signer = secrets_list[0].get_signer(round);
+        let sig = signer.sign_bytes(&msg).expect("sign");
+        prover.add(0, sig).expect("add");
+        assert!(prover.ready());
+
+        let proof1 = prover.create_proof().expect("first create_proof");
+        let proof2 = prover.create_proof().expect("second create_proof (cached)");
+        assert_eq!(proof1.sig_commit, proof2.sig_commit);
+        assert_eq!(proof1.positions_to_reveal, proof2.positions_to_reveal);
+    }
+
+    #[test]
+    fn prover_create_proof_rejects_insufficient_signed_weight() {
+        let round = 0u64;
+        let msg = [2u8; 32];
+        let (_, participants, part_tree) = build_prover_participants(2, round, 100);
+
+        // proven_weight = 1000 is never reached by two 100-weight signers.
+        let mut prover =
+            Prover::make_prover(msg, round, 1000, participants, part_tree, 0).expect("make_prover");
+        let err = prover
+            .create_proof()
+            .expect_err("must reject: no signatures added");
+        assert!(matches!(
+            err,
+            StateProofError::SignedWeightLessThanProvenWeight { signed: 0, proven: 1000 }
+        ));
+    }
+
+    #[test]
+    fn prover_present_rejects_out_of_bound_position() {
+        let round = 0u64;
+        let msg = [3u8; 32];
+        let (_, participants, part_tree) = build_prover_participants(2, round, 100);
+        let prover =
+            Prover::make_prover(msg, round, 50, participants, part_tree, 0).expect("make_prover");
+        let err = prover.present(5).expect_err("pos 5 is out of bounds for 2 participants");
+        assert_eq!(
+            err,
+            StateProofError::PositionOutOfBound { pos: 5, bound: 2 }
+        );
+    }
+
+    #[test]
+    fn prover_add_rejects_duplicate_position() {
+        let round = 0u64;
+        let msg = [4u8; 32];
+        let (secrets_list, participants, part_tree) = build_prover_participants(2, round, 100);
+        let mut prover =
+            Prover::make_prover(msg, round, 50, participants, part_tree, 0).expect("make_prover");
+        let sig = secrets_list[0]
+            .get_signer(round)
+            .sign_bytes(&msg)
+            .expect("sign");
+        prover.add(0, sig.clone()).expect("first add");
+        let err = prover
+            .add(0, sig)
+            .expect_err("second add at same position must fail");
+        assert_eq!(err, StateProofError::PositionAlreadyPresent);
+    }
+
+    #[test]
+    fn prover_is_valid_rejects_wrong_signature() {
+        let round = 0u64;
+        let msg = [5u8; 32];
+        let (secrets_list, participants, part_tree) = build_prover_participants(2, round, 100);
+        let prover =
+            Prover::make_prover(msg, round, 50, participants, part_tree, 0).expect("make_prover");
+        // Sign a *different* message than the prover's `data`.
+        let wrong_sig = secrets_list[0]
+            .get_signer(round)
+            .sign_bytes(&[0xEEu8; 32])
+            .expect("sign");
+        let err = prover
+            .is_valid(0, &wrong_sig, true)
+            .expect_err("signature over a different message must be rejected");
+        assert!(matches!(
+            err,
+            StateProofError::SignatureVerificationFailed { pos: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn prover_is_valid_rejects_zero_weight_participant() {
+        let round = 0u64;
+        let msg = [6u8; 32];
+        let (secrets_list, mut participants, part_tree) = build_prover_participants(1, round, 100);
+        participants[0].weight = 0;
+        // part_tree was built before zeroing the weight, but IsValid only
+        // reads `Participants`, matching go's behavior exactly (the tree
+        // itself is irrelevant to this particular check).
+        let prover =
+            Prover::make_prover(msg, round, 50, participants, part_tree, 0).expect("make_prover");
+        let sig = secrets_list[0]
+            .get_signer(round)
+            .sign_bytes(&msg)
+            .expect("sign");
+        let err = prover
+            .is_valid(0, &sig, true)
+            .expect_err("zero-weight participant must be rejected");
+        assert_eq!(err, StateProofError::PositionWithZeroWeight { pos: 0 });
+    }
+
+    #[test]
+    fn num_reveals_matches_hand_computed_case() {
+        // strength_target = 0 trivially needs only 1 reveal (the `+1` fudge
+        // guarantees at least 1 regardless of weight).
+        let ln_pw = ln_int_approximation(10).unwrap();
+        assert_eq!(num_reveals(1000, ln_pw, 0).unwrap(), 1);
+
+        // A reveal count computed by num_reveals must itself satisfy
+        // verify_weights -- the two functions are meant to be inverses at
+        // the boundary (go's real-world usage relies on exactly this).
+        let ln_pw2 = ln_int_approximation(100).unwrap();
+        let nr = num_reveals(1000, ln_pw2, 256).unwrap();
+        assert!((1..=MAX_REVEALS).contains(&nr));
+        assert!(verify_weights(1000, ln_pw2, nr, 256).is_ok());
+        // One fewer reveal must not be enough (num_reveals returns the
+        // *smallest* sufficient count).
+        if nr > 1 {
+            assert!(verify_weights(1000, ln_pw2, nr - 1, 256).is_err());
+        }
+    }
+
+    #[test]
+    fn num_reveals_rejects_too_many_reveals() {
+        // An enormous strength target against a tiny signed weight demands
+        // more than MAX_REVEALS reveals.
+        let ln_pw = ln_int_approximation(1).unwrap();
+        let err = num_reveals(2, ln_pw, u64::MAX / 2).unwrap_err();
+        assert_eq!(err, StateProofError::TooManyReveals);
     }
 }
