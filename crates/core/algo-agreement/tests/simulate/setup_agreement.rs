@@ -123,15 +123,23 @@ pub fn setup_agreement(n: usize) -> AgreementCluster {
 
     // Every node gets its OWN ledger instance seeded from the same account
     // balances (mirrors go's `ledgers[i] = ledgerFactory(balances)` — a
-    // fresh ledger per node, not a shared one).
+    // fresh ledger per node, not a shared one). They share ONE
+    // `SharedCommits` registry so a node whose own vote tally never
+    // reaches quorum locally (e.g. it missed the round's proposal payload
+    // broadcast) can still catch up via `ensure_digest` — see
+    // `test_ledger.rs`'s doc comment on `SharedCommits` for why this
+    // matters: without it, that node stalls forever (issue #911).
+    let shared_commits = super::test_ledger::SharedCommits::default();
     let mut ledgers = Vec::with_capacity(n);
     for _ in 0..n {
-        ledgers.push(TestLedger::new(
+        let mut ledger = TestLedger::new(
             &accounts,
             1_000_000_000_000,
             params.clone(),
             consensus_version.to_string(),
-        ));
+        );
+        ledger.share_commits(shared_commits.clone());
+        ledgers.push(ledger);
     }
     let start_round = ledgers[0].next_round();
 
