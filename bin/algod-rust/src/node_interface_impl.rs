@@ -72,8 +72,9 @@ use algo_rest_api::models::{
 };
 use algo_rest_api::node::{
     AccountLookup, AppResourceLookup, AppResourceWithIDs, ApplicationLookup, AssetLookup,
-    AssetResourceLookup, AssetResourceWithIDs, BuildVersion, NodeError, NodeInterface, NodeStatus,
-    PeerInfo, PeerNetworkType, ProtocolSwitchInfo, SupplyInfo, TxnGroupDeltaWithIds, TxnWithStatus,
+    AssetResourceLookup, AssetResourceWithIDs, BuildVersion, CatchupStartResult, NodeError,
+    NodeInterface, NodeStatus, PeerInfo, PeerNetworkType, ProtocolSwitchInfo, SupplyInfo,
+    TxnGroupDeltaWithIds, TxnWithStatus,
 };
 use algo_types::consensus::consensus_params_for_version;
 use algo_types::{
@@ -275,6 +276,13 @@ pub struct AlgodNodeInterface {
     /// `GET /metrics` includes the network-interface byte counters from
     /// `algo_rest_api::process_metrics::NetDevMetricsSnapshot`.
     enable_netdev_metrics_cfg: bool,
+    /// Live catchpoint-catchup mode toggle (issue #937). `Some` only for
+    /// commands that construct a
+    /// [`live_catchup::LiveCatchupManager`](crate::live_catchup::LiveCatchupManager)
+    /// — today, `node start --follow <peer>` (see `commands/node.rs`).
+    /// `None` everywhere else, in which case `start_catchup`/`abort_catchup`
+    /// report [`NodeError::NotImplemented`], matching this trait's default.
+    catchup_manager: Option<Arc<crate::live_catchup::LiveCatchupManager>>,
 }
 
 impl AlgodNodeInterface {
@@ -310,6 +318,7 @@ impl AlgodNodeInterface {
             max_api_box_per_application_cfg: 100_000,
             enable_runtime_metrics_cfg: false,
             enable_netdev_metrics_cfg: false,
+            catchup_manager: None,
         }
     }
 
@@ -453,6 +462,20 @@ impl AlgodNodeInterface {
     #[must_use]
     pub fn with_enable_netdev_metrics(mut self, enabled: bool) -> Self {
         self.enable_netdev_metrics_cfg = enabled;
+        self
+    }
+
+    /// Attach a [`live_catchup::LiveCatchupManager`](crate::live_catchup::LiveCatchupManager)
+    /// so `start_catchup`/`abort_catchup` (issue #937) actually toggle live
+    /// catchpoint-catchup mode instead of reporting
+    /// [`NodeError::NotImplemented`]. Builder-style, matching the other
+    /// collaborators.
+    #[must_use]
+    pub fn with_catchup_manager(
+        mut self,
+        manager: Arc<crate::live_catchup::LiveCatchupManager>,
+    ) -> Self {
+        self.catchup_manager = Some(manager);
         self
     }
 
@@ -765,6 +788,22 @@ impl NodeInterface for AlgodNodeInterface {
     async fn status(&self) -> Result<NodeStatus, NodeError> {
         let snap = self.read_status_snapshot()?;
 
+        // Live catchpoint-catchup mode (issue #937): `catchpoint` is
+        // non-empty exactly while a catchup is in flight (mirrors go's
+        // `catchpointCatchupStatus`, `node/node.go`), `last_catchpoint` is
+        // the most recently *completed* one. Granular per-account/per-KV/
+        // per-block progress counters are left at zero — the
+        // `SyncOrchestrator` backing `LiveCatchupManager` reports coarse
+        // phase progress, not go's fine-grained counts; see
+        // `live_catchup.rs`'s module doc for the tracked follow-up.
+        let (catchpoint, last_catchpoint) = match &self.catchup_manager {
+            Some(mgr) => (
+                mgr.current_catchpoint().await.unwrap_or_default(),
+                mgr.last_catchpoint(),
+            ),
+            None => (String::new(), String::new()),
+        };
+
         // Protocol-switch fields come from the latest block header when
         // present; fall back to "next == current, next round = last + 1" when
         // the ledger is empty.
@@ -794,10 +833,8 @@ impl NodeInterface for AlgodNodeInterface {
             next_version_round,
             next_version_supported,
             stopped_at_unsupported_round: false,
-            // Catchpoint-catchup progress is zero until the catchpoint
-            // service exposes its state via this adapter (future work).
-            catchpoint: String::new(),
-            last_catchpoint: String::new(),
+            catchpoint,
+            last_catchpoint,
             catchpoint_total_accounts: 0,
             catchpoint_processed_accounts: 0,
             catchpoint_verified_accounts: 0,
@@ -2091,12 +2128,45 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     /// Latest committed round, used by the catchup handler's `min_rounds`
-    /// admission check. (Catchup itself remains stubbed — TASK-267 leaves
-    /// `start_catchup`/`abort_catchup` to a separate plan — but exposing the
-    /// real latest round here keeps the admission arithmetic honest if catchup
-    /// is wired later.) Falls back to 0 on a poisoned lock.
+    /// admission check. Falls back to 0 on a poisoned lock.
     fn latest_round_for_catchup(&self) -> u64 {
         self.ledger.lock().map(|l| l.current_round().0).unwrap_or(0)
+    }
+
+    /// Start a live catchpoint catchup (issue #937), mirroring go's
+    /// `Node.StartCatchup(catchpoint)` (`node/node.go`). Delegates to the
+    /// attached [`crate::live_catchup::LiveCatchupManager`] if one was
+    /// configured (see [`Self::with_catchup_manager`]); reports
+    /// [`NodeError::NotImplemented`] otherwise — today that's every command
+    /// except `node start --follow <peer>` (see `commands/node.rs`).
+    /// `min_rounds`'s admission check has already run in the REST handler
+    /// (`handlers.rs::start_catchup`) before this is called.
+    async fn start_catchup(
+        &self,
+        catchpoint: &str,
+        _min_rounds: u64,
+    ) -> Result<CatchupStartResult, NodeError> {
+        match &self.catchup_manager {
+            Some(mgr) => Ok(mgr.start_catchup(catchpoint).await),
+            None => Err(NodeError::NotImplemented("start_catchup")),
+        }
+    }
+
+    /// Abort an in-progress live catchpoint catchup (issue #937), mirroring
+    /// go's `Node.AbortCatchup(catchpoint)` (`node/node.go`). See
+    /// [`Self::start_catchup`] for the `catchup_manager`-absent fallback.
+    async fn abort_catchup(&self, catchpoint: &str) -> Result<(), NodeError> {
+        match &self.catchup_manager {
+            // go's own `abortCatchup` handler maps *any* `AbortCatchup`
+            // error (including "wrong catchpoint") to a 500
+            // (`internalError`, `handlers.go:1877-1879`) rather than 400 —
+            // matched here via `NodeError::Internal` for exact parity.
+            Some(mgr) => mgr
+                .abort_catchup(catchpoint)
+                .await
+                .map_err(NodeError::Internal),
+            None => Err(NodeError::NotImplemented("abort_catchup")),
+        }
     }
 
     /// Connected peers, backing `GET /v2/node/peers` (issue #673). Queries
@@ -6152,6 +6222,115 @@ mod tests {
         let (adapter, _ledger, _gh) = seed_dev_adapter(sender, 10_000_000);
         // Genesis committed at round 0.
         assert_eq!(adapter.latest_round_for_catchup(), 0);
+    }
+
+    // ── Live catchpoint catchup (issue #937) ─────────────────────────
+
+    /// A [`live_catchup::CatchupRunner`] fake that blocks until cancelled,
+    /// mirroring `live_catchup.rs`'s own `BlockingRunner` test double —
+    /// used here to prove the *trait-level* `start_catchup`/`abort_catchup`
+    /// wiring (not just `LiveCatchupManager` in isolation) round-trips
+    /// through `AlgodNodeInterface` and is reflected in `status()`.
+    struct BlockingRunner {
+        cancel_observed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::live_catchup::CatchupRunner for BlockingRunner {
+        async fn run(
+            &self,
+            _catchpoint: &str,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<()> {
+            cancel.cancelled().await;
+            self.cancel_observed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::anyhow!("sync cancelled by user"))
+        }
+    }
+
+    /// Without an attached [`live_catchup::LiveCatchupManager`],
+    /// `start_catchup`/`abort_catchup` must report `NotImplemented` — the
+    /// pre-issue-#937 behavior, still correct for every command except
+    /// `node start --follow <peer>`.
+    #[tokio::test]
+    async fn start_catchup_without_manager_is_not_implemented() {
+        let adapter = make_adapter();
+        assert!(matches!(
+            adapter.start_catchup("1000#deadbeef", 0).await,
+            Err(NodeError::NotImplemented("start_catchup"))
+        ));
+        assert!(matches!(
+            adapter.abort_catchup("1000#deadbeef").await,
+            Err(NodeError::NotImplemented("abort_catchup"))
+        ));
+    }
+
+    /// End-to-end through the `NodeInterface` trait methods: `start_catchup`
+    /// returns `Created`, `status()` reports the in-flight catchpoint while
+    /// running, and `abort_catchup` cancels it and clears the field again.
+    #[tokio::test]
+    async fn start_and_abort_catchup_round_trip_through_status() {
+        let cancel_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Arc::new(BlockingRunner {
+            cancel_observed: cancel_observed.clone(),
+        });
+        let manager = crate::live_catchup::LiveCatchupManager::new(
+            runner,
+            Arc::new(crate::live_catchup::NoopSyncControl),
+        );
+        let adapter = make_adapter().with_catchup_manager(manager.clone());
+
+        let started = adapter.start_catchup("1000#deadbeef", 0).await.unwrap();
+        assert_eq!(started, CatchupStartResult::Created);
+
+        let status = adapter.status().await.unwrap();
+        assert_eq!(status.catchpoint, "1000#deadbeef");
+        assert_eq!(status.last_catchpoint, "");
+
+        adapter.abort_catchup("1000#deadbeef").await.unwrap();
+
+        // `abort_catchup` fires cancellation and returns immediately
+        // (mirroring go's fire-and-forget `Abort()`); poll for the
+        // manager to observe it and return to idle, bounded so a
+        // regression can't hang the suite.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if manager.current_catchpoint().await.is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "manager did not reach idle"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(cancel_observed.load(std::sync::atomic::Ordering::SeqCst));
+
+        let status = adapter.status().await.unwrap();
+        assert_eq!(status.catchpoint, "");
+    }
+
+    /// Aborting an unknown catchpoint when a *different* one is running
+    /// must surface go's `AbortCatchup` error via `NodeError::Internal`
+    /// (matching go's own `internalError` mapping for any `AbortCatchup`
+    /// failure — `handlers.go:1877-1879`).
+    #[tokio::test]
+    async fn abort_catchup_wrong_label_returns_internal_error() {
+        let cancel_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Arc::new(BlockingRunner { cancel_observed });
+        let manager = crate::live_catchup::LiveCatchupManager::new(
+            runner,
+            Arc::new(crate::live_catchup::NoopSyncControl),
+        );
+        let adapter = make_adapter().with_catchup_manager(manager.clone());
+
+        adapter.start_catchup("1000#aaaa", 0).await.unwrap();
+        let result = adapter.abort_catchup("2000#bbbb").await;
+        assert!(matches!(result, Err(NodeError::Internal(_))));
+
+        // Clean up so the spawned task doesn't outlive the test.
+        adapter.abort_catchup("1000#aaaa").await.unwrap();
     }
 
     // ── get_peers (issue #673) ───────────────────────────────────────

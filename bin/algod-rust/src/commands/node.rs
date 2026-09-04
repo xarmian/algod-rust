@@ -52,6 +52,9 @@ use tracing::{info, warn};
 
 use crate::cli::NodeCommands;
 use crate::commands::participate::PoolLedgerAdapter;
+use crate::live_catchup::{
+    LiveCatchupManager, LiveCatchupParams, NormalSyncControl, OrchestratorCatchupRunner,
+};
 use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
 
 /// Default REST bind address when `--listen` is not provided. Matches
@@ -354,6 +357,60 @@ async fn run_start(
         build_version: BuildVersion::from_build_env(),
         default_protocol: genesis.proto.clone(),
     };
+    // -----------------------------------------------------------------------
+    // 3a. `--follow <peer>`: construct the pausable/resumable block-sync
+    //     loop up front (rather than spawning it directly, as before), so
+    //     it can double as the [`NormalSyncControl`] a
+    //     [`LiveCatchupManager`] (issue #937) pauses while a live
+    //     catchpoint catchup owns the ledger, and resumes afterward. The
+    //     loop itself is unchanged — still `run_follow_loop`, still
+    //     applying via `apply_block_caching_delta` — only its start/stop
+    //     is now indirected through `FollowLoopControl`.
+    // -----------------------------------------------------------------------
+    let follow_control = follow_url.map(|url| {
+        FollowLoopControl::new(
+            ledger.clone(),
+            Arc::new(algo_rest_client::AlgodClient::new(url, follow_token))
+                as Arc<dyn algo_rest_client::BlockSource>,
+        )
+    });
+    if let Some(control) = &follow_control {
+        info!(
+            peer = follow_url.unwrap(),
+            "follow mode enabled — syncing blocks from peer"
+        );
+        control.resume().await;
+    }
+
+    // Live catchpoint-catchup mode (issue #937): only meaningful when
+    // there's a known peer (`--follow`'s URL) to fetch the catchpoint and
+    // blocks from, and a running sync loop against that same peer to pause
+    // while the catchup owns the ledger. Without `--follow` (plain
+    // read-serving or `--dev`), `start_catchup`/`abort_catchup` stay
+    // `NotImplemented` — there's no peer to catch up *from*. Also skipped
+    // on an archival node (`config.json`'s `Archival`), mirroring go's own
+    // refusal — `AlgorandFullNode.StartCatchup`, "catching up using a
+    // catchpoint is not supported on archive nodes" (`node/node.go`).
+    let catchup_manager = match (&follow_control, follow_url) {
+        (Some(control), Some(url)) if !file_config.archival => {
+            let params = LiveCatchupParams {
+                algod_url: url.to_string(),
+                algod_token: follow_token.to_string(),
+                db_path: ledger_prefix.clone(),
+                genesis_id: genesis_id.clone(),
+                genesis_hash: gh,
+                concurrency: 8,
+                catchpoint_peer_urls: Vec::new(),
+            };
+            let runner = Arc::new(OrchestratorCatchupRunner::new(params));
+            Some(LiveCatchupManager::new(
+                runner,
+                control.clone() as Arc<dyn NormalSyncControl>,
+            ))
+        }
+        _ => None,
+    };
+
     let mut node_interface = AlgodNodeInterface::new(ledger.clone(), node_config)
         .with_shutdown_token(shutdown_token.clone())
         .with_participation_store(part_store)
@@ -377,6 +434,9 @@ async fn run_start(
         ));
         node_interface = node_interface.with_pool(pool).with_dev_mode();
         info!("dev mode enabled — each submitted transaction group produces a block");
+    }
+    if let Some(mgr) = &catchup_manager {
+        node_interface = node_interface.with_catchup_manager(mgr.clone());
     }
     let node = Arc::new(node_interface);
 
@@ -415,27 +475,12 @@ async fn run_start(
     );
 
     // -----------------------------------------------------------------------
-    // 4b. `--follow`: spawn a background task that syncs new blocks from a
-    //     remote REST peer through the real sync path
-    //     (`apply_block_caching_delta`, the same call `algod-rust sync`
-    //     makes — see `commands/sync.rs`), while this process keeps serving
-    //     its own REST API. This is what lets `GET /v2/deltas/{round}`
-    //     be queried against a genuinely synced block, as opposed to
-    //     `--dev` mode's self-produced-block path (which calls
-    //     `cache_state_delta` directly and never exercises
-    //     `apply_block_caching_delta` at all). Issue #612.
-    // -----------------------------------------------------------------------
-    let follow_handle = follow_url.map(|url| {
-        let client: Arc<dyn algo_rest_client::BlockSource> =
-            Arc::new(algo_rest_client::AlgodClient::new(url, follow_token));
-        info!(peer = url, "follow mode enabled — syncing blocks from peer");
-        let ledger = ledger.clone();
-        let cancel = shutdown_token.clone();
-        tokio::spawn(async move { run_follow_loop(ledger, client, cancel).await })
-    });
-
-    // -----------------------------------------------------------------------
-    // 5. Run until Ctrl-C, then shut the server down gracefully.
+    // 5. Run until Ctrl-C, then shut the server down gracefully. The
+    //    `--follow` block-sync loop (started in step 3a, via
+    //    `FollowLoopControl::resume`) is stopped through the same
+    //    pause/resume interface a live catchpoint catchup uses (issue
+    //    #937), rather than a directly-held `JoinHandle` — `pause()`
+    //    cancels and joins it exactly like the old direct-join code did.
     // -----------------------------------------------------------------------
     if let Err(e) = tokio::signal::ctrl_c().await {
         warn!("failed to listen for Ctrl-C ({e}); shutting down");
@@ -443,8 +488,8 @@ async fn run_start(
     info!("shutdown requested");
     shutdown_token.cancel();
     let _ = join_handle.await;
-    if let Some(h) = follow_handle {
-        let _ = h.await;
+    if let Some(control) = &follow_control {
+        control.pause().await;
     }
     Ok(())
 }
@@ -536,6 +581,59 @@ fn apply_one_block(ledger: &Mutex<SqliteLedger>, round: u64, block: &algo_types:
         Err(e) => {
             warn!(round, error = %e, "follow: apply_block failed");
             let _ = l.rollback_block();
+        }
+    }
+}
+
+/// [`NormalSyncControl`] that pauses/resumes `--follow`'s background block-
+/// sync loop (issue #937's live catchpoint-catchup toggle).
+///
+/// Each `resume()` spawns a *fresh* [`run_follow_loop`] task with its own
+/// [`CancellationToken`], deliberately independent of `run_start`'s
+/// process-wide `shutdown_token` — pausing for a live catchpoint catchup
+/// must not look like (or race with) a full node shutdown, and the loop
+/// needs to be resumable afterward. `run_start`'s own shutdown sequence
+/// calls [`Self::pause`] directly instead of awaiting a stored
+/// `JoinHandle`, so the two cancellation sources never overlap.
+struct FollowLoopControl {
+    ledger: Arc<Mutex<SqliteLedger>>,
+    client: Arc<dyn algo_rest_client::BlockSource>,
+    running: tokio::sync::Mutex<Option<(CancellationToken, tokio::task::JoinHandle<()>)>>,
+}
+
+impl FollowLoopControl {
+    fn new(
+        ledger: Arc<Mutex<SqliteLedger>>,
+        client: Arc<dyn algo_rest_client::BlockSource>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            ledger,
+            client,
+            running: tokio::sync::Mutex::new(None),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl NormalSyncControl for FollowLoopControl {
+    async fn pause(&self) {
+        let mut guard = self.running.lock().await;
+        if let Some((cancel, handle)) = guard.take() {
+            cancel.cancel();
+            let _ = handle.await;
+        }
+    }
+
+    async fn resume(&self) {
+        let mut guard = self.running.lock().await;
+        if guard.is_none() {
+            let cancel = CancellationToken::new();
+            let ledger = self.ledger.clone();
+            let client = self.client.clone();
+            let cancel_task = cancel.clone();
+            let handle =
+                tokio::spawn(async move { run_follow_loop(ledger, client, cancel_task).await });
+            *guard = Some((cancel, handle));
         }
     }
 }

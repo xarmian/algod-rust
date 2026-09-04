@@ -22,6 +22,7 @@ mod cli;
 mod commands;
 mod config;
 mod dev_producer;
+mod live_catchup;
 mod node_interface_impl;
 
 use clap::Parser;
