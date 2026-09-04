@@ -249,7 +249,7 @@ fn resolve_account(value: AvmValue, ctx: &dyn AvmContext) -> Result<[u8; 32], Al
 /// Matches go-algorand's `mutableAccountReference`
 /// (`data/transactions/logic/eval.go`): a raw 32-byte address is only a
 /// valid mutation target when it resolves to the sender or a member of the
-/// txn's `Accounts`/`Access` array ([`AvmContext::is_named_account`] --
+/// txn's `Accounts`/`Access` array ([`AvmContext::is_named_account_for_mutation`] --
 /// go's `IndexByAddress` finding a real position, encodable in
 /// `EvalDelta.LocalDeltas`), OR -- from `sharedResourcesVersion` (v9)
 /// onward -- any address available under the group's broader
@@ -269,7 +269,7 @@ fn resolve_mutable_account(
         AvmValue::Bytes(b) if b.len() == 32 => {
             let mut addr = [0u8; 32];
             addr.copy_from_slice(&b);
-            if ctx.is_named_account(&addr) {
+            if ctx.is_named_account_for_mutation(&addr) {
                 return Ok(addr);
             }
             if version >= SHARED_RESOURCES_VERSION && ctx.is_account_available(&addr) {
@@ -2002,7 +2002,7 @@ mod tests {
         // `resolve_account`) but must be rejected for a write before
         // `sharedResourcesVersion` (v9) -- it has no position in the txn's
         // Accounts array to encode a mutation against (`TestStateContext`
-        // doesn't implement `is_named_account`, so it isn't the sender or a
+        // doesn't implement `is_named_account_for_mutation`, so it isn't the sender or a
         // named `Accounts` entry either), matching go-algorand's
         // `mutableAccountReference`.
         let addr = test_addr(0x02);

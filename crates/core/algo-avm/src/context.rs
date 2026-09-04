@@ -719,7 +719,7 @@ pub trait AvmContext {
     /// Defaults to `false` (conservative — a context that doesn't track
     /// group resources at all has no sender/`Accounts` array to consult).
     /// `LedgerAvmContext` overrides this with the real check.
-    fn is_named_account(&self, addr: &[u8; 32]) -> bool {
+    fn is_named_account_for_mutation(&self, addr: &[u8; 32]) -> bool {
         let _ = addr;
         false
     }

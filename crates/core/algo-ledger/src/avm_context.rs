@@ -5211,9 +5211,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     /// Matches go-algorand's `IndexByAddress`-succeeds subset of
     /// `accountReference`: the current transaction's own sender, or a
     /// member of its `Accounts`/`Access` array. See the trait doc comment
-    /// ([`algo_avm::context::AvmContext::is_named_account`]) for why this
-    /// is narrower than [`Self::is_account_available`].
-    fn is_named_account(&self, addr: &[u8; 32]) -> bool {
+    /// ([`algo_avm::context::AvmContext::is_named_account_for_mutation`])
+    /// for why this is narrower than [`Self::is_account_available`].
+    fn is_named_account_for_mutation(&self, addr: &[u8; 32]) -> bool {
         let txn = &self.group[self.group_index].txn;
         if txn.sender.0 == *addr {
             return true;
