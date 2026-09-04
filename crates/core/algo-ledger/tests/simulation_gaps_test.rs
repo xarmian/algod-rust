@@ -39,8 +39,8 @@ use algo_ledger::simulation::{
 };
 use algo_ledger::{apply_transaction, ApplyContext, ApplyMode, LedgerState, LedgerStore};
 use algo_types::{
-    AccountData, Address, AppParams, BoxRef, LogicSig, Round, SignedTransaction, StateSchema,
-    Transaction,
+    AccountData, Address, AppParams, AssetParams, AssetParamsRecord, BoxRef, LogicSig, Round,
+    SignedTransaction, StateSchema, Transaction,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha512_256};
@@ -2708,5 +2708,92 @@ int 1
     assert!(
         result2.txn_groups[0].failure_message.is_some(),
         "without allow_unnamed_resources, an unnamed local write must fail"
+    );
+}
+
+/// Issue #991 (sibling to #974's `unnamed_resources_account_local_write`):
+/// an app reads an asset holding (`asset_holding_get`) for an account that
+/// is named nowhere in the group -- not the sender, not in `Accounts`, not
+/// a created app's address -- while the asset itself *is* named (present in
+/// `foreign_assets`). Under `allow_unnamed_resources`, this must succeed
+/// and the `(account, asset)` pair must appear in
+/// `unnamed_resources_accessed`'s `asset_holdings` set, exactly like the
+/// local-state analog.
+///
+/// This pins go-algorand's `ResourceTracker.addHolding`
+/// (`ledger/simulation/resources.go`, from `1088a2aad7e` /
+/// `v3.18.0-beta`), which records the cross-product unconditionally on
+/// first access -- unlike the pre-fix `note_holding_access`, which required
+/// *both* halves to be independently named before recording the pair,
+/// silently dropping this exact scenario (a wholly unnamed account paired
+/// with an already-named asset).
+#[test]
+fn unnamed_resources_asset_holding_access() {
+    let sender = Address([0xAA; 32]);
+    let other = Address([0xCC; 32]);
+    let app_id = 1001u64;
+    let asset_id = 777u64;
+    let mut state = base_state();
+    fund(&mut state, sender, 20_000_000);
+    fund(&mut state, other, 20_000_000);
+    state.set_asset_params(
+        asset_id,
+        AssetParamsRecord {
+            params: AssetParams {
+                total: 1_000_000,
+                ..Default::default()
+            },
+            creator: sender,
+        },
+    );
+
+    let src = format!(
+        "#pragma version 9
+addr {other}
+int {asset_id}
+asset_holding_get AssetBalance
+pop
+pop
+int 1
+"
+    );
+    let approval = assemble(&src);
+    let clear = assemble("#pragma version 9\nint 1\n");
+    register_app(
+        &mut state,
+        sender,
+        app_id,
+        approval,
+        clear,
+        StateSchema::default(),
+        StateSchema::default(),
+    );
+
+    let mut txn = appl_txn(sender, app_id, 0);
+    txn.foreign_assets = Some(vec![asset_id]);
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![SignedTransaction {
+            txn,
+            ..Default::default()
+        }]],
+        allow_empty_signatures: true,
+        allow_unnamed_resources: true,
+        ..Default::default()
+    };
+    let result = simulate(&mut state, request).expect("simulation should succeed");
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "unnamed holding access must succeed under v9+ with allow_unnamed_resources: {:?}",
+        group.failure_message
+    );
+    let unnamed = group
+        .unnamed_resources_accessed
+        .as_ref()
+        .expect("unnamed resources must be reported");
+    assert!(
+        unnamed.asset_holdings.contains(&(other, asset_id)),
+        "the (account, asset) pair must be tracked: {unnamed:?}"
     );
 }

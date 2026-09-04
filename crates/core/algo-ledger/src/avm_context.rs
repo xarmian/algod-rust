@@ -1435,9 +1435,23 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         }
     }
 
-    /// Track an asset-holding access. Records the unnamed halves, or — when
-    /// both halves are named but no single transaction names them together —
-    /// the holding cross-product itself (go-algorand `AllowsHolding`).
+    /// Track an asset-holding access. Records the unnamed halves
+    /// (account/asset, whichever aren't independently named), and -- unless
+    /// the asset was created earlier in the group or a pair some single
+    /// transaction already names together -- the holding cross-product
+    /// itself.
+    ///
+    /// Matches go-algorand's `resourcePolicy.AllowsHolding` ->
+    /// `addHolding` (`ledger/simulation/resources.go`, from `1088a2aad7e` /
+    /// `v3.18.0-beta`): `ResourceTracker.addHolding` is called
+    /// unconditionally by `AllowsHolding` with **no** "both halves already
+    /// named" precondition -- unlike `note_local_access`'s sibling
+    /// app-own-account special case, `addHolding` doesn't even have that;
+    /// only the tracker's own dedup skips recording. Requiring both halves
+    /// to be independently named here (as this method previously did)
+    /// silently drops exactly the scenario issue #991 pins: a wholly
+    /// unnamed account paired with an already-named asset (see #974's
+    /// analogous `note_local_access` fix, PR #990).
     fn note_holding_access(&self, account: &[u8; 32], asset_id: u64) {
         if let Some(named) = &self.unnamed_tracking {
             let acct_named = self.is_named_account(named, account);
@@ -1448,9 +1462,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             if !asset_named {
                 self.record_unnamed(UnnamedResourceAccess::Asset(asset_id));
             }
-            if acct_named
-                && asset_named
-                && asset_id != 0
+            if asset_id != 0
                 && !self.created_assets.contains(&asset_id)
                 && !named.has_holding(account, asset_id)
             {
@@ -1466,19 +1478,17 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// itself.
     ///
     /// Matches go-algorand's `resourcePolicy.AllowsLocal` -> `addLocal`
-    /// (`ledger/simulation/resources.go`): unlike the sibling
-    /// `note_holding_access`'s asset-holding cross-product (which this
-    /// crate gates on both halves being independently named -- there is no
-    /// go-side equivalent narrowing for holdings either, but no test here
-    /// currently exercises the gap), go's `ResourceTracker.addLocal` is
-    /// called unconditionally by `AllowsLocal` with **no** "both halves
+    /// (`ledger/simulation/resources.go`): go's `ResourceTracker.addLocal`
+    /// is called unconditionally by `AllowsLocal` with **no** "both halves
     /// already named" precondition -- only its `hasLocal` sibling's
     /// app's-own-account special case and the tracker's own dedup skip
     /// recording. Requiring both halves to be independently named here
     /// would silently drop exactly the scenario issue #974's
     /// `TestUnnamedResourcesAccountLocalWrite` pins: a completely unnamed
     /// account written via `app_local_put` to the (already-available,
-    /// hence trivially "named") current app.
+    /// hence trivially "named") current app. The sibling
+    /// `note_holding_access`'s asset-holding cross-product had the
+    /// identical bug (fixed by issue #991) -- see its own doc comment.
     fn note_local_access(&self, account: &[u8; 32], app_id: u64) {
         if let Some(named) = &self.unnamed_tracking {
             let acct_named = self.is_named_account(named, account);
