@@ -39,6 +39,14 @@
 //                         pumps each node's `Tick` and `tick` deliveries
 //   * `filters::drop_message`      — drop every Nth message
 //   * `filters::duplicate_message` — re-deliver every Nth message N+1 times
+//   * `filters::message_reordering` — buffer-and-displace delivery order
+//   * `filters::node_crash`        — suppress all traffic in a tick range
+//   * `filters::bandwidth`         — throttle to a bytes-per-tick rate
+//     (issue #954)
+//   * `filters::message_decoder`   — decode-and-cache observability
+//     primitive (issue #954)
+//   * `filters::message_regossip`  — suppress re-sending an
+//     already-received message (issue #954)
 //
 // Public API: see [`scheduler::Scheduler`] for the harness entry point and
 // [`AlgoMessage`] for the in-flight message envelope.
@@ -49,7 +57,9 @@
 //     scenarios; binding the harness to N real `Service` instances over
 //     a custom `AgreementNetwork` impl is TASK-85 / Phase 6 mixed-cluster
 //     work.
-//   * Reorder, nodeCrash, bandwidth, message-delay, regossip filters.
+//   * Message-delay, message-reflection, topology, traffic-statistics,
+//     and scheduler filters (the remaining Go filters this harness has
+//     not yet ported).
 //   * RNG-driven scenario generation.
 
 #![allow(dead_code)] // Some of the message-routing helpers are exercised
