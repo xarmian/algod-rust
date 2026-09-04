@@ -28,7 +28,7 @@ mod node_interface_impl;
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{BenchAction, CatchpointAction, Cli, Commands};
+use cli::{AlgocfgAction, AlgocfgProfileAction, BenchAction, CatchpointAction, Cli, Commands};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -596,6 +596,35 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?;
             }
+        },
+        Commands::Algocfg { action } => match action {
+            AlgocfgAction::Get { parameter, datadir } => {
+                commands::algocfg::run_get(&parameter, &datadir)?;
+            }
+            AlgocfgAction::String { parameter, datadir } => {
+                commands::algocfg::run_string(&parameter, &datadir)?;
+            }
+            AlgocfgAction::Set {
+                parameter,
+                value,
+                datadir,
+            } => {
+                commands::algocfg::run_set(&parameter, &value, &datadir)?;
+            }
+            AlgocfgAction::Delete { parameter, datadir } => {
+                commands::algocfg::run_delete(&parameter, &datadir)?;
+            }
+            AlgocfgAction::Profile { action } => match action {
+                AlgocfgProfileAction::List => {
+                    commands::algocfg::run_profile_list();
+                }
+                AlgocfgProfileAction::Print { name } => {
+                    commands::algocfg::run_profile_print(&name)?;
+                }
+                AlgocfgProfileAction::Set { name, datadir, yes } => {
+                    commands::algocfg::run_profile_set(&name, &datadir, yes)?;
+                }
+            },
         },
     }
 
