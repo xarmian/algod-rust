@@ -835,6 +835,65 @@ mod tests {
         assert!(matches!(err, TxSyncError::Peer { .. }));
     }
 
+    /// Port of `TestSyncFromClientAndTimeout` (`rpcs/txSyncer_test.go`):
+    /// go's test configures a zero `syncTimeout` and asserts
+    /// `syncFromClient` returns an error (its RPC layer maps a
+    /// deadline-exceeded context to an error) with the handler never
+    /// invoked -- distinct from `sync_round_propagates_peer_error`'s
+    /// generic `TxSyncError::Peer`, this pins the dedicated
+    /// `TxSyncError::Timeout` variant specifically.
+    #[tokio::test]
+    async fn sync_round_propagates_timeout_error() {
+        struct TimingOutPeer;
+        #[async_trait]
+        impl TxSyncPeerClient for TimingOutPeer {
+            fn address(&self) -> String {
+                "timing-out".into()
+            }
+            async fn sync(
+                &self,
+                _pending: &[Digest],
+                timeout: Duration,
+            ) -> Result<Vec<Vec<SignedTransaction>>, TxSyncError> {
+                // Mirrors the real `HttpTxSyncClient`: a zero (or already
+                // elapsed) deadline is reported as `TxSyncError::Timeout`,
+                // not silently treated as "no time budget, but proceed
+                // anyway".
+                Err(TxSyncError::Timeout {
+                    peer: "timing-out".into(),
+                    elapsed: timeout,
+                })
+            }
+        }
+        struct Src(Arc<TimingOutPeer>);
+        impl PeerSource for Src {
+            fn sample_peer(&self) -> Option<Arc<dyn TxSyncPeerClient>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let handler_calls = Arc::new(StdMutex::new(0));
+        let cfg = TxSyncerConfig {
+            sync_timeout: Duration::ZERO,
+            ..TxSyncerConfig::default()
+        };
+        let pool = FakePool(vec![]);
+        let src = Src(Arc::new(TimingOutPeer));
+        let handler = CountingHandler {
+            calls: handler_calls.clone(),
+        };
+        let err = sync_round(&cfg, &pool, &src, &handler).await.unwrap_err();
+        assert!(
+            matches!(err, TxSyncError::Timeout { elapsed, .. } if elapsed == Duration::ZERO),
+            "expected TxSyncError::Timeout with the zero configured timeout, got {err:?}",
+        );
+        assert_eq!(
+            *handler_calls.lock().unwrap(),
+            0,
+            "a timed-out round must never reach the handler",
+        );
+    }
+
     /// Issue #801: a peer that returns a group in which *every* txid is
     /// already in our own pending set (i.e., a group we told it, via the
     /// request's Bloom filter, that we already have in full) must be

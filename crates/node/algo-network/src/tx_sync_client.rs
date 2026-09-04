@@ -462,6 +462,38 @@ mod tests {
         );
     }
 
+    /// Port of `TestSyncFromUnsupportedClient` (`rpcs/txSyncer_test.go`):
+    /// go's test simulates a peer whose RPC layer returns `nil, nil` (no
+    /// error, no reply) for the sync call — the behavior of a peer too old
+    /// (or otherwise incapable) to understand the sync RPC method at all —
+    /// and asserts `syncFromClient` treats that as an error rather than
+    /// silently proceeding with zero groups.
+    ///
+    /// algod-rust's tx-sync is HTTP-pull rather than RPC-over-gossip, so
+    /// the direct analog of "peer doesn't understand this sync protocol"
+    /// is a peer whose HTTP server has no handler at all for the
+    /// `/v1/{genesisID}/txsync` path (a stock 404, not the 400
+    /// `wrong_genesis_id_is_bad_request` gives for a *recognized* endpoint
+    /// with a mismatched genesis). Pins that `HttpTxSyncClient::sync`
+    /// surfaces this as `TxSyncError::Peer`, not `Ok(vec![])`.
+    #[tokio::test]
+    async fn http_client_rejects_response_from_unsupported_peer() {
+        // A router that answers everything with 404 -- standing in for a
+        // peer with no txsync handler registered at all.
+        let router = axum::Router::new()
+            .fallback(|| async { (http::StatusCode::NOT_FOUND, "no such route") });
+        let addr = spawn_router(router).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client =
+            HttpTxSyncClient::new(addr, "g".to_string(), reqwest::Client::new(), 1_000_000);
+        let result = client.sync(&[], Duration::from_secs(5)).await;
+        assert!(
+            matches!(result, Err(TxSyncError::Peer { .. })),
+            "an unsupported/unrecognized peer must be a sync error, not Ok(_), got {result:?}"
+        );
+    }
+
     /// go's server returns a *flat* array (`protocol.EncodeReflect(txns)`
     /// over `[]transactions.SignedTxn`, never grouped); the client must
     /// reconstruct groups from each txn's `Group` field

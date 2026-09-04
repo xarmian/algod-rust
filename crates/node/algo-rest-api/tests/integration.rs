@@ -544,6 +544,61 @@ impl MockNode {
         node.wait_behavior = MockWaitBehavior::Error("ledger read failed".to_string());
         node
     }
+
+    /// Return a mock node whose `wait_for_round()` fails the way
+    /// `AlgodNodeInterface::wait_for_round` does when the enclosing
+    /// subcommand's shutdown token fires mid-wait (see
+    /// `bin/algod-rust/src/node_interface_impl.rs`'s
+    /// `wait_for_round_returns_timeout_when_shutdown_token_fires` unit
+    /// test, which pins that surface at the `NodeInterface` layer). Used
+    /// to pin the corresponding REST-level behavior, matching go's
+    /// `TestGetStatusAfterBlockShutdown`.
+    fn wait_shutdown() -> Self {
+        let mut node = Self::synced();
+        node.wait_behavior =
+            MockWaitBehavior::Error("wait_for_round: node is shutting down".to_string());
+        node
+    }
+
+    /// Return a mock node in the middle of an upgrade vote where the vote
+    /// is unanimous "yes", set up so the naive
+    /// `next_protocol_vote_before - last_round - 1` subtraction lands
+    /// exactly on the boundary (`votes_to_go == 0`) rather than going
+    /// negative. Mirrors go's `TestGetStatusConsensusUpgradeUnderflow`
+    /// fixture (`currentRound - 1` / `currentRound` / all-yes approvals).
+    fn upgrading_unanimous_boundary() -> Self {
+        let mut node = Self::synced();
+        let current_round: u64 = 1_000_000;
+        node.upgrade_vote_rounds = 10_000;
+        node.upgrade_threshold = 9_000;
+        node.status = MockStatus::Ok(Box::new(NodeStatus {
+            last_round: current_round - 1,
+            time_since_last_round: 0,
+            catchup_time: 0,
+            last_version: "v41".to_string(),
+            next_version: "v41".to_string(),
+            next_version_round: 0,
+            next_version_supported: true,
+            stopped_at_unsupported_round: false,
+            catchpoint: String::new(),
+            last_catchpoint: String::new(),
+            catchpoint_total_accounts: 0,
+            catchpoint_processed_accounts: 0,
+            catchpoint_verified_accounts: 0,
+            catchpoint_total_kvs: 0,
+            catchpoint_processed_kvs: 0,
+            catchpoint_verified_kvs: 0,
+            catchpoint_total_blocks: 0,
+            catchpoint_acquired_blocks: 0,
+            next_protocol_vote_before: current_round,
+            // Unanimous "yes": every counted vote (upgrade_vote_rounds,
+            // once votes_to_go == 0) approved.
+            next_protocol_approvals: 10_000,
+            upgrade_approve: false,
+            upgrade_delay: 0,
+        }));
+        node
+    }
 }
 
 #[async_trait]
@@ -2350,6 +2405,52 @@ async fn status_includes_upgrade_fields_during_upgrade() {
     );
 }
 
+/// Port of `TestGetStatusConsensusUpgradeUnderflow`
+/// (`daemon/algod/api/server/v2/test/handlers_test.go`): a unanimous "yes"
+/// vote lands `votes_to_go == 0` exactly (`next_protocol_vote_before ==
+/// last_round + 1`), so `votes == upgrade_vote_rounds` and
+/// `votes_no == votes.saturating_sub(votes_yes) == 0` -- not a wrapped
+/// huge `u64` from an unguarded subtraction. Pins the underflow-safe
+/// arithmetic in `handlers::get_status` (`upgrade-no-votes` computed via
+/// `saturating_sub`, and `votes_to_go` itself guarded by the
+/// `next_protocol_vote_before > last_round` check).
+#[tokio::test]
+async fn status_upgrade_votes_at_unanimous_boundary_does_not_underflow() {
+    let server = TestServer::start(MockNode::upgrading_unanimous_boundary()).await;
+
+    let body: serde_json::Value = server
+        .client
+        .get(server.url("/v2/status"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        body["upgrade-no-votes"].as_u64().unwrap(),
+        0,
+        "unanimous yes vote must yield zero no-votes, not an underflowed huge value"
+    );
+    assert_eq!(
+        body["upgrade-yes-votes"].as_u64().unwrap(),
+        10_000,
+        "upgrade-yes-votes should be next_protocol_approvals"
+    );
+    assert_eq!(
+        body["upgrade-votes"].as_u64().unwrap(),
+        10_000,
+        "upgrade-votes should equal upgrade_vote_rounds at the votes_to_go==0 boundary"
+    );
+    assert_eq!(
+        body["upgrade-votes-required"].as_u64().unwrap(),
+        9_000,
+        "upgrade-votes-required should be upgrade_threshold"
+    );
+}
+
 #[tokio::test]
 async fn status_requires_auth_token() {
     let server = TestServer::start(MockNode::synced()).await;
@@ -2608,6 +2709,43 @@ async fn wait_for_block_returns_500_when_protocol_info_errors() {
     assert_eq!(
         body["message"].as_str().unwrap(),
         "failed retrieving latest block header"
+    );
+}
+
+/// Port of `TestGetStatusAfterBlockShutdown`
+/// (`daemon/algod/api/server/v2/test/handlers_test.go`): go's test closes
+/// the handler's shutdown channel before calling `WaitForBlock` and
+/// asserts a 500 whose body contains "operation aborted as server is
+/// shutting down".
+///
+/// algod-rust surfaces node shutdown through `wait_for_round`'s `Result`
+/// (see `AlgodNodeInterface::wait_for_round`'s `shutdown_token` handling,
+/// `bin/algod-rust/src/node_interface_impl.rs`) rather than a separate
+/// shutdown channel raced against inside the REST handler itself, so this
+/// pins the REST-level 500 response for that specific error message --
+/// distinct from `wait_for_block_returns_500_when_wait_for_round_errors`,
+/// which pins the same status code for a generic (non-shutdown) failure.
+#[tokio::test]
+async fn wait_for_block_returns_500_on_shutdown() {
+    let server = TestServer::start(MockNode::wait_shutdown()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/status/wait-for-block-after/100"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("node is shutting down"),
+        "expected a shutdown-flavored error message, got: {}",
+        body["message"]
     );
 }
 

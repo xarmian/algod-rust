@@ -1054,6 +1054,121 @@ mod tests {
         );
     }
 
+    /// A [`LedgerForBlockService`] that blocks inside `encoded_block_cert`
+    /// until released, notifying a channel the instant it is entered.
+    /// Lets a test deterministically observe "the handler is now in
+    /// flight" before acting, instead of racing a fixed sleep against the
+    /// real (near-instantaneous) in-process handler.
+    struct SlowLedger {
+        inner: MockLedger,
+        entered_tx: std::sync::mpsc::Sender<()>,
+        release_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl LedgerForBlockService for SlowLedger {
+        fn encoded_block_cert(&self, round: u64) -> Result<(Vec<u8>, Vec<u8>), BlockServiceError> {
+            let _ = self.entered_tx.send(());
+            // Blocking recv is fine here: the test runtime is multi-threaded
+            // (see `#[tokio::test(flavor = "multi_thread", ...)]` below), so
+            // stalling this handler's worker thread doesn't stall the
+            // listener's accept loop or the shutdown-signal task.
+            let _ = self.release_rx.lock().unwrap().recv();
+            self.inner.encoded_block_cert(round)
+        }
+
+        fn latest_round(&self) -> u64 {
+            self.inner.latest_round()
+        }
+    }
+
+    /// Port of `TestBlockServiceShutdown` (`rpcs/blockService_test.go`):
+    /// go's test starts the block service, fires off a block-fetch request
+    /// on a background goroutine, immediately calls `bs1.Stop()` and
+    /// `ledger1.Close()` while that request is in flight, then asserts the
+    /// request's goroutine still completes (`<-requestDone`) rather than
+    /// hanging forever.
+    ///
+    /// algod-rust has no separate `BlockService::Stop()` — the router it
+    /// builds is served by the ambient `axum::serve` HTTP server, whose
+    /// lifecycle (including graceful shutdown) is owned by the caller (see
+    /// `algo-rest-api::server`). The equivalent guarantee here is that
+    /// triggering that server's graceful-shutdown future while a
+    /// block-fetch request is genuinely in flight (blocked inside the
+    /// ledger lookup, confirmed via `entered_rx`) still lets that request
+    /// complete and lets the server task exit promptly, instead of the
+    /// client hanging or the server task never returning.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_server_graceful_shutdown_completes_inflight_request() {
+        let inner = MockLedger::new();
+        inner.add_block(1, b"\x81\xa3foo\xa3bar".to_vec(), b"\x80".to_vec());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let ledger = Arc::new(SlowLedger {
+            inner,
+            entered_tx,
+            release_rx: std::sync::Mutex::new(release_rx),
+        });
+        let service = BlockService::new(
+            ledger,
+            "testnet-v1.0".to_string(),
+            DEFAULT_BLOCK_SERVICE_MEM_CAP,
+        );
+        let app = service.http_router();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let uri = format!(
+            "http://{addr}/v1/testnet-v1.0/block/{}",
+            format_round_base36(1)
+        );
+        let client = reqwest::Client::new();
+        // Fire off the request on a background task, mirroring go's
+        // `go func() { ...; client.Do(request) }()`.
+        let request = tokio::spawn(async move { client.get(uri).send().await });
+
+        // Block until the handler has genuinely entered the ledger lookup
+        // (i.e. the request is in flight, not merely dispatched), then
+        // trigger graceful shutdown -- exactly as go's test calls
+        // `bs1.Stop()` while the fetch goroutine is still running.
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("blocking wait task must not panic")
+            .expect("handler must signal it has entered the lookup");
+        let _ = shutdown_tx.send(());
+
+        // Give the shutdown signal a moment to actually stop the accept
+        // loop before releasing the in-flight handler, so the test proves
+        // the *in-flight* request survives shutdown rather than merely
+        // being a request that got lucky and finished first.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = release_tx.send(());
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("request must not hang past graceful shutdown")
+            .expect("request task must not panic")
+            .expect("in-flight request should still succeed despite concurrent shutdown");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server task must exit promptly after graceful shutdown")
+            .expect("server task must not panic")
+            .expect("server must shut down without error");
+    }
+
     #[test]
     fn ws_block_request_bad_topics() {
         let ledger = Arc::new(MockLedger::new());
