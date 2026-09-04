@@ -56,7 +56,10 @@ use super::trace::{
 /// synthetic leading element, leaving a path relative to the top-level
 /// transaction; the caller (the simulation loop in `mod.rs`) prepends the
 /// real top-level index.
-#[derive(Debug, Default)]
+// Deliberately no `Default` impl: an empty cursor (no seeded base frame)
+// would break the accumulator invariant `relative_path` relies on — always
+// construct via `new()`.
+#[derive(Debug)]
 struct TxnCursor {
     /// Mirrors go's `relativeCursor`. Seeded with one entry (`0`) standing in
     /// for the top-level transaction's own (never-materialized) frame.
