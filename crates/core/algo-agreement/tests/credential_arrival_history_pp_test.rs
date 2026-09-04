@@ -185,10 +185,7 @@ fn player_retains_received_validated_at_pp_one_sample() {
     assert_eq!(machine.player().lowest_credential_arrivals.write_ptr(), 0);
 
     let mut historical_clocks = HashMap::new();
-    historical_clocks.insert(
-        Round(r.0 - cred_lag),
-        Duration::from_millis(900),
-    );
+    historical_clocks.insert(Round(r.0 - cred_lag), Duration::from_millis(900));
 
     // PP message for the round we'll take the sample from.
     let lag_round = Round(r.0 - cred_lag);

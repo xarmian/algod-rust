@@ -387,7 +387,10 @@ pub fn assert_payload_timings(
     for action in machine.trace().actions() {
         if let Action::Ensure(ea) = action {
             if ea.payload.unauthenticated_proposal.round() == r {
-                assert!(found.is_none(), "found more than one EnsureAction for round {r:?}");
+                assert!(
+                    found.is_none(),
+                    "found more than one EnsureAction for round {r:?}"
+                );
                 found = Some(ea.clone());
             }
         }

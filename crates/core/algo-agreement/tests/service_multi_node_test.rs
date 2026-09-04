@@ -95,8 +95,7 @@ fn largest_same_period_group(
     min_size: usize,
 ) -> Option<Vec<PocketedMessage>> {
     use std::collections::HashMap;
-    let mut groups: HashMap<(Round, algo_agreement::Period), Vec<PocketedMessage>> =
-        HashMap::new();
+    let mut groups: HashMap<(Round, algo_agreement::Period), Vec<PocketedMessage>> = HashMap::new();
     for msg in pocketed {
         let uv = codec::decode_vote(msg.data()).expect("pocketed cert vote decodes");
         groups

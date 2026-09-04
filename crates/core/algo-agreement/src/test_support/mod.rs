@@ -68,10 +68,9 @@ pub mod setup;
 pub mod vote_maker;
 
 pub use credential_history::{
-    assert_payload_timings, assert_single_credential_arrival, move_to_round,
-    send_compound_message, send_compound_message_for_vote, send_payload_present,
-    send_payload_present_at, send_vote_present, send_vote_verified, send_vote_verified_for_vote,
-    test_clock_for_round,
+    assert_payload_timings, assert_single_credential_arrival, move_to_round, send_compound_message,
+    send_compound_message_for_vote, send_payload_present, send_payload_present_at,
+    send_vote_present, send_vote_verified, send_vote_verified_for_vote, test_clock_for_round,
 };
 pub use io_automata::IoAutomataConcretePlayer;
 pub use io_trace::{IoTrace, TraceEntry};
