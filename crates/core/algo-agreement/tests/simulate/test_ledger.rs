@@ -96,10 +96,20 @@ pub struct TestLedgerState {
     pub accounts: HashMap<Address, OnlineAccountData>,
     /// Total online circulation (= sum of `accounts[].micro_algos`).
     pub circulation: u64,
-    /// Consensus params (same for every round).
+    /// Consensus params (same for every round), used when [`Self::version_fn`]
+    /// is `None`.
     pub params: ConsensusParams,
-    /// Consensus version string.
+    /// Consensus version string, used when [`Self::version_fn`] is `None`.
     pub version: String,
+    /// When set, overrides `version`/`params` with a per-round consensus
+    /// version — mirrors go's `makeTestLedgerWithConsensusVersion`
+    /// (`agreement/agreementtest/simulate_test.go`), which lets a test
+    /// select a different `protocol.ConsensusVersion` per round (e.g.
+    /// `TestAgreementSynchronousFutureUpgrade`'s round >= 5 ->
+    /// `ConsensusFuture` switch). `consensus_params(round)` resolves the
+    /// selected version's params via
+    /// `algo_types::consensus::consensus_params_for_version`.
+    pub version_fn: Option<Arc<dyn Fn(Round) -> String + Send + Sync>>,
     /// Next round = highest committed round + 1.
     pub next_rnd: Round,
     /// Pending `round_notify` waiters: `(requested_round, sender)`.
@@ -179,6 +189,7 @@ impl TestLedger {
             circulation,
             params,
             version,
+            version_fn: None,
             // The ledger starts "at round 1" — i.e., round 0 is implicitly
             // "the genesis" and the agreement service drives round 1 next.
             next_rnd: Round(1),
@@ -200,6 +211,16 @@ impl TestLedger {
     /// serialized and re-verified).
     pub fn share_commits(&mut self, shared: SharedCommits) {
         self.shared_commits = shared;
+    }
+
+    /// Install a per-round consensus-version selector — mirrors go's
+    /// `makeTestLedgerWithConsensusVersion`. From now on,
+    /// `consensus_version(round)`/`consensus_params(round)` resolve via `f`
+    /// instead of the fixed `version`/`params` this ledger was constructed
+    /// with.
+    pub fn with_version_fn(self, f: impl Fn(Round) -> String + Send + Sync + 'static) -> Self {
+        self.state.lock().unwrap().version_fn = Some(Arc::new(f));
+        self
     }
 
     /// Snapshot the current `next_round` (advances on every `ensure_block`).
@@ -303,16 +324,29 @@ impl LedgerReader for TestLedger {
             .ok_or(LedgerError::RoundNotAvailable(round))
     }
 
-    fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, LedgerError> {
-        Ok(self.state.lock().unwrap().params.clone())
+    fn consensus_params(&self, round: Round) -> Result<ConsensusParams, LedgerError> {
+        let s = self.state.lock().unwrap();
+        match &s.version_fn {
+            Some(f) => {
+                let version = f(round);
+                algo_types::consensus::consensus_params_for_version(&version).ok_or_else(|| {
+                    LedgerError::Other(format!("unknown consensus version {version:?}"))
+                })
+            }
+            None => Ok(s.params.clone()),
+        }
     }
 
     fn next_round(&self) -> Round {
         self.state.lock().unwrap().next_rnd
     }
 
-    fn consensus_version(&self, _round: Round) -> Result<String, LedgerError> {
-        Ok(self.state.lock().unwrap().version.clone())
+    fn consensus_version(&self, round: Round) -> Result<String, LedgerError> {
+        let s = self.state.lock().unwrap();
+        match &s.version_fn {
+            Some(f) => Ok(f(round)),
+            None => Ok(s.version.clone()),
+        }
     }
 
     fn wait_for_round(&self, round: Round) -> Result<(), LedgerError> {

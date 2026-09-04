@@ -148,6 +148,20 @@ impl AgreementCluster {
 /// the single-node full-consensus harness), which is go's `makeTestLedger`
 /// equivalent.
 pub fn setup_agreement(n: usize) -> AgreementCluster {
+    setup_agreement_with_version_fn(n, None)
+}
+
+/// Like [`setup_agreement`], but installs `version_fn` (if given) on every
+/// node's [`TestLedger`] via [`TestLedger::with_version_fn`] — mirrors go's
+/// `setupAgreement(t, numNodes, traceLevel, ledgerFactory)` where
+/// `ledgerFactory` is `makeTestLedgerWithConsensusVersion(data,
+/// consensusVersion)` (used by `simulateAgreementWithConsensusVersion` /
+/// `TestAgreementSynchronousFutureUpgrade`) instead of the fixed-version
+/// `makeTestLedger`.
+pub fn setup_agreement_with_version_fn(
+    n: usize,
+    version_fn: Option<Arc<dyn Fn(Round) -> String + Send + Sync>>,
+) -> AgreementCluster {
     let buf_capacity = 1000;
     let consensus_version = algo_types::CONSENSUS_V41;
     let params: ConsensusParams =
@@ -175,6 +189,9 @@ pub fn setup_agreement(n: usize) -> AgreementCluster {
             consensus_version.to_string(),
         );
         ledger.share_commits(shared_commits.clone());
+        if let Some(f) = version_fn.clone() {
+            ledger = ledger.with_version_fn(move |r| f(r));
+        }
         ledgers.push(ledger);
     }
     let start_round = ledgers[0].next_round();

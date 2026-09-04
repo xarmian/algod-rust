@@ -36,11 +36,26 @@
 // pocketing — intercept-and-collect instead of deliver, with a later replay
 // via direct `multicast`) and `partition` (two-group delivery filter) are
 // ported here for `Late`/`Redo`/`LateCertBug`/`LargePeriods`.
-// `crown`/`makeRelays`/`intercept` (relay/star topology, and arbitrary
-// message rewriting) are still not ported — no scenario landed in this pass
-// needed them; a follow-up can add them the same way once one does (e.g.
-// `RecoverBothVAndBotQuorums`'s `crown`, `CertificateDoesNotStallSingleRelay`'s
-// `makeRelays`).
+//
+// `crown` (deliver only to a given set of recipients, regardless of sender —
+// go's `crownedNodes` delivery-side filter) is ported as a primitive
+// (`TestingNetwork::crown`, covered by
+// `crown_only_delivers_to_crowned_recipients` below) for issue #825's
+// remaining `TestAgreementRecoverBothVAndBotQuorums` scope, but that
+// scenario's full port is NOT landed yet — see
+// `service_multi_node_test.rs`'s module doc comment / issue #825's progress
+// notes for why (go's version additionally fires `TimeoutDeadline` on a
+// SUBSET of clocks across two different, precisely-timed "next vote range"
+// deltas — `(next).nextVoteRanges`/`(next+1).nextVoteRanges` — a mechanic
+// this harness has no equivalent driver hook for yet; the primitive is
+// landed on its own because it's real, independently useful infrastructure,
+// same as `pocket_all_compound` was left in place after `TestAgreementSlow
+// Payloads*` proved intractable).
+//
+// `makeRelays`/`intercept` (relay/star topology, and arbitrary message
+// rewriting) are still not ported — no scenario landed in this pass needed
+// them; a follow-up can add them the same way once one does (e.g.
+// `CertificateDoesNotStallSingleRelay`'s `makeRelays`).
 //
 // A real limitation found while porting, NOT fixed here:
 // `pocketAllCompound` (used by go's `TestAgreementSlowPayloadsPreDeadline`/
@@ -134,6 +149,13 @@ struct NetworkState {
     /// between nodes in the same group. Mirrors go's `partitionedNodes`.
     partitioned: Option<Vec<bool>>,
 
+    /// `Some(flags)` while `crown` is active: `flags[i]` is true if node
+    /// `i` is "crowned" — a message is only delivered to a crowned
+    /// recipient, regardless of who sent it (delivery-side filter only,
+    /// unlike `partitioned` which is symmetric). Mirrors go's
+    /// `crownedNodes`.
+    crowned: Option<Vec<bool>>,
+
     /// Bounded FIFO of the most recently, normally-delivered (i.e. not
     /// pocketed) `PROPOSAL_PAYLOAD_TAG` broadcasts — a harness-only
     /// payload-catch-up mechanism with no go equivalent, because go's real
@@ -198,6 +220,7 @@ impl TestingNetwork {
                 soft_vote_pocket: None,
                 compound_pocket: None,
                 partitioned: None,
+                crowned: None,
                 payload_history: Vec::new(),
             }),
         })
@@ -276,6 +299,7 @@ impl TestingNetwork {
         state.soft_vote_pocket = None;
         state.compound_pocket = None;
         state.partitioned = None;
+        state.crowned = None;
     }
 
     /// Re-multicast every proposal-payload broadcast currently held in
@@ -409,6 +433,22 @@ impl TestingNetwork {
             flags[i] = true;
         }
         state.partitioned = Some(flags);
+    }
+
+    /// Mirrors go's `testingNetwork.crown(prophets...)`: from now on, only
+    /// deliver messages to the given set of nodes — every other node
+    /// receives nothing, regardless of who sent the message. Independent of
+    /// [`Self::partition`] (both, if set, must pass for delivery — mirrors
+    /// go's `multicast` checking `partitionedNodes` and `crownedNodes` as
+    /// two separate, both-must-pass filters).
+    pub fn crown(&self, prophets: &[usize]) {
+        let mut state = self.state.lock().expect("TestingNetwork poisoned");
+        let n = state.channels.len();
+        let mut flags = vec![false; n];
+        for &i in prophets {
+            flags[i] = true;
+        }
+        state.crowned = Some(flags);
     }
 
     /// Total number of messages currently sitting unconsumed in every node's
@@ -599,6 +639,11 @@ fn multicast(
                 continue;
             }
         }
+        if let Some(crowned) = &state.crowned {
+            if !crowned[peer] {
+                continue;
+            }
+        }
         let msg = Message {
             handle: handle.clone(),
             data: data.to_vec(),
@@ -746,6 +791,63 @@ mod tests {
             recv_vote_count(&rx),
             1,
             "delivery must resume after repair_all"
+        );
+    }
+
+    /// Mirrors go's `crown`: only the crowned node(s) receive a broadcast,
+    /// regardless of who sent it; `repair_all` clears it again.
+    #[test]
+    fn crown_only_delivers_to_crowned_recipients() {
+        let net = TestingNetwork::new(3, 16);
+        net.crown(&[0]);
+        let node0 = net.endpoint(0);
+        let node1 = net.endpoint(1);
+        let node2 = net.endpoint(2);
+
+        // node1 broadcasts: only node0 (crowned) should get it, not node2.
+        node1
+            .broadcast(
+                &Tag(AGREEMENT_VOTE_TAG),
+                &codec::encode_vote(&vote_with_step(SOFT)),
+            )
+            .unwrap();
+        assert_eq!(
+            recv_vote_count(&node0.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            1,
+            "crowned node0 must receive the broadcast"
+        );
+        assert_eq!(
+            recv_vote_count(&node2.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            0,
+            "non-crowned node2 must not receive the broadcast"
+        );
+
+        // node2 broadcasts: still only node0 gets it (crown is a
+        // recipient-side filter, independent of the sender).
+        node2
+            .broadcast(
+                &Tag(AGREEMENT_VOTE_TAG),
+                &codec::encode_vote(&vote_with_step(SOFT)),
+            )
+            .unwrap();
+        assert_eq!(
+            recv_vote_count(&node0.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            1,
+            "crowned node0 must receive every broadcast, regardless of sender"
+        );
+
+        // repair_all clears the crown; delivery returns to normal.
+        net.repair_all();
+        node1
+            .broadcast(
+                &Tag(AGREEMENT_VOTE_TAG),
+                &codec::encode_vote(&vote_with_step(SOFT)),
+            )
+            .unwrap();
+        assert_eq!(
+            recv_vote_count(&node2.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            1,
+            "delivery to every connected peer must resume after repair_all"
         );
     }
 
