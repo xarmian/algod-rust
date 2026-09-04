@@ -39,9 +39,15 @@
 
 mod fuzzer;
 
+use algo_agreement::{codec, Period, RawVote, Step, UnauthenticatedVote, BOTTOM, SOFT};
+use algo_types::{Address, Round};
+
 use fuzzer::filter::{Filter, FilterDecision};
+use fuzzer::filters::bandwidth::BandwidthFilterBuilder;
 use fuzzer::filters::drop_message::DropMessageFilterBuilder;
 use fuzzer::filters::duplicate_message::DuplicateMessageFilterBuilder;
+use fuzzer::filters::message_decoder::MessageDecoderFilterBuilder;
+use fuzzer::filters::message_regossip::MessageRegossipFilter;
 use fuzzer::filters::message_reordering::MessageReorderingFilterBuilder;
 use fuzzer::filters::node_crash::NodeCrashFilterBuilder;
 use fuzzer::network_facade::NetworkFacade;
@@ -953,4 +959,330 @@ fn scheduler_four_node_with_all_four_filters_is_deterministic() {
         !a[0].is_empty(),
         "expected at least some messages to survive the 4-filter chain",
     );
+}
+
+// ---------------------------------------------------------------------------
+// BandwidthFilter (issue #954) — mirrors TestBandwidthFilter /
+// TestManyBandwidthFilter (`agreement/fuzzer/tests_test.go`, currently
+// commented out upstream but still the authoritative behavior spec —
+// same precedent as `TestCertVoteDrops` above).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bandwidth_filter_none_is_noop() {
+    let mut f = BandwidthFilterBuilder::new().build();
+    for i in 0..5u8 {
+        let msg = AlgoMessage::broadcast(0, TAG, vec![i; 64]);
+        assert_eq!(f.filter_outgoing(&msg), FilterDecision::Keep);
+    }
+    assert_eq!(f.outgoing_delayed(), 0);
+    assert_eq!(f.outgoing_seen(), 5);
+}
+
+#[test]
+fn bandwidth_filter_throttles_to_configured_rate() {
+    // 10 bytes/tick outgoing cap; each message is 10 bytes, so every
+    // message after the first must be pushed at least one tick later
+    // than the previous one's release — a directly observable
+    // "serialize traffic that exceeds the rate" effect.
+    let mut f = BandwidthFilterBuilder::new()
+        .outgoing_bandwidth(Some(10))
+        .build();
+    let msg = AlgoMessage::broadcast(0, TAG, vec![0u8; 10]);
+
+    // First message at tick 0: exactly fills this tick's budget, so it
+    // still needs the standard 1-tick occupancy before it clears.
+    assert_eq!(
+        f.filter_outgoing(&msg),
+        FilterDecision::Delay { delay_ticks: 1 }
+    );
+    // Second message, still at tick 0: must queue behind the first,
+    // landing 2 ticks out.
+    assert_eq!(
+        f.filter_outgoing(&msg),
+        FilterDecision::Delay { delay_ticks: 2 }
+    );
+    // Third message: queues behind both.
+    assert_eq!(
+        f.filter_outgoing(&msg),
+        FilterDecision::Delay { delay_ticks: 3 }
+    );
+    assert_eq!(f.outgoing_delayed(), 3);
+    assert_eq!(f.outgoing_seen(), 3);
+}
+
+#[test]
+fn bandwidth_filter_advances_after_tick() {
+    // Once the clock advances past a message's reservation, a fresh
+    // message should clear with a fresh (smaller) delay rather than
+    // stacking on the old reservation forever.
+    let mut f = BandwidthFilterBuilder::new()
+        .outgoing_bandwidth(Some(10))
+        .build();
+    let msg = AlgoMessage::broadcast(0, TAG, vec![0u8; 10]);
+
+    assert_eq!(
+        f.filter_outgoing(&msg),
+        FilterDecision::Delay { delay_ticks: 1 }
+    );
+    // Advance well past the first message's release tick.
+    f.tick(5);
+    assert_eq!(
+        f.filter_outgoing(&msg),
+        FilterDecision::Delay { delay_ticks: 1 },
+        "a fresh message after the channel is free again should only pay the base 1-tick occupancy",
+    );
+}
+
+#[test]
+fn bandwidth_filter_incoming_and_outgoing_are_independent() {
+    let mut f = BandwidthFilterBuilder::new()
+        .outgoing_bandwidth(Some(10))
+        .incoming_bandwidth(None)
+        .build();
+    let msg = AlgoMessage::unicast(1, 0, TAG, vec![0u8; 10]);
+    // Outgoing is capped...
+    assert!(matches!(
+        f.filter_outgoing(&msg),
+        FilterDecision::Delay { .. }
+    ));
+    // ...but incoming has no cap configured, so it's unaffected.
+    assert_eq!(f.filter_incoming(&msg), FilterDecision::Keep);
+    assert_eq!(f.incoming_delayed(), 0);
+}
+
+/// Mirrors `TestManyBandwidthFilter` (Go): rerun the same scenario
+/// several times and require byte-identical decision sequences — the
+/// filter keeps no RNG, only tick/size-derived counters, so it must be
+/// perfectly reproducible.
+#[test]
+fn bandwidth_filter_is_deterministic_across_many_runs() {
+    fn run() -> Vec<FilterDecision> {
+        let mut f = BandwidthFilterBuilder::new()
+            .outgoing_bandwidth(Some(16))
+            .build();
+        let mut decisions = Vec::new();
+        for tick in 0..6u64 {
+            f.tick(tick);
+            for i in 0..3u8 {
+                let msg = AlgoMessage::broadcast(0, TAG, vec![i; 12]);
+                decisions.push(f.filter_outgoing(&msg));
+            }
+        }
+        decisions
+    }
+
+    let baseline = run();
+    for _ in 0..10 {
+        assert_eq!(run(), baseline, "BandwidthFilter must be deterministic");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MessageDecoderFilter (issue #954) — mirrors TestMessageDecoderFilter
+// (`agreement/fuzzer/tests_test.go`, also inside the commented block).
+// ---------------------------------------------------------------------------
+
+fn sample_vote_bytes(step: Step) -> Vec<u8> {
+    codec::encode_vote(&UnauthenticatedVote {
+        raw_vote: RawVote {
+            sender: Address([9u8; 32]),
+            round: Round(1),
+            period: Period(0),
+            step,
+            proposal: BOTTOM,
+        },
+        ..UnauthenticatedVote::default()
+    })
+}
+
+#[test]
+fn message_decoder_filter_caches_decoded_votes_only_for_traffic_actually_sent() {
+    // Mirrors TestMessageDecoderFilter's assertions: with a scenario
+    // that only ever sends AGREEMENT_VOTE_TAG traffic, decoded vote
+    // count must be nonzero while the bundle count stays exactly zero
+    // — the filter must not fabricate cache entries for tags nobody
+    // sent.
+    let builder = MessageDecoderFilterBuilder::new();
+    let mut f = builder.build();
+
+    let vote_msg = AlgoMessage::broadcast(0, "AV", sample_vote_bytes(SOFT));
+    assert_eq!(f.filter_outgoing(&vote_msg), FilterDecision::Keep);
+
+    let another_vote_msg = AlgoMessage::broadcast(0, "AV", sample_vote_bytes(algo_agreement::CERT));
+    assert_eq!(f.filter_outgoing(&another_vote_msg), FilterDecision::Keep);
+
+    assert!(
+        builder.decoded_vote_count() != 0,
+        "expected at least one decoded vote, got {}",
+        builder.decoded_vote_count(),
+    );
+    assert_eq!(
+        builder.decoded_bundle_count(),
+        0,
+        "no bundle traffic was sent, so the bundle cache must stay empty",
+    );
+    assert_eq!(
+        builder.decoded_proposal_count(),
+        0,
+        "no proposal traffic was sent, so the proposal cache must stay empty",
+    );
+}
+
+#[test]
+fn message_decoder_filter_shares_cache_across_nodes_built_from_same_builder() {
+    // Mirrors Go's shared-`msgStore`-across-`CreateFilter`-calls
+    // behavior: every node built from the same builder observes into
+    // the SAME aggregate cache.
+    let builder = MessageDecoderFilterBuilder::new();
+    let mut node0 = builder.build();
+    let mut node1 = builder.build();
+
+    node0.filter_outgoing(&AlgoMessage::broadcast(0, "AV", sample_vote_bytes(SOFT)));
+    node1.filter_outgoing(&AlgoMessage::broadcast(
+        1,
+        "AV",
+        sample_vote_bytes(algo_agreement::CERT),
+    ));
+
+    assert_eq!(
+        builder.decoded_vote_count(),
+        2,
+        "both nodes' decoded votes must land in the shared cache",
+    );
+}
+
+#[test]
+fn message_decoder_filter_ignores_undecodable_payloads_without_dropping_the_message() {
+    // A malformed payload must not panic and must not be cached — but
+    // the message itself still flows through (Go: the decode failure
+    // is silent, `SendMessage` always forwards regardless).
+    let builder = MessageDecoderFilterBuilder::new();
+    let mut f = builder.build();
+    let garbage = AlgoMessage::broadcast(0, "AV", vec![0xff, 0x00, 0x13, 0x37]);
+
+    assert_eq!(f.filter_outgoing(&garbage), FilterDecision::Keep);
+    assert_eq!(builder.decoded_vote_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// MessageRegossipFilter + network-scale growth / regossip-elimination
+// (issue #954) — mirrors TestRegossipinngElimination and the growth
+// intent of TestUnstakedNetworkLinearGrowth / TestStakedNetworkQuadricGrowth
+// (`agreement/fuzzer/tests_test.go`).
+//
+// Go's versions run a live 20-node (+8 relay) Fuzzer/Service cluster
+// for 150 ticks and compare `TrafficStatisticsFilter` byte counters
+// across several node counts (`TestNetworkBandwidth`,
+// `TestUnstakedNetworkLinearGrowth`, `TestStakedNetworkQuadricGrowth`)
+// or with/without `MessageRegossipFilter` installed
+// (`TestRegossipinngElimination`) — all of which need the live
+// multi-`Service` integration this harness explicitly defers (see
+// `mod.rs`'s "Out of scope" note: no `TopologyFilter` /
+// `TrafficStatisticsFilter` / live consensus yet).
+//
+// This is the "smaller-scale proof, documented honestly" the issue's
+// acceptance criteria explicitly allow for that case. The proof below
+// reproduces the SAME structural claim Go's tests make — naive
+// full-mesh regossiping grows traffic quadratically in node count,
+// while a network with regossip suppressed grows only linearly — using
+// this harness's existing all-to-all `Router` and the ported
+// `MessageRegossipFilter`, at node counts small enough to stay fast
+// and deterministic under `cargo test --workspace`.
+// ---------------------------------------------------------------------------
+
+/// One broadcast from node 0, followed by every OTHER node "relaying"
+/// (re-broadcasting) the exact same message once. Returns total
+/// messages delivered network-wide. With no suppression, delivery
+/// count is `(n-1)` [the original broadcast] `+ (n-1)*(n-1)` [every
+/// other node re-broadcasting the same message to every other peer] —
+/// quadratic in `n`. With `MessageRegossipFilter` installed at every
+/// node, each relay's re-broadcast of a message it already received is
+/// suppressed entirely, leaving only the original `(n-1)` deliveries —
+/// linear in `n`.
+fn run_relay_storm(n: usize, with_regossip_filter: bool) -> usize {
+    let router = Router::new(n);
+    let facades = (0..n)
+        .map(|i| {
+            if with_regossip_filter {
+                // Both chains must share the SAME underlying digest
+                // set (see message_regossip.rs's module doc) — clone
+                // one filter handle into each chain.
+                let filter = MessageRegossipFilter::new();
+                NetworkFacade::new(
+                    i,
+                    vec![Box::new(filter.clone()) as Box<dyn Filter>],
+                    vec![Box::new(filter) as Box<dyn Filter>],
+                )
+            } else {
+                NetworkFacade::new(i, Vec::new(), Vec::new())
+            }
+        })
+        .collect();
+    let mut sched = Scheduler::new(router, facades);
+
+    let payload = vec![0xABu8; 8];
+    sched.enqueue_send(AlgoMessage::broadcast(0, TAG, payload.clone()));
+
+    // Every node that isn't the original source relays the same
+    // message once (a naive "forward what I heard" gossip habit).
+    for node in 1..n {
+        sched.enqueue_send(AlgoMessage::broadcast(node, TAG, payload.clone()));
+    }
+
+    (0..n).map(|node| sched.received(node).len()).sum()
+}
+
+#[test]
+fn message_regossip_filter_suppresses_already_received_relay_storm() {
+    let n = 6;
+    let without = run_relay_storm(n, false);
+    let with = run_relay_storm(n, true);
+
+    // Without suppression: (n-1) + (n-1)*(n-1).
+    let expected_without = (n - 1) + (n - 1) * (n - 1);
+    // With suppression: only the original broadcast survives — every
+    // relay's re-send of a message it already received is dropped.
+    let expected_with = n - 1;
+
+    assert_eq!(without, expected_without);
+    assert_eq!(with, expected_with);
+    assert!(
+        with < without,
+        "regossip elimination must strictly reduce total delivered traffic",
+    );
+}
+
+/// Mirrors the growth-rate CLAIM in `TestUnstakedNetworkLinearGrowth` /
+/// `TestStakedNetworkQuadricGrowth`: as the node count scales up,
+/// traffic WITHOUT regossip suppression grows faster than traffic WITH
+/// it. Rather than fitting a literal quadratic/linear regression (Go's
+/// `calcQuadricCoefficients`), which needs many more samples and a
+/// live network to produce a meaningful curve, this asserts the
+/// qualitative growth-rate ordering directly: the ratio of unsuppressed
+/// to suppressed traffic strictly increases as `n` grows — i.e.
+/// suppression's relative benefit compounds with scale, which is
+/// exactly what "quadratic vs linear" means in practice.
+#[test]
+fn network_scale_regossip_elimination_reduces_growth() {
+    let node_counts = [4usize, 8, 16];
+    let mut ratios = Vec::with_capacity(node_counts.len());
+
+    for &n in &node_counts {
+        let without = run_relay_storm(n, false) as f64;
+        let with = run_relay_storm(n, true) as f64;
+        assert!(with < without, "n={n}: suppression must reduce traffic");
+        ratios.push(without / with);
+    }
+
+    for w in ratios.windows(2) {
+        assert!(
+            w[1] > w[0],
+            "unsuppressed/suppressed traffic ratio must strictly increase with node count \
+             (got {:?} for node counts {:?}) — this is the linear-vs-quadratic growth gap \
+             TestUnstakedNetworkLinearGrowth/TestStakedNetworkQuadricGrowth measure at full scale",
+            ratios,
+            node_counts,
+        );
+    }
 }
