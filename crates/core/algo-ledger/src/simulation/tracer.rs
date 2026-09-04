@@ -35,6 +35,104 @@ use super::trace::{
     StateChange, StateChangeKind, StateChangeOp, TransactionTrace, UnnamedResourcesAccessed,
 };
 
+/// Tracks the "transaction path" (go-algorand's `TxnPath`) pointing at the
+/// currently-executing inner transaction, relative to the top-level
+/// transaction this tracer instance was created for.
+///
+/// A direct Rust port of go-algorand's `cursorEvalTracer`
+/// (`ledger/simulation/tracer.go`), which maintains this same push-on-enter/
+/// pop-on-return bookkeeping across `BeforeTxnGroup`/`BeforeTxn`/`AfterTxn`/
+/// `AfterTxnGroup`. One structural difference: go's tracer is shared across
+/// the *whole* top-level group and its `BeforeTxnGroup`/`BeforeTxn` hooks
+/// fire for the top-level transaction too, so `absolutePath()` returns a
+/// fully-absolute path (top-level index included). algod-rust creates one
+/// `SimulationTracer` per top-level transaction, and `before_txn_group`/
+/// `before_txn` only ever fire for *inner* transaction groups (see
+/// `avm_context.rs`) — so this cursor is seeded with one synthetic opening
+/// frame (equivalent to go's state immediately after the top-level
+/// `BeforeTxnGroup`+`BeforeTxn`) purely to host the sibling-accumulator slot
+/// that later inner-group closures need (`AfterTxnGroup`'s
+/// `previous_inner_txns[top-1]` bump). `relative_path()` then strips that
+/// synthetic leading element, leaving a path relative to the top-level
+/// transaction; the caller (the simulation loop in `mod.rs`) prepends the
+/// real top-level index.
+#[derive(Debug, Default)]
+struct TxnCursor {
+    /// Mirrors go's `relativeCursor`. Seeded with one entry (`0`) standing in
+    /// for the top-level transaction's own (never-materialized) frame.
+    relative_cursor: Vec<i64>,
+    /// Mirrors go's `previousInnerTxns`. Seeded with one entry (`0`) so the
+    /// first real inner-group closure has a slot to accumulate into.
+    previous_inner_txns: Vec<i64>,
+}
+
+impl TxnCursor {
+    fn new() -> Self {
+        TxnCursor {
+            relative_cursor: vec![0],
+            previous_inner_txns: vec![0],
+        }
+    }
+
+    fn before_txn_group(&mut self) {
+        self.relative_cursor.push(-1); // will go to 0 in before_txn
+    }
+
+    fn before_txn(&mut self) {
+        let top = self.relative_cursor.len() - 1;
+        self.relative_cursor[top] += 1;
+        self.previous_inner_txns.push(0);
+    }
+
+    fn after_txn(&mut self) {
+        self.previous_inner_txns.pop();
+    }
+
+    fn after_txn_group(&mut self) {
+        let top = self.relative_cursor.len() - 1;
+        if !self.previous_inner_txns.is_empty() {
+            let last = self.previous_inner_txns.len() - 1;
+            self.previous_inner_txns[last] += self.relative_cursor[top] + 1;
+        }
+        self.relative_cursor.pop();
+    }
+
+    /// The full path, including the synthetic leading element standing in
+    /// for the top-level transaction's own frame (always index 0 relative to
+    /// itself).
+    fn absolute_path(&self) -> Vec<i64> {
+        let mut path = Vec::with_capacity(self.relative_cursor.len());
+        for (i, &relative_group_index) in self.relative_cursor.iter().enumerate() {
+            let mut absolute_index = relative_group_index;
+            if i > 0 {
+                absolute_index += self.previous_inner_txns[i - 1];
+            }
+            path.push(absolute_index);
+        }
+        path
+    }
+
+    /// The path relative to the top-level transaction (the synthetic leading
+    /// element stripped off), ready to be appended after the real top-level
+    /// index. Returns `None` if any component is negative — which can only
+    /// happen if `after_txn_group` fires without a matching `before_txn`
+    /// having run first (a pre-existing structural gap in a couple of
+    /// early-fee-check error paths in `avm_context.rs`, unrelated to this
+    /// path-tracking fix); callers fall back to the top-level-only path in
+    /// that case, matching pre-fix behavior.
+    fn relative_path(&self) -> Option<Vec<usize>> {
+        let absolute = self.absolute_path();
+        let mut out = Vec::with_capacity(absolute.len().saturating_sub(1));
+        for &v in &absolute[1..] {
+            if v < 0 {
+                return None;
+            }
+            out.push(v as usize);
+        }
+        Some(out)
+    }
+}
+
 /// Converts an AVM machine value to a trace-friendly representation.
 fn to_trace_value(v: &AvmValue) -> AvmValueTrace {
     match v {
@@ -128,6 +226,17 @@ pub struct SimulationTracer {
     /// (`tracer.go:156`). Accumulated even when opcode tracing is disabled,
     /// since group budget is a standard simulate response field.
     inner_txn_group_count: u64,
+    /// Path/cursor tracking the currently-executing inner transaction,
+    /// relative to the top-level transaction (issue #972). Updated
+    /// unconditionally (not gated on `config.is_enabled()`) — `failed_at` is
+    /// a standard simulate response field, not a trace-capture detail.
+    cursor: TxnCursor,
+    /// The relative path (see `TxnCursor::relative_path`) to the first
+    /// transaction — top-level or nested inner — that failed under this
+    /// top-level transaction. `None` until the first failure; mirrors
+    /// go-algorand's `evalTracer.handleError`, which only ever sets
+    /// `failedAt` once (`tracer.go:114`).
+    failed_at: Option<Vec<usize>>,
 }
 
 impl SimulationTracer {
@@ -144,6 +253,8 @@ impl SimulationTracer {
             app_cost_consumed: 0,
             unnamed_resources: UnnamedResourcesAccessed::default(),
             inner_txn_group_count: 0,
+            cursor: TxnCursor::new(),
+            failed_at: None,
         }
     }
 
@@ -165,6 +276,17 @@ impl SimulationTracer {
     /// `MaxAppProgramCost` to the group's `AppBudgetAdded` figure.
     pub fn inner_txn_group_count(&self) -> u64 {
         self.inner_txn_group_count
+    }
+
+    /// The path (relative to this tracer's top-level transaction) to the
+    /// first inner transaction that failed while this top-level transaction
+    /// was executing, if any (issue #972). Empty when the top-level
+    /// transaction's own execution failed directly (no inner descent).
+    /// `None` only in the rare case a group-level failure fired without a
+    /// matching `before_txn` (see `TxnCursor::relative_path`); callers
+    /// should fall back to the top-level-only path then.
+    pub fn failed_at(&self) -> Option<&[usize]> {
+        self.failed_at.as_deref()
     }
 
     /// Take the initial-state snapshot captured during this transaction,
@@ -220,6 +342,7 @@ impl EvalTracer for SimulationTracer {
         // `config.is_enabled()`), matching `app_cost_consumed`: group budget
         // is a standard simulate response field, not a trace-capture detail.
         self.inner_txn_group_count += 1;
+        self.cursor.before_txn_group();
     }
 
     fn before_program(&mut self, program_type: ProgramType, program_hash: [u8; 32]) {
@@ -273,6 +396,11 @@ impl EvalTracer for SimulationTracer {
     }
 
     fn before_txn(&mut self, _group_index: usize) {
+        // Cursor bookkeeping (issue #972) happens unconditionally, matching
+        // `inner_txn_group_count`/`app_cost_consumed`: `failed_at` is a
+        // standard simulate response field, not a trace-capture detail.
+        self.cursor.before_txn();
+
         if !self.config.is_enabled() {
             return;
         }
@@ -296,7 +424,20 @@ impl EvalTracer for SimulationTracer {
         self.trace_path.push(idx);
     }
 
-    fn after_txn(&mut self, _group_index: usize, _error: Option<&str>) {
+    fn after_txn(&mut self, _group_index: usize, error: Option<&str>) {
+        // Capture `failed_at` (issue #972) using the cursor's *current*
+        // state — i.e. still including this transaction's own frame — before
+        // popping it, so the path points at the actual failing transaction.
+        // Mirrors go-algorand's `evalTracer.AfterTxn`, which calls
+        // `handleError` before `cursorEvalTracer.AfterTxn` (`tracer.go:250-
+        // 251,267`). Only the *first* failure is recorded (`handleError`'s
+        // nil-check), since later, outer `AfterTxn`/`AfterTxnGroup` calls see
+        // the same error as it propagates back up.
+        if error.is_some() && self.failed_at.is_none() {
+            self.failed_at = self.cursor.relative_path();
+        }
+        self.cursor.after_txn();
+
         if !self.config.is_enabled() {
             return;
         }
@@ -304,6 +445,18 @@ impl EvalTracer for SimulationTracer {
         self.trace_path.pop();
         // Restore the saved program state.
         self.current_program = self.program_state_stack.pop().flatten();
+    }
+
+    fn after_txn_group(&mut self, error: Option<&str>) {
+        // See `after_txn`: capture before popping, first-failure-only.
+        // Handles group-level failures not attributable to one specific
+        // member's `AfterTxn` (e.g. the whole inner group rejected as
+        // malformed) — mirrors go's `evalTracer.AfterTxnGroup`
+        // (`tracer.go:181-183`).
+        if error.is_some() && self.failed_at.is_none() {
+            self.failed_at = self.cursor.relative_path();
+        }
+        self.cursor.after_txn_group();
     }
 
     fn before_opcode(&mut self, _pc: usize, _opcode: u8) {

@@ -719,7 +719,25 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     // stopping (the tracer may have captured events up to
                     // the point of failure).
                     failure_message = Some(e.to_string());
-                    failed_at = Some(vec![i]);
+                    // The tracer descended into this top-level transaction's
+                    // own inner-txn tree (if any) and, on the first failure
+                    // anywhere in it, recorded the path relative to this
+                    // transaction (issue #972). Prepend the real top-level
+                    // index to get the full path -- mirroring go-algorand's
+                    // `TxnPath` (e.g. `[2, 0, 0]` for a failure two levels
+                    // deep inside transaction 2's inner-txn tree). Falls back
+                    // to the top-level-only path when the tracer never
+                    // descended (a direct top-level program failure) or
+                    // couldn't attribute a path (see `TxnCursor::relative_path`).
+                    failed_at = Some(match tracer.failed_at() {
+                        Some(relative) => {
+                            let mut path = Vec::with_capacity(1 + relative.len());
+                            path.push(i);
+                            path.extend_from_slice(relative);
+                            path
+                        }
+                        None => vec![i],
+                    });
                     initial_states.merge(tracer.take_initial_states());
                     group_unnamed.merge(tracer.take_unnamed_resources());
                     group_result.txn_results[i].trace =
