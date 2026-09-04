@@ -1010,6 +1010,8 @@ pub struct CatchpointVerifyResult {
     pub trie_root: [u8; 32],
     /// Number of accounts found in the `accountbase` table.
     pub accounts_count: u64,
+    /// Number of key-value ("box") entries found in the `kvstore` table.
+    pub kvs_count: u64,
 }
 
 /// A non-critical warning found during post-import validation.
@@ -1120,6 +1122,14 @@ pub(crate) fn count_accounts(conn: &Connection) -> Result<u64, CatchpointError> 
     Ok(count as u64)
 }
 
+/// Count rows in the `kvstore` table.
+pub(crate) fn count_kvs(conn: &Connection) -> Result<u64, CatchpointError> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM kvstore", [], |row| row.get(0))
+        .map_err(|e| CatchpointError::VerificationError(format!("failed to count kvs: {e}")))?;
+    Ok(count as u64)
+}
+
 /// Verify a catchpoint database after import.
 ///
 /// This orchestrates the full verification pipeline:
@@ -1180,8 +1190,9 @@ pub fn verify_catchpoint(
     // Step 6: Read account totals.
     let totals = read_account_totals(conn)?;
 
-    // Step 7: Count accounts.
+    // Step 7: Count accounts and kvs.
     let accounts_count = count_accounts(conn)?;
+    let kvs_count = count_kvs(conn)?;
 
     // Step 8: Construct the label based on file version.
     let computed_label = match version {
@@ -1216,6 +1227,7 @@ pub fn verify_catchpoint(
         computed_label,
         trie_root,
         accounts_count,
+        kvs_count,
     })
 }
 

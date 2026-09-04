@@ -96,6 +96,30 @@ pub struct ImportResult {
 }
 
 // ---------------------------------------------------------------------------
+// ImportProgressUpdate
+// ---------------------------------------------------------------------------
+
+/// Incremental progress snapshot emitted while streaming chunks into the
+/// database, for callers that want live progress (issue #941).
+///
+/// Mirrors go-algorand's `ledger.CatchpointCatchupAccessorProgress`
+/// (`ledger/catchupaccessor.go`), which `CatchpointCatchupService`'s
+/// `updateLedgerFetcherProgress` (`catchup/catchpointService.go`) copies into
+/// `CatchpointCatchupStats.TotalAccounts`/`ProcessedAccounts`/`TotalKVs`/
+/// `ProcessedKVs` — ultimately surfaced on `GET /v2/status`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImportProgressUpdate {
+    /// Total accounts declared in the catchpoint file header.
+    pub total_accounts: u64,
+    /// Accounts imported into the database so far.
+    pub processed_accounts: u64,
+    /// Total key-value ("box") entries declared in the catchpoint file header.
+    pub total_kvs: u64,
+    /// Key-value entries imported into the database so far.
+    pub processed_kvs: u64,
+}
+
+// ---------------------------------------------------------------------------
 // CatchpointImporter
 // ---------------------------------------------------------------------------
 
@@ -748,6 +772,22 @@ pub fn import_catchpoint_file(
     path: &Path,
     reward_unit: u64,
 ) -> Result<ImportResult, CatchpointError> {
+    import_catchpoint_file_with_progress(conn, path, reward_unit, None)
+}
+
+/// Same as [`import_catchpoint_file`], but invokes `on_progress` after every
+/// chunk is imported with a live [`ImportProgressUpdate`] snapshot — the
+/// hook [`crate::sync::SyncOrchestrator`] uses to populate
+/// [`crate::sync::SyncProgress`]'s `catchpoint_total_accounts`/
+/// `catchpoint_processed_accounts`/`catchpoint_total_kvs`/
+/// `catchpoint_processed_kvs` fields as import progresses (issue #941),
+/// mirroring go's `updateLedgerFetcherProgress`.
+pub fn import_catchpoint_file_with_progress(
+    conn: &Connection,
+    path: &Path,
+    reward_unit: u64,
+    mut on_progress: Option<&mut dyn FnMut(&ImportProgressUpdate)>,
+) -> Result<ImportResult, CatchpointError> {
     let start = Instant::now();
 
     // --- Pass 1: extract header only ---
@@ -804,6 +844,15 @@ pub fn import_catchpoint_file(
 
                     importer.import_chunk(chunk_ordinal, &chunk, &mut stats)?;
                     batch_count += 1;
+
+                    if let Some(cb) = on_progress.as_deref_mut() {
+                        cb(&ImportProgressUpdate {
+                            total_accounts: header.total_accounts,
+                            processed_accounts: stats.accounts,
+                            total_kvs: header.total_kvs,
+                            processed_kvs: stats.kvs,
+                        });
+                    }
 
                     if batch_count >= batch_size {
                         conn.execute_batch("COMMIT")?;
