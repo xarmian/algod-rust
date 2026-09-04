@@ -2080,6 +2080,8 @@ pub fn canonical_encode_account_application_model(
 mod tests {
     use super::*;
     use algo_types::Round;
+    use rand::{Rng, RngCore, SeedableRng};
+    use rand_chacha::ChaCha20Rng;
 
     #[test]
     fn test_empty_transaction_produces_minimal_map() {
@@ -3061,5 +3063,283 @@ mod tests {
         let encoded = rmp_serde::to_vec_named(&lsig).expect("encode LogicSig");
         let decoded: LogicSig = rmp_serde::from_slice(&encoded).expect("decode LogicSig");
         assert_eq!(decoded.pqsig, Some(pqsig));
+    }
+
+    // ── Randomized round-trip: state-proof wire types (issue #956) ─────────
+    //
+    // Mirrors go-algorand's `TestRandomizedEncodingReveal`,
+    // `TestRandomizedEncodingStateProof`, and
+    // `TestRandomizedEncodingsigslotCommit`
+    // (`crypto/stateproof/msgp_gen_test.go`), each a thin
+    // `protocol.RunEncodingTest(t, &Type{})` call: generate 1000
+    // reflection-randomized instances of the type, msgpack round-trip each,
+    // and assert equality. algod-rust's canonical encoder is hand-written
+    // (not reflection/derive-generated), so [`assert_state_proof_roundtrip`]
+    // plays the role of `RunEncodingTest` here: each type below supplies its
+    // own small random-instance generator, encodes through the real
+    // `canonical_encode_reveal`/`canonical_encode_state_proof_body`/
+    // `canonical_encode_sig_slot_commit` functions (the same ones
+    // `canonical_encode_transaction` calls for a `stpf` transaction's `sp`
+    // field), and decodes back through the real `#[derive(Deserialize)]` on
+    // `algo_types::{Reveal, StateProofBody, SigSlotCommit}` (the same decode
+    // path `rmp_serde::from_slice::<SignedTransaction>` uses for an incoming
+    // state-proof transaction).
+    //
+    // These are the algo-types/algo-codec *wire* `Reveal`/`StateProofBody`/
+    // `SigSlotCommit` (go's `stateproof.Reveal`/`stateproof.StateProof`/
+    // `stateproof.sigslotCommit`) — distinct from
+    // `algo_consensus_crypto::stateproof`'s same-named types, which are the
+    // verification-side structs consumed by `Verifier::verify`/`Prover` and
+    // have no msgpack codec of their own; `algo-ledger`'s
+    // `apply_stateproof.rs` converts between the two at the ledger-apply
+    // boundary.
+    //
+    // Generator design note: go's `omitempty` (mirrored here by
+    // `CanonicalMap::add_map`/`add_bytes` skipping an all-default nested
+    // value) means a `Some(default_value)` for a nested `Option<Struct>`
+    // field is byte-identical on the wire to `None` — both decode back to
+    // `None`. That is expected, go-equivalent behavior, not a bug, but it
+    // means a naive 50/50 `Option` generator would produce spurious
+    // mismatches (`Some(all-zero)` on one side, `None` on the other) with no
+    // real codec defect behind them. So every generator for a struct that
+    // can appear *inside* an `Option<_>` field guarantees a
+    // non-collapsing (never-all-default) encoding — e.g. `gen_hash_factory`
+    // always picks a non-zero `hash_type`, `gen_merkle_proof` always picks a
+    // non-zero `tree_depth` — while scalar fields (u64/u8 weights, counts,
+    // salt versions) are left fully random since a real `0` is a legitimate,
+    // unambiguous value for a field that isn't itself `Option`-wrapped.
+
+    const STATE_PROOF_ITERATIONS: usize = 1000;
+
+    /// Generate `STATE_PROOF_ITERATIONS` random instances of `T` via `gen`,
+    /// canonical-msgpack encode each with `encode`, decode back via
+    /// `rmp_serde` (the real `#[derive(Deserialize)]` path), and assert the
+    /// decoded value equals the original.
+    ///
+    /// `seed` is a fixed, per-call constant so a failure reproduces
+    /// deterministically across CI runs (no OS-randomness dependency).
+    fn assert_state_proof_roundtrip<T>(
+        seed: u64,
+        mut gen: impl FnMut(&mut ChaCha20Rng) -> T,
+        encode: impl Fn(&T) -> Vec<u8>,
+    ) where
+        T: PartialEq + std::fmt::Debug + serde::de::DeserializeOwned,
+    {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        for i in 0..STATE_PROOF_ITERATIONS {
+            let original = gen(&mut rng);
+            let encoded = encode(&original);
+            let decoded: T = rmp_serde::from_slice(&encoded)
+                .unwrap_or_else(|e| panic!("iteration {i} (seed {seed:#x}) failed to decode: {e}"));
+            assert_eq!(
+                decoded, original,
+                "randomized msgpack round-trip mismatch at iteration {i} (seed {seed:#x})"
+            );
+        }
+    }
+
+    /// Random non-empty byte vector with at least one guaranteed non-zero
+    /// byte, so it never collides with the codec's "all-zero content is
+    /// empty" `add_bytes` omitempty rule (see the module note above).
+    fn gen_nonzero_bytes(rng: &mut ChaCha20Rng, min_len: usize, max_len: usize) -> Vec<u8> {
+        let len = rng.gen_range(min_len.max(1)..=max_len.max(min_len.max(1)));
+        let mut v = vec![0u8; len];
+        rng.fill_bytes(&mut v);
+        v[0] |= 1;
+        v
+    }
+
+    fn gen_hash_factory(rng: &mut ChaCha20Rng) -> HashFactory {
+        HashFactory {
+            hash_type: rng.gen_range(1..=1000u16),
+        }
+    }
+
+    fn gen_falcon_verifier(rng: &mut ChaCha20Rng) -> FalconVerifier {
+        FalconVerifier {
+            public_key: ByteBuf::from(gen_nonzero_bytes(rng, 1, 64)),
+        }
+    }
+
+    fn gen_merkle_proof(rng: &mut ChaCha20Rng) -> MerkleProof {
+        let path = if rng.gen_bool(0.6) {
+            let len = rng.gen_range(1..=4);
+            Some(
+                (0..len)
+                    .map(|_| {
+                        if rng.gen_bool(0.3) {
+                            None
+                        } else {
+                            Some(ByteBuf::from(gen_nonzero_bytes(rng, 1, 32)))
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let hash_factory = if rng.gen_bool(0.6) {
+            Some(gen_hash_factory(rng))
+        } else {
+            None
+        };
+        MerkleProof {
+            path,
+            hash_factory,
+            // Always non-zero: guarantees this MerkleProof's own encoding
+            // is never the empty map, so it never collapses when wrapped in
+            // an `Option<MerkleProof>` field (`sig_proofs`/`part_proofs`/
+            // `MerkleSignature::proof`).
+            tree_depth: rng.gen_range(1..=255),
+        }
+    }
+
+    fn gen_merkle_signature(rng: &mut ChaCha20Rng) -> MerkleSignature {
+        MerkleSignature {
+            // Always non-empty/non-zero: guarantees this MerkleSignature's
+            // own encoding is never the empty map, for the same reason as
+            // `gen_merkle_proof`'s `tree_depth` above.
+            signature: ByteBuf::from(gen_nonzero_bytes(rng, 1, 64)),
+            vector_commitment_index: rng.gen::<u64>(),
+            proof: if rng.gen_bool(0.6) {
+                Some(gen_merkle_proof(rng))
+            } else {
+                None
+            },
+            verifying_key: if rng.gen_bool(0.6) {
+                Some(gen_falcon_verifier(rng))
+            } else {
+                None
+            },
+        }
+    }
+
+    fn gen_merkle_sig_verifier(rng: &mut ChaCha20Rng) -> MerkleSignatureVerifier {
+        let mut commitment = [0u8; 64];
+        rng.fill_bytes(&mut commitment);
+        commitment[0] |= 1; // guarantee non-zero content, see module note above
+        MerkleSignatureVerifier {
+            commitment,
+            key_lifetime: rng.gen::<u64>(),
+        }
+    }
+
+    fn gen_sig_slot_commit(rng: &mut ChaCha20Rng) -> SigSlotCommit {
+        SigSlotCommit {
+            sig: if rng.gen_bool(0.7) {
+                Some(gen_merkle_signature(rng))
+            } else {
+                None
+            },
+            // Always non-zero: guarantees a non-collapsing encoding when
+            // this SigSlotCommit is wrapped in `Reveal::sig_slot`
+            // (`Option<SigSlotCommit>`), regardless of whether `sig` above
+            // is `None`.
+            l: rng.gen_range(1..=u64::MAX),
+        }
+    }
+
+    fn gen_participant(rng: &mut ChaCha20Rng) -> Participant {
+        Participant {
+            pk: if rng.gen_bool(0.7) {
+                Some(gen_merkle_sig_verifier(rng))
+            } else {
+                None
+            },
+            // Always non-zero: guarantees a non-collapsing encoding when
+            // this Participant is wrapped in `Reveal::part`
+            // (`Option<Participant>`).
+            weight: rng.gen_range(1..=u64::MAX),
+        }
+    }
+
+    fn gen_reveal(rng: &mut ChaCha20Rng) -> Reveal {
+        Reveal {
+            sig_slot: if rng.gen_bool(0.7) {
+                Some(gen_sig_slot_commit(rng))
+            } else {
+                None
+            },
+            part: if rng.gen_bool(0.7) {
+                Some(gen_participant(rng))
+            } else {
+                None
+            },
+        }
+    }
+
+    fn gen_state_proof_body(rng: &mut ChaCha20Rng) -> StateProofBody {
+        let sig_commit = if rng.gen_bool(0.7) {
+            ByteBuf::from(gen_nonzero_bytes(rng, 1, 64))
+        } else {
+            ByteBuf::new()
+        };
+        let sig_proofs = if rng.gen_bool(0.6) {
+            Some(gen_merkle_proof(rng))
+        } else {
+            None
+        };
+        let part_proofs = if rng.gen_bool(0.6) {
+            Some(gen_merkle_proof(rng))
+        } else {
+            None
+        };
+        let reveals = if rng.gen_bool(0.7) {
+            let n = rng.gen_range(1..=4);
+            let mut map = BTreeMap::new();
+            for _ in 0..n {
+                map.insert(rng.gen::<u64>(), gen_reveal(rng));
+            }
+            Some(map)
+        } else {
+            None
+        };
+        let positions_to_reveal = if rng.gen_bool(0.7) {
+            let n = rng.gen_range(1..=6);
+            Some((0..n).map(|_| rng.gen::<u64>()).collect())
+        } else {
+            None
+        };
+        StateProofBody {
+            sig_commit,
+            signed_weight: rng.gen::<u64>(),
+            sig_proofs,
+            part_proofs,
+            merkle_signature_salt_version: rng.gen::<u8>(),
+            reveals,
+            positions_to_reveal,
+        }
+    }
+
+    /// Matches go's `TestRandomizedEncodingsigslotCommit`/
+    /// `TestMarshalUnmarshalsigslotCommit` (`crypto/stateproof/msgp_gen_test.go`).
+    #[test]
+    fn sig_slot_commit_randomized_roundtrip() {
+        assert_state_proof_roundtrip(
+            0x9560_0001,
+            gen_sig_slot_commit,
+            canonical_encode_sig_slot_commit,
+        );
+    }
+
+    /// Matches go's `TestRandomizedEncodingReveal`
+    /// (`crypto/stateproof/msgp_gen_test.go`).
+    #[test]
+    fn reveal_randomized_roundtrip() {
+        assert_state_proof_roundtrip(0x9560_0002, gen_reveal, canonical_encode_reveal);
+    }
+
+    /// Matches go's `TestRandomizedEncodingStateProof`/
+    /// `TestMarshalUnmarshalStateProof` (`crypto/stateproof/msgp_gen_test.go`).
+    /// (algod-rust names go's `stateproof.StateProof` wire type
+    /// `StateProofBody`, to avoid clashing with
+    /// `algo_consensus_crypto::stateproof::StateProof`.)
+    #[test]
+    fn state_proof_body_randomized_roundtrip() {
+        assert_state_proof_roundtrip(
+            0x9560_0003,
+            gen_state_proof_body,
+            canonical_encode_state_proof_body,
+        );
     }
 }

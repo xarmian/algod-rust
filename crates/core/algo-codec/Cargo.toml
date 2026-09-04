@@ -20,6 +20,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 hex.workspace = true
 rmpv.workspace = true
 serde_json.workspace = true
+rand.workspace = true
+rand_chacha = "0.3"
 
 [[bench]]
 name = "codec_bench"
