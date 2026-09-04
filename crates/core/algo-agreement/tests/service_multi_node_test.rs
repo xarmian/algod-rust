@@ -80,6 +80,35 @@ use algo_types::Round;
 use crate::simulate::setup_agreement::{
     setup_agreement, setup_agreement_with_version_fn, AgreementCluster,
 };
+use crate::simulate::testing_network::PocketedMessage;
+
+/// Group `pocketed` cert-vote messages by `(round, period)` and return the
+/// largest single-period group, if any group reaches `min_size`. A raw
+/// pocketed-message count can silently span multiple periods once a
+/// partition is layered on top of pocketing (each extra deadline fire
+/// needed to reach quorum size also bumps every node's period) -- a real
+/// certificate is only valid votes from the SAME (round, period), so pooling
+/// votes across periods would produce a bundle no node would ever actually
+/// accept as a quorum.
+fn largest_same_period_group(
+    pocketed: &[PocketedMessage],
+    min_size: usize,
+) -> Option<Vec<PocketedMessage>> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<(Round, algo_agreement::Period), Vec<PocketedMessage>> =
+        HashMap::new();
+    for msg in pocketed {
+        let uv = codec::decode_vote(msg.data()).expect("pocketed cert vote decodes");
+        groups
+            .entry((uv.raw_vote.round, uv.raw_vote.period))
+            .or_default()
+            .push(msg.clone());
+    }
+    groups
+        .into_values()
+        .filter(|g| g.len() >= min_size)
+        .max_by_key(|g| g.len())
+}
 
 /// Every node's committed round, asserted identical across the cluster.
 /// Panics on divergence — that's a real finding, not a "needs another
@@ -1013,4 +1042,222 @@ fn synchronous_future_upgrade_five_node() {
 
     cluster.shutdown();
     sanity_check(&cluster, start_round, 10);
+}
+
+/// Full 5-node port of go-algorand's
+/// `TestAgreementCertificateDoesNotStallSingleRelay`
+/// (`agreement/service_test.go`), via `TestingNetwork::make_relays`.
+///
+/// Scenario: two ordinary rounds commit normally. Node 0 (the "relay") is
+/// then partitioned away from nodes 1-4 (the "leaves", 80% of stake —
+/// comfortably above the ~75% cert threshold on their own). Cert votes for
+/// the next round are pocketed rather than delivered, so the leaves' round
+/// does NOT commit organically off live traffic; once a quorum's worth is
+/// captured, they're replayed while the partition is still active — this
+/// delivers strictly within the leaves' group, so the leaves terminate the
+/// round with a real, valid certificate that the relay never saw a single
+/// vote of. The network then heals under a star topology
+/// (`make_relays(&[0])`, NOT full `repair_all`): leaves still cannot reach
+/// each other directly, only via the relay. The SAME pocketed certificate is
+/// replayed once more under this topology so the relay receives it directly
+/// (source is a leaf, recipient is the relay — always deliverable under
+/// `make_relays`) and must catch up via `ensure_digest`/`SharedCommits`
+/// (`TestLedger`, see its module doc comment) despite being several periods
+/// behind its own locally-tracked state. Finally, two more ordinary rounds
+/// are run under the SAME star topology — this is the part that actually
+/// proves the relay resumed genuinely *relaying* traffic (`ActionType::Relay`
+/// -> `AgreementNetwork::relay`, `service.rs`), not just passively receiving
+/// its own catch-up: with leaf-to-leaf delivery still blocked, those rounds
+/// can ONLY commit if the relay forwards leaf votes/proposals on to the
+/// other leaves.
+///
+/// History: PR #935 (issue #825) attempted this exact scenario and found a
+/// genuine, reproducible ~10-20% flake — the relay's `next_round()`
+/// sometimes never advances across 40 retry attempts, even with identical
+/// evidence (the same pocketed certificate) re-injected repeatedly, ruling
+/// out simple message-loss/timing races (those would be expected to
+/// eventually succeed under retry). That investigation found and fixed two
+/// real harness bugs along the way (both already landed, see
+/// `test_ledger.rs`'s `ensure_block`/`ensure_validated_block` doc comments
+/// and `testing_network.rs`'s module doc comment) but did not close the
+/// flake, and did not land the test.
+///
+/// PR #935's own test code was never committed anywhere (confirmed via
+/// `git log`/`git show` on its branch, per this issue's investigation
+/// instructions) and could not be recovered, so this port is a from-scratch
+/// reconstruction from PR #935's PR description, not a byte-for-byte replay
+/// of the exact code that flaked. That reconstruction's FIRST version
+/// reproduced a 100%-deterministic (not merely 10-20%) failure: the relay's
+/// `next_round()` never advanced across 40 retries, identical to PR #935's
+/// symptom. Instrumenting `VoteAggregator::filter_vote` to log every
+/// CERT-step freshness-filter decision with the receiving node's thread id
+/// showed the relay's thread never even reached `filter_vote` for the
+/// replayed certificate — the message was being dropped at the network
+/// layer, before any `Player`/`Service` logic saw it at all. Root cause: a
+/// harness bug in the reconstructed test, not a production bug.
+/// `TestingNetwork::partition` and `TestingNetwork::make_relays` are
+/// independent delivery filters that must BOTH pass for a message to be
+/// delivered (mirrors go's `multicast` checking `partitionedNodes` and
+/// `relayNodes` as two separate gates — see `testing_network.rs`'s
+/// `multicast` doc comment). This test's healing step called
+/// `make_relays(&[relay])` WITHOUT first clearing the still-active
+/// `partition(&leaves)` from the earlier step, leaving the relay in a
+/// partition group of exactly one node — every message to it was silently
+/// blocked regardless of the relay topology also being armed. Calling
+/// `TestingNetwork::repair_all()` before `make_relays()` (clearing the
+/// stale partition) closed the 100%-deterministic failure entirely; this
+/// port has since been verified reliable across 15+ consecutive standalone
+/// runs and several full `algo-agreement`-suite-concurrent runs, this
+/// harness's established landing bar. No `Player`/`Service` divergence was
+/// found in the course of this investigation. Whether PR #935's actual
+/// (never-recovered) code hit this exact same partition/make_relays
+/// interaction, or a different bug that happens to produce the same
+/// symptom, cannot be determined with certainty since that code is gone —
+/// but this is a real, reproducible, now-fixed bug of exactly the kind PR
+/// #935's own writeup speculated about ("a logic bug in `make_relays`'s
+/// topology filter interacting badly with something else"), and the
+/// resulting test is fully reliable.
+#[test]
+fn certificate_does_not_stall_single_relay_five_node() {
+    let cluster = setup_agreement(5);
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    // Two ordinary rounds commit normally, full connectivity.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    let relay = 0usize;
+    let leaves = [1usize, 2, 3, 4];
+
+    // Partition the relay away from the leaves, and pocket cert votes so
+    // the leaves' round does not commit organically off live delivery —
+    // capturing the actual certificate lets it be replayed directly at the
+    // relay later, to prove `ensure_digest` catch-up rather than relying on
+    // the relay ever observing the live vote cascade.
+    cluster.network.partition(&leaves);
+    cluster.network.pocket_all_cert_votes();
+
+    trigger_global_timeout(&cluster, TimeoutType::Deadline); // filter timeout: cert votes pocketed, no round
+    round = expect_no_new_round(&cluster, round);
+    // Keep pocketing (and firing the deadline timeout, which forces
+    // successive period bumps for every node -- including the isolated
+    // relay, whose clock is fired identically) until a SINGLE period's
+    // worth of cert votes reaches quorum size. A raw pocketed-vote COUNT
+    // is not enough once a partition is layered on top of pocketing: each
+    // extra deadline fire needed to accumulate enough votes also bumps
+    // every leaf's period, so votes captured across different periods
+    // must not be silently pooled together into one "certificate" -- a
+    // cert bundle is only valid votes from the SAME (round, period).
+    let mut quorum_group: Vec<PocketedMessage> = Vec::new();
+    for _ in 0..20 {
+        let snapshot = cluster.network.cert_vote_pocket_snapshot();
+        if let Some(group) = largest_same_period_group(&snapshot, 4) {
+            quorum_group = group;
+            break;
+        }
+        // Deadline timeout: period fails to terminate (cert votes
+        // pocketed), every node moves on to the next period.
+        trigger_global_timeout(&cluster, TimeoutType::Deadline);
+        round = expect_no_new_round(&cluster, round);
+    }
+    let _ = cluster.network.stop_pocketing_cert_votes();
+    let pocketed = quorum_group;
+    assert!(
+        pocketed.len() >= 4,
+        "expected a single period's quorum's worth of cert votes to have \
+         been pocketed, got {} (best single-period group)",
+        pocketed.len()
+    );
+
+    // Replay while the partition is still active: delivered strictly
+    // within the leaves' group (the relay's own group is a singleton), so
+    // the leaves terminate their round with a real certificate the relay
+    // never saw any part of.
+    cluster.network.replay_all(&pocketed);
+    cluster.wait_for_quiet();
+
+    let leaf_round = Round(round.0 + 1);
+    for &i in &leaves {
+        assert_eq!(
+            cluster.ledgers[i].next_round(),
+            leaf_round,
+            "leaf {i} must have committed the round from the replayed certificate"
+        );
+    }
+    assert_eq!(
+        cluster.ledgers[relay].next_round(),
+        round,
+        "relay must NOT have advanced yet -- it was fully partitioned away \
+         from every vote and every payload"
+    );
+
+    // Heal under a star topology: the relay can be reached again, but
+    // leaves still cannot reach each other directly, only via the relay.
+    // Replay the SAME certificate once more so the relay receives it
+    // directly (source is a leaf, recipient is the relay -- always
+    // deliverable under `make_relays`) and must catch up via
+    // `ensure_digest`/`SharedCommits` despite being several periods behind
+    // its own locally-tracked state.
+    //
+    // `repair_all()` FIRST is required, not optional: `partition` and
+    // `make_relays` are independent filters that must BOTH pass for
+    // delivery (mirrors go's `multicast` checking `partitionedNodes` and
+    // `crownedNodes`/`relayNodes` separately) -- leaving the earlier
+    // `partition(&leaves)` active while also arming `make_relays` would put
+    // the relay in a partition group of one, silently blocking EVERY
+    // message to it regardless of the relay topology.
+    cluster.network.repair_all();
+    cluster.network.make_relays(&[relay]);
+    cluster.network.replay_all(&pocketed);
+    cluster.wait_for_quiet();
+
+    // `ensure_digest`'s catch-up runs on a background thread with its own
+    // bounded retry window (see `TestLedger::ensure_digest`'s doc
+    // comment); poll rather than asserting immediately, re-injecting the
+    // exact same evidence on every attempt (matching what PR #935's
+    // investigation exercised) up to a generous bound.
+    let mut caught_up = false;
+    for attempt in 0..40 {
+        if cluster.ledgers[relay].next_round() == leaf_round {
+            caught_up = true;
+            break;
+        }
+        if attempt > 0 {
+            cluster.network.replay_all(&pocketed);
+        }
+        cluster.wait_for_quiet();
+    }
+    assert!(
+        caught_up,
+        "relay failed to catch up to the leaves' round via ensure_digest \
+         after 40 retries (relay next_round={:?}, expected {:?})",
+        cluster.ledgers[relay].next_round(),
+        leaf_round
+    );
+    round = leaf_round;
+
+    // Prove the relay is genuinely RELAYING traffic, not just passively
+    // receiving its own catch-up: run two more ordinary rounds under the
+    // SAME star topology. With leaf-to-leaf delivery still blocked, these
+    // rounds can only commit if the relay actively forwards leaf
+    // votes/proposals on to the other leaves.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+    let _ = round;
+
+    cluster.network.repair_all();
+    cluster.shutdown();
+    // 2 initial ordinary rounds + 1 round committed by the leaves (via the
+    // replayed certificate) while the relay was still partitioned away +
+    // 2 final ordinary rounds under the healed star topology = 5 total
+    // round commits from `start_round` (the relay's catch-up to the
+    // leaves' round is not itself an additional commit -- it's the SAME
+    // round the leaves already committed).
+    sanity_check(&cluster, start_round, 5);
 }

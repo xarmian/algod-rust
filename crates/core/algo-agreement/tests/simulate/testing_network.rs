@@ -56,28 +56,46 @@
 // source or its recipient is a designated "relay" node, so two "leaf" nodes
 // can never reach each other directly) is ported here
 // (`TestingNetwork::make_relays`, covered by
-// `make_relays_drops_only_leaf_to_leaf_traffic` below), same treatment as
-// `crown` above: landed as a standalone, independently useful primitive
-// even though the scenario it was built for —
-// `TestAgreementCertificateDoesNotStallSingleRelay` — is NOT landed. A full
-// port was attempted (partition the relay away from 4 leaves, pocket+replay
+// `make_relays_drops_only_leaf_to_leaf_traffic` below). Its target scenario,
+// `TestAgreementCertificateDoesNotStallSingleRelay`, is now landed as
+// `certificate_does_not_stall_single_relay_five_node`
+// (`service_multi_node_test.rs`) after two investigation passes:
+//
+// The first pass (partition the relay away from 4 leaves, pocket+replay
 // cert votes so the leaves terminate their round without it, heal under the
 // star topology, replay the same certificate to the relay, require the
-// whole cluster to converge afterward) and found two real harness bugs
-// along the way (fixed regardless: `TestLedger::ensure_block`/
+// whole cluster to converge afterward) found two real harness bugs along
+// the way (fixed regardless: `TestLedger::ensure_block`/
 // `ensure_validated_block` publishing to `SharedCommits` AFTER advancing
 // `next_rnd` instead of before, a genuine race; and this scenario's own
 // cert-vote-pocketing needing same-`(round, period)` grouping, not just a
 // raw count, once a partition is layered on top of pocketing). Neither fix
-// closed a genuine residual flake (~10-20% across several 15-20-run
-// batches: the relay's `next_round()` never advances at all across 40
-// retry attempts, despite repeatedly re-injecting the exact same evidence
-// — ruling out simple message loss/timing races as the cause) — below this
-// harness's ~95%+ landing bar, so the scenario itself was not kept. See
-// `docs/phase17/parity_agreement.md`'s row for this test for the full
-// writeup; a future attempt should start from this primitive and the two
-// fixes above, with deeper `Player`/`Service`-thread instrumentation of a
-// captured failure to find the actual root cause.
+// closed a genuine-looking residual flake (~10-20% across several 15-20-run
+// batches: the relay's `next_round()` never advanced at all across 40 retry
+// attempts, despite repeatedly re-injecting the exact same evidence) and
+// the scenario itself was not landed.
+//
+// A second pass reconstructed the scenario from scratch (the first pass's
+// code was never committed and could not be recovered) and reproduced a
+// 100%-deterministic version of the same symptom. Instrumenting
+// `VoteAggregator::filter_vote` (temporarily) to log every CERT-step
+// freshness-filter decision by thread id showed the relay's thread never
+// even reached `filter_vote` for the replayed certificate — the message
+// was being dropped at the NETWORK layer, before any `Player`/`Service`
+// logic saw it. Root cause: `partition` and `make_relays` are independent
+// delivery filters that must BOTH pass (see `multicast` below) — the
+// reconstructed test's healing step called `make_relays(&[relay])` without
+// first clearing the earlier `partition(&leaves)`, leaving the relay in a
+// partition group of one that silently blocked everything regardless of
+// the relay topology. Calling `TestingNetwork::repair_all()` before
+// `make_relays()` closed the deterministic failure entirely; the resulting
+// test has been verified reliable across 15+ consecutive standalone runs
+// plus several full-`algo-agreement`-suite-concurrent runs. No
+// `Player`/`Service` divergence was found. See
+// `certificate_does_not_stall_single_relay_five_node`'s own doc comment
+// (`service_multi_node_test.rs`) for the full writeup, including the
+// caveat that the first pass's un-recovered code may or may not have hit
+// this exact same bug.
 //
 // `intercept` (arbitrary per-message rewriting/redirection) is still not
 // ported — no scenario landed so far needed anything beyond the structured
@@ -387,6 +405,20 @@ impl TestingNetwork {
             .as_ref()
             .map(Vec::len)
             .unwrap_or(0)
+    }
+
+    /// Non-destructive peek at everything pocketed so far by
+    /// [`Self::pocket_all_cert_votes`], without stopping. No go equivalent
+    /// (see [`Self::cert_vote_pocket_len`]'s doc comment) -- lets a caller
+    /// inspect the actual captured votes (e.g. group them by `(round,
+    /// period)`) before deciding whether to keep pocketing.
+    pub fn cert_vote_pocket_snapshot(&self) -> Vec<PocketedMessage> {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .cert_vote_pocket
+            .clone()
+            .unwrap_or_default()
     }
 
     /// Mirrors go's `closeFn` returned by `pocketAllCertVotes`, plus
