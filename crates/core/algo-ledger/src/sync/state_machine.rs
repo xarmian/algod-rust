@@ -172,6 +172,46 @@ pub struct SyncProgress {
     pub started_at: Option<Instant>,
     /// Estimated time remaining for the current phase, if calculable.
     pub eta: Option<Duration>,
+
+    // -- Granular catchpoint-catchup counters (issue #941) --------------
+    //
+    // Mirror go-algorand's `catchup.CatchpointCatchupStats`
+    // (`catchup/catchpointService.go`), surfaced by `node.go`'s
+    // `catchpointCatchupStatus` on `StatusReport`'s eight
+    // `CatchpointCatchup*` fields (`daemon/algod/api/server/v2/handlers.go`'s
+    // status handler copies them verbatim into `GET /v2/status`'s
+    // `catchpoint-total-accounts`/etc. JSON fields). Populated during the
+    // `ImportingLedger` phase (from `catchpoint::importer::import_catchpoint_file_with_progress`,
+    // mirroring go's `updateLedgerFetcherProgress`), the `VerifyingLedger`
+    // phase (mirroring go's `updateVerifiedCounts`), and the
+    // `DownloadingLookback` phase (mirroring go's
+    // `updateBlockRetrievalStatistics`). All zero before/outside those
+    // phases, exactly like go's stats struct before `CatchpointCatchupService`
+    // has made progress.
+    /// Total accounts in the catchpoint file, from the file header
+    /// (go: `CatchpointCatchupStats.TotalAccounts`).
+    pub catchpoint_total_accounts: u64,
+    /// Accounts imported into the local database so far
+    /// (go: `CatchpointCatchupStats.ProcessedAccounts`).
+    pub catchpoint_processed_accounts: u64,
+    /// Accounts confirmed against the rebuilt Merkle trie during verification
+    /// (go: `CatchpointCatchupStats.VerifiedAccounts`).
+    pub catchpoint_verified_accounts: u64,
+    /// Total key-value ("box") entries in the catchpoint file, from the file
+    /// header (go: `CatchpointCatchupStats.TotalKVs`).
+    pub catchpoint_total_kvs: u64,
+    /// Key-value entries imported into the local database so far
+    /// (go: `CatchpointCatchupStats.ProcessedKVs`).
+    pub catchpoint_processed_kvs: u64,
+    /// Key-value entries confirmed against the rebuilt Merkle trie during
+    /// verification (go: `CatchpointCatchupStats.VerifiedKVs`).
+    pub catchpoint_verified_kvs: u64,
+    /// Total lookback blocks that need to be downloaded/backfilled after the
+    /// catchpoint round (go: `CatchpointCatchupStats.TotalBlocks`).
+    pub catchpoint_total_blocks: u64,
+    /// Lookback blocks successfully downloaded and stored so far
+    /// (go: `CatchpointCatchupStats.AcquiredBlocks`).
+    pub catchpoint_acquired_blocks: u64,
 }
 
 impl Default for SyncProgress {
@@ -183,6 +223,14 @@ impl Default for SyncProgress {
             elapsed: Duration::ZERO,
             started_at: None,
             eta: None,
+            catchpoint_total_accounts: 0,
+            catchpoint_processed_accounts: 0,
+            catchpoint_verified_accounts: 0,
+            catchpoint_total_kvs: 0,
+            catchpoint_processed_kvs: 0,
+            catchpoint_verified_kvs: 0,
+            catchpoint_total_blocks: 0,
+            catchpoint_acquired_blocks: 0,
         }
     }
 }
