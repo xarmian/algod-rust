@@ -722,7 +722,10 @@ fn repack(
         return Err(e);
     }
 
-    if let Err(e) = std::fs::rename(&temp_path, out_path) {
+    // `move_file` (issue #971) falls back to copy+delete if `temp_path` and
+    // `out_path` ever end up on different filesystems (EXDEV), instead of
+    // failing outright the way a bare `std::fs::rename` would.
+    if let Err(e) = super::fsutil::move_file(&temp_path, out_path) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(CatchpointError::Io(e));
     }
