@@ -700,6 +700,30 @@ pub trait AvmContext {
         true
     }
 
+    /// Check if a raw 32-byte address is a *named* reference: the current
+    /// transaction's own sender, or a member of its `Accounts`/`Access`
+    /// array. This is the narrow subset of [`Self::is_account_available`]'s
+    /// checks that go-algorand's `mutableAccountReference`
+    /// (`data/transactions/logic/eval.go`) treats as always resolvable to a
+    /// real `txn.Accounts` position (`IndexByAddress` succeeds), as opposed
+    /// to the "available via some other path" sentinel that only becomes
+    /// acceptable for a *mutating* local-state op
+    /// (`app_local_put`/`app_local_del`) at `sharedResourcesVersion` (v9+).
+    /// Unlike `is_account_available`, this deliberately excludes
+    /// created-app addresses, foreign-apps addresses, group-shared
+    /// accounts, the current app's own address, and simulation's
+    /// unnamed-resource relaxation -- all of those are only valid mutation
+    /// targets from v9 onward, matched by the version gate the caller
+    /// applies alongside this check (`resolve_mutable_account`).
+    ///
+    /// Defaults to `false` (conservative — a context that doesn't track
+    /// group resources at all has no sender/`Accounts` array to consult).
+    /// `LedgerAvmContext` overrides this with the real check.
+    fn is_named_account(&self, addr: &[u8; 32]) -> bool {
+        let _ = addr;
+        false
+    }
+
     /// Check if an asset holding (account+asset cross-product) is available
     /// under the transaction group's resource-sharing rules (AVM v9+,
     /// `sharedResourcesVersion`). Matches go-algorand's `allowsHolding`
