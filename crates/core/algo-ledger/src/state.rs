@@ -205,32 +205,18 @@ impl LedgerState {
 
     /// Compute schema-aware minimum balance for an account.
     ///
-    /// Extends the flat min-balance with per-app schema costs:
-    /// - Local state schema costs for apps the account has opted into.
-    /// - Global state schema costs for apps the account has created.
-    ///
-    /// Flat costs (APP_FLAT_PARAMS_MIN_BALANCE per created app,
-    /// APP_FLAT_OPT_IN_MIN_BALANCE per opted-in app) are already included
-    /// via the base `min_balance()`.
-    pub fn min_balance_with_state(&self, addr: &Address, account: &AccountData) -> u64 {
-        let flat = crate::params::min_balance(account);
-        let mut extra: u64 = 0;
-
-        // Opted-in apps: add local state schema cost.
-        for ((a, _app_id), local_state) in &self.app_local_states {
-            if a == addr {
-                extra += schema_min_balance(&local_state.schema);
-            }
-        }
-
-        // Created apps: add global state schema cost.
-        for app in self.app_params.values() {
-            if app.creator == *addr {
-                extra += schema_min_balance(&app.global_state_schema);
-            }
-        }
-
-        flat + extra
+    /// Matches go-algorand's `AccountData.MinBalance` (`data/basics/
+    /// userBalance.go`), which derives the schema-driven MBR cost *once*
+    /// from the account's own aggregate `total_app_schema` field. That
+    /// field is maintained incrementally by every op that changes an
+    /// app's global/local schema footprint on this account (create,
+    /// update/resize, opt-in, close-out, delete), so it already reflects
+    /// exactly the created + opted-in schemas below -- do NOT also rescan
+    /// `app_local_states`/`app_params` and re-add their schema cost here,
+    /// that would double-count it on top of `crate::params::min_balance`'s
+    /// own use of `total_app_schema` (see issue #989).
+    pub fn min_balance_with_state(&self, _addr: &Address, account: &AccountData) -> u64 {
+        crate::params::min_balance(account)
     }
 
     // ---- Snapshot / Restore ----
@@ -1930,9 +1916,19 @@ mod tests {
         let mut state = LedgerState::new();
         let addr = Address([1u8; 32]);
 
+        let local_schema = StateSchema {
+            num_uint: 2,
+            num_byte_slice: 1,
+        };
+
+        // `total_app_schema` is the single source of truth for schema cost
+        // (go-algorand's `AccountData.TotalAppSchema` / issue #989) --
+        // it must reflect the opted-in app's local schema exactly as the
+        // real opt-in path (apply.rs) maintains it.
         let account = AccountData {
             micro_algos: 10_000_000,
             total_apps_opted_in: 1,
+            total_app_schema: local_schema.clone(),
             ..Default::default()
         };
         state.accounts.insert(addr, account.clone());
@@ -1941,10 +1937,7 @@ mod tests {
         state.app_local_states.insert(
             (addr, 100),
             AppLocalState {
-                schema: StateSchema {
-                    num_uint: 2,
-                    num_byte_slice: 1,
-                },
+                schema: local_schema,
                 key_value: BTreeMap::new(),
             },
         );
@@ -1955,6 +1948,74 @@ mod tests {
         // Schema: 3 entries * 25_000 + 2 * 3_500 + 1 * 25_000 = 75_000 + 7_000 + 25_000 = 107_000
         // Total: 307_000
         assert_eq!(mb, 200_000 + 107_000);
+    }
+
+    #[test]
+    fn test_min_balance_with_state_no_double_count() {
+        // Issue #989: `min_balance_with_state` must not add schema cost on
+        // top of the flat `crate::params::min_balance()`, which already
+        // folds in the account's aggregate `total_app_schema` (go-algorand's
+        // single source of truth, `AccountData.MinBalance` in
+        // data/basics/userBalance.go). This pins the single-counted result
+        // for an account that both created an app (global schema) and
+        // opted into another (local schema) -- mirroring how
+        // `total_app_schema` is actually maintained by create/opt-in.
+        use std::collections::BTreeMap;
+
+        let mut state = LedgerState::new();
+        let addr = Address([9u8; 32]);
+        let created_app_id = 100u64;
+        let opted_in_app_id = 200u64;
+
+        let global_schema = StateSchema {
+            num_uint: 2,
+            num_byte_slice: 1,
+        };
+        let local_schema = StateSchema {
+            num_uint: 1,
+            num_byte_slice: 2,
+        };
+
+        // total_app_schema is the aggregate of the created app's global
+        // schema plus the opted-in app's local schema, exactly as
+        // apply.rs's create_application/opt-in paths maintain it.
+        let account = AccountData {
+            micro_algos: 10_000_000,
+            total_created_apps: 1,
+            total_apps_opted_in: 1,
+            total_app_schema: StateSchema {
+                num_uint: global_schema.num_uint + local_schema.num_uint,
+                num_byte_slice: global_schema.num_byte_slice + local_schema.num_byte_slice,
+            },
+            ..Default::default()
+        };
+        state.accounts.insert(addr, account.clone());
+
+        state.app_params.insert(
+            created_app_id,
+            AppParams {
+                creator: addr,
+                global_state_schema: global_schema.clone(),
+                ..Default::default()
+            },
+        );
+        state.app_local_states.insert(
+            (addr, opted_in_app_id),
+            AppLocalState {
+                schema: local_schema.clone(),
+                key_value: BTreeMap::new(),
+            },
+        );
+
+        let mb = state.min_balance_with_state(&addr, &account);
+
+        // go-algorand's single-counted formula (AccountData.MinBalance):
+        // base 100_000 + 1 created app * 100_000 + 1 opted-in app * 100_000
+        // + schema_cost(total_app_schema = 3 uint, 3 byte-slice)
+        // schema_cost: 6 entries * 25_000 + 3 * 3_500 + 3 * 25_000
+        //            = 150_000 + 10_500 + 75_000 = 235_500
+        let expected = 100_000 + 100_000 + 100_000 + 235_500;
+        assert_eq!(mb, expected);
     }
 
     #[test]
