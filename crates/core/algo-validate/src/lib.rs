@@ -24,6 +24,7 @@ pub mod fee;
 pub mod merkle;
 pub mod rules;
 pub mod signature;
+pub mod verified_txn_cache;
 
 pub use block::{
     contents_match_header, validate_block, BlockValidationError, BlockValidationResult,
@@ -50,4 +51,7 @@ pub use signature::{
     validate_pqsig_scheme, verify_auth_addr_sender_diff, verify_group_logicsig_size,
     verify_heartbeat_proof, verify_single_sig, verify_transaction_signature,
     verify_transaction_signature_with_tracer,
+};
+pub use verified_txn_cache::{
+    GroupContext, VerificationContext, VerifiedTransactionCache, VerifiedTxnCacheError,
 };
