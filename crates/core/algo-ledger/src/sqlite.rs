@@ -6128,21 +6128,13 @@ impl LedgerStore for SqliteLedger {
 
     // ---- Min balance ----
 
-    fn min_balance_with_state(&self, addr: &Address, account: &AccountData) -> u64 {
-        let flat = crate::params::min_balance(account);
-        let mut extra: u64 = 0;
-
-        // Opted-in apps: add local state schema cost.
-        for (_app_id, local_state) in self.app_local_states_for_addr(addr) {
-            extra += crate::state::schema_min_balance(&local_state.schema);
-        }
-
-        // Created apps: add global state schema cost.
-        for app in self.app_params_created_by(addr) {
-            extra += crate::state::schema_min_balance(&app.global_state_schema);
-        }
-
-        flat + extra
+    fn min_balance_with_state(&self, _addr: &Address, account: &AccountData) -> u64 {
+        // Matches go-algorand's `AccountData.MinBalance`: the schema cost
+        // is derived once from the account's own aggregate
+        // `total_app_schema` field via `crate::params::min_balance`. Do
+        // NOT also rescan `app_local_states_for_addr`/`app_params_created_by`
+        // and re-add their schema cost -- that double-counts it (issue #989).
+        crate::params::min_balance(account)
     }
 
     // ---- Trie integration ----
@@ -8633,8 +8625,18 @@ mod tests {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let addr = Address([10u8; 32]);
 
+        let local_schema = StateSchema {
+            num_uint: 2,
+            num_byte_slice: 1,
+        };
+
+        // `total_app_schema` is the single source of truth for schema cost
+        // (go-algorand's `AccountData.TotalAppSchema` / issue #989) -- it
+        // must reflect the opted-in app's local schema exactly as the real
+        // opt-in path maintains it.
         let account = AccountData {
             total_apps_opted_in: 1,
+            total_app_schema: local_schema.clone(),
             ..Default::default()
         };
         ledger.set_account(&addr, account.clone());
@@ -8643,10 +8645,7 @@ mod tests {
             &addr,
             100,
             AppLocalState {
-                schema: StateSchema {
-                    num_uint: 2,
-                    num_byte_slice: 1,
-                },
+                schema: local_schema,
                 key_value: BTreeMap::new(),
             },
         );
