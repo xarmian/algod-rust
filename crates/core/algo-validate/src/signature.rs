@@ -930,6 +930,24 @@ pub fn verify_transaction_signature_with_tracer(
     let has_pqsig = stx_pqsig_present;
     let count = has_sig as u8 + has_msig as u8 + has_lsig as u8 + has_pqsig as u8;
     if count == 0 {
+        // Special case (Go: `checkTxnSigTypeCounts`, `verify/txn.go:344`):
+        // the special state-proof sender address may issue a state-proof
+        // transaction with NO signature at all -- well-formedness
+        // (`rules.rs`'s `txn_type == "stpf"` branch) already guarantees such
+        // a transaction can pay no fee and carries no other interesting
+        // fields besides the state-proof payload itself, so there is
+        // nothing here to authenticate with a conventional signature; the
+        // proof's own cryptographic validity is checked separately at
+        // block-apply time (`apply_stateproof.rs`). Found missing during
+        // issue #814's live mixed-cluster verification: without this, a
+        // genuine zero-signature `StateProofTx` -- whether the node's own
+        // locally-built proof or one gossiped in from a peer -- was
+        // universally rejected as "no signature", even after the pool's
+        // separate blanket stpf-rejection (fixed alongside this) was
+        // removed.
+        if stx.txn.sender == Address::STATE_PROOF_SENDER && stx.txn.txn_type == "stpf" {
+            return Ok(());
+        }
         return Err(AlgoError::Validation {
             message: "transaction has no signature (no sig, msig, lsig, or pqsig)".into(),
         });
@@ -1375,6 +1393,96 @@ mod tests {
     #[test]
     fn verify_no_sig_errors() {
         let txn = minimal_pay_txn(Address([0x01; 32]));
+        let stx = SignedTransaction {
+            txn,
+            sig: [0u8; 64],
+            msig: None,
+            lsig: None,
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        let err = verify_sig(&stx).unwrap_err();
+        assert!(err.to_string().contains("no signature"));
+    }
+
+    /// Issue #814 live-verification fix: a genuine zero-signature state-proof
+    /// transaction (sender == `Address::STATE_PROOF_SENDER`, type "stpf") must
+    /// be *accepted* with no signature at all -- mirroring go's
+    /// `checkTxnSigTypeCounts` special case (`verify/txn.go:344`). Before
+    /// this fix, `verify_no_sig_errors` above (a different sender/type) would
+    /// have covered this case identically and wrongly rejected it too.
+    #[test]
+    fn verify_zero_sig_state_proof_txn_is_accepted() {
+        let txn = Transaction {
+            txn_type: "stpf".into(),
+            sender: Address::STATE_PROOF_SENDER,
+            fee: 0,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            ..Default::default()
+        };
+        let stx = SignedTransaction {
+            txn,
+            sig: [0u8; 64],
+            msig: None,
+            lsig: None,
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        assert!(
+            verify_sig(&stx).is_ok(),
+            "a zero-signature stpf transaction from the state-proof sender must be accepted"
+        );
+    }
+
+    /// The zero-signature exemption above must be narrowly scoped: a
+    /// zero-signature transaction from an ordinary sender (even one with an
+    /// otherwise-identical shape) must still be rejected exactly as
+    /// `verify_no_sig_errors` proves for the "pay" case.
+    #[test]
+    fn verify_zero_sig_wrong_sender_still_rejected() {
+        let txn = Transaction {
+            txn_type: "stpf".into(),
+            sender: Address([0x01; 32]), // not STATE_PROOF_SENDER
+            fee: 0,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            ..Default::default()
+        };
+        let stx = SignedTransaction {
+            txn,
+            sig: [0u8; 64],
+            msig: None,
+            lsig: None,
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        let err = verify_sig(&stx).unwrap_err();
+        assert!(err.to_string().contains("no signature"));
+    }
+
+    /// Nor does the exemption widen to non-stpf transaction types from the
+    /// state-proof sender address.
+    #[test]
+    fn verify_zero_sig_wrong_type_still_rejected() {
+        let txn = Transaction {
+            txn_type: "pay".into(),
+            sender: Address::STATE_PROOF_SENDER,
+            fee: 0,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            receiver: Address([0x42; 32]),
+            ..Default::default()
+        };
         let stx = SignedTransaction {
             txn,
             sig: [0u8; 64],

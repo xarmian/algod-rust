@@ -1567,6 +1567,15 @@ pub struct BonusOverride {
     pub decay_interval: u64,
 }
 
+/// `serde(default = "default_true")` helper for
+/// [`ConsensusParamsOverride`]'s `enable_fee_pooling`/
+/// `enable_logicsig_size_pooling` fields -- see their doc comments and
+/// [`ConsensusParamsOverride`]'s own doc comment for why a non-zero default
+/// is required for these two fields specifically.
+fn default_true() -> bool {
+    true
+}
+
 /// JSON-deserializable mirror of go-algorand's `config.ConsensusParams`
 /// (`config/consensus.go`), used only for parsing/writing a
 /// `consensus.json` override entry. Field names match go's JSON tags
@@ -1591,6 +1600,17 @@ pub struct BonusOverride {
 /// doesn't yet model) are silently ignored rather than rejected — this is
 /// not `deny_unknown_fields` — so a real go-algorand-authored file that also
 /// sets fields algod-rust doesn't yet track still loads instead of erroring.
+///
+/// `enable_fee_pooling` and `enable_logicsig_size_pooling` are the one
+/// deliberate exception to the zero-valued-default rule above: go-algorand
+/// removed both fields from its own live `ConsensusParams` struct once they
+/// became permanently on (v28+ / v40+ respectively), so a real
+/// go-algorand-authored `consensus.json` (e.g. from
+/// `tools/vfuture-consensus-override`) never carries either key. Defaulting
+/// them to Rust's zero value (`false`) would silently disable both features
+/// for every version this repo targets whenever such a file overrides that
+/// version — found live during issue #814's mixed-cluster verification.
+/// Both carry an explicit `#[serde(default = "default_true")]` instead.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ConsensusParamsOverride {
@@ -1609,6 +1629,15 @@ pub struct ConsensusParamsOverride {
     pub max_absolute_extra_program_pages: u32,
     pub max_absolute_total_arg_len: usize,
     pub per_byte_txn_surcharge: u64,
+    /// Go's own `config.ConsensusParams` dropped `EnableFeePooling` once fee
+    /// pooling became permanently on (v28+), so a `consensus.json` built by
+    /// marshaling a real go-algorand `ConsensusParams` (e.g.
+    /// `tools/vfuture-consensus-override`) never carries this key. Default
+    /// to `true` rather than the container's zero-value default so such a
+    /// full-struct override doesn't silently disable fee pooling on every
+    /// version this repo targets (all >= v28) -- see issue #814's
+    /// live-verification session.
+    #[serde(default = "default_true")]
     pub enable_fee_pooling: bool,
     pub support_tx_groups: bool,
     pub support_transaction_leases: bool,
@@ -1624,7 +1653,11 @@ pub struct ConsensusParamsOverride {
     #[serde(rename = "EnablePQSchemeFalcon1024")]
     pub enable_pq_scheme_falcon1024: bool,
     pub enable_select_f128: bool,
-    #[serde(rename = "EnableLogicSigSizePooling")]
+    /// Same rationale as `enable_fee_pooling` above: go removed
+    /// `EnableLogicSigSizePooling` from its live struct once it became
+    /// permanently on (v40+), so it is never present in a real
+    /// go-algorand-authored `consensus.json`. Default to `true`.
+    #[serde(rename = "EnableLogicSigSizePooling", default = "default_true")]
     pub enable_logicsig_size_pooling: bool,
     #[serde(rename = "EnableLogicSigCostPooling")]
     pub enable_logicsig_cost_pooling: bool,

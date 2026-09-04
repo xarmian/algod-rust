@@ -817,11 +817,26 @@ impl StateProofRuntime {
             }
             let entry = self.provers.get_mut(&round).expect("round from provers keys");
             if !entry.collector.prover.ready() {
+                tracing::debug!(
+                    round,
+                    signed_weight = entry.collector.prover.signed_weight(),
+                    proven_weight = entry.collector.prover.proven_weight,
+                    "stateproof: try_build: round not ready yet, stopping ascending scan"
+                );
                 break;
             }
             match entry.collector.prover.create_proof() {
                 Ok(proof) => out.push((round, proof, entry.message.clone())),
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!(
+                        round,
+                        error = %e,
+                        signed_weight = entry.collector.prover.signed_weight(),
+                        proven_weight = entry.collector.prover.proven_weight,
+                        "stateproof: try_build: create_proof failed, stopping ascending scan"
+                    );
+                    break;
+                }
             }
         }
         out
@@ -1143,6 +1158,87 @@ mod tests {
                 .unwrap();
         let prover = Prover::make_prover(msg, round, weight, participants, part_tree, 0).unwrap();
         (SigCollector::new(prover, addr_to_pos), secrets_list)
+    }
+
+    // ── StateProofRuntime: try_build's ascending-scan + prune interaction
+    //    (issue #814 live mixed-cluster verification) ──────────────────
+
+    /// `try_build` scans `provers` in ascending round order and stops at the
+    /// first not-ready round, mirroring go's `tryBroadcast` -- correct when
+    /// state proofs genuinely can't skip an interval. But it doesn't handle
+    /// a real multi-node race: some OTHER online signer can independently
+    /// gather enough weight and commit the earlier round's `StateProofTx`
+    /// first, and this node's own local prover for that round then never
+    /// gathers more signatures (peers stop broadcasting for an
+    /// already-superseded round) -- so without pruning, `try_build` stays
+    /// wedged on the stale round forever, even once a LATER round's prover
+    /// has gathered full weight. `prune(retain_round)` (fed by the ledger's
+    /// own `StateProofNextRound`, exactly like go's
+    /// `OnPrepareVoterCommit`/`trimProversCache`) is what breaks the wedge.
+    #[test]
+    fn try_build_is_wedged_by_a_stale_round_until_pruned() {
+        let mut rt = StateProofRuntime::new();
+
+        // Round 16: only 1 of 3 participants signed (not ready) -- stands in
+        // for "this node lost the race; the network already committed round
+        // 16's real proof via another signer, so no more round-16 sigs will
+        // ever arrive here".
+        let (mut early_collector, early_secrets) = build_collector(16, [1u8; 32], 3, 100);
+        early_collector
+            .insert_sig(
+                Address([1u8; 32]),
+                early_secrets[0].get_signer(16).sign_bytes(&[1u8; 32]).unwrap(),
+                true,
+            )
+            .unwrap();
+        assert!(!early_collector.prover.ready(), "only 1/3 weight signed");
+        rt.provers.insert(
+            16,
+            ProverEntry {
+                collector: early_collector,
+                message: StateProofMessage::default(),
+            },
+        );
+
+        // Round 32: all 3 participants signed -- genuinely ready to build.
+        let (mut late_collector, late_secrets) = build_collector(32, [2u8; 32], 3, 100);
+        for (i, secrets) in late_secrets.iter().enumerate() {
+            late_collector
+                .insert_sig(
+                    Address([(i as u8) + 1; 32]),
+                    secrets.get_signer(32).sign_bytes(&[2u8; 32]).unwrap(),
+                    true,
+                )
+                .unwrap();
+        }
+        assert!(late_collector.prover.ready(), "3/3 weight signed");
+        rt.provers.insert(
+            32,
+            ProverEntry {
+                collector: late_collector,
+                message: StateProofMessage::default(),
+            },
+        );
+
+        // Before pruning: the ascending scan hits round 16 first, finds it
+        // not ready, and stops -- round 32 is never even attempted, despite
+        // being fully ready.
+        assert!(
+            rt.try_build().is_empty(),
+            "must not build anything while the stale round-16 entry blocks the scan"
+        );
+
+        // The ledger reports round 32 as the next one still needed (i.e.
+        // round 16's real proof already landed on-chain via another
+        // signer) -- prune discards the now-moot round-16 entry.
+        rt.prune(32);
+        assert!(!rt.provers.contains_key(&16), "stale round must be pruned");
+        assert!(rt.provers.contains_key(&32), "still-needed round must survive");
+
+        // Now the ascending scan reaches round 32 immediately and builds it.
+        let built = rt.try_build();
+        assert_eq!(built.len(), 1, "round 32 must now build");
+        assert_eq!(built[0].0, 32);
     }
 
     #[test]

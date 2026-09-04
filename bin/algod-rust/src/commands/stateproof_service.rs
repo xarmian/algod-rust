@@ -409,6 +409,47 @@ fn run_loop(
             }
         }
 
+        // 1b. Prune stale in-progress provers before attempting to build.
+        // `StateProofRuntime::try_build` scans `self.provers` in ascending
+        // round order and stops at the first round that isn't ready yet
+        // (state proofs are chained -- round N+interval's proof can't be
+        // submitted before round N's), mirroring go's `tryBroadcast`. But
+        // unlike a single-node testbed, a real multi-node network races: any
+        // OTHER online signer can independently gather enough weight and
+        // commit round N's `StateProofTx` first, advancing the ledger's
+        // `StateProofNextRound` past N without this node's own local prover
+        // for N ever reaching its own weight threshold. Go's worker handles
+        // this via `OnPrepareVoterCommit`/`trimProversCache`, invoked on
+        // every new block; this is the equivalent, invoked once per loop
+        // iteration from the ledger's own committed state. Without it, a
+        // single lost race permanently wedges `try_build`'s ascending scan
+        // on a round that will now never gather more signatures (peers stop
+        // broadcasting for an already-superseded round), silently blocking
+        // every later round's build forever. Found live during issue #814's
+        // shortened-`StateProofInterval` mixed-cluster verification: the
+        // three go-algorand relays (90% combined stake) routinely built and
+        // committed real `StateProofTx`s among themselves before the Rust
+        // node (10% stake, plus real signature-gossip propagation delay)
+        // ever finished gathering its own.
+        {
+            let needed_round = {
+                let l = match ledger.lock() {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                l.get_block_header(current.0)
+                    .ok()
+                    .flatten()
+                    .map(|h| algo_ledger::block_header::state_proof_next_round(&h.state_proof_tracking))
+                    .unwrap_or(0)
+            };
+            if needed_round > 0 {
+                if let Ok(mut rt) = runtime.lock() {
+                    rt.prune(needed_round);
+                }
+            }
+        }
+
         // 2. Try to build+submit any round that's now ready.
         let built = {
             let mut rt = match runtime.lock() {
