@@ -373,17 +373,39 @@ impl LedgerReader for TestLedger {
 
 impl LedgerWriter for TestLedger {
     fn ensure_block(&self, block: &Block, cert: &Certificate) {
+        // Publish to `SharedCommits` BEFORE advancing `next_rnd`
+        // (`record_block_locked`), not after — see this method's sibling
+        // `ensure_validated_block`'s doc note and `SharedCommits`'s own
+        // doc comment for why the ordering matters: another thread that
+        // observes `next_round()` advance must never be able to run
+        // `ensure_digest` and find `SharedCommits` still empty for that
+        // round.
+        self.publish_commit(block.clone(), cert.clone());
         let mut s = self.state.lock().unwrap();
         TestLedger::record_block_locked(&mut s, block.clone(), cert.clone());
-        drop(s);
-        self.publish_commit(block.clone(), cert.clone());
     }
 
     fn ensure_validated_block(&self, vb: &dyn ValidatedBlock, cert: &Certificate) {
+        // Same publish-before-advance ordering as `ensure_block` above —
+        // found while investigating a real, harness-only flake in
+        // `certificate_does_not_stall_single_relay_five_node`
+        // (`service_multi_node_test.rs`): the OLD ordering (advance
+        // `next_rnd` first, publish to `SharedCommits` after dropping the
+        // state lock) left a genuine, if usually narrow, window in which
+        // another node's `next_round()`-driven observation of "this round
+        // committed" could win a race against this node's own
+        // `publish_commit` — so a peer's `ensure_digest` catch-up fetch,
+        // triggered right after seeing that, could poll `SharedCommits`
+        // before the entry existed. `ensure_digest`'s own retry loop
+        // (`Duration::from_secs(5)`) usually papers over a narrow window,
+        // but under real thread contention (5 live `Service` instances
+        // competing for CPU) the window was observed to occasionally
+        // outlast it, permanently stalling the catching-up node for the
+        // rest of that test run. Publishing first makes the race
+        // impossible instead of just unlikely.
+        self.publish_commit(vb.block().clone(), cert.clone());
         let mut s = self.state.lock().unwrap();
         TestLedger::record_block_locked(&mut s, vb.block().clone(), cert.clone());
-        drop(s);
-        self.publish_commit(vb.block().clone(), cert.clone());
     }
 
     /// Mirrors go-algorand's `EnsureDigest`: the player reached vote quorum

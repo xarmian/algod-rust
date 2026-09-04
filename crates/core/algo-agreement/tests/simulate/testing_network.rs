@@ -52,10 +52,37 @@
 // same as `pocket_all_compound` was left in place after `TestAgreementSlow
 // Payloads*` proved intractable).
 //
-// `makeRelays`/`intercept` (relay/star topology, and arbitrary message
-// rewriting) are still not ported — no scenario landed in this pass needed
-// them; a follow-up can add them the same way once one does (e.g.
-// `CertificateDoesNotStallSingleRelay`'s `makeRelays`).
+// `makeRelays` (star/relay topology — a message is delivered only if its
+// source or its recipient is a designated "relay" node, so two "leaf" nodes
+// can never reach each other directly) is ported here
+// (`TestingNetwork::make_relays`, covered by
+// `make_relays_drops_only_leaf_to_leaf_traffic` below), same treatment as
+// `crown` above: landed as a standalone, independently useful primitive
+// even though the scenario it was built for —
+// `TestAgreementCertificateDoesNotStallSingleRelay` — is NOT landed. A full
+// port was attempted (partition the relay away from 4 leaves, pocket+replay
+// cert votes so the leaves terminate their round without it, heal under the
+// star topology, replay the same certificate to the relay, require the
+// whole cluster to converge afterward) and found two real harness bugs
+// along the way (fixed regardless: `TestLedger::ensure_block`/
+// `ensure_validated_block` publishing to `SharedCommits` AFTER advancing
+// `next_rnd` instead of before, a genuine race; and this scenario's own
+// cert-vote-pocketing needing same-`(round, period)` grouping, not just a
+// raw count, once a partition is layered on top of pocketing). Neither fix
+// closed a genuine residual flake (~10-20% across several 15-20-run
+// batches: the relay's `next_round()` never advances at all across 40
+// retry attempts, despite repeatedly re-injecting the exact same evidence
+// — ruling out simple message loss/timing races as the cause) — below this
+// harness's ~95%+ landing bar, so the scenario itself was not kept. See
+// `docs/phase17/parity_agreement.md`'s row for this test for the full
+// writeup; a future attempt should start from this primitive and the two
+// fixes above, with deeper `Player`/`Service`-thread instrumentation of a
+// captured failure to find the actual root cause.
+//
+// `intercept` (arbitrary per-message rewriting/redirection) is still not
+// ported — no scenario landed so far needed anything beyond the structured
+// filters above (`partition`/`crown`/`make_relays`/the pocket family); a
+// follow-up can add it the same way once one does.
 //
 // A real limitation found while porting, NOT fixed here:
 // `pocketAllCompound` (used by go's `TestAgreementSlowPayloadsPreDeadline`/
@@ -156,6 +183,14 @@ struct NetworkState {
     /// `crownedNodes`.
     crowned: Option<Vec<bool>>,
 
+    /// `Some(flags)` while `make_relays` is active: `flags[i]` is true if
+    /// node `i` is a "relay". A message is delivered between two nodes only
+    /// if at least one of them (source or recipient) is a relay — so two
+    /// non-relay ("leaf") nodes can never reach each other directly, only
+    /// through a relay. Mirrors go's `relayNodes` ("star topology with the
+    /// given nodes at the center").
+    relay_nodes: Option<Vec<bool>>,
+
     /// Bounded FIFO of the most recently, normally-delivered (i.e. not
     /// pocketed) `PROPOSAL_PAYLOAD_TAG` broadcasts — a harness-only
     /// payload-catch-up mechanism with no go equivalent, because go's real
@@ -221,6 +256,7 @@ impl TestingNetwork {
                 compound_pocket: None,
                 partitioned: None,
                 crowned: None,
+                relay_nodes: None,
                 payload_history: Vec::new(),
             }),
         })
@@ -300,6 +336,7 @@ impl TestingNetwork {
         state.compound_pocket = None;
         state.partitioned = None;
         state.crowned = None;
+        state.relay_nodes = None;
     }
 
     /// Re-multicast every proposal-payload broadcast currently held in
@@ -449,6 +486,25 @@ impl TestingNetwork {
             flags[i] = true;
         }
         state.crowned = Some(flags);
+    }
+
+    /// Mirrors go's `testingNetwork.makeRelays(relays...)`: star topology
+    /// with the given nodes at the center — from now on, a message is
+    /// delivered between two nodes only if at least one of them is a
+    /// relay, so two non-relay ("leaf") nodes can never reach each other
+    /// directly, only via a relay (which must itself actively `relay()` a
+    /// message onward for it to fan out to other leaves — this primitive
+    /// only changes which direct sends succeed, it doesn't add any
+    /// forwarding behavior of its own). To revert, call
+    /// [`Self::repair_all`] (go: same — "to revert, call repairAll").
+    pub fn make_relays(&self, relays: &[usize]) {
+        let mut state = self.state.lock().expect("TestingNetwork poisoned");
+        let n = state.channels.len();
+        let mut flags = vec![false; n];
+        for &i in relays {
+            flags[i] = true;
+        }
+        state.relay_nodes = Some(flags);
     }
 
     /// Total number of messages currently sitting unconsumed in every node's
@@ -641,6 +697,11 @@ fn multicast(
         }
         if let Some(crowned) = &state.crowned {
             if !crowned[peer] {
+                continue;
+            }
+        }
+        if let Some(relays) = &state.relay_nodes {
+            if !relays[source] && !relays[peer] {
                 continue;
             }
         }
@@ -848,6 +909,73 @@ mod tests {
             recv_vote_count(&node2.messages(&Tag(AGREEMENT_VOTE_TAG))),
             1,
             "delivery to every connected peer must resume after repair_all"
+        );
+    }
+
+    /// Mirrors go's `makeRelays`: a message is delivered if either its
+    /// source or its recipient is a relay, so leaf-to-leaf traffic is
+    /// dropped but relay-to-leaf and leaf-to-relay traffic both go
+    /// through; `repair_all` clears it again.
+    #[test]
+    fn make_relays_drops_only_leaf_to_leaf_traffic() {
+        let net = TestingNetwork::new(3, 16);
+        // node0 is the relay; node1/node2 are leaves.
+        net.make_relays(&[0]);
+        let relay = net.endpoint(0);
+        let leaf1 = net.endpoint(1);
+        let leaf2 = net.endpoint(2);
+
+        // A single leaf broadcast reaches the relay (recipient is a relay)
+        // but not the other leaf (neither end is a relay) — one broadcast
+        // proves both halves of the filter at once.
+        leaf1
+            .broadcast(
+                &Tag(AGREEMENT_VOTE_TAG),
+                &codec::encode_vote(&vote_with_step(SOFT)),
+            )
+            .unwrap();
+        assert_eq!(
+            recv_vote_count(&relay.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            1,
+            "leaf-to-relay traffic must be delivered"
+        );
+        assert_eq!(
+            recv_vote_count(&leaf2.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            0,
+            "leaf-to-leaf traffic must be dropped under a relay topology"
+        );
+
+        // Relay -> leaf: delivered (source is a relay), and fans out to
+        // every other connected leaf, not just one.
+        relay
+            .broadcast(
+                &Tag(AGREEMENT_VOTE_TAG),
+                &codec::encode_vote(&vote_with_step(SOFT)),
+            )
+            .unwrap();
+        assert_eq!(
+            recv_vote_count(&leaf1.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            1,
+            "relay-to-leaf traffic must be delivered"
+        );
+        assert_eq!(
+            recv_vote_count(&leaf2.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            1,
+            "relay-to-leaf traffic must fan out to every leaf"
+        );
+
+        // repair_all clears the relay topology; leaf-to-leaf resumes.
+        net.repair_all();
+        leaf1
+            .broadcast(
+                &Tag(AGREEMENT_VOTE_TAG),
+                &codec::encode_vote(&vote_with_step(SOFT)),
+            )
+            .unwrap();
+        assert_eq!(
+            recv_vote_count(&leaf2.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            1,
+            "leaf-to-leaf delivery must resume after repair_all"
         );
     }
 
