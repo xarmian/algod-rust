@@ -3591,6 +3591,33 @@ pub async fn run(
     let tx_seen_cache = Arc::new(algo_network::SeenTxCache::new(
         tx_syncer_config.seen_cache_size,
     ));
+    // Application-call excessive-rate-limiter (ARL) (issue #821): protects
+    // pool-admission resources from any single application generating
+    // excessive gossip-pushed transaction volume or eval failures. Shared
+    // (same `Arc`) across every `TxTagHandler` registered below (WS-gossip
+    // and, if enabled, the libp2p P2P transport) so a single node-wide
+    // limiter sees traffic from both transports, mirroring go-algorand's
+    // single `TxHandler.appLimiter`. See
+    // `algo_pool::app_rate_limiter`'s module doc and
+    // `algo_network::tx_tag_handler`'s module doc for the full design and
+    // the go-algorand trace establishing this as the correct wiring point.
+    let app_rate_limiter = node_config.enable_tx_backlog_app_rate_limiting.then(|| {
+        Arc::new(algo_pool::AppRateLimiter::new(
+            node_config.tx_backlog_app_tx_rate_limiter_max_size.max(0) as usize,
+            node_config.tx_backlog_app_tx_per_second_rate.max(0) as u64,
+            std::time::Duration::from_secs(
+                node_config.tx_backlog_service_rate_window_seconds.max(0) as u64,
+            ),
+        ))
+    });
+    // Mirrors go's `appLimiterBacklogThreshold = int(float64(TxBacklogSize) *
+    // float64(TxBacklogAppRateLimitingCongestionPct) / 100)`, applied here
+    // to `PoolConfig::default().pool_size` since algod-rust's `TxTagHandler`
+    // checks pool occupancy rather than a separate backlog-queue depth (see
+    // that module's doc comment for why).
+    let app_rate_limiter_congestion_threshold = ((PoolConfig::default().pool_size as f64)
+        * (node_config.tx_backlog_app_rate_limiting_congestion_pct.max(0) as f64)
+        / 100.0) as usize;
     // Serve blocks to peers, both over HTTP (`/v1/{genesisID}/block/{round}`)
     // and over gossip (`UniEnsBlockReq`). Registered before `start_arc()` so
     // the routes exist the moment the listener accepts its first connection.
@@ -3632,12 +3659,15 @@ pub async fn run(
     .with_peer_limiter(tx_sync_peer_limiter);
     gossip_node.register_http_handler("/", tx_sync_service.http_router());
 
+    let mut ws_tx_tag_handler =
+        algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone());
+    if let Some(limiter) = &app_rate_limiter {
+        ws_tx_tag_handler = ws_tx_tag_handler
+            .with_app_rate_limiter(limiter.clone(), app_rate_limiter_congestion_threshold);
+    }
     let mut gossip_handlers = vec![algo_network::handler::TaggedMessageHandler {
         tag: algo_network::Tag::Transaction,
-        handler: Arc::new(algo_network::TxTagHandler::new(
-            pool.clone(),
-            tx_seen_cache.clone(),
-        )),
+        handler: Arc::new(ws_tx_tag_handler),
     }];
     // `EnableGossipBlockService` (go default: true, matching algod-rust's
     // prior always-on behavior) — gate the UniEnsBlockReq gossip-tag
@@ -3801,12 +3831,15 @@ pub async fn run(
         // P2P `/algorand-ws` stream now writes back a handler's `Respond`
         // result (see `p2p_transport.rs`'s `spawn_ws_peer`), but only if a
         // handler is actually registered here to produce one.
+        let mut p2p_tx_tag_handler =
+            algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone());
+        if let Some(limiter) = &app_rate_limiter {
+            p2p_tx_tag_handler = p2p_tx_tag_handler
+                .with_app_rate_limiter(limiter.clone(), app_rate_limiter_congestion_threshold);
+        }
         let mut p2p_handlers = vec![algo_network::handler::TaggedMessageHandler {
             tag: algo_network::Tag::Transaction,
-            handler: Arc::new(algo_network::TxTagHandler::new(
-                pool.clone(),
-                tx_seen_cache.clone(),
-            )),
+            handler: Arc::new(p2p_tx_tag_handler),
         }];
         // See the matching `enable_gossip_block_service` gate on the
         // WS-gossip registration above (issue #748).

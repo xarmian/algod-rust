@@ -617,25 +617,35 @@ static ENABLE_DEVELOPER_API: VersionedDefault<bool> = VersionedDefault::new(&[(9
 //   with zero consumers anywhere in non-test Go source (no `txnsync`
 //   package, no adaptive rate-based tx-sync protocol at this pin; that
 //   experiment was retired upstream). Deliberately not added here.
-// - The 9-field `TxBacklog*RateLimiting*`/congestion-manager group
-//   (`TxBacklogServiceRateWindowSeconds`, `TxBacklogReservedCapacityPerPeer`,
-//   `TxBacklogAppTxRateLimiterMaxSize`, `TxBacklogAppTxPerSecondRate`,
-//   `TxBacklogRateLimitingCongestionPct`, `TxBacklogAppRateLimitingCongestionPct`,
-//   `EnableTxBacklogAppRateLimiting`, `TxBacklogAppRateLimitingCountERLDrops`,
-//   `EnableTxBacklogRateLimiting`) implements an ERL (Early Random Drop)
-//   congestion manager plus an app-transaction rate limiter in go's
-//   `data/pools/`. **Architectural decision recorded here**: not ported.
-//   This is a whole admission/drop subsystem that changes pool behavior
-//   under load, not a tunable knob on existing behavior (unlike the
-//   documented-no-op pattern used elsewhere in this file for fields that
-//   gate real-but-not-yet-built machinery) — porting it is real new
-//   pool-admission-control functionality, judged out of scope for a
-//   config-parity issue. algod-rust's `algo-pool` keeps its current
-//   unconditional-admission model (bounded only by `TxPoolSize`/
-//   `TxBacklogSize`, both already correct at their v5 defaults and not
-//   requiring config-surfacing beyond this general mechanism). Treated the
-//   same as `CatchpointDir`'s hot/cold-directory-splitting group above: a
-//   judgment-called non-goal, not silently dropped.
+// - The `TxBacklog*RateLimiting*`/congestion-manager group was originally a
+//   9-field block judged entirely out of scope here (issue #753). Issue
+//   #821 later found a genuine wiring point for the *app*-rate-limiter half
+//   of that group — algod-rust's inbound gossip `TxTagHandler` (the
+//   architectural analogue of go's `TxHandler.processIncomingTxn`, an
+//   unsolicited peer-pushed ingestion path this repo didn't have when the
+//   note below was first written) — so 5 of the 9 fields
+//   (`TxBacklogServiceRateWindowSeconds`, `TxBacklogAppTxRateLimiterMaxSize`,
+//   `TxBacklogAppTxPerSecondRate`, `TxBacklogAppRateLimitingCongestionPct`,
+//   `EnableTxBacklogAppRateLimiting`) are now real config-plumbed knobs
+//   feeding `algo_pool::AppRateLimiter` via `TxTagHandler::with_app_rate_limiter`
+//   in `bin/algod-rust/src/commands/participate.rs`. See
+//   `crates/core/algo-pool/src/app_rate_limiter.rs`'s module doc for the
+//   full go-algorand trace establishing this as the only legitimate wiring
+//   point (and why go's own pull-sync path, the analogue of algod-rust's
+//   `tx_syncer.rs`, never applies this gate either).
+//
+//   The remaining 4 fields (`TxBacklogReservedCapacityPerPeer`,
+//   `TxBacklogRateLimitingCongestionPct`, `EnableTxBacklogRateLimiting`,
+//   `TxBacklogAppRateLimitingCountERLDrops`) gate go's *separate*
+//   `ElasticRateLimiter`/RED congestion manager (`handler.erl`), whose
+//   fairness property has its own redesigned pull-side analogue —
+//   `algo_network::TxSyncPeerLimiter`, driven by its own
+//   `TxSyncerConfig`/`TxSyncPeerLimiter::new` parameters, not these
+//   `config.Local` fields (issue #860). Porting these 4 as additional
+//   `config.json`-surfaced knobs for that already-wired mechanism remains a
+//   judgment-called non-goal for now, same as `CatchpointDir`'s
+//   hot/cold-directory-splitting group above — not silently dropped, just
+//   not plumbed through `config.Local` yet.
 // - `EnableAssembleStats`/`EnableProcessBlockStats`/`MaxBlockHistoryLookback`
 //   are telemetry-event toggles / a lookback bound with no existing
 //   algod-rust machinery to gate yet (no `AssembleBlockMetrics`/
@@ -706,6 +716,44 @@ static TX_SYNC_INTERVAL_SECONDS: VersionedDefault<i64> = VersionedDefault::new(&
 /// (`localTemplate.go:324-325`). See `tx_sync_timeout_seconds`'s note.
 static TX_SYNC_SERVE_RESPONSE_SIZE: VersionedDefault<i64> =
     VersionedDefault::new(&[(3, || 1_000_000)]);
+
+/// Go: `TxBacklogServiceRateWindowSeconds int` `version[27]:"10"`
+/// (`localTemplate.go:237-238`). Wired into
+/// `algo_pool::AppRateLimiter::new`'s `service_rate_window` argument in
+/// `bin/algod-rust/src/commands/participate.rs` (issue #821) — the
+/// sliding-window duration over which `TxBacklogAppTxPerSecondRate` is
+/// enforced.
+static TX_BACKLOG_SERVICE_RATE_WINDOW_SECONDS: VersionedDefault<i64> =
+    VersionedDefault::new(&[(27, || 10)]);
+
+/// Go: `TxBacklogAppTxRateLimiterMaxSize int` `version[32]:"1048576"`
+/// (`localTemplate.go:243-245`). Wired into
+/// `algo_pool::AppRateLimiter::new`'s `max_cache_size` argument (issue
+/// #821).
+static TX_BACKLOG_APP_TX_RATE_LIMITER_MAX_SIZE: VersionedDefault<i64> =
+    VersionedDefault::new(&[(32, || 1_048_576)]);
+
+/// Go: `TxBacklogAppTxPerSecondRate int` `version[32]:"100"`
+/// (`localTemplate.go:247-248`). Wired into
+/// `algo_pool::AppRateLimiter::new`'s `max_app_peer_rate` argument (issue
+/// #821).
+static TX_BACKLOG_APP_TX_PER_SECOND_RATE: VersionedDefault<i64> =
+    VersionedDefault::new(&[(32, || 100)]);
+
+/// Go: `TxBacklogAppRateLimitingCongestionPct int` `version[38]:"10"`
+/// (`localTemplate.go:253-254`). Wired into
+/// `TxTagHandler::with_app_rate_limiter`'s `congestion_threshold` argument
+/// (issue #821): `pool_size * this_pct / 100` pending transactions is the
+/// threshold above which the app-rate-limit admission check engages.
+static TX_BACKLOG_APP_RATE_LIMITING_CONGESTION_PCT: VersionedDefault<i64> =
+    VersionedDefault::new(&[(38, || 10)]);
+
+/// Go: `EnableTxBacklogAppRateLimiting bool` `version[32]:"true"`
+/// (`localTemplate.go:256-257`). Wired into whether
+/// `bin/algod-rust/src/commands/participate.rs` attaches an
+/// `AppRateLimiter` to its `TxTagHandler`s at all (issue #821).
+static ENABLE_TX_BACKLOG_APP_RATE_LIMITING: VersionedDefault<bool> =
+    VersionedDefault::new(&[(32, || true)]);
 
 /// Go: `EnableAssembleStats bool` `version[0]:""` (`localTemplate.go:315-316`).
 /// **Documented no-op** — see the module-level note above.
@@ -1294,6 +1342,21 @@ fn default_tx_sync_interval_seconds() -> i64 {
 }
 fn default_tx_sync_serve_response_size() -> i64 {
     TX_SYNC_SERVE_RESPONSE_SIZE.at(LATEST_VERSION)
+}
+fn default_tx_backlog_service_rate_window_seconds() -> i64 {
+    TX_BACKLOG_SERVICE_RATE_WINDOW_SECONDS.at(LATEST_VERSION)
+}
+fn default_tx_backlog_app_tx_rate_limiter_max_size() -> i64 {
+    TX_BACKLOG_APP_TX_RATE_LIMITER_MAX_SIZE.at(LATEST_VERSION)
+}
+fn default_tx_backlog_app_tx_per_second_rate() -> i64 {
+    TX_BACKLOG_APP_TX_PER_SECOND_RATE.at(LATEST_VERSION)
+}
+fn default_tx_backlog_app_rate_limiting_congestion_pct() -> i64 {
+    TX_BACKLOG_APP_RATE_LIMITING_CONGESTION_PCT.at(LATEST_VERSION)
+}
+fn default_enable_tx_backlog_app_rate_limiting() -> bool {
+    ENABLE_TX_BACKLOG_APP_RATE_LIMITING.at(LATEST_VERSION)
 }
 fn default_enable_assemble_stats() -> bool {
     ENABLE_ASSEMBLE_STATS.at(LATEST_VERSION)
@@ -1906,6 +1969,53 @@ pub struct Local {
     )]
     pub tx_sync_serve_response_size: i64,
 
+    /// Go: `TxBacklogServiceRateWindowSeconds`. Wired into
+    /// `algo_pool::AppRateLimiter`'s sliding-window duration (issue #821)
+    /// — see [`TX_BACKLOG_SERVICE_RATE_WINDOW_SECONDS`]'s doc comment.
+    #[serde(
+        rename = "TxBacklogServiceRateWindowSeconds",
+        default = "default_tx_backlog_service_rate_window_seconds"
+    )]
+    pub tx_backlog_service_rate_window_seconds: i64,
+
+    /// Go: `TxBacklogAppTxRateLimiterMaxSize`. Wired into
+    /// `algo_pool::AppRateLimiter`'s max cache size (issue #821) — see
+    /// [`TX_BACKLOG_APP_TX_RATE_LIMITER_MAX_SIZE`]'s doc comment.
+    #[serde(
+        rename = "TxBacklogAppTxRateLimiterMaxSize",
+        default = "default_tx_backlog_app_tx_rate_limiter_max_size"
+    )]
+    pub tx_backlog_app_tx_rate_limiter_max_size: i64,
+
+    /// Go: `TxBacklogAppTxPerSecondRate`. Wired into
+    /// `algo_pool::AppRateLimiter`'s per-app-per-origin admitted rate
+    /// (issue #821) — see [`TX_BACKLOG_APP_TX_PER_SECOND_RATE`]'s doc
+    /// comment.
+    #[serde(
+        rename = "TxBacklogAppTxPerSecondRate",
+        default = "default_tx_backlog_app_tx_per_second_rate"
+    )]
+    pub tx_backlog_app_tx_per_second_rate: i64,
+
+    /// Go: `TxBacklogAppRateLimitingCongestionPct`. Wired into
+    /// `TxTagHandler`'s congestion threshold (issue #821) — see
+    /// [`TX_BACKLOG_APP_RATE_LIMITING_CONGESTION_PCT`]'s doc comment.
+    #[serde(
+        rename = "TxBacklogAppRateLimitingCongestionPct",
+        default = "default_tx_backlog_app_rate_limiting_congestion_pct"
+    )]
+    pub tx_backlog_app_rate_limiting_congestion_pct: i64,
+
+    /// Go: `EnableTxBacklogAppRateLimiting`. Wired into whether
+    /// `participate` attaches an `AppRateLimiter` to its `TxTagHandler`s
+    /// at all (issue #821) — see [`ENABLE_TX_BACKLOG_APP_RATE_LIMITING`]'s
+    /// doc comment.
+    #[serde(
+        rename = "EnableTxBacklogAppRateLimiting",
+        default = "default_enable_tx_backlog_app_rate_limiting"
+    )]
+    pub enable_tx_backlog_app_rate_limiting: bool,
+
     /// Go: `EnableAssembleStats`. **Documented no-op** (issue #753) — see
     /// [`ENABLE_ASSEMBLE_STATS`]'s doc comment.
     #[serde(
@@ -2299,6 +2409,14 @@ impl Local {
             tx_sync_timeout_seconds: TX_SYNC_TIMEOUT_SECONDS.at(version),
             tx_sync_interval_seconds: TX_SYNC_INTERVAL_SECONDS.at(version),
             tx_sync_serve_response_size: TX_SYNC_SERVE_RESPONSE_SIZE.at(version),
+            tx_backlog_service_rate_window_seconds: TX_BACKLOG_SERVICE_RATE_WINDOW_SECONDS
+                .at(version),
+            tx_backlog_app_tx_rate_limiter_max_size: TX_BACKLOG_APP_TX_RATE_LIMITER_MAX_SIZE
+                .at(version),
+            tx_backlog_app_tx_per_second_rate: TX_BACKLOG_APP_TX_PER_SECOND_RATE.at(version),
+            tx_backlog_app_rate_limiting_congestion_pct:
+                TX_BACKLOG_APP_RATE_LIMITING_CONGESTION_PCT.at(version),
+            enable_tx_backlog_app_rate_limiting: ENABLE_TX_BACKLOG_APP_RATE_LIMITING.at(version),
             enable_assemble_stats: ENABLE_ASSEMBLE_STATS.at(version),
             enable_process_block_stats: ENABLE_PROCESS_BLOCK_STATS.at(version),
             max_block_history_lookback: MAX_BLOCK_HISTORY_LOOKBACK.at(version),
@@ -2641,6 +2759,36 @@ impl Local {
             migrate_field(
                 &mut self.tx_sync_serve_response_size,
                 &TX_SYNC_SERVE_RESPONSE_SIZE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.tx_backlog_service_rate_window_seconds,
+                &TX_BACKLOG_SERVICE_RATE_WINDOW_SECONDS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.tx_backlog_app_tx_rate_limiter_max_size,
+                &TX_BACKLOG_APP_TX_RATE_LIMITER_MAX_SIZE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.tx_backlog_app_tx_per_second_rate,
+                &TX_BACKLOG_APP_TX_PER_SECOND_RATE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.tx_backlog_app_rate_limiting_congestion_pct,
+                &TX_BACKLOG_APP_RATE_LIMITING_CONGESTION_PCT,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_tx_backlog_app_rate_limiting,
+                &ENABLE_TX_BACKLOG_APP_RATE_LIMITING,
                 cur,
                 next,
             );
@@ -3222,6 +3370,11 @@ mod tests {
         assert_eq!(d.tx_sync_timeout_seconds, 30);
         assert_eq!(d.tx_sync_interval_seconds, 60);
         assert_eq!(d.tx_sync_serve_response_size, 1_000_000);
+        assert_eq!(d.tx_backlog_service_rate_window_seconds, 10);
+        assert_eq!(d.tx_backlog_app_tx_rate_limiter_max_size, 1_048_576);
+        assert_eq!(d.tx_backlog_app_tx_per_second_rate, 100);
+        assert_eq!(d.tx_backlog_app_rate_limiting_congestion_pct, 10);
+        assert!(d.enable_tx_backlog_app_rate_limiting);
         assert!(!d.enable_assemble_stats);
         assert!(!d.enable_process_block_stats);
         assert_eq!(d.max_block_history_lookback, 0);
