@@ -181,13 +181,19 @@ Status counts: matched-1:1 = 18, matched-1:many = 21, missing-test = 6, not-impl
   FD-pressure rebalancing, `ValidateP2PHybridConfig`, and the whole
   `EnsureAndResolveGenesisDirs`/`ResolveLogPaths` directory-resolution and
   hot/cold-data-dir-migration mechanism (7 config-package rows,
-  not-implemented). These should be tracked as Phase 16-lineage gaps, not
-  filed as new discoveries.
+  not-implemented). The `HotDataDir`/`ColdDataDir`/etc. directory-splitting
+  subset was explicitly dispositioned as an architectural non-goal by
+  issue #749 (algod-rust's fixed two-file-pair storage design). The
+  remaining behavioral derivations — `IsListenServer`/`IsWsListenServer`/
+  `IsP2PListenServer`/`IsHybridServer`, `AdjustConnectionLimits`/
+  `RecalculateConnectionLimits`, `ValidateP2PHybridConfig` — are genuinely
+  untracked and filed as [issue #949](https://github.com/xarmian/algod-rust/issues/949).
 - **No `phonebook.json` / `config.json.example` files.** go-algorand loads
   an optional phonebook include/exclude allow-list file and ships a
   `config.json.example` regression-checked against compiled defaults;
   algod-rust's in-memory `Phonebook` is populated only from DNS bootstrap,
-  and no example config file exists to check.
+  and no example config file exists to check. The `phonebook.json` loader
+  is bundled into [issue #949](https://github.com/xarmian/algod-rust/issues/949).
 - **No self-update mechanism.** `TestAlgodVsUpdatedVersions` tests
   go-algorand's S3-hosted-binary version-naming scheme; algod-rust ships no
   self-update mechanism at all (out-of-scope, architectural).
@@ -199,7 +205,7 @@ Status counts: matched-1:1 = 18, matched-1:many = 21, missing-test = 6, not-impl
   the table. algod-rust's `consensus.rs` tests are thorough per-version
   spot checks but have no equivalent "does this invariant hold across the
   whole table" sweep — a real regression-guard gap distinct from any
-  specific field value being wrong.
+  specific field value being wrong. Tracked (together with the parallel AVM opcode/field table-completeness gap in `parity_txn_logic.md`) as [issue #946](https://github.com/xarmian/algod-rust/issues/946).
 - **Go-reflection/codegen-specific test machinery has no Rust analogue
   (out-of-scope, `protocol`/`protocol/test`/`protocol/transcode`).** Tests
   like `TestEncodeInline`, `TestRandomizeObjectWithPtrField`,
