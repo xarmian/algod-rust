@@ -721,8 +721,73 @@ pub struct BoxRef {
     pub index: u64,
 
     /// Box name (variable length).
-    #[serde(rename = "n", default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// go-algorand's `transactions.BoxRef.Name` is a plain `[]byte` (issue
+    /// #948) — go-codec's JSON handle renders it as a base64 string (the
+    /// same convention every other `[]byte` API field uses, see #578/#579
+    /// for `Address`/`AssetParamsRecord`), while its msgpack handle writes
+    /// raw bytes. A bare `#[serde(rename = "n")]` derive on `Option<ByteBuf>`
+    /// reproduces the msgpack side (serde_bytes emits msgpack `bin`
+    /// regardless of human-readability) but not JSON: `serde_json` has no
+    /// native "bytes" type and `Serializer::serialize_bytes` falls back to a
+    /// JSON array of numbers instead of a base64 string. This is a live bug,
+    /// not just latent: `POST /v2/transactions/simulate`
+    /// (`algo-rest-api::handlers::simulate_transaction`) decodes JSON
+    /// request bodies via `serde_json::from_value::<SignedTransaction>`, so
+    /// a box-referencing simulate request submitted as JSON (rather than
+    /// msgpack) previously failed to decode a base64 `"n"` field.
+    ///
+    /// `BoxRef`'s Go struct also carries `_struct codec:",omitempty,
+    /// omitemptyarray"`, so go always omits `Name` from JSON when nil *or*
+    /// zero-length (`TestJsonMarshal`'s `Index: 1, Name: []byte("")` case
+    /// still yields `{"i":1}`) — mirrored here by treating `Some(empty)` the
+    /// same as `None` on the encode side.
+    #[serde(
+        rename = "n",
+        default,
+        skip_serializing_if = "is_none_or_empty_box_ref_name",
+        serialize_with = "serialize_box_ref_name",
+        deserialize_with = "deserialize_box_ref_name"
+    )]
     pub name: Option<ByteBuf>,
+}
+
+fn is_none_or_empty_box_ref_name(v: &Option<ByteBuf>) -> bool {
+    match v {
+        None => true,
+        Some(b) => b.is_empty(),
+    }
+}
+
+fn serialize_box_ref_name<S: serde::Serializer>(
+    v: &Option<ByteBuf>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    let bytes: &[u8] = v.as_ref().map(|b| b.as_slice()).unwrap_or(&[]);
+    if s.is_human_readable() {
+        s.serialize_str(&data_encoding::BASE64.encode(bytes))
+    } else {
+        s.serialize_bytes(bytes)
+    }
+}
+
+fn deserialize_box_ref_name<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<ByteBuf>, D::Error> {
+    if d.is_human_readable() {
+        let s = String::deserialize(d)?;
+        let bytes = data_encoding::BASE64
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)?;
+        Ok(if bytes.is_empty() {
+            None
+        } else {
+            Some(ByteBuf::from(bytes))
+        })
+    } else {
+        let buf = ByteBuf::deserialize(d)?;
+        Ok(if buf.is_empty() { None } else { Some(buf) })
+    }
 }
 
 impl BoxRef {
@@ -2173,5 +2238,151 @@ mod required_field_decode_tests {
         let mut rd: &[u8] = &buf;
         let r = Reveal::decode_from_reader(&mut rd).unwrap();
         assert!(r.part.is_some());
+    }
+}
+
+/// Issue #948: `BoxRef.name`'s JSON encoding must match go-algorand's
+/// `transactions.BoxRef` (base64 string via go-codec's JSON handle, raw
+/// bytes via msgpack), pinned against go's own
+/// `data/transactions/json_test.go` (`TestJsonMarshal`, `TestJsonUnmarshal`,
+/// `TestTxnJson`) fixtures. These tests exercise `serde_json` specifically
+/// (not `algo-codec`'s canonical msgpack encoder), since that's the encoding
+/// that was broken: a bare `#[serde(rename = "n")]` derive on
+/// `Option<ByteBuf>` serialized to a JSON array of byte values instead of a
+/// base64 string.
+#[cfg(test)]
+mod box_ref_json_tests {
+    use super::*;
+
+    /// Mirrors go's `TestJsonMarshal`.
+    #[test]
+    fn box_ref_json_marshal_matches_go() {
+        let br = BoxRef {
+            index: 4,
+            name: Some(ByteBuf::from(b"joe".to_vec())),
+        };
+        assert_eq!(serde_json::to_string(&br).unwrap(), r#"{"i":4,"n":"am9l"}"#);
+
+        let br = BoxRef {
+            index: 0,
+            name: Some(ByteBuf::from(b"joe".to_vec())),
+        };
+        assert_eq!(serde_json::to_string(&br).unwrap(), r#"{"n":"am9l"}"#);
+
+        let br = BoxRef {
+            index: 1,
+            name: Some(ByteBuf::from(Vec::new())),
+        };
+        assert_eq!(serde_json::to_string(&br).unwrap(), r#"{"i":1}"#);
+
+        let br = BoxRef {
+            index: 0,
+            name: Some(ByteBuf::from(Vec::new())),
+        };
+        assert_eq!(serde_json::to_string(&br).unwrap(), r#"{}"#);
+    }
+
+    /// Mirrors go's `TestJsonUnmarshal`.
+    #[test]
+    fn box_ref_json_unmarshal_matches_go() {
+        let br: BoxRef = serde_json::from_str(r#"{"i":4,"n":"am9l"}"#).unwrap();
+        assert_eq!(
+            br,
+            BoxRef {
+                index: 4,
+                name: Some(ByteBuf::from(b"joe".to_vec())),
+            }
+        );
+
+        let br: BoxRef = serde_json::from_str(r#"{"n":"am9l"}"#).unwrap();
+        assert_eq!(
+            br,
+            BoxRef {
+                index: 0,
+                name: Some(ByteBuf::from(b"joe".to_vec())),
+            }
+        );
+
+        let br: BoxRef = serde_json::from_str(r#"{"i":4}"#).unwrap();
+        assert_eq!(
+            br,
+            BoxRef {
+                index: 4,
+                name: None,
+            }
+        );
+
+        let br: BoxRef = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(
+            br,
+            BoxRef {
+                index: 0,
+                name: None,
+            }
+        );
+    }
+
+    /// Mirrors go's `TestTxnJson`'s `apbx` case: a `Transaction` carrying a
+    /// `BoxRef` must render `n` as base64 in its JSON encoding too, not just
+    /// bare `BoxRef` in isolation.
+    #[test]
+    fn transaction_json_encodes_boxref_name_as_base64() {
+        let txn = Transaction {
+            txn_type: TxnType::Appl,
+            boxes: Some(vec![BoxRef {
+                index: 3,
+                name: Some(ByteBuf::from(b"john".to_vec())),
+            }]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&txn).unwrap();
+        assert!(
+            json.contains(r#""apbx":[{"i":3,"n":"am9obg=="}]"#),
+            "got: {json}"
+        );
+    }
+
+    /// The live REST bug this issue found: `POST /v2/transactions/simulate`
+    /// decodes JSON request bodies via
+    /// `serde_json::from_value::<SignedTransaction>` (see
+    /// `algo-rest-api::handlers::simulate_transaction`), so a box-referencing
+    /// txn submitted as JSON must decode `"n"` as base64, not a byte array.
+    #[test]
+    fn transaction_json_round_trips_boxref_name() {
+        let original = Transaction {
+            txn_type: TxnType::Appl,
+            boxes: Some(vec![BoxRef {
+                index: 3,
+                name: Some(ByteBuf::from(b"john".to_vec())),
+            }]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(
+            json.contains(r#""n":"am9obg=="#),
+            "expected base64-encoded box name in JSON: {json}"
+        );
+        let decoded: Transaction = serde_json::from_str(&json).unwrap();
+        let boxes = decoded.boxes.expect("boxes must decode");
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].index, 3);
+        assert_eq!(
+            boxes[0].name.as_ref().map(|b| b.as_slice()),
+            Some(b"john".as_slice())
+        );
+    }
+
+    /// `algo-codec`'s canonical msgpack path (via `serde_bytes`) must stay
+    /// unaffected: `BoxRef.name` still round-trips as raw msgpack bytes, not
+    /// base64, when the wire format isn't human-readable.
+    #[test]
+    fn box_ref_msgpack_round_trip_uses_raw_bytes_not_base64() {
+        let br = BoxRef {
+            index: 3,
+            name: Some(ByteBuf::from(b"john".to_vec())),
+        };
+        let bytes = rmp_serde::to_vec_named(&br).unwrap();
+        let decoded: BoxRef = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, br);
     }
 }
