@@ -1937,6 +1937,61 @@ fn invalid_tx_group_incentive_pool_sender() {
     assert_eq!(group.failed_at, Some(vec![0]));
 }
 
+/// Port of `TestSimulateTransactionMultipleGroups`
+/// (`daemon/algod/api/server/v2/test/handlers_test.go`): go-algorand's
+/// simulate endpoint currently supports exactly one transaction group per
+/// request; a request naming two groups is rejected with a specific
+/// "expected 1 transaction group, got N" `InvalidRequest` error
+/// (`ledger/simulation/simulator.go`), not silently truncated or evaluated
+/// as if it were one group. Pins `Simulator::simulate`'s matching
+/// group-count check (`crates/core/algo-ledger/src/simulation/mod.rs`).
+#[test]
+fn simulate_multiple_groups_is_rejected() {
+    let mut state = base_state();
+    let sender = Address([0xAA; 32]);
+    let receiver = Address([0xBB; 32]);
+    fund(&mut state, sender, 20_000_000);
+
+    let make_txn = |amount: u64| Transaction {
+        txn_type: "pay".into(),
+        sender,
+        receiver,
+        amount,
+        fee: 1000,
+        first_valid: 0.into(),
+        last_valid: 1000.into(),
+        ..Default::default()
+    };
+
+    let request = SimulationRequest {
+        txn_groups: vec![
+            vec![SignedTransaction {
+                txn: make_txn(1),
+                ..Default::default()
+            }],
+            vec![SignedTransaction {
+                txn: make_txn(2),
+                ..Default::default()
+            }],
+        ],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+
+    let err = simulate(&mut state, request)
+        .expect_err("two transaction groups must be rejected, not evaluated");
+    match err {
+        SimulatorError::InvalidRequest(e) => {
+            assert!(
+                e.message.contains("expected 1 transaction group, got 2"),
+                "unexpected message: {}",
+                e.message
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+}
+
 /// Port of `TestOptionalSignatures`: with `allow_empty_signatures` enabled,
 /// both a genuinely-signed transaction and a completely unsigned one must
 /// simulate successfully (the proxy-signing path for the unsigned case).

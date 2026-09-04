@@ -294,8 +294,15 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         }
 
         if request.txn_groups.len() > 1 {
+            // Matches go-algorand's exact wording
+            // (`ledger/simulation/simulator.go`: `"expected 1 transaction
+            // group, got %d"`), verified by `TestSimulateTransactionMultipleGroups`
+            // (`daemon/algod/api/server/v2/test/handlers_test.go`).
             return Err(SimulatorError::InvalidRequest(InvalidRequestError {
-                message: "simulation currently supports exactly one transaction group".to_string(),
+                message: format!(
+                    "expected 1 transaction group, got {}",
+                    request.txn_groups.len()
+                ),
             }));
         }
 

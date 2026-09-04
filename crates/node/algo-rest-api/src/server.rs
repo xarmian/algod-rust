@@ -537,6 +537,76 @@ mod tests {
         assert!(!body.is_empty());
     }
 
+    // --- `RestConnectionsSoftLimit` (issue #751) -------------------------
+
+    /// Port of go's `TestConnectionLimiterBasic`
+    /// (`daemon/algod/api/server/lib/middlewares/connectionLimiter_test.go`):
+    /// go's soft limit (`MakeConnectionLimiter`) *queues* excess requests
+    /// behind a semaphore rather than rejecting them, unlike the hard
+    /// limit's immediate 503. algod-rust wires this as a bare
+    /// `tower::limit::ConcurrencyLimitLayer` (see `ApiServerConfig`'s
+    /// `rest_connections_soft_limit` doc comment) rather than a
+    /// hand-rolled guard, so this test exercises that layer directly:
+    /// three concurrent requests against a limit of 1 must all eventually
+    /// succeed (never 503/429), and at most one may run inside the
+    /// handler at any instant -- proving admission is serialized
+    /// (queued), not merely rate-tracked.
+    ///
+    /// Exercises `tower::limit::ConcurrencyLimitLayer` (the exact type
+    /// `serve()` wires up for `rest_connections_soft_limit`) directly
+    /// atop a plain `tower::service_fn`, rather than through
+    /// `axum::Router` — `Router`'s own `Service::poll_ready` always
+    /// returns `Ready` unconditionally (axum defers all inner-layer
+    /// backpressure into the future returned by `call`), which makes a
+    /// Router-mediated version of this test unable to distinguish "queued
+    /// behind the semaphore" from "ran immediately"; testing the layer
+    /// directly avoids that axum-specific readiness quirk entirely.
+    #[tokio::test]
+    async fn soft_limit_layer_queues_rather_than_rejects_at_capacity() {
+        use std::convert::Infallible;
+        use std::sync::atomic::AtomicUsize;
+        use tower::{Service, ServiceBuilder, ServiceExt};
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_observed = Arc::new(AtomicUsize::new(0));
+        let in_flight_svc = in_flight.clone();
+        let max_observed_svc = max_observed.clone();
+
+        let svc = ServiceBuilder::new()
+            .layer(ConcurrencyLimitLayer::new(1))
+            .service(tower::service_fn(move |_req: ()| {
+                let in_flight = in_flight_svc.clone();
+                let max_observed = max_observed_svc.clone();
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_observed.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, Infallible>(())
+                }
+            }));
+
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let mut svc = svc.clone();
+            handles.push(tokio::spawn(async move {
+                svc.ready().await.unwrap().call(()).await.unwrap();
+            }));
+        }
+
+        for handle in handles {
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("queued request must not hang forever")
+                .expect("task must not panic");
+        }
+        assert_eq!(
+            max_observed.load(Ordering::SeqCst),
+            1,
+            "at most one request should run inside the service at a time under a soft limit of 1"
+        );
+    }
+
     // ── bind_listener port-0-fallback (issue #953) ─────────────────────
 
     /// TDD anchor for issue #953, mirroring go-algorand's
