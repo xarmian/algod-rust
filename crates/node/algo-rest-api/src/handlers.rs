@@ -2556,6 +2556,15 @@ pub async fn raw_transaction<N: NodeInterface>(
     Query(params): Query<RawTransactionParams>,
     body: axum::body::Bytes,
 ) -> Response {
+    // go-algorand's `AlgorandFollowerNode.BroadcastSignedTxGroup` (and its
+    // async twin) unconditionally reject in follower mode -- there's no
+    // agreement service or transaction pool to broadcast into
+    // (`node/follower_node.go`, matched by `node/follower_node_test.go`'s
+    // `TestErrors`).
+    if node.is_follower_mode() {
+        return error::bad_request("cannot broadcast txns in follower mode");
+    }
+
     // Check catchpoint status
     let status = match node.status().await {
         Ok(s) => s,
@@ -3675,6 +3684,13 @@ pub async fn add_participation_key<N: NodeInterface>(
     State(node): State<AppState<N>>,
     body: axum::body::Bytes,
 ) -> Response {
+    // go's `AlgorandFollowerNode.InstallParticipationKey` unconditionally
+    // rejects in follower mode -- a follower has no agreement service to
+    // participate with (`node/follower_node.go`, `TestErrors`).
+    if node.is_follower_mode() {
+        return error::bad_request("cannot install participation key in follower mode");
+    }
+
     let data = body.to_vec();
     if data.is_empty() {
         return error::bad_request("payload length is zero");
@@ -3781,6 +3797,12 @@ pub async fn get_participation_key_by_id<N: NodeInterface>(
     State(node): State<AppState<N>>,
     Path(participation_id): Path<String>,
 ) -> Response {
+    // go's `AlgorandFollowerNode.GetParticipationKey` unconditionally
+    // rejects in follower mode (`node/follower_node.go`, `TestErrors`).
+    if node.is_follower_mode() {
+        return error::bad_request("cannot get participation key in follower mode");
+    }
+
     let decoded_id = match ParticipationID::from_base32(&participation_id) {
         Ok(id) => id,
         Err(e) => return error::bad_request(e),
@@ -3823,6 +3845,12 @@ pub async fn delete_participation_key_by_id<N: NodeInterface>(
     State(node): State<AppState<N>>,
     Path(participation_id): Path<String>,
 ) -> Response {
+    // go's `AlgorandFollowerNode.RemoveParticipationKey` unconditionally
+    // rejects in follower mode (`node/follower_node.go`, `TestErrors`).
+    if node.is_follower_mode() {
+        return error::bad_request("cannot remove participation key in follower mode");
+    }
+
     let decoded_id = match ParticipationID::from_base32(&participation_id) {
         Ok(id) => id,
         Err(e) => return error::bad_request(e),
@@ -3847,6 +3875,12 @@ pub async fn append_keys<N: NodeInterface>(
     Path(participation_id): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
+    // go's `AlgorandFollowerNode.AppendParticipationKeys` unconditionally
+    // rejects in follower mode (`node/follower_node.go`, `TestErrors`).
+    if node.is_follower_mode() {
+        return error::bad_request("cannot append participation keys in follower mode");
+    }
+
     let decoded_id = match ParticipationID::from_base32(&participation_id) {
         Ok(id) => id,
         Err(e) => return error::bad_request(e),
@@ -4651,6 +4685,12 @@ pub async fn raw_transaction_async<N: NodeInterface>(
             StatusCode::NOT_FOUND,
             "/transactions/async was not enabled in the configuration file by setting the EnableDeveloperAPI to true",
         );
+    }
+    // See `raw_transaction`'s equivalent guard above -- go's
+    // `AlgorandFollowerNode.BroadcastInternalSignedTxGroup` also
+    // unconditionally rejects in follower mode.
+    if node.is_follower_mode() {
+        return error::bad_request("cannot broadcast internal signed txn group in follower mode");
     }
 
     let max_group_size = node.max_tx_group_size();
