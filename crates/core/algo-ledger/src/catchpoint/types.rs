@@ -162,6 +162,12 @@ pub enum CatchpointError {
 
     #[error("catchpoint verification error: {0}")]
     VerificationError(String),
+
+    /// No catchpoint file is known for the given round -- go's
+    /// `GetCatchpointStream` returns `ledgercore.ErrNoEntry{}` for the same
+    /// condition (`../go-algorand/ledger/catchpointtracker.go:1501,1528`).
+    #[error("no catchpoint file for round {0}")]
+    NotFound(u64),
 }
 
 // ---------------------------------------------------------------------------

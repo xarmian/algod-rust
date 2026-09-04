@@ -25,6 +25,7 @@ pub mod importer;
 pub mod msgp_compat;
 pub mod parser;
 pub mod state_keys;
+pub mod stream;
 pub mod types;
 pub mod verify;
 pub mod writer;
@@ -36,6 +37,7 @@ pub use importer::{
     ImportResult, ImportStats,
 };
 pub use parser::{CatchpointEntry, CatchpointReader, CatchpointReaderFile};
+pub use stream::{get_catchpoint_stream, make_catchpoint_file_path, CatchpointStream};
 pub use types::{
     AccountTotals, AlgoCount, BalanceRecordV6, CatchpointBaseAccountData,
     CatchpointBaseOnlineAccountData, CatchpointError, CatchpointFileHeader, CatchpointLabel,
