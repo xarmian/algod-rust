@@ -19,27 +19,36 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Simulation `ResourceTracker` capacity/cross-product/empty-box-ref
-//! reporting (issue #970).
+//! reporting (issue #970) and opcode-failure enforcement once that capacity
+//! is exhausted (issue #1005).
 //!
-//! Ports the reporting-focused subset of go-algorand's `ledger/simulation`
-//! `ResourceTracker` (`ledger/simulation/resources.go`, `1088a2aad7e` /
-//! `v3.18.0-beta`): the `Max*`/`MaxCrossProductReferences` capacity
-//! computation (`makeGlobalResourceTracker`), capacity-gated recording of
-//! unnamed accesses (`add*`), and the `NumEmptyBoxRefs`/`extra-box-refs`
-//! anonymous-empty-ref count (`Simplify`) -- distinct from `boxes`, which
-//! suggests concrete `(app_id, name)` refs.
+//! Ports go-algorand's `ledger/simulation` `ResourceTracker`
+//! (`ledger/simulation/resources.go`, `1088a2aad7e` / `v3.18.0-beta`): the
+//! `Max*`/`MaxCrossProductReferences` capacity computation
+//! (`makeGlobalResourceTracker`), capacity-gated recording of unnamed
+//! accesses (`add*`), the `NumEmptyBoxRefs`/`extra-box-refs` anonymous-
+//! empty-ref count (`Simplify`) -- distinct from `boxes`, which suggests
+//! concrete `(app_id, name)` refs -- and, since issue #1005, the actual
+//! opcode-failure enforcement `add*` performs once a category's capacity
+//! is exhausted: `resourcePolicy.AvailableAccount`/`AvailableAsset`/
+//! `AvailableApp`/`AllowsHolding`/`AllowsLocal`/`AvailableBox` feed
+//! straight into `availableAccount`/`availableAsset`/`availableApp`/
+//! `allowsHolding`/`allowsLocals`/`availableAppBox`
+//! (`data/transactions/logic/eval.go`, `box.go`), so a resource beyond
+//! capacity fails the opcode itself (go's exact "unavailable Account ..."/
+//! "unavailable Asset ..."/"unavailable App ..."/"invalid Box reference
+//! ..." text), matching go's `TestUnnamedResourcesLimits`/
+//! `TestUnnamedResourcesCrossProductLimits`
+//! (`ledger/simulation/simulation_eval_test.go`).
 //!
-//! Scope note: this engine (unlike go-algorand's `ResourceTracker.add*`)
-//! does not reject the underlying AVM access once a category's capacity is
-//! exhausted -- it only stops adding to the *reported* access sets. Full
-//! opcode-failure enforcement matching go's `TestUnnamedResourcesLimits`/
-//! `TestUnnamedResourcesCrossProductLimits` (an "unavailable Account ..."/
-//! "invalid Box reference ..." error once capacity truly runs out) is a
-//! distinct, larger follow-up -- see the issue's tracking comment.
+//! Scope note (unchanged from #970): the deeper box read/write I/O-budget
+//! reconciliation (`ioSurplus`/`appReadBudget` for oversized programs) that
+//! `TestUnnamedResourcesBoxIOBudget`/`TestUnnamedResourcesBigProgramReadBudget`/
+//! etc. exercise remains out of scope.
 
 use std::collections::BTreeMap;
 
-use algo_codec::canonical_encode_transaction;
+use algo_codec::{canonical_encode_transaction, compute_group_id};
 use algo_ledger::simulation::{SimulationRequest, SimulationResult, Simulator, SimulatorError};
 use algo_ledger::{
     apply_transaction, avm_context::app_address, ApplyContext, ApplyMode, LedgerStore,
@@ -249,5 +258,125 @@ int 1
         unnamed.boxes.is_empty(),
         "must NOT be reported as a concrete (app_id, name) suggestion \
          since the app has no stable, resubmittable ID: {unnamed:?}"
+    );
+}
+
+// --- Opcode-failure enforcement once capacity is exhausted (issue #1005) ---
+
+fn pay_txn(sender: Address, note_byte: u8) -> Transaction {
+    Transaction {
+        txn_type: "pay".into(),
+        sender,
+        receiver: sender,
+        fee: 1000,
+        first_valid: 0.into(),
+        last_valid: 1000.into(),
+        note: serde_bytes::ByteBuf::from(vec![note_byte]),
+        ..Default::default()
+    }
+}
+
+/// Assemble a program that reads `balance` on each of `n` distinct, wholly
+/// unnamed raw addresses (byte `i+1` repeated, so each is a different
+/// 32-byte value), then approves. Every address is supplied as a literal on
+/// the stack -- never named in any txn's `Accounts`/foreign-resource arrays
+/// -- so each one is resolved purely through `allow_unnamed_resources`.
+fn balance_probe_source(n: u8) -> String {
+    let mut src = String::from("#pragma version 9\n");
+    for i in 1..=n {
+        src.push_str(&format!("byte 0x{}\nbalance\npop\n", hex::encode([i; 32])));
+    }
+    src.push_str("int 1\n");
+    src
+}
+
+/// Builds a full `[appl, pay, pay, ..., pay]` group of exactly
+/// `MaxTxGroupSize` (V41: 16) transactions, mirroring go-algorand's
+/// `testUnnamedResourceLimits` helper
+/// (`ledger/simulation/simulation_eval_test.go`): filling the group all the
+/// way out collapses `makeGlobalResourceTracker`'s "remaining txn slots
+/// count as empty app calls" padding to zero, so the group-wide capacity
+/// for the lone app call reduces to exactly its own per-txn
+/// `MaxAppTotalTxnReferences` (V41: 8) -- a small, hand-verifiable number,
+/// instead of the (also correct, but far larger and less legible)
+/// capacity a single-transaction group would compute.
+fn balance_probe_group(sender: Address, app_id: u64) -> Vec<SignedTransaction> {
+    let mut txns = vec![appl_txn(sender, app_id, 0)];
+    for i in 1..=15u8 {
+        txns.push(pay_txn(sender, i));
+    }
+    let gid = compute_group_id(&txns);
+    for txn in &mut txns {
+        txn.group = gid.0;
+    }
+    txns.into_iter()
+        .map(|txn| SignedTransaction {
+            txn,
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// End-to-end pin of go's `TestUnnamedResourcesLimits` account-limit
+/// scenario, exercised through `Simulator::simulate` (not just the
+/// `AvmContext` trait directly): exactly at the group's account/total-ref
+/// capacity (V41, full 16-txn group: `MaxAppTotalTxnReferences` = 8)
+/// succeeds; one more distinct, wholly-unnamed account fails the `balance`
+/// opcode itself with go's exact error text.
+#[test]
+fn balance_opcode_fails_end_to_end_once_account_capacity_exhausted() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 1002u64;
+
+    // Exactly at the limit: 8 distinct accounts.
+    let mut state_ok = base_state();
+    fund(&mut state_ok, sender, 40_000_000);
+    register_app(
+        &mut state_ok,
+        sender,
+        app_id,
+        assemble(&balance_probe_source(8)),
+        assemble("#pragma version 9\nint 1\n"),
+    );
+    let group_ok = balance_probe_group(sender, app_id);
+    let request_ok = SimulationRequest {
+        txn_groups: vec![group_ok],
+        allow_empty_signatures: true,
+        allow_unnamed_resources: true,
+        ..Default::default()
+    };
+    let result_ok = simulate(&mut state_ok, request_ok).expect("simulation should run");
+    assert!(
+        result_ok.txn_groups[0].failure_message.is_none(),
+        "exactly at the account limit must approve: {:?}",
+        result_ok.txn_groups[0].failure_message
+    );
+
+    // One over the limit: a 9th distinct account.
+    let mut state_over = base_state();
+    fund(&mut state_over, sender, 40_000_000);
+    register_app(
+        &mut state_over,
+        sender,
+        app_id,
+        assemble(&balance_probe_source(9)),
+        assemble("#pragma version 9\nint 1\n"),
+    );
+    let group_over = balance_probe_group(sender, app_id);
+    let request_over = SimulationRequest {
+        txn_groups: vec![group_over],
+        allow_empty_signatures: true,
+        allow_unnamed_resources: true,
+        ..Default::default()
+    };
+    let result_over = simulate(&mut state_over, request_over).expect("simulation should run");
+    let failure = result_over.txn_groups[0]
+        .failure_message
+        .as_ref()
+        .expect("must fail once the account limit is exceeded");
+    let addr9 = Address([9u8; 32]);
+    assert!(
+        failure.contains(&format!("unavailable Account {addr9}")),
+        "unexpected failure message: {failure}"
     );
 }

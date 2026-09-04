@@ -1266,8 +1266,18 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 || txn.config_asset == index
                 || txn.freeze_asset == index
                 || self.created_assets.contains(&index)
-                || self.unnamed_tracking.is_some()
             {
+                return Ok(index);
+            }
+            // Unnamed-resource relaxation (simulation `allow_unnamed_resources`),
+            // capacity-gated: matches go's `availableAsset`'s final fallback
+            // to `cx.UnnamedResources.AvailableAsset` (`ResourceTracker.addAsset`,
+            // `ledger/simulation/resources.go`) -- once the group's asset/
+            // total-ref capacity is exhausted the opcode itself fails (issue
+            // #1005), not just the *reporting* (issue #970). Checked only
+            // after every named path above has already failed, so a named
+            // asset never spends capacity or gets reported as unnamed.
+            if self.unnamed_tracking.is_some() && self.unnamed_asset_available(index) {
                 return Ok(index);
             }
         }
@@ -1302,12 +1312,11 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 }
             }
         }
+        // Matches go-algorand's `resolveAsset` final error text exactly
+        // (`data/transactions/logic/eval.go`): `fmt.Errorf("unavailable
+        // Asset %d", ref)`.
         Err(AlgoError::Avm {
-            message: format!(
-                "resolve_asset: index {} out of range (foreign_assets len={})",
-                index,
-                assets.len() + 1
-            ),
+            message: format!("unavailable Asset {index}"),
         })
     }
 
@@ -1345,8 +1354,18 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 || index == self.app_id
                 || txn.application_id == index
                 || self.created_apps.contains(&index)
-                || self.unnamed_tracking.is_some()
             {
+                return Ok(index);
+            }
+            // Unnamed-resource relaxation (simulation `allow_unnamed_resources`),
+            // capacity-gated: matches go's `availableApp`'s final fallback
+            // to `cx.UnnamedResources.AvailableApp` (`ResourceTracker.addApp`,
+            // `ledger/simulation/resources.go`) -- once the group's app/
+            // total-ref capacity is exhausted the opcode itself fails (issue
+            // #1005), not just the *reporting* (issue #970). Checked only
+            // after every named path above has already failed, so a named
+            // app never spends capacity or gets reported as unnamed.
+            if self.unnamed_tracking.is_some() && self.unnamed_app_available(index) {
                 return Ok(index);
             }
         }
@@ -1364,12 +1383,11 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 }
             }
         }
+        // Matches go-algorand's `resolveApp` final error text exactly
+        // (`data/transactions/logic/eval.go`): `fmt.Errorf("unavailable App
+        // %d", ref)`.
         Err(AlgoError::Avm {
-            message: format!(
-                "resolve_app: index {} out of range (foreign_apps len={})",
-                index,
-                apps.len() + 1
-            ),
+            message: format!("unavailable App {index}"),
         })
     }
 
@@ -1626,6 +1644,79 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         self.unnamed_capacity.as_ref().map_or(true, |cap| {
             cap.borrow_mut().try_add_local((account, app_id))
         })
+    }
+
+    // --- Opcode-failure enforcement (issue #1005) ---
+    //
+    // The five methods below are the actual availability *gate* for a
+    // resource that a caller has already established isn't available
+    // through any named path (own account/txn arrays/group sharing/etc.):
+    // they consume one unit of the shared group capacity (or reuse an
+    // already-tracked slot, at no cost) and report the access, exactly like
+    // go's `resourcePolicy.AvailableAccount`/`AvailableAsset`/`AvailableApp`/
+    // `AllowsHolding`/`AllowsLocal` (`ledger/simulation/resources.go`) --
+    // whose own return value is what fails `availableAccount`/
+    // `availableAsset`/`availableApp`/`allowsHolding`/`allowsLocals` in
+    // `data/transactions/logic/eval.go`, and from there the opcode itself.
+    // Unlike [`Self::note_account_access`] and its siblings (kept below,
+    // used only for secondary/redundant reporting at call sites where
+    // availability was already gated upstream), these do not re-check
+    // named-ness: callers must only reach them once every named path has
+    // already been tried and failed, matching go's call order exactly.
+
+    /// See the section doc comment above. Mirrors go's
+    /// `ResourceTracker.addAccount` via `resourcePolicy.AvailableAccount`.
+    fn unnamed_account_available(&self, account: [u8; 32]) -> bool {
+        if self.capacity_allows_account(account) {
+            self.record_unnamed(UnnamedResourceAccess::Account(account));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// See [`Self::unnamed_account_available`]; mirrors go's `addAsset` via
+    /// `AvailableAsset`.
+    fn unnamed_asset_available(&self, asset_id: u64) -> bool {
+        if self.capacity_allows_asset(asset_id) {
+            self.record_unnamed(UnnamedResourceAccess::Asset(asset_id));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// See [`Self::unnamed_account_available`]; mirrors go's `addApp` via
+    /// `AvailableApp`.
+    fn unnamed_app_available(&self, app_id: u64) -> bool {
+        if self.capacity_allows_app(app_id) {
+            self.record_unnamed(UnnamedResourceAccess::App(app_id));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// See [`Self::unnamed_account_available`]; mirrors go's `addHolding`
+    /// via `AllowsHolding`.
+    fn unnamed_holding_available(&self, account: [u8; 32], asset_id: u64) -> bool {
+        if self.capacity_allows_holding(account, asset_id) {
+            self.record_unnamed(UnnamedResourceAccess::AssetHolding(account, asset_id));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// See [`Self::unnamed_account_available`]; mirrors go's `addLocal` via
+    /// `AllowsLocal`.
+    fn unnamed_local_available(&self, account: [u8; 32], app_id: u64) -> bool {
+        if self.capacity_allows_local(account, app_id) {
+            self.record_unnamed(UnnamedResourceAccess::AppLocal(account, app_id));
+            true
+        } else {
+            false
+        }
     }
 
     /// Track an account access when unnamed-resource tracking is enabled.
@@ -2143,20 +2234,22 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         // tracer, and grow the I/O budget as if one more box reference had
         // been supplied (go-algorand raises the budget to
         // `maxPossibleBoxIOBudget` instead; see the divergence note on
-        // `NamedGroupResources`).
+        // `NamedGroupResources`). Capacity-gated (issue #1005), matching
+        // go's `AvailableBox` -> `ResourceTracker.addBox`: once the group's
+        // box/total-ref capacity is exhausted, `ok` stays `false` and the
+        // opcode itself fails below with go's exact "invalid Box reference"
+        // text -- this only enforces the `Max*`/total-ref capacity check
+        // already ported by issue #970, not go's deeper box read/write
+        // I/O-budget reconciliation (`ioSurplus`/`appReadBudget`), which
+        // remains a distinct, out-of-scope gap (see `NamedGroupResources`'s
+        // divergence note).
         if !ok && self.unnamed_tracking.is_some() {
-            ok = true;
             // A box owned by an app created earlier in this same simulation
             // can't be suggested back as a concrete `(app_id, name)` ref --
             // that app has no stable ID until it's actually submitted.
             // Matches go-algorand's `ResourceTracker.Simplify` (see
             // `UnnamedResourceAccess::EmptyBoxRef`'s doc comment): report an
             // anonymous empty-ref count instead of a named box suggestion.
-            // Both paths are still capacity-gated the same way (mirrors go's
-            // `addBox`): once the group's box/total-ref capacity is
-            // exhausted, the access is still allowed (this engine doesn't
-            // enforce go's opcode-failure behavior) but is no longer added
-            // to the reported set.
             let is_new_app = self.created_apps.contains(&app_id);
             let allowed = match &self.unnamed_capacity {
                 Some(cap) => {
@@ -2171,21 +2264,24 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 None => true,
             };
             if allowed {
+                ok = true;
                 if is_new_app {
                     self.record_unnamed(UnnamedResourceAccess::EmptyBoxRef);
                 } else {
                     self.record_unnamed(UnnamedResourceAccess::Box(app_id, name.to_vec()));
                 }
+                self.io_budget = self
+                    .io_budget
+                    .saturating_add(self.consensus.bytes_per_box_reference);
+                self.available_boxes.entry(key.clone()).or_insert(false);
             }
-            self.io_budget = self
-                .io_budget
-                .saturating_add(self.consensus.bytes_per_box_reference);
-            self.available_boxes.entry(key.clone()).or_insert(false);
         }
 
         if !ok {
+            // Matches go-algorand's exact text (`data/transactions/logic/
+            // box.go`): `fmt.Errorf("invalid Box reference %#x", name)`.
             return Err(AlgoError::Avm {
-                message: format!("invalid Box reference {:?}", name),
+                message: format!("invalid Box reference {}", box_name_hex(name)),
             });
         }
 
@@ -5494,13 +5590,6 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     /// in the current transaction's foreign-apps array (v7+), or the
     /// current app's own address.
     fn is_account_available(&self, addr: &[u8; 32]) -> bool {
-        // Unnamed-resource relaxation (simulation `allow_unnamed_resources`):
-        // every account is available, and the access is tracked and reported
-        // to the tracer for the simulate response's `unnamed-resources-accessed`.
-        if self.unnamed_tracking.is_some() {
-            self.note_account_access(addr);
-            return true;
-        }
         let txn = &self.group[self.group_index].txn;
         // The current transaction's own sender is index 0 (`IndexByAddress`),
         // always available regardless of version.
@@ -5541,6 +5630,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // The current app's own address is always available.
         if app_address(self.app_id) == *addr {
             return true;
+        }
+        // Unnamed-resource relaxation (simulation `allow_unnamed_resources`),
+        // capacity-gated: matches go's `availableAccount`'s final fallback
+        // to `cx.UnnamedResources.AvailableAccount` (`ResourceTracker.addAccount`,
+        // `ledger/simulation/resources.go`) -- once the group's account/
+        // total-ref capacity is exhausted the opcode itself fails (issue
+        // #1005), not just the *reporting* (issue #970).
+        if self.unnamed_tracking.is_some() {
+            return self.unnamed_account_available(*addr);
         }
         false
     }
@@ -5596,14 +5694,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         if self.created_apps.iter().any(|&id| app_address(id) == *addr) {
             return self.is_asset_available(asset_id);
         }
-        // Simulation's `allow_unnamed_resources`: bypass unconditionally
-        // (the account/asset-name access is tracked and reported via
-        // `note_holding_access`, called separately by the real accessors --
-        // matches `is_account_available`'s own unconditional-bypass
-        // pattern, not `is_asset_available`'s stricter one, which has no
-        // such bypass and would otherwise wrongly reject here).
+        // Simulation's `allow_unnamed_resources`: capacity-gated, matching
+        // go's `AllowsHolding` -> `ResourceTracker.addHolding` (issue
+        // #1005) -- once the group's shared cross-product capacity is
+        // exhausted the opcode itself fails, not just the *reporting*
+        // (issue #970).
         if self.unnamed_tracking.is_some() {
-            return true;
+            return self.unnamed_holding_available(*addr, asset_id);
         }
         false
     }
@@ -5626,11 +5723,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         if self.created_apps.iter().any(|&id| app_address(id) == *addr) {
             return self.is_app_available(app_id);
         }
-        // See `is_holding_available`'s comment: unconditional bypass under
-        // simulation's `allow_unnamed_resources`, not gated through
-        // `is_app_available` (which has no such bypass).
+        // See `is_holding_available`'s comment: capacity-gated under
+        // simulation's `allow_unnamed_resources` (issue #1005), matching
+        // go's `AllowsLocal` -> `ResourceTracker.addLocal`.
         if self.unnamed_tracking.is_some() {
-            return true;
+            return self.unnamed_local_available(*addr, app_id);
         }
         false
     }
@@ -13213,6 +13310,237 @@ mod tests {
         assert!(
             !t.try_add_box((3, b"c".to_vec())),
             "box_count is already 2 == max_boxes"
+        );
+    }
+
+    // --- Opcode-failure enforcement once unnamed-resource capacity is
+    // exhausted (issue #1005) ---
+    //
+    // Pins the same "exactly-at-limit succeeds, one-over-limit fails" shape
+    // go's `TestUnnamedResourcesLimits`/`TestUnnamedResourcesCrossProductLimits`
+    // (`ledger/simulation/simulation_eval_test.go`) assert end-to-end through
+    // simulate, but exercised directly against the `AvmContext` trait methods
+    // that gate each opcode, with go's exact error text.
+
+    fn attach_capacity<L: LedgerStore>(
+        ctx: &mut LedgerAvmContext<'_, L>,
+        capacity: crate::simulation::trace::ResourceCapacity,
+    ) {
+        ctx.enable_unnamed_resource_tracking(Arc::new(NamedGroupResources::default()));
+        ctx.enable_unnamed_capacity_tracking(Rc::new(RefCell::new(tracker_with(capacity))));
+    }
+
+    #[test]
+    fn is_account_available_rejects_once_max_accounts_exhausted() {
+        let sender = [80u8; 32];
+        let txn = make_appl_txn(sender, 900, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        let mut cap = tiny_capacity();
+        cap.max_accounts = 2;
+        cap.max_total_refs = 100; // isolate the per-category limit
+        attach_capacity(&mut ctx, cap);
+
+        // Exactly at the account limit: both distinct, never-named accounts
+        // are available.
+        assert!(ctx.is_account_available(&[1u8; 32]));
+        assert!(ctx.is_account_available(&[2u8; 32]));
+        // A repeat access of an already-tracked account never costs
+        // capacity, so it stays available even though the category is full.
+        assert!(ctx.is_account_available(&[1u8; 32]));
+        // One over the limit: the opcode must now fail, matching go's
+        // `availableAccount` returning false once
+        // `ResourceTracker.addAccount` runs out of `MaxAccounts`.
+        assert!(
+            !ctx.is_account_available(&[3u8; 32]),
+            "a third distinct account must exceed max_accounts=2"
+        );
+    }
+
+    #[test]
+    fn is_account_available_rejects_once_max_total_refs_exhausted() {
+        // Mirrors go's "Adding 1 more of any is over the limit" total-ref
+        // scenario in `TestUnnamedResourcesLimits`: each individual
+        // category's own max is generous, but the shared total-ref ceiling
+        // is what actually bites.
+        let sender = [81u8; 32];
+        let txn = make_appl_txn(sender, 901, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        let mut cap = tiny_capacity();
+        cap.max_accounts = 10;
+        cap.max_total_refs = 2;
+        attach_capacity(&mut ctx, cap);
+
+        assert!(ctx.is_account_available(&[1u8; 32]));
+        assert!(ctx.is_account_available(&[2u8; 32]));
+        assert!(
+            !ctx.is_account_available(&[3u8; 32]),
+            "ref_count is already 2 == max_total_refs"
+        );
+    }
+
+    #[test]
+    fn resolve_asset_fails_with_go_exact_message_once_capacity_exhausted() {
+        let sender = [82u8; 32];
+        let txn = make_appl_txn(sender, 902, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        let mut cap = tiny_capacity();
+        cap.max_assets = 1;
+        cap.max_total_refs = 100;
+        attach_capacity(&mut ctx, cap);
+
+        // Exactly at the asset limit.
+        assert_eq!(ctx.resolve_asset(500).unwrap(), 500);
+        // One more distinct asset exceeds max_assets=1: the opcode fails
+        // with go's exact `resolveAsset` error text
+        // (`data/transactions/logic/eval.go`):
+        // `fmt.Errorf("unavailable Asset %d", ref)`.
+        let err = ctx.resolve_asset(501).unwrap_err();
+        assert_eq!(format!("{err}"), "AVM: unavailable Asset 501");
+    }
+
+    #[test]
+    fn resolve_app_fails_with_go_exact_message_once_capacity_exhausted() {
+        let sender = [83u8; 32];
+        let txn = make_appl_txn(sender, 903, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        let mut cap = tiny_capacity();
+        cap.max_apps = 1;
+        cap.max_total_refs = 100;
+        attach_capacity(&mut ctx, cap);
+
+        assert_eq!(ctx.resolve_app(600).unwrap(), 600);
+        let err = ctx.resolve_app(601).unwrap_err();
+        assert_eq!(format!("{err}"), "AVM: unavailable App 601");
+    }
+
+    #[test]
+    fn is_holding_available_and_is_local_available_reject_once_cross_product_capacity_exhausted() {
+        let sender = [84u8; 32];
+        let txn = make_appl_txn(sender, 904, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        let mut cap = tiny_capacity();
+        cap.max_accounts = 100;
+        cap.max_assets = 100;
+        cap.max_apps = 100;
+        cap.max_total_refs = 100;
+        cap.max_cross_product_references = 1;
+        attach_capacity(&mut ctx, cap);
+
+        // The single available cross-product slot is consumed by the
+        // holding.
+        assert!(ctx.is_holding_available(&[9u8; 32], 700));
+        // A local shares the same `MaxCrossProductReferences` ceiling
+        // (mirrors go's `addHolding`/`addLocal` both drawing from the same
+        // tracker), so it's now rejected -- the opcode itself fails, not
+        // just the reporting.
+        assert!(!ctx.is_local_available(&[9u8; 32], 800));
+    }
+
+    #[test]
+    fn available_app_box_fails_with_go_exact_message_once_capacity_exhausted() {
+        let sender = [85u8; 32];
+        let app_id = 905u64;
+        let txn = make_appl_txn(sender, app_id, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        store.set_app_params(
+            app_id,
+            algo_types::AppParams {
+                creator: Address(sender),
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = app_id;
+        let mut cap = tiny_capacity();
+        cap.max_boxes = 1;
+        cap.max_total_refs = 100;
+        attach_capacity(&mut ctx, cap);
+
+        // Exactly at the box limit: an unnamed box on the current app is
+        // allowed under `allow_unnamed_resources`.
+        assert!(ctx
+            .available_app_box(app_id, b"box0", BoxOperation::Read, 0)
+            .is_ok());
+        // One more distinct box exceeds max_boxes=1: the opcode fails with
+        // go's exact `availableAppBox` error text
+        // (`data/transactions/logic/box.go`):
+        // `fmt.Errorf("invalid Box reference %#x", name)`.
+        let err = ctx
+            .available_app_box(app_id, b"box1", BoxOperation::Read, 0)
+            .unwrap_err();
+        assert_eq!(format!("{err}"), "AVM: invalid Box reference 0x626f7831");
+    }
+
+    /// Assemble a raw AVM program (bypassing the text assembler) that reads
+    /// `balance` on each of `addrs` in turn (each supplied as a raw 32-byte
+    /// address literal on the stack, exercising the same
+    /// [`AvmContext::is_account_available`] path a real `balance <addr>`
+    /// opcode sequence would), then approves.
+    fn balance_probe_program(version: u8, addrs: &[[u8; 32]]) -> Vec<u8> {
+        let mut program = vec![version];
+        for addr in addrs {
+            program.push(0x80); // pushbytes
+            program.push(32);
+            program.extend_from_slice(addr);
+            program.push(0x60); // balance
+            program.push(0x48); // pop
+        }
+        program.push(0x81); // pushint
+        program.push(0x01);
+        program
+    }
+
+    #[test]
+    fn balance_opcode_fails_end_to_end_once_account_capacity_exhausted() {
+        // End-to-end pin of go's `TestUnnamedResourcesLimits` account-limit
+        // scenario (`ledger/simulation/simulation_eval_test.go`): exactly at
+        // the account limit approves; one more distinct, wholly-unnamed
+        // account fails the `balance` opcode itself with go's exact
+        // `assignAccount` error text (`data/transactions/logic/eval.go`):
+        // `fmt.Errorf("unavailable Account %s", addr)`.
+        use algo_avm::eval::run_approval_program;
+        use algo_avm::group::GroupBudget;
+
+        let sender = [86u8; 32];
+        let appl = make_appl_txn(sender, 906, vec![], vec![], vec![]);
+        let mut cap = tiny_capacity();
+        cap.max_accounts = 2;
+        cap.max_total_refs = 100;
+
+        // Exactly at the limit: two distinct, never-named accounts.
+        let mut store_ok = LedgerState::new();
+        let mut ctx_ok = make_context(&mut store_ok, vec![appl.clone()]);
+        attach_capacity(&mut ctx_ok, cap);
+        let program_ok = balance_probe_program(8, &[[1u8; 32], [2u8; 32]]);
+        let mut budget_ok = GroupBudget::new(1);
+        let result_ok =
+            run_approval_program(&program_ok, &mut ctx_ok, &mut budget_ok).expect("must not error");
+        assert!(
+            result_ok.approved,
+            "exactly at the account limit must approve"
+        );
+
+        // One over the limit: a third distinct account.
+        let mut store_over = LedgerState::new();
+        let mut ctx_over = make_context(&mut store_over, vec![appl]);
+        attach_capacity(&mut ctx_over, cap);
+        let program_over = balance_probe_program(8, &[[1u8; 32], [2u8; 32], [3u8; 32]]);
+        let mut budget_over = GroupBudget::new(1);
+        let result_over = run_approval_program(&program_over, &mut ctx_over, &mut budget_over)
+            .expect("program errors surface via AvmResult::error, not Err");
+        assert!(
+            !result_over.approved,
+            "must be rejected once the account limit is exceeded"
+        );
+        let addr3 = algo_types::Address([3u8; 32]);
+        assert_eq!(
+            result_over.error.as_deref(),
+            Some(format!("AVM: unavailable Account {addr3}").as_str())
         );
     }
 }
