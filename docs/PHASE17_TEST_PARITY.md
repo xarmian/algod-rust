@@ -53,13 +53,13 @@ per-area split of the former).
 |---|---|---|
 | `matched-1:1` | 762 | 24% |
 | `partial` | 736 | 23% |
-| `matched-1:many` | 581 | 18% |
+| `matched-1:many` | 582 | 18% |
 | `out-of-scope` | 425 | 13% |
-| `not-implemented` | 237 | 7% |
+| `not-implemented` | 236 | 7% |
 | `missing-test` | 229 | 7% |
 | `matched-many:1` | 209 | 7% |
 
-**466 rows (`not-implemented` + `missing-test`, 15%) are real, actionable
+**465 rows (`not-implemented` + `missing-test`, 15%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
 implements but never tests. `partial` (736, 23%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
@@ -73,7 +73,7 @@ were triaged into tracked issues.
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 84 | 156 | 6 | 123 | 11 | 45 | 24 |
 | Transactions core (`data/transactions`) | [parity_txn_core.md](phase17/parity_txn_core.md) | 173 | 33 | 33 | 0 | 67 | 29 | 10 | 1 |
-| Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 45 | 101 | 44 | 132 | 37 | 7 | 137 |
+| Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 45 | 102 | 44 | 132 | 36 | 7 | 137 |
 | Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 31 | 22 | 0 | 7 | 5 | 2 | 1 |
 | Agreement protocol (`agreement`) | [parity_agreement.md](phase17/parity_agreement.md) | 326 | 134 | 33 | 77 | 49 | 0 | 30 | 3 |
 | e2e integration (`test/e2e-go`) | [parity_e2e.md](phase17/parity_e2e.md) | 195 | 30 | 18 | 0 | 64 | 0 | 57 | 26 |
@@ -86,5 +86,5 @@ were triaged into tracked issues.
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 31 | 25 | 7 | 21 | 4 | 1 | 84 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 10 | 0 | 16 | 3 | 0 | 1 |
-| **Total** | | **3,179** | **762** | **581** | **209** | **736** | **237** | **229** | **425** |
+| **Total** | | **3,179** | **762** | **582** | **209** | **736** | **236** | **229** | **425** |
 
