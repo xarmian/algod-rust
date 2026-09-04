@@ -25,6 +25,7 @@ pub mod capture;
 pub mod capture_wire;
 pub mod catchpoint;
 pub mod catchpoint_sync;
+pub mod catchupsrv;
 pub mod dual_gossip_node;
 pub mod follow;
 pub mod heartbeat_service;

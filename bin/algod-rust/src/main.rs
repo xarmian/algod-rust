@@ -267,6 +267,12 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             }
         },
+        Commands::Catchupsrv { dir, addr } => {
+            let addr: std::net::SocketAddr = addr
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --addr '{addr}': {e}"))?;
+            commands::catchupsrv::run(dir, addr).await?;
+        }
         Commands::Bench { action } => match action {
             BenchAction::Replay {
                 algod_url,

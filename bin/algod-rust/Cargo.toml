@@ -28,6 +28,7 @@ algo-fixtures.workspace = true
 algo-rest-api.workspace = true
 algo-txn-pipeline.workspace = true
 algo-p2p.workspace = true
+axum.workspace = true
 libp2p = { version = "0.54", features = ["tcp", "noise", "yamux", "tokio", "kad", "identify", "gossipsub", "macros"] }
 async-trait.workspace = true
 ed25519-dalek.workspace = true
