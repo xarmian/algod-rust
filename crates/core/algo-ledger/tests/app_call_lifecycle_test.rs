@@ -45,11 +45,34 @@
 //!   `LedgerState`/`StateDelta` design (same class of gap already
 //!   reclassified `out-of-scope` for `TestMakeStateDeltaMaps` et al. in
 //!   Theme 5, PR #864).
-//! - `TestForeignAppAccountsAccessible`, `TestInnerAppCreateAndOptin`,
-//!   `TestInnerCreateCanUseAbsoluteExtraProgramPages`,
-//!   `TestInnerUpdateResizing`, `TestAppCallCheckProgramsWithAccess`, and
-//!   `TestAppCallCheckProgramCosts` are deferred -- see the follow-up issue
-//!   referenced from `docs/phase17/parity_ledger_core.md`.
+//! - `TestAppCallCheckProgramsWithAccess` and `TestAppCallCheckProgramCosts`
+//!   are deferred -- see the follow-up issue referenced from
+//!   `docs/phase17/parity_ledger_core.md`.
+//!
+//! `TestForeignAppAccountsAccessible`, `TestInnerAppCreateAndOptin`,
+//! `TestInnerCreateCanUseAbsoluteExtraProgramPages`, and
+//! `TestInnerUpdateResizing` -- deferred above pending #841 -- are now
+//! covered below (issue #964). Porting them surfaced two real,
+//! previously-unexercised gaps, both fixed alongside these tests:
+//! - Inner transactions (of *any* type, not just `appl`) silently ignored
+//!   `itxn_field RekeyTo`: `avm_context.rs`'s `itxn_submit` dispatched
+//!   straight to `apply_pay`/`apply_axfer`/`execute_inner_appl` without
+//!   ever applying the rekey go-algorand's `applyTransaction` performs
+//!   unconditionally before type-specific dispatch. `TestInnerAppCreateAndOptin`
+//!   depends on exactly this: an inner appl-call's `RekeyTo` must take
+//!   effect immediately so a *subsequent* nested inner txn's
+//!   sender-authorization check sees the new `AuthAddr` within the same
+//!   top-level transaction.
+//! - `ON_COMPLETION_UPDATE` in `apply.rs` incorrectly required the
+//!   update's sender to equal the app's creator (a check go-algorand's
+//!   `updateApplication` never performs -- permissioning an update is left
+//!   entirely to the called app's own approval-program logic), and did not
+//!   implement `AppSizeUpdates` resizing (`GlobalStateSchema`/
+//!   `ExtraProgramPages` growth via update, with MBR "size sponsor"
+//!   tracking) at all, despite `algo-validate` already accepting a
+//!   resizing update transaction as well-formed. `TestInnerUpdateResizing`
+//!   depends on both: a non-creator inner update, and the resizing MBR
+//!   accounting itself.
 
 use std::cell::RefCell;
 
@@ -794,4 +817,581 @@ fn test_gtxn_effects_via_apply_block_capturing_apply_data() {
     if let Some(dt) = results[1].eval_delta.as_ref() {
         parse_eval_delta(dt).expect("eval delta must parse");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Composite scenarios (issue #964, follow-up to #824/#866/#841)
+// ---------------------------------------------------------------------------
+
+// 7. TestInnerAppCreateAndOptin (ledger/apptxn_test.go:945)
+//
+// A composite rekey + inner-create + inner-axfer-optin flow: a create-time
+// approval program issues an inner `appl` call that BOTH rekeys the
+// creating app's own about-to-exist account to a pre-existing "helper" app
+// AND invokes it, all in one inner transaction. The helper then acts *as*
+// the caller (using the just-installed rekey authority) to submit a nested
+// inner group: an axfer self-opt-in for the caller, followed by a pay that
+// funds the caller's opt-in MBR.
+//
+// Adapted from go's exact TEAL (matched-1:many, not a byte-for-byte port):
+// go's helper populates several inner-txn `Fee` fields implicitly, relying
+// on go's `addInnerTxn` computing a fee-credit-aware *default* fee per
+// sub-transaction as it's added (`data/transactions/logic/eval.go:5491`) --
+// a separate, not-yet-ported feature in algod-rust, where an unset `Fee`
+// always defaults to the flat `MinTxnFee` regardless of available credit
+// (tracked in a follow-up issue). Sidestepped here by pre-funding the
+// creating app's own (deterministic, since `app_id` is fixed) address
+// directly, rather than depending on that fee-credit-population gap --
+// this keeps the test focused on the actual behavior under test (the
+// composite rekey/inner-create/inner-optin authorization chain) instead of
+// coupling it to an unrelated fee-accounting feature.
+#[test]
+fn test_inner_app_create_and_optin_composite_rekey_create_axfer() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let helper_creator = Address([9u8; 32]);
+    let helper_id = 900u64;
+    let app_id = 901u64;
+    const ASA_ID: u64 = 500;
+
+    let helper_addr = Address(algo_ledger::avm_context::app_address(helper_id));
+    let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+
+    let mut state = make_state(
+        &[
+            (creator, 50_000_000),
+            (fee_sink, 0),
+            (helper_addr, 1_000_000),
+            (app_addr, 1_000_000),
+        ],
+        fee_sink,
+    );
+
+    // Pre-seed the asset directly (equivalent to go's `createasa := dl.txn(...)`).
+    state.asset_params.insert(
+        ASA_ID,
+        algo_types::AssetParamsRecord {
+            params: algo_types::AssetParams {
+                total: 2,
+                unit_name: "$".into(),
+                ..Default::default()
+            },
+            creator,
+        },
+    );
+
+    // Pre-seed the helper app: when CALLED (not created), it opts the
+    // CALLER (`txn Sender`) into the asset, then pays it 200_000 microAlgo
+    // for the opt-in's MBR. Mirrors go's `dl.fundedApp(addrs[0], 1_000_000,
+    // main(...))`; `main()`'s `txn ApplicationID; bz end` skip is reproduced
+    // by the `wrap_main`-style prelude below.
+    let helper_src = format!(
+        "itxn_begin\n\
+         int axfer\n itxn_field TypeEnum\n\
+         int {ASA_ID}\n itxn_field XferAsset\n\
+         txn Sender\n itxn_field Sender\n\
+         txn Sender\n itxn_field AssetReceiver\n\
+         itxn_next\n\
+         int pay\n itxn_field TypeEnum\n\
+         int 200000\n itxn_field Amount\n\
+         txn Sender\n itxn_field Receiver\n\
+         itxn_submit\n"
+    );
+    let helper_wrapped =
+        format!("#pragma version 8\ntxn ApplicationID\nbz end\n{helper_src}\nend:\nint 1\n");
+    state.app_params.insert(
+        helper_id,
+        algo_types::AppParams {
+            creator: helper_creator,
+            approval_program: assemble(&helper_wrapped),
+            clear_state_program: assemble(APPROVE_SRC),
+            ..Default::default()
+        },
+    );
+
+    // The create call's own approval program runs its inner logic DURING
+    // creation (unlike the helper, deliberately NOT wrapped by a
+    // `bz end` skip): it rekeys its own about-to-exist account to the
+    // helper and invokes it, all in the SAME inner transaction -- go's "call
+    // as the caller! (works because of rekey by caller)".
+    let create_src = format!(
+        "#pragma version 8\n\
+         itxn_begin\n\
+         int appl\n itxn_field TypeEnum\n\
+         addr {helper_addr}\n itxn_field RekeyTo\n\
+         int {helper_id}\n itxn_field ApplicationID\n\
+         itxn_submit\n\
+         int 1\n"
+    );
+    let create = appl_create(
+        creator,
+        3_000, // 3x MinTxnFee, mirroring go's `Fee: 3 * proto.MinTxnFee`.
+        app_id,
+        &create_src,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    let block = minimal_block(fee_sink, 1, vec![create]);
+    let results = apply_block_capturing_apply_data(&mut state, &block, ApplyMode::Execute)
+        .expect("composite rekey+inner-create+axfer-optin flow must apply cleanly");
+    assert_eq!(results[0].application_id, app_id);
+
+    // The caller (the newly created app's own account) must now hold the
+    // asset (opted in via the helper's inner axfer) and must have been
+    // rekeyed to the helper by the create call's own inner RekeyTo.
+    let holding = state
+        .get_asset_holding(&app_addr, ASA_ID)
+        .expect("app account must be opted into the asset via the helper's inner axfer");
+    assert_eq!(holding.amount, 0);
+
+    let app_account = state.get_account(&app_addr).unwrap();
+    assert_eq!(
+        app_account.auth_addr,
+        Some(helper_addr),
+        "the create call's own inner RekeyTo must actually take effect"
+    );
+}
+
+// 8. TestForeignAppAccountsAccessible (ledger/apptxn_test.go:3083)
+//
+// A foreign app's computed `AppAddress` (resolved via `app_params_get
+// AppAddress` against `txn Applications 1`) can be used as an inner-pay
+// `Receiver`, once that app is listed in the caller's `ForeignApps` --
+// gated by resource-availability rules active from v34 on (algod-rust's
+// default `minimal_block` protocol, V41, already qualifies).
+#[test]
+fn test_foreign_app_accounts_accessible_as_inner_pay_receiver() {
+    let creator = Address([1u8; 32]);
+    let caller = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let app_a_id = 900u64;
+    let app_b_id = 901u64;
+
+    let mut state = make_state(
+        &[
+            (creator, 3_000_000_000),
+            (caller, 50_000_000),
+            (fee_sink, 0),
+        ],
+        fee_sink,
+    );
+
+    let app_a = appl_create(
+        creator,
+        1_000,
+        app_a_id,
+        APPROVE_SRC,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+
+    let app_b_src = "\
+itxn_begin
+int pay
+itxn_field TypeEnum
+int 100
+itxn_field Amount
+txn Applications 1
+app_params_get AppAddress
+assert
+itxn_field Receiver
+itxn_submit
+";
+    let app_b_wrapped =
+        format!("#pragma version 8\ntxn ApplicationID\nbz end\n{app_b_src}\nend:\nint 1\n");
+    let app_b = appl_create(
+        creator,
+        1_000,
+        app_b_id,
+        &app_b_wrapped,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+
+    let create_block = minimal_block(fee_sink, 1, vec![app_a, app_b]);
+    apply_block_capturing_apply_data(&mut state, &create_block, ApplyMode::Execute)
+        .expect("app creation block must apply cleanly");
+
+    let app_a_addr = Address(algo_ledger::avm_context::app_address(app_a_id));
+    let app_b_addr = Address(algo_ledger::avm_context::app_address(app_b_id));
+
+    let group_id = [0xCCu8; 32];
+    let mut fund0 = SignedTransaction::default();
+    fund0.txn.txn_type = "pay".into();
+    fund0.txn.sender = creator;
+    fund0.txn.fee = 1_000;
+    fund0.txn.receiver = app_a_addr;
+    fund0.txn.amount = 1_000_000_000;
+    fund0.txn.group = group_id;
+
+    let mut fund1 = fund0.clone();
+    fund1.txn.receiver = app_b_addr;
+
+    let mut call_tx = appl_call(caller, 1_000, app_b_id, 0, None);
+    call_tx.txn.foreign_apps = Some(vec![app_a_id]);
+    call_tx.txn.group = group_id;
+
+    let call_block = minimal_block(fee_sink, 2, vec![fund0, fund1, call_tx]);
+    let results = apply_block_capturing_apply_data(&mut state, &call_block, ApplyMode::Execute)
+        .expect("foreign-app-account-as-inner-pay-receiver group must apply cleanly");
+
+    let dt = results[2]
+        .eval_delta
+        .as_ref()
+        .expect("call must produce an eval delta with an inner pay");
+    let ed = parse_eval_delta(dt).expect("eval delta must parse");
+    let inner = ed.inner_txns.expect("call must submit one inner pay");
+    assert_eq!(inner.len(), 1);
+    assert_eq!(inner[0].txn.receiver, app_a_addr);
+    assert_eq!(inner[0].txn.amount, 100);
+}
+
+/// Mirrors go's `assembleLargePassingProgram` (`ledger/applications_test.go:
+/// 1789`): assembles a TEAL program of an EXACT target byte length that
+/// still always approves, via an unreachable `err` filler branched around
+/// by an unconditional `b end`. Used to exercise oversized-program budget
+/// accounting without needing the program to do anything real.
+fn assemble_large_passing_program(version: u8, size: usize) -> Vec<u8> {
+    // version byte + "b end" (3 bytes) + "app_global_get" (1 byte) +
+    // "end: int 1" (2 bytes, `pushint 1`) = 7 bytes of fixed overhead.
+    const OVERHEAD: usize = 7;
+    assert!(
+        size >= OVERHEAD,
+        "target size must cover the fixed overhead"
+    );
+    let mut source = format!("#pragma version {version}\nb end\napp_global_get\n");
+    for _ in 0..(size - OVERHEAD) {
+        source.push_str("err\n");
+    }
+    source.push_str("end:\nint 1");
+    let program = assemble(&source);
+    assert_eq!(
+        program.len(),
+        size,
+        "assembled program length must match the requested size exactly"
+    );
+    program
+}
+
+// 9. TestInnerCreateCanUseAbsoluteExtraProgramPages (ledger/applications_test.go:1907)
+//
+// `MaxAbsoluteExtraProgramPages` (v42, 7) allows an INNER app-create to
+// install a larger `ExtraProgramPages` than a plain top-level create could
+// (`MaxExtraAppProgramPages`, 3) -- provided the group supplies enough box
+// I/O budget to cover the program's write-budget cost
+// (`consider_budget_program_writes`, issue #723). Adapted from go's exact
+// numbers: with V42's `max_app_total_program_len` (2048) and
+// `max_extra_app_program_pages` (3), `programSize = 2048 * 8 / 2 = 8192`
+// per program, whose combined size (16384) exceeds the free tier
+// (2048 * (1+3) = 8192) by exactly 8192 bytes -- covered by 4 empty box
+// refs at V42's `bytes_per_box_reference` (2048), matching go's own "2*8k
+// exceeds the normal 8k limit by 4 2k pages" comment exactly. Matches go's
+// structure closely: the oversized programs travel through the OUTER
+// (factory-create) transaction's `ApplicationArgs`, split into
+// `MAX_AVM_BYTES_SIZE`-sized (4096) halves -- NOT embedded as `byte`
+// literals in the factory's own TEAL source, which would inflate the
+// factory's OWN program past its own write-budget free tier and conflate
+// two independent write-budget charges into one.
+#[test]
+fn test_inner_create_can_use_absolute_extra_program_pages() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let factory_id = 900u64;
+    let factory_addr = Address(algo_ledger::avm_context::app_address(factory_id));
+
+    let mut state = make_state(
+        &[
+            (creator, 50_000_000),
+            (fee_sink, 0),
+            (factory_addr, 1_000_000),
+        ],
+        fee_sink,
+    );
+
+    let params =
+        algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V42)
+            .expect("V42 must be a known protocol version");
+    assert!(params.max_absolute_extra_program_pages >= params.max_extra_app_program_pages);
+
+    let program_size = (params.max_app_total_program_len
+        * (1 + params.max_absolute_extra_program_pages as usize))
+        / 2;
+    let approval = assemble_large_passing_program(8, program_size);
+    let clear = assemble_large_passing_program(8, program_size);
+
+    // Split each program in half and pass the halves through the OUTER
+    // (factory-create) transaction's `ApplicationArgs` -- exactly go's own
+    // structure, and for the same reason: `ApplicationArgs` is transaction
+    // wire data, not part of the factory's OWN approval-program bytecode,
+    // so embedding the (huge) target programs there -- rather than as
+    // `byte` literals inside the factory's own TEAL source -- keeps the
+    // factory's OWN program-size write-budget cost negligible. Each half is
+    // exactly `MAX_AVM_BYTES_SIZE` (4096), matching go's
+    // `config.MaxAVMBytesSize`/`transactions.MaxLogicSigArgSize` split.
+    let half = program_size / 2;
+    let factory_src = format!(
+        "itxn_begin\n\
+         int appl\n itxn_field TypeEnum\n\
+         txn ApplicationArgs 0\n itxn_field ApprovalProgramPages\n\
+         txn ApplicationArgs 1\n itxn_field ApprovalProgramPages\n\
+         txn ApplicationArgs 2\n itxn_field ClearStateProgramPages\n\
+         txn ApplicationArgs 3\n itxn_field ClearStateProgramPages\n\
+         int {}\n itxn_field ExtraProgramPages\n\
+         itxn_submit\n\
+         int 1\n",
+        params.max_absolute_extra_program_pages,
+    );
+    let factory_wrapped = format!("#pragma version 8\n{factory_src}");
+
+    // 4 empty box refs at V42's 2048 bytes-per-box-reference cover the 8192
+    // extra bytes this program pair costs above the free tier.
+    let mut create = appl_create(
+        creator,
+        20_000, // generous fee headroom, mirroring go's `20 * proto.MinTxnFee`
+        factory_id,
+        &factory_wrapped,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    create.txn.app_arguments = Some(vec![
+        Some(serde_bytes::ByteBuf::from(approval[..half].to_vec())),
+        Some(serde_bytes::ByteBuf::from(approval[half..].to_vec())),
+        Some(serde_bytes::ByteBuf::from(clear[..half].to_vec())),
+        Some(serde_bytes::ByteBuf::from(clear[half..].to_vec())),
+    ]);
+    create.txn.boxes = Some(vec![
+        algo_types::BoxRef::default(),
+        algo_types::BoxRef::default(),
+        algo_types::BoxRef::default(),
+        algo_types::BoxRef::default(),
+    ]);
+
+    let mut block = minimal_block(fee_sink, 1, vec![create]);
+    block.current_protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    let results = apply_block_capturing_apply_data(&mut state, &block, ApplyMode::Execute).expect(
+        "inner create with MaxAbsoluteExtraProgramPages and matching box budget must succeed",
+    );
+
+    let dt = results[0]
+        .eval_delta
+        .as_ref()
+        .expect("factory call must produce an eval delta with an inner create");
+    let ed = parse_eval_delta(dt).expect("eval delta must parse");
+    let inner = ed
+        .inner_txns
+        .expect("factory must submit exactly one inner create");
+    assert_eq!(inner.len(), 1);
+    assert_ne!(
+        inner[0].apply_data_application_id, 0,
+        "inner create must produce an app ID"
+    );
+    assert_eq!(
+        inner[0].txn.extra_program_pages,
+        params.max_absolute_extra_program_pages
+    );
+    assert_eq!(
+        inner[0]
+            .txn
+            .approval_program
+            .as_ref()
+            .map(|p| p.len())
+            .unwrap_or(0),
+        program_size
+    );
+    assert_eq!(
+        inner[0]
+            .txn
+            .clear_state_program
+            .as_ref()
+            .map(|p| p.len())
+            .unwrap_or(0),
+        program_size
+    );
+}
+
+// 10. TestInnerUpdateResizing (ledger/applications_test.go:2055)
+//
+// AppSizeUpdates (V42) lets an inner `UpdateApplication` call grow an
+// app's `GlobalStateSchema`/`ExtraProgramPages`, moving MBR responsibility
+// (the "size sponsor") to whoever performed the resize -- even when that
+// account is NOT the app's creator, which is exactly what this test
+// exercises: `smallID` is created by `creator`, but resized by a
+// completely different `updaterID` app.
+//
+// Unlike go's own `mbr()` helper (which reads real ledger `MinBalance()`
+// values), this test asserts directly on the underlying accounting fields
+// the resize actually touches (`AppParams.size_sponsor`/
+// `global_state_schema`/`extra_program_pages`, and the sponsor/creator
+// accounts' `total_app_schema`/`total_extra_app_pages`) rather than
+// computed MBR totals -- `min_balance_with_state`'s own schema-cost
+// aggregation (`state.rs`) independently re-derives global/local schema
+// cost by rescanning `app_params`/`app_local_states`, on top of the flat
+// `min_balance()` which already folds the same cost in via
+// `total_app_schema` -- an unrelated, pre-existing double-counting gap
+// filed separately rather than fixed here, since asserting on the
+// accounting fields the resize itself owns keeps this test decoupled from
+// it.
+#[test]
+fn test_inner_update_resizing_moves_sponsor_and_grows_schema() {
+    let creator = Address([1u8; 32]);
+    let updater_creator = Address([2u8; 32]);
+    let caller = Address([3u8; 32]);
+    let fee_sink = Address([4u8; 32]);
+    let small_id = 900u64;
+    let updater_id = 901u64;
+
+    let updater_addr = Address(algo_ledger::avm_context::app_address(updater_id));
+
+    let mut state = make_state(
+        &[
+            (creator, 50_000_000),
+            (updater_creator, 50_000_000),
+            (caller, 50_000_000),
+            (fee_sink, 0),
+            (updater_addr, 3_000_000),
+        ],
+        fee_sink,
+    );
+
+    // smallID: created with NO explicit global schema (zero), so the resize
+    // starting point is unambiguous. If given an arg, it writes that arg's
+    // bytes as a global key (value "X").
+    let small_src = "\
+txn NumAppArgs
+bz end
+txn ApplicationArgs 0
+byte \"X\"
+app_global_put
+";
+    let small_wrapped =
+        format!("#pragma version 8\ntxn ApplicationID\nbz end\n{small_src}\nend:\nint 1\n");
+    let small_create = appl_create(
+        creator,
+        1_000,
+        small_id,
+        &small_wrapped,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    let mut create_block = minimal_block(fee_sink, 1, vec![small_create]);
+    create_block.current_protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    apply_block_capturing_apply_data(&mut state, &create_block, ApplyMode::Execute)
+        .expect("smallID creation must apply cleanly");
+    assert!(state
+        .get_app_params(small_id)
+        .unwrap()
+        .global_state_schema
+        .is_empty());
+
+    // updaterID: resizes smallID to 2 extra pages / 3 uint / 4 byte-slice
+    // globals (re-submitting its own unchanged programs, read back via
+    // `app_params_get`), then immediately re-calls it with an arg in the
+    // SAME inner group to prove the new schema is already live, followed by
+    // a second call in a fresh inner group.
+    let updater_src = "\
+itxn_begin
+int appl
+itxn_field TypeEnum
+txn Applications 1
+itxn_field ApplicationID
+int UpdateApplication
+itxn_field OnCompletion
+txn Applications 1
+app_params_get AppApprovalProgram
+assert
+itxn_field ApprovalProgram
+txn Applications 1
+app_params_get AppClearStateProgram
+assert
+itxn_field ClearStateProgram
+int 2
+itxn_field ExtraProgramPages
+int 3
+itxn_field GlobalNumUint
+int 4
+itxn_field GlobalNumByteSlice
+itxn_next
+int appl
+itxn_field TypeEnum
+txn Applications 1
+itxn_field ApplicationID
+byte \"A\"
+itxn_field ApplicationArgs
+itxn_submit
+itxn_begin
+int appl
+itxn_field TypeEnum
+txn Applications 1
+itxn_field ApplicationID
+byte \"B\"
+itxn_field ApplicationArgs
+itxn_submit
+";
+    let updater_wrapped =
+        format!("#pragma version 8\ntxn ApplicationID\nbz end\n{updater_src}\nend:\nint 1\n");
+    let updater_create = appl_create(
+        updater_creator,
+        1_000,
+        updater_id,
+        &updater_wrapped,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    let mut updater_block = minimal_block(fee_sink, 2, vec![updater_create]);
+    updater_block.current_protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    apply_block_capturing_apply_data(&mut state, &updater_block, ApplyMode::Execute)
+        .expect("updater app creation must apply cleanly");
+
+    // caller invokes updaterID, which performs the non-creator inner
+    // resize on smallID.
+    let mut call = appl_call(caller, 1_000, updater_id, 0, None);
+    call.txn.foreign_apps = Some(vec![small_id]);
+    let mut call_block = minimal_block(fee_sink, 3, vec![call]);
+    call_block.current_protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    apply_block_capturing_apply_data(&mut state, &call_block, ApplyMode::Execute)
+        .expect("non-creator inner update resizing smallID must apply cleanly");
+
+    let small_params = state.get_app_params(small_id).unwrap();
+    assert_eq!(small_params.global_state_schema.num_uint, 3);
+    assert_eq!(small_params.global_state_schema.num_byte_slice, 4);
+    assert_eq!(small_params.extra_program_pages, 2);
+    assert_eq!(
+        small_params.size_sponsor, updater_addr,
+        "MBR responsibility must move to the non-creator updater"
+    );
+
+    let creator_account = state.get_account(&creator).unwrap();
+    assert!(
+        creator_account.total_app_schema.is_empty(),
+        "the original creator must not be charged for a resize it didn't perform"
+    );
+    assert_eq!(creator_account.total_extra_app_pages, 0);
+
+    let updater_account = state.get_account(&updater_addr).unwrap();
+    assert_eq!(updater_account.total_app_schema.num_uint, 3);
+    assert_eq!(updater_account.total_app_schema.num_byte_slice, 4);
+    assert_eq!(updater_account.total_extra_app_pages, 2);
+
+    // The new schema was already live for the SAME inner group's follow-up
+    // call ("A") and a later separate inner group ("B").
+    assert_eq!(
+        small_params.global_state.get(b"A".as_slice()),
+        Some(&algo_types::TealValue::Bytes(b"X".to_vec()))
+    );
+    assert_eq!(
+        small_params.global_state.get(b"B".as_slice()),
+        Some(&algo_types::TealValue::Bytes(b"X".to_vec()))
+    );
 }
