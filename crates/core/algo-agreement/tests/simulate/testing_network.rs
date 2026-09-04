@@ -40,17 +40,26 @@
 // `crown` (deliver only to a given set of recipients, regardless of sender —
 // go's `crownedNodes` delivery-side filter) is ported as a primitive
 // (`TestingNetwork::crown`, covered by
-// `crown_only_delivers_to_crowned_recipients` below) for issue #825's
-// remaining `TestAgreementRecoverBothVAndBotQuorums` scope, but that
-// scenario's full port is NOT landed yet — see
-// `service_multi_node_test.rs`'s module doc comment / issue #825's progress
-// notes for why (go's version additionally fires `TimeoutDeadline` on a
-// SUBSET of clocks across two different, precisely-timed "next vote range"
-// deltas — `(next).nextVoteRanges`/`(next+1).nextVoteRanges` — a mechanic
-// this harness has no equivalent driver hook for yet; the primitive is
-// landed on its own because it's real, independently useful infrastructure,
-// same as `pocket_all_compound` was left in place after `TestAgreementSlow
-// Payloads*` proved intractable).
+// `crown_only_delivers_to_crowned_recipients` below), and its target
+// scenario, `TestAgreementRecoverBothVAndBotQuorums`, is now landed as
+// `recover_both_v_and_bot_quorums_five_node`
+// (`service_multi_node_test.rs`). That scenario was previously deferred
+// (see this repo's git history / issue #825's progress notes) on the
+// theory that it additionally needed precise `nextVoteRanges`-equivalent
+// timing — go's version fires `TimeoutDeadline` on a SUBSET of clocks
+// across two different deltas derived from
+// `(next).nextVoteRanges`/`(next+1).nextVoteRanges`
+// (`agreement/types.go`). That turned out to be a non-issue: go's own
+// `testingClock.fire` (`agreement/service_test.go`) ignores its `d
+// time.Duration` argument entirely — it just closes whatever channel is
+// currently registered for the given `TimeoutType` — identically to this
+// harness's own `TestingClock::fire` (see its doc comment). The only real
+// requirement was firing `TimeoutType::Deadline` on the `[1, 2, 3, 4]`
+// subset a bounded number of times, via [`TestingNetwork::pocket_all_soft_
+// votes`]/[`Self::replay_all`] plus the already-landed
+// `trigger_subset_timeout` (`service_multi_node_test.rs`, added for
+// `fast_recovery_down_miss_five_node`) — no new harness primitive was
+// needed.
 //
 // `makeRelays` (star/relay topology — a message is delivered only if its
 // source or its recipient is a designated "relay" node, so two "leaf" nodes

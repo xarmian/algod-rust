@@ -622,6 +622,294 @@ fn late_cert_bug_five_node() {
     sanity_check(&cluster, start_round, 5);
 }
 
+/// Local mirror of go's `expectNewPeriod`/`expectNoNewPeriod`, operating on
+/// [`TestingClock::zeroes`] directly (unlike every other scenario in this
+/// file, which tracks progress via committed round because zero-count
+/// reliability across many real fires was flagged as an open question in
+/// this file's module doc comment). `recover_both_v_and_bot_quorums_five_node`
+/// needs the finer-grained "did a PERIOD change (not necessarily a round
+/// commit)" signal go's version asserts, and zero-count is the only signal
+/// this harness exposes for that — see that test's own doc comment for why
+/// it turned out to be reliable enough here after all.
+fn expect_new_period_all(cluster: &AgreementCluster, zeroes: u64) -> u64 {
+    let z = zeroes + 1;
+    for (i, clock) in cluster.clocks.iter().enumerate() {
+        assert_eq!(clock.zeroes(), z, "node {i}: unexpected number of zeroes");
+    }
+    z
+}
+
+fn expect_no_new_period_all(cluster: &AgreementCluster, zeroes: u64) -> u64 {
+    for (i, clock) in cluster.clocks.iter().enumerate() {
+        assert_eq!(
+            clock.zeroes(),
+            zeroes,
+            "node {i}: unexpected number of zeroes"
+        );
+    }
+    zeroes
+}
+
+fn expect_no_new_period_subset(indices: &[usize], cluster: &AgreementCluster, zeroes: u64) -> u64 {
+    for &i in indices {
+        assert_eq!(
+            cluster.clocks[i].zeroes(),
+            zeroes,
+            "node {i}: unexpected number of zeroes"
+        );
+    }
+    zeroes
+}
+
+/// Fire `TimeoutType::Deadline` repeatedly (bounded), but ONLY on whichever
+/// nodes haven't yet reached `zeroes + 1`, until every node has, then assert
+/// exact lockstep. Unlike [`pump_until_new_round`] (which re-fires every
+/// clock every attempt, safe because it only checks a `>` inequality on the
+/// committed round), this must never re-fire a node that has already
+/// rezeroed: `TestingClock::fire` (like go's own `testingClock.fire`)
+/// releases whatever is CURRENTLY registered for a `TimeoutType` regardless
+/// of what period that registration belongs to, so firing an
+/// already-advanced node again would force it into an extra, unwanted period
+/// bump and break the exact-lockstep assertion this test relies on (unlike
+/// `pump_until_new_round`'s round-number check, an exact zero-count check
+/// cannot tolerate overshoot). Needed because a single global fire is not
+/// always enough for every node to have finished processing/verifying real
+/// vote traffic and rezeroed by the time this driver's `wait_for_quiet`
+/// returns — the same class of real-thread timing gap this file's module
+/// doc comment already documents for round commits.
+fn pump_until_new_period_all(cluster: &AgreementCluster, zeroes: u64, max_attempts: u32) -> u64 {
+    let target = zeroes + 1;
+    for _ in 0..max_attempts {
+        let lagging: Vec<usize> = (0..cluster.clocks.len())
+            .filter(|&i| cluster.clocks[i].zeroes() < target)
+            .collect();
+        if lagging.is_empty() {
+            break;
+        }
+        trigger_subset_timeout(cluster, &lagging, TimeoutType::Deadline);
+    }
+    expect_new_period_all(cluster, zeroes)
+}
+
+/// Like [`pump_until_new_period_all`], but restricted to a fixed set of node
+/// indices throughout (used for the value-quorum recovery step, which must
+/// never touch node 0 — it already rezeroed via the bottom quorum). Needs at
+/// least two fires structurally even in the best case (the `next`-step "nap"
+/// mechanic in `player.rs`'s `Player::handle`: the first fire only arms a
+/// randomized nap deadline, the second casts the actual next-vote), and may
+/// need a few more under real-thread timing — see
+/// [`pump_until_new_period_all`]'s doc comment for why this only ever fires
+/// nodes still lagging, never one that has already reached `zeroes + 1`.
+fn pump_until_new_period_subset(
+    cluster: &AgreementCluster,
+    indices: &[usize],
+    zeroes: u64,
+    max_attempts: u32,
+) -> u64 {
+    let target = zeroes + 1;
+    for _ in 0..max_attempts {
+        let lagging: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| cluster.clocks[i].zeroes() < target)
+            .collect();
+        if lagging.is_empty() {
+            break;
+        }
+        trigger_subset_timeout(cluster, &lagging, TimeoutType::Deadline);
+    }
+    for &i in indices {
+        assert_eq!(
+            cluster.clocks[i].zeroes(),
+            target,
+            "node {i}: unexpected number of zeroes"
+        );
+    }
+    target
+}
+
+/// Full 5-node port of go-algorand's `TestAgreementRecoverBothVAndBotQuorums`
+/// (`agreement/service_test.go`).
+///
+/// Scenario: after two ordinary rounds, period 0's soft votes are pocketed
+/// (never delivered) so no node observes a soft-value quorum before the
+/// round's next deadline fire. That fire moves every node from CERT to NEXT
+/// step, and since none of them have seen a soft quorum yet, every node's
+/// own next-vote is for BOTTOM. `crown(&[0])` restricts delivery of those
+/// next-votes to node 0 alone, so only node 0 accumulates a bottom quorum
+/// and rezeros into period 1 — nodes 1-4 remain parked in step NEXT, having
+/// cast a bottom next-vote nobody else received.
+///
+/// The network is then healed and the earlier-pocketed soft votes are
+/// replayed, giving nodes 1-4 (still in period 0, step NEXT) knowledge of
+/// the real proposal's soft-value quorum for the first time. Two more
+/// deadline-type fires restricted to nodes 1-4 (`trigger_subset_timeout`)
+/// walk them through the `next`-step "nap" mechanic
+/// (`Player::handle`'s `_` branch in `player.rs`: the first fire arms a
+/// randomized nap deadline without casting a vote, the second — now napping
+/// — issues the actual next-vote via `issue_next_vote`, this time as a
+/// next-VALUE vote since the soft quorum is now known) until nodes 1-4 reach
+/// their own next-value quorum and rezero into period 1 too, pinned to the
+/// real value. So period 0 recovers into BOTH a bottom quorum (node 0 only)
+/// and a value quorum (everyone else) simultaneously — the scenario's name.
+///
+/// Divergence from go's literal test structure, noted once here: go passes
+/// specific `time.Duration` values to `triggerGlobalTimeout` for the two
+/// subset fires, computed via `(next).nextVoteRanges`/`(next+1).nextVoteRanges`
+/// (`agreement/types.go`). Investigating those confirmed they are cosmetic
+/// only: go's own `testingClock.fire` (`agreement/service_test.go`) ignores
+/// its `d time.Duration` argument entirely — it just closes whatever channel
+/// is currently registered for the given `TimeoutType`, regardless of the
+/// delta it was registered with — exactly like this harness's own
+/// `TestingClock::fire` (see its doc comment). So the "needs
+/// `nextVoteRanges`-equivalent timing" blocker this scenario was previously
+/// deferred under (issue #825's PR #932 progress note) does not actually
+/// exist: the only real requirement is firing `TimeoutType::Deadline` on the
+/// `[1, 2, 3, 4]` subset exactly twice, in order, which
+/// [`trigger_subset_timeout`] (already landed for
+/// `fast_recovery_down_miss_five_node`) already provides — no new harness
+/// primitive was needed.
+///
+/// Unlike every other scenario in this file, this port tracks progress via
+/// [`TestingClock::zeroes`] directly (go's own signal), not committed round —
+/// go's assertions here are specifically about PERIOD transitions that don't
+/// always coincide with a round commit (node 0's bottom-quorum period bump
+/// commits no round at all). This turned out to stay in lockstep across
+/// nodes reliably for this scenario (a baseline is captured right after the
+/// two ordinary rounds settle, rather than assuming go's exact absolute
+/// counts, since this file's module doc comment already flags absolute
+/// zero-counts as not always dependable that early under real-thread
+/// timing) — verified across repeated standalone and full-suite-concurrent
+/// runs, see the note left in the PR description for exact counts.
+#[test]
+fn recover_both_v_and_bot_quorums_five_node() {
+    let cluster = setup_agreement(5);
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    // Run two ordinary rounds.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+    cluster.wait_for_quiet();
+
+    // Capture the zero-count baseline here rather than assuming go's exact
+    // absolute counts (1 boot + 2 rounds = 3) — see this test's doc comment.
+    let baseline = cluster.clocks[0].zeroes();
+    let mut zeroes = expect_no_new_period_all(&cluster, baseline);
+
+    // Force partition recovery into both bottom and value: one node (0)
+    // enters bottom, the rest enter value.
+    let mut expected: Option<ProposalValue> = None;
+    {
+        cluster.network.pocket_all_soft_votes();
+        trigger_global_timeout(&cluster, TimeoutType::Deadline); // filter timeout: soft votes pocketed
+        zeroes = expect_no_new_period_all(&cluster, zeroes);
+        let pocketed_soft = cluster.network.stop_pocketing_soft_votes();
+        assert!(
+            !pocketed_soft.is_empty(),
+            "expected at least one soft vote to have been pocketed"
+        );
+        for msg in &pocketed_soft {
+            let uv = codec::decode_vote(msg.data()).expect("pocketed soft vote decodes");
+            match expected {
+                None => expected = Some(uv.raw_vote.proposal),
+                Some(e) => assert_eq!(e, uv.raw_vote.proposal, "unexpected soft vote"),
+            }
+        }
+        assert_ne!(
+            expected.expect("at least one pocketed soft vote"),
+            BOTTOM,
+            "pocketed soft vote must carry a real value"
+        );
+
+        // Generate a bottom quorum; let only node 0 see it. None of the 5
+        // nodes have observed a soft-value quorum yet (every soft vote was
+        // pocketed above), so every node's own next-vote at this step is for
+        // BOTTOM regardless of crowning — crown only restricts who RECEIVES
+        // the votes, not what any individual node casts.
+        cluster.network.crown(&[0]);
+        trigger_global_timeout(&cluster, TimeoutType::Deadline); // CERT -> NEXT, cast bottom next-votes
+        assert_eq!(
+            cluster.clocks[0].zeroes(),
+            zeroes + 1,
+            "node 0 did not enter new period from bottom quorum"
+        );
+        zeroes = expect_no_new_period_subset(&[1, 2, 3, 4], &cluster, zeroes);
+
+        // Enable creation of a value quorum: let everyone else see the
+        // earlier-pocketed soft votes.
+        cluster.network.repair_all();
+        cluster.network.replay_all(&pocketed_soft);
+        cluster.wait_for_quiet();
+
+        // Actually create the value quorum: two deadline-type fires
+        // restricted to nodes 1-4 (node 0 already rezeroed and must not be
+        // fired again here, matching go's `clocks[1:]`) — the first arms the
+        // `next`-step nap deadline, the second casts the actual (now
+        // value-aware) next-vote. See this test's doc comment for why the
+        // specific durations go computes via `nextVoteRanges` don't matter
+        // here.
+        trigger_subset_timeout(&cluster, &[1, 2, 3, 4], TimeoutType::Deadline);
+        zeroes = expect_no_new_period_subset(&[1, 2, 3, 4], &cluster, zeroes);
+
+        pump_until_new_period_subset(&cluster, &[1, 2, 3, 4], zeroes, 20);
+        zeroes = expect_new_period_all(&cluster, zeroes);
+    }
+    let expected = expected.expect("at least one pocketed soft vote");
+
+    // Now, try again in period 1. We should vote on reproposal due to
+    // non-propagation of the bottom bundle to node 0.
+    {
+        cluster.network.repair_all();
+        cluster.network.pocket_all_cert_votes();
+        trigger_global_timeout(&cluster, TimeoutType::Deadline); // filter timeout equivalent
+        zeroes = expect_no_new_period_all(&cluster, zeroes);
+        let pocketed_cert = cluster.network.stop_pocketing_cert_votes();
+        for msg in &pocketed_cert {
+            let uv = codec::decode_vote(msg.data()).expect("pocketed cert vote decodes");
+            assert_eq!(
+                uv.raw_vote.proposal, expected,
+                "got unexpected proposal in period 1"
+            );
+        }
+
+        zeroes = pump_until_new_period_all(&cluster, zeroes, 20);
+    }
+
+    // Finish in period 2.
+    {
+        cluster.network.repair_all();
+        zeroes = pump_until_new_period_all(&cluster, zeroes, 20);
+    }
+    let _ = zeroes;
+
+    // The whole recovery block above (period 0's bottom/value quorum split,
+    // period 1's reproposal, period 2's finish) commits exactly ONE round —
+    // re-sync `round` here (it was never touched inside that block, which
+    // tracks progress via `zeroes` instead) before resuming round-based
+    // tracking for the final two ordinary rounds. Skipping this made an
+    // early version of this test under-count by one round at `sanity_check`:
+    // `pump_until_new_round`'s first call below would otherwise fire an
+    // unnecessary extra global timeout against the stale `round` baseline
+    // before ever checking it, and then silently accept whatever round
+    // happened to result, one commit short of the true total.
+    cluster.wait_for_quiet();
+    round = current_round(&cluster);
+
+    // Run two more ordinary rounds.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+    let _ = round;
+
+    cluster.shutdown();
+    sanity_check(&cluster, start_round, 5);
+}
+
 // `TestAgreementFastRecoveryLate` and `TestAgreementFastRecoveryRedo`
 // (`agreement/service_test.go`): fast partition recovery into a real
 // proposal VALUE (not bottom), then (`Redo` only) a second forced failure
