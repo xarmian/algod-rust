@@ -52,11 +52,11 @@ per-area split of the former).
 | status | count | share |
 |---|---|---|
 | `partial` | 752 | 24% |
-| `matched-1:1` | 683 | 21% |
+| `matched-1:1` | 684 | 22% |
 | `matched-1:many` | 547 | 17% |
 | `out-of-scope` | 382 | 12% |
 | `not-implemented` | 329 | 10% |
-| `missing-test` | 281 | 9% |
+| `missing-test` | 280 | 9% |
 | `matched-many:1` | 205 | 6% |
 
 **610 rows (`not-implemented` + `missing-test`, 19%) are real, actionable
@@ -75,7 +75,7 @@ were triaged into tracked issues.
 | Transactions core (`data/transactions`) | [parity_txn_core.md](phase17/parity_txn_core.md) | 173 | 31 | 32 | 0 | 68 | 31 | 10 | 1 |
 | Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 42 | 99 | 43 | 133 | 39 | 10 | 137 |
 | Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 6 | 16 | 0 | 19 | 9 | 17 | 1 |
-| Agreement protocol (`agreement`) | [parity_agreement.md](phase17/parity_agreement.md) | 326 | 132 | 30 | 77 | 47 | 6 | 31 | 3 |
+| Agreement protocol (`agreement`) | [parity_agreement.md](phase17/parity_agreement.md) | 326 | 133 | 30 | 77 | 47 | 6 | 30 | 3 |
 | e2e integration (`test/e2e-go`) | [parity_e2e.md](phase17/parity_e2e.md) | 195 | 30 | 18 | 0 | 64 | 0 | 57 | 26 |
 | Networking (`network`, `network/p2p`, ...) | [parity_network.md](phase17/parity_network.md) | 263 | 83 | 52 | 11 | 72 | 22 | 20 | 3 |
 | Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 75 | 31 | 16 | 62 | 39 | 32 | 21 |
@@ -86,5 +86,5 @@ were triaged into tracked issues.
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 19 | 19 | 7 | 21 | 61 | 4 | 42 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 22 | 9 | 0 | 16 | 5 | 4 | 1 |
-| **Total** | | **3,179** | **683** | **547** | **205** | **752** | **329** | **281** | **382** |
+| **Total** | | **3,179** | **684** | **547** | **205** | **752** | **329** | **280** | **382** |
 
