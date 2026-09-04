@@ -36,6 +36,7 @@ pub mod identity;
 pub mod listener;
 pub mod message;
 pub mod msg_of_interest;
+pub mod net_prio;
 pub mod peer_features;
 pub mod peer_ranker;
 pub mod reconnect;

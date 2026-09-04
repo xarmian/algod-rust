@@ -734,7 +734,7 @@ mod app_rate_limiter_wiring_tests {
         let handler = TxTagHandler::new(pool.clone(), seen).with_app_rate_limiter(limiter, 100);
 
         let tx = make_app_call_txn(7, 1);
-        let msg = incoming(&[tx.clone()], "1.2.3.4:4160");
+        let msg = incoming(std::slice::from_ref(&tx), "1.2.3.4:4160");
         let out = handler.handle(msg).await;
         assert_eq!(out.action, ForwardingPolicy::Ignore);
 

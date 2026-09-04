@@ -117,6 +117,43 @@ impl LightBlockHeader {
 
         buf
     }
+
+    /// Decode a [`LightBlockHeader`] from bytes produced by
+    /// [`Self::canonical_encode`] — the inverse of that hand-rolled
+    /// encoder. Test-only: production code has no consumer of this type
+    /// besides hashing (`to_be_hashed`/`ToBeHashed`), but issue #961 pins
+    /// the encode/decode round-trip go's `TestMarshalUnmarshalLightBlockHeader`
+    /// (`data/bookkeeping/msgp_gen_test.go`) exercises.
+    #[cfg(test)]
+    fn decode(bytes: &[u8]) -> Self {
+        let mut rd = bytes;
+        let len = rmp::decode::read_map_len(&mut rd).expect("map len");
+        let mut h = Self::default();
+        for _ in 0..len {
+            let key_len = rmp::decode::read_str_len(&mut rd).expect("key len") as usize;
+            let (key, rest) = rd.split_at(key_len);
+            rd = rest;
+            match key {
+                b"0" => h.seed = read_bin32(&mut rd),
+                b"1" => h.block_hash = read_bin32(&mut rd),
+                b"gh" => h.genesis_hash = read_bin32(&mut rd),
+                b"r" => h.round = rmp::decode::read_int::<u64, _>(&mut rd).expect("round"),
+                b"tc" => h.sha256_txn_commitment = read_bin32(&mut rd),
+                other => panic!("LightBlockHeader::decode: unknown key {other:?}"),
+            }
+        }
+        h
+    }
+}
+
+#[cfg(test)]
+fn read_bin32(rd: &mut &[u8]) -> [u8; 32] {
+    let len = rmp::decode::read_bin_len(rd).expect("bin len") as usize;
+    assert_eq!(len, 32, "LightBlockHeader fields are always 32 bytes");
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&rd[..32]);
+    *rd = &rd[32..];
+    arr
 }
 
 fn write_fixstr(buf: &mut Vec<u8>, s: &str) {
@@ -195,6 +232,81 @@ mod tests {
             ..Default::default()
         };
         assert_ne!(a.canonical_encode(), b.canonical_encode());
+    }
+
+    // ── Msgpack self-roundtrip coverage (Phase 17, issue #961) ─────────
+    //
+    // Mirrors go's `TestMarshalUnmarshalLightBlockHeader`/
+    // `TestRandomizedEncodingLightBlockHeader`
+    // (`data/bookkeeping/msgp_gen_test.go`): encode, decode, and assert the
+    // result equals the original — proving no field is silently dropped
+    // or corrupted by the hand-rolled canonical codec above.
+
+    #[test]
+    fn light_block_header_zero_value_roundtrips() {
+        let h = LightBlockHeader::default();
+        let encoded = h.canonical_encode();
+        let decoded = LightBlockHeader::decode(&encoded);
+        assert_eq!(h, decoded);
+    }
+
+    #[test]
+    fn light_block_header_populated_roundtrips() {
+        let h = LightBlockHeader {
+            seed: [1u8; 32],
+            block_hash: [2u8; 32],
+            round: 12345,
+            genesis_hash: [3u8; 32],
+            sha256_txn_commitment: [4u8; 32],
+        };
+        let encoded = h.canonical_encode();
+        let decoded = LightBlockHeader::decode(&encoded);
+        assert_eq!(h, decoded);
+    }
+
+    #[test]
+    fn light_block_header_randomized_field_combinations_roundtrip() {
+        // Deterministic pseudo-randomization (LCG) over field presence/
+        // values, matching the spirit of go-algorand's
+        // protocol.RunEncodingTest fuzz and this repo's established
+        // pattern (crates/node/algo-rest-api/tests/msgpack_model_roundtrip_test.rs).
+        let mut state: u64 = 0xC0FF_EE12_3456_789A;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+
+        for i in 0..32u64 {
+            let r = next();
+            let h = LightBlockHeader {
+                seed: if r & 1 == 0 {
+                    [0u8; 32]
+                } else {
+                    [(r % 256) as u8; 32]
+                },
+                block_hash: if r & 2 == 0 {
+                    [0u8; 32]
+                } else {
+                    [((r >> 8) % 256) as u8; 32]
+                },
+                round: r ^ i,
+                genesis_hash: if r & 4 == 0 {
+                    [0u8; 32]
+                } else {
+                    [((r >> 16) % 256) as u8; 32]
+                },
+                sha256_txn_commitment: if r & 8 == 0 {
+                    [0u8; 32]
+                } else {
+                    [((r >> 24) % 256) as u8; 32]
+                },
+            };
+            let encoded = h.canonical_encode();
+            let decoded = LightBlockHeader::decode(&encoded);
+            assert_eq!(h, decoded, "round {i}: seed r={r:#x}");
+        }
     }
 
     #[test]
