@@ -8589,6 +8589,157 @@ async fn admin_token_works_on_sync_endpoints() {
 }
 
 // ===========================================================================
+// Follower-mode operation rejection (issue #827 theme 4; go-algorand's
+// `node/follower_node_test.go`'s `TestErrors`).
+//
+// go's `AlgorandFollowerNode` overrides `BroadcastSignedTxGroup`,
+// `BroadcastInternalSignedTxGroup`, `GetParticipationKey`,
+// `RemoveParticipationKey`, `AppendParticipationKeys`, and
+// `InstallParticipationKey` to unconditionally return an error in follower
+// mode (`node/follower_node.go`) -- broadcasting txns and mutating
+// participation keys make no sense on a node with no agreement service and
+// no transaction pool. (`Simulate` is deliberately excluded here: go's own
+// `AlgorandFollowerNode.Simulate` does *not* reject in follower mode --
+// `TestErrors`'s `Simulate(simulation.Request{})` call only errors because
+// an empty request has no txn groups, and `TestSimulate` in the same file
+// proves a real simulate request succeeds in follower mode.)
+//
+// algod-rust has no in-process node type analogous to
+// `AlgorandFollowerNode` -- `NodeInterface` is the trait every node
+// implementation (participate, follow, mock) sits behind -- so the
+// equivalent guard lives at the REST handler layer, gated on
+// `NodeInterface::is_follower_mode()`, matching how the sync-round
+// endpoints are already gated at the router layer just above.
+// ===========================================================================
+
+#[tokio::test]
+async fn raw_transaction_rejected_in_follower_mode() {
+    let mut node = MockNode::synced();
+    node.is_follower_mode = true;
+    let server = TestServer::start(node).await;
+
+    let stxn = make_test_signed_txn();
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"].as_str().unwrap().contains("follower mode"),
+        "error should mention follower mode, got: {}",
+        json["message"]
+    );
+}
+
+#[tokio::test]
+async fn raw_transaction_async_rejected_in_follower_mode() {
+    let mut node = mock_with_experimental_and_developer_api();
+    node.is_follower_mode = true;
+    let server = TestServer::start(node).await;
+
+    let stxn = make_test_signed_txn();
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/async"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn participation_add_key_rejected_in_follower_mode() {
+    let mut node = MockNode::synced();
+    node.is_follower_mode = true;
+    let server = TestServer::start(node).await;
+    let resp = server
+        .client
+        .post(server.url("/v2/participation"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .body(vec![0x01, 0x02, 0x03])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"].as_str().unwrap().contains("follower mode"),
+        "error should mention follower mode, got: {}",
+        json["message"]
+    );
+}
+
+#[tokio::test]
+async fn participation_get_by_id_rejected_in_follower_mode() {
+    let mut node = MockNode::synced();
+    node.is_follower_mode = true;
+    let record = mock_participation_record();
+    let id_base32 = record.participation_id.to_base32();
+    node.participation_records.push(record);
+
+    let server = TestServer::start(node).await;
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/participation/{id_base32}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    // Rejected before the (found) record is even looked up.
+    assert_ne!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn participation_delete_rejected_in_follower_mode() {
+    let mut node = MockNode::synced();
+    node.is_follower_mode = true;
+    let server = TestServer::start(node).await;
+    let id = ParticipationID([0x01; 32]);
+    let id_base32 = id.to_base32();
+
+    let resp = server
+        .client
+        .delete(server.url(&format!("/v2/participation/{id_base32}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn participation_append_keys_rejected_in_follower_mode() {
+    let mut node = MockNode::synced();
+    node.is_follower_mode = true;
+    let server = TestServer::start(node).await;
+    let id = ParticipationID([0x01; 32]);
+    let id_base32 = id.to_base32();
+
+    let resp = server
+        .client
+        .post(server.url(&format!("/v2/participation/{id_base32}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .body(vec![0xAA, 0xBB, 0xCC])
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), 200);
+}
+
+// ===========================================================================
 // Min-rounds catchup check test
 // ===========================================================================
 
