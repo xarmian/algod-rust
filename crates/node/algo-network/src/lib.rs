@@ -282,7 +282,7 @@ pub use tx_sync_pool_adapter::{PoolPendingTxAggregate, PoolSolicitedTxHandler};
 
 // Server side of the TxSyncer pull protocol
 pub use tx_sync_service::{
-    PendingTxGroupsSource, TxSyncService, TX_SYNC_REQUEST_CONTENT_TYPE,
+    PendingTxGroupsSource, TxSyncPeerLimiter, TxSyncService, TX_SYNC_REQUEST_CONTENT_TYPE,
     TX_SYNC_RESPONSE_CONTENT_TYPE,
 };
 

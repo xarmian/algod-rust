@@ -86,6 +86,24 @@ pub struct TxSyncerConfig {
     /// skeleton owns the full configuration surface; enforced by the
     /// tx-service endpoint when it lands.
     pub server_response_size: usize,
+    /// Total concurrent `POST .../txsync` requests this node will service
+    /// across all peers before applying fairness-preserving backpressure.
+    ///
+    /// This is **not** a go-algorand config.json field — go has no
+    /// equivalent because its tx-sync path is push-based (see
+    /// `crate::tx_sync_service::TxSyncPeerLimiter`'s doc comment for the
+    /// full design rationale from issues #821/#860); this is an
+    /// algod-rust-only pull-side servicing-fairness knob, deliberately
+    /// kept out of `algo_config::NodeConfig` so it never shows up in a
+    /// go-parity config-field audit as a spurious extra field.
+    pub server_max_concurrent_requests: usize,
+    /// Guaranteed concurrent `POST .../txsync` requests reserved per
+    /// requesting peer (by source IP) out of
+    /// `server_max_concurrent_requests`, so a single peer issuing many
+    /// pull requests cannot starve another peer's already-reserved share
+    /// of this node's servicing capacity. See
+    /// `crate::tx_sync_service::TxSyncPeerLimiter`.
+    pub server_capacity_per_peer: usize,
 }
 
 impl Default for TxSyncerConfig {
@@ -95,6 +113,8 @@ impl Default for TxSyncerConfig {
             sync_timeout: Duration::from_secs(30),
             seen_cache_size: 100_000,
             server_response_size: 1_000_000,
+            server_max_concurrent_requests: 64,
+            server_capacity_per_peer: 4,
         }
     }
 }
