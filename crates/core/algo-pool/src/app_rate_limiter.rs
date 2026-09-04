@@ -81,47 +81,104 @@
 //!   counter (useful for tests/metrics) but drops the eviction-duration
 //!   timing, which go itself flags as dead weight.
 //!
-//! # Wiring into algod-rust's pull-based architecture (NOT implemented here)
+//! # Wiring into algod-rust (issue #821)
 //!
-//! This module is intentionally **not** wired into any live transaction
-//! ingestion path. go-algorand's rate limiter is invoked from its
-//! push-based gossip `TxHandler` (peers unsolicitedly relay transactions
-//! at the node); algod-rust instead *pulls* transactions on a timer via
-//! `crates/node/algo-network/src/tx_syncer.rs` (`TxSyncer::sync_round`,
-//! `TxSyncPeerClient::sync`, dispatching admitted groups to a
-//! `SolicitedTxHandler::handle`). Whether/how to rate limit a pull-based
-//! flow is an architecture decision this issue deliberately leaves open;
-//! a plausible design (for a future PR to evaluate, not to implement
-//! blindly) looks like:
+//! This module is now wired into algod-rust's live transaction ingestion
+//! path — [`crate::tx_tag_handler`] in `crates/node/algo-network`, via
+//! [`TxTagHandler::with_app_rate_limiter`], attached in
+//! `bin/algod-rust/src/commands/participate.rs`.
 //!
-//! 1. Own one [`AppRateLimiter`] per node (sized from a config knob
-//!    analogous to go's `TxBacklogAppTxRateLimiterMaxSize` /
-//!    `TxBacklogAppTxPerSecondRate` / `TxBacklogServiceRateWindowSeconds`),
-//!    shared (e.g. behind an `Arc`) between the tx-syncer and whatever
-//!    surfaces eval errors.
-//! 2. In `sync_round`/`SolicitedTxHandler::handle`, after a peer's
-//!    `sync()` call returns a candidate txgroup but before it is handed to
-//!    the pool, call [`AppRateLimiter::should_drop`] with the group and an
-//!    origin byte string derived from the peer identity (e.g.
-//!    `TxSyncPeerClient::address()`, or a stable peer/connection id if one
-//!    exists) — since this is pull-based, "origin" naturally maps to
-//!    *which peer we pulled the group from*, not an inbound gossip sender.
-//!    A dropped group is simply not added to the pool (no different from
-//!    today's existing pool-full/duplicate rejection paths).
-//! 3. Wherever algod-rust surfaces an application eval error for a group
-//!    already admitted to the pool (block-assembly-time or
-//!    speculative/simulate-time evaluation, mirroring go's
-//!    `ledger/apply/application.go` failure path that go's `TxHandler`
-//!    listens for), call [`AppRateLimiter::penalize_eval_error`] with the
-//!    same group/origin so a misbehaving app's *future* pulls get rate
-//!    limited faster.
-//! 4. Because algod-rust's design pulls from potentially many peers per
-//!    round rather than being pushed transactions by whichever peer relays
-//!    first, the "origin" bucketing may end up mattering less than in
-//!    go's push model (a dropped group can simply be re-pulled from
-//!    another peer next round) — this is exactly the kind of behavioral
-//!    delta that needs a deliberate design call, not a blind 1:1 port,
-//!    per the parity audit that opened this issue.
+//! ## Two prior investigation passes looked in the wrong place
+//!
+//! Two earlier passes on this issue (see the issue's own history)
+//! considered only two candidate wiring points — algod-rust's REST
+//! transaction-submission path, and its pull-based tx-syncer
+//! (`crates/node/algo-network/src/tx_syncer.rs`) — and rejected both, the
+//! second time concluding no legitimate wiring point existed at all.
+//! Both candidates were the right *kind* of question (find go-algorand's
+//! actual, current call sites for `incomingTxGroupAppRateLimit` and match
+//! algod-rust's architecture to them) but missed a third candidate that
+//! already existed in this repo: [`crate::tx_tag_handler::TxTagHandler`],
+//! registered on `Tag::Transaction` for both the WS-gossip and libp2p P2P
+//! transports (`bin/algod-rust/src/commands/participate.rs`). This is a
+//! genuinely unsolicited, peer-pushed transaction ingestion path — a peer
+//! relays a `TX`-tagged gossip message without algod-rust having asked
+//! for it — the exact architectural analogue of go-algorand's
+//! `TxHandler.processIncomingTxn`/`validateIncomingTxMessage`, the only
+//! two call sites in go-algorand @ v5.0.0-stable (`data/txHandler.go`)
+//! that invoke `incomingTxGroupAppRateLimit`/`appLimiter.shouldDrop`.
+//!
+//! ## Confirming go-algorand's own pull-sync path never calls this either
+//!
+//! Before wiring `TxTagHandler`, this third pass re-traced go-algorand's
+//! actual pull-sync code (`data/txHandler.go`, `rpcs/txSyncer.go` @
+//! v5.0.0-stable) to settle whether the prior conclusion — that
+//! algod-rust's `tx_syncer.rs` (pull-based) has no legitimate wiring
+//! point for this gate — still holds now that a genuine push-side
+//! candidate exists:
+//!
+//! * go-algorand's own pull-based transaction sync — `rpcs.TxSyncer`,
+//!   wired up in `node/node.go`'s `MakeTxSyncer(..., node.txHandler.SolicitedTxHandler(), ...)`
+//!   — is precisely the go-algorand analogue of algod-rust's
+//!   `tx_syncer.rs`: both poll peers on a timer and pull candidate
+//!   transaction groups rather than being pushed them. `TxSyncer.sync`
+//!   (`rpcs/txSyncer.go:166`) hands every pulled group to
+//!   `data.SolicitedTxHandler.Handle`, whose sole implementation
+//!   (`data/txHandler.go:978`, `solicitedTxHandler.Handle`) calls
+//!   `handler.txHandler.processDecoded(txgroup)`.
+//! * `processDecoded` (`data/txHandler.go:914-960`) runs
+//!   `checkAlreadyCommitted` → `verify.PaysetGroups` →
+//!   `handler.txPool.Remember` — the full admission sequence — and calls
+//!   **neither** `incomingTxGroupAppRateLimit` **nor**
+//!   `appLimiter.shouldDrop`/`penalizeEvalError` anywhere in that path.
+//!   Compare this to the push path, `processIncomingTxn`
+//!   (`data/txHandler.go:740-808`) and `validateIncomingTxMessage`
+//!   (`data/txHandler.go:811-869`), both of which call
+//!   `handler.incomingTxGroupAppRateLimit(unverifiedTxGroup, rawmsg.Sender)`
+//!   before the group ever reaches the backlog queue, and
+//!   `postProcessCheckedTxn` (`data/txHandler.go:407-464`), which calls
+//!   `appLimiter.penalizeEvalError` on a `txPool.Remember` failure — but
+//!   only `if handler.appLimiter != nil && !wi.rawmsg.Outgoing &&
+//!   wi.rawmsg.Sender != nil`, i.e. only for messages that came in with a
+//!   real gossip `Sender`. A pulled group handed to `processDecoded` never
+//!   sets `rawmsg` at all (`solicitedTxHandler.Handle` calls
+//!   `processDecoded(txgroup)` directly, not through a `txBacklogMsg` with
+//!   a `rawmsg.Sender`), so it structurally cannot reach either check.
+//! * `incomingTxGroupAppRateLimit` is additionally gated by
+//!   `congestedARL := len(handler.backlogQueue) > handler.appLimiterBacklogThreshold`
+//!   — a push-specific gossip-backlog-queue-depth signal with no
+//!   analogue on a pull path at all.
+//! * Confirmed empirically: every `TestTxHandlerAppRateLimiter*`/
+//!   `TestAppRateLimiter_*` test in `data/txHandler_test.go` @
+//!   v5.0.0-stable drives the limiter exclusively through
+//!   `handler.processIncomingTxn(...)`; none exercise `processDecoded` or
+//!   `SolicitedTxHandler`.
+//!
+//! So `tx_syncer.rs` correctly remains unwired — go-algorand's own close
+//! structural analogue of a pull-sync mechanism (`TxSyncer` +
+//! `SolicitedTxHandler`) deliberately never applies this gate either, in
+//! the one version this project tracks (v5.0.0-stable). The earlier
+//! passes' conclusion about the *pull* side was right; what they missed
+//! was that algod-rust already has a genuine *push* side
+//! (`TxTagHandler`) that go's gate does apply to.
+//!
+//! ## Wiring summary
+//!
+//! [`crate::tx_tag_handler`]'s module doc has the concrete design:
+//! `TxTagHandler::with_app_rate_limiter` attaches a shared
+//! [`AppRateLimiter`], the admission check runs once
+//! `TransactionPool::pending_count()` exceeds a configured congestion
+//! threshold (the analogue of go's backlog-queue-depth signal — see that
+//! module for why pool occupancy is used instead), keyed by the sending
+//! peer's IP (port stripped, the analogue of go's `RoutingAddr()`), and
+//! `penalize_eval_error` is called on every `pool.remember` failure
+//! (go additionally excludes `TxnDeadError`/`ErrEvaluatorCorruptedState`,
+//! which algod-rust's `PoolError` has no equivalents for today — see that
+//! module for the full deviation note). Config knobs
+//! (`TxBacklogServiceRateWindowSeconds`, `TxBacklogAppTxRateLimiterMaxSize`,
+//! `TxBacklogAppTxPerSecondRate`, `TxBacklogAppRateLimitingCongestionPct`,
+//! `EnableTxBacklogAppRateLimiting`) are threaded through
+//! `algo_config::Local` at their go-algorand v5.0.0-stable defaults.
 //!
 //! ## Investigated and rejected: wiring into the REST submission path
 //!
@@ -170,13 +227,13 @@
 //! faithful analogue of go's un-gated `broadcastSignedTxGroup`/
 //! `LocalTransaction` paths and is intentionally left unchanged.
 //!
-//! No other push-style, unsolicited-external-input entry point currently
-//! exists in algod-rust outside the REST layer, so as of this writing there
-//! is **no legitimate wiring point** for `AppRateLimiter` in algod-rust: the
-//! only architecturally-correct point (mirroring go's actual gate) is the
-//! pull-based tx-syncer peer path sketched above, which requires the
-//! deliberate pull-vs-push redesign this issue and issue #860 both already
-//! flag as future, separately-scoped work.
+//! REST submission remains correctly ungated, matching go. `TxTagHandler`
+//! — algod-rust's inbound gossip TX-tag handler for both the WS-gossip
+//! and libp2p P2P transports — is the legitimate wiring point instead
+//! (see "Wiring summary" above): it is a genuinely unsolicited,
+//! peer-pushed ingestion path, the direct analogue of go's
+//! `TxHandler.processIncomingTxn`/`validateIncomingTxMessage`, and is now
+//! wired accordingly.
 //!
 //! # References
 //!
