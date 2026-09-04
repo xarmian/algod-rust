@@ -2886,10 +2886,16 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
         "appl" => {
             if txn.application_id != 0 {
                 app_ids_to_snap.push(txn.application_id);
-                // Snapshot the app creator for delete rollback.
+                // Snapshot the app creator for delete rollback, and the
+                // current "size sponsor" (if it differs from the creator --
+                // see the `ON_COMPLETION_UPDATE` resizing logic below) for
+                // resize-update rollback.
                 if let Some(params) = store.get_app_params(txn.application_id) {
                     if !touched.contains(&params.creator) {
                         touched.push(params.creator);
+                    }
+                    if !params.size_sponsor.is_zero() && !touched.contains(&params.size_sponsor) {
+                        touched.push(params.size_sponsor);
                     }
                 }
             }
@@ -3991,14 +3997,13 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
         }
         ON_COMPLETION_UPDATE => {
             if let Some(mut app) = store.get_app_params(app_id) {
-                if txn.sender != app.creator {
-                    return Err(err_ctx.error(format!(
-                        "{} update: sender {} is not the creator of app {}",
-                        err_ctx.prefix(),
-                        txn.sender,
-                        app_id,
-                    )));
-                }
+                // Unlike Delete, go-algorand's `ApplicationCall`
+                // (`ledger/apply/application.go`) does NOT require the
+                // update's sender to be the app's creator -- it calls
+                // `updateApplication(&ac, balances, creator, appIdx,
+                // header.Sender)` unconditionally. Permissioning an update
+                // to a particular admin address (or to the creator) is left
+                // entirely to the approval program's own TEAL logic.
                 // go-algorand `transactions.CheckContractVersions`
                 // (`data/transactions/transaction.go`): once a program
                 // version reaches `MinInnerApplVersion` (callable as an
@@ -4045,6 +4050,65 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
                 if consensus.enable_app_versioning {
                     app.version += 1;
                 }
+
+                // Resizing (`AppSizeUpdates`, go-algorand
+                // `ledger/apply/application.go:190-267`'s `updateApplication`,
+                // `sizeChange := ac.UpdatingSizes()` branch): a nonzero
+                // `GlobalStateSchema`/`ExtraProgramPages` on an update is
+                // rejected at well-formedness time unless `AppSizeUpdates`
+                // is active (`algo_validate::rules`'s `updating_sizes` gate),
+                // so by the time apply runs, a size-changing update here is
+                // already known-legal. Installs the new sizes and moves MBR
+                // responsibility (the "size sponsor") from whoever is
+                // currently on the hook to this update's sender -- back to
+                // "nobody" (encoded as the zero address) if the sender is
+                // the creator itself.
+                let new_global_schema = txn.global_state_schema.clone().unwrap_or_default();
+                let size_change = txn.extra_program_pages != 0 || !new_global_schema.is_empty();
+                if size_change {
+                    let sponsor = if app.size_sponsor.is_zero() {
+                        app.creator
+                    } else {
+                        app.size_sponsor
+                    };
+                    // Move the *old* size's MBR off the current sponsor
+                    // before overwriting `app.global_state_schema`/
+                    // `app.extra_program_pages` below -- matches go's
+                    // `sponsorRecord.TotalAppSchema.SubSchema(params.
+                    // GlobalStateSchema)` running before `params.
+                    // GlobalStateSchema = ac.GlobalStateSchema`.
+                    let mut sponsor_account = store.get_or_default_account(&sponsor);
+                    sponsor_account.total_app_schema = sponsor_account
+                        .total_app_schema
+                        .sub_schema(&app.global_state_schema);
+                    sponsor_account.total_extra_app_pages = sponsor_account
+                        .total_extra_app_pages
+                        .saturating_sub(app.extra_program_pages);
+                    store.set_account(&sponsor, sponsor_account);
+
+                    app.global_state_schema = new_global_schema.clone();
+                    app.extra_program_pages = txn.extra_program_pages;
+                    app.size_sponsor = if txn.sender == app.creator {
+                        Address::ZERO
+                    } else {
+                        txn.sender
+                    };
+
+                    // Sponsor and updater may be the same account (a repeat
+                    // resize by whoever already sponsors it) -- fetching the
+                    // updater's record only now, after the sponsor's `Put`
+                    // above, mirrors go's explicit ordering comment for
+                    // exactly this reason.
+                    let mut updater_account = store.get_or_default_account(&txn.sender);
+                    updater_account.total_app_schema = updater_account
+                        .total_app_schema
+                        .add_schema(&new_global_schema);
+                    updater_account.total_extra_app_pages = updater_account
+                        .total_extra_app_pages
+                        .saturating_add(txn.extra_program_pages);
+                    store.set_account(&txn.sender, updater_account);
+                }
+
                 store.set_app_params(app_id, app);
             }
         }

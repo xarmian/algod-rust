@@ -4651,6 +4651,30 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 self.store.set_account(&fee_sink, sink_acct);
             }
 
+            // Handle RekeyTo BEFORE type-specific dispatch (matches
+            // go-algorand's `ledger/eval/eval.go` `applyTransaction`
+            // ordering -- rewards, then rekey, then type dispatch -- applied
+            // unconditionally to every transaction, inner or top-level).
+            // Mirrors `apply.rs::apply_transaction_inner_body`'s identical
+            // top-level handling; inner transactions previously bypassed it
+            // entirely by dispatching straight to `apply_pay`/`apply_axfer`/
+            // `execute_inner_appl`, so an inner RekeyTo was silently
+            // ignored -- a real gap surfaced while porting go's
+            // `TestInnerAppCreateAndOptin` (issue #964), which relies on an
+            // inner appl-call's RekeyTo taking effect immediately so a
+            // subsequent nested inner txn's sender-authorization check
+            // (`auth_addr`) sees it within the same top-level transaction.
+            if let Some(rekey_addr) = txns[i].txn.rekey_to {
+                let rekey_sender = txns[i].txn.sender;
+                let mut rekey_account = self.store.get_or_default_account(&rekey_sender);
+                if rekey_addr == rekey_sender || rekey_addr.is_zero() {
+                    rekey_account.auth_addr = None;
+                } else {
+                    rekey_account.auth_addr = Some(rekey_addr);
+                }
+                self.store.set_account(&rekey_sender, rekey_account);
+            }
+
             // Increment txn counter before execution (matches go-algorand incTxnCount).
             current_counter += 1;
             self.txn_counter = current_counter;
@@ -9963,13 +9987,24 @@ mod tests {
         );
     }
 
-    // ---- P1-1: Inner update/delete creator checks ----
+    // ---- P1-1: Inner delete creator check; inner update has none ----
 
     #[test]
-    fn inner_appl_update_by_non_creator_fails() {
-        // App 100 was created by [1u8;32] (setup_app default).
-        // The inner txn sender (app 42's address) is NOT [1u8;32].
-        // An inner update (on_completion=4) should fail with a creator check error.
+    fn inner_appl_update_by_non_creator_succeeds() {
+        // App 100 was created by [1u8;32] (setup_app default). The inner
+        // txn's sender is app 42's own address, NOT [1u8;32].
+        //
+        // Unlike Delete, go-algorand's `updateApplication`
+        // (`ledger/apply/application.go:190`) takes no creator check
+        // whatsoever -- `ApplicationCall` invokes it unconditionally as
+        // `updateApplication(&ac, balances, creator, appIdx, header.Sender)`.
+        // Permissioning an update to a particular admin address is left
+        // entirely to the called app's own approval-program logic.
+        // Corrected from the previous (incorrect) `..._fails` expectation
+        // after checking directly against go-algorand source while porting
+        // `TestInnerUpdateResizing` (issue #964) -- the old assumption blocked
+        // exactly the legitimate non-creator-update pattern that test relies
+        // on.
         let mut store = LedgerState::new();
         setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
         setup_app(
@@ -9994,21 +10029,35 @@ mod tests {
         ctx.fee_sink = Address([0xFEu8; 32]);
         ctx.opcode_budget = 2000;
 
+        // Distinguishable from the original (version 6) programs purely so
+        // the assertions below can tell the update actually took effect.
+        let new_approval = make_program(7, true);
+        let new_clear = make_program(7, true);
+
         ctx.itxn_begin().unwrap();
         ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
         ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
         ctx.itxn_field(25, TealValue::Uint(4)).unwrap(); // OnCompletion = UpdateApplication
-        ctx.itxn_field(30, TealValue::Bytes(make_program(6, true)))
+        ctx.itxn_field(30, TealValue::Bytes(new_approval.clone()))
             .unwrap(); // ApprovalProgram
-        ctx.itxn_field(31, TealValue::Bytes(make_program(6, true)))
+        ctx.itxn_field(31, TealValue::Bytes(new_clear.clone()))
             .unwrap(); // ClearStateProgram
-        let result = ctx.itxn_submit();
+        ctx.itxn_submit()
+            .expect("a non-creator update must succeed when the called app's own program approves");
 
-        assert!(result.is_err(), "non-creator update should fail");
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("not the creator"),
-            "expected creator check error, got: {msg}"
+        let updated = ctx.store.get_app_params(100).unwrap();
+        assert_eq!(
+            updated.approval_program, new_approval,
+            "the update must actually install the new approval program"
+        );
+        assert_eq!(
+            updated.clear_state_program, new_clear,
+            "the update must actually install the new clear-state program"
+        );
+        assert_eq!(
+            updated.creator,
+            Address([1u8; 32]),
+            "update does not change the app's creator"
         );
     }
 
