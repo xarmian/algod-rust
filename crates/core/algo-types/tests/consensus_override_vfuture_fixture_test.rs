@@ -118,6 +118,23 @@ fn real_vfuture_fixture_load_is_visible_globally_through_consensus_params_for_ve
     assert_eq!(future_after.logic_sig_version, 13);
     assert_eq!(future_after.max_tx_group_size, 16);
     assert!(future_after.enable_heartbeat);
+    // Issue #814 live-verification finding: `EnableFeePooling`/
+    // `EnableLogicSigSizePooling` were removed from go-algorand's own live
+    // `ConsensusParams` struct once their gated behavior became permanently
+    // on (v28+/v40+), so this real go-authored fixture -- like any full
+    // struct-replace override sourced from a genuine go-algorand JSON dump
+    // -- never carries either key. Before the fix, ConsensusParamsOverride's
+    // container-level `#[serde(default)]` silently reset both to `false`
+    // here, which would have disabled fee pooling and logicsig-size pooling
+    // for the whole "future" protocol under this fixture.
+    assert!(
+        future_after.enable_fee_pooling,
+        "EnableFeePooling is absent from real go-algorand consensus.json output (removed once permanently-on, v28+) and must default to true, not the struct's zero value"
+    );
+    assert!(
+        future_after.enable_logicsig_size_pooling,
+        "EnableLogicSigSizePooling is absent from real go-algorand consensus.json output (removed once permanently-on, v40+) and must default to true, not the struct's zero value"
+    );
     assert_ne!(
         future_after, pristine_future,
         "the fixture must actually change \"future\"'s effective params"

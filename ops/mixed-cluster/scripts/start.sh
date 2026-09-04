@@ -189,6 +189,33 @@ mkdir -p "$RUST_DATA_DIR"
 printf '%s' "$ALGOD_TOKEN" > "$RUST_DATA_DIR/algod.token"
 printf '%s' "$ALGOD_TOKEN" > "$RUST_DATA_DIR/algod.admin.token"
 
+# -- 4b. Optional test-only consensus-parameter override (issue #814) ------
+# Opt-in, off by default: PHASE6_CONSENSUS_OVERRIDE points at a real
+# go-algorand-authored `consensus.json` (config.ConfigurableConsensusProtocolsFilename
+# — see tools/vfuture-consensus-override) to install identically on all
+# three Go relays AND the Rust node before any of them start, so every node
+# agrees on the same (possibly non-default) consensus parameters — e.g. a
+# shortened StateProofInterval for a soak that needs to observe a full
+# state-proof cycle without waiting out the real 256-round interval. Never
+# set by default; does not change any built-in default.
+if [ -n "${PHASE6_CONSENSUS_OVERRIDE:-}" ]; then
+    echo "==> installing consensus override from $PHASE6_CONSENSUS_OVERRIDE on all 4 nodes"
+    for node in Node1 Node2 Node3; do
+        cp "$PHASE6_CONSENSUS_OVERRIDE" "$NETROOT/$node/consensus.json"
+    done
+    cp "$PHASE6_CONSENSUS_OVERRIDE" "$RUST_DATA_DIR/consensus.json"
+fi
+
+# -- 4c. Optional opt-in state-proof worker (issue #814) -------------------
+# Off by default (go's own always-on worker has no analog here yet — see
+# `EnableStateProofWorker` in `bin/algod-rust`'s config.json schema). Set
+# PHASE6_ENABLE_STATE_PROOF_WORKER=1 to have the Rust node run its
+# signing/gossip/build/submit background service for this soak.
+if [ "${PHASE6_ENABLE_STATE_PROOF_WORKER:-0}" = "1" ]; then
+    echo "==> enabling EnableStateProofWorker on rust-node-4"
+    printf '{"EnableStateProofWorker": true}' > "$RUST_DATA_DIR/config.json"
+fi
+
 # -- 5. Start the Go nodes, then the Rust node -----------------------------
 cd "$ROOT"
 export PHASE6_GENESIS_ID="$GENESIS_ID"

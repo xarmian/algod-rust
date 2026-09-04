@@ -890,37 +890,43 @@ impl SimpleBlockEvaluator {
         let params = &self.consensus_params;
         let round = self.hdr.round;
 
-        // 1. Reject consensus-injected transaction types.
-        // State proof (stpf) transactions are injected directly into the
-        // block by the proposer's stateproof worker, not submitted by users
-        // through the pool -- there is no such side channel for it here
-        // (state-proof block assembly is unimplemented in this binary), so
-        // any stpf txn reaching the pool is necessarily bogus.
+        // 1. (formerly) blanket-reject state proof (stpf) transactions here.
+        // Issue #814 live mixed-cluster verification: this guard's own
+        // rationale -- "state-proof block assembly is unimplemented in this
+        // binary" -- went stale the moment #918 implemented
+        // `stateproof_service`'s `LocalTxBroadcaster::submit_group` path, and
+        // the guard kept firing on it: the Rust node's own state-proof
+        // worker submits its locally-built `StateProofTx` through this exact
+        // `ingest`/`validate_group_stateless_inner` path, so the blanket
+        // rejection silently discarded the node's own real proof before it
+        // ever reached the pool. It also rejected a Go peer's legitimately
+        // gossiped `StateProofTx` (observed live: `go-node-3` broadcasting
+        // its own worker's proof, rejected here with this exact message).
+        // go-algorand's own pool has no such rejection --
+        // `data/pools/transactionPool.go` special-cases `StateProofTx` for
+        // *acceptance* (pool-size overflow allowance, zero-fee exemption at
+        // `checkPendingQueueSize`/fee summarization), never excludes it.
+        // algod-rust's downstream checks are already stpf-aware and need no
+        // help from this guard: `validate_transaction_wellformed` (below)
+        // enforces stpf's own field shape (`Address::STATE_PROOF_SENDER`,
+        // zero fee/note/group/lease/rekey — `rules.rs`'s dedicated
+        // `txn_type == "stpf"` branch), `summarize_fees` prices it at zero
+        // fee-usage, and `verify_transaction_signature` already special-cases
+        // its zero-signature category (mirrors go's `verify/txn.go:344`).
         //
-        // Heartbeat (hb) transactions are, by contrast, ordinary pool
-        // transactions in go-algorand: `data/transactions/verify/txn.go`
-        // and `ledger/eval/eval.go`'s `applyTransaction` dispatch on
-        // `protocol.HeartbeatTx` exactly like any other type, with no
-        // pool-admission special case, and go's own heartbeat service
-        // (`heartbeat/service.go`) submits them via the same
+        // Heartbeat (hb) transactions went through the identical fix in
+        // issue #820 for the identical reason: go's own heartbeat service
+        // (`heartbeat/service.go`) submits via the same
         // `BroadcastInternalSignedTxGroup` path any locally-originated
-        // transaction uses. Issue #820: this used to reject `hb` here too,
-        // which meant algod-rust could never itself propose a block
-        // containing a heartbeat -- even one its own heartbeat service had
-        // submitted to the pool moments earlier. Heartbeat's own
+        // transaction uses, with no pool-admission special case, and
+        // rejecting it here meant algod-rust could never itself propose a
+        // block containing a heartbeat -- even one its own heartbeat service
+        // had submitted to the pool moments earlier. Heartbeat's own
         // correctness gates (proof verification, challenge eligibility,
         // free-fee eligibility) are enforced elsewhere: LogicSig signature
         // verification a few lines below (this account's accepting
         // program), `block.rs`'s block-level `verify_heartbeat_proof` call,
         // and `apply::apply_heartbeat`'s challenge/vote-ID/seed checks.
-        for stx in txgroup {
-            if stx.txn.txn_type == TxnType::Stpf {
-                return Err(algo_error::AlgoError::Validation {
-                    message: "state proof transactions (stpf) cannot be submitted via the pool"
-                        .into(),
-                });
-            }
-        }
 
         // 2. Per-transaction well-formedness.
         let in_group = txgroup.len() > 1;
@@ -3150,6 +3156,31 @@ pub async fn run(
     node_config: algo_config::Local,
     dns_bootstrap_override: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Load `<data_dir>/consensus.json` (if present) and merge it onto the
+    // built-in consensus table, exactly like `node.rs`'s `run_node` already
+    // does for `node start` (issue #750/#762). Found missing here during
+    // issue #814's live mixed-cluster verification: `participate` --
+    // the actual entry point a consensus-participating node runs, and the
+    // one `ops/mixed-cluster/` uses -- never called this, so a
+    // `consensus.json` override dropped into a participating node's data
+    // dir was silently ignored while the very same file worked for
+    // `node start`. Must happen before the ledger/participation/agreement
+    // machinery below ever evaluates a transaction or block, matching
+    // `node.rs`'s write-once/thread-safety contract (see
+    // `install_consensus_overrides`'s doc comment).
+    if let Some(data_dir) = rest_opts.data_dir.as_deref() {
+        let consensus_overrides_path =
+            data_dir.join(algo_types::consensus::CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
+        let consensus_protocols = algo_types::consensus::preload_configurable_consensus_protocols(
+            data_dir,
+        )
+        .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
+        algo_types::consensus::install_consensus_overrides(&consensus_protocols);
+        if consensus_overrides_path.exists() {
+            info!(path = %consensus_overrides_path.display(), "loaded consensus-parameter overrides");
+        }
+    }
+
     let resolved_p2p = p2p_opts.resolve();
     let network_mode = resolved_p2p.mode;
     // Resolve genesis ID: use the provided value, or look it up by network name.
@@ -6203,11 +6234,19 @@ mod tests {
     }
 
     // ====================================================================
-    // 2. stpf rejection / heartbeat acceptance tests (issue #820)
+    // 2. stpf rejection / heartbeat acceptance tests (issue #820, revised
+    //    for issue #814: the pool no longer blanket-rejects every `stpf`
+    //    transaction -- see `validate_group_stateless_inner`'s "1." comment)
     // ====================================================================
 
+    /// A transaction of type `stpf` from an ordinary (non-state-proof-sender)
+    /// account, carrying an ordinary payment shape and an ordinary ed25519
+    /// signature, must still be rejected -- not because `stpf` is
+    /// categorically banned from the pool anymore (issue #814 removed that
+    /// blanket guard), but because it fails `stpf`'s own well-formedness
+    /// check (`rules.rs`: sender must be `Address::STATE_PROOF_SENDER`).
     #[test]
-    fn reject_stpf_from_pool() {
+    fn reject_stpf_from_wrong_sender() {
         let ledger = test_ledger();
         let params = v41_params();
         let (sender, key) = test_keypair(1);
@@ -6220,9 +6259,45 @@ mod tests {
 
         let err = eval.transaction_group(&[stx]).unwrap_err();
         assert!(
-            err.to_string().contains("stpf"),
-            "expected stpf rejection, got: {err}"
+            err.to_string().contains("state-proof sender"),
+            "expected a state-proof-sender well-formedness rejection, got: {err}"
         );
+    }
+
+    /// Issue #814 live mixed-cluster verification: a genuine, well-formed,
+    /// zero-signature `stpf` transaction from `Address::STATE_PROOF_SENDER`
+    /// must now be ADMITTED to the pool -- whether it is the node's own
+    /// locally-built state proof (`stateproof_service`'s
+    /// `LocalTxBroadcaster::submit_group`) or one gossiped in from a peer
+    /// that built it first. Before this fix, `validate_group_stateless_inner`
+    /// rejected every `stpf` transaction outright with "cannot be submitted
+    /// via the pool" -- discovered live when a real go-algorand relay's own
+    /// state-proof-worker output was rejected by the Rust node's pool, and
+    /// confirmed that the Rust node's *own* state-proof worker would have
+    /// hit the identical rejection trying to submit its own proof.
+    #[test]
+    fn accept_well_formed_state_proof_txn_from_pool() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let mut eval = make_evaluator(&ledger, &params, 100, &[]);
+
+        let stx = algo_types::SignedTransaction {
+            txn: Transaction {
+                txn_type: TxnType::Stpf,
+                sender: Address::STATE_PROOF_SENDER,
+                fee: 0,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                genesis_hash: [0xAA; 32], // matches make_evaluator's block header
+                ..Default::default()
+            },
+            sig: [0u8; 64],
+            ..Default::default()
+        };
+
+        eval.transaction_group(&[stx])
+            .expect("a well-formed zero-signature stpf transaction must be admitted");
+        assert_eq!(eval.pay_set_size(), 1);
     }
 
     /// Issue #820: a well-formed, fee-exempt heartbeat transaction (as the
