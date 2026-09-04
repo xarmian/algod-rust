@@ -4000,6 +4000,66 @@ async fn account_info_includes_participation_keys() {
     );
 }
 
+/// Matches go-algorand's `TestNilStateProofInParticipationInfo`
+/// (`test/e2e-go/restAPI/stateproof/stateproofRestAPI_test.go`): an account
+/// that has registered participation keys (via keyreg) without a
+/// `StateProofKey` must report `participation` with `state-proof-key`
+/// entirely absent, not present-but-null or present-but-empty.
+#[tokio::test]
+async fn account_info_participation_without_state_proof_key_omits_field() {
+    let mut vote_id = [0u8; 32];
+    vote_id[0] = 0xAA;
+    vote_id[31] = 0xBB;
+
+    let mut selection_id = [0u8; 32];
+    selection_id[0] = 0xCC;
+
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 5_000_000,
+            status: algo_types::AccountStatus::Online,
+            vote_id: Some(vote_id),
+            selection_id: Some(selection_id),
+            state_proof_id: None,
+            vote_first_valid: 1,
+            vote_last_valid: 20,
+            vote_key_dilution: 100,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 5_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    let participation = body
+        .get("participation")
+        .expect("participation should be present for online account with vote_id");
+    assert!(
+        participation.get("state-proof-key").is_none(),
+        "state-proof-key must be entirely absent when the account has no state proof key, \
+         got: {participation:?}"
+    );
+
+    // Sanity: the other participation fields are still present.
+    assert!(participation.get("vote-participation-key").is_some());
+    assert!(participation.get("selection-participation-key").is_some());
+}
+
 // ===========================================================================
 // Application query endpoint tests (GET /v2/applications/:application-id)
 // ===========================================================================
