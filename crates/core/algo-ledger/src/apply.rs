@@ -1313,7 +1313,7 @@ fn collect_txn_addresses(
 /// address with its own valid key. Run only when `ctx.validate` (block
 /// validation of a newly-received block), not replay/re-execution of an
 /// already-certified block.
-fn check_authorizer<L: crate::store_trait::LedgerStore>(
+pub(crate) fn check_authorizer<L: crate::store_trait::LedgerStore>(
     store: &L,
     stx: &SignedTransaction,
 ) -> Result<(), AlgoError> {

@@ -814,20 +814,23 @@ fn simulate_rejects_box_index_exceeding_foreign_apps() {
         ..Default::default()
     };
 
-    let err = simulate(&mut state, request).expect_err("out-of-range box index must be rejected");
-    match err {
-        SimulatorError::InvalidRequest(e) => {
-            // Now caught by `wellFormed`'s own box-index/ForeignApps bound
-            // (issue #701), which mirrors upstream's exact message
-            // capitalization ("tx.Boxes[i].Index ... Exceeds
-            // len(tx.ForeignApps)"), rather than only the separate
-            // `check_application_call_boxes` group-level check.
-            assert!(
-                e.message.to_lowercase().contains("box"),
-                "expected a box-index rejection, got: {}",
-                e.message
-            );
-        }
-        other => panic!("expected InvalidRequest, got {other:?}"),
-    }
+    // Caught by `wellFormed`'s own box-index/ForeignApps bound (issue #701),
+    // which mirrors upstream's exact message capitalization ("tx.Boxes[i]
+    // .Index ... Exceeds len(tx.ForeignApps)"). This is a `WellFormed`
+    // failure attributable to a single transaction (go-algorand's
+    // `txnBatchPrep` wraps it with a known `GroupIndex`), so -- like
+    // TestInvalidTxGroup's incentive-pool-sender case (issue #974) -- it
+    // surfaces as the group's `FailureMessage`/`FailedAt` on an otherwise
+    // successful `Result`, not a hard request error.
+    let result = simulate(&mut state, request).expect("simulation returns a result");
+    let group = &result.txn_groups[0];
+    let msg = group
+        .failure_message
+        .as_ref()
+        .expect("out-of-range box index must fail the group");
+    assert!(
+        msg.to_lowercase().contains("box"),
+        "expected a box-index rejection, got: {msg}"
+    );
+    assert_eq!(group.failed_at, Some(vec![0]));
 }

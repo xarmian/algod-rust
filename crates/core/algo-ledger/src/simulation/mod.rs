@@ -62,8 +62,8 @@ use algo_validate::{
 use ed25519_dalek::{Signer, SigningKey};
 
 use crate::apply::{
-    apply_transaction_with_budget, compute_group_fee_credit_and_residue, ApplyContext, ApplyMode,
-    AvmEvalOverrides, BoxBudgetState, GroupInfo,
+    apply_transaction_with_budget, check_authorizer, compute_group_fee_credit_and_residue,
+    ApplyContext, ApplyMode, AvmEvalOverrides, BoxBudgetState, GroupInfo,
 };
 use crate::avm_context::NamedGroupResources;
 use crate::store_trait::LedgerStore;
@@ -138,6 +138,37 @@ impl fmt::Display for EvalFailureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} (at {:?})", self.message, self.failed_at)
     }
+}
+
+/// Outcome of [`Simulator::check`].
+///
+/// Mirrors go-algorand's split between a `verify.TxGroupError` with a known
+/// `GroupIndex` (attributable to one transaction -- surfaced as the group's
+/// `FailureMessage`/`FailedAt` on an otherwise-successful `Result`, exactly
+/// like an evaluation failure, per `simulator.go`'s `Simulate` switch) and a
+/// genuinely group-wide failure (`GroupIndex < 0`, e.g. a corrupted
+/// signature caught only by batch cryptographic verification, or a
+/// structural screen with no single offending transaction) -- returned as a
+/// hard [`SimulatorError::InvalidRequest`] instead. Well-formedness and
+/// signature-*format* failures (missing signature, more than one signature
+/// category, orphaned LogicSig fields) are per-transaction attributable in
+/// go-algorand and so become [`CheckOutcome::RecoverableFailure`]; actual
+/// cryptographic signature-verification failures stay hard errors, matching
+/// go's non-attributable batch-verifier failure.
+enum CheckOutcome {
+    /// The group passed `check()`; evaluation may proceed.
+    Passed {
+        logicsig_traces: Vec<Option<TransactionTrace>>,
+        logicsig_budgets: Vec<u64>,
+    },
+    /// A per-transaction attributable check failure. Evaluation never runs;
+    /// the caller reports this exactly like an early evaluation failure.
+    RecoverableFailure {
+        index: usize,
+        message: String,
+        logicsig_traces: Vec<Option<TransactionTrace>>,
+        logicsig_budgets: Vec<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +433,23 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         // Fetch block header for consensus params and timestamp
         let block_hdr = self.store.get_block_header(sim_round.0)?;
+        // An explicitly-requested round with no corresponding block header
+        // does not exist on this ledger (go-algorand: `s.ledger.BlockHdr`
+        // returns "ledger does not have entry N" from `simulatorLedger`'s
+        // embedded `data.Ledger`, propagated as a hard `Simulate` error --
+        // `TestStartRound`'s "1 round in the future" case). Only enforced
+        // when the caller supplied a round: the *default* round
+        // (`store.current_round()`) has no header in many unit tests that
+        // never call `put_block`, and go's own default (`s.ledger.Latest()`)
+        // is guaranteed to resolve on a real ledger, so silently falling
+        // back to the store's declared protocol there preserves existing
+        // behavior instead of newly rejecting it.
+        if request.round.is_some() && block_hdr.is_none() {
+            self.store.restore_snapshot(snapshot);
+            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                message: format!("ledger does not have entry {}", sim_round.0),
+            }));
+        }
         let consensus = match &block_hdr {
             Some(hdr) => consensus_params_for_version(&hdr.current_protocol).unwrap_or_default(),
             None => consensus_params_for_version(self.store.protocol()).unwrap_or_default(),
@@ -415,6 +463,16 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // execution. When tracing is enabled, `check` also captures logic-sig
         // opcode traces, since LogicSig programs run during signature
         // verification — before the per-transaction execution tracer exists.
+        //
+        // A `RecoverableFailure` (per-transaction attributable, e.g. a
+        // missing signature or `WellFormed` rejection) never reaches
+        // evaluation in go-algorand either -- `precheck_failure` seeds the
+        // group's `FailureMessage`/`FailedAt` up front and the per-txn eval
+        // loop below is skipped entirely, falling through to the normal
+        // fee-usage/initial-states finalization with every `TxnResult` left
+        // at its pre-populated (no `ApplyData`) default, exactly as if
+        // evaluation had failed on transaction zero before running anything.
+        let mut precheck_failure: Option<(usize, String)> = None;
         let (logicsig_traces, logicsig_budgets) = match self.check(
             &eval_group,
             request.allow_empty_signatures,
@@ -422,7 +480,19 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             &consensus,
             &request.trace_config,
         ) {
-            Ok(captured) => captured,
+            Ok(CheckOutcome::Passed {
+                logicsig_traces,
+                logicsig_budgets,
+            }) => (logicsig_traces, logicsig_budgets),
+            Ok(CheckOutcome::RecoverableFailure {
+                index,
+                message,
+                logicsig_traces,
+                logicsig_budgets,
+            }) => {
+                precheck_failure = Some((index, message));
+                (logicsig_traces, logicsig_budgets)
+            }
             Err(e) => {
                 self.store.restore_snapshot(snapshot);
                 return Err(e);
@@ -497,9 +567,22 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         for (i, consumed) in logicsig_budgets.iter().enumerate() {
             group_result.txn_results[i].logicsig_budget_consumed = *consumed;
         }
+        // Seed each transaction's trace with its LogicSig-only portion too
+        // (captured during `check()`, before any execution tracer exists).
+        // Normally the per-txn eval loop below overwrites this with the full
+        // execution trace via the same `merge_logicsig_trace` call; when
+        // `check()` fails before evaluation starts (`precheck_failure`),
+        // that loop never runs, so this is the only place the transaction's
+        // (partial) LogicSig trace gets attached.
+        for i in 0..group_result.txn_results.len() {
+            group_result.txn_results[i].trace = merge_logicsig_trace(None, &logicsig_traces, i);
+        }
 
-        let mut failure_message: Option<String> = None;
-        let mut failed_at: Option<TxnPath> = None;
+        let mut failure_message: Option<String> = precheck_failure
+            .as_ref()
+            .map(|(_, message)| message.clone());
+        let mut failed_at: Option<TxnPath> =
+            precheck_failure.as_ref().map(|(index, _)| vec![*index]);
 
         // Initial application state captured across the group (populated only
         // when state-change tracing is requested). Each transaction's tracer
@@ -545,6 +628,13 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         let scratch = std::cell::RefCell::new(vec![None; eval_group.len()]);
 
         for i in 0..eval_group.len() {
+            if precheck_failure.is_some() {
+                // `check()` already failed at a known index -- evaluation
+                // never starts, matching go-algorand (an outcome from
+                // `s.check` short-circuits `simulateWithTracer` before
+                // `s.evaluate` runs).
+                break;
+            }
             apply_ctx.txn_index.set(i);
 
             // Create a per-transaction tracer to capture execution details.
@@ -558,24 +648,38 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // so they all share the group context. The group refs are rebuilt
             // per iteration because `fix_signers` may mutate later
             // transactions' `auth_addr` between iterations.
-            let apply_result = {
-                let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
-                let gi = GroupInfo {
-                    txns: &group_refs,
-                    index: i,
-                    ran_program: &ran_program,
-                    scratch: &scratch,
-                };
-                apply_transaction_with_budget(
-                    self.store,
-                    &eval_group[i],
-                    &apply_ctx,
-                    0,
-                    Some(&mut group_budget),
-                    Some(&mut group_box_budget),
-                    Some(&gi),
-                    Some(&mut tracer),
-                )
+            // The account-authorizer check (go-algorand's `eval.go`
+            // `checkAuthorizer` -- "should have been authorized by X but
+            // was actually authorized by Y") runs on the real block-apply
+            // group path (`apply_group_transactions`) but was never wired
+            // into simulation's per-transaction loop, which calls
+            // `apply_transaction_with_budget` directly. A declared
+            // `auth_addr` that doesn't match the ledger's actual rekey
+            // state must fail evaluation here too -- including under
+            // `allow_empty_signatures`, which only relaxes *signature*
+            // verification, not this apply-time authorization fact
+            // (TestWrongAuthorizerTxn, issue #974).
+            let apply_result = match check_authorizer(self.store, &eval_group[i]) {
+                Err(e) => Err(e),
+                Ok(()) => {
+                    let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
+                    let gi = GroupInfo {
+                        txns: &group_refs,
+                        index: i,
+                        ran_program: &ran_program,
+                        scratch: &scratch,
+                    };
+                    apply_transaction_with_budget(
+                        self.store,
+                        &eval_group[i],
+                        &apply_ctx,
+                        0,
+                        Some(&mut group_budget),
+                        Some(&mut group_box_budget),
+                        Some(&gi),
+                        Some(&mut tracer),
+                    )
+                }
             };
             // Per-transaction app budget consumed = the sum of every approval /
             // clear-state program cost under this txn, including inner app calls,
@@ -757,7 +861,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         fix_signers: bool,
         consensus: &ConsensusParams,
         trace_config: &ExecTraceConfig,
-    ) -> Result<(Vec<Option<TransactionTrace>>, Vec<u64>), SimulatorError> {
+    ) -> Result<CheckOutcome, SimulatorError> {
         let spec = SpecialAddresses {
             fee_sink: self.store.fee_sink(),
             rewards_pool: self.store.rewards_pool(),
@@ -771,12 +875,41 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // Pass 1: reject unsupported transaction types, check well-formedness,
         // and proxy-sign unsigned transactions. Matches go-algorand's ordering
         // where all proxy-signing happens before group verification.
-        for stx in &mut verify_group {
+        for i in 0..verify_group.len() {
+            let stx = &mut verify_group[i];
             // Reject StateProof transactions (go-algorand: simulator.go:164).
             if stx.txn.txn_type == "stpf" {
                 return Err(SimulatorError::InvalidRequest(InvalidRequestError {
                     message: "cannot simulate StateProof transactions".to_string(),
                 }));
+            }
+
+            // A LogicSig carrying fields (args/msig/lmsig/sig) but no program
+            // is "orphaned": go-algorand's `logicSigGroupSizeCheck`
+            // (`verify/txn.go:266`) rejects it once size pricing is enabled,
+            // attributed to this transaction's `GroupIndex` -- a recoverable
+            // check failure, not a hard request error. Mirrors
+            // `algo_validate::logic_sig_group_size_check`'s orphan-content
+            // branch, duplicated here (rather than called) because that
+            // group-level helper has no per-transaction index to report and
+            // is reserved for real block validation (`block.rs`).
+            if consensus.per_byte_txn_surcharge != 0 {
+                if let Some(lsig) = &stx.lsig {
+                    let has_program = !lsig.logic.is_empty();
+                    let is_blank = lsig.logic.is_empty()
+                        && lsig.sig == [0u8; 64]
+                        && lsig.msig.is_none()
+                        && lsig.args.is_none()
+                        && lsig.lmsig.is_none();
+                    if !has_program && !is_blank {
+                        return Ok(CheckOutcome::RecoverableFailure {
+                            index: i,
+                            message: "LogicSig fields without LogicSig program".to_string(),
+                            logicsig_traces: vec![None; verify_group.len()],
+                            logicsig_budgets: vec![0; verify_group.len()],
+                        });
+                    }
+                }
             }
 
             // Check well-formedness. Pass `allow_fee_pooling = enable_fee_pooling`
@@ -786,17 +919,26 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // On fee-pooling protocols the per-txn check is skipped here and the
             // pooled group-fee check below enforces the minimum (mirroring
             // `verify.TxnGroup`).
-            validate_transaction_wellformed(
+            // A well-formedness failure is attributable to this transaction
+            // (go-algorand's `txnBatchPrep` wraps `Transaction.WellFormed`
+            // errors as `TxGroupError{GroupIndex: i}` -- known index, so
+            // `Simulate` reports it as the group's `FailureMessage`/
+            // `FailedAt` on an otherwise-successful `Result` rather than a
+            // hard request error, exactly like TestDefaultSignatureCheck's
+            // unknown-type/box-index/incentive-pool-sender siblings).
+            if let Err(e) = validate_transaction_wellformed(
                 &stx.txn,
                 consensus.enable_fee_pooling,
                 consensus,
                 Some(&spec),
-            )
-            .map_err(|e| {
-                SimulatorError::InvalidRequest(InvalidRequestError {
+            ) {
+                return Ok(CheckOutcome::RecoverableFailure {
+                    index: i,
                     message: e.to_string(),
-                })
-            })?;
+                    logicsig_traces: vec![None; verify_group.len()],
+                    logicsig_budgets: vec![0; verify_group.len()],
+                });
+            }
 
             // Handle empty signatures when allowed.
             let has_sig = stx.sig != [0u8; 64];
@@ -965,14 +1107,56 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // A non-LogicSig transaction consumes no LogicSig budget, leaving
             // the delta at 0.
             logicsig_budgets[i] = (budget_before - budget.remaining()).max(0) as u64;
-            result.map_err(|e| {
-                SimulatorError::InvalidRequest(InvalidRequestError {
-                    message: e.to_string(),
-                })
-            })?;
+            if let Err(e) = result {
+                let message = e.to_string();
+                // Signature-*format* failures (no signature at all, more
+                // than one signature category present) are per-transaction
+                // attributable in go-algorand (`checkTxnSigTypeCounts`
+                // wraps them as `TxGroupError{GroupIndex: groupIndex}`) --
+                // recoverable, like TestDefaultSignatureCheck's first
+                // (missing-signature) assertion. An actual cryptographic
+                // verification failure (wrong key, tampered signature bytes)
+                // stays a hard request error: go-algorand's batch verifier
+                // reports these with no attributable index
+                // (TestDefaultSignatureCheck's "one signature didn't pass"
+                // / TestOptionalSignaturesIncorrect), and even though this
+                // engine verifies signatures sequentially (so the index
+                // *is* technically known here), matching go's observable
+                // hard-error behavior is the parity target.
+                // A LogicSig program that rejects (top of stack zero) or
+                // errors during evaluation is likewise per-transaction
+                // attributable in go-algorand
+                // (`TxGroupErrorReasonLogicSigFailed`, `verify/txn.go:393`,
+                // `GroupIndex: gi`) -- recoverable, matching
+                // TestInvalidLogicSigPCandStack/TestInvalidApp's
+                // `require.NoError(t, err)` + `FailureMessage` pattern.
+                // `e.to_string()` on the underlying `AlgoError::Validation`
+                // prepends a `"validation error: "` prefix (see
+                // `algo_error::AlgoError`'s `Display` impl), so match on
+                // substring containment rather than the bare message.
+                let is_format_failure = message
+                    .contains("transaction has no signature (no sig, msig, lsig, or pqsig)")
+                    || message.contains("signedtxn should have only one type of signature, found")
+                    || message.contains("LogicSig program rejected the transaction")
+                    || message.contains("LogicSig program error:");
+                if is_format_failure {
+                    return Ok(CheckOutcome::RecoverableFailure {
+                        index: i,
+                        message,
+                        logicsig_traces,
+                        logicsig_budgets,
+                    });
+                }
+                return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                    message,
+                }));
+            }
         }
 
-        Ok((logicsig_traces, logicsig_budgets))
+        Ok(CheckOutcome::Passed {
+            logicsig_traces,
+            logicsig_budgets,
+        })
     }
 }
 
@@ -1293,6 +1477,64 @@ mod tests {
         };
         assert!(is_placeholder_delegated_pqsig(&stx));
         assert!(!is_placeholder_pqsig(&stx));
+    }
+
+    // ── txn_has_no_signature (issue #974, port of go's
+    // TestTxnNeedsSyntheticSignatureLogicSigContent) ──────────────────
+    //
+    // go-algorand's `txnNeedsSyntheticSignature` is `!txn.HasSignature() ||
+    // isPlaceholderPQSig(txn) || isPlaceholderDelegatedPQSig(txn)`; this
+    // crate's `txn_has_no_signature` is the analogous first disjunct
+    // (`!HasSignature()`), used the same way by `fix_unsigned_signers_*` to
+    // decide which transactions need their `auth_addr` corrected. Mirrors
+    // go's three assertions on a default (fully blank) `SignedTxn`, a
+    // `LogicSig` carrying only `Args`, and a `LogicSig` carrying only a
+    // (non-blank) delegated `Sig` -- in both LogicSig cases go's
+    // `LogicSig.Blank()` (and this crate's analogous `lsig.is_some()` gate)
+    // treats the LogicSig as a present signature category, independent of
+    // which specific field is set.
+
+    #[test]
+    fn txn_has_no_signature_true_for_fully_blank_txn() {
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(),
+            ..Default::default()
+        };
+        assert!(txn_has_no_signature(&stx));
+    }
+
+    #[test]
+    fn txn_has_no_signature_false_for_logicsig_args_only() {
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(),
+            lsig: Some(algo_types::LogicSig {
+                logic: serde_bytes::ByteBuf::new(),
+                sig: [0u8; 64],
+                msig: None,
+                lmsig: None,
+                args: Some(vec![serde_bytes::ByteBuf::from(vec![1u8])]),
+                pqsig: None,
+            }),
+            ..Default::default()
+        };
+        assert!(!txn_has_no_signature(&stx));
+    }
+
+    #[test]
+    fn txn_has_no_signature_false_for_logicsig_sig_only() {
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(),
+            lsig: Some(algo_types::LogicSig {
+                logic: serde_bytes::ByteBuf::new(),
+                sig: [1u8; 64],
+                msig: None,
+                lmsig: None,
+                args: None,
+                pqsig: None,
+            }),
+            ..Default::default()
+        };
+        assert!(!txn_has_no_signature(&stx));
     }
 
     #[test]

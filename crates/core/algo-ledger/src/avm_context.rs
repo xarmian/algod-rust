@@ -1450,9 +1450,26 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         }
     }
 
-    /// Track an app-local access. Records the unnamed halves, or — when both
-    /// halves are named but no single transaction names them together — the
-    /// local cross-product itself (go-algorand `AllowsLocal`).
+    /// Track an app-local access. Records the unnamed halves (account/app,
+    /// whichever aren't independently named), and -- unless this is the
+    /// app's own account, a group-created app, or a pair some single
+    /// transaction already names together -- the local cross-product
+    /// itself.
+    ///
+    /// Matches go-algorand's `resourcePolicy.AllowsLocal` -> `addLocal`
+    /// (`ledger/simulation/resources.go`): unlike the sibling
+    /// `note_holding_access`'s asset-holding cross-product (which this
+    /// crate gates on both halves being independently named -- there is no
+    /// go-side equivalent narrowing for holdings either, but no test here
+    /// currently exercises the gap), go's `ResourceTracker.addLocal` is
+    /// called unconditionally by `AllowsLocal` with **no** "both halves
+    /// already named" precondition -- only its `hasLocal` sibling's
+    /// app's-own-account special case and the tracker's own dedup skip
+    /// recording. Requiring both halves to be independently named here
+    /// would silently drop exactly the scenario issue #974's
+    /// `TestUnnamedResourcesAccountLocalWrite` pins: a completely unnamed
+    /// account written via `app_local_put` to the (already-available,
+    /// hence trivially "named") current app.
     fn note_local_access(&self, account: &[u8; 32], app_id: u64) {
         if let Some(named) = &self.unnamed_tracking {
             let acct_named = self.is_named_account(named, account);
@@ -1463,9 +1480,9 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             if !app_named {
                 self.record_unnamed(UnnamedResourceAccess::App(app_id));
             }
-            if acct_named
-                && app_named
-                && app_id != 0
+            let is_own_account = app_id != 0 && app_address(app_id) == *account;
+            if app_id != 0
+                && !is_own_account
                 && !self.created_apps.contains(&app_id)
                 && !named.has_local(account, app_id)
             {
@@ -3583,6 +3600,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         key: &[u8],
         value: TealValue,
     ) -> Result<(), AlgoError> {
+        // Matches `app_local_get`/`app_opted_in`'s tracking call: a
+        // local-state *write* to an unnamed (account, app) pair must be
+        // recorded too, not just reads (issue #974's
+        // `TestUnnamedResourcesAccountLocalWrite`) -- `is_local_available`
+        // itself only decides availability; the note is the accessor's job,
+        // matching `is_holding_available`'s documented pattern.
+        self.note_local_access(account, app_id);
         let addr = Address(*account);
         let mut local = self
             .store
@@ -3620,6 +3644,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         app_id: u64,
         key: &[u8],
     ) -> Result<(), AlgoError> {
+        self.note_local_access(account, app_id);
         let addr = Address(*account);
         let pre = self
             .store
@@ -5179,6 +5204,29 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // The current app's own address is always available.
         if app_address(self.app_id) == *addr {
             return true;
+        }
+        false
+    }
+
+    /// Matches go-algorand's `IndexByAddress`-succeeds subset of
+    /// `accountReference`: the current transaction's own sender, or a
+    /// member of its `Accounts`/`Access` array. See the trait doc comment
+    /// ([`algo_avm::context::AvmContext::is_named_account_for_mutation`])
+    /// for why this is narrower than [`Self::is_account_available`].
+    fn is_named_account_for_mutation(&self, addr: &[u8; 32]) -> bool {
+        let txn = &self.group[self.group_index].txn;
+        if txn.sender.0 == *addr {
+            return true;
+        }
+        if let Some(ref access) = txn.access {
+            if access.iter().any(|rr| rr.address.0 == *addr) {
+                return true;
+            }
+        }
+        if let Some(ref accounts) = txn.accounts {
+            if accounts.iter().any(|a| a.0 == *addr) {
+                return true;
+            }
         }
         false
     }

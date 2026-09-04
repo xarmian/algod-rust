@@ -247,20 +247,34 @@ fn resolve_account(value: AvmValue, ctx: &dyn AvmContext) -> Result<[u8; 32], Al
 /// (`app_local_put`/`app_local_del`).
 ///
 /// Matches go-algorand's `mutableAccountReference`
-/// (`data/transactions/logic/eval.go`): unlike the general
-/// [`resolve_account`], a raw 32-byte address is rejected outright here,
-/// even though it may be perfectly resolvable for reads. A write must be
-/// encodable in the transaction's `EvalDelta.LocalDeltas`, which is indexed
-/// by position in the txn's `Accounts` array (`Sender` is index 0); a raw
-/// address supplied directly on the stack has no such position and so
-/// cannot be the target of a local-state mutation, even if the account
-/// happens to be readable for other purposes.
-fn resolve_mutable_account(value: AvmValue, ctx: &dyn AvmContext) -> Result<[u8; 32], AlgoError> {
+/// (`data/transactions/logic/eval.go`): a raw 32-byte address is only a
+/// valid mutation target when it resolves to the sender or a member of the
+/// txn's `Accounts`/`Access` array ([`AvmContext::is_named_account_for_mutation`] --
+/// go's `IndexByAddress` finding a real position, encodable in
+/// `EvalDelta.LocalDeltas`), OR -- from `sharedResourcesVersion` (v9)
+/// onward -- any address available under the group's broader
+/// resource-sharing/unnamed-tracking rules
+/// ([`AvmContext::is_account_available`]; go's `mutableAccountReference`
+/// falls through to accept the "available via some other path" sentinel
+/// index once `cx.version >= sharedResourcesVersion`). Before v9, a raw
+/// address that isn't the sender or in `Accounts` is rejected outright,
+/// even though it may be perfectly resolvable for reads.
+fn resolve_mutable_account(
+    value: AvmValue,
+    ctx: &dyn AvmContext,
+    version: u8,
+) -> Result<[u8; 32], AlgoError> {
     match value {
         AvmValue::Uint64(idx) => ctx.resolve_account(idx),
         AvmValue::Bytes(b) if b.len() == 32 => {
             let mut addr = [0u8; 32];
             addr.copy_from_slice(&b);
+            if ctx.is_named_account_for_mutation(&addr) {
+                return Ok(addr);
+            }
+            if version >= SHARED_RESOURCES_VERSION && ctx.is_account_available(&addr) {
+                return Ok(addr);
+            }
             Err(AlgoError::Avm {
                 message: format!(
                     "invalid Account reference for mutation {}",
@@ -410,7 +424,7 @@ pub fn op_app_local_put(
     let value = machine.pop()?;
     let key = machine.pop_bytes()?;
     let acct_val = machine.pop()?;
-    let addr = resolve_mutable_account(acct_val, ctx)?;
+    let addr = resolve_mutable_account(acct_val, ctx, machine.version)?;
     let app_id = ctx.current_app_id();
     check_locals_available(machine.version, ctx, &addr, app_id)?;
     ctx.app_local_put(&addr, app_id, &key, avm_to_teal(value))
@@ -436,7 +450,7 @@ pub fn op_app_local_del(
 ) -> Result<(), AlgoError> {
     let key = machine.pop_bytes()?;
     let acct_val = machine.pop()?;
-    let addr = resolve_mutable_account(acct_val, ctx)?;
+    let addr = resolve_mutable_account(acct_val, ctx, machine.version)?;
     let app_id = ctx.current_app_id();
     check_locals_available(machine.version, ctx, &addr, app_id)?;
     ctx.app_local_del(&addr, app_id, &key)
@@ -1978,19 +1992,55 @@ mod tests {
         let addr = test_addr(0x01);
         let mut ctx = TestStateContext::new(100);
         ctx.accounts.push(addr);
-        let resolved = super::resolve_mutable_account(AvmValue::Uint64(0), &ctx).unwrap();
+        let resolved = super::resolve_mutable_account(AvmValue::Uint64(0), &ctx, 8).unwrap();
         assert_eq!(resolved, addr);
     }
 
     #[test]
-    fn resolve_mutable_account_rejects_raw_address() {
+    fn resolve_mutable_account_rejects_raw_address_pre_v9() {
         // A raw 32-byte address is resolvable for reads (see
-        // `resolve_account`) but must be rejected for a write -- it has no
-        // position in the txn's Accounts array to encode a mutation
-        // against, matching go-algorand's `mutableAccountReference`.
+        // `resolve_account`) but must be rejected for a write before
+        // `sharedResourcesVersion` (v9) -- it has no position in the txn's
+        // Accounts array to encode a mutation against (`TestStateContext`
+        // doesn't implement `is_named_account_for_mutation`, so it isn't the sender or a
+        // named `Accounts` entry either), matching go-algorand's
+        // `mutableAccountReference`.
         let addr = test_addr(0x02);
         let ctx = TestStateContext::new(100);
-        let err = super::resolve_mutable_account(AvmValue::Bytes(addr.to_vec()), &ctx).unwrap_err();
+        let err =
+            super::resolve_mutable_account(AvmValue::Bytes(addr.to_vec()), &ctx, 8).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid Account reference for mutation"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_mutable_account_accepts_available_raw_address_at_v9() {
+        // From `sharedResourcesVersion` (v9) onward, a raw address that
+        // isn't the sender/named but is otherwise available (here: default
+        // `TestStateContext::is_account_available` -- true unless
+        // explicitly marked unavailable) is a valid mutation target,
+        // matching go-algorand's `mutableAccountReference` v9+
+        // fallthrough (issue #974's `TestUnnamedResourcesAccountLocalWrite`
+        // v9+ scenario).
+        let addr = test_addr(0x03);
+        let ctx = TestStateContext::new(100);
+        let resolved =
+            super::resolve_mutable_account(AvmValue::Bytes(addr.to_vec()), &ctx, 9).unwrap();
+        assert_eq!(resolved, addr);
+    }
+
+    #[test]
+    fn resolve_mutable_account_rejects_unavailable_raw_address_at_v9() {
+        // Even at v9+, an address the group's resource rules mark
+        // unavailable must still be rejected.
+        let addr = test_addr(0x04);
+        let mut ctx = TestStateContext::new(100);
+        ctx.unavailable_raw_accounts.insert(addr);
+        let err =
+            super::resolve_mutable_account(AvmValue::Bytes(addr.to_vec()), &ctx, 9).unwrap_err();
         assert!(
             err.to_string()
                 .contains("invalid Account reference for mutation"),
@@ -2001,7 +2051,7 @@ mod tests {
     #[test]
     fn resolve_mutable_account_rejects_out_of_range_index() {
         let ctx = TestStateContext::new(100);
-        assert!(super::resolve_mutable_account(AvmValue::Uint64(5), &ctx).is_err());
+        assert!(super::resolve_mutable_account(AvmValue::Uint64(5), &ctx, 8).is_err());
     }
 
     // ── resolve_account availability gate (issue #808) ────────────
