@@ -1773,6 +1773,20 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     }
 
     store.set_current_round(block.round);
+    // Keep the ledger's tracked "live" protocol version (`resolve_protocol`'s
+    // `ledger.protocol()`, consulted by `/v2/status`'s `last-version` and by
+    // `/v2/transactions/params`'s fee/param resolution) advancing with the
+    // chain. `set_protocol` used to be called only once, at genesis
+    // (`genesis.rs`'s `populate_store`) -- so a node that lived through a
+    // real on-chain consensus-protocol upgrade (`current_protocol` switching
+    // via `block_header.rs`'s `process_upgrade_params`/`apply_upgrade_vote`)
+    // kept reporting its *pre-upgrade* protocol forever after, even though
+    // every block header correctly recorded the new one. Found live via
+    // `bin/algod-rust/tests/multi_node_consensus_sync.rs`'s consensus-upgrade
+    // test (issue #827 theme 4, `TestSimpleUpgrade`): both nodes' block
+    // headers switched to the new protocol right on schedule, but
+    // `/v2/status` kept reporting the old one indefinitely.
+    store.set_protocol(block.current_protocol.clone());
     store.purge_expired_leases(block.round.0);
 
     // Persist the block's txn_counter so the next block's ID generation

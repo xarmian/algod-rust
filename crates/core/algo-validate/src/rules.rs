@@ -1270,14 +1270,27 @@ fn validate_application_call_wellformed(
 /// Validate that a block's protocol version is known.
 ///
 /// go-algorand rejects blocks whose `proto` field is not in the consensus
-/// params map. We replicate this by checking against `KNOWN_PROTOCOL_VERSIONS`.
+/// params map (`config.Consensus`). That map is not fixed at compile time in
+/// go-algorand -- a node's `<data_dir>/consensus.json` can add wholly new
+/// version names to it (`PreloadConfigurableConsensusProtocols`) -- so the
+/// correct check here is "does *this node's* consensus-params table know
+/// this version" (`consensus_params_for_version`, which already consults the
+/// process-global `consensus.json` override registry installed at startup),
+/// not "is this one of the compile-time-known versions"
+/// (`KNOWN_PROTOCOL_VERSIONS`). Checking only the latter used to reject
+/// every block on a custom-named override version (e.g. a `TestSimpleUpgrade`
+/// -style test protocol) as "unsupported", even though the node's own
+/// `consensus.json` had it -- found live via
+/// `bin/algod-rust/tests/multi_node_consensus_sync.rs`'s consensus-upgrade
+/// test: a follower node's catchup service rejected every fetched block
+/// under the override-only version with "unsupported protocol version".
 pub fn validate_protocol_version(version: &str) -> Result<(), AlgoError> {
     if version.is_empty() {
         return Err(AlgoError::Validation {
             message: "block protocol version is empty".to_string(),
         });
     }
-    if !KNOWN_PROTOCOL_VERSIONS.contains(&version) {
+    if consensus_params_for_version(version).is_none() {
         return Err(AlgoError::Validation {
             message: format!("unknown protocol version: {version}"),
         });
