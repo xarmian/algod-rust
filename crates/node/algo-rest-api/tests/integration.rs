@@ -9583,3 +9583,129 @@ async fn metrics_endpoint_404s_when_not_participating() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+// ===========================================================================
+// Max request body size (issue #953)
+// ===========================================================================
+
+/// Builds a router directly (no real TCP listener) and dispatches a raw
+/// request via `tower::ServiceExt::oneshot` — mirroring go's own
+/// `TestRouterRequestBody`, which dispatches through `e.ServeHTTP(rec,
+/// req)` in-process rather than over a real socket. A real
+/// `reqwest`-over-TCP round trip (like every other test in this file uses)
+/// is unsuitable here specifically: once the server-side body extractor
+/// rejects a request for exceeding the size limit, hyper's h1 server can
+/// abort the still-uploading connection before the client finishes writing
+/// an 11MB body, which surfaces to `reqwest` as a transport-level
+/// "connection reset" error instead of a clean `413` response — a known
+/// interaction between axum's `DefaultBodyLimit` and streamed uploads, not
+/// a bug in the body-limit logic under test.
+async fn oneshot_request(
+    node: MockNode,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Vec<u8>,
+) -> axum::response::Response {
+    use tower::ServiceExt;
+
+    let tokens = TokenConfig {
+        api_token: generate_token(),
+        admin_token: generate_token(),
+        enable_experimental_api: node.enable_experimental_api,
+        disable_api_auth: node.disable_api_auth,
+        enable_private_network_access_header: false,
+    };
+    // Route the caller-supplied token through whichever tier it names, so
+    // callers can pass either the freshly generated api_token or
+    // admin_token below.
+    let (api_token, admin_token) = (tokens.api_token.clone(), tokens.admin_token.clone());
+    let effective_token = if token == "API" {
+        api_token
+    } else {
+        admin_token
+    };
+
+    let router = build_router(Arc::new(node), tokens);
+    let request = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("X-Algo-API-Token", effective_token)
+        .header("Content-Type", "application/x-binary")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    router.oneshot(request).await.unwrap()
+}
+
+/// TDD anchor for issue #953, mirroring go-algorand's
+/// `TestRouterRequestBody` (`daemon/algod/api/server/v2/test/handlers_test.go`):
+/// a request body larger than `MaxRequestBodyBytes` ("10MB") on the
+/// authenticated (public-token) tier must be rejected with `413 Payload Too
+/// Large`, closing a real DoS-hardening gap where algod-rust previously
+/// enforced no explicit body-size limit at all on this tier (only axum's
+/// undocumented implicit 2MB default, which is narrower than go's 10MB and
+/// not something any code here declared on purpose).
+#[tokio::test]
+async fn oversized_body_on_authenticated_route_is_rejected_with_413() {
+    let oversized_body = vec![b'a'; 11 * 1024 * 1024]; // 11MB > the 10MB limit
+    let resp = oneshot_request(
+        MockNode::synced(),
+        "POST",
+        "/v2/transactions",
+        "API",
+        oversized_body,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        413,
+        "oversized authenticated-tier body must be rejected"
+    );
+}
+
+/// TDD anchor for issue #953: a body at or under the 10MB limit on the
+/// authenticated tier must NOT be rejected on size grounds alone (it may
+/// still fail with a different status once the handler actually inspects
+/// the — here deliberately garbage — payload, but never `413`).
+#[tokio::test]
+async fn body_at_the_limit_on_authenticated_route_is_not_413() {
+    let body_at_limit = vec![b'a'; 10 * 1024 * 1024]; // exactly the 10MB limit
+    let resp = oneshot_request(
+        MockNode::synced(),
+        "POST",
+        "/v2/transactions",
+        "API",
+        body_at_limit,
+    )
+    .await;
+    assert_ne!(
+        resp.status(),
+        413,
+        "a body at (not over) the limit must not be size-rejected"
+    );
+}
+
+/// TDD anchor for issue #953, mirroring go-algorand's
+/// `TestRouterRequestBody`: go's admin tier (`adminMiddleware`) never gets
+/// `publicMiddleware`'s `BodyLimit`, so an admin-token POST larger than
+/// `MaxRequestBodyBytes` still succeeds. `MockNode::install_participation_key`
+/// ignores its payload and always returns `Ok`, so this proves the body was
+/// never truncated/rejected on size grounds — only a genuine size-unrelated
+/// failure (never `413`) would indicate a regression here.
+#[tokio::test]
+async fn oversized_body_on_admin_route_is_not_size_limited() {
+    let oversized_body = vec![b'a'; 11 * 1024 * 1024]; // 11MB > the public tier's 10MB limit
+    let resp = oneshot_request(
+        MockNode::synced(),
+        "POST",
+        "/v2/participation",
+        "ADMIN",
+        oversized_body,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "admin-tier body size must be unbounded, matching go's adminMiddleware (no BodyLimit)"
+    );
+}

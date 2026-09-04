@@ -26,6 +26,7 @@
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
@@ -77,6 +78,21 @@ pub struct TokenConfig {
     pub enable_private_network_access_header: bool,
 }
 
+/// Maximum request body size accepted by the public-API tier (issue #953).
+///
+/// Mirrors go-algorand's `server.MaxRequestBodyBytes` (`"10MB"`,
+/// `../go-algorand/daemon/algod/api/server/router.go:56`), parsed by
+/// echo/gommon's binary (1024-based) unit convention — `10 * 1024 * 1024`,
+/// not the decimal `10_000_000` a literal SI reading of "MB" might suggest.
+/// Applied only to the `authenticated`/`data`/`experimental` route groups
+/// below (go's `publicMiddleware`), matching go exactly: the no-auth
+/// `public` group and the admin-token-only `admin` group are deliberately
+/// left unbounded, since go's `common.Routes`/`adminMiddleware`
+/// registrations never include `middleware.BodyLimit` either
+/// (`router.go:131-146` — only `nppublic`/`ppublic`/`data`/`experimental`
+/// get `publicMiddleware`).
+pub const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Build the complete API router.
 ///
 /// The router is split into three layers:
@@ -105,7 +121,14 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
         // Prometheus text exposition (issue #473). Public, like
         // go-algorand's `/metrics`: it carries counters only, and every
         // off-the-shelf scraper expects an unauthenticated endpoint.
-        .route("/metrics", get(handlers::metrics::<N>));
+        .route("/metrics", get(handlers::metrics::<N>))
+        // `MaxRequestBodyBytes` (issue #953) doesn't apply here either —
+        // go's `common.Routes` are registered with no middleware at all
+        // (router.go:131). Every route above is GET-only today so this is
+        // currently a no-op, but it keeps this group's stated "unbounded"
+        // contract true rather than silently depending on axum's implicit
+        // 2MB default if a body-consuming route is ever added here.
+        .layer(DefaultBodyLimit::disable());
 
     // Authenticated routes (public API token required)
     let authenticated = Router::new()
@@ -228,6 +251,10 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/devmode/blocks/offset/:offset",
             post(handlers::set_block_timestamp_offset::<N>),
         );
+    // `MaxRequestBodyBytes` (issue #953): applied unconditionally, exactly
+    // like go's `publicMiddleware` — independent of `DisableAPIAuth`, which
+    // only ever gates the *auth* layer below, not the body-size limit.
+    let authenticated = authenticated.layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES));
     // Authenticated routes accept either the admin or the public token,
     // matching go-algorand's `[adminToken, apiToken]` public middleware
     // (router.go:96) — the admin token is valid everywhere. Skipped
@@ -280,6 +307,18 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
                 .delete(handlers::delete_participation_key_by_id::<N>)
                 .post(handlers::append_keys::<N>),
         )
+        // `MaxRequestBodyBytes` (issue #953) deliberately does *not* apply
+        // here — go's admin tier (`adminMiddleware`, router.go:144/146)
+        // never gets `publicMiddleware`'s `BodyLimit`, so
+        // `/v2/participation`'s `add_participation_key`/`append_keys` and
+        // `/debug/settings/pprof`'s `put_debug_settings_prof` stay
+        // unbounded, matching go's `TestRouterRequestBody` (a >
+        // `MaxRequestBodyBytes` admin POST still succeeds). Explicitly
+        // disables axum's own implicit 2MB `DefaultBodyLimit` (applied to
+        // every `Bytes`/`Json`-consuming handler when no layer overrides
+        // it) rather than silently inheriting a narrower, go-mismatched
+        // cap here.
+        .layer(DefaultBodyLimit::disable())
         .layer(middleware::from_fn_with_state(
             // Admin routes require the admin token only (go router.go:83).
             vec![tokens.admin_token.clone()],
@@ -301,7 +340,8 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             .route(
                 "/v2/ledger/sync/:round",
                 post(handlers::set_sync_round::<N>),
-            );
+            )
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES));
         // Data API uses the public middleware (admin token also valid),
         // skipped when `DisableAPIAuth` is set (issue #748) — same
         // "non-admin only" scope as the `authenticated` group above.
@@ -324,7 +364,8 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             .route(
                 "/v2/transactions/async",
                 post(handlers::raw_transaction_async::<N>),
-            );
+            )
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES));
         // Experimental routes use the public middleware (admin token also
         // valid), skipped when `DisableAPIAuth` is set — same scope note
         // as above.
