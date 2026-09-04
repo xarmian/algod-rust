@@ -177,11 +177,7 @@ fn run_send_inner(
             Address::from_algorand_string(&c).map_err(|e| format!("Could not parse close-to: {e}"))
         })
         .transpose()?;
-    let rekey_addr = args
-        .rekey_to
-        .as_deref()
-        .map(|r| Address::from_algorand_string(r).map_err(|e| format!("rekey-to invalid: {e}")))
-        .transpose()?;
+    let rekey_addr = parse_rekey(args.rekey_to.as_deref().unwrap_or(""))?;
 
     // Resolve --signer/-S into an AuthAddr; it must differ from the sender
     // (clerk.go:271-277). Applied on the program-account and wallet paths.
@@ -235,8 +231,8 @@ fn run_send_inner(
     if let Some(close) = close_resolved {
         builder = builder.close_remainder_to(close);
     }
-    if let Some(rekey) = rekey_addr {
-        builder = builder.rekey_to(rekey);
+    if rekey_addr != Address::default() {
+        builder = builder.rekey_to(rekey_addr);
     }
     let mut txn = builder.build().map_err(|e| e.to_string())?;
 
@@ -527,6 +523,21 @@ pub(crate) fn parse_lease(lease: Option<&str>) -> Result<[u8; 32], String> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
     Ok(out)
+}
+
+/// Resolve `clerk send`'s `--rekey-to` flag into an [`Address`], mirroring
+/// Go's `parseRekey` (`cmd/goal/common.go:68-77`). An empty/unset flag
+/// resolves to the zero address (Go's `basics.Address{}`, meaning "no
+/// rekey"); a non-empty value must be a valid checksummed Algorand address.
+///
+/// Go's `parseRekey` calls `reportErrorln` (process-exit) on a bad address;
+/// we return `Result` instead so the caller can surface the error through
+/// the normal `Err(String)` exit path used throughout this module.
+pub(crate) fn parse_rekey(rekey_to_address: &str) -> Result<Address, String> {
+    if rekey_to_address.is_empty() {
+        return Ok(Address::default());
+    }
+    Address::from_algorand_string(rekey_to_address).map_err(|e| format!("rekey-to invalid: {e}"))
 }
 
 /// Compute a transaction's `[first_valid, last_valid]` window, mirroring
@@ -918,6 +929,120 @@ fn run_tealsign_inner(args: TealsignArgs) -> Result<(), String> {
 /// Sentinel filename meaning stdin/stdout in goal (`-`), matching Go's
 /// `stdinFileNameValue` / `stdoutFilenameValue` (common.go:27-28).
 const STDIN_STDOUT: &str = "-";
+
+/// Resolve the path a TEAL program's source map should record for its
+/// source file, mirroring Go's `determinePathToSourceFromSourceMap`
+/// (`cmd/goal/clerk.go:1007-1027`): the path is relative to the *output*
+/// file's directory (so a source map next to `out.teal.tok` can locate
+/// `program.teal` even if the compiler was invoked from a different
+/// working directory), with two special cases carried over verbatim:
+/// stdin source → the literal `<stdin>`; stdout output → the source
+/// file's absolute path (there is no output directory to be relative to).
+///
+/// This resolves a TEAL runtime error's PC back to the right `.teal` file
+/// when go-algorand's local assembler (`logic.AssembleString`) builds the
+/// source map. goal-rust's `clerk compile` currently compiles via the
+/// node's `/v2/teal/compile` endpoint rather than assembling locally (see
+/// `run_compile`'s doc comment), so there is no live call site to attach
+/// this to yet — ported ahead of that work so `TestDeterminePathToSourceFromSourceMap`
+/// parity is pinned now.
+///
+/// `#[allow(dead_code)]`: no production call site until local TEAL
+/// assembly + source-map generation is ported (see the doc comment
+/// above); exercised directly by this module's unit tests in the
+/// meantime, mirroring the precedent at
+/// `crate::cmd::wallet::format_data_dir_error`.
+#[allow(dead_code)]
+pub(crate) fn determine_path_to_source_from_source_map(
+    source_file: &str,
+    out_file: &str,
+) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    determine_path_to_source_from_source_map_in(source_file, out_file, &cwd)
+}
+
+/// [`determine_path_to_source_from_source_map`] with an explicit base
+/// directory in place of the process's actual current directory, so tests
+/// don't need to mutate global process state (`std::env::set_current_dir`
+/// races across the test binary's parallel test threads).
+fn determine_path_to_source_from_source_map_in(
+    source_file: &str,
+    out_file: &str,
+    cwd: &Path,
+) -> Result<String, String> {
+    if source_file == STDIN_STDOUT {
+        return Ok("<stdin>".to_string());
+    }
+    let source_abs = abs_path_in(source_file, cwd).map_err(|e| {
+        format!("could not determine absolute path to source file '{source_file}': {e}")
+    })?;
+    if out_file == STDIN_STDOUT {
+        return Ok(source_abs.to_string_lossy().into_owned());
+    }
+    let out_abs = abs_path_in(out_file, cwd).map_err(|e| {
+        format!("could not determine absolute path to output file '{out_file}': {e}")
+    })?;
+    let out_dir = out_abs.parent().unwrap_or(Path::new(""));
+    Ok(relative_path(out_dir, &source_abs))
+}
+
+/// Join a possibly-relative path onto `cwd` and lexically normalize it
+/// (`.`/`..` resolution without touching the filesystem), mirroring Go's
+/// `filepath.Abs` (which does not require the path to exist).
+fn abs_path_in(p: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let path = Path::new(p);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    Ok(normalize_path(&joined))
+}
+
+/// Lexically resolve `.`/`..` components, matching Go's `filepath.Clean`
+/// (no filesystem access, so this works for paths that don't exist).
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The path from `base` to `target` (both absolute, normalized), matching
+/// Go's `filepath.Rel(base, target)` for the cases this module needs:
+/// strip the common prefix, then `..` out of what's left of `base` before
+/// descending into what's left of `target`.
+fn relative_path(base: &Path, target: &Path) -> String {
+    let base_components: Vec<_> = base.components().collect();
+    let target_components: Vec<_> = target.components().collect();
+    let mut common = 0;
+    while common < base_components.len()
+        && common < target_components.len()
+        && base_components[common] == target_components[common]
+    {
+        common += 1;
+    }
+    let mut rel = PathBuf::new();
+    for _ in common..base_components.len() {
+        rel.push("..");
+    }
+    for c in &target_components[common..] {
+        rel.push(c.as_os_str());
+    }
+    if rel.as_os_str().is_empty() {
+        rel.push(".");
+    }
+    rel.to_string_lossy().into_owned()
+}
 
 /// `clerk compile [files...] [-o out] [-n]`.
 ///
@@ -2713,5 +2838,211 @@ mod tests {
     fn out_label_renders_path_or_empty() {
         assert_eq!(out_label(None), "");
         assert_eq!(out_label(Some(Path::new("out.tx"))), "out.tx");
+    }
+
+    // ---- parse_rekey -------------------------------------------------
+    // Direct port of go's `TestParseRekey` (cmd/goal/rekey_test.go:28-45).
+
+    #[test]
+    fn parse_rekey_empty_is_zero_address() {
+        assert_eq!(parse_rekey("").unwrap(), Address::default());
+    }
+
+    #[test]
+    fn parse_rekey_valid_address_roundtrips() {
+        let valid = "5ZHAMU2BLPLFEE2VFFBVWMKRIZKUBSPUUWT3YIOWSP7VWFRJIT4XF3VYNI";
+        let expected = Address::from_algorand_string(valid).unwrap();
+        assert_eq!(parse_rekey(valid).unwrap(), expected);
+    }
+
+    #[test]
+    fn parse_rekey_invalid_address_errors() {
+        // Go's parseRekey calls reportErrorln (process exit) on a bad
+        // address; goal-rust surfaces it as an `Err` instead.
+        assert!(parse_rekey("INVALID_ADDRESS").is_err());
+    }
+
+    // ---- compute_validity ---------------------------------------------
+    // Direct port of go's `TestValidRounds` (libgoal/libgoal_test.go:32-...),
+    // against `computeValidityRounds(firstValid, lastValid, validRounds,
+    // lastRound, maxTxnLife=1000)`. `compute_validity` takes `Option<u64>`
+    // for first/last valid where Go uses `basics.Round` (0 == unset), so
+    // `0` inputs below are translated to `None`/`Some(0)` as noted.
+
+    const TEST_LAST_ROUND: u64 = 1;
+
+    #[test]
+    fn compute_validity_all_unset_defaults_from_last_round() {
+        let (fv, lv) = compute_validity(None, None, None, TEST_LAST_ROUND).unwrap();
+        assert_eq!(fv, TEST_LAST_ROUND);
+        assert_eq!(lv, fv + MAX_TXN_LIFE);
+    }
+
+    #[test]
+    fn compute_validity_rounds_at_max_plus_one_ok() {
+        let (fv, lv) =
+            compute_validity(None, None, Some(MAX_TXN_LIFE + 1), TEST_LAST_ROUND).unwrap();
+        assert_eq!(fv, TEST_LAST_ROUND);
+        assert_eq!(lv, fv + MAX_TXN_LIFE);
+    }
+
+    #[test]
+    fn compute_validity_rounds_over_max_plus_one_errors() {
+        let err =
+            compute_validity(None, None, Some(MAX_TXN_LIFE + 2), TEST_LAST_ROUND).unwrap_err();
+        assert_eq!(
+            err,
+            "cannot construct transaction: txn validity period 1001 is greater than protocol \
+             max txn lifetime 1000"
+        );
+    }
+
+    #[test]
+    fn compute_validity_ambiguous_last_valid_and_valid_rounds_errors() {
+        let err = compute_validity(None, Some(1), Some(2), TEST_LAST_ROUND).unwrap_err();
+        assert_eq!(
+            err,
+            "cannot construct transaction: ambiguous input: lastValid = 1, validRounds = 2"
+        );
+    }
+
+    #[test]
+    fn compute_validity_first_after_last_errors() {
+        let err = compute_validity(Some(2), Some(1), None, TEST_LAST_ROUND).unwrap_err();
+        assert_eq!(
+            err,
+            "cannot construct transaction: txn would first be valid on round 2 which is after \
+             last valid round 1"
+        );
+    }
+
+    #[test]
+    fn compute_validity_explicit_window_over_max_life_errors() {
+        let err =
+            compute_validity(Some(1), Some(MAX_TXN_LIFE + 2), None, TEST_LAST_ROUND).unwrap_err();
+        assert_eq!(
+            err,
+            "cannot construct transaction: txn validity period ( 1 to 1002 ) is greater than \
+             protocol max txn lifetime 1000"
+        );
+    }
+
+    #[test]
+    fn compute_validity_explicit_window_at_max_life_ok() {
+        let (fv, lv) =
+            compute_validity(Some(1), Some(MAX_TXN_LIFE + 1), None, TEST_LAST_ROUND).unwrap();
+        assert_eq!(fv, 1);
+        assert_eq!(lv, MAX_TXN_LIFE + 1);
+    }
+
+    #[test]
+    fn compute_validity_last_valid_only_defaults_first_from_last_round() {
+        let (fv, lv) =
+            compute_validity(None, Some(TEST_LAST_ROUND + 1), None, TEST_LAST_ROUND).unwrap();
+        assert_eq!(fv, TEST_LAST_ROUND);
+        assert_eq!(lv, TEST_LAST_ROUND + 1);
+    }
+
+    #[test]
+    fn compute_validity_valid_rounds_one_gives_single_round_window() {
+        let (fv, lv) = compute_validity(None, None, Some(1), TEST_LAST_ROUND).unwrap();
+        assert_eq!(fv, TEST_LAST_ROUND);
+        assert_eq!(lv, TEST_LAST_ROUND);
+    }
+
+    #[test]
+    fn compute_validity_valid_rounds_at_max_life() {
+        let (fv, lv) = compute_validity(None, None, Some(MAX_TXN_LIFE), TEST_LAST_ROUND).unwrap();
+        assert_eq!(fv, TEST_LAST_ROUND);
+        assert_eq!(lv, TEST_LAST_ROUND + MAX_TXN_LIFE - 1);
+    }
+
+    #[test]
+    fn compute_validity_explicit_first_valid_rounds_one() {
+        let (fv, lv) = compute_validity(Some(1), None, Some(1), TEST_LAST_ROUND).unwrap();
+        assert_eq!(fv, 1);
+        assert_eq!(lv, 1);
+    }
+
+    // ---- determine_path_to_source_from_source_map ---------------------
+    // Direct port of go's `TestDeterminePathToSourceFromSourceMap`
+    // (cmd/goal/clerk_test.go:35-99).
+
+    /// Synthetic base directory for the source-map path tests below — a
+    /// fixed value instead of the process's actual cwd, so parallel test
+    /// threads in this binary can't race on `std::env::set_current_dir`.
+    fn fixture_cwd() -> PathBuf {
+        Path::new("/fixture-root").to_path_buf()
+    }
+
+    #[test]
+    fn source_map_path_public_wrapper_uses_real_cwd() {
+        // Exercises the public `determine_path_to_source_from_source_map`
+        // (real `env::current_dir()`) rather than the `_in` test seam —
+        // no other test in this binary mutates the process cwd, so this
+        // is safe to run alongside them. stdin source skips filesystem
+        // path resolution entirely, so it's cwd-independent.
+        let got =
+            determine_path_to_source_from_source_map(STDIN_STDOUT, "program.teal.tok").unwrap();
+        assert_eq!(got, "<stdin>");
+    }
+
+    #[test]
+    fn source_map_path_same_directory() {
+        let got = determine_path_to_source_from_source_map_in(
+            "data/program.teal",
+            "data/program.teal.tok",
+            &fixture_cwd(),
+        )
+        .unwrap();
+        assert_eq!(got, "program.teal");
+    }
+
+    #[test]
+    fn source_map_path_output_one_level_up() {
+        let got = determine_path_to_source_from_source_map_in(
+            "data/program.teal",
+            "data/output/program.teal.tok",
+            &fixture_cwd(),
+        )
+        .unwrap();
+        assert_eq!(got, Path::new("..").join("program.teal").to_string_lossy());
+    }
+
+    #[test]
+    fn source_map_path_output_one_level_down() {
+        let got = determine_path_to_source_from_source_map_in(
+            "data/program.teal",
+            "program.teal.tok",
+            &fixture_cwd(),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            Path::new("data").join("program.teal").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn source_map_path_stdin_source_is_literal() {
+        let got = determine_path_to_source_from_source_map_in(
+            STDIN_STDOUT,
+            "program.teal.tok",
+            &fixture_cwd(),
+        )
+        .unwrap();
+        assert_eq!(got, "<stdin>");
+    }
+
+    #[test]
+    fn source_map_path_stdout_output_is_source_absolute_path() {
+        let got = determine_path_to_source_from_source_map_in(
+            "data/program.teal",
+            STDIN_STDOUT,
+            &fixture_cwd(),
+        )
+        .unwrap();
+        let expected = abs_path_in("data/program.teal", &fixture_cwd()).unwrap();
+        assert_eq!(got, expected.to_string_lossy());
     }
 }

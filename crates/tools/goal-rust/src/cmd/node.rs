@@ -423,6 +423,64 @@ fn write_token(path: &Path, token: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Fetch and validate a catchpoint label from a plain-text URL, mirroring
+/// Go's `getMissingCatchpointLabel` (`cmd/goal/node.go:131-153`). Used by
+/// `goal node catchup` when no catchpoint argument is given: it looks up
+/// the latest catchpoint label for the network from a well-known URL
+/// (e.g. `https://algorand-catchpoints.s3.us-east-2.amazonaws.com/...`).
+///
+/// Returns the label (trailing newline trimmed, matching Go's
+/// `strings.TrimSuffix(label, "\n")`) on a `200 OK` response whose body
+/// parses as a valid catchpoint label (`{round}#{base32_hash}`, matching
+/// `ledgercore.ParseCatchpointLabel` — see
+/// `algo_ledger::catchpoint::parse_catchpoint_label`, which we mirror
+/// locally here rather than pulling the (sqlite/ledger-heavy) `algo-ledger`
+/// crate into `goal-rust` for one small validation helper). Any non-200
+/// status is reported as Go's `resp.Status` string (`"404 Not Found"`), and
+/// a well-formed-but-invalid body is reported as a parse error.
+///
+/// `#[allow(dead_code)]`: `goal node catchup` itself is still an
+/// `unimplemented` stub (`crate::groups::node::NodeCmd::Catchup`) — a full
+/// port needs the catchpoint-download progress loop too, which is out of
+/// scope here. Ported ahead of that work so `TestGetMissingCatchpointLabel`
+/// parity is pinned now; the future `catchup` port should call this
+/// directly rather than re-deriving it.
+#[allow(dead_code)]
+pub(crate) async fn get_missing_catchpoint_label(url: &str) -> Result<String, String> {
+    let resp = reqwest::get(url).await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if status.as_u16() != 200 {
+        // Mirrors Go's `resp.Status` format: "404 Not Found".
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(format!("{} {reason}", status.as_u16())
+            .trim_end()
+            .to_string());
+    }
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    let label = body.strip_suffix('\n').unwrap_or(&body).to_string();
+    if !is_valid_catchpoint_label(&label) {
+        return Err(format!("'{label}' is not a valid catchpoint label"));
+    }
+    Ok(label)
+}
+
+/// Mirrors go-algorand's `ledgercore.ParseCatchpointLabel` validation
+/// (round `#` base32-hash, hash decoding to at most 32 bytes) — just the
+/// well-formedness check `get_missing_catchpoint_label` needs, without
+/// pulling in `algo-ledger`.
+fn is_valid_catchpoint_label(label: &str) -> bool {
+    let mut parts = label.split('#');
+    let (Some(round), Some(hash), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    if round.parse::<u64>().is_err() {
+        return false;
+    }
+    data_encoding::BASE32_NOPAD
+        .decode(hash.as_bytes())
+        .is_ok_and(|bytes| bytes.len() <= 32)
+}
+
 fn build_client(data_dir: &Path) -> Result<AlgodClient, ()> {
     let net = match read_algod_net(data_dir) {
         Ok(n) => n,
@@ -812,5 +870,100 @@ mod tests {
         write_token(&p, "x").expect("write");
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "token file mode must be 0600; got {mode:o}");
+    }
+
+    // ---- is_valid_catchpoint_label -------------------------------------
+
+    #[test]
+    fn is_valid_catchpoint_label_accepts_well_formed_labels() {
+        assert!(is_valid_catchpoint_label(
+            "6500000#JZOMXYAWFXKZ6X3TVIF5NIHXP3JQU5FUMKY7BOULCMT7BQV6QGVQ"
+        ));
+    }
+
+    #[test]
+    fn is_valid_catchpoint_label_rejects_malformed_labels() {
+        assert!(!is_valid_catchpoint_label("no-hash-separator"));
+        assert!(!is_valid_catchpoint_label("6500000#abc#def"));
+        assert!(!is_valid_catchpoint_label("not-a-round#JZOMXYAW"));
+        assert!(!is_valid_catchpoint_label("6500000#not!valid!base32"));
+    }
+
+    // ---- get_missing_catchpoint_label -----------------------------------
+    // Ports go's `TestGetMissingCatchpointLabel` HTTP-status branches
+    // (`cmd/goal/node_test.go:35-...`) against a hand-rolled TCP mock (this
+    // crate's established pattern — see `tests/node_status_e2e.rs`) instead
+    // of hitting the real S3 URLs the go test also covers.
+
+    /// Spawn a single-response mock HTTP server on `127.0.0.1` returning
+    /// the given status line and body, and return its base URL.
+    fn spawn_mock_http(status_line: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let resp = format!(
+                "{status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    #[tokio::test]
+    async fn get_missing_catchpoint_label_valid_label_ok() {
+        let label = "6500000#JZOMXYAWFXKZ6X3TVIF5NIHXP3JQU5FUMKY7BOULCMT7BQV6QGVQ";
+        let url = spawn_mock_http("HTTP/1.1 200 OK", label);
+        let got = get_missing_catchpoint_label(&url).await.unwrap();
+        assert_eq!(got, label);
+    }
+
+    #[tokio::test]
+    async fn get_missing_catchpoint_label_trims_trailing_newline() {
+        let label = "6500000#JZOMXYAWFXKZ6X3TVIF5NIHXP3JQU5FUMKY7BOULCMT7BQV6QGVQ";
+        let url = spawn_mock_http(
+            "HTTP/1.1 200 OK",
+            "6500000#JZOMXYAWFXKZ6X3TVIF5NIHXP3JQU5FUMKY7BOULCMT7BQV6QGVQ\n",
+        );
+        let got = get_missing_catchpoint_label(&url).await.unwrap();
+        assert_eq!(got, label);
+    }
+
+    #[tokio::test]
+    async fn get_missing_catchpoint_label_bad_request_errors() {
+        let url = spawn_mock_http("HTTP/1.1 400 Bad Request", "");
+        let err = get_missing_catchpoint_label(&url).await.unwrap_err();
+        assert_eq!(err, "400 Bad Request");
+    }
+
+    #[tokio::test]
+    async fn get_missing_catchpoint_label_forbidden_errors() {
+        let url = spawn_mock_http("HTTP/1.1 403 Forbidden", "");
+        let err = get_missing_catchpoint_label(&url).await.unwrap_err();
+        assert_eq!(err, "403 Forbidden");
+    }
+
+    #[tokio::test]
+    async fn get_missing_catchpoint_label_not_found_errors() {
+        let url = spawn_mock_http("HTTP/1.1 404 Not Found", "");
+        let err = get_missing_catchpoint_label(&url).await.unwrap_err();
+        assert_eq!(err, "404 Not Found");
+    }
+
+    #[tokio::test]
+    async fn get_missing_catchpoint_label_malformed_body_errors() {
+        let url = spawn_mock_http("HTTP/1.1 200 OK", "not a catchpoint label");
+        let err = get_missing_catchpoint_label(&url).await.unwrap_err();
+        assert!(err.contains("not a valid catchpoint label"), "got: {err}");
     }
 }
