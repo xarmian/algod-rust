@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+#
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+#
 # Poll GitHub for the PR that closes a given issue, then poll that PR's CI
 # checks until they all resolve. Prints a single-line machine-readable
 # summary at the end and exits non-zero on timeout/failure so a caller can
