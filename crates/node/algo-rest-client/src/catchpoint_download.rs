@@ -828,6 +828,54 @@ mod tests {
         assert_eq!(dl.base_url, "http://localhost:4001");
     }
 
+    /// Port of go's `TestNonParsableAddress` (`catchup/ledgerFetcher_test.go`,
+    /// issue #976): a malformed peer address must cause the catchpoint fetch
+    /// to fail gracefully with an error, not panic.
+    ///
+    /// Unlike go's `ledgerFetcher.getPeerLedger` (which parses the peer's
+    /// address into a URL up front), `CatchpointDownloader::new`/
+    /// `with_config` only trim a trailing slash and store the string
+    /// verbatim — they never construct or parse a URL themselves. The
+    /// equivalent rejection point here is the first network call, where
+    /// `reqwest`'s request builder parses the assembled URL: malformed input
+    /// (no scheme/host, like go's test address `":def"`) fails that parse
+    /// and `.send()` surfaces it as `Err`, never a panic — `is_retryable`
+    /// only treats connect/timeout failures as transient
+    /// (`catchpoint_download.rs`'s `is_retryable`), so a parse failure is
+    /// neither silently swallowed nor endlessly retried.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_availability_rejects_non_parsable_base_url() {
+        let dl = CatchpointDownloader::new(":def", "");
+        let result = dl.probe_availability("test genesisID", 0).await;
+        assert!(
+            result.is_err(),
+            "a non-parsable base URL must be rejected with an error, not accepted or panicked on"
+        );
+    }
+
+    /// Same rejection, exercised through the retrying `download` path
+    /// (`get_with_retry`) rather than the single-shot `probe_availability`
+    /// HEAD request — confirms the parse failure is treated as permanent
+    /// (not retried `max_retries` times before failing).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_rejects_non_parsable_base_url_without_retrying() {
+        let dl = CatchpointDownloader::new(":def", "");
+        let dest = std::env::temp_dir().join(format!(
+            "algod-rust-test-nonparsable-{}.tmp",
+            std::process::id()
+        ));
+
+        let result = dl
+            .download("test genesisID", 0, &dest, None::<fn(DownloadProgress)>)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a non-parsable base URL must be rejected with an error"
+        );
+        let _ = std::fs::remove_file(&dest);
+    }
+
     // -- probe_availability (issue #917's checkLedgerDownload-equivalent
     //    pre-flight probe, go's ledgerFetcher.headLedger) --
 

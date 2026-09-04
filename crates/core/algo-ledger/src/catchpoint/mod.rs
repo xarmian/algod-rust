@@ -44,9 +44,10 @@ pub use types::{
     CATCHPOINT_FILE_VERSION_V6, CATCHPOINT_FILE_VERSION_V7, CATCHPOINT_FILE_VERSION_V8,
 };
 pub use verify::{
-    build_sp_verification_blob, download_lookback_blocks, hash_sp_verification_blob,
-    parse_catchpoint_label, reconstruct_lease_table, validate_post_import, verify_catchpoint,
-    CatchpointVerifyResult, ValidationWarning, MAX_TXN_LIFE,
+    build_sp_verification_blob, download_lookback_blocks, download_lookback_blocks_with_lookback,
+    hash_sp_verification_blob, parse_catchpoint_label, reconstruct_lease_table,
+    validate_post_import, verify_catchpoint, CatchpointVerifyResult, ValidationWarning,
+    MAX_TXN_LIFE,
 };
 pub use writer::{
     export_catchpoint_file, select_catchpoint_file_version, ExportOptions, ExportResult,

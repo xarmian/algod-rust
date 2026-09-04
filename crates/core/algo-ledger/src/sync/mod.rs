@@ -968,7 +968,47 @@ impl SyncOrchestrator {
             catchpoint_round = round,
             "downloading lookback blocks for lease reconstruction"
         );
-        let lookback_start_round = round.saturating_sub(crate::catchpoint::MAX_TXN_LIFE);
+
+        // Mirrors go's `processStageBlocksDownload` picking the greater of
+        // the plain transaction-lifetime lookback and
+        // `lookbackForStateproofsSupport(topBlock)` (issue #976): a pending
+        // state proof needs the voters snapshot for its oldest still-
+        // expected round to survive the lookback window, which can reach
+        // further back than `MAX_TXN_LIFE` alone. Fetch the catchpoint
+        // round's own header to read its protocol and `StateProofNextRound`
+        // — falling back to the plain `MAX_TXN_LIFE` window (rather than
+        // failing the whole phase) if the header can't be read or decoded,
+        // since `download_lookback_blocks` below will surface any real
+        // fetch failure for `round` itself anyway.
+        let sp_lookback =
+            self.backend
+                .fetch_block_raw(round)
+                .ok()
+                .and_then(|(_, _, blkdata)| algo_codec::decode_block(&blkdata).ok())
+                .and_then(|block| {
+                    algo_types::consensus::consensus_params_for_version(&block.current_protocol)
+                        .map(|params| {
+                            crate::voters_tracker::lookback_for_stateproofs_support(
+                                round,
+                                crate::block_header::state_proof_next_round(
+                                    &block.state_proof_tracking,
+                                ),
+                                params.state_proof_interval,
+                                params.state_proof_voters_lookback,
+                                params.state_proof_max_recovery_intervals,
+                            )
+                        })
+                })
+                .unwrap_or(0);
+        let lookback = std::cmp::max(crate::catchpoint::MAX_TXN_LIFE, sp_lookback);
+        if sp_lookback > crate::catchpoint::MAX_TXN_LIFE {
+            tracing::info!(
+                sp_lookback,
+                "extending lookback window to keep a pending state proof verifiable"
+            );
+        }
+
+        let lookback_start_round = round.saturating_sub(lookback);
         self.progress.phase_detail =
             format!("downloading lookback blocks from round {lookback_start_round}");
         // Mirrors go's `processStageBlocksDownload` setting
@@ -1004,9 +1044,12 @@ impl SyncOrchestrator {
             message: format!("create blocks/txtail tables for lookback: {e}"),
         })?;
 
-        // Use download_lookback_blocks with callbacks that bridge to the backend.
-        let blocks_downloaded = crate::catchpoint::download_lookback_blocks(
+        // Use download_lookback_blocks_with_lookback with callbacks that
+        // bridge to the backend, passing the (possibly state-proof-extended)
+        // `lookback` computed above.
+        let blocks_downloaded = crate::catchpoint::download_lookback_blocks_with_lookback(
             round,
+            lookback,
             // fetch_block callback
             |rnd| {
                 let (proto, hdrdata, blkdata) = self.backend.fetch_block_raw(rnd).map_err(|e| {
@@ -2194,7 +2237,11 @@ mod tests {
         }
 
         fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-            Ok(("test-proto".to_string(), Vec::new(), format!("blk{round}").into_bytes()))
+            Ok((
+                "test-proto".to_string(),
+                Vec::new(),
+                format!("blk{round}").into_bytes(),
+            ))
         }
 
         fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
@@ -2264,8 +2311,11 @@ mod tests {
         // window size — so `total` starts at 0 (still the `SyncProgress`
         // default) and is set once, to 6, before the acquisition loop's
         // notifications begin. From that point on it must stay fixed.
-        let after_total_set: Vec<(u64, u64)> =
-            snaps.iter().copied().skip_while(|(total, _)| *total == 0).collect();
+        let after_total_set: Vec<(u64, u64)> = snaps
+            .iter()
+            .copied()
+            .skip_while(|(total, _)| *total == 0)
+            .collect();
         assert!(
             !after_total_set.is_empty(),
             "total_blocks was never set: {snaps:?}"
