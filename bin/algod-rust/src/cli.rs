@@ -305,6 +305,22 @@ pub enum Commands {
         action: CatchpointAction,
     },
 
+    /// Run a `catchupsrv`-equivalent HTTP daemon serving block files from a
+    /// local directory (go-algorand `cmd/catchupsrv`, issue #969). Lets an
+    /// airgapped `algod` fast-catch-up from a staged directory of block
+    /// files pulled over HTTP instead of the live gossip network.
+    Catchupsrv {
+        /// Directory containing catchup blocks, laid out as
+        /// `<dir>/v<version>/<genesis-id>/block/<sharded-path>` (matching
+        /// go's `-dir` layout).
+        #[arg(long)]
+        dir: PathBuf,
+
+        /// Address to listen on (host:port).
+        #[arg(long, default_value = "127.0.0.1:4160")]
+        addr: String,
+    },
+
     /// Run a relay node: accept inbound connections and forward gossip messages.
     Relay {
         /// Address to bind for incoming connections (e.g. "0.0.0.0:4160").
