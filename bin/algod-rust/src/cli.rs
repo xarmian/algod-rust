@@ -783,6 +783,36 @@ pub enum Commands {
         #[command(subcommand)]
         action: AlgocfgAction,
     },
+
+    /// Run an `algoh`-equivalent block-stall health-monitor daemon (go:
+    /// `cmd/algoh`, issue #966): polls a running node's `/v2/status` and
+    /// `/v2/blocks/{round}`, reports per-block agreement-time/active-user
+    /// telemetry, and detects when block production stalls.
+    ///
+    /// Unlike go's split `algod`/`algoh` binaries (where `algoh` launches
+    /// and can restart a child `algod` process), this subcommand only
+    /// monitors an already-running node over REST — algod-rust's node
+    /// serves its own REST API in-process, so there is no separate `algod`
+    /// process for it to supervise.
+    HealthMonitor {
+        /// Base URL of the algod REST API to monitor.
+        #[arg(long, default_value = "http://localhost:4001")]
+        algod_url: String,
+
+        /// API token for the algod node.
+        #[arg(long, default_value = DEFAULT_TOKEN)]
+        algod_token: String,
+
+        /// How often to poll `/v2/status`, in milliseconds. Matches go's
+        /// `algoh.defaultConfig.StatusDelayMS` (`shared/algoh/config.go`).
+        #[arg(long, default_value = "500")]
+        poll_interval_ms: u64,
+
+        /// How long without a new block before a stall is declared, in
+        /// milliseconds. Matches go's `algoh.defaultConfig.StallDelayMS`.
+        #[arg(long, default_value = "60000")]
+        stall_detect_ms: u64,
+    },
 }
 
 /// Subcommands for `algod-rust algocfg`. Go: `cmd/algocfg`'s `get`/`set`/
