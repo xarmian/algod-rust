@@ -51,7 +51,7 @@ pub const MAX_TXN_BYTES_PER_BLOCK_V33: usize = 5 * 1024 * 1024;
 /// Special addresses for validation (fee sink and rewards pool).
 ///
 /// Mirrors go-algorand's `transactions.SpecialAddresses`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SpecialAddresses {
     pub fee_sink: Address,
     pub rewards_pool: Address,
