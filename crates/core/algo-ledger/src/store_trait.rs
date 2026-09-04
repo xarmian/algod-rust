@@ -119,7 +119,6 @@ pub trait LedgerStore {
 
     /// Iterate over all app params where the creator matches the given address.
     ///
-    /// Used by `min_balance_with_state` to sum global schema costs for created apps.
     /// Returns a `Vec` to avoid lifetime issues with non-in-memory backends.
     fn app_params_created_by(&self, creator: &Address) -> Vec<AppParams>;
 
@@ -162,7 +161,6 @@ pub trait LedgerStore {
 
     /// Collect all app local states for a given address.
     ///
-    /// Used by `min_balance_with_state` to sum local schema costs.
     /// Returns `Vec<(u64, AppLocalState)>` — the app ID and local state.
     fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)>;
 
@@ -356,6 +354,14 @@ pub trait LedgerStore {
 
     /// Compute the minimum balance for an account, including schema-based
     /// costs from opted-in and created apps.
+    ///
+    /// Matches go-algorand's `AccountData.MinBalance` (`data/basics/
+    /// userBalance.go`): the schema cost is derived once from the
+    /// account's own aggregate `total_app_schema` field, which is already
+    /// maintained by every op that changes an app's schema footprint on
+    /// this account. Implementations must not additionally rescan the
+    /// account's app local states / created app params and re-add their
+    /// schema cost -- that double-counts it (see issue #989).
     fn min_balance_with_state(&self, addr: &Address, account: &AccountData) -> u64;
 
     // ---- Trie integration ----

@@ -1231,14 +1231,16 @@ fn test_inner_create_can_use_absolute_extra_program_pages() {
 // the resize actually touches (`AppParams.size_sponsor`/
 // `global_state_schema`/`extra_program_pages`, and the sponsor/creator
 // accounts' `total_app_schema`/`total_extra_app_pages`) rather than
-// computed MBR totals -- `min_balance_with_state`'s own schema-cost
-// aggregation (`state.rs`) independently re-derives global/local schema
-// cost by rescanning `app_params`/`app_local_states`, on top of the flat
-// `min_balance()` which already folds the same cost in via
-// `total_app_schema` -- an unrelated, pre-existing double-counting gap
-// filed separately rather than fixed here, since asserting on the
-// accounting fields the resize itself owns keeps this test decoupled from
-// it.
+// computed MBR totals, keeping this test decoupled from
+// `min_balance_with_state`'s own schema-cost computation (`state.rs`).
+//
+// `min_balance_with_state` previously double-counted schema cost by
+// independently re-deriving global/local schema cost via a rescan of
+// `app_params`/`app_local_states`, on top of the flat `min_balance()`
+// which already folds the same cost in via `total_app_schema` -- fixed in
+// issue #989 by removing the redundant rescan; `min_balance_with_state`
+// now relies solely on `total_app_schema` (as go-algorand's
+// `AccountData.MinBalance` does), matching this test's own accounting.
 #[test]
 fn test_inner_update_resizing_moves_sponsor_and_grows_schema() {
     let creator = Address([1u8; 32]);
