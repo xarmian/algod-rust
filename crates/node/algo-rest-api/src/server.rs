@@ -311,7 +311,7 @@ impl ApiServer {
             ));
         }
 
-        let listener = TcpListener::bind(self.config.listen_addr).await?;
+        let listener = bind_listener(self.config.listen_addr).await?;
         let local_addr = listener.local_addr()?;
 
         // Write algod.net file
@@ -333,6 +333,36 @@ impl ApiServer {
 
         Ok((local_addr, handle))
     }
+}
+
+/// Bind the REST API listener, applying go-algorand's port-0-falls-back-
+/// to-8080 special case (issue #953).
+///
+/// Mirrors `daemon/algod/server.go`'s `makeListener`
+/// (`../go-algorand/daemon/algod/server.go:294-307`): when the configured
+/// address's port is `0` ("pick any free port"), first *prefer* port 8080
+/// on the same host, and only fall back to the OS-assigned ephemeral port
+/// (the original `addr`, unchanged) if 8080 is already taken. A
+/// non-zero configured port is bound directly with no special-casing,
+/// exactly as before this issue.
+///
+/// go's version string-matches only the literal `"127.0.0.1:0"`/`":0"`
+/// addresses; this is generalized to "any address whose port is 0" since
+/// `SocketAddr` doesn't retain the original string form and every real
+/// caller already only ever passes one of those two forms (or an explicit
+/// non-zero port) for `EndpointAddress`. This is a strict superset of go's
+/// behavior and produces identical results for both forms go recognizes.
+async fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    if addr.port() == 0 {
+        let preferred = SocketAddr::new(addr.ip(), 8080);
+        if let Ok(listener) = TcpListener::bind(preferred).await {
+            return Ok(listener);
+        }
+        // 8080 unavailable (or a bind error unrelated to the port) — fall
+        // back to the original, port-0 address, matching go's fallthrough
+        // to `net.Listen("tcp", addr)`.
+    }
+    TcpListener::bind(addr).await
 }
 
 /// The `RestConnectionsHardLimit` admission check (issue #751), factored
@@ -505,5 +535,86 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(!body.is_empty());
+    }
+
+    // ── bind_listener port-0-fallback (issue #953) ─────────────────────
+
+    /// TDD anchor for issue #953, mirroring go-algorand's
+    /// `TestFirstListenerSetupGetsPort8080WhenPassedPortZero`
+    /// (`daemon/algod/server_test.go`): binding with port `0` must prefer
+    /// port 8080 over an OS-assigned ephemeral port when 8080 is free.
+    ///
+    /// Skipped if port 8080 is already occupied on the test machine, same
+    /// caveat go's own test carries.
+    #[tokio::test]
+    async fn bind_listener_prefers_port_8080_when_passed_port_zero() {
+        let host = std::net::Ipv4Addr::LOCALHOST;
+        let probe_addr = SocketAddr::from((host, 8080));
+        // Skip if 8080 is already in use on this machine (matches go's own
+        // test skip condition).
+        match TcpListener::bind(probe_addr).await {
+            Ok(probe) => drop(probe),
+            Err(_) => {
+                eprintln!("SKIPPED: port 8080 is already in use on this machine");
+                return;
+            }
+        }
+
+        let requested = SocketAddr::from((host, 0));
+        let listener = bind_listener(requested)
+            .await
+            .expect("bind_listener must succeed");
+        assert_eq!(
+            listener.local_addr().unwrap(),
+            probe_addr,
+            "port 0 must fall back to port 8080 when it's free"
+        );
+    }
+
+    /// TDD anchor for issue #953, mirroring go-algorand's
+    /// `TestSecondListenerSetupGetsAnotherPortWhen8080IsBusy`: once 8080 is
+    /// already bound, a second port-0 bind must fall back to a different
+    /// (OS-assigned) port rather than failing.
+    #[tokio::test]
+    async fn bind_listener_falls_back_when_8080_is_busy() {
+        let host = std::net::Ipv4Addr::LOCALHOST;
+        let requested = SocketAddr::from((host, 0));
+
+        let first = bind_listener(requested)
+            .await
+            .expect("first bind_listener must succeed");
+        // Whichever address the first listener landed on (8080, if free —
+        // otherwise this test still holds, since a second port-0 bind must
+        // never collide with the first).
+        let second = bind_listener(requested)
+            .await
+            .expect("second bind_listener must succeed despite the first one holding a port");
+        assert_ne!(
+            first.local_addr().unwrap(),
+            second.local_addr().unwrap(),
+            "two concurrent port-0 binds must never land on the same address"
+        );
+    }
+
+    /// TDD anchor for issue #953, mirroring go-algorand's
+    /// `TestFirstListenerSetupGetsPassedPortWhenPassedPortNonZero`: an
+    /// explicit non-zero port is bound directly, with no 8080 special-casing.
+    #[tokio::test]
+    async fn bind_listener_uses_explicit_nonzero_port_directly() {
+        let host = std::net::Ipv4Addr::LOCALHOST;
+        // Bind to port 0 first to reserve *some* free ephemeral port, then
+        // release it and immediately request that exact port explicitly —
+        // avoids hardcoding a port number that might collide with another
+        // process on the CI runner.
+        let probe = TcpListener::bind(SocketAddr::from((host, 0)))
+            .await
+            .unwrap();
+        let explicit_addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let listener = bind_listener(explicit_addr)
+            .await
+            .expect("bind_listener must succeed for an explicit non-zero port");
+        assert_eq!(listener.local_addr().unwrap(), explicit_addr);
     }
 }

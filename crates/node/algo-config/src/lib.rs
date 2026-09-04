@@ -357,14 +357,20 @@ static DNS_BOOTSTRAP_ID: VersionedDefault<String> = VersionedDefault::new(&[
 ]);
 
 /// Go: `CatchpointDir string` `version[31]:""` (`localTemplate.go:114`).
-/// Adopted from go's 9-field hot/cold directory-splitting group as a
-/// judgment-called subset (issue #749): algod-rust's fixed
-/// `<prefix>.tracker.sqlite` + `<prefix>.block.sqlite` layout has no
-/// hot/cold split, so `HotDataDir`/`ColdDataDir`/`TrackerDBDir`/
-/// `BlockDBDir`/`CrashDBDir`/`LogFileDir`/`LogArchiveDir` are recorded as
-/// an explicit architectural non-goal rather than added here. Wired into
-/// `algod-rust catchpoint export`/`download`'s default output location
-/// (`bin/algod-rust/src/commands/catchpoint.rs`).
+/// Originally adopted from go's 9-field hot/cold directory-splitting group
+/// as a judgment-called subset (issue #749) that left
+/// `HotDataDir`/`ColdDataDir`/`TrackerDBDir`/`BlockDBDir`/`CrashDBDir` as an
+/// explicit architectural non-goal. Issue #953 (Phase 17 test-parity audit)
+/// revisited that call: [`HOT_DATA_DIR`]/[`COLD_DATA_DIR`]/
+/// [`TRACKER_DB_DIR`]/[`BLOCK_DB_DIR`]/[`CRASH_DB_DIR`] are now added below
+/// and wired into `algod-rust participate`'s ledger/crash-db path
+/// resolution (`bin/algod-rust/src/commands/participate.rs`'s
+/// `resolve_resource_paths`). `CatchpointDir` itself keeps its existing
+/// standalone `algod-rust catchpoint export`/`download` wiring
+/// (`bin/algod-rust/src/commands/catchpoint.rs`) and is not cross-wired to
+/// fall back onto `ColdDataDir` the way go's does — that finer cross-field
+/// fallback is out of scope for #953, which only had to close the
+/// per-resource *directory override* gap itself.
 static CATCHPOINT_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
 
 /// Go: `StateproofDir string` `version[31]:""` (`localTemplate.go:118`).
@@ -376,7 +382,60 @@ static CATCHPOINT_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, |
 /// no distinct location to redirect yet. Round-trips through `config.json`
 /// for forward compatibility; real wiring is deferred to whichever future
 /// issue splits stateproof persistence into its own storage location.
+/// Unaffected by issue #953's `HotDataDir`/`ColdDataDir` addition below —
+/// go falls `StateproofDir` back onto `HotDataDir`, but that fallback is
+/// meaningless here while this field itself stays a no-op.
 static STATEPROOF_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
+
+/// Go: `HotDataDir string` `version[31]:""` (`localTemplate.go:93`). Issue
+/// #953: an optional directory for data that is frequently accessed by the
+/// node. When set, it becomes the fallback directory for `TrackerDBDir`
+/// and `CrashDBDir` (see [`TRACKER_DB_DIR`]/[`CRASH_DB_DIR`]); when unset,
+/// the ledger prefix's own directory (`--ledger-path`'s parent) is used,
+/// matching today's pre-#953 behavior exactly.
+static HOT_DATA_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
+
+/// Go: `ColdDataDir string` `version[31]:""` (`localTemplate.go:100`).
+/// Issue #953: an optional directory for data that is infrequently
+/// accessed by the node. When set, it becomes the fallback directory for
+/// `BlockDBDir` (see [`BLOCK_DB_DIR`]); when unset, the ledger prefix's own
+/// directory is used, matching today's pre-#953 behavior exactly.
+static COLD_DATA_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
+
+/// Go: `TrackerDBDir string` `version[31]:""` (`localTemplate.go:105`,
+/// "If not specified, the node will use the HotDataDir"). Issue #953:
+/// overrides the directory `<prefix>.tracker.sqlite` opens in, independent
+/// of where the block DB and crash DB live. Falls back to `HotDataDir`.
+static TRACKER_DB_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
+
+/// Go: `BlockDBDir string` `version[31]:""` (`localTemplate.go:108`, "If
+/// not specified, the node will use the ColdDataDir"). Issue #953:
+/// overrides the directory `<prefix>.block.sqlite` opens in. Falls back to
+/// `ColdDataDir`.
+static BLOCK_DB_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
+
+/// Go: `CrashDBDir string` `version[31]:""` (`localTemplate.go:121`, "If
+/// not specified, the node will use the HotDataDir"). Issue #953: overrides
+/// the directory the agreement crash-recovery database (`crash.sqlite`)
+/// opens in. Falls back to `HotDataDir`.
+static CRASH_DB_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
+
+/// Go: `LogFileDir string` `version[31]:""` (`localTemplate.go:125`, "If
+/// not specified, the node will use the ColdDataDir"). **Documented
+/// no-op**, same pattern as [`STATEPROOF_DIR`]: algod-rust has no
+/// file-based log-archival subsystem to redirect (logging currently goes
+/// to stdout/tracing subscribers configured at process startup, not a
+/// rotated `node.log` file the way go's `logging.CreateGlobalLogger`
+/// resolves via `ResolveLogPaths`). Round-trips through `config.json` for
+/// forward compatibility; real wiring is deferred to whichever future
+/// issue adds file-based log output.
+static LOG_FILE_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
+
+/// Go: `LogArchiveDir string` `version[31]:""` (`localTemplate.go:129`, "If
+/// not specified, the node will use the ColdDataDir"). **Documented
+/// no-op** — see [`LOG_FILE_DIR`]'s doc comment; algod-rust has no
+/// log-archival subsystem to redirect either half of.
+static LOG_ARCHIVE_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
 
 /// Go: `CatchpointInterval uint64` `version[7]:"10000"` (`localTemplate.go:399`).
 /// Wired into the live block-apply loop (issue #770): `SqliteLedger::commit_block`
@@ -1268,6 +1327,27 @@ fn default_catchpoint_dir() -> String {
 fn default_stateproof_dir() -> String {
     STATEPROOF_DIR.at(LATEST_VERSION)
 }
+fn default_hot_data_dir() -> String {
+    HOT_DATA_DIR.at(LATEST_VERSION)
+}
+fn default_cold_data_dir() -> String {
+    COLD_DATA_DIR.at(LATEST_VERSION)
+}
+fn default_tracker_db_dir() -> String {
+    TRACKER_DB_DIR.at(LATEST_VERSION)
+}
+fn default_block_db_dir() -> String {
+    BLOCK_DB_DIR.at(LATEST_VERSION)
+}
+fn default_crash_db_dir() -> String {
+    CRASH_DB_DIR.at(LATEST_VERSION)
+}
+fn default_log_file_dir() -> String {
+    LOG_FILE_DIR.at(LATEST_VERSION)
+}
+fn default_log_archive_dir() -> String {
+    LOG_ARCHIVE_DIR.at(LATEST_VERSION)
+}
 fn default_catchpoint_interval() -> u64 {
     CATCHPOINT_INTERVAL.at(LATEST_VERSION)
 }
@@ -1713,6 +1793,48 @@ pub struct Local {
     /// for forward compatibility.
     #[serde(rename = "StateproofDir", default = "default_stateproof_dir")]
     pub stateproof_dir: String,
+
+    /// Go: `HotDataDir`. Issue #953. Wired into `algod-rust participate`'s
+    /// ledger/crash-db path resolution — see this field's `VersionedDefault`
+    /// doc comment.
+    #[serde(rename = "HotDataDir", default = "default_hot_data_dir")]
+    pub hot_data_dir: String,
+
+    /// Go: `ColdDataDir`. Issue #953. Wired into `algod-rust participate`'s
+    /// ledger path resolution — see this field's `VersionedDefault` doc
+    /// comment.
+    #[serde(rename = "ColdDataDir", default = "default_cold_data_dir")]
+    pub cold_data_dir: String,
+
+    /// Go: `TrackerDBDir`. Issue #953. Wired into `algod-rust participate`'s
+    /// tracker-database path resolution — see this field's
+    /// `VersionedDefault` doc comment.
+    #[serde(rename = "TrackerDBDir", default = "default_tracker_db_dir")]
+    pub tracker_db_dir: String,
+
+    /// Go: `BlockDBDir`. Issue #953. Wired into `algod-rust participate`'s
+    /// block-database path resolution — see this field's `VersionedDefault`
+    /// doc comment.
+    #[serde(rename = "BlockDBDir", default = "default_block_db_dir")]
+    pub block_db_dir: String,
+
+    /// Go: `CrashDBDir`. Issue #953. Wired into `algod-rust participate`'s
+    /// agreement crash-recovery database path resolution — see this
+    /// field's `VersionedDefault` doc comment.
+    #[serde(rename = "CrashDBDir", default = "default_crash_db_dir")]
+    pub crash_db_dir: String,
+
+    /// Go: `LogFileDir`. **Documented no-op** — see this field's
+    /// `VersionedDefault` doc comment. Round-trips through `config.json`
+    /// for forward compatibility.
+    #[serde(rename = "LogFileDir", default = "default_log_file_dir")]
+    pub log_file_dir: String,
+
+    /// Go: `LogArchiveDir`. **Documented no-op** — see this field's
+    /// `VersionedDefault` doc comment. Round-trips through `config.json`
+    /// for forward compatibility.
+    #[serde(rename = "LogArchiveDir", default = "default_log_archive_dir")]
+    pub log_archive_dir: String,
 
     /// Go: `CatchpointInterval`. Wired into the live block-apply loop
     /// (issue #770) — see this field's `VersionedDefault` doc comment.
@@ -2396,6 +2518,13 @@ impl Local {
             dns_bootstrap_id: DNS_BOOTSTRAP_ID.at(version),
             catchpoint_dir: CATCHPOINT_DIR.at(version),
             stateproof_dir: STATEPROOF_DIR.at(version),
+            hot_data_dir: HOT_DATA_DIR.at(version),
+            cold_data_dir: COLD_DATA_DIR.at(version),
+            tracker_db_dir: TRACKER_DB_DIR.at(version),
+            block_db_dir: BLOCK_DB_DIR.at(version),
+            crash_db_dir: CRASH_DB_DIR.at(version),
+            log_file_dir: LOG_FILE_DIR.at(version),
+            log_archive_dir: LOG_ARCHIVE_DIR.at(version),
             catchpoint_interval: CATCHPOINT_INTERVAL.at(version),
             catchpoint_file_history_length: CATCHPOINT_FILE_HISTORY_LENGTH.at(version),
             catchpoint_tracking: CATCHPOINT_TRACKING.at(version),
@@ -2605,6 +2734,13 @@ impl Local {
             migrate_field(&mut self.dns_bootstrap_id, &DNS_BOOTSTRAP_ID, cur, next);
             migrate_field(&mut self.catchpoint_dir, &CATCHPOINT_DIR, cur, next);
             migrate_field(&mut self.stateproof_dir, &STATEPROOF_DIR, cur, next);
+            migrate_field(&mut self.hot_data_dir, &HOT_DATA_DIR, cur, next);
+            migrate_field(&mut self.cold_data_dir, &COLD_DATA_DIR, cur, next);
+            migrate_field(&mut self.tracker_db_dir, &TRACKER_DB_DIR, cur, next);
+            migrate_field(&mut self.block_db_dir, &BLOCK_DB_DIR, cur, next);
+            migrate_field(&mut self.crash_db_dir, &CRASH_DB_DIR, cur, next);
+            migrate_field(&mut self.log_file_dir, &LOG_FILE_DIR, cur, next);
+            migrate_field(&mut self.log_archive_dir, &LOG_ARCHIVE_DIR, cur, next);
             migrate_field(
                 &mut self.catchpoint_interval,
                 &CATCHPOINT_INTERVAL,
@@ -3252,6 +3388,13 @@ mod tests {
             DNS_BOOTSTRAP_ID.max_tag_version(),
             CATCHPOINT_DIR.max_tag_version(),
             STATEPROOF_DIR.max_tag_version(),
+            HOT_DATA_DIR.max_tag_version(),
+            COLD_DATA_DIR.max_tag_version(),
+            TRACKER_DB_DIR.max_tag_version(),
+            BLOCK_DB_DIR.max_tag_version(),
+            CRASH_DB_DIR.max_tag_version(),
+            LOG_FILE_DIR.max_tag_version(),
+            LOG_ARCHIVE_DIR.max_tag_version(),
             CATCHPOINT_INTERVAL.max_tag_version(),
             CATCHPOINT_FILE_HISTORY_LENGTH.max_tag_version(),
             CATCHPOINT_TRACKING.max_tag_version(),
@@ -3354,6 +3497,13 @@ mod tests {
         );
         assert_eq!(d.catchpoint_dir, "");
         assert_eq!(d.stateproof_dir, "");
+        assert_eq!(d.hot_data_dir, "");
+        assert_eq!(d.cold_data_dir, "");
+        assert_eq!(d.tracker_db_dir, "");
+        assert_eq!(d.block_db_dir, "");
+        assert_eq!(d.crash_db_dir, "");
+        assert_eq!(d.log_file_dir, "");
+        assert_eq!(d.log_archive_dir, "");
         assert_eq!(d.catchpoint_interval, 10_000);
         assert_eq!(d.catchpoint_file_history_length, 365);
         assert_eq!(d.catchpoint_tracking, 0);
@@ -3882,6 +4032,34 @@ mod tests {
         .expect("parses");
         assert_eq!(cfg.catchpoint_dir, "/data/catchpoints");
         assert_eq!(cfg.stateproof_dir, "/data/stateproof");
+    }
+
+    /// TDD anchor for issue #953: the hot/cold/per-resource data-dir
+    /// override fields must round-trip through `config.json` (partial
+    /// overlay — only the fields present in the JSON change; the rest keep
+    /// their empty-string default), matching go's `HotDataDir`/
+    /// `ColdDataDir`/`TrackerDBDir`/`BlockDBDir`/`CrashDBDir`
+    /// (`../go-algorand/config/localTemplate.go:93-122`).
+    #[test]
+    fn resource_data_dirs_round_trip_through_json() {
+        let cfg = Local::load_from_str(
+            r#"{
+                "HotDataDir": "/data/hot",
+                "ColdDataDir": "/data/cold",
+                "TrackerDBDir": "/data/hot/tracker",
+                "BlockDBDir": "/data/cold/block",
+                "CrashDBDir": "/data/hot/crash"
+            }"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.hot_data_dir, "/data/hot");
+        assert_eq!(cfg.cold_data_dir, "/data/cold");
+        assert_eq!(cfg.tracker_db_dir, "/data/hot/tracker");
+        assert_eq!(cfg.block_db_dir, "/data/cold/block");
+        assert_eq!(cfg.crash_db_dir, "/data/hot/crash");
+        // Fields not present in the JSON keep their empty-string default.
+        assert_eq!(cfg.log_file_dir, "");
+        assert_eq!(cfg.log_archive_dir, "");
     }
 
     #[test]

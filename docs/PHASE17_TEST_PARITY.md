@@ -51,15 +51,15 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 756 | 24% |
+| `matched-1:1` | 761 | 24% |
 | `partial` | 734 | 23% |
-| `matched-1:many` | 576 | 18% |
+| `matched-1:many` | 578 | 18% |
 | `out-of-scope` | 425 | 13% |
-| `not-implemented` | 249 | 8% |
-| `missing-test` | 230 | 7% |
+| `not-implemented` | 243 | 8% |
+| `missing-test` | 229 | 7% |
 | `matched-many:1` | 209 | 7% |
 
-**479 rows (`not-implemented` + `missing-test`, 15%) are real, actionable
+**472 rows (`not-implemented` + `missing-test`, 15%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
 implements but never tests. `partial` (734, 23%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
@@ -79,12 +79,12 @@ were triaged into tracked issues.
 | e2e integration (`test/e2e-go`) | [parity_e2e.md](phase17/parity_e2e.md) | 195 | 30 | 18 | 0 | 64 | 0 | 57 | 26 |
 | Networking (`network`, `network/p2p`, ...) | [parity_network.md](phase17/parity_network.md) | 263 | 83 | 52 | 11 | 72 | 22 | 20 | 3 |
 | Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 80 | 32 | 16 | 61 | 39 | 27 | 21 |
-| Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 40 | 48 | 1 | 12 | 18 | 14 | 11 |
+| Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 45 | 50 | 1 | 12 | 12 | 13 | 11 |
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 100 | 20 | 47 | 62 | 24 | 14 | 7 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 19 | 22 | 0 | 30 | 40 | 3 | 5 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 20 | 7 | 0 | 20 | 11 | 0 | 60 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 31 | 25 | 7 | 21 | 4 | 1 | 84 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 10 | 0 | 16 | 3 | 0 | 1 |
-| **Total** | | **3,179** | **756** | **576** | **209** | **734** | **249** | **230** | **425** |
+| **Total** | | **3,179** | **761** | **578** | **209** | **734** | **243** | **229** | **425** |
 

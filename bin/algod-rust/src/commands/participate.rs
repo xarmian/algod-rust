@@ -367,6 +367,12 @@ struct RunningAgreementCycle {
 struct ParticipateAgreementControl {
     ledger: Arc<Mutex<SqliteLedger>>,
     ledger_path: PathBuf,
+    /// Resolved crash-recovery DB path (issue #953) — see
+    /// [`resolve_resource_paths`]. Computed once at startup from
+    /// `ledger_path` and the loaded `config.json`'s `HotDataDir`/
+    /// `CrashDBDir`, rather than re-derived from `ledger_path` on every
+    /// `open_crash_db` call.
+    crash_db_path: PathBuf,
     p2p_active_gossip_node: Arc<dyn GossipNode>,
     gossip_node: Arc<WebsocketNetwork>,
     rt_handle: tokio::runtime::Handle,
@@ -528,7 +534,7 @@ impl ParticipateAgreementControl {
         );
         info!("catchup service (re)started");
 
-        let crash_db = open_crash_db(&self.ledger_path)?;
+        let crash_db = open_crash_db(&self.crash_db_path)?;
         let params = Parameters {
             network: agreement_network,
             ledger: agreement_ledger,
@@ -623,6 +629,7 @@ impl ParticipateAgreementControl {
         Self {
             ledger: self.ledger.clone(),
             ledger_path: self.ledger_path.clone(),
+            crash_db_path: self.crash_db_path.clone(),
             p2p_active_gossip_node: self.p2p_active_gossip_node.clone(),
             gossip_node: self.gossip_node.clone(),
             rt_handle: self.rt_handle.clone(),
@@ -2849,21 +2856,105 @@ fn load_signing_keys_for_round(
     signing_keys
 }
 
-/// Open (or create) the agreement crash recovery database.
+/// Resolved on-disk paths for the tracker DB, block DB, and agreement
+/// crash-recovery DB, after applying `algo_config::Local`'s per-resource
+/// directory overrides (issue #953: `HotDataDir`/`ColdDataDir`/
+/// `TrackerDBDir`/`BlockDBDir`/`CrashDBDir`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedResourcePaths {
+    tracker_path: PathBuf,
+    block_path: PathBuf,
+    crash_path: PathBuf,
+}
+
+/// Resolve where the tracker DB, block DB, and agreement crash-recovery DB
+/// should live, given the `--ledger-path` prefix and the loaded
+/// `config.json` (`algo_config::Local`).
+///
+/// Mirrors go-algorand's `Local.EnsureAndResolveGenesisDirs`
+/// (`../go-algorand/config/localTemplate.go:897-985`) fallback chain —
+/// `TrackerDBDir` falls back to `HotDataDir`, `BlockDBDir` falls back to
+/// `ColdDataDir`, `CrashDBDir` falls back to `HotDataDir`, and `HotDataDir`/
+/// `ColdDataDir` each fall back to the ledger prefix's own directory —
+/// adapted to algod-rust's `<prefix>.tracker.sqlite` /
+/// `<prefix>.block.sqlite` / `crash.sqlite` filename layout
+/// (`../go-algorand/ledger/ledger.go:327,336`, `node/node.go:305-323`)
+/// instead of go's per-resource genesis-ID subdirectory layout: overriding
+/// a resource's directory relocates its file but keeps the ledger prefix's
+/// basename for the tracker/block pair, and `crash.sqlite`'s fixed name
+/// (go's `config.CrashFilename`) for the crash DB.
+///
+/// Every directory empty (the default, and today's pre-#953 behavior)
+/// resolves every path to exactly what `SqliteLedger::open`/the old
+/// `open_crash_db` produced: `<ledger_path>.tracker.sqlite`,
+/// `<ledger_path>.block.sqlite`, and `crash.sqlite` next to the ledger.
+///
+/// Pure function: unlike go's `EnsureAndResolveGenesisDirs`, this does not
+/// create directories or move pre-existing DB files between old/new
+/// locations on a reconfigure — the caller must `create_dir_all` each
+/// resolved parent directory before opening, and an operator who changes
+/// these settings on an existing node is responsible for moving any
+/// existing files themselves.
+fn resolve_resource_paths(ledger_path: &Path, cfg: &algo_config::Local) -> ResolvedResourcePaths {
+    let prefix = algo_ledger::sqlite::derive_ledger_prefix(ledger_path);
+    let root_dir = prefix
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let basename = prefix.file_name().map(|n| n.to_owned());
+
+    fn dir_or(cfg_val: &str, fallback: &Path) -> PathBuf {
+        if cfg_val.is_empty() {
+            fallback.to_path_buf()
+        } else {
+            PathBuf::from(cfg_val)
+        }
+    }
+
+    let hot_dir = dir_or(&cfg.hot_data_dir, &root_dir);
+    let cold_dir = dir_or(&cfg.cold_data_dir, &root_dir);
+    let tracker_dir = dir_or(&cfg.tracker_db_dir, &hot_dir);
+    let block_dir = dir_or(&cfg.block_db_dir, &cold_dir);
+    let crash_dir = dir_or(&cfg.crash_db_dir, &hot_dir);
+
+    let prefix_in = |dir: &Path| -> PathBuf {
+        match &basename {
+            Some(name) => dir.join(name),
+            None => dir.to_path_buf(),
+        }
+    };
+
+    ResolvedResourcePaths {
+        tracker_path: algo_ledger::sqlite::tracker_path_for_prefix(&prefix_in(&tracker_dir)),
+        block_path: algo_ledger::sqlite::block_path_for_prefix(&prefix_in(&block_dir)),
+        crash_path: crash_dir.join("crash.sqlite"),
+    }
+}
+
+/// Open (or create) the agreement crash recovery database at an explicit,
+/// already-resolved path.
 ///
 /// Mirrors go-algorand v4.6.0-stable `node/node.go:305-323`, which opens
-/// `crash.sqlite` (`config.CrashFilename`) inside the genesis directory next
-/// to the ledger and threads the resulting accessor into `agreement.Parameters`.
+/// `crash.sqlite` (`config.CrashFilename`) inside the resolved
+/// `CrashDBDir`/`HotDataDir`/genesis directory and threads the resulting
+/// accessor into `agreement.Parameters`. The caller resolves the path via
+/// [`resolve_resource_paths`] (issue #953) so `HotDataDir`/`CrashDBDir`
+/// overrides apply uniformly across every call site.
 ///
 /// Without this connection, `Parameters.crash_db` is `None`, the agreement
 /// service skips persistence entirely, and a node crash mid-round can lead to
 /// equivocation (double-vote) on restart. See [[DOC-21]] §3.7.
-fn open_crash_db(ledger_path: &Path) -> anyhow::Result<rusqlite::Connection> {
-    let crash_db_path = ledger_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("crash.sqlite");
-    let conn = rusqlite::Connection::open(&crash_db_path).map_err(|e| {
+fn open_crash_db(crash_db_path: &Path) -> anyhow::Result<rusqlite::Connection> {
+    if let Some(dir) = crash_db_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create crash db directory {}: {}",
+                dir.display(),
+                e
+            )
+        })?;
+    }
+    let conn = rusqlite::Connection::open(crash_db_path).map_err(|e| {
         anyhow::anyhow!(
             "failed to open agreement crash db at {}: {}",
             crash_db_path.display(),
@@ -3606,8 +3697,39 @@ pub async fn run(
     // -----------------------------------------------------------------------
     // 1. Open the SQLite ledger (shared between agreement and pool bridges).
     // -----------------------------------------------------------------------
-    let mut sqlite_ledger = SqliteLedger::open(ledger_path).map_err(|e| {
-        anyhow::anyhow!("failed to open ledger at {}: {}", ledger_path.display(), e)
+    // Resolve per-resource directory overrides (issue #953:
+    // `HotDataDir`/`ColdDataDir`/`TrackerDBDir`/`BlockDBDir`/`CrashDBDir`)
+    // before opening anything, so the tracker DB, block DB, and crash DB
+    // each land in their configured location.
+    let resolved_paths = resolve_resource_paths(ledger_path, &node_config);
+    for resolved_dir in [
+        resolved_paths.tracker_path.parent(),
+        resolved_paths.block_path.parent(),
+        resolved_paths.crash_path.parent(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        std::fs::create_dir_all(resolved_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create resource directory {}: {}",
+                resolved_dir.display(),
+                e
+            )
+        })?;
+    }
+    let mut sqlite_ledger = SqliteLedger::open_split(
+        &resolved_paths.tracker_path,
+        &resolved_paths.block_path,
+        Some(algo_ledger::sqlite::derive_ledger_prefix(ledger_path)),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open ledger (tracker={}, block={}): {}",
+            resolved_paths.tracker_path.display(),
+            resolved_paths.block_path.display(),
+            e
+        )
     })?;
 
     // Apply config-driven storage settings (issue #749):
@@ -3707,7 +3829,7 @@ pub async fn run(
     // (issue #940) — a live catchpoint-catchup pause/resume tears the
     // agreement `Service` down and rebuilds it, and `Parameters::crash_db`
     // is consumed by `Service::start`, so each cycle needs its own handle.
-    drop(open_crash_db(ledger_path)?);
+    drop(open_crash_db(&resolved_paths.crash_path)?);
 
     // -----------------------------------------------------------------------
     // 2. Open the participation key store.
@@ -4382,6 +4504,7 @@ pub async fn run(
     let agreement_control = Arc::new(ParticipateAgreementControl {
         ledger: ledger.clone(),
         ledger_path: ledger_path.to_path_buf(),
+        crash_db_path: resolved_paths.crash_path.clone(),
         p2p_active_gossip_node: p2p_active_gossip_node.clone(),
         gossip_node: gossip_node.clone(),
         rt_handle: rt_handle.clone(),
@@ -9523,7 +9646,6 @@ mod tests {
             nonce,
         ));
         fs::create_dir_all(&tmp_dir).expect("create tmp dir");
-        let ledger_path = tmp_dir.join("ledger.sqlite");
         let crash_db_path = tmp_dir.join("crash.sqlite");
 
         let payload: Vec<u8> = b"persisted-agreement-state".to_vec();
@@ -9531,7 +9653,7 @@ mod tests {
         // Open the crash db, write a payload, then drop the connection to
         // simulate a node shutdown / crash.
         {
-            let conn = super::open_crash_db(&ledger_path).expect("open crash db");
+            let conn = super::open_crash_db(&crash_db_path).expect("open crash db");
             persist(&conn, &payload).expect("persist payload");
         }
 
@@ -9543,7 +9665,7 @@ mod tests {
         );
 
         // Reopen and restore — must return the exact bytes we wrote.
-        let conn = super::open_crash_db(&ledger_path).expect("reopen crash db");
+        let conn = super::open_crash_db(&crash_db_path).expect("reopen crash db");
         let restored = restore(&conn)
             .expect("restore must succeed")
             .expect("restored payload must be present");
@@ -9555,6 +9677,143 @@ mod tests {
         // Cleanup. Drop conn first so SQLite releases its file handles.
         drop(conn);
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ── resolve_resource_paths (issue #953) ───────────────────────────
+
+    /// TDD anchor for issue #953, mirroring go-algorand's
+    /// `TestDefaultResourcePaths` (`node/node_test.go`): with no
+    /// `HotDataDir`/`ColdDataDir`/`TrackerDBDir`/`BlockDBDir`/`CrashDBDir`
+    /// configured, every resource resolves next to the ledger path —
+    /// exactly the pre-#953 behavior, so existing deployments see no
+    /// change.
+    #[test]
+    fn resolve_resource_paths_defaults_to_ledger_directory() {
+        let cfg = algo_config::Local::default();
+        let ledger_path = Path::new("/data/ledger");
+        let resolved = super::resolve_resource_paths(ledger_path, &cfg);
+        assert_eq!(
+            resolved.tracker_path,
+            PathBuf::from("/data/ledger.tracker.sqlite")
+        );
+        assert_eq!(
+            resolved.block_path,
+            PathBuf::from("/data/ledger.block.sqlite")
+        );
+        assert_eq!(resolved.crash_path, PathBuf::from("/data/crash.sqlite"));
+    }
+
+    /// TDD anchor for issue #953, mirroring go-algorand's
+    /// `TestConfiguredDataDirs`: with `HotDataDir`/`ColdDataDir` set but
+    /// `TrackerDBDir`/`BlockDBDir`/`CrashDBDir` left empty, the tracker DB
+    /// and crash DB fall back to `HotDataDir` and the block DB falls back
+    /// to `ColdDataDir`.
+    #[test]
+    fn resolve_resource_paths_honors_hot_and_cold_data_dirs() {
+        let cfg = algo_config::Local {
+            hot_data_dir: "/data/hot".to_string(),
+            cold_data_dir: "/data/cold".to_string(),
+            ..Default::default()
+        };
+        let ledger_path = Path::new("/data/ledger");
+        let resolved = super::resolve_resource_paths(ledger_path, &cfg);
+        assert_eq!(
+            resolved.tracker_path,
+            PathBuf::from("/data/hot/ledger.tracker.sqlite"),
+            "tracker DB must fall back to HotDataDir"
+        );
+        assert_eq!(
+            resolved.block_path,
+            PathBuf::from("/data/cold/ledger.block.sqlite"),
+            "block DB must fall back to ColdDataDir"
+        );
+        assert_eq!(
+            resolved.crash_path,
+            PathBuf::from("/data/hot/crash.sqlite"),
+            "crash DB must fall back to HotDataDir"
+        );
+    }
+
+    /// TDD anchor for issue #953, mirroring go-algorand's
+    /// `TestConfiguredResourcePaths`: explicit `TrackerDBDir`/`BlockDBDir`/
+    /// `CrashDBDir` take precedence over `HotDataDir`/`ColdDataDir`, even
+    /// when both are configured to different directories.
+    #[test]
+    fn resolve_resource_paths_honors_explicit_per_resource_overrides() {
+        let cfg = algo_config::Local {
+            hot_data_dir: "/data/hot".to_string(),
+            cold_data_dir: "/data/cold".to_string(),
+            tracker_db_dir: "/data/custom_tracker".to_string(),
+            block_db_dir: "/data/custom_block".to_string(),
+            crash_db_dir: "/data/custom_crash".to_string(),
+            ..Default::default()
+        };
+        let ledger_path = Path::new("/data/ledger");
+        let resolved = super::resolve_resource_paths(ledger_path, &cfg);
+        assert_eq!(
+            resolved.tracker_path,
+            PathBuf::from("/data/custom_tracker/ledger.tracker.sqlite")
+        );
+        assert_eq!(
+            resolved.block_path,
+            PathBuf::from("/data/custom_block/ledger.block.sqlite")
+        );
+        assert_eq!(
+            resolved.crash_path,
+            PathBuf::from("/data/custom_crash/crash.sqlite")
+        );
+    }
+
+    /// Confirms `resolve_resource_paths`'s output actually round-trips
+    /// through `SqliteLedger::open_split`: opening the ledger at the
+    /// resolved tracker/block paths must create real files at the
+    /// configured `TrackerDBDir`/`BlockDBDir`, not the default ledger
+    /// directory — closing the gap between the pure path-resolution logic
+    /// above and go's `TestConfiguredResourcePaths`, which asserts against
+    /// real files on disk.
+    #[test]
+    fn resolve_resource_paths_wires_into_a_real_open_split() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-resource-paths-test-{}-{}",
+            std::process::id(),
+            nonce,
+        ));
+        let tracker_dir = tmp_dir.join("tracker_dir");
+        let block_dir = tmp_dir.join("block_dir");
+        std::fs::create_dir_all(&tracker_dir).expect("create tracker dir");
+        std::fs::create_dir_all(&block_dir).expect("create block dir");
+
+        let cfg = algo_config::Local {
+            tracker_db_dir: tracker_dir.to_string_lossy().into_owned(),
+            block_db_dir: block_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        let ledger_path = tmp_dir.join("ledger");
+        let resolved = super::resolve_resource_paths(&ledger_path, &cfg);
+
+        let ledger =
+            SqliteLedger::open_split(&resolved.tracker_path, &resolved.block_path, None)
+                .expect("open ledger at resolved per-resource paths");
+        drop(ledger);
+
+        assert!(
+            resolved.tracker_path.exists(),
+            "tracker db must exist at the configured TrackerDBDir"
+        );
+        assert!(
+            resolved.block_path.exists(),
+            "block db must exist at the configured BlockDBDir"
+        );
+        // Not at the default (unconfigured) ledger directory.
+        assert!(!tmp_dir.join("ledger.tracker.sqlite").exists());
+        assert!(!tmp_dir.join("ledger.block.sqlite").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     // ── ParticipateAgreementControl (issue #940) ─────────────────────
@@ -9598,6 +9857,7 @@ mod tests {
         let control = ParticipateAgreementControl {
             ledger,
             ledger_path: ledger_path.clone(),
+            crash_db_path: tmp_dir.join("crash.sqlite"),
             p2p_active_gossip_node: gossip_node.clone() as Arc<dyn GossipNode>,
             gossip_node,
             rt_handle: tokio::runtime::Handle::current(),
