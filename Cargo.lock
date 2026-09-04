@@ -394,6 +394,7 @@ dependencies = [
  "algo-codec",
  "algo-consensus-crypto",
  "algo-error",
+ "algo-falcon",
  "algo-types",
  "algo-validate",
  "base64",
