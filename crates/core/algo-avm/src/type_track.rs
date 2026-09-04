@@ -132,7 +132,7 @@
 //!   function), so there is no per-field lookup table to reuse. The only
 //!   real modeling work is arity: `txn`/`gtxn`/`gtxns` are pseudo-ops whose
 //!   *immediate count* (not the mnemonic) picks the real dispatched-to
-//!   opcode (`txn` vs. `txna`, etc. -- see `asm_pseudo_txn`); this happens
+//!   opcode (`txn` vs. `txna`, etc. -- see `asm_pseudo_arity`); this happens
 //!   to be moot for type tracking specifically, because within each pseudo
 //!   mnemonic's dispatch table every arity shares the exact same proto
 //!   (`txn`/`txna` both pop 0 push 1; `gtxn`/`gtxna` both pop 0 push 1;
@@ -367,7 +367,7 @@ const TYPE_TABLE: &[(&str, &[StackType], &[StackType])] = &[
     // other four take every selector as an assembler immediate instead, so
     // they pop nothing (proto ":a"). This applies identically regardless of
     // which of a pseudo-op's dispatch arities was used to reach here (see
-    // `asm_pseudo_txn`'s doc comment): `txn`'s 1- and 2-immediate forms
+    // `asm_pseudo_arity`'s doc comment): `txn`'s 1- and 2-immediate forms
     // (`txn` vs `txna`) share this exact proto, and likewise for
     // `gtxn`/`gtxna` and `gtxns`/`gtxnsa`. ----
     ("txn", &[], &[Any]),
@@ -930,10 +930,30 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
         return;
     }
 
+    // `replace`'s pseudo-op arity dispatch (issue #945, `assembler.go:1815`
+    // `"replace": {0: replace3, 1: replace2}`): unlike `txn`/`gtxn`/`gtxns`
+    // (whose dispatched-to opcodes all share one proto regardless of which
+    // arity was used -- see the `TYPE_TABLE` entries below), `replace`'s
+    // two target opcodes pop a genuinely different number/type of stack
+    // arguments -- `replace2 s` (immediate offset) pops `[Bytes, Bytes]`;
+    // `replace3` (stack offset) pops `[Bytes, Uint64, Bytes]` -- so this
+    // has to branch on `args.len()` directly rather than going through the
+    // fixed-shape `TYPE_TABLE`/`refined_types` lookups below. An
+    // unrecognized arity is left untracked; `asm_pseudo_arity` reports its
+    // own "replace expects ..." assembly error for it.
+    if mnemonic == "replace" {
+        match args.len() {
+            0 => apply_stack_effect(ops, mnemonic, args, &[Bytes, Uint64, Bytes], &[Bytes]),
+            1 => apply_stack_effect(ops, mnemonic, args, &[Bytes, Bytes], &[Bytes]),
+            _ => {}
+        }
+        return;
+    }
+
     let spec = match opcode::lookup_by_name(mnemonic) {
         // Not a real opcode (or a pseudo-op this slice doesn't model, e.g.
-        // `extract`/`replace`'s own arity dispatch) -- the rest of assembly
-        // will report its own error if this mnemonic is genuinely invalid;
+        // `extract`'s own arity dispatch) -- the rest of assembly will
+        // report its own error if this mnemonic is genuinely invalid;
         // nothing to track here either way.
         None => return,
         Some(s) => s,
