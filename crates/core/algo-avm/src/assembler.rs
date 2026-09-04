@@ -195,6 +195,22 @@ struct ByteReference {
     position: usize,
 }
 
+/// A `#define NAME substitution` macro definition (go's `ops.macros[name]`,
+/// `assembler.go:277`). `body` is the raw, unexpanded token list following
+/// the name -- it may itself reference other macros (expanded lazily at
+/// each *use* site, not at definition time -- see `next_statement`) and may
+/// contain a literal `;`, letting one macro usage expand into multiple
+/// statements (`#define -> ; store` in go's `TestMacros`). `line` is the
+/// `#define` directive's own source line, used to attribute a
+/// [`recheck_macro_names`] failure to where the macro was *defined* rather
+/// than to whatever later line caused the recheck (mirrors go's
+/// `ops.macros[macroName][0]` token, which carries its own line).
+#[derive(Debug, Clone)]
+struct MacroDef {
+    line: usize,
+    body: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // OpStream — main assembler state
 // ---------------------------------------------------------------------------
@@ -217,6 +233,12 @@ pub struct OpStream {
     pending: Vec<u8>,
     labels: HashMap<String, usize>,
     label_references: Vec<LabelReference>,
+
+    /// Currently defined `#define` macros, keyed by name. Mirrors go's
+    /// `ops.macros` (`assembler.go:277`). Consulted by `next_statement`
+    /// (go's `nextStatement`) to expand macro-name tokens in place before
+    /// each statement is assembled.
+    macros: HashMap<String, MacroDef>,
 
     intc: Vec<u64>,
     intc_refs: Vec<IntReference>,
@@ -333,6 +355,7 @@ impl OpStream {
             pending: Vec::new(),
             labels: HashMap::new(),
             label_references: Vec::new(),
+            macros: HashMap::new(),
             intc: Vec::new(),
             intc_refs: Vec::new(),
             cnt_intc_block: 0,
@@ -1061,6 +1084,467 @@ impl OpStream {
 }
 
 // ---------------------------------------------------------------------------
+// `#define` macro expansion
+// ---------------------------------------------------------------------------
+//
+// go-algorand's assembler lets source text `#define NAME substitution`
+// macros that are textually substituted wherever `NAME` appears as a later
+// token, including inside another macro's body (macro chaining) and even
+// as a `;` statement separator (`assembler.go:2432-2455`'s `define`,
+// `assembler.go:2098-2114`'s `nextStatement`). See the `TestMacros` port in
+// this module's tests.
+
+/// Pseudo-op mnemonics (go's `pseudoOps` map keys, `assembler.go:1804-
+/// 1816`) -- these are never real opcode names, so a macro can't be named
+/// after one either (`checkMacroName`, `assembler.go:2415-2417`).
+const PSEUDO_OP_NAMES: &[&str] = &[
+    "int", "byte", "addr", "method", "txn", "gtxn", "gtxns", "extract", "replace",
+];
+
+/// Characters allowed in a macro name besides letters/digits (go's
+/// `otherAllowedChars`, `assembler.go:2378`).
+const MACRO_NAME_OTHER_CHARS: &[char] = &[
+    '+', '-', '*', '/', '^', '%', '&', '|', '~', '!', '>', '<', '=', '?', '_',
+];
+
+/// Whether `name` is a field name recognized by *any* field-selector
+/// immediate group (`TxnField`, `GlobalField`, `AssetHoldingField`, ...).
+/// Mirrors go's `fieldNames[version]`, which unions every field-group name
+/// used by any opcode available at that version (`opcodes.go:999-1010`);
+/// this checks the union across all versions rather than narrowing to
+/// exactly the fields reachable at `ops.version`; unlike the opcode-name
+/// check just below, a macro named after a real field name is being
+/// rejected regardless of when this codebase happened to grow support for
+/// that specific field, so a version-widened conservative check errs the
+/// same direction go's real per-version set would.
+fn is_any_field_name(name: &str) -> bool {
+    fields::global_field_by_name(name).is_some()
+        || fields::txn_field_by_name(name).is_some()
+        || fields::asset_holding_field_by_name(name).is_some()
+        || fields::asset_params_field_by_name(name).is_some()
+        || fields::app_params_field_by_name(name).is_some()
+        || fields::acct_params_field_by_name(name).is_some()
+        || fields::voter_params_field_by_name(name).is_some()
+        || fields::ecdsa_curve_by_name(name).is_some()
+        || fields::ec_group_by_name(name).is_some()
+        || fields::base64_encoding_by_name(name).is_some()
+        || fields::json_ref_type_by_name(name).is_some()
+        || fields::vrf_standard_by_name(name).is_some()
+        || fields::block_field_by_name(name).is_some()
+        || fields::mimc_config_by_name(name).is_some()
+        || fields::poseidon2_config_by_name(name).is_some()
+}
+
+/// Validates a candidate macro name, matching go's `checkMacroName`
+/// (`assembler.go:2380-2430`). `ops.version == 0` stands in for go's
+/// `assemblerNoVersion` sentinel (version not yet settled by a `#pragma
+/// version` or the first real instruction) -- the opcode/field-name checks
+/// only activate once a version is known, mirroring go exactly (see
+/// [`recheck_macro_names`], invoked the moment the version does become
+/// known, to re-validate every macro defined while it wasn't).
+fn check_macro_name(name: &str, ops: &OpStream) -> Result<(), String> {
+    let mut chars = name.chars();
+    let first = chars.next();
+    let second = chars.next();
+    for c in name.chars() {
+        if !c.is_alphanumeric() && !MACRO_NAME_OTHER_CHARS.contains(&c) {
+            return Err(format!("{c} character not allowed in macro name"));
+        }
+    }
+    if let Some(first) = first {
+        if first.is_ascii_digit() {
+            return Err(format!("Cannot begin macro name with number: {name}"));
+        }
+        if name.chars().count() > 1 && (first == '-' || first == '+') {
+            if let Some(second) = second {
+                if second.is_ascii_digit() {
+                    return Err(format!("Cannot begin macro name with number: {name}"));
+                }
+            }
+        }
+    }
+    // Parentheses aren't allowed characters, so `b64(...)`/`base64(...)`
+    // syntax can't collide with a macro name -- only the bare directive
+    // names need excluding.
+    if matches!(name, "b64" | "base64" | "b32" | "base32") {
+        return Err(format!("Cannot use {name} as macro name"));
+    }
+    if parse_named_int(name).is_some() {
+        return Err(format!(
+            "Named constants cannot be used as macro names: {name}"
+        ));
+    }
+    if PSEUDO_OP_NAMES.contains(&name) {
+        return Err(format!("Macro names cannot be pseudo-ops: {name}"));
+    }
+    if ops.version != 0 {
+        if let Some(spec) = opcode::lookup_by_name(name) {
+            if spec.version <= ops.version {
+                return Err(format!("Macro names cannot be opcodes: {name}"));
+            }
+        }
+        if is_any_field_name(name) {
+            return Err(format!("Macro names cannot be field names: {name}"));
+        }
+    }
+    if ops.labels.contains_key(name) {
+        return Err(format!("Labels cannot be used as macro names: {name}"));
+    }
+    Ok(())
+}
+
+/// Searches for a macro-expansion cycle reachable from `start`, matching
+/// go's `cycle` (`assembler.go:2343-2357`): only a chain that eventually
+/// expands back to `start` itself counts (not any cycle elsewhere in the
+/// macro graph -- every other currently-defined macro was already checked
+/// cycle-free when *it* was defined). Returns the cycle as a chain of
+/// macro names (`start -> ... -> start`) for the error message, or `None`.
+fn find_macro_cycle(macros: &HashMap<String, MacroDef>, start: &str) -> Option<Vec<String>> {
+    fn walk(
+        macros: &HashMap<String, MacroDef>,
+        name: &str,
+        previous: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        let def = macros.get(name)?;
+        if let Some(root) = previous.first() {
+            if root == name {
+                let mut cyc = previous.clone();
+                cyc.push(name.to_string());
+                return Some(cyc);
+            }
+        }
+        for tok in def.body.clone() {
+            previous.push(name.to_string());
+            let found = walk(macros, &tok, previous);
+            previous.pop();
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+    let mut previous = Vec::new();
+    walk(macros, start, &mut previous)
+}
+
+/// Re-validates every currently-defined macro's name against `ops.version`,
+/// removing (and reporting) any that's no longer valid now that the
+/// version is known -- mirrors go's `recheckMacroNames` (`assembler.go:
+/// 2359-2376`), called the moment `ops.Version` first settles (either an
+/// explicit `#pragma version` or the default applied at the first real
+/// instruction). A macro name that didn't collide with anything while the
+/// version was still unknown may turn out to collide with a real
+/// opcode/field name once it is.
+fn recheck_macro_names(ops: &mut OpStream) {
+    let names: Vec<String> = ops.macros.keys().cloned().collect();
+    for name in names {
+        if let Err(e) = check_macro_name(&name, ops) {
+            let line = ops
+                .macros
+                .get(&name)
+                .map(|d| d.line)
+                .unwrap_or(ops.source_line);
+            ops.record_error(line, 0, e);
+            ops.macros.remove(&name);
+        }
+    }
+}
+
+/// Handles one `#define NAME substitution` directive line. `tokens` is the
+/// directive's entire, un-split token list (`tokens[0] == "#define"`).
+/// Mirrors go's `define` (`assembler.go:2432-2455`).
+fn handle_define(ops: &mut OpStream, tokens: &[&str]) {
+    if tokens.len() < 3 {
+        ops.record_error(
+            ops.source_line,
+            0,
+            "define directive requires a name and body".into(),
+        );
+        return;
+    }
+    let name = tokens[1].to_string();
+    if let Err(e) = check_macro_name(&name, ops) {
+        ops.record_error(ops.source_line, 0, e);
+        return;
+    }
+    let body: Vec<String> = tokens[2..].iter().map(|s| s.to_string()).collect();
+    let saved = ops.macros.insert(
+        name.clone(),
+        MacroDef {
+            line: ops.source_line,
+            body,
+        },
+    );
+    if let Some(cycle) = find_macro_cycle(&ops.macros, &name) {
+        match saved {
+            Some(prev) => {
+                ops.macros.insert(name.clone(), prev);
+            }
+            None => {
+                ops.macros.remove(&name);
+            }
+        }
+        ops.record_error(
+            ops.source_line,
+            0,
+            format!("macro expansion cycle discovered: {}", cycle.join(" -> ")),
+        );
+    }
+}
+
+/// Expands macro-name tokens in place and splits at the next literal `;`
+/// token, matching go's `nextStatement` (`assembler.go:2098-2114`): a
+/// macro's own body can contain a literal `;` (`#define -> ; store`), so
+/// this operates on the live token stream -- not on statements already
+/// split at the character level -- and re-examines the same position after
+/// each expansion in case the replacement's own first token is itself a
+/// (different, non-cyclical) macro name. Returns `(current, rest)`: the
+/// tokens making up this statement, and whatever tokens remain
+/// unprocessed on the line.
+fn next_statement(ops: &OpStream, mut tokens: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if let Some(def) = ops.macros.get(&tokens[i]) {
+            let mut expanded = tokens[..i].to_vec();
+            expanded.extend(def.body.iter().cloned());
+            expanded.extend_from_slice(&tokens[i + 1..]);
+            tokens = expanded;
+            continue;
+        }
+        if tokens[i] == ";" {
+            let rest = tokens[i + 1..].to_vec();
+            tokens.truncate(i);
+            return (tokens, rest);
+        }
+        i += 1;
+    }
+    (tokens, Vec::new())
+}
+
+/// Dispatches a `#`-prefixed directive line (`#pragma ...` / `#define
+/// ...`) using its entire, un-split token list. Mirrors go's `directives`
+/// map lookup (`assembler.go:2116-2118,2166-2177`) -- an unrecognized
+/// directive is a hard error, not silently skipped.
+fn handle_directive(ops: &mut OpStream, tokens: &[&str], version_set: &mut bool) {
+    match &tokens[0][1..] {
+        "pragma" => handle_pragma(ops, tokens, version_set),
+        "define" => handle_define(ops, tokens),
+        other => {
+            ops.record_error(ops.source_line, 0, format!("unknown directive: {other}"));
+        }
+    }
+}
+
+/// Handles one `#pragma ...` directive line. `tokens` is the directive's
+/// entire, un-split token list (`tokens[0] == "#pragma"`).
+fn handle_pragma(ops: &mut OpStream, tokens: &[&str], version_set: &mut bool) {
+    let parts = tokens;
+    if parts.len() == 1 {
+        // #pragma with no keyword
+        ops.record_error(ops.source_line, 0, "empty pragma".into());
+    } else if parts[1] == "version" {
+        if parts.len() == 2 {
+            // #pragma version (no number)
+            ops.record_error(ops.source_line, 0, "no version value".into());
+        } else if parts.len() > 3 {
+            // #pragma version N extra
+            ops.record_error(
+                ops.source_line,
+                0,
+                "unexpected tokens after version value".into(),
+            );
+        } else {
+            // #pragma version N
+            if !ops.pending.is_empty() {
+                ops.record_error(
+                    ops.source_line,
+                    0,
+                    "#pragma version is only allowed before instructions".into(),
+                );
+            }
+            if let Ok(v) = parts[2].parse::<u8>() {
+                if v == 0 || v > MAX_AVM_VERSION {
+                    ops.record_error(ops.source_line, 0, format!("unsupported version: {v}"));
+                } else {
+                    let was_unknown = ops.version == 0;
+                    ops.version = v;
+                    *version_set = true;
+                    if was_unknown {
+                        recheck_macro_names(ops);
+                    }
+                }
+            } else {
+                ops.record_error(ops.source_line, 0, format!("invalid version: {}", parts[2]));
+            }
+        }
+    } else if parts[1] == "autosalt" {
+        if parts.len() == 2 {
+            // #pragma autosalt (no value)
+            ops.record_error(ops.source_line, 0, "no autosalt value".into());
+        } else if parts.len() > 3 {
+            // #pragma autosalt VALUE extra
+            ops.record_error(
+                ops.source_line,
+                0,
+                "unexpected tokens after autosalt value".into(),
+            );
+        } else if !ops.pending.is_empty() {
+            ops.record_error(
+                ops.source_line,
+                0,
+                "#pragma autosalt is only allowed before instructions".into(),
+            );
+        } else if let Some(on) = parse_pragma_bool(parts[2]) {
+            ops.auto_salt = if on {
+                AutoSaltMode::On
+            } else {
+                AutoSaltMode::Off
+            };
+            ops.auto_salt_line = ops.source_line;
+        } else {
+            ops.record_error(
+                ops.source_line,
+                0,
+                format!("bad #pragma autosalt: {:?}", parts[2]),
+            );
+        }
+    } else if parts[1] == "typetrack" {
+        if parts.len() == 2 {
+            // #pragma typetrack (no value)
+            ops.record_error(ops.source_line, 0, "no typetrack value".into());
+        } else if parts.len() > 3 {
+            // #pragma typetrack VALUE extra
+            ops.record_error(
+                ops.source_line,
+                0,
+                "unexpected tokens after typetrack value".into(),
+            );
+        } else if let Some(on) = parse_pragma_bool(parts[2]) {
+            // Mirrors go's `#pragma typetrack` handling
+            // (`assembler.go:2501-2519`): unlike `version`/
+            // `autosalt`, this pragma has no "only allowed
+            // before instructions" restriction -- it can
+            // toggle mid-program, any number of times
+            // (`TestTypeTracking`'s "Turning type tracking
+            // off and then back on" cases).
+            //
+            // Note this only gates whether a mismatch is
+            // *reported* -- the tracked stack itself keeps
+            // evolving underneath even while reporting is
+            // off, exactly like go's `trackStack` still
+            // popping/pushing `ops.known.stack` regardless
+            // of `ops.typeTracking` and only `typeErrorf`
+            // checking the flag (`assembler.go:2039-2043,
+            // 2056-2096`). See
+            // `type_track::track_instruction`/
+            // `apply_stack_effect`.
+            let was_reporting = ops.type_track_reporting;
+            ops.type_track_reporting = on;
+            // Mirrors `assembler.go:2513-2517`: toggling
+            // from off to on resets tracked knowledge to a
+            // permissive "unknown incoming stack" state
+            // (`ops.known.reset()`), exactly like reaching a
+            // label after dead code -- whatever was tracked
+            // while reporting was off (which may have
+            // silently drifted from reality, since
+            // mismatched pops/pushes still happened without
+            // being reported) is discarded rather than
+            // trusted. Toggling off, or declaring the
+            // already-current state again (on-to-on or
+            // off-to-off), does *not* reset --
+            // `TestTypeTracking`'s "consecutively does _not_
+            // reset" case.
+            if !was_reporting && on {
+                ops.type_stack.clear();
+                ops.type_stack_const.clear();
+                ops.scratch_space = [type_track::StackType::Any; 256];
+                ops.type_track_deadcode = false;
+                ops.type_track_bottom_permissive = true;
+            }
+        } else {
+            ops.record_error(
+                ops.source_line,
+                0,
+                format!("bad #pragma typetrack: {:?}", parts[2]),
+            );
+        }
+    } else {
+        // #pragma <unknown>
+        ops.record_error(
+            ops.source_line,
+            0,
+            format!("unsupported pragma directive: {}", parts[1]),
+        );
+    }
+}
+
+/// Processes one already macro-expanded, `;`-split statement: label
+/// handling followed by mnemonic + immediate-argument dispatch. `current`
+/// is never empty (callers skip empty statements from adjacent `;`
+/// tokens).
+fn process_statement(ops: &mut OpStream, current: &[String]) {
+    let mut tok_idx = 0;
+
+    // Handle labels
+    if current[0].ends_with(':') {
+        let label = &current[0][..current[0].len() - 1];
+        // Mirrors go's label-vs-macro-name conflict check at the
+        // `createLabel` call site (`assembler.go:2192-2199`): checked
+        // *before* the ordinary duplicate-label check, and skips creating
+        // the label entirely on a conflict.
+        if ops.macros.contains_key(label) {
+            ops.record_error(
+                ops.source_line,
+                0,
+                format!("Cannot create label with same name as macro: {label}"),
+            );
+        } else if ops.labels.contains_key(label) {
+            ops.record_error(ops.source_line, 0, format!("duplicate label {:?}", label));
+        } else {
+            ops.labels.insert(label.to_string(), ops.pending.len());
+        }
+        // A label is a possible entry point from elsewhere in the
+        // program (a branch target). Mirrors go-algorand's
+        // `ProgramKnowledge.label`/`reset` (assembler.go:364-380),
+        // called from `createLabel` (assembler.go:390): if the
+        // instructions since the last label unconditionally
+        // diverted control flow (`type_track_deadcode`), the
+        // knowledge accumulated up to here doesn't describe what's
+        // actually on the stack at this label, so analysis reopens
+        // with permissive "any" knowledge instead. Otherwise (a
+        // label reached by ordinary fallthrough, e.g. right after a
+        // conditional `bnz`/`bz`) go does *not* reset -- it simply
+        // trusts that whatever's tracked from the fallthrough path
+        // also describes any jump into this label, and keeps
+        // analyzing with the tracked stack as-is. See the
+        // `type_track` module docs for what's still deferred, and
+        // the `#pragma typetrack` handling above for the other spot
+        // this same reset shape (minus `type_track_disabled`, which
+        // the pragma never touches -- see its handling above) is
+        // triggered. Mirrors go's `ProgramKnowledge.reset`
+        // (`assembler.go:371-380`) resetting `scratchSpace` to
+        // `StackAny` for every slot alongside `bottom`/`deadcode` --
+        // see `Self::scratch_space`'s doc comment.
+        if !ops.type_track_disabled && ops.type_track_deadcode {
+            ops.type_track_deadcode = false;
+            ops.type_track_bottom_permissive = true;
+            ops.scratch_space = [type_track::StackType::Any; 256];
+        }
+        tok_idx = 1;
+        if tok_idx >= current.len() {
+            return;
+        }
+    }
+
+    let mnemonic = current[tok_idx].as_str();
+    let args: Vec<&str> = current[tok_idx + 1..].iter().map(|s| s.as_str()).collect();
+
+    ops.record_source_location(ops.source_line, 0);
+    type_track::track_instruction(ops, mnemonic, &args);
+    assemble_instruction(ops, mnemonic, &args);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -1083,217 +1567,45 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
     for (line_idx, &line_text) in lines.iter().enumerate() {
         ops.source_line = line_idx + 1; // 1-based
 
-        for code in split_statements(line_text) {
-            // Handle pragma
-            if code.starts_with('#') {
-                if code.starts_with("#pragma") {
-                    let parts: Vec<&str> = code.split_whitespace().collect();
-                    if parts.len() == 1 {
-                        // #pragma with no keyword
-                        ops.record_error(ops.source_line, 0, "empty pragma".into());
-                    } else if parts[1] == "version" {
-                        if parts.len() == 2 {
-                            // #pragma version (no number)
-                            ops.record_error(ops.source_line, 0, "no version value".into());
-                        } else if parts.len() > 3 {
-                            // #pragma version N extra
-                            ops.record_error(
-                                ops.source_line,
-                                0,
-                                "unexpected tokens after version value".into(),
-                            );
-                        } else {
-                            // #pragma version N
-                            if !ops.pending.is_empty() {
-                                ops.record_error(
-                                    ops.source_line,
-                                    0,
-                                    "#pragma version is only allowed before instructions".into(),
-                                );
-                            }
-                            if let Ok(v) = parts[2].parse::<u8>() {
-                                if v == 0 || v > MAX_AVM_VERSION {
-                                    ops.record_error(
-                                        ops.source_line,
-                                        0,
-                                        format!("unsupported version: {v}"),
-                                    );
-                                } else {
-                                    ops.version = v;
-                                    version_set = true;
-                                }
-                            } else {
-                                ops.record_error(
-                                    ops.source_line,
-                                    0,
-                                    format!("invalid version: {}", parts[2]),
-                                );
-                            }
-                        }
-                    } else if parts[1] == "autosalt" {
-                        if parts.len() == 2 {
-                            // #pragma autosalt (no value)
-                            ops.record_error(ops.source_line, 0, "no autosalt value".into());
-                        } else if parts.len() > 3 {
-                            // #pragma autosalt VALUE extra
-                            ops.record_error(
-                                ops.source_line,
-                                0,
-                                "unexpected tokens after autosalt value".into(),
-                            );
-                        } else if !ops.pending.is_empty() {
-                            ops.record_error(
-                                ops.source_line,
-                                0,
-                                "#pragma autosalt is only allowed before instructions".into(),
-                            );
-                        } else if let Some(on) = parse_pragma_bool(parts[2]) {
-                            ops.auto_salt = if on {
-                                AutoSaltMode::On
-                            } else {
-                                AutoSaltMode::Off
-                            };
-                            ops.auto_salt_line = ops.source_line;
-                        } else {
-                            ops.record_error(
-                                ops.source_line,
-                                0,
-                                format!("bad #pragma autosalt: {:?}", parts[2]),
-                            );
-                        }
-                    } else if parts[1] == "typetrack" {
-                        if parts.len() == 2 {
-                            // #pragma typetrack (no value)
-                            ops.record_error(ops.source_line, 0, "no typetrack value".into());
-                        } else if parts.len() > 3 {
-                            // #pragma typetrack VALUE extra
-                            ops.record_error(
-                                ops.source_line,
-                                0,
-                                "unexpected tokens after typetrack value".into(),
-                            );
-                        } else if let Some(on) = parse_pragma_bool(parts[2]) {
-                            // Mirrors go's `#pragma typetrack` handling
-                            // (`assembler.go:2501-2519`): unlike `version`/
-                            // `autosalt`, this pragma has no "only allowed
-                            // before instructions" restriction -- it can
-                            // toggle mid-program, any number of times
-                            // (`TestTypeTracking`'s "Turning type tracking
-                            // off and then back on" cases).
-                            //
-                            // Note this only gates whether a mismatch is
-                            // *reported* -- the tracked stack itself keeps
-                            // evolving underneath even while reporting is
-                            // off, exactly like go's `trackStack` still
-                            // popping/pushing `ops.known.stack` regardless
-                            // of `ops.typeTracking` and only `typeErrorf`
-                            // checking the flag (`assembler.go:2039-2043,
-                            // 2056-2096`). See
-                            // `type_track::track_instruction`/
-                            // `apply_stack_effect`.
-                            let was_reporting = ops.type_track_reporting;
-                            ops.type_track_reporting = on;
-                            // Mirrors `assembler.go:2513-2517`: toggling
-                            // from off to on resets tracked knowledge to a
-                            // permissive "unknown incoming stack" state
-                            // (`ops.known.reset()`), exactly like reaching a
-                            // label after dead code -- whatever was tracked
-                            // while reporting was off (which may have
-                            // silently drifted from reality, since
-                            // mismatched pops/pushes still happened without
-                            // being reported) is discarded rather than
-                            // trusted. Toggling off, or declaring the
-                            // already-current state again (on-to-on or
-                            // off-to-off), does *not* reset --
-                            // `TestTypeTracking`'s "consecutively does _not_
-                            // reset" case.
-                            if !was_reporting && on {
-                                ops.type_stack.clear();
-                                ops.type_stack_const.clear();
-                                ops.scratch_space = [type_track::StackType::Any; 256];
-                                ops.type_track_deadcode = false;
-                                ops.type_track_bottom_permissive = true;
-                            }
-                        } else {
-                            ops.record_error(
-                                ops.source_line,
-                                0,
-                                format!("bad #pragma typetrack: {:?}", parts[2]),
-                            );
-                        }
-                    } else {
-                        // #pragma <unknown>
-                        ops.record_error(
-                            ops.source_line,
-                            0,
-                            format!("unsupported pragma directive: {}", parts[1]),
-                        );
-                    }
-                }
-                continue;
+        let full_tokens = tokenize_line(line_text);
+        if full_tokens.is_empty() {
+            continue;
+        }
+
+        // Directive lines (`#pragma`/`#define`) consume the entire line's
+        // tokens (including any literal `;`) as one call and never fall
+        // through to statement processing -- mirrors go's `parseText`
+        // (assembler.go:2165-2177): a directive is recognized by its first
+        // token alone, with no per-statement splitting for that line.
+        if full_tokens[0].starts_with('#') {
+            handle_directive(&mut ops, &full_tokens, &mut version_set);
+            continue;
+        }
+
+        // If no version set yet, default -- and, like go's parseText
+        // (assembler.go:2183-2187), recheck every macro defined so far now
+        // that a version is implicitly known.
+        if !version_set && ops.version == 0 {
+            ops.version = ASSEMBLER_DEFAULT_VERSION;
+            version_set = true;
+            recheck_macro_names(&mut ops);
+        }
+
+        // Statement loop: repeatedly expand macros and split at the next
+        // `;` token (`next_statement`, go's `nextStatement`) until the
+        // line's tokens are exhausted. This has to run on the whole
+        // line's token stream rather than on statements pre-split at the
+        // character level, since a macro's body may itself contain a
+        // literal `;` (see `next_statement`'s doc comment).
+        let tokens: Vec<String> = full_tokens.iter().map(|s| s.to_string()).collect();
+        let (mut current, mut rest) = next_statement(&ops, tokens);
+        while !current.is_empty() || !rest.is_empty() {
+            if !current.is_empty() {
+                process_statement(&mut ops, &current);
             }
-
-            // If no version set yet, default
-            if !version_set && ops.version == 0 {
-                ops.version = ASSEMBLER_DEFAULT_VERSION;
-                version_set = true;
-            }
-
-            // Tokenize the line
-            let tokens = tokenize(code);
-            if tokens.is_empty() {
-                continue;
-            }
-
-            let mut tok_idx = 0;
-
-            // Handle labels
-            if tokens[0].ends_with(':') {
-                let label = &tokens[0][..tokens[0].len() - 1];
-                if ops.labels.contains_key(label) {
-                    ops.record_error(ops.source_line, 0, format!("duplicate label {:?}", label));
-                } else {
-                    ops.labels.insert(label.to_string(), ops.pending.len());
-                }
-                // A label is a possible entry point from elsewhere in the
-                // program (a branch target). Mirrors go-algorand's
-                // `ProgramKnowledge.label`/`reset` (assembler.go:364-380),
-                // called from `createLabel` (assembler.go:390): if the
-                // instructions since the last label unconditionally
-                // diverted control flow (`type_track_deadcode`), the
-                // knowledge accumulated up to here doesn't describe what's
-                // actually on the stack at this label, so analysis reopens
-                // with permissive "any" knowledge instead. Otherwise (a
-                // label reached by ordinary fallthrough, e.g. right after a
-                // conditional `bnz`/`bz`) go does *not* reset -- it simply
-                // trusts that whatever's tracked from the fallthrough path
-                // also describes any jump into this label, and keeps
-                // analyzing with the tracked stack as-is. See the
-                // `type_track` module docs for what's still deferred, and
-                // the `#pragma typetrack` handling above for the other spot
-                // this same reset shape (minus `type_track_disabled`, which
-                // the pragma never touches -- see its handling above) is
-                // triggered. Mirrors go's `ProgramKnowledge.reset`
-                // (`assembler.go:371-380`) resetting `scratchSpace` to
-                // `StackAny` for every slot alongside `bottom`/`deadcode` --
-                // see `Self::scratch_space`'s doc comment.
-                if !ops.type_track_disabled && ops.type_track_deadcode {
-                    ops.type_track_deadcode = false;
-                    ops.type_track_bottom_permissive = true;
-                    ops.scratch_space = [type_track::StackType::Any; 256];
-                }
-                tok_idx = 1;
-                if tok_idx >= tokens.len() {
-                    continue;
-                }
-            }
-
-            let mnemonic = &tokens[tok_idx];
-            let args: Vec<&str> = tokens[tok_idx + 1..].to_vec();
-
-            ops.record_source_location(ops.source_line, 0);
-            type_track::track_instruction(&mut ops, mnemonic, &args);
-            assemble_instruction(&mut ops, mnemonic, &args);
+            let next = next_statement(&ops, rest);
+            current = next.0;
+            rest = next.1;
         }
     }
 
@@ -1357,42 +1669,50 @@ fn assemble_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
         "method" => asm_method(ops, args),
         "intcblock" => asm_intc_block(ops, args),
         "bytecblock" => asm_bytec_block(ops, args),
-        "txn" | "gtxn" | "gtxns" => asm_pseudo_txn(ops, mnemonic, args),
+        "txn" | "gtxn" | "gtxns" | "replace" => asm_pseudo_arity(ops, mnemonic, args),
         _ => asm_regular(ops, mnemonic, args),
     }
 }
 
 // ---------------------------------------------------------------------------
-// `txn`/`gtxn`/`gtxns` pseudo-op arity dispatch
+// `txn`/`gtxn`/`gtxns`/`replace` pseudo-op arity dispatch
 // ---------------------------------------------------------------------------
 //
-// go-algorand's assembler treats these three mnemonics as "pseudo-ops": the
+// go-algorand's assembler treats these mnemonics as "pseudo-ops": the
 // *number of immediates supplied* (not the mnemonic itself) picks the real
 // opcode to assemble -- `txn Field` (1 immediate) is the real `txn` opcode,
 // while `txn Field i` (2 immediates) transparently assembles as `txna`
 // (assembler.go:1804-1816's `pseudoOps` table):
 //
-//   "txn":   {1: OpSpec{Name: "txn"},   2: OpSpec{Name: "txna"}},
-//   "gtxn":  {2: OpSpec{Name: "gtxn"},  3: OpSpec{Name: "gtxna"}},
-//   "gtxns": {1: OpSpec{Name: "gtxns"}, 2: OpSpec{Name: "gtxnsa"}},
+//   "txn":     {1: OpSpec{Name: "txn"},     2: OpSpec{Name: "txna"}},
+//   "gtxn":    {2: OpSpec{Name: "gtxn"},    3: OpSpec{Name: "gtxna"}},
+//   "gtxns":   {1: OpSpec{Name: "gtxns"},   2: OpSpec{Name: "gtxnsa"}},
+//   "replace": {0: OpSpec{Name: "replace3"}, 1: OpSpec{Name: "replace2"}},
+//
+// `replace` (issue #945) follows the exact same immediate-count dispatch
+// shape as `txn`/`gtxn`/`gtxns`: `replace` with a literal byte-offset
+// immediate (1 immediate) assembles as the fixed-offset `replace2`;
+// `replace` with no immediate (the offset instead comes off the stack, 0
+// immediates) assembles as `replace3`.
 //
 // go-algorand's `getSpec` (assembler.go:1735-1773) resolves the target spec
 // by arity, but keeps reporting diagnostics under the *pseudo* mnemonic
 // (`pseudo.Name = name` at assembler.go:1755) rather than the dispatched-to
 // opcode's own name -- e.g. `txn Accounts 0 1` (3 immediates, no arity
 // matches) is `"txn expects 1 or 2 immediate arguments"`, not a `txna`-named
-// error. `asm_pseudo_txn` mirrors that: it looks up the dispatched-to
+// error. `asm_pseudo_arity` mirrors that: it looks up the dispatched-to
 // opcode's `OpSpec` to borrow its opcode byte/`ImmKind`/version, but always
 // reports errors under the original pseudo mnemonic.
 
 /// The `(immediate count -> real opcode name)` arity table for one
 /// pseudo-op mnemonic, mirroring a single entry of go-algorand's
 /// `pseudoOps` map (assembler.go:1804-1816).
-fn pseudo_txn_table(mnemonic: &str) -> &'static [(usize, &'static str)] {
+fn pseudo_arity_table(mnemonic: &str) -> &'static [(usize, &'static str)] {
     match mnemonic {
         "txn" => &[(1, "txn"), (2, "txna")],
         "gtxn" => &[(2, "gtxn"), (3, "gtxna")],
         "gtxns" => &[(1, "gtxns"), (2, "gtxnsa")],
+        "replace" => &[(0, "replace3"), (1, "replace2")],
         _ => &[],
     }
 }
@@ -1422,11 +1742,13 @@ fn join_immediate_counts(counts: &[usize]) -> String {
     msg
 }
 
-/// Assemble `txn`/`gtxn`/`gtxns`, dispatching by immediate count to the real
-/// scalar opcode or its array-indexed (`txna`/`gtxna`/`gtxnsa`) sibling, per
-/// go-algorand's `pseudoOps` table (assembler.go:1804-1816).
-fn asm_pseudo_txn(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
-    let table = pseudo_txn_table(mnemonic);
+/// Assemble a `txn`/`gtxn`/`gtxns`/`replace` pseudo-op, dispatching by
+/// immediate count to the real opcode -- the scalar opcode or its
+/// array-indexed (`txna`/`gtxna`/`gtxnsa`) sibling, or `replace3`/
+/// `replace2` -- per go-algorand's `pseudoOps` table (assembler.go:1804-
+/// 1816).
+fn asm_pseudo_arity(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
+    let table = pseudo_arity_table(mnemonic);
     match table.iter().find(|(n, _)| *n == args.len()) {
         Some(&(_, target)) => {
             let spec = match opcode::lookup_by_name(target) {
@@ -1772,8 +2094,9 @@ fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
 /// looking up the opcode spec under `lookup_name` but reporting every
 /// diagnostic and resolving every field immediate under `display_name`.
 ///
-/// These differ only when called from `asm_pseudo_txn`: `txn`/`gtxn`/`gtxns`
-/// dispatch by arity to the real opcode (`lookup_name`, e.g. `"txna"`) but
+/// These differ only when called from `asm_pseudo_arity`: `txn`/`gtxn`/
+/// `gtxns`/`replace` dispatch by arity to the real opcode (`lookup_name`,
+/// e.g. `"txna"`) but
 /// keep reporting errors under the pseudo mnemonic the user actually wrote
 /// (`display_name`, e.g. `"txn"`), matching go-algorand's `getSpec`
 /// (`pseudo.Name = name`, assembler.go:1755). Every other caller passes the
@@ -2446,71 +2769,26 @@ fn decode_algorand_address(addr: &str) -> Result<Vec<u8>, String> {
     Ok(pubkey.to_vec())
 }
 
-/// Split a source line into `;`-separated statements and strip trailing
-/// `//` comments, matching go-algorand's assembler (`data/transactions/
-/// logic/assembler.go`): `;` is a genuine statement separator (its
-/// tokenizer's `tokenSeparators` includes `;` alongside whitespace, and
-/// `tokensFromLine` emits an explicit `;` token that the statement loop
-/// treats like a newline) -- NOT a comment delimiter. A `//` comment
-/// (outside a string literal) ends the whole line, including any further
-/// `;`-delimited statements that would have followed it, mirroring go's
-/// `tokensFromLine` returning immediately on an unescaped `//`.
-fn split_statements(line: &str) -> Vec<&str> {
-    let mut result = Vec::new();
-    let mut in_string = false;
-    let mut escape = false;
-    let bytes = line.as_bytes();
-    let mut start = 0usize;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if escape {
-            escape = false;
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'\\' && in_string {
-            escape = true;
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'"' {
-            in_string = !in_string;
-            i += 1;
-            continue;
-        }
-        if !in_string {
-            if bytes[i] == b';' {
-                let seg = line[start..i].trim();
-                if !seg.is_empty() {
-                    result.push(seg);
-                }
-                start = i + 1;
-                i += 1;
-                continue;
-            }
-            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-                let seg = line[start..i].trim();
-                if !seg.is_empty() {
-                    result.push(seg);
-                }
-                return result;
-            }
-        }
-        i += 1;
-    }
-    let seg = line[start..].trim();
-    if !seg.is_empty() {
-        result.push(seg);
-    }
-    result
-}
-
-/// Tokenize a TEAL source line into whitespace-separated tokens,
-/// preserving string literals as single tokens.
-fn tokenize(line: &str) -> Vec<&str> {
+/// Tokenize an entire TEAL source line into a flat, whitespace-separated
+/// token stream, preserving string literals as single tokens and emitting
+/// `;` as its own explicit single-character token rather than splitting
+/// the line into statements up front. An unescaped `//` (outside a string
+/// literal) ends tokenization for the rest of the line, including
+/// anything past a `;` that would otherwise have followed it.
+///
+/// Matches go-algorand's `tokensFromLine` (`data/transactions/logic/
+/// assembler.go`): a `#pragma`/`#define` directive line needs its whole,
+/// un-split token list (see `handle_directive`), and macro expansion can
+/// turn a single textual statement into several by substituting a `;`
+/// into the middle of it (`#define -> ; store`) -- both need `;` to still
+/// be a first-class token here rather than something already consumed by
+/// a separate statement-splitting pass. [`next_statement`] does that
+/// splitting afterward, at the token level, once macros have been
+/// expanded.
+fn tokenize_line(line: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let bytes = line.as_bytes();
-    let mut i = 0;
+    let mut i = 0usize;
     while i < bytes.len() {
         // Skip whitespace
         while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
@@ -2518,6 +2796,15 @@ fn tokenize(line: &str) -> Vec<&str> {
         }
         if i >= bytes.len() {
             break;
+        }
+        // An unescaped `//` outside a string ends the whole line.
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            break;
+        }
+        if bytes[i] == b';' {
+            tokens.push(&line[i..i + 1]);
+            i += 1;
+            continue;
         }
         let start = i;
         if bytes[i] == b'"' {
@@ -2535,8 +2822,14 @@ fn tokenize(line: &str) -> Vec<&str> {
                 i += 1;
             }
         } else {
-            // Regular token
-            while i < bytes.len() && bytes[i] != b' ' && bytes[i] != b'\t' {
+            // Regular token: consume until whitespace, `;`, or `//`.
+            while i < bytes.len() {
+                if bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b';' {
+                    break;
+                }
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    break;
+                }
                 i += 1;
             }
         }
@@ -2975,6 +3268,282 @@ mod tests {
         );
     }
 
+    // ── `replace` pseudo-op arity dispatch (issue #945), ported from
+    // go-algorand's TestReplacePseudo (assembler_test.go:3553) ───────────
+
+    #[test]
+    fn test_replace_pseudo_immediate_dispatches_to_replace2() {
+        // `replace N` (1 immediate) assembles identically to `replace2 N`
+        // -- go's pseudoOps table dispatches "replace" to the real
+        // `replace2` opcode based purely on immediate count
+        // (assembler.go:1815).
+        let replace =
+            assemble_string("#pragma version 8\nbyte 0x0000\nbyte 0x1234\nreplace 0\n").unwrap();
+        let replace2 =
+            assemble_string("#pragma version 8\nbyte 0x0000\nbyte 0x1234\nreplace2 0\n").unwrap();
+        assert_eq!(replace.program, replace2.program);
+    }
+
+    #[test]
+    fn test_replace_pseudo_no_immediate_dispatches_to_replace3() {
+        // `replace` (0 immediates, offset comes off the stack) assembles
+        // identically to `replace3` (assembler.go:1815).
+        let replace =
+            assemble_string("#pragma version 8\nbyte 0x0000\nint 0\nbyte 0x1234\nreplace\n")
+                .unwrap();
+        let replace3 =
+            assemble_string("#pragma version 8\nbyte 0x0000\nint 0\nbyte 0x1234\nreplace3\n")
+                .unwrap();
+        assert_eq!(replace.program, replace3.program);
+    }
+
+    #[test]
+    fn test_replace_pseudo_wrong_arity_errors() {
+        // TestReplacePseudo: an immediate count matching neither arity in
+        // the pseudoOps table is rejected with a combined "N or M" message,
+        // reported under the arg-height check for the 3-stack-argument
+        // form when no immediate was given at all but the stack is short.
+        let errs = expect_errors("#pragma version 8\nbyte 0x0000\nbyte 0x1234\nreplace\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "replace expects 3 stack arguments but stack height is 2"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_replace_pseudo_type_error_uses_pseudo_mnemonic() {
+        // TestReplacePseudo: `replace 0` with a non-`[]byte` argument on
+        // top of the stack (a `Uint64` from a stray `int 0`) is a type
+        // error reported under the pseudo mnemonic "replace 0", not the
+        // dispatched-to opcode's own name.
+        let errs = expect_errors("#pragma version 8\nbyte 0x0000\nint 0\nbyte 0x1234\nreplace 0\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "replace 0 arg 0 wanted type []byte got uint64"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_replace_pseudo_version_gating() {
+        // `replace`/`replace2`/`replace3` were introduced in v7 -- using
+        // the pseudo-op below that version is rejected the same way
+        // `txn`/`gtxn`'s array-form dispatch is (`asm_pseudo_arity`).
+        let errs = expect_errors("#pragma version 6\nbyte 0x0000\nbyte 0x1234\nreplace 0\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "replace opcode with 1 immediate was introduced in v7"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    // ── `#define` macro expansion (issue #945), ported from go-algorand's
+    // TestMacros (assembler_test.go:3673) ────────────────────────────────
+
+    #[test]
+    fn test_macro_basic_single_token_substitution() {
+        let with_macro = assemble_string(
+            "#pragma version 8\n#define none 0\n#define one 1\npushint none\npushint one\n+\n",
+        )
+        .unwrap();
+        let without_macro =
+            assemble_string("#pragma version 8\npushint 0\npushint 1\n+\n").unwrap();
+        assert_eq!(with_macro.program, without_macro.program);
+    }
+
+    #[test]
+    fn test_macro_body_containing_semicolon_splits_statement() {
+        // `#define ==? ==; bnz` -- the macro body itself contains a `;`,
+        // so a single textual `==? label1` usage expands into *two*
+        // statements: `==` then `bnz label1`. This is the case that rules
+        // out expanding macros only after a line has already been split
+        // into `;`-delimited statements at the character level.
+        let with_macro = assemble_string(
+            "#pragma version 8\n#define ==? ==; bnz\npushint 1\npushint 2\n==? label1\nerr\nlabel1:\npushint 1\n",
+        )
+        .unwrap();
+        let without_macro = assemble_string(
+            "#pragma version 8\npushint 1\npushint 2\n==\nbnz label1\nerr\nlabel1:\npushint 1\n",
+        )
+        .unwrap();
+        assert_eq!(with_macro.program, without_macro.program);
+    }
+
+    #[test]
+    fn test_macro_redefinition_and_chaining() {
+        // Redefining a macro after it's already been used elsewhere picks
+        // up the new definition for later uses (macros are expanded at
+        // each *use* site, not resolved once at definition time), and one
+        // macro's body can itself reference other macros.
+        let with_macro = assemble_string(
+            "#pragma version 8\n#define rowSize 3\n#define columnSize 5\n#define tableDimensions rowSize columnSize\npushbytes 0x100000000000\nsubstring tableDimensions\n#define rowSize 0\n#define columnSize 1\nsubstring tableDimensions\n",
+        )
+        .unwrap();
+        let without_macro = assemble_string(
+            "#pragma version 8\npushbytes 0x100000000000\nsubstring 3 5\nsubstring 0 1\n",
+        )
+        .unwrap();
+        assert_eq!(with_macro.program, without_macro.program);
+    }
+
+    #[test]
+    fn test_macro_self_reference_is_a_cycle() {
+        // `#define X X` -- go's TestMacros: a macro whose own body refers
+        // to itself is rejected as a cycle at define time, and later use
+        // reports "unknown opcode" since the (rejected) macro was never
+        // actually recorded.
+        let errs = expect_errors("#pragma version 8\n#define X X\nint 3\nX\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "macro expansion cycle discovered: X -> X"),
+            "unexpected errors: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "unknown opcode: \"X\""
+                    || e.message.contains("unknown opcode")),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_macro_indirect_cycle_is_rejected() {
+        // go's TestMacros: `c -> hey -> x -> d -> c` is a cycle even
+        // though no single macro directly refers to itself.
+        let errs = expect_errors(
+            "#pragma version 8\n#define x a d\n#define d c a\n#define hey wat's up x\n#define c woah hey\nint 1\nc\n",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "macro expansion cycle discovered: c -> hey -> x -> d -> c"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_macro_name_cannot_be_named_constant() {
+        // go's TestMacros: txn-type/OnCompletion named constants can't be
+        // used as macro names, regardless of version.
+        let errs = expect_errors("#pragma version 8\n#define pay randomm\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "Named constants cannot be used as macro names: pay"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_macro_name_cannot_be_pseudo_op() {
+        let errs = expect_errors("#define int 3\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "Macro names cannot be pseudo-ops: int"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_macro_name_opcode_check_is_version_gated() {
+        // go's TestMacros: "+" is a real v1 opcode, so a macro named "+"
+        // is rejected once the version is known to include it -- but not
+        // before, and `recheck_macro_names` re-validates every macro
+        // already defined the moment the version becomes known (whether
+        // via `#pragma version` or the first real instruction).
+        let errs = expect_errors("#define + randommmm\n#pragma version 1\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "Macro names cannot be opcodes: +"),
+            "unexpected errors: {errs:?}"
+        );
+
+        // "return" isn't a v1 opcode (introduced in v2), so at v1 it's a
+        // perfectly fine macro name.
+        let ok = assemble_string("#define return random\n#pragma version 1\nint 1\n");
+        assert!(ok.is_ok(), "expected success");
+    }
+
+    #[test]
+    fn test_macro_name_cannot_be_field_name() {
+        let errs = expect_errors("#pragma version 8\n#define Sender hello\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "Macro names cannot be field names: Sender"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_macro_name_character_restrictions() {
+        // Digit-leading names, and characters outside the allowed set, are
+        // rejected (go's `checkMacroName`, assembler.go:2380-2430).
+        let errs = expect_errors("#pragma version 8\n#define 1hello one\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "Cannot begin macro name with number: 1hello"),
+            "unexpected errors: {errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\n#define wh@t 1\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "@ character not allowed in macro name"),
+            "unexpected errors: {errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\n#define b64 AA\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "Cannot use b64 as macro name"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_macro_name_vs_label_conflicts() {
+        // A label can't share a name with a currently-defined macro, and
+        // vice versa (go's TestMacros).
+        let errs = expect_errors("#pragma version 8\ncoolLabel:\nint 1\n#define coolLabel 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "Labels cannot be used as macro names: coolLabel"),
+            "unexpected errors: {errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\n#define coolLabel 1\ncoolLabel:\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "Cannot create label with same name as macro: coolLabel"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_define_requires_name_and_body() {
+        let errs = expect_errors("#pragma version 8\n#define\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "define directive requires a name and body"),
+            "unexpected errors: {errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\n#define hello\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "define directive requires a name and body"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_directive_is_an_error() {
+        let errs = expect_errors("#bogus\nint 1\n");
+        assert!(
+            errs.iter().any(|e| e.message == "unknown directive: bogus"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
     #[test]
     fn test_assemble_constants_intc_bytec_out_of_range_rejected() {
         // TestAssembleConstants: a direct `intc N`/`bytec N` reference past
@@ -3096,40 +3665,41 @@ mod tests {
     }
 
     #[test]
-    fn test_tokenize() {
-        let tokens = tokenize(r#"byte "hello world" 42"#);
+    fn test_tokenize_line() {
+        let tokens = tokenize_line(r#"byte "hello world" 42"#);
         assert_eq!(tokens, vec!["byte", "\"hello world\"", "42"]);
-    }
-
-    #[test]
-    fn test_split_statements() {
-        // A `//` comment strips the trailing text (single statement).
-        assert_eq!(split_statements("int 1 // comment"), vec!["int 1"]);
-        // `;` separates statements -- it is not a comment delimiter
+        // A `//` comment strips the trailing text.
+        assert_eq!(tokenize_line("int 1 // comment"), vec!["int", "1"]);
+        // `;` is its own explicit token -- it is not a comment delimiter
         // (issue #847: this assembler previously, incorrectly, treated it
         // as one, matching go-algorand's `assembler.go` tokenizer instead).
-        assert_eq!(split_statements("int 1 ; return"), vec!["int 1", "return"]);
         assert_eq!(
-            split_statements("zero: int 1; return"),
-            vec!["zero: int 1", "return"]
+            tokenize_line("int 1 ; return"),
+            vec!["int", "1", ";", "return"]
+        );
+        assert_eq!(
+            tokenize_line("zero: int 1; return"),
+            vec!["zero:", "int", "1", ";", "return"]
         );
         // `//` and `;` inside a string literal are not separators.
         assert_eq!(
-            split_statements(r#"byte "hello // world""#),
-            vec![r#"byte "hello // world""#]
+            tokenize_line(r#"byte "hello // world""#),
+            vec!["byte", r#""hello // world""#]
         );
-        assert_eq!(split_statements(r#"byte "a;b""#), vec![r#"byte "a;b""#]);
+        assert_eq!(tokenize_line(r#"byte "a;b""#), vec!["byte", r#""a;b""#]);
         // A `//` comment after some `;`-separated statements ends the
-        // whole line -- statements after the `//` are dropped, matching
-        // go's `tokensFromLine` returning immediately on an unescaped `//`.
+        // whole line -- tokens after the `//` are dropped, matching go's
+        // `tokensFromLine` returning immediately on an unescaped `//`.
         assert_eq!(
-            split_statements("int 1; int 2 // int 3; int 4"),
-            vec!["int 1", "int 2"]
+            tokenize_line("int 1; int 2 // int 3; int 4"),
+            vec!["int", "1", ";", "int", "2"]
         );
-        // Empty statements (leading/trailing/doubled `;`) are dropped.
-        assert_eq!(split_statements(";int 1;;"), vec!["int 1"]);
-        assert_eq!(split_statements(""), Vec::<&str>::new());
-        assert_eq!(split_statements("// only a comment"), Vec::<&str>::new());
+        // Adjacent/leading/trailing `;` tokens are preserved as-is --
+        // `next_statement` is what collapses the empty statements between
+        // them.
+        assert_eq!(tokenize_line(";int 1;;"), vec![";", "int", "1", ";", ";"]);
+        assert_eq!(tokenize_line(""), Vec::<&str>::new());
+        assert_eq!(tokenize_line("// only a comment"), Vec::<&str>::new());
     }
 
     #[test]
