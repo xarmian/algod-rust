@@ -37,7 +37,7 @@ statically validated.
 - [x] #810 — avm: add per-field version gating for global/txn/gtxn/asset_params_get/acct_params_get/block — merged via PR #840; found gap in v13+ block fields split to #839
 - [x] #811 — avm: implement RekeyTo/ApplicationCall minimum-AVM-version rule — merged via PR #831
 - [x] #812 — validate: add per-type WellFormed() mempool validation — merged via PR #837
-- [ ] #948 — types: `BoxRef.name` likely serializes wrong in JSON (raw byte array instead of go's base64 string) — found during the final txn_core/txn_logic/config_proto_sp sweep; needs an audit of whether any live REST API path is actually affected before/alongside the fix
+- [x] #948 — types: `BoxRef.name` likely serializes wrong in JSON (raw byte array instead of go's base64 string) — fixed: custom `serialize_with`/`deserialize_with` matches go's base64-in-JSON/raw-bytes-in-msgpack encoding; confirmed a live REST API path was affected (`POST /v2/transactions/simulate` JSON decoding)
 - [x] #813 — consensus: reconcile Falcon-512 vs Falcon-1024 parameter-set naming — resolved-by-investigation, no bug found (false alarm from audit test-name grepping)
 - [x] #815 — ledger: FirstValidTime + block_field implemented via PR #834; absentee computation split to #833 (needs new block-proposal-time online-stake infrastructure)
 - [x] #833 — ledger: implement block-proposal-side absentee/suspension list computation (split from #815); isAbsent pure function implemented via PR #846, block-assembly wiring split to #845 — closed as superseded by #845
