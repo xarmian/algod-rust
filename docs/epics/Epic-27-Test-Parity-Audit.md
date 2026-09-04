@@ -112,7 +112,7 @@ statically validated.
 **Util / Tools-CLI final sweep** (re-read `parity_util.md`/`parity_tools_cmd.md` end to end, cross-checked against every issue this epic has already filed, closed the last genuinely untracked gaps):
 - [ ] #962 — goal-rust: implement remaining `app` subcommands (`create`/`update`/`delete`/`optin`/`closeout`/`clear`/`read`/`info`/`box info`/`box list`) + `AppCallBytes` reverse-encoding (follow-up to #888's deferred scope)
 - [ ] #965 — goal-rust: implement TEAL source-map error-path resolution + close clerk/node/libgoal small CLI gaps (`TestDeterminePathToSourceFromSourceMap`, `TestGetMissingCatchpointLabel`, `TestUnicodePrintable`, `TestParseRekey`, `TestValidRounds`)
-- [ ] #966 — bin: implement algoh-equivalent block-stall health-monitor daemon (Tier 2 ops tooling per `docs/PROJECT_SCOPE.md`)
+- [x] #966 — bin: implement algoh-equivalent block-stall health-monitor daemon (Tier 2 ops tooling per `docs/PROJECT_SCOPE.md`)
 - [ ] #969 — bin: implement catchupsrv-equivalent catchpoint-file HTTP serving daemon (Tier 2 ops tooling)
 - [ ] #971 — util: port `MoveFile` cross-device-safe rename + `IsEmpty` helper, audit catchpoint atomic writes (the ledger's catchpoint writer currently depends on unguarded `std::fs::rename`)
 - [ ] #973 — bin: implement algocfg-equivalent config-editing CLI (`get`/`set`/`string`/`delete`/`profile`) (Tier 2 ops tooling)

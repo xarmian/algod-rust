@@ -626,6 +626,20 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
         },
+        Commands::HealthMonitor {
+            algod_url,
+            algod_token,
+            poll_interval_ms,
+            stall_detect_ms,
+        } => {
+            commands::health_monitor::run(
+                algod_url,
+                algod_token,
+                std::time::Duration::from_millis(poll_interval_ms),
+                std::time::Duration::from_millis(stall_detect_ms),
+            )
+            .await?;
+        }
     }
 
     Ok(())
