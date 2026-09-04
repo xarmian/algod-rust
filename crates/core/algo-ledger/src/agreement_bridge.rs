@@ -152,10 +152,37 @@ impl AgreementLedgerBridge {
         Self,
         crossbeam_channel::Receiver<PendingUnmatchedCertificate>,
     ) {
+        Self::new_with_catchup_and_condvar(ledger, network_advancer, Arc::new(Condvar::new()))
+    }
+
+    /// Create a new bridge with catchup support, reusing a caller-supplied
+    /// `round_advanced` condvar instead of minting a fresh one.
+    ///
+    /// This is [`new_with_catchup`](Self::new_with_catchup) plus the
+    /// condvar-sharing behavior of
+    /// [`new_with_advancer_and_condvar`](Self::new_with_advancer_and_condvar):
+    /// needed when the *agreement* bridge itself (not just the catchup
+    /// bridge) has to be torn down and rebuilt in place: a live
+    /// catchpoint-catchup pause/resume cycle (issue #940) stops and
+    /// reconstructs the agreement `Service` (and the `AgreementLedgerBridge`
+    /// plus certificate channel it owns) without restarting sibling
+    /// services, namely the pool-block-follower, heartbeat, and
+    /// state-proof-worker threads, that are still blocked waiting on the
+    /// *original* condvar instance. Passing that original `Arc<Condvar>`
+    /// back in here on every rebuild keeps those waiters correctly woken
+    /// across the whole node lifetime, not just until the first pause.
+    pub fn new_with_catchup_and_condvar(
+        ledger: Arc<Mutex<SqliteLedger>>,
+        network_advancer: Arc<dyn NetworkAdvancer>,
+        round_advanced: Arc<Condvar>,
+    ) -> (
+        Self,
+        crossbeam_channel::Receiver<PendingUnmatchedCertificate>,
+    ) {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let bridge = Self {
             ledger,
-            round_advanced: Arc::new(Condvar::new()),
+            round_advanced,
             pending_cert_tx: Some(tx),
             pending_cert_rx: Some(rx.clone()),
             network_advancer,
@@ -1002,6 +1029,49 @@ mod tests {
 
         // And empty again after receiving.
         assert!(rx.try_recv().is_err(), "receiver should be empty again");
+    }
+
+    /// `new_with_catchup_and_condvar` must reuse the *exact* condvar instance
+    /// passed in, not mint a fresh one — this is what lets a pause/resume
+    /// cycle (issue #940) rebuild the agreement bridge without breaking
+    /// sibling threads still waiting on the original condvar via
+    /// `wait_for_round`/`round_notify`.
+    #[test]
+    fn new_with_catchup_and_condvar_reuses_the_given_condvar() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let advancer = Arc::new(NoOpNetworkAdvancer);
+        let shared_condvar = Arc::new(Condvar::new());
+
+        let (bridge, _rx) = AgreementLedgerBridge::new_with_catchup_and_condvar(
+            ledger,
+            advancer,
+            Arc::clone(&shared_condvar),
+        );
+
+        assert!(
+            Arc::ptr_eq(&bridge.round_advanced_condvar(), &shared_condvar),
+            "bridge must reuse the exact condvar Arc passed in, not create a new one"
+        );
+    }
+
+    /// The certificate channel plumbing must work identically to
+    /// `new_with_catchup` — the condvar-sharing variant is otherwise the
+    /// same constructor.
+    #[test]
+    fn new_with_catchup_and_condvar_returns_working_receiver() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let advancer = Arc::new(NoOpNetworkAdvancer);
+        let (bridge, rx) = AgreementLedgerBridge::new_with_catchup_and_condvar(
+            ledger,
+            advancer,
+            Arc::new(Condvar::new()),
+        );
+
+        assert!(rx.try_recv().is_err());
+        let verifier = AsyncVoteVerifier::new();
+        bridge.ensure_digest(&make_cert(7), &verifier);
+        let pending = rx.try_recv().expect("receiver should have a value");
+        assert_eq!(pending.cert.round, Round(7));
     }
 
     // -- Certificate storage tests --

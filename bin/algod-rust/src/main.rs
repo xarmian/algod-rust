@@ -450,6 +450,8 @@ async fn main() -> anyhow::Result<()> {
             tls_cert,
             tls_key,
             dns_bootstrap,
+            catchup_peer,
+            catchup_peer_token,
         } => {
             let file_config = crate::config::AlgodRustConfig::load(config.as_deref())?;
             // Load `<data-dir>/config.json` (go-algorand `config.Local`
@@ -516,6 +518,13 @@ async fn main() -> anyhow::Result<()> {
                 tls_cert_file: tls_cert,
                 tls_key_file: tls_key,
             };
+            // Live catchpoint-catchup (issue #940): a REST peer to fetch
+            // catchpoint files/blocks from, separate from `--peers`' gossip
+            // addresses. See `CatchupPeerOptions`'s doc comment.
+            let catchup_opts = commands::participate::CatchupPeerOptions {
+                url: catchup_peer,
+                token: catchup_peer_token,
+            };
             commands::participate::run(
                 &ledger_path,
                 genesis_id.as_deref(),
@@ -533,6 +542,7 @@ async fn main() -> anyhow::Result<()> {
                 network_opts,
                 node_config,
                 dns_bootstrap.as_deref(),
+                catchup_opts,
             )
             .await?;
         }
