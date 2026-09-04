@@ -52,6 +52,20 @@ fn account_nob_i64(account: &AccountData) -> i64 {
     i64::try_from(nob).expect("normalized online balance should fit in i64")
 }
 
+/// Mirrors go-algorand's `BaseOnlineAccountData.IsVotingEmpty`
+/// (`ledger/store/trackerdb/data.go`, via `BaseVotingData.IsEmpty`): true
+/// when every participation-key field is at its zero value, i.e. this
+/// `onlineaccounts` row represents an offline marker rather than a real
+/// online snapshot.
+fn is_voting_empty(account: &AccountData) -> bool {
+    account.vote_id.is_none()
+        && account.selection_id.is_none()
+        && account.state_proof_id.is_none()
+        && account.vote_first_valid == 0
+        && account.vote_last_valid == 0
+        && account.vote_key_dilution == 0
+}
+
 // ---------------------------------------------------------------------------
 // Schema DDL
 // ---------------------------------------------------------------------------
@@ -2068,6 +2082,18 @@ pub struct SqliteLedger {
     /// `commit_block` — see [`AccountTotalsDelta`] and issue #523.
     pending_totals_delta: AccountTotalsDelta,
 
+    /// Addresses written by `set_account`/`remove_account` during the block
+    /// currently open between `begin_block`/`commit_block`, consumed and
+    /// cleared by [`Self::record_online_account_history`] at `commit_block`
+    /// (issue #960). Mirrors go-algorand's `onlineAccounts.newBlockImpl`
+    /// collecting `delta.Accts` (the block's touched-account deltas,
+    /// `ledger/acctonline.go`) as the input to
+    /// `makeCompactOnlineAccountDeltas`/`onlineAccountsNewRoundImpl`
+    /// (`ledger/acctdeltas.go`) — the set of addresses a normal block
+    /// commit considers for a new `onlineaccounts` history row, as opposed
+    /// to a full sweep of every currently-online account.
+    pending_online_touched: std::collections::HashSet<Address>,
+
     /// Automatic interval-driven catchpoint generation config (issue
     /// #770), set via [`Self::configure_automatic_catchpoints`]. `None`
     /// (the default) disables the feature entirely — matching go's
@@ -2520,6 +2546,7 @@ impl SqliteLedger {
             delta_cache: crate::delta_cache::DeltaCache::with_default_window(),
             group_delta_tracer: None,
             pending_totals_delta: AccountTotalsDelta::default(),
+            pending_online_touched: std::collections::HashSet::new(),
             catchpoint_auto: None,
             catchpoint_worker: None,
         })
@@ -2826,6 +2853,9 @@ impl SqliteLedger {
         // this codebase's own tests, and genesis/catchpoint bootstrap code)
         // leaking into the next real block's flush.
         self.pending_totals_delta = AccountTotalsDelta::default();
+        // Issue #960: same reasoning as `pending_totals_delta` above -- start
+        // this block's online-account-history touched-address set clean.
+        self.pending_online_touched.clear();
         Ok(())
     }
 
@@ -3384,6 +3414,16 @@ impl SqliteLedger {
         // aggregate for any round the last catchpoint import didn't cover.
         self.record_online_supply_snapshot()?;
 
+        // Issue #960: append per-account online-status history rows to
+        // `onlineaccounts` on every commit, not just catchpoint import.
+        // Mirrors go-algorand's `onlineAccounts.newBlockImpl` +
+        // `onlineAccountsNewRoundImpl` (`ledger/acctonline.go`,
+        // `ledger/acctdeltas.go`). Without a live writer,
+        // `get_online_account_at_round` (backing `AgreementLedgerBridge`'s
+        // per-round online-status lookups) silently fell back to current
+        // state for any round the last catchpoint import didn't cover.
+        self.record_online_account_history()?;
+
         // Persist the trie if enabled. Paged commit via the same SQLite
         // transaction we're about to COMMIT — page writes happen against
         // `accounthashes` (PLAN-130 TASK-136). PLAN-36 G4 (TASK-118)
@@ -3793,6 +3833,9 @@ impl SqliteLedger {
         // ROLLBACK below, so the totals delta must not survive to the next
         // block's flush.
         self.pending_totals_delta = AccountTotalsDelta::default();
+        // Issue #960: same reasoning — the touched-address set feeding
+        // `record_online_account_history` must not survive a rolled-back block.
+        self.pending_online_touched.clear();
 
         // Restore the in-memory lease table to its pre-block state — the SQLite
         // ROLLBACK below does not cover it, so leases recorded by partially-
@@ -4293,6 +4336,203 @@ impl SqliteLedger {
             .unwrap_or(crate::catchpoint::writer::DEFAULT_MAX_BAL_LOOKBACK);
         let forget_before = round.saturating_sub(max_bal_lookback);
         self.prune_online_supply_before(forget_before)
+    }
+
+    /// Append per-account online-status snapshot rows to `onlineaccounts`
+    /// for every address touched during this round, and prune rows that
+    /// have fallen outside the `MaxBalLookback` retention window. Called
+    /// from every [`Self::commit_block`] (issue #960) so the table is a
+    /// live, bounded per-account history rather than something only
+    /// catchpoint import populates.
+    ///
+    /// Mirrors go-algorand's `onlineAccounts.newBlockImpl` collecting
+    /// `delta.Accts` (the block's touched-account deltas) and
+    /// `onlineAccountsNewRoundImpl`'s per-address decision
+    /// (`ledger/acctdeltas.go`): for each address touched this round,
+    /// compare its new status/data against the most recently stored
+    /// `onlineaccounts` row (regardless of round) for that address --
+    ///
+    /// - No previous row and the account is now online -> insert a new row.
+    /// - No previous row and the account is not online -> nothing to record.
+    /// - A previous row exists and the account is (still) online -> insert a
+    ///   new row only if the online-relevant data actually changed (skips a
+    ///   write when, e.g., an unrelated resource-only transaction happened
+    ///   to touch the account without changing its status/balance/voting
+    ///   data).
+    /// - A previous row exists and the account is now offline -> insert a
+    ///   "zero" marker row (matching go's `InsertOnlineAccount` with a zero
+    ///   `BaseOnlineAccountData`), unless the previous row was already such
+    ///   a marker (both old and new are offline: nothing changed, skip).
+    ///
+    /// Round-window retention reuses the exact
+    /// `round.saturating_sub(max_bal_lookback)` formula and rationale as
+    /// [`Self::record_online_supply_snapshot`] (issue #529): this crate
+    /// commits synchronously with no deferred-commit lag, so the "one round
+    /// earlier than go's literal formula" adjustment is required for the
+    /// same reason there.
+    fn record_online_account_history(&mut self) -> Result<(), AlgoError> {
+        let round = self.current_round.0;
+        let touched = std::mem::take(&mut self.pending_online_touched);
+
+        for addr in touched {
+            let new_account = self.get_account(&addr).unwrap_or_default();
+            let new_online = new_account.status == AccountStatus::Online;
+
+            let prev_blob: Option<Vec<u8>> = self
+                .conn
+                .query_row(
+                    "SELECT data FROM onlineaccounts WHERE address = ?1 \
+                     ORDER BY updround DESC LIMIT 1",
+                    params![addr.0.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("record_online_account_history: query latest row error: {e}"),
+                })?;
+
+            match prev_blob {
+                None => {
+                    if new_online {
+                        self.insert_online_account_row(&addr, round, &new_account)?;
+                    }
+                    // else: never had online history and still isn't online
+                    // -- nothing to record, matching go's `prevAcct.Ref ==
+                    // nil && newStatus != Online` skip.
+                }
+                Some(blob) => {
+                    let prev_account =
+                        decode_account_data(&blob).map_err(|e| AlgoError::Ledger {
+                            message: format!(
+                                "record_online_account_history: decode latest row error: {e}"
+                            ),
+                        })?;
+                    if new_online {
+                        if prev_account != new_account {
+                            self.insert_online_account_row(&addr, round, &new_account)?;
+                        }
+                    } else if !is_voting_empty(&prev_account) {
+                        // Was online (or otherwise carried voting data)
+                        // before, offline now -- record the transition with
+                        // a zero marker row, matching go's "delete by
+                        // inserting a zero entry".
+                        self.insert_online_account_row(&addr, round, &AccountData::default())?;
+                    }
+                    // else: both old and new are offline markers -- skip.
+                }
+            }
+        }
+
+        let max_bal_lookback = algo_types::consensus::consensus_params_for_version(&self.protocol)
+            .map(|p| p.max_bal_lookback)
+            .unwrap_or(crate::catchpoint::writer::DEFAULT_MAX_BAL_LOOKBACK);
+        let forget_before = round.saturating_sub(max_bal_lookback);
+        self.prune_online_account_history_before(forget_before)
+    }
+
+    /// Insert (or replace, for an idempotent re-run within the same round) a
+    /// single `onlineaccounts` history row for `addr` at `round`, keeping
+    /// `normalizedonlinebalance`/`votelastvalid` in sync with `account`.
+    fn insert_online_account_row(
+        &self,
+        addr: &Address,
+        round: u64,
+        account: &AccountData,
+    ) -> Result<(), AlgoError> {
+        let nob = account_nob_i64(account);
+        let data = encode_account_data(account);
+        self.conn
+            .execute(
+                "INSERT INTO onlineaccounts \
+                 (address, updround, normalizedonlinebalance, votelastvalid, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(address, updround) DO UPDATE SET \
+                     normalizedonlinebalance = excluded.normalizedonlinebalance, \
+                     votelastvalid = excluded.votelastvalid, \
+                     data = excluded.data",
+                params![
+                    addr.0.as_slice(),
+                    round as i64,
+                    nob,
+                    account.vote_last_valid as i64,
+                    data,
+                ],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("insert_online_account_row error: {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// Prune `onlineaccounts` rows that have fallen outside the retention
+    /// window, matching go-algorand's `onlineAccountsDelete`
+    /// (`ledger/store/trackerdb/sqlitedriver/accountsV2.go`): among rows
+    /// older than `forget_before`, keep at most the single most recent one
+    /// per address -- and even that one only if it represents an online
+    /// (non-empty-voting-data) snapshot, since an offline marker older than
+    /// the window carries no information a lookback query still needs (a
+    /// miss already answers "offline").
+    fn prune_online_account_history_before(&self, forget_before: u64) -> Result<(), AlgoError> {
+        // Step 1: for each address, delete every row older than the window
+        // except the single most recent one (still older than the window).
+        self.conn
+            .execute(
+                "DELETE FROM onlineaccounts \
+                 WHERE updround < ?1 \
+                 AND updround < ( \
+                     SELECT MAX(updround) FROM onlineaccounts AS o2 \
+                     WHERE o2.address = onlineaccounts.address AND o2.updround < ?1 \
+                 )",
+                params![forget_before as i64],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("prune_online_account_history_before step1 error: {e}"),
+            })?;
+
+        // Step 2: at most one row per address now remains older than the
+        // window. Drop it too if it's an offline marker.
+        let mut to_delete: Vec<(Vec<u8>, i64)> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT address, updround, data FROM onlineaccounts WHERE updround < ?1")
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("prune_online_account_history_before prepare error: {e}"),
+                })?;
+            let rows = stmt
+                .query_map(params![forget_before as i64], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("prune_online_account_history_before query error: {e}"),
+                })?;
+            for row in rows {
+                let (addr_bytes, updround, data) = row.map_err(|e| AlgoError::Ledger {
+                    message: format!("prune_online_account_history_before read row error: {e}"),
+                })?;
+                let account = decode_account_data(&data).map_err(|e| AlgoError::Ledger {
+                    message: format!("prune_online_account_history_before decode error: {e}"),
+                })?;
+                if is_voting_empty(&account) {
+                    to_delete.push((addr_bytes, updround));
+                }
+            }
+        }
+        for (addr_bytes, updround) in to_delete {
+            self.conn
+                .execute(
+                    "DELETE FROM onlineaccounts WHERE address = ?1 AND updround = ?2",
+                    params![addr_bytes, updround],
+                )
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("prune_online_account_history_before delete error: {e}"),
+                })?;
+        }
+        Ok(())
     }
 
     /// Returns the total online stake to report as "circulation" at `round`:
@@ -5074,6 +5314,10 @@ impl LedgerStore for SqliteLedger {
 
     fn set_account(&mut self, addr: &Address, account: AccountData) {
         let old = self.get_account(addr);
+        // Issue #960: record this address as touched this block so
+        // `record_online_account_history` (called from `commit_block`)
+        // considers it for a new `onlineaccounts` history row.
+        self.pending_online_touched.insert(*addr);
         // Issue #523: fold this write's status/balance change into the
         // block-level `accounttotals` delta accumulator (flushed once at
         // `commit_block`) — see `AccountTotalsDelta::fold`.
@@ -5107,6 +5351,9 @@ impl LedgerStore for SqliteLedger {
 
     fn remove_account(&mut self, addr: &Address) {
         let old = self.get_account(addr);
+        // Issue #960: same reasoning as `set_account` — a closed account
+        // that was previously online must still get an offline marker row.
+        self.pending_online_touched.insert(*addr);
         // Issue #523: fold the removal (no replacement state) into the
         // block-level `accounttotals` delta accumulator — see `set_account`.
         if let Some(old) = &old {
@@ -6586,7 +6833,10 @@ impl LedgerStore for SqliteLedger {
     fn put_voters_participants(
         &mut self,
         round: u64,
-        participants: &[(algo_types::Address, algo_consensus_crypto::stateproof::Participant)],
+        participants: &[(
+            algo_types::Address,
+            algo_consensus_crypto::stateproof::Participant,
+        )],
     ) -> Result<(), AlgoError> {
         let encoded = crate::voters::encode_participants(participants);
         self.conn
@@ -6604,7 +6854,12 @@ impl LedgerStore for SqliteLedger {
         &self,
         round: u64,
     ) -> Result<
-        Option<Vec<(algo_types::Address, algo_consensus_crypto::stateproof::Participant)>>,
+        Option<
+            Vec<(
+                algo_types::Address,
+                algo_consensus_crypto::stateproof::Participant,
+            )>,
+        >,
         AlgoError,
     > {
         let blob: Option<Vec<u8>> = self
@@ -8350,6 +8605,300 @@ mod tests {
              must survive the commit at round {target_round}",
             target_round,
             max_bal_lookback,
+        );
+    }
+
+    /// Issue #960: a normal (non-catchpoint) block commit must append a
+    /// per-account online-status snapshot row to `onlineaccounts`, mirroring
+    /// go-algorand's `onlineAccounts.newBlockImpl` +
+    /// `onlineAccountsNewRoundImpl` (`ledger/acctonline.go`,
+    /// `ledger/acctdeltas.go`). Before this fix, `onlineaccounts` was
+    /// populated only by catchpoint import
+    /// (`crates/core/algo-ledger/src/catchpoint/importer.rs`), so
+    /// `get_online_account_at_round` returned `None` for any round a live
+    /// node reached through ordinary block application.
+    #[test]
+    fn commit_block_appends_online_account_snapshot_for_changed_accounts() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                status: AccountStatus::Online,
+                vote_id: Some([1u8; 32]),
+                selection_id: Some([2u8; 32]),
+                vote_first_valid: 1,
+                vote_last_valid: 100_000,
+                vote_key_dilution: 10_000,
+                ..Default::default()
+            },
+        );
+        ledger.commit_block().unwrap();
+
+        let recorded = ledger
+            .get_online_account_at_round(&addr, 1)
+            .unwrap()
+            .expect("normal block commit must append an onlineaccounts history row");
+        assert_eq!(recorded.micro_algos, 10_000_000);
+        assert_eq!(recorded.status, AccountStatus::Online);
+        assert_eq!(recorded.vote_last_valid, 100_000);
+
+        // A later round with no further writes for this address must still
+        // resolve to the last known snapshot (`updround <= round`).
+        assert_eq!(
+            ledger
+                .get_online_account_at_round(&addr, 5)
+                .unwrap()
+                .map(|a| a.micro_algos),
+            Some(10_000_000),
+        );
+    }
+
+    /// Issue #960: touching an account without changing its online-relevant
+    /// data must not append a redundant history row, matching go's
+    /// `onlineAccountsNewRoundImpl` "was already online ... create an update
+    /// only if something changed" branch.
+    #[test]
+    fn commit_block_skips_unchanged_online_account_snapshot() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        let online = AccountData {
+            micro_algos: 10_000_000,
+            status: AccountStatus::Online,
+            vote_id: Some([1u8; 32]),
+            selection_id: Some([2u8; 32]),
+            vote_first_valid: 1,
+            vote_last_valid: 100_000,
+            vote_key_dilution: 10_000,
+            ..Default::default()
+        };
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.set_account(&addr, online.clone());
+        ledger.commit_block().unwrap();
+
+        // Round 2: rewrite the exact same account data (as e.g. an
+        // unrelated resource write might do via a full read-modify-write).
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(2));
+        ledger.set_account(&addr, online);
+        ledger.commit_block().unwrap();
+
+        let rows: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
+                params![addr.0.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "no history row change -> no new onlineaccounts row for round 2"
+        );
+    }
+
+    /// Issue #960: when a previously-online account goes offline, the
+    /// history must record the transition (a zero marker row) rather than
+    /// silently leaving the last online snapshot as the queryable answer
+    /// for later rounds -- matching go's "delete by inserting a zero
+    /// entry" (`onlineAccountsNewRoundImpl`).
+    #[test]
+    fn commit_block_records_online_to_offline_transition() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                status: AccountStatus::Online,
+                vote_id: Some([1u8; 32]),
+                selection_id: Some([2u8; 32]),
+                vote_first_valid: 1,
+                vote_last_valid: 100_000,
+                vote_key_dilution: 10_000,
+                ..Default::default()
+            },
+        );
+        ledger.commit_block().unwrap();
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(2));
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                status: AccountStatus::Offline,
+                ..Default::default()
+            },
+        );
+        ledger.commit_block().unwrap();
+
+        let at_round_1 = ledger
+            .get_online_account_at_round(&addr, 1)
+            .unwrap()
+            .expect("round 1's online snapshot must still be recorded");
+        assert_eq!(at_round_1.status, AccountStatus::Online);
+
+        let at_round_2 = ledger
+            .get_online_account_at_round(&addr, 2)
+            .unwrap()
+            .expect("the offline transition itself must be a recorded history row");
+        assert_eq!(
+            at_round_2.status,
+            AccountStatus::Offline,
+            "round 2 must resolve to the offline marker, not the stale round-1 online snapshot"
+        );
+    }
+
+    /// Issue #960: `onlineaccounts` history rows older than the
+    /// `MaxBalLookback` retention window are pruned by normal block commit
+    /// down to at most one surviving row per address, mirroring
+    /// go-algorand's `onlineAccountsDelete`
+    /// (`ledger/store/trackerdb/sqlitedriver/accountsV2.go`) -- this is the
+    /// per-account analog of issue #519's aggregate
+    /// `onlineroundparamstail` pruning, and the scenario
+    /// `TestOnlineAccountsExceedOfflineRows` pins upstream. Unlike the
+    /// aggregate table, go's per-account pruning deliberately *keeps* the
+    /// single most recent pre-window row when it is an online snapshot
+    /// (rather than deleting it outright): a lookback query for a round
+    /// between that kept row and the next in-window row must still resolve
+    /// to "was online", not silently miss.
+    #[test]
+    fn commit_block_prunes_online_account_history_beyond_lookback_window() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_protocol(algo_types::consensus::CONSENSUS_V41.to_string());
+        let addr = Address([9u8; 32]);
+        let addr2 = Address([10u8; 32]);
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                status: AccountStatus::Online,
+                vote_id: Some([1u8; 32]),
+                selection_id: Some([2u8; 32]),
+                vote_first_valid: 1,
+                vote_last_valid: 100_000,
+                vote_key_dilution: 10_000,
+                ..Default::default()
+            },
+        );
+        // A second address that goes offline at round 1 -- its offline
+        // marker must be dropped entirely once it ages out (no online
+        // state worth remembering), unlike `addr`'s online snapshot.
+        ledger.set_account(
+            &addr2,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                vote_id: Some([3u8; 32]),
+                selection_id: Some([4u8; 32]),
+                vote_first_valid: 1,
+                vote_last_valid: 100_000,
+                vote_key_dilution: 10_000,
+                ..Default::default()
+            },
+        );
+        ledger.commit_block().unwrap();
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(2));
+        ledger.set_account(
+            &addr2,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Offline,
+                ..Default::default()
+            },
+        );
+        ledger.commit_block().unwrap();
+        assert!(ledger
+            .get_online_account_at_round(&addr, 1)
+            .unwrap()
+            .is_some());
+
+        // Jump far enough ahead that rounds 1/2 fall outside the 320-round
+        // MaxBalLookback retention window -- touch `addr` again so there is
+        // an in-window row too, and to drive `commit_block`'s prune step.
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(500));
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 20_000_000,
+                status: AccountStatus::Online,
+                vote_id: Some([1u8; 32]),
+                selection_id: Some([2u8; 32]),
+                vote_first_valid: 1,
+                vote_last_valid: 100_000,
+                vote_key_dilution: 10_000,
+                ..Default::default()
+            },
+        );
+        ledger.commit_block().unwrap();
+
+        let rows_addr: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
+                params![addr.0.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows_addr, 2,
+            "round 1's online snapshot must be kept (not pruned) as the last-known state \
+             before the retention window, alongside the in-window round-500 row"
+        );
+        assert_eq!(
+            ledger
+                .get_online_account_at_round(&addr, 1)
+                .unwrap()
+                .map(|a| a.micro_algos),
+            Some(10_000_000),
+            "round 1's kept snapshot must still answer a query for round 1 itself"
+        );
+        assert_eq!(
+            ledger
+                .get_online_account_at_round(&addr, 499)
+                .unwrap()
+                .map(|a| a.micro_algos),
+            Some(10_000_000),
+            "a lookback query between the kept old row and the new in-window row must \
+             still resolve to the last known online state, not miss"
+        );
+        assert_eq!(
+            ledger
+                .get_online_account_at_round(&addr, 500)
+                .unwrap()
+                .map(|a| a.micro_algos),
+            Some(20_000_000),
+            "the just-committed round's snapshot must remain"
+        );
+
+        let rows_addr2: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
+                params![addr2.0.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows_addr2, 0,
+            "an offline marker aging out of the retention window carries no information \
+             a lookback query still needs, so it must be dropped entirely"
         );
     }
 
