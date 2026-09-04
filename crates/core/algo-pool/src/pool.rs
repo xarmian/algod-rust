@@ -402,7 +402,7 @@ impl TransactionPool {
 
         // Feed to the evaluator (with "no space" handling).
         // Mirrors Go's ingest() which calls addToPendingBlockEvaluator().
-        self.add_to_pending_block_evaluator(tx_group, guard)?;
+        self.add_to_pending_block_evaluator(tx_group, guard, false)?;
 
         // Store in remembered collections.
         let group_clone: Vec<SignedTransaction> = tx_group.to_vec();
@@ -576,8 +576,9 @@ impl TransactionPool {
         &self,
         txgroup: &[SignedTransaction],
         inner: &mut PoolInner,
+        reevaluating: bool,
     ) -> Result<(), PoolError> {
-        match self.add_to_pending_block_evaluator_once(txgroup, inner) {
+        match self.add_to_pending_block_evaluator_once(txgroup, inner, reevaluating) {
             Ok(()) => Ok(()),
             Err(e) => {
                 let err_str = e.to_string();
@@ -586,7 +587,7 @@ impl TransactionPool {
                     if let Some(ref mut evaluator) = inner.evaluator {
                         evaluator.reset_txn_bytes();
                     }
-                    self.add_to_pending_block_evaluator_once(txgroup, inner)
+                    self.add_to_pending_block_evaluator_once(txgroup, inner, reevaluating)
                 } else {
                     Err(e)
                 }
@@ -600,10 +601,17 @@ impl TransactionPool {
     /// - Checks if any transaction in the group has expired
     ///   (last_valid < evaluator_round + pending_blocks)
     /// - Feeds the group to the evaluator
+    ///
+    /// `reevaluating` mirrors Go's `LeaseInLedgerError.InBlockEvaluator`: it
+    /// is `true` when this call originates from `recompute_block_evaluator`
+    /// (re-evaluation after a new block), `false` for a normal `Remember()`.
+    /// It only affects how a lease-conflict failure is classified (see
+    /// `PoolError::LeaseConflict` / `classify_pool_error`), not behavior.
     fn add_to_pending_block_evaluator_once(
         &self,
         txgroup: &[SignedTransaction],
         inner: &mut PoolInner,
+        reevaluating: bool,
     ) -> Result<(), PoolError> {
         // Check for expired transactions.
         let effective_round = match &inner.evaluator {
@@ -622,9 +630,17 @@ impl TransactionPool {
 
         // Feed to the evaluator.
         if let Some(ref mut evaluator) = inner.evaluator {
-            evaluator
-                .transaction_group(txgroup)
-                .map_err(|e| PoolError::Evaluator(e.to_string()))?;
+            evaluator.transaction_group(txgroup).map_err(|e| {
+                let message = e.to_string();
+                if message.contains("duplicate lease") || message.contains("overlapping lease") {
+                    PoolError::LeaseConflict {
+                        message,
+                        in_block_evaluator: reevaluating,
+                    }
+                } else {
+                    PoolError::Evaluator(message)
+                }
+            })?;
             Ok(())
         } else {
             Err(PoolError::NoPendingBlockEvaluator)
@@ -643,7 +659,7 @@ impl TransactionPool {
         txgroup: &[SignedTransaction],
         inner: &mut PoolInner,
     ) -> Result<(), PoolError> {
-        self.add_to_pending_block_evaluator(txgroup, inner)?;
+        self.add_to_pending_block_evaluator(txgroup, inner, true)?;
 
         // Store in remembered collections (these get flushed to pending later).
         inner.remembered_tx_groups.push(txgroup.to_vec());
@@ -2445,6 +2461,100 @@ mod tests {
             err_str.contains("shutting down"),
             "should mention shutdown: {}",
             err_str
+        );
+    }
+
+    // ── Lease-conflict re-evaluation classification ────────────────
+
+    /// An evaluator that always reports a lease conflict, mirroring the
+    /// message `algo-ledger`'s `lease.rs::check()` produces
+    /// (`"duplicate lease"`).
+    struct LeaseConflictEvaluator {
+        round: Round,
+    }
+
+    impl BlockEvaluator for LeaseConflictEvaluator {
+        fn round(&self) -> Round {
+            self.round
+        }
+
+        fn pay_set_size(&self) -> usize {
+            0
+        }
+
+        fn test_transaction_group(&self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Ok(())
+        }
+
+        fn transaction_group(&mut self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Err(AlgoError::Ledger {
+                message: "duplicate lease".to_string(),
+            })
+        }
+
+        fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+            Ok(Block::default())
+        }
+
+        fn reset_txn_bytes(&mut self) {}
+    }
+
+    /// Port of go's `TestPoolLeaseReevalClassification` (`data/pools/
+    /// transactionPool_test.go`), adapted to this crate's architecture.
+    ///
+    /// Go's test commits a leased txn in a block, forces the pool to
+    /// re-evaluate against the new state (`OnNewBlock`), and asserts the
+    /// resulting lease conflict is tagged `TxPoolErrTagLease` — the
+    /// `_eval` variant — via the `InBlockEvaluator` flag on
+    /// `ledgercore.LeaseInLedgerError` (`data/pools/errors.go`'s
+    /// `ClassifyTxPoolError`). algod-rust's `BlockEvaluator` abstraction
+    /// reports only a message string, so the same distinction is carried
+    /// on `PoolError::LeaseConflict::in_block_evaluator`, threaded through
+    /// `add_to_pending_block_evaluator_once`'s `reevaluating` parameter:
+    /// `false` for a normal `Remember()`, `true` for the re-evaluation path
+    /// used by `recompute_block_evaluator` (invoked from `OnNewBlock`).
+    /// This test exercises that private plumbing directly to confirm both
+    /// sides of the flag produce the correct, distinct tag.
+    #[test]
+    fn test_lease_conflict_classification_by_reevaluation_context() {
+        let pool = make_pool_with_evaluator(1000);
+        let mut guard = pool.mu.lock();
+
+        guard.evaluator = Some(Box::new(LeaseConflictEvaluator { round: Round(2) }));
+
+        let txgroup = vec![make_test_txn(9)];
+
+        // Normal Remember() path: reevaluating = false => Lease.
+        let err = pool
+            .add_to_pending_block_evaluator_once(&txgroup, &mut guard, false)
+            .expect_err("evaluator always reports a lease conflict");
+        assert!(matches!(
+            err,
+            PoolError::LeaseConflict {
+                in_block_evaluator: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            crate::error::classify_pool_error(&err),
+            crate::error::PoolErrorTag::Lease
+        );
+
+        // Re-evaluation path (OnNewBlock -> recompute_block_evaluator):
+        // reevaluating = true => LeaseEval.
+        let err = pool
+            .add_to_pending_block_evaluator_once(&txgroup, &mut guard, true)
+            .expect_err("evaluator always reports a lease conflict");
+        assert!(matches!(
+            err,
+            PoolError::LeaseConflict {
+                in_block_evaluator: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            crate::error::classify_pool_error(&err),
+            crate::error::PoolErrorTag::LeaseEval
         );
     }
 }

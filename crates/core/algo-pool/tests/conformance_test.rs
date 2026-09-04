@@ -25,7 +25,7 @@
 //! implementation matches the Go behaviour exactly (error strings,
 //! fee escalation formula, eviction semantics, etc.).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -769,6 +769,82 @@ fn test_pool_error_classification() {
     );
 }
 
+/// Port of Go's `TestPoolLeaseReevalClassification`
+/// (`data/pools/transactionPool_test.go`): a lease conflict discovered
+/// while the pool's block evaluator is being rebuilt during re-evaluation
+/// (`OnNewBlock` -> `recompute_block_evaluator`) must classify as
+/// `LeaseEval`, distinct from a lease conflict discovered during a normal
+/// `Remember()` (`Lease`). Go carries this distinction on
+/// `ledgercore.LeaseInLedgerError.InBlockEvaluator`; algod-rust carries it
+/// on `PoolError::LeaseConflict::in_block_evaluator` for the same reason
+/// (the `BlockEvaluator` trait only reports a message string, not a typed
+/// error). The plumbing that sets this flag from the two call sites is
+/// exercised directly in `pool.rs`'s
+/// `test_lease_conflict_classification_by_reevaluation_context` (it needs
+/// private access); this test pins the public classification contract.
+#[test]
+fn test_pool_lease_reeval_classification() {
+    let reeval_err = PoolError::LeaseConflict {
+        message: "duplicate lease".into(),
+        in_block_evaluator: true,
+    };
+    assert_eq!(classify_pool_error(&reeval_err), PoolErrorTag::LeaseEval);
+
+    let remember_err = PoolError::LeaseConflict {
+        message: "duplicate lease".into(),
+        in_block_evaluator: false,
+    };
+    assert_eq!(classify_pool_error(&remember_err), PoolErrorTag::Lease);
+}
+
+/// Port of Go's `TestPoolAssetBalanceClassification`
+/// (`data/pools/transactionPool_test.go`): a transfer of more of an asset
+/// than the sender holds must classify as `AssetBalance`, mirroring Go's
+/// `ledgercore.AssetBalanceError` case in `ClassifyTxPoolError`. The
+/// message text pinned here is `algo-ledger`'s `apply.rs` axfer
+/// insufficient-holding message (`"axfer: {sender} holding {held}
+/// insufficient for transfer {amount} of asset {id}"`), which is what a
+/// real evaluator would surface through `PoolError::Evaluator`.
+#[test]
+fn test_pool_asset_balance_classification() {
+    let err = PoolError::Evaluator(
+        "axfer: SENDERADDR holding 0 insufficient for transfer 10 of asset 1".to_string(),
+    );
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::AssetBalance);
+}
+
+/// Port of Go's `TestPoolTealRejectClassification`
+/// (`data/pools/transactionPool_test.go`): an approval program that simply
+/// returns false (no runtime error) must classify as `TealReject`,
+/// mirroring Go's `ledgercore.ApprovalProgramRejectedError` case. The
+/// message text pinned here is `algo-ledger`'s `apply.rs` `apply_appl`
+/// rejection message with no `result.error` suffix (i.e. no trailing
+/// `": <err>"`).
+#[test]
+fn test_pool_teal_reject_classification() {
+    let err = PoolError::Evaluator(
+        "appl execute: app 1 approval program rejected transaction".to_string(),
+    );
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::TealReject);
+}
+
+/// Port of Go's `TestPoolTealErrClassification`
+/// (`data/pools/transactionPool_test.go`): an approval program that hits a
+/// runtime error (e.g. the `err` opcode) must classify as `TealErr`,
+/// mirroring Go's `logic.EvalError` case. The message text pinned here is
+/// `algo-ledger`'s `apply.rs` `apply_appl` rejection message *with* a
+/// `result.error` suffix (`": <err>"`), which is how a genuine runtime
+/// error (as opposed to an explicit `return 0`) is distinguished from a
+/// plain reject at the message-text level.
+#[test]
+fn test_pool_teal_err_classification() {
+    let err = PoolError::Evaluator(
+        "appl execute: app 1 approval program rejected transaction: err opcode executed"
+            .to_string(),
+    );
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::TealErr);
+}
+
 /// Verify exact error string format for FeeBelowThreshold matches Go's
 /// `fmt.Sprintf("fee %d below threshold %d (%d per byte * %d bytes)", ...)`.
 #[test]
@@ -978,4 +1054,320 @@ fn test_method_does_not_store() {
     assert!(result.is_ok());
 
     assert_eq!(pool.pending_count(), 0, "test should not store txn");
+}
+
+// ── Close-account pool-admission tests ──────────────────────────────
+//
+// Port of Go's `TestCloseAccount`, `TestCloseAccountWhileTxIsPending`, and
+// `TestCloseToAccountBelowMinBalance` (`data/pools/transactionPool_test.go`).
+// These exercise account-closing (`close_remainder_to`) at the
+// pool-admission layer. algo-pool itself does no balance accounting (that
+// lives in algo-ledger's block evaluator, reached only through the
+// `BlockEvaluator` trait), so this harness plugs in an evaluator that
+// tracks per-address balances and applies go-algorand's payment/close
+// semantics -- fee + amount debited from the sender, the remainder swept
+// to `close_remainder_to`, min-balance enforced on the receiver and the
+// close-to address but *not* on a closing sender -- closely enough to
+// prove the pool correctly propagates the accept/reject verdict for each
+// scenario end to end. Failure messages follow `algo-ledger::apply.rs`'s
+// conventions (`"...insufficient balance..."`, `"...below minimum
+// balance..."`) so `classify_pool_error` also classifies them correctly.
+
+const CLOSE_TEST_MIN_BALANCE: u64 = 100_000;
+const CLOSE_TEST_FEE: u64 = 1_000;
+
+/// A ledger whose evaluator tracks per-address balances and applies
+/// payment/close-remainder-to semantics, mirroring go-algorand's mock
+/// ledger used by the close-account pool tests.
+struct BalanceLedger {
+    round: AtomicU64,
+    balances: Arc<parking_lot::Mutex<HashMap<Address, u64>>>,
+}
+
+impl BalanceLedger {
+    fn new(round: u64, initial: &[(Address, u64)]) -> Self {
+        Self {
+            round: AtomicU64::new(round),
+            balances: Arc::new(parking_lot::Mutex::new(initial.iter().copied().collect())),
+        }
+    }
+
+    fn balance_of(&self, addr: Address) -> u64 {
+        *self.balances.lock().get(&addr).unwrap_or(&0)
+    }
+}
+
+impl PoolLedger for BalanceLedger {
+    fn latest(&self) -> Round {
+        Round(self.round.load(Ordering::SeqCst))
+    }
+
+    fn block_hdr(&self, _round: Round) -> Result<BlockHeader, AlgoError> {
+        Ok(BlockHeader::default())
+    }
+
+    fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, AlgoError> {
+        Ok(ConsensusParams::default())
+    }
+
+    fn start_evaluator(
+        &self,
+        _hdr: BlockHeader,
+        _payset_hint: usize,
+        _max_txn_bytes_per_block: usize,
+    ) -> Result<Box<dyn BlockEvaluator>, AlgoError> {
+        Ok(Box::new(BalanceEvaluator {
+            round: self.latest().next(),
+            balances: self.balances.clone(),
+        }))
+    }
+}
+
+/// Evaluator counterpart to [`BalanceLedger`]: applies payment/close
+/// semantics against the shared balance map, rejecting (without mutating
+/// state) on overspend or a resulting balance strictly between 0 and the
+/// minimum balance.
+struct BalanceEvaluator {
+    round: Round,
+    balances: Arc<parking_lot::Mutex<HashMap<Address, u64>>>,
+}
+
+impl BlockEvaluator for BalanceEvaluator {
+    fn round(&self) -> Round {
+        self.round
+    }
+
+    fn pay_set_size(&self) -> usize {
+        0
+    }
+
+    fn test_transaction_group(&self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+        Ok(())
+    }
+
+    fn transaction_group(&mut self, txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+        let mut balances = self.balances.lock();
+        for stx in txgroup {
+            let t = &stx.txn;
+            let sender_bal = *balances.get(&t.sender).unwrap_or(&0);
+            let total_spend = t.fee + t.amount;
+            if sender_bal < total_spend {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "sender {} has insufficient balance {} for payment {}",
+                        t.sender, sender_bal, total_spend
+                    ),
+                });
+            }
+            let remainder = sender_bal - total_spend;
+            let closing = !t.close_remainder_to.is_zero();
+
+            let new_sender_bal = if closing { 0 } else { remainder };
+            let new_receiver_bal = balances.get(&t.receiver).copied().unwrap_or(0) + t.amount;
+            let new_close_to_bal = closing
+                .then(|| balances.get(&t.close_remainder_to).copied().unwrap_or(0) + remainder);
+
+            // Min-balance checks (a closing sender is exempt; go-algorand
+            // never enforces a minimum on an account that ends at zero via
+            // CloseRemainderTo). Nothing is committed until all checks pass,
+            // matching go's evaluator (a rejected txn has no side effects).
+            if !closing && new_sender_bal > 0 && new_sender_bal < CLOSE_TEST_MIN_BALANCE {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "account {} balance {} below minimum balance {}",
+                        t.sender, new_sender_bal, CLOSE_TEST_MIN_BALANCE
+                    ),
+                });
+            }
+            if new_receiver_bal > 0 && new_receiver_bal < CLOSE_TEST_MIN_BALANCE {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "account {} balance {} below minimum balance {}",
+                        t.receiver, new_receiver_bal, CLOSE_TEST_MIN_BALANCE
+                    ),
+                });
+            }
+            if let Some(close_to_bal) = new_close_to_bal {
+                if close_to_bal > 0 && close_to_bal < CLOSE_TEST_MIN_BALANCE {
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "account {} balance {} below minimum balance {}",
+                            t.close_remainder_to, close_to_bal, CLOSE_TEST_MIN_BALANCE
+                        ),
+                    });
+                }
+            }
+
+            balances.insert(t.sender, new_sender_bal);
+            balances.insert(t.receiver, new_receiver_bal);
+            if let Some(close_to_bal) = new_close_to_bal {
+                balances.insert(t.close_remainder_to, close_to_bal);
+            }
+        }
+        Ok(())
+    }
+
+    fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+        Ok(Block::default())
+    }
+
+    fn reset_txn_bytes(&mut self) {}
+}
+
+/// Build a pool backed by a [`BalanceLedger`] seeded with the given
+/// initial balances, with the evaluator already installed (mirrors
+/// `make_pool`'s `on_new_block` bootstrap).
+fn make_balance_pool(
+    round: u64,
+    initial: &[(Address, u64)],
+) -> (TransactionPool, Arc<BalanceLedger>) {
+    let ledger = Arc::new(BalanceLedger::new(round, initial));
+    let config = PoolConfig {
+        pool_size: 1000,
+        ..Default::default()
+    };
+    let pool = TransactionPool::new(config, ledger.clone());
+
+    let block = Block {
+        round: Round(round),
+        ..Block::default()
+    };
+    pool.on_new_block(&block, &HashSet::new());
+
+    (pool, ledger)
+}
+
+/// A payment transaction with an optional `close_remainder_to`, using a
+/// distinguishing note byte for a unique txid.
+fn make_payment(
+    note_byte: u8,
+    sender: Address,
+    receiver: Address,
+    amount: u64,
+    close_remainder_to: Address,
+) -> SignedTransaction {
+    let mut txn = make_txn(note_byte);
+    txn.txn.sender = sender;
+    txn.txn.fee = CLOSE_TEST_FEE;
+    txn.txn.receiver = receiver;
+    txn.txn.amount = amount;
+    txn.txn.close_remainder_to = close_remainder_to;
+    txn
+}
+
+/// Port of Go's `TestCloseAccount`: after a payment closes the sender's
+/// account out via `CloseRemainderTo`, a further payment from that same
+/// (now-empty) sender must be rejected for insufficient balance.
+#[test]
+fn test_close_account() {
+    let addr0 = Address([10u8; 32]);
+    let addr1 = Address([11u8; 32]);
+    let addr2 = Address([12u8; 32]);
+
+    let (pool, ledger) = make_balance_pool(
+        1,
+        &[(addr0, 3 * CLOSE_TEST_MIN_BALANCE + 2 * CLOSE_TEST_FEE)],
+    );
+
+    // Close addr0 out: pay addr1 minBalance, sweep the remainder to addr2.
+    let close_txn = make_payment(1, addr0, addr1, CLOSE_TEST_MIN_BALANCE, addr2);
+    pool.remember_one(close_txn)
+        .expect("closing payment should be accepted");
+    assert_eq!(ledger.balance_of(addr0), 0, "sender should be fully closed");
+
+    // The sender is closed -- it can no longer pay the fee, let alone a
+    // further payment.
+    let follow_up = make_payment(2, addr0, addr1, CLOSE_TEST_MIN_BALANCE, Address::ZERO);
+    let err = pool
+        .remember_one(follow_up)
+        .expect_err("closed sender should not be able to spend");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("insufficient balance"),
+        "expected an overspend-style rejection, got: {}",
+        err_str
+    );
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::Overspend);
+}
+
+/// Port of Go's `TestCloseAccountWhileTxIsPending`: a close transaction
+/// that would overspend (because a prior pending payment already
+/// consumed most of the balance) is rejected, but a slightly smaller
+/// close succeeds even though the sender ends up below the minimum
+/// balance -- closing is exempt from the sender-side minimum-balance
+/// check.
+#[test]
+fn test_close_account_while_tx_is_pending() {
+    let addr0 = Address([20u8; 32]);
+    let addr1 = Address([21u8; 32]);
+    let addr2 = Address([22u8; 32]);
+
+    let (pool, _ledger) = make_balance_pool(
+        1,
+        &[
+            (addr0, 2 * CLOSE_TEST_MIN_BALANCE + 2 * CLOSE_TEST_FEE - 1),
+            (addr1, CLOSE_TEST_MIN_BALANCE),
+            (addr2, CLOSE_TEST_MIN_BALANCE),
+        ],
+    );
+
+    // First payment leaves addr0 with minBalance + fee - 1.
+    let first = make_payment(1, addr0, addr1, CLOSE_TEST_MIN_BALANCE, Address::ZERO);
+    pool.remember_one(first)
+        .expect("first payment should be accepted");
+
+    // Trying to pay minBalance + fee again overspends by 1.
+    let overspend_close = make_payment(2, addr0, addr1, CLOSE_TEST_MIN_BALANCE, addr2);
+    let err = pool
+        .remember_one(overspend_close)
+        .expect_err("second close should overspend by 1");
+    assert!(
+        err.to_string().contains("insufficient balance"),
+        "expected an overspend-style rejection, got: {}",
+        err
+    );
+
+    // Paying a bit less succeeds even though it's closing -- the sender
+    // would end up below the minimum balance, but that's fine because the
+    // account is closing (CloseRemainderTo sweeps the rest away).
+    let ok_close = make_payment(3, addr0, addr1, CLOSE_TEST_MIN_BALANCE - 10, addr2);
+    pool.remember_one(ok_close)
+        .expect("closing for slightly less should be accepted");
+}
+
+/// Port of Go's `TestCloseToAccountBelowMinBalance`: a close transaction
+/// is rejected when the `CloseRemainderTo` account would end up holding a
+/// nonzero balance below the minimum -- the problem is on the close-to
+/// side, not the sender's.
+#[test]
+fn test_close_to_account_below_min_balance() {
+    let addr0 = Address([30u8; 32]);
+    let addr1 = Address([31u8; 32]);
+    let addr2 = Address([32u8; 32]);
+
+    let (pool, _ledger) = make_balance_pool(
+        1,
+        &[
+            (addr0, 2 * CLOSE_TEST_MIN_BALANCE - 1 + CLOSE_TEST_FEE),
+            (addr2, 0),
+        ],
+    );
+
+    let close_txn = make_payment(1, addr0, addr1, CLOSE_TEST_MIN_BALANCE, addr2);
+    let err = pool
+        .remember_one(close_txn)
+        .expect_err("close-to account ending up below min balance should be rejected");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains(&addr2.to_string()),
+        "error should name the close-to address {}: {}",
+        addr2,
+        err_str
+    );
+    assert!(
+        err_str.contains("below minimum balance"),
+        "expected a min-balance rejection, got: {}",
+        err_str
+    );
+    assert_eq!(classify_pool_error(&err), PoolErrorTag::MinBalance);
 }

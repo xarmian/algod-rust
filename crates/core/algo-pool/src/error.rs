@@ -85,6 +85,20 @@ pub enum PoolError {
     #[error("TransactionPool.ingest: {0}")]
     Evaluator(String),
 
+    /// The transaction's lease is already recorded for the sender within
+    /// the relevant round window.
+    ///
+    /// Mirrors go-algorand's `ledgercore.LeaseInLedgerError`. `in_block_evaluator`
+    /// mirrors its `InBlockEvaluator` field: `true` when the conflict was
+    /// discovered while the pool's block evaluator was being rebuilt during
+    /// re-evaluation (`TxPoolErrTagLeaseEval`), `false` when discovered
+    /// during a normal `Remember()` (`TxPoolErrTagLease`).
+    #[error("TransactionPool.ingest: {message}")]
+    LeaseConflict {
+        message: String,
+        in_block_evaluator: bool,
+    },
+
     /// Wraps an inner error with `"TransactionPool.Remember: "` prefix,
     /// matching Go's `fmt.Errorf("TransactionPool.Remember: %w", err)`.
     #[error("TransactionPool.Remember: {0}")]
@@ -194,7 +208,16 @@ impl fmt::Display for PoolErrorTag {
 
 /// Classify a `PoolError` into a `PoolErrorTag` for metrics.
 ///
-/// This mirrors Go's `ClassifyTxPoolError`.
+/// This mirrors Go's `ClassifyTxPoolError`. Go dispatches on the concrete
+/// Go error type returned by the block evaluator (`errors.As` down the
+/// wrapped chain: `OverspendError`, `MinBalanceError`,
+/// `AssetBalanceError`, `ApprovalProgramRejectedError`, `logic.EvalError`,
+/// etc. — see `data/pools/errors.go`'s `ClassifyTxPoolError`). algod-rust's
+/// pool abstracts the evaluator behind `BlockEvaluator::transaction_group`,
+/// which returns only a message string (`PoolError::Evaluator`), so the
+/// equivalent categories are recovered from the message text produced by
+/// `algo-ledger`'s `apply.rs` (each pattern below is quoted verbatim from
+/// its source location there).
 pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
     match err {
         PoolError::PendingQueueFull => PoolErrorTag::Cap,
@@ -204,8 +227,47 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
         PoolError::PoolShutdown => PoolErrorTag::EvalGeneric,
         PoolError::DuplicateTxn(_) => PoolErrorTag::TxId,
         PoolError::AlreadyInLedger(_) => PoolErrorTag::TxId,
-        PoolError::Evaluator(_) => PoolErrorTag::EvalGeneric,
+        PoolError::Evaluator(msg) => classify_evaluator_message(msg),
+        PoolError::LeaseConflict {
+            in_block_evaluator, ..
+        } => {
+            if *in_block_evaluator {
+                PoolErrorTag::LeaseEval
+            } else {
+                PoolErrorTag::Lease
+            }
+        }
         PoolError::Remember(inner) => classify_pool_error(inner),
+    }
+}
+
+/// Sub-classify a block-evaluator failure message into a `PoolErrorTag`.
+///
+/// The substrings matched here come from `algo-ledger`'s `apply.rs`:
+/// - `"...approval program rejected transaction: <err>"` (has a runtime
+///   error appended) => `TealErr`, mirroring Go's `logic.EvalError` case.
+/// - `"...approval program rejected transaction"` (no runtime error
+///   appended — the program simply returned false) => `TealReject`,
+///   mirroring Go's `ledgercore.ApprovalProgramRejectedError` case.
+/// - `"...holding ... insufficient for transfer ..."` => `AssetBalance`,
+///   mirroring Go's `ledgercore.AssetBalanceError` case.
+/// - `"...balance ... below minimum balance ..."` => `MinBalance`,
+///   mirroring Go's `ledgercore.MinBalanceError` case.
+/// - `"...insufficient balance ... for fee/payment ..."` => `Overspend`,
+///   mirroring Go's `ledgercore.OverspendError` case.
+fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
+    if msg.contains("approval program rejected transaction:") {
+        PoolErrorTag::TealErr
+    } else if msg.contains("approval program rejected transaction") {
+        PoolErrorTag::TealReject
+    } else if msg.contains("insufficient for transfer") {
+        PoolErrorTag::AssetBalance
+    } else if msg.contains("below minimum balance") {
+        PoolErrorTag::MinBalance
+    } else if msg.contains("insufficient balance") {
+        PoolErrorTag::Overspend
+    } else {
+        PoolErrorTag::EvalGeneric
     }
 }
 
