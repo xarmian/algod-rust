@@ -599,10 +599,7 @@ pub trait LedgerStore {
     fn put_voters_participants(
         &mut self,
         round: u64,
-        participants: &[(
-            algo_types::Address,
-            algo_consensus_crypto::stateproof::Participant,
-        )],
+        participants: &[(algo_types::Address, algo_consensus_crypto::stateproof::Participant)],
     ) -> Result<(), AlgoError> {
         let _ = (round, participants);
         Ok(())
@@ -618,12 +615,7 @@ pub trait LedgerStore {
         &self,
         round: u64,
     ) -> Result<
-        Option<
-            Vec<(
-                algo_types::Address,
-                algo_consensus_crypto::stateproof::Participant,
-            )>,
-        >,
+        Option<Vec<(algo_types::Address, algo_consensus_crypto::stateproof::Participant)>>,
         AlgoError,
     > {
         let _ = round;
