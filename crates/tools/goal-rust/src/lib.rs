@@ -35,6 +35,7 @@ pub mod accounts_list;
 pub mod cli_state;
 pub mod cmd;
 pub mod data_dir;
+pub mod formatting;
 pub mod groups;
 pub mod resource_resolution;
 
