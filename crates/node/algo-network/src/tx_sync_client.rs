@@ -376,8 +376,19 @@ mod tests {
         listener.set_nonblocking(true).expect("nonblocking");
         let addr = listener.local_addr().expect("local_addr");
         let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        // `TxSyncService`'s handler requires axum's `ConnectInfo<SocketAddr>`
+        // extractor (issues #821, #860's peer-fairness gate identifies
+        // requesting peers by source IP even when no `TxSyncPeerLimiter` is
+        // installed) -- a bare `axum::serve(listener, router)` does not
+        // supply it, so this must use the connect-info-aware `MakeService`,
+        // exactly as `WebsocketNetwork`'s real relay listener does.
         tokio::spawn(async move {
-            axum::serve(listener, router).await.ok();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .ok();
         });
         addr.to_string()
     }
