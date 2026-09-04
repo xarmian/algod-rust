@@ -204,6 +204,20 @@ impl SyncBackend for AlgodSyncBackend {
     }
 }
 
+/// Build the same [`SyncBackend`] the standalone `algod-rust sync`
+/// subcommand uses, for reuse by [`crate::live_catchup::OrchestratorCatchupRunner`]
+/// (issue #937's live-toggle catchpoint catchup). Kept as a thin
+/// `pub(crate)` wrapper rather than making [`AlgodSyncBackend`] itself
+/// public, since its type is otherwise an internal implementation detail
+/// of this module.
+pub(crate) fn build_algod_sync_backend(
+    algod_url: &str,
+    algod_token: &str,
+    extra_catchpoint_peer_urls: &[String],
+) -> impl SyncBackend {
+    AlgodSyncBackend::with_catchpoint_peers(algod_url, algod_token, extra_catchpoint_peer_urls)
+}
+
 // ---------------------------------------------------------------------------
 // GossipSyncBackend — SyncBackend using gossip-first with HTTP fallback
 // ---------------------------------------------------------------------------
