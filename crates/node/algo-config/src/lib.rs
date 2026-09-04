@@ -105,6 +105,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod algocfg;
+
 /// Filename go-algorand (and algod-rust) reads relative to the node's data
 /// directory. Go: `config.ConfigFilename` (`config/config.go:61`).
 pub const CONFIG_FILENAME: &str = "config.json";
@@ -158,6 +160,31 @@ pub enum ConfigError {
     /// are added).
     #[error("failed to encode config as JSON: {0}")]
     Encode(#[source] serde_json::Error),
+
+    /// [`algocfg::get_property`]/[`algocfg::set_property`]/
+    /// [`algocfg::reset_property`] were asked about a name that isn't a
+    /// [`Local`] field. Go: `"unknown property named '%s'"`
+    /// (`cmd/algocfg/getCommand.go:76`, `setCommand.go:87`,
+    /// `resetCommand.go:84,92`).
+    #[error("unknown property named '{name}'")]
+    UnknownProperty { name: String },
+
+    /// [`algocfg::set_property`] was given a value that doesn't parse as
+    /// the field's type. Go: the per-`reflect.Kind` parse errors in
+    /// `setFieldValue` (`cmd/algocfg/setCommand.go:94`).
+    #[error("error setting property '{name}' -> '{value}': {reason}")]
+    InvalidPropertyValue {
+        name: String,
+        value: String,
+        reason: String,
+    },
+
+    /// [`algocfg::config_for_profile`] was given a name not in
+    /// [`algocfg::profile_names`]. Go: `"unknown profile provided: '%s' is
+    /// not in list of valid profiles: %s"`
+    /// (`cmd/algocfg/profileCommand.go:269`).
+    #[error("unknown profile provided: '{name}' is not in list of valid profiles: {valid}")]
+    UnknownProfile { name: String, valid: String },
 }
 
 /// One field's version-tagged default-value history, mirroring go's

@@ -760,6 +760,105 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: LoadgenCommands,
     },
+
+    /// Inspect and edit a node's `config.json` — go-algorand's `algocfg`
+    /// tool (`cmd/algocfg`), issue #973.
+    Algocfg {
+        #[command(subcommand)]
+        action: AlgocfgAction,
+    },
+}
+
+/// Subcommands for `algod-rust algocfg`. Go: `cmd/algocfg`'s `get`/`set`/
+/// `reset`/`profile` commands (`getCommand.go`/`setCommand.go`/
+/// `resetCommand.go`/`profileCommand.go`), field names matching go's
+/// `config.Local` field names exactly (e.g. `EnableP2P`, `GossipFanout`).
+#[derive(Subcommand)]
+pub enum AlgocfgAction {
+    /// Retrieve the current value for the specified parameter.
+    Get {
+        /// Parameter to query (go's `config.Local` field name, e.g. `EnableP2P`).
+        #[arg(long, short = 'p')]
+        parameter: String,
+
+        /// Data directory holding `config.json`.
+        #[arg(long, short = 'd', default_value = ".")]
+        datadir: PathBuf,
+    },
+
+    /// Retrieve the current value for the specified parameter as a
+    /// shell-quoted string, safe to embed directly in a shell command.
+    /// Algod-rust addition beyond go's `algocfg` (issue #973) — `get`
+    /// never quotes its output.
+    String {
+        /// Parameter to query (go's `config.Local` field name).
+        #[arg(long, short = 'p')]
+        parameter: String,
+
+        /// Data directory holding `config.json`.
+        #[arg(long, short = 'd', default_value = ".")]
+        datadir: PathBuf,
+    },
+
+    /// Update the current value for the specified parameter.
+    Set {
+        /// Parameter to update (go's `config.Local` field name).
+        #[arg(long, short = 'p')]
+        parameter: String,
+
+        /// Value to set.
+        #[arg(long, short = 'v')]
+        value: String,
+
+        /// Data directory holding `config.json`.
+        #[arg(long, short = 'd', default_value = ".")]
+        datadir: PathBuf,
+    },
+
+    /// Reset the specified parameter to its default (delete from
+    /// config.json). Go: `algocfg reset`.
+    Delete {
+        /// Parameter to reset (go's `config.Local` field name).
+        #[arg(long, short = 'p')]
+        parameter: String,
+
+        /// Data directory holding `config.json`.
+        #[arg(long, short = 'd', default_value = ".")]
+        datadir: PathBuf,
+    },
+
+    /// Generate `config.json` from a named usage profile.
+    Profile {
+        #[command(subcommand)]
+        action: AlgocfgProfileAction,
+    },
+}
+
+/// Subcommands for `algod-rust algocfg profile`.
+#[derive(Subcommand)]
+pub enum AlgocfgProfileAction {
+    /// A list of valid config profiles and a short description.
+    List,
+
+    /// Print the profile's config.json contents to stdout.
+    Print {
+        /// Profile name (e.g. `participation`, `archival`, `hybridRelay`).
+        name: String,
+    },
+
+    /// Write `config.json` for the given profile.
+    Set {
+        /// Profile name (e.g. `participation`, `archival`, `hybridRelay`).
+        name: String,
+
+        /// Data directory to write `config.json` into.
+        #[arg(long, short = 'd', default_value = ".")]
+        datadir: PathBuf,
+
+        /// Force overwrite without prompting if `config.json` already exists.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 /// Subcommands for `algod-rust loadgen`.
