@@ -40,9 +40,6 @@
 //   participation-key/ledger fixtures) rather than `setupP`. Porting them
 //   requires building that fixture harness from scratch, which is a
 //   separate, larger undertaking.
-// - ISV/ICV sub-cases, pipelined-threshold and verification-request tests
-//   (`TestPlayerISV*`, `TestPlayerICV*`, `TestPlayerRequests*Verification`,
-//   `TestPlayerHandlesPipelinedThresholds`, `TestPlayerRequestsPipelinedPayloadVerification`).
 //
 // Ported scenarios (see also `docs/phase17/parity_agreement.md`):
 // - `TestPlayerProposesBottomBundle`
@@ -64,14 +61,33 @@
 //   payload-catch-up path below `Player::partitioned()`'s period-3
 //   threshold, where `partition_policy` -- the only pin-payload-relay
 //   mechanic -- is gated off), not to anything this test exercises.
+// - ISV (Issue Soft Vote) sub-cases: `TestPlayerISVDoesNotSoftVoteBottom`,
+//   `TestPlayerISVVoteForStartingValue`, `TestPlayerISVVoteNoVoteSansProposal`,
+//   `TestPlayerISVVoteForReProposal`, `TestPlayerISVNoVoteForUnsupportedReProposal`
+//   (`player_isv_*`).
+// - ICV (Issue Cert Vote) sub-cases: `TestPlayerICVOnSoftThresholdSamePeriod`,
+//   `TestPlayerICVOnSoftThresholdPrePayload`,
+//   `TestPlayerICVOnSoftThresholdThenPayloadNoProposalVote`,
+//   `TestPlayerICVNoVoteForUncommittableProposal`,
+//   `TestPlayerICVPanicOnSoftBottomThreshold` (`player_icv_*`).
+// - Verification-request/pipelining sub-cases: `TestPlayerRequestsVoteVerification`,
+//   `TestPlayerRequestsProposalVoteVerification`,
+//   `TestPlayerRequestsBundleVerification`, `TestPlayerRequestsPayloadVerification`,
+//   `TestPlayerRequestsPipelinedPayloadVerification`,
+//   `TestPlayerHandlesPipelinedThresholds` (`player_requests_*`,
+//   `player_handles_pipelined_thresholds`).
+// All of the above are now ported below (this pass), using the same
+// `setupP` harness with no new test infrastructure required.
+//
+// Ported scenarios (see also `docs/phase17/parity_agreement.md`):
 
 use algo_agreement::test_support::{
     override_consensus_with_dynamic_filter, setup_p, IoAutomataConcretePlayer, VoteMakerHelper,
 };
 use algo_agreement::{
     Action, ActionType, Certificate, ConsensusVersionView, Event, EventType, InternalMessage,
-    MessageEvent, Proposal, ProposalValue, SerializableError, UnauthenticatedBundle,
-    UnauthenticatedCredential, VoteAuthenticator, BOTTOM, CERT, NEXT, PROPOSE,
+    MessageEvent, Proposal, ProposalValue, SerializableError, TimeoutEvent, UnauthenticatedBundle,
+    UnauthenticatedCredential, VoteAuthenticator, BOTTOM, CERT, NEXT, PROPOSE, SOFT,
 };
 use algo_types::{ConsensusParams, Round, CONSENSUS_V41};
 
@@ -761,6 +777,663 @@ fn player_always_resynchs_pinned_value() {
     assert!(
         resynched_payload,
         "player should relay payload even if not staged in previous period; trace:\n{}",
+        machine.trace()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for the ISV/ICV/verification-request sub-cases below.
+// ---------------------------------------------------------------------------
+
+/// Dispatch a bare `timeoutEvent` (soft-vote-timeout fire). Mirrors Go's
+/// `makeTimeoutEvent()` — no round/period is attached; the player consults
+/// its own internal state for freshness.
+fn send_timeout(machine: &mut IoAutomataConcretePlayer) {
+    let msg = TimeoutEvent {
+        t: EventType::Timeout,
+        random_entropy: 7,
+        round: Round(0),
+        proto: proto_view(),
+    };
+    machine
+        .transition(Event::Timeout(msg))
+        .expect("timeout transition should not panic");
+}
+
+/// Whether the trace contains a soft-vote (`attest`, step `SOFT`) for the
+/// given `(round, period, value)`.
+fn contains_soft_vote_for(
+    machine: &IoAutomataConcretePlayer,
+    round: Round,
+    period: algo_agreement::Period,
+    value: ProposalValue,
+) -> bool {
+    machine.trace().contains_action_fn(|a| {
+        matches!(a, Action::Pseudonode(pa)
+            if pa.t == ActionType::Attest
+                && pa.round == round
+                && pa.period == period
+                && pa.step == SOFT
+                && pa.proposal == value)
+    })
+}
+
+/// Whether the trace contains a cert vote (`attest`, step `CERT`) for the
+/// given `(round, period, value)`.
+fn contains_cert_vote_for(
+    machine: &IoAutomataConcretePlayer,
+    round: Round,
+    period: algo_agreement::Period,
+    value: ProposalValue,
+) -> bool {
+    machine.trace().contains_action_fn(|a| {
+        matches!(a, Action::Pseudonode(pa)
+            if pa.t == ActionType::Attest
+                && pa.round == round
+                && pa.period == period
+                && pa.step == CERT
+                && pa.proposal == value)
+    })
+}
+
+/// Whether the trace contains ANY `attest` (vote-issuing) action at all.
+/// Mirrors Go's `pM.getTrace().ContainsFn(func(b event) bool { ... e.action.t()
+/// == attest ... })` idiom used by the "should not issue any vote" tests.
+fn contains_any_attest(machine: &IoAutomataConcretePlayer) -> bool {
+    machine
+        .trace()
+        .contains_action_fn(|a| matches!(a, Action::Pseudonode(pa) if pa.t == ActionType::Attest))
+}
+
+/// Dispatch a `votePresent`/`bundlePresent`/`payloadPresent` message event
+/// (an unauthenticated, not-yet-verified message the player must ask the
+/// crypto verifier about).
+fn send_present(machine: &mut IoAutomataConcretePlayer, t: EventType, input: InternalMessage) {
+    let msg = MessageEvent {
+        t,
+        input,
+        proto: proto_view(),
+        ..MessageEvent::default()
+    };
+    machine
+        .transition(Event::Message(msg))
+        .expect("*Present transition should not panic");
+}
+
+// ---------------------------------------------------------------------------
+// ISV (Issue Soft Vote) sub-cases. Mirror Go's `TestPlayerISV*`
+// (`player_test.go:517-787`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn player_isv_does_not_soft_vote_bottom() {
+    // Every soft vote is associated with a proposalValue != bottom: a lone
+    // verified vote for bottom at the soft step must not itself trigger a
+    // soft-vote issuance.
+    let r = Round(209);
+    let p = algo_agreement::Period(1);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    let pv = BOTTOM;
+    send_votes(&mut machine, &mut helper, 1, r, p, SOFT, pv);
+
+    assert!(
+        !contains_soft_vote_for(&machine, r, p, pv),
+        "player should not issue soft vote; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_isv_vote_for_starting_value() {
+    // If we see a next-value quorum, and no next-bottom quorum, vote for
+    // that value regardless once the soft-vote timeout fires.
+    let r = Round(209);
+    let p = algo_agreement::Period(11);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    let pv = helper.make_random_proposal_value();
+    send_bundle_verified(
+        &mut machine,
+        &mut helper,
+        r,
+        algo_agreement::Period(p.0 - 1),
+        NEXT,
+        pv,
+    );
+
+    send_timeout(&mut machine);
+
+    assert!(
+        contains_soft_vote_for(&machine, r, p, pv),
+        "player should issue soft vote; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_isv_vote_no_vote_sans_proposal() {
+    // If there's no proposal, even seeing a next-value-bottom quorum must
+    // not issue a soft vote (or any vote at all).
+    let r = Round(209);
+    let p = algo_agreement::Period(11);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    let pv = BOTTOM;
+    send_bundle_verified(
+        &mut machine,
+        &mut helper,
+        r,
+        algo_agreement::Period(p.0 - 1),
+        NEXT,
+        pv,
+    );
+
+    send_timeout(&mut machine);
+
+    assert!(
+        !contains_any_attest(&machine),
+        "player should not issue any vote, especially soft vote; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_isv_vote_for_reproposal() {
+    // Even if we saw bottom, if we see a reproposal, AND a next-value
+    // quorum (not just a next-bottom quorum), vote for it.
+    let r = Round(209);
+    let p = algo_agreement::Period(11);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    // Bottom quorum at period p-1, step `next` — this is how the player
+    // got into period p in the first place.
+    send_bundle_verified(
+        &mut machine,
+        &mut helper,
+        r,
+        algo_agreement::Period(p.0 - 1),
+        NEXT,
+        BOTTOM,
+    );
+
+    // Value quorum at period p-1, step `next+1`.
+    let pv = helper.make_random_proposal_value();
+    send_bundle_verified(
+        &mut machine,
+        &mut helper,
+        r,
+        algo_agreement::Period(p.0 - 1),
+        algo_agreement::Step(NEXT.0 + 1),
+        pv,
+    );
+
+    // Reproposal (single propose-step vote) for the same value at period p.
+    send_votes(&mut machine, &mut helper, 1, r, p, PROPOSE, pv);
+
+    send_timeout(&mut machine);
+
+    assert!(
+        contains_soft_vote_for(&machine, r, p, pv),
+        "player should issue soft vote; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_isv_no_vote_for_unsupported_reproposal() {
+    // If there's no next-value quorum, don't support the reproposal.
+    let r = Round(209);
+    let p = algo_agreement::Period(11);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    // Bottom quorum at period p-1, step `next` — this is how the player
+    // got into period p in the first place.
+    let pv = BOTTOM;
+    send_bundle_verified(
+        &mut machine,
+        &mut helper,
+        r,
+        algo_agreement::Period(p.0 - 1),
+        NEXT,
+        pv,
+    );
+
+    // Reproposal for a random value, but with no supporting next-value
+    // quorum.
+    let reproposed = helper.make_random_proposal_value();
+    send_votes(&mut machine, &mut helper, 1, r, p, PROPOSE, reproposed);
+
+    send_timeout(&mut machine);
+
+    assert!(
+        !contains_soft_vote_for(&machine, r, p, reproposed),
+        "player should not issue soft vote without corresponding next threshold; trace:\n{}",
+        machine.trace()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ICV (Issue Cert Vote) sub-cases. Mirror Go's `TestPlayerICV*`
+// (`player_test.go:790-1078`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn player_icv_on_soft_threshold_same_period() {
+    // Basic cert-vote check: proposal vote + payload delivered first, THEN
+    // the soft threshold arrives. Also proves cert-voting doesn't require
+    // the freeze timer to have fired.
+    let r = Round(12);
+    let p = algo_agreement::Period(1);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    let payload = algo_agreement::test_support::make_random_proposal_payload(r);
+    let pv = payload.unauthenticated_proposal.value();
+
+    send_votes(&mut machine, &mut helper, 1, r, p, PROPOSE, pv);
+    send_payload_verified(&mut machine, &payload);
+    send_bundle_verified(&mut machine, &mut helper, r, p, SOFT, pv);
+
+    assert!(
+        contains_cert_vote_for(&machine, r, p, pv),
+        "player should issue cert vote; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_icv_on_soft_threshold_pre_payload() {
+    // Cert voting when the soft bundle is received BEFORE the proposal
+    // payload. Should still generate a cert vote.
+    let r = Round(12);
+    let p = algo_agreement::Period(1);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    let payload = algo_agreement::test_support::make_random_proposal_payload(r);
+    let pv = payload.unauthenticated_proposal.value();
+
+    send_bundle_verified(&mut machine, &mut helper, r, p, SOFT, pv);
+    send_votes(&mut machine, &mut helper, 1, r, p, PROPOSE, pv);
+    send_payload_verified(&mut machine, &payload);
+
+    assert!(
+        contains_cert_vote_for(&machine, r, p, pv),
+        "player should issue cert vote; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_icv_on_soft_threshold_then_payload_no_proposal_vote() {
+    // If there's no proposal vote at all, a soft threshold followed by the
+    // payload should still trigger a cert vote.
+    let r = Round(12);
+    let p = algo_agreement::Period(1);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    let payload = algo_agreement::test_support::make_random_proposal_payload(r);
+    let pv = payload.unauthenticated_proposal.value();
+
+    send_bundle_verified(&mut machine, &mut helper, r, p, SOFT, pv);
+    send_payload_verified(&mut machine, &payload);
+
+    assert!(
+        contains_cert_vote_for(&machine, r, p, pv),
+        "player should issue cert vote; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_icv_no_vote_for_uncommittable_proposal() {
+    // A soft threshold for a value with no corresponding payload must not
+    // trigger a cert vote, and must not move the player out of the soft
+    // step.
+    let r = Round(12);
+    let p = algo_agreement::Period(1);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    let pv = helper.make_random_proposal_value();
+    send_votes(&mut machine, &mut helper, 1, r, p, PROPOSE, pv);
+    send_bundle_verified(&mut machine, &mut helper, r, p, SOFT, pv);
+
+    assert!(
+        !contains_cert_vote_for(&machine, r, p, pv),
+        "player should not issue cert vote; trace:\n{}",
+        machine.trace()
+    );
+    assert_eq!(
+        machine.player().step,
+        SOFT,
+        "player should not move out of soft step"
+    );
+}
+
+#[test]
+fn player_icv_panic_on_soft_bottom_threshold() {
+    // The player should never observe a softThreshold for bottom — this is
+    // treated as an invariant violation (panic) mirroring Go's own
+    // `panic("bad state: got softThreshold for bottom")`-class defensive
+    // check.
+    let r = Round(209);
+    let p = algo_agreement::Period(1);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, algo_agreement::Step(0), &params);
+
+    let pv = BOTTOM;
+    // Note: Go constructs this bundle with no explicit `Step` field (so it
+    // defaults to the zero step); the replay logic determines the
+    // threshold purely from each individual vote's own step, so the
+    // bundle-level step is immaterial (see `player_proposes_bottom_bundle`
+    // above for the same note) — we set it explicitly here for clarity.
+    let n = SOFT.committee_threshold(&params) as usize;
+    let mut votes = Vec::with_capacity(n);
+    for i in 0..n {
+        votes.push(helper.make_verified_vote(i, r, p, SOFT, pv));
+    }
+    let unauth = UnauthenticatedBundle {
+        round: r,
+        period: p,
+        step: algo_agreement::Step(0),
+        proposal: pv,
+        votes: votes
+            .iter()
+            .map(|v| VoteAuthenticator {
+                sender: v.raw_vote.sender,
+                cred: UnauthenticatedCredential::new(v.cred.proof),
+                sig: v.sig.clone(),
+            })
+            .collect(),
+        equivocation_votes: Vec::new(),
+    };
+    let msg = MessageEvent {
+        t: EventType::BundleVerified,
+        input: InternalMessage {
+            verified_bundle_votes: votes,
+            unauthenticated_bundle: unauth,
+            ..InternalMessage::default()
+        },
+        proto: proto_view(),
+        ..MessageEvent::default()
+    };
+    let result = machine.transition(Event::Message(msg));
+    assert!(
+        result.is_err(),
+        "player should never see softThreshold = bottom without panicking"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Verification-request / pipelining sub-cases. Mirror Go's
+// `TestPlayerRequests*Verification` and `TestPlayerHandlesPipelinedThresholds`
+// (`player_test.go:2401-2600`, `2603-2715`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn player_requests_vote_verification() {
+    let r = Round(201221);
+    let p = algo_agreement::Period(0);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, CERT, &params);
+    let pv = helper.make_random_proposal_value();
+    let vote = helper.make_verified_vote(0, r, p, SOFT, pv);
+
+    send_present(
+        &mut machine,
+        EventType::VotePresent,
+        InternalMessage {
+            unauthenticated_vote: vote.to_unauthenticated(),
+            ..InternalMessage::default()
+        },
+    );
+
+    let verified = machine.trace().contains_action_fn(|a| match a {
+        Action::Crypto(ca) => {
+            ca.t == ActionType::VerifyVote && ca.round == r && ca.period == p && ca.task_index == 0
+        }
+        _ => false,
+    });
+    assert!(
+        verified,
+        "player should verify vote; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_requests_proposal_vote_verification() {
+    let r = Round(1);
+    let p = algo_agreement::Period(0);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, CERT, &params);
+    let pv = helper.make_random_proposal_value();
+    let vote = helper.make_verified_vote(0, r, p, PROPOSE, pv);
+
+    send_present(
+        &mut machine,
+        EventType::VotePresent,
+        InternalMessage {
+            unauthenticated_vote: vote.to_unauthenticated(),
+            ..InternalMessage::default()
+        },
+    );
+
+    let verified = machine.trace().contains_action_fn(|a| match a {
+        Action::Crypto(ca) => {
+            ca.t == ActionType::VerifyVote && ca.round == r && ca.period == p && ca.task_index == 1
+        }
+        _ => false,
+    });
+    assert!(
+        verified,
+        "player should verify proposal vote with task index 1; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_requests_bundle_verification() {
+    let r = Round(201221);
+    let p = algo_agreement::Period(0);
+    let params = test_params();
+    let (_player, mut machine, _helper) = setup_p(r, p, CERT, &params);
+
+    let bundle = UnauthenticatedBundle {
+        round: r,
+        period: p,
+        step: algo_agreement::Step(0),
+        proposal: BOTTOM,
+        votes: Vec::new(),
+        equivocation_votes: Vec::new(),
+    };
+    send_present(
+        &mut machine,
+        EventType::BundlePresent,
+        InternalMessage {
+            unauthenticated_bundle: bundle,
+            ..InternalMessage::default()
+        },
+    );
+
+    let verified = machine.trace().contains_action_fn(|a| match a {
+        Action::Crypto(ca) => ca.t == ActionType::VerifyBundle && ca.round == r && ca.period == p,
+        _ => false,
+    });
+    assert!(
+        verified,
+        "player should verify bundle; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_requests_payload_verification() {
+    let r = Round(201221);
+    let p = algo_agreement::Period(0);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, CERT, &params);
+    let payload = algo_agreement::test_support::make_random_proposal_payload(r);
+    let pv = payload.unauthenticated_proposal.value();
+
+    // Submit a proposal/initial payload (propose-step vote).
+    send_votes(&mut machine, &mut helper, 1, r, p, PROPOSE, pv);
+
+    send_present(
+        &mut machine,
+        EventType::PayloadPresent,
+        InternalMessage {
+            unauthenticated_proposal: payload.unauthenticated_proposal.clone(),
+            ..InternalMessage::default()
+        },
+    );
+
+    let verified = machine.trace().contains_action_fn(|a| match a {
+        Action::Crypto(ca) => ca.t == ActionType::VerifyPayload && ca.round == r && ca.period == p,
+        _ => false,
+    });
+    assert!(
+        verified,
+        "player should verify payload; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_requests_pipelined_payload_verification() {
+    let r = Round(201221);
+    let p = algo_agreement::Period(0);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, CERT, &params);
+
+    // A payload for round r+1 arrives while the player is still at round r
+    // — it must NOT trigger an immediate verify request (it's for a future
+    // round).
+    let payload_two = algo_agreement::test_support::make_random_proposal_payload(Round(r.0 + 1));
+    let pv_two = payload_two.unauthenticated_proposal.value();
+    send_votes(
+        &mut machine,
+        &mut helper,
+        1,
+        Round(r.0 + 1),
+        algo_agreement::Period(0),
+        PROPOSE,
+        pv_two,
+    );
+    send_present(
+        &mut machine,
+        EventType::PayloadPresent,
+        InternalMessage {
+            unauthenticated_proposal: payload_two.unauthenticated_proposal.clone(),
+            ..InternalMessage::default()
+        },
+    );
+    let verified_early = machine.trace().contains_action_fn(
+        |a| matches!(a, Action::Crypto(ca) if ca.t == ActionType::VerifyPayload),
+    );
+    assert!(
+        !verified_early,
+        "player should not verify payload from r + 1 while still in round r; trace:\n{}",
+        machine.trace()
+    );
+
+    // Now commit round r via the usual propose/payload/cert-bundle path.
+    let payload = algo_agreement::test_support::make_random_proposal_payload(r);
+    let pv = payload.unauthenticated_proposal.value();
+    send_votes(&mut machine, &mut helper, 1, r, p, PROPOSE, pv);
+    send_payload_verified(&mut machine, &payload);
+    let cert = send_bundle_verified(&mut machine, &mut helper, r, p, CERT, pv);
+
+    assert_eq!(
+        machine.player().round,
+        Round(r.0 + 1),
+        "player did not enter new round"
+    );
+    assert_eq!(
+        machine.player().period,
+        algo_agreement::Period(0),
+        "player did not enter period 0 in new round"
+    );
+    assert!(
+        contains_ensure_for(
+            &machine,
+            &cert,
+            payload.unauthenticated_proposal.block_digest()
+        ),
+        "player should try to ensure block/digest on ledger; trace:\n{}",
+        machine.trace()
+    );
+
+    // The pipelined payload first seen in the previous round should now be
+    // (re-)requested for verification.
+    let verified_pipelined = machine.trace().contains_action_fn(|a| match a {
+        Action::Crypto(ca) => ca.t == ActionType::VerifyPayload && ca.round == Round(r.0 + 1),
+        _ => false,
+    });
+    assert!(
+        verified_pipelined,
+        "player should verify pipelined payload first seen in previous round; trace:\n{}",
+        machine.trace()
+    );
+}
+
+#[test]
+fn player_handles_pipelined_thresholds() {
+    // Make sure we stage a pipelined soft threshold after entering the new
+    // round: verified soft votes for round r+1 arrive individually (a
+    // bundle would be rejected by freshness rules) while the player is
+    // still at round r; once the player enters round r+1, delivering the
+    // matching payload should trigger an immediate verify request (proving
+    // the pipelined soft threshold was staged, not discarded).
+    let r = Round(20);
+    let p = algo_agreement::Period(0);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, CERT, &params);
+
+    let payload = algo_agreement::test_support::make_random_proposal_payload(Round(r.0 + 1));
+    let pv = payload.unauthenticated_proposal.value();
+    let n = SOFT.committee_threshold(&params) as usize;
+    send_votes(&mut machine, &mut helper, n, Round(r.0 + 1), p, SOFT, pv);
+
+    // Now enter the next round via the usual propose/payload/cert-bundle
+    // path.
+    let payload_two = algo_agreement::test_support::make_random_proposal_payload(r);
+    let pv_two = payload_two.unauthenticated_proposal.value();
+    send_votes(&mut machine, &mut helper, 1, r, p, PROPOSE, pv_two);
+    send_payload_verified(&mut machine, &payload_two);
+    send_bundle_verified(&mut machine, &mut helper, r, p, CERT, pv_two);
+
+    assert_eq!(
+        machine.player().round,
+        Round(r.0 + 1),
+        "player did not enter new round"
+    );
+
+    // We verify the pipelined soft threshold was staged indirectly: send
+    // the matching payload and confirm it gets a verify request.
+    send_present(
+        &mut machine,
+        EventType::PayloadPresent,
+        InternalMessage {
+            unauthenticated_proposal: payload.unauthenticated_proposal.clone(),
+            ..InternalMessage::default()
+        },
+    );
+    let verified = machine.trace().contains_action_fn(|a| match a {
+        Action::Crypto(ca) => ca.t == ActionType::VerifyPayload && ca.round == Round(r.0 + 1),
+        _ => false,
+    });
+    assert!(
+        verified,
+        "player should verify pipelined payload first seen in previous round; trace:\n{}",
         machine.trace()
     );
 }
