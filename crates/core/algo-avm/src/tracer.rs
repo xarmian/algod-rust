@@ -233,6 +233,14 @@ pub enum UnnamedResourceAccess {
     /// An app local state `(account, app)` where both the account and the
     /// app are named but the pairing is not.
     AppLocal([u8; 32], u64),
+    /// An unnamed box access whose owning app was created earlier in this
+    /// same simulation, so it cannot be suggested back to the caller as a
+    /// concrete `(app_id, name)` box ref (a not-yet-submitted app has no
+    /// stable, resubmittable ID). Reported as a plain count instead, mirroring
+    /// go-algorand's `ResourceTracker.Simplify` (`ledger/simulation/resources.go`,
+    /// from `1088a2aad7e` / `v3.18.0-beta`), which moves any `BoxStat.NewApp`
+    /// box out of `Boxes` and into an anonymous `NumEmptyBoxRefs` count.
+    EmptyBoxRef,
 }
 
 /// A no-op tracer that discards all events.

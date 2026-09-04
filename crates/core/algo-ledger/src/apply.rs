@@ -175,6 +175,12 @@ pub struct AvmEvalOverrides {
     /// Enable unnamed-resource tracking (simulation `allow_unnamed_resources`).
     /// Holds the group's named resources, shared across all transactions.
     pub unnamed_tracking: Option<std::sync::Arc<crate::avm_context::NamedGroupResources>>,
+    /// Live capacity accounting for unnamed-resource reporting (see
+    /// [`crate::avm_context::UnnamedCapacityTracker`]), shared across all
+    /// transactions in the group. `Some` exactly when `unnamed_tracking` is
+    /// `Some`.
+    pub unnamed_capacity:
+        Option<std::rc::Rc<std::cell::RefCell<crate::avm_context::UnnamedCapacityTracker>>>,
 }
 
 impl ApplyContext {
@@ -218,6 +224,9 @@ impl ApplyContext {
         }
         if let Some(named) = &self.avm_overrides.unnamed_tracking {
             avm_ctx.enable_unnamed_resource_tracking(named.clone());
+        }
+        if let Some(capacity) = &self.avm_overrides.unnamed_capacity {
+            avm_ctx.enable_unnamed_capacity_tracking(capacity.clone());
         }
         if let Some(recorder) = &self.kv_mods_recorder {
             avm_ctx.kv_mods_recorder = Some(recorder.clone());

@@ -669,6 +669,9 @@ impl EvalTracer for SimulationTracer {
                     .app_locals
                     .insert((Address(*addr), *id));
             }
+            UnnamedResourceAccess::EmptyBoxRef => {
+                self.unnamed_resources.num_empty_box_refs += 1;
+            }
         }
     }
 }

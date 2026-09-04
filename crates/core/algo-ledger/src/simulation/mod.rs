@@ -44,9 +44,10 @@ pub use trace::{
 };
 pub use tracer::SimulationTracer;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use algo_avm::group::GroupBudget;
@@ -65,7 +66,7 @@ use crate::apply::{
     apply_transaction_with_budget, check_authorizer, compute_group_fee_credit_and_residue,
     ApplyContext, ApplyMode, AvmEvalOverrides, BoxBudgetState, GroupInfo,
 };
-use crate::avm_context::NamedGroupResources;
+use crate::avm_context::{NamedGroupResources, UnnamedCapacityTracker};
 use crate::store_trait::LedgerStore;
 
 /// Fixed proxy signing key seed (first 32 bytes of go-algorand's `proxySigner`).
@@ -520,6 +521,19 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             compute_group_fee_credit_and_residue(&group_refs, &consensus)
         };
 
+        // Capacity accounting for unnamed-resource reporting: constructed
+        // once for the whole group (shared, via `Rc<RefCell<_>>`, across
+        // every top-level transaction and inner call) so a category's
+        // capacity is only ever exhausted once, group-wide -- matching
+        // go-algorand's single per-group `ResourceTracker`. Must be computed
+        // before `consensus` is moved into `apply_ctx` below.
+        let unnamed_capacity = request.allow_unnamed_resources.then(|| {
+            Rc::new(RefCell::new(UnnamedCapacityTracker::new(
+                &eval_group,
+                &consensus,
+            )))
+        });
+
         let apply_ctx = ApplyContext {
             rewards_level: self.store.rewards_level(),
             fee_sink: self.store.fee_sink(),
@@ -542,6 +556,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 unnamed_tracking: request
                     .allow_unnamed_resources
                     .then(|| Arc::new(NamedGroupResources::from_group(&eval_group))),
+                unnamed_capacity,
             },
             failed_eval_delta: Cell::new(None),
             kv_mods_recorder: None,
@@ -780,9 +795,15 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         group_result.failed_at = failed_at;
 
         // Report unnamed resources accessed by the group (go-algorand drops
-        // the field entirely when nothing was recorded).
-        if request.allow_unnamed_resources && group_unnamed.has_resources() {
-            group_result.unnamed_resources_accessed = Some(group_unnamed);
+        // the field entirely when nothing was recorded). The `Max*`
+        // capacity fields are group-level constants derived purely from the
+        // submitted group, so compute them once here rather than per
+        // transaction (see `UnnamedResourcesAccessed::set_capacity_fields`).
+        if request.allow_unnamed_resources {
+            group_unnamed.set_capacity_fields(&eval_group, &apply_ctx.consensus);
+            if group_unnamed.has_resources() {
+                group_result.unnamed_resources_accessed = Some(group_unnamed);
+            }
         }
 
         // FixSigners: report the corrected signer for each transaction whose

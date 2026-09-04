@@ -891,6 +891,12 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// resources named by the top-level transaction group.
     unnamed_tracking: Option<Arc<NamedGroupResources>>,
 
+    /// Live capacity accounting for unnamed-resource reporting (see
+    /// [`UnnamedCapacityTracker`]), shared across every top-level
+    /// transaction and inner call in the simulated group. `Some` exactly
+    /// when [`Self::unnamed_tracking`] is `Some`.
+    unnamed_capacity: Option<Rc<RefCell<UnnamedCapacityTracker>>>,
+
     /// Optional per-round box-modification recorder for `StateDelta.kv_mods`
     /// (issue #570). Shared (via `Rc<RefCell<_>>`, cheaply cloned) across
     /// every transaction and every inner app call within one block-apply
@@ -923,6 +929,164 @@ pub const MAX_LOG_CALLS: u64 = 32;
 /// Base AVM limit on the total bytes logged per program execution.
 /// Mirrors go-algorand's `logic.maxLogSize` (`bounds.MaxEvalDeltaTotalLogSize`).
 pub const MAX_LOG_SIZE: u64 = 1024;
+
+/// Live capacity accounting for unnamed-resource *reporting*, shared (via
+/// `Rc<RefCell<_>>`) across every top-level transaction -- and their inner
+/// calls -- in one simulated group.
+///
+/// Mirrors go-algorand's per-group `ResourceTracker` capacity fields and
+/// `add*` capacity checks (`ledger/simulation/resources.go`,
+/// `1088a2aad7e` / `v3.18.0-beta`) -- but, unlike go, exhausting capacity
+/// here does not fail the underlying AVM access (this engine still allows
+/// it once `allow_unnamed_resources` is set); it only stops adding to the
+/// *reported* access sets once the group could no longer actually accept
+/// the resource, so simulate's response never claims more room than the
+/// group truly has. See issue #970's tracking notes for the remaining
+/// full-enforcement gap (go rejects the opcode outright once a category's
+/// capacity is exhausted).
+#[derive(Debug, Default)]
+pub struct UnnamedCapacityTracker {
+    capacity: crate::simulation::trace::ResourceCapacity,
+    seen_accounts: HashSet<[u8; 32]>,
+    seen_assets: HashSet<u64>,
+    seen_apps: HashSet<u64>,
+    seen_boxes: HashSet<(u64, Vec<u8>)>,
+    seen_empty_box_refs: HashSet<(u64, Vec<u8>)>,
+    seen_holdings: HashSet<([u8; 32], u64)>,
+    seen_locals: HashSet<([u8; 32], u64)>,
+}
+
+impl UnnamedCapacityTracker {
+    /// Build a tracker for the given group, precomputing its `Max*`
+    /// capacity via [`crate::simulation::trace::compute_resource_capacity`].
+    pub fn new(txgroup: &[SignedTransaction], consensus: &ConsensusParams) -> Self {
+        UnnamedCapacityTracker {
+            capacity: crate::simulation::trace::compute_resource_capacity(txgroup, consensus),
+            ..Default::default()
+        }
+    }
+
+    /// go-algorand `ResourceTracker.refCount`: total references recorded so
+    /// far across every flat category (boxes include empty-ref placeholders).
+    fn ref_count(&self) -> usize {
+        self.seen_accounts.len() + self.seen_assets.len() + self.seen_apps.len() + self.box_count()
+    }
+
+    fn box_count(&self) -> usize {
+        self.seen_boxes.len() + self.seen_empty_box_refs.len()
+    }
+
+    /// Returns `true` if `addr` is already recorded or there is capacity for
+    /// one more account; records it in the latter case. Mirrors go's
+    /// `addAccount`.
+    fn try_add_account(&mut self, addr: [u8; 32]) -> bool {
+        if self.seen_accounts.contains(&addr) {
+            return true;
+        }
+        if self.seen_accounts.len() >= self.capacity.max_accounts
+            || self.ref_count() >= self.capacity.max_total_refs
+        {
+            return false;
+        }
+        self.seen_accounts.insert(addr);
+        true
+    }
+
+    /// Mirrors go's `addAsset`.
+    fn try_add_asset(&mut self, id: u64) -> bool {
+        if self.seen_assets.contains(&id) {
+            return true;
+        }
+        if self.seen_assets.len() >= self.capacity.max_assets
+            || self.ref_count() >= self.capacity.max_total_refs
+        {
+            return false;
+        }
+        self.seen_assets.insert(id);
+        true
+    }
+
+    /// Mirrors go's `addApp`.
+    fn try_add_app(&mut self, id: u64) -> bool {
+        if self.seen_apps.contains(&id) {
+            return true;
+        }
+        if self.seen_apps.len() >= self.capacity.max_apps
+            || self.ref_count() >= self.capacity.max_total_refs
+        {
+            return false;
+        }
+        self.seen_apps.insert(id);
+        true
+    }
+
+    /// Returns `true` if `key` is already recorded (as either a concrete
+    /// suggestion or an empty ref) or there is capacity for one more box;
+    /// records it as a concrete suggestion in the latter case. Mirrors go's
+    /// `addBox`.
+    fn try_add_box(&mut self, key: (u64, Vec<u8>)) -> bool {
+        if self.seen_boxes.contains(&key) || self.seen_empty_box_refs.contains(&key) {
+            return true;
+        }
+        if self.box_count() >= self.capacity.max_boxes
+            || self.ref_count() >= self.capacity.max_total_refs
+        {
+            return false;
+        }
+        self.seen_boxes.insert(key);
+        true
+    }
+
+    /// Same capacity check and cross-dedup as [`Self::try_add_box`], but for
+    /// a box owned by an app created during this simulation -- recorded as
+    /// an anonymous empty-ref instead of a concrete suggestion (see
+    /// `UnnamedResourceAccess::EmptyBoxRef`). Tracked in a set distinct from
+    /// [`Self::seen_boxes`] (rather than reusing it) so a box counted here
+    /// isn't double-charged against `box_count`/`ref_count` if the same key
+    /// is later also considered by `try_add_box`.
+    fn try_add_empty_box_ref(&mut self, key: (u64, Vec<u8>)) -> bool {
+        if self.seen_boxes.contains(&key) || self.seen_empty_box_refs.contains(&key) {
+            return true;
+        }
+        if self.box_count() >= self.capacity.max_boxes
+            || self.ref_count() >= self.capacity.max_total_refs
+        {
+            return false;
+        }
+        self.seen_empty_box_refs.insert(key);
+        true
+    }
+
+    /// Mirrors go's `addHolding` (capacity shared with app-locals via
+    /// `MaxCrossProductReferences`).
+    fn try_add_holding(&mut self, key: ([u8; 32], u64)) -> bool {
+        if self.seen_holdings.contains(&key) {
+            return true;
+        }
+        if self.seen_holdings.len() + self.seen_locals.len()
+            >= self.capacity.max_cross_product_references
+        {
+            return false;
+        }
+        self.seen_holdings.insert(key);
+        true
+    }
+
+    /// Mirrors go's `addLocal` (capacity shared with asset-holdings via
+    /// `MaxCrossProductReferences`).
+    fn try_add_local(&mut self, key: ([u8; 32], u64)) -> bool {
+        if self.seen_locals.contains(&key) {
+            return true;
+        }
+        if self.seen_holdings.len() + self.seen_locals.len()
+            >= self.capacity.max_cross_product_references
+        {
+            return false;
+        }
+        self.seen_locals.insert(key);
+        true
+    }
+}
 
 /// Resources named by a top-level transaction group's reference arrays,
 /// precomputed for unnamed-resource tracking (`allow_unnamed_resources`).
@@ -1292,6 +1456,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             max_log_size: MAX_LOG_SIZE,
             log_size: 0,
             unnamed_tracking: None,
+            unnamed_capacity: None,
             kv_mods_recorder: None,
             // Defaults to 0 (sharing inactive) until the caller sets the
             // real executing program version via `set_program_version`.
@@ -1325,10 +1490,26 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         self.unnamed_tracking = Some(named);
     }
 
+    /// Enable capacity-aware unnamed-resource reporting, sharing `capacity`
+    /// (typically constructed once per simulated group) across every
+    /// top-level transaction and inner call. See [`UnnamedCapacityTracker`].
+    pub fn enable_unnamed_capacity_tracking(
+        &mut self,
+        capacity: Rc<RefCell<UnnamedCapacityTracker>>,
+    ) {
+        self.unnamed_capacity = Some(capacity);
+    }
+
     /// The active unnamed-tracking named-resource set, for propagation to
     /// inner-transaction contexts.
     pub fn unnamed_tracking(&self) -> Option<Arc<NamedGroupResources>> {
         self.unnamed_tracking.clone()
+    }
+
+    /// The active unnamed-resource capacity tracker, for propagation to
+    /// inner-transaction contexts.
+    pub fn unnamed_capacity(&self) -> Option<Rc<RefCell<UnnamedCapacityTracker>>> {
+        self.unnamed_capacity.clone()
     }
 
     /// Set LogicSig arguments (for LogicSig mode).
@@ -1408,10 +1589,49 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         app_id == self.app_id || named.apps.contains(&app_id) || self.created_apps.contains(&app_id)
     }
 
+    /// Returns `true` if the shared capacity tracker (when unnamed-resource
+    /// tracking is enabled) has room for one more account; `true`
+    /// unconditionally when no tracker is attached, so callers built without
+    /// [`Self::enable_unnamed_capacity_tracking`] keep the pre-#970,
+    /// unbounded-reporting behavior. Mirrors go's `ResourceTracker.addAccount`.
+    fn capacity_allows_account(&self, account: [u8; 32]) -> bool {
+        self.unnamed_capacity
+            .as_ref()
+            .map_or(true, |cap| cap.borrow_mut().try_add_account(account))
+    }
+
+    /// See [`Self::capacity_allows_account`]; mirrors go's `addAsset`.
+    fn capacity_allows_asset(&self, asset_id: u64) -> bool {
+        self.unnamed_capacity
+            .as_ref()
+            .map_or(true, |cap| cap.borrow_mut().try_add_asset(asset_id))
+    }
+
+    /// See [`Self::capacity_allows_account`]; mirrors go's `addApp`.
+    fn capacity_allows_app(&self, app_id: u64) -> bool {
+        self.unnamed_capacity
+            .as_ref()
+            .map_or(true, |cap| cap.borrow_mut().try_add_app(app_id))
+    }
+
+    /// See [`Self::capacity_allows_account`]; mirrors go's `addHolding`.
+    fn capacity_allows_holding(&self, account: [u8; 32], asset_id: u64) -> bool {
+        self.unnamed_capacity.as_ref().map_or(true, |cap| {
+            cap.borrow_mut().try_add_holding((account, asset_id))
+        })
+    }
+
+    /// See [`Self::capacity_allows_account`]; mirrors go's `addLocal`.
+    fn capacity_allows_local(&self, account: [u8; 32], app_id: u64) -> bool {
+        self.unnamed_capacity.as_ref().map_or(true, |cap| {
+            cap.borrow_mut().try_add_local((account, app_id))
+        })
+    }
+
     /// Track an account access when unnamed-resource tracking is enabled.
     fn note_account_access(&self, account: &[u8; 32]) {
         if let Some(named) = &self.unnamed_tracking {
-            if !self.is_named_account(named, account) {
+            if !self.is_named_account(named, account) && self.capacity_allows_account(*account) {
                 self.record_unnamed(UnnamedResourceAccess::Account(*account));
             }
         }
@@ -1420,7 +1640,10 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// Track an asset access when unnamed-resource tracking is enabled.
     fn note_asset_access(&self, asset_id: u64) {
         if let Some(named) = &self.unnamed_tracking {
-            if asset_id != 0 && !self.is_named_asset(named, asset_id) {
+            if asset_id != 0
+                && !self.is_named_asset(named, asset_id)
+                && self.capacity_allows_asset(asset_id)
+            {
                 self.record_unnamed(UnnamedResourceAccess::Asset(asset_id));
             }
         }
@@ -1429,7 +1652,8 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// Track an app access when unnamed-resource tracking is enabled.
     fn note_app_access(&self, app_id: u64) {
         if let Some(named) = &self.unnamed_tracking {
-            if app_id != 0 && !self.is_named_app(named, app_id) {
+            if app_id != 0 && !self.is_named_app(named, app_id) && self.capacity_allows_app(app_id)
+            {
                 self.record_unnamed(UnnamedResourceAccess::App(app_id));
             }
         }
@@ -1456,15 +1680,16 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         if let Some(named) = &self.unnamed_tracking {
             let acct_named = self.is_named_account(named, account);
             let asset_named = asset_id == 0 || self.is_named_asset(named, asset_id);
-            if !acct_named {
+            if !acct_named && self.capacity_allows_account(*account) {
                 self.record_unnamed(UnnamedResourceAccess::Account(*account));
             }
-            if !asset_named {
+            if !asset_named && self.capacity_allows_asset(asset_id) {
                 self.record_unnamed(UnnamedResourceAccess::Asset(asset_id));
             }
             if asset_id != 0
                 && !self.created_assets.contains(&asset_id)
                 && !named.has_holding(account, asset_id)
+                && self.capacity_allows_holding(*account, asset_id)
             {
                 self.record_unnamed(UnnamedResourceAccess::AssetHolding(*account, asset_id));
             }
@@ -1493,10 +1718,10 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         if let Some(named) = &self.unnamed_tracking {
             let acct_named = self.is_named_account(named, account);
             let app_named = app_id == 0 || self.is_named_app(named, app_id);
-            if !acct_named {
+            if !acct_named && self.capacity_allows_account(*account) {
                 self.record_unnamed(UnnamedResourceAccess::Account(*account));
             }
-            if !app_named {
+            if !app_named && self.capacity_allows_app(app_id) {
                 self.record_unnamed(UnnamedResourceAccess::App(app_id));
             }
             let is_own_account = app_id != 0 && app_address(app_id) == *account;
@@ -1504,6 +1729,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 && !is_own_account
                 && !self.created_apps.contains(&app_id)
                 && !named.has_local(account, app_id)
+                && self.capacity_allows_local(*account, app_id)
             {
                 self.record_unnamed(UnnamedResourceAccess::AppLocal(*account, app_id));
             }
@@ -1920,7 +2146,37 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         // `NamedGroupResources`).
         if !ok && self.unnamed_tracking.is_some() {
             ok = true;
-            self.record_unnamed(UnnamedResourceAccess::Box(app_id, name.to_vec()));
+            // A box owned by an app created earlier in this same simulation
+            // can't be suggested back as a concrete `(app_id, name)` ref --
+            // that app has no stable ID until it's actually submitted.
+            // Matches go-algorand's `ResourceTracker.Simplify` (see
+            // `UnnamedResourceAccess::EmptyBoxRef`'s doc comment): report an
+            // anonymous empty-ref count instead of a named box suggestion.
+            // Both paths are still capacity-gated the same way (mirrors go's
+            // `addBox`): once the group's box/total-ref capacity is
+            // exhausted, the access is still allowed (this engine doesn't
+            // enforce go's opcode-failure behavior) but is no longer added
+            // to the reported set.
+            let is_new_app = self.created_apps.contains(&app_id);
+            let allowed = match &self.unnamed_capacity {
+                Some(cap) => {
+                    let key = (app_id, name.to_vec());
+                    let mut cap = cap.borrow_mut();
+                    if is_new_app {
+                        cap.try_add_empty_box_ref(key)
+                    } else {
+                        cap.try_add_box(key)
+                    }
+                }
+                None => true,
+            };
+            if allowed {
+                if is_new_app {
+                    self.record_unnamed(UnnamedResourceAccess::EmptyBoxRef);
+                } else {
+                    self.record_unnamed(UnnamedResourceAccess::Box(app_id, name.to_vec()));
+                }
+            }
             self.io_budget = self
                 .io_budget
                 .saturating_add(self.consensus.bytes_per_box_reference);
@@ -2624,6 +2880,7 @@ fn execute_inner_appl<L: LedgerStore>(
     mut tracer: Option<&mut dyn algo_avm::tracer::EvalTracer>,
     log_limits: (u64, u64),
     unnamed_tracking: Option<Arc<NamedGroupResources>>,
+    unnamed_capacity: Option<Rc<RefCell<UnnamedCapacityTracker>>>,
     kv_mods_recorder: Option<KvModsRecorder>,
     // ── Inner-group sibling context (issue #714) ──
     //
@@ -2780,6 +3037,7 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.max_log_calls = log_limits.0;
     inner_ctx.max_log_size = log_limits.1;
     inner_ctx.unnamed_tracking = unnamed_tracking;
+    inner_ctx.unnamed_capacity = unnamed_capacity;
 
     // Propagate the round-level kv_mods recorder so box mutations made by
     // an inner app call are captured too (issue #570) — box budget/dirty
@@ -4842,6 +5100,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     tracer_ref,
                     (self.max_log_calls, self.max_log_size),
                     self.unnamed_tracking.clone(),
+                    self.unnamed_capacity.clone(),
                     self.kv_mods_recorder.clone(),
                     siblings_snapshot,
                     i,
@@ -12853,6 +13112,107 @@ mod tests {
             format!("{err}"),
             "AVM: read budget exceeded (150 > 100)",
             "without group-wide sharing, sibling B wrongly re-checks against the box's post-write size"
+        );
+    }
+
+    // --- UnnamedCapacityTracker (issue #970) ---
+
+    fn tiny_capacity() -> crate::simulation::trace::ResourceCapacity {
+        crate::simulation::trace::ResourceCapacity {
+            max_accounts: 2,
+            max_assets: 2,
+            max_apps: 2,
+            max_boxes: 2,
+            max_total_refs: 5,
+            max_cross_product_references: 2,
+        }
+    }
+
+    fn tracker_with(
+        capacity: crate::simulation::trace::ResourceCapacity,
+    ) -> UnnamedCapacityTracker {
+        UnnamedCapacityTracker {
+            capacity,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unnamed_capacity_try_add_account_dedups_without_consuming_capacity() {
+        let mut t = tracker_with(tiny_capacity());
+        let a = [1u8; 32];
+        assert!(t.try_add_account(a));
+        assert!(t.try_add_account(a), "repeat access must still succeed");
+        assert_eq!(t.seen_accounts.len(), 1);
+    }
+
+    #[test]
+    fn unnamed_capacity_try_add_account_rejects_once_max_accounts_reached() {
+        let mut t = tracker_with(tiny_capacity()); // max_accounts = 2
+        assert!(t.try_add_account([1u8; 32]));
+        assert!(t.try_add_account([2u8; 32]));
+        assert!(
+            !t.try_add_account([3u8; 32]),
+            "a third distinct account exceeds max_accounts=2"
+        );
+        assert_eq!(t.seen_accounts.len(), 2);
+    }
+
+    #[test]
+    fn unnamed_capacity_try_add_rejects_once_max_total_refs_reached() {
+        // max_total_refs=3, but each individual category's own max is higher,
+        // so the total-ref ceiling is what actually bites.
+        let mut cap = tiny_capacity();
+        cap.max_accounts = 10;
+        cap.max_assets = 10;
+        cap.max_total_refs = 3;
+        let mut t = tracker_with(cap);
+        assert!(t.try_add_account([1u8; 32]));
+        assert!(t.try_add_asset(7));
+        assert!(t.try_add_asset(8));
+        assert!(
+            !t.try_add_account([2u8; 32]),
+            "ref_count is already 3 == max_total_refs"
+        );
+    }
+
+    #[test]
+    fn unnamed_capacity_holding_and_local_share_cross_product_cap() {
+        let mut t = tracker_with(tiny_capacity()); // max_cross_product_references = 2
+        assert!(t.try_add_holding(([1u8; 32], 10)));
+        assert!(t.try_add_local(([1u8; 32], 20)));
+        assert!(
+            !t.try_add_holding(([1u8; 32], 30)),
+            "holdings + locals combined already hit the shared cap of 2"
+        );
+        assert!(
+            !t.try_add_local(([1u8; 32], 40)),
+            "same shared cap blocks a third local too"
+        );
+        // A repeat of an already-recorded pair is unaffected by the cap.
+        assert!(t.try_add_holding(([1u8; 32], 10)));
+    }
+
+    #[test]
+    fn unnamed_capacity_try_add_empty_box_ref_dedups_against_try_add_box() {
+        let mut t = tracker_with(tiny_capacity()); // max_boxes = 2
+        let key = (100u64, b"bk".to_vec());
+        assert!(t.try_add_empty_box_ref(key.clone()));
+        assert_eq!(t.seen_empty_box_refs.len(), 1);
+        // The same key seen again as a concrete box suggestion must dedup
+        // against the empty-ref slot already spent, not double-count.
+        assert!(t.try_add_box(key));
+        assert_eq!(t.box_count(), 1);
+    }
+
+    #[test]
+    fn unnamed_capacity_box_and_empty_ref_share_max_boxes() {
+        let mut t = tracker_with(tiny_capacity()); // max_boxes = 2
+        assert!(t.try_add_box((1, b"a".to_vec())));
+        assert!(t.try_add_empty_box_ref((2, b"b".to_vec())));
+        assert!(
+            !t.try_add_box((3, b"c".to_vec())),
+            "box_count is already 2 == max_boxes"
         );
     }
 }
