@@ -20,6 +20,7 @@
 
 pub mod auto;
 pub mod checkpoint;
+pub mod fsutil;
 pub mod importer;
 pub mod msgp_compat;
 pub mod parser;
@@ -29,6 +30,7 @@ pub mod verify;
 pub mod writer;
 
 pub use auto::{catchpoint_filename, prune_catchpoint_files, AutoCatchpointConfig};
+pub use fsutil::{is_empty, move_file};
 pub use importer::{
     import_catchpoint_file, import_catchpoint_file_with_progress, ImportProgressUpdate,
     ImportResult, ImportStats,
