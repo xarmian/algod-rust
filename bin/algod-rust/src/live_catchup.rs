@@ -77,6 +77,36 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+/// Granular catchpoint-catchup progress counters (issue #941), mirroring
+/// go-algorand's `catchup.CatchpointCatchupStats`
+/// (`catchup/catchpointService.go`) — the struct `node.go`'s
+/// `catchpointCatchupStatus` copies field-for-field into `StatusReport`'s
+/// `CatchpointCatchup*` fields, which `GET /v2/status` serializes as
+/// `catchpoint-total-accounts`/etc.
+///
+/// Populated live from [`algo_ledger::sync::SyncProgress`]'s matching
+/// `catchpoint_*` fields via [`OrchestratorCatchupRunner`]'s progress
+/// callback, and surfaced by [`LiveCatchupManager::catchpoint_counters`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatchpointCounters {
+    /// go: `CatchpointCatchupStats.TotalAccounts`.
+    pub total_accounts: u64,
+    /// go: `CatchpointCatchupStats.ProcessedAccounts`.
+    pub processed_accounts: u64,
+    /// go: `CatchpointCatchupStats.VerifiedAccounts`.
+    pub verified_accounts: u64,
+    /// go: `CatchpointCatchupStats.TotalKVs`.
+    pub total_kvs: u64,
+    /// go: `CatchpointCatchupStats.ProcessedKVs`.
+    pub processed_kvs: u64,
+    /// go: `CatchpointCatchupStats.VerifiedKVs`.
+    pub verified_kvs: u64,
+    /// go: `CatchpointCatchupStats.TotalBlocks`.
+    pub total_blocks: u64,
+    /// go: `CatchpointCatchupStats.AcquiredBlocks`.
+    pub acquired_blocks: u64,
+}
+
 /// Controls the node's "normal sync loop" so it can be quiesced while a
 /// live catchpoint catchup owns the ledger, then resumed afterward.
 ///
@@ -123,7 +153,17 @@ pub trait CatchupRunner: Send + Sync {
     /// Run the fetch/verify/replay sequence for `catchpoint`, honoring
     /// `cancel` the way [`algo_ledger::sync::SyncOrchestrator::run`] already
     /// does (checked between phases and between block downloads).
-    async fn run(&self, catchpoint: &str, cancel: CancellationToken) -> anyhow::Result<()>;
+    ///
+    /// `counters` is a shared sink the runner should update live as it
+    /// progresses (issue #941) — [`OrchestratorCatchupRunner`] wires it to
+    /// [`algo_ledger::sync::SyncOrchestrator::set_progress_callback`]. Test
+    /// fakes that don't model fine-grained progress may leave it untouched.
+    async fn run(
+        &self,
+        catchpoint: &str,
+        cancel: CancellationToken,
+        counters: Arc<StdMutex<CatchpointCounters>>,
+    ) -> anyhow::Result<()>;
 }
 
 /// State for the currently-running catchup, if any.
@@ -147,6 +187,9 @@ pub struct LiveCatchupManager {
     /// The most recently *completed* catchpoint label, surfaced by
     /// `GET /v2/status`'s `last-catchpoint` field once catchup finishes.
     last_catchpoint: StdMutex<String>,
+    /// Live granular progress counters for the in-flight (or most recently
+    /// finished) catchup — see [`Self::catchpoint_counters`] (issue #941).
+    counters: Arc<StdMutex<CatchpointCounters>>,
 }
 
 impl LiveCatchupManager {
@@ -158,6 +201,7 @@ impl LiveCatchupManager {
             control,
             running: AsyncMutex::new(None),
             last_catchpoint: StdMutex::new(String::new()),
+            counters: Arc::new(StdMutex::new(CatchpointCounters::default())),
         })
     }
 
@@ -195,6 +239,13 @@ impl LiveCatchupManager {
         // download begins) is the same and simpler to reason about here
         // since `SyncOrchestrator` doesn't expose a mid-run pause hook.
         self.control.pause().await;
+
+        // Reset progress counters for the new run — mirrors go building a
+        // fresh `CatchpointCatchupStats{}` per `CatchpointCatchupService`
+        // instance (`MakeResumedCatchpointCatchupService`).
+        if let Ok(mut counters) = self.counters.lock() {
+            *counters = CatchpointCounters::default();
+        }
 
         let cancel = CancellationToken::new();
         let manager = Arc::clone(self);
@@ -243,6 +294,15 @@ impl LiveCatchupManager {
             .map(|r| r.catchpoint.clone())
     }
 
+    /// The current live progress counters for the in-flight (or most
+    /// recently finished) catchup (issue #941). Callers gate on
+    /// [`Self::current_catchpoint`] being non-empty the way go gates on
+    /// `catchpointCatchupService != nil` — go-algorand does not report
+    /// these fields at all once catchup is no longer running.
+    pub fn catchpoint_counters(&self) -> CatchpointCounters {
+        self.counters.lock().map(|g| *g).unwrap_or_default()
+    }
+
     /// The most recently *completed* catchpoint label (empty if none has
     /// completed yet). Backs `GET /v2/status`'s `last-catchpoint` field.
     pub fn last_catchpoint(&self) -> String {
@@ -258,7 +318,10 @@ impl LiveCatchupManager {
     /// `updateNodeCatchupMode(false)` on the way out, regardless of
     /// success or failure.
     async fn drive(self: Arc<Self>, catchpoint: String, cancel: CancellationToken) {
-        let result = self.runner.run(&catchpoint, cancel).await;
+        let result = self
+            .runner
+            .run(&catchpoint, cancel, Arc::clone(&self.counters))
+            .await;
         match &result {
             Ok(()) => {
                 info!(catchpoint = %catchpoint, "live catchpoint catchup completed");
@@ -325,7 +388,12 @@ impl OrchestratorCatchupRunner {
 
 #[async_trait]
 impl CatchupRunner for OrchestratorCatchupRunner {
-    async fn run(&self, catchpoint: &str, cancel: CancellationToken) -> anyhow::Result<()> {
+    async fn run(
+        &self,
+        catchpoint: &str,
+        cancel: CancellationToken,
+        counters: Arc<StdMutex<CatchpointCounters>>,
+    ) -> anyhow::Result<()> {
         use algo_ledger::sync::{SyncConfig, SyncOrchestrator};
 
         let backend = crate::commands::catchpoint_sync::build_algod_sync_backend(
@@ -356,6 +424,24 @@ impl CatchupRunner for OrchestratorCatchupRunner {
 
         let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
         orchestrator.set_cancel(cancel);
+        // Mirror the eight `catchpoint_*` counters from `SyncProgress` into
+        // the shared sink `LiveCatchupManager::catchpoint_counters()` reads
+        // (issue #941), on every progress notification (state transitions
+        // and periodic within-phase updates).
+        orchestrator.set_progress_callback(Box::new(move |progress| {
+            if let Ok(mut c) = counters.lock() {
+                *c = CatchpointCounters {
+                    total_accounts: progress.catchpoint_total_accounts,
+                    processed_accounts: progress.catchpoint_processed_accounts,
+                    verified_accounts: progress.catchpoint_verified_accounts,
+                    total_kvs: progress.catchpoint_total_kvs,
+                    processed_kvs: progress.catchpoint_processed_kvs,
+                    verified_kvs: progress.catchpoint_verified_kvs,
+                    total_blocks: progress.catchpoint_total_blocks,
+                    acquired_blocks: progress.catchpoint_acquired_blocks,
+                };
+            }
+        }));
         orchestrator.run().await?;
         Ok(())
     }
@@ -412,7 +498,12 @@ mod tests {
 
     #[async_trait]
     impl CatchupRunner for ImmediateRunner {
-        async fn run(&self, _catchpoint: &str, _cancel: CancellationToken) -> anyhow::Result<()> {
+        async fn run(
+            &self,
+            _catchpoint: &str,
+            _cancel: CancellationToken,
+            _counters: Arc<StdMutex<CatchpointCounters>>,
+        ) -> anyhow::Result<()> {
             match self.result.lock().unwrap().take() {
                 Some(Ok(())) | None => Ok(()),
                 Some(Err(e)) => Err(anyhow::anyhow!(e)),
@@ -428,7 +519,12 @@ mod tests {
 
     #[async_trait]
     impl CatchupRunner for BlockingRunner {
-        async fn run(&self, _catchpoint: &str, cancel: CancellationToken) -> anyhow::Result<()> {
+        async fn run(
+            &self,
+            _catchpoint: &str,
+            cancel: CancellationToken,
+            _counters: Arc<StdMutex<CatchpointCounters>>,
+        ) -> anyhow::Result<()> {
             cancel.cancelled().await;
             self.cancel_observed
                 .store(true, std::sync::atomic::Ordering::SeqCst);

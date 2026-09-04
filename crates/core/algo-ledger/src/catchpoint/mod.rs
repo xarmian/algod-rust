@@ -29,7 +29,10 @@ pub mod verify;
 pub mod writer;
 
 pub use auto::{catchpoint_filename, prune_catchpoint_files, AutoCatchpointConfig};
-pub use importer::{import_catchpoint_file, ImportResult, ImportStats};
+pub use importer::{
+    import_catchpoint_file, import_catchpoint_file_with_progress, ImportProgressUpdate,
+    ImportResult, ImportStats,
+};
 pub use parser::{CatchpointEntry, CatchpointReader, CatchpointReaderFile};
 pub use types::{
     AccountTotals, AlgoCount, BalanceRecordV6, CatchpointBaseAccountData,

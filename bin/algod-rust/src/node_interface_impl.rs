@@ -791,17 +791,30 @@ impl NodeInterface for AlgodNodeInterface {
         // Live catchpoint-catchup mode (issue #937): `catchpoint` is
         // non-empty exactly while a catchup is in flight (mirrors go's
         // `catchpointCatchupStatus`, `node/node.go`), `last_catchpoint` is
-        // the most recently *completed* one. Granular per-account/per-KV/
-        // per-block progress counters are left at zero — the
-        // `SyncOrchestrator` backing `LiveCatchupManager` reports coarse
-        // phase progress, not go's fine-grained counts; see
-        // `live_catchup.rs`'s module doc for the tracked follow-up.
+        // the most recently *completed* one.
+        //
+        // Granular per-account/per-KV/per-block progress counters (issue
+        // #941) are read from `LiveCatchupManager::catchpoint_counters`,
+        // which `OrchestratorCatchupRunner` keeps live-updated from
+        // `SyncOrchestrator`'s `SyncProgress.catchpoint_*` fields. Gated on
+        // `catchpoint` being non-empty to mirror go: `catchpointCatchupStatus`
+        // is only on the reporting path while `node.catchpointCatchupService`
+        // is non-nil — once catchup ends, `StatusReport`'s zero value takes
+        // over and these fields report zero again, not stale last-run values.
         let (catchpoint, last_catchpoint) = match &self.catchup_manager {
             Some(mgr) => (
                 mgr.current_catchpoint().await.unwrap_or_default(),
                 mgr.last_catchpoint(),
             ),
             None => (String::new(), String::new()),
+        };
+        let catchpoint_counters = if catchpoint.is_empty() {
+            crate::live_catchup::CatchpointCounters::default()
+        } else {
+            self.catchup_manager
+                .as_ref()
+                .map(|mgr| mgr.catchpoint_counters())
+                .unwrap_or_default()
         };
 
         // Protocol-switch fields come from the latest block header when
@@ -835,14 +848,14 @@ impl NodeInterface for AlgodNodeInterface {
             stopped_at_unsupported_round: false,
             catchpoint,
             last_catchpoint,
-            catchpoint_total_accounts: 0,
-            catchpoint_processed_accounts: 0,
-            catchpoint_verified_accounts: 0,
-            catchpoint_total_kvs: 0,
-            catchpoint_processed_kvs: 0,
-            catchpoint_verified_kvs: 0,
-            catchpoint_total_blocks: 0,
-            catchpoint_acquired_blocks: 0,
+            catchpoint_total_accounts: catchpoint_counters.total_accounts,
+            catchpoint_processed_accounts: catchpoint_counters.processed_accounts,
+            catchpoint_verified_accounts: catchpoint_counters.verified_accounts,
+            catchpoint_total_kvs: catchpoint_counters.total_kvs,
+            catchpoint_processed_kvs: catchpoint_counters.processed_kvs,
+            catchpoint_verified_kvs: catchpoint_counters.verified_kvs,
+            catchpoint_total_blocks: catchpoint_counters.total_blocks,
+            catchpoint_acquired_blocks: catchpoint_counters.acquired_blocks,
             next_protocol_vote_before: snap
                 .latest_header
                 .as_ref()
@@ -6241,7 +6254,24 @@ mod tests {
             &self,
             _catchpoint: &str,
             cancel: tokio_util::sync::CancellationToken,
+            counters: Arc<Mutex<crate::live_catchup::CatchpointCounters>>,
         ) -> anyhow::Result<()> {
+            // Publish a partial-progress snapshot before blocking, so
+            // `start_and_abort_catchup_round_trip_through_status` can prove
+            // `status()` surfaces live counters while catchup is in flight
+            // (issue #941).
+            if let Ok(mut c) = counters.lock() {
+                *c = crate::live_catchup::CatchpointCounters {
+                    total_accounts: 5000,
+                    processed_accounts: 2000,
+                    verified_accounts: 0,
+                    total_kvs: 100,
+                    processed_kvs: 40,
+                    verified_kvs: 0,
+                    total_blocks: 1001,
+                    acquired_blocks: 250,
+                };
+            }
             cancel.cancelled().await;
             self.cancel_observed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -6288,6 +6318,33 @@ mod tests {
         assert_eq!(status.catchpoint, "1000#deadbeef");
         assert_eq!(status.last_catchpoint, "");
 
+        // `start_catchup` spawns the runner task and returns immediately —
+        // `BlockingRunner` publishes its counters snapshot on that spawned
+        // task before blocking on cancellation, so poll (bounded) until it
+        // has actually run rather than racing it.
+        let counters_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if manager.catchpoint_counters().total_accounts == 5000 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < counters_deadline,
+                "BlockingRunner never published its counters snapshot"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let status = adapter.status().await.unwrap();
+        // Granular catchpoint-catchup counters (issue #941): while a
+        // catchup is in flight, `status()` must surface the live values
+        // `BlockingRunner` published, not hardcoded zeros.
+        assert_eq!(status.catchpoint_total_accounts, 5000);
+        assert_eq!(status.catchpoint_processed_accounts, 2000);
+        assert_eq!(status.catchpoint_total_kvs, 100);
+        assert_eq!(status.catchpoint_processed_kvs, 40);
+        assert_eq!(status.catchpoint_total_blocks, 1001);
+        assert_eq!(status.catchpoint_acquired_blocks, 250);
+
         adapter.abort_catchup("1000#deadbeef").await.unwrap();
 
         // `abort_catchup` fires cancellation and returns immediately
@@ -6309,6 +6366,11 @@ mod tests {
 
         let status = adapter.status().await.unwrap();
         assert_eq!(status.catchpoint, "");
+        // Once catchup is no longer running, go's `catchpointCatchupStatus`
+        // is no longer on the reporting path at all — these fields must
+        // revert to zero, not keep reporting the last run's counters.
+        assert_eq!(status.catchpoint_total_accounts, 0);
+        assert_eq!(status.catchpoint_acquired_blocks, 0);
     }
 
     /// Aborting an unknown catchpoint when a *different* one is running

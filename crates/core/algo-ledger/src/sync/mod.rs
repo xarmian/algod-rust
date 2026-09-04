@@ -44,8 +44,8 @@ use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 
 use crate::catchpoint::{
-    import_catchpoint_file, parse_catchpoint_label, validate_post_import, verify_catchpoint,
-    CatchpointError, CatchpointFileHeader,
+    import_catchpoint_file_with_progress, parse_catchpoint_label, validate_post_import,
+    verify_catchpoint, CatchpointError, CatchpointFileHeader, ImportProgressUpdate,
 };
 use crate::EvalDeltaStats;
 use crate::LedgerStore;
@@ -56,6 +56,23 @@ use crate::LedgerStore;
 /// within long-running phases (e.g. block replay). The callback receives an
 /// immutable reference to the current [`SyncProgress`].
 pub type ProgressCallback = Box<dyn Fn(&SyncProgress) + Send>;
+
+/// Free-function twin of [`SyncOrchestrator::notify_progress`] that takes
+/// `progress`/`on_progress` as separate arguments rather than `&mut self`.
+///
+/// Needed for the callbacks passed into
+/// [`crate::catchpoint::import_catchpoint_file_with_progress`] and
+/// [`crate::catchpoint::download_lookback_blocks`]: those closures also
+/// capture other `SyncOrchestrator` fields (e.g. `self.backend`) via
+/// disjoint field capture, so they cannot call an `&mut self` method
+/// (which would require a whole-`self` borrow) without conflicting.
+fn notify_progress_fields(progress: &mut SyncProgress, on_progress: &Option<ProgressCallback>) {
+    progress.update_elapsed();
+    progress.estimate_eta();
+    if let Some(cb) = on_progress {
+        cb(progress);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SyncBackend — trait abstracting network operations
@@ -772,14 +789,30 @@ impl SyncOrchestrator {
             });
         }
 
-        // Import the catchpoint file.
+        // Import the catchpoint file, threading a progress callback that
+        // updates `catchpoint_total_accounts`/`catchpoint_processed_accounts`/
+        // `catchpoint_total_kvs`/`catchpoint_processed_kvs` on every chunk —
+        // mirrors go's `updateLedgerFetcherProgress` (issue #941).
         let reward_unit = crate::rewards::REWARD_UNITS;
-        let import_result =
-            import_catchpoint_file(&conn, &file_path, reward_unit).map_err(|e| {
-                AlgoError::Ledger {
-                    message: format!("catchpoint import failed: {e}"),
-                }
-            })?;
+        let import_result = {
+            let progress = &mut self.progress;
+            let on_progress = &self.on_progress;
+            import_catchpoint_file_with_progress(
+                &conn,
+                &file_path,
+                reward_unit,
+                Some(&mut |update: &ImportProgressUpdate| {
+                    progress.catchpoint_total_accounts = update.total_accounts;
+                    progress.catchpoint_processed_accounts = update.processed_accounts;
+                    progress.catchpoint_total_kvs = update.total_kvs;
+                    progress.catchpoint_processed_kvs = update.processed_kvs;
+                    notify_progress_fields(progress, on_progress);
+                }),
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("catchpoint import failed: {e}"),
+            })?
+        };
 
         self.accounts_imported = import_result.stats.accounts;
         let round = import_result.round;
@@ -875,6 +908,26 @@ impl SyncOrchestrator {
             "catchpoint label verification passed"
         );
 
+        // Mirrors go's `updateVerifiedCounts` — once the Merkle trie
+        // rebuild + label comparison succeeds, every account/kv in the
+        // database has been cryptographically verified (issue #941). Our
+        // verify pass is single-shot rather than incremental, so this
+        // jumps straight to the final count rather than growing gradually
+        // like go's estimate does mid-trie-build.
+        self.progress.catchpoint_verified_accounts = verify_result.accounts_count;
+        self.progress.catchpoint_verified_kvs = verify_result.kvs_count;
+        // The import phase already set these from the file header, but set
+        // them again here too in case verify is ever reached without a
+        // preceding import phase (e.g. a future resume-from-checkpoint path).
+        self.progress.catchpoint_total_accounts = self
+            .progress
+            .catchpoint_total_accounts
+            .max(verify_result.accounts_count);
+        self.progress.catchpoint_total_kvs = self
+            .progress
+            .catchpoint_total_kvs
+            .max(verify_result.kvs_count);
+
         // Step 2: Post-import validation (non-critical warnings).
         let catchpoint_round = self.catchpoint_round.unwrap_or(0);
         let warnings =
@@ -915,10 +968,15 @@ impl SyncOrchestrator {
             catchpoint_round = round,
             "downloading lookback blocks for lease reconstruction"
         );
-        self.progress.phase_detail = format!(
-            "downloading lookback blocks from round {}",
-            round.saturating_sub(crate::catchpoint::MAX_TXN_LIFE)
-        );
+        let lookback_start_round = round.saturating_sub(crate::catchpoint::MAX_TXN_LIFE);
+        self.progress.phase_detail =
+            format!("downloading lookback blocks from round {lookback_start_round}");
+        // Mirrors go's `processStageBlocksDownload` setting
+        // `stats.TotalBlocks = lookback; stats.AcquiredBlocks = 0` before
+        // the backfill loop begins (issue #941). `download_lookback_blocks`
+        // walks `[lookback_start_round, round]` inclusive on both ends.
+        self.progress.catchpoint_total_blocks = round - lookback_start_round + 1;
+        self.progress.catchpoint_acquired_blocks = 0;
         self.notify_progress();
 
         let conn = self.open_db()?;
@@ -986,6 +1044,12 @@ impl SyncOrchestrator {
                     }
                 }
 
+                // Mirrors go's `updateBlockRetrievalStatistics(1, 0)` /
+                // `(0, 1)` net effect on `stats.AcquiredBlocks` for each
+                // successfully-stored lookback block (issue #941).
+                self.progress.catchpoint_acquired_blocks += 1;
+                notify_progress_fields(&mut self.progress, &self.on_progress);
+
                 Ok(())
             },
         )
@@ -994,6 +1058,9 @@ impl SyncOrchestrator {
         })?;
 
         tracing::info!(blocks_downloaded, "lookback blocks downloaded");
+        // Should already equal `blocks_downloaded` from the incremental
+        // counting above; re-assert it as the authoritative final value.
+        self.progress.catchpoint_acquired_blocks = blocks_downloaded;
 
         // Reconstruct lease table from the downloaded txtail entries.
         let lease_table =
@@ -2102,6 +2169,116 @@ mod tests {
         let orchestrator = SyncOrchestrator::new(test_config(db_path, 3));
         let conn = orchestrator.open_db().unwrap();
         assert_eq!(query_synchronous(&conn), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A [`SyncBackend`] fake that serves canned lookback blocks from an
+    /// in-memory map, so `run_download_lookback` can be driven without a
+    /// network. `blkdata` is deliberately not a valid canonical block
+    /// encoding — `run_download_lookback` already treats
+    /// `algo_codec::decode_block` failure as non-fatal (txtail/lease
+    /// reconstruction is skipped for that block, matching how a
+    /// non-decodable block is handled today), so an empty payload is
+    /// enough to exercise the block-storage/counter-increment path.
+    struct FakeLookbackBackend;
+
+    impl SyncBackend for FakeLookbackBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            Ok(("test-proto".to_string(), Vec::new(), format!("blk{round}").into_bytes()))
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// TDD for issue #941: `run_download_lookback` must populate
+    /// `SyncProgress`'s `catchpoint_total_blocks`/`catchpoint_acquired_blocks`
+    /// — mirroring go's `processStageBlocksDownload` setting
+    /// `stats.TotalBlocks = lookback` up front and incrementing
+    /// `stats.AcquiredBlocks` via `updateBlockRetrievalStatistics` for each
+    /// block successfully fetched and stored.
+    #[test]
+    fn download_lookback_reports_total_and_acquired_block_counters() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-lookback-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("ledger");
+
+        let mut orchestrator =
+            SyncOrchestrator::with_backend(test_config(db_path, 1), FakeLookbackBackend);
+
+        // Fast-forward past the phases that would normally set these up —
+        // this test targets `run_download_lookback` in isolation, not the
+        // full pipeline (private-field access is available since `tests`
+        // is a submodule of `sync::mod`).
+        let catchpoint_round = 5u64;
+        orchestrator.state = SyncState::VerifyingLedger;
+        orchestrator.catchpoint_round = Some(catchpoint_round);
+
+        // Snapshot every progress notification so we can assert the total
+        // is announced before acquisition begins, and acquired count rises
+        // monotonically to the final total.
+        let snapshots: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let snapshots_cb = snapshots.clone();
+        orchestrator.set_progress_callback(Box::new(move |p| {
+            snapshots_cb
+                .lock()
+                .unwrap()
+                .push((p.catchpoint_total_blocks, p.catchpoint_acquired_blocks));
+        }));
+
+        orchestrator.run_download_lookback().unwrap();
+
+        // MAX_TXN_LIFE (1000) saturates at 0 for catchpoint_round=5, so the
+        // lookback window is [0, 5] inclusive — 6 blocks.
+        assert_eq!(orchestrator.progress().catchpoint_total_blocks, 6);
+        assert_eq!(orchestrator.progress().catchpoint_acquired_blocks, 6);
+
+        let snaps = snapshots.lock().unwrap();
+        assert!(snaps.len() >= 6, "expected a snapshot per block: {snaps:?}");
+        // The very first notification comes from `transition()` entering
+        // `DownloadingLookback`, before the phase has computed the lookback
+        // window size — so `total` starts at 0 (still the `SyncProgress`
+        // default) and is set once, to 6, before the acquisition loop's
+        // notifications begin. From that point on it must stay fixed.
+        let after_total_set: Vec<(u64, u64)> =
+            snaps.iter().copied().skip_while(|(total, _)| *total == 0).collect();
+        assert!(
+            !after_total_set.is_empty(),
+            "total_blocks was never set: {snaps:?}"
+        );
+        assert!(
+            after_total_set.iter().all(|(total, _)| *total == 6),
+            "total_blocks changed mid-phase: {snaps:?}"
+        );
+        // Acquired count never decreases and reaches the total.
+        for pair in after_total_set.windows(2) {
+            assert!(pair[1].1 >= pair[0].1, "acquired regressed: {snaps:?}");
+        }
+        assert_eq!(after_total_set.last().unwrap().1, 6);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

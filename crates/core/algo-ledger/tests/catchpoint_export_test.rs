@@ -36,8 +36,9 @@ use algo_ledger::catchpoint::verify::{
     calculate_sp_verification_hash, rebuild_trie_from_db,
 };
 use algo_ledger::catchpoint::{
-    export_catchpoint_file, import_catchpoint_file, verify_catchpoint, CatchpointEntry,
-    ExportOptions, CATCHPOINT_FILE_VERSION_V8,
+    export_catchpoint_file, import_catchpoint_file, import_catchpoint_file_with_progress,
+    verify_catchpoint, CatchpointEntry, ExportOptions, ImportProgressUpdate,
+    CATCHPOINT_FILE_VERSION_V8,
 };
 use algo_ledger::rewards::REWARD_UNITS;
 
@@ -405,6 +406,107 @@ fn export_then_import_round_trips_state_and_label() {
     );
     assert_eq!(verified.computed_label, result.label);
     assert_eq!(verified.accounts_count, 5);
+    // go's `CatchpointCatchupStats.VerifiedKVs` (issue #941) is backed by
+    // this same post-import count once the Merkle trie verification
+    // succeeds — see `crate::sync::SyncOrchestrator::run_verify_ledger`.
+    assert_eq!(verified.kvs_count, 4);
+}
+
+/// TDD for issue #941: `import_catchpoint_file_with_progress` must report a
+/// live, monotonically-increasing `ImportProgressUpdate` on every imported
+/// chunk — the hook `SyncOrchestrator` uses to populate `SyncProgress`'s
+/// `catchpoint_total_accounts`/`catchpoint_processed_accounts`/
+/// `catchpoint_total_kvs`/`catchpoint_processed_kvs` fields, which
+/// ultimately back `GET /v2/status`'s `catchpoint-total-accounts`/etc.
+/// (go: `CatchpointCatchupStats.TotalAccounts`/`ProcessedAccounts`/
+/// `TotalKVs`/`ProcessedKVs`, updated by `updateLedgerFetcherProgress`).
+#[test]
+fn import_with_progress_reports_monotonic_counters_reaching_final_totals() {
+    let src = build_source_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catchpoint.tar.gz");
+
+    // This fixture always splits into >= 3 chunks (see
+    // `export_splits_accounts_across_chunks`), so the progress callback is
+    // guaranteed to fire more than once — proving genuinely incremental
+    // reporting, not just a single before/after snapshot.
+    let result = export_catchpoint_file(&src, &path, &export_options()).unwrap();
+    assert!(result.total_chunks >= 3, "{:?}", result);
+
+    let dst = Connection::open_in_memory().unwrap();
+    let mut updates: Vec<ImportProgressUpdate> = Vec::new();
+    let import = import_catchpoint_file_with_progress(
+        &dst,
+        &path,
+        REWARD_UNITS,
+        Some(&mut |update: &ImportProgressUpdate| {
+            updates.push(*update);
+        }),
+    )
+    .unwrap();
+
+    assert!(
+        updates.len() >= 3,
+        "expected at least one progress update per chunk, got {}: {:?}",
+        updates.len(),
+        updates
+    );
+
+    // Totals are known from the file header before any chunk is streamed,
+    // so they must be constant and correct from the very first update.
+    for u in &updates {
+        assert_eq!(u.total_accounts, 5);
+        assert_eq!(u.total_kvs, 4);
+    }
+
+    // Processed counts must never go backwards...
+    for pair in updates.windows(2) {
+        assert!(
+            pair[1].processed_accounts >= pair[0].processed_accounts,
+            "processed_accounts regressed: {:?} -> {:?}",
+            pair[0],
+            pair[1]
+        );
+        assert!(
+            pair[1].processed_kvs >= pair[0].processed_kvs,
+            "processed_kvs regressed: {:?} -> {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    // ...at least one update must show forward progress (not every chunk
+    // touches both accounts and kvs, but the run as a whole must).
+    assert!(updates.iter().any(|u| u.processed_accounts > 0));
+    assert!(updates.iter().any(|u| u.processed_kvs > 0));
+
+    // ...and the final update must land exactly on the completed import's
+    // totals.
+    let last = updates.last().unwrap();
+    assert_eq!(last.processed_accounts, import.stats.accounts);
+    assert_eq!(last.processed_kvs, import.stats.kvs);
+    assert_eq!(import.stats.accounts, 5);
+    assert_eq!(import.stats.kvs, 4);
+}
+
+/// `import_catchpoint_file` (the callback-free entry point every existing
+/// caller uses) must behave identically whether or not progress reporting
+/// is wired in — `import_catchpoint_file_with_progress(..., None)` is a
+/// pure superset, not a behavior change.
+#[test]
+fn import_without_progress_callback_matches_import_with_progress_none() {
+    let src = build_source_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catchpoint.tar.gz");
+    export_catchpoint_file(&src, &path, &export_options()).unwrap();
+
+    let dst_a = Connection::open_in_memory().unwrap();
+    let a = import_catchpoint_file(&dst_a, &path, REWARD_UNITS).unwrap();
+
+    let dst_b = Connection::open_in_memory().unwrap();
+    let b = import_catchpoint_file_with_progress(&dst_b, &path, REWARD_UNITS, None).unwrap();
+
+    assert_eq!(a.round, b.round);
+    assert_eq!(a.stats, b.stats);
 }
 
 #[test]
