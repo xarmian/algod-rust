@@ -40,15 +40,25 @@
 //!   `stateProofVotersAndTotal`.
 //!
 //! Because algod-rust's ledger backends (`LedgerState`, `SqliteLedger`) hold
-//! only the *current* committed state (no historical per-round account
-//! snapshots), the snapshot must be taken synchronously, in the same call
-//! that applies the snapshot round's block -- there is no way to later ask
-//! "what were the online accounts as of round r" after round r+1 has been
-//! applied. This differs from go's `votersTracker.loadTree`, which spawns a
-//! background goroutine (`VotersForStateProof` blocks on its completion);
-//! algod-rust does the equivalent work inline, which is fine at the actual
-//! sizes involved (`StateProofTopVoters` truncates the tree to at most 1024
-//! participants).
+//! only the *current* committed state (no historical per-round *aggregate*
+//! online-set snapshots), the snapshot must be taken synchronously, in the
+//! same call that applies the snapshot round's block -- there is no cheap
+//! way to later reconstruct "the full online set as of round r" after round
+//! r+1 has been applied (it would require scanning every address's history
+//! rather than one aggregate query). This differs from go's
+//! `votersTracker.loadTree`, which spawns a background goroutine
+//! (`VotersForStateProof` blocks on its completion); algod-rust does the
+//! equivalent work inline, which is fine at the actual sizes involved
+//! (`StateProofTopVoters` truncates the tree to at most 1024 participants).
+//!
+//! This is now a narrower claim than it used to be: since issue #960,
+//! `SqliteLedger::commit_block` appends a genuine per-round `onlineaccounts`
+//! history row for every touched *individual* address (not just catchpoint
+//! import), so a single address's online status/balance as of an old round
+//! *is* answerable via `get_online_account_at_round`. What's still missing
+//! is an efficient index over "every address online as of round r" -- this
+//! module's synchronous full-participant-array snapshot remains the right
+//! tool for that specific query.
 //!
 //! # Full participant retention (issue #912)
 //!
