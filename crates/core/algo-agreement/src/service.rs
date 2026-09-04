@@ -1865,6 +1865,44 @@ mod tests {
         handle.shutdown();
     }
 
+    /// `Service::new(params).start()` / `handle.shutdown()` must be safe to
+    /// repeat with a *fresh* `Service` each time — the exact pattern issue
+    /// #940's live catchpoint-catchup pause/resume needs for
+    /// `algod-rust participate`: `ServiceHandle::shutdown` consumes `self`,
+    /// so there is no in-place "pause" on one `Service` instance, only
+    /// "shut this one down cleanly, then build and start a brand new one
+    /// from freshly-constructed bridges." This pins that repeated
+    /// construct/start/shutdown/reconstruct cycle never panics, hangs, or
+    /// leaves a partially-joined thread behind — regardless of what the
+    /// individual bridge implementations are (production code swaps these
+    /// stubs for the real `AgreementNetworkBridge`/`AgreementLedgerBridge`/
+    /// `AgreementKeyManagerBridge`/`BlockFactoryBridge`/
+    /// `AsyncCryptoVerifier` wired up in `bin/algod-rust/src/commands/
+    /// participate.rs`).
+    #[test]
+    fn service_survives_repeated_reconstruct_start_shutdown_cycles() {
+        for cycle in 0..3 {
+            let params = Parameters {
+                network: StubNetwork::new(),
+                ledger: StubLedger::new(v41_params(), Round(100 + cycle)),
+                key_manager: TestKeyManager,
+                block_factory: StubBlockFactory::new(),
+                block_validator: StubBlockValidator::accepting(),
+                random_source: StubRandomSource::constant(42),
+                monitor: StubEventsProcessingMonitor::new(),
+                crypto: StubCryptoVerifier::new(),
+                clock: crate::SystemClock::new(),
+                crash_db: None,
+                signing_keys: std::collections::HashMap::new(),
+            };
+
+            let service = Service::new(params);
+            let handle = service.start();
+            thread::sleep(Duration::from_millis(20));
+            handle.shutdown();
+        }
+    }
+
     #[test]
     fn service_handle_shutdown_signals_quit() {
         let quit = Arc::new(AtomicBool::new(false));

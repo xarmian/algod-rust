@@ -65,6 +65,7 @@ use crate::commands::network_common::{
 };
 use crate::commands::p2p_transport::{NetworkMode, P2pOptions, P2pTransport, P2pTransportConfig};
 use crate::config::RestConfig;
+use crate::live_catchup::NormalSyncControl;
 use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
 
 /// Upper bound on how long Ctrl-C is willing to wait for the REST
@@ -269,6 +270,375 @@ impl BlockFetcher for FallbackBlockFetcher {
                 );
                 self.secondary.fetch_block(round)
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live catchpoint-catchup: pause/resume the agreement Service (issue #940)
+// ---------------------------------------------------------------------------
+
+/// The agreement `Service` + `CatchupService` pair currently running, if any.
+///
+/// These are the *only* two writers to the participate ledger (the
+/// agreement service via `ensure_block`/`ensure_digest`, the catchup
+/// service via the certificates `ensure_digest` hands it) — see
+/// [`ParticipateAgreementControl`]'s doc comment for why stopping exactly
+/// this pair (and no other service) is what makes a live catchpoint catchup
+/// safe against the ledger.
+struct RunningAgreementCycle {
+    handle: algo_agreement::service::ServiceHandle,
+    catchup_service: CatchupService,
+}
+
+/// A [`crate::live_catchup::NormalSyncControl`] that pauses/resumes the live
+/// agreement `Service` + `CatchupService` pair for `algod-rust participate`
+/// (issue #940, follow-up to issue #937's `node start --follow` wiring).
+///
+/// # Why the agreement `Service` can't be paused in place
+///
+/// go-algorand's `SetCatchpointCatchupMode(true)` stops seven independent
+/// node services before recreating the node context, then
+/// `SetCatchpointCatchupMode(false)` restarts all of them
+/// (`../go-algorand/node/node.go:1275-1317`): `net.ClearHandlers()`/
+/// `ClearValidatorHandlers()`, `heartbeatService.Stop()`,
+/// `stateProofWorker.Stop()`, `txHandler.Stop()`, `agreementService.Shutdown()`,
+/// `catchupService.Stop()`, `txPoolSyncerService.Stop()`, `blockService.Stop()`,
+/// `ledgerService.Stop()`.
+///
+/// algod-rust's `algo_agreement::service::Service` has no equivalent
+/// in-place pause: `Service::start(self)` consumes `self` and
+/// `ServiceHandle::shutdown(self)` consumes `self` too — there is
+/// deliberately no "stop, then restart the exact same instance" API,
+/// because the two loop threads it spawns own their bridge values
+/// (network/ledger/key-manager/etc.) outright once started
+/// (`service.rs`'s `Parameters { network, ledger, .. } = self.params;`
+/// destructure). The only safe pattern is "shut this instance down
+/// completely, then construct and start a brand new one from freshly-built
+/// bridges" — [`Self::build_cycle`] does exactly that, and
+/// `crates/core/algo-agreement/src/service.rs`'s
+/// `service_survives_repeated_reconstruct_start_shutdown_cycles` test pins
+/// that this construct/start/shutdown/reconstruct cycle is safe to repeat.
+///
+/// # Why only these two services are stopped (not go's other five)
+///
+/// Of go's seven, only `agreementService` and `catchupService` ever write
+/// to the ledger in algod-rust's architecture — both through an
+/// `AgreementLedgerBridge::ensure_block`/`ensure_digest` call. `txHandler`
+/// (routes inbound transactions into the pool), `blockService`/
+/// `ledgerService` (serve reads to peers), `txPoolSyncerService` (pool-only
+/// sync), and `heartbeatService`/`stateProofWorker` (submit transactions
+/// through the pool like any other local sender, never write the ledger
+/// directly) are all downstream of the ledger, not writers to it. The
+/// acceptance criterion this exists to satisfy — "must not race the live
+/// agreement service's own block writes against the catchpoint-catchup
+/// task's writes to the same ledger" — is fully satisfied by quiescing
+/// exactly the two ledger writers; leaving the other five running (they
+/// keep serving reads / relaying transactions through the pause) is a
+/// deliberate, narrower deviation from go's exact service list, not an
+/// oversight.
+///
+/// # What's captured once vs. rebuilt every cycle
+///
+/// Fields below fall into two groups:
+/// - Stable for the node's whole lifetime, shared with services that are
+///   *not* restarted here (the pool-block-follower, heartbeat, and
+///   state-proof-worker threads spawned once in [`run`]): `ledger`,
+///   `pool`, `round_advanced` (the condvar those threads block on via
+///   `wait_for_round`/`round_notify` — see
+///   `algo_ledger::AgreementLedgerBridge::new_with_catchup_and_condvar`'s
+///   doc comment for why reusing the *same* `Arc<Condvar>` across rebuilds
+///   is required, not optional).
+/// - Rebuilt fresh every [`Self::resume`] call, mirroring what [`run`]
+///   built exactly once before this issue: the `AgreementNetworkBridge`
+///   (handler registration is last-write-wins per
+///   `algo_network::handler::Multiplexer::register_handlers`, so a fresh
+///   bridge's `start()` naturally supersedes the paused one's — no
+///   explicit `clear_handlers` needed), a fresh `ParticipationStore`
+///   handle + freshly-loaded signing secrets (participation keys can
+///   change on disk while paused), a fresh `BlockValidatorBridge` (its
+///   `prev_timestamp` is re-derived from whatever round the ledger is at
+///   *after* the catchup, not the round it was at before), a fresh
+///   `AsyncCryptoVerifier` (its worker threads are joined cleanly by its
+///   `Drop` impl when the old one is dropped), and a fresh
+///   `AgreementLedgerBridge`/`cert_rx`/`CatchupService` triple (the
+///   certificate channel is 1:1 with one `AgreementLedgerBridge`
+///   instance, so the pair must be rebuilt together).
+struct ParticipateAgreementControl {
+    ledger: Arc<Mutex<SqliteLedger>>,
+    ledger_path: PathBuf,
+    p2p_active_gossip_node: Arc<dyn GossipNode>,
+    gossip_node: Arc<WebsocketNetwork>,
+    rt_handle: tokio::runtime::Handle,
+    agreement_network_config: algo_network::AgreementNetworkConfig,
+    partkey_path: PathBuf,
+    resolved_genesis_id: String,
+    genesis_hash: [u8; 32],
+    pool: Arc<TransactionPool>,
+    round_advanced: Arc<std::sync::Condvar>,
+    participation_metrics: Arc<algo_agreement::ParticipationMetrics>,
+    enable_agreement_reporting: bool,
+    enable_agreement_time_metrics: bool,
+    network_mode: NetworkMode,
+    p2p_transport: Option<Arc<P2pTransport>>,
+    catchup_parallel_blocks: u64,
+    running: tokio::sync::Mutex<Option<RunningAgreementCycle>>,
+}
+
+impl ParticipateAgreementControl {
+    /// Build and start a fresh agreement `Service` + `CatchupService` pair,
+    /// exactly mirroring what [`run`] used to build inline exactly once
+    /// (see the removed "4. Build agreement bridges" / "5. Build and start
+    /// the catchup service" / "6. Build and start the agreement Service"
+    /// steps this replaces). Synchronous and potentially blocking (SQLite
+    /// opens, `Mutex::lock`s, and the two `Service::start`/
+    /// `CatchupService::start_with_parallelism` calls, which themselves
+    /// only spawn `std::thread`s and return promptly) — always called from
+    /// inside `spawn_blocking` by [`Self::resume`].
+    fn build_cycle(&self) -> anyhow::Result<RunningAgreementCycle> {
+        let agreement_network = AgreementNetworkBridge::new(
+            self.p2p_active_gossip_node.clone(),
+            self.rt_handle.clone(),
+            self.agreement_network_config.clone(),
+        );
+
+        let network_advancer: Arc<dyn NetworkAdvancer> = Arc::new(GossipNetworkAdvancer {
+            node: self.p2p_active_gossip_node.clone(),
+        });
+
+        // Reuse the SAME `round_advanced` condvar across every rebuild — the
+        // pool-block-follower/heartbeat/state-proof-worker threads (spawned
+        // once and never restarted) are blocked waiting on this exact
+        // `Arc<Condvar>` instance for the node's whole lifetime.
+        let (agreement_ledger, cert_rx) = AgreementLedgerBridge::new_with_catchup_and_condvar(
+            self.ledger.clone(),
+            network_advancer.clone(),
+            self.round_advanced.clone(),
+        );
+
+        let latest = {
+            let l = self.ledger.lock().expect("ledger lock poisoned");
+            l.current_round().0
+        };
+        let vote_round = Round(latest + 1);
+        let keys_round = {
+            let params_round = algo_agreement::params_round(vote_round);
+            let proto = {
+                let l = self.ledger.lock().expect("ledger lock poisoned");
+                l.get_block_header_data(params_round.0)
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| BlockHeader::decode_from_bytes(&bytes).ok())
+                    .map(|hdr| hdr.current_protocol)
+            };
+            match proto.and_then(|p| algo_types::consensus::consensus_params_for_version(&p)) {
+                Some(cp) => algo_agreement::balance_round(vote_round, &cp),
+                None => {
+                    warn!(
+                        round = params_round.0,
+                        "could not resolve consensus params for the balance-round lookback; \
+                         using the vote round as the keys round"
+                    );
+                    vote_round
+                }
+            }
+        };
+
+        let part_store = ParticipationStore::open(&self.partkey_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to (re)open participation key store at {}: {}",
+                self.partkey_path.display(),
+                e
+            )
+        })?;
+        let signing_keys = load_signing_keys_for_round(&part_store, vote_round, keys_round);
+        if signing_keys.is_empty() {
+            warn!(
+                vote_round = vote_round.0,
+                keys_round = keys_round.0,
+                "no participation signing secrets loaded — node will not produce valid proposals or votes"
+            );
+        } else {
+            info!(
+                accounts = signing_keys.len(),
+                vote_round = vote_round.0,
+                keys_round = keys_round.0,
+                "loaded participation signing secrets for consensus"
+            );
+        }
+        let key_manager = AgreementKeyManagerBridge::new(part_store);
+        let block_factory = BlockFactoryBridge::new(self.pool.clone());
+
+        let prev_timestamp: Option<i64> = {
+            let l = self.ledger.lock().expect("ledger lock poisoned");
+            let current = l.current_round().0;
+            if current > 0 {
+                l.get_block_header_data(current)
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| BlockHeader::decode_from_bytes(&bytes).ok())
+                    .map(|hdr| hdr.timestamp)
+            } else {
+                None
+            }
+        };
+        let block_validator: Arc<BlockValidatorBridge> = Arc::new(BlockValidatorBridge::new(
+            self.resolved_genesis_id.clone(),
+            self.genesis_hash,
+            prev_timestamp,
+        ));
+
+        let random_source = RealRandomSource;
+        let monitor = NoOpMonitor;
+
+        let crypto_ledger = Arc::new(AgreementLedgerBridge::new(self.ledger.clone()));
+        let crypto =
+            AsyncCryptoVerifier::new_with_validator(crypto_ledger, Arc::clone(&block_validator));
+
+        let catchup_bridge = Arc::new(AgreementLedgerBridge::new_with_advancer_and_condvar(
+            self.ledger.clone(),
+            network_advancer,
+            agreement_ledger.round_advanced_condvar(),
+        ));
+
+        let ws_block_fetcher: Arc<dyn BlockFetcher> = Arc::new(GossipBlockFetcher {
+            ws_network: self.gossip_node.clone(),
+            rt_handle: self.rt_handle.clone(),
+        });
+        let block_fetcher: Arc<dyn BlockFetcher> = match (&self.network_mode, &self.p2p_transport) {
+            (NetworkMode::P2pOnly, Some(p2p)) => Arc::new(P2pBlockFetcher {
+                p2p_transport: Arc::clone(p2p),
+                rt_handle: self.rt_handle.clone(),
+            }),
+            (NetworkMode::Hybrid, Some(p2p)) => Arc::new(FallbackBlockFetcher {
+                primary: Arc::new(P2pBlockFetcher {
+                    p2p_transport: Arc::clone(p2p),
+                    rt_handle: self.rt_handle.clone(),
+                }),
+                secondary: ws_block_fetcher,
+            }),
+            _ => ws_block_fetcher,
+        };
+        let catchup_ledger: Arc<dyn algo_ledger::CatchupLedger> = catchup_bridge;
+        let catchup_service = CatchupService::start_with_parallelism(
+            cert_rx,
+            catchup_ledger,
+            block_fetcher,
+            self.catchup_parallel_blocks,
+        );
+        info!("catchup service (re)started");
+
+        let crash_db = open_crash_db(&self.ledger_path)?;
+        let params = Parameters {
+            network: agreement_network,
+            ledger: agreement_ledger,
+            key_manager,
+            block_factory,
+            block_validator,
+            random_source,
+            monitor,
+            crypto,
+            clock: SystemClock::new(),
+            crash_db: Some(crash_db),
+            signing_keys,
+        };
+        let agreement_tracer = algo_agreement::Tracer::new(
+            self.enable_agreement_reporting,
+            self.enable_agreement_time_metrics,
+        );
+        let service = Service::new(params)
+            .with_metrics(self.participation_metrics.clone())
+            .with_tracer(agreement_tracer);
+        let handle = service.start();
+        info!(
+            genesis_id = %self.resolved_genesis_id,
+            latest_round = latest,
+            "consensus participation (re)started"
+        );
+
+        Ok(RunningAgreementCycle {
+            handle,
+            catchup_service,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::live_catchup::NormalSyncControl for ParticipateAgreementControl {
+    async fn pause(&self) {
+        let mut guard = self.running.lock().await;
+        if let Some(cycle) = guard.take() {
+            // `ServiceHandle::shutdown`/`CatchupService::stop` join real OS
+            // threads — run them on a blocking-pool thread so this doesn't
+            // stall the tokio runtime the REST server and `LiveCatchupManager`
+            // share.
+            let joined = tokio::task::spawn_blocking(move || {
+                let RunningAgreementCycle {
+                    handle,
+                    mut catchup_service,
+                } = cycle;
+                // Mirrors `run`'s original shutdown order: agreement service
+                // before catchup service, so no new certificates are handed
+                // to catchup after it stops.
+                handle.shutdown();
+                catchup_service.stop();
+            })
+            .await;
+            if let Err(e) = joined {
+                warn!(error = %e, "agreement pause: shutdown task panicked");
+            }
+            info!("consensus participation paused for live catchpoint catchup");
+        }
+    }
+
+    async fn resume(&self) {
+        let mut guard = self.running.lock().await;
+        if guard.is_some() {
+            return;
+        }
+        // `build_cycle` does blocking SQLite/mutex work; run it off the
+        // tokio runtime like `pause`'s shutdown does.
+        let this = self.clone_for_rebuild();
+        let built = tokio::task::spawn_blocking(move || this.build_cycle()).await;
+        match built {
+            Ok(Ok(cycle)) => {
+                *guard = Some(cycle);
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "failed to resume consensus participation after live catchpoint catchup");
+            }
+            Err(e) => {
+                warn!(error = %e, "agreement resume: build task panicked");
+            }
+        }
+    }
+}
+
+impl ParticipateAgreementControl {
+    /// A cheap `Arc`-cloning "clone" of the fields `build_cycle` needs, so
+    /// `resume` can move a self-contained value into `spawn_blocking`
+    /// without requiring `ParticipateAgreementControl` itself (which holds
+    /// the non-`Clone` `running` mutex) to be `Clone`.
+    fn clone_for_rebuild(&self) -> Self {
+        Self {
+            ledger: self.ledger.clone(),
+            ledger_path: self.ledger_path.clone(),
+            p2p_active_gossip_node: self.p2p_active_gossip_node.clone(),
+            gossip_node: self.gossip_node.clone(),
+            rt_handle: self.rt_handle.clone(),
+            agreement_network_config: self.agreement_network_config.clone(),
+            partkey_path: self.partkey_path.clone(),
+            resolved_genesis_id: self.resolved_genesis_id.clone(),
+            genesis_hash: self.genesis_hash,
+            pool: self.pool.clone(),
+            round_advanced: self.round_advanced.clone(),
+            participation_metrics: self.participation_metrics.clone(),
+            enable_agreement_reporting: self.enable_agreement_reporting,
+            enable_agreement_time_metrics: self.enable_agreement_time_metrics,
+            network_mode: self.network_mode,
+            p2p_transport: self.p2p_transport.clone(),
+            catchup_parallel_blocks: self.catchup_parallel_blocks,
+            running: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -2507,6 +2877,26 @@ fn open_crash_db(ledger_path: &Path) -> anyhow::Result<rusqlite::Connection> {
     Ok(conn)
 }
 
+/// A REST peer to fetch catchpoint files and blocks from for a live
+/// `POST /v2/catchup/:catchpoint` request (issue #940).
+///
+/// go-algorand's `CatchpointCatchupService` fetches over the same gossip
+/// network `--peers` already connects to; algod-rust's catchup path
+/// (`algo_ledger::sync::SyncOrchestrator`, shared with the standalone
+/// `catchpoint_sync`/`sync` subcommand and `node start --follow`'s live
+/// catchup wiring — issue #937) fetches over REST instead, so a
+/// participating node — which otherwise has no REST peer configured at
+/// all — needs one explicitly. `url: None` (the default) leaves
+/// `start_catchup`/`abort_catchup` reporting `NotImplemented`, exactly as
+/// before this issue.
+#[derive(Debug, Default, Clone)]
+pub struct CatchupPeerOptions {
+    /// `--catchup-peer`.
+    pub url: Option<String>,
+    /// `--catchup-peer-token`.
+    pub token: String,
+}
+
 /// CLI overrides for the networking `config.json` fields wired into
 /// `algo-network` (issue #748). Each `None` means "not explicitly passed
 /// on the CLI" — the loaded `algo_config::Local` value applies instead
@@ -3155,6 +3545,7 @@ pub async fn run(
     network_opts: NetworkOptions,
     node_config: algo_config::Local,
     dns_bootstrap_override: Option<&str>,
+    catchup_opts: CatchupPeerOptions,
 ) -> anyhow::Result<()> {
     // Load `<data_dir>/consensus.json` (if present) and merge it onto the
     // built-in consensus table, exactly like `node.rs`'s `run_node` already
@@ -3303,11 +3694,20 @@ pub async fn run(
 
     let ledger = Arc::new(Mutex::new(sqlite_ledger));
 
-    // Open the agreement crash recovery database alongside the ledger.
-    // Without this, agreement state is never persisted before votes are
-    // broadcast, so a crash-restart could cause equivocation. Mirrors Go's
+    // Open (and immediately close) the agreement crash recovery database
+    // alongside the ledger, purely to fail fast at startup if it can't be
+    // opened (e.g. a permissions problem) rather than only discovering that
+    // once the agreement service actually starts. Without a working crash
+    // db, agreement state is never persisted before votes are broadcast, so
+    // a crash-restart could cause equivocation. Mirrors Go's
     // `node/node.go:305-323`. See [[DOC-21]] §3.7.
-    let crash_db = open_crash_db(ledger_path)?;
+    //
+    // The real, long-lived connection used by the agreement service is
+    // opened fresh on every `ParticipateAgreementControl::build_cycle` call
+    // (issue #940) — a live catchpoint-catchup pause/resume tears the
+    // agreement `Service` down and rebuilds it, and `Parameters::crash_db`
+    // is consumed by `Service::start`, so each cycle needs its own handle.
+    drop(open_crash_db(ledger_path)?);
 
     // -----------------------------------------------------------------------
     // 2. Open the participation key store.
@@ -3616,7 +4016,9 @@ pub async fn run(
     // checks pool occupancy rather than a separate backlog-queue depth (see
     // that module's doc comment for why).
     let app_rate_limiter_congestion_threshold = ((PoolConfig::default().pool_size as f64)
-        * (node_config.tx_backlog_app_rate_limiting_congestion_pct.max(0) as f64)
+        * (node_config
+            .tx_backlog_app_rate_limiting_congestion_pct
+            .max(0) as f64)
         / 100.0) as usize;
     // Serve blocks to peers, both over HTTP (`/v1/{genesisID}/block/{round}`)
     // and over gossip (`UniEnsBlockReq`). Registered before `start_arc()` so
@@ -3702,8 +4104,10 @@ pub async fn run(
         None
     };
     let stateproof_runtime = stateproof_sig_conn.as_ref().map(|sig_conn| {
-        let (handler, runtime) =
-            crate::commands::stateproof_service::build_handler(ledger.clone(), Arc::clone(sig_conn));
+        let (handler, runtime) = crate::commands::stateproof_service::build_handler(
+            ledger.clone(),
+            Arc::clone(sig_conn),
+        );
         gossip_handlers.push(handler);
         runtime
     });
@@ -3953,6 +4357,77 @@ pub async fn run(
     // agreement service will later write to (`Service::with_metrics` below).
     let participation_metrics = Arc::new(algo_agreement::ParticipationMetrics::new());
 
+    // -----------------------------------------------------------------------
+    // 3d. Build the `ParticipateAgreementControl` (issue #940) — the
+    //     pause/resume handle for the live agreement `Service` +
+    //     `CatchupService` pair. Built here, before the REST adapter below,
+    //     because `with_catchup_manager` (like `with_pool`/`with_broadcaster`
+    //     etc.) has to be attached before the adapter is frozen into an
+    //     `Arc` and handed to `ApiServer::serve`. The agreement/catchup pair
+    //     itself isn't started yet — that happens via `resume()` once the
+    //     REST server is up, in the same place `Service::start()` used to
+    //     run inline.
+    // -----------------------------------------------------------------------
+    let rt_handle = tokio::runtime::Handle::current();
+    let agreement_network_config = algo_network::AgreementNetworkConfig {
+        vote_queue_len: node_config.agreement_incoming_votes_queue_length as usize,
+        proposal_queue_len: node_config.agreement_incoming_proposals_queue_length as usize,
+        bundle_queue_len: node_config.agreement_incoming_bundles_queue_length as usize,
+    };
+    // Stable for the node's whole lifetime — shared with the
+    // pool-block-follower/heartbeat/state-proof-worker threads spawned
+    // once below, which are never restarted by a pause/resume cycle. See
+    // `ParticipateAgreementControl`'s doc comment.
+    let round_advanced = Arc::new(std::sync::Condvar::new());
+    let agreement_control = Arc::new(ParticipateAgreementControl {
+        ledger: ledger.clone(),
+        ledger_path: ledger_path.to_path_buf(),
+        p2p_active_gossip_node: p2p_active_gossip_node.clone(),
+        gossip_node: gossip_node.clone(),
+        rt_handle: rt_handle.clone(),
+        agreement_network_config,
+        partkey_path: partkey_path.to_path_buf(),
+        resolved_genesis_id: resolved_genesis_id.clone(),
+        genesis_hash,
+        pool: pool.clone(),
+        round_advanced: round_advanced.clone(),
+        participation_metrics: participation_metrics.clone(),
+        enable_agreement_reporting: node_config.enable_agreement_reporting,
+        enable_agreement_time_metrics: node_config.enable_agreement_time_metrics,
+        network_mode,
+        p2p_transport: p2p_transport.clone(),
+        catchup_parallel_blocks: node_config.catchup_parallel_blocks,
+        running: tokio::sync::Mutex::new(None),
+    });
+
+    // Live catchpoint-catchup mode (issue #940): only meaningful with a REST
+    // peer to fetch the catchpoint/blocks from — see `CatchupPeerOptions`'s
+    // doc comment for why `participate` needs this explicitly (unlike
+    // `node start --follow`, which already has one). Also skipped on an
+    // archival node, mirroring go's own refusal
+    // (`AlgorandFullNode.StartCatchup`) and `node.rs`'s `--follow` wiring.
+    let catchup_manager = match catchup_opts.url.as_deref() {
+        Some(url) if !node_config.archival => {
+            let live_catchup_params = crate::live_catchup::LiveCatchupParams {
+                algod_url: url.to_string(),
+                algod_token: catchup_opts.token.clone(),
+                db_path: ledger_path.to_path_buf(),
+                genesis_id: resolved_genesis_id.clone(),
+                genesis_hash,
+                concurrency: 8,
+                catchpoint_peer_urls: Vec::new(),
+            };
+            let runner = Arc::new(crate::live_catchup::OrchestratorCatchupRunner::new(
+                live_catchup_params,
+            ));
+            Some(crate::live_catchup::LiveCatchupManager::new(
+                runner,
+                agreement_control.clone() as Arc<dyn crate::live_catchup::NormalSyncControl>,
+            ))
+        }
+        _ => None,
+    };
+
     let default_data_dir = ledger_path.parent().map(Path::to_path_buf);
     let rest_cfg = rest_opts.resolve(default_data_dir.as_deref())?;
     let rest_server_handle = if let Some(cfg) = rest_cfg {
@@ -4001,6 +4476,9 @@ pub async fn run(
         if let Some(capacity) = cfg.async_backlog_size {
             adapter = adapter.with_async_backlog_capacity(capacity);
         }
+        if let Some(mgr) = &catchup_manager {
+            adapter = adapter.with_catchup_manager(mgr.clone());
+        }
         let node = Arc::new(adapter);
 
         let api_config = ApiServerConfig {
@@ -4038,217 +4516,15 @@ pub async fn run(
     };
 
     // -----------------------------------------------------------------------
-    // 4. Build agreement bridges.
+    // 4/5/6. Build and start the agreement `Service` + `CatchupService` pair
+    // (issue #940). What used to be built inline exactly once here now
+    // lives in `ParticipateAgreementControl::build_cycle` (called by
+    // `resume()` below) so a live catchpoint catchup can later pause
+    // (`ParticipateAgreementControl::pause`, called from
+    // `LiveCatchupManager::start_catchup`) and resume the exact same pair
+    // without restarting this whole function.
     // -----------------------------------------------------------------------
-
-    // Network bridge: wraps GossipNode for agreement message passing.
-    // Uses `p2p_active_gossip_node` so proposals/votes/bundles flow over
-    // whichever transport(s) `network_mode` has active (#559) — in
-    // `WsOnly` mode this is exactly `gossip_node`, unchanged from before.
-    let rt_handle = tokio::runtime::Handle::current();
-    // `AgreementIncomingVotesQueueLength`/`...ProposalsQueueLength`/
-    // `...BundlesQueueLength` (issue #755): threaded from `node_config`
-    // rather than left at `AgreementNetworkConfig::default()`.
-    let agreement_network_config = algo_network::AgreementNetworkConfig {
-        vote_queue_len: node_config.agreement_incoming_votes_queue_length as usize,
-        proposal_queue_len: node_config.agreement_incoming_proposals_queue_length as usize,
-        bundle_queue_len: node_config.agreement_incoming_bundles_queue_length as usize,
-    };
-    let agreement_network = AgreementNetworkBridge::new(
-        p2p_active_gossip_node.clone(),
-        rt_handle.clone(),
-        agreement_network_config,
-    );
-
-    // Network advancer: wraps the active gossip node(s) so the ledger
-    // bridge can signal network progress when certificates arrive.
-    let network_advancer: Arc<dyn NetworkAdvancer> = Arc::new(GossipNetworkAdvancer {
-        node: p2p_active_gossip_node.clone(),
-    });
-
-    // Ledger bridge: wraps SqliteLedger for agreement read/write access.
-    // Uses `new_with_catchup` to enable the certificate-driven catchup path.
-    // The returned `cert_rx` is consumed by the CatchupService below.
-    let (agreement_ledger, cert_rx) =
-        AgreementLedgerBridge::new_with_catchup(ledger.clone(), network_advancer.clone());
-
-    // Load the actual signing secrets (VRF + OTS) before the store is moved
-    // into the key-manager bridge. The bridge only exposes public voting
-    // records; the pseudonode needs the secrets to sign proposals/votes.
-    //
-    // Select for the next round to produce (`latest + 1`) using the same
-    // online-stake lookback round (`balance_round`) the pseudonode passes to
-    // `voting_keys`, resolved from the protocol governing that round's params
-    // (`params_round`). Matching both rounds means the secrets loaded here line
-    // up exactly with the public records the agreement will sign under.
-    let vote_round = Round(latest + 1);
-    let keys_round = {
-        let params_round = algo_agreement::params_round(vote_round);
-        let proto = {
-            let l = ledger.lock().expect("ledger lock");
-            l.get_block_header_data(params_round.0)
-                .ok()
-                .flatten()
-                .and_then(|bytes| BlockHeader::decode_from_bytes(&bytes).ok())
-                .map(|hdr| hdr.current_protocol)
-        };
-        match proto.and_then(|p| algo_types::consensus::consensus_params_for_version(&p)) {
-            Some(cp) => algo_agreement::balance_round(vote_round, &cp),
-            None => {
-                warn!(
-                    round = params_round.0,
-                    "could not resolve consensus params for the balance-round lookback; \
-                     using the vote round as the keys round"
-                );
-                vote_round
-            }
-        }
-    };
-    let signing_keys = load_signing_keys_for_round(&part_store, vote_round, keys_round);
-    if signing_keys.is_empty() {
-        warn!(
-            vote_round = vote_round.0,
-            keys_round = keys_round.0,
-            "no participation signing secrets loaded — node will not produce valid proposals or votes"
-        );
-    } else {
-        info!(
-            accounts = signing_keys.len(),
-            vote_round = vote_round.0,
-            keys_round = keys_round.0,
-            "loaded participation signing secrets for consensus"
-        );
-    }
-
-    // Key manager bridge: wraps ParticipationStore for voting key lookups.
-    let key_manager = AgreementKeyManagerBridge::new(part_store);
-
-    // Block factory bridge: wraps TransactionPool for block assembly.
-    let block_factory = BlockFactoryBridge::new(pool.clone());
-
-    // Block validator bridge: wraps algo-validate for incoming block checks.
-    // Extract the timestamp from the latest committed block header so the
-    // validator can enforce the MaxTimestampIncrement constraint.
-    let prev_timestamp: Option<i64> = {
-        let l = ledger.lock().expect("ledger lock");
-        let current = l.current_round().0;
-        if current > 0 {
-            match l.get_block_header_data(current) {
-                Ok(Some(hdr_bytes)) => match BlockHeader::decode_from_bytes(&hdr_bytes) {
-                    Ok(hdr) => {
-                        info!(
-                            round = current,
-                            timestamp = hdr.timestamp,
-                            "extracted previous block timestamp"
-                        );
-                        Some(hdr.timestamp)
-                    }
-                    Err(e) => {
-                        warn!(round = current, error = %e, "failed to decode block header for timestamp; skipping timestamp validation");
-                        None
-                    }
-                },
-                Ok(None) => {
-                    warn!(
-                        round = current,
-                        "no block header data found; skipping timestamp validation"
-                    );
-                    None
-                }
-                Err(e) => {
-                    warn!(round = current, error = %e, "failed to read block header data; skipping timestamp validation");
-                    None
-                }
-            }
-        } else {
-            // Round 0 (genesis) — no previous timestamp needed.
-            None
-        }
-    };
-    // A single shared BlockValidatorBridge is used by both the Parameters
-    // (demux loop / ensure action) and the AsyncCryptoVerifier (proposal
-    // verification). This mirrors Go where the same BlockValidator is passed
-    // to both. Sharing ensures that `set_prev_timestamp` updates made in
-    // `do_ensure_action` are visible to the crypto verifier's proposal
-    // validation, keeping timestamp validation accurate.
-    let block_validator: Arc<BlockValidatorBridge> = Arc::new(BlockValidatorBridge::new(
-        resolved_genesis_id.clone(),
-        genesis_hash,
-        prev_timestamp,
-    ));
-
-    // Real random source backed by the OS CSPRNG; no-op monitor.
-    let random_source = RealRandomSource;
-    let monitor = NoOpMonitor;
-
-    // Real crypto verifier backed by the agreement ledger bridge.
-    // This verifies VRF credentials and OTS signatures on incoming votes
-    // and bundles, rather than blindly accepting them.
-    //
-    // The block validator is also threaded into the crypto verifier so that
-    // proposal verification validates the block eagerly and caches the
-    // `ValidatedBlock` — mirroring Go's `makeCryptoVerifier(l, v, ...)`.
-    let crypto_ledger = Arc::new(AgreementLedgerBridge::new(ledger.clone()));
-    let crypto =
-        AsyncCryptoVerifier::new_with_validator(crypto_ledger, Arc::clone(&block_validator));
-
-    // -----------------------------------------------------------------------
-    // 5. Build and start the catchup service.
-    // -----------------------------------------------------------------------
-    // The catchup service runs a background thread that receives certificates
-    // from the agreement service (via `cert_rx`) and fetches the corresponding
-    // blocks from peers when the ledger doesn't have them yet.
-    //
-    // The catchup bridge is a separate `AgreementLedgerBridge` wrapping the
-    // same underlying `SqliteLedger`. It only needs `ensure_block` to commit
-    // fetched blocks, and shares the same ledger mutex so commits are visible
-    // to the agreement service immediately.
-    let catchup_bridge = Arc::new(AgreementLedgerBridge::new_with_advancer_and_condvar(
-        ledger.clone(),
-        network_advancer,
-        agreement_ledger.round_advanced_condvar(),
-    ));
-
-    // Issue #591: which transport(s) `CatchupService` fetches missed
-    // blocks+certs from must track `network_mode` exactly the same way the
-    // live agreement traffic routing (`p2p_active_gossip_node`, above) does
-    // — `P2pOnly` has no WS-gossip peers at all (`WebsocketNetwork::get_unicast_peers()`
-    // is always empty), so `GossipBlockFetcher` alone left a `P2pOnly` node
-    // with zero fault tolerance against a single missed live-agreement
-    // round. `Hybrid` prefers the P2P fetch path (the transport its
-    // agreement traffic actually flows over) but keeps WS-gossip as a
-    // fallback.
-    let ws_block_fetcher: Arc<dyn BlockFetcher> = Arc::new(GossipBlockFetcher {
-        ws_network: gossip_node.clone(),
-        rt_handle: rt_handle.clone(),
-    });
-    let block_fetcher: Arc<dyn BlockFetcher> = match (&network_mode, &p2p_transport) {
-        (NetworkMode::P2pOnly, Some(p2p)) => Arc::new(P2pBlockFetcher {
-            p2p_transport: Arc::clone(p2p),
-            rt_handle: rt_handle.clone(),
-        }),
-        (NetworkMode::Hybrid, Some(p2p)) => Arc::new(FallbackBlockFetcher {
-            primary: Arc::new(P2pBlockFetcher {
-                p2p_transport: Arc::clone(p2p),
-                rt_handle: rt_handle.clone(),
-            }),
-            secondary: ws_block_fetcher,
-        }),
-        _ => ws_block_fetcher,
-    };
-
-    let catchup_ledger: Arc<dyn algo_ledger::CatchupLedger> = catchup_bridge;
-
-    // Issue #753: honor `CatchupParallelBlocks` (go default 16 at v5) for
-    // the live periodic catchup path's fetch concurrency, rather than the
-    // hardcoded serial behavior `CatchupService::start` used before.
-    let mut catchup_service = CatchupService::start_with_parallelism(
-        cert_rx,
-        catchup_ledger,
-        block_fetcher,
-        node_config.catchup_parallel_blocks,
-    );
-    info!("catchup service started");
+    agreement_control.resume().await;
 
     // -----------------------------------------------------------------------
     // Pool block follower.
@@ -4268,7 +4544,11 @@ pub async fn run(
     // `run_pool_block_follower`'s doc comment for why the original
     // sleep-then-check polling fell behind under sustained load (issue #492).
     let pool_follower_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let pool_follower_round_advanced = agreement_ledger.round_advanced_condvar();
+    // Issue #940: this is the same `Arc<Condvar>` every agreement
+    // pause/resume cycle's `AgreementLedgerBridge` reuses (see
+    // `ParticipateAgreementControl::build_cycle`), so this thread keeps
+    // waking correctly across a live catchpoint catchup's pause/resume.
+    let pool_follower_round_advanced = round_advanced.clone();
     let pool_follower = {
         let pool = pool.clone();
         let ledger = ledger.clone();
@@ -4354,38 +4634,8 @@ pub async fn run(
         None
     };
 
-    // -----------------------------------------------------------------------
-    // 6. Build and start the agreement Service.
-    // -----------------------------------------------------------------------
-    let params = Parameters {
-        network: agreement_network,
-        ledger: agreement_ledger,
-        key_manager,
-        block_factory,
-        block_validator,
-        random_source,
-        monitor,
-        crypto,
-        clock: SystemClock::new(),
-        crash_db: Some(crash_db),
-        signing_keys,
-    };
-
-    // `EnableAgreementReporting`/`EnableAgreementTimeMetrics` (issue #755):
-    // threaded into `Tracer::new` rather than left at `Tracer::default()`
-    // (always false/false).
-    let agreement_tracer = algo_agreement::Tracer::new(
-        node_config.enable_agreement_reporting,
-        node_config.enable_agreement_time_metrics,
-    );
-    let service = Service::new(params)
-        .with_metrics(participation_metrics.clone())
-        .with_tracer(agreement_tracer);
-    let handle = service.start();
-
     info!(
         genesis_id = %resolved_genesis_id,
-        latest_round = latest,
         "consensus participation active -- press Ctrl+C to stop"
     );
 
@@ -4406,9 +4656,10 @@ pub async fn run(
     // Stop the agreement service first, then the catchup service (mirrors
     // Go's shutdown order where the agreement service is stopped before the
     // catchup service, ensuring no new certificates are sent after the
-    // catchup service shuts down).
-    handle.shutdown();
-    catchup_service.stop();
+    // catchup service shuts down). `ParticipateAgreementControl::pause`
+    // (issue #940) does exactly this ordering internally; a no-op if a live
+    // catchpoint catchup has already paused it.
+    agreement_control.pause().await;
     pool_follower_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = pool_follower.join();
     heartbeat_service_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -9304,5 +9555,150 @@ mod tests {
         // Cleanup. Drop conn first so SQLite releases its file handles.
         drop(conn);
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ── ParticipateAgreementControl (issue #940) ─────────────────────
+
+    /// Builds a `ParticipateAgreementControl` wired against a real
+    /// in-memory ledger, a real (never-started, so no network I/O)
+    /// `WebsocketNetwork`, a real `TransactionPool`, and a fresh temp-file
+    /// `ParticipationStore`/crash-db directory — everything
+    /// `build_cycle`/`pause`/`resume` touch is real, matching production
+    /// wiring, except the network stays offline (no listener bound, no
+    /// peers dialed) since these tests only exercise the agreement
+    /// `Service`'s own start/stop lifecycle, not wire traffic.
+    fn test_agreement_control() -> (ParticipateAgreementControl, PathBuf) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-agreement-control-test-{}-{}",
+            std::process::id(),
+            nonce,
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+        let ledger_path = tmp_dir.join("ledger");
+        let partkey_path = tmp_dir.join("partkeys.sqlite");
+
+        let ledger = test_ledger();
+        let pool = Arc::new(TransactionPool::new(
+            PoolConfig::default(),
+            Arc::new(PoolLedgerAdapter::new(ledger.clone()))
+                as Arc<dyn algo_pool::traits::PoolLedger>,
+        ));
+        let phonebook = Arc::new(Phonebook::new(0, Duration::from_secs(60)));
+        let gossip_node = Arc::new(WebsocketNetwork::new(
+            WebsocketNetworkConfig::default(),
+            phonebook,
+        ));
+        let part_store = ParticipationStore::open(&partkey_path).expect("open partkey store");
+        drop(part_store);
+
+        let control = ParticipateAgreementControl {
+            ledger,
+            ledger_path: ledger_path.clone(),
+            p2p_active_gossip_node: gossip_node.clone() as Arc<dyn GossipNode>,
+            gossip_node,
+            rt_handle: tokio::runtime::Handle::current(),
+            agreement_network_config: algo_network::AgreementNetworkConfig::default(),
+            partkey_path,
+            resolved_genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            pool,
+            round_advanced: Arc::new(std::sync::Condvar::new()),
+            participation_metrics: Arc::new(algo_agreement::ParticipationMetrics::new()),
+            enable_agreement_reporting: false,
+            enable_agreement_time_metrics: false,
+            network_mode: NetworkMode::WsOnly,
+            p2p_transport: None,
+            catchup_parallel_blocks: 4,
+            running: tokio::sync::Mutex::new(None),
+        };
+        (control, tmp_dir)
+    }
+
+    /// TDD anchor for issue #940: `resume()` must actually start a live
+    /// agreement `Service` + `CatchupService` pair (not silently do
+    /// nothing), and `pause()` must cleanly stop it, leaving the control
+    /// idle again — mirroring `LiveCatchupManager::start_catchup`/the
+    /// `drive` cleanup path pausing/resuming a `NormalSyncControl`
+    /// (`live_catchup.rs`).
+    #[tokio::test]
+    async fn resume_starts_a_cycle_and_pause_cleanly_stops_it() {
+        let (control, tmp_dir) = test_agreement_control();
+
+        assert!(control.running.lock().await.is_none(), "must start idle");
+
+        control.resume().await;
+        assert!(
+            control.running.lock().await.is_some(),
+            "resume() must start a running agreement cycle"
+        );
+
+        control.pause().await;
+        assert!(
+            control.running.lock().await.is_none(),
+            "pause() must fully stop the cycle and clear the running state"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// `resume()` must be a no-op when a cycle is already running — mirrors
+    /// `NormalSyncControl::resume`'s doc contract ("A no-op if it's already
+    /// running") that `LiveCatchupManager` and `node.rs`'s
+    /// `FollowLoopControl` both already rely on.
+    #[tokio::test]
+    async fn resume_is_a_no_op_when_already_running() {
+        let (control, tmp_dir) = test_agreement_control();
+
+        control.resume().await;
+        assert!(control.running.lock().await.is_some());
+
+        // A second resume() must not replace (or duplicate) the running
+        // cycle.
+        control.resume().await;
+        assert!(control.running.lock().await.is_some());
+
+        control.pause().await;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// `pause()` must be a no-op (not panic) when nothing is running —
+    /// mirrors `NormalSyncControl::pause`'s implicit contract and the
+    /// shutdown path in `run()` calling `agreement_control.pause().await`
+    /// unconditionally even when a live catchpoint catchup already paused
+    /// it.
+    #[tokio::test]
+    async fn pause_is_a_no_op_when_nothing_is_running() {
+        let (control, tmp_dir) = test_agreement_control();
+        control.pause().await;
+        assert!(control.running.lock().await.is_none());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// The full pause -> resume cycle must be safely repeatable multiple
+    /// times in a row against the *same* control instance and the *same*
+    /// underlying ledger — the exact shape a live catchpoint catchup drives
+    /// it through repeatedly across a node's lifetime (`start_catchup`
+    /// pauses, the catchup finishes or is aborted, `drive`'s cleanup
+    /// resumes; a later `start_catchup` repeats this). Each `build_cycle`
+    /// call constructs entirely fresh bridge/service instances (see
+    /// `ParticipateAgreementControl`'s doc comment), so this is the
+    /// regression guard that repeating that construct/destroy cycle never
+    /// panics, hangs, or leaves the control wedged.
+    #[tokio::test]
+    async fn pause_resume_cycle_repeats_safely_multiple_times() {
+        let (control, tmp_dir) = test_agreement_control();
+
+        for _ in 0..3 {
+            control.resume().await;
+            assert!(control.running.lock().await.is_some());
+            control.pause().await;
+            assert!(control.running.lock().await.is_none());
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

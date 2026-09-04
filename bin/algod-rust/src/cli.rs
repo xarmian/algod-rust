@@ -696,6 +696,25 @@ pub enum Commands {
         /// `observe` (issue #748).
         #[arg(long)]
         dns_bootstrap: Option<String>,
+
+        /// REST URL of a peer to fetch catchpoint files and blocks from
+        /// for a live `POST /v2/catchup/:catchpoint` request (issue #940).
+        ///
+        /// Unlike go-algorand's `CatchpointCatchupService` (which fetches
+        /// over the same gossip network `--peers` already connects to),
+        /// algod-rust's catchup path (`algo_ledger::sync::SyncOrchestrator`,
+        /// shared with the standalone `catchpoint_sync`/`sync` subcommand
+        /// and `node start --follow`'s live-catchup wiring, issue #937)
+        /// fetches over REST, so a participating node needs an explicit
+        /// REST peer to catch up *from*. Without this flag,
+        /// `start_catchup`/`abort_catchup` report `NotImplemented`, exactly
+        /// as before this issue.
+        #[arg(long)]
+        catchup_peer: Option<String>,
+
+        /// Auth token for `--catchup-peer`.
+        #[arg(long, default_value = DEFAULT_TOKEN)]
+        catchup_peer_token: String,
     },
 
     /// Follow mode: continuously validate new blocks as they arrive.
