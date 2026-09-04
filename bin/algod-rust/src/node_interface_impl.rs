@@ -2441,7 +2441,11 @@ impl AlgodNodeInterface {
                     })
                     .collect(),
             ),
-            extra_box_refs: None,
+            // Mirrors go-algorand's `ResourceTracker.NumEmptyBoxRefs`
+            // (`ledger/simulation/resources.go`): the number of additional
+            // box refs suggested purely for I/O-budget/anonymous-access
+            // reasons, distinct from the concrete `boxes` suggestions above.
+            extra_box_refs: Self::opt_nonzero_u64(unnamed.num_empty_box_refs as u64),
         }
     }
 
@@ -2970,6 +2974,22 @@ mod tests {
         let locals = model.app_locals.expect("app locals present");
         assert_eq!(locals[0].account, addr.to_string());
         assert_eq!(locals[0].app, 9);
+    }
+
+    /// Issue #970: `num_empty_box_refs` (go-algorand's
+    /// `ResourceTracker.NumEmptyBoxRefs`) must surface as the REST model's
+    /// `extra-box-refs` field, previously hardcoded to `None` regardless of
+    /// the underlying simulation engine's tracked count.
+    #[test]
+    fn unnamed_resources_to_model_surfaces_extra_box_refs() {
+        use algo_ledger::simulation::UnnamedResourcesAccessed;
+
+        let unnamed = UnnamedResourcesAccessed {
+            num_empty_box_refs: 3,
+            ..Default::default()
+        };
+        let model = AlgodNodeInterface::unnamed_resources_to_model(&unnamed);
+        assert_eq!(model.extra_box_refs, Some(3));
     }
 
     #[test]

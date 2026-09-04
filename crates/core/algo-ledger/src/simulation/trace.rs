@@ -312,21 +312,58 @@ pub struct UnnamedResourcesAccessed {
     /// App local states `(account, app)` whose halves are named but never by
     /// the same transaction.
     pub app_locals: BTreeSet<(Address, u64)>,
+    /// Number of additional empty box refs the group should add to satisfy
+    /// I/O-budget requirements (or to reach a box owned by an app created
+    /// during this simulation, which has no stable, resubmittable ID) --
+    /// distinct from [`Self::boxes`], which suggests concrete `(app_id,
+    /// name)` refs. Mirrors go-algorand's `ResourceTracker.NumEmptyBoxRefs`
+    /// (`ledger/simulation/resources.go`, `1088a2aad7e` / `v3.18.0-beta`).
+    pub num_empty_box_refs: usize,
+    /// Largest number of additional new accounts the group could still
+    /// accept beyond what is already named, computed from the submitted
+    /// group's txn types and named reference-array lengths. Mirrors
+    /// go-algorand's `ResourceTracker.MaxAccounts`
+    /// (`makeGlobalResourceTracker`, `ledger/simulation/resources.go`).
+    pub max_accounts: usize,
+    /// Largest number of additional new assets the group could still accept.
+    /// Mirrors go-algorand's `ResourceTracker.MaxAssets`.
+    pub max_assets: usize,
+    /// Largest number of additional new apps the group could still accept.
+    /// Mirrors go-algorand's `ResourceTracker.MaxApps`.
+    pub max_apps: usize,
+    /// Largest number of additional new box refs the group could still
+    /// accept. Mirrors go-algorand's `ResourceTracker.MaxBoxes`.
+    pub max_boxes: usize,
+    /// Largest number of additional new references of any kind the group
+    /// could still accept. Mirrors go-algorand's
+    /// `ResourceTracker.MaxTotalRefs`.
+    pub max_total_refs: usize,
+    /// Largest number of additional asset-holding/app-local cross-product
+    /// references the group could still accept. Mirrors go-algorand's
+    /// `ResourceTracker.MaxCrossProductReferences`.
+    pub max_cross_product_references: usize,
 }
 
 impl UnnamedResourcesAccessed {
     /// Whether any unnamed resource was recorded (go-algorand's
-    /// `HasResources`).
+    /// `HasResources`). The `Max*`/`MaxCrossProductReferences` capacity
+    /// fields are excluded, matching go's own `HasResources`, which never
+    /// consults them either.
     pub fn has_resources(&self) -> bool {
         !(self.accounts.is_empty()
             && self.assets.is_empty()
             && self.apps.is_empty()
             && self.boxes.is_empty()
             && self.asset_holdings.is_empty()
-            && self.app_locals.is_empty())
+            && self.app_locals.is_empty()
+            && self.num_empty_box_refs == 0)
     }
 
-    /// Merge another set of accesses into this one.
+    /// Merge another set of accesses into this one. `Max*` capacity fields
+    /// are group-level constants (see [`Self::set_capacity_fields`]), not
+    /// per-transaction accumulations, so they are left untouched here --
+    /// callers compute and assign them once, after merging every
+    /// transaction's accesses.
     pub fn merge(&mut self, other: UnnamedResourcesAccessed) {
         self.accounts.extend(other.accounts);
         self.assets.extend(other.assets);
@@ -334,6 +371,127 @@ impl UnnamedResourcesAccessed {
         self.boxes.extend(other.boxes);
         self.asset_holdings.extend(other.asset_holdings);
         self.app_locals.extend(other.app_locals);
+        self.num_empty_box_refs += other.num_empty_box_refs;
+    }
+
+    /// Populate the `Max*`/`MaxCrossProductReferences` capacity fields for
+    /// the submitted group. See [`compute_resource_capacity`].
+    pub fn set_capacity_fields(
+        &mut self,
+        txgroup: &[SignedTransaction],
+        consensus: &ConsensusParams,
+    ) {
+        let cap = compute_resource_capacity(txgroup, consensus);
+        self.max_accounts = cap.max_accounts;
+        self.max_assets = cap.max_assets;
+        self.max_apps = cap.max_apps;
+        self.max_boxes = cap.max_boxes;
+        self.max_total_refs = cap.max_total_refs;
+        self.max_cross_product_references = cap.max_cross_product_references;
+    }
+}
+
+/// The `Max*`/`MaxCrossProductReferences` capacity fields of go-algorand's
+/// `ResourceTracker` (`ledger/simulation/resources.go`), computed for one
+/// transaction group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceCapacity {
+    /// Largest number of additional new accounts the group could accept.
+    pub max_accounts: usize,
+    /// Largest number of additional new assets the group could accept.
+    pub max_assets: usize,
+    /// Largest number of additional new apps the group could accept.
+    pub max_apps: usize,
+    /// Largest number of additional new box refs the group could accept.
+    pub max_boxes: usize,
+    /// Largest number of additional new references of any kind the group
+    /// could accept.
+    pub max_total_refs: usize,
+    /// Largest number of additional asset-holding/app-local cross-product
+    /// references the group could accept.
+    pub max_cross_product_references: usize,
+}
+
+/// Compute the `Max*`/`MaxCrossProductReferences` capacity fields for a
+/// transaction group, mirroring go-algorand's `makeGlobalResourceTracker`
+/// (`ledger/simulation/resources.go`, `1088a2aad7e` / `v3.18.0-beta`).
+///
+/// These are static capacity numbers derived purely from the group's txn
+/// types and named reference-array lengths -- how many *additional* unnamed
+/// resources of each kind the group could accept in principle. They are used
+/// both to populate [`UnnamedResourcesAccessed::set_capacity_fields`] (an
+/// internal, non-wire field -- go's own `SimulateUnnamedResourcesAccessed`
+/// REST model has no `Max*`/cross-product wire fields either, only
+/// `extra-box-refs`) and, in `avm_context`, to cap how many unnamed
+/// resources are *recorded* into the reported access sets once a group's
+/// actual capacity for a category is exhausted. This crate (unlike
+/// go-algorand's `ResourceTracker.add*`) does not reject the underlying AVM
+/// access once capacity is exhausted -- only the *reporting* is
+/// capacity-aware; see issue #970's tracking notes for that remaining
+/// enforcement gap.
+pub fn compute_resource_capacity(
+    txgroup: &[SignedTransaction],
+    consensus: &ConsensusParams,
+) -> ResourceCapacity {
+    let unused_txns = consensus.max_tx_group_size.saturating_sub(txgroup.len());
+    let mut non_app_calls = 0usize;
+    let (mut sum_accounts, mut sum_assets, mut sum_apps, mut sum_boxes, mut sum_total_refs) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for stxn in txgroup {
+        let txn = &stxn.txn;
+        if txn.txn_type != "appl" {
+            non_app_calls += 1;
+            continue;
+        }
+        let n_accounts = txn.accounts.as_ref().map_or(0, |v| v.len());
+        let n_foreign_apps = txn.foreign_apps.as_ref().map_or(0, |v| v.len());
+        let n_foreign_assets = txn.foreign_assets.as_ref().map_or(0, |v| v.len());
+        let n_boxes = txn.boxes.as_ref().map_or(0, |v| v.len());
+
+        sum_accounts += (consensus.max_app_txn_accounts + consensus.max_app_txn_foreign_apps)
+            .saturating_sub(n_accounts)
+            .saturating_sub(n_foreign_apps);
+        sum_assets += consensus
+            .max_app_txn_foreign_assets
+            .saturating_sub(n_foreign_assets);
+        sum_apps += consensus
+            .max_app_txn_foreign_apps
+            .saturating_sub(n_foreign_apps);
+        sum_boxes += consensus.max_app_box_references.saturating_sub(n_boxes);
+        sum_total_refs += consensus
+            .max_app_total_txn_references
+            .saturating_sub(n_accounts)
+            .saturating_sub(n_foreign_assets)
+            .saturating_sub(n_foreign_apps)
+            .saturating_sub(n_boxes);
+    }
+
+    // (MaxAppTxnForeignApps + 1) apps crossed with (MaxAppTxnForeignApps + 2)
+    // accounts, minus the trivially-available app-own-account locals -- see
+    // go's `makeGlobalResourceTracker` comment for the full derivation of
+    // this simplified form.
+    let max_cross_products_per_app_call =
+        consensus.max_app_txn_foreign_apps * (consensus.max_app_txn_foreign_apps + 2);
+
+    ResourceCapacity {
+        max_cross_product_references: max_cross_products_per_app_call
+            .saturating_mul(consensus.max_tx_group_size.saturating_sub(non_app_calls)),
+        max_accounts: unused_txns
+            .saturating_mul(consensus.max_app_txn_accounts + consensus.max_app_txn_foreign_apps)
+            .saturating_add(sum_accounts),
+        max_assets: unused_txns
+            .saturating_mul(consensus.max_app_txn_foreign_assets)
+            .saturating_add(sum_assets),
+        max_apps: unused_txns
+            .saturating_mul(consensus.max_app_txn_foreign_apps)
+            .saturating_add(sum_apps),
+        max_boxes: unused_txns
+            .saturating_mul(consensus.max_app_box_references)
+            .saturating_add(sum_boxes),
+        max_total_refs: unused_txns
+            .saturating_mul(consensus.max_app_total_txn_references)
+            .saturating_add(sum_total_refs),
     }
 }
 
@@ -1008,5 +1166,151 @@ mod tests {
         let b = stxn_with_inner(u64::MAX, vec![]);
         let (_usage, paid) = summarize_txn_group_fee_usage(&[a, b], &p);
         assert_eq!(paid, u64::MAX);
+    }
+
+    // --- compute_resource_capacity (issue #970) ---
+
+    /// Small, hand-computable consensus params so expected capacity numbers
+    /// can be verified by hand rather than depending on the exact (and
+    /// subject-to-change) production constants.
+    fn small_consensus() -> ConsensusParams {
+        ConsensusParams {
+            max_tx_group_size: 4,
+            max_app_txn_accounts: 2,
+            max_app_txn_foreign_apps: 3,
+            max_app_txn_foreign_assets: 5,
+            max_app_box_references: 6,
+            max_app_total_txn_references: 10,
+            ..ConsensusParams::default()
+        }
+    }
+
+    fn appl_txn() -> SignedTransaction {
+        SignedTransaction {
+            txn: algo_types::Transaction {
+                txn_type: "appl".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn pay_txn() -> SignedTransaction {
+        SignedTransaction {
+            txn: algo_types::Transaction {
+                txn_type: "pay".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Single-txn group, no named resources: every `Max*` field equals
+    /// `unusedTxns * txnLimit + txnLimit` (this txn's own full allowance,
+    /// since nothing is named), matching go-algorand's
+    /// `makeGlobalResourceTracker` for a lone app call.
+    #[test]
+    fn compute_resource_capacity_single_unnamed_appl_txn() {
+        let p = small_consensus();
+        let cap = compute_resource_capacity(&[appl_txn()], &p);
+        // unused_txns = 4 - 1 = 3
+        assert_eq!(cap.max_accounts, 3 * (2 + 3) + (2 + 3));
+        assert_eq!(cap.max_assets, 3 * 5 + 5);
+        assert_eq!(cap.max_apps, 3 * 3 + 3);
+        assert_eq!(cap.max_boxes, 3 * 6 + 6);
+        assert_eq!(cap.max_total_refs, 3 * 10 + 10);
+        // maxCrossProductsPerAppCall = 3*(3+2) = 15; non_app_calls = 0.
+        assert_eq!(cap.max_cross_product_references, 15 * 4);
+    }
+
+    /// Named reference-array entries on the txn reduce that txn's own
+    /// per-category allowance (but not the credit from unused group slots).
+    #[test]
+    fn compute_resource_capacity_named_arrays_reduce_per_txn_allowance() {
+        let p = small_consensus();
+        let mut txn = appl_txn();
+        txn.txn.accounts = Some(vec![algo_types::Address([1; 32])]);
+        txn.txn.foreign_apps = Some(vec![7]);
+        txn.txn.foreign_assets = Some(vec![9]);
+        txn.txn.boxes = Some(vec![algo_types::BoxRef {
+            index: 0,
+            name: Some(b"b".to_vec().into()),
+        }]);
+        let cap = compute_resource_capacity(&[txn], &p);
+        // unused_txns = 3; this txn's own allowance drops by the named count.
+        assert_eq!(cap.max_accounts, 3 * 5 + (5 - 1 - 1)); // accounts + foreign_apps both count
+        assert_eq!(cap.max_assets, 3 * 5 + (5 - 1));
+        assert_eq!(cap.max_apps, 3 * 3 + (3 - 1));
+        assert_eq!(cap.max_boxes, 3 * 6 + (6 - 1));
+        assert_eq!(cap.max_total_refs, 3 * 10 + (10 - 1 - 1 - 1 - 1));
+    }
+
+    /// A non-app-call txn contributes nothing to the per-txn sums (mirrors
+    /// go's `makeTxnResourceTracker` returning a zero tracker for it) but
+    /// still counts toward `nonAppCalls`, shrinking
+    /// `MaxCrossProductReferences`.
+    #[test]
+    fn compute_resource_capacity_non_app_call_excluded_from_sums() {
+        let p = small_consensus();
+        let cap = compute_resource_capacity(&[pay_txn(), appl_txn()], &p);
+        // unused_txns = 4 - 2 = 2; only the appl txn contributes to sums.
+        assert_eq!(cap.max_accounts, 2 * 5 + 5);
+        assert_eq!(cap.max_assets, 2 * 5 + 5);
+        assert_eq!(cap.max_apps, 2 * 3 + 3);
+        assert_eq!(cap.max_boxes, 2 * 6 + 6);
+        assert_eq!(cap.max_total_refs, 2 * 10 + 10);
+        // non_app_calls = 1: maxCrossProductsPerAppCall * (4 - 1) = 15 * 3.
+        assert_eq!(cap.max_cross_product_references, 15 * 3);
+    }
+
+    #[test]
+    fn unnamed_resources_accessed_set_capacity_fields_matches_compute() {
+        let p = small_consensus();
+        let group = [appl_txn()];
+        let mut unnamed = UnnamedResourcesAccessed::default();
+        unnamed.set_capacity_fields(&group, &p);
+        let cap = compute_resource_capacity(&group, &p);
+        assert_eq!(unnamed.max_accounts, cap.max_accounts);
+        assert_eq!(unnamed.max_assets, cap.max_assets);
+        assert_eq!(unnamed.max_apps, cap.max_apps);
+        assert_eq!(unnamed.max_boxes, cap.max_boxes);
+        assert_eq!(unnamed.max_total_refs, cap.max_total_refs);
+        assert_eq!(
+            unnamed.max_cross_product_references,
+            cap.max_cross_product_references
+        );
+    }
+
+    /// `has_resources` must treat a nonzero `num_empty_box_refs` as a real
+    /// accessed resource (go's own `HasResources` includes
+    /// `NumEmptyBoxRefs != 0`), even when every set-valued field is empty.
+    #[test]
+    fn has_resources_true_for_empty_box_refs_alone() {
+        let mut unnamed = UnnamedResourcesAccessed::default();
+        assert!(!unnamed.has_resources());
+        unnamed.num_empty_box_refs = 1;
+        assert!(unnamed.has_resources());
+    }
+
+    /// `merge` sums `num_empty_box_refs` across transactions (each
+    /// transaction's own tracer only counts its own accesses) but leaves the
+    /// `Max*` capacity fields alone -- those are a group-level constant the
+    /// caller assigns once via `set_capacity_fields`, not a per-transaction
+    /// accumulation.
+    #[test]
+    fn merge_sums_empty_box_refs_but_not_capacity_fields() {
+        let mut a = UnnamedResourcesAccessed {
+            num_empty_box_refs: 2,
+            max_accounts: 100,
+            ..Default::default()
+        };
+        let b = UnnamedResourcesAccessed {
+            num_empty_box_refs: 3,
+            max_accounts: 999,
+            ..Default::default()
+        };
+        a.merge(b);
+        assert_eq!(a.num_empty_box_refs, 5);
+        assert_eq!(a.max_accounts, 100, "merge must not touch capacity fields");
     }
 }
