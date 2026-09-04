@@ -856,6 +856,32 @@ pub const MAX_TXN_LIFE: u64 = 1000;
 /// to reconstruct leases and block header history.
 pub fn download_lookback_blocks<F, S>(
     round: u64,
+    fetch_block: F,
+    store_block: S,
+) -> Result<u64, CatchpointError>
+where
+    F: FnMut(u64) -> Result<(String, Vec<u8>, Vec<u8>), CatchpointError>,
+    S: FnMut(u64, &str, &[u8], &[u8]) -> Result<(), CatchpointError>,
+{
+    download_lookback_blocks_with_lookback(round, MAX_TXN_LIFE, fetch_block, store_block)
+}
+
+/// Same as [`download_lookback_blocks`], but with an explicit `lookback`
+/// window instead of the fixed [`MAX_TXN_LIFE`].
+///
+/// Mirrors go's `processStageBlocksDownload` (`catchup/catchpointService.go`),
+/// which extends its download range beyond the plain transaction-lifetime
+/// lookback when a pending state proof needs older blocks to stay
+/// verifiable (`lookbackForStateproofsSupport`, ported as
+/// [`crate::voters_tracker::lookback_for_stateproofs_support`]). Callers
+/// that need that behavior compute `max(MAX_TXN_LIFE,
+/// lookback_for_stateproofs_support(..))` and pass it here; callers that
+/// don't care about state proofs (or are fine with the plain
+/// transaction-lifetime window) should use [`download_lookback_blocks`]
+/// instead.
+pub fn download_lookback_blocks_with_lookback<F, S>(
+    round: u64,
+    lookback: u64,
     mut fetch_block: F,
     mut store_block: S,
 ) -> Result<u64, CatchpointError>
@@ -863,7 +889,7 @@ where
     F: FnMut(u64) -> Result<(String, Vec<u8>, Vec<u8>), CatchpointError>,
     S: FnMut(u64, &str, &[u8], &[u8]) -> Result<(), CatchpointError>,
 {
-    let start_round = round.saturating_sub(MAX_TXN_LIFE);
+    let start_round = round.saturating_sub(lookback);
 
     let mut count = 0u64;
     // Download from the catchpoint round backward (inclusive on both ends).

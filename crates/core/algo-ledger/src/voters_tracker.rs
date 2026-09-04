@@ -156,6 +156,42 @@ pub fn get_oldest_expected_state_proof(
     }
 }
 
+/// Port of go's `catchup/catchpointService.go`'s `lookbackForStateproofsSupport`:
+/// how many extra blocks *beyond* `top_round`, going backward, the catchup
+/// service's lookback-block download must cover so a still-pending state
+/// proof can be verified once catchup finishes.
+///
+/// go's formula: the block range must reach back to the voters round that
+/// produced the commitment for the *oldest* state proof the ledger still
+/// expects (`stateproof.GetOldestExpectedStateProof`, ported here as
+/// [`get_oldest_expected_state_proof`]), because verifying that state proof
+/// requires reconstructing the corresponding `votersForRound`, which lives
+/// at `oldest_state_proof_round - interval - voters_lookback` (the same
+/// snapshot/consume relationship [`voters_round_for_state_proof_round`]
+/// already encodes for the "does a block need a voters snapshot" question).
+/// `interval == 0` (state proofs disabled for this protocol) short-circuits
+/// to zero lookback, matching go.
+pub fn lookback_for_stateproofs_support(
+    top_round: u64,
+    state_proof_next_round_value: u64,
+    interval: u64,
+    voters_lookback: u64,
+    max_recovery_intervals: u64,
+) -> u64 {
+    if interval == 0 {
+        return 0;
+    }
+    let oldest_state_proof_round = get_oldest_expected_state_proof(
+        top_round,
+        state_proof_next_round_value,
+        interval,
+        max_recovery_intervals,
+    );
+    let lowest_voters_round =
+        voters_round_for_state_proof_round(oldest_state_proof_round, interval, voters_lookback);
+    top_round.saturating_sub(lowest_voters_round)
+}
+
 /// go's `votersTracker.removeOldVoters` per-entry deletion predicate
 /// (`ledger/voters.go:257`): a snapshot taken at `snapshot_round` is removed
 /// once the state-proof round it exists to serve
@@ -355,8 +391,7 @@ pub fn voters_participants_and_tree<L: LedgerStore>(
     let Some(addressed) = store.get_voters_participants(round)? else {
         return Ok(None);
     };
-    let participants: Vec<crypto_sp::Participant> =
-        addressed.into_iter().map(|(_, p)| p).collect();
+    let participants: Vec<crypto_sp::Participant> = addressed.into_iter().map(|(_, p)| p).collect();
     let tree = commit_participants(&participants)
         .map_err(|e| ledger_err(format!("voters_participants_and_tree: {e}")))?;
     Ok(Some((participants, tree)))
@@ -468,6 +503,56 @@ mod tests {
             0,
             "disabled"
         );
+    }
+
+    /// Oracle test ported from go's `catchup/service_test.go`'s
+    /// `TestDownloadBlocksToSupportStateProofs` (issue #976): three cases
+    /// pinning [`lookback_for_stateproofs_support`] against go's own
+    /// hand-computed expectations, using v41's `StateProofInterval = 256`,
+    /// `StateProofVotersLookback = 16`, `StateProofMaxRecoveryIntervals = 10`.
+    #[test]
+    fn lookback_for_stateproofs_support_matches_go_test_oracle() {
+        let v41 = v41();
+
+        // Case 1 (go: round 1500, StateProofNextRound 512): make sure we
+        // download enough blocks to verify state proof 512. Expected oldest
+        // round = 512 - StateProofInterval - StateProofVotersLookback
+        //        = 512 - 256 - 16 = 240.
+        let lookback = lookback_for_stateproofs_support(
+            1500,
+            512,
+            v41.state_proof_interval,
+            v41.state_proof_voters_lookback,
+            v41.state_proof_max_recovery_intervals,
+        );
+        let oldest_round = 1500u64.saturating_sub(lookback);
+        assert_eq!(
+            oldest_round,
+            512 - v41.state_proof_interval - v41.state_proof_voters_lookback
+        );
+
+        // Case 2 (go: round 8000, StateProofNextRound 512): the network has
+        // made progress past the recovery window, so the lookback is capped
+        // by the recovery-interval floor rather than reaching back to round
+        // 512. Expected oldest round = 8000 - (8000 % interval) -
+        // interval*(maxRecoveryIntervals+1) - votersLookback.
+        let lookback = lookback_for_stateproofs_support(
+            8000,
+            512,
+            v41.state_proof_interval,
+            v41.state_proof_voters_lookback,
+            v41.state_proof_max_recovery_intervals,
+        );
+        let oldest_round = 8000u64.saturating_sub(lookback);
+        let lowest_round_to_retain = 8000
+            - (8000 % v41.state_proof_interval)
+            - v41.state_proof_interval * (v41.state_proof_max_recovery_intervals + 1)
+            - v41.state_proof_voters_lookback;
+        assert_eq!(oldest_round, lowest_round_to_retain);
+
+        // Case 3 (go: protocol with StateProofInterval == 0): state proofs
+        // are disabled, so no extra lookback is needed.
+        assert_eq!(lookback_for_stateproofs_support(8000, 0, 0, 0, 0), 0);
     }
 
     #[test]

@@ -2041,6 +2041,206 @@ mod tests {
         svc.stop();
     }
 
+    // -- Protocol-switch interruption during catchup (issue #976) --
+    //
+    // Ports of go's `TestOnSwitchToUnSupportedProtocol1-4`
+    // (`catchup/service_test.go`), which exercise `roundIsNotSupported`'s
+    // effect on the periodic sync loop at four different interruption
+    // timings. `round_is_not_supported`/its use in `sync_pass_inner` and
+    // `sync_cert` were already implemented (mirroring go's guard at the top
+    // of `fetchRound`), but no test previously exercised any of these
+    // timings — these are direct, synchronous calls into `sync_pass_inner`
+    // (rather than the background-thread `CatchupService::start`) so the
+    // outcome can be asserted deterministically with no polling/timing
+    // races, mirroring how go's tests inspect `local.LastRound()`
+    // synchronously after `syncer.sync()` returns.
+
+    /// A permissive ledger (authenticates every certificate, like
+    /// [`PermissiveCatchupLedger`]) whose [`CatchupLedger::round_is_not_supported`]
+    /// becomes `true` once `round.0 >= switch_round` — mirroring go's
+    /// `roundIsNotSupported` once a pending upgrade's `NextProtocolSwitchOn`
+    /// has been set to `switch_round`.
+    struct SwitchingCatchupLedger {
+        inner: MockCatchupLedger,
+        switch_round: u64,
+    }
+
+    impl CatchupLedger for SwitchingCatchupLedger {
+        fn next_round(&self) -> Round {
+            self.inner.next_round()
+        }
+        fn ensure_block(&self, block: &Block, cert: &Certificate) {
+            self.inner.ensure_block(block, cert)
+        }
+        fn authenticate_block(&self, _block: &Block, _cert: &Certificate) -> Result<(), String> {
+            Ok(())
+        }
+        fn round_is_not_supported(&self, round: Round) -> bool {
+            round.0 >= self.switch_round
+        }
+    }
+
+    /// A shutdown receiver that never fires, for direct `sync_pass_inner`
+    /// calls that don't need to exercise shutdown handling.
+    fn never_shutdown() -> Receiver<()> {
+        crossbeam_channel::bounded::<()>(0).1
+    }
+
+    /// Port of go's `TestOnSwitchToUnSupportedProtocol1`: the interruption
+    /// happens on the very first round of the pass ("This cannot happen in
+    /// practice, but is used to test the code" — go's own comment). No
+    /// block should ever be committed.
+    #[test]
+    fn sync_pass_interrupted_in_initial_loop() {
+        let ledger = Arc::new(SwitchingCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+            switch_round: 1,
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to: 10,
+            calls: AtomicU64::new(0),
+        });
+        let shutdown_rx = never_shutdown();
+
+        CatchupService::sync_pass_inner(&ledger_dyn, &fetcher, &shutdown_rx, 2);
+
+        assert_eq!(
+            ledger.next_round(),
+            Round(1),
+            "round 1 is already unsupported, so the ledger must not advance at all"
+        );
+    }
+
+    /// Port of go's `TestOnSwitchToUnSupportedProtocol2`: the interruption
+    /// happens partway through a pass, after several rounds have already
+    /// been fetched and committed. Sync must stop exactly at the last
+    /// supported round.
+    #[test]
+    fn sync_pass_interrupted_mid_loop() {
+        let ledger = Arc::new(SwitchingCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+            switch_round: 8,
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to: 20,
+            calls: AtomicU64::new(0),
+        });
+        let shutdown_rx = never_shutdown();
+
+        CatchupService::sync_pass_inner(&ledger_dyn, &fetcher, &shutdown_rx, 2);
+
+        assert_eq!(
+            ledger.next_round(),
+            Round(8),
+            "rounds 1..=7 are supported and should be committed; round 8 is not"
+        );
+    }
+
+    /// Port of go's `TestOnSwitchToUnSupportedProtocol3`: interruption with
+    /// short notice — the switch boundary is reached with fewer rounds of
+    /// warning than the fetch-ahead window (`parallel_blocks`), so a worker
+    /// may already be mid-fetch on the unsupported round when the boundary
+    /// is discovered. go's assertion is `< lastRoundLocal+2` (i.e. the extra
+    /// prefetched round is buffered but never *applied*) — the strict
+    /// in-order apply loop in `sync_pass_inner` gives the same guarantee
+    /// here: applying stops exactly at the boundary regardless of how many
+    /// rounds beyond it were concurrently prefetched.
+    #[test]
+    fn sync_pass_interrupted_with_short_notice() {
+        let ledger = Arc::new(SwitchingCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+            switch_round: 2,
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to: 20,
+            calls: AtomicU64::new(0),
+        });
+        let shutdown_rx = never_shutdown();
+
+        // parallel_blocks=2: workers may prefetch round 2 (unsupported)
+        // concurrently with round 1 (supported), but the boundary must
+        // still be honored exactly — no partial/out-of-order commit.
+        CatchupService::sync_pass_inner(&ledger_dyn, &fetcher, &shutdown_rx, 2);
+
+        assert_eq!(
+            ledger.next_round(),
+            Round(2),
+            "only round 1 is supported; round 2 must never be applied even if prefetched"
+        );
+    }
+
+    /// Port of go's `TestOnSwitchToUnSupportedProtocol4`: a variation of the
+    /// short-notice case that happens when the catchup service restarts
+    /// exactly at the switch round (e.g. after a crash/restart at the
+    /// boundary) — the ledger already holds every supported round, so a
+    /// fresh pass must decline to fetch anything at all, not just stop
+    /// after an extra prefetch.
+    #[test]
+    fn sync_pass_interrupted_restart_at_switch_round() {
+        let ledger = Arc::new(SwitchingCatchupLedger {
+            inner: MockCatchupLedger::new(Round(7)),
+            switch_round: 8,
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to: 20,
+            calls: AtomicU64::new(0),
+        });
+        let shutdown_rx = never_shutdown();
+
+        CatchupService::sync_pass_inner(&ledger_dyn, &fetcher, &shutdown_rx, 2);
+
+        assert_eq!(
+            ledger.next_round(),
+            Round(8),
+            "the ledger already sits at the switch boundary on restart; a fresh pass must \
+             not advance past it"
+        );
+    }
+
+    /// The same guard, exercised through `sync_cert` (the certificate-driven
+    /// path) rather than `sync_pass_inner` (the periodic path) — go's
+    /// `fetchRound` applies the identical `roundIsNotSupported` check before
+    /// any network fetch is attempted, and this pins that algod-rust never
+    /// even calls the fetcher for an unsupported round's certificate.
+    #[test]
+    fn sync_cert_bails_out_for_unsupported_round() {
+        let ledger = Arc::new(SwitchingCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+            switch_round: 1,
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher = Arc::new(BoundedBlockFetcher {
+            up_to: 20,
+            calls: AtomicU64::new(0),
+        });
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+        let shutdown_rx = never_shutdown();
+        let fork_count = Arc::new(AtomicU64::new(0));
+
+        CatchupService::sync_cert(
+            &make_pending_cert(1),
+            &ledger_dyn,
+            &fetcher_dyn,
+            &shutdown_rx,
+            &fork_count,
+        );
+
+        assert_eq!(
+            ledger.next_round(),
+            Round(1),
+            "certificate for an unsupported round must not be committed"
+        );
+        assert_eq!(
+            fetcher.calls.load(Ordering::SeqCst),
+            0,
+            "the guard must bail out before ever calling the fetcher"
+        );
+    }
+
     #[test]
     fn contents_mismatch_triggers_retry() {
         // Create a block with a valid digest but tampered txn_commitment.
