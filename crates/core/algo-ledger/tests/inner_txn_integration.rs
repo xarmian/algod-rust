@@ -786,6 +786,69 @@ fn fee_credit_insufficient_fails() {
     assert!(is_failure(&result), "should fail: insufficient fee credit");
 }
 
+/// Issue #988: the *default* Fee for an inner txn (no explicit
+/// `itxn_field Fee`) must be computed fee-credit-aware, exactly like
+/// go-algorand's `addInnerTxn` (`data/transactions/logic/eval.go`) --
+/// which shrinks the populated default by `cx.FeeCredit` at `itxn_begin`/
+/// `itxn_next` time, not just at `itxn_submit`. Before the fix, algod-rust
+/// always defaulted an unset Fee to the flat `MinTxnFee`, so a zero-balance
+/// inner-txn sender relying purely on an ancestor's fee overpayment failed
+/// with "insufficient balance ... for fee" even though go-algorand's
+/// equivalent transaction succeeds (the default fee there is 0 whenever
+/// FeeCredit already covers the group's MinTxnFee requirement).
+#[test]
+fn fee_credit_covers_default_fee_for_zero_balance_sender() {
+    let sender = [0xAA; 32];
+    let receiver = [0xBB; 32];
+    let app_id = 42u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    // The app account (default inner-txn sender) has NO balance at all --
+    // it can only pay a fee here via the outer group's fee_credit, never
+    // out of its own microAlgos.
+    fund_account(&mut store, app_addr, 0);
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    // Simulates an ancestor transaction's fee overpayment: exactly enough
+    // credit to cover this single inner pay's default MinTxnFee (1000),
+    // with nothing left over.
+    ctx.fee_credit = 1000;
+
+    // Inner pay with NO explicit `itxn_field Fee` -- the default must come
+    // out to 0 (shrunk fully by fee_credit) rather than the flat MinTxnFee,
+    // since the zero-balance sender has nothing to pay a nonzero fee with.
+    let mut code = build_inner_pay(&receiver, 0);
+    code.extend(pushint(1));
+    code.push(0x43);
+
+    let result = run_with_context(6, &code, &mut ctx).unwrap();
+    assert!(
+        result,
+        "zero-balance inner sender should succeed: fee_credit covers the default fee"
+    );
+
+    // The credit was fully consumed by the (would-be) 1000 shortfall.
+    assert_eq!(
+        ctx.fee_credit, 0,
+        "the full fee_credit should have been consumed covering the default fee"
+    );
+
+    let app_bal = ctx
+        .store
+        .get_account(&app_addr)
+        .map(|a| a.micro_algos)
+        .unwrap_or(0);
+    assert_eq!(
+        app_bal, 0,
+        "app account balance must be untouched -- it never had anything to pay a fee with"
+    );
+}
+
 // ===========================================================================
 // Fee residue (FeeForUsage) — issue #677
 //
@@ -970,7 +1033,11 @@ fn fee_deducted_from_app_address() {
     let mut ctx = make_context(&mut store, vec![txn], app_id);
     ctx.fee_sink = Address([0xFE; 32]);
     fund_account(ctx.store, Address([0xFE; 32]), 0);
-    ctx.fee_credit = 10_000;
+    // No fee_credit: per issue #988 (go-algorand's `addInnerTxn`), any
+    // available credit shrinks the *default* fee, so this test -- whose
+    // point is that a nonzero default fee actually gets deducted from the
+    // app account's own balance -- must leave no credit to shrink it away.
+    ctx.fee_credit = 0;
 
     // Inner pay with default fee (gets set to 1000)
     let mut code = Vec::new();
