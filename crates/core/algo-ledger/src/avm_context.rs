@@ -177,6 +177,15 @@ impl InnerTxnBuilder {
         }
     }
 
+    /// Pre-populate the Fee field with a computed default (go-algorand's
+    /// `addInnerTxn`-style fee-credit-aware default). Unlike `set_field`,
+    /// this does **not** mark `fee_set` — a later explicit
+    /// `itxn_field Fee` (even `0`) must still override this default, per
+    /// go-algorand semantics.
+    fn set_default_fee(&mut self, fee: u64) {
+        self.fields.insert(1, TealValue::Uint(fee));
+    }
+
     /// Convert the accumulated fields into a minimal `SignedTransaction`.
     ///
     /// This performs a best-effort mapping from field bytes back into the
@@ -3325,6 +3334,67 @@ fn read_txn_field(
     }
 }
 
+impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
+    /// Compute the fee-credit-aware default fee for a new sub-transaction
+    /// being added to `self.inner_building`, and push a fresh
+    /// [`InnerTxnBuilder`] pre-populated with it.
+    ///
+    /// Mirrors go-algorand's `addInnerTxn` (`data/transactions/logic/
+    /// eval.go`): the default `Fee` for each inner txn is computed **as
+    /// it's added** (at `itxn_begin`/`itxn_next` time), fee-credit- and
+    /// fee-residue-aware, rather than defaulted to a flat `MinTxnFee` once
+    /// at `itxn_submit` time. This lets a zero-balance inner-txn sender
+    /// rely on an ancestor's fee overpayment (`fee_credit`) to cover its
+    /// own fee, exactly like go-algorand.
+    ///
+    /// Critically, this must **not** consume/mutate the real `fee_credit`
+    /// or `fee_residue` — this txn might never be submitted, or its fee
+    /// might later be changed via an explicit `itxn_field Fee` (which
+    /// still wins over this default, via `fee_set`). Only `itxn_submit`'s
+    /// real charge consumes credit/residue.
+    fn push_inner_builder(&mut self) -> Result<(), AlgoError> {
+        // Usage/paid so far in the group being built, from the already-added
+        // (and by now fully field-populated) sub-transactions.
+        let default_sender = Address(app_address(self.app_id));
+        let built: Vec<SignedTransaction> = self
+            .inner_building
+            .iter()
+            .map(|b| {
+                let mut stxn = b.build();
+                if stxn.txn.sender == Address::ZERO {
+                    stxn.txn.sender = default_sender;
+                }
+                stxn
+            })
+            .collect();
+        let built_refs: Vec<&SignedTransaction> = built.iter().collect();
+        let (usage, group_paid) = algo_validate::summarize_fees(&built_refs, &self.consensus);
+        // +1e6 ("Micros" for one MinTxnFee) because we're adding a txn.
+        let usage = usage.saturating_add(algo_validate::ONE_MICROS);
+        let (group_fee, _residue, overflow) = algo_validate::fee_for_usage(
+            self.consensus.min_txn_fee,
+            usage,
+            algo_validate::ONE_MICROS,
+            self.fee_residue,
+        );
+        if overflow {
+            return Err(AlgoError::Avm {
+                message: "inner group fee saturation".to_string(),
+            });
+        }
+        let default_fee = if group_paid < group_fee {
+            (group_fee - group_paid).saturating_sub(self.fee_credit)
+        } else {
+            0
+        };
+
+        let mut builder = InnerTxnBuilder::new();
+        builder.set_default_fee(default_fee);
+        self.inner_building.push(builder);
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AvmContext implementation
 // ---------------------------------------------------------------------------
@@ -4159,8 +4229,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 message: "clear state programs can not issue inner transactions".to_string(),
             });
         }
-        self.inner_building.push(InnerTxnBuilder::new());
-        Ok(())
+        self.push_inner_builder()
     }
 
     fn itxn_field(&mut self, field: u8, value: TealValue) -> Result<(), AlgoError> {
@@ -4201,8 +4270,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 ),
             });
         }
-        self.inner_building.push(InnerTxnBuilder::new());
-        Ok(())
+        self.push_inner_builder()
     }
 
     fn itxn_submit(&mut self) -> Result<(), AlgoError> {
@@ -4236,12 +4304,12 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 if stxn.txn.sender == Address::ZERO {
                     stxn.txn.sender = default_sender;
                 }
-                // Default fee to MinTxnFee only if the fee was never explicitly
-                // set via `itxn_field Fee`. When `fee_set` is true, the program
-                // intentionally chose the fee value (even 0 for fee pooling).
-                if !b.fee_set && stxn.txn.fee == 0 {
-                    stxn.txn.fee = self.consensus.min_txn_fee;
-                }
+                // The Fee field is already populated at this point: either a
+                // fee-credit-aware default computed when this sub-transaction
+                // was added (`push_inner_builder`, mirroring go-algorand's
+                // `addInnerTxn`), or an explicit value from `itxn_field Fee`
+                // (tracked via `b.fee_set`, which always wins over the
+                // default -- see `set_field`/`set_default_fee`).
                 // Copy FirstValid/LastValid from the outer transaction.
                 let outer = &self.group[self.group_index].txn;
                 stxn.txn.first_valid = outer.first_valid;
@@ -9161,14 +9229,15 @@ mod tests {
         ctx.itxn_submit().unwrap();
 
         // fee_credit should be propagated back from the child.
-        // The child received fee_credit = 50_000, and since it didn't
-        // issue any inner txns that would consume credit, it should still
-        // have the same credit (minus any shortfall/overpay at the child level).
-        // In this case the inner appl has default fee=1000 and MinTxnFee=1000,
-        // so no shortfall or overpay.
+        // The child received fee_credit = 50_000. Per issue #988
+        // (go-algorand's `addInnerTxn`), the inner appl's *default* fee is
+        // itself fee-credit-aware and gets shrunk to 0 by the abundant
+        // credit at itxn_begin time -- so the group pays 0, MinTxnFee=1000
+        // is still owed, and covering that 1000 shortfall consumes exactly
+        // 1000 of the 50_000 credit (50_000 - 1000 = 49_000).
         assert_eq!(
-            ctx.fee_credit, 50_000,
-            "fee_credit should be propagated back"
+            ctx.fee_credit, 49_000,
+            "fee_credit should be propagated back, minus the shortfall it covered"
         );
     }
 
@@ -9911,7 +9980,11 @@ mod tests {
 
         let mut ctx = make_context(&mut store, vec![txn]);
         // Do NOT set fee_sink — it stays as Address::ZERO.
-        ctx.fee_credit = 100_000; // ensure fee credit check passes
+        // No fee_credit: per issue #988, credit shrinks the *default* fee
+        // at itxn_begin time, and this test's point is that a genuinely
+        // nonzero fee actually gets deducted (hitting the zero-fee_sink
+        // error) -- so leave nothing to shrink the default fee away.
+        ctx.fee_credit = 0;
 
         ctx.itxn_begin().unwrap();
         ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
