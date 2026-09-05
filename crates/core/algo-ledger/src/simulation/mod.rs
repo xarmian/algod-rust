@@ -439,6 +439,31 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         // --- Build apply context ---
 
+        // A requested round that predates the ledger's tracked history is a
+        // distinct failure from "round doesn't exist yet" -- go-algorand's
+        // accountupdates `RoundOffsetError` (`ledger/acctupdates.go`),
+        // surfaced verbatim through `Ledger.BlockHdr`/`trackerDBRound` as
+        // `"round %d before dbRound %d"`, a raw (non-`InvalidRequestError`)
+        // error that the REST handler propagates as a 500
+        // (`daemon/algod/api/server/v2/handlers.go`'s `SimulateTransaction`
+        // only special-cases `simulation.InvalidRequestError` as a 400).
+        // `TestSimulateStartRound` (`test/e2e-go/restAPI/simulate`) pins
+        // this for a follower node whose `dbRound` tracks its sync round --
+        // see [`crate::store_trait::LedgerStore::earliest_round`] for what
+        // this does and doesn't model. Checked ahead of the block-header
+        // lookup below since algod-rust does not actually evict old block
+        // headers (`forget_before` isn't wired into the normal apply path),
+        // so the header would otherwise still resolve.
+        if let Some(requested_round) = request.round {
+            let earliest = self.store.earliest_round();
+            if requested_round < earliest {
+                self.store.restore_snapshot(snapshot);
+                return Err(SimulatorError::Internal(AlgoError::Ledger {
+                    message: format!("round {} before dbRound {}", requested_round.0, earliest.0),
+                }));
+            }
+        }
+
         // Fetch block header for consensus params and timestamp
         let block_hdr = self.store.get_block_header(sim_round.0)?;
         // An explicitly-requested round with no corresponding block header

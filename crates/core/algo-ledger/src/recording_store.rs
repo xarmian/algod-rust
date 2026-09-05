@@ -295,6 +295,10 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
         self.inner.current_round()
     }
 
+    fn earliest_round(&self) -> Round {
+        self.inner.earliest_round()
+    }
+
     fn rewards_level(&self) -> u64 {
         self.inner.rewards_level()
     }
@@ -343,6 +347,10 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
 
     fn set_current_round(&mut self, round: Round) {
         self.inner.set_current_round(round);
+    }
+
+    fn set_earliest_round(&mut self, round: Round) {
+        self.inner.set_earliest_round(round);
     }
 
     fn set_rewards_level(&mut self, level: u64) {

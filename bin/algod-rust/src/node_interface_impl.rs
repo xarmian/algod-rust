@@ -193,6 +193,13 @@ impl FollowerSyncRoundState {
     pub fn new(ledger: Arc<Mutex<SqliteLedger>>, max_acct_lookback: u64) -> Arc<Self> {
         let current_round = ledger.lock().map(|l| l.current_round().0).unwrap_or(0);
         let initial = current_round + 1 + max_acct_lookback;
+        // Seed `earliest_round` (go's `dbRound`) to match the sync round
+        // this state starts at, so a simulate request for a round behind it
+        // is rejected from process start, not just after the first explicit
+        // `SetSyncRound` call. See `LedgerStore::earliest_round`.
+        if let Ok(mut l) = ledger.lock() {
+            l.set_earliest_round(Round(current_round + 1));
+        }
         Arc::new(Self {
             ledger,
             max_acct_lookback,
@@ -224,6 +231,14 @@ impl FollowerSyncRoundState {
         if let Ok(mut guard) = self.raw_disable_sync_round.lock() {
             *guard = Some(disable_sync_round);
         }
+        // Advance the ledger's `dbRound`-equivalent to this sync round: a
+        // follower node has no tracked state before the round it was told
+        // to sync to, so a simulate request behind it must fail the same
+        // way go's accountupdates `RoundOffsetError` does. See
+        // `LedgerStore::earliest_round`.
+        if let Ok(mut l) = self.ledger.lock() {
+            l.set_earliest_round(Round(round));
+        }
         Ok(())
     }
 
@@ -232,6 +247,11 @@ impl FollowerSyncRoundState {
     fn unset(&self) {
         if let Ok(mut guard) = self.raw_disable_sync_round.lock() {
             *guard = None;
+        }
+        // No sync-round restriction in effect: lift the earliest-round
+        // floor back to genesis (no restriction).
+        if let Ok(mut l) = self.ledger.lock() {
+            l.set_earliest_round(Round(0));
         }
     }
 }
@@ -6971,6 +6991,28 @@ mod tests {
 
         adapter.unset_sync_round().await.unwrap();
         assert_eq!(adapter.get_sync_round().await.unwrap(), 0);
+    }
+
+    /// `SetSyncRound`/`UnsetSyncRound` must advance the ledger's
+    /// `dbRound`-equivalent (`LedgerStore::earliest_round`) exactly like the
+    /// exposed sync round -- this is what lets a simulate request against a
+    /// too-old round on a follower node fail with go's
+    /// `"round %d before dbRound %d"` (`TestSimulateStartRound`, issue
+    /// #950) instead of silently resolving.
+    #[tokio::test]
+    async fn follower_sync_round_advances_ledger_earliest_round() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let state = FollowerSyncRoundState::new(ledger.clone(), 4);
+        let adapter = make_adapter_with_ledger(ledger.clone()).with_follower_mode(state);
+
+        // Freshly constructed: dbRound + 1 = 1 (matches `get_sync_round`).
+        assert_eq!(ledger.lock().unwrap().earliest_round(), Round(1));
+
+        adapter.set_sync_round(4).await.unwrap();
+        assert_eq!(ledger.lock().unwrap().earliest_round(), Round(4));
+
+        adapter.unset_sync_round().await.unwrap();
+        assert_eq!(ledger.lock().unwrap().earliest_round(), Round(0));
     }
 
     /// A non-follower node must report `is_follower_mode() == false` and
