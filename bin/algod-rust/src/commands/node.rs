@@ -101,6 +101,56 @@ fn follower_devmode_warning_needed(follower_mode: bool, genesis_devmode: bool) -
     follower_mode && genesis_devmode
 }
 
+/// Open (or create) `node start`'s ledger at `ledger_prefix`, applying
+/// `config.json`'s per-resource directory overrides (`HotDataDir`/
+/// `ColdDataDir`/`TrackerDBDir`/`BlockDBDir`) via
+/// [`participate::resolve_resource_paths`] exactly like `participate`
+/// already does (issue #953).
+///
+/// `node start` serves both plain/`--dev` full-node mode and `--follow`
+/// follower mode through this single startup path — the only difference is
+/// whether a peer URL is present — so wiring the override resolution in
+/// here closes the parity gap go-algorand's follower-specific tests track:
+/// `TestDefaultResourcePaths_Follower`, `TestConfiguredDataDirs_Follower`,
+/// `TestConfiguredResourcePaths_Follower` (`node/follower_node_test.go`,
+/// issue #1030), which exercise the exact same `HotDataDir`/`ColdDataDir`/
+/// etc. resolution against go's `AlgorandFollowerNode` that #953 already
+/// wired for `AlgorandFullNode`/`participate`.
+///
+/// Unlike `participate`'s crash-recovery DB (only meaningful for agreement
+/// participation), `node start` has no agreement crash DB to open — only
+/// the tracker DB and block DB are resolved and opened here.
+fn open_ledger_with_resource_overrides(
+    ledger_prefix: &Path,
+    cfg: &algo_config::Local,
+) -> anyhow::Result<SqliteLedger> {
+    let resolved = crate::commands::participate::resolve_resource_paths(ledger_prefix, cfg);
+    for resolved_dir in [resolved.tracker_path.parent(), resolved.block_path.parent()]
+        .into_iter()
+        .flatten()
+    {
+        std::fs::create_dir_all(resolved_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create resource directory {}: {}",
+                resolved_dir.display(),
+                e
+            )
+        })?;
+    }
+    SqliteLedger::open_split(
+        &resolved.tracker_path,
+        &resolved.block_path,
+        Some(algo_ledger::sqlite::derive_ledger_prefix(ledger_prefix)),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "opening ledger (tracker={}, block={}): {e}",
+            resolved.tracker_path.display(),
+            resolved.block_path.display()
+        )
+    })
+}
+
 pub async fn run(cmd: NodeCommands) -> anyhow::Result<()> {
     match cmd {
         NodeCommands::Start {
@@ -154,15 +204,56 @@ async fn run_start(
     let gh = algo_ledger::genesis::genesis_hash(&genesis);
 
     // -----------------------------------------------------------------------
+    // 1b. Load `<data_dir>/config.json` (go-algorand `config.Local`
+    //     equivalent, issue #754) — `node start` previously never read this
+    //     file at all, leaving `docker/localnet-rust/data/config.json`
+    //     decorative dead weight (issue #757). A missing file falls back to
+    //     `Local::default()` (go-matching defaults, same as `participate`'s
+    //     handling in `main.rs`); a malformed one is logged and defaults are
+    //     used rather than refusing to start — `node start` is the
+    //     localnet/dev entry point and a bad hand-edited config.json
+    //     shouldn't brick it.
+    //
+    //     Loaded before the ledger is opened (moved up from its original
+    //     post-ledger-open position, issue #1030) so its per-resource
+    //     directory overrides (`HotDataDir`/`ColdDataDir`/`TrackerDBDir`/
+    //     `BlockDBDir`) are available to apply at ledger-open time, exactly
+    //     like `participate` already does (issue #953) — this is what
+    //     closes the follower-node parity gap tracked by go's
+    //     `TestDefaultResourcePaths_Follower`/`TestConfiguredDataDirs_Follower`/
+    //     `TestConfiguredResourcePaths_Follower`.
+    // -----------------------------------------------------------------------
+    let file_config = match algo_config::Local::load_from_data_dir(data_dir) {
+        Ok(cfg) => {
+            info!(
+                version = cfg.version,
+                endpoint_address = %cfg.endpoint_address,
+                dns_bootstrap_id = %cfg.dns_bootstrap_id,
+                enable_developer_api = cfg.enable_developer_api,
+                "loaded config.json"
+            );
+            cfg
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to load config.json; continuing with defaults");
+            algo_config::Local::default()
+        }
+    };
+
+    // -----------------------------------------------------------------------
     // 2. Open the ledger (Go layout: <datadir>/<genesisID>/ledger.*), seeding
-    //    genesis state on first boot.
+    //    genesis state on first boot. Applies `file_config`'s per-resource
+    //    directory overrides (issue #1030, mirroring issue #953's
+    //    `participate` wiring) so the tracker/block DBs land wherever
+    //    `HotDataDir`/`ColdDataDir`/`TrackerDBDir`/`BlockDBDir` configure —
+    //    for both plain/`--dev` full-node mode and `--follow` follower mode,
+    //    since both share this same startup path.
     // -----------------------------------------------------------------------
     let ledger_dir = data_dir.join(&genesis_id);
     std::fs::create_dir_all(&ledger_dir)
         .with_context(|| format!("creating ledger directory {}", ledger_dir.display()))?;
     let ledger_prefix = ledger_dir.join("ledger");
-    let mut sqlite_ledger = SqliteLedger::open(&ledger_prefix)
-        .map_err(|e| anyhow::anyhow!("opening ledger at {}: {e}", ledger_prefix.display()))?;
+    let mut sqlite_ledger = open_ledger_with_resource_overrides(&ledger_prefix, &file_config)?;
 
     let latest = sqlite_ledger.current_round().0;
     // "Already seeded" is the presence of the accounttotals row, not nonzero
@@ -288,32 +379,6 @@ async fn run_start(
 
     let ledger = Arc::new(Mutex::new(sqlite_ledger));
 
-    // -----------------------------------------------------------------------
-    // 2b. Load `<data_dir>/config.json` (go-algorand `config.Local`
-    //     equivalent, issue #754) — `node start` previously never read this
-    //     file at all, leaving `docker/localnet-rust/data/config.json`
-    //     decorative dead weight (issue #757). A missing file falls back to
-    //     `Local::default()` (go-matching defaults, same as `participate`'s
-    //     handling in `main.rs`); a malformed one is logged and defaults are
-    //     used rather than refusing to start — `node start` is the
-    //     localnet/dev entry point and a bad hand-edited config.json
-    //     shouldn't brick it.
-    let file_config = match algo_config::Local::load_from_data_dir(data_dir) {
-        Ok(cfg) => {
-            info!(
-                version = cfg.version,
-                endpoint_address = %cfg.endpoint_address,
-                dns_bootstrap_id = %cfg.dns_bootstrap_id,
-                enable_developer_api = cfg.enable_developer_api,
-                "loaded config.json"
-            );
-            cfg
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to load config.json; continuing with defaults");
-            algo_config::Local::default()
-        }
-    };
     // `DNSBootstrapID` (config.json) has a real, exercised consumer on
     // `algod-rust participate`/`relay` (issue #748's `Discovery`/`Phonebook`
     // DNS-SRV peer bootstrap over the gossip WS protocol), but `node start`
@@ -977,5 +1042,156 @@ mod config_json_wiring_tests {
             !follower_devmode_warning_needed(true, false),
             "a follower node against a non-dev-mode genesis must not warn"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `open_ledger_with_resource_overrides` — issue #1030's `_Follower` variants
+// of go-algorand's per-resource data-dir override tests
+// (`node/follower_node_test.go`'s `TestDefaultResourcePaths_Follower`,
+// `TestConfiguredDataDirs_Follower`, `TestConfiguredResourcePaths_Follower`).
+//
+// `node start`'s single `run_start` startup path serves both plain/`--dev`
+// full-node mode and `--follow` follower mode (the only difference is
+// whether `follow_url` is `Some`), so wiring `HotDataDir`/`ColdDataDir`/
+// `TrackerDBDir`/`BlockDBDir` overrides into the shared ledger-open call
+// closes this gap for the follower path exactly like issue #953 did for
+// `participate` — these tests exercise the *real* `SqliteLedger::open_split`
+// call `run_start` (including its `--follow` branch) now makes, not a
+// `MockNode`-backed surface test.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod resource_path_override_tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "algod-rust-node-resource-paths-{label}-{}-{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// `TestDefaultResourcePaths_Follower`: with no per-resource overrides
+    /// configured, the tracker DB and block DB land at the default
+    /// `<genesis_dir>/ledger.{tracker,block}.sqlite` locations — matching
+    /// go's assertion that both resources exist directly under the
+    /// per-genesis data directory.
+    #[test]
+    fn open_ledger_with_resource_overrides_defaults_to_ledger_directory() {
+        let tmp_dir = temp_dir("default");
+        let ledger_dir = tmp_dir.join("go-test-node-genesis");
+        std::fs::create_dir_all(&ledger_dir).expect("create genesis dir");
+        let ledger_prefix = ledger_dir.join("ledger");
+
+        let cfg = algo_config::Local::default();
+        let ledger = open_ledger_with_resource_overrides(&ledger_prefix, &cfg)
+            .expect("open ledger with default resource paths");
+        drop(ledger);
+
+        assert!(
+            ledger_dir.join("ledger.tracker.sqlite").exists(),
+            "tracker db must exist at the default per-genesis directory"
+        );
+        assert!(
+            ledger_dir.join("ledger.block.sqlite").exists(),
+            "block db must exist at the default per-genesis directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// `TestConfiguredDataDirs_Follower`: with `HotDataDir`/`ColdDataDir`
+    /// set but no explicit `TrackerDBDir`/`BlockDBDir`, the tracker DB
+    /// falls back into `HotDataDir` and the block DB falls back into
+    /// `ColdDataDir`, and neither lands in the default per-genesis
+    /// directory.
+    #[test]
+    fn open_ledger_with_resource_overrides_honors_hot_and_cold_data_dirs() {
+        let tmp_dir = temp_dir("hotcold");
+        let ledger_dir = tmp_dir.join("go-test-node-genesis");
+        std::fs::create_dir_all(&ledger_dir).expect("create genesis dir");
+        let ledger_prefix = ledger_dir.join("ledger");
+        let hot_dir = tmp_dir.join("hot");
+        let cold_dir = tmp_dir.join("cold");
+
+        let cfg = algo_config::Local {
+            hot_data_dir: hot_dir.to_string_lossy().into_owned(),
+            cold_data_dir: cold_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let ledger = open_ledger_with_resource_overrides(&ledger_prefix, &cfg)
+            .expect("open ledger with HotDataDir/ColdDataDir overrides");
+        drop(ledger);
+
+        assert!(
+            hot_dir.join("ledger.tracker.sqlite").exists(),
+            "tracker db must fall back to HotDataDir"
+        );
+        assert!(
+            cold_dir.join("ledger.block.sqlite").exists(),
+            "block db must fall back to ColdDataDir"
+        );
+        assert!(
+            !ledger_dir.join("ledger.tracker.sqlite").exists(),
+            "tracker db must not land in the default per-genesis directory anymore"
+        );
+        assert!(
+            !ledger_dir.join("ledger.block.sqlite").exists(),
+            "block db must not land in the default per-genesis directory anymore"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// `TestConfiguredResourcePaths_Follower`: explicit `TrackerDBDir`/
+    /// `BlockDBDir` take precedence over `HotDataDir`/`ColdDataDir`, even
+    /// when both are configured to different directories.
+    #[test]
+    fn open_ledger_with_resource_overrides_honors_explicit_per_resource_overrides() {
+        let tmp_dir = temp_dir("explicit");
+        let ledger_dir = tmp_dir.join("go-test-node-genesis");
+        std::fs::create_dir_all(&ledger_dir).expect("create genesis dir");
+        let ledger_prefix = ledger_dir.join("ledger");
+        let hot_dir = tmp_dir.join("hot");
+        let cold_dir = tmp_dir.join("cold");
+        let tracker_dir = tmp_dir.join("custom_tracker");
+        let block_dir = tmp_dir.join("custom_block");
+
+        let cfg = algo_config::Local {
+            hot_data_dir: hot_dir.to_string_lossy().into_owned(),
+            cold_data_dir: cold_dir.to_string_lossy().into_owned(),
+            tracker_db_dir: tracker_dir.to_string_lossy().into_owned(),
+            block_db_dir: block_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let ledger = open_ledger_with_resource_overrides(&ledger_prefix, &cfg)
+            .expect("open ledger with explicit TrackerDBDir/BlockDBDir overrides");
+        drop(ledger);
+
+        assert!(
+            !hot_dir.join("ledger.tracker.sqlite").exists(),
+            "tracker db must not land in HotDataDir once TrackerDBDir is set explicitly"
+        );
+        assert!(
+            tracker_dir.join("ledger.tracker.sqlite").exists(),
+            "tracker db must exist at the explicit TrackerDBDir"
+        );
+        assert!(
+            !cold_dir.join("ledger.block.sqlite").exists(),
+            "block db must not land in ColdDataDir once BlockDBDir is set explicitly"
+        );
+        assert!(
+            block_dir.join("ledger.block.sqlite").exists(),
+            "block db must exist at the explicit BlockDBDir"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
