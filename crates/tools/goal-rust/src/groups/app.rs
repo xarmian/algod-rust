@@ -28,9 +28,11 @@ use clap::{Args, Subcommand};
 use crate::unimplemented;
 
 #[derive(Subcommand, Debug)]
-// `Call`/`Method` carry the full application-call flag surface; the other
-// leaves are still unit variants pending later slices. See the `SendArgs`
-// precedent in `groups::clerk` for why boxing isn't worth it here.
+// `Call`/`Method`/the lifecycle leaves carry the full application-call flag
+// surface; `Info`/`Read` are still unit variants pending a later slice (see
+// issue #962's PR #1023 comment: `read`/`info` need byte-exact JSON parity
+// work beyond what fits in this slice). See the `SendArgs` precedent in
+// `groups::clerk` for why boxing isn't worth it here.
 #[allow(clippy::large_enum_variant)]
 pub enum AppCmd {
     /// Read application box data.
@@ -41,23 +43,23 @@ pub enum AppCmd {
     /// Call an application.
     Call(CallArgs),
     /// Clear out an application's state in your account.
-    Clear,
+    Clear(LifecycleArgs),
     /// Close out of an application.
-    Closeout,
+    Closeout(LifecycleArgs),
     /// Create an application.
-    Create,
+    Create(CreateArgs),
     /// Delete an application.
-    Delete,
+    Delete(LifecycleArgs),
     /// Look up current parameters for an application.
     Info,
     /// Invoke an ABI method.
     Method(MethodArgs),
     /// Opt in to an application.
-    Optin,
+    Optin(LifecycleArgs),
     /// Read local or global state for an application.
     Read,
     /// Update an application's programs.
-    Update,
+    Update(UpdateArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -205,6 +207,157 @@ pub struct AppTxnArgs {
     pub password: Option<String>,
 }
 
+/// The `--app-arg` flag shared by every `app` leaf that submits an
+/// application-call transaction (Go's persistent `appCmd.PersistentFlags()
+/// .StringArrayVar(&appArgs, "app-arg", ...)`, `application.go:118`).
+/// [`CallArgs`] keeps its own copy of this field (predates this struct);
+/// new leaves flatten this one instead of repeating the doc comment.
+#[derive(Args, Debug, Default)]
+pub struct AppArgArgs {
+    /// Args to encode for the application call, `encoding:value` form (Go
+    /// `--app-arg`, repeatable): `int:1234`, `b64:A==`, `str:hello`,
+    /// `addr:XYZ...`, `b32:...`, or `abi:<type>:<json-value>`.
+    #[arg(long = "app-arg")]
+    pub app_arg: Vec<String>,
+}
+
+/// The approval/clear-state program flags shared by `app create`/`app
+/// update` (Go's persistent `--approval-prog`/`--clear-prog`/
+/// `--approval-prog-raw`/`--clear-prog-raw`, `application.go:128-132`).
+#[derive(Args, Debug, Default)]
+pub struct AppProgramArgs {
+    /// (Uncompiled) TEAL assembly for the approval program (Go
+    /// `--approval-prog`). Mutually exclusive with `--approval-prog-raw`;
+    /// exactly one of the pair is required.
+    #[arg(long = "approval-prog")]
+    pub approval_prog: Option<PathBuf>,
+    /// (Uncompiled) TEAL assembly for the clear-state program (Go
+    /// `--clear-prog`). Mutually exclusive with `--clear-prog-raw`.
+    #[arg(long = "clear-prog")]
+    pub clear_prog: Option<PathBuf>,
+    /// Compiled AVM bytecode for the approval program (Go
+    /// `--approval-prog-raw`). Mutually exclusive with `--approval-prog`.
+    #[arg(long = "approval-prog-raw")]
+    pub approval_prog_raw: Option<PathBuf>,
+    /// Compiled AVM bytecode for the clear-state program (Go
+    /// `--clear-prog-raw`). Mutually exclusive with `--clear-prog`.
+    #[arg(long = "clear-prog-raw")]
+    pub clear_prog_raw: Option<PathBuf>,
+}
+
+/// `app optin`/`app closeout`/`app clear`/`app delete` -f <from> --app-id
+/// <id> [--app-arg ...] [refs] [txn]`.
+///
+/// Mirrors Go's `optInAppCmd`/`closeOutAppCmd`/`clearAppCmd`/`deleteAppCmd`
+/// (`application.go:659-991`): all four share the exact same flag surface
+/// (no programs, no schemas) and differ only in the numeric `OnCompletion`
+/// they submit (`OptIn`=1, `CloseOut`=2, `ClearState`=3,
+/// `DeleteApplication`=5) — see `crate::cmd::app::run_optin`/`run_closeout`/
+/// `run_clear`/`run_delete`.
+#[derive(Args, Debug)]
+pub struct LifecycleArgs {
+    /// Account to send the transaction from (Go `-f/--from`). Required.
+    #[arg(short = 'f', long = "from")]
+    pub from: String,
+    /// Application ID (Go `--app-id`). Required.
+    #[arg(long = "app-id")]
+    pub app_id: u64,
+    /// RejectVersion for the application transaction (Go `--reject-version`).
+    #[arg(long = "reject-version", default_value_t = 0)]
+    pub reject_version: u64,
+    #[command(flatten)]
+    pub app_args: AppArgArgs,
+    #[command(flatten)]
+    pub refs: AppRefsArgs,
+    #[command(flatten)]
+    pub txn: AppTxnArgs,
+}
+
+/// `app create --creator <addr> --approval-prog <f> --clear-prog <f>
+/// [--on-completion oc] [schema flags] [--extra-pages n] [refs] [txn]`.
+///
+/// Mirrors Go's `createAppCmd` (`application.go:496-584`): build and submit
+/// an `ApplicationCallTx` with `ApplicationID=0`, the given `OnCompletion`
+/// (default `NoOp`; Go warns — doesn't reject — for `CloseOut`/`ClearState`),
+/// the compiled approval/clear programs, and the global/local state schemas.
+/// `--reject-version` is deliberately *not* exposed here: Go's
+/// `MakeUnsignedAppCreateTx` never threads the persistent `--reject-version`
+/// flag through to the built transaction (verified against
+/// `libgoal/transactions.go:536-538`), so a value there would silently have
+/// no effect.
+#[derive(Args, Debug)]
+pub struct CreateArgs {
+    /// Account to create the application from (Go `--creator`). Required.
+    #[arg(long = "creator")]
+    pub creator: String,
+    /// OnCompletion action for the application transaction (Go
+    /// `--on-completion`).
+    #[arg(long = "on-completion", default_value = "NoOp")]
+    pub on_completion: String,
+    /// Maximum global integer values (Go `--global-ints`).
+    #[arg(long = "global-ints", default_value_t = 0)]
+    pub global_ints: u64,
+    /// Maximum global byte-slice values (Go `--global-byteslices`).
+    #[arg(long = "global-byteslices", default_value_t = 0)]
+    pub global_byteslices: u64,
+    /// Maximum local integer values (Go `--local-ints`). Immutable.
+    #[arg(long = "local-ints", default_value_t = 0)]
+    pub local_ints: u64,
+    /// Maximum local byte-slice values (Go `--local-byteslices`). Immutable.
+    #[arg(long = "local-byteslices", default_value_t = 0)]
+    pub local_byteslices: u64,
+    /// Additional program pages (Go `--extra-pages`).
+    #[arg(long = "extra-pages", default_value_t = 0)]
+    pub extra_pages: u32,
+    #[command(flatten)]
+    pub programs: AppProgramArgs,
+    #[command(flatten)]
+    pub app_args: AppArgArgs,
+    #[command(flatten)]
+    pub refs: AppRefsArgs,
+    #[command(flatten)]
+    pub txn: AppTxnArgs,
+}
+
+/// `app update --app-id <id> -f <from> --approval-prog <f> --clear-prog <f>
+/// [--global-ints n] [--global-byteslices n] [--extra-pages n] [refs] [txn]`.
+///
+/// Mirrors Go's `updateAppCmd` (`application.go:586-657`): submit an
+/// `UpdateApplication` call replacing the approval/clear programs. Only the
+/// *global* schema/extra-pages may grow on update (Go doesn't register
+/// `--local-ints`/`--local-byteslices` on `updateAppCmd` at all — local
+/// schema is immutable after creation).
+#[derive(Args, Debug)]
+pub struct UpdateArgs {
+    /// Application ID (Go `--app-id`). Required.
+    #[arg(long = "app-id")]
+    pub app_id: u64,
+    /// Account to send the update transaction from (Go `-f/--from`).
+    /// Required.
+    #[arg(short = 'f', long = "from")]
+    pub from: String,
+    /// Maximum global integer values (Go `--global-ints`).
+    #[arg(long = "global-ints", default_value_t = 0)]
+    pub global_ints: u64,
+    /// Maximum global byte-slice values (Go `--global-byteslices`).
+    #[arg(long = "global-byteslices", default_value_t = 0)]
+    pub global_byteslices: u64,
+    /// Additional program pages (Go `--extra-pages`).
+    #[arg(long = "extra-pages", default_value_t = 0)]
+    pub extra_pages: u32,
+    /// RejectVersion for the application transaction (Go `--reject-version`).
+    #[arg(long = "reject-version", default_value_t = 0)]
+    pub reject_version: u64,
+    #[command(flatten)]
+    pub programs: AppProgramArgs,
+    #[command(flatten)]
+    pub app_args: AppArgArgs,
+    #[command(flatten)]
+    pub refs: AppRefsArgs,
+    #[command(flatten)]
+    pub txn: AppTxnArgs,
+}
+
 /// `app call -f <from> --app-id <id> [--app-arg ...] [refs] [txn]`.
 ///
 /// Mirrors Go's `callAppCmd` (`application.go:860-870` for the flag surface
@@ -346,14 +499,14 @@ pub fn run(cmd: AppCmd, wallet: Option<String>) -> ExitCode {
             }
         }
         AppCmd::Call(args) => crate::cmd::app::run_call(args, wallet),
-        AppCmd::Clear => unimplemented("app", "clear"),
-        AppCmd::Closeout => unimplemented("app", "closeout"),
-        AppCmd::Create => unimplemented("app", "create"),
-        AppCmd::Delete => unimplemented("app", "delete"),
+        AppCmd::Clear(args) => crate::cmd::app::run_clear(args, wallet),
+        AppCmd::Closeout(args) => crate::cmd::app::run_closeout(args, wallet),
+        AppCmd::Create(args) => crate::cmd::app::run_create(args, wallet),
+        AppCmd::Delete(args) => crate::cmd::app::run_delete(args, wallet),
         AppCmd::Info => unimplemented("app", "info"),
         AppCmd::Method(args) => crate::cmd::app::run_method(args, wallet),
-        AppCmd::Optin => unimplemented("app", "optin"),
+        AppCmd::Optin(args) => crate::cmd::app::run_optin(args, wallet),
         AppCmd::Read => unimplemented("app", "read"),
-        AppCmd::Update => unimplemented("app", "update"),
+        AppCmd::Update(args) => crate::cmd::app::run_update(args, wallet),
     }
 }

@@ -56,12 +56,24 @@ use crate::cmd::clerk::{
     build_algod_client_for_dir, build_kmd_client, compute_validity, kmd_msg, parse_lease,
     parse_note, resolve_wallet_and_init, write_file_0600,
 };
+use crate::cmd::clerk_sign::hash_program;
 use crate::data_dir;
 use crate::formatting::encode_bytes_as_app_call_bytes;
-use crate::groups::app::{AppRefsArgs, AppTxnArgs, BoxInfoArgs, BoxListArgs, CallArgs, MethodArgs};
+use crate::groups::app::{
+    AppRefsArgs, AppTxnArgs, BoxInfoArgs, BoxListArgs, CallArgs, CreateArgs, LifecycleArgs,
+    MethodArgs, UpdateArgs,
+};
 use crate::resource_resolution::{
     app_address, attach_references, BoxHint, HoldingHint, LocalHint, RefBundle,
 };
+
+/// The numeric `OnCompletion` values (matches [`parse_on_completion`]'s
+/// mapping and Go's `transactions.OnCompletion` enum).
+const ON_COMPLETION_NOOP: u64 = 0;
+const ON_COMPLETION_OPTIN: u64 = 1;
+const ON_COMPLETION_CLOSE_OUT: u64 = 2;
+const ON_COMPLETION_CLEAR_STATE: u64 = 3;
+const ON_COMPLETION_DELETE_APPLICATION: u64 = 5;
 
 /// The 4-byte prefix ARC-4 (`https://arc.algorand.foundation/ARCs/arc-0004`)
 /// specifies for a logged return value, matching Go's `abiReturnHash`
@@ -370,12 +382,112 @@ fn resolve_txn_header(
 }
 
 // ---------------------------------------------------------------------------
-// app call
+// app call / optin / closeout / clear / delete
 // ---------------------------------------------------------------------------
 
 /// `app call -f <from> --app-id <id> [--app-arg ...] [refs] [txn]`.
 pub fn run_call(args: CallArgs, wallet: Option<String>) -> ExitCode {
-    match run_call_inner(args, wallet) {
+    run_and_report(|| {
+        // Go's `callAppCmd` always builds a NoOp call
+        // (`client.MakeUnsignedAppNoOpTx`, `application.go:870`) — there is
+        // no `--on-completion` flag on `app call` at all (see `CallArgs`'s
+        // struct docs).
+        submit_app_lifecycle_txn(
+            args.app_id,
+            &args.from,
+            ON_COMPLETION_NOOP,
+            &args.app_arg,
+            &args.refs,
+            args.reject_version,
+            &args.txn,
+            wallet,
+        )
+    })
+}
+
+/// `app optin -f <from> --app-id <id> [--app-arg ...] [refs] [txn]`.
+///
+/// Mirrors Go's `optInAppCmd` (`application.go:659-724`).
+pub fn run_optin(args: LifecycleArgs, wallet: Option<String>) -> ExitCode {
+    run_and_report(|| {
+        submit_app_lifecycle_txn(
+            args.app_id,
+            &args.from,
+            ON_COMPLETION_OPTIN,
+            &args.app_args.app_arg,
+            &args.refs,
+            args.reject_version,
+            &args.txn,
+            wallet,
+        )
+    })
+}
+
+/// `app closeout -f <from> --app-id <id> [--app-arg ...] [refs] [txn]`.
+///
+/// Mirrors Go's `closeOutAppCmd` (`application.go:726-791`).
+pub fn run_closeout(args: LifecycleArgs, wallet: Option<String>) -> ExitCode {
+    run_and_report(|| {
+        submit_app_lifecycle_txn(
+            args.app_id,
+            &args.from,
+            ON_COMPLETION_CLOSE_OUT,
+            &args.app_args.app_arg,
+            &args.refs,
+            args.reject_version,
+            &args.txn,
+            wallet,
+        )
+    })
+}
+
+/// `app clear -f <from> --app-id <id> [--app-arg ...] [refs] [txn]`.
+///
+/// Mirrors Go's `clearAppCmd` (`application.go:793-858`). Submitting
+/// `OnCompletion=ClearState` is the only special handling this leaf needs:
+/// go-algorand's ledger apply layer (`ledger/apply/application.go`) swallows
+/// a rejecting/erroring ClearState program and never fails the outer
+/// transaction for it — clearing out is always allowed. That's a ledger-side
+/// property, not something the CLI submission path needs to replicate (see
+/// `CLAUDE.md`'s "Simulation EvalDelta-on-Error Semantics" note for the
+/// equivalent simulate-endpoint behavior).
+pub fn run_clear(args: LifecycleArgs, wallet: Option<String>) -> ExitCode {
+    run_and_report(|| {
+        submit_app_lifecycle_txn(
+            args.app_id,
+            &args.from,
+            ON_COMPLETION_CLEAR_STATE,
+            &args.app_args.app_arg,
+            &args.refs,
+            args.reject_version,
+            &args.txn,
+            wallet,
+        )
+    })
+}
+
+/// `app delete -f <from> --app-id <id> [--app-arg ...] [refs] [txn]`.
+///
+/// Mirrors Go's `deleteAppCmd` (`application.go:926-991`).
+pub fn run_delete(args: LifecycleArgs, wallet: Option<String>) -> ExitCode {
+    run_and_report(|| {
+        submit_app_lifecycle_txn(
+            args.app_id,
+            &args.from,
+            ON_COMPLETION_DELETE_APPLICATION,
+            &args.app_args.app_arg,
+            &args.refs,
+            args.reject_version,
+            &args.txn,
+            wallet,
+        )
+    })
+}
+
+/// Run `f`, mapping an `Err` into the `eprintln!` + exit-1 shape every leaf
+/// in this module reports failures with.
+fn run_and_report(f: impl FnOnce() -> Result<ExitCode, String>) -> ExitCode {
+    match f() {
         Ok(code) => code,
         Err(msg) => {
             eprintln!("{msg}");
@@ -384,27 +496,152 @@ pub fn run_call(args: CallArgs, wallet: Option<String>) -> ExitCode {
     }
 }
 
-fn run_call_inner(args: CallArgs, wallet: Option<String>) -> Result<ExitCode, String> {
-    // Go's `callAppCmd` always builds a NoOp call (`client.MakeUnsignedAppNoOpTx`,
-    // `application.go:870`) — there is no `--on-completion` flag on `app call`
-    // at all (see `CallArgs`'s struct docs).
-    const ON_COMPLETION_NOOP: u64 = 0;
-
+/// Build and submit a plain (no programs, no schema) application-call
+/// transaction: `app call` (NoOp), `app optin`, `app closeout`, `app clear`,
+/// `app delete`. Shared because Go's `callAppCmd`/`optInAppCmd`/
+/// `closeOutAppCmd`/`clearAppCmd`/`deleteAppCmd` are all textually identical
+/// aside from which `MakeUnsignedApp*Tx` (and thus which `OnCompletion`
+/// value) they call (`application.go:660-991`).
+#[allow(clippy::too_many_arguments)]
+fn submit_app_lifecycle_txn(
+    app_id: u64,
+    from: &str,
+    on_completion: u64,
+    app_arg: &[String],
+    refs_args: &AppRefsArgs,
+    reject_version: u64,
+    txn_args: &AppTxnArgs,
+    wallet: Option<String>,
+) -> Result<ExitCode, String> {
     let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
         .map_err(|e| e.to_string())?;
     let accounts = AccountsList::load(&data_dir_path);
-    let from_resolved = accounts.address_for(&args.from);
+    let from_resolved = accounts.address_for(from);
     let from_addr = Address::from_algorand_string(&from_resolved)
         .map_err(|e| format!("Could not parse from address {from_resolved}: {e}"))?;
 
-    let mut app_arguments = Vec::with_capacity(args.app_arg.len());
-    for a in &args.app_arg {
+    let mut app_arguments = Vec::with_capacity(app_arg.len());
+    for a in app_arg {
         if a.is_empty() {
             continue;
         }
         app_arguments.push(parse_app_call_bytes(a)?);
     }
 
+    let refs = build_ref_bundle_from_flags(refs_args)?;
+
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+    let params = rt
+        .block_on(algod.suggested_transaction_params())
+        .map_err(|e| e.to_string())?;
+    let header = resolve_txn_header(txn_args, &params)?;
+
+    let signer_addr = txn_args
+        .signer
+        .as_deref()
+        .map(|s| Address::from_algorand_string(s).map_err(|e| format!("Signer invalid ({s}): {e}")))
+        .transpose()?;
+
+    let mut txn = algo_txn_pipeline::ApplicationCallBuilder::new(from_addr, app_id, on_completion)
+        .app_arguments(app_arguments)
+        .reject_version(reject_version)
+        .fee(header.fee)
+        .validity(header.first_valid, header.last_valid)
+        .genesis_hash(header.genesis_hash)
+        .genesis_id(header.genesis_id)
+        .note(header.note)
+        .lease(header.lease);
+    if let Some(rekey) = header.rekey_to {
+        txn = txn.rekey_to(rekey);
+    }
+    let mut txn = txn.build().map_err(|e| e.to_string())?;
+    attach_references(&mut txn, &refs);
+    if txn_args.fee.is_none() {
+        txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
+    }
+
+    submit_single(
+        txn,
+        signer_addr,
+        txn_args,
+        wallet,
+        &data_dir_path,
+        &rt,
+        algod,
+        None,
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The `"Attempting to {action} app (approval size {n}, hash {h}; clear
+/// size {n}, hash {h})"` line `app create`/`app update` print right before
+/// broadcasting. Mirrors Go's
+/// `reportInfof("Attempting to %s app (approval size %d, hash %v; clear
+/// size %d, hash %v)", ...)` (`application.go:564`/`641`): the hash is the
+/// raw `logic.HashProgram` digest's base32 (no padding) string form — the
+/// *program hash*, not a checksummed Algorand address (contrast
+/// [`crate::cmd::clerk_sign::program_address`], which wraps the same digest
+/// as an `Address`).
+fn format_program_attempt_line(action: &str, approval: &[u8], clear: &[u8]) -> String {
+    format!(
+        "Attempting to {action} app (approval size {}, hash {}; clear size {}, hash {})",
+        approval.len(),
+        base32_digest(&hash_program(approval)),
+        clear.len(),
+        base32_digest(&hash_program(clear)),
+    )
+}
+
+/// Base32 (RFC4648, standard alphabet, no padding) encoding of a digest,
+/// matching Go's `crypto.Digest.String()` (`crypto/util.go:63-65`).
+fn base32_digest(digest: &[u8; 32]) -> String {
+    data_encoding::BASE32_NOPAD.encode(digest)
+}
+
+/// `app create --creator <addr> --approval-prog <f> --clear-prog <f>
+/// [--on-completion oc] [schema flags] [--extra-pages n] [refs] [txn]`.
+///
+/// Mirrors Go's `createAppCmd` (`application.go:496-584`).
+pub fn run_create(args: CreateArgs, wallet: Option<String>) -> ExitCode {
+    run_and_report(|| run_create_inner(args, wallet))
+}
+
+fn run_create_inner(args: CreateArgs, wallet: Option<String>) -> Result<ExitCode, String> {
+    let on_completion = parse_on_completion(&args.on_completion)?;
+    if on_completion == ON_COMPLETION_CLOSE_OUT || on_completion == ON_COMPLETION_CLEAR_STATE {
+        eprintln!(
+            "Warning: '--on-completion {}' may be ill-formed for 'goal app create'",
+            args.on_completion
+        );
+    }
+
+    let local_schema = StateSchema {
+        num_uint: args.local_ints,
+        num_byte_slice: args.local_byteslices,
+    };
+    let global_schema = StateSchema {
+        num_uint: args.global_ints,
+        num_byte_slice: args.global_byteslices,
+    };
+
+    let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
+        .map_err(|e| e.to_string())?;
+    let accounts = AccountsList::load(&data_dir_path);
+    let creator_resolved = accounts.address_for(&args.creator);
+    let creator_addr = Address::from_algorand_string(&creator_resolved)
+        .map_err(|e| format!("Could not parse creator address {creator_resolved}: {e}"))?;
+
+    let mut app_arguments = Vec::with_capacity(args.app_args.app_arg.len());
+    for a in &args.app_args.app_arg {
+        if a.is_empty() {
+            continue;
+        }
+        app_arguments.push(parse_app_call_bytes(a)?);
+    }
     let refs = build_ref_bundle_from_flags(&args.refs)?;
 
     let algod = build_algod_client_for_dir(&data_dir_path)?;
@@ -412,6 +649,15 @@ fn run_call_inner(args: CallArgs, wallet: Option<String>) -> Result<ExitCode, St
         .enable_all()
         .build()
         .map_err(|e| format!("Error processing command: {e}"))?;
+    let (approval_prog, clear_prog) = resolve_programs(
+        &algod,
+        &rt,
+        args.programs.approval_prog.as_deref(),
+        args.programs.approval_prog_raw.as_deref(),
+        args.programs.clear_prog.as_deref(),
+        args.programs.clear_prog_raw.as_deref(),
+    )?;
+
     let params = rt
         .block_on(algod.suggested_transaction_params())
         .map_err(|e| e.to_string())?;
@@ -424,10 +670,14 @@ fn run_call_inner(args: CallArgs, wallet: Option<String>) -> Result<ExitCode, St
         .map(|s| Address::from_algorand_string(s).map_err(|e| format!("Signer invalid ({s}): {e}")))
         .transpose()?;
 
-    let mut txn =
-        algo_txn_pipeline::ApplicationCallBuilder::new(from_addr, args.app_id, ON_COMPLETION_NOOP)
+    let mut builder =
+        algo_txn_pipeline::ApplicationCallBuilder::new(creator_addr, 0, on_completion)
             .app_arguments(app_arguments)
-            .reject_version(args.reject_version)
+            .approval_program(approval_prog.clone())
+            .clear_state_program(clear_prog.clone())
+            .global_state_schema(global_schema)
+            .local_state_schema(local_schema)
+            .extra_program_pages(args.extra_pages)
             .fee(header.fee)
             .validity(header.first_valid, header.last_valid)
             .genesis_hash(header.genesis_hash)
@@ -435,14 +685,121 @@ fn run_call_inner(args: CallArgs, wallet: Option<String>) -> Result<ExitCode, St
             .note(header.note)
             .lease(header.lease);
     if let Some(rekey) = header.rekey_to {
-        txn = txn.rekey_to(rekey);
+        builder = builder.rekey_to(rekey);
     }
-    let mut txn = txn.build().map_err(|e| e.to_string())?;
+    let mut txn = builder.build().map_err(|e| e.to_string())?;
     attach_references(&mut txn, &refs);
     if args.txn.fee.is_none() {
         txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
     }
 
+    let extra_line = format_program_attempt_line("create", &approval_prog, &clear_prog);
+    let info = submit_single(
+        txn,
+        signer_addr,
+        &args.txn,
+        wallet,
+        &data_dir_path,
+        &rt,
+        algod,
+        Some(extra_line),
+    )?;
+    if let Some(info) = info {
+        if let Some(app_idx) = info.application_index.filter(|i| *i != 0) {
+            println!("Created app with app index {app_idx}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `app update --app-id <id> -f <from> --approval-prog <f> --clear-prog <f>
+/// [--global-ints n] [--global-byteslices n] [--extra-pages n] [refs] [txn]`.
+///
+/// Mirrors Go's `updateAppCmd` (`application.go:586-657`).
+pub fn run_update(args: UpdateArgs, wallet: Option<String>) -> ExitCode {
+    run_and_report(|| run_update_inner(args, wallet))
+}
+
+fn run_update_inner(args: UpdateArgs, wallet: Option<String>) -> Result<ExitCode, String> {
+    let global_schema = StateSchema {
+        num_uint: args.global_ints,
+        num_byte_slice: args.global_byteslices,
+    };
+
+    let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
+        .map_err(|e| e.to_string())?;
+    let accounts = AccountsList::load(&data_dir_path);
+    let from_resolved = accounts.address_for(&args.from);
+    let from_addr = Address::from_algorand_string(&from_resolved)
+        .map_err(|e| format!("Could not parse from address {from_resolved}: {e}"))?;
+
+    let mut app_arguments = Vec::with_capacity(args.app_args.app_arg.len());
+    for a in &args.app_args.app_arg {
+        if a.is_empty() {
+            continue;
+        }
+        app_arguments.push(parse_app_call_bytes(a)?);
+    }
+    let refs = build_ref_bundle_from_flags(&args.refs)?;
+
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+    let (approval_prog, clear_prog) = resolve_programs(
+        &algod,
+        &rt,
+        args.programs.approval_prog.as_deref(),
+        args.programs.approval_prog_raw.as_deref(),
+        args.programs.clear_prog.as_deref(),
+        args.programs.clear_prog_raw.as_deref(),
+    )?;
+
+    let params = rt
+        .block_on(algod.suggested_transaction_params())
+        .map_err(|e| e.to_string())?;
+    let header = resolve_txn_header(&args.txn, &params)?;
+
+    let signer_addr = args
+        .txn
+        .signer
+        .as_deref()
+        .map(|s| Address::from_algorand_string(s).map_err(|e| format!("Signer invalid ({s}): {e}")))
+        .transpose()?;
+
+    // Mirrors Go's `MakeUnsignedAppUpdateTx` (empty schemas/extra-pages 0)
+    // immediately overwritten by the literal `tx.GlobalStateSchema =
+    // ...; tx.ExtraProgramPages = ...` assignments in `updateAppCmd`
+    // (`application.go:602-606`) — net effect is just "use the flags
+    // as given"; local schema is never touched (immutable after create).
+    let mut builder = algo_txn_pipeline::ApplicationCallBuilder::new(
+        from_addr,
+        args.app_id,
+        ON_COMPLETION_UPDATE_APPLICATION,
+    )
+    .app_arguments(app_arguments)
+    .reject_version(args.reject_version)
+    .approval_program(approval_prog.clone())
+    .clear_state_program(clear_prog.clone())
+    .global_state_schema(global_schema)
+    .extra_program_pages(args.extra_pages)
+    .fee(header.fee)
+    .validity(header.first_valid, header.last_valid)
+    .genesis_hash(header.genesis_hash)
+    .genesis_id(header.genesis_id)
+    .note(header.note)
+    .lease(header.lease);
+    if let Some(rekey) = header.rekey_to {
+        builder = builder.rekey_to(rekey);
+    }
+    let mut txn = builder.build().map_err(|e| e.to_string())?;
+    attach_references(&mut txn, &refs);
+    if args.txn.fee.is_none() {
+        txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
+    }
+
+    let extra_line = format_program_attempt_line("update", &approval_prog, &clear_prog);
     submit_single(
         txn,
         signer_addr,
@@ -451,13 +808,21 @@ fn run_call_inner(args: CallArgs, wallet: Option<String>) -> Result<ExitCode, St
         &data_dir_path,
         &rt,
         algod,
-    )
+        Some(extra_line),
+    )?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Sign (via wallet) and either write to file or broadcast a single
 /// application-call transaction, reporting the txid the way Go's
-/// `callAppCmd` does. Shared by `app call`; `app method` uses its own
-/// group-aware path (see [`run_method_inner`]).
+/// `callAppCmd` et al. do. `extra_info_line`, when given, is printed
+/// immediately after broadcasting and before the "Issued transaction..."
+/// line (Go's `create`/`update` "Attempting to ... app (...)" line).
+/// Returns the confirmed [`algo_rest_client::PendingTxnInfo`] (`None` when
+/// `--no-wait` was given) so `app create` can report the new app index.
+/// Shared by every plain-lifecycle leaf and `create`/`update`; `app method`
+/// uses its own group-aware path (see [`run_method_inner`]).
+#[allow(clippy::too_many_arguments)]
 fn submit_single(
     txn: Transaction,
     signer_addr: Option<Address>,
@@ -466,7 +831,8 @@ fn submit_single(
     data_dir_path: &Path,
     rt: &tokio::runtime::Runtime,
     algod: AlgodClient,
-) -> Result<ExitCode, String> {
+    extra_info_line: Option<String>,
+) -> Result<Option<algo_rest_client::PendingTxnInfo>, String> {
     let want_wallet_sign = txn_args.out.is_none() || txn_args.sign;
     let stx = if want_wallet_sign {
         let kmd = build_kmd_client(data_dir_path, crate::cli_state::kmddir().as_deref())?;
@@ -512,17 +878,20 @@ fn submit_single(
         let encoded = canonical_encode_signed_transaction(&stx);
         std::fs::write(out_path, &encoded)
             .map_err(|e| format!("Cannot write file {}: {e}", out_path.display()))?;
-        return Ok(ExitCode::SUCCESS);
+        return Ok(None);
     }
 
     let last_valid = txn.last_valid.0;
     let encoded_stx = canonical_encode_signed_transaction(&stx);
     let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, None);
-    rt.block_on(async {
+    let info = rt.block_on(async {
         let txid = pipeline
             .submit(&encoded_stx)
             .await
             .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
+        if let Some(line) = &extra_info_line {
+            println!("{line}");
+        }
         println!(
             "Issued transaction from account {}, txid {} (fee {})",
             txn.sender.to_algorand_string(),
@@ -530,7 +899,7 @@ fn submit_single(
             txn.fee
         );
         if txn_args.no_wait {
-            return Ok::<(), String>(());
+            return Ok::<Option<algo_rest_client::PendingTxnInfo>, String>(None);
         }
         let info = pipeline
             .wait_for_confirmation(&txid, last_valid)
@@ -539,9 +908,9 @@ fn submit_single(
         if let Some(round) = info.confirmed_round {
             println!("Transaction {txid} committed in round {round}");
         }
-        Ok(())
+        Ok(Some(info))
     })?;
-    Ok(ExitCode::SUCCESS)
+    Ok(info)
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,5 +1884,73 @@ mod tests {
     #[test]
     fn should_not_stop_after_page_with_neither_flag() {
         assert!(!should_stop_after_page(0, ""));
+    }
+
+    // --- app create/update/optin/closeout/clear/delete on-completion wiring ---
+
+    #[test]
+    fn lifecycle_on_completion_constants_match_parse_on_completion() {
+        // Pins the numeric OnCompletion each lifecycle leaf submits against
+        // the same mapping `parse_on_completion`/Go's
+        // `transactions.OnCompletion` enum use, so `run_optin`/`run_closeout`/
+        // `run_clear`/`run_delete`'s hard-coded constants can't silently
+        // drift from that mapping.
+        assert_eq!(ON_COMPLETION_NOOP, parse_on_completion("NoOp").unwrap());
+        assert_eq!(ON_COMPLETION_OPTIN, parse_on_completion("OptIn").unwrap());
+        assert_eq!(
+            ON_COMPLETION_CLOSE_OUT,
+            parse_on_completion("CloseOut").unwrap()
+        );
+        assert_eq!(
+            ON_COMPLETION_CLEAR_STATE,
+            parse_on_completion("ClearState").unwrap()
+        );
+        assert_eq!(
+            ON_COMPLETION_UPDATE_APPLICATION,
+            parse_on_completion("UpdateApplication").unwrap()
+        );
+        assert_eq!(
+            ON_COMPLETION_DELETE_APPLICATION,
+            parse_on_completion("DeleteApplication").unwrap()
+        );
+    }
+
+    #[test]
+    fn base32_digest_matches_go_crypto_digest_string() {
+        // Go's `crypto.Digest.String()` is unpadded standard base32
+        // (`crypto/util.go:63-65`); RFC4648 test vector for "hi" x2
+        // hashed... instead, pin against a known digest computed the same
+        // way `data_encoding::BASE32` (padded) would, minus padding.
+        let digest = [0u8; 32];
+        let encoded = base32_digest(&digest);
+        // 256 bits at 5 bits/char = 52 chars, no padding — unlike the
+        // padded BASE32 codec used elsewhere in this module for box
+        // names/app-args.
+        assert_eq!(encoded.len(), 52);
+        assert!(encoded.chars().all(|c| c == 'A'));
+        assert!(!encoded.contains('='));
+    }
+
+    #[test]
+    fn format_program_attempt_line_matches_go_shape() {
+        let approval = vec![0x06, 0x81, 0x01];
+        let clear = vec![0x06, 0x81, 0x00];
+        let line = format_program_attempt_line("create", &approval, &clear);
+        let expected_approval_hash = base32_digest(&hash_program(&approval));
+        let expected_clear_hash = base32_digest(&hash_program(&clear));
+        assert_eq!(
+            line,
+            format!(
+                "Attempting to create app (approval size 3, hash {expected_approval_hash}; \
+                 clear size 3, hash {expected_clear_hash})"
+            )
+        );
+    }
+
+    #[test]
+    fn format_program_attempt_line_reports_action_and_sizes() {
+        let line = format_program_attempt_line("update", &[0u8; 5], &[0u8; 7]);
+        assert!(line.starts_with("Attempting to update app (approval size 5, hash "));
+        assert!(line.contains("clear size 7, hash "));
     }
 }
