@@ -52,6 +52,7 @@ use algo_agreement::{
 use algo_types::{ConsensusParams, Round};
 
 use super::activity_monitor::ActivityMonitor;
+use super::suspendable_validator::SuspendableBlockValidator;
 use super::test_account::{generate_n_accounts, TestAccount};
 use super::test_factory::{AutoBlockFactory, TestKeyManager};
 use super::test_ledger::TestLedger;
@@ -76,7 +77,9 @@ impl RandomSource for FixedRandomSource {
 /// `shutdown()` must be called before the test returns (put it behind a
 /// `defer`-equivalent — a local closure or just call it at the end of a
 /// `#[test]` fn body) — mirrors go's `cleanupFn`.
-pub struct AgreementCluster {
+pub struct AgreementCluster<
+    BV: algo_agreement::BlockValidator + Send + Sync + 'static = NoOpValidator,
+> {
     pub network: Arc<TestingNetwork>,
     pub start_round: Round,
     pub clocks: Vec<Arc<TestingClock>>,
@@ -87,11 +90,24 @@ pub struct AgreementCluster {
     /// was handed to `Parameters::crypto`, made possible by the
     /// `CryptoVerifier for Arc<C>` blanket impl added for this — see
     /// `wait_for_quiet`'s doc comment for why this is needed).
-    verifiers: Vec<Arc<AsyncCryptoVerifier<TestLedger, NoOpValidator>>>,
+    verifiers: Vec<Arc<AsyncCryptoVerifier<TestLedger, BV>>>,
     handles: Cell<Vec<ServiceHandle>>,
 }
 
-impl AgreementCluster {
+impl<BV: algo_agreement::BlockValidator + Send + Sync + 'static> AgreementCluster<BV> {
+    /// Sum, across every node, of proposal-verification requests currently
+    /// blocked inside `BlockValidator::validate` — see
+    /// `AsyncCryptoVerifier::pending_proposal_validations`'s doc comment.
+    /// Used by scenarios driving a [`super::suspendable_validator::SuspendableBlockValidator`]
+    /// (theme-3's `8ba23942` regression) to synchronize on a precise count
+    /// of pending verifications rather than on quiescence (which, by
+    /// design, never arrives while the validator stays suspended).
+    pub fn pending_proposal_validations(&self) -> usize {
+        self.verifiers
+            .iter()
+            .map(|v| v.pending_proposal_validations())
+            .sum()
+    }
     /// Block until every node's demux/pseudonode-reported queues, every
     /// network channel, AND every node's crypto-verifier output channels
     /// (votes/proposals/bundles verified but not yet drained by that node's
@@ -110,6 +126,20 @@ impl AgreementCluster {
     /// spanning several settle points in quick succession) hit this gap
     /// often enough to be genuinely flaky; folding the verifiers' output
     /// channels into the quiescence check closes it.
+    ///
+    /// Also folds in `pending_proposal_validations()` (issue #825's
+    /// coservice-count-equivalent primitive, added for the `8ba23942`
+    /// investigation): a request that has been dequeued from
+    /// `proposal_in_rx` but not yet resolved to `proposal_out_rx` (e.g.
+    /// blocked inside a [`super::suspendable_validator::SuspendableBlockValidator`])
+    /// is invisible to every OTHER term here (it has left the input
+    /// channel but hasn't reached the output channel yet), so without this
+    /// a driver that suspends validation mid-scenario would see a false
+    /// "quiet" instead of the genuine stall. A caller that deliberately
+    /// suspends a validator and wants to keep making progress elsewhere
+    /// must poll `pending_proposal_validations()` directly instead of
+    /// calling `wait_for_quiet()` during the suspended window — this method
+    /// will now correctly refuse to report quiescence until resumed.
     pub fn wait_for_quiet(&self) {
         self.monitor
             .wait_for_quiet(&self.network, &self.clocks, || {
@@ -119,6 +149,7 @@ impl AgreementCluster {
                         v.verified_votes().len()
                             + v.verified(PROPOSAL_PAYLOAD_TAG).len()
                             + v.verified(VOTE_BUNDLE_TAG).len()
+                            + v.pending_proposal_validations()
                             + (v.channel_full(AGREEMENT_VOTE_TAG)
                                 || v.channel_full(PROPOSAL_PAYLOAD_TAG)
                                 || v.channel_full(VOTE_BUNDLE_TAG))
@@ -223,6 +254,109 @@ pub fn setup_agreement_with_version_fn(
         // satisfies `Parameters`'s `C: CryptoVerifier` bound via the
         // blanket `impl<C: CryptoVerifier> CryptoVerifier for Arc<C>`.
         let crypto = Arc::new(AsyncCryptoVerifier::new(Arc::new(ledger.clone())));
+        verifiers.push(Arc::clone(&crypto));
+
+        let this_params = Parameters {
+            network: network.endpoint(i),
+            ledger,
+            key_manager,
+            block_factory: AutoBlockFactory,
+            block_validator: StubBlockValidator::accepting(),
+            random_source: FixedRandomSource,
+            monitor: monitor.listener(i),
+            crypto,
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+            crash_db: None,
+            signing_keys,
+        };
+
+        let handle = Service::new(this_params).start();
+        clocks.push(clock);
+        handles.push(handle);
+    }
+
+    AgreementCluster {
+        network,
+        start_round,
+        clocks,
+        ledgers,
+        monitor,
+        verifiers,
+        handles: Cell::new(handles),
+    }
+}
+
+/// Like [`setup_agreement`], but wires EVERY node's `AsyncCryptoVerifier` to
+/// the SAME `validator` handle (clones of one `SuspendableBlockValidator`,
+/// sharing its inner gate — see that type's doc comment) instead of the
+/// fixed `NoOpValidator`. Mirrors go's `setupAgreementWithValidator`, whose
+/// single `validator BlockValidator` argument is handed to every node's
+/// `Parameters.BlockValidator` AND to the shared `testingNetwork` (which
+/// wires it into every node's crypto verifier) — a genuinely global,
+/// cluster-wide suspend switch, used by
+/// `TestAgreementRegression_WrongPeriodPayloadVerificationCancellation_8ba23942`
+/// to pin every node's stale-period proposal-payload verification in place
+/// at once.
+///
+/// Note: this only swaps the crypto verifier's validator (the one actually
+/// exercised by real proposal-payload verification). Each node's
+/// `Parameters::block_validator` (the separate, ensure-path fallback used by
+/// `do_ensure_action`/`set_prev_timestamp` — see `crypto_verifier.rs`'s and
+/// `service.rs`'s independent `BV` type parameters) stays the ordinary
+/// always-accepting `StubBlockValidator`, since a block already carrying a
+/// crypto-verifier-attached `ValidatedBlock` never re-enters
+/// `BlockValidator::validate` on the ensure path — go's version shares one
+/// instance for both roles only because its ensure path also always takes
+/// the already-validated fast path in these scenarios, so this is a
+/// behavior-preserving simplification, not a divergence.
+pub fn setup_agreement_with_validator(
+    n: usize,
+    validator: SuspendableBlockValidator,
+) -> AgreementCluster<SuspendableBlockValidator> {
+    let buf_capacity = 1000;
+    let consensus_version = algo_types::CONSENSUS_V41;
+    let params: ConsensusParams =
+        algo_types::consensus::consensus_params_for_version(consensus_version)
+            .expect("v41 consensus params available");
+
+    let mut accounts: Vec<TestAccount> =
+        generate_n_accounts(n, Round(0), Round(1000), 10_000, rand_salt());
+
+    let shared_commits = super::test_ledger::SharedCommits::default();
+    let mut ledgers = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut ledger = TestLedger::new(
+            &accounts,
+            1_000_000_000_000,
+            params.clone(),
+            consensus_version.to_string(),
+        );
+        ledger.share_commits(shared_commits.clone());
+        ledgers.push(ledger);
+    }
+    let start_round = ledgers[0].next_round();
+
+    let network = TestingNetwork::new(n, buf_capacity);
+    let monitor = ActivityMonitor::new(n);
+
+    let mut clocks = Vec::with_capacity(n);
+    let mut handles = Vec::with_capacity(n);
+    let mut verifiers = Vec::with_capacity(n);
+
+    for (i, account) in accounts.drain(..).enumerate() {
+        let key_manager = TestKeyManager::new(std::slice::from_ref(&account));
+        let TestAccount {
+            address, vrf, ots, ..
+        } = account;
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert(address, AccountSigningKeys { vrf, ots });
+
+        let clock = TestingClock::new();
+        let ledger = ledgers[i].clone();
+        let crypto = Arc::new(AsyncCryptoVerifier::new_with_validator(
+            Arc::new(ledger.clone()),
+            Arc::new(validator.clone()),
+        ));
         verifiers.push(Arc::clone(&crypto));
 
         let this_params = Parameters {

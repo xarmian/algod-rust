@@ -78,8 +78,10 @@ use algo_agreement::{codec, ProposalValue, BOTTOM};
 use algo_types::Round;
 
 use crate::simulate::setup_agreement::{
-    setup_agreement, setup_agreement_with_version_fn, AgreementCluster,
+    setup_agreement, setup_agreement_with_validator, setup_agreement_with_version_fn,
+    AgreementCluster,
 };
+use crate::simulate::suspendable_validator::SuspendableBlockValidator;
 use crate::simulate::testing_network::PocketedMessage;
 
 /// Group `pocketed` cert-vote messages by `(round, period)` and return the
@@ -112,7 +114,9 @@ fn largest_same_period_group(
 /// Every node's committed round, asserted identical across the cluster.
 /// Panics on divergence — that's a real finding, not a "needs another
 /// nudge" condition.
-fn current_round(cluster: &AgreementCluster) -> Round {
+fn current_round<BV: algo_agreement::BlockValidator + Send + Sync + 'static>(
+    cluster: &AgreementCluster<BV>,
+) -> Round {
     let rounds: Vec<Round> = cluster.ledgers.iter().map(|l| l.next_round()).collect();
     let first = rounds[0];
     assert!(
@@ -122,7 +126,10 @@ fn current_round(cluster: &AgreementCluster) -> Round {
     first
 }
 
-fn expect_no_new_round(cluster: &AgreementCluster, round: Round) -> Round {
+fn expect_no_new_round<BV: algo_agreement::BlockValidator + Send + Sync + 'static>(
+    cluster: &AgreementCluster<BV>,
+    round: Round,
+) -> Round {
     let r = current_round(cluster);
     assert_eq!(
         r, round,
@@ -136,7 +143,10 @@ fn expect_no_new_round(cluster: &AgreementCluster, round: Round) -> Round {
 /// `triggerGlobalTimeout` (the `d time.Duration` first argument go takes is
 /// unused by `fire` there too — see `testing_clock.rs`'s doc comment for why
 /// this port drops it).
-fn trigger_global_timeout(cluster: &AgreementCluster, timeout_type: TimeoutType) {
+fn trigger_global_timeout<BV: algo_agreement::BlockValidator + Send + Sync + 'static>(
+    cluster: &AgreementCluster<BV>,
+    timeout_type: TimeoutType,
+) {
     for clock in &cluster.clocks {
         clock.fire(timeout_type);
     }
@@ -161,8 +171,8 @@ fn trigger_subset_timeout(
 /// real-thread, real-async-crypto timing. Panics if the cluster hasn't
 /// progressed within `max_attempts`, or if nodes end up at DIFFERENT
 /// rounds (a real divergence, not just "needed another nudge").
-fn pump_until_new_round(
-    cluster: &AgreementCluster,
+fn pump_until_new_round<BV: algo_agreement::BlockValidator + Send + Sync + 'static>(
+    cluster: &AgreementCluster<BV>,
     round: Round,
     timeout_type: TimeoutType,
     max_attempts: u32,
@@ -211,7 +221,11 @@ fn pump_until_new_round_multi(
 /// Mirrors go's `sanityCheck(startRound, numRounds, ledgers)`: every node's
 /// ledger advanced exactly `num_rounds` rounds past `start`, and every node
 /// committed the identical block (by digest) at every one of those rounds.
-fn sanity_check(cluster: &AgreementCluster, start: Round, num_rounds: u64) {
+fn sanity_check<BV: algo_agreement::BlockValidator + Send + Sync + 'static>(
+    cluster: &AgreementCluster<BV>,
+    start: Round,
+    num_rounds: u64,
+) {
     for (i, ledger) in cluster.ledgers.iter().enumerate() {
         assert_eq!(
             ledger.next_round(),
@@ -1547,4 +1561,88 @@ fn certificate_does_not_stall_single_relay_five_node() {
     // leaves' round is not itself an additional commit -- it's the SAME
     // round the leaves already committed).
     sanity_check(&cluster, start_round, 5);
+}
+
+/// End-to-end integration proof for the two harness pieces built for issue
+/// #825's `8ba23942` investigation — `AsyncCryptoVerifier::
+/// pending_proposal_validations` (coservice-count-equivalent quiescence
+/// tracking) and `simulate::suspendable_validator::SuspendableBlockValidator`
+/// / `setup_agreement_with_validator` (a cluster-wide suspendable
+/// `BlockValidator`) — wired through a REAL 5-node `Service`/`Player`
+/// cluster, not just the unit tests each piece already has in isolation.
+///
+/// This is deliberately NOT a port of
+/// `TestAgreementRegression_WrongPeriodPayloadVerificationCancellation_8ba23942`
+/// itself: porting that exact scenario turned out to need more than these
+/// two pieces provide (see `docs/phase17/parity_agreement.md`'s row for it,
+/// and issue #1035) — a pause/checkpoint hook between "a round commits" and
+/// "the next round's proposal auto-broadcasts," which this harness's
+/// real-thread `Service`s have no observable point for a driver to act on.
+/// Suspending the validator from the very start of the cluster sidesteps
+/// that exact race (there is no "previous round" whose settle cascade could
+/// have already raced ahead), which is why this test can be reliable where
+/// the full regression scenario, so far, is not.
+#[test]
+fn suspended_block_validator_stalls_verification_and_resume_unblocks_it_five_node() {
+    let validator = SuspendableBlockValidator::new();
+    validator.suspend();
+
+    let cluster = setup_agreement_with_validator(5, validator.clone());
+    let start_round = cluster.start_round;
+
+    // Do NOT call `cluster.wait_for_quiet()` here: with every node's
+    // crypto verifier suspended, the round-1 proposal broadcast by
+    // whichever node wins period-0 sortition can never finish verifying at
+    // the other 4 nodes, so the cluster never reaches quiescence — exactly
+    // the condition `wait_for_quiet`'s doc comment says to poll
+    // `pending_proposal_validations()` directly for instead.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while cluster.pending_proposal_validations() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no node ever reported a pending (suspended) proposal validation \
+             within 10s of cluster startup"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // With validation stuck, round 1 must not have committed anywhere.
+    for (i, ledger) in cluster.ledgers.iter().enumerate() {
+        assert_eq!(
+            ledger.next_round(),
+            start_round,
+            "node {i} committed a round while every proposal verification \
+             was suspended"
+        );
+    }
+
+    // Release every blocked validation. The stuck verification(s) resolve,
+    // the cluster catches up on its own (no further clock fire needed —
+    // matching how every other "ordinary round" in this file commits off
+    // real vote/proposal traffic alone), and `pending_proposal_validations`
+    // drops back to zero.
+    validator.resume();
+    cluster.wait_for_quiet();
+    assert_eq!(cluster.pending_proposal_validations(), 0);
+
+    // Releasing the suspended validator is necessary but not always
+    // immediately sufficient for round 1 to commit — like every other
+    // "ordinary round" in this file, real-thread timing sometimes needs an
+    // explicit nudge on top of organic vote/proposal traffic (see this
+    // file's module doc comment). `pump_until_new_round` fires+settles in a
+    // bounded retry loop rather than asserting after a single
+    // `wait_for_quiet`.
+    let mut round = pump_until_new_round(&cluster, start_round, TimeoutType::Deadline, 20);
+
+    // Prove the cluster is fully healthy afterward, not just unstuck for
+    // one round.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+    let _ = round;
+
+    cluster.shutdown();
+    // 1 round committed once suspension was released + 2 further ordinary
+    // rounds pumped afterward = 3 total commits from `start_round`.
+    sanity_check(&cluster, start_round, 3);
 }

@@ -30,7 +30,7 @@
 // Mirrors Go's `poolCryptoVerifier` in `agreement/cryptoVerifier.go`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -380,6 +380,12 @@ pub struct AsyncCryptoVerifier<
     /// Only accessed from the demux loop thread, so contention is zero.
     cancellation: Mutex<PendingRequestsContext>,
 
+    /// Count of proposal-verification requests currently dequeued and being
+    /// processed (i.e. blocked inside `BlockValidator::validate`), across
+    /// all `PROPOSAL_PARALLELISM` worker threads. See
+    /// `pending_proposal_validations`'s doc comment.
+    pending_proposal_validations: Arc<AtomicUsize>,
+
     /// Marker for the validator type parameter.
     _validator: std::marker::PhantomData<BV>,
 }
@@ -468,6 +474,7 @@ fn proposal_worker<BV: BlockValidator + Send + Sync + 'static>(
     tx: crossbeam_channel::Sender<CryptoResult>,
     quit_rx: crossbeam_channel::Receiver<()>,
     validator: Arc<BV>,
+    pending_validations: Arc<AtomicUsize>,
 ) {
     loop {
         let internal = crossbeam_channel::select! {
@@ -503,7 +510,27 @@ fn proposal_worker<BV: BlockValidator + Send + Sync + 'static>(
             continue;
         }
 
+        // Track "in flight" proposal validations (dequeued but not yet
+        // resolved) so test harnesses can observe how many
+        // `BlockValidator::validate` calls are currently blocked — mirrors
+        // Go's `coserviceListener` accounting for `cryptoVerifierCoserviceType`
+        // (see `agreement/cryptoVerifier.go`'s `inc`/`dec` calls around its
+        // proposal-verification exec-pool task), used by
+        // `TestAgreementRegression_WrongPeriodPayloadVerificationCancellation_8ba23942`-style
+        // scenarios to synchronize on a suspended validator draining a
+        // precise number of pending requests. A `Drop` guard ensures the
+        // counter is decremented even if `verify_proposal_impl` were to
+        // panic, so a single bad request can't wedge the counter forever.
+        struct PendingGuard<'a>(&'a AtomicUsize);
+        impl Drop for PendingGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        pending_validations.fetch_add(1, Ordering::SeqCst);
+        let _guard = PendingGuard(&pending_validations);
         let mut result = verify_proposal_impl(validator.as_ref(), request);
+        drop(_guard);
 
         // Check cancellation again after verification.
         if internal.cancel.load(Ordering::Acquire) {
@@ -1033,6 +1060,7 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
         // Spawn workers.
         let mut handles =
             Vec::with_capacity(VOTE_PARALLELISM + PROPOSAL_PARALLELISM + BUNDLE_PARALLELISM);
+        let pending_proposal_validations = Arc::new(AtomicUsize::new(0));
 
         for i in 0..VOTE_PARALLELISM {
             let rx = vote_in_rx.clone();
@@ -1052,10 +1080,11 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             let tx = proposal_out_tx.clone();
             let qrx = quit_signal_rx.clone();
             let v = validator.clone();
+            let pv = Arc::clone(&pending_proposal_validations);
             handles.push(
                 thread::Builder::new()
                     .name(format!("proposal-worker-{i}"))
-                    .spawn(move || proposal_worker(rx, tx, qrx, v))
+                    .spawn(move || proposal_worker(rx, tx, qrx, v, pv))
                     .expect("failed to spawn proposal worker thread"),
             );
         }
@@ -1091,8 +1120,28 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             quit_signal_tx: Mutex::new(Some(quit_signal_tx)),
             worker_handles: Mutex::new(Some(handles)),
             cancellation: Mutex::new(PendingRequestsContext::new()),
+            pending_proposal_validations,
             _validator: std::marker::PhantomData,
         }
+    }
+
+    /// Number of proposal-verification requests currently dequeued and
+    /// blocked inside `BlockValidator::validate` (not yet resolved to a
+    /// result on `verified(PROPOSAL_PAYLOAD_TAG)`).
+    ///
+    /// Mirrors the *purpose* of Go's `activityMonitor` `cryptoVerifierCoserviceType`
+    /// callback (`agreement/service_test.go`), which a test driver uses to
+    /// know precisely how many proposal-verification goroutines are
+    /// currently parked (e.g. behind a suspended `testSuspendableBlockValidator`)
+    /// before proceeding — see
+    /// `TestAgreementRegression_WrongPeriodPayloadVerificationCancellation_8ba23942`.
+    /// Unlike Go's push-based callback, this is a plain poll target: safe
+    /// here because the count is monotonically non-decreasing while the
+    /// validator stays suspended, so a driver polling for "count has
+    /// reached N" cannot miss the transition the way it could for a
+    /// transient value.
+    pub fn pending_proposal_validations(&self) -> usize {
+        self.pending_proposal_validations.load(Ordering::SeqCst)
     }
 }
 
@@ -1339,8 +1388,9 @@ mod tests {
     use crate::events::InternalMessage;
     use crate::step::Period;
     use crate::stubs::{StubBlockValidator, StubLedger};
+    use crate::traits::AgreementError;
     use crate::vote::UnauthenticatedVote;
-    use algo_types::{ConsensusParams, Round};
+    use algo_types::{Block, ConsensusParams, Round};
     use std::time::Duration;
 
     fn v41_params() -> ConsensusParams {
@@ -1425,6 +1475,72 @@ mod tests {
             proposal.validated_block.is_some(),
             "validated_block should be Some after successful block validation"
         );
+    }
+
+    /// A `BlockValidator` that blocks inside `validate()` until released,
+    /// used to pin `pending_proposal_validations` at a known nonzero value
+    /// for [`pending_proposal_validations_tracks_in_flight_requests`].
+    struct BlockingValidator {
+        release: crossbeam_channel::Receiver<()>,
+    }
+
+    impl BlockValidator for BlockingValidator {
+        fn validate(&self, block: &Block) -> Result<Box<dyn ValidatedBlock>, AgreementError> {
+            let _ = self.release.recv();
+            Ok(Box::new(crate::stubs::StubValidatedBlock {
+                block: block.clone(),
+            }))
+        }
+    }
+
+    /// Pins the coservice-count-equivalent primitive added for issue #825's
+    /// `8ba23942` service-level regression: while a proposal-verification
+    /// worker is blocked inside `BlockValidator::validate`,
+    /// `pending_proposal_validations()` must report it as in-flight, and
+    /// must drop back to zero once the block is released and the result is
+    /// resolved.
+    #[test]
+    fn pending_proposal_validations_tracks_in_flight_requests() {
+        let ledger = Arc::new(StubLedger::new(v41_params(), Round(100)));
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(0);
+        let validator = Arc::new(BlockingValidator {
+            release: release_rx,
+        });
+        let verifier = AsyncCryptoVerifier::new_with_validator(ledger, validator);
+
+        assert_eq!(verifier.pending_proposal_validations(), 0);
+
+        verifier.verify_proposal(CryptoProposalRequest {
+            message: InternalMessage {
+                tag: "PP".to_string(),
+                ..InternalMessage::default()
+            },
+            task_index: 1,
+            round: Round(5),
+            period: Period(0),
+            pinned: false,
+        });
+
+        // Poll until the worker thread has actually entered `validate()`
+        // (dequeuing from a crossbeam channel is not instantaneous).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while verifier.pending_proposal_validations() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never reported an in-flight proposal validation"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(verifier.pending_proposal_validations(), 1);
+
+        // Release the block and confirm both the result arrives AND the
+        // counter drops back to zero.
+        drop(release_tx);
+        let _ = verifier
+            .verified(PROPOSAL_PAYLOAD_TAG)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("should have a result within 5s");
+        assert_eq!(verifier.pending_proposal_validations(), 0);
     }
 
     /// When the block validator rejects the block, verify_proposal should
