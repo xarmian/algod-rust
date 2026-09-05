@@ -259,6 +259,15 @@ pub struct ApiApplicationParams {
     )]
     pub extra_program_pages: Option<u64>,
 
+    /// \[fbr\] whether any app may read (but not write) this app's boxes.
+    #[serde(rename = "foreign-box-reads", skip_serializing_if = "Option::is_none")]
+    pub foreign_box_reads: Option<bool>,
+
+    /// \[fba\] whether any app with the same creator as this app may read
+    /// and write this app's boxes.
+    #[serde(rename = "family-box-access", skip_serializing_if = "Option::is_none")]
+    pub family_box_access: Option<bool>,
+
     /// Represents a key-value store for use in an application.
     #[serde(rename = "global-state", skip_serializing_if = "Option::is_none")]
     pub global_state: Option<TealKeyValueStore>,
@@ -1233,6 +1242,8 @@ pub fn app_params_to_api(app_id: u64, creator: &str, params: &AppParams) -> ApiA
             approval_program: params.approval_program.clone(),
             clear_state_program: params.clear_state_program.clone(),
             extra_program_pages,
+            foreign_box_reads: params.foreign_box_reads.then_some(true),
+            family_box_access: params.family_box_access.then_some(true),
             global_state,
             local_state_schema: Some(ApiApplicationStateSchema {
                 num_byte_slice: params.local_state_schema.num_byte_slice,
