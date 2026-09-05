@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::{
-    AccountInfo, AlgodVersions, BlockSource, BoxResponse, BoxesResponse, NodeStatus,
+    AccountInfo, AlgodVersions, Application, BlockSource, BoxResponse, BoxesResponse, NodeStatus,
     ParticipationKey, ParticipationKeyAdded, PendingTxnInfo, PostTransactionResponse,
     SuggestedParams, TealCompileResult, TxId,
 };
@@ -590,6 +590,49 @@ impl AlgodClient {
             .map_err(|e| AlgoError::RestClient {
                 source: Box::new(e),
                 context: format!("reading GET /v2/deltas/{round}?format=msgpack response body"),
+            })
+    }
+}
+
+// ---- Application info surface (issue #1033) ----
+//
+// Mirrors go's `client.ApplicationInformation`/`client.RawAccountApplicationInformation`
+// (`libgoal/libgoal.go:694-713`). Used by goal-rust's `app info`/`app read`.
+
+impl AlgodClient {
+    /// `GET /v2/applications/{app_id}` — application info (JSON). Used by
+    /// `goal app info` (Go's `client.ApplicationInformation`,
+    /// `daemon/algod/api/client/restClient.go:494`). A nonexistent
+    /// application returns [`AlgoError::NotFound`].
+    pub async fn get_application(&self, app_id: u64) -> Result<Application> {
+        let path = format!("/v2/applications/{app_id}");
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.json::<Application>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("parsing GET {path} response"),
+            })
+    }
+
+    /// `GET /v2/accounts/{address}/applications/{app_id}?format=msgpack` —
+    /// raw msgpack `AccountApplicationModel` bytes (go's basics-typed ledger
+    /// shape: an `{"app-local-state": ..., "app-params": ...}` map, each
+    /// using `basics.AppLocalState`/`basics.AppParams`'s own codec tags,
+    /// *not* the array-shaped `TealKeyValueStore` REST JSON model). Used by
+    /// `goal app read` (Go's `client.RawAccountApplicationInformation`,
+    /// `daemon/algod/api/client/restClient.go:599`, `libgoal/libgoal.go:702-713`).
+    /// Returns [`AlgoError::NotFound`] when the address has neither local
+    /// state nor created-app params for `app_id`.
+    pub async fn get_account_application_raw(&self, address: &str, app_id: u64) -> Result<Vec<u8>> {
+        let path = format!("/v2/accounts/{address}/applications/{app_id}?format=msgpack");
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("reading GET {path} response body"),
             })
     }
 }

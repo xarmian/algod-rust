@@ -23,6 +23,7 @@
 
 pub mod account;
 pub mod app;
+mod app_state_json;
 pub mod clerk;
 pub mod clerk_sign;
 pub mod node;

@@ -34,6 +34,7 @@
 //! not vendored at the `../go-algorand` pin — read from the Go module cache,
 //! `apps/parsing.go`).
 
+use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -43,25 +44,26 @@ use algo_abi::{
 };
 use algo_codec::{
     canonical_encode_signed_transaction, canonical_encode_transaction, compute_group_id,
-    compute_txn_id, decode_signed_txn_stream,
+    compute_txn_id, decode_raw, decode_signed_txn_stream,
 };
 use algo_error::AlgoError;
 use algo_kmd_client::KmdClient;
 use algo_rest_client::AlgodClient;
-use algo_types::{Address, SignedTransaction, StateSchema, Transaction};
+use algo_types::{Address, SignedTransaction, StateSchema, TealValue, Transaction};
 use base64::Engine;
 
 use crate::accounts_list::AccountsList;
+use crate::cmd::app_state_json::{encode_teal_state_json, heuristic_format_entries, TealEntry};
 use crate::cmd::clerk::{
     build_algod_client_for_dir, build_kmd_client, compute_validity, kmd_msg, parse_lease,
     parse_note, resolve_wallet_and_init, write_file_0600,
 };
-use crate::cmd::clerk_sign::hash_program;
+use crate::cmd::clerk_sign::{hash_program, program_address};
 use crate::data_dir;
 use crate::formatting::encode_bytes_as_app_call_bytes;
 use crate::groups::app::{
-    AppRefsArgs, AppTxnArgs, BoxInfoArgs, BoxListArgs, CallArgs, CreateArgs, LifecycleArgs,
-    MethodArgs, UpdateArgs,
+    AppRefsArgs, AppTxnArgs, BoxInfoArgs, BoxListArgs, CallArgs, CreateArgs, InfoArgs,
+    LifecycleArgs, MethodArgs, ReadArgs, UpdateArgs,
 };
 use crate::resource_resolution::{
     app_address, attach_references, BoxHint, HoldingHint, LocalHint, RefBundle,
@@ -911,6 +913,266 @@ fn submit_single(
         Ok(Some(info))
     })?;
     Ok(info)
+}
+
+// ---------------------------------------------------------------------------
+// app info / app read
+// ---------------------------------------------------------------------------
+
+/// `app info --app-id <id>`.
+///
+/// Mirrors Go's `infoAppCmd` (`application.go:1073-1127`): fetch the
+/// application's params via `GET /v2/applications/{id}` and print a
+/// multi-field text block. The approval/clear "hash" lines are the
+/// checksummed *address* form of `logic.HashProgram` ([`program_address`]),
+/// not the raw digest `app create`/`app update`'s
+/// [`format_program_attempt_line`] prints — go's `basics.Address(...)`
+/// wrapping in `infoAppCmd` is exactly `program_address`.
+pub fn run_info(args: InfoArgs) -> ExitCode {
+    run_and_report(|| run_info_inner(args))
+}
+
+fn run_info_inner(args: InfoArgs) -> Result<ExitCode, String> {
+    let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
+        .map_err(|e| e.to_string())?;
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+
+    let meta = rt
+        .block_on(algod.get_application(args.app_id))
+        .map_err(|e| format!("Error processing command: {e}"))?;
+    let params = &meta.params;
+
+    // Field labels/spacing are copied byte-for-byte from
+    // `application.go:1087-1124`'s `fmt.Printf` calls (verified against the
+    // pinned source's exact column offsets, not eyeballed).
+    println!("Application ID:        {}", args.app_id);
+    println!(
+        "Application account:   {}",
+        app_address(args.app_id).to_algorand_string()
+    );
+    println!("Creator:               {}", params.creator);
+    println!(
+        "Approval hash:         {}",
+        program_address(&params.approval_program).to_algorand_string()
+    );
+    println!(
+        "Clear hash:            {}",
+        program_address(&params.clear_state_program).to_algorand_string()
+    );
+
+    if let Some(ver) = params.version {
+        println!("Program version:       {ver}");
+    }
+    if let Some(sponsor) = &params.size_sponsor {
+        println!("Size sponsor:        {sponsor}");
+    }
+    if let Some(epp) = params.extra_program_pages {
+        println!("Extra program pages:   {epp}");
+    }
+    if params.foreign_box_reads == Some(true) {
+        println!("Foreign box reads:     enabled");
+    }
+    if params.family_box_access == Some(true) {
+        println!("Family box access:     enabled");
+    }
+    if let Some(gsch) = &params.global_state_schema {
+        println!("Max global byteslices: {}", gsch.num_byte_slice);
+        println!("Max global integers:   {}", gsch.num_uint);
+    }
+    if let Some(lsch) = &params.local_state_schema {
+        println!("Max local byteslices:  {}", lsch.num_byte_slice);
+        println!("Max local integers:    {}", lsch.num_uint);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The two-level presence of a `("app-local-state","tkv")`/`("app-params",
+/// "gs")` field pair extracted from a raw `GET .../applications/{id}
+/// ?format=msgpack` response. Mirrors Go's two-level nil check
+/// (`application.go:1022`/`1052`): the *outer* field (`AppLocalState`/
+/// `AppParams`) being absent from the decoded payload means "not opted
+/// in"/"didn't create this app"; the outer field being present but its
+/// inner `KeyValue`/`GlobalState` field absent is a nil
+/// `map[string]TealValue` (no entries were ever stored), which Go's
+/// `protocol.EncodeJSON` renders as the JSON literal `null`.
+enum AppResourceState {
+    NotPresent,
+    Present(Option<Vec<TealEntry>>),
+}
+
+fn as_msgpack_map(val: &rmpv::Value) -> Result<&Vec<(rmpv::Value, rmpv::Value)>, String> {
+    val.as_map()
+        .ok_or_else(|| "Error processing command: malformed application response".to_string())
+}
+
+fn find_map_entry<'a>(map: &'a [(rmpv::Value, rmpv::Value)], key: &str) -> Option<&'a rmpv::Value> {
+    map.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v)
+}
+
+/// Decode a msgpack-string-format `TealKeyValue` key into its raw bytes.
+/// Go's `map[string]TealValue` keys are binary-safe Go strings encoded as
+/// msgpack str format (not bin) — see
+/// `algo_codec::canonical_encode_teal_key_value`'s matching encode side.
+fn teal_key_bytes(key: &rmpv::Value) -> Result<Vec<u8>, String> {
+    match key {
+        rmpv::Value::String(s) => Ok(s.as_bytes().to_vec()),
+        other => Err(format!(
+            "Error processing command: unexpected TealKeyValue key type: {other:?}"
+        )),
+    }
+}
+
+/// Decode a single msgpack-encoded `basics.TealValue` (`{"tt":...,"tb":...,
+/// "ui":...}`, matching `algo_codec::canonical_encode_teal_value`'s encode
+/// side) into a [`TealValue`].
+fn decode_teal_value(val: &rmpv::Value) -> Result<TealValue, String> {
+    let map = as_msgpack_map(val)?;
+    let tt = find_map_entry(map, "tt")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    if tt == 2 {
+        let ui = find_map_entry(map, "ui")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        Ok(TealValue::Uint(ui))
+    } else {
+        let tb = find_map_entry(map, "tb")
+            .and_then(|v| match v {
+                rmpv::Value::String(s) => Some(s.as_bytes().to_vec()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        Ok(TealValue::Bytes(tb))
+    }
+}
+
+/// Extract the `(outer_key, inner_key)` field pair (`("app-local-state",
+/// "tkv")` or `("app-params", "gs")`) from a raw
+/// `GET .../applications/{id}?format=msgpack` response body.
+fn extract_app_resource_state(
+    raw: &[u8],
+    outer_key: &str,
+    inner_key: &str,
+) -> Result<AppResourceState, String> {
+    let val = decode_raw(raw)
+        .map_err(|e| format!("Error processing command: malformed response: {e}"))?;
+    let map = as_msgpack_map(&val)?;
+    let Some(outer) = find_map_entry(map, outer_key) else {
+        return Ok(AppResourceState::NotPresent);
+    };
+    let outer_map = as_msgpack_map(outer)?;
+    let Some(inner) = find_map_entry(outer_map, inner_key) else {
+        return Ok(AppResourceState::Present(None));
+    };
+    let inner_map = as_msgpack_map(inner)?;
+    let mut entries = Vec::with_capacity(inner_map.len());
+    for (k, v) in inner_map {
+        entries.push((teal_key_bytes(k)?, decode_teal_value(v)?));
+    }
+    Ok(AppResourceState::Present(Some(entries)))
+}
+
+/// `app read --app-id <id> (--local --from <addr> | --global) [--guess-format]`.
+///
+/// Mirrors Go's `readStateAppCmd` (`application.go:993-1071`): fetch local
+/// (via `--from`) or global state through the raw msgpack
+/// `GET /v2/accounts/{addr}/applications/{id}?format=msgpack` endpoint
+/// (go's `client.RawAccountApplicationInformation`, which decodes into the
+/// basics-typed `AccountApplicationModel` -- a *different* wire shape from
+/// the array-shaped `TealKeyValueStore` REST JSON model used elsewhere in
+/// this tool), optionally apply the `--guess-format` heuristic, and write
+/// go's exact `protocol.EncodeJSON` byte shape to stdout (no trailing
+/// newline, matching Go's `os.Stdout.Write(enc)`).
+pub fn run_read(args: ReadArgs) -> ExitCode {
+    run_and_report(|| run_read_inner(args))
+}
+
+fn run_read_inner(args: ReadArgs) -> Result<ExitCode, String> {
+    // Mirrors `if fetchLocal == fetchGlobal { reportErrorf(errorLocalGlobal) }`.
+    if args.local == args.global {
+        return Err("Exactly one of --local or --global is required".to_string());
+    }
+    let from = args.from.clone().unwrap_or_default();
+    if args.local && from.is_empty() {
+        return Err("--local requires --from account".to_string());
+    }
+
+    let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
+        .map_err(|e| e.to_string())?;
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+
+    let state = if args.local {
+        let accounts = AccountsList::load(&data_dir_path);
+        let resolved = accounts.address_for(&from);
+        // Go's `--local` path treats a 404 specially (`errors.As(err,
+        // &httpError) && httpError.StatusCode == http.StatusNotFound`) as
+        // "not opted in"; any other transport error is generic
+        // (`application.go:1013-1020`).
+        let raw = match rt.block_on(algod.get_account_application_raw(&resolved, args.app_id)) {
+            Ok(b) => b,
+            Err(AlgoError::NotFound(_)) => {
+                return Err(format!(
+                    "{from} has not opted in to application {}",
+                    args.app_id
+                ));
+            }
+            Err(e) => return Err(format!("Error processing command: {e}")),
+        };
+        match extract_app_resource_state(&raw, "app-local-state", "tkv")? {
+            AppResourceState::NotPresent => {
+                return Err(format!(
+                    "{from} has not opted in to application {}",
+                    args.app_id
+                ));
+            }
+            AppResourceState::Present(entries) => entries,
+        }
+    } else {
+        // Go's `--global` path does NOT special-case 404 -- any error from
+        // either call is the generic `errorRequestFail`
+        // (`application.go:1041-1050`); only a *successful* response with a
+        // nil `AppParams` becomes "not opted in" (`application.go:1052-1053`,
+        // reusing the same message and the -- likely always empty --
+        // `account`/`--from` value even though this is the global-state
+        // path, a literal Go quirk we replicate for byte-exact CLI output).
+        let meta = rt
+            .block_on(algod.get_application(args.app_id))
+            .map_err(|e| format!("Error processing command: {e}"))?;
+        let raw = rt
+            .block_on(algod.get_account_application_raw(&meta.params.creator, args.app_id))
+            .map_err(|e| format!("Error processing command: {e}"))?;
+        match extract_app_resource_state(&raw, "app-params", "gs")? {
+            AppResourceState::NotPresent => {
+                return Err(format!(
+                    "{from} has not opted in to application {}",
+                    args.app_id
+                ));
+            }
+            AppResourceState::Present(entries) => entries,
+        }
+    };
+
+    let state = if args.guess_format {
+        state.map(heuristic_format_entries)
+    } else {
+        state
+    };
+
+    let json = encode_teal_state_json(state);
+    std::io::stdout()
+        .write_all(&json)
+        .map_err(|e| format!("Error processing command: {e}"))?;
+    Ok(ExitCode::SUCCESS)
 }
 
 // ---------------------------------------------------------------------------
@@ -1952,5 +2214,96 @@ mod tests {
         let line = format_program_attempt_line("update", &[0u8; 5], &[0u8; 7]);
         assert!(line.starts_with("Attempting to update app (approval size 5, hash "));
         assert!(line.contains("clear size 7, hash "));
+    }
+
+    // --- app info / app read: raw msgpack decode round-trip ---
+    //
+    // These build a raw `AccountApplicationModel` payload with this repo's
+    // own server-side encoder (`algo_codec::canonical_encode_account_application_model`,
+    // which mirrors go's `daemon/algod/api/spec/v2.AccountApplicationModel`
+    // wire shape byte-for-byte -- see that function's doc comment) and
+    // confirm `extract_app_resource_state`/`decode_teal_value` decode it
+    // back correctly, proving the client and server sides of this repo
+    // agree on the wire format `goal app read` depends on.
+
+    use algo_types::{AppLocalState, AppParams, StateSchema};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn extract_app_resource_state_not_present_when_field_absent() {
+        // Neither app-local-state nor app-params present -> encodes as an
+        // empty map (mirrors the server's 404 case, but here we're testing
+        // the decode of a raw payload directly).
+        let raw = algo_codec::canonical_encode_account_application_model(None, None);
+        let state = extract_app_resource_state(&raw, "app-local-state", "tkv").unwrap();
+        assert!(matches!(state, AppResourceState::NotPresent));
+    }
+
+    #[test]
+    fn extract_app_resource_state_present_with_nil_inner_map() {
+        // AppLocalState present (nonzero schema, so the "app-local-state"
+        // wrapper itself isn't recursively-empty-omitted) but with an empty
+        // KeyValue store -> the "tkv" field is omitted on the wire
+        // (canonical omitempty), which must decode as `Present(None)` (Go's
+        // nil-map -> JSON `null`).
+        let als = AppLocalState {
+            schema: StateSchema {
+                num_uint: 1,
+                num_byte_slice: 0,
+            },
+            key_value: BTreeMap::new(),
+        };
+        let raw = algo_codec::canonical_encode_account_application_model(None, Some(&als));
+        let state = extract_app_resource_state(&raw, "app-local-state", "tkv").unwrap();
+        assert!(matches!(state, AppResourceState::Present(None)));
+    }
+
+    #[test]
+    fn extract_app_resource_state_present_with_entries() {
+        let mut kv = BTreeMap::new();
+        kv.insert(b"foo".to_vec(), TealValue::Bytes(b"bar".to_vec()));
+        kv.insert(b"num".to_vec(), TealValue::Uint(42));
+        let als = AppLocalState {
+            schema: StateSchema::default(),
+            key_value: kv,
+        };
+        let raw = algo_codec::canonical_encode_account_application_model(None, Some(&als));
+        let state = extract_app_resource_state(&raw, "app-local-state", "tkv").unwrap();
+        let AppResourceState::Present(Some(mut entries)) = state else {
+            panic!("expected Present(Some(entries)), got a different variant");
+        };
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            entries,
+            vec![
+                (b"foo".to_vec(), TealValue::Bytes(b"bar".to_vec())),
+                (b"num".to_vec(), TealValue::Uint(42)),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_app_resource_state_global_reads_gs_field() {
+        let mut gs = BTreeMap::new();
+        gs.insert(b"g".to_vec(), TealValue::Uint(7));
+        let ap = AppParams {
+            global_state: gs,
+            ..AppParams::default()
+        };
+        let raw = algo_codec::canonical_encode_account_application_model(Some(&ap), None);
+        let state = extract_app_resource_state(&raw, "app-params", "gs").unwrap();
+        let AppResourceState::Present(Some(entries)) = state else {
+            panic!("expected Present(Some(entries)), got a different variant");
+        };
+        assert_eq!(entries, vec![(b"g".to_vec(), TealValue::Uint(7))]);
+    }
+
+    #[test]
+    fn extract_app_resource_state_wrong_outer_key_is_not_present() {
+        let ap = AppParams::default();
+        let raw = algo_codec::canonical_encode_account_application_model(Some(&ap), None);
+        // Asking for "app-local-state" when only "app-params" is present.
+        let state = extract_app_resource_state(&raw, "app-local-state", "tkv").unwrap();
+        assert!(matches!(state, AppResourceState::NotPresent));
     }
 }

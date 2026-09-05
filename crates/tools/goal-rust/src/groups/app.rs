@@ -25,14 +25,10 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-use crate::unimplemented;
-
 #[derive(Subcommand, Debug)]
 // `Call`/`Method`/the lifecycle leaves carry the full application-call flag
-// surface; `Info`/`Read` are still unit variants pending a later slice (see
-// issue #962's PR #1023 comment: `read`/`info` need byte-exact JSON parity
-// work beyond what fits in this slice). See the `SendArgs` precedent in
-// `groups::clerk` for why boxing isn't worth it here.
+// surface. See the `SendArgs` precedent in `groups::clerk` for why boxing
+// isn't worth it here.
 #[allow(clippy::large_enum_variant)]
 pub enum AppCmd {
     /// Read application box data.
@@ -51,13 +47,13 @@ pub enum AppCmd {
     /// Delete an application.
     Delete(LifecycleArgs),
     /// Look up current parameters for an application.
-    Info,
+    Info(InfoArgs),
     /// Invoke an ABI method.
     Method(MethodArgs),
     /// Opt in to an application.
     Optin(LifecycleArgs),
     /// Read local or global state for an application.
-    Read,
+    Read(ReadArgs),
     /// Update an application's programs.
     Update(UpdateArgs),
 }
@@ -358,6 +354,42 @@ pub struct UpdateArgs {
     pub txn: AppTxnArgs,
 }
 
+/// `app info --app-id <id>`.
+///
+/// Mirrors Go's `infoAppCmd` (`application.go:1073-1127`).
+#[derive(Args, Debug)]
+pub struct InfoArgs {
+    /// Application ID (Go `--app-id`). Required.
+    #[arg(long = "app-id")]
+    pub app_id: u64,
+}
+
+/// `app read --app-id <id> (--local --from <addr> | --global) [--guess-format]`.
+///
+/// Mirrors Go's `readStateAppCmd` (`application.go:993-1071`).
+#[derive(Args, Debug)]
+pub struct ReadArgs {
+    /// Application ID (Go `--app-id`). Required.
+    #[arg(long = "app-id")]
+    pub app_id: u64,
+    /// Fetch account-specific state for this application; `--from` is
+    /// required with this flag (Go `--local`). Exactly one of `--local`/
+    /// `--global` is required.
+    #[arg(long = "local")]
+    pub local: bool,
+    /// Fetch global state for this application (Go `--global`).
+    #[arg(long = "global")]
+    pub global: bool,
+    /// Account to fetch local state from, required with `--local` (Go
+    /// `-f/--from`).
+    #[arg(short = 'f', long = "from")]
+    pub from: Option<String>,
+    /// Format application state using heuristics to guess data encoding
+    /// (Go `--guess-format`).
+    #[arg(long = "guess-format")]
+    pub guess_format: bool,
+}
+
 /// `app call -f <from> --app-id <id> [--app-arg ...] [refs] [txn]`.
 ///
 /// Mirrors Go's `callAppCmd` (`application.go:860-870` for the flag surface
@@ -503,10 +535,10 @@ pub fn run(cmd: AppCmd, wallet: Option<String>) -> ExitCode {
         AppCmd::Closeout(args) => crate::cmd::app::run_closeout(args, wallet),
         AppCmd::Create(args) => crate::cmd::app::run_create(args, wallet),
         AppCmd::Delete(args) => crate::cmd::app::run_delete(args, wallet),
-        AppCmd::Info => unimplemented("app", "info"),
+        AppCmd::Info(args) => crate::cmd::app::run_info(args),
         AppCmd::Method(args) => crate::cmd::app::run_method(args, wallet),
         AppCmd::Optin(args) => crate::cmd::app::run_optin(args, wallet),
-        AppCmd::Read => unimplemented("app", "read"),
+        AppCmd::Read(args) => crate::cmd::app::run_read(args),
         AppCmd::Update(args) => crate::cmd::app::run_update(args, wallet),
     }
 }
