@@ -672,6 +672,10 @@ impl EvalTracer for SimulationTracer {
             UnnamedResourceAccess::EmptyBoxRef => {
                 self.unnamed_resources.num_empty_box_refs += 1;
             }
+            UnnamedResourceAccess::DeficitEmptyBoxRefs(delta) => {
+                let current = self.unnamed_resources.num_empty_box_refs as i64;
+                self.unnamed_resources.num_empty_box_refs = (current + delta).max(0) as usize;
+            }
         }
     }
 }

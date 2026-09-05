@@ -954,6 +954,34 @@ pub struct UnnamedCapacityTracker {
     seen_empty_box_refs: HashSet<(u64, Vec<u8>)>,
     seen_holdings: HashSet<([u8; 32], u64)>,
     seen_locals: HashSet<([u8; 32], u64)>,
+
+    // --- issue #1006: box read/write I/O-budget reconciliation ---
+    /// Read size recorded for each unnamed box observed (both concrete
+    /// [`Self::seen_boxes`] suggestions and [`Self::seen_empty_box_refs`]
+    /// new-app accesses), keyed identically to those sets. Mirrors go's
+    /// `BoxStat.ReadSize` in `ResourceTracker.Boxes`
+    /// (`ledger/simulation/resources.go`).
+    box_read_sizes: HashMap<(u64, Vec<u8>), u64>,
+    /// Empty box refs added purely to satisfy a read/write I/O-budget
+    /// deficit -- distinct from the flat one-per-box
+    /// [`Self::seen_empty_box_refs`] count. Can grow or shrink during
+    /// evaluation (a later named/unnamed box's own ref capacity can make an
+    /// earlier deficit ref redundant). Mirrors go's
+    /// `ResourceTracker.NumEmptyBoxRefs` increments/decrements from
+    /// `ioSurplus`/`reconcileReadBudget`/`addEmptyBoxRefsForWriteBudget`.
+    deficit_empty_box_refs: usize,
+    /// High-water mark of dirty box bytes ever observed this group. Mirrors
+    /// go's `ResourceTracker.maxWriteBudget`.
+    max_write_budget: u64,
+    /// Read-budget surplus (positive) or deficit (negative) baseline from
+    /// the group's named box refs vs. their on-chain sizes, computed once
+    /// per top-level call via [`Self::note_named_read_surplus`]. Mirrors
+    /// go's `ResourceTracker.initialReadSurplus`.
+    initial_read_surplus: i64,
+    /// Group-wide count of named box refs supplied by the submitted group
+    /// ("bumps"/"startingBoxes"), used as the write-budget baseline.
+    /// Mirrors go's `groupResourceTracker.startingBoxes`.
+    starting_box_refs: u64,
 }
 
 impl UnnamedCapacityTracker {
@@ -973,7 +1001,146 @@ impl UnnamedCapacityTracker {
     }
 
     fn box_count(&self) -> usize {
-        self.seen_boxes.len() + self.seen_empty_box_refs.len()
+        self.seen_boxes.len() + self.seen_empty_box_refs.len() + self.deficit_empty_box_refs
+    }
+
+    fn remaining_boxes(&self) -> usize {
+        self.capacity.max_boxes.saturating_sub(self.box_count())
+    }
+
+    fn remaining_total_refs(&self) -> usize {
+        self.capacity
+            .max_total_refs
+            .saturating_sub(self.ref_count())
+    }
+
+    /// Sum of read sizes recorded for every unnamed box observed so far.
+    /// Mirrors go's `ResourceTracker.usedReadBudget` (the `appReadBudget`
+    /// half of that function is issue #1006's still-open
+    /// oversized-unnamed-foreign-app-program gap, tracked separately -- see
+    /// the issue's "What algod-rust must do" section).
+    fn used_read_budget(&self) -> u64 {
+        self.box_read_sizes
+            .values()
+            .fold(0u64, |acc, v| acc.saturating_add(*v))
+    }
+
+    /// The read-side I/O budget available from the boxes/empty-refs
+    /// observed so far, adjusted by [`Self::initial_read_surplus`]. Mirrors
+    /// go's `ResourceTracker.readBudget`.
+    fn read_io_budget(&self, bytes_per_box_ref: u64) -> u64 {
+        let base = (self.box_count() as u64).saturating_mul(bytes_per_box_ref);
+        if self.initial_read_surplus > 0 {
+            base.saturating_add(self.initial_read_surplus as u64)
+        } else {
+            base.saturating_sub(self.initial_read_surplus.unsigned_abs())
+        }
+    }
+
+    /// Mirrors go's `ResourceTracker.ioSurplus`: called once per top-level
+    /// call with the named-box read surplus (positive) or deficit
+    /// (negative) computed from the group's named box refs vs. their
+    /// on-chain sizes. Returns the net change to
+    /// [`Self::deficit_empty_box_refs`] (always `>= 0` here, since this is
+    /// only ever called once with a fresh baseline), or `None` if a deficit
+    /// can't be paid for even with all remaining capacity -- the caller
+    /// must then fail the read-budget check.
+    fn note_named_read_surplus(&mut self, surplus: i64, bytes_per_box_ref: u64) -> Option<i64> {
+        self.initial_read_surplus = surplus;
+        if surplus > 0 {
+            return Some(0);
+        }
+        let needed = surplus.unsigned_abs();
+        let empty_refs = needed.div_ceil(bytes_per_box_ref);
+        let empty_refs = usize::try_from(empty_refs).ok()?;
+        if empty_refs > self.remaining_boxes() || empty_refs > self.remaining_total_refs() {
+            return None;
+        }
+        self.deficit_empty_box_refs += empty_refs;
+        Some(empty_refs as i64)
+    }
+
+    /// Mirrors go's `ResourceTracker.reconcileReadBudget`. Called after
+    /// recording a newly-observed unnamed box's read size.
+    /// `can_remove_empty_ref` mirrors go's parameter of the same name: when
+    /// `true` (always, for a fresh box addition), a prior deficit ref may be
+    /// released if this box's own capacity contribution created read *and*
+    /// write surplus. Returns the net change to
+    /// [`Self::deficit_empty_box_refs`] (negative if a ref was released), or
+    /// `None` if the resulting box/ref count exceeds capacity -- the caller
+    /// must then roll back the box addition entirely (mirrors go's `addBox`
+    /// deleting the just-inserted entry and returning `false`).
+    fn reconcile_read_budget(
+        &mut self,
+        bytes_per_box_ref: u64,
+        can_remove_empty_ref: bool,
+    ) -> Option<i64> {
+        let used_read_budget = self.used_read_budget();
+        let mut io_budget = self.read_io_budget(bytes_per_box_ref);
+        let mut delta: i64 = 0;
+
+        if can_remove_empty_ref && self.deficit_empty_box_refs > 0 {
+            let surplus_read = io_budget.saturating_sub(used_read_budget);
+            let surplus_write = io_budget.saturating_sub(self.max_write_budget);
+            if surplus_read >= bytes_per_box_ref && surplus_write >= bytes_per_box_ref {
+                self.deficit_empty_box_refs -= 1;
+                delta -= 1;
+                io_budget = io_budget.saturating_sub(bytes_per_box_ref);
+            }
+        }
+
+        if self.box_count() > self.capacity.max_boxes
+            || self.ref_count() > self.capacity.max_total_refs
+        {
+            return None;
+        }
+
+        if used_read_budget > io_budget {
+            let needed = used_read_budget - io_budget;
+            let empty_refs = needed.div_ceil(bytes_per_box_ref);
+            let empty_refs = usize::try_from(empty_refs).ok()?;
+            if empty_refs > self.remaining_boxes() || empty_refs > self.remaining_total_refs() {
+                return None;
+            }
+            self.deficit_empty_box_refs += empty_refs;
+            delta += empty_refs as i64;
+        }
+        Some(delta)
+    }
+
+    /// Mirrors go's `groupResourceTracker.reconcileWriteBudget` /
+    /// `ResourceTracker.addEmptyBoxRefsForWriteBudget`. Called after every
+    /// change to the group's dirty box bytes, with the group-wide dirty
+    /// byte count. Returns the net change to
+    /// [`Self::deficit_empty_box_refs`] (always `>= 0`; write-budget refs
+    /// are never released, matching go's high-water-mark `maxWriteBudget`),
+    /// or `None` if satisfying the deficit would exceed capacity -- the
+    /// caller leaves its own real enforcement budget unchanged in that
+    /// case, so the existing dirty-bytes-vs-budget check reports go's exact
+    /// "write budget exceeded" text instead.
+    fn reconcile_write_budget(
+        &mut self,
+        used_write_budget: u64,
+        bytes_per_box_ref: u64,
+    ) -> Option<i64> {
+        let additional_write_budget = self.starting_box_refs.saturating_mul(bytes_per_box_ref);
+        let write_budget = additional_write_budget
+            .saturating_add((self.box_count() as u64).saturating_mul(bytes_per_box_ref));
+        let mut delta = 0i64;
+        if used_write_budget > write_budget {
+            let overspend = used_write_budget - write_budget;
+            let extra_refs = overspend.div_ceil(bytes_per_box_ref);
+            let extra_refs = usize::try_from(extra_refs).ok()?;
+            if extra_refs > self.remaining_boxes() || extra_refs > self.remaining_total_refs() {
+                return None;
+            }
+            self.deficit_empty_box_refs += extra_refs;
+            delta = extra_refs as i64;
+        }
+        if self.max_write_budget < used_write_budget {
+            self.max_write_budget = used_write_budget;
+        }
+        Some(delta)
     }
 
     /// Returns `true` if `addr` is already recorded or there is capacity for
@@ -2037,6 +2204,12 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         }
 
         self.io_budget = num_box_refs.saturating_mul(self.consensus.bytes_per_box_reference);
+        if let Some(cap) = &self.unnamed_capacity {
+            // Group-wide "bumps"/"startingBoxes" baseline (issue #1006), set
+            // once alongside `io_budget` since both derive from the same
+            // one-time, group-wide box-ref count.
+            cap.borrow_mut().starting_box_refs = num_box_refs;
+        }
     }
 
     /// Perform the one-time read budget check for a top-level call. Sums the
@@ -2064,7 +2237,11 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         self.read_budget_checked = true;
         let mut used: u64 = 0;
 
-        // Iterate over a snapshot of box keys.
+        // Iterate over a snapshot of box keys, summing the full named-box
+        // read total before checking it against the budget -- matches
+        // go-algorand's `EvalContract`, which sums `bytesRead` across every
+        // available box before its single post-loop budget check
+        // (`data/transactions/logic/eval.go:1289-1322`).
         let keys: Vec<(u64, Vec<u8>)> = self.available_boxes.keys().cloned().collect();
         for (app_id, name) in &keys {
             if name.is_empty() {
@@ -2073,17 +2250,50 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             if let Some(content) = self.store.get_box(*app_id, name) {
                 let size = content.len() as u64;
                 used = used.saturating_add(size);
-                if used > self.io_budget {
-                    // Matches go-algorand's `EvalContract` read-budget error
-                    // exactly (`data/transactions/logic/eval.go:1324`):
-                    // `fmt.Errorf("read budget exceeded (%d > %d)", bytesRead, cx.ioBudget)`.
-                    return Err(AlgoError::Avm {
-                        message: format!("read budget exceeded ({} > {})", used, self.io_budget),
-                    });
-                }
                 // Mark as not-dirty (content is cached / known).
                 self.available_boxes.insert((*app_id, name.clone()), false);
             }
+        }
+
+        // Report the named-box read surplus/deficit to the unnamed-resource
+        // policy (issue #1006's `ResourceTracker.ioSurplus`), which may
+        // absorb a deficit here into empty box refs rather than failing
+        // outright -- matches go-algorand's `EvalContract`
+        // (`data/transactions/logic/eval.go:1322-1343`): a negative surplus
+        // only fails immediately when there is no unnamed-resource policy.
+        if let Some(cap) = self.unnamed_capacity.clone() {
+            let surplus = self.io_budget as i64 - used as i64;
+            let outcome = cap
+                .borrow_mut()
+                .note_named_read_surplus(surplus, self.consensus.bytes_per_box_reference);
+            match outcome {
+                Some(delta) => {
+                    if delta != 0 {
+                        self.record_unnamed(UnnamedResourceAccess::DeficitEmptyBoxRefs(delta));
+                        self.io_budget = self.io_budget.saturating_add(
+                            (delta as u64).saturating_mul(self.consensus.bytes_per_box_reference),
+                        );
+                    }
+                }
+                None => {
+                    // Matches go-algorand's exact text
+                    // (`data/transactions/logic/eval.go:1339`):
+                    // `fmt.Errorf("read budget exceeded despite policy (%d)", cx.ioBudget)`.
+                    return Err(AlgoError::Avm {
+                        message: format!(
+                            "read budget exceeded despite policy ({})",
+                            self.io_budget
+                        ),
+                    });
+                }
+            }
+        } else if used > self.io_budget {
+            // Matches go-algorand's `EvalContract` read-budget error exactly
+            // (`data/transactions/logic/eval.go:1324`):
+            // `fmt.Errorf("read budget exceeded (%d > %d)", bytesRead, cx.ioBudget)`.
+            return Err(AlgoError::Avm {
+                message: format!("read budget exceeded ({} > {})", used, self.io_budget),
+            });
         }
 
         Ok(())
@@ -2168,6 +2378,8 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         self.dirty_bytes = self.dirty_bytes.saturating_add(new_size);
         self.update_bytes.insert(self.app_id, new_size);
 
+        self.reconcile_write_budget_and_grow_io();
+
         if self.dirty_bytes > self.io_budget {
             // go's verb selection (`eval.go:561-564`) literally only checks
             // for "updating"; a delete-only call (not creating, not
@@ -2182,6 +2394,46 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             });
         }
         Ok(())
+    }
+
+    /// Reconcile the group's write-budget deficit (issue #1006's
+    /// `ResourceTracker.addEmptyBoxRefsForWriteBudget`) against the current
+    /// group-wide `dirty_bytes`, and grow this call's real enforcement
+    /// `io_budget` to match whenever the shared tracker agreed to cover a
+    /// deficit with additional empty box refs. A no-op when unnamed-resource
+    /// capacity tracking is disabled (the consensus apply path, and
+    /// simulation without `allow_unnamed_resources`).
+    ///
+    /// If the tracker instead reports that the deficit exceeds remaining
+    /// capacity, `io_budget` is left untouched -- go-algorand never actually
+    /// reaches that path (its real enforcement always runs against an
+    /// already-elevated `maxPossibleIOBudget` ceiling, so a genuine
+    /// reconciliation failure there is an invariant violation it panics
+    /// on), so here it simply falls through to the existing
+    /// dirty-bytes-vs-`io_budget` check below, which reports go's real
+    /// "write budget exceeded" text for the case that matters: even the
+    /// group's maximum achievable box-ref capacity can't cover the write.
+    fn reconcile_write_budget_and_grow_io(&mut self) {
+        let Some(cap) = self.unnamed_capacity.clone() else {
+            return;
+        };
+        let bytes_per_box_ref = self.consensus.bytes_per_box_reference;
+        let mut cap_ref = cap.borrow_mut();
+        let Some(delta) = cap_ref.reconcile_write_budget(self.dirty_bytes, bytes_per_box_ref)
+        else {
+            return;
+        };
+        let required = cap_ref
+            .starting_box_refs
+            .saturating_add(cap_ref.box_count() as u64)
+            .saturating_mul(bytes_per_box_ref);
+        drop(cap_ref);
+        if delta != 0 {
+            self.record_unnamed(UnnamedResourceAccess::DeficitEmptyBoxRefs(delta));
+        }
+        if required > self.io_budget {
+            self.io_budget = required;
+        }
     }
 
     /// Box availability check, cross-app authorization, and dirty tracking
@@ -2230,19 +2482,19 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         }
 
         // Unnamed-resource relaxation (simulation `allow_unnamed_resources`):
-        // permit access to a box without a matching box ref, report it to the
-        // tracer, and grow the I/O budget as if one more box reference had
-        // been supplied (go-algorand raises the budget to
-        // `maxPossibleBoxIOBudget` instead; see the divergence note on
-        // `NamedGroupResources`). Capacity-gated (issue #1005), matching
-        // go's `AvailableBox` -> `ResourceTracker.addBox`: once the group's
-        // box/total-ref capacity is exhausted, `ok` stays `false` and the
-        // opcode itself fails below with go's exact "invalid Box reference"
-        // text -- this only enforces the `Max*`/total-ref capacity check
-        // already ported by issue #970, not go's deeper box read/write
-        // I/O-budget reconciliation (`ioSurplus`/`appReadBudget`), which
-        // remains a distinct, out-of-scope gap (see `NamedGroupResources`'s
-        // divergence note).
+        // permit access to a box without a matching box ref, report it to
+        // the tracer, and reconcile the group's box read I/O budget
+        // (issue #1006's `ResourceTracker.ioSurplus`/`reconcileReadBudget`)
+        // against this box's real on-chain size -- a box larger than one
+        // `BytesPerBoxReference` may need more than one empty ref, while a
+        // small one may fit entirely within the ref its own presence grants
+        // (`reconcile_write_budget_and_grow_io`, called below, grows the
+        // real enforcement `io_budget` to match). Capacity-gated (issue
+        // #1005), matching go's `AvailableBox` -> `ResourceTracker.addBox`:
+        // once the group's box/total-ref capacity is exhausted -- whether by
+        // the box itself or by the empty refs its budget deficit would
+        // require -- `ok` stays `false` and the opcode itself fails below
+        // with go's exact "invalid Box reference" text.
         if !ok && self.unnamed_tracking.is_some() {
             // A box owned by an app created earlier in this same simulation
             // can't be suggested back as a concrete `(app_id, name)` ref --
@@ -2251,14 +2503,58 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             // `UnnamedResourceAccess::EmptyBoxRef`'s doc comment): report an
             // anonymous empty-ref count instead of a named box suggestion.
             let is_new_app = self.created_apps.contains(&app_id);
-            let allowed = match &self.unnamed_capacity {
+            // A box owned by an app created in this simulation cannot exist
+            // yet, so its read size is 0 (matches go's `BoxStat{ReadSize: 0,
+            // NewApp: true}`). Otherwise, look up its real on-chain size --
+            // 0 if it doesn't exist -- for read-budget reconciliation.
+            let read_size: u64 = if is_new_app {
+                0
+            } else {
+                self.store
+                    .get_box(app_id, name)
+                    .map(|v| v.len() as u64)
+                    .unwrap_or(0)
+            };
+            let key = (app_id, name.to_vec());
+            let allowed = match self.unnamed_capacity.clone() {
                 Some(cap) => {
-                    let key = (app_id, name.to_vec());
                     let mut cap = cap.borrow_mut();
-                    if is_new_app {
-                        cap.try_add_empty_box_ref(key)
+                    let added = if is_new_app {
+                        cap.try_add_empty_box_ref(key.clone())
                     } else {
-                        cap.try_add_box(key)
+                        cap.try_add_box(key.clone())
+                    };
+                    if !added {
+                        false
+                    } else {
+                        cap.box_read_sizes.insert(key.clone(), read_size);
+                        match cap
+                            .reconcile_read_budget(self.consensus.bytes_per_box_reference, true)
+                        {
+                            Some(delta) => {
+                                drop(cap);
+                                if delta != 0 {
+                                    self.record_unnamed(
+                                        UnnamedResourceAccess::DeficitEmptyBoxRefs(delta),
+                                    );
+                                }
+                                true
+                            }
+                            None => {
+                                // Capacity can't cover the resulting read
+                                // deficit -- roll back this box's addition
+                                // entirely, mirroring go's `addBox` deleting
+                                // the just-inserted entry and returning
+                                // `false`.
+                                cap.box_read_sizes.remove(&key);
+                                if is_new_app {
+                                    cap.seen_empty_box_refs.remove(&key);
+                                } else {
+                                    cap.seen_boxes.remove(&key);
+                                }
+                                false
+                            }
+                        }
                     }
                 }
                 None => true,
@@ -2270,10 +2566,11 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 } else {
                     self.record_unnamed(UnnamedResourceAccess::Box(app_id, name.to_vec()));
                 }
-                self.io_budget = self
-                    .io_budget
-                    .saturating_add(self.consensus.bytes_per_box_reference);
                 self.available_boxes.entry(key.clone()).or_insert(false);
+                // Reflect this box's own capacity contribution (and any
+                // deficit-driven refs just added/released) in the real
+                // enforcement budget for the write-budget check below.
+                self.reconcile_write_budget_and_grow_io();
             }
         }
 
@@ -2361,6 +2658,10 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         };
 
         self.available_boxes.insert(key, new_dirty);
+
+        // Reconcile the write-budget deficit against this op's dirty-byte
+        // change (issue #1006) before the real enforcement check below.
+        self.reconcile_write_budget_and_grow_io();
 
         if self.dirty_bytes > self.io_budget {
             // Matches go-algorand's exact format
@@ -13542,5 +13843,363 @@ mod tests {
             result_over.error.as_deref(),
             Some(format!("AVM: unavailable Account {addr3}").as_str())
         );
+    }
+
+    // --- Box read/write I/O-budget reconciliation (issue #1006) ---
+    //
+    // Pins go's `TestUnnamedResourcesBoxIOBudget`/
+    // `TestUnnamedResourcesLargeProgramCreateWriteBudget`
+    // (`ledger/simulation/simulation_eval_test.go`, `1088a2aad7e` /
+    // `v3.18.0-beta`): `NumEmptyBoxRefs` must reflect a genuine read/write
+    // I/O-budget deficit computed via `DivCeil`, not a flat one-ref-per-
+    // access count -- a box larger than one `BytesPerBoxReference` can need
+    // more than one empty ref, a small box's own ref can absorb another
+    // box's deficit, and a `maxWriteBudget` high-water mark never shrinks
+    // even after the offending box is deleted.
+
+    /// Build a `LedgerAvmContext` with NO named box refs (so
+    /// `starting_box_refs`/the raw `io_budget` baseline are both 0) and
+    /// unnamed-resource capacity tracking enabled with `bytes_per_box_ref`
+    /// as `BytesPerBoxReference`. Returns the context plus the shared
+    /// tracker for direct inspection of `NumEmptyBoxRefs`
+    /// (`seen_empty_box_refs.len() + deficit_empty_box_refs`).
+    fn make_unnamed_box_io_context<'a>(
+        store: &'a mut LedgerState,
+        app_id: u64,
+        capacity: crate::simulation::trace::ResourceCapacity,
+        bytes_per_box_ref: u64,
+    ) -> (
+        LedgerAvmContext<'a, LedgerState>,
+        Rc<RefCell<UnnamedCapacityTracker>>,
+    ) {
+        if !store.has_app_params(app_id) {
+            store.set_app_params(
+                app_id,
+                algo_types::AppParams {
+                    creator: Address([1u8; 32]),
+                    ..Default::default()
+                },
+            );
+        }
+        let txn = make_appl_txn([9u8; 32], app_id, vec![], vec![], vec![]);
+        let mut consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .expect("V41 consensus params must exist");
+        consensus.bytes_per_box_reference = bytes_per_box_ref;
+        let mut ctx = LedgerAvmContext::new(
+            store,
+            vec![txn],
+            0,
+            1000,
+            12345,
+            app_id,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            consensus,
+        );
+        ctx.app_id = app_id;
+        let tracker = Rc::new(RefCell::new(tracker_with(capacity)));
+        ctx.enable_unnamed_resource_tracking(Arc::new(NamedGroupResources::default()));
+        ctx.enable_unnamed_capacity_tracking(tracker.clone());
+        (ctx, tracker)
+    }
+
+    /// go's post-`Simplify` `ResourceTracker.NumEmptyBoxRefs`: the flat
+    /// one-per-new-app-box count plus the budget-deficit-driven count.
+    fn num_empty_box_refs(tracker: &Rc<RefCell<UnnamedCapacityTracker>>) -> usize {
+        let t = tracker.borrow();
+        t.seen_empty_box_refs.len() + t.deficit_empty_box_refs
+    }
+
+    fn generous_capacity() -> crate::simulation::trace::ResourceCapacity {
+        crate::simulation::trace::ResourceCapacity {
+            max_accounts: 100,
+            max_assets: 100,
+            max_apps: 100,
+            max_boxes: 100,
+            max_total_refs: 100,
+            max_cross_product_references: 100,
+        }
+    }
+
+    #[test]
+    fn box_io_budget_read_exactly_one_ref_needs_no_empty_ref() {
+        // Box A: exactly BytesPerBoxReference bytes -- fits in the one ref
+        // its own presence grants.
+        let mut store = LedgerState::new();
+        store.set_box(1, b"A", vec![0u8; 100]);
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.available_app_box(1, b"A", BoxOperation::Read, 0)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 0);
+    }
+
+    #[test]
+    fn box_io_budget_read_oversized_box_needs_one_empty_ref() {
+        // Box C: 2*BytesPerBoxReference - 1 bytes -- exceeds what its own
+        // single ref provides, needing exactly one more.
+        let mut store = LedgerState::new();
+        store.set_box(1, b"C", vec![0u8; 199]);
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.available_app_box(1, b"C", BoxOperation::Read, 0)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 1);
+    }
+
+    #[test]
+    fn box_io_budget_reading_a_then_c_needs_one_empty_ref() {
+        // A (100 bytes) then C (199 bytes): combined 299 bytes against
+        // 2*100=200 from the two refs -- deficit 99, ceil(99/100)=1.
+        let mut store = LedgerState::new();
+        store.set_box(1, b"A", vec![0u8; 100]);
+        store.set_box(1, b"C", vec![0u8; 199]);
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.available_app_box(1, b"A", BoxOperation::Read, 0)
+            .unwrap();
+        ctx.available_app_box(1, b"C", BoxOperation::Read, 0)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 1);
+    }
+
+    #[test]
+    fn box_io_budget_reading_a_b_c_together_needs_no_empty_ref() {
+        // A (100) + B (1) + C (199) = 300 bytes, exactly 3 refs' worth (300)
+        // -- no deficit despite C alone needing a bump.
+        let mut store = LedgerState::new();
+        store.set_box(1, b"A", vec![0u8; 100]);
+        store.set_box(1, b"B", vec![0u8; 1]);
+        store.set_box(1, b"C", vec![0u8; 199]);
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.available_app_box(1, b"A", BoxOperation::Read, 0)
+            .unwrap();
+        ctx.available_app_box(1, b"B", BoxOperation::Read, 0)
+            .unwrap();
+        ctx.available_app_box(1, b"C", BoxOperation::Read, 0)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 0);
+    }
+
+    #[test]
+    fn box_io_budget_create_101_bytes_needs_one_empty_ref() {
+        let mut store = LedgerState::new();
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.available_app_box(1, b"D", BoxOperation::Create, 101)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 1);
+    }
+
+    #[test]
+    fn box_io_budget_create_300_bytes_needs_two_empty_refs() {
+        // usedWriteBudget=300, writeBudget=1*100=100, overspend=200,
+        // ceil(200/100)=2.
+        let mut store = LedgerState::new();
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.available_app_box(1, b"D", BoxOperation::Create, 300)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 2);
+    }
+
+    #[test]
+    fn box_io_budget_create_two_one_byte_boxes_needs_no_empty_ref() {
+        let mut store = LedgerState::new();
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.available_app_box(1, b"D", BoxOperation::Create, 1)
+            .unwrap();
+        ctx.available_app_box(1, b"E", BoxOperation::Create, 1)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 0);
+    }
+
+    #[test]
+    fn box_io_budget_create_then_read_named_box_needs_no_extra_ref_either_order() {
+        // Since D (create, 102 bytes) is never written to a *second* box,
+        // the extra bytes from creating D fit within the combined write
+        // budget once A's own ref is counted -- regardless of access order.
+        let mut store = LedgerState::new();
+        store.set_box(1, b"A", vec![0u8; 100]);
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.available_app_box(1, b"D", BoxOperation::Create, 102)
+            .unwrap();
+        ctx.available_app_box(1, b"A", BoxOperation::Read, 0)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 0);
+
+        let mut store2 = LedgerState::new();
+        store2.set_box(1, b"A", vec![0u8; 100]);
+        let (mut ctx2, tracker2) =
+            make_unnamed_box_io_context(&mut store2, 1, generous_capacity(), 100);
+        ctx2.available_app_box(1, b"A", BoxOperation::Read, 0)
+            .unwrap();
+        ctx2.available_app_box(1, b"D", BoxOperation::Create, 102)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker2), 0);
+    }
+
+    #[test]
+    fn box_io_budget_create_then_write_named_box_needs_one_empty_ref() {
+        // Creating D (102 bytes) then also *writing* to A means both boxes'
+        // dirty bytes now compete for the same 2-ref write budget (200):
+        // 102 (D) + 100 (A, its full existing size once dirtied) = 202,
+        // deficit 2, ceil(2/100)=1.
+        let mut store = LedgerState::new();
+        store.set_box(1, b"A", vec![0u8; 100]);
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.available_app_box(1, b"D", BoxOperation::Create, 102)
+            .unwrap();
+        ctx.available_app_box(1, b"A", BoxOperation::Write, 0)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 1);
+    }
+
+    #[test]
+    fn box_io_budget_write_then_delete_keeps_high_water_mark() {
+        // Creating D at 4*BytesPerBoxReference (400) needs 3 extra refs
+        // (write_budget starts at 1*100=100, overspend=300, ceil=3).
+        // Deleting D afterward must NOT release those 3 refs -- maxWriteBudget
+        // is a high-water mark that never shrinks, matching go exactly.
+        let mut store = LedgerState::new();
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.available_app_box(1, b"D", BoxOperation::Create, 400)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 3);
+        ctx.available_app_box(1, b"D", BoxOperation::Delete, 0)
+            .unwrap();
+        assert_eq!(
+            num_empty_box_refs(&tracker),
+            3,
+            "maxWriteBudget high-water mark must not shrink after delete"
+        );
+    }
+
+    #[test]
+    fn box_io_budget_write_then_delete_then_read_releases_one_ref() {
+        // Continuing from the previous scenario (3 empty refs after
+        // create+delete of D), reading C (199 bytes) can reuse the surplus
+        // I/O capacity one of those 3 refs provides, releasing it -- but the
+        // other two must remain (maxWriteBudget stays at 400).
+        let mut store = LedgerState::new();
+        store.set_box(1, b"C", vec![0u8; 199]);
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.available_app_box(1, b"D", BoxOperation::Create, 400)
+            .unwrap();
+        ctx.available_app_box(1, b"D", BoxOperation::Delete, 0)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 3);
+        ctx.available_app_box(1, b"C", BoxOperation::Read, 0)
+            .unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 2);
+    }
+
+    #[test]
+    fn box_io_budget_over_write_budget_fails_when_capacity_exhausted() {
+        // Only 1 box slot remains (max_boxes=1): X itself consumes it, so
+        // the 1-ref deficit needed to cover its 101-byte create can't be
+        // satisfied -- the real enforcement `write budget exceeded` error
+        // must surface (go's real path never reaches this because it
+        // pre-elevates `ioBudget`; our engine reports it directly instead).
+        let mut store = LedgerState::new();
+        let mut cap = generous_capacity();
+        cap.max_boxes = 1;
+        let (mut ctx, _tracker) = make_unnamed_box_io_context(&mut store, 1, cap, 100);
+        let err = ctx
+            .available_app_box(1, b"X", BoxOperation::Create, 101)
+            .unwrap_err();
+        assert_eq!(
+            format!("{err}"),
+            "AVM: write budget exceeded (101 > 100) while creating box 0x58"
+        );
+    }
+
+    #[test]
+    fn box_io_budget_over_read_budget_rolls_back_box_and_fails() {
+        // Only 1 box slot remains (max_boxes=1): C's own concrete suggestion
+        // consumes it, leaving no room for the 1 extra empty ref its size
+        // deficit needs -- go's `addBox` rolls the whole access back, so the
+        // opcode itself fails with "invalid Box reference", not a budget
+        // error.
+        let mut store = LedgerState::new();
+        store.set_box(1, b"C", vec![0u8; 199]);
+        let mut cap = generous_capacity();
+        cap.max_boxes = 1;
+        let (mut ctx, tracker) = make_unnamed_box_io_context(&mut store, 1, cap, 100);
+        let err = ctx
+            .available_app_box(1, b"C", BoxOperation::Read, 0)
+            .unwrap_err();
+        assert_eq!(format!("{err}"), "AVM: invalid Box reference 0x43");
+        assert_eq!(
+            num_empty_box_refs(&tracker),
+            0,
+            "the rejected box access must be rolled back entirely"
+        );
+        assert!(
+            tracker.borrow().seen_boxes.is_empty(),
+            "C's concrete suggestion must also be rolled back"
+        );
+    }
+
+    #[test]
+    fn box_io_budget_new_app_box_create_needs_one_empty_ref_when_oversized() {
+        // A box owned by an app created earlier in this simulation is
+        // reported as an anonymous empty ref (issue #970), but creating one
+        // larger than a single ref's write budget must ALSO trigger the
+        // budget-deficit reconciliation on top of that flat 1-per-box count
+        // -- matching go's "small"/"big" `duringCreate` cases.
+        let mut store = LedgerState::new();
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(&mut store, 1, generous_capacity(), 100);
+        ctx.created_apps.push(1);
+
+        ctx.available_app_box(1, b"small", BoxOperation::Create, 100)
+            .unwrap();
+        assert_eq!(
+            num_empty_box_refs(&tracker),
+            1,
+            "small fits within the one flat ref the new-app access itself grants"
+        );
+
+        ctx.available_app_box(1, b"big", BoxOperation::Create, 101)
+            .unwrap();
+        assert_eq!(
+            num_empty_box_refs(&tracker),
+            3,
+            "big needs its own flat ref plus one more for the write deficit"
+        );
+    }
+
+    #[test]
+    fn box_io_budget_large_program_create_needs_empty_ref_for_write_budget() {
+        // TestUnnamedResourcesLargeProgramCreateWriteBudget: an app creation
+        // whose combined approval+clear-state program exceeds the free
+        // size tier, with NO box refs supplied at all, must succeed under
+        // unnamed-resource tracking by reconciling the deficit into empty
+        // box refs -- rather than failing outright the way
+        // `consider_budget_program_writes` does without unnamed tracking.
+        let mut store = LedgerState::new();
+        let txn = make_program_txn(0, 0, 1224, 0); // 1224 extra bytes over the free tier
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 20;
+        zero_free_program_tier(&mut ctx);
+        ctx.boxes_initialized = false; // let `ensure_boxes_initialized` run for real (no named box refs)
+        ctx.consensus.bytes_per_box_reference = 1024;
+        let tracker = Rc::new(RefCell::new(tracker_with(generous_capacity())));
+        ctx.enable_unnamed_resource_tracking(Arc::new(NamedGroupResources::default()));
+        ctx.enable_unnamed_capacity_tracking(tracker.clone());
+
+        ctx.consider_budget_program_writes().unwrap();
+        assert_eq!(num_empty_box_refs(&tracker), 2, "ceil(1224/1024) = 2");
     }
 }
