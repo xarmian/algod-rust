@@ -1225,6 +1225,12 @@ struct SimpleBlockEvaluator {
     /// Running total of fees collected in this block.
     /// Mirrors Go's `eval.block.FeesCollected` used in v39+ headers.
     fees_collected: u64,
+    /// Issue #1017: shared cache of recently-verified transaction groups,
+    /// consulted before real signature verification and updated on success
+    /// -- mirrors go's `verify.TxnGroup` using the node's shared
+    /// `VerifiedTransactionCache` rather than a bare signature check.
+    /// `None` in tests that don't exercise the cache-wiring behavior.
+    verified_txn_cache: Option<Arc<algo_validate::VerifiedTransactionCache>>,
 }
 
 impl SimpleBlockEvaluator {
@@ -1372,17 +1378,37 @@ impl SimpleBlockEvaluator {
             self.restore_genesis_fields(stx);
         }
 
-        // Create a per-group LogicSig budget for logicsig evaluation.
-        let mut lsig_budget = GroupBudget::for_logicsig(restored.len());
+        // Issue #1017: consult the shared `VerifiedTransactionCache` when one
+        // is available -- this is the gossip/mempool-admission call site
+        // (`TransactionPool::remember` -> `BlockEvaluator::test_transaction_group`
+        // -> here): a transaction group already verified once (e.g. an
+        // earlier gossip sighting, or inclusion in a previous block) skips
+        // real signature verification, and a freshly-verified group is
+        // recorded so a later sighting can skip it too. Mirrors go's
+        // `verify.TxnGroup` using the node's shared cache rather than a bare
+        // signature check.
+        if let Some(cache) = &self.verified_txn_cache {
+            let context = algo_validate::VerificationContext {
+                spec_addrs: algo_validate::SpecialAddresses {
+                    fee_sink: self.hdr.fee_sink,
+                    rewards_pool: self.hdr.rewards_pool,
+                },
+                consensus_version: self.hdr.current_protocol.clone(),
+            };
+            algo_validate::verify_transaction_group_cached(&restored, &context, params, cache)?;
+        } else {
+            // Create a per-group LogicSig budget for logicsig evaluation.
+            let mut lsig_budget = GroupBudget::for_logicsig(restored.len());
 
-        for (intra_group_idx, stx) in restored.iter().enumerate() {
-            verify_transaction_signature(
-                stx,
-                &restored,
-                intra_group_idx,
-                &mut lsig_budget,
-                params,
-            )?;
+            for (intra_group_idx, stx) in restored.iter().enumerate() {
+                verify_transaction_signature(
+                    stx,
+                    &restored,
+                    intra_group_idx,
+                    &mut lsig_budget,
+                    params,
+                )?;
+            }
         }
 
         Ok(restored)
@@ -2422,7 +2448,19 @@ pub(crate) struct PoolLedgerAdapter {
     /// round's header is immutable, so caching the last one read is
     /// trivially coherent.
     hdr_cache: Mutex<Option<(u64, BlockHeader)>>,
+    /// Issue #1017: cache of recently-verified transaction groups, shared
+    /// across every `BlockEvaluator` this adapter creates via
+    /// `start_evaluator` -- one node-wide cache, exactly like go's single
+    /// `VerifiedTransactionCache` shared between the tx handler and the
+    /// block evaluator (`node/node.go`'s `MakeFull`).
+    verified_txn_cache: Arc<algo_validate::VerifiedTransactionCache>,
 }
+
+/// Cache sizing mirrors go's default (`config.go`'s
+/// `TxPoolSize` * a small multiplier is roughly how go-algorand's node.go
+/// wires it up); a few thousand entries comfortably covers a block's worth
+/// of gossip traffic without unbounded growth.
+const VERIFIED_TXN_CACHE_SIZE: usize = 5000;
 
 impl PoolLedgerAdapter {
     /// Wrap a shared ledger as a pool ledger.
@@ -2431,6 +2469,9 @@ impl PoolLedgerAdapter {
             ledger,
             dup_cache: Mutex::new(algo_ledger::txtail_cache::TxTailDupCache::new()),
             hdr_cache: Mutex::new(None),
+            verified_txn_cache: Arc::new(algo_validate::VerifiedTransactionCache::new(
+                VERIFIED_TXN_CACHE_SIZE,
+            )),
         }
     }
 }
@@ -2628,6 +2669,7 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
             snapshot,
             overlay: CowOverlay::new(),
             fees_collected: 0,
+            verified_txn_cache: Some(self.verified_txn_cache.clone()),
         }))
     }
 }
@@ -6582,6 +6624,7 @@ mod tests {
             snapshot,
             overlay: CowOverlay::new(),
             fees_collected: 0,
+            verified_txn_cache: None,
         }
     }
 
@@ -6966,6 +7009,72 @@ mod tests {
         assert!(
             err.to_string().contains("signature"),
             "expected signature error, got: {err}"
+        );
+    }
+
+    /// Issue #1017: gossip/mempool-admission wiring. When a
+    /// `VerifiedTransactionCache` is attached to the evaluator (as
+    /// `PoolLedgerAdapter::start_evaluator` does in production), a second
+    /// sighting of an already-verified group is a cache hit -- proven here
+    /// via the cache's own state (the same lookup
+    /// `validate_group_stateless_inner` performs) after a first successful
+    /// `test_transaction_group` call, and by confirming a *different*
+    /// signature over the same txids still goes through real verification
+    /// and is rejected (i.e. the cache checks exact signature bytes, it
+    /// doesn't blindly trust anything with a matching txid).
+    #[test]
+    fn cache_hit_skips_reverification_on_pool_admission() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(40);
+        let (receiver, _) = test_keypair(41);
+        let mut eval = make_evaluator(
+            &ledger,
+            &params,
+            100,
+            &[(sender, 10_000_000), (receiver, 100_000)],
+        );
+        let cache = Arc::new(algo_validate::VerifiedTransactionCache::new(100));
+        eval.verified_txn_cache = Some(cache.clone());
+
+        let stx = make_signed_pay(&key, &sender, &receiver, 1000, 1000, 100);
+
+        // First sighting: real verification runs and populates the cache.
+        eval.test_transaction_group(std::slice::from_ref(&stx))
+            .expect("first sighting should verify for real and pass");
+
+        // The exact same group (after genesis-field restoration, which is
+        // what the cache actually indexes by) is now a cache hit.
+        let mut restored = stx.clone();
+        eval.restore_genesis_fields(&mut restored);
+        let context = algo_validate::VerificationContext {
+            spec_addrs: algo_validate::SpecialAddresses {
+                fee_sink: eval.hdr.fee_sink,
+                rewards_pool: eval.hdr.rewards_pool,
+            },
+            consensus_version: eval.hdr.current_protocol.clone(),
+        };
+        let unverified = cache
+            .get_unverified_transaction_groups(std::slice::from_ref(&vec![restored]), &context);
+        assert!(
+            unverified.is_empty(),
+            "group should be a cache hit after the first successful admission"
+        );
+
+        // A second, IDENTICAL sighting takes the skip path and still passes.
+        eval.test_transaction_group(std::slice::from_ref(&stx))
+            .expect("second identical sighting should hit the cache and pass");
+
+        // A genuinely different signature over the same txn body is a
+        // different sighting, not a repeat of the cached one -- real
+        // verification runs again and correctly rejects it.
+        let mut mutated = stx;
+        mutated.sig[0] ^= 0xFF;
+        let err = eval.test_transaction_group(&[mutated]).unwrap_err();
+        assert!(
+            err.to_string().contains("signature"),
+            "a genuinely different signature must still be verified for real and rejected, \
+             got: {err}"
         );
     }
 
@@ -7550,6 +7659,7 @@ mod tests {
             },
             overlay: CowOverlay::new(),
             fees_collected: 0,
+            verified_txn_cache: None,
         };
 
         let stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
@@ -7745,6 +7855,7 @@ mod tests {
             },
             overlay: CowOverlay::new(),
             fees_collected: 12345,
+            verified_txn_cache: None,
         };
 
         let block = eval.generate_block(&[]).unwrap();
@@ -7962,6 +8073,7 @@ mod tests {
             snapshot,
             overlay: CowOverlay::new(),
             fees_collected: 0,
+            verified_txn_cache: None,
         };
 
         // Submit a transaction with fee=2000
@@ -8027,6 +8139,7 @@ mod tests {
             snapshot,
             overlay: CowOverlay::new(),
             fees_collected: 0,
+            verified_txn_cache: None,
         };
 
         // Group 1: fee=1000
@@ -8114,6 +8227,7 @@ mod tests {
             snapshot,
             overlay: CowOverlay::new(),
             fees_collected: 0,
+            verified_txn_cache: None,
         };
 
         let stx = make_signed_pay(&key, &sender, &receiver, 0, 5000, 100);
@@ -8176,6 +8290,7 @@ mod tests {
             snapshot,
             overlay: CowOverlay::new(),
             fees_collected: 0,
+            verified_txn_cache: None,
         };
 
         // First: a valid group with fee=1000
@@ -8315,6 +8430,7 @@ mod tests {
             snapshot,
             overlay: CowOverlay::new(),
             fees_collected: 0,
+            verified_txn_cache: None,
         };
 
         // Send a transaction FROM the FeeSink address
@@ -8670,6 +8786,7 @@ mod tests {
             snapshot,
             overlay: CowOverlay::new(),
             fees_collected: 0,
+            verified_txn_cache: None,
         }
     }
 
@@ -9713,6 +9830,7 @@ mod tests {
             snapshot,
             overlay: CowOverlay::new(),
             fees_collected: 0,
+            verified_txn_cache: None,
         };
 
         // Submit 3 individual transaction groups (1 txn each)

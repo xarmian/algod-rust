@@ -42,10 +42,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use algo_avm::group::GroupBudget;
 use algo_codec::compute_txn_id;
+use algo_error::AlgoError;
 use algo_types::{Digest, SignedTransaction};
 
-use crate::rules::SpecialAddresses;
+use crate::rules::{ConsensusParams, SpecialAddresses};
+use crate::signature::verify_transaction_signature;
 
 /// Number of cyclic buckets in the bottom cache tier (Go:
 /// `len(v.buckets) == 3`, `verifiedTxnCache.go`'s `MakeVerifiedTransactionCache`).
@@ -371,6 +374,79 @@ impl VerifiedTransactionCache {
     }
 }
 
+/// Verify `txgroup`'s signatures, consulting and updating `cache` exactly
+/// like go's `TxnGroup` (`data/transactions/verify/txn.go`): a group that is
+/// already fully covered by `cache` under the identical `context` skips real
+/// signature verification entirely; otherwise every member is verified for
+/// real, and the group is added to `cache` only once every member's
+/// signature checks out (a partially- or fully-failed group is never
+/// cached, so a later resubmission — e.g. with a corrected signature — is
+/// verified for real rather than incorrectly trusted).
+///
+/// This is the single call site both the gossip/mempool-admission path
+/// (`SimpleBlockEvaluator::validate_group_stateless_inner`,
+/// `bin/algod-rust/src/commands/participate.rs`) and block verification
+/// (`crate::block::validate_block`) should use once a
+/// [`VerifiedTransactionCache`] is available, so the skip-on-cache-hit
+/// behavior and the cache-population-on-success behavior stay in one place.
+///
+/// Like go's `TxnGroup`, an unexpected panic anywhere during verification
+/// (e.g. a poisoned cache mutex from an earlier panic elsewhere) is caught
+/// and converted into an ordinary `Err` rather than propagated to the
+/// caller — this repo's gossip/mempool-admission and block-verification
+/// callers process many independent, mutually-untrusted transaction groups
+/// per call, and one group's internal bug must not take the whole batch (or
+/// the calling task) down with it.
+pub fn verify_transaction_group_cached(
+    txgroup: &[SignedTransaction],
+    context: &VerificationContext,
+    consensus: &ConsensusParams,
+    cache: &VerifiedTransactionCache,
+) -> Result<(), AlgoError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify_transaction_group_cached_inner(txgroup, context, consensus, cache)
+    }))
+    .unwrap_or_else(|payload| {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+        Err(AlgoError::Validation {
+            message: format!("panic while verifying transaction group: {msg}"),
+        })
+    })
+}
+
+fn verify_transaction_group_cached_inner(
+    txgroup: &[SignedTransaction],
+    context: &VerificationContext,
+    consensus: &ConsensusParams,
+    cache: &VerifiedTransactionCache,
+) -> Result<(), AlgoError> {
+    if txgroup.is_empty() {
+        return Err(AlgoError::Validation {
+            message: "empty transaction group".into(),
+        });
+    }
+
+    let owned_group = txgroup.to_vec();
+    let unverified =
+        cache.get_unverified_transaction_groups(std::slice::from_ref(&owned_group), context);
+    if unverified.is_empty() {
+        // The whole group is already verified under this exact context.
+        return Ok(());
+    }
+
+    let mut lsig_budget = GroupBudget::for_logicsig(txgroup.len());
+    for (group_index, stx) in txgroup.iter().enumerate() {
+        verify_transaction_signature(stx, txgroup, group_index, &mut lsig_budget, consensus)?;
+    }
+
+    cache.add(Arc::new(GroupContext::new(context.clone(), owned_group)));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,6 +671,48 @@ mod tests {
         assert_eq!(
             cache.pin(&two_more),
             Err(VerifiedTxnCacheError::TooManyPinnedEntries)
+        );
+    }
+
+    /// Port of go's `TestTxnGroupRecoversPanic` (`data/transactions/verify/
+    /// txn_test.go`): go's `TxnGroup` recovers a panic during group
+    /// preparation (there: a nil `*BlockHeader` dereference) into an
+    /// ordinary error rather than propagating it -- "one bad group must not
+    /// take down the caller" carries over even though Rust's type system
+    /// already rules out go's specific trigger (there is no nullable
+    /// `VerificationContext` to dereference).
+    ///
+    /// A general, always-reachable panic surface exists here too: a
+    /// std::sync::Mutex that panicked while held becomes poisoned, and every
+    /// subsequent `.lock().expect(..)` on it panics. This test poisons the
+    /// cache's internal mutex the same way an unrelated bug elsewhere in the
+    /// same process could, then asserts `verify_transaction_group_cached`
+    /// still returns a normal `Err` (mentioning "panic") instead of
+    /// unwinding into the caller.
+    #[test]
+    fn verify_transaction_group_cached_recovers_panic() {
+        let cache = VerifiedTransactionCache::new(10);
+
+        // Poison the cache's internal mutex by panicking while it's held,
+        // exactly as an unrelated bug elsewhere touching this same cache
+        // could.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.inner.lock().unwrap();
+            panic!("simulated bug while holding the verified-txn-cache lock");
+        }));
+        assert!(poisoned.is_err(), "the setup panic itself must have fired");
+
+        let group = vec![test_stxn(1)];
+        let context = test_context();
+        let params = crate::rules::ConsensusParams::default();
+
+        let result = verify_transaction_group_cached(&group, &context, &params, &cache);
+        let err = result.expect_err(
+            "verification against a poisoned cache must return an Err, not unwind the caller",
+        );
+        assert!(
+            err.to_string().contains("panic"),
+            "expected a panic-recovery error, got: {err}"
         );
     }
 }

@@ -3295,4 +3295,270 @@ mod tests {
             "expected a no-signature error, got: {err}"
         );
     }
+
+    // ------------------------------------------------------------------
+    // Issue #1017: `VerifiedTransactionCache` update-on-success tests,
+    // ported from go's `data/transactions/verify/txn_test.go`
+    // (`TestTxnGroupCacheUpdate`/`TestTxnGroupCacheUpdateMultiSig`/
+    // `TestTxnGroupCacheUpdateRejLogic`/`TestTxnGroupCacheUpdateLogicWithSig`).
+    // Each pins the same contract go's `verifyGroup` helper checks: a group
+    // whose signature verification fails is NEVER added to the cache (a
+    // corrected resubmission is still verified for real), and a group that
+    // verifies is added and becomes a cache hit.
+    // ------------------------------------------------------------------
+
+    /// "int 0" -- rejects (a false top-of-stack value) unlike
+    /// [`int1_program`]'s always-accepting "int 1".
+    fn int0_program() -> Vec<u8> {
+        vec![0x02, 0x20, 0x01, 0x00, 0x22]
+    }
+
+    fn cache_test_context() -> crate::verified_txn_cache::VerificationContext {
+        crate::verified_txn_cache::VerificationContext {
+            spec_addrs: crate::rules::SpecialAddresses::default(),
+            consensus_version: "cache-update-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn txn_group_cache_update_single_sig() {
+        use crate::verified_txn_cache::{
+            verify_transaction_group_cached, VerifiedTransactionCache,
+        };
+
+        let key = test_signing_key();
+        let sender = Address(key.verifying_key().to_bytes());
+        let txn = minimal_pay_txn(sender);
+        let good_sig = sign_txn(&key, &txn);
+
+        let cache = VerifiedTransactionCache::new(100);
+        let context = cache_test_context();
+        let consensus = ConsensusParams::default();
+
+        // A broken signature fails verification and must NOT be cached.
+        let mut broken = SignedTransaction {
+            txn: txn.clone(),
+            sig: good_sig,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+        broken.sig[0] ^= 0xFF;
+        let group = vec![broken.clone()];
+        assert!(verify_transaction_group_cached(&group, &context, &consensus, &cache).is_err());
+        assert_eq!(
+            cache
+                .get_unverified_transaction_groups(&[group], &context)
+                .len(),
+            1,
+            "a failed group must not be cached"
+        );
+
+        // The corrected signature verifies and IS cached.
+        let fixed = SignedTransaction {
+            sig: good_sig,
+            ..broken
+        };
+        let group = vec![fixed];
+        assert!(verify_transaction_group_cached(&group, &context, &consensus, &cache).is_ok());
+        assert!(
+            cache
+                .get_unverified_transaction_groups(&[group], &context)
+                .is_empty(),
+            "a successfully-verified group must be cached"
+        );
+    }
+
+    #[test]
+    fn txn_group_cache_update_multisig() {
+        use crate::verified_txn_cache::{
+            verify_transaction_group_cached, VerifiedTransactionCache,
+        };
+
+        let keys: Vec<SigningKey> = (40u8..43).map(signing_key_from_seed).collect();
+        let msig_addr = compute_msig_addr(&keys, 1, 2);
+        let txn = minimal_pay_txn(msig_addr);
+        let mut msig = build_multisig(&keys, &[0, 2], 2, &txn);
+
+        let cache = VerifiedTransactionCache::new(100);
+        let context = cache_test_context();
+        let consensus = ConsensusParams::default();
+
+        // Corrupt one subsig -- the whole group fails and must not be cached.
+        msig.subsigs[0].signature[0] ^= 0xFF;
+        let broken_stx = SignedTransaction {
+            txn: txn.clone(),
+            sig: [0u8; 64],
+            msig: Some(msig.clone()),
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+        let group = vec![broken_stx];
+        assert!(verify_transaction_group_cached(&group, &context, &consensus, &cache).is_err());
+        assert_eq!(
+            cache
+                .get_unverified_transaction_groups(&[group], &context)
+                .len(),
+            1,
+            "a group with any failed subsig must not be cached"
+        );
+
+        // Restore the subsig -- now every signature is correct, and the
+        // group verifies and is cached.
+        msig.subsigs[0].signature[0] ^= 0xFF;
+        let good_stx = SignedTransaction {
+            txn,
+            sig: [0u8; 64],
+            msig: Some(msig),
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+        let group = vec![good_stx];
+        assert!(verify_transaction_group_cached(&group, &context, &consensus, &cache).is_ok());
+        assert!(
+            cache
+                .get_unverified_transaction_groups(&[group], &context)
+                .is_empty(),
+            "a fully-signed multisig group must be cached"
+        );
+    }
+
+    #[test]
+    fn txn_group_cache_update_logicsig_rejected() {
+        use crate::verified_txn_cache::{
+            verify_transaction_group_cached, VerifiedTransactionCache,
+        };
+
+        // Contract-account LogicSig: sender == hash of the program.
+        let rejecting_program = int0_program();
+        let mut msg = Vec::new();
+        msg.extend_from_slice(PROGRAM_PREFIX);
+        msg.extend_from_slice(&rejecting_program);
+        let hash = Sha512_256::digest(&msg);
+        let mut addr_bytes = [0u8; 32];
+        addr_bytes.copy_from_slice(&hash);
+        let rejecting_addr = Address(addr_bytes);
+
+        let cache = VerifiedTransactionCache::new(100);
+        let context = cache_test_context();
+        let consensus = ConsensusParams::default();
+
+        // The program evaluates to a false top-of-stack -- rejected, and
+        // must not be cached.
+        let lsig = LogicSig {
+            logic: ByteBuf::from(rejecting_program),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(rejecting_addr),
+            lsig: Some(lsig),
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+        let group = vec![stx];
+        let err = verify_transaction_group_cached(&group, &context, &consensus, &cache)
+            .expect_err("a rejecting LogicSig program must fail verification");
+        assert!(err.to_string().contains("rejected"));
+        assert_eq!(
+            cache
+                .get_unverified_transaction_groups(&[group], &context)
+                .len(),
+            1,
+            "a logic-rejected group must not be cached"
+        );
+
+        // An accepting program (same contract-account shape) verifies and
+        // is cached.
+        let accepting_program = int1_program();
+        let mut msg = Vec::new();
+        msg.extend_from_slice(PROGRAM_PREFIX);
+        msg.extend_from_slice(&accepting_program);
+        let hash = Sha512_256::digest(&msg);
+        let mut addr_bytes = [0u8; 32];
+        addr_bytes.copy_from_slice(&hash);
+        let accepting_addr = Address(addr_bytes);
+        let lsig = LogicSig {
+            logic: ByteBuf::from(accepting_program),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(accepting_addr),
+            lsig: Some(lsig),
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+        let group = vec![stx];
+        assert!(verify_transaction_group_cached(&group, &context, &consensus, &cache).is_ok());
+        assert!(
+            cache
+                .get_unverified_transaction_groups(&[group], &context)
+                .is_empty(),
+            "an accepting logic-sig group must be cached"
+        );
+    }
+
+    #[test]
+    fn txn_group_cache_update_logicsig_with_sig() {
+        use crate::verified_txn_cache::{
+            verify_transaction_group_cached, VerifiedTransactionCache,
+        };
+
+        let key = test_signing_key();
+        let sender = Address(key.verifying_key().to_bytes());
+        let program = int1_program();
+        let good_delegated_sig = sign_program(&key, &program);
+
+        let cache = VerifiedTransactionCache::new(100);
+        let context = cache_test_context();
+        let consensus = ConsensusParams::default();
+
+        // A garbage delegated sig fails verification and must not be cached.
+        let bad_lsig = LogicSig {
+            logic: ByteBuf::from(program.clone()),
+            sig: [0x11u8; 64],
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(sender),
+            lsig: Some(bad_lsig),
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+        let group = vec![stx];
+        assert!(verify_transaction_group_cached(&group, &context, &consensus, &cache).is_err());
+        assert_eq!(
+            cache
+                .get_unverified_transaction_groups(&[group], &context)
+                .len(),
+            1,
+            "a bad delegated signature must not be cached"
+        );
+
+        // The correctly delegated signature verifies and is cached.
+        let good_lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            sig: good_delegated_sig,
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(sender),
+            lsig: Some(good_lsig),
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+        let group = vec![stx];
+        assert!(verify_transaction_group_cached(&group, &context, &consensus, &cache).is_ok());
+        assert!(
+            cache
+                .get_unverified_transaction_groups(&[group], &context)
+                .is_empty(),
+            "a correctly delegated logic-sig must be cached"
+        );
+    }
 }

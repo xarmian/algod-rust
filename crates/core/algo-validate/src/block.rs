@@ -34,6 +34,7 @@
 // validation report.
 
 use std::fmt;
+use std::sync::Arc;
 
 use algo_avm::group::GroupBudget;
 use algo_codec::canonical_encode_signed_txn_in_block;
@@ -54,6 +55,7 @@ use crate::signature::{
     logic_sig_group_size_check, verify_auth_addr_sender_diff, verify_heartbeat_proof,
     verify_transaction_signature,
 };
+use crate::verified_txn_cache::{GroupContext, VerificationContext, VerifiedTransactionCache};
 
 /// Result of validating a complete block.
 #[derive(Debug, Clone)]
@@ -224,6 +226,37 @@ pub fn validate_block(
     genesis_hash: &[u8; 32],
     raw_payset_blobs: Option<&[Vec<u8>]>,
 ) -> BlockValidationResult {
+    validate_block_with_cache(
+        block,
+        prev_timestamp,
+        genesis_id,
+        genesis_hash,
+        raw_payset_blobs,
+        None,
+    )
+}
+
+/// Like [`validate_block`], but consults and updates `cache` (issue #1017)
+/// so a transaction group already verified once (e.g. seen over gossip, or
+/// in an earlier block that included the same group) is not re-verified
+/// here. Mirrors go's real usage: `ledger/eval/eval.go`'s block evaluator
+/// calls `verify.TxnGroup` per group with the node's shared
+/// `VerifiedTransactionCache`, not a bare signature check.
+///
+/// A cache hit skips real signature verification for every member of the
+/// covered group; a cache miss verifies for real and, only on success,
+/// records the group so a later sighting (e.g. this same block re-validated,
+/// or the group appearing again in a future block before eviction) can skip
+/// it too. A group with ANY per-member signature failure is never cached,
+/// so resubmission with a corrected signature is still verified for real.
+pub fn validate_block_with_cache(
+    block: &Block,
+    prev_timestamp: Option<i64>,
+    genesis_id: &str,
+    genesis_hash: &[u8; 32],
+    raw_payset_blobs: Option<&[Vec<u8>]>,
+    cache: Option<&VerifiedTransactionCache>,
+) -> BlockValidationResult {
     let mut errors = Vec::new();
     let round = block.round.0;
     let txn_count = block.payset.len();
@@ -305,6 +338,14 @@ pub fn validate_block(
         }
     };
 
+    // Verification context a cache hit must match exactly (Go:
+    // `GroupContext.Equal`) — the fee sink/rewards pool and the protocol
+    // version this block claims.
+    let verification_context = VerificationContext {
+        spec_addrs: spec,
+        consensus_version: block.current_protocol.clone(),
+    };
+
     for group in &groups {
         let mut lsig_budget = GroupBudget::for_logicsig(group.len());
 
@@ -323,6 +364,20 @@ pub fn validate_block(
                 error: e.to_string(),
             });
         }
+
+        // Issue #1017: skip real signature verification when this exact
+        // group is already fully covered by `cache` under the identical
+        // context. `group_sig_ok` tracks whether every member's signature
+        // check has succeeded so far, so the group is only added to the
+        // cache (below) when nothing failed.
+        let already_verified = cache.is_some_and(|c| {
+            c.get_unverified_transaction_groups(
+                std::slice::from_ref(&group_txns),
+                &verification_context,
+            )
+            .is_empty()
+        });
+        let mut group_sig_ok = true;
 
         for (intra_group_idx, &(idx, stx)) in group.iter().enumerate() {
             // State proof transactions (`stpf`) are special protocol-level
@@ -357,17 +412,24 @@ pub fn validate_block(
             // Pass the atomic group slice and intra-group index so that
             // LogicSig programs see correct `gtxn`, `global GroupSize`,
             // and `txn GroupIndex` values.
-            if let Err(e) = verify_transaction_signature(
-                stx,
-                &group_txns,
-                intra_group_idx,
-                &mut lsig_budget,
-                &params,
-            ) {
-                errors.push(BlockValidationError::SignatureVerificationFailed {
-                    txn_index: idx,
-                    error: e.to_string(),
-                });
+            //
+            // Skipped entirely when `already_verified` — this exact group
+            // was already checked (and cached) under this exact
+            // `VerificationContext` (issue #1017).
+            if !already_verified {
+                if let Err(e) = verify_transaction_signature(
+                    stx,
+                    &group_txns,
+                    intra_group_idx,
+                    &mut lsig_budget,
+                    &params,
+                ) {
+                    group_sig_ok = false;
+                    errors.push(BlockValidationError::SignatureVerificationFailed {
+                        txn_index: idx,
+                        error: e.to_string(),
+                    });
+                }
             }
 
             // Heartbeat proof verification (Go: stxnCoreChecks, verify/txn.go).
@@ -423,6 +485,20 @@ pub fn validate_block(
             errors.push(BlockValidationError::GroupValidationFailed {
                 error: e.to_string(),
             });
+        }
+
+        // Issue #1017: remember this group as verified only when it wasn't
+        // already a cache hit and every member's signature checked out —
+        // mirrors go's `TxnGroup`, which calls `cache.Add` only on the
+        // success path so a group with any failed signature is never
+        // trusted on a later sighting.
+        if let Some(c) = cache {
+            if !already_verified && group_sig_ok {
+                c.add(Arc::new(GroupContext::new(
+                    verification_context.clone(),
+                    group_txns.clone(),
+                )));
+            }
         }
     }
 
@@ -956,6 +1032,156 @@ mod tests {
         );
         assert_eq!(result.txn_count, 1);
         assert!(result.total_txn_bytes > 0);
+    }
+
+    /// Issue #1017: a group already present in the `VerifiedTransactionCache`
+    /// under the identical `VerificationContext` is treated as a cache hit —
+    /// `VerifiedTransactionCache::get_unverified_transaction_groups` (the
+    /// exact call `validate_block_with_cache` makes before doing any real
+    /// signature work) reports it as fully covered, and a second
+    /// `validate_block_with_cache` pass over the identical bytes keeps
+    /// passing via that skip path rather than falling through to a fresh
+    /// (redundant) verification.
+    #[test]
+    fn validate_block_with_cache_skips_reverification_on_cache_hit() {
+        let key = test_signing_key();
+        let stx = make_signed_txn(&key, 5000);
+
+        let mut block = empty_block();
+        block.payset = vec![stx.clone()];
+        let root = compute_payset_merkle_root(&block);
+        block.txn_commitment = root;
+
+        let cache = VerifiedTransactionCache::new(100);
+
+        // First pass: real signature verification runs and populates the cache.
+        let first = validate_block_with_cache(
+            &block,
+            Some(90),
+            "test-v1",
+            &test_genesis_hash(),
+            None,
+            Some(&cache),
+        );
+        assert!(
+            first.is_valid,
+            "first pass should verify for real and pass: {:?}",
+            first.errors
+        );
+
+        // The group is now a cache hit under the block's own verification
+        // context (fee sink/rewards pool + protocol version) -- this is
+        // precisely the lookup `validate_block_with_cache` performs to
+        // decide whether to skip real signature verification for the group.
+        //
+        // The cache indexes by txid, which is computed over the RESTORED
+        // transaction (genesis_id/genesis_hash filled back in from the block
+        // header) -- the same bytes `validate_block_with_cache` caches under
+        // -- not the stripped in-block encoding, so restore them here too.
+        let mut restored_stx = stx;
+        restored_stx.txn.genesis_id = block.genesis_id.clone();
+        restored_stx.txn.genesis_hash = block.genesis_hash;
+        let context = VerificationContext {
+            spec_addrs: crate::rules::SpecialAddresses {
+                fee_sink: block.fee_sink,
+                rewards_pool: block.rewards_pool,
+            },
+            consensus_version: block.current_protocol.clone(),
+        };
+        let unverified = cache
+            .get_unverified_transaction_groups(std::slice::from_ref(&vec![restored_stx]), &context);
+        assert!(
+            unverified.is_empty(),
+            "group should be a full cache hit after the first successful pass"
+        );
+
+        // A second pass over the identical bytes takes the skip path and
+        // still passes.
+        let second = validate_block_with_cache(
+            &block,
+            Some(90),
+            "test-v1",
+            &test_genesis_hash(),
+            None,
+            Some(&cache),
+        );
+        assert!(
+            second.is_valid,
+            "second pass should hit the cache and pass: {:?}",
+            second.errors
+        );
+
+        // A genuinely different signature is a DIFFERENT "sighting", not a
+        // repeat of the cached one -- the cache correctly falls through to
+        // real verification (and rejects it), proving the skip above is
+        // gated on an exact match rather than an unconditional bypass once
+        // any entry for the group exists.
+        block.payset[0].sig[0] ^= 0xFF;
+        let mutated = validate_block_with_cache(
+            &block,
+            Some(90),
+            "test-v1",
+            &test_genesis_hash(),
+            None,
+            Some(&cache),
+        );
+        assert!(
+            !mutated.is_valid,
+            "a genuinely different signature must still be verified for real and rejected"
+        );
+        assert!(mutated
+            .errors
+            .iter()
+            .any(|e| matches!(e, BlockValidationError::SignatureVerificationFailed { .. })));
+    }
+
+    /// Issue #1017: a group that fails signature verification must NOT be
+    /// added to the cache, so a later (corrected) resubmission is still
+    /// verified for real rather than trusted from a bad cache entry.
+    #[test]
+    fn validate_block_with_cache_does_not_cache_failed_group() {
+        let key = test_signing_key();
+        let mut stx = make_signed_txn(&key, 5000);
+        stx.sig[0] ^= 0xFF; // corrupt before ever verifying
+
+        let mut block = empty_block();
+        block.payset = vec![stx];
+        let root = compute_payset_merkle_root(&block);
+        block.txn_commitment = root;
+
+        let cache = VerifiedTransactionCache::new(100);
+
+        let first = validate_block_with_cache(
+            &block,
+            Some(90),
+            "test-v1",
+            &test_genesis_hash(),
+            None,
+            Some(&cache),
+        );
+        assert!(!first.is_valid, "corrupted signature should fail");
+
+        // Restore the correct signature: since the failed group was never
+        // cached, this must be verified for real and succeed -- not
+        // erroneously treated as already-verified.
+        let key2 = test_signing_key();
+        block.payset[0] = make_signed_txn(&key2, 5000);
+        let root2 = compute_payset_merkle_root(&block);
+        block.txn_commitment = root2;
+
+        let second = validate_block_with_cache(
+            &block,
+            Some(90),
+            "test-v1",
+            &test_genesis_hash(),
+            None,
+            Some(&cache),
+        );
+        assert!(
+            second.is_valid,
+            "corrected group should verify for real and pass: {:?}",
+            second.errors
+        );
     }
 
     #[test]
