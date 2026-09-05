@@ -2335,6 +2335,49 @@ mod tests {
         assert!(validate_transaction_group(&signed).is_ok());
     }
 
+    /// Parity with go-algorand's `TestGroupTransactions` /
+    /// `TestGroupTransactionsSubmission`
+    /// (`test/e2e-go/features/transactions/group_test.go`): a 2-member
+    /// atomic group's stored `Group` field is a hash over the *ordered*
+    /// sequence of member transactions (`compute_group_id`/`GroupID`), so
+    /// submitting the same two members in the wrong relative order must be
+    /// rejected as a group-ID mismatch, exactly as submitting them in their
+    /// original order (pinned by `test_valid_group_passes` above) succeeds.
+    /// Go's test broadcasts `[stx2, stx1]` (wrong order) and asserts an
+    /// error, then `[stx1, stx2]` (correct order) and asserts success.
+    #[test]
+    fn test_group_wrong_relative_order_fails() {
+        let txn1 = make_valid_txn();
+        let mut txn2 = make_valid_txn();
+        txn2.amount = 999;
+
+        // The Group field is computed once, over the intended [txn1, txn2]
+        // order, and stamped onto both members (as go's client.GroupID +
+        // tx.Group = gid does).
+        let gid = compute_group_id(&[txn1.clone(), txn2.clone()]);
+        let mut s1 = txn1;
+        s1.group = *gid.as_bytes();
+        let mut s2 = txn2;
+        s2.group = *gid.as_bytes();
+
+        // Submitting in the wrong order: the payload's *positional* order
+        // is what `for_each_group`/`compute_group_id` re-derives the hash
+        // from, so [s2, s1] recomputes a different digest than the stamped
+        // `gid` -- a mismatch, matching go's rejection of
+        // `BroadcastTransactionGroup([]SignedTxn{stx2, stx1})`.
+        let wrong_order = vec![wrap_signed(s2.clone()), wrap_signed(s1.clone())];
+        let err = validate_transaction_group(&wrong_order).unwrap_err();
+        assert!(
+            err.to_string().contains("mismatch"),
+            "expected group ID mismatch for the wrong member order, got: {err}"
+        );
+
+        // The correct order still succeeds (mirrors go's subsequent
+        // successful `BroadcastTransactionGroup([]SignedTxn{stx1, stx2})`).
+        let correct_order = vec![wrap_signed(s1), wrap_signed(s2)];
+        assert!(validate_transaction_group(&correct_order).is_ok());
+    }
+
     // ── Lease constraint tests ──────────────────────────────────
 
     #[test]
@@ -4091,6 +4134,29 @@ mod tests {
         txn.state_proof_pk = Some([1u8; 64]);
         let params = v42_params();
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    /// Parity with go-algorand's `TestKeysWithoutStateProofKeyCanRegister`
+    /// (`test/e2e-go/upgrades/stateproof_participation_test.go:84`): at a
+    /// pre-state-proof-mandate consensus version (`EnableStateProofKeyregCheck
+    /// == false`, e.g. ConsensusV30), an online keyreg that carries no
+    /// state-proof key at all must be accepted -- unlike
+    /// `test_keyreg_state_proof_pk_set_when_disabled_rejected` above, which
+    /// pins the opposite case (a *present* key is rejected at this consensus
+    /// version). Together the two pin both directions of `keyreg.go`'s
+    /// `stateProofPKWellFormed` for the disabled-check branch, matching the
+    /// go test's "CanRegister"/"CannotRegister" pair.
+    #[test]
+    fn test_keyreg_without_state_proof_pk_accepted_when_check_disabled() {
+        let mut txn = make_keyreg_txn();
+        txn.state_proof_pk = None;
+        let mut params = v42_params();
+        params.enable_state_proof_keyreg_check = false;
+        assert!(
+            validate_transaction_wellformed(&txn, false, &params, None).is_ok(),
+            "a going-online keyreg with no state-proof key must be accepted \
+             pre-mandate, matching go-algorand's TestKeysWithoutStateProofKeyCanRegister"
+        );
     }
 
     // ── State proof well-formedness (issue #812) ──────────────────
