@@ -18,6 +18,8 @@ serde_bytes.workspace = true
 hex.workspace = true
 rmp.workspace = true
 tracing.workspace = true
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 algo-codec.workspace = true

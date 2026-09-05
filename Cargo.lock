@@ -617,6 +617,8 @@ dependencies = [
  "rmpv",
  "serde_bytes",
  "sha2",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 

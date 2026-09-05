@@ -18,6 +18,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+pub mod batch_verify;
 pub mod block;
 pub mod checks;
 pub mod fee;
@@ -26,6 +27,7 @@ pub mod rules;
 pub mod signature;
 pub mod verified_txn_cache;
 
+pub use batch_verify::{BatchVerifier, BatchVerifierConfig, BatchVerifyRequest};
 pub use block::{
     contents_match_header, validate_block, BlockValidationError, BlockValidationResult,
 };
@@ -53,5 +55,6 @@ pub use signature::{
     verify_transaction_signature_with_tracer,
 };
 pub use verified_txn_cache::{
-    GroupContext, VerificationContext, VerifiedTransactionCache, VerifiedTxnCacheError,
+    verify_transaction_group_cached, GroupContext, VerificationContext, VerifiedTransactionCache,
+    VerifiedTxnCacheError,
 };
