@@ -51,15 +51,15 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 789 | 25% |
+| `matched-1:1` | 791 | 25% |
 | `partial` | 734 | 23% |
-| `matched-1:many` | 590 | 19% |
+| `matched-1:many` | 593 | 19% |
 | `out-of-scope` | 425 | 13% |
-| `not-implemented` | 230 | 7% |
+| `not-implemented` | 227 | 7% |
 | `matched-many:1` | 209 | 7% |
-| `missing-test` | 202 | 6% |
+| `missing-test` | 200 | 6% |
 
-**432 rows (`not-implemented` + `missing-test`, 14%) are real, actionable
+**427 rows (`not-implemented` + `missing-test`, 13%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
 implements but never tests. `partial` (734, 23%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
@@ -81,10 +81,10 @@ were triaged into tracked issues.
 | Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 80 | 32 | 16 | 61 | 39 | 27 | 21 |
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 53 | 53 | 1 | 10 | 12 | 4 | 11 |
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 100 | 20 | 47 | 62 | 24 | 14 | 7 |
-| Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 19 | 22 | 0 | 30 | 40 | 3 | 5 |
+| Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 21 | 25 | 0 | 30 | 37 | 1 | 5 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 20 | 7 | 0 | 20 | 11 | 0 | 60 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 31 | 25 | 7 | 21 | 4 | 1 | 84 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 10 | 0 | 16 | 3 | 0 | 1 |
-| **Total** | | **3,179** | **789** | **590** | **209** | **734** | **230** | **202** | **425** |
+| **Total** | | **3,179** | **791** | **593** | **209** | **734** | **227** | **200** | **425** |
 

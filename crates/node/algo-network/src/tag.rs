@@ -291,4 +291,54 @@ mod tests {
     fn max_message_length_constant() {
         assert_eq!(MAX_MESSAGE_LENGTH, 6 * 1024 * 1024);
     }
+
+    /// Go: `TestLockdownTagList` (`protocol/tags_test.go:273`, issue #949).
+    ///
+    /// go's own comment on this test explains why it exists: "The node will
+    /// drop the connection when the connecting node requests a message of
+    /// interest which is not in this list. This is a backward compatibility
+    /// problem. When a new tag is introduced, the nodes with older version
+    /// will not connect to the nodes running the new version... it is
+    /// necessary to check the version of the other node before sending a
+    /// request for a newly added tag."
+    ///
+    /// The test is deliberately written against a **hardcoded, spelled-out**
+    /// tag list rather than [`Tag::ACTIVE_TAGS`] itself — if it instead
+    /// asserted `ACTIVE_TAGS == ACTIVE_TAGS`, adding or removing a tag from
+    /// `ACTIVE_TAGS` would never fail this test, defeating the whole point
+    /// of a lockdown: a change to the advertised tag set must force a
+    /// reviewer to touch this test's literal list and think about the
+    /// interop hazard, exactly as go's own test does.
+    #[test]
+    fn lockdown_tag_list() {
+        let tag_list = [
+            Tag::AgreementVote,
+            Tag::MsgOfInterest,
+            Tag::MsgDigestSkip,
+            Tag::NetIDVerification,
+            Tag::NetPrioResponse,
+            Tag::ProposalPayload,
+            Tag::StateProofSig,
+            Tag::TopicMsgResp,
+            Tag::Transaction,
+            Tag::UniEnsBlockReq,
+            Tag::VoteBundle,
+            Tag::VotePacked,
+        ];
+        assert_eq!(tag_list.len(), Tag::ACTIVE_TAGS.len());
+        for tag in tag_list {
+            assert!(
+                Tag::ACTIVE_TAGS.contains(&tag),
+                "{tag:?} is hardcoded in this lockdown list but missing from Tag::ACTIVE_TAGS"
+            );
+        }
+        for tag in Tag::ACTIVE_TAGS {
+            assert!(
+                tag_list.contains(&tag),
+                "{tag:?} is in Tag::ACTIVE_TAGS but missing from this lockdown list — a new \
+                 tag was added without updating (or deliberately confirming) this test, which \
+                 is exactly the interop hazard go's TestLockdownTagList guards against"
+            );
+        }
+    }
 }
