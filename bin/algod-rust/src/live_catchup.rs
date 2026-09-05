@@ -339,7 +339,20 @@ impl LiveCatchupManager {
     }
 
     /// The most recently *completed* catchpoint label (empty if none has
-    /// completed yet). Backs `GET /v2/status`'s `last-catchpoint` field.
+    /// completed yet), tracked purely as this manager's own internal
+    /// bookkeeping.
+    ///
+    /// No longer backs `GET /v2/status`'s `last-catchpoint` field (issue
+    /// #827 theme 4): go's own `LastCatchpoint` (`node/node.go`) is
+    /// populated only from `ledger.GetLastCatchpointLabel()` -- the
+    /// ledger's self-generated-catchpoint bookkeeping -- never from a
+    /// completed *download*, so `AlgodNodeInterface::status` now reads
+    /// `SqliteLedger::last_catchpoint_label` directly instead of this
+    /// method. Kept `pub` and still exercised directly by this module's
+    /// own tests, since the underlying state is genuinely useful for a
+    /// caller that wants to know "did my own `start_catchup` call
+    /// succeed" without going through `NodeStatus`.
+    #[allow(dead_code)]
     pub fn last_catchpoint(&self) -> String {
         self.last_catchpoint
             .lock()

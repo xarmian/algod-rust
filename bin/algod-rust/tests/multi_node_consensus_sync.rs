@@ -300,6 +300,37 @@ fn spawn_participate_node_with_consensus_override(
     peer_gossip_addr: Option<&str>,
     consensus_override_json: Option<&str>,
 ) -> NodeProcess {
+    spawn_participate_node_full(
+        gossip_port,
+        rest_port,
+        genesis_json,
+        online_participation,
+        peer_gossip_addr,
+        consensus_override_json,
+        None,
+        None,
+    )
+}
+
+/// Full-generality node spawn used by every helper above plus the live
+/// catchpoint-catchup test below: additionally writes `config_json` (when
+/// given) to `<data_dir>/config.json` -- e.g. to enable automatic
+/// interval-driven catchpoint export/serving (issue #770/#955) -- and, when
+/// `catchup_peer` is given (`(rest_url, token)`), passes `--catchup-peer`/
+/// `--catchup-peer-token` so this node's `NodeInterface::start_catchup`
+/// (issue #940) can fetch a live catchpoint-catchup from that peer instead
+/// of `NotImplemented`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_participate_node_full(
+    gossip_port: u16,
+    rest_port: u16,
+    genesis_json: &str,
+    online_participation: Option<&Participation>,
+    peer_gossip_addr: Option<&str>,
+    consensus_override_json: Option<&str>,
+    config_json: Option<&str>,
+    catchup_peer: Option<(&str, &str)>,
+) -> NodeProcess {
     let data_dir = tempfile::Builder::new()
         .prefix("algod-rust-multinode-")
         .tempdir()
@@ -312,6 +343,9 @@ fn spawn_participate_node_with_consensus_override(
     if let Some(overrides) = consensus_override_json {
         std::fs::write(data_dir_path.join("consensus.json"), overrides)
             .expect("write consensus.json");
+    }
+    if let Some(config) = config_json {
+        std::fs::write(data_dir_path.join("config.json"), config).expect("write config.json");
     }
 
     let ledger_path = data_dir_path.join("ledger.sqlite");
@@ -363,6 +397,12 @@ fn spawn_participate_node_with_consensus_override(
     if let Some(peer) = peer_gossip_addr {
         cmd.arg("--peers").arg(peer);
     }
+    if let Some((url, token)) = catchup_peer {
+        cmd.arg("--catchup-peer")
+            .arg(url)
+            .arg("--catchup-peer-token")
+            .arg(token);
+    }
 
     let log_path = data_dir_path.join("algod.stderr.log");
     let log_file = std::fs::File::create(&log_path).expect("create log file");
@@ -409,7 +449,20 @@ async fn wait_for_rest_ready(client: &reqwest::Client, rest_addr: &str, deadline
 }
 
 async fn read_api_token(data_dir: &Path, deadline: Instant) -> String {
-    let path = data_dir.join("algod.token");
+    read_token_file(data_dir, "algod.token", deadline).await
+}
+
+/// Same as [`read_api_token`], but for `algod.admin.token` -- the
+/// `POST`/`DELETE /v2/catchup/:catchpoint` routes are registered in the
+/// admin-only tier (`crates/node/algo-rest-api/src/router.rs`), so a live
+/// catchpoint-catchup request must authenticate with this token, not the
+/// ordinary API one.
+async fn read_admin_token(data_dir: &Path, deadline: Instant) -> String {
+    read_token_file(data_dir, "algod.admin.token", deadline).await
+}
+
+async fn read_token_file(data_dir: &Path, filename: &str, deadline: Instant) -> String {
+    let path = data_dir.join(filename);
     loop {
         if let Ok(buf) = tokio::fs::read_to_string(&path).await {
             let trimmed = buf.trim().to_string();
@@ -591,6 +644,109 @@ async fn get_block_hash(
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("GET {url} response missing blockHash: {body}"))
         .to_string()
+}
+
+/// Poll `GET /v2/status` until `last-catchpoint` is non-empty (a real
+/// automatic catchpoint export has completed and been persisted to the
+/// ledger's `catchpointstate` table -- issue #824 theme 6), or panic at
+/// `deadline`. Returns the observed label (`"<round>#<hash>"`).
+///
+/// The label lags the round it was generated for: `SqliteLedger`'s
+/// automatic-export worker thread is only joined (persisting the label)
+/// either at the *next* interval boundary or at graceful shutdown (see
+/// `configure_automatic_catchpoints`'s doc comment) -- so this must be
+/// polled well past the target export round, not right at it.
+async fn wait_for_last_catchpoint(
+    client: &reqwest::Client,
+    rest_addr: &str,
+    token: &str,
+    deadline: Instant,
+    label: &str,
+) -> String {
+    let url = format!("http://{rest_addr}/v2/status");
+    loop {
+        if let Ok(resp) = client
+            .get(&url)
+            .header("X-Algo-API-Token", token)
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(lc) = body.get("last-catchpoint").and_then(|v| v.as_str()) {
+                        if !lc.is_empty() {
+                            return lc.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("{label}: last-catchpoint did not become non-empty before deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// `POST /v2/catchup/:catchpoint` against `rest_addr`, mirroring go's
+/// `Handlers.StartCatchup` -- the admin-tier route
+/// (`crates/node/algo-rest-api/src/router.rs`), so `admin_token` (not the
+/// ordinary API token) is required. The `#` in `catchpoint` must be
+/// percent-encoded (`%23`) since it's otherwise a URL-fragment delimiter.
+async fn start_catchup(
+    client: &reqwest::Client,
+    rest_addr: &str,
+    admin_token: &str,
+    catchpoint: &str,
+) {
+    let encoded = catchpoint.replace('#', "%23");
+    let url = format!("http://{rest_addr}/v2/catchup/{encoded}");
+    let resp = client
+        .post(&url)
+        .header("X-Algo-API-Token", admin_token)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("POST {url} failed: {e}"));
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(status.is_success(), "POST {url} returned {status}: {body}");
+}
+
+/// Poll `GET /v2/status` until the in-flight `catchpoint` field goes back
+/// to empty (the live catchup finished, successfully or not), or panic at
+/// `deadline`.
+async fn wait_for_catchup_to_finish(
+    client: &reqwest::Client,
+    rest_addr: &str,
+    token: &str,
+    deadline: Instant,
+) {
+    let url = format!("http://{rest_addr}/v2/status");
+    loop {
+        if let Ok(resp) = client
+            .get(&url)
+            .header("X-Algo-API-Token", token)
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    let in_progress = body
+                        .get("catchpoint")
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    if !in_progress {
+                        return;
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("live catchpoint catchup did not finish before deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 fn dump_node_logs(node: &NodeProcess, label: &str) {
@@ -916,5 +1072,196 @@ async fn two_nodes_stay_in_sync_through_consensus_protocol_upgrade() {
         hash_a, hash_b,
         "node B's synced block at round {compare_round} does not match node A's through the \
          protocol upgrade"
+    );
+}
+
+/// The algod-rust equivalent of go-algorand's `TestNodeSetCatchpointCatchupMode`
+/// (`node/node_test.go`) happy path: a real live catchpoint-catchup, end to
+/// end, against a real self-generated catchpoint file -- closing the one
+/// gap `docs/phase17/parity_daemon_node.md` flagged as "not verified" after
+/// issues #937/#940 (issue #827 theme 4).
+///
+/// Node A runs with `CatchpointTracking: Stored`/a short `CatchpointInterval`
+/// (issue #770's automatic export) and `EnableLedgerService` (issue #955's
+/// catchpoint-tarball-serving endpoint), so it both generates and serves a
+/// real catchpoint file entirely on its own, the same way `wsRelay`/
+/// `hybridRelay` profile nodes do in production. Node B starts from the
+/// *same* genesis with no chain history and, critically, is **not** peered
+/// via gossip at all (no `--peers`) -- its only way to advance is the
+/// explicit `POST /v2/catchup/:catchpoint` request this test issues against
+/// it (`LiveCatchupManager::start_catchup`, issue #940's
+/// `ParticipateAgreementControl` wiring), which fetches the catchpoint
+/// tarball and replay blocks from node A over REST via
+/// `--catchup-peer`/`--catchup-peer-token`.
+///
+/// Writing this test surfaced two real bugs, both fixed alongside it:
+///
+/// - `CatchpointService`'s HTTP router (`GET/HEAD /v1/{genesis_id}/ledger/{round}`)
+///   was previously only ever mounted on the gossip network's own HTTP
+///   listener (`gossip_node.register_http_handler`) -- a *different* port
+///   from `--rest-listen`. Since `--catchup-peer` is documented as, and
+///   `CatchpointDownloader` always fetches from, a REST URL, a live
+///   catchpoint-catchup request against a real `--catchup-peer` 404'd
+///   unconditionally, even against a peer that genuinely had the labeled
+///   catchpoint file. Fixed by giving `ApiServer` a
+///   `with_extra_router` builder (`crates/node/algo-rest-api/src/server.rs`)
+///   that `participate` uses to merge `CatchpointService`'s router onto the
+///   REST server too.
+/// - `BlockHeader::round`'s `#[serde(rename = "rnd")]` field had no
+///   `default`, so a genuine genesis (round 0) header -- whose `rnd` key is
+///   correctly omitted by the canonical/omitempty encoder, since 0 is its
+///   zero value like every other field on the struct -- failed to decode
+///   generically ("missing field `rnd`"). This broke
+///   `reconstruct_lease_table`'s post-catchpoint-import lookback-block
+///   replay (`crates/core/algo-ledger/src/catchpoint/verify.rs`) whenever
+///   the lookback window reached back to round 0, silently leaving the
+///   catchup in a `Failed` state even though the catchpoint itself had
+///   already been imported correctly. Fixed by adding `default` to that
+///   field (`crates/core/algo-types/src/header.rs`), matching every other
+///   zero-valued field's existing `default`/`skip_serializing_if` pairing.
+#[tokio::test]
+#[ignore = "spawns child algod-rust processes and runs real BFT agreement; run with --ignored"]
+async fn follower_catches_up_via_live_catchpoint_catchup_from_a_real_catchpoint() {
+    let online = build_online_genesis();
+
+    let gossip_a = alloc_loopback_port();
+    let rest_a = alloc_loopback_port();
+    let gossip_b = alloc_loopback_port();
+    let rest_b = alloc_loopback_port();
+
+    // Owned independently of either node's own `--data-dir` (itself a
+    // throwaway `TempDir` created inside `spawn_participate_node_full`) --
+    // any absolute directory node A can write to and node B's peer fetch
+    // never needs to see directly (it always goes through node A's REST
+    // `CatchpointService`, never the filesystem).
+    let catchpoint_dir = tempfile::Builder::new()
+        .prefix("algod-rust-catchpoint-dir-")
+        .tempdir()
+        .expect("tempdir for catchpoint export");
+    std::fs::create_dir_all(catchpoint_dir.path()).expect("ensure catchpoint dir exists");
+
+    // A short interval so a handful of real agreement rounds already
+    // produces several catchpoints; `Stored` (2) forces `stores_catchpoints()`
+    // to `true` unconditionally (go: `config.Local.StoresCatchpoints`),
+    // independent of `Archival`.
+    let config_a = serde_json::json!({
+        "EnableLedgerService": true,
+        "CatchpointDir": catchpoint_dir.path().to_string_lossy(),
+        "CatchpointInterval": 2,
+        "CatchpointTracking": 2,
+    })
+    .to_string();
+
+    let mut node_a = spawn_participate_node_full(
+        gossip_a,
+        rest_a,
+        &online.genesis_json,
+        Some(&online.participation),
+        None,
+        None,
+        Some(&config_a),
+        None,
+    );
+
+    let client = http_client();
+    let overall_deadline = Instant::now() + Duration::from_secs(180);
+
+    wait_for_rest_ready(&client, &node_a.rest_addr, overall_deadline).await;
+    let token_a = read_api_token(&node_a.data_dir_path, overall_deadline).await;
+
+    // Reach round 4 -- past the interval-2 boundary a second time, which is
+    // what actually joins round 2's export thread and persists its label
+    // (see `wait_for_last_catchpoint`'s doc comment). Comfortable margin
+    // past the minimum needed.
+    wait_for_round(
+        &client,
+        &node_a.rest_addr,
+        &token_a,
+        4,
+        overall_deadline,
+        "node A",
+    )
+    .await;
+    let label = wait_for_last_catchpoint(
+        &client,
+        &node_a.rest_addr,
+        &token_a,
+        overall_deadline,
+        "node A",
+    )
+    .await;
+    let catchpoint_round: u64 = label
+        .split('#')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse round out of catchpoint label {label:?}"));
+    assert!(
+        catchpoint_round > 0,
+        "catchpoint label {label:?} must not be for genesis"
+    );
+
+    // Node B: same genesis, empty partkey registry, deliberately **not**
+    // peered via gossip (`peer_gossip_addr: None`) -- if it advances at
+    // all, it can only be via the explicit `start_catchup` call below, not
+    // an incidental ordinary catchup path.
+    let node_a_rest_url = format!("http://{}", node_a.rest_addr);
+    let mut node_b = spawn_participate_node_full(
+        gossip_b,
+        rest_b,
+        &online.genesis_json,
+        None,
+        None,
+        None,
+        None,
+        Some((&node_a_rest_url, &token_a)),
+    );
+
+    wait_for_rest_ready(&client, &node_b.rest_addr, overall_deadline).await;
+    let token_b = read_api_token(&node_b.data_dir_path, overall_deadline).await;
+    let admin_token_b = read_admin_token(&node_b.data_dir_path, overall_deadline).await;
+
+    // Confirm node B genuinely starts from genesis (round 0) -- the
+    // catchup below is the *only* thing that can move it.
+    let round_b_before = wait_for_round(
+        &client,
+        &node_b.rest_addr,
+        &token_b,
+        0,
+        overall_deadline,
+        "node B (pre-catchup)",
+    )
+    .await;
+    assert_eq!(
+        round_b_before, 0,
+        "node B must start at round 0 -- it has no gossip peers to have caught up any other way"
+    );
+
+    start_catchup(&client, &node_b.rest_addr, &admin_token_b, &label).await;
+    wait_for_catchup_to_finish(&client, &node_b.rest_addr, &token_b, overall_deadline).await;
+
+    let round_b_after = wait_for_round(
+        &client,
+        &node_b.rest_addr,
+        &token_b,
+        catchpoint_round,
+        overall_deadline,
+        "node B (post-catchup)",
+    )
+    .await;
+
+    let hash_a = get_block_hash(&client, &node_a.rest_addr, &token_a, catchpoint_round).await;
+    let hash_b = get_block_hash(&client, &node_b.rest_addr, &token_b, catchpoint_round).await;
+
+    if hash_a != hash_b {
+        dump_node_logs(&node_a, "A");
+        dump_node_logs(&node_b, "B");
+    }
+    node_b.shutdown();
+    node_a.shutdown();
+
+    assert_eq!(
+        hash_a, hash_b,
+        "node B's block at the catchpoint round {catchpoint_round} (reached at round \
+         {round_b_after} via live catchpoint catchup) does not match node A's"
     );
 }

@@ -831,10 +831,20 @@ impl AlgodNodeInterface {
         let latest_header = ledger
             .get_block_header(last_round)
             .map_err(|e| NodeError::Internal(format!("get_block_header({last_round}): {e}")))?;
+        // go: `ledger.GetLastCatchpointLabel()`, read unconditionally here
+        // (not gated on whether a `LiveCatchupManager` is attached) —
+        // `SqliteLedger::last_catchpoint_label` is the ledger's own
+        // self-generated-catchpoint bookkeeping (issue #824 theme 6),
+        // populated by the automatic-export path regardless of whether
+        // this node also happens to consume catchpoints from a peer.
+        let last_catchpoint_label = ledger
+            .last_catchpoint_label()
+            .map_err(|e| NodeError::Internal(format!("last_catchpoint_label: {e}")))?;
         Ok(StatusSnapshot {
             last_round,
             protocol,
             latest_header,
+            last_catchpoint_label,
         })
     }
 
@@ -882,6 +892,7 @@ struct StatusSnapshot {
     last_round: u64,
     protocol: String,
     latest_header: Option<BlockHeader>,
+    last_catchpoint_label: String,
 }
 
 #[async_trait]
@@ -911,8 +922,7 @@ impl NodeInterface for AlgodNodeInterface {
 
         // Live catchpoint-catchup mode (issue #937): `catchpoint` is
         // non-empty exactly while a catchup is in flight (mirrors go's
-        // `catchpointCatchupStatus`, `node/node.go`), `last_catchpoint` is
-        // the most recently *completed* one.
+        // `catchpointCatchupStatus`, `node/node.go`).
         //
         // Granular per-account/per-KV/per-block progress counters (issue
         // #941) are read from `LiveCatchupManager::catchpoint_counters`,
@@ -922,12 +932,25 @@ impl NodeInterface for AlgodNodeInterface {
         // is only on the reporting path while `node.catchpointCatchupService`
         // is non-nil — once catchup ends, `StatusReport`'s zero value takes
         // over and these fields report zero again, not stale last-run values.
-        let (catchpoint, last_catchpoint) = match &self.catchup_manager {
-            Some(mgr) => (
-                mgr.current_catchpoint().await.unwrap_or_default(),
-                mgr.last_catchpoint(),
-            ),
-            None => (String::new(), String::new()),
+        let catchpoint = match &self.catchup_manager {
+            Some(mgr) => mgr.current_catchpoint().await.unwrap_or_default(),
+            None => String::new(),
+        };
+        // `last_catchpoint`: go's `node.go` has two call sites —
+        // `catchpointCatchupStatus` (while a catchup is in flight) leaves
+        // `LastCatchpoint` at its zero value (the `ledger.GetLastCatchpointLabel()`
+        // read there is *commented out*, per a "once we refactor some of
+        // the ledger locking mechanisms" note), while `latestBlockStatus`
+        // (normal, not-currently-catching-up operation) sets it from
+        // `ledger.GetLastCatchpointLabel()` — the ledger's own
+        // self-generated-catchpoint bookkeeping, tracked regardless of
+        // whether this same node also happens to consume catchpoints from
+        // a peer. Reproduced here rather than a `LiveCatchupManager`-scoped
+        // "last catchup I completed" value (which is not what go tracks).
+        let last_catchpoint = if catchpoint.is_empty() {
+            snap.last_catchpoint_label.clone()
+        } else {
+            String::new()
         };
         let catchpoint_counters = if catchpoint.is_empty() {
             crate::live_catchup::CatchpointCounters::default()
@@ -6560,6 +6583,70 @@ mod tests {
         // revert to zero, not keep reporting the last run's counters.
         assert_eq!(status.catchpoint_total_accounts, 0);
         assert_eq!(status.catchpoint_acquired_blocks, 0);
+    }
+
+    /// `status()`'s `last_catchpoint` field must reflect the ledger's own
+    /// self-generated-catchpoint bookkeeping (`SqliteLedger::last_catchpoint_label`,
+    /// issue #824 theme 6) whenever no catchup is currently in flight --
+    /// matching go's `latestBlockStatus` setting `s.LastCatchpoint =
+    /// ledger.GetLastCatchpointLabel()` (`node/node.go`) -- regardless of
+    /// whether a `LiveCatchupManager` happens to be attached at all (issue
+    /// #827 theme 4: previously this field was hardcoded empty on any node
+    /// without one, even though a `participate`/`relay` node can generate
+    /// and persist real catchpoint labels entirely on its own).
+    #[tokio::test]
+    async fn status_last_catchpoint_reflects_the_ledgers_own_generated_label() {
+        let ledger = Arc::new(Mutex::new(
+            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+        ));
+        ledger
+            .lock()
+            .unwrap()
+            .set_last_catchpoint_label("2#REALLABEL")
+            .expect("set last catchpoint label");
+        let adapter = make_adapter_with_ledger(ledger);
+
+        let status = adapter.status().await.unwrap();
+        assert_eq!(status.catchpoint, "");
+        assert_eq!(status.last_catchpoint, "2#REALLABEL");
+    }
+
+    /// The mirror image of the test above: go's `node.go` has two call
+    /// sites for `LastCatchpoint` -- `catchpointCatchupStatus` (while a
+    /// catchup is in flight) leaves it at its zero value (the
+    /// `ledger.GetLastCatchpointLabel()` read there is commented out with a
+    /// "once we refactor some of the ledger locking mechanisms" note) --
+    /// so even a node that separately has a real self-generated label on
+    /// its ledger must report `last_catchpoint` as empty while `catchpoint`
+    /// (the in-flight one) is non-empty.
+    #[tokio::test]
+    async fn status_last_catchpoint_is_empty_while_a_catchup_is_in_flight() {
+        let ledger = Arc::new(Mutex::new(
+            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+        ));
+        ledger
+            .lock()
+            .unwrap()
+            .set_last_catchpoint_label("2#REALLABEL")
+            .expect("set last catchpoint label");
+        let manager = crate::live_catchup::LiveCatchupManager::new(
+            Arc::new(BlockingRunner {
+                cancel_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            Arc::new(crate::live_catchup::NoopSyncControl),
+        );
+        let adapter = make_adapter_with_ledger(ledger).with_catchup_manager(manager.clone());
+
+        adapter.start_catchup("1000#deadbeef", 0).await.unwrap();
+        let status = adapter.status().await.unwrap();
+        assert_eq!(status.catchpoint, "1000#deadbeef");
+        assert_eq!(
+            status.last_catchpoint, "",
+            "last_catchpoint must stay empty while a catchup is in flight, even though the \
+             ledger has a real self-generated label recorded"
+        );
+
+        adapter.abort_catchup("1000#deadbeef").await.unwrap();
     }
 
     /// Aborting an unknown catchpoint when a *different* one is running
