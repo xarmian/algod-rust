@@ -425,3 +425,110 @@ pub struct TealCompileResult {
     /// Base64-encoded compiled program bytes.
     pub result: String,
 }
+
+/// Serde adapter for a JSON string that is standard-base64 encoded bytes.
+/// Mirrors the `base64_bytes` helper in `algo-rest-api::models` (the server
+/// side of the same wire contract) — kept as a separate copy here since this
+/// crate doesn't depend on `algo-rest-api`.
+mod base64_bytes {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        STANDARD.decode(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// [`base64_bytes`], but for an `Option<Vec<u8>>` field that may be entirely
+/// absent (rather than present-and-empty).
+mod optional_base64_bytes {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(b) => s.serialize_str(&STANDARD.encode(b)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt: Option<String> = Option::deserialize(d)?;
+        match opt {
+            Some(s) => STANDARD
+                .decode(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Response from `GET /v2/applications/{id}/box?name=...`.
+///
+/// Matches go-algorand's `model.Box` (aliased as `BoxResponse`). Used by
+/// goal-rust's `app box info`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BoxResponse {
+    /// The box name, base64 encoded over the wire.
+    #[serde(with = "base64_bytes")]
+    pub name: Vec<u8>,
+
+    /// The round for which this information is relevant.
+    pub round: u64,
+
+    /// The box value, base64 encoded over the wire.
+    #[serde(with = "base64_bytes")]
+    pub value: Vec<u8>,
+}
+
+/// One entry of `GET /v2/applications/{id}/boxes`'s `boxes` array.
+///
+/// Matches go-algorand's `model.BoxDescriptor`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BoxDescriptor {
+    /// The box name, base64 encoded over the wire.
+    #[serde(with = "base64_bytes")]
+    pub name: Vec<u8>,
+
+    /// The box value, base64 encoded over the wire. Present only when the
+    /// request asked for `include=values` (pagination mode).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_base64_bytes"
+    )]
+    pub value: Option<Vec<u8>>,
+}
+
+/// Response from `GET /v2/applications/{id}/boxes`.
+///
+/// Matches go-algorand's `model.BoxesResponse`. Used by goal-rust's
+/// `app box list`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct BoxesResponse {
+    /// The box descriptors for this page.
+    #[serde(default)]
+    pub boxes: Vec<BoxDescriptor>,
+
+    /// Pagination cursor for the next page, present only in pagination mode
+    /// when more results exist.
+    #[serde(
+        rename = "next-token",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub next_token: Option<String>,
+
+    /// The round this listing is relevant for. Present only in pagination
+    /// mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u64>,
+}
