@@ -40,6 +40,33 @@
 //! drop it without another round-trip to the pool. Cache misses are
 //! inserted before the pool call.
 //!
+//! ## Signature verification (issue #1043)
+//!
+//! When [`TxTagHandler::with_batch_verifier`] has been used to attach a
+//! shared [`BatchVerifier`], each decoded (and not-already-seen) group is
+//! submitted to it *before* [`TransactionPool::remember`] is called,
+//! mirroring go-algorand's `data/txHandler.go` routing every incoming
+//! gossip group through its `StreamToBatch` async worker pool
+//! (`data/transactions/verify/txnBatch.go`) rather than verifying
+//! synchronously inline. A batch-verification failure is logged and the
+//! group is dropped (`Ignore`) without ever reaching the pool — it is not
+//! treated as a `remember`/eval-error for `appLimiter.penalizeEvalError`
+//! purposes (see that section below), since a bad signature is a distinct
+//! failure kind from a valid-signature group that the evaluator rejects.
+//!
+//! The `BatchVerifier` is constructed against the *same*
+//! `algo_validate::VerifiedTransactionCache` instance the node's
+//! `BlockEvaluator` consults (mirrors go's single node-wide
+//! `VerifiedTransactionCache` shared between `node.go`'s tx handler and
+//! block evaluator), so a group verified here is a cache hit — not
+//! redundant work — when the pool's evaluator verifies it again inside
+//! `remember()`.
+//!
+//! Without a verifier attached (the default from [`TxTagHandler::new`]),
+//! behavior is unchanged from before issue #1043: no pre-admission
+//! signature verification happens in this handler, and `remember()`'s own
+//! (evaluator-internal) verification is the only gate, exactly as before.
+//!
 //! ## Pool call
 //!
 //! The whole decoded group is submitted as one unit via
@@ -122,6 +149,7 @@ use tracing::{debug, warn};
 use algo_codec::compute_txn_id;
 use algo_pool::{AppRateLimiter, TransactionPool};
 use algo_types::SignedTransaction;
+use algo_validate::{BatchVerifier, BatchVerifyRequest, SpecialAddresses, VerificationContext};
 
 use crate::forwarding_policy::ForwardingPolicy;
 use crate::handler::MessageHandler;
@@ -232,6 +260,7 @@ pub struct TxTagHandler {
     seen: Arc<SeenTxCache>,
     app_limiter: Option<Arc<AppRateLimiter>>,
     app_limiter_congestion_threshold: usize,
+    batch_verifier: Option<Arc<BatchVerifier>>,
 }
 
 impl std::fmt::Debug for TxTagHandler {
@@ -243,6 +272,7 @@ impl std::fmt::Debug for TxTagHandler {
                 "app_limiter_congestion_threshold",
                 &self.app_limiter_congestion_threshold,
             )
+            .field("batch_verifier_enabled", &self.batch_verifier.is_some())
             .finish()
     }
 }
@@ -265,6 +295,7 @@ impl TxTagHandler {
             seen,
             app_limiter: None,
             app_limiter_congestion_threshold: 0,
+            batch_verifier: None,
         }
     }
 
@@ -296,11 +327,61 @@ impl TxTagHandler {
         self
     }
 
+    /// Attach a shared [`BatchVerifier`] (issue #1043), mirroring
+    /// go-algorand's `TxHandler` routing every incoming gossip transaction
+    /// group through its `StreamToBatch` async worker pool before it ever
+    /// reaches the transaction pool. See the module doc's "Signature
+    /// verification" section for the full behavioral contract.
+    ///
+    /// `verifier` should typically be shared (same `Arc`) across every
+    /// `TxTagHandler` instance registered on this node (one per active
+    /// transport, same as [`Self::with_app_rate_limiter`]'s `limiter`), and
+    /// should be constructed against the same
+    /// `algo_validate::VerifiedTransactionCache` the node's `BlockEvaluator`
+    /// uses, so verification here and inside `remember()` share one cache
+    /// rather than each verifying independently.
+    #[must_use]
+    pub fn with_batch_verifier(mut self, verifier: Arc<BatchVerifier>) -> Self {
+        self.batch_verifier = Some(verifier);
+        self
+    }
+
     /// Returns a reference to the shared seen-tx cache.
     #[must_use]
     pub fn seen_cache(&self) -> Arc<SeenTxCache> {
         self.seen.clone()
     }
+}
+
+/// Build a [`BatchVerifyRequest`] for pre-admission signature verification
+/// of an inbound gossip group, from the pool's current ledger tip (issue
+/// #1043).
+///
+/// Returns `None` when the ledger has no committed tip yet (e.g. during
+/// node startup, before `pool.on_new_block` has bootstrapped an
+/// evaluator) -- in that case pre-admission verification is skipped and
+/// `pool.remember()` itself surfaces the appropriate
+/// `NoPendingBlockEvaluator`-style error, exactly as it did before a
+/// `BatchVerifier` was attached.
+fn build_verify_request(
+    pool: &TransactionPool,
+    group: &[SignedTransaction],
+) -> Option<BatchVerifyRequest> {
+    let ledger = pool.ledger();
+    let round = ledger.latest();
+    let hdr = ledger.block_hdr(round).ok()?;
+    let params = ledger.consensus_params(round).ok()?;
+    Some(BatchVerifyRequest {
+        group: group.to_vec(),
+        context: VerificationContext {
+            spec_addrs: SpecialAddresses {
+                fee_sink: hdr.fee_sink,
+                rewards_pool: hdr.rewards_pool,
+            },
+            consensus_version: hdr.current_protocol,
+        },
+        params,
+    })
 }
 
 /// Extract the `origin` byte string used to key [`AppRateLimiter`]
@@ -397,6 +478,34 @@ impl MessageHandler for TxTagHandler {
                     };
                 }
             }
+        }
+
+        // Batch signature verification (issue #1043), mirroring go's
+        // `TxHandler` routing every incoming gossip group through
+        // `StreamToBatch` before it reaches the pool. Only engages when a
+        // verifier has been attached (see module doc); a rejection here
+        // drops the group without ever calling `pool.remember()` and
+        // without penalizing the app rate limiter -- a bad signature is a
+        // distinct failure kind from a `remember`/eval-error.
+        if let Some(verifier) = &self.batch_verifier {
+            if let Some(request) = build_verify_request(&self.pool, &group) {
+                if let Err(e) = verifier.verify(request).await {
+                    warn!(
+                        sender = %msg.sender,
+                        error = %e,
+                        "TxTagHandler: batch signature verification rejected inbound TX group",
+                    );
+                    return OutgoingMessage {
+                        action: ForwardingPolicy::Ignore,
+                        tag: Tag::Transaction,
+                        payload: Vec::new(),
+                        topics: None,
+                    };
+                }
+            }
+            // `None` means the ledger has no committed tip yet -- fall
+            // through to `pool.remember()` below, which surfaces the
+            // correct error for that case itself.
         }
 
         // Submit the whole group to the pool on the blocking executor.
@@ -899,5 +1008,257 @@ mod app_rate_limiter_wiring_tests {
             pool.pending_tx_ids().contains(&txid),
             "a plain payment group must never be gated by the app rate limiter"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: BatchVerifier wiring into the live gossip tx-admission path
+// (issue #1043)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod batch_verifier_wiring_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use algo_error::AlgoError;
+    use algo_pool::traits::{BlockEvaluator, PoolLedger};
+    use algo_pool::{PoolConfig, TransactionPool};
+    use algo_types::{Address, Block, BlockHeader, ConsensusParams, Round, TxnType};
+    use algo_validate::{BatchVerifier, BatchVerifierConfig, BatchVerifyRequest, VerifiedTransactionCache};
+
+    use super::*;
+    use crate::tx_syncer::SeenTxCache;
+
+    /// Test-only alias for a `BatchVerifier::spawn_with_verifier` closure
+    /// (the real crate uses an equivalent private alias internally).
+    type TestVerifyFn =
+        dyn Fn(&BatchVerifyRequest, &VerifiedTransactionCache) -> Result<(), AlgoError>
+            + Send
+            + Sync;
+
+    /// Minimal stub ledger/evaluator, replicated from
+    /// `app_rate_limiter_wiring_tests::StubLedger` above -- `remember`
+    /// always succeeds so these tests isolate the *verification* gate.
+    struct StubLedger {
+        round: Round,
+    }
+
+    impl PoolLedger for StubLedger {
+        fn latest(&self) -> Round {
+            self.round
+        }
+        fn block_hdr(&self, _round: Round) -> Result<BlockHeader, AlgoError> {
+            Ok(BlockHeader::default())
+        }
+        fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, AlgoError> {
+            Ok(ConsensusParams::default())
+        }
+        fn start_evaluator(
+            &self,
+            _hdr: BlockHeader,
+            _payset_hint: usize,
+            _max_txn_bytes_per_block: usize,
+        ) -> Result<Box<dyn BlockEvaluator>, AlgoError> {
+            Ok(Box::new(StubEvaluator {
+                round: self.round.next(),
+            }))
+        }
+    }
+
+    struct StubEvaluator {
+        round: Round,
+    }
+
+    impl BlockEvaluator for StubEvaluator {
+        fn round(&self) -> Round {
+            self.round
+        }
+        fn pay_set_size(&self) -> usize {
+            0
+        }
+        fn test_transaction_group(&self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Ok(())
+        }
+        fn transaction_group(&mut self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Ok(())
+        }
+        fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+            Ok(Block::default())
+        }
+        fn reset_txn_bytes(&mut self) {}
+    }
+
+    fn make_pool() -> Arc<TransactionPool> {
+        let ledger: Arc<dyn PoolLedger> = Arc::new(StubLedger { round: Round(1) });
+        let pool = Arc::new(TransactionPool::new(PoolConfig::default(), ledger));
+        pool.on_new_block(&Block::default(), &std::collections::HashSet::new());
+        pool
+    }
+
+    fn make_payment_txn(sender_byte: u8, note: u8) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = TxnType::Pay;
+        stx.txn.sender = Address([sender_byte; 32]);
+        stx.txn.fee = 1_000_000;
+        stx.txn.first_valid = Round(1);
+        stx.txn.last_valid = Round(1_000);
+        stx.txn.note = serde_bytes::ByteBuf::from(vec![note]);
+        stx
+    }
+
+    fn encode_group(group: &[SignedTransaction]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for tx in group {
+            let bytes = rmp_serde::to_vec_named(tx).expect("encode stxn");
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
+    fn incoming(group: &[SignedTransaction], sender: &str) -> IncomingMessage {
+        let data = encode_group(group);
+        IncomingMessage::new(Tag::Transaction, data, sender.to_string(), 0)
+    }
+
+    /// A group that verifies successfully must be routed through the
+    /// attached `BatchVerifier` (proven by the injected verify function
+    /// being invoked) and then still reach the pool exactly as before.
+    #[tokio::test]
+    async fn successful_verification_routes_through_batch_verifier_then_admits_to_pool() {
+        let pool = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let cache = Arc::new(VerifiedTransactionCache::new(100));
+        let verify_fn: Arc<TestVerifyFn> = Arc::new(move |_request, _cache| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let verifier = Arc::new(BatchVerifier::spawn_with_verifier(
+            BatchVerifierConfig::default(),
+            cache,
+            verify_fn,
+        ));
+        let handler = TxTagHandler::new(pool.clone(), seen).with_batch_verifier(verifier.clone());
+
+        let tx = make_payment_txn(1, 1);
+        let txid = compute_txn_id(&tx.txn);
+        let msg = incoming(std::slice::from_ref(&tx), "1.2.3.4:4160");
+        let out = handler.handle(msg).await;
+
+        assert_eq!(out.action, ForwardingPolicy::Ignore);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the injected BatchVerifier verify function must be invoked exactly once"
+        );
+        assert!(
+            pool.pending_tx_ids().contains(&txid),
+            "a group that verifies successfully must still reach the pool"
+        );
+
+        drop(handler);
+        Arc::try_unwrap(verifier)
+            .unwrap_or_else(|_| panic!("verifier still shared"))
+            .shutdown()
+            .await;
+    }
+
+    /// A group that fails batch verification must never reach the pool at
+    /// all -- proving the verifier actually *gates* admission rather than
+    /// being called and ignored.
+    #[tokio::test]
+    async fn failed_verification_never_reaches_the_pool() {
+        let pool = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let cache = Arc::new(VerifiedTransactionCache::new(100));
+        let verify_fn: Arc<TestVerifyFn> = Arc::new(|_request, _cache| {
+            Err(AlgoError::Validation {
+                message: "injected verification failure".into(),
+            })
+        });
+        let verifier = Arc::new(BatchVerifier::spawn_with_verifier(
+            BatchVerifierConfig::default(),
+            cache,
+            verify_fn,
+        ));
+        let handler = TxTagHandler::new(pool.clone(), seen).with_batch_verifier(verifier.clone());
+
+        let tx = make_payment_txn(2, 2);
+        let txid = compute_txn_id(&tx.txn);
+        let msg = incoming(std::slice::from_ref(&tx), "5.6.7.8:4160");
+        let out = handler.handle(msg).await;
+
+        assert_eq!(out.action, ForwardingPolicy::Ignore);
+        assert_eq!(pool.pending_count(), 0, "a failed-verification group must admit nothing");
+        assert!(
+            !pool.pending_tx_ids().contains(&txid),
+            "a failed-verification group must never reach the pool"
+        );
+
+        drop(handler);
+        Arc::try_unwrap(verifier)
+            .unwrap_or_else(|_| panic!("verifier still shared"))
+            .shutdown()
+            .await;
+    }
+
+    /// Concurrently-submitted gossip transaction groups must both be
+    /// processed through the *same* shared `BatchVerifier` instance, not
+    /// each bypass it independently -- the core architectural claim of
+    /// issue #1043.
+    #[tokio::test]
+    async fn concurrent_submissions_share_one_batch_verifier() {
+        let pool = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let cache = Arc::new(VerifiedTransactionCache::new(100));
+        let verify_fn: Arc<TestVerifyFn> = Arc::new(move |_request, _cache| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let verifier = Arc::new(BatchVerifier::spawn_with_verifier(
+            BatchVerifierConfig {
+                num_workers: 2,
+                max_batch_size: 8,
+                batch_linger: std::time::Duration::from_millis(20),
+                ..Default::default()
+            },
+            cache,
+            verify_fn,
+        ));
+        let handler = Arc::new(
+            TxTagHandler::new(pool.clone(), seen).with_batch_verifier(verifier.clone()),
+        );
+
+        let tx1 = make_payment_txn(3, 1);
+        let tx2 = make_payment_txn(4, 2);
+        let txid1 = compute_txn_id(&tx1.txn);
+        let txid2 = compute_txn_id(&tx2.txn);
+        let msg1 = incoming(std::slice::from_ref(&tx1), "9.9.9.1:4160");
+        let msg2 = incoming(std::slice::from_ref(&tx2), "9.9.9.2:4160");
+
+        let h1 = handler.clone();
+        let h2 = handler.clone();
+        let (out1, out2) = tokio::join!(h1.handle(msg1), h2.handle(msg2));
+
+        assert_eq!(out1.action, ForwardingPolicy::Ignore);
+        assert_eq!(out2.action, ForwardingPolicy::Ignore);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both concurrently-submitted groups must be verified via the shared pool"
+        );
+        assert!(pool.pending_tx_ids().contains(&txid1));
+        assert!(pool.pending_tx_ids().contains(&txid2));
+
+        drop(h1);
+        drop(h2);
+        drop(handler);
+        Arc::try_unwrap(verifier)
+            .unwrap_or_else(|_| panic!("verifier still shared"))
+            .shutdown()
+            .await;
     }
 }

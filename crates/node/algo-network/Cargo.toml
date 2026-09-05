@@ -11,6 +11,7 @@ algo-types.workspace = true
 algo-codec.workspace = true
 algo-error.workspace = true
 algo-pool.workspace = true
+algo-validate.workspace = true
 algo-config.workspace = true
 async-trait.workspace = true
 axum.workspace = true

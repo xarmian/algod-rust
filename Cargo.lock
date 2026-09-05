@@ -432,6 +432,7 @@ dependencies = [
  "algo-error",
  "algo-pool",
  "algo-types",
+ "algo-validate",
  "async-trait",
  "axum",
  "base64",
