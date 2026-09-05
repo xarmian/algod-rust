@@ -1328,8 +1328,14 @@ impl SimpleBlockEvaluator {
             }
         }
 
-        // 3. Group ID consistency.
-        algo_validate::validate_transaction_group(txgroup)?;
+        // 3. Group ID consistency. This is fresh-submission (pool-admission)
+        // validation, not block-replay -- use the strict variant so a lone
+        // submitted transaction whose `Group` field is non-zero (i.e. it
+        // claims membership in a real multi-member atomic group that wasn't
+        // submitted alongside it) is rejected, matching go-algorand's
+        // `TxnGroup`/`TxnGroupWithTracer` (`data/transactions/verify/txn.go`)
+        // and its `TestGroupTransactions` (see issue #1034).
+        algo_validate::validate_transaction_group_strict(txgroup)?;
 
         // 4. Group fee total check. Go's `CheckGroupFees`/`SummarizeFees`
         // (`ledger/eval/eval.go`) run unconditionally for every top-level
@@ -7697,6 +7703,85 @@ mod tests {
             block.payset.len(),
             2,
             "block should contain both transactions from the group"
+        );
+    }
+
+    /// Issue #1034 / parity with go-algorand's `TestGroupTransactions`
+    /// (`test/e2e-go/features/transactions/group_test.go`): sign `txn_a` +
+    /// `txn_b` as a genuine 2-member atomic group (`Group` field stamped
+    /// with the hash over `[txn_a, txn_b]`), then submit `stx_a` **alone**
+    /// through the same pool-admission path (`SimpleBlockEvaluator::
+    /// transaction_group` -> `validate_group_stateless_inner`) that
+    /// `POST /v2/transactions` (dev mode) uses. go-algorand rejects this
+    /// with a group-ID mismatch -- the hash recomputed over the submitted
+    /// slice `[stx_a]` alone doesn't match the stamped 2-element hash.
+    /// Before the fix for #1034, `validate_group_stateless_inner`'s step 3
+    /// used the lenient (block-replay) `validate_transaction_group`, which
+    /// unconditionally skips validation for any submitted group with fewer
+    /// than 2 members -- wrongly accepting this escaped single-member
+    /// group.
+    #[test]
+    fn escaped_single_member_of_real_group_rejected_on_submission() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender_a, key_a) = test_keypair(140);
+        let (sender_b, key_b) = test_keypair(141);
+        let (receiver, _) = test_keypair(142);
+        let mut eval = make_evaluator(
+            &ledger,
+            &params,
+            100,
+            &[
+                (sender_a, 10_000_000),
+                (sender_b, 10_000_000),
+                (receiver, 100_000),
+            ],
+        );
+
+        let mut txn_a = Transaction {
+            txn_type: TxnType::Pay,
+            sender: sender_a,
+            receiver,
+            amount: 1_000,
+            fee: 1_000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            ..Default::default()
+        };
+        let mut txn_b = Transaction {
+            txn_type: TxnType::Pay,
+            sender: sender_b,
+            receiver,
+            amount: 2_000,
+            fee: 1_000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            ..Default::default()
+        };
+
+        let group_id = algo_validate::rules::compute_group_id(&[txn_a.clone(), txn_b.clone()]);
+        txn_a.group = *group_id.as_bytes();
+        txn_b.group = *group_id.as_bytes();
+
+        let sig_a = sign_txn(&txn_a, &key_a);
+        let _sig_b = sign_txn(&txn_b, &key_b);
+        let stx_a = SignedTransaction {
+            txn: txn_a,
+            sig: sig_a,
+            ..Default::default()
+        };
+
+        // Submit stx_a ALONE -- its sibling txn_b was never submitted.
+        let err = eval
+            .transaction_group(&[stx_a])
+            .expect_err("a lone member of a real 2-member atomic group must be rejected");
+        assert!(
+            err.to_string().contains("mismatch"),
+            "expected a group-ID mismatch rejection, got: {err}"
         );
     }
 

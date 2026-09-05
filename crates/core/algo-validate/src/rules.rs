@@ -1420,15 +1420,52 @@ where
 /// ID across the entire payset (using a HashMap). Each group must have
 /// 2..=MAX_GROUP_SIZE members and the stored group ID must match the computed
 /// one. Standalone (empty `grp`) transactions are skipped.
+///
+/// This is the **lenient** (block-replay) variant: a single-member "group"
+/// (i.e. a non-zero `Txn.Group` field whose only other members aren't present
+/// in `txns`) is treated as already-valid rather than rejected. That is
+/// correct only when `txns` is an already-agreed block's payset (or a
+/// restored subset of one) — by construction there is no way for an agreed
+/// block to contain a dangling incomplete group, and on mainnet a block may
+/// legitimately expose only a subset of group members due to field-level
+/// deserialization differences. See `validate_transaction_group_strict` for
+/// fresh-submission (pool-admission) validation, where this leniency is
+/// wrong: a genuine standalone transaction always has `Group == [0u8; 32]`,
+/// so a non-zero `Group` field on a lone submitted transaction can only mean
+/// the rest of its atomic group was never submitted.
 pub fn validate_transaction_group(txns: &[SignedTransaction]) -> Result<(), AlgoError> {
+    validate_transaction_group_inner(txns, false)
+}
+
+/// Validate transaction groups for **pool admission of a fresh submission**
+/// (Go: `data/transactions/verify/txn.go`'s `TxnGroup`/`TxnGroupWithTracer`,
+/// called from the `POST /v2/transactions` path). Unlike
+/// [`validate_transaction_group`], this does NOT skip a single-member
+/// "group" — it recomputes and compares the group ID exactly as the
+/// `size >= 2` path does, since a genuine standalone/ungrouped transaction
+/// always has `Group == [0u8; 32]`. Submitting one member of a real
+/// multi-member atomic group alone must be rejected (go-algorand's
+/// `TestGroupTransactions`), because the hash recomputed over the submitted
+/// slice alone will not match the stamped multi-element group ID.
+pub fn validate_transaction_group_strict(txns: &[SignedTransaction]) -> Result<(), AlgoError> {
+    validate_transaction_group_inner(txns, true)
+}
+
+fn validate_transaction_group_inner(
+    txns: &[SignedTransaction],
+    strict: bool,
+) -> Result<(), AlgoError> {
     for_each_group(txns, |group_members| {
         let size = group_members.len();
 
         // On mainnet, a block may contain only a subset of group members
         // visible to us (e.g., due to field-level deserialization differences).
-        // Skip validation for single-member groups — the group was already
-        // validated at submission time by the network.
-        if size < 2 {
+        // Skip validation for single-member groups in lenient (block-replay)
+        // mode — the group was already validated at submission time by the
+        // network. In strict (pool-admission) mode, a single member with a
+        // non-zero `Group` field IS the thing we must reject: fall through to
+        // the group-ID recomputation below.
+        if size < 2 && !strict {
             return Ok(());
         }
 
@@ -2287,6 +2324,60 @@ mod tests {
         let signed = vec![wrap_signed(txn)];
 
         assert!(validate_transaction_group(&signed).is_ok());
+    }
+
+    /// Parity with go-algorand's `TestGroupTransactions`
+    /// (`test/e2e-go/features/transactions/group_test.go`): a genuine
+    /// standalone transaction always has `Group == [0u8; 32]`, so a lone
+    /// submitted transaction with a *non-zero* `Group` field can only mean
+    /// the rest of its atomic group was never submitted. Unlike lenient
+    /// block-replay validation (`test_single_txn_group_skipped` above,
+    /// unchanged), strict pool-admission validation must reject this: the
+    /// group ID recomputed over the submitted slice `[stx]` alone will not
+    /// match the stamped multi-member hash. See issue #1034.
+    #[test]
+    fn test_strict_escaped_single_member_group_rejected() {
+        let mut txn = make_valid_txn();
+        txn.group = [0xAA; 32];
+        let signed = vec![wrap_signed(txn)];
+
+        // Lenient (block-replay) mode still accepts it unchanged.
+        assert!(validate_transaction_group(&signed).is_ok());
+
+        // Strict (pool-admission) mode must reject it as a group-ID mismatch.
+        let err = validate_transaction_group_strict(&signed).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mismatch"),
+            "expected group ID mismatch error, got: {msg}"
+        );
+    }
+
+    /// Strict mode must still accept a correctly-submitted full group.
+    #[test]
+    fn test_strict_valid_group_passes() {
+        let txn1 = make_valid_txn();
+        let mut txn2 = make_valid_txn();
+        txn2.amount = 999;
+
+        let gid = compute_group_id(&[txn1.clone(), txn2.clone()]);
+        let mut s1 = txn1;
+        s1.group = *gid.as_bytes();
+        let mut s2 = txn2;
+        s2.group = *gid.as_bytes();
+
+        let signed = vec![wrap_signed(s1), wrap_signed(s2)];
+        assert!(validate_transaction_group_strict(&signed).is_ok());
+    }
+
+    /// Strict mode must still accept a genuine standalone (ungrouped)
+    /// transaction — `Group == [0u8; 32]` is skipped by `for_each_group`
+    /// entirely, in both modes.
+    #[test]
+    fn test_strict_standalone_txn_no_group_passes() {
+        let txn = make_valid_txn();
+        let signed = vec![wrap_signed(txn)];
+        assert!(validate_transaction_group_strict(&signed).is_ok());
     }
 
     #[test]
