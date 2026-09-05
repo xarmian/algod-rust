@@ -50,6 +50,7 @@ pub mod activity_monitor;
 pub mod blackhole_network;
 pub mod instant_clock;
 pub mod setup_agreement;
+pub mod suspendable_validator;
 pub mod test_account;
 pub mod test_factory;
 pub mod test_ledger;
