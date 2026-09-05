@@ -41,7 +41,7 @@
 //! exceeded, the service returns 503 (HTTP) or an error topic (WS).
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -52,6 +52,7 @@ use axum::routing::get;
 use axum::Router;
 use http::StatusCode;
 use http_body::Body as HttpBody;
+use url::Url;
 
 use crate::block_fetcher::decode_round_from_uvarint;
 use crate::topics::{
@@ -94,6 +95,149 @@ const ROUND_NUMBER_PARSE_ERR_MSG: &str = "unable to parse round number";
 const BLOCK_NOT_AVAILABLE_ERR_MSG: &str = "requested block is not available";
 const DATATYPE_UNSUPPORTED_ERR_MSG: &str = "requested data type is unsupported";
 const MEMORY_AT_CAPACITY_ERR_MSG: &str = "block service memory over capacity";
+
+// ---------------------------------------------------------------------------
+// Fallback (redirect-to-archival-peer) endpoints
+// ---------------------------------------------------------------------------
+//
+// Mirrors go's `rpcs/blockService.go` "Fast Catchup Backend"
+// (`BlockServiceCustomFallbackEndpoints`, `fallbackEndpoints`,
+// `redirectRequest`/`getNextCustomFallbackEndpoint`): when this node can't
+// satisfy a block request itself (round not on disk yet, or over the
+// in-flight memory cap), it 307-redirects the requester to the next
+// configured fallback endpoint in round-robin order rather than answering
+// 404/503 directly — issue #955.
+//
+// Deliberate simplification vs. go: go's `addr.ParseHostOrURL` accepts a
+// handful of Go-`net/url`-specific quirky inputs (bare "host:port",
+// scheme-relative "//host", multiaddr strings for the libp2p transport) and
+// re-validates each configured endpoint lazily *at redirect time*, silently
+// falling back to "no redirect" for that one request if parsing fails. This
+// port instead validates once at construction time and drops any entry
+// that can't be turned into a usable HTTP(S) redirect target, which is
+// behaviorally equivalent for well-formed configuration (the common case)
+// while being simpler to reason about; a misconfigured entry is surfaced
+// immediately via a `tracing::warn!` at startup rather than silently
+// degrading a single request. Multiaddr-style entries (`/ip4/.../p2p/...`)
+// are recognized but always dropped here: `algo-p2p` doesn't yet expose the
+// registration point this classic-transport service would need to build a
+// meaningful redirect target for one (tracked as a follow-up to issue
+// #955).
+
+/// Round-robin list of configured fallback (redirect target) endpoints.
+struct FallbackEndpoints {
+    endpoints: Vec<Url>,
+    next: AtomicUsize,
+}
+
+impl FallbackEndpoints {
+    fn empty() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// Parse go's `BlockServiceCustomFallbackEndpoints` config string (a
+    /// comma-delimited list) into validated redirect targets, mirroring
+    /// go's `makeFallbackEndpoints` (see the module-level note above for
+    /// where this simplifies vs. go).
+    fn parse(custom_fallback_endpoints: &str) -> Self {
+        let mut endpoints = Vec::new();
+        for raw in custom_fallback_endpoints.split(',') {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            if is_multiaddr_like(raw) {
+                tracing::warn!(
+                    endpoint = raw,
+                    "block service: multiaddr-style fallback endpoints are not yet \
+                     supported (no algo-p2p HTTP-redirect target); skipping"
+                );
+                continue;
+            }
+            match parse_host_or_url(raw) {
+                Some(url) => endpoints.push(url),
+                None => {
+                    tracing::warn!(
+                        endpoint = raw,
+                        "block service: could not parse fallback endpoint; skipping"
+                    );
+                }
+            }
+        }
+        Self {
+            endpoints,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// Returns the next endpoint in round-robin order, or `None` if no
+    /// (valid) fallback endpoints are configured.
+    fn next_endpoint(&self) -> Option<&Url> {
+        if self.endpoints.is_empty() {
+            return None;
+        }
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.endpoints.len();
+        Some(&self.endpoints[idx])
+    }
+
+    /// Builds the 307-redirect `Location` for `round` at the next
+    /// round-robin fallback endpoint, or `None` if none are configured.
+    fn redirect_location(&self, genesis_id: &str, round: u64) -> Option<String> {
+        let endpoint = self.next_endpoint()?;
+        let mut url = endpoint.clone();
+        url.set_path(&format!(
+            "/v1/{genesis_id}/block/{}",
+            crate::block_fetcher::format_round_base36(round)
+        ));
+        Some(url.to_string())
+    }
+}
+
+/// A crude structural check for a libp2p multiaddr (`/ip4/.../tcp/.../p2p/...`),
+/// matching go's `addr.IsMultiaddr`'s prefix test (a leading `/` that isn't
+/// the start of a scheme-relative URL's `//`) without pulling in a
+/// multiaddr-parsing dependency this crate doesn't otherwise need.
+fn is_multiaddr_like(s: &str) -> bool {
+    s.starts_with('/') && !s.starts_with("//")
+}
+
+/// Parse a fallback endpoint into a usable redirect-target [`Url`],
+/// mirroring go's `addr.ParseHostOrURL`'s two fallbacks: a bare
+/// `host:port` (which plain URL parsing chokes on because it reads `host:`
+/// as a scheme), or a full URL/host that's missing its scheme entirely.
+fn parse_host_or_url(addr: &str) -> Option<Url> {
+    if is_host_colon_port(addr) {
+        return Url::parse(&format!("http://{addr}")).ok();
+    }
+    if let Ok(url) = Url::parse(addr) {
+        if url.host().is_some() {
+            return Some(url);
+        }
+        return None;
+    }
+    let with_scheme = Url::parse(&format!("http://{addr}")).ok()?;
+    if with_scheme.host().is_some() {
+        Some(with_scheme)
+    } else {
+        None
+    }
+}
+
+/// Matches go's `HostColonPortPattern` (`^[-a-zA-Z0-9.]+:\d+$`).
+fn is_host_colon_port(s: &str) -> bool {
+    let Some((host, port)) = s.rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && !port.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -168,6 +312,12 @@ pub struct BlockService {
     ws_mem_used: Arc<AtomicU64>,
     /// Maximum bytes allowed in-flight before returning 503 / error.
     mem_cap: u64,
+    /// Configured redirect-to-archival-peer fallback endpoints (go's
+    /// `BlockServiceCustomFallbackEndpoints`/"Fast Catchup Backend",
+    /// issue #955). Empty by default — matches go's `""` default, under
+    /// which `redirectRequest` always returns `false` and the service
+    /// falls back to plain 404/503 responses.
+    fallback: Arc<FallbackEndpoints>,
 }
 
 impl BlockService {
@@ -183,7 +333,23 @@ impl BlockService {
             http_mem_used: Arc::new(AtomicU64::new(0)),
             ws_mem_used: Arc::new(AtomicU64::new(0)),
             mem_cap,
+            fallback: Arc::new(FallbackEndpoints::empty()),
         }
+    }
+
+    /// Configure redirect-to-archival-peer fallback endpoints from go's
+    /// `BlockServiceCustomFallbackEndpoints` config string (a comma-delimited
+    /// list of `host:port`/URL endpoints). When the HTTP block endpoint
+    /// can't satisfy a request itself (block not available, or over the
+    /// memory cap), it 307-redirects to the next endpoint in round-robin
+    /// order instead of responding 404/503 directly — mirrors go's
+    /// `redirectRequest`/`getNextCustomFallbackEndpoint`.
+    ///
+    /// A builder method (rather than an extra `new` parameter) so the many
+    /// existing call sites that don't need redirect behavior are unaffected.
+    pub fn with_custom_fallback_endpoints(mut self, custom_fallback_endpoints: &str) -> Self {
+        self.fallback = Arc::new(FallbackEndpoints::parse(custom_fallback_endpoints));
+        self
     }
 
     /// Build an [`axum::Router`] for the HTTP block endpoint.
@@ -196,6 +362,7 @@ impl BlockService {
             genesis_id: self.genesis_id.clone(),
             mem_used: Arc::clone(&self.http_mem_used),
             mem_cap: self.mem_cap,
+            fallback: Arc::clone(&self.fallback),
         };
 
         // Axum requires each `:param` to span a full path segment, so we
@@ -356,6 +523,7 @@ struct BlockServiceState {
     genesis_id: String,
     mem_used: Arc<AtomicU64>,
     mem_cap: u64,
+    fallback: Arc<FallbackEndpoints>,
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +589,11 @@ impl HttpBody for MemoryTrackingBody {
 
 /// Parse a base-36 encoded round number, matching Go's
 /// `strconv.ParseUint(s, 36, 64)`.
-fn parse_round_base36(s: &str) -> Option<u64> {
+///
+/// `pub(crate)` so [`crate::catchpoint_service`] (go's `LedgerService` uses
+/// the same base-36 round encoding as `BlockService`) can reuse it rather
+/// than duplicating the parser.
+pub(crate) fn parse_round_base36(s: &str) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
@@ -470,6 +642,11 @@ async fn serve_block(
     // mem_cap == 0 means unlimited — skip the check entirely.
     let mem_used = state.mem_used.load(Ordering::Relaxed);
     if state.mem_cap > 0 && mem_used >= state.mem_cap {
+        // Go's `errMemoryAtCapacity` case: redirect to the next configured
+        // fallback endpoint before giving up and returning 503.
+        if let Some(location) = state.fallback.redirect_location(&state.genesis_id, round) {
+            return redirect_response(&location);
+        }
         return Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header("Retry-After", BLOCK_RESPONSE_RETRY_AFTER)
@@ -483,6 +660,11 @@ async fn serve_block(
     // peer immediately" whereas 503 triggers aggressive backoff.
     let latest = state.ledger.latest_round();
     if round > latest {
+        // Go's `ledgercore.ErrNoEntry` case: redirect before falling back
+        // to a plain 404.
+        if let Some(location) = state.fallback.redirect_location(&state.genesis_id, round) {
+            return redirect_response(&location);
+        }
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header("Cache-Control", BLOCK_RESPONSE_MISSING_BLOCK_CACHE_CONTROL)
@@ -525,6 +707,9 @@ async fn serve_block(
                 .into_response()
         }
         Err(BlockServiceError::BlockNotAvailable { latest_round, .. }) => {
+            if let Some(location) = state.fallback.redirect_location(&state.genesis_id, round) {
+                return redirect_response(&location);
+            }
             let mut builder = Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header("Cache-Control", BLOCK_RESPONSE_MISSING_BLOCK_CACHE_CONTROL);
@@ -535,6 +720,18 @@ async fn serve_block(
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// Builds a `307 Temporary Redirect` response with the given `Location`,
+/// matching go's `http.Redirect(response, request, redirectURL,
+/// http.StatusTemporaryRedirect)`.
+fn redirect_response(location: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header("Location", location)
+        .body(Body::empty())
+        .unwrap()
+        .into_response()
 }
 
 /// Encode raw block and cert bytes into the PreEncodedBlockCert msgpack format.
@@ -1204,5 +1401,156 @@ mod tests {
         let key1 = map[1].0.as_str().unwrap();
         assert_eq!(key0, "block");
         assert_eq!(key1, "cert");
+    }
+
+    // -----------------------------------------------------------------------
+    // Redirect-to-archival-peer fallback (issue #955)
+    //
+    // Ports the intent of go's `TestRedirectFallbackEndpoints`,
+    // `TestRedirectOnFullCapacity`, `TestRedirectExceptions`, and
+    // `TestBlockServiceRedirect` (`rpcs/blockService_test.go`), adapted to
+    // this crate's construction-time endpoint validation (see the
+    // module-level note above `FallbackEndpoints` for why) rather than
+    // go's exact `net/url`-quirk-dependent runtime parsing.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fallback_endpoints_parses_comma_delimited_list() {
+        let fb = FallbackEndpoints::parse("10.0.0.1:1234,http://example.com:5678/foo");
+        assert_eq!(fb.endpoints.len(), 2);
+    }
+
+    #[test]
+    fn fallback_endpoints_skips_unparseable_entries() {
+        // "://badaddress" cannot be parsed as a URL (no valid scheme) by
+        // go's `net/url` or this crate's `url` crate alike -- go's
+        // `redirectRequest` discovers this lazily per-request and returns
+        // `ok=false` for that one attempt; this port instead drops it once
+        // at construction, so round-robin never lands on it at all.
+        let fb = FallbackEndpoints::parse("://badaddress,10.0.0.1:1234");
+        assert_eq!(fb.endpoints.len(), 1);
+    }
+
+    #[test]
+    fn fallback_endpoints_skips_multiaddr_entries() {
+        let fb = FallbackEndpoints::parse(
+            "/ip4/127.0.0.1/tcp/2345/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN,10.0.0.1:1234",
+        );
+        assert_eq!(fb.endpoints.len(), 1);
+    }
+
+    #[test]
+    fn fallback_endpoints_empty_string_has_no_endpoints() {
+        let fb = FallbackEndpoints::parse("");
+        assert!(fb.next_endpoint().is_none());
+    }
+
+    #[test]
+    fn fallback_endpoints_round_robin_cycles_through_all_entries() {
+        let fb = FallbackEndpoints::parse("host-a:1111,host-b:2222,host-c:3333");
+        let picked: Vec<String> = (0..6)
+            .map(|_| fb.next_endpoint().unwrap().host_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            picked,
+            vec!["host-a", "host-b", "host-c", "host-a", "host-b", "host-c"]
+        );
+    }
+
+    #[test]
+    fn redirect_location_builds_expected_url_and_path() {
+        let fb = FallbackEndpoints::parse("archival.example.com:8080");
+        let location = fb.redirect_location("test-genesis-ID", 10).unwrap();
+        assert_eq!(
+            location,
+            format!(
+                "http://archival.example.com:8080/v1/test-genesis-ID/block/{}",
+                format_round_base36(10)
+            )
+        );
+    }
+
+    #[test]
+    fn redirect_location_none_when_no_fallback_configured() {
+        let fb = FallbackEndpoints::empty();
+        assert!(fb.redirect_location("test-genesis-ID", 10).is_none());
+    }
+
+    /// Port of `TestRedirectFallbackEndpoints`: a block request for a round
+    /// this node doesn't have yet redirects (307, with a `Location` header)
+    /// to the configured fallback rather than answering 404 directly.
+    #[tokio::test]
+    async fn http_redirects_to_fallback_when_round_not_available() {
+        let ledger = Arc::new(MockLedger::new());
+        ledger.add_block(1, b"\x80".to_vec(), b"\x80".to_vec());
+        let service = BlockService::new(
+            ledger,
+            "testnet-v1.0".to_string(),
+            DEFAULT_BLOCK_SERVICE_MEM_CAP,
+        )
+        .with_custom_fallback_endpoints("archival.example.com:8080");
+        let app = service.http_router();
+
+        // Round 5 is ahead of latest (1) -- the "not available" branch.
+        let uri = format!("/v1/testnet-v1.0/block/{}", format_round_base36(5));
+        let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(location.starts_with("http://archival.example.com:8080/v1/testnet-v1.0/block/"));
+    }
+
+    /// Port of `TestRedirectOnFullCapacity`: over the memory cap, the
+    /// service redirects rather than returning 503, when a fallback is
+    /// configured.
+    #[tokio::test]
+    async fn http_redirects_to_fallback_when_over_memory_cap() {
+        let ledger = Arc::new(MockLedger::new());
+        ledger.add_block(1, b"\x80".to_vec(), b"\x80".to_vec());
+        let service = BlockService::new(ledger, "testnet-v1.0".to_string(), 10)
+            .with_custom_fallback_endpoints("archival.example.com:8080");
+        service.http_mem_used.store(100, Ordering::Relaxed);
+        let app = service.http_router();
+
+        let uri = format!("/v1/testnet-v1.0/block/{}", format_round_base36(1));
+        let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(resp.headers().get("location").is_some());
+    }
+
+    /// Port of `TestRedirectExceptions`'s "no valid fallback" half: with no
+    /// fallback endpoints configured, an unavailable round still falls back
+    /// to a plain 404 (unchanged pre-#955 behavior) rather than ever
+    /// producing a redirect.
+    #[tokio::test]
+    async fn http_returns_404_when_round_ahead_of_latest_and_no_fallback_configured() {
+        let ledger = Arc::new(MockLedger::new());
+        ledger.add_block(5, b"\x80".to_vec(), b"\x80".to_vec());
+        let app = make_test_service(ledger); // no fallback endpoints configured
+
+        let uri = format!("/v1/testnet-v1.0/block/{}", format_round_base36(100));
+        let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Port of `TestBlockServiceRedirect`: a bare `host:port` fallback
+    /// endpoint redirects to an `http://` URL built from it, at the go-shaped
+    /// block-query path.
+    #[test]
+    fn test_block_service_redirect_host_colon_port() {
+        let fb = FallbackEndpoints::parse("localhost:1234");
+        let location = fb.redirect_location("test-genesis-ID", 10).unwrap();
+        assert_eq!(
+            location,
+            format!(
+                "http://localhost:1234/v1/test-genesis-ID/block/{}",
+                format_round_base36(10)
+            )
+        );
     }
 }

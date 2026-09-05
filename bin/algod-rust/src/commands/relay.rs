@@ -22,14 +22,16 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use algo_ledger::catchpoint::{get_catchpoint_stream, CatchpointError};
 use algo_ledger::{
     apply::apply_block, parse_genesis_json, populate_store, seed_account_totals_from_genesis,
     LedgerStore, SqliteLedger,
 };
 use algo_network::{
-    BlockService, BlockServiceError, ForwardingPolicy, GossipNode, IncomingMessage,
-    LedgerForBlockService, MessageHandler, OutgoingMessage, Phonebook, Tag, TaggedMessageHandler,
-    WebsocketNetwork, WebsocketNetworkConfig, RELAY_ROLE,
+    BlockService, BlockServiceError, CatchpointService, CatchpointServiceError, ForwardingPolicy,
+    GossipNode, IncomingMessage, LedgerForBlockService, LedgerForCatchpointService, MessageHandler,
+    OutgoingMessage, Phonebook, Tag, TaggedMessageHandler, WebsocketNetwork,
+    WebsocketNetworkConfig, RELAY_ROLE,
 };
 use algo_types::Round;
 use async_trait::async_trait;
@@ -225,6 +227,34 @@ impl LedgerForBlockService for LedgerBlockService {
 
     fn latest_round(&self) -> u64 {
         self.latest_round_inner()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Catchpoint-directory-backed catchpoint service (issue #955)
+// ---------------------------------------------------------------------------
+
+/// Adapts a catchpoint directory on disk to [`LedgerForCatchpointService`],
+/// wiring [`algo_ledger::catchpoint::get_catchpoint_stream`] (issue #957) up
+/// to the server-side HTTP catchpoint-serving endpoint (go's
+/// `rpcs.LedgerService`).
+struct CatchpointFileLedger {
+    dir: std::path::PathBuf,
+}
+
+impl LedgerForCatchpointService for CatchpointFileLedger {
+    fn catchpoint_file_bytes(&self, round: u64) -> Result<Vec<u8>, CatchpointServiceError> {
+        use std::io::Read;
+
+        let mut stream = get_catchpoint_stream(&self.dir, round).map_err(|e| match e {
+            CatchpointError::NotFound(round) => CatchpointServiceError::NotFound { round },
+            other => CatchpointServiceError::Internal(other.to_string()),
+        })?;
+        let mut bytes = Vec::new();
+        stream
+            .read_to_end(&mut bytes)
+            .map_err(|e| CatchpointServiceError::Internal(e.to_string()))?;
+        Ok(bytes)
     }
 }
 
@@ -742,12 +772,35 @@ pub async fn run(
     let ledger = Arc::new(LedgerBlockService {
         ledger: Mutex::new(sqlite_ledger),
     });
-    let block_service = Arc::new(BlockService::new(
-        Arc::clone(&ledger) as Arc<dyn LedgerForBlockService>,
-        resolved_genesis_id.clone(),
-        mem_cap,
-    ));
+    let block_service = Arc::new(
+        BlockService::new(
+            Arc::clone(&ledger) as Arc<dyn LedgerForBlockService>,
+            resolved_genesis_id.clone(),
+            mem_cap,
+        )
+        .with_custom_fallback_endpoints(&node_config.block_service_custom_fallback_endpoints),
+    );
     net.register_http_handler("/", block_service.http_router());
+
+    // Issue #955: server-side catchpoint-tarball-serving endpoint (go's
+    // `rpcs.LedgerService`), gated on `EnableLedgerService` the same way go
+    // gates registering its handler at all. Only meaningful with a
+    // configured `CatchpointDir` -- without one there's nowhere on disk a
+    // catchpoint file could ever have been written to serve.
+    if node_config.enable_ledger_service && !node_config.catchpoint_dir.is_empty() {
+        let catchpoint_ledger = Arc::new(CatchpointFileLedger {
+            dir: std::path::PathBuf::from(&node_config.catchpoint_dir),
+        });
+        let catchpoint_service = CatchpointService::new(
+            catchpoint_ledger as Arc<dyn LedgerForCatchpointService>,
+            resolved_genesis_id.clone(),
+        );
+        net.register_http_handler("/", catchpoint_service.http_router());
+        info!(
+            dir = %node_config.catchpoint_dir,
+            "catchpoint-serving endpoint enabled (EnableLedgerService)"
+        );
+    }
 
     // Register gossip handlers for all relay-forwarded message types.
     // The handler returns ForwardingPolicy::Broadcast so the network layer
