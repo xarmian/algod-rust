@@ -284,6 +284,31 @@ pub trait LedgerStore {
     // ---- Chain-level state (getters) ----
 
     fn current_round(&self) -> Round;
+
+    /// The earliest round this store can resolve historical ledger state
+    /// for -- go-algorand's accountupdates `dbRound` concept
+    /// (`ledger/acctupdates.go`'s `RoundOffsetError`), which distinguishes
+    /// "round genuinely predates the ledger's tracked history"
+    /// (`RoundOffsetError`, `"round %d before dbRound %d"`) from "round
+    /// doesn't exist yet" (`ledgercore.ErrNoEntry`, `"ledger does not have
+    /// entry"`). algod-rust does not implement real multi-round historical
+    /// state pruning (`forget_before` is not yet wired into the normal
+    /// apply path -- see its `TODO` in `apply.rs`), so this defaults to
+    /// genesis (round 0, i.e. "no restriction") and is only ever advanced
+    /// explicitly -- currently by a follower node's `SetSyncRound`
+    /// (`bin/algod-rust`'s `FollowerSyncRoundState`), which reproduces go's
+    /// actual restriction for that scenario without claiming to model
+    /// general-purpose ledger pruning.
+    fn earliest_round(&self) -> Round {
+        Round(0)
+    }
+
+    /// Advance the earliest round this store can serve historical queries
+    /// for. See [`Self::earliest_round`].
+    fn set_earliest_round(&mut self, round: Round) {
+        let _ = round;
+    }
+
     fn rewards_level(&self) -> u64;
     fn rewards_rate(&self) -> u64;
     fn rewards_residue(&self) -> u64;

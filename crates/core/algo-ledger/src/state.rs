@@ -106,6 +106,10 @@ pub struct LedgerState {
     // Current round
     pub current_round: Round,
 
+    /// See [`crate::store_trait::LedgerStore::earliest_round`]. Defaults to
+    /// genesis (round 0, no restriction).
+    pub earliest_round: Round,
+
     // Rewards tracking
     pub rewards_level: u64,
     pub rewards_rate: u64,
@@ -154,6 +158,7 @@ impl LedgerState {
             resource_update_rounds: HashMap::new(),
             lease_table: LeaseTable::new(),
             current_round: Round(0),
+            earliest_round: Round(0),
             rewards_level: 0,
             rewards_rate: 0,
             rewards_residue: 0,
@@ -975,6 +980,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
         self.current_round
     }
 
+    fn earliest_round(&self) -> Round {
+        self.earliest_round
+    }
+
     fn rewards_level(&self) -> u64 {
         self.rewards_level
     }
@@ -1048,6 +1057,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
 
     fn set_current_round(&mut self, round: Round) {
         self.current_round = round;
+    }
+
+    fn set_earliest_round(&mut self, round: Round) {
+        self.earliest_round = round;
     }
 
     fn set_rewards_level(&mut self, level: u64) {

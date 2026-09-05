@@ -2389,6 +2389,97 @@ int 1
     }
 }
 
+/// Port of `TestSimulateStartRound`
+/// (`test/e2e-go/restAPI/simulate/simulateRestAPI_test.go`): a round that
+/// predates the ledger's tracked history ("before dbRound") is a distinct
+/// failure from a round that simply doesn't exist yet. Go's e2e test
+/// reproduces this with a follower node whose `dbRound` tracks its sync
+/// round; here we pin the underlying `Simulator` behavior directly via
+/// [`LedgerStore::set_earliest_round`] (see that method's doc comment for
+/// what it does and doesn't model -- algod-rust has no real multi-round
+/// historical-state pruning, so this is the minimal round-bookkeeping
+/// needed to produce go's exact error class, not a full dbRound/lookback
+/// reimplementation).
+#[test]
+fn simulate_round_before_db_round_is_rejected() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 1001u64;
+    let mut state = base_state();
+    fund(&mut state, sender, 20_000_000);
+
+    let src = "#pragma version 8
+global Round
+itob
+log
+int 1
+";
+    let approval = assemble(src);
+    let clear = assemble("#pragma version 8\nint 1\n");
+    register_app(
+        &mut state,
+        sender,
+        app_id,
+        approval,
+        clear,
+        StateSchema::default(),
+        StateSchema::default(),
+    );
+
+    // Populate block headers for rounds 1..=5, mirroring a follower node
+    // that has synced up to round 5.
+    for r in 1..=5u64 {
+        let hdr = algo_types::BlockHeader {
+            round: Round(r),
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            ..Default::default()
+        };
+        let hdr_bytes = algo_codec::canonical_encode_block_header(&hdr);
+        state
+            .put_block(r, &hdr.current_protocol, &hdr_bytes, &[])
+            .expect("put_block succeeds");
+    }
+    state.set_current_round(Round(5));
+
+    // The follower's dbRound is 4: it has no tracked state before the
+    // round it was told to sync to (mirrors `TestSimulateStartRound`'s
+    // `followerSyncRound`).
+    state.set_earliest_round(Round(4));
+
+    let request_at = |round: Round| SimulationRequest {
+        txn_groups: vec![vec![SignedTransaction {
+            txn: appl_txn(sender, app_id, 0),
+            ..Default::default()
+        }]],
+        allow_empty_signatures: true,
+        round: Some(round),
+        ..Default::default()
+    };
+
+    // Exactly at dbRound: still available.
+    let result = simulate(&mut state, request_at(Round(4))).expect("dbRound itself must resolve");
+    assert!(result.txn_groups[0].failure_message.is_none());
+
+    // One round after dbRound: also available.
+    simulate(&mut state, request_at(Round(5))).expect("a round after dbRound must resolve");
+
+    // Before dbRound: rejected with go's exact "before dbRound" error
+    // class (an `Internal` error, not `InvalidRequest` -- go's handler
+    // only special-cases `InvalidRequestError` as a 400, so this must
+    // surface as a 500 like the real ledger's `RoundOffsetError`).
+    let err = simulate(&mut state, request_at(Round(3)))
+        .expect_err("a round before dbRound must be rejected");
+    match err {
+        SimulatorError::Internal(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("round 3 before dbRound 4"),
+                "expected go's exact error text, got {msg:?}"
+            );
+        }
+        other => panic!("expected SimulatorError::Internal, got {other:?}"),
+    }
+}
+
 /// Port of `TestGlobalStateTypeChangeErr`: an app declares a global schema
 /// of one uint and zero byte-slices; writing a *bytes* value violates that
 /// schema during a later call (the create call itself only reserves the

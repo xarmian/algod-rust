@@ -2021,6 +2021,11 @@ pub struct SqliteLedger {
     lease_snapshot: Option<LeaseTable>,
     /// Cached chain-level state (loaded from DB, flushed on commit).
     current_round: Round,
+    /// See [`crate::store_trait::LedgerStore::earliest_round`]. Not
+    /// persisted across restarts -- a follower node re-establishes it via
+    /// `SetSyncRound` on every startup, matching go's own
+    /// process-lifetime-only `disableSyncRound` state.
+    earliest_round: Round,
     rewards_level: u64,
     rewards_rate: u64,
     rewards_residue: u64,
@@ -2527,6 +2532,7 @@ impl SqliteLedger {
             lease_table: LeaseTable::new(),
             lease_snapshot: None,
             current_round,
+            earliest_round: Round(0),
             rewards_level,
             rewards_rate,
             rewards_residue,
@@ -6228,6 +6234,10 @@ impl LedgerStore for SqliteLedger {
         self.current_round
     }
 
+    fn earliest_round(&self) -> Round {
+        self.earliest_round
+    }
+
     fn rewards_level(&self) -> u64 {
         self.rewards_level
     }
@@ -6276,6 +6286,10 @@ impl LedgerStore for SqliteLedger {
 
     fn set_current_round(&mut self, round: Round) {
         self.current_round = round;
+    }
+
+    fn set_earliest_round(&mut self, round: Round) {
+        self.earliest_round = round;
     }
 
     fn set_rewards_level(&mut self, level: u64) {
