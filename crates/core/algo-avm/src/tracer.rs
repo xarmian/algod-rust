@@ -241,6 +241,16 @@ pub enum UnnamedResourceAccess {
     /// from `1088a2aad7e` / `v3.18.0-beta`), which moves any `BoxStat.NewApp`
     /// box out of `Boxes` and into an anonymous `NumEmptyBoxRefs` count.
     EmptyBoxRef,
+    /// Net change to the number of empty box refs required purely to
+    /// satisfy a read/write I/O-budget deficit -- positive to add refs,
+    /// negative to release a previously-added one that a later box's own
+    /// ref capacity made redundant. Distinct from [`Self::EmptyBoxRef`],
+    /// which is a flat one-per-box count for boxes owned by an app created
+    /// during this simulation. Mirrors go-algorand's
+    /// `ResourceTracker.NumEmptyBoxRefs` mutations from `ioSurplus`/
+    /// `reconcileReadBudget`/`addEmptyBoxRefsForWriteBudget`
+    /// (`ledger/simulation/resources.go`, `1088a2aad7e` / `v3.18.0-beta`).
+    DeficitEmptyBoxRefs(i64),
 }
 
 /// A no-op tracer that discards all events.
