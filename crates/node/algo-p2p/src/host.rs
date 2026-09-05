@@ -469,6 +469,23 @@ impl P2pHost {
         self.swarm.connected_peers().copied().collect()
     }
 
+    /// Forcibly close one specific established connection, identified by
+    /// its [`libp2p::swarm::ConnectionId`] (from a previously observed
+    /// `SwarmEvent::ConnectionEstablished`/`ConnectionClosed`). Returns
+    /// `true` if a connection with that id was found and is now closing.
+    ///
+    /// Used by [`crate::identity_tracker`]'s live wiring (issue #952): when
+    /// two connections to the same peer identity race (both established
+    /// before either side's redundant-connection dedup could prevent it —
+    /// mirroring go's `identityTracker`/`p2pNetwork.go`'s
+    /// `stream.Close()` on the loser), the connection that lost the
+    /// [`crate::identity_tracker::IdentityTracker::set_identity`] race is
+    /// closed via this method rather than left to linger as a second,
+    /// redundant transport-level connection to the same logical peer.
+    pub fn close_connection(&mut self, connection_id: libp2p::swarm::ConnectionId) -> bool {
+        self.swarm.close_connection(connection_id)
+    }
+
     /// Subscribe to a gossipsub topic by name (see [`crate::pubsub`] for the
     /// topic names this crate defines). Idempotent: subscribing to a topic
     /// this host is already subscribed to is a no-op that returns `Ok(())`.

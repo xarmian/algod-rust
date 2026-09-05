@@ -296,6 +296,37 @@ impl<S> StreamManager<S> {
     pub fn remove_stream(&mut self, remote: &PeerId) -> Option<S> {
         self.streams.remove(remote)
     }
+
+    /// The stream currently tracked for `remote`, if any. A read-only
+    /// counterpart to [`StreamManager::set_stream`]/[`StreamManager::remove_stream`]
+    /// for a caller that needs to inspect (not mutate) the current entry —
+    /// e.g. to confirm a background task's own handle is still the one
+    /// installed before that task removes it on cleanup (see
+    /// `bin/algod-rust`'s `p2p_transport` module, which uses this to avoid a
+    /// stale, already-replaced task's cleanup evicting a newer stream).
+    pub fn get(&self, remote: &PeerId) -> Option<&S> {
+        self.streams.get(remote)
+    }
+
+    /// Iterate over every peer currently tracked with a live stream, and its
+    /// handle. Go has no direct equivalent (`streamManager.streams` is a
+    /// private field only ever range-d over internally); exposed here since
+    /// a live caller (e.g. a broadcast fan-out, or a unicast-peer listing)
+    /// needs to enumerate every currently-established stream, not just query
+    /// one peer at a time.
+    pub fn iter(&self) -> impl Iterator<Item = (&PeerId, &S)> {
+        self.streams.iter()
+    }
+
+    /// Number of peers currently tracked with a live stream.
+    pub fn len(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// True if no peer currently has a live stream tracked.
+    pub fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -509,5 +540,43 @@ mod tests {
         assert_eq!(sm.remove_stream(&remote), Some("stream"));
         assert!(!sm.has_stream(&remote));
         assert_eq!(sm.remove_stream(&remote), None);
+    }
+
+    // -----------------------------------------------------------------
+    // get / iter / len / is_empty — live-wiring accessors (#952)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn get_reflects_the_currently_installed_stream() {
+        let mut sm: StreamManager<&str> = StreamManager::new();
+        let remote = peer(1);
+        assert_eq!(sm.get(&remote), None);
+        sm.set_stream(remote, "first");
+        assert_eq!(sm.get(&remote), Some(&"first"));
+        // A replacement must be visible via `get` too, so a caller checking
+        // "is my handle still the installed one" (the stale-cleanup guard
+        // `p2p_transport` relies on) observes the *new* value, not the old.
+        sm.set_stream(remote, "second");
+        assert_eq!(sm.get(&remote), Some(&"second"));
+    }
+
+    #[test]
+    fn iter_and_len_enumerate_every_tracked_stream() {
+        let mut sm: StreamManager<&str> = StreamManager::new();
+        assert!(sm.is_empty());
+        assert_eq!(sm.len(), 0);
+
+        let a = peer(1);
+        let b = peer(2);
+        sm.set_stream(a, "stream-a");
+        sm.set_stream(b, "stream-b");
+
+        assert_eq!(sm.len(), 2);
+        assert!(!sm.is_empty());
+        let mut collected: Vec<(PeerId, &str)> = sm.iter().map(|(p, s)| (*p, *s)).collect();
+        collected.sort_by_key(|(p, _)| *p);
+        let mut expected = vec![(a, "stream-a"), (b, "stream-b")];
+        expected.sort_by_key(|(p, _)| *p);
+        assert_eq!(collected, expected);
     }
 }
