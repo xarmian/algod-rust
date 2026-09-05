@@ -27,8 +27,9 @@ use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::{
-    AccountInfo, AlgodVersions, BlockSource, NodeStatus, ParticipationKey, ParticipationKeyAdded,
-    PendingTxnInfo, PostTransactionResponse, SuggestedParams, TealCompileResult, TxId,
+    AccountInfo, AlgodVersions, BlockSource, BoxResponse, BoxesResponse, NodeStatus,
+    ParticipationKey, ParticipationKeyAdded, PendingTxnInfo, PostTransactionResponse,
+    SuggestedParams, TealCompileResult, TxId,
 };
 
 /// Configuration for the REST client.
@@ -591,6 +592,101 @@ impl AlgodClient {
                 context: format!("reading GET /v2/deltas/{round}?format=msgpack response body"),
             })
     }
+}
+
+// ---- Application box surface (issue #962) ----
+//
+// Mirrors `../go-algorand/daemon/algod/api/server/v2/handlers.go`'s
+// `GetApplicationBoxByName`/`GetApplicationBoxes`, reached via libgoal's
+// `GetApplicationBoxByName`/`ApplicationBoxesPage` (`libgoal/libgoal.go:781-806`).
+// Used by goal-rust's `app box info`/`app box list`.
+
+impl AlgodClient {
+    /// `GET /v2/applications/{app_id}/box?name={name}` — fetch a single
+    /// box's value by name. `name` is the goal app-call-arg form
+    /// (`encoding:value`, e.g. `str:mybox`) exactly as `--name` accepts it;
+    /// the node decodes it server-side (mirrors `box_name::parse_box_name`
+    /// on the Rust server, `apps.AppCallBytes.Raw` on go's). A box that
+    /// doesn't exist returns [`AlgoError::NotFound`].
+    pub async fn get_application_box_by_name(
+        &self,
+        app_id: u64,
+        name: &str,
+    ) -> Result<BoxResponse> {
+        let path = format!(
+            "/v2/applications/{app_id}/box?name={}",
+            percent_encode_query_value(name)
+        );
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.json::<BoxResponse>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("parsing GET /v2/applications/{app_id}/box response"),
+            })
+    }
+
+    /// `GET /v2/applications/{app_id}/boxes` — list box descriptors for an
+    /// application, in the go-algorand v4.7.0-beta cursor-pagination mode
+    /// (mirrors libgoal's `ApplicationBoxesPage`).
+    ///
+    /// `next`/`prefix` are the goal app-call-arg form, same as `name` above;
+    /// pass an empty string for either to omit it from the query. `round`
+    /// pins the query to a specific round once known (`0` before the first
+    /// page, matching Go's `boxRound` default; the server auto-pins the
+    /// first page's round otherwise).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_application_boxes_page(
+        &self,
+        app_id: u64,
+        limit: u64,
+        next: &str,
+        prefix: &str,
+        include_values: bool,
+        round: u64,
+    ) -> Result<BoxesResponse> {
+        let mut path = format!("/v2/applications/{app_id}/boxes?limit={limit}");
+        if !next.is_empty() {
+            path.push_str(&format!("&next={}", percent_encode_query_value(next)));
+        }
+        if !prefix.is_empty() {
+            path.push_str(&format!("&prefix={}", percent_encode_query_value(prefix)));
+        }
+        if include_values {
+            path.push_str("&include=values");
+        }
+        if round != 0 {
+            path.push_str(&format!("&round={round}"));
+        }
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.json::<BoxesResponse>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("parsing GET /v2/applications/{app_id}/boxes response"),
+            })
+    }
+}
+
+/// Percent-encode a query-string value per RFC 3986's `unreserved` set
+/// (`A-Za-z0-9-_.~` pass through unescaped, everything else becomes
+/// `%XX`). Hand-rolled rather than pulling in the `url`/`percent-encoding`
+/// crates for this one call site (this crate has no URL-building
+/// dependency today): box names/prefixes/pagination cursors are
+/// `encoding:value` strings that can contain base64's `+`, `/`, `=`, plus
+/// arbitrary raw bytes for `b64:`-encoded values, all of which need
+/// escaping to survive as a single query parameter.
+fn percent_encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Check if a reqwest error is transient and worth retrying.
