@@ -197,6 +197,8 @@ fn account_application_response_created_app_only_roundtrips() {
             clear_state_program: vec![0x06, 0x81, 0x01],
             creator: "CREATORADDR".to_string(),
             extra_program_pages: Some(1),
+            foreign_box_reads: Some(true),
+            family_box_access: Some(true),
             global_state: None,
             global_state_schema: Some(ApiApplicationStateSchema {
                 num_uint: 5,
@@ -230,6 +232,8 @@ fn account_application_response_both_fields_populated_roundtrips() {
             clear_state_program: vec![],
             creator: String::new(),
             extra_program_pages: None,
+            foreign_box_reads: None,
+            family_box_access: None,
             global_state: None,
             global_state_schema: None,
             local_state_schema: None,
@@ -342,6 +346,8 @@ fn account_application_response_randomized_field_combinations_roundtrip() {
                     clear_state_program: vec![(r % 128) as u8; (r % 4) as usize],
                     creator: format!("CREATOR{i}"),
                     extra_program_pages: if r & 4 == 0 { None } else { Some(r % 3) },
+                    foreign_box_reads: if r & 32 == 0 { None } else { Some(true) },
+                    family_box_access: if r & 64 == 0 { None } else { Some(true) },
                     global_state: None,
                     global_state_schema: if r & 8 == 0 {
                         None

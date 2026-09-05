@@ -321,6 +321,60 @@ fn standalone_application_json_matches_go() {
     );
 }
 
+/// go's `model.ApplicationParams.ForeignBoxReads`/`FamilyBoxAccess` are
+/// `*bool` `omitempty` fields (added in `v5.0.0-beta`, issue #1048): present
+/// as `true` when the app opted in via `app_params_set`, and absent
+/// (never `false`) otherwise.
+#[test]
+fn application_json_surfaces_box_access_flags_when_true() {
+    use algo_rest_api::models::app_params_to_api;
+    let creator = addr(0x44);
+    let params = AppParams {
+        creator,
+        approval_program: vec![0x06, 0x81, 0x01],
+        clear_state_program: vec![0x06, 0x81, 0x01],
+        foreign_box_reads: true,
+        family_box_access: true,
+        ..Default::default()
+    };
+    let got =
+        serde_json::to_value(app_params_to_api(9, &creator.to_algorand_string(), &params)).unwrap();
+    assert_eq!(
+        got["params"]["foreign-box-reads"],
+        serde_json::json!(true),
+        "foreign-box-reads must be surfaced as true in the JSON model"
+    );
+    assert_eq!(
+        got["params"]["family-box-access"],
+        serde_json::json!(true),
+        "family-box-access must be surfaced as true in the JSON model"
+    );
+}
+
+/// The false/default case must omit both fields entirely, matching go's
+/// `*bool` `omitempty` semantics (a `false` value is never serialized).
+#[test]
+fn application_json_omits_box_access_flags_when_false() {
+    use algo_rest_api::models::app_params_to_api;
+    let creator = addr(0x44);
+    let params = AppParams {
+        creator,
+        approval_program: vec![0x06, 0x81, 0x01],
+        clear_state_program: vec![0x06, 0x81, 0x01],
+        ..Default::default()
+    };
+    let got =
+        serde_json::to_value(app_params_to_api(9, &creator.to_algorand_string(), &params)).unwrap();
+    assert!(
+        got["params"].get("foreign-box-reads").is_none(),
+        "foreign-box-reads must be omitted when false"
+    );
+    assert!(
+        got["params"].get("family-box-access").is_none(),
+        "family-box-access must be omitted when false"
+    );
+}
+
 /// `exclude=all` omits resource lists but keeps the counts (go's
 /// `basicAccountInformation`).
 #[test]
