@@ -114,6 +114,35 @@ impl TestingClock {
         entry.sender = None;
     }
 
+    /// Like [`Self::fire`], but a silent no-op instead of a panic when
+    /// nothing is registered for `timeout_type` yet.
+    ///
+    /// For a driver that wants to repeatedly fire a timeout across an
+    /// unknown number of round/period transitions without a settle
+    /// (`wait_for_quiet`) between attempts (e.g.
+    /// `arm_and_catch_next_proposal_broadcast`,
+    /// `service_multi_node_test.rs`, issue #1035): a bare `fire()` loop
+    /// races a node's `zero()` (called on every round rezero, which clears
+    /// every entry) against the driver's own retry cadence, and can hit
+    /// the exact window between a rezero and that node's demux thread
+    /// reaching its next `Demux::next()` `Select` call (which re-registers
+    /// `Deadline`) — an entirely expected timing gap under this harness's
+    /// real threading, not a harness-usage bug the way calling `fire()`
+    /// with NOTHING ever registered (a genuine test-setup mistake) is. Note
+    /// this is deliberately not `has_pending`-then-`fire`: `has_pending`
+    /// additionally requires the entry to be un-fired, which stays false
+    /// forever once two consecutive registrations share the same delta
+    /// (see `has_pending`'s own doc comment) — this method only checks that
+    /// an entry exists at all, regardless of its fired state, since
+    /// `fire()`'s own effect (`entry.sender = None`) is idempotent and safe
+    /// to repeat.
+    pub fn try_fire(&self, timeout_type: TimeoutType) {
+        let mut state = self.state.lock().expect("TestingClock state poisoned");
+        if let Some(entry) = state.entries.get_mut(&timeout_type) {
+            entry.sender = None;
+        }
+    }
+
     /// True if `timeout_type` currently has an un-fired entry registered
     /// (i.e. some thread has called `timeout_at` for it since the last
     /// `zero()`/`fire()` and hasn't been released yet).

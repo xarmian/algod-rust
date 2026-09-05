@@ -471,6 +471,21 @@ impl TestingNetwork {
             .compound_pocket = Some(Vec::new());
     }
 
+    /// Number of proposal payloads pocketed so far (without stopping) — lets
+    /// a caller poll for "enough" (e.g. one per period visited) before
+    /// calling [`Self::stop_pocketing_compound`], the same pattern
+    /// [`Self::cert_vote_pocket_len`] provides for cert votes. No go
+    /// equivalent (see that method's doc comment).
+    pub fn compound_pocket_len(&self) -> usize {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .compound_pocket
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
     /// Mirrors the `closeFn` returned by `pocketAllCompound`.
     pub fn stop_pocketing_compound(&self) -> Vec<PocketedMessage> {
         self.state

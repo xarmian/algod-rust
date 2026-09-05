@@ -72,13 +72,16 @@
 mod simulate;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use algo_agreement::types::TimeoutType;
 use algo_agreement::{codec, ProposalValue, BOTTOM};
 use algo_types::Round;
 
+use crate::simulate::propose_broadcast_gate::ProposeBroadcastGate;
 use crate::simulate::setup_agreement::{
-    setup_agreement, setup_agreement_with_validator, setup_agreement_with_version_fn,
+    setup_agreement, setup_agreement_with_propose_gate, setup_agreement_with_validator,
+    setup_agreement_with_validator_and_propose_gate, setup_agreement_with_version_fn,
     AgreementCluster,
 };
 use crate::simulate::suspendable_validator::SuspendableBlockValidator;
@@ -1646,3 +1649,371 @@ fn suspended_block_validator_stalls_verification_and_resume_unblocks_it_five_nod
     // rounds pumped afterward = 3 total commits from `start_round`.
     sanity_check(&cluster, start_round, 3);
 }
+
+/// Arm `gate`, then repeatedly fire every clock's `Deadline` timeout — NOT
+/// via [`trigger_global_timeout`] (which internally calls `wait_for_quiet`,
+/// and the cluster cannot go quiet while a demux thread is genuinely
+/// parked on the armed gate; calling it here from the driver thread would
+/// deadlock) — until at least one node's outbound proposal broadcast
+/// reaches the pause point (issue #1035's checkpoint hook). Panics if
+/// nothing pauses within `timeout`.
+///
+/// Fires unconditionally each attempt (mirroring `trigger_global_timeout`
+/// and every other repeated-fire loop in this file), deliberately NOT
+/// gated on `TestingClock::has_pending`: `has_pending` and `timeout_at`
+/// key a pending registration by `(TimeoutType, delta)`, and
+/// `filter_timeout`/`deadline_timeout` return the SAME duration for every
+/// period `>= 1` (only period 0 uses a distinct constant) — so once a
+/// period-`>=1` registration has been fired once, a later re-registration
+/// with the identical delta is treated as already-satisfied by
+/// `TestingClock::timeout_at` (`need_new` compares deltas) and never flips
+/// `has_pending` back to true. A `has_pending`-gated version of this loop
+/// was tried first and found to stall indefinitely (~10% of runs) for
+/// exactly this reason once a scenario needed more than one period bump.
+/// `TestingClock::fire` itself is safe to call unconditionally — it's a
+/// no-op if nothing is currently pending, and only panics if the
+/// `TimeoutType` key was never registered at all, which cannot happen
+/// this far into a running cluster.
+///
+/// Whatever broadcast this catches — a genuinely new round's first
+/// proposal, or a same-round reproposal for a later period — this bounded,
+/// no-quiescence-wait loop cannot guarantee which; callers must not assume
+/// a round commit happened, only that SOME node's next outbound proposal
+/// broadcast is now held at the checkpoint.
+fn arm_and_catch_next_proposal_broadcast(
+    clocks: &[Arc<crate::simulate::testing_clock::TestingClock>],
+    gate: &ProposeBroadcastGate,
+    timeout: Duration,
+) {
+    gate.arm();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        for clock in clocks {
+            clock.try_fire(TimeoutType::Deadline);
+        }
+        if gate.wait_for_pause(1, Duration::from_millis(200)) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected at least one node's next proposal broadcast to reach \
+             the propose-broadcast checkpoint within {timeout:?}"
+        );
+    }
+}
+
+/// Port of go-algorand's
+/// `TestAgreementRegression_WrongPeriodPayloadVerificationCancellation_8ba23942`
+/// (`agreement/service_test.go:2253`), using the propose-broadcast checkpoint
+/// hook added for issue #1035
+/// (`crates/core/algo-agreement/tests/simulate/propose_broadcast_gate.rs`) to
+/// close the exact race that blocked this scenario (see that file's module
+/// doc comment, `testing_network.rs`'s module doc comment, and
+/// `docs/phase17/parity_agreement.md`'s row for this test).
+///
+/// Structure (deliberately adapted to this harness's idioms rather than a
+/// literal transliteration of go's channel-counting bookkeeping, which
+/// depends on internal per-coservice accounting this port doesn't have):
+///
+/// 1. Two ordinary rounds commit normally (proves the harness/cluster is
+///    healthy before the interesting part starts).
+/// 2. `propose_gate.arm()`, then every clock's `Deadline` timeout is fired
+///    WITHOUT waiting for quiescence (a bare `fire`, not
+///    `trigger_global_timeout`, since the cluster provably cannot go quiet
+///    while a node's demux thread is parked on the armed gate). This
+///    finalizes the current round; whichever node(s) win next round's
+///    proposal committee immediately try to broadcast, and are paused
+///    INSIDE their own demux thread, strictly before the network sees
+///    anything — the exact checkpoint go's synchronous test model gets for
+///    free and this harness previously had no way to observe.
+/// 3. While paused: `validator.suspend()` (all future proposal-payload
+///    verification blocks) and `network.pocket_all_compound()` (all future
+///    proposal-payload broadcasts are intercepted, not delivered) are armed,
+///    THEN the gate is released — so the very next round's very first
+///    proposal broadcast is guaranteed to be pocketed rather than delivered
+///    (go's "(takes effect next round)" guarantee, reconstructed here via
+///    the explicit pause rather than program order).
+/// 4. With that round's proposal now unreachable by any node, soft votes
+///    are dropped and `Deadline` is fired twice more (bounded, polling
+///    `compound_pocket_len` for progress under this harness's real-thread
+///    timing) to force the round through two more periods — each period's
+///    own freshly-generated proposal is ALSO pocketed automatically
+///    (`pocket_all_compound` stays armed continuously; only the FIRST
+///    proposal after a commit needed the gate to close the arming race —
+///    see `testing_network.rs`'s doc comment on why the primitive itself
+///    was already reliable).
+/// 5. `repair_all()` (restores normal vote delivery) then EVERY pocketed
+///    proposal — spanning all the periods just visited, including stale
+///    ones from periods the cluster has since moved past — is replayed at
+///    once via `replay_all`, while validation is STILL suspended: this is
+///    the regression's actual shape, multiple pending payload verifications
+///    queued for different periods (some already stale) at the same time.
+/// 6. `validator.resume()` releases every queued verification simultaneously
+///    (go's `close(ch)`) and the cluster is driven (bounded retries, this
+///    harness's established pattern) until the round commits — proving
+///    that a stale-period payload's verification completing late does not
+///    corrupt state, crash, or prevent the round from terminating on
+///    whichever period's proposal is actually current.
+/// 7. Two more ordinary rounds commit afterward, proving the cluster is
+///    fully healthy, not just unstuck for one round.
+#[test]
+fn regression_wrong_period_payload_verification_cancellation_8ba23942_five_node() {
+    let validator = SuspendableBlockValidator::new();
+    let propose_gate = ProposeBroadcastGate::new();
+    let cluster = setup_agreement_with_validator_and_propose_gate(
+        5,
+        validator.clone(),
+        Arc::clone(&propose_gate),
+    );
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    // Step 1: two ordinary rounds, proving the cluster is healthy before the
+    // interesting part starts. The gate is disarmed throughout, so it has
+    // zero effect on ordinary operation.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    // Step 2+3: catch the very next proposal broadcast at the checkpoint,
+    // arm suspend+pocketing while it's held, then release it into the
+    // now-armed interception.
+    arm_and_catch_next_proposal_broadcast(&cluster.clocks, &propose_gate, Duration::from_secs(300));
+    validator.suspend();
+    cluster.network.pocket_all_compound();
+    propose_gate.release();
+
+    // Whatever broadcast the gate just caught — a genuinely new round's
+    // first proposal, or a same-round reproposal for a later period, this
+    // harness's repeated bare fires can't guarantee which — is now
+    // pocketed rather than delivered, so it cannot commit. Safe to
+    // `wait_for_quiet` now: nothing paused at the gate ever reached a
+    // node's crypto verifier, so there is no pending verification anywhere
+    // yet. `stuck_round` is simply whatever round the cluster is at once
+    // things settle — the specific round number doesn't matter to this
+    // scenario, only that its proposal is now unreachable by every node.
+    cluster.wait_for_quiet();
+    let stuck_round = current_round(&cluster);
+    assert!(
+        stuck_round.0 >= round.0,
+        "round must not have gone BACKWARDS while catching the checkpoint"
+    );
+    round = stuck_round;
+
+    // Step 4: with `stuck_round`'s proposal now unreachable by any node,
+    // force it through two more periods, bounded-polling
+    // `compound_pocket_len` for progress under real-thread timing (mirrors
+    // `late_cert_bug_five_node`'s cert-vote-pocket polling loop).
+    cluster.network.drop_all_soft_votes();
+    for target_len in 1..=2 {
+        for _ in 0..40 {
+            if cluster.network.compound_pocket_len() >= target_len {
+                break;
+            }
+            // Fires unconditionally, not gated on `has_pending` — see
+            // `arm_and_catch_next_proposal_broadcast`'s doc comment for why
+            // that gate stalls indefinitely once a period repeats a
+            // `filter_timeout`/`deadline_timeout` duration already fired.
+            for clock in &cluster.clocks {
+                clock.try_fire(TimeoutType::Deadline);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            cluster.network.compound_pocket_len() >= target_len,
+            "expected at least {target_len} pocketed stale-period proposal(s) \
+             for round {round:?}, got {}",
+            cluster.network.compound_pocket_len()
+        );
+    }
+    // `round` must not have advanced during this forced-period-bump phase —
+    // its proposal has been unreachable the entire time.
+    assert_eq!(
+        current_round(&cluster),
+        round,
+        "round must not commit while every one of its periods' proposals is pocketed"
+    );
+
+    // Step 5: heal vote delivery, then replay EVERY pocketed proposal
+    // (spanning every period visited) at once, while validation is STILL
+    // suspended — multiple pending, some now-stale, verifications queued
+    // simultaneously is the regression's actual shape.
+    //
+    // Order matters: `stop_pocketing_compound` must run BEFORE `repair_all`
+    // — `repair_all` unconditionally clears `compound_pocket` too (it's one
+    // of the drop/pocket/partition flags it resets), so calling it first
+    // would silently discard everything just pocketed.
+    let pocketed = cluster.network.stop_pocketing_compound();
+    cluster.network.repair_all();
+    assert!(
+        pocketed.len() >= 2,
+        "expected proposals from at least 2 periods to have been pocketed, got {}",
+        pocketed.len()
+    );
+    cluster.network.replay_all(&pocketed);
+
+    // Give every node's crypto verifier a chance to actually pick up and
+    // queue the replayed (still-suspended) verifications before resuming,
+    // so `validator.resume()` below is (when possible) releasing
+    // genuinely-queued work, not racing ahead of delivery. This is
+    // deliberately a best-effort wait, not a hard requirement: under this
+    // harness's real-thread timing (worse under a full concurrent-suite
+    // run's CPU contention — see this file's module doc comment), a
+    // replayed payload can legitimately be freshness-filtered (rejected as
+    // stale before ever reaching `BlockValidator::validate`, e.g. by
+    // `VoteAggregator`/proposal-tracker round/period bookkeeping) rather
+    // than actually queuing a pending validation — that is ALSO a safe
+    // outcome for this regression's actual claim (no corruption/crash from
+    // a stale-period payload, whether it's cancelled via suspended
+    // verification or dropped earlier by the ordinary freshness filter), so
+    // this must not be a failure condition on its own. `validator.resume()`
+    // and the round-recovery assertions below are what actually verify the
+    // regression is fixed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while cluster.pending_proposal_validations() == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Step 6: release every queued verification at once and drive the
+    // cluster until the round finally commits.
+    validator.resume();
+    cluster.wait_for_quiet();
+    assert_eq!(cluster.pending_proposal_validations(), 0);
+    round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+
+    // Step 7: prove the cluster is fully healthy afterward, not just
+    // unstuck for one round.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    cluster.shutdown();
+    // Go's literal port asserts exactly `expectNumRounds := 5` (2 initial +
+    // 1 recovered + 2 final). This harness can overshoot a target round by
+    // more than one commit per `pump_until_new_round` call under real-thread
+    // timing (see this file's module doc comment on `zeroes`/round-count
+    // overshoot) — e.g. resuming validation in step 6 can itself let a
+    // round settle far enough that the very next `wait_for_quiet` also
+    // clears the round after it. The number of rounds committed is
+    // therefore read back dynamically rather than hard-coded: what actually
+    // matters for this regression (every node converging on the SAME block
+    // at every round, never diverging or crashing after the stale-period
+    // verification cancellation) is exactly what `sanity_check` verifies,
+    // regardless of exactly how many rounds that took.
+    let total_rounds = round.0 - start_round.0;
+    assert!(
+        total_rounds >= 5,
+        "expected at least 5 rounds to have committed (2 initial + 1 \
+         recovered + 2 final), got {total_rounds}"
+    );
+    sanity_check(&cluster, start_round, total_rounds);
+}
+
+/// Port of go-algorand's `TestAgreementSlowPayloadsPreDeadline`
+/// (`agreement/service_test.go:2036`) — a simpler relative of the
+/// `8ba23942` regression above (no suspendable validator, single period):
+/// a round's proposal payload is pocketed right at the checkpoint before it
+/// reaches the network, one more `Deadline` fire proves the round genuinely
+/// cannot commit while it's unreachable (`late` but still WITHIN the same
+/// period, unlike `PostDeadline` below), then the payload is delivered and
+/// the round commits normally.
+#[test]
+fn slow_payloads_pre_deadline_five_node() {
+    let propose_gate = ProposeBroadcastGate::new();
+    let cluster = setup_agreement_with_propose_gate(5, Arc::clone(&propose_gate));
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    // Two ordinary rounds, proving the cluster is healthy first.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    // Catch the next proposal broadcast at the checkpoint and pocket it
+    // (go's "run round and then start pocketing payloads ... (takes effect
+    // next round)").
+    arm_and_catch_next_proposal_broadcast(&cluster.clocks, &propose_gate, Duration::from_secs(300));
+    cluster.network.pocket_all_compound();
+    propose_gate.release();
+    cluster.wait_for_quiet();
+    let stuck_round = current_round(&cluster);
+    assert!(
+        stuck_round.0 >= round.0,
+        "round must not have gone BACKWARDS while catching the checkpoint"
+    );
+    round = stuck_round;
+
+    // "run round with late payload": one more Deadline fire must NOT commit
+    // the round — its proposal is still pocketed, unreachable by anyone.
+    // Fires unconditionally — see `arm_and_catch_next_proposal_broadcast`'s
+    // doc comment for why a `has_pending` gate is unsafe here.
+    for clock in &cluster.clocks {
+        clock.try_fire(TimeoutType::Deadline);
+    }
+    cluster.wait_for_quiet();
+    assert_eq!(
+        current_round(&cluster),
+        round,
+        "round must not commit while its proposal is pocketed"
+    );
+
+    // Release the payload: the round must now commit purely from that
+    // delivery (still within the same period — no stale-period handling
+    // needed here, unlike PostDeadline below).
+    let pocketed = cluster.network.stop_pocketing_compound();
+    cluster.network.repair_all();
+    assert!(
+        !pocketed.is_empty(),
+        "expected at least one proposal to have been pocketed"
+    );
+    cluster.network.replay_all(&pocketed);
+    round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+
+    // Two more ordinary rounds, proving the cluster is fully healthy
+    // afterward.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    cluster.shutdown();
+    // Go asserts exactly `sanityCheck(startRound, 6, ledgers)`; this port
+    // reads the actual round count back dynamically rather than hard-coding
+    // it — see `regression_wrong_period_payload_verification_cancellation_
+    // 8ba23942_five_node`'s doc comment for why (this harness's real-thread
+    // `pump_until_new_round` can commit more than one round per call).
+    let total_rounds = round.0 - start_round.0;
+    assert!(
+        total_rounds >= 5,
+        "expected at least 5 rounds to have committed (2 initial + 1 \
+         recovered + 2 final), got {total_rounds}"
+    );
+    sanity_check(&cluster, start_round, total_rounds);
+}
+
+// `TestAgreementSlowPayloadsPostDeadline` (`agreement/service_test.go:2094`)
+// was attempted using the same `arm_and_catch_next_proposal_broadcast`
+// checkpoint as the two scenarios above, and its structure worked reliably
+// in isolation and under this file's own full-package-concurrent runs (10+
+// consecutive standalone passes, clean concurrent `-p algo-agreement` runs).
+// It was NOT landed: across repeated `cargo test --workspace` runs (every
+// crate's suite executing together, not just this package's), it
+// intermittently (but reproducibly, on the SAME test each time it occurred)
+// failed the initial checkpoint-catch with a timeout even at a 300-second
+// budget, while `slow_payloads_pre_deadline_five_node` and
+// `regression_wrong_period_payload_verification_cancellation_8ba23942_five_node`
+// (both using the identical checkpoint mechanism) did not. Whether this is a
+// genuine, scenario-specific weakness or an artifact of this specific
+// investigation's heavy background tooling load was not conclusively
+// determined given the time available — issue #1035 stays open over this
+// unmet criterion; see `docs/phase17/parity_agreement.md`'s row for this
+// test for the precise writeup. Left `missing-test` rather than landed at a
+// confidence level
+// below this harness's established bar.

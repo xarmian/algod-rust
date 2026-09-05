@@ -151,7 +151,7 @@ pub use router::{PeriodRouter, RootRouter, RoundRouter, StateMachineTag, StepRou
 pub use crypto_verifier::{AsyncCryptoVerifier, NoOpValidator};
 
 // Re-exports from service module
-pub use service::{Parameters, Service, ServiceHandle};
+pub use service::{Parameters, ProposeBroadcastHook, Service, ServiceHandle};
 
 // Re-exports from the participation-metrics module (issue #473)
 pub use metrics::{
