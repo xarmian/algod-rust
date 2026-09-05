@@ -339,7 +339,7 @@ async fn main() -> anyhow::Result<()> {
             // had no `config.json` loading at all, only this command's own
             // hardcoded CLI-flag defaults — now wired the same way
             // `participate` was in issue #748).
-            let node_config = match data_dir.as_deref() {
+            let mut node_config = match data_dir.as_deref() {
                 Some(dir) => match algo_config::Local::load_from_data_dir(dir) {
                     Ok(cfg) => cfg,
                     Err(e) => {
@@ -352,6 +352,14 @@ async fn main() -> anyhow::Result<()> {
                 },
                 None => algo_config::Local::default(),
             };
+            // Go: `daemon/algod/server.go:172-200`'s FD-pressure connection-
+            // limit rebalancing (`Local.AdjustConnectionLimits`, issue #949)
+            // — must run before `network_opts.resolve`/`rest_opts` read
+            // `node_config`'s connection-limit fields below, since a
+            // constrained FD budget shrinks them in place. A relay is
+            // always a WS listen server at `bind_address`; it never runs
+            // the P2P hybrid transport.
+            rebalance_fd_pressure(&mut node_config, Some(bind_address.as_str()), None);
             let network_opts = commands::participate::NetworkOptions {
                 max_connections_per_ip: max_per_ip,
                 incoming_connections_limit: incoming_limit,
@@ -470,7 +478,7 @@ async fn main() -> anyhow::Result<()> {
             // `node_config` parameters. A missing `--data-dir` (or a
             // missing `config.json` within it) is not an error — `Local`
             // falls back to its fully-materialized, go-matching defaults.
-            let node_config = match data_dir.as_deref() {
+            let mut node_config = match data_dir.as_deref() {
                 Some(dir) => match algo_config::Local::load_from_data_dir(dir) {
                     Ok(cfg) => {
                         tracing::debug!(
@@ -494,6 +502,22 @@ async fn main() -> anyhow::Result<()> {
                 },
                 None => algo_config::Local::default(),
             };
+            // Go: `daemon/algod/server.go:172-200`'s FD-pressure connection-
+            // limit rebalancing (`Local.AdjustConnectionLimits`, issue #949)
+            // — must run before `rest_opts`/`network_opts` below capture
+            // `node_config`'s connection-limit fields, since a constrained
+            // FD budget shrinks them in place. Uses the raw CLI-provided
+            // addresses (not `resolved_p2p`'s fully-merged addresses, which
+            // aren't computed until inside `commands::participate::run`) —
+            // the same imprecision go itself accepts, since go's own
+            // `Initialize()` call site reads `cfg.NetAddress`/
+            // `cfg.P2PHybridNetAddress` directly rather than any
+            // CLI-flag-merged value.
+            rebalance_fd_pressure(
+                &mut node_config,
+                listen_address.as_deref(),
+                p2p_listen_address.as_deref(),
+            );
             let rest_opts = commands::participate::RestOptions {
                 listen: rest_listen,
                 data_dir,
@@ -644,4 +668,44 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Go: `daemon/algod/server.go:172-200`'s FD-pressure connection-limit
+/// rebalancing call site — reads the process's actual FD headroom (Unix:
+/// real `getrlimit`(2); Windows: go's own hard-coded "unlimited", see
+/// `algo_network::fd_limits`'s module docs) and, if `cfg`'s configured
+/// connection limits would need more file descriptors than the OS actually
+/// grants, shrinks them in place via
+/// [`algo_config::Local::adjust_connection_limits`] so the node still
+/// starts instead of over-subscribing its real FD budget (issue #949).
+///
+/// Both `relay`/`participate` call this immediately after loading
+/// `config.json`, before any other struct captures a copy of `cfg`'s
+/// connection-limit fields.
+fn rebalance_fd_pressure(
+    cfg: &mut algo_config::Local,
+    net_address: Option<&str>,
+    p2p_net_address: Option<&str>,
+) {
+    match algo_network::fd_limits::rebalance_connection_limits(cfg, net_address, p2p_net_address) {
+        Ok(outcome) if outcome.adjusted => {
+            tracing::warn!(
+                fd_soft_limit = outcome.fd_limits.soft,
+                fd_hard_limit = outcome.fd_limits.hard,
+                required_fds = outcome.required_fds,
+                rest_connections_soft_limit = cfg.rest_connections_soft_limit,
+                rest_connections_hard_limit = cfg.rest_connections_hard_limit,
+                incoming_connections_limit = cfg.incoming_connections_limit,
+                p2p_hybrid_incoming_connections_limit = cfg.p2p_hybrid_incoming_connections_limit,
+                "updated connection limits to fit the process's file-descriptor budget"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Go: `s.log.Errorf(...)` on a `RaiseFdSoftLimit` failure —
+            // logged, not fatal, since the node may still work fine within
+            // its current soft limit.
+            tracing::error!(error = %e, "failed to read/raise the process file-descriptor limit");
+        }
+    }
 }
