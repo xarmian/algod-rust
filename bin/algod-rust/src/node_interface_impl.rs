@@ -385,6 +385,11 @@ pub struct AlgodNodeInterface {
     /// `AlgorandFollowerNode` being a distinct node type from
     /// `AlgorandFullNode` rather than a runtime flag on one type.
     follower_sync_round: Option<Arc<FollowerSyncRoundState>>,
+    /// Polling-based approximation of go's `StatusReport.LastRoundTimestamp`
+    /// (`node/node.go`), backing `time_since_last_round` in
+    /// [`NodeInterface::status`]. See [`RoundTimestampTracker`]'s doc
+    /// comment for why this is poll-based rather than commit-notified.
+    round_timestamp_tracker: Mutex<RoundTimestampTracker>,
 }
 
 impl AlgodNodeInterface {
@@ -422,6 +427,7 @@ impl AlgodNodeInterface {
             enable_netdev_metrics_cfg: false,
             catchup_manager: None,
             follower_sync_round: None,
+            round_timestamp_tracker: Mutex::new(RoundTimestampTracker::new()),
         }
     }
 
@@ -895,6 +901,101 @@ struct StatusSnapshot {
     last_catchpoint_label: String,
 }
 
+/// Tracks the wall-clock instant the locally-observed last-committed round
+/// last advanced, so [`time_since_last_round`] can report a real elapsed
+/// duration instead of the hardcoded zero this adapter used to report.
+///
+/// Mirrors go's `AlgorandFullNode` setting `StatusReport.LastRoundTimestamp
+/// = time.Now()` whenever a new block is written
+/// (`node/node.go`'s `OnNewBlock`) — but since this adapter has no
+/// commit-time notification channel wired to it yet (`TASK-79`), it instead
+/// detects the round advancing by comparing against the previous
+/// [`AlgodNodeInterface::status`] poll. This is not byte-identical to go's
+/// push-based timestamp (a round that advances between two widely-spaced
+/// polls is timestamped at the *later* poll, not the moment of commit), but
+/// it is a real, monotonically-sane signal rather than a permanent zero, and
+/// converges to the same value under status polling faster than the block
+/// interval (the common case — go-algorand's own `statusDelayCPUUsage`
+/// mechanism assumes sub-second polling).
+struct RoundTimestampTracker {
+    last_round: u64,
+    last_round_timestamp: Option<std::time::Instant>,
+}
+
+impl RoundTimestampTracker {
+    fn new() -> Self {
+        Self {
+            last_round: 0,
+            last_round_timestamp: None,
+        }
+    }
+
+    /// Record an observation of the current last-committed round, updating
+    /// the tracked timestamp when the round has advanced (including the
+    /// very first observation, so long as at least one round has been
+    /// committed — round 0 alone, before any real block, leaves the
+    /// timestamp unset just like go's zero-valued `LastRoundTimestamp`).
+    /// Returns the timestamp to report for this observation.
+    fn observe(&mut self, round: u64) -> Option<std::time::Instant> {
+        if round > 0 && (round != self.last_round || self.last_round_timestamp.is_none()) {
+            self.last_round = round;
+            self.last_round_timestamp = Some(std::time::Instant::now());
+        }
+        self.last_round_timestamp
+    }
+}
+
+/// Port of go's `StatusReport.TimeSinceLastRound` (`node/node.go`):
+/// "returns the time since the last block was approved (locally), or 0 if
+/// no blocks seen". `None` (go's `LastRoundTimestamp.IsZero()`) reports
+/// [`Duration::ZERO`]; otherwise the elapsed wall-clock time since the
+/// timestamp (go's `time.Since`).
+fn time_since_last_round(last_round_timestamp: Option<std::time::Instant>) -> Duration {
+    match last_round_timestamp {
+        None => Duration::ZERO,
+        Some(ts) => std::time::Instant::now().saturating_duration_since(ts),
+    }
+}
+
+/// Port of go's `getOfflineClosedStatus` (`node/node.go`): classifies an
+/// account's online/offline/closed status from its voting-key validity
+/// window and reward-inclusive balance, returning the same bitmask go uses
+/// for its participation-key-mismatch diagnostic logging
+/// (`AlgorandFullNode.VotingKeys`). An account is offline when it has no
+/// valid voting-key round range (`vote_first_valid == vote_last_valid == 0`);
+/// an offline account is additionally closed when its balance
+/// (`micro_algos_with_rewards`) is zero. Bit values match go's
+/// `bitAccountOffline` / `bitAccountIsClosed` (`1 << 2`, `1 << 3` — the low
+/// two bits, `bitMismatchingVotingKey`/`bitMismatchingSelectionKey`, belong
+/// to the surrounding diagnostic caller this repo has not yet ported).
+///
+/// `#[allow(dead_code)]`: this is the classifier formula only — the
+/// surrounding `VotingKeys` participation-key-mismatch diagnostic logging
+/// it feeds in go has no algod-rust equivalent yet (no production call
+/// site), so it is currently exercised only by the unit tests pinning its
+/// behavior against go's `TestOfflineOnlineClosedBitStatus`. Matches the
+/// existing scaffolding pattern in `live_catchup.rs`.
+#[allow(dead_code)]
+fn offline_closed_status(
+    vote_first_valid: u64,
+    vote_last_valid: u64,
+    micro_algos_with_rewards: u64,
+) -> u32 {
+    const BIT_ACCOUNT_OFFLINE: u32 = 1 << 2;
+    const BIT_ACCOUNT_IS_CLOSED: u32 = 1 << 3;
+
+    let mut rval = 0u32;
+    let is_offline = vote_first_valid == 0 && vote_last_valid == 0;
+    if is_offline {
+        rval |= BIT_ACCOUNT_OFFLINE;
+    }
+    let is_closed = is_offline && micro_algos_with_rewards == 0;
+    if is_closed {
+        rval |= BIT_ACCOUNT_IS_CLOSED;
+    }
+    rval
+}
+
 #[async_trait]
 impl NodeInterface for AlgodNodeInterface {
     // ---- Genesis / build metadata (cached, branch-free) ----
@@ -978,12 +1079,22 @@ impl NodeInterface for AlgodNodeInterface {
                 ),
             };
 
+        // Poll-based `LastRoundTimestamp` tracking (see
+        // `RoundTimestampTracker`'s doc comment) — not a commit-time
+        // notification channel (TASK-79 still pending for that), but no
+        // longer a hardcoded zero either.
+        let last_round_timestamp = self
+            .round_timestamp_tracker
+            .lock()
+            .map_err(|_| NodeError::Internal("status: round timestamp tracker poisoned".into()))?
+            .observe(snap.last_round);
+
         Ok(NodeStatus {
             last_round: snap.last_round,
-            // Without a commit-time notification channel we cannot track the
-            // wall-clock delta accurately; reported as zero until TASK-79
-            // wires the adapter to the block-commit path.
-            time_since_last_round: 0,
+            time_since_last_round: time_since_last_round(last_round_timestamp)
+                .as_nanos()
+                .try_into()
+                .unwrap_or(i64::MAX),
             catchup_time: 0,
             last_version: snap.protocol,
             next_version,
@@ -3051,6 +3162,83 @@ mod tests {
             branch: "main".into(),
             channel: "dev".into(),
         }
+    }
+
+    // ---- TimeSinceLastRound (issue #958 theme 6; go's
+    // TestStatusReport_TimeSinceLastRound, node/node_test.go) ----
+
+    #[test]
+    fn time_since_last_round_reports_zero_for_unset_timestamp() {
+        // go test1: a zero-valued `LastRoundTimestamp` reports `Duration(0)`.
+        assert_eq!(time_since_last_round(None), Duration::ZERO);
+    }
+
+    #[test]
+    fn time_since_last_round_reports_elapsed_for_set_timestamp() {
+        // go test2: a `LastRoundTimestamp` set to "now" reports a nonzero
+        // (however small) elapsed duration via `time.Since`.
+        let ts = std::time::Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let elapsed = time_since_last_round(Some(ts));
+        assert!(elapsed >= Duration::from_millis(5));
+    }
+
+    #[test]
+    fn round_timestamp_tracker_stays_unset_until_first_nonzero_round() {
+        let mut tracker = RoundTimestampTracker::new();
+        // Round 0 (no real block yet) mirrors go's zero-valued
+        // `LastRoundTimestamp` — never observed as "advanced".
+        assert_eq!(tracker.observe(0), None);
+        assert_eq!(tracker.observe(0), None);
+    }
+
+    #[test]
+    fn round_timestamp_tracker_sets_timestamp_on_first_and_advancing_round() {
+        let mut tracker = RoundTimestampTracker::new();
+        let first = tracker.observe(1).expect("round 1 sets a timestamp");
+        // Observing the same round again must not reset the timestamp —
+        // only an actual round advance should.
+        std::thread::sleep(Duration::from_millis(5));
+        let still_first = tracker
+            .observe(1)
+            .expect("re-observing the same round keeps the timestamp");
+        assert_eq!(first, still_first);
+
+        std::thread::sleep(Duration::from_millis(5));
+        let second = tracker.observe(2).expect("round 2 advances the timestamp");
+        assert!(
+            second > first,
+            "advancing the round must bump the timestamp"
+        );
+    }
+
+    // ---- offline/online closed-bit status (issue #958 theme 6; go's
+    // TestOfflineOnlineClosedBitStatus, node/node_test.go) ----
+
+    #[test]
+    fn offline_closed_status_online_account_reports_zero() {
+        // go "online 1": valid voting-key window, zero balance.
+        assert_eq!(offline_closed_status(1, 100, 0), 0);
+        // go "online 2": valid voting-key window, nonzero balance.
+        assert_eq!(offline_closed_status(1, 100, 1), 0);
+    }
+
+    #[test]
+    fn offline_closed_status_offline_not_closed_sets_offline_bit_only() {
+        // go "offline & not closed": no voting-key window, nonzero balance.
+        const BIT_ACCOUNT_OFFLINE: u32 = 1 << 2;
+        assert_eq!(offline_closed_status(0, 0, 1), BIT_ACCOUNT_OFFLINE);
+    }
+
+    #[test]
+    fn offline_closed_status_offline_and_closed_sets_both_bits() {
+        // go "offline & closed": no voting-key window, zero balance.
+        const BIT_ACCOUNT_OFFLINE: u32 = 1 << 2;
+        const BIT_ACCOUNT_IS_CLOSED: u32 = 1 << 3;
+        assert_eq!(
+            offline_closed_status(0, 0, 0),
+            BIT_ACCOUNT_OFFLINE | BIT_ACCOUNT_IS_CLOSED
+        );
     }
 
     #[test]

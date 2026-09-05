@@ -124,6 +124,23 @@ pub async fn run(cmd: NodeCommands) -> anyhow::Result<()> {
     }
 }
 
+/// Create (or reuse) the per-genesis ledger subdirectory `<data_dir>/<genesis_id>`,
+/// mirroring go's `os.MkdirAll` check in `node.MakeFull`/`EnsureAndResolveGenesisDirs`
+/// (`node/node.go`) that `TestMismatchingGenesisDirectoryPermissions`
+/// (`node/node_test.go`) exercises: when `data_dir` itself denies write access,
+/// directory creation fails and the caller must surface a "permission denied"
+/// error rather than a node object. Extracted from `run_start` so this
+/// failure path is directly unit-testable without booting a full node.
+fn create_genesis_ledger_dir(
+    data_dir: &Path,
+    genesis_id: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let ledger_dir = data_dir.join(genesis_id);
+    std::fs::create_dir_all(&ledger_dir)
+        .with_context(|| format!("creating ledger directory {}", ledger_dir.display()))?;
+    Ok(ledger_dir)
+}
+
 async fn run_start(
     data_dir: &Path,
     listen: Option<&str>,
@@ -157,9 +174,7 @@ async fn run_start(
     // 2. Open the ledger (Go layout: <datadir>/<genesisID>/ledger.*), seeding
     //    genesis state on first boot.
     // -----------------------------------------------------------------------
-    let ledger_dir = data_dir.join(&genesis_id);
-    std::fs::create_dir_all(&ledger_dir)
-        .with_context(|| format!("creating ledger directory {}", ledger_dir.display()))?;
+    let ledger_dir = create_genesis_ledger_dir(data_dir, &genesis_id)?;
     let ledger_prefix = ledger_dir.join("ledger");
     let mut sqlite_ledger = SqliteLedger::open(&ledger_prefix)
         .map_err(|e| anyhow::anyhow!("opening ledger at {}: {e}", ledger_prefix.display()))?;
@@ -977,5 +992,53 @@ mod config_json_wiring_tests {
             !follower_devmode_warning_needed(true, false),
             "a follower node against a non-dev-mode genesis must not warn"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // `create_genesis_ledger_dir` — issue #958 theme 6's
+    // `TestMismatchingGenesisDirectoryPermissions` (`node/node_test.go`):
+    // a data dir that denies write access must fail directory creation
+    // with a "permission denied" error, not silently succeed or panic.
+    // Unix-only: Windows ACLs don't honor the same `chmod`-based
+    // write-denial this go test (and this port of it) rely on.
+    // -------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn create_genesis_ledger_dir_fails_with_permission_denied_on_readonly_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = tmp.path();
+        // 0o200: write-only, no execute -- mirrors go's `os.Chmod(testDirectroy, 0200)`,
+        // which is enough to make `os.MkDir`'s child-creation fail on the parent.
+        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o200))
+            .expect("chmod data dir to write-only");
+
+        let result = create_genesis_ledger_dir(data_dir, "test-genesis-id");
+
+        // Restore permissions before the `TempDir` guard tries to clean up,
+        // mirroring go's own `os.Chmod(testDirectroy, 1700)` restoration.
+        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore data dir permissions");
+
+        let err = result.expect_err("directory creation under a write-only parent must fail");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("permission denied"),
+            "expected a permission-denied error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_genesis_ledger_dir_succeeds_and_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let dir1 = create_genesis_ledger_dir(tmp.path(), "test-genesis-id")
+            .expect("first creation succeeds");
+        assert!(dir1.is_dir());
+        // Calling again (the `run_start` restart path) must not error.
+        let dir2 = create_genesis_ledger_dir(tmp.path(), "test-genesis-id")
+            .expect("second creation is a no-op success");
+        assert_eq!(dir1, dir2);
     }
 }
