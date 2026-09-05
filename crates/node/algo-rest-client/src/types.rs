@@ -532,3 +532,74 @@ pub struct BoxesResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round: Option<u64>,
 }
+
+// ---------------------------------------------------------------------------
+// Application info (issue #1033: `goal app info`/`goal app read`)
+// ---------------------------------------------------------------------------
+
+/// Specifies maximums on the number of each type that may be stored in an
+/// application's global/local key-value store.
+///
+/// Matches go-algorand's `model.ApplicationStateSchema`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApplicationStateSchema {
+    /// Maximum number of byte-slice values that may be stored.
+    #[serde(rename = "num-byte-slice")]
+    pub num_byte_slice: u64,
+    /// Maximum number of integer values that may be stored.
+    #[serde(rename = "num-uint")]
+    pub num_uint: u64,
+}
+
+/// Response from `GET /v2/applications/{id}`'s `params` field.
+///
+/// Matches go-algorand's `model.ApplicationParams`
+/// (`daemon/algod/api/server/v2/generated/model/types.go:403-436`). Used by
+/// `goal app info` (Go's `client.ApplicationInformation`,
+/// `daemon/algod/api/client/restClient.go:494`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApplicationParams {
+    /// \[approv\] approval program, base64 encoded over the wire.
+    #[serde(rename = "approval-program", with = "base64_bytes")]
+    pub approval_program: Vec<u8>,
+    /// \[clearp\] clear state program, base64 encoded over the wire.
+    #[serde(rename = "clear-state-program", with = "base64_bytes")]
+    pub clear_state_program: Vec<u8>,
+    /// The address that created this application.
+    pub creator: String,
+    /// \[epp\] the amount of extra program pages available to this app.
+    #[serde(rename = "extra-program-pages", default)]
+    pub extra_program_pages: Option<u64>,
+    /// \[fba\] if true, apps with the same creator may read and write this
+    /// app's boxes.
+    #[serde(rename = "family-box-access", default)]
+    pub family_box_access: Option<bool>,
+    /// \[fbr\] if true, any app may read this app's boxes.
+    #[serde(rename = "foreign-box-reads", default)]
+    pub foreign_box_reads: Option<bool>,
+    /// Specifies maximums on the number of each type that may be stored in
+    /// the global key/value store.
+    #[serde(rename = "global-state-schema", default)]
+    pub global_state_schema: Option<ApplicationStateSchema>,
+    /// Specifies maximums on the number of each type that may be stored in
+    /// local (per-account) key/value stores.
+    #[serde(rename = "local-state-schema", default)]
+    pub local_state_schema: Option<ApplicationStateSchema>,
+    /// \[ss\] the account responsible for extra pages and global state MBR.
+    #[serde(rename = "size-sponsor", default)]
+    pub size_sponsor: Option<String>,
+    /// \[v\] the number of updates to the application programs.
+    #[serde(default)]
+    pub version: Option<u64>,
+}
+
+/// Response from `GET /v2/applications/{id}`.
+///
+/// Matches go-algorand's `model.Application`. Used by `goal app info`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Application {
+    /// \[appidx\] application index.
+    pub id: u64,
+    /// Stores the global information associated with an application.
+    pub params: ApplicationParams,
+}
