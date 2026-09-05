@@ -63,9 +63,51 @@ pub enum AppCmd {
 #[derive(Subcommand, Debug)]
 pub enum BoxCmd {
     /// Retrieve information about an application box.
-    Info,
+    Info(BoxInfoArgs),
     /// List all application boxes belonging to an application.
-    List,
+    List(BoxListArgs),
+}
+
+/// `app box info --app-id <id> -n/--name <encoding:value>`.
+///
+/// Mirrors Go's `appBoxInfoCmd` (`box.go:63-98`).
+#[derive(Args, Debug)]
+pub struct BoxInfoArgs {
+    /// Application ID (Go's `appBoxCmd` persistent `--app-id`). Required.
+    #[arg(long = "app-id")]
+    pub app_id: u64,
+    /// Application box name, `encoding:value` form (Go `-n/--name`).
+    /// Required.
+    #[arg(short = 'n', long = "name")]
+    pub name: String,
+}
+
+/// `app box list --app-id <id> [-l <limit>] [-n <next>] [-p <prefix>] [-v] [-r <round>]`.
+///
+/// Mirrors Go's `appBoxListCmd` (`box.go:100-163`).
+#[derive(Args, Debug)]
+pub struct BoxListArgs {
+    /// Application ID (Go's `appBoxCmd` persistent `--app-id`). Required.
+    #[arg(long = "app-id")]
+    pub app_id: u64,
+    /// Maximum number of boxes per page (Go `-l/--limit`; default 1000,
+    /// or 100 with `--values`, applied when unset/zero).
+    #[arg(short = 'l', long = "limit", default_value_t = 0)]
+    pub limit: u64,
+    /// Pagination cursor from a previous response's `NextToken` (Go
+    /// `-n/--next`).
+    #[arg(short = 'n', long = "next")]
+    pub next: Option<String>,
+    /// Filter by box name prefix, `encoding:value` form (Go `-p/--prefix`).
+    #[arg(short = 'p', long = "prefix")]
+    pub prefix: Option<String>,
+    /// Include box values in the output (Go `-v/--values`).
+    #[arg(short = 'v', long = "values")]
+    pub values: bool,
+    /// Query boxes at a specific round; auto-pinned from the first page
+    /// when unset (Go `-r/--round`).
+    #[arg(short = 'r', long = "round", default_value_t = 0)]
+    pub round: u64,
 }
 
 /// The resource-reference flag surface shared by every `app` leaf that can
@@ -298,11 +340,10 @@ pub fn run(cmd: AppCmd, wallet: Option<String>) -> ExitCode {
             let Some(cmd) = cmd else {
                 return crate::print_group_help(&["app", "box"]);
             };
-            let leaf = match cmd {
-                BoxCmd::Info => "info",
-                BoxCmd::List => "list",
-            };
-            unimplemented("app box", leaf)
+            match cmd {
+                BoxCmd::Info(args) => crate::cmd::app::run_box_info(args),
+                BoxCmd::List(args) => crate::cmd::app::run_box_list(args),
+            }
         }
         AppCmd::Call(args) => crate::cmd::app::run_call(args, wallet),
         AppCmd::Clear => unimplemented("app", "clear"),

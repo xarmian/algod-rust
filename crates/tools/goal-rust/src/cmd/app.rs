@@ -18,10 +18,12 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `goal-rust app call` / `goal-rust app method` — port of
+//! `goal-rust app call` / `goal-rust app method` / `goal-rust app box info`
+//! / `goal-rust app box list` — port of
 //! `../go-algorand/cmd/goal/application.go`'s `callAppCmd`/`methodAppCmd`
 //! (plus the shared `getAppInputs`/`parseAppInputs`/`populateMethodCall*`
-//! helpers).
+//! helpers) and `../go-algorand/cmd/goal/box.go`'s `appBoxInfoCmd`/
+//! `appBoxListCmd` (issue #962).
 //!
 //! ABI type/method encoding is delegated to `algo_abi` (issue #888 slice 1,
 //! PR #896); the foreign-resource/access-list lowering is delegated to
@@ -43,6 +45,7 @@ use algo_codec::{
     canonical_encode_signed_transaction, canonical_encode_transaction, compute_group_id,
     compute_txn_id, decode_signed_txn_stream,
 };
+use algo_error::AlgoError;
 use algo_kmd_client::KmdClient;
 use algo_rest_client::AlgodClient;
 use algo_types::{Address, SignedTransaction, StateSchema, Transaction};
@@ -54,7 +57,8 @@ use crate::cmd::clerk::{
     parse_note, resolve_wallet_and_init, write_file_0600,
 };
 use crate::data_dir;
-use crate::groups::app::{AppRefsArgs, AppTxnArgs, CallArgs, MethodArgs};
+use crate::formatting::encode_bytes_as_app_call_bytes;
+use crate::groups::app::{AppRefsArgs, AppTxnArgs, BoxInfoArgs, BoxListArgs, CallArgs, MethodArgs};
 use crate::resource_resolution::{
     app_address, attach_references, BoxHint, HoldingHint, LocalHint, RefBundle,
 };
@@ -1048,6 +1052,180 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
     Ok(ExitCode::SUCCESS)
 }
 
+// ---------------------------------------------------------------------------
+// app box info / app box list
+// ---------------------------------------------------------------------------
+
+/// `app box info --app-id <id> -n/--name <encoding:value>`.
+///
+/// Mirrors Go's `appBoxInfoCmd` (`cmd/goal/box.go:63-98`): fetch the box's
+/// value via `GET /v2/applications/{id}/box`, cross-check the returned box
+/// name against the one requested (guards against a server that resolves a
+/// different box than intended), and print `Name:`/`Value:` in the
+/// `apps.AppCallBytes` display form ([`encode_bytes_as_app_call_bytes`]).
+pub fn run_box_info(args: BoxInfoArgs) -> ExitCode {
+    match run_box_info_inner(args) {
+        Ok(code) => code,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_box_info_inner(args: BoxInfoArgs) -> Result<ExitCode, String> {
+    if args.name.is_empty() {
+        return Err("Box --name is required".to_string());
+    }
+
+    let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
+        .map_err(|e| e.to_string())?;
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+
+    let box_resp = match rt.block_on(algod.get_application_box_by_name(args.app_id, &args.name)) {
+        Ok(b) => b,
+        Err(AlgoError::NotFound(msg)) if msg.contains("box not found") => {
+            return Err(format!(
+                "No box found for appid {} with name {}",
+                args.app_id, args.name
+            ));
+        }
+        Err(e) => return Err(format!("Error processing command: {e}")),
+    };
+
+    // Cross-check the returned box name against what was requested, mirroring
+    // Go's belt-and-suspenders comparison (box.go:84-92) — reduces confusion
+    // if the server ever resolved a different box representation.
+    verify_box_name(&args.name, &box_resp.name)?;
+
+    println!("Name:  {}", args.name);
+    println!("Value: {}", encode_bytes_as_app_call_bytes(&box_resp.value));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Verify a `GET /v2/applications/{id}/box` response's box name matches the
+/// one requested, mirroring Go's belt-and-suspenders check
+/// (`box.go:84-92`): re-decode `requested` (the raw `-n/--name` CLI value)
+/// through [`parse_app_call_bytes`] and compare against `returned_name`
+/// byte-for-byte.
+fn verify_box_name(requested: &str, returned_name: &[u8]) -> Result<(), String> {
+    let requested_bytes = parse_app_call_bytes(requested).map_err(|e| {
+        format!("Failed to parse box name {requested}. It must have the same form as app-arg. Error: {e}")
+    })?;
+    if returned_name != requested_bytes {
+        return Err(format!(
+            "Inputted box name {} does not match box name {} received from algod",
+            String::from_utf8_lossy(returned_name),
+            String::from_utf8_lossy(&requested_bytes)
+        ));
+    }
+    Ok(())
+}
+
+/// `app box list --app-id <id> [-l <limit>] [-n <next>] [-p <prefix>] [-v] [-r <round>]`.
+///
+/// Mirrors Go's `appBoxListCmd` (`cmd/goal/box.go:100-163`): page through
+/// `GET /v2/applications/{id}/boxes` (always in the go-algorand
+/// v4.7.0-beta cursor-pagination mode — `--limit`/`--next`/`--round` are
+/// always sent, matching libgoal's `ApplicationBoxesPage`), auto-pinning
+/// the round from the first page and printing a `NextToken:` line only
+/// when the caller explicitly asked for a single page (`--limit`/`--next`
+/// given) rather than exhausting every page automatically.
+pub fn run_box_list(args: BoxListArgs) -> ExitCode {
+    match run_box_list_inner(args) {
+        Ok(code) => code,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_box_list_inner(args: BoxListArgs) -> Result<ExitCode, String> {
+    let data_dir_path = data_dir::ensure_single_data_dir(&crate::cli_state::datadirs())
+        .map_err(|e| e.to_string())?;
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+
+    let limit = default_box_list_limit(args.limit, args.values);
+    let explicit_next = args.next.clone().unwrap_or_default();
+    let mut next = explicit_next.clone();
+    let mut round = args.round;
+    let prefix = args.prefix.as_deref().unwrap_or("");
+
+    loop {
+        let resp = rt
+            .block_on(algod.get_application_boxes_page(
+                args.app_id,
+                limit,
+                &next,
+                prefix,
+                args.values,
+                round,
+            ))
+            .map_err(|e| format!("Error processing command: {e}"))?;
+
+        if round == 0 {
+            // Auto-pin round from the first page for consistent pagination.
+            round = resp
+                .round
+                .ok_or("algod did not return a round for a paginated box listing")?;
+            if resp.boxes.is_empty() {
+                return Err("No matching boxes found".to_string());
+            }
+        }
+
+        for descriptor in &resp.boxes {
+            let encoded_name = encode_bytes_as_app_call_bytes(&descriptor.name);
+            match (&args.values, &descriptor.value) {
+                (true, Some(value)) => {
+                    println!("{encoded_name} : {}", encode_bytes_as_app_call_bytes(value));
+                }
+                _ => println!("{encoded_name}"),
+            }
+        }
+
+        next = resp.next_token.unwrap_or_default();
+        if next.is_empty() {
+            break;
+        }
+        if should_stop_after_page(args.limit, &explicit_next) {
+            println!("NextToken: {next}");
+            break;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The effective `--limit` to request, mirroring Go's
+/// `if limit == 0 { limit = ... }` (`box.go:117-124`): the caller's explicit
+/// `--limit` (`0` meaning unset), else 100 with `--values` or 1000 without.
+fn default_box_list_limit(limit_flag: u64, values: bool) -> u64 {
+    if limit_flag != 0 {
+        return limit_flag;
+    }
+    if values {
+        100
+    } else {
+        1000
+    }
+}
+
+/// Whether to stop after a single page and print `NextToken:` rather than
+/// looping through every page automatically, mirroring Go's
+/// `if boxLimit > 0 || boxNext != ""` (`box.go:156-160`) — checked against
+/// the *original* CLI flags, not the resolved/looped values.
+fn should_stop_after_page(limit_flag: u64, explicit_next: &str) -> bool {
+    limit_flag > 0 || !explicit_next.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1287,5 +1465,55 @@ mod tests {
         let direct = parse_method_signature("empty()void").unwrap();
         let via_resolve = resolve_method("empty()void", None).unwrap();
         assert_eq!(direct, via_resolve);
+    }
+
+    // --- app box info / app box list ---
+
+    #[test]
+    fn verify_box_name_matches_accepts_identical_bytes() {
+        assert!(verify_box_name("str:mybox", b"mybox").is_ok());
+    }
+
+    #[test]
+    fn verify_box_name_matches_rejects_mismatch() {
+        let err = verify_box_name("str:mybox", b"otherbox").unwrap_err();
+        assert!(err.contains("does not match box name"), "got: {err}");
+    }
+
+    #[test]
+    fn verify_box_name_matches_rejects_unparseable_requested_name() {
+        let err = verify_box_name("nocolon", b"mybox").unwrap_err();
+        assert!(err.contains("Failed to parse box name"), "got: {err}");
+    }
+
+    #[test]
+    fn default_box_list_limit_uses_explicit_value_when_set() {
+        assert_eq!(default_box_list_limit(42, false), 42);
+        assert_eq!(default_box_list_limit(42, true), 42);
+    }
+
+    #[test]
+    fn default_box_list_limit_defaults_to_1000_without_values() {
+        assert_eq!(default_box_list_limit(0, false), 1000);
+    }
+
+    #[test]
+    fn default_box_list_limit_defaults_to_100_with_values() {
+        assert_eq!(default_box_list_limit(0, true), 100);
+    }
+
+    #[test]
+    fn should_stop_after_page_when_limit_explicit() {
+        assert!(should_stop_after_page(50, ""));
+    }
+
+    #[test]
+    fn should_stop_after_page_when_next_explicit() {
+        assert!(should_stop_after_page(0, "str:cursor"));
+    }
+
+    #[test]
+    fn should_not_stop_after_page_with_neither_flag() {
+        assert!(!should_stop_after_page(0, ""));
     }
 }

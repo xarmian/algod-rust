@@ -35,7 +35,7 @@ pub use parallel_fetch::{ParallelBlockFetcher, DEFAULT_CONCURRENCY};
 pub use ranked_catchpoint_source::RankedCatchpointSource;
 pub use traits::BlockSource;
 pub use types::{
-    AccountInfo, AccountParticipation, AlgodVersions, NodeStatus, ParticipationKey,
-    ParticipationKeyAdded, PendingTxnInfo, PostTransactionResponse, SuggestedParams,
-    TealCompileResult, TxId,
+    AccountInfo, AccountParticipation, AlgodVersions, BoxDescriptor, BoxResponse, BoxesResponse,
+    NodeStatus, ParticipationKey, ParticipationKeyAdded, PendingTxnInfo, PostTransactionResponse,
+    SuggestedParams, TealCompileResult, TxId,
 };
