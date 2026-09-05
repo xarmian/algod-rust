@@ -2885,10 +2885,10 @@ fn load_signing_keys_for_round(
 /// directory overrides (issue #953: `HotDataDir`/`ColdDataDir`/
 /// `TrackerDBDir`/`BlockDBDir`/`CrashDBDir`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedResourcePaths {
-    tracker_path: PathBuf,
-    block_path: PathBuf,
-    crash_path: PathBuf,
+pub(crate) struct ResolvedResourcePaths {
+    pub(crate) tracker_path: PathBuf,
+    pub(crate) block_path: PathBuf,
+    pub(crate) crash_path: PathBuf,
 }
 
 /// Resolve where the tracker DB, block DB, and agreement crash-recovery DB
@@ -2919,7 +2919,10 @@ struct ResolvedResourcePaths {
 /// resolved parent directory before opening, and an operator who changes
 /// these settings on an existing node is responsible for moving any
 /// existing files themselves.
-fn resolve_resource_paths(ledger_path: &Path, cfg: &algo_config::Local) -> ResolvedResourcePaths {
+pub(crate) fn resolve_resource_paths(
+    ledger_path: &Path,
+    cfg: &algo_config::Local,
+) -> ResolvedResourcePaths {
     let prefix = algo_ledger::sqlite::derive_ledger_prefix(ledger_path);
     let root_dir = prefix
         .parent()
