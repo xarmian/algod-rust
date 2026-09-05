@@ -69,13 +69,16 @@
 
 use std::time::Duration;
 
+use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::gossipsub::{self, MessageId, TopicHash};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, kad, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 
+use crate::conn_limits::{derive_conn_limits, ConnLimitConfig};
 use crate::dht;
 use crate::errors::P2pError;
 use crate::identity::IdentityConfig;
+use crate::pubsub::{derive_algorand_gossipsub_params, GossipsubMeshParams, IWANT_FOLLOWUP_TIME};
 
 /// Default timeout applied to an outbound dial attempt.
 ///
@@ -114,6 +117,101 @@ pub struct P2pBehaviour {
     identify: identify::Behaviour,
     gossipsub: gossipsub::Behaviour,
     stream: libp2p_stream::Behaviour,
+    /// Enforces [`derive_conn_limits`]'s output as hard admission control on
+    /// established connections. Go: `network/p2p/p2p.go` `MakeHost`'s
+    /// `libp2p.ResourceManager(rm)` (`configureResourceManager`) — see
+    /// [`P2pHostConfig`]'s doc comment for the scope this behaviour actually
+    /// covers versus go's fuller resource-manager/connection-manager split.
+    connection_limits: connection_limits::Behaviour,
+}
+
+/// Node-mode/config inputs [`P2pHost::new`] needs to derive live connection
+/// limits and gossipsub mesh parameters, mirroring the subset of go's
+/// `config.Local` that `deriveConnLimits`/`deriveAlgorandGossipSubParams`
+/// consume (see `crate::conn_limits`/`crate::pubsub` for the derivation
+/// logic itself). `Default` mirrors go's own `config/local_defaults.go`
+/// (`GossipFanout: 4`) for every field except `incoming_connections_limit`
+/// — go's shipped default there (`2400`) only means something once
+/// `is_listen_server` is `true` (see [`derive_conn_limits`]'s doc comment:
+/// the field is not consulted at all for a client), so this `Default`
+/// mirrors go's own "unbounded/unused" client shape (`is_listen_server:
+/// false`) rather than a listen-server value nothing here defaults to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct P2pHostConfig {
+    /// Go: `cfg.GossipFanout`. Feeds both [`derive_conn_limits`] and
+    /// [`derive_algorand_gossipsub_params`].
+    pub gossip_fanout: i64,
+    /// Go: `cfg.IncomingConnectionsLimit`. Only consulted when
+    /// `is_listen_server` is `true`.
+    pub incoming_connections_limit: i64,
+    /// Go: `cfg.IsListenServer()`.
+    pub is_listen_server: bool,
+    /// Go: `cfg.EnableDHTProviders`.
+    pub enable_dht_providers: bool,
+}
+
+impl Default for P2pHostConfig {
+    fn default() -> Self {
+        Self {
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
+            enable_dht_providers: false,
+        }
+    }
+}
+
+/// Convert a possibly-unbounded `i64` limit from [`ConnLimitConfig`] (which
+/// mirrors go's `int`/`math.MaxInt` "unbounded" convention) into the
+/// `Option<u32>` shape `libp2p-connection-limits`'s [`ConnectionLimits`]
+/// expects (`None` meaning "no limit"). Any non-positive value is also
+/// treated as "no limit" here — [`derive_conn_limits`] only ever produces
+/// `0` for a field that is genuinely inapplicable in that mode (e.g.
+/// `rcmgr_conns_inbound` for a pure client), never as a real "deny
+/// everything" limit, matching go's own `configureResourceManager`, which
+/// likewise only sets a `rcmgr.LimitVal` override when the derived value is
+/// `> 0`.
+fn to_connection_limit(value: i64) -> Option<u32> {
+    u32::try_from(value).ok().filter(|&v| v > 0)
+}
+
+/// Map [`derive_conn_limits`]'s output onto `libp2p-connection-limits`'s
+/// [`ConnectionLimits`]. Only the three fields go's own
+/// `configureResourceManager` actually overrides on top of
+/// `rcmgr.DefaultLimits`'s auto-scaled per-scope defaults
+/// (`system.Conns`/`ConnsInbound`/`ConnsOutbound`) have a mapping here;
+/// `libp2p-connection-limits` has no per-peer/pending-connection
+/// counterparts to those go leaves at their scaled defaults either, so
+/// `max_pending_*`/`max_established_per_peer` are left unset (`None`).
+fn conn_limits_to_libp2p(limits: ConnLimitConfig) -> ConnectionLimits {
+    ConnectionLimits::default()
+        .with_max_established(to_connection_limit(limits.rcmgr_conns))
+        .with_max_established_incoming(to_connection_limit(limits.rcmgr_conns_inbound))
+        .with_max_established_outgoing(to_connection_limit(limits.rcmgr_conns_outbound))
+}
+
+/// Map [`derive_algorand_gossipsub_params`]'s output onto a
+/// [`gossipsub::ConfigBuilder`] — see [`GossipsubMeshParams`]'s doc comment
+/// for the field-name mapping this follows. `DirectConnectInitialDelay`
+/// (go's other non-D-family field this crate's `pubsub` module also
+/// derives) has no equivalent knob on `libp2p-gossipsub`'s `ConfigBuilder`
+/// — direct-peer connection maintenance is handled structurally differently
+/// there (`explicit_peers`, which this crate does not use) — so it is not
+/// applied here.
+fn apply_gossipsub_mesh_params(
+    builder: &mut gossipsub::ConfigBuilder,
+    params: GossipsubMeshParams,
+) {
+    builder
+        .mesh_n(params.d)
+        .mesh_n_low(params.dlo)
+        .mesh_n_high(params.dhi)
+        .retain_scores(params.dscore)
+        .mesh_outbound_min(params.dout)
+        .gossip_lazy(params.dlazy)
+        .history_length(params.history_length)
+        .gossip_factor(params.gossip_factor)
+        .iwant_followup_time(IWANT_FOLLOWUP_TIME);
 }
 
 /// Outcome a caller reports for a received gossipsub message, mirroring
@@ -148,20 +246,46 @@ impl From<MessageValidationResult> for gossipsub::MessageAcceptance {
 /// discovery.
 pub struct P2pHost {
     swarm: Swarm<P2pBehaviour>,
+    /// The connection limits actually derived and applied to
+    /// `connection_limits::Behaviour` at construction time — kept for
+    /// [`P2pHost::applied_connection_limits`] (tests/diagnostics), since
+    /// `libp2p-connection-limits`'s own `ConnectionLimits` exposes no
+    /// getters to read this back off the live behaviour.
+    applied_connection_limits: ConnLimitConfig,
+    /// The gossipsub mesh-degree parameters actually derived and applied to
+    /// the `gossipsub::Behaviour`'s config at construction time — kept for
+    /// [`P2pHost::applied_gossipsub_params`] (tests/diagnostics), for the
+    /// same reason as `applied_connection_limits` above.
+    applied_gossipsub_params: GossipsubMeshParams,
 }
 
 impl P2pHost {
-    /// Build a new host from the given identity configuration and
-    /// Algorand network ID (used to derive this DHT's protocol name — see
-    /// [`dht::dht_protocol_name`]). Does not start listening — call
+    /// Build a new host from the given identity configuration, Algorand
+    /// network ID (used to derive this DHT's protocol name — see
+    /// [`dht::dht_protocol_name`]), and node-mode config (connection-limit
+    /// and gossipsub mesh-parameter derivation inputs — see
+    /// [`P2pHostConfig`]). Does not start listening — call
     /// [`P2pHost::listen`] to do so.
     ///
     /// Go: `MakeHost` (creates the libp2p host but does not listen) +
     /// `MakeDHT` (attaches the DHT behaviour).
-    pub fn new(identity_cfg: &IdentityConfig, network_id: &str) -> Result<Self, P2pError> {
+    pub fn new(
+        identity_cfg: &IdentityConfig,
+        network_id: &str,
+        host_cfg: &P2pHostConfig,
+    ) -> Result<Self, P2pError> {
         let keypair = crate::identity::get_or_create_keypair(identity_cfg)?;
         let local_peer_id = keypair.public().to_peer_id();
         let kad_config = dht::dht_config(network_id);
+        let host_cfg = *host_cfg;
+
+        let conn_limits_cfg = derive_conn_limits(
+            host_cfg.gossip_fanout,
+            host_cfg.incoming_connections_limit,
+            host_cfg.is_listen_server,
+            host_cfg.enable_dht_providers,
+        );
+        let gossipsub_params = derive_algorand_gossipsub_params(host_cfg.gossip_fanout);
 
         let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -182,10 +306,17 @@ impl P2pHost {
                 // — no per-message signature/seqno/from, and
                 // `pubsub.WithValidateQueueSize`+async `ValidatorEx` per topic —
                 // `validate_messages(true)` is rust-libp2p's equivalent (see
-                // this module's doc comment).
-                let gossipsub_config = gossipsub::ConfigBuilder::default()
+                // this module's doc comment). Mesh-degree parameters are
+                // go's `deriveAlgorandGossipSubParams(cfg.GossipFanout)`,
+                // applied here in place of `libp2p-gossipsub`'s own
+                // (unrelated) library defaults — see
+                // `apply_gossipsub_mesh_params`.
+                let mut gossipsub_config_builder = gossipsub::ConfigBuilder::default();
+                gossipsub_config_builder
                     .validation_mode(gossipsub::ValidationMode::Anonymous)
-                    .validate_messages()
+                    .validate_messages();
+                apply_gossipsub_mesh_params(&mut gossipsub_config_builder, gossipsub_params);
+                let gossipsub_config = gossipsub_config_builder
                     .build()
                     .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
                 let gossipsub = gossipsub::Behaviour::new(
@@ -194,11 +325,19 @@ impl P2pHost {
                 )
                 .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
                 let stream = libp2p_stream::Behaviour::new();
+                // Go: `MakeHost`'s `libp2p.ResourceManager(rm)`
+                // (`configureResourceManager(deriveConnLimits(cfg))`) — see
+                // `conn_limits_to_libp2p` for the field mapping and its
+                // scope-of-coverage caveat versus go's fuller
+                // resource-manager/connection-manager split.
+                let connection_limits =
+                    connection_limits::Behaviour::new(conn_limits_to_libp2p(conn_limits_cfg));
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(P2pBehaviour {
                     kad,
                     identify,
                     gossipsub,
                     stream,
+                    connection_limits,
                 })
             })
             .map_err(|e| P2pError::SwarmBuild(e.to_string()))?
@@ -210,7 +349,27 @@ impl P2pHost {
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
-        Ok(Self { swarm })
+        Ok(Self {
+            swarm,
+            applied_connection_limits: conn_limits_cfg,
+            applied_gossipsub_params: gossipsub_params,
+        })
+    }
+
+    /// The connection-manager/resource-manager limits actually derived and
+    /// enforced by this host's `connection_limits::Behaviour`, from the
+    /// [`P2pHostConfig`] passed to [`P2pHost::new`]. Exposed for tests and
+    /// diagnostics — see [`derive_conn_limits`].
+    pub fn applied_connection_limits(&self) -> ConnLimitConfig {
+        self.applied_connection_limits
+    }
+
+    /// The gossipsub mesh-degree parameters actually derived and applied to
+    /// this host's gossipsub config, from the [`P2pHostConfig`] passed to
+    /// [`P2pHost::new`]. Exposed for tests and diagnostics — see
+    /// [`derive_algorand_gossipsub_params`].
+    pub fn applied_gossipsub_params(&self) -> GossipsubMeshParams {
+        self.applied_gossipsub_params
     }
 
     /// This host's [`PeerId`], derived from its identity keypair's public
@@ -642,7 +801,12 @@ mod tests {
     }
 
     fn new_test_host() -> P2pHost {
-        P2pHost::new(&loopback_identity(), TEST_NETWORK_ID).expect("host")
+        P2pHost::new(
+            &loopback_identity(),
+            TEST_NETWORK_ID,
+            &P2pHostConfig::default(),
+        )
+        .expect("host")
     }
 
     async fn start_listening(host: &mut P2pHost) -> Multiaddr {
@@ -1083,5 +1247,142 @@ mod tests {
             .await;
 
         assert!(found.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // conn-limit / gossipsub-param live wiring (#952)
+    // -----------------------------------------------------------------------
+
+    /// TDD anchor for #952: `P2pHost::new` must actually call
+    /// `derive_algorand_gossipsub_params` with the configured
+    /// `gossip_fanout` and apply the result to the live gossipsub config —
+    /// not just build with `libp2p-gossipsub`'s unrelated library defaults.
+    /// `gossipsub::Behaviour` exposes no getter to read its applied config
+    /// back, so this checks the value `P2pHost` itself recorded at
+    /// construction time (see `applied_gossipsub_params`'s doc comment).
+    #[test]
+    fn p2p_host_applies_derived_gossipsub_params_from_config() {
+        for gossip_fanout in [0, 3, 9, 20] {
+            let host_cfg = P2pHostConfig {
+                gossip_fanout,
+                ..P2pHostConfig::default()
+            };
+            let host = P2pHost::new(&loopback_identity(), TEST_NETWORK_ID, &host_cfg)
+                .expect("host with custom gossip_fanout");
+            assert_eq!(
+                host.applied_gossipsub_params(),
+                derive_algorand_gossipsub_params(gossip_fanout),
+                "gossip_fanout={gossip_fanout}"
+            );
+        }
+    }
+
+    /// TDD anchor for #952: `P2pHost::new` must actually call
+    /// `derive_conn_limits` with the configured mode inputs and record the
+    /// result that gets applied to `connection_limits::Behaviour` — see
+    /// `p2p_host_enforces_derived_max_established_incoming_limit` below for
+    /// proof it is also *enforced*, not just recorded.
+    #[test]
+    fn p2p_host_applies_derived_connection_limits_from_config() {
+        let host_cfg = P2pHostConfig {
+            gossip_fanout: 4,
+            incoming_connections_limit: 2400,
+            is_listen_server: true,
+            enable_dht_providers: false,
+        };
+        let host = P2pHost::new(&loopback_identity(), TEST_NETWORK_ID, &host_cfg)
+            .expect("host with listen-server config");
+        assert_eq!(
+            host.applied_connection_limits(),
+            derive_conn_limits(4, 2400, true, false)
+        );
+    }
+
+    /// A restrictive `P2pHostConfig` (a listen server with
+    /// `incoming_connections_limit: 1`, no gossip fanout) derives a
+    /// `rcmgr_conns_inbound` of `1` (see `conn_limits::derive_conn_limits`'s
+    /// `derive_conn_limits_server`-style math). Proves the derived limit is
+    /// actually *enforced* by a live `connection_limits::Behaviour`, not
+    /// merely computed: a second inbound dial while the first is still
+    /// established is denied.
+    #[tokio::test]
+    async fn p2p_host_enforces_derived_max_established_incoming_limit() {
+        let restrictive_cfg = P2pHostConfig {
+            gossip_fanout: 0,
+            incoming_connections_limit: 1,
+            is_listen_server: true,
+            enable_dht_providers: false,
+        };
+        assert_eq!(
+            derive_conn_limits(0, 1, true, false).rcmgr_conns_inbound,
+            1,
+            "test setup sanity check"
+        );
+
+        let mut listener = P2pHost::new(&loopback_identity(), TEST_NETWORK_ID, &restrictive_cfg)
+            .expect("restrictive listener host");
+        let mut first_dialer = new_test_host();
+        let mut second_dialer = new_test_host();
+
+        let listen_addr = start_listening(&mut listener).await;
+        let listener_peer_id = listener.peer_id();
+
+        first_dialer
+            .dial(
+                listen_addr
+                    .clone()
+                    .with(libp2p::multiaddr::Protocol::P2p(listener_peer_id)),
+            )
+            .expect("first dial should be accepted for opening");
+
+        // Drive both sides until the first connection is fully established.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut first_established = false;
+        while !first_established {
+            tokio::select! {
+                ev = listener.next_event() => {
+                    if let SwarmEvent::ConnectionEstablished { .. } = ev { first_established = true; }
+                }
+                _ = first_dialer.next_event() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out before the first connection established");
+                }
+            }
+        }
+
+        // A second, independent peer dials in while the first connection is
+        // still up — the derived `max_established_incoming: 1` must deny
+        // it.
+        second_dialer
+            .dial(listen_addr.with(libp2p::multiaddr::Protocol::P2p(listener_peer_id)))
+            .expect("second dial should be accepted for opening");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut second_denied = false;
+        loop {
+            tokio::select! {
+                ev = listener.next_event() => {
+                    if let SwarmEvent::IncomingConnectionError { .. } = ev {
+                        second_denied = true;
+                        break;
+                    }
+                }
+                _ = second_dialer.next_event() => {}
+                _ = first_dialer.next_event() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            second_denied,
+            "expected the listener's derived max_established_incoming: 1 limit to deny a second inbound connection"
+        );
+        assert_eq!(
+            listener.connected_peers().len(),
+            1,
+            "listener should still have exactly the first connection established"
+        );
     }
 }

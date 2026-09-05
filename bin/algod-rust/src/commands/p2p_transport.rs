@@ -80,7 +80,7 @@ use algo_network::{
 use algo_p2p::{
     build_headers, handshake_inbound, handshake_outbound, libp2p_stream, read_frame,
     resolve_dht_mode, write_frame, IdentityConfig, MessageValidationResult, P2pBehaviourEvent,
-    P2pHost, PeerMetaHeaders, ALGORAND_HTTP_PROTOCOL, ALGORAND_WS_PROTOCOL_V22,
+    P2pHost, P2pHostConfig, PeerMetaHeaders, ALGORAND_HTTP_PROTOCOL, ALGORAND_WS_PROTOCOL_V22,
 };
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
@@ -755,6 +755,24 @@ pub struct P2pTransportConfig {
     /// `""`/`"server"`/`"client"` semantics. Only consulted when
     /// `enable_dht_providers` is `true`.
     pub dht_mode: String,
+    /// Matches go's `cfg.GossipFanout` — fed to
+    /// [`algo_p2p::derive_conn_limits`]/[`algo_p2p::derive_algorand_gossipsub_params`]
+    /// via [`P2pHostConfig`] (issue #952). `Default::default()` gives `0`,
+    /// unlike [`P2pHostConfig::default`]'s go-config-matching `4` — a
+    /// caller building a real node config should always set this from its
+    /// actual `GossipFanout`, mirroring how every other field on this
+    /// struct already requires an explicit value from the caller.
+    pub gossip_fanout: i64,
+    /// Matches go's `cfg.IncomingConnectionsLimit`. Only consulted when
+    /// `is_listen_server` is `true` — see
+    /// [`algo_p2p::derive_conn_limits`]'s doc comment.
+    pub incoming_connections_limit: i64,
+    /// Matches go's `cfg.IsListenServer()` — whether this node accepts
+    /// inbound connections as a relay/listen server (as opposed to a pure
+    /// client). The caller is expected to compute this itself (e.g. from
+    /// `algo_config::Local::is_listen_server`), mirroring
+    /// [`algo_p2p::derive_conn_limits`]'s own expectations.
+    pub is_listen_server: bool,
 }
 
 /// Split a multiaddr into its dialable transport address and an optional
@@ -847,7 +865,13 @@ impl P2pTransport {
             data_dir: cfg.data_dir.clone(),
             persist_peer_id: cfg.persist_peer_id,
         };
-        let mut host = P2pHost::new(&identity_cfg, &cfg.network_id)
+        let host_cfg = P2pHostConfig {
+            gossip_fanout: cfg.gossip_fanout,
+            incoming_connections_limit: cfg.incoming_connections_limit,
+            is_listen_server: cfg.is_listen_server,
+            enable_dht_providers: cfg.enable_dht_providers,
+        };
+        let mut host = P2pHost::new(&identity_cfg, &cfg.network_id, &host_cfg)
             .map_err(|e| anyhow::anyhow!("failed to build P2P host: {e}"))?;
         let peer_id = host.peer_id();
 
@@ -1586,6 +1610,9 @@ mod tests {
             private_key_path: None,
             enable_dht_providers: true,
             dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
         })
         .await
         .expect("start p2p transport");
@@ -1614,6 +1641,9 @@ mod tests {
             private_key_path: None,
             enable_dht_providers: true,
             dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
         })
         .await
         .expect("start p2p transport");
@@ -1638,6 +1668,9 @@ mod tests {
             private_key_path: None,
             enable_dht_providers: true,
             dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
         })
         .await
         .expect("start listener");
@@ -1662,6 +1695,9 @@ mod tests {
             private_key_path: None,
             enable_dht_providers: true,
             dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
         })
         .await
         .expect("start dialer");
@@ -2162,6 +2198,9 @@ mod tests {
             private_key_path: None,
             enable_dht_providers: true,
             dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
         })
         .await
         .expect("start transport");

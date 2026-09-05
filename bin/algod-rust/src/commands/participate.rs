@@ -4436,6 +4436,19 @@ pub async fn run(
                 .then(|| PathBuf::from(&node_config.p2p_private_key_location)),
             enable_dht_providers: node_config.enable_dht_providers,
             dht_mode: node_config.dht_mode.clone(),
+            // Issue #952: fed to `algo_p2p::derive_conn_limits`/
+            // `derive_algorand_gossipsub_params` via `P2pHostConfig`,
+            // mirroring the exact same `GossipFanout`/
+            // `IsListenServer`/`IncomingConnectionsLimit` inputs go's
+            // `MakeHost`/`makePubSub` derive their own connection-manager/
+            // resource-manager/gossipsub-mesh tuning from — the same
+            // `resolve_gossip_fanout`/`is_listen_server` already computed
+            // above for `net_config` (go shares one `cfg.GossipFanout`
+            // across both the WS and P2P transports).
+            gossip_fanout: resolve_gossip_fanout(&node_config, is_listen_server, peers.len())
+                as i64,
+            incoming_connections_limit: resolved_net.incoming_connections_limit as i64,
+            is_listen_server,
         })
         .await
         .map_err(|e| anyhow::anyhow!("failed to start P2P transport: {e}"))?;

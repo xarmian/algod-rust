@@ -65,7 +65,7 @@ use algo_network::framing;
 use algo_network::tag::Tag;
 use algo_p2p::{
     build_headers, handshake_outbound, read_frame, write_frame, IdentityConfig, P2pHost,
-    ALGORAND_WS_PROTOCOL_V22,
+    P2pHostConfig, ALGORAND_WS_PROTOCOL_V22,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use libp2p::multiaddr::Protocol;
@@ -152,8 +152,12 @@ fn throwaway_identity() -> IdentityConfig {
 async fn connect(cfg: &P2pInjectorConfig) -> Result<(JoinHandle<()>, libp2p::swarm::Stream)> {
     let target_peer = target_peer_id(&cfg.peer_multiaddr)?;
 
-    let mut host = P2pHost::new(&throwaway_identity(), &cfg.genesis_id)
-        .map_err(|e| anyhow!("failed to build P2P host: {e}"))?;
+    let mut host = P2pHost::new(
+        &throwaway_identity(),
+        &cfg.genesis_id,
+        &P2pHostConfig::default(),
+    )
+    .map_err(|e| anyhow!("failed to build P2P host: {e}"))?;
     let mut stream_control = host.stream_control();
 
     host.dial(cfg.peer_multiaddr.clone())
@@ -416,7 +420,12 @@ mod tests {
         Multiaddr,
         JoinHandle<(Vec<u8>, libp2p::swarm::Stream)>,
     ) {
-        let mut host = P2pHost::new(&test_identity(), listener_genesis_id).expect("host");
+        let mut host = P2pHost::new(
+            &test_identity(),
+            listener_genesis_id,
+            &P2pHostConfig::default(),
+        )
+        .expect("host");
         host.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .expect("listen");
         let mut stream_control = host.stream_control();
@@ -560,7 +569,8 @@ mod tests {
     /// correctly, without a live node.
     #[tokio::test]
     async fn capture_proposal_p2p_decompresses_a_zstd_compressed_payload() {
-        let mut host = P2pHost::new(&test_identity(), "test-597c").expect("host");
+        let mut host =
+            P2pHost::new(&test_identity(), "test-597c", &P2pHostConfig::default()).expect("host");
         host.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .expect("listen");
         let mut stream_control = host.stream_control();

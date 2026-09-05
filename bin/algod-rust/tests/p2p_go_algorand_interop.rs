@@ -125,7 +125,7 @@
 use std::time::Duration;
 
 use algo_p2p::{
-    build_headers, handshake_outbound, Capability, IdentityConfig, P2pHost,
+    build_headers, handshake_outbound, Capability, IdentityConfig, P2pHost, P2pHostConfig,
     ALGORAND_WS_PROTOCOL_V22,
 };
 use libp2p::swarm::SwarmEvent;
@@ -160,7 +160,8 @@ async fn dials_real_go_algorand_p2p_host_and_establishes_secure_connection() {
     // mismatched `dht_protocol_name` would not prevent
     // `ConnectionEstablished` from firing, since that happens before any
     // DHT-specific protocol negotiation.
-    let mut host = P2pHost::new(&identity, "p2pinterop-v1").expect("build P2P host");
+    let mut host = P2pHost::new(&identity, "p2pinterop-v1", &P2pHostConfig::default())
+        .expect("build P2P host");
 
     host.dial(target.clone())
         .unwrap_or_else(|e| panic!("dial to {target} rejected before it even started: {e}"));
@@ -222,7 +223,8 @@ async fn discovers_go_algorand_peer_via_gossip_capability_provider_records() {
     };
 
     let identity = IdentityConfig::default();
-    let mut host = P2pHost::new(&identity, P2PINTEROP_NETWORK_ID).expect("build P2P host");
+    let mut host = P2pHost::new(&identity, P2PINTEROP_NETWORK_ID, &P2pHostConfig::default())
+        .expect("build P2P host");
 
     host.dial(target.clone())
         .unwrap_or_else(|e| panic!("dial to {target} rejected before it even started: {e}"));
@@ -333,7 +335,8 @@ async fn provider_record_advertised_by_neighbor_propagates_to_queried_node() {
     const PROPAGATION_WAIT: Duration = Duration::from_secs(20);
 
     let identity = IdentityConfig::default();
-    let mut host = P2pHost::new(&identity, P2PINTEROP_NETWORK_ID).expect("build P2P host");
+    let mut host = P2pHost::new(&identity, P2PINTEROP_NETWORK_ID, &P2pHostConfig::default())
+        .expect("build P2P host");
 
     // Only ever dial go-node-1 — go-node-2's providership must be learned
     // purely through the DHT provider-record mechanism relayed via
@@ -406,7 +409,8 @@ async fn algorand_ws_stream_handshake_round_trips_with_real_go_algorand_node() {
     };
 
     let identity = IdentityConfig::default();
-    let mut host = P2pHost::new(&identity, P2PINTEROP_NETWORK_ID).expect("build P2P host");
+    let mut host = P2pHost::new(&identity, P2PINTEROP_NETWORK_ID, &P2pHostConfig::default())
+        .expect("build P2P host");
     let mut control = host.stream_control();
 
     host.dial(target.clone())
