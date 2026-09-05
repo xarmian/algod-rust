@@ -3665,6 +3665,23 @@ pub async fn run(
 
     let resolved_p2p = p2p_opts.resolve();
     let network_mode = resolved_p2p.mode;
+    // Go: `Local.ValidateP2PHybridConfig` (`config/localTemplate.go:801`,
+    // issue #949) — reject a hybrid-mode configuration up front rather than
+    // silently running with a half-configured hybrid mode (e.g. a WS
+    // listen address but no P2P one, which would leave the net-identity
+    // challenge dedup this validation exists for unable to work). Checked
+    // against the addresses that will actually be used below
+    // (`listen_address`/`resolved_p2p.listen_address`), not
+    // `node_config.p2p_hybrid_net_address` (round-trip-only — see its doc
+    // comment in `algo_config`).
+    if let Err(e) = algo_config::validate_p2p_hybrid_config(
+        resolved_p2p.enable_p2p_hybrid_mode,
+        listen_address,
+        resolved_p2p.listen_address.as_deref(),
+        &node_config.public_address,
+    ) {
+        anyhow::bail!("invalid P2P hybrid configuration: {e}");
+    }
     // Resolve genesis ID: use the provided value, or look it up by network name.
     let resolved_genesis_id = match genesis_id {
         Some(id) if !id.is_empty() => id.to_string(),
@@ -3965,6 +3982,23 @@ pub async fn run(
         resolved_net.connections_rate_limiting_count as usize,
         Duration::from_secs(rate_limit_window_secs),
     ));
+    // `phonebook.json`'s `Include` allow-list (issue #949, go:
+    // `config.LoadPhonebook`) — an optional, legacy operator escape hatch
+    // for pinning bootstrap peers independent of `--peers`/DNS discovery.
+    // Loaded as persistent peers so `replace_peer_list`'s DNS-driven
+    // refresh below never evicts them.
+    if let Some(dir) = rest_opts.data_dir.as_deref() {
+        match algo_network::phonebook_file::load_phonebook(dir) {
+            Ok(entries) if !entries.is_empty() => {
+                info!(count = entries.len(), "loaded phonebook.json include list");
+                phonebook.add_persistent_peers(&entries, "phonebook.json", RELAY_ROLE);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to load phonebook.json; continuing without it");
+            }
+        }
+    }
     if ws_active && !peers.is_empty() {
         phonebook.replace_peer_list(peers, "cli", RELAY_ROLE);
         info!(count = peers.len(), "added initial peer addresses");
@@ -4024,7 +4058,22 @@ pub async fn run(
     // (go's `NetAddress != ""` equivalent), its `GossipFanout` gets bumped
     // to go's relay default unless explicitly overridden. Computed before
     // `effective_listen_address` is moved into `net_address` below.
-    let is_listen_server = effective_listen_address.is_some();
+    //
+    // Go: `Local.IsListenServer` (`config/localTemplate.go:779`, issue
+    // #949) — the canonical derivation, replacing the prior ad hoc
+    // `effective_listen_address.is_some()` (which only ever asked "is the
+    // WS listener open", silently wrong for `P2pOnly` mode, where no WS
+    // listener ever opens but the node can still be a P2P listen server).
+    // `resolved_p2p.enable_p2p`/`enable_p2p_hybrid_mode` are passed rather
+    // than `node_config.enable_p2p`/`enable_p2p_hybrid_mode` because those
+    // are the flags that actually produced `network_mode` above (see
+    // `ResolvedP2p`'s doc comment).
+    let is_listen_server = algo_config::is_listen_server(
+        resolved_p2p.enable_p2p,
+        resolved_p2p.enable_p2p_hybrid_mode,
+        effective_listen_address.as_deref(),
+        resolved_p2p.listen_address.as_deref(),
+    );
 
     let net_config = WebsocketNetworkConfig {
         genesis_id: resolved_genesis_id.clone(),
@@ -9796,9 +9845,8 @@ mod tests {
         let ledger_path = tmp_dir.join("ledger");
         let resolved = super::resolve_resource_paths(&ledger_path, &cfg);
 
-        let ledger =
-            SqliteLedger::open_split(&resolved.tracker_path, &resolved.block_path, None)
-                .expect("open ledger at resolved per-resource paths");
+        let ledger = SqliteLedger::open_split(&resolved.tracker_path, &resolved.block_path, None)
+            .expect("open ledger at resolved per-resource paths");
         drop(ledger);
 
         assert!(

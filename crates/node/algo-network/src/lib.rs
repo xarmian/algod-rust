@@ -52,6 +52,7 @@ pub mod mesh;
 pub mod message_filter;
 pub mod peer_role;
 pub mod phonebook;
+pub mod phonebook_file;
 pub mod request_response;
 pub mod request_tracker;
 pub mod srv_resolver;

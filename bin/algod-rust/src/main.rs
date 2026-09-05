@@ -386,6 +386,7 @@ async fn main() -> anyhow::Result<()> {
                 &ledger_path,
                 genesis_json.as_deref(),
                 &node_config,
+                data_dir.as_deref(),
             )
             .await?;
         }

@@ -511,6 +511,7 @@ pub async fn run(
     ledger_path: &Path,
     genesis_json_path: Option<&Path>,
     node_config: &algo_config::Local,
+    data_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
     // Resolve genesis ID: use the provided value, or look it up by network name.
     let resolved_genesis_id = if genesis_id.is_empty() {
@@ -555,6 +556,22 @@ pub async fn run(
     if !peers.is_empty() {
         phonebook.replace_peer_list(peers, "cli", RELAY_ROLE);
         info!(count = peers.len(), "added initial peer addresses");
+    }
+
+    // `phonebook.json`'s `Include` allow-list (issue #949, go:
+    // `config.LoadPhonebook`) — see `commands::participate::run`'s
+    // identical wiring for the full rationale.
+    if let Some(dir) = data_dir {
+        match algo_network::phonebook_file::load_phonebook(dir) {
+            Ok(entries) if !entries.is_empty() => {
+                info!(count = entries.len(), "loaded phonebook.json include list");
+                phonebook.add_persistent_peers(&entries, "phonebook.json", RELAY_ROLE);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to load phonebook.json; continuing without it");
+            }
+        }
     }
 
     // Build network config with relay mode enabled.
