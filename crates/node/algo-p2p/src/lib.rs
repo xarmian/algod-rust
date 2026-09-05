@@ -65,8 +65,8 @@ pub use dht::{dht_protocol_name, resolve_dht_mode};
 pub use dnsaddr::{resolve_multiaddrs, DnsaddrError, DnsaddrResolver, HickoryDnsaddrResolver};
 pub use errors::P2pError;
 pub use host::{
-    MessageValidationResult, P2pBehaviour, P2pBehaviourEvent, P2pHost, DHT_LOOKUP_TIMEOUT,
-    DIAL_TIMEOUT,
+    MessageValidationResult, P2pBehaviour, P2pBehaviourEvent, P2pHost, P2pHostConfig,
+    DHT_LOOKUP_TIMEOUT, DIAL_TIMEOUT,
 };
 pub use httpproto::ALGORAND_HTTP_PROTOCOL;
 pub use identity::{get_or_create_keypair, IdentityConfig, DEFAULT_PRIV_KEY_FILENAME};

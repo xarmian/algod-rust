@@ -34,28 +34,30 @@
 //! (Gaps 1 and 2 from #818 — the stream manager and `IdentityTracker` —
 //! landed in PR #893; see `crate::streams` and `crate::identity_tracker`.)
 //!
-//! **This module is computation-only.** `algo_p2p::host::P2pHost::new`
-//! still configures the swarm/gossipsub with library defaults, exactly as
-//! before this change. Wiring [`derive_conn_limits`]'s output into a live
-//! connection manager and resource manager needs:
-//! - a new config surface on `P2pHost::new` (it takes only an identity
-//!   config and network ID today, not the `gossip_fanout` /
-//!   `incoming_connections_limit` / `is_listen_server` /
-//!   `enable_dht_providers` inputs this module's functions need), and
-//! - genuinely new `rust-libp2p` dependencies: go's connection manager
-//!   (`go-libp2p/p2p/net/connmgr`) and resource manager
-//!   (`go-libp2p/p2p/host/resource-manager`) both have `rust-libp2p`
-//!   counterparts (`libp2p-connection-limits` and
-//!   `libp2p::swarm::Config`'s own per-peer/per-connection limits
-//!   respectively), but neither is a dependency of this crate yet, and
-//!   fitting the resource manager's scope-based accounting
-//!   (system/transient/peer/protocol scopes) onto `rust-libp2p`'s simpler
-//!   connection-count-only limiter is a design decision of its own, not a
-//!   mechanical substitution.
+//! **[`derive_conn_limits`]'s output is now wired into a live
+//! `libp2p-connection-limits::Behaviour` on `algo_p2p::host::P2pHost::new`**
+//! (issue #952, via `host::P2pHostConfig` — see `host.rs`'s
+//! `conn_limits_to_libp2p`/`P2pBehaviour::connection_limits`). That crate's
+//! own hard-cap-only limiter (concurrent-connection counts) is what backs
+//! this mapping — go's fuller resource-manager (scope-based
+//! system/transient/peer/protocol accounting,
+//! `go-libp2p/p2p/host/resource-manager`) and connection manager (a *soft*
+//! low/high-water-mark trim-by-score, `go-libp2p/p2p/net/connmgr`) have no
+//! single `rust-libp2p` counterpart of matching shape; only the
+//! resource-manager's three system-scope connection-count fields
+//! (`rcmgr_conns`/`rcmgr_conns_inbound`/`rcmgr_conns_outbound`) have a
+//! direct mapping applied. `conn_mgr_low`/`conn_mgr_high` (the
+//! connection-manager's own soft-trim watermarks) remain unapplied — this
+//! module still computes them for parity with go's `deriveConnLimits`
+//! output shape, but no live trim-by-score behavior is wired to them.
+//! [`net_address_to_listen_address`]/[`address_filter`]/[`needs_address_filter`]
+//! remain unwired too — `P2pHost::new` does not yet configure an
+//! `AddrsFactory` equivalent from these.
 //!
-//! This is left as a documented follow-up, consistent with how #893
-//! scoped the stream manager and `IdentityTracker` (ported, unit-tested,
-//! not wired into a live connection-acceptance path).
+//! This remaining scope is left as a documented follow-up, consistent with
+//! how #893 scoped the stream manager and `IdentityTracker` (ported,
+//! unit-tested, not wired into a live connection-acceptance path) — see
+//! issue #952.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
