@@ -156,6 +156,101 @@ pub struct NodeInterfaceConfig {
     pub default_protocol: String,
 }
 
+/// Follower-node sync-round state (issue #951), mirroring go's
+/// `catchup.Service.disableSyncRound` field as driven by
+/// `AlgorandFollowerNode.SetSyncRound`/`GetSyncRound`/`UnsetSyncRound`
+/// (`node/follower_node.go`).
+///
+/// Go stores the caller's requested round plus a `MaxAcctLookback` offset
+/// (`disableSyncRound := rnd + MaxAcctLookback`) so the ledger's delta-cache
+/// window never falls out from under an in-flight sync; `GetSyncRound`
+/// subtracts the same offset back off (`basics.SubSaturate`). This struct
+/// reproduces that arithmetic exactly, plus go's `SetDisableSyncRound`
+/// validation (`rnd < ledger.LastRound()` is rejected) and the
+/// `SetCatchpointCatchupMode(false)` reset (`SetSyncRound(ledger.LastRound
+/// ())`) via [`crate::live_catchup::SyncRoundResetHook`].
+///
+/// Shared (via `Arc`) between the [`AlgodNodeInterface`] that exposes it
+/// through the `NodeInterface` trait and — only when `node start --follow
+/// <peer>` also attaches a live catchpoint-catchup toggle — the
+/// [`crate::live_catchup::LiveCatchupManager`] that resets it on catchup
+/// completion.
+pub struct FollowerSyncRoundState {
+    ledger: Arc<Mutex<SqliteLedger>>,
+    /// `config.json`'s `MaxAcctLookback` (go default `4`).
+    max_acct_lookback: u64,
+    /// The raw `disableSyncRound` value (already offset by
+    /// `max_acct_lookback`); `None` means "unset" (go's zero value).
+    raw_disable_sync_round: Mutex<Option<u64>>,
+}
+
+impl FollowerSyncRoundState {
+    /// Construct follower sync-round state, initializing it to the
+    /// ledger's current round + 1 — mirroring go's `MakeFollower`:
+    /// `node.SetSyncRound(node.Ledger().LatestTrackerCommitted() + 1)`, so
+    /// nothing falls out of the delta-cache window before the first real
+    /// sync-round request arrives.
+    pub fn new(ledger: Arc<Mutex<SqliteLedger>>, max_acct_lookback: u64) -> Arc<Self> {
+        let current_round = ledger.lock().map(|l| l.current_round().0).unwrap_or(0);
+        let initial = current_round + 1 + max_acct_lookback;
+        Arc::new(Self {
+            ledger,
+            max_acct_lookback,
+            raw_disable_sync_round: Mutex::new(Some(initial)),
+        })
+    }
+
+    /// go's `AlgorandFollowerNode.GetSyncRound`: `0` when unset.
+    fn get(&self) -> u64 {
+        let raw = self
+            .raw_disable_sync_round
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or(0);
+        raw.saturating_sub(self.max_acct_lookback)
+    }
+
+    /// go's `AlgorandFollowerNode.SetSyncRound` /
+    /// `catchup.Service.SetDisableSyncRound`: rejects a round that would
+    /// put the disable-sync-round boundary behind the ledger's current
+    /// round (go: `ErrSyncRoundInvalid`).
+    fn set(&self, round: u64) -> Result<(), String> {
+        let disable_sync_round = round.saturating_add(self.max_acct_lookback);
+        let last_round = self.ledger.lock().map(|l| l.current_round().0).unwrap_or(0);
+        if disable_sync_round < last_round {
+            return Err("sync round invalid".to_string());
+        }
+        if let Ok(mut guard) = self.raw_disable_sync_round.lock() {
+            *guard = Some(disable_sync_round);
+        }
+        Ok(())
+    }
+
+    /// go's `AlgorandFollowerNode.UnsetSyncRound` /
+    /// `catchup.Service.UnsetDisableSyncRound`.
+    fn unset(&self) {
+        if let Ok(mut guard) = self.raw_disable_sync_round.lock() {
+            *guard = None;
+        }
+    }
+}
+
+#[async_trait]
+impl crate::live_catchup::SyncRoundResetHook for FollowerSyncRoundState {
+    /// go's `AlgorandFollowerNode.SetCatchpointCatchupMode(false)`:
+    /// `node.SetSyncRound(node.ledger.LastRound())` before resuming normal
+    /// sync. Swallows the (extremely unlikely) validation error the same
+    /// way go does — the resume path doesn't handle `SetSyncRound`
+    /// failing, it just logs a warning (`node/follower_node.go`).
+    async fn reset_sync_round(&self) {
+        let last_round = self.ledger.lock().map(|l| l.current_round().0).unwrap_or(0);
+        if let Err(e) = self.set(last_round) {
+            warn!(error = %e, "unable to set sync round while resuming fast catchup");
+        }
+    }
+}
+
 /// Production `NodeInterface` adapter backed by a live [`SqliteLedger`] and
 /// (optionally) an in-memory [`TransactionPool`] + [`LocalTxBroadcaster`].
 ///
@@ -283,6 +378,13 @@ pub struct AlgodNodeInterface {
     /// `None` everywhere else, in which case `start_catchup`/`abort_catchup`
     /// report [`NodeError::NotImplemented`], matching this trait's default.
     catchup_manager: Option<Arc<crate::live_catchup::LiveCatchupManager>>,
+    /// Follower-node sync-round state (issue #951). `Some` only for a real
+    /// in-process, ledger-owning follower node (`node start --follow
+    /// <peer>`, see `commands/node.rs`) — `is_follower_mode()` returns
+    /// `true` exactly when this is `Some`, matching go's
+    /// `AlgorandFollowerNode` being a distinct node type from
+    /// `AlgorandFullNode` rather than a runtime flag on one type.
+    follower_sync_round: Option<Arc<FollowerSyncRoundState>>,
 }
 
 impl AlgodNodeInterface {
@@ -319,6 +421,7 @@ impl AlgodNodeInterface {
             enable_runtime_metrics_cfg: false,
             enable_netdev_metrics_cfg: false,
             catchup_manager: None,
+            follower_sync_round: None,
         }
     }
 
@@ -476,6 +579,24 @@ impl AlgodNodeInterface {
         manager: Arc<crate::live_catchup::LiveCatchupManager>,
     ) -> Self {
         self.catchup_manager = Some(manager);
+        self
+    }
+
+    /// Make this a real, ledger-owning follower node (issue #951): sets
+    /// `is_follower_mode() == true` and backs `get_sync_round`/
+    /// `set_sync_round`/`unset_sync_round` with `state`. Builder-style,
+    /// matching the other collaborators.
+    ///
+    /// `state` is constructed once by the caller (`commands/node.rs`) so
+    /// the same handle can also be registered with a
+    /// [`crate::live_catchup::LiveCatchupManager`] via
+    /// [`crate::live_catchup::LiveCatchupManager::set_sync_round_reset_hook`]
+    /// — a real follower node's sync round and its live catchpoint-catchup
+    /// toggle share one source of truth, matching go's single
+    /// `AlgorandFollowerNode` owning both.
+    #[must_use]
+    pub fn with_follower_mode(mut self, state: Arc<FollowerSyncRoundState>) -> Self {
+        self.follower_sync_round = Some(state);
         self
     }
 
@@ -1954,6 +2075,47 @@ impl NodeInterface for AlgodNodeInterface {
         self.dev_mode
     }
 
+    /// Whether this is a real, ledger-owning follower node (issue #951) —
+    /// go's `AlgorandFollowerNode` as opposed to `AlgorandFullNode`. Gates
+    /// `/v2/ledger/sync` route registration (`router.rs`) and several
+    /// handler-level rejections (`raw_transaction`, participation-key
+    /// mutation, etc. — `handlers.rs`).
+    fn is_follower_mode(&self) -> bool {
+        self.follower_sync_round.is_some()
+    }
+
+    /// go's `AlgorandFollowerNode.GetSyncRound` (`node/follower_node.go`).
+    /// Only ever called when [`Self::is_follower_mode`] is true — the REST
+    /// router doesn't register `/v2/ledger/sync` otherwise — but falls
+    /// back to `0` (go's "unset" value) rather than an error if it somehow
+    /// is.
+    async fn get_sync_round(&self) -> Result<u64, NodeError> {
+        Ok(self
+            .follower_sync_round
+            .as_ref()
+            .map(|s| s.get())
+            .unwrap_or(0))
+    }
+
+    /// go's `AlgorandFollowerNode.SetSyncRound` (`node/follower_node.go`).
+    async fn set_sync_round(&self, round: u64) -> Result<(), NodeError> {
+        match &self.follower_sync_round {
+            Some(state) => state.set(round).map_err(NodeError::Internal),
+            None => Err(NodeError::NotImplemented("set_sync_round")),
+        }
+    }
+
+    /// go's `AlgorandFollowerNode.UnsetSyncRound` (`node/follower_node.go`).
+    async fn unset_sync_round(&self) -> Result<(), NodeError> {
+        match &self.follower_sync_round {
+            Some(state) => {
+                state.unset();
+                Ok(())
+            }
+            None => Err(NodeError::NotImplemented("unset_sync_round")),
+        }
+    }
+
     /// Consensus-participation counters as JSON (issue #473).
     ///
     /// `None` — hence a 404 from `/v2/participation/status` — whenever no
@@ -3200,6 +3362,13 @@ mod tests {
         let ledger = Arc::new(Mutex::new(
             SqliteLedger::open_in_memory().expect("in-memory ledger"),
         ));
+        make_adapter_with_ledger(ledger)
+    }
+
+    /// Same as [`make_adapter`], but against a caller-supplied ledger — used
+    /// by tests that need to inspect/advance the ledger independently of
+    /// the adapter (e.g. [`FollowerSyncRoundState`] tests).
+    fn make_adapter_with_ledger(ledger: Arc<Mutex<SqliteLedger>>) -> AlgodNodeInterface {
         AlgodNodeInterface::new(
             ledger,
             NodeInterfaceConfig {
@@ -6413,6 +6582,166 @@ mod tests {
 
         // Clean up so the spawned task doesn't outlive the test.
         adapter.abort_catchup("1000#aaaa").await.unwrap();
+    }
+
+    // ── Real follower-node ledger ownership (issue #951) ─────────────
+
+    /// Applies one trivial, empty-payset block to `ledger`, advancing its
+    /// current round by one — mirrors `commands/node.rs`'s
+    /// `follow_loop_tests` helper block construction, used here purely to
+    /// advance [`LedgerStore::current_round`] for sync-round-validation
+    /// tests (go's `ErrSyncRoundInvalid` is defined relative to
+    /// `ledger.LastRound()`).
+    fn apply_one_trivial_block(ledger: &Arc<Mutex<SqliteLedger>>, round: u64) {
+        let block = algo_types::Block {
+            round: algo_types::Round(round),
+            fee_sink: Address([3u8; 32]),
+            current_protocol: CONSENSUS_V41.to_string(),
+            ..algo_types::Block::default()
+        };
+        let mut l = ledger.lock().unwrap();
+        l.begin_block().unwrap();
+        l.apply_block_caching_delta(&block).unwrap();
+        l.commit_block().unwrap();
+    }
+
+    /// Mirrors go's `TestSyncRound` (`node/follower_node_test.go`): a fresh
+    /// follower node's sync round initializes to `dbRound + 1`, a
+    /// `SetSyncRound` call round-trips through `GetSyncRound`, and
+    /// `UnsetSyncRound` resets it to `0`.
+    #[tokio::test]
+    async fn follower_sync_round_initializes_set_and_unset_round_trip() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let state = FollowerSyncRoundState::new(ledger.clone(), 4);
+        let adapter = AlgodNodeInterface::new(
+            ledger.clone(),
+            NodeInterfaceConfig {
+                genesis_id: "testnet-v1.0".into(),
+                genesis_hash: Digest([0xAB; 32]),
+                genesis_json: r#"{"network":"testnet"}"#.into(),
+                build_version: build_version_fixture(),
+                default_protocol: CONSENSUS_V41.into(),
+            },
+        )
+        .with_follower_mode(state);
+
+        assert!(adapter.is_follower_mode());
+        // dbRound (0) + 1.
+        assert_eq!(adapter.get_sync_round().await.unwrap(), 1);
+
+        adapter.set_sync_round(11).await.unwrap();
+        assert_eq!(adapter.get_sync_round().await.unwrap(), 11);
+
+        adapter.unset_sync_round().await.unwrap();
+        assert_eq!(adapter.get_sync_round().await.unwrap(), 0);
+    }
+
+    /// A non-follower node must report `is_follower_mode() == false` and
+    /// `NodeError::NotImplemented` for the sync-round setters (matching
+    /// this trait's own default, and the pre-issue-#951 behavior for every
+    /// command except `node start --follow <peer>`).
+    #[tokio::test]
+    async fn non_follower_adapter_has_no_sync_round_state() {
+        let adapter = make_adapter();
+        assert!(!adapter.is_follower_mode());
+        assert_eq!(adapter.get_sync_round().await.unwrap(), 0);
+        assert!(matches!(
+            adapter.set_sync_round(10).await,
+            Err(NodeError::NotImplemented("set_sync_round"))
+        ));
+        assert!(matches!(
+            adapter.unset_sync_round().await,
+            Err(NodeError::NotImplemented("unset_sync_round"))
+        ));
+    }
+
+    /// go's `catchup.Service.SetDisableSyncRound` rejects a round that
+    /// would put the disable-sync-round boundary behind the ledger's
+    /// current round (`ErrSyncRoundInvalid`) — surfaced here as
+    /// `NodeError::Internal("sync round invalid")`, matching
+    /// `handlers.rs::set_sync_round`'s substring match for a 400 response.
+    #[tokio::test]
+    async fn set_sync_round_rejects_round_behind_ledger() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        apply_one_trivial_block(&ledger, 1);
+        // max_acct_lookback = 0 so the offset doesn't mask the comparison.
+        let state = FollowerSyncRoundState::new(ledger.clone(), 0);
+        let adapter = make_adapter_with_ledger(ledger).with_follower_mode(state);
+
+        let err = adapter.set_sync_round(0).await.unwrap_err();
+        match err {
+            NodeError::Internal(msg) => assert!(msg.contains("invalid")),
+            other => panic!("expected NodeError::Internal, got {other:?}"),
+        }
+    }
+
+    /// A minimal [`live_catchup::CatchupRunner`] fake that completes
+    /// immediately, mirroring `live_catchup.rs`'s own `ImmediateRunner` —
+    /// used here to prove the sync-round reset actually fires end-to-end
+    /// through a real [`FollowerSyncRoundState`] + [`AlgodNodeInterface`],
+    /// not just `LiveCatchupManager` in isolation.
+    struct ImmediateRunner;
+
+    #[async_trait::async_trait]
+    impl crate::live_catchup::CatchupRunner for ImmediateRunner {
+        async fn run(
+            &self,
+            _catchpoint: &str,
+            _cancel: tokio_util::sync::CancellationToken,
+            _counters: Arc<Mutex<crate::live_catchup::CatchpointCounters>>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Mirrors go's `TestFastCatchupResume` (`node/follower_node_test.go`):
+    /// after setting a far-future sync round, a live catchpoint catchup
+    /// finishing must reset the sync round to the ledger's current round
+    /// (`SetCatchpointCatchupMode(false)` calling
+    /// `SetSyncRound(ledger.LastRound())`), end-to-end through the real
+    /// `NodeInterface` trait methods.
+    #[tokio::test]
+    async fn fast_catchup_resume_resets_sync_round_to_ledger_round() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let state = FollowerSyncRoundState::new(ledger.clone(), 0);
+        let manager = crate::live_catchup::LiveCatchupManager::new(
+            Arc::new(ImmediateRunner),
+            Arc::new(crate::live_catchup::NoopSyncControl),
+        );
+        manager.set_sync_round_reset_hook(
+            state.clone() as Arc<dyn crate::live_catchup::SyncRoundResetHook>
+        );
+        let adapter = make_adapter_with_ledger(ledger.clone())
+            .with_follower_mode(state)
+            .with_catchup_manager(manager.clone());
+
+        // Initialize sync round to a future round, mirroring go's test.
+        adapter.set_sync_round(10_000).await.unwrap();
+        assert_eq!(adapter.get_sync_round().await.unwrap(), 10_000);
+
+        adapter.start_catchup("1000#deadbeef", 0).await.unwrap();
+
+        // `start_catchup` spawns the runner task; poll (bounded) for the
+        // manager to return to idle, at which point the reset hook must
+        // already have fired (it runs before `LiveCatchupManager::drive`
+        // resumes normal operation).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if manager.current_catchpoint().await.is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "manager did not reach idle in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The ledger is still at round 0 (no blocks applied), so the sync
+        // round must have been reset there — the assertion
+        // `TestFastCatchupResume` itself makes (`assert.Zero(t,
+        // node.GetSyncRound())`).
+        assert_eq!(adapter.get_sync_round().await.unwrap(), 0);
     }
 
     // ── get_peers (issue #673) ───────────────────────────────────────

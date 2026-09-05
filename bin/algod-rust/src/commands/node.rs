@@ -55,7 +55,7 @@ use crate::commands::participate::PoolLedgerAdapter;
 use crate::live_catchup::{
     LiveCatchupManager, LiveCatchupParams, NormalSyncControl, OrchestratorCatchupRunner,
 };
-use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
+use crate::node_interface_impl::{AlgodNodeInterface, FollowerSyncRoundState, NodeInterfaceConfig};
 
 /// Default REST bind address when `--listen` is not provided. Matches
 /// go-algorand's default algod endpoint port.
@@ -87,6 +87,18 @@ fn resolve_listen_addr(cli_listen: Option<&str>, config_endpoint_address: &str) 
 /// the full `run_start` startup sequence.
 fn dns_bootstrap_unconsumed(dns_bootstrap_id: &str) -> bool {
     !dns_bootstrap_id.is_empty()
+}
+
+/// Whether the follower-node dev-mode-genesis warning (issue #951) is owed
+/// at startup — go's `MakeFollower` (`node/follower_node.go`) logs "Follower
+/// running on a devMode network. Must submit txns to a different node."
+/// whenever a real follower node's own genesis has `DevMode: true`,
+/// unconditionally (it does not depend on what the followed peer's genesis
+/// says — go's `AlgorandFollowerNode` reads only its *own* `genesis.DevMode`
+/// field). Pulled out as its own pure function, mirroring
+/// [`dns_bootstrap_unconsumed`], so the decision is independently testable.
+fn follower_devmode_warning_needed(follower_mode: bool, genesis_devmode: bool) -> bool {
+    follower_mode && genesis_devmode
 }
 
 pub async fn run(cmd: NodeCommands) -> anyhow::Result<()> {
@@ -213,6 +225,15 @@ async fn run_start(
     let dev_mode = dev_flag || (genesis.devmode && follow_url.is_none());
     if genesis.devmode && follow_url.is_some() {
         info!("genesis sets \"devmode\": true but --follow was given — following the peer instead of self-producing blocks");
+    }
+    // Follower-node dev-mode-genesis warning (issue #951), matching go's
+    // `MakeFollower` (`node/follower_node.go`) exactly — logged whenever a
+    // real follower node's own genesis is dev-mode, since a follower can't
+    // submit transactions to itself either way (no pool/broadcaster in
+    // follower mode) and a dev-mode chain isn't produced by consensus
+    // agreement other peers could also follow.
+    if follower_devmode_warning_needed(follow_url.is_some(), genesis.devmode) {
+        warn!("Follower running on a devMode network. Must submit txns to a different node.");
     }
 
     // Load `<data_dir>/consensus.json` (if present) and merge it onto the
@@ -382,6 +403,19 @@ async fn run_start(
         control.resume().await;
     }
 
+    // -----------------------------------------------------------------------
+    // 3a-bis. Real, ledger-owning follower-node state (issue #951): only
+    //     `--follow <peer>` makes this a follower node in go-algorand's
+    //     sense (`AlgorandFollowerNode` vs `AlgorandFullNode`) — plain
+    //     read-serving/`--dev` `node start` stays a full node. Constructed
+    //     up front (before the catchup manager below) so both the
+    //     `NodeInterface` adapter and the live catchpoint-catchup toggle
+    //     share the exact same sync-round state, matching go's single
+    //     `AlgorandFollowerNode` owning both.
+    // -----------------------------------------------------------------------
+    let follower_sync_round = follow_url
+        .map(|_| FollowerSyncRoundState::new(ledger.clone(), file_config.max_acct_lookback));
+
     // Live catchpoint-catchup mode (issue #937): only meaningful when
     // there's a known peer (`--follow`'s URL) to fetch the catchpoint and
     // blocks from, and a running sync loop against that same peer to pause
@@ -403,10 +437,18 @@ async fn run_start(
                 catchpoint_peer_urls: Vec::new(),
             };
             let runner = Arc::new(OrchestratorCatchupRunner::new(params));
-            Some(LiveCatchupManager::new(
-                runner,
-                control.clone() as Arc<dyn NormalSyncControl>,
-            ))
+            let manager =
+                LiveCatchupManager::new(runner, control.clone() as Arc<dyn NormalSyncControl>);
+            // Issue #951: a completed live catchup must reset the follower
+            // node's sync round before resuming normal sync, mirroring
+            // go's `SetCatchpointCatchupMode(false)` — see
+            // `TestFastCatchupResume` (`node/follower_node_test.go`).
+            if let Some(state) = &follower_sync_round {
+                manager.set_sync_round_reset_hook(
+                    state.clone() as Arc<dyn crate::live_catchup::SyncRoundResetHook>
+                );
+            }
+            Some(manager)
         }
         _ => None,
     };
@@ -437,6 +479,9 @@ async fn run_start(
     }
     if let Some(mgr) = &catchup_manager {
         node_interface = node_interface.with_catchup_manager(mgr.clone());
+    }
+    if let Some(state) = &follower_sync_round {
+        node_interface = node_interface.with_follower_mode(state.clone());
     }
     let node = Arc::new(node_interface);
 
@@ -897,6 +942,40 @@ mod config_json_wiring_tests {
         assert_eq!(
             resolve_listen_addr(Some("0.0.0.0:8080"), &cfg.endpoint_address),
             "0.0.0.0:8080"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `follower_devmode_warning_needed` — issue #951's `TestDevModeWarning`
+    // (`node/follower_node_test.go#L125`) equivalent: go's `MakeFollower`
+    // logs "Follower running on a devMode network. Must submit txns to a
+    // different node." whenever a real follower node's own genesis is
+    // dev-mode, regardless of anything about the peer it follows.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn follower_devmode_warning_needed_when_following_devmode_genesis() {
+        assert!(
+            follower_devmode_warning_needed(true, true),
+            "a follower node running against its own dev-mode genesis must warn, \
+             matching go's MakeFollower"
+        );
+    }
+
+    #[test]
+    fn follower_devmode_warning_not_needed_when_not_following() {
+        assert!(
+            !follower_devmode_warning_needed(false, true),
+            "plain `node start` (not `--follow`) is never a real follower node in \
+             go's sense, so this warning does not apply to it even with a dev-mode genesis"
+        );
+    }
+
+    #[test]
+    fn follower_devmode_warning_not_needed_for_non_devmode_genesis() {
+        assert!(
+            !follower_devmode_warning_needed(true, false),
+            "a follower node against a non-dev-mode genesis must not warn"
         );
     }
 }

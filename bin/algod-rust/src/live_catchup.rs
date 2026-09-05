@@ -125,6 +125,22 @@ pub trait NormalSyncControl: Send + Sync {
     async fn resume(&self);
 }
 
+/// Resets a follower node's sync round when a live catchpoint catchup
+/// finishes, mirroring go's `AlgorandFollowerNode.SetCatchpointCatchupMode
+/// (false)` (`node/follower_node.go`), which calls
+/// `node.SetSyncRound(node.ledger.LastRound())` before restarting the
+/// normal catchup/block services — the behavior `TestFastCatchupResume`
+/// (`node/follower_node_test.go`) pins (issue #951).
+///
+/// Optional: only `node start --follow <peer>` attaches one (via
+/// [`LiveCatchupManager::set_sync_round_reset_hook`]), since only a
+/// follower node has a sync round to reset in the first place.
+#[async_trait]
+pub trait SyncRoundResetHook: Send + Sync {
+    /// Reset the sync round to the ledger's current last round.
+    async fn reset_sync_round(&self);
+}
+
 /// A [`NormalSyncControl`] with nothing to pause — used where no
 /// concurrent writer exists (e.g. a read-only `node start` with neither
 /// `--dev` nor `--follow`). Not yet constructed by any production wiring
@@ -190,6 +206,14 @@ pub struct LiveCatchupManager {
     /// Live granular progress counters for the in-flight (or most recently
     /// finished) catchup — see [`Self::catchpoint_counters`] (issue #941).
     counters: Arc<StdMutex<CatchpointCounters>>,
+    /// Optional follower-node sync-round reset hook (issue #951) — see
+    /// [`SyncRoundResetHook`]. `None` for every command except `node start
+    /// --follow <peer>`, which attaches one via
+    /// [`Self::set_sync_round_reset_hook`] right after construction (the
+    /// hook and this manager are built from the same `run_start` call but
+    /// need each other, so it can't be threaded through [`Self::new`]
+    /// without a circular constructor dependency).
+    sync_round_reset: StdMutex<Option<Arc<dyn SyncRoundResetHook>>>,
 }
 
 impl LiveCatchupManager {
@@ -202,7 +226,18 @@ impl LiveCatchupManager {
             running: AsyncMutex::new(None),
             last_catchpoint: StdMutex::new(String::new()),
             counters: Arc::new(StdMutex::new(CatchpointCounters::default())),
+            sync_round_reset: StdMutex::new(None),
         })
+    }
+
+    /// Attach a [`SyncRoundResetHook`] so a finished catchup resets the
+    /// follower node's sync round (issue #951), mirroring go's
+    /// `SetCatchpointCatchupMode(false)`. Idempotent — a later call
+    /// replaces any previously attached hook.
+    pub fn set_sync_round_reset_hook(&self, hook: Arc<dyn SyncRoundResetHook>) {
+        if let Ok(mut guard) = self.sync_round_reset.lock() {
+            *guard = Some(hook);
+        }
     }
 
     /// Start a live catchpoint catchup, mirroring go's
@@ -338,6 +373,22 @@ impl LiveCatchupManager {
             let mut guard = self.running.lock().await;
             *guard = None;
         }
+
+        // Reset the follower node's sync round before resuming normal
+        // operation, regardless of success/failure/abort — mirrors go's
+        // `processStageSwitch`/`abort` both calling
+        // `updateNodeCatchupMode(false)` (which resets the sync round via
+        // `SetCatchpointCatchupMode(false)`) unconditionally on the way
+        // out (issue #951, `TestFastCatchupResume`).
+        let reset_hook = self
+            .sync_round_reset
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(hook) = reset_hook {
+            hook.reset_sync_round().await;
+        }
+
         self.control.resume().await;
     }
 }
@@ -746,5 +797,69 @@ mod tests {
 
         assert_eq!(control.pauses.load(Ordering::SeqCst), 2);
         assert_eq!(control.resumes.load(Ordering::SeqCst), 2);
+    }
+
+    // -- SyncRoundResetHook (issue #951) -------------------------------------
+
+    /// A [`SyncRoundResetHook`] fake that just counts invocations.
+    #[derive(Default)]
+    struct CountingResetHook {
+        resets: AtomicU32,
+    }
+
+    #[async_trait]
+    impl SyncRoundResetHook for CountingResetHook {
+        async fn reset_sync_round(&self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Mirrors go's `TestFastCatchupResume` (`node/follower_node_test.go`):
+    /// `SetCatchpointCatchupMode(false)` — i.e. a catchup run finishing —
+    /// must reset the follower node's sync round. Here that's proven by
+    /// the attached hook firing exactly once after a *successful* run,
+    /// before the normal sync loop resumes.
+    #[tokio::test]
+    async fn successful_catchup_resets_sync_round_before_resuming() {
+        let control = Arc::new(CountingControl::default());
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), control.clone());
+        let hook = Arc::new(CountingResetHook::default());
+        manager.set_sync_round_reset_hook(hook.clone());
+
+        manager.start_catchup("1000#aaaa").await;
+        wait_idle(&manager).await;
+
+        assert_eq!(hook.resets.load(Ordering::SeqCst), 1);
+        assert_eq!(control.resumes.load(Ordering::SeqCst), 1);
+    }
+
+    /// The reset must fire on every completion path, not just success —
+    /// go's `abort()` calls `updateNodeCatchupMode(false)` (hence resets
+    /// the sync round) exactly like the success path
+    /// (`processStageSwitch`), matching `LiveCatchupManager::drive`'s own
+    /// unconditional `self.control.resume()` after it.
+    #[tokio::test]
+    async fn failed_catchup_still_resets_sync_round() {
+        let manager =
+            LiveCatchupManager::new(ImmediateRunner::err("boom"), Arc::new(NoopSyncControl));
+        let hook = Arc::new(CountingResetHook::default());
+        manager.set_sync_round_reset_hook(hook.clone());
+
+        manager.start_catchup("1000#aaaa").await;
+        wait_idle(&manager).await;
+
+        assert_eq!(hook.resets.load(Ordering::SeqCst), 1);
+    }
+
+    /// Without an attached hook (every command except `node start --follow
+    /// <peer>`), a completed catchup must not panic or otherwise behave
+    /// differently — the hook is genuinely optional.
+    #[tokio::test]
+    async fn no_reset_hook_is_a_no_op() {
+        let manager = LiveCatchupManager::new(ImmediateRunner::ok(), Arc::new(NoopSyncControl));
+        manager.start_catchup("1000#aaaa").await;
+        wait_idle(&manager).await;
+        // No assertion beyond "did not panic" — absence of a hook must be
+        // silently fine.
     }
 }
