@@ -5319,6 +5319,68 @@ mod tests {
         ));
     }
 
+    /// Parity with go-algorand's `TestCloseOnError`
+    /// (`test/e2e-go/features/transactions/onlineStatusChange_test.go:154`):
+    /// installing the identical partkey-DB blob a second time must fail
+    /// with the exact message go's `Node.InstallParticipationKey` produces
+    /// (`node/node.go:1014`, `"ParticipationRegistry: cannot register
+    /// duplicate participation key"`) -- not merely surface *some* error, or
+    /// crash, as the go test's comment ("check duplicate keys does not
+    /// crash") specifically calls out.
+    #[tokio::test]
+    async fn install_participation_key_rejects_exact_duplicate() {
+        let addr = Address([0x5b; 32]);
+        let dir = std::env::temp_dir().join(format!(
+            "algod-rust-test-partkey-dup.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut db = algo_ledger::erasable_db::ErasableDb::open(&dir).expect("open partkey db");
+        algo_ledger::participation::fill_db_with_participation_keys(
+            &mut db,
+            addr,
+            Round(1),
+            Round(100),
+            10_000,
+        )
+        .expect("fill partkey db");
+        db.close().expect("close db");
+        let bytes = std::fs::read(&dir).expect("read partkey bytes");
+        let _ = std::fs::remove_file(&dir);
+
+        let adapter = adapter_with_part_store();
+        adapter
+            .install_participation_key(bytes.clone())
+            .await
+            .expect("first install must succeed");
+
+        let err = adapter
+            .install_participation_key(bytes)
+            .await
+            .expect_err("re-installing the identical partkey must be rejected");
+        match err {
+            NodeError::Internal(msg) => assert!(
+                msg.contains("cannot register duplicate participation key"),
+                "expected go's exact duplicate-key wording, got {msg:?}"
+            ),
+            other => panic!("expected Internal(duplicate key), got {other:?}"),
+        }
+
+        // Exactly one copy is stored -- the duplicate attempt didn't crash
+        // or corrupt the registry.
+        assert_eq!(
+            adapter
+                .list_participation_keys()
+                .await
+                .expect("list ok")
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn append_participation_keys_rejects_empty_body() {
         let adapter = adapter_with_part_store();

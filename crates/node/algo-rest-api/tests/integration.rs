@@ -6316,6 +6316,98 @@ async fn raw_transaction_insufficient_balance_returns_400() {
     );
 }
 
+/// A transaction whose *fee* (not amount) exceeds the sender's balance must
+/// also be rejected as a broadcast error, surfaced as 400 -- the second half
+/// of go-algorand's `TestSendingTooMuchErrs`
+/// (`test/e2e-go/restAPI/restClient_test.go#L464`: "too much fee" /"waaaay
+/// too much fee", both asserting a broadcast-time error). algod-rust's
+/// ledger apply layer produces a distinct message for this case
+/// (`"sender {} has insufficient balance {} for fee {}"`,
+/// `crates/core/algo-ledger/src/apply.rs`) from the amount-overspend case
+/// pinned by `raw_transaction_insufficient_balance_returns_400` above; this
+/// test pins that the REST layer forwards it the same way.
+#[tokio::test]
+async fn raw_transaction_fee_exceeds_balance_returns_400() {
+    let mut node = MockNode::synced();
+    node.broadcast_result = Some(format!(
+        "sender {TEST_ADDR} has insufficient balance 0 for fee 5000000"
+    ));
+    let server = TestServer::start(node).await;
+
+    let mut stxn = make_test_signed_txn();
+    stxn.txn.fee = 5_000_000;
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("insufficient balance"),
+        "error should mention insufficient balance for the fee, got: {}",
+        json["message"]
+    );
+}
+
+/// A payment that would leave the *receiver* below the minimum balance
+/// requirement must be rejected -- go-algorand's
+/// `TestSendingTooLittleToEmptyAccountErrs`
+/// (`test/e2e-go/restAPI/restClient_test.go#L550`) sends 1 microAlgo to a
+/// zero-balance account, which after the payment (1 microAlgo) still sits
+/// below `MinBalance` (100,000 microAlgos for a bare account). This is
+/// backed by algod-rust's real ledger apply layer
+/// (`crates/core/algo-ledger/src/apply.rs`: `"account {} balance {} below
+/// minimum balance {}"`), which is distinct from both the sender-overspend
+/// messages above; this test pins that the REST layer forwards it the same
+/// passthrough way, using `MockNode.broadcast_result` to stand in for the
+/// real ledger rejection (matching the pattern of every other
+/// `raw_transaction_*_returns_400` test in this file).
+#[tokio::test]
+async fn raw_transaction_receiver_below_min_balance_returns_400() {
+    let mut node = MockNode::synced();
+    let empty_receiver = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
+    node.broadcast_result = Some(format!(
+        "account {empty_receiver} balance 1 below minimum balance 100000"
+    ));
+    let server = TestServer::start(node).await;
+
+    let mut stxn = make_test_signed_txn();
+    stxn.txn.amount = 1;
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("below minimum balance"),
+        "error should mention the receiver's minimum-balance shortfall, got: {}",
+        json["message"]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // GET /v2/transactions/pending
 // ---------------------------------------------------------------------------

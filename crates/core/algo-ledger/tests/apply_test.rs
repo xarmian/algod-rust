@@ -1154,6 +1154,106 @@ fn test_lease_different_senders_ok() {
 }
 
 // ---------------------------------------------------------------------------
+// 17b. Lease-conflict regression: FirstValid must never gate the check
+// (go-algorand commit 2f3880f7, test/e2e-go/features/transactions/lease_test.go)
+// ---------------------------------------------------------------------------
+//
+// The historical bug this pair of go-algorand e2e tests guards against was
+// a lease-conflict check keyed off (or otherwise sensitive to) a
+// transaction's *FirstValid* field rather than purely the round the
+// transaction is being applied in. algod-rust's `check_lease` (apply.rs)
+// takes `ctx.round` -- the block round -- and never reads `txn.first_valid`
+// at all; these two tests pin that FirstValid is irrelevant to the
+// lease-conflict outcome in both directions, mirroring the "Old"/"New"
+// pair's opposite expected results.
+
+/// Mirrors `TestLeaseRegressionFaultyFirstValidCheckOld_2f3880f7`: tx1
+/// (same sender+lease) is confirmed and *expires* before tx2 is applied.
+/// tx2 carries an explicit, non-default FirstValid (deliberately set past
+/// tx1's confirmation round, as the historical Go test does) -- this must
+/// have no bearing on the outcome, which is governed solely by whether
+/// tx1's lease has expired by the applying round. Expected: success.
+#[test]
+fn test_lease_regression_faulty_first_valid_check_old_2f3880f7() {
+    let sender = Address([11u8; 32]);
+    let receiver = Address([12u8; 32]);
+    let fee_sink = Address([13u8; 32]);
+
+    let mut state = make_state(
+        &[(sender, 10_000_000), (receiver, 100_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let lease_val: [u8; 32] = [0x2F; 32];
+
+    // tx1 at round 1, lease expires at round 1 (last_valid = 1).
+    let mut stx1 = pay_txn(sender, receiver, 1_000_000, 1_000);
+    stx1.txn.lease = lease_val;
+    stx1.txn.last_valid = Round(1);
+    let block1 = minimal_block(fee_sink, 1, vec![stx1]);
+    apply_block(&mut state, &block1).unwrap();
+
+    // Advance past the lease's expiry.
+    for r in 2..=4 {
+        apply_block(&mut state, &minimal_block(fee_sink, r, vec![])).unwrap();
+    }
+
+    // tx2 at round 5: same sender+lease, but with an explicit FirstValid
+    // set to the round right after tx1 confirmed (round 2) -- a value the
+    // faulty historical check keyed off of. Must succeed regardless.
+    let mut stx2 = pay_txn(sender, receiver, 2_000_000, 1_000);
+    stx2.txn.lease = lease_val;
+    stx2.txn.first_valid = Round(2);
+    stx2.txn.last_valid = Round(10);
+    let block5 = minimal_block(fee_sink, 5, vec![stx2]);
+    apply_block(&mut state, &block5).expect(
+        "lease from an expired transaction must not block a new one, \
+         regardless of the new transaction's FirstValid",
+    );
+}
+
+/// Mirrors `TestLeaseRegressionFaultyFirstValidCheckNew_2f3880f7`: tx1
+/// (same sender+lease) is confirmed and its lease is still *active* when
+/// tx2 is applied. tx2 carries the same default FirstValid as tx1 (the
+/// "New" variant's shape, as opposed to Old's explicit later FirstValid)
+/// -- this must still be rejected, proving the still-active branch isn't
+/// bypassed by whatever FirstValid happens to be set.
+#[test]
+fn test_lease_regression_faulty_first_valid_check_new_2f3880f7() {
+    let sender = Address([21u8; 32]);
+    let receiver = Address([22u8; 32]);
+    let fee_sink = Address([23u8; 32]);
+
+    let mut state = make_state(
+        &[(sender, 10_000_000), (receiver, 100_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let lease_val: [u8; 32] = [0x38; 32];
+
+    // tx1 at round 1, with a generous validity window so its lease is
+    // still active for many subsequent rounds.
+    let mut stx1 = pay_txn(sender, receiver, 1_000_000, 1_000);
+    stx1.txn.lease = lease_val;
+    stx1.txn.last_valid = Round(1000);
+    let block1 = minimal_block(fee_sink, 1, vec![stx1]);
+    apply_block(&mut state, &block1).unwrap();
+
+    // tx2 at round 2: same sender+lease, default (zero) FirstValid --
+    // must be rejected because tx1's lease is still active.
+    let mut stx2 = pay_txn(sender, receiver, 2_000_000, 1_000);
+    stx2.txn.lease = lease_val;
+    stx2.txn.last_valid = Round(1000);
+    let block2 = minimal_block(fee_sink, 2, vec![stx2]);
+    let result = apply_block(&mut state, &block2);
+    assert!(
+        result.is_err(),
+        "a still-active lease must reject the duplicate regardless of FirstValid"
+    );
+    assert!(result.unwrap_err().to_string().contains("duplicate lease"));
+}
+
+// ---------------------------------------------------------------------------
 // 18. Rewards recalculation round — rate drops to 0
 // ---------------------------------------------------------------------------
 
