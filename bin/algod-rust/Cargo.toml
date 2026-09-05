@@ -50,8 +50,18 @@ toml = "0.8"
 reqwest.workspace = true
 rand.workspace = true
 sha2.workspace = true
+# Serving axum::Router HTTP handlers (CatchpointService/BlockService, both
+# transport-agnostic per issue #955) over a raw libp2p stream (issue #1024) --
+# `algo-network`'s classic WS-gossip transport already depends on both for
+# the identical purpose (see `ws_network.rs`'s `hyper::server::conn::http1`
+# usage); the P2P transport lives in this binary crate rather than
+# `algo-p2p` (which deliberately has no `axum`/`hyper` dependency), so the
+# same pair is needed here too.
+hyper.workspace = true
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 
 [dev-dependencies]
 serde_bytes = "0.11"
 tempfile = "3"
 base64.workspace = true
+flate2.workspace = true

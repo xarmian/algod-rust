@@ -4234,20 +4234,34 @@ pub async fn run(
 
     // Issue #955: server-side catchpoint-tarball-serving endpoint (go's
     // `rpcs.LedgerService`) -- same gating as `relay.rs`'s identical wiring.
-    if node_config.enable_ledger_service && !node_config.catchpoint_dir.is_empty() {
-        let catchpoint_ledger = Arc::new(ParticipateCatchpointService {
-            dir: std::path::PathBuf::from(&node_config.catchpoint_dir),
-        });
-        let catchpoint_service = CatchpointService::new(
-            catchpoint_ledger as Arc<dyn LedgerForCatchpointService>,
-            resolved_genesis_id.clone(),
-        );
-        gossip_node.register_http_handler("/", catchpoint_service.http_router());
-        info!(
-            dir = %node_config.catchpoint_dir,
-            "catchpoint-serving endpoint enabled (EnableLedgerService)"
-        );
-    }
+    //
+    // Kept as an `Option<CatchpointService>` (rather than scoped to this
+    // `if`) so the P2P-transport wiring below (issue #1024, the
+    // `TestLedgerServiceP2P` half of the same upstream feature) can reuse
+    // the exact same transport-agnostic router — `CatchpointService::new`
+    // is cheap and stateless, but reusing one instance rather than building
+    // a second keeps the "EnableLedgerService gates the whole endpoint"
+    // logging/config story in one place, matching go's single
+    // `MakeLedgerService` call shared across both of its transports
+    // (`node/node.go`).
+    let catchpoint_service: Option<CatchpointService> =
+        if node_config.enable_ledger_service && !node_config.catchpoint_dir.is_empty() {
+            let catchpoint_ledger = Arc::new(ParticipateCatchpointService {
+                dir: std::path::PathBuf::from(&node_config.catchpoint_dir),
+            });
+            let service = CatchpointService::new(
+                catchpoint_ledger as Arc<dyn LedgerForCatchpointService>,
+                resolved_genesis_id.clone(),
+            );
+            gossip_node.register_http_handler("/", service.http_router());
+            info!(
+                dir = %node_config.catchpoint_dir,
+                "catchpoint-serving endpoint enabled (EnableLedgerService)"
+            );
+            Some(service)
+        } else {
+            None
+        };
 
     // Serve the TxSyncer pull protocol's HTTP endpoint (issue #774). Like
     // `block_service` above, this must be registered before `start_arc()`
@@ -4471,6 +4485,20 @@ pub async fn run(
             });
         }
         transport.multiplexer().register_handlers(p2p_handlers);
+
+        // Issue #1024: wire the same transport-agnostic `CatchpointService`
+        // router onto the P2P transport's `/algorand-http/1.0.0`
+        // registration point, the P2P-transport half of issue #955's
+        // catchpoint-serving endpoint (go's `TestLedgerService`/
+        // `TestLedgerServiceP2P` both serve the identical `LedgerService`
+        // over their respective transports). No new `CatchpointService`
+        // construction here -- `register_http_handler` is transport-generic
+        // (`GossipNode`), so this is exactly the same call the WS-gossip
+        // registration above makes, just against `transport` instead of
+        // `gossip_node`.
+        if let Some(service) = &catchpoint_service {
+            transport.register_http_handler("/", service.http_router());
+        }
 
         Some(Arc::new(transport))
     } else {

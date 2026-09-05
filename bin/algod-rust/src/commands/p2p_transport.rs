@@ -78,16 +78,19 @@ use algo_network::{
     PeerOption, RequestTracker, Router, Tag, DEFAULT_REQUEST_TIMEOUT, RESPONSE_HASH_FIELD,
 };
 use algo_p2p::{
-    build_headers, handshake_inbound, handshake_outbound, read_frame, resolve_dht_mode,
-    write_frame, IdentityConfig, MessageValidationResult, P2pBehaviourEvent, P2pHost,
-    PeerMetaHeaders, ALGORAND_WS_PROTOCOL_V22,
+    build_headers, handshake_inbound, handshake_outbound, libp2p_stream, read_frame,
+    resolve_dht_mode, write_frame, IdentityConfig, MessageValidationResult, P2pBehaviourEvent,
+    P2pHost, PeerMetaHeaders, ALGORAND_HTTP_PROTOCOL, ALGORAND_WS_PROTOCOL_V22,
 };
 use async_trait::async_trait;
+use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
 use libp2p::futures::{AsyncReadExt, StreamExt as _};
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{Stream as P2pRawStream, SwarmEvent};
 use libp2p::{gossipsub, Multiaddr, PeerId};
 use tokio::sync::mpsc;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::config::P2pConfig;
 
@@ -798,6 +801,31 @@ pub struct P2pTransport {
     /// doc comment on why AV/PP/VB traffic needs this in addition to
     /// gossipsub.
     stream_peers: StreamPeers,
+    /// HTTP handlers registered via [`GossipNode::register_http_handler`],
+    /// served over inbound `/algorand-http/1.0.0` streams (issue #1024) —
+    /// the P2P-transport counterpart of [`algo_p2p::ALGORAND_HTTP_PROTOCOL`]
+    /// go's `rpcs.LedgerService`/`rpcs.BlockService` register against via
+    /// `HTTPServer.RegisterHTTPHandler` (`network/p2p/http.go`). Rebuilt
+    /// (via [`Router::nest`]) on every `register_http_handler` call and
+    /// snapshotted (a cheap `Router::clone` — internally `Arc`-backed) by
+    /// the accept-loop each time a peer opens a new HTTP stream, so a
+    /// handler registered after this transport starts is still picked up by
+    /// the next inbound request.
+    http_router: Arc<Mutex<Router>>,
+    /// A [`libp2p_stream::Control`] handle kept around (in addition to the
+    /// one consumed by the accept-loop above) so a caller can open an
+    /// outbound `/algorand-http/1.0.0` stream to a peer — see
+    /// [`P2pTransport::open_http_stream`]. Mirrors go's `p2pHTTPRoundTripper`
+    /// opening a fresh stream per outbound HTTP request.
+    ///
+    /// No production caller exists yet — this transport only *serves*
+    /// `/algorand-http/1.0.0` today (issue #1024's scope); the client side
+    /// (e.g. a future `BlockServiceCustomFallbackEndpoints`-style P2P
+    /// redirect-follow fetcher, noted as unblocked by this issue) is a
+    /// deliberately separate follow-up. Exercised directly by this module's
+    /// own tests in the meantime.
+    #[allow(dead_code)]
+    http_stream_control: libp2p_stream::Control,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -870,6 +898,21 @@ impl P2pTransport {
         let mut incoming_ws_streams = stream_control
             .accept(ALGORAND_WS_PROTOCOL_V22)
             .map_err(|e| anyhow::anyhow!("failed to register algorand-ws stream acceptor: {e}"))?;
+
+        // `/algorand-http/1.0.0` stream setup (issue #1024): register an
+        // acceptor for inbound HTTP-over-libp2p-stream requests now, on the
+        // same `Control` used above, before any peer can possibly dial in.
+        // `http_stream_control` is a clone saved for outbound use (this
+        // transport's `open_http_stream`, mirroring go's
+        // `p2pHTTPRoundTripper`) — registering the acceptor on `stream_control`
+        // itself (not a clone) first, exactly as the WS acceptor above does,
+        // is what actually wires up the protocol handler on the shared swarm
+        // behaviour.
+        let mut incoming_http_streams =
+            stream_control.accept(ALGORAND_HTTP_PROTOCOL).map_err(|e| {
+                anyhow::anyhow!("failed to register algorand-http stream acceptor: {e}")
+            })?;
+        let http_stream_control = stream_control.clone();
         // Vote-compression advertisement (issue #925): always offer
         // stateless + stateful (table size 2048) vpack compression, exactly
         // as `algo_network::ws_network`'s classic WS-gossip transport does
@@ -891,6 +934,7 @@ impl P2pTransport {
         let connected_peers: Arc<Mutex<Vec<PeerId>>> = Arc::new(Mutex::new(Vec::new()));
         let multiplexer = Arc::new(Multiplexer::new());
         let stream_peers: StreamPeers = Arc::new(Mutex::new(HashMap::new()));
+        let http_router: Arc<Mutex<Router>> = Arc::new(Mutex::new(Router::new()));
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<P2pCommand>();
 
         // Accept-loop: every inbound `/algorand-ws/2.2.0` stream a peer
@@ -909,6 +953,27 @@ impl P2pTransport {
                         Arc::clone(&mux),
                         Arc::clone(&sp),
                     ));
+                }
+            });
+        }
+
+        // Accept-loop: every inbound `/algorand-http/1.0.0` stream a peer
+        // opens to us is served as a single HTTP/1.1 request/response
+        // against whatever [`Router`] is currently registered (issue #1024)
+        // — the P2P-transport equivalent of go's `HTTPServer`
+        // (`network/p2p/http.go`) dispatching through its `gorilla/mux`
+        // router. The router is snapshotted (a cheap, `Arc`-backed clone)
+        // per accepted stream rather than once at startup, so a handler
+        // registered via `register_http_handler` after this transport is
+        // already running (the normal node-startup ordering — see
+        // `GossipNode::register_http_handler`'s doc comment) is still
+        // picked up by the next request.
+        {
+            let hr = Arc::clone(&http_router);
+            tokio::spawn(async move {
+                while let Some((peer_id, stream)) = incoming_http_streams.next().await {
+                    let router = hr.lock().expect("http_router mutex poisoned").clone();
+                    tokio::spawn(serve_p2p_http_stream(peer_id, stream, router));
                 }
             });
         }
@@ -1016,6 +1081,8 @@ impl P2pTransport {
             multiplexer,
             cmd_tx,
             stream_peers,
+            http_router,
+            http_stream_control,
             _task: task,
         })
     }
@@ -1093,6 +1160,26 @@ impl P2pTransport {
     /// `WebsocketNetwork::multiplexer()`.
     pub fn multiplexer(&self) -> &Arc<Multiplexer> {
         &self.multiplexer
+    }
+
+    /// Open an outbound `/algorand-http/1.0.0` stream to `peer` (issue
+    /// #1024) — the client-side counterpart of the HTTP-serving accept-loop
+    /// [`P2pTransport::start`] spawns, for a caller that wants to speak the
+    /// P2P-transport HTTP-over-libp2p-stream protocol directly: write a raw
+    /// HTTP/1.1 request onto the returned stream and read a raw HTTP/1.1
+    /// response back, exactly as go's `p2pHTTPRoundTripper`
+    /// (`network/p2p/http.go`) does over its own per-request stream. Used
+    /// today by this module's own tests; a future
+    /// `BlockServiceCustomFallbackEndpoints`-style P2P redirect-follow
+    /// client (noted as unblocked by issue #955/#1024) would use the same
+    /// entry point.
+    #[allow(dead_code)]
+    pub async fn open_http_stream(&self, peer: PeerId) -> Result<P2pRawStream, anyhow::Error> {
+        self.http_stream_control
+            .clone()
+            .open_stream(peer, ALGORAND_HTTP_PROTOCOL)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to open P2P HTTP stream to {peer}: {e}"))
     }
 
     /// Publish `data` on the gossipsub topic corresponding to `tag` and,
@@ -1271,9 +1358,41 @@ impl GossipNode for P2pTransport {
         &self.network_id
     }
 
-    fn register_http_handler(&self, _path: &str, _handler: Router) {
-        // The P2P transport does not serve HTTP; block/tx HTTP serving
-        // stays on the WS-gossip node's router regardless of mode.
+    fn register_http_handler(&self, path: &str, handler: Router) {
+        // Mirrors `WebsocketNetwork::register_http_handler`
+        // (`ws_network.rs`) / go's `HTTPServer::RegisterHTTPHandler`
+        // (`network/p2p/http.go`): nest the newly registered router under
+        // `path` onto whatever was previously registered, so a caller like
+        // `relay.rs`/`participate.rs` registering both `BlockService` and
+        // `CatchpointService` at `/` ends up with both merged, not the
+        // second overwriting the first.
+        let mut guard = self.http_router.lock().expect("http_router mutex poisoned");
+        let existing = std::mem::replace(&mut *guard, Router::new());
+        *guard = existing.nest(path, handler);
+    }
+}
+
+/// Serve one inbound `/algorand-http/1.0.0` stream as a single HTTP/1.1
+/// request/response dispatched into `router` (issue #1024) — the
+/// libp2p-transport equivalent of go's `HTTPServer.RegisterHTTPHandler`
+/// (`network/p2p/http.go`), which wraps a `libp2phttp.Host` around the same
+/// registered `http.Handler` mux and lets `go-libp2p` translate the raw
+/// HTTP/1.1 bytes on the wire. `CatchpointService`/`BlockService` need no
+/// change to be served this way — they are already plain `axum::Router`s,
+/// transport-agnostic by construction (see `catchpoint_service.rs`'s module
+/// doc comment) — exactly the same `hyper::server::conn::http1` machinery
+/// `algo_network::ws_network`'s classic-transport relay server already uses
+/// to serve the identical `Router` over a raw TCP connection; here the "raw
+/// connection" is a libp2p stream instead, adapted to `tokio`'s
+/// `AsyncRead`/`AsyncWrite` via `tokio_util::compat`.
+async fn serve_p2p_http_stream(peer_id: PeerId, stream: P2pRawStream, router: Router) {
+    let io = TokioIo::new(stream.compat());
+    let hyper_svc = TowerToHyperService::new(router);
+    if let Err(e) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, hyper_svc)
+        .await
+    {
+        tracing::debug!(%peer_id, error = %e, "P2P HTTP stream connection error");
     }
 }
 
@@ -1827,6 +1946,99 @@ mod tests {
             response.block.round,
             Round(7),
             "fetched block should be exactly the round the listener served"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP-over-P2P (issue #1024) — the P2P-transport counterpart of go's
+    // `TestLedgerServiceP2P`: `CatchpointService::http_router()` (issue #955,
+    // already transport-agnostic) registered on a P2P-only `GossipNode` and
+    // fetched over a raw `/algorand-http/1.0.0` libp2p stream, exactly as
+    // go's `p2pHTTPRoundTripper` fetches from `rpcs.LedgerService` registered
+    // via `HTTPServer.RegisterHTTPHandler` (`network/p2p/http.go`).
+    // -----------------------------------------------------------------------
+
+    /// A fixed-round catchpoint tarball, mirroring `FixedRoundLedger` above
+    /// but for [`algo_network::catchpoint_service::LedgerForCatchpointService`].
+    struct FixedRoundCatchpoint {
+        round: u64,
+        gz_bytes: Vec<u8>,
+    }
+
+    impl algo_network::catchpoint_service::LedgerForCatchpointService for FixedRoundCatchpoint {
+        fn catchpoint_file_bytes(
+            &self,
+            round: u64,
+        ) -> Result<Vec<u8>, algo_network::catchpoint_service::CatchpointServiceError> {
+            if round == self.round {
+                Ok(self.gz_bytes.clone())
+            } else {
+                Err(algo_network::catchpoint_service::CatchpointServiceError::NotFound { round })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn p2p_client_fetches_a_p2p_registered_catchpoint_service_over_algorand_http() {
+        use algo_network::catchpoint_service::CatchpointService;
+        use libp2p::futures::AsyncWriteExt;
+        use std::io::Write as _;
+
+        let (listener, dialer) = connected_pair().await;
+
+        // Gzip-compress a small fixed payload, matching what
+        // `CatchpointService`'s ledger trait expects (raw catchpoint files
+        // are gzip tarballs on disk).
+        let plain = b"p2p catchpoint tarball bytes".to_vec();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&plain).expect("gzip write");
+        let gz_bytes = encoder.finish().expect("gzip finish");
+
+        let ledger = Arc::new(FixedRoundCatchpoint { round: 7, gz_bytes });
+        let catchpoint_service = CatchpointService::new(ledger, "test-1024".to_string());
+
+        // Register the transport-agnostic router onto the P2P `GossipNode`
+        // exactly as `relay.rs`/`participate.rs` register it onto the
+        // classic WS-gossip node.
+        GossipNode::register_http_handler(&listener, "/", catchpoint_service.http_router());
+
+        let listener_peer_id = listener.peer_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match dialer.open_http_stream(listener_peer_id).await {
+                Ok(stream) => break stream,
+                Err(e) if tokio::time::Instant::now() < deadline => {
+                    tracing::debug!(error = %e, "retrying P2P HTTP stream open");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("failed to open P2P HTTP stream before deadline: {e}"),
+            }
+        };
+
+        // Speak raw HTTP/1.1 directly onto the stream, matching go's
+        // `p2pHTTPRoundTripper.RoundTrip` (`r.Write(s)` /
+        // `http.ReadResponse(bufio.NewReader(s), r)`) — no additional
+        // framing beyond what `hyper::server::conn::http1` on the listener
+        // side already expects.
+        let request =
+            b"GET /v1/test-1024/ledger/7 HTTP/1.1\r\nHost: p2p\r\nConnection: close\r\n\r\n";
+        stream.write_all(request).await.expect("write HTTP request");
+        stream.flush().await.expect("flush HTTP request");
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+            .await
+            .expect("reading the HTTP response should not time out")
+            .expect("read HTTP response");
+
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 200"),
+            "expected a 200 response from the P2P-registered CatchpointService, got: {response_str}"
+        );
+        assert!(
+            response_str.ends_with(std::str::from_utf8(&plain).unwrap()),
+            "expected the decompressed catchpoint bytes as the response body, got: {response_str}"
         );
     }
 
