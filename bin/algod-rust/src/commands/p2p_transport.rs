@@ -58,7 +58,6 @@
 //! message (redundant but harmless — existing rust-to-rust tests below only
 //! ever consume one delivery per `recv`/`recv_timeout` call).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -79,16 +78,18 @@ use algo_network::{
 };
 use algo_p2p::{
     build_headers, handshake_inbound, handshake_outbound, libp2p_stream, read_frame,
-    resolve_dht_mode, write_frame, IdentityConfig, MessageValidationResult, P2pBehaviourEvent,
-    P2pHost, P2pHostConfig, PeerMetaHeaders, ALGORAND_HTTP_PROTOCOL, ALGORAND_WS_PROTOCOL_V22,
+    resolve_dht_mode, should_initiate_stream, write_frame, DispatchError, IdentityConfig,
+    IdentityTracker, LogLevel, MessageValidationResult, P2pBehaviourEvent, P2pHost, P2pHostConfig,
+    PeerMetaHeaders, StreamManager, ALGORAND_HTTP_PROTOCOL, ALGORAND_WS_PROTOCOL_V22,
 };
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use libp2p::futures::{AsyncReadExt, StreamExt as _};
 use libp2p::multiaddr::Protocol;
-use libp2p::swarm::{Stream as P2pRawStream, SwarmEvent};
+use libp2p::swarm::{ConnectionId, Stream as P2pRawStream, SwarmEvent};
 use libp2p::{gossipsub, Multiaddr, PeerId};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tokio::sync::mpsc;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
@@ -148,6 +149,17 @@ struct StreamPeerHandle {
     /// Correlates outbound unicast requests (see [`P2pTransport::unicast_peers`])
     /// to this peer's `TopicMsgResp` replies.
     request_tracker: Arc<RequestTracker>,
+    /// Monotonically increasing id assigned when this handle is installed
+    /// into the shared [`StreamManager`] (issue #952's live wiring) — lets a
+    /// stream's own cleanup task (see `spawn_ws_peer`) tell whether it is
+    /// still the currently-installed handle for its peer before removing
+    /// the entry, so a *stale* task (one whose stream was already replaced
+    /// by a newer successful dispatch — go's "Replacing old stream"
+    /// scenario in `streamHandler`) can't race and evict the newer stream
+    /// out from under it. `StreamManager` itself does not compare handle
+    /// identity (its `S` is caller-defined), so this is the mechanism this
+    /// caller supplies for that guarantee.
+    generation: u64,
     /// This stream's negotiated vote-compression feature set (issue #925):
     /// the intersection of both peers' advertised `PeerFeatureFlags`,
     /// computed once from the `/algorand-ws/2.2.0` handshake's peer-meta
@@ -160,11 +172,33 @@ struct StreamPeerHandle {
     /// field would otherwise sit unused in a release build.
     #[cfg(test)]
     negotiated_features: PeerFeatureFlags,
+    /// Whether *this* side opened the `/algorand-ws/2.2.0` stream (as
+    /// opposed to accepting an inbound one) — i.e. whether
+    /// [`should_initiate_stream`] decided this side should dial, mirroring
+    /// go's `streamManager.Connected`'s `localPeer > remotePeer` ordering
+    /// rule (issue #952). `cfg(test)`-only: proves the live wiring actually
+    /// governs *which side* opens the stream (peer-ID order, not raw TCP
+    /// dial direction), not just that a stream came up at all — see
+    /// `p2p_stream_open_side_follows_peer_id_order_not_dial_direction`.
+    #[cfg(test)]
+    initiated_locally: bool,
 }
 
 /// Registry of currently-established `/algorand-ws/2.2.0` streams, keyed by
-/// peer (see this module's doc comment and [`StreamPeerHandle`]).
-type StreamPeers = Arc<Mutex<HashMap<PeerId, StreamPeerHandle>>>;
+/// peer.
+///
+/// Backed by [`algo_p2p::StreamManager`] (issue #952's live wiring) rather
+/// than a bare `HashMap`, so the already-tested dispatch-error/unprotect/
+/// replace-on-success semantics that module encodes — see its own doc
+/// comment — actually govern these real, live streams: [`spawn_ws_peer`]
+/// installs a newly (successfully) handshaken stream via
+/// [`StreamManager::set_stream`] (never before a successful handshake,
+/// mirroring go's `streamHandler`'s "dispatch first, install only on
+/// success"), and the swarm event loop below gates a fresh outbound dial on
+/// [`StreamManager::should_skip_dial`]/[`StreamManager::begin_peer_attempt`]/
+/// [`StreamManager::end_peer_attempt`] exactly as go's `handleConnected`
+/// does.
+type StreamPeers = Arc<Mutex<StreamManager<StreamPeerHandle>>>;
 
 /// Run the post-handshake read/write loop for one peer's `/algorand-ws`
 /// stream: registers a [`StreamPeerHandle`] in `stream_peers` (its sender is
@@ -184,9 +218,13 @@ fn spawn_ws_peer(
     peer_id: PeerId,
     stream: P2pRawStream,
     mux: Arc<Multiplexer>,
-    stream_peers: StreamPeers,
+    stream_manager: StreamPeers,
+    stream_generation: Arc<AtomicU64>,
     negotiated_features: PeerFeatureFlags,
+    initiated_locally: bool,
 ) {
+    #[cfg(not(test))]
+    let _ = initiated_locally;
     let (tx, mut rx) = mpsc::unbounded_channel::<(Tag, Vec<u8>)>();
     let request_tracker = Arc::new(RequestTracker::new());
     // A clone of `tx` outlives the map insertion below so the reader half
@@ -194,18 +232,52 @@ fn spawn_ws_peer(
     // stateful vpack decode failure) can still queue a message onto this
     // same peer's writer task.
     let reply_tx = tx.clone();
-    stream_peers
-        .lock()
-        .expect("stream_peers mutex poisoned")
-        .insert(
-            peer_id,
-            StreamPeerHandle {
-                tx,
-                request_tracker: Arc::clone(&request_tracker),
-                #[cfg(test)]
-                negotiated_features,
-            },
-        );
+    // This handshake has already succeeded by the time `spawn_ws_peer` is
+    // called (both `handle_inbound_ws_stream`/`handle_outbound_ws_stream`
+    // only call it on `Ok(meta)`) — installing the handle here via
+    // `StreamManager::set_stream` is therefore exactly go's `streamHandler`
+    // "install only after a successful dispatch" rule, and any stream this
+    // one displaces is a real "Replacing old stream" event (go:
+    // `streamHandler`'s `if oldStream != nil { ... oldStream.Close() }`).
+    // Dropping the displaced handle's `tx` below closes its writer loop
+    // (`rx.recv()` returns `None`), which in turn ends its `tokio::select!`
+    // and lets its own cleanup below run and no-op (its `generation` no
+    // longer matches what's installed — see the cleanup comment below).
+    let generation = stream_generation.fetch_add(1, AtomicOrdering::Relaxed);
+    let mut guard = stream_manager.lock().expect("stream_peers mutex poisoned");
+    let displaced = guard.set_stream(
+        peer_id,
+        StreamPeerHandle {
+            tx,
+            request_tracker: Arc::clone(&request_tracker),
+            generation,
+            #[cfg(test)]
+            negotiated_features,
+            #[cfg(test)]
+            initiated_locally,
+        },
+    );
+    // Go: `handleConnected`/`streamHandler` both call `endPeerAttempt` via
+    // `defer` right after `dispatch` returns — a successful dispatch (this
+    // function is only reached on one, see the doc comment above) still
+    // ends the in-flight attempt that started it, but only *after*
+    // `set_stream` above, so `end_peer_attempt`'s own `has_stream` check
+    // observes the just-installed stream and correctly reports "do not
+    // unprotect" (`ending_attempt_does_not_unprotect_while_stream_installed`
+    // in `algo_p2p::streams`'s own tests pin this ordering).
+    let should_unprotect = guard.end_peer_attempt(peer_id);
+    drop(guard);
+    drop(displaced);
+    if should_unprotect {
+        // Go unprotects the peer in the connection manager here
+        // (`n.host.ConnManager().Unprotect`) once neither a live stream nor
+        // another in-flight attempt remains — `libp2p-connection-limits`
+        // (this crate's connection-manager equivalent, see
+        // `algo_p2p::conn_limits`'s module doc comment) has no
+        // protect/unprotect tag concept to release, so this is a no-op
+        // beyond the diagnostic below.
+        tracing::trace!(%peer_id, "P2P algorand-ws stream attempt settled with no in-flight/live stream remaining");
+    }
 
     tokio::spawn(async move {
         let (mut read_half, mut write_half) = stream.split();
@@ -430,10 +502,20 @@ fn spawn_ws_peer(
             _ = writer => {}
             _ = reader => {}
         }
-        stream_peers
-            .lock()
-            .expect("stream_peers mutex poisoned")
-            .remove(&peer_id);
+        // Only remove the entry if it is still *this* task's own handle —
+        // go's `Disconnected` always removes unconditionally because it
+        // holds `streamsLock` around both the removal and
+        // `streamHandler`'s replacement swap, so the two can never race.
+        // This port instead lets a replacement install (`set_stream` above)
+        // happen concurrently with an old stream's teardown, so a stale
+        // task finishing late must check its `generation` before removing —
+        // otherwise it could evict a *newer*, healthy stream that replaced
+        // it in the meantime (see `StreamPeerHandle::generation`'s doc
+        // comment).
+        let mut guard = stream_manager.lock().expect("stream_peers mutex poisoned");
+        if guard.get(&peer_id).map(|h| h.generation) == Some(generation) {
+            guard.remove_stream(&peer_id);
+        }
     });
 }
 
@@ -446,16 +528,48 @@ async fn handle_inbound_ws_stream(
     our_headers: PeerMetaHeaders,
     our_features: PeerFeatureFlags,
     mux: Arc<Multiplexer>,
-    stream_peers: StreamPeers,
+    stream_manager: StreamPeers,
+    stream_generation: Arc<AtomicU64>,
 ) {
     match handshake_inbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS).await {
         Ok(meta) => {
             let negotiated =
                 decode_peer_features(&meta.version, &meta.features).intersection(our_features);
-            spawn_ws_peer(peer_id, stream, mux, stream_peers, negotiated)
+            spawn_ws_peer(
+                peer_id,
+                stream,
+                mux,
+                stream_manager,
+                stream_generation,
+                negotiated,
+                false,
+            )
         }
         Err(e) => {
-            tracing::debug!(%peer_id, error = %e, "P2P algorand-ws inbound handshake failed")
+            // A failed dispatch still ends the in-flight attempt
+            // `begin_peer_attempt` (called by this handler's caller, the
+            // accept-loop) started — go's `streamHandler` does the same via
+            // `defer n.endPeerAttempt(remotePeer)`, unconditionally on
+            // dispatch success *or* failure. Never installs a stream here
+            // (mirrors go's "dispatch first, install only on success" — see
+            // `spawn_ws_peer`'s doc comment), so an existing healthy stream
+            // for this peer, if any, survives untouched.
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            // Go: `wsStreamHandlerV22`'s handshake failures are all
+            // `logging.Warn`-level `p2p.StreamHandlerLoggedError`s (see
+            // `p2pNetwork.go`'s `wsStreamHandlerV22`) — an inbound
+            // handshake failure is routine (a peer speaking an
+            // incompatible version, or dropping mid-handshake), not a
+            // node-local bug, so it is logged at `Warn` via
+            // `DispatchError`'s explicit-level constructor rather than the
+            // `Error` level a bare error would default to (see
+            // `algo_p2p::streams::DispatchError::log_level`'s doc comment).
+            let dispatch_err =
+                DispatchError::with_level(format!("inbound handshake failed: {e}"), LogLevel::Warn);
+            log_dispatch_error(&peer_id, &dispatch_err);
         }
     }
 }
@@ -469,16 +583,56 @@ async fn handle_outbound_ws_stream(
     our_headers: PeerMetaHeaders,
     our_features: PeerFeatureFlags,
     mux: Arc<Multiplexer>,
-    stream_peers: StreamPeers,
+    stream_manager: StreamPeers,
+    stream_generation: Arc<AtomicU64>,
 ) {
     match handshake_outbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS).await {
         Ok(meta) => {
             let negotiated =
                 decode_peer_features(&meta.version, &meta.features).intersection(our_features);
-            spawn_ws_peer(peer_id, stream, mux, stream_peers, negotiated)
+            spawn_ws_peer(
+                peer_id,
+                stream,
+                mux,
+                stream_manager,
+                stream_generation,
+                negotiated,
+                true,
+            )
         }
         Err(e) => {
-            tracing::debug!(%peer_id, error = %e, "P2P algorand-ws outbound handshake failed")
+            // See `handle_inbound_ws_stream`'s matching comment: ends the
+            // in-flight attempt `begin_peer_attempt` (called by this
+            // handler's caller, the swarm event loop's outbound-dial arm)
+            // started, without installing a stream.
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            let dispatch_err = DispatchError::with_level(
+                format!("outbound handshake failed: {e}"),
+                LogLevel::Warn,
+            );
+            log_dispatch_error(&peer_id, &dispatch_err);
+        }
+    }
+}
+
+/// Log a [`DispatchError`] at the severity it carries — the live-wiring
+/// counterpart of go's `streamManager.logDispatchError` (issue #952):
+/// `streams.rs`'s `DispatchError`/`LogLevel` types are ported and
+/// unit-tested there, but nothing previously called `log_level()` from a
+/// real code path. `tracing`'s macros can't take a runtime-selected level
+/// directly, hence the explicit match.
+fn log_dispatch_error(peer_id: &PeerId, err: &DispatchError) {
+    match err.log_level() {
+        LogLevel::Debug => {
+            tracing::debug!(%peer_id, error = %err, "P2P algorand-ws stream dispatch")
+        }
+        LogLevel::Info => tracing::info!(%peer_id, error = %err, "P2P algorand-ws stream dispatch"),
+        LogLevel::Warn => tracing::warn!(%peer_id, error = %err, "P2P algorand-ws stream dispatch"),
+        LogLevel::Error => {
+            tracing::error!(%peer_id, error = %err, "P2P algorand-ws stream dispatch")
         }
     }
 }
@@ -819,6 +973,26 @@ pub struct P2pTransport {
     /// doc comment on why AV/PP/VB traffic needs this in addition to
     /// gossipsub.
     stream_peers: StreamPeers,
+    /// Connection-identity dedup (issue #952): tracks, per connected
+    /// `PeerId`, which single [`ConnectionId`] currently "owns" that
+    /// identity — mirrors go's `identityTracker`/`p2pNetwork.go`'s
+    /// `baseWsStreamHandler` (`n.identityTracker.setIdentity(wsp)`), whose
+    /// dedup key there is the peer's raw public key
+    /// (`p2pPeer.ExtractPublicKey()`, `netIdentPeerID`) — already
+    /// equivalent to `PeerId` itself in this transport, since libp2p's
+    /// Noise handshake cryptographically binds every established
+    /// connection's `PeerId` to its authenticated public key (unlike the
+    /// classic WS transport, which needs `algo_network::identity`'s
+    /// separate 3-message challenge/response exchange to establish that
+    /// binding over a plain, unauthenticated TCP+HTTP-upgrade connection —
+    /// see [`P2pTransport::start`]'s swarm-loop comment on
+    /// `ConnectionEstablished` for the full reasoning). A second
+    /// established connection to a `PeerId` already claimed by a different
+    /// `ConnectionId` is therefore a genuine redundant connection (e.g. both
+    /// sides dialed each other at once), deduped the same way go's
+    /// `baseWsStreamHandler` does: keep the first, close the second.
+    #[cfg_attr(not(test), allow(dead_code))]
+    identity_tracker: Arc<Mutex<IdentityTracker<PeerId, ConnectionId>>>,
     /// HTTP handlers registered via [`GossipNode::register_http_handler`],
     /// served over inbound `/algorand-http/1.0.0` streams (issue #1024) —
     /// the P2P-transport counterpart of [`algo_p2p::ALGORAND_HTTP_PROTOCOL`]
@@ -957,18 +1131,36 @@ impl P2pTransport {
         let listen_addrs: Arc<Mutex<Vec<Multiaddr>>> = Arc::new(Mutex::new(Vec::new()));
         let connected_peers: Arc<Mutex<Vec<PeerId>>> = Arc::new(Mutex::new(Vec::new()));
         let multiplexer = Arc::new(Multiplexer::new());
-        let stream_peers: StreamPeers = Arc::new(Mutex::new(HashMap::new()));
+        let stream_peers: StreamPeers = Arc::new(Mutex::new(StreamManager::new()));
+        // Monotonically increasing id handed to every `StreamPeerHandle`
+        // installed via `spawn_ws_peer` — see `StreamPeerHandle::generation`'s
+        // doc comment for why a stale, already-replaced task needs this to
+        // avoid evicting a newer stream on cleanup.
+        let stream_generation: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let identity_tracker: Arc<Mutex<IdentityTracker<PeerId, ConnectionId>>> =
+            Arc::new(Mutex::new(IdentityTracker::new()));
         let http_router: Arc<Mutex<Router>> = Arc::new(Mutex::new(Router::new()));
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<P2pCommand>();
+        let local_peer_id = host.peer_id();
 
         // Accept-loop: every inbound `/algorand-ws/2.2.0` stream a peer
         // opens to us gets handshaken and, on success, joins `stream_peers`.
+        // Go: `streamManager.streamHandler` brackets every accepted stream
+        // (not just outbound dial attempts) with
+        // `beginPeerAttempt`/`endPeerAttempt` — mirrored here by bumping the
+        // in-flight counter before handing off to `handle_inbound_ws_stream`,
+        // which itself ends the attempt on both the success path (inside
+        // `spawn_ws_peer`, after the stream installs) and the failure path.
         {
             let mux = Arc::clone(&multiplexer);
             let sp = Arc::clone(&stream_peers);
+            let gen_counter = Arc::clone(&stream_generation);
             let headers = our_ws_headers.clone();
             tokio::spawn(async move {
                 while let Some((peer_id, stream)) = incoming_ws_streams.next().await {
+                    sp.lock()
+                        .expect("stream_peers mutex poisoned")
+                        .begin_peer_attempt(peer_id);
                     tokio::spawn(handle_inbound_ws_stream(
                         peer_id,
                         stream,
@@ -976,6 +1168,7 @@ impl P2pTransport {
                         our_features,
                         Arc::clone(&mux),
                         Arc::clone(&sp),
+                        Arc::clone(&gen_counter),
                     ));
                 }
             });
@@ -1006,6 +1199,8 @@ impl P2pTransport {
         let cp = Arc::clone(&connected_peers);
         let mux = Arc::clone(&multiplexer);
         let sp_for_task = Arc::clone(&stream_peers);
+        let gen_counter_for_task = Arc::clone(&stream_generation);
+        let identity_tracker_for_task = Arc::clone(&identity_tracker);
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -1014,40 +1209,104 @@ impl P2pTransport {
                             SwarmEvent::NewListenAddr { address, .. } => {
                                 la.lock().expect("listen_addrs mutex poisoned").push(address);
                             }
-                            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+                                // Connection-identity dedup (issue #952):
+                                // go's `baseWsStreamHandler` runs
+                                // `identityTracker.setIdentity(wsp)` keyed
+                                // by the peer's own public key — already
+                                // 1:1 with `PeerId` here (Noise
+                                // cryptographically binds the two; see
+                                // `identity_tracker`'s doc comment). A
+                                // `false` result means a *different*,
+                                // already-established `ConnectionId` for
+                                // this same `PeerId` exists (e.g. both
+                                // sides dialed each other at once) — close
+                                // this redundant one immediately, mirroring
+                                // go's `stream.Close()` on the loser, and
+                                // skip opening a second `/algorand-ws`
+                                // stream for it.
+                                let is_new_identity = identity_tracker_for_task
+                                    .lock()
+                                    .expect("identity_tracker mutex poisoned")
+                                    .set_identity(peer_id, connection_id);
+                                if !is_new_identity {
+                                    tracing::debug!(
+                                        %peer_id, ?connection_id,
+                                        "P2P: closing redundant connection — identity already claimed by another connection to this peer"
+                                    );
+                                    let _ = host.close_connection(connection_id);
+                                    continue;
+                                }
+
                                 cp.lock().expect("connected_peers mutex poisoned").push(peer_id);
-                                // Only the dialing side opens the
-                                // `/algorand-ws/2.2.0` stream — mirrors go's
-                                // asymmetric handshake (the `!incoming`
-                                // branch writes first) and avoids both
-                                // sides racing to open a duplicate stream
-                                // for the same connection.
-                                if endpoint.is_dialer() {
-                                    let mut control = stream_control.clone();
-                                    let mux = Arc::clone(&mux);
-                                    let sp = Arc::clone(&sp_for_task);
-                                    let headers = our_ws_headers.clone();
-                                    tokio::spawn(async move {
-                                        match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V22).await {
-                                            Ok(stream) => {
-                                                handle_outbound_ws_stream(peer_id, stream, headers, our_features, mux, sp).await;
+
+                                // Which side opens the `/algorand-ws/2.2.0`
+                                // stream is decided by peer-ID order, not by
+                                // which side physically dialed the TCP
+                                // connection — go: `streamManager.Connected`'s
+                                // `if localPeer > remotePeer { ignore }`
+                                // ("ensure that only one of the peers
+                                // initiates the stream"). A libp2p stream
+                                // can be opened over an already-established
+                                // connection regardless of which side
+                                // originally dialed it, so the numerically
+                                // lower `PeerId` always opens it — even when
+                                // that side is the one that *accepted* the
+                                // inbound TCP connection.
+                                if should_initiate_stream(&local_peer_id, &peer_id) {
+                                    // Go: `handleConnected`'s pre-flight
+                                    // guard — skip re-opening a stream to a
+                                    // peer we already have a live one with
+                                    // (e.g. a second `ConnectionEstablished`
+                                    // for a peer whose first connection's
+                                    // stream is still up).
+                                    let should_skip = sp_for_task
+                                        .lock()
+                                        .expect("stream_peers mutex poisoned")
+                                        .should_skip_dial(&peer_id);
+                                    if should_skip {
+                                        tracing::debug!(%peer_id, "P2P: already have a live algorand-ws stream, skipping dial");
+                                    } else {
+                                        sp_for_task
+                                            .lock()
+                                            .expect("stream_peers mutex poisoned")
+                                            .begin_peer_attempt(peer_id);
+                                        let mut control = stream_control.clone();
+                                        let mux = Arc::clone(&mux);
+                                        let sp = Arc::clone(&sp_for_task);
+                                        let gen_counter = Arc::clone(&gen_counter_for_task);
+                                        let headers = our_ws_headers.clone();
+                                        tokio::spawn(async move {
+                                            match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V22).await {
+                                                Ok(stream) => {
+                                                    handle_outbound_ws_stream(peer_id, stream, headers, our_features, mux, sp, gen_counter).await;
+                                                }
+                                                Err(e) => {
+                                                    sp.lock()
+                                                        .expect("stream_peers mutex poisoned")
+                                                        .end_peer_attempt(peer_id);
+                                                    tracing::debug!(
+                                                        %peer_id, error = %e,
+                                                        "failed to open P2P algorand-ws stream"
+                                                    );
+                                                }
                                             }
-                                            Err(e) => tracing::debug!(
-                                                %peer_id, error = %e,
-                                                "failed to open P2P algorand-ws stream"
-                                            ),
-                                        }
-                                    });
+                                        });
+                                    }
                                 }
                             }
-                            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            SwarmEvent::ConnectionClosed { peer_id, connection_id, .. } => {
+                                identity_tracker_for_task
+                                    .lock()
+                                    .expect("identity_tracker mutex poisoned")
+                                    .remove_identity(&peer_id, &connection_id);
                                 cp.lock()
                                     .expect("connected_peers mutex poisoned")
                                     .retain(|p| *p != peer_id);
                                 sp_for_task
                                     .lock()
                                     .expect("stream_peers mutex poisoned")
-                                    .remove(&peer_id);
+                                    .remove_stream(&peer_id);
                             }
                             SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(
                                 gossipsub::Event::Message {
@@ -1105,6 +1364,7 @@ impl P2pTransport {
             multiplexer,
             cmd_tx,
             stream_peers,
+            identity_tracker,
             http_router,
             http_stream_control,
             _task: task,
@@ -1246,7 +1506,7 @@ impl P2pTransport {
             .stream_peers
             .lock()
             .expect("stream_peers mutex poisoned");
-        for handle in peers.values() {
+        for (_, handle) in peers.iter() {
             let _ = handle.tx.send((tag, data.to_vec()));
         }
     }
@@ -1273,6 +1533,35 @@ impl P2pTransport {
                     stateful_table_size(h.negotiated_features),
                 )
             })
+    }
+
+    /// Whether *this* transport is the side that opened (dialed) the
+    /// currently-established `/algorand-ws/2.2.0` stream to `peer_id`, as
+    /// opposed to having accepted an inbound one — see
+    /// [`StreamPeerHandle::initiated_locally`]'s doc comment. `None` if no
+    /// stream is currently established with that peer. `cfg(test)`-only:
+    /// proves the live `should_initiate_stream` wiring (issue #952) actually
+    /// governs which side opens the stream.
+    #[cfg(test)]
+    pub fn stream_initiated_locally(&self, peer_id: PeerId) -> Option<bool> {
+        self.stream_peers
+            .lock()
+            .expect("stream_peers mutex poisoned")
+            .get(&peer_id)
+            .map(|h| h.initiated_locally)
+    }
+
+    /// Number of distinct peer identities currently claimed in this
+    /// transport's [`IdentityTracker`] (issue #952) — exposed for tests to
+    /// confirm the connection-acceptance-level dedup wiring actually runs,
+    /// independent of whether a `/algorand-ws` stream also came up for that
+    /// peer.
+    #[cfg(test)]
+    pub fn identity_count(&self) -> usize {
+        self.identity_tracker
+            .lock()
+            .expect("identity_tracker mutex poisoned")
+            .len()
     }
 }
 
@@ -1825,8 +2114,11 @@ mod tests {
     /// gossipsub mesh forming, also bring up an `/algorand-ws/2.2.0` stream
     /// between the two peers — the transport go-algorand actually uses for
     /// AV/PP/VB traffic (see this module's doc comment). Both sides should
-    /// see the other as a stream peer: the dialer opens the stream
-    /// (`endpoint.is_dialer()`), the listener accepts it.
+    /// see the other as a stream peer: exactly one side opens the stream
+    /// (decided by peer-ID order — see
+    /// `p2p_stream_open_side_follows_peer_id_order_not_dial_direction` below
+    /// for the issue #952 regression guard that it's peer-ID order, not raw
+    /// TCP dial direction), the other accepts it.
     #[tokio::test]
     async fn connecting_peers_establish_an_algorand_ws_stream_in_both_directions() {
         let (listener, dialer) = connected_pair().await;
@@ -1841,13 +2133,143 @@ mod tests {
         assert_eq!(
             listener.stream_peer_count(),
             1,
-            "listener should have accepted exactly one inbound algorand-ws stream"
+            "listener should have exactly one algorand-ws stream to the dialer"
         );
         assert_eq!(
             dialer.stream_peer_count(),
             1,
-            "dialer should have opened exactly one outbound algorand-ws stream"
+            "dialer should have exactly one algorand-ws stream to the listener"
         );
+
+        // Issue #952: identity-based connection dedup (see
+        // `P2pTransport::identity_tracker`'s doc comment) claims exactly one
+        // identity per connected peer — proves that live wiring runs on
+        // every established connection, not just ones that also end up
+        // carrying an algorand-ws stream.
+        assert_eq!(listener.identity_count(), 1);
+        assert_eq!(dialer.identity_count(), 1);
+    }
+
+    /// Issue #952: which side opens the `/algorand-ws/2.2.0` stream is
+    /// decided by [`algo_p2p::should_initiate_stream`]'s peer-ID ordering
+    /// rule (mirroring go's `streamManager.Connected`'s `localPeer >
+    /// remotePeer` check), *not* by which side physically dialed the
+    /// underlying TCP connection. Before this issue's live wiring, this
+    /// transport used `endpoint.is_dialer()` instead — always correct in
+    /// the common case, but wrong whenever the physical dialer's `PeerId`
+    /// happens to be numerically higher than the physical listener's.
+    ///
+    /// Deterministically forces that exact scenario: generates keypairs
+    /// until the physical dialer's `PeerId` is higher than the physical
+    /// listener's, then asserts the *listener* (despite only having
+    /// accepted an inbound TCP connection) is the side that actually
+    /// dialed the libp2p-stream substream, and the dialer only accepted
+    /// one — the reverse of what dial direction alone would predict.
+    #[tokio::test]
+    async fn p2p_stream_open_side_follows_peer_id_order_not_dial_direction() {
+        use libp2p::identity::Keypair;
+
+        // Persisted-key identities (via `private_key_path`) so each side's
+        // `PeerId` is known and controllable before any connection is made —
+        // `IdentityConfig`/`get_or_create_keypair` already support loading a
+        // pre-written protobuf-encoded key from an explicit path.
+        fn write_keypair(dir: &std::path::Path, name: &str, keypair: &Keypair) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, keypair.to_protobuf_encoding().unwrap()).unwrap();
+            path
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-p2p-stream-order-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Generate keypairs until the *physical listener's* PeerId is lower
+        // than the *physical dialer's* — guaranteed to terminate (each draw
+        // succeeds independently with probability ~1/2).
+        let (listener_kp, dialer_kp) = loop {
+            let a = Keypair::generate_ed25519();
+            let b = Keypair::generate_ed25519();
+            if a.public().to_peer_id() < b.public().to_peer_id() {
+                break (a, b);
+            }
+        };
+        let listener_key_path = write_keypair(&dir, "listener.key", &listener_kp);
+        let dialer_key_path = write_keypair(&dir, "dialer.key", &dialer_kp);
+
+        let listener = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-952-order".to_string(),
+            listen_multiaddr: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+            bootstrap_peers: vec![],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: Some(listener_key_path),
+            enable_dht_providers: false,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
+        })
+        .await
+        .expect("start listener");
+        assert_eq!(listener.peer_id(), listener_kp.public().to_peer_id());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while listener.listen_addrs().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let listen_addr = listener.listen_addrs().first().cloned().unwrap();
+        let dial_addr = listen_addr.with(Protocol::P2p(listener.peer_id()));
+
+        let dialer = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-952-order".to_string(),
+            listen_multiaddr: None,
+            bootstrap_peers: vec![dial_addr],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: Some(dialer_key_path),
+            enable_dht_providers: false,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
+        })
+        .await
+        .expect("start dialer");
+        assert_eq!(dialer.peer_id(), dialer_kp.public().to_peer_id());
+        assert!(
+            listener.peer_id() < dialer.peer_id(),
+            "test setup sanity check: listener must have the lower PeerId"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (listener.stream_peer_count() == 0 || dialer.stream_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(listener.stream_peer_count(), 1);
+        assert_eq!(dialer.stream_peer_count(), 1);
+
+        // The physical *listener* has the lower PeerId, so per
+        // `should_initiate_stream` it must be the side that opened the
+        // algorand-ws stream — the opposite of what `endpoint.is_dialer()`
+        // (the pre-#952 logic) would have decided.
+        assert_eq!(
+            listener.stream_initiated_locally(dialer.peer_id()),
+            Some(true),
+            "the lower-PeerId side (the physical listener here) must have initiated the stream"
+        );
+        assert_eq!(
+            dialer.stream_initiated_locally(listener.peer_id()),
+            Some(false),
+            "the higher-PeerId side (the physical dialer here) must have only accepted the stream"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -----------------------------------------------------------------------
