@@ -133,6 +133,76 @@ fn import_rejects_invalid_preimage() {
     ));
 }
 
+/// Parity with go-algorand's `TestZeroThreshold`
+/// (`test/e2e-go/features/multisig/multisig_test.go:113`): importing a
+/// multisig preimage with threshold 0 is rejected, matching
+/// `crypto.MultisigAddrGen`'s "bad threshold" check.
+#[test]
+fn zero_threshold_multisig_import_rejected() {
+    let dir = TempDir::new().unwrap();
+    let driver = WalletDriver::new(weak_cfg(dir.path())).unwrap();
+    driver.create_wallet(b"zt", b"id-zt", b"pw", None).unwrap();
+    let w = driver.fetch_wallet(b"id-zt").unwrap();
+
+    let pks = fixed_pks(3, 0x20);
+    let err = w.import_multisig(1, 0, &pks).unwrap_err();
+    assert!(matches!(err, Error::MultisigInvalid), "got {err:?}");
+}
+
+/// Parity with go-algorand's `TestZeroSigners`
+/// (`test/e2e-go/features/multisig/multisig_test.go:143`): importing a
+/// multisig preimage with zero potential signers (empty pks) is
+/// rejected, matching `crypto.MultisigAddrGen`'s "no public keys"
+/// check.
+#[test]
+fn zero_signers_multisig_import_rejected() {
+    let dir = TempDir::new().unwrap();
+    let driver = WalletDriver::new(weak_cfg(dir.path())).unwrap();
+    driver.create_wallet(b"zs", b"id-zs", b"pw", None).unwrap();
+    let w = driver.fetch_wallet(b"id-zs").unwrap();
+
+    let err = w.import_multisig(1, 3, &[]).unwrap_err();
+    assert!(matches!(err, Error::MultisigInvalid), "got {err:?}");
+}
+
+/// Parity with go-algorand's `TestMultisigExportDelete`
+/// (`test/e2e-go/kmd/e2e_kmd_wallet_multisig_test.go:92`): import a
+/// multisig preimage, export it back out and confirm it round-trips
+/// byte-for-byte (not just presence, as `lookup_multisig` alone would
+/// prove -- this pins the exact `(version, threshold, pks)` triple a
+/// dedicated `/multisig/export` caller would see), then delete it and
+/// confirm `list_multisig` is empty -- as distinct from
+/// `import_lookup_list_delete_round_trip` above, which deletes only
+/// one of two entries.
+#[test]
+fn export_then_delete_leaves_list_empty() {
+    let dir = TempDir::new().unwrap();
+    let driver = WalletDriver::new(weak_cfg(dir.path())).unwrap();
+    driver.create_wallet(b"ed", b"id-ed", b"pw", None).unwrap();
+    let w = driver.fetch_wallet(b"id-ed").unwrap();
+
+    let pks = fixed_pks(2, 0x70);
+    let addr = w.import_multisig(1, 2, &pks).unwrap();
+    assert_eq!(w.list_multisig().unwrap(), vec![addr]);
+
+    // "Export" is `lookup_multisig` at the storage layer (the REST
+    // /multisig/export handler is a thin wrapper over the same call,
+    // exercised end-to-end in algo-kmd's api_v1.rs router tests) --
+    // pin that it returns the exact preimage that was imported.
+    let exported = w.lookup_multisig(&addr).unwrap();
+    assert_eq!(
+        exported,
+        MultisigPreimage {
+            version: 1,
+            threshold: 2,
+            pks: pks.clone(),
+        }
+    );
+
+    w.delete_multisig(&addr, b"pw").unwrap();
+    assert!(w.list_multisig().unwrap().is_empty());
+}
+
 #[test]
 fn duplicate_import_is_rejected() {
     let dir = TempDir::new().unwrap();

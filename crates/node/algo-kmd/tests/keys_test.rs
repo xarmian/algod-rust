@@ -155,6 +155,59 @@ fn generate_skips_indices_already_taken_by_import() {
     assert_eq!(generated, expected_addr2);
 }
 
+/// Parity with go-algorand's `TestMasterKeyGeneratePastImportedKeys`
+/// (`test/e2e-go/kmd/e2e_kmd_wallet_keyops_test.go:608`): two *separate*
+/// wallets sharing the same MDK derive the same sequence of keys by
+/// index, and importing a key from wallet A into wallet B (an
+/// `key_idx = NULL` import, not a generate) does not itself advance
+/// wallet B's generation counter -- but a later `generate_key` call in
+/// wallet B must still skip past that imported address (via the same
+/// collision-probe loop `generate_skips_indices_already_taken_by_import`
+/// pins for a single wallet) and land on the *next* MDK-derived index.
+#[test]
+fn generate_key_in_second_wallet_skips_past_key_imported_from_first() {
+    let dir = TempDir::new().unwrap();
+    let driver = WalletDriver::new(weak_cfg(dir.path())).unwrap();
+
+    // Wallet 1: generate three MDK-derived keys (indices 1, 2, 3).
+    driver
+        .create_wallet(b"first", b"id-first", b"pw1", None)
+        .unwrap();
+    let mut w1 = driver.fetch_wallet(b"id-first").unwrap();
+    w1.init(b"pw1").unwrap();
+    let addrs = [
+        w1.generate_key().unwrap(),
+        w1.generate_key().unwrap(),
+        w1.generate_key().unwrap(),
+    ];
+
+    // Export wallet 1's MDK and create wallet 2 from the same MDK.
+    let mdk = w1.export_master_derivation_key(b"pw1").unwrap();
+    driver
+        .create_wallet(b"related", b"id-related", b"pw2", Some(mdk))
+        .unwrap();
+    let mut w2 = driver.fetch_wallet(b"id-related").unwrap();
+    w2.init(b"pw2").unwrap();
+
+    // Generating in wallet 2 must reproduce wallet 1's first derived key
+    // (same MDK, same starting index).
+    let addr0 = w2.generate_key().unwrap();
+    assert_eq!(addr0, addrs[0]);
+
+    // Export addrs[1]'s secret from wallet 1 and import it into wallet 2
+    // as a plain (non-generated) key.
+    let key1_secret = w1.export_key(&addrs[1], b"pw1").unwrap();
+    let imported = w2.import_key(&key1_secret).unwrap();
+    assert_eq!(imported, addrs[1]);
+
+    // Generating again in wallet 2 must skip the now-colliding index
+    // (which would derive addrs[1]) and land on addrs[2] -- proving the
+    // generation counter continues past the imported key rather than
+    // re-deriving or re-using it.
+    let addr2 = w2.generate_key().unwrap();
+    assert_eq!(addr2, addrs[2]);
+}
+
 #[test]
 fn key_ops_on_locked_wallet_are_rejected() {
     let dir = TempDir::new().unwrap();

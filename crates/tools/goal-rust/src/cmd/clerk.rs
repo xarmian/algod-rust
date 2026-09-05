@@ -2410,6 +2410,7 @@ pub(crate) fn kmd_msg(e: &KmdError) -> String {
 mod tests {
     use super::*;
     use algo_types::{Transaction, TxnType};
+    use tempfile::TempDir;
 
     fn sample_payment(amount: u64, receiver: [u8; 32]) -> Transaction {
         Transaction {
@@ -2430,6 +2431,69 @@ mod tests {
             txn,
             ..SignedTransaction::default()
         }
+    }
+
+    /// Minimal `SendArgs` builder — the fields not under test are left at
+    /// their "unset" defaults, mirroring an unadorned `goal clerk send -a
+    /// ... -f ... -t ...` invocation.
+    fn bare_send_args(from: Option<&str>, to: &str) -> SendArgs {
+        SendArgs {
+            amount: 100_000,
+            from: from.map(str::to_string),
+            to: to.to_string(),
+            close_to: None,
+            rekey_to: None,
+            from_program: None,
+            from_program_bytes: None,
+            logic_sig: None,
+            argb64: Vec::new(),
+            msig_params: None,
+            signer: None,
+            fee: None,
+            first_valid: None,
+            last_valid: None,
+            valid_rounds: None,
+            note: None,
+            note_b64: None,
+            lease: None,
+            out: None,
+            sign: false,
+            no_wait: false,
+            password: None,
+        }
+    }
+
+    /// Parity with go-algorand's `TestClientRejectsBadFromAddressWhenSending`
+    /// (`test/e2e-go/restAPI/restClient_test.go:141`): a malformed sender
+    /// address must be rejected before any network/kmd contact is attempted
+    /// -- `run_send_inner` parses `-f/--from` (clerk.go:388-403,
+    /// `basics.UnmarshalChecksumAddress`) well before it builds an algod or
+    /// kmd client, so passing a bogus address with an otherwise-empty data
+    /// dir (no algod/kmd running) still exercises the real rejection path.
+    #[test]
+    fn run_send_rejects_bad_from_address() {
+        let tmp = TempDir::new().unwrap();
+        let args = bare_send_args(
+            Some("This is absolutely not a valid account address."),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ",
+        );
+        let err = run_send_inner(args, None, vec![tmp.path().to_path_buf()], None).unwrap_err();
+        assert!(err.contains("Could not parse from address"), "got: {err}");
+    }
+
+    /// Parity with go-algorand's `TestClientRejectsBadToAddressWhenSending`
+    /// (`test/e2e-go/restAPI/restClient_test.go:160`): same as above, but
+    /// for the receiver (`-t/--to`), which is parsed immediately after the
+    /// sender and before any network/kmd contact.
+    #[test]
+    fn run_send_rejects_bad_to_address() {
+        let tmp = TempDir::new().unwrap();
+        let args = bare_send_args(
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ"),
+            "This is absolutely not a valid account address.",
+        );
+        let err = run_send_inner(args, None, vec![tmp.path().to_path_buf()], None).unwrap_err();
+        assert!(err.contains("Could not parse to address"), "got: {err}");
     }
 
     #[test]

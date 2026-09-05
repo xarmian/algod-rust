@@ -134,6 +134,36 @@ fn sign_transaction_with_explicit_public_key() {
     verify_single_sig(&stx).expect("explicit-pk path must verify");
 }
 
+/// Parity with go-algorand's
+/// `TestClientRejectsSendingMoneyFromAccountForWhichItHasNoKey`
+/// (`test/e2e-go/restAPI/restClient_test.go:231`): signing a transaction
+/// whose sender the wallet never generated or imported a key for must
+/// fail (`Error::KeyNotFound`, mirroring kmd's `errKeyNotFound`), not
+/// silently produce an unsigned/garbage signature.
+#[test]
+fn sign_transaction_rejects_sender_with_no_key() {
+    let dir = TempDir::new().unwrap();
+    let driver = WalletDriver::new(weak_cfg(dir.path())).unwrap();
+    driver
+        .create_wallet(b"nokey", b"id-nokey", b"pw", Some([9u8; 32]))
+        .unwrap();
+    let mut wallet = driver.fetch_wallet(b"id-nokey").unwrap();
+    wallet.init(b"pw").unwrap();
+
+    // This wallet never generated or imported a key for this address.
+    let stranger_addr: [u8; 32] = [0x77u8; 32];
+    let txn = payment_txn(stranger_addr, [0x11u8; 32]);
+
+    let err = wallet.sign_transaction(&txn, None, b"pw").unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound), "got {err:?}");
+
+    // Same result when the address is passed explicitly as the signer.
+    let err = wallet
+        .sign_transaction(&txn, Some(stranger_addr), b"pw")
+        .unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound), "got {err:?}");
+}
+
 #[test]
 fn sign_transaction_rejects_wrong_password() {
     let dir = TempDir::new().unwrap();

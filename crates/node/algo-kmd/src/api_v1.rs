@@ -2573,6 +2573,54 @@ mod tests {
             modern.subsigs[0].signature, legacy.subsigs[0].signature,
             "legacy vs modern multisig signprogram must produce different signatures"
         );
+
+        // Full parity with Go's TestMultisigSignProgram
+        // (e2e_kmd_wallet_multisig_test.go:384): each signature must
+        // verify under `algo_validate::logicsig_sanity_check` when
+        // attached to the LogicSig field matching its own tag (`msig`
+        // for legacy "Program"||data, `lmsig` for modern
+        // "MultisigProgram"||addr||data), and must FAIL verification
+        // (`crypto.MultisigVerify` returning "At least one signature
+        // didn't pass verification" in Go) when attached to the wrong
+        // field.
+        let msig_pk = Address::from_algorand_string(&msig_addr).unwrap();
+        let stx_authorized_by_msig = algo_types::SignedTransaction {
+            txn: make_pay_txn(&msig_pk.0),
+            ..Default::default()
+        };
+        let lsig_program = serde_bytes::ByteBuf::from(program.to_vec());
+
+        let modern_correctly_tagged = algo_types::LogicSig {
+            logic: lsig_program.clone(),
+            lmsig: Some(modern.clone()),
+            ..Default::default()
+        };
+        algo_validate::logicsig_sanity_check(&stx_authorized_by_msig, &modern_correctly_tagged)
+            .expect("modern signature must verify against MultisigProgram||addr||program");
+
+        let modern_wrongly_tagged = algo_types::LogicSig {
+            logic: lsig_program.clone(),
+            msig: Some(modern),
+            ..Default::default()
+        };
+        algo_validate::logicsig_sanity_check(&stx_authorized_by_msig, &modern_wrongly_tagged)
+            .expect_err("modern signature must NOT verify as a legacy Program||data signature");
+
+        let legacy_correctly_tagged = algo_types::LogicSig {
+            logic: lsig_program.clone(),
+            msig: Some(legacy.clone()),
+            ..Default::default()
+        };
+        algo_validate::logicsig_sanity_check(&stx_authorized_by_msig, &legacy_correctly_tagged)
+            .expect("legacy signature must verify against Program||program");
+
+        let legacy_wrongly_tagged = algo_types::LogicSig {
+            logic: lsig_program,
+            lmsig: Some(legacy),
+            ..Default::default()
+        };
+        algo_validate::logicsig_sanity_check(&stx_authorized_by_msig, &legacy_wrongly_tagged)
+            .expect_err("legacy signature must NOT verify as a modern MultisigProgram signature");
     }
 
     #[tokio::test]
