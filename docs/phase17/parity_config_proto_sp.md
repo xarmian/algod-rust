@@ -25,7 +25,7 @@ Scope: go-algorand test packages `config`, `protocol`, `protocol/test`, `protoco
 | [TestLocal_GetNonDefaultConfigValues](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L600) | [save_non_default_only_includes_version_and_overridden_fields](../../crates/node/algo-config/src/lib.rs#L3907), [save_non_default_round_trips_back_to_the_same_config](../../crates/node/algo-config/src/lib.rs#L3930) | matched-1:many | |
 | [TestLocal_TxFiltering](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L629) | [tx_incoming_filter_fields_round_trip](../../crates/node/algo-config/src/lib.rs#L3640) | partial | go asserts the specific bitflag semantics of `TxFilterRawMsgEnabled()`/`TxFilterCanonicalEnabled()` derived from `TxIncomingFilteringFlags`; Rust's test round-trips the raw field through JSON but does not assert the derived bitflag-decode helper methods' behavior. |
 | [TestLocal_IsListenServer](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L656) | [is_ws_listen_server_matrix](../../crates/node/algo-config/src/lib.rs#L4858), [is_p2p_listen_server_matrix](../../crates/node/algo-config/src/lib.rs#L4879), [is_listen_server_is_the_or_of_ws_and_p2p](../../crates/node/algo-config/src/lib.rs#L4899), [is_hybrid_server_requires_both_addresses_and_the_mode_flag](../../crates/node/algo-config/src/lib.rs#L4913) | matched-1:many | Issue #949: `algo_config::is_ws_listen_server`/`is_p2p_listen_server`/`is_listen_server`/`is_hybrid_server` (plus `Local` method wrappers) port the full state matrix as free functions taking the WS/P2P listen addresses as explicit parameters, since algod-rust keeps those as CLI-flag concepts rather than `Local` fields (see the module doc note on `NetAddress`). Wired into `commands::participate::run`, replacing the prior ad hoc `effective_listen_address.is_some()` check. |
-| [TestLocal_RecalculateConnectionLimits](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L736) | — | not-implemented | go's `AdjustConnectionLimits` dynamically rebalances REST/incoming/P2P-hybrid connection-limit budgets against the process's file-descriptor ceiling. No equivalent exists in algod-rust; `algo-network`'s `request_tracker.rs` connection-limit tests enforce a single static configured limit, not FD-pressure-driven rebalancing. Issue #949 scoped this out (deferred to a follow-up — requires live FD/rlimit accounting, not pure config-derivation logic). |
+| [TestLocal_RecalculateConnectionLimits](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L736) | [adjust_connection_limits_matches_go_table](../../crates/node/algo-config/src/lib.rs#L5093) | matched-1:1 | Issue #949: `Local::adjust_connection_limits` ports go's `AdjustConnectionLimits` verbatim (same REST/incoming/P2P-hybrid-limit rebalancing algorithm, same `reservedRESTConns`/split-ratio logic), and the test ports go's own 14-row table exactly. Live FD accounting (go: `util.GetFdLimits`/`RaiseFdSoftLimit`, `getrlimit`(2)/`setrlimit`(2) on Unix, hard-coded "unlimited" on Windows in go itself) is ported in `algo_network::fd_limits` (`get_fd_limits`/`raise_fd_soft_limit`/`rebalance_connection_limits`; see [adjust_connection_limits_triggers_under_simulated_fd_pressure](../../crates/node/algo-network/src/fd_limits.rs#L273) for the simulated-FD-pressure case and [rebalance_lowers_limits_under_a_real_lowered_rlimit](../../crates/node/algo-network/src/fd_limits.rs#L302) for a real-rlimit-driven one, Unix-only), wired into `main.rs`'s `relay`/`participate` startup paths ahead of `config.json`'s connection-limit fields being captured into `RestOptions`/`NetworkOptions`. |
 | [TestLocal_ValidateP2PHybridConfig](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L797) | [validate_p2p_hybrid_config_ok_when_both_addresses_and_public_address_set](../../crates/node/algo-config/src/lib.rs#L4938), [validate_p2p_hybrid_config_rejects_net_address_without_p2p_address](../../crates/node/algo-config/src/lib.rs#L4957), [validate_p2p_hybrid_config_rejects_missing_public_address](../../crates/node/algo-config/src/lib.rs#L4981) | matched-1:many | Issue #949: `algo_config::validate_p2p_hybrid_config`/`Local::validate_p2p_hybrid_config` port go's mismatched-address and missing-`PublicAddress` checks; wired into `commands::participate::run` as a startup-time rejection. |
 | [TestEnsureAbsDir](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L839) | — | not-implemented | No `ensureAbsGenesisDir` equivalent (absolute-path resolution + directory creation for a single genesis dir) found. |
 | [TestEnsureAndResolveGenesisDirs](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L869) | — | not-implemented | No `EnsureAndResolveGenesisDirs` equivalent (resolves/creates per-genesis-ID tracker/block/crash/stateproof/catchpoint directories) found in algod-rust. |
@@ -126,7 +126,7 @@ Scope: go-algorand test packages `config`, `protocol`, `protocol/test`, `protoco
 
 ## Gaps summary
 
-Status counts: matched-1:1 = 18, matched-1:many = 21, missing-test = 6, not-implemented = 41, out-of-scope = 4, partial = 29 (119 total).
+Status counts: matched-1:1 = 19, matched-1:many = 21, missing-test = 6, not-implemented = 40, out-of-scope = 4, partial = 29 (119 total).
 
 - ~~**No state-proof worker/signing daemon (44 rows, the largest single gap
   group).**~~ **Core algorithm landed in issue #814** (`crates/core/algo-ledger/src/stateproof_worker.rs`):
@@ -170,20 +170,22 @@ Status counts: matched-1:1 = 18, matched-1:many = 21, missing-test = 6, not-impl
   each row's note. This is a distinct, previously-undocumented
   architectural gap — not covered by Phase 16 (which scoped only
   `config.Local`/`ConsensusParams`, not node subsystems).
-- **`config.Local` node-runtime derivations — mostly closed by issue #949,
-  FD-pressure rebalancing still open.** Phase 16's original finding ("~58
-  of ~97 `Local` fields have no equivalent at all") is significantly
-  narrowed by `crates/node/algo-config` (76 tests covering versioned
-  defaults, migration, JSON load/save, catchpoint-tracking gates, etc.).
+- **`config.Local` node-runtime derivations — closed by issue #949.**
+  Phase 16's original finding ("~58 of ~97 `Local` fields have no
+  equivalent at all") is significantly narrowed by
+  `crates/node/algo-config` (76+ tests covering versioned defaults,
+  migration, JSON load/save, catchpoint-tracking gates, etc.).
   [Issue #949](https://github.com/xarmian/algod-rust/issues/949) closed
   the `IsListenServer`/`IsWsListenServer`/`IsP2PListenServer`/
-  `IsHybridServer` state matrix and `ValidateP2PHybridConfig` (both now
-  live in `algo_config` and wired into `commands::participate::run`),
-  plus the `phonebook.json` loader and `TestLockdownTagList`-equivalent
-  (see below). Still open: `AdjustConnectionLimits`/
-  `RecalculateConnectionLimits` FD-pressure rebalancing (deferred —
-  requires live FD/rlimit accounting, not pure config-derivation logic;
-  see the row's note) and the whole `EnsureAndResolveGenesisDirs`/
+  `IsHybridServer` state matrix, `ValidateP2PHybridConfig`, the
+  `phonebook.json` loader, the `TestLockdownTagList`-equivalent, and (in
+  a follow-up pass) `AdjustConnectionLimits`'s FD-pressure connection-limit
+  rebalancing — `Local::adjust_connection_limits` (pure rebalancing
+  algorithm, table-tested against go's own 14 cases) plus
+  `algo_network::fd_limits` (live `getrlimit`/`setrlimit` FD accounting on
+  Unix, go's own hard-coded Windows "unlimited"), wired into `main.rs`'s
+  `relay`/`participate` startup paths. Still open: the whole
+  `EnsureAndResolveGenesisDirs`/
   `ResolveLogPaths` directory-resolution and hot/cold-data-dir-migration
   mechanism (7 config-package rows, not-implemented). The
   `HotDataDir`/`ColdDataDir`/etc. directory-splitting subset was
