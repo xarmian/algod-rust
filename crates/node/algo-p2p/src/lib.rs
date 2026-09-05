@@ -48,6 +48,7 @@ pub mod dht;
 pub mod dnsaddr;
 pub mod errors;
 pub mod host;
+pub mod httpproto;
 pub mod identity;
 pub mod identity_tracker;
 pub mod peerstore;
@@ -67,6 +68,7 @@ pub use host::{
     MessageValidationResult, P2pBehaviour, P2pBehaviourEvent, P2pHost, DHT_LOOKUP_TIMEOUT,
     DIAL_TIMEOUT,
 };
+pub use httpproto::ALGORAND_HTTP_PROTOCOL;
 pub use identity::{get_or_create_keypair, IdentityConfig, DEFAULT_PRIV_KEY_FILENAME};
 pub use identity_tracker::IdentityTracker;
 pub use peerstore::{PersistentPeerStore, DEFAULT_PEERSTORE_FILENAME};
