@@ -427,6 +427,7 @@ version = "0.1.0"
 dependencies = [
  "algo-agreement",
  "algo-codec",
+ "algo-config",
  "algo-consensus-crypto",
  "algo-error",
  "algo-pool",
@@ -444,6 +445,7 @@ dependencies = [
  "http-body 1.0.1",
  "hyper 1.8.1",
  "hyper-util",
+ "libc",
  "rand 0.8.5",
  "regex",
  "reqwest",

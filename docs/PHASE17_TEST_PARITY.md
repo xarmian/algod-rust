@@ -51,15 +51,15 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 808 | 25% |
+| `matched-1:1` | 809 | 25% |
 | `partial` | 735 | 23% |
 | `matched-1:many` | 609 | 19% |
 | `out-of-scope` | 424 | 13% |
-| `not-implemented` | 213 | 7% |
+| `not-implemented` | 212 | 7% |
 | `matched-many:1` | 209 | 7% |
 | `missing-test` | 181 | 6% |
 
-**394 rows (`not-implemented` + `missing-test`, 12%) are real, actionable
+**393 rows (`not-implemented` + `missing-test`, 12%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
 implements but never tests. `partial` (735, 23%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
@@ -81,10 +81,10 @@ were triaged into tracked issues.
 | Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 80 | 32 | 16 | 61 | 39 | 27 | 21 |
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 57 | 62 | 1 | 10 | 2 | 2 | 10 |
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 100 | 20 | 47 | 62 | 24 | 14 | 7 |
-| Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 21 | 25 | 0 | 30 | 37 | 1 | 5 |
+| Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 22 | 25 | 0 | 30 | 36 | 1 | 5 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 20 | 7 | 0 | 20 | 11 | 0 | 60 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 31 | 26 | 7 | 21 | 3 | 1 | 84 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 10 | 0 | 16 | 3 | 0 | 1 |
-| **Total** | | **3,179** | **808** | **609** | **209** | **735** | **213** | **181** | **424** |
+| **Total** | | **3,179** | **809** | **609** | **209** | **735** | **212** | **181** | **424** |
 

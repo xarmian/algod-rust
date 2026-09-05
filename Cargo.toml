@@ -100,6 +100,9 @@ hkdf = "0.12"
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# System (Unix rlimit/FD accounting — see `algo_network::fd_limits`)
+libc = "0.2"
+
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 

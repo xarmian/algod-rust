@@ -28,6 +28,7 @@ pub mod catchpoint_service;
 pub mod compression;
 pub mod connect;
 pub mod errors;
+pub mod fd_limits;
 pub mod forwarding_policy;
 pub mod framing;
 pub mod handler;
