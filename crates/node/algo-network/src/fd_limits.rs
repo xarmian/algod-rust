@@ -206,12 +206,7 @@ pub fn rebalance_connection_limits(
 mod tests {
     use super::*;
 
-    fn cfg_with(
-        reserved_fds: u64,
-        rest_hard: u64,
-        incoming: i64,
-        p2p_incoming: i64,
-    ) -> Local {
+    fn cfg_with(reserved_fds: u64, rest_hard: u64, incoming: i64, p2p_incoming: i64) -> Local {
         Local {
             reserved_fds,
             rest_connections_soft_limit: rest_hard,
@@ -282,12 +277,8 @@ mod tests {
         assert_eq!(required, 110);
 
         let simulated_max_fds = 60; // far below `required`
-        let adjusted = cfg.adjust_connection_limits(
-            required,
-            simulated_max_fds,
-            Some(":4160"),
-            None,
-        );
+        let adjusted =
+            cfg.adjust_connection_limits(required, simulated_max_fds, Some(":4160"), None);
         assert!(adjusted, "must rebalance when FD budget is constrained");
         // The node's limits must have moved strictly downward from their
         // configured values.
@@ -318,7 +309,10 @@ mod tests {
         let outcome = rebalance_connection_limits(&mut cfg, Some(":4160"), None)
             .expect("rebalance should succeed");
 
-        assert!(outcome.adjusted, "must rebalance against the real rlimit hard cap");
+        assert!(
+            outcome.adjusted,
+            "must rebalance against the real rlimit hard cap"
+        );
         assert!(outcome.required_fds <= real_hard);
         assert!(required_fds(&cfg, Some(":4160"), None) <= real_hard);
     }
