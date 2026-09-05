@@ -24,6 +24,7 @@ pub mod block_fetcher;
 pub mod block_service;
 pub mod bloom;
 pub mod broadcast;
+pub mod catchpoint_service;
 pub mod compression;
 pub mod connect;
 pub mod errors;
@@ -84,6 +85,12 @@ pub use block_fetcher::{
 pub use block_service::{
     BlockService, BlockServiceError, LedgerForBlockService, MemoryGuard,
     BLOCK_RESPONSE_CONTENT_TYPE, DEFAULT_BLOCK_SERVICE_MEM_CAP,
+};
+
+// Catchpoint service (server-side catchpoint-tarball-serving HTTP endpoint)
+pub use catchpoint_service::{
+    CatchpointService, CatchpointServiceError, LedgerForCatchpointService,
+    LEDGER_RESPONSE_CONTENT_TYPE,
 };
 
 // Compression

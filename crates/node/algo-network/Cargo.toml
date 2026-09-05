@@ -48,6 +48,11 @@ rustls-pemfile.workspace = true
 # `algo-rest-client`) — promoted here from dev-only rather than adding a
 # genuinely new dependency.
 reqwest.workspace = true
+# Catchpoint files are gzip-compressed tarballs on disk (matching go's own
+# convention); the catchpoint-serving HTTP endpoint (issue #955) needs to
+# decompress them for callers that don't advertise `Accept-Encoding: gzip`,
+# mirroring go's `rpcs.LedgerService`'s use of `compress/gzip`.
+flate2.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

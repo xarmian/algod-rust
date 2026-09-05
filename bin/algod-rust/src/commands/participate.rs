@@ -33,6 +33,7 @@ use algo_codec::{
     canonical_encode_block, canonical_encode_block_header_from_block,
     canonical_encode_signed_txn_in_block, canonical_encode_transaction,
 };
+use algo_ledger::catchpoint::{get_catchpoint_stream, CatchpointError};
 use algo_ledger::participation::{restore_participation, ParticipationStore};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{
@@ -42,7 +43,8 @@ use algo_ledger::{
 };
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, PoolIngestAdapter};
 use algo_network::{
-    AgreementNetworkBridge, BlockService, BlockServiceError, GossipNode, LedgerForBlockService,
+    AgreementNetworkBridge, BlockService, BlockServiceError, CatchpointService,
+    CatchpointServiceError, GossipNode, LedgerForBlockService, LedgerForCatchpointService,
     Phonebook, WebsocketNetwork, WebsocketNetworkConfig, RELAY_ROLE,
 };
 use algo_pool::{PoolConfig, TransactionPool};
@@ -2366,6 +2368,28 @@ impl LedgerForBlockService for ParticipateBlockService {
     }
 }
 
+/// Adapts a catchpoint directory on disk to [`LedgerForCatchpointService`]
+/// (issue #955), mirroring `relay.rs`'s identical `CatchpointFileLedger`.
+struct ParticipateCatchpointService {
+    dir: std::path::PathBuf,
+}
+
+impl LedgerForCatchpointService for ParticipateCatchpointService {
+    fn catchpoint_file_bytes(&self, round: u64) -> Result<Vec<u8>, CatchpointServiceError> {
+        use std::io::Read;
+
+        let mut stream = get_catchpoint_stream(&self.dir, round).map_err(|e| match e {
+            CatchpointError::NotFound(round) => CatchpointServiceError::NotFound { round },
+            other => CatchpointServiceError::Internal(other.to_string()),
+        })?;
+        let mut bytes = Vec::new();
+        stream
+            .read_to_end(&mut bytes)
+            .map_err(|e| CatchpointServiceError::Internal(e.to_string()))?;
+        Ok(bytes)
+    }
+}
+
 /// Serves `UniEnsBlockReq` gossip messages from the local ledger.
 ///
 /// Mirrors `relay.rs`'s `BlockRequestHandler`.
@@ -4196,14 +4220,34 @@ pub async fn run(
     // the routes exist the moment the listener accepts its first connection.
     // Issue #478: without this a Rust node acting as a relay answered every
     // block request with 404 / timeout, so nothing could catch up from it.
-    let block_service = Arc::new(BlockService::new(
-        Arc::new(ParticipateBlockService {
-            ledger: ledger.clone(),
-        }) as Arc<dyn LedgerForBlockService>,
-        resolved_genesis_id.clone(),
-        0,
-    ));
+    let block_service = Arc::new(
+        BlockService::new(
+            Arc::new(ParticipateBlockService {
+                ledger: ledger.clone(),
+            }) as Arc<dyn LedgerForBlockService>,
+            resolved_genesis_id.clone(),
+            0,
+        )
+        .with_custom_fallback_endpoints(&node_config.block_service_custom_fallback_endpoints),
+    );
     gossip_node.register_http_handler("/", block_service.http_router());
+
+    // Issue #955: server-side catchpoint-tarball-serving endpoint (go's
+    // `rpcs.LedgerService`) -- same gating as `relay.rs`'s identical wiring.
+    if node_config.enable_ledger_service && !node_config.catchpoint_dir.is_empty() {
+        let catchpoint_ledger = Arc::new(ParticipateCatchpointService {
+            dir: std::path::PathBuf::from(&node_config.catchpoint_dir),
+        });
+        let catchpoint_service = CatchpointService::new(
+            catchpoint_ledger as Arc<dyn LedgerForCatchpointService>,
+            resolved_genesis_id.clone(),
+        );
+        gossip_node.register_http_handler("/", catchpoint_service.http_router());
+        info!(
+            dir = %node_config.catchpoint_dir,
+            "catchpoint-serving endpoint enabled (EnableLedgerService)"
+        );
+    }
 
     // Serve the TxSyncer pull protocol's HTTP endpoint (issue #774). Like
     // `block_service` above, this must be registered before `start_arc()`
