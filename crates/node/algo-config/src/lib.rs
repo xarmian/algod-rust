@@ -290,6 +290,14 @@ static ENABLE_P2P: VersionedDefault<bool> = VersionedDefault::new(&[(31, || fals
 /// Go: `EnableP2PHybridMode bool` `version[34]:"false"` (`localTemplate.go:624`).
 static ENABLE_P2P_HYBRID_MODE: VersionedDefault<bool> = VersionedDefault::new(&[(34, || false)]);
 
+/// Go: `P2PHybridIncomingConnectionsLimit int` `version[34]:"1200"`
+/// (`localTemplate.go:139`) — the `IncomingConnectionsLimit` equivalent for
+/// the P2P side of a hybrid-mode node; consumed by
+/// [`Local::adjust_connection_limits`] (go: `AdjustConnectionLimits`,
+/// `config/localTemplate.go:1012`).
+static P2P_HYBRID_INCOMING_CONNECTIONS_LIMIT: VersionedDefault<i64> =
+    VersionedDefault::new(&[(34, || 1_200)]);
+
 /// Go: `P2PPersistPeerID bool` `version[29]:"false"` (`localTemplate.go:642`).
 static P2P_PERSIST_PEER_ID: VersionedDefault<bool> = VersionedDefault::new(&[(29, || false)]);
 
@@ -1276,6 +1284,9 @@ fn default_enable_p2p() -> bool {
 fn default_enable_p2p_hybrid_mode() -> bool {
     ENABLE_P2P_HYBRID_MODE.at(LATEST_VERSION)
 }
+fn default_p2p_hybrid_incoming_connections_limit() -> i64 {
+    P2P_HYBRID_INCOMING_CONNECTIONS_LIMIT.at(LATEST_VERSION)
+}
 fn default_p2p_persist_peer_id() -> bool {
     P2P_PERSIST_PEER_ID.at(LATEST_VERSION)
 }
@@ -1655,6 +1666,15 @@ pub struct Local {
         default = "default_enable_p2p_hybrid_mode"
     )]
     pub enable_p2p_hybrid_mode: bool,
+
+    /// Go: `P2PHybridIncomingConnectionsLimit`. Wired into
+    /// [`Local::adjust_connection_limits`]'s FD-pressure rebalancing
+    /// (issue #949).
+    #[serde(
+        rename = "P2PHybridIncomingConnectionsLimit",
+        default = "default_p2p_hybrid_incoming_connections_limit"
+    )]
+    pub p2p_hybrid_incoming_connections_limit: i64,
 
     /// Go: `P2PPersistPeerID`.
     #[serde(rename = "P2PPersistPeerID", default = "default_p2p_persist_peer_id")]
@@ -2500,6 +2520,8 @@ impl Local {
             incoming_connections_limit: INCOMING_CONNECTIONS_LIMIT.at(version),
             enable_p2p: ENABLE_P2P.at(version),
             enable_p2p_hybrid_mode: ENABLE_P2P_HYBRID_MODE.at(version),
+            p2p_hybrid_incoming_connections_limit: P2P_HYBRID_INCOMING_CONNECTIONS_LIMIT
+                .at(version),
             p2p_persist_peer_id: P2P_PERSIST_PEER_ID.at(version),
             gossip_fanout: GOSSIP_FANOUT.at(version),
             broadcast_connections_limit: BROADCAST_CONNECTIONS_LIMIT.at(version),
@@ -2664,6 +2686,12 @@ impl Local {
             migrate_field(
                 &mut self.enable_p2p_hybrid_mode,
                 &ENABLE_P2P_HYBRID_MODE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.p2p_hybrid_incoming_connections_limit,
+                &P2P_HYBRID_INCOMING_CONNECTIONS_LIMIT,
                 cur,
                 next,
             );
@@ -3418,6 +3446,74 @@ impl Local {
             p2p_net_address,
             &self.public_address,
         )
+    }
+
+    /// Go: `Local.AdjustConnectionLimits` (`config/localTemplate.go:1012`) —
+    /// updates `rest_connections_soft_limit`/`rest_connections_hard_limit`/
+    /// `incoming_connections_limit`/`p2p_hybrid_incoming_connections_limit`
+    /// downward, in place, when `required_fds` (the number of file
+    /// descriptors the node's current configuration would need) exceeds
+    /// `max_fds` (the process's actual FD hard limit). Returns `true` iff
+    /// any field was changed.
+    ///
+    /// This is go's own FD-pressure rebalancing algorithm verbatim — see
+    /// `daemon/algod/server.go:181`'s call site (`cfg.AdjustConnectionLimits
+    /// (fdRequired, hard)`) for how `required_fds`/`max_fds` are computed
+    /// from live `getrlimit`(2) accounting; that live accounting lives in
+    /// `algo_network`'s `fd_limits` module, which calls this pure function
+    /// once it has read the process's actual FD headroom (see
+    /// `algo_network::fd_limits::rebalance_connection_limits`).
+    ///
+    /// `net_address`/`p2p_net_address` play the same "which listen modes
+    /// are active" role as [`Self::is_hybrid_server`]'s parameters — go
+    /// reads `IsHybridServer()`/`IsWsListenServer()`/`IsP2PListenServer()`
+    /// off the receiver directly for the same reason documented above.
+    pub fn adjust_connection_limits(
+        &mut self,
+        required_fds: u64,
+        max_fds: u64,
+        net_address: Option<&str>,
+        p2p_net_address: Option<&str>,
+    ) -> bool {
+        if max_fds >= required_fds {
+            return false;
+        }
+        // Matches go's untyped `const reservedRESTConns = 10`.
+        const RESERVED_REST_CONNS: u64 = 10;
+        let diff = required_fds - max_fds;
+
+        let is_hybrid = self.is_hybrid_server(net_address, p2p_net_address);
+        let is_ws_or_p2p_listen = self.is_ws_listen_server(net_address)
+            || self.is_p2p_listen_server(net_address, p2p_net_address);
+
+        if self.rest_connections_hard_limit <= diff + RESERVED_REST_CONNS {
+            let rest_delta = diff + RESERVED_REST_CONNS - self.rest_connections_hard_limit;
+            self.rest_connections_hard_limit = RESERVED_REST_CONNS;
+            let split_ratio: i64 = if is_hybrid { 2 } else { 1 };
+
+            if is_ws_or_p2p_listen {
+                if self.incoming_connections_limit > rest_delta as i64 {
+                    self.incoming_connections_limit -= rest_delta as i64 / split_ratio;
+                } else {
+                    self.incoming_connections_limit = 0;
+                }
+            }
+            if is_hybrid {
+                if self.p2p_hybrid_incoming_connections_limit > rest_delta as i64 {
+                    self.p2p_hybrid_incoming_connections_limit -= rest_delta as i64 / split_ratio;
+                } else {
+                    self.p2p_hybrid_incoming_connections_limit = 0;
+                }
+            }
+        } else {
+            self.rest_connections_hard_limit -= diff;
+        }
+
+        if self.rest_connections_soft_limit > self.rest_connections_hard_limit {
+            self.rest_connections_soft_limit = self.rest_connections_hard_limit;
+        }
+
+        true
     }
 }
 
@@ -4983,6 +5079,112 @@ mod tests {
         assert_eq!(
             cfg.validate_p2p_hybrid_config(Some(":4160"), Some(":4190")),
             Err(P2PHybridConfigError::MissingPublicAddress)
+        );
+    }
+
+    // --- AdjustConnectionLimits (issue #949) --------------------------------
+    //
+    // Ported verbatim from go's `TestLocal_RecalculateConnectionLimits`
+    // (`config/config_test.go:736`) — same rows, same expected outputs — so
+    // any future edit to `adjust_connection_limits` that silently diverges
+    // from go's FD-pressure rebalancing algorithm fails this test, not just
+    // a freshly invented one.
+    #[test]
+    fn adjust_connection_limits_matches_go_table() {
+        struct Case {
+            max_fds: u64,
+            reserved: u64,
+            rest_soft_in: u64,
+            rest_hard_in: u64,
+            incoming_in: i64,
+            p2p_incoming_in: i64,
+            updated: bool,
+            rest_soft_exp: u64,
+            rest_hard_exp: u64,
+            incoming_exp: i64,
+            p2p_incoming_exp: i64,
+        }
+
+        let cases = [
+            Case { max_fds: 100, reserved: 10, rest_soft_in: 20, rest_hard_in: 40, incoming_in: 50, p2p_incoming_in: 0, updated: false, rest_soft_exp: 20, rest_hard_exp: 40, incoming_exp: 50, p2p_incoming_exp: 0 },
+            Case { max_fds: 100, reserved: 10, rest_soft_in: 20, rest_hard_in: 50, incoming_in: 50, p2p_incoming_in: 0, updated: true, rest_soft_exp: 20, rest_hard_exp: 40, incoming_exp: 50, p2p_incoming_exp: 0 },
+            Case { max_fds: 100, reserved: 10, rest_soft_in: 25, rest_hard_in: 50, incoming_in: 50, p2p_incoming_in: 0, updated: true, rest_soft_exp: 25, rest_hard_exp: 40, incoming_exp: 50, p2p_incoming_exp: 0 },
+            Case { max_fds: 100, reserved: 10, rest_soft_in: 25, rest_hard_in: 50, incoming_in: 50, p2p_incoming_in: 50, updated: true, rest_soft_exp: 10, rest_hard_exp: 10, incoming_exp: 40, p2p_incoming_exp: 40 },
+            Case { max_fds: 100, reserved: 10, rest_soft_in: 50, rest_hard_in: 50, incoming_in: 50, p2p_incoming_in: 0, updated: true, rest_soft_exp: 40, rest_hard_exp: 40, incoming_exp: 50, p2p_incoming_exp: 0 },
+            Case { max_fds: 100, reserved: 10, rest_soft_in: 50, rest_hard_in: 50, incoming_in: 40, p2p_incoming_in: 10, updated: true, rest_soft_exp: 40, rest_hard_exp: 40, incoming_exp: 40, p2p_incoming_exp: 10 },
+            Case { max_fds: 100, reserved: 10, rest_soft_in: 9, rest_hard_in: 19, incoming_in: 81, p2p_incoming_in: 0, updated: true, rest_soft_exp: 9, rest_hard_exp: 10, incoming_exp: 80, p2p_incoming_exp: 0 },
+            Case { max_fds: 100, reserved: 10, rest_soft_in: 9, rest_hard_in: 19, incoming_in: 41, p2p_incoming_in: 41, updated: true, rest_soft_exp: 9, rest_hard_exp: 10, incoming_exp: 40, p2p_incoming_exp: 40 },
+            Case { max_fds: 100, reserved: 90, rest_soft_in: 10, rest_hard_in: 30, incoming_in: 40, p2p_incoming_in: 0, updated: true, rest_soft_exp: 10, rest_hard_exp: 10, incoming_exp: 0, p2p_incoming_exp: 0 },
+            Case { max_fds: 100, reserved: 90, rest_soft_in: 10, rest_hard_in: 30, incoming_in: 40, p2p_incoming_in: 40, updated: true, rest_soft_exp: 10, rest_hard_exp: 10, incoming_exp: 0, p2p_incoming_exp: 0 },
+            Case { max_fds: 100, reserved: 90, rest_soft_in: 10, rest_hard_in: 30, incoming_in: 50, p2p_incoming_in: 40, updated: true, rest_soft_exp: 10, rest_hard_exp: 10, incoming_exp: 0, p2p_incoming_exp: 0 },
+            Case { max_fds: 4096, reserved: 256, rest_soft_in: 1024, rest_hard_in: 2048, incoming_in: 2400, p2p_incoming_in: 0, updated: true, rest_soft_exp: 1024, rest_hard_exp: 1440, incoming_exp: 2400, p2p_incoming_exp: 0 },
+            Case { max_fds: 5000, reserved: 256, rest_soft_in: 1024, rest_hard_in: 2048, incoming_in: 2400, p2p_incoming_in: 0, updated: false, rest_soft_exp: 1024, rest_hard_exp: 2048, incoming_exp: 2400, p2p_incoming_exp: 0 },
+            Case { max_fds: 4096, reserved: 256, rest_soft_in: 1024, rest_hard_in: 2048, incoming_in: 2400, p2p_incoming_in: 1200, updated: true, rest_soft_exp: 240, rest_hard_exp: 240, incoming_exp: 2400, p2p_incoming_exp: 1200 },
+            Case { max_fds: 6000, reserved: 256, rest_soft_in: 1024, rest_hard_in: 2048, incoming_in: 2400, p2p_incoming_in: 1200, updated: false, rest_soft_exp: 1024, rest_hard_exp: 2048, incoming_exp: 2400, p2p_incoming_exp: 1200 },
+        ];
+
+        for (i, case) in cases.iter().enumerate() {
+            let mut cfg = Local {
+                rest_connections_soft_limit: case.rest_soft_in,
+                rest_connections_hard_limit: case.rest_hard_in,
+                incoming_connections_limit: case.incoming_in,
+                p2p_hybrid_incoming_connections_limit: case.p2p_incoming_in,
+                enable_p2p_hybrid_mode: case.p2p_incoming_in > 0,
+                ..Local::default()
+            };
+            let p2p_net_address = if case.p2p_incoming_in > 0 {
+                Some(":4190")
+            } else {
+                None
+            };
+            let required_fds = case.reserved
+                + case.rest_hard_in
+                + case.incoming_in as u64
+                + case.p2p_incoming_in as u64;
+            let updated =
+                cfg.adjust_connection_limits(required_fds, case.max_fds, Some(":4160"), p2p_net_address);
+            assert_eq!(updated, case.updated, "case {i}: updated mismatch");
+            assert_eq!(
+                cfg.rest_connections_soft_limit, case.rest_soft_exp,
+                "case {i}: rest_soft mismatch"
+            );
+            assert_eq!(
+                cfg.rest_connections_hard_limit, case.rest_hard_exp,
+                "case {i}: rest_hard mismatch"
+            );
+            assert_eq!(
+                cfg.incoming_connections_limit, case.incoming_exp,
+                "case {i}: incoming mismatch"
+            );
+            assert_eq!(
+                cfg.p2p_hybrid_incoming_connections_limit, case.p2p_incoming_exp,
+                "case {i}: p2p_incoming mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn adjust_connection_limits_no_change_when_fds_sufficient() {
+        let mut cfg = Local::default();
+        let before = cfg.clone();
+        assert!(!cfg.adjust_connection_limits(100, 200, Some(":4160"), None));
+        assert_eq!(cfg, before);
+    }
+
+    #[test]
+    fn p2p_hybrid_incoming_connections_limit_default_matches_go() {
+        // go: `P2PHybridIncomingConnectionsLimit int` `version[34]:"1200"`.
+        assert_eq!(
+            Local::default().p2p_hybrid_incoming_connections_limit,
+            1_200
+        );
+        assert_eq!(
+            Local::default_at_version(33).p2p_hybrid_incoming_connections_limit,
+            0
+        );
+        assert_eq!(
+            Local::default_at_version(34).p2p_hybrid_incoming_connections_limit,
+            1_200
         );
     }
 }
