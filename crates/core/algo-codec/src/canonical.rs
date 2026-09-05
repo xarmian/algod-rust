@@ -2318,6 +2318,52 @@ mod tests {
         assert!(!keys_zero.contains(&"ct".to_string()));
     }
 
+    /// A genesis (round 0) header's canonical encoding correctly omits
+    /// `"rnd"` entirely (it's the zero value, like every other numeric
+    /// field on `BlockHeader`) -- and a **generic** `serde`-derived decode
+    /// of `BlockHeader` must tolerate that absence, not error, exactly
+    /// like the struct's own hand-rolled `decode_from_bytes` already does
+    /// (see that function's "a missing `rnd` means round 0" comment).
+    ///
+    /// Before `BlockHeader::round`'s `#[serde(rename = "rnd")]` gained a
+    /// `default` (issue #827 theme 4), this failed with a "missing field
+    /// `rnd`" error -- caught in practice by
+    /// `algo_ledger::catchpoint::verify::reconstruct_lease_table` (used
+    /// during a live catchpoint-catchup's post-import lookback-block
+    /// replay), which decodes an embedded `TxTailRound.hdr: BlockHeader`
+    /// via `rmp_serde::from_slice`, not the hand-rolled decoder, and
+    /// silently failed the whole catchup whenever the lookback window
+    /// reached back to genesis.
+    #[test]
+    fn genesis_block_header_with_omitted_rnd_decodes_generically_via_serde() {
+        let header = BlockHeader {
+            round: Round(0),
+            ..BlockHeader::default()
+        };
+        let encoded = canonical_encode_block_header(&header);
+
+        // Confirm the premise: "rnd" is really absent from the encoding.
+        let val = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
+        let rmpv::Value::Map(pairs) = val else {
+            panic!("expected map");
+        };
+        assert!(
+            !pairs.iter().any(|(k, _)| k.as_str() == Some("rnd")),
+            "a genesis header's canonical encoding must omit \"rnd\" like every other zero-valued field"
+        );
+
+        // The hand-rolled decoder already tolerated this (existing
+        // behavior, unaffected by this fix) ...
+        let decoded_manual = BlockHeader::decode_from_bytes(&encoded).expect("hand-rolled decode");
+        assert_eq!(decoded_manual.round, Round(0));
+
+        // ... and the generic serde-derived decode path must too.
+        let decoded_generic: BlockHeader =
+            rmp_serde::from_slice(&encoded).expect("generic serde decode of a genesis header");
+        assert_eq!(decoded_generic.round, Round(0));
+        assert_eq!(decoded_generic, header);
+    }
+
     #[test]
     fn test_integer_packing_compact() {
         // Small value (< 128) should be positive fixint (1 byte)

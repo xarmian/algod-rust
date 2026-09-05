@@ -33,7 +33,18 @@ use crate::{rmp_decode, Address, Round};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlockHeader {
     /// Round number.
-    #[serde(rename = "rnd")]
+    ///
+    /// `default` (issue #827 theme 4): go's canonical/omitempty msgpack
+    /// encoding omits `rnd` entirely when it's the zero value (genesis),
+    /// exactly like every other zero-valued field on this struct — so a
+    /// generic decoder must tolerate its absence rather than erroring,
+    /// matching go's own msgp-generated `UnmarshalMsg` (a missing field
+    /// simply leaves the zero value already in place). Caught by
+    /// `crates/core/algo-ledger/src/catchpoint/verify.rs`'s
+    /// `reconstruct_lease_table` failing to decode a `TxTailRound` embedding
+    /// a genesis (round 0) header during a live catchpoint-catchup's
+    /// post-import lookback-block replay.
+    #[serde(rename = "rnd", default)]
     pub round: Round,
 
     /// Previous block hash (crypto.Digest = [32]byte in Go).

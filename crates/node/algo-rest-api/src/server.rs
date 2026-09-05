@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::Router;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower::limit::ConcurrencyLimitLayer;
@@ -150,12 +151,38 @@ pub struct ApiServerConfig {
 /// Wraps an axum server with the full Algorand REST API router.
 pub struct ApiServer {
     config: ApiServerConfig,
+    extra_router: Option<Router>,
 }
 
 impl ApiServer {
     /// Create a new API server with the given configuration.
     pub fn new(config: ApiServerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            extra_router: None,
+        }
+    }
+
+    /// Merge additional, unauthenticated routes into the REST server's
+    /// router (issue #827 theme 4 / #940): lets a caller expose a plain
+    /// axum sub-router -- e.g. [`algo_network::CatchpointService::http_router`]
+    /// -- on the *same* port/address as the rest of the v2 API.
+    ///
+    /// This closes a real wiring gap: `algod-rust participate
+    /// --catchup-peer <rest-url>` documents its peer as a REST URL and
+    /// `algo_rest_client::catchpoint_download::CatchpointDownloader`
+    /// fetches `/v1/{genesis_id}/ledger/{round}` from that exact URL, but
+    /// `CatchpointService`'s router was previously only ever mounted on
+    /// the gossip network's own HTTP listener (a *different* port from
+    /// `--rest-listen`) -- so a live catchpoint-catchup request against a
+    /// `--catchup-peer` REST URL always 404'd, even against a peer that
+    /// really had the labeled catchpoint file. Reachable at both
+    /// listeners now, since go-algorand's own gossip-network peers still
+    /// expect it on the gossip port too (`relay.rs`'s wiring is
+    /// unaffected by this method existing).
+    pub fn with_extra_router(mut self, router: Router) -> Self {
+        self.extra_router = Some(router);
+        self
     }
 
     /// Resolve the public API token.
@@ -265,6 +292,9 @@ impl ApiServer {
         };
 
         let mut router = router::build_router(node, tokens);
+        if let Some(extra) = self.extra_router.clone() {
+            router = router.merge(extra);
+        }
 
         // `RestConnectionsHardLimit` (issue #751): once concurrently
         // in-flight requests reach this count, further requests are

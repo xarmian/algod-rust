@@ -4761,7 +4761,15 @@ pub async fn run(
             let token = shutdown_token.clone();
             async move { token.cancelled().await }
         };
-        let api_server = ApiServer::new(api_config);
+        let mut api_server = ApiServer::new(api_config);
+        // Issue #827 theme 4 / #940: also expose the catchpoint-tarball
+        // endpoint on the REST port, not just the gossip network's HTTP
+        // listener -- see `ApiServer::with_extra_router`'s doc comment for
+        // why this is required for `--catchup-peer <rest-url>` to ever
+        // find a real catchpoint file.
+        if let Some(service) = &catchpoint_service {
+            api_server = api_server.with_extra_router(service.http_router());
+        }
         let (bound_addr, join_handle) = api_server
             .serve(node, shutdown_future)
             .await
