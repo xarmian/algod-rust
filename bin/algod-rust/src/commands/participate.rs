@@ -4213,9 +4213,33 @@ pub async fn run(
     // TxSyncer when TASK-70 lands.
     // -------------------------------------------------------------------
     let pool_ledger_adapter = Arc::new(PoolLedgerAdapter::new(ledger.clone()));
+    // Issue #1043: the `BatchVerifier` verifies against the *same*
+    // `VerifiedTransactionCache` instance `PoolLedgerAdapter::start_evaluator`
+    // hands each `SimpleBlockEvaluator` -- cloning the concrete adapter's
+    // field before it's erased to `Arc<dyn PoolLedger>` below is the only way
+    // to get at it, since the trait object doesn't expose it. A group
+    // verified here is therefore a cache *hit*, not redundant work, when
+    // `pool.remember()`'s evaluator verifies it again.
+    let verified_txn_cache = pool_ledger_adapter.verified_txn_cache.clone();
     let pool = Arc::new(TransactionPool::new(
         PoolConfig::default(),
         pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
+    ));
+    // StreamToBatch-equivalent async worker pool (issue #1017) wired into
+    // the live gossip tx-admission path (issue #1043): every inbound TX-tag
+    // group is routed through this shared pool for signature verification
+    // *before* `pool.remember()`, mirroring go-algorand's `data/txHandler.go`
+    // routing incoming groups through `StreamToBatch`
+    // (`data/transactions/verify/txnBatch.go`) rather than verifying
+    // synchronously inline per group. One node-wide instance, shared (same
+    // `Arc`) across every `TxTagHandler` registered below (WS-gossip and,
+    // if enabled, the libp2p P2P transport) -- mirrors the single
+    // `VerifiedTransactionCache`/verifier pool go's `node.go` shares across
+    // transports. Shut down alongside the rest of the network stack below
+    // (see the `batch_verifier.cancel()` call in the shutdown sequence).
+    let batch_verifier = Arc::new(algo_validate::BatchVerifier::spawn(
+        algo_validate::BatchVerifierConfig::default(),
+        verified_txn_cache,
     ));
     // Issue #753: `TxSyncTimeoutSeconds`/`TxSyncIntervalSeconds`/
     // `TxSyncServeResponseSize` are threaded from `node_config` here rather
@@ -4341,8 +4365,8 @@ pub async fn run(
     .with_peer_limiter(tx_sync_peer_limiter);
     gossip_node.register_http_handler("/", tx_sync_service.http_router());
 
-    let mut ws_tx_tag_handler =
-        algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone());
+    let mut ws_tx_tag_handler = algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
+        .with_batch_verifier(batch_verifier.clone());
     if let Some(limiter) = &app_rate_limiter {
         ws_tx_tag_handler = ws_tx_tag_handler
             .with_app_rate_limiter(limiter.clone(), app_rate_limiter_congestion_threshold);
@@ -4529,7 +4553,8 @@ pub async fn run(
         // result (see `p2p_transport.rs`'s `spawn_ws_peer`), but only if a
         // handler is actually registered here to produce one.
         let mut p2p_tx_tag_handler =
-            algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone());
+            algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
+                .with_batch_verifier(batch_verifier.clone());
         if let Some(limiter) = &app_rate_limiter {
             p2p_tx_tag_handler = p2p_tx_tag_handler
                 .with_app_rate_limiter(limiter.clone(), app_rate_limiter_congestion_threshold);
@@ -4989,6 +5014,19 @@ pub async fn run(
     // last-second round starting against a network that's mid-shutdown.
     tx_syncer.stop().await;
     gossip_node.stop().await;
+
+    // Issue #1043: stop the shared `BatchVerifier` after both transports
+    // have stopped dispatching gossip messages -- by this point nothing
+    // can still be calling `TxTagHandler::handle` (and therefore nothing
+    // can still be submitting to the verifier), so `cancel()` (stop
+    // accepting further work) is equivalent here to the fully graceful
+    // `shutdown()` (drain-then-join) without requiring exclusive `Arc`
+    // ownership, which this node-wide instance -- shared across the
+    // WS-gossip and (if enabled) P2P `TxTagHandler`s constructed above --
+    // does not have. `cancel()` takes `&self`, so it works through the
+    // still-shared `Arc` cleanly; the dispatcher task itself is torn down
+    // with the rest of the tokio runtime at process exit.
+    batch_verifier.cancel();
 
     // Await the REST server last — its graceful shutdown depends on
     // axum finishing any in-flight requests, and by now gossip has

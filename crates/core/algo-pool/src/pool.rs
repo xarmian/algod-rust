@@ -208,6 +208,17 @@ impl TransactionPool {
         self.fee_per_byte.load(Ordering::Relaxed)
     }
 
+    /// Return the pool's backing [`PoolLedger`].
+    ///
+    /// Issue #1043: exposed so an inbound-transaction-admission caller
+    /// (e.g. `algo_network::TxTagHandler`) can look up the current round's
+    /// [`BlockHeader`]/[`ConsensusParams`] to build the
+    /// `algo_validate::VerificationContext` a `BatchVerifier` submission
+    /// needs, without duplicating the pool's own round-lookup logic.
+    pub fn ledger(&self) -> &Arc<dyn PoolLedger> {
+        &self.ledger
+    }
+
     /// Number of individual pending transactions (not groups).
     pub fn pending_count(&self) -> usize {
         let pending = self.pending_mu.read();
