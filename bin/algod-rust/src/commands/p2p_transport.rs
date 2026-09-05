@@ -668,6 +668,18 @@ pub struct ResolvedP2p {
     pub persist_peer_id: bool,
     pub bootstrap_peers: Vec<String>,
     pub listen_address: Option<String>,
+    /// The actual `enable_p2p`/`enable_p2p_hybrid_mode` values `mode` was
+    /// derived from (CLI-flag/`[p2p]`-TOML precedence already applied).
+    /// Exposed so call sites can feed `algo_config`'s canonical
+    /// `is_listen_server`/`is_hybrid_server`/`validate_p2p_hybrid_config`
+    /// derivations with the flags that actually drove this run's
+    /// `NetworkMode`, rather than the possibly-stale `Local::enable_p2p`/
+    /// `enable_p2p_hybrid_mode` loaded from `config.json` (issue #949) —
+    /// `config.json`'s copies of these two flags are not currently part of
+    /// this precedence chain at all (a pre-existing, separate gap; not
+    /// closed here).
+    pub enable_p2p: bool,
+    pub enable_p2p_hybrid_mode: bool,
 }
 
 impl P2pOptions {
@@ -698,6 +710,8 @@ impl P2pOptions {
             persist_peer_id,
             bootstrap_peers,
             listen_address,
+            enable_p2p,
+            enable_p2p_hybrid_mode,
         }
     }
 }
@@ -1370,6 +1384,42 @@ mod tests {
             opts.resolve().bootstrap_peers,
             vec!["/ip4/1.1.1.1/tcp/1".to_string()]
         );
+    }
+
+    /// Issue #949: `ResolvedP2p::enable_p2p`/`enable_p2p_hybrid_mode` must
+    /// carry the same merged (CLI-wins-over-file) flags `mode` was actually
+    /// derived from, since call sites feed these into `algo_config`'s
+    /// canonical `is_listen_server`/`is_hybrid_server`/
+    /// `validate_p2p_hybrid_config` derivations rather than re-deriving the
+    /// booleans themselves.
+    #[test]
+    fn resolved_enable_flags_match_the_mode_they_produced() {
+        let ws_only = P2pOptions::default().resolve();
+        assert_eq!(ws_only.mode, NetworkMode::WsOnly);
+        assert!(!ws_only.enable_p2p);
+        assert!(!ws_only.enable_p2p_hybrid_mode);
+
+        let p2p_only = P2pOptions {
+            enable_p2p: true,
+            ..Default::default()
+        }
+        .resolve();
+        assert_eq!(p2p_only.mode, NetworkMode::P2pOnly);
+        assert!(p2p_only.enable_p2p);
+        assert!(!p2p_only.enable_p2p_hybrid_mode);
+
+        let hybrid = P2pOptions {
+            enable_p2p_hybrid_mode: true,
+            file_p2p: Some(P2pConfig {
+                enable_p2p: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .resolve();
+        assert_eq!(hybrid.mode, NetworkMode::Hybrid);
+        assert!(hybrid.enable_p2p);
+        assert!(hybrid.enable_p2p_hybrid_mode);
     }
 
     // -----------------------------------------------------------------------

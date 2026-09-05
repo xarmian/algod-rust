@@ -8,8 +8,8 @@ Scope: go-algorand test packages `config`, `protocol`, `protocol/test`, `protoco
 | [TestConfig_LoadMissing](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L72) | [missing_config_json_in_data_dir_returns_defaults](../../crates/node/algo-config/src/lib.rs#L3856) | partial | go returns an `os.IsNotExist` error when the file is missing; algod-rust's design deliberately returns defaults instead of erroring for a missing `config.json` — a documented behavioral difference, not a byte-for-byte port. |
 | [TestLocal_MergeConfig](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L82) | [json_partial_overlay_only_overrides_present_fields](../../crates/node/algo-config/src/lib.rs#L3745), [string_field_partial_overlay_only_overrides_present_field](../../crates/node/algo-config/src/lib.rs#L3758) | matched-1:many | |
 | [TestLocal_EnrichNetworkingConfig](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L125) | [gossip_fanout_for_listen_server_bumps_default_to_relay_fanout](../../crates/node/algo-config/src/lib.rs#L4248), [gossip_fanout_for_listen_server_preserves_explicit_override](../../crates/node/algo-config/src/lib.rs#L4258) | partial | go's `enrichNetworkingConfig` also auto-enables `EnableLedgerService`/`EnableBlockService` when `NetAddress` is set and lower-cases `PublicAddress`; algod-rust only ports the gossip-fanout-bump piece (`gossip_fanout_for_listen_server`), not the ledger/block-service auto-enable or public-address normalization. |
-| [TestLoadPhonebook](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L186) | — | not-implemented | go loads a `phonebook.json` include/exclude blacklist-whitelist file from the data dir. algod-rust's `Phonebook` (`crates/node/algo-network/src/phonebook.rs`) is populated only from DNS bootstrap / config, never from a `phonebook.json` file on disk. |
-| [TestLoadPhonebookMissing](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L203) | — | not-implemented | Same gap as above. |
+| [TestLoadPhonebook](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L186) | [round_trips_a_real_include_list](../../crates/node/algo-network/src/phonebook_file.rs#L123), [loads_a_hand_written_go_style_file](../../crates/node/algo-network/src/phonebook_file.rs#L135) | matched-1:many | Issue #949: `algo_network::phonebook_file::load_phonebook`/`save_phonebook` port go's `config.LoadPhonebook`/`SavePhonebookToDisk` (`{"Include": [...]}` JSON shape), wired into `Phonebook` construction in `commands::participate::run`/`commands::relay::run` via `add_persistent_peers`. |
+| [TestLoadPhonebookMissing](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L203) | [missing_file_returns_empty_list_not_error](../../crates/node/algo-network/src/phonebook_file.rs#L116) | matched-1:1 | Issue #949. |
 | [TestLocal_ConfigExampleIsCorrect](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L212) | — | not-implemented | No `config.json.example` file (or equivalent) is shipped in algod-rust, so there is nothing to validate against the compiled-in defaults. |
 | [TestLocal_ConfigMigrate](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L255) | [field_still_at_old_default_advances_to_new_default_across_multiple_boundaries](../../crates/node/algo-config/src/lib.rs#L3769), [field_explicitly_overridden_away_from_default_is_never_clobbered](../../crates/node/algo-config/src/lib.rs#L3782), [version_newer_than_latest_known_is_rejected_not_panicked](../../crates/node/algo-config/src/lib.rs#L3817) | matched-1:many | Rust's per-field version-tagged migration mechanism covers the same "advance stale defaults, preserve explicit overrides, reject too-new versions" behavior go's `migrate()` implements, though not via the identical named-field spot-checks go's test uses. |
 | [TestLocal_ConfigMigrateFromDisk](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L304) | [default_at_version_replays_only_tags_up_to_that_version](../../crates/node/algo-config/src/lib.rs#L3699), [catchup_parallel_blocks_explicit_override_survives_migration](../../crates/node/algo-config/src/lib.rs#L3465), [max_catchpoint_download_duration_migrates_from_2h_to_12h_default](../../crates/node/algo-config/src/lib.rs#L3657), [dns_security_flags_migrates_across_version_34](../../crates/node/algo-config/src/lib.rs#L3289), [base_logger_debug_level_migrates_from_1_to_4_default](../../crates/node/algo-config/src/lib.rs#L3953), [cadaver_size_target_migrates_from_1gib_to_disabled_default](../../crates/node/algo-config/src/lib.rs#L3989) | matched-1:many | go replays real `config-v<N>.json` fixture files from disk for every historical version; algod-rust instead spot-checks the same individual field migrations (`DNSSecurityFlags`, `CadaverSizeTarget`, `MaxCatchpointDownloadDuration`, etc.) directly against its version-tag table rather than fixture files, so coverage is field-equivalent but not fixture-file-equivalent. |
@@ -24,9 +24,9 @@ Scope: go-algorand test packages `config`, `protocol`, `protocol/test`, `protoco
 | [TestLocal_VersionField](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L579) | [latest_version_matches_max_field_tag](../../crates/node/algo-config/src/lib.rs#L3042) | partial | go reflection-checks the `Version` field's own tag contiguity; Rust's test instead checks the latest-version constant matches the highest field tag actually used, a related but not identical invariant. |
 | [TestLocal_GetNonDefaultConfigValues](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L600) | [save_non_default_only_includes_version_and_overridden_fields](../../crates/node/algo-config/src/lib.rs#L3907), [save_non_default_round_trips_back_to_the_same_config](../../crates/node/algo-config/src/lib.rs#L3930) | matched-1:many | |
 | [TestLocal_TxFiltering](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L629) | [tx_incoming_filter_fields_round_trip](../../crates/node/algo-config/src/lib.rs#L3640) | partial | go asserts the specific bitflag semantics of `TxFilterRawMsgEnabled()`/`TxFilterCanonicalEnabled()` derived from `TxIncomingFilteringFlags`; Rust's test round-trips the raw field through JSON but does not assert the derived bitflag-decode helper methods' behavior. |
-| [TestLocal_IsListenServer](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L656) | — | missing-test | go's `IsListenServer`/`IsWsListenServer`/`IsP2PListenServer`/`IsHybridServer` state matrix (across `NetAddress`, `EnableP2P`, `EnableP2PHybridMode`, `P2PHybridNetAddress`) has no ported equivalent in `algo-config`; only the narrower `gossip_fanout_for_listen_server` derivation exists. Related to the Phase 16 finding that ~58 `Local` fields/behaviors have no equivalent — this specific listen-server-mode matrix is one of them, not yet closed by the newer `algo-config` work. |
-| [TestLocal_RecalculateConnectionLimits](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L736) | — | not-implemented | go's `AdjustConnectionLimits` dynamically rebalances REST/incoming/P2P-hybrid connection-limit budgets against the process's file-descriptor ceiling. No equivalent exists in algod-rust; `algo-network`'s `request_tracker.rs` connection-limit tests enforce a single static configured limit, not FD-pressure-driven rebalancing. |
-| [TestLocal_ValidateP2PHybridConfig](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L797) | — | not-implemented | No `ValidateP2PHybridConfig` equivalent found; `algo-config`'s lib.rs (line 969) references the go function by name in a doc comment only, with no corresponding validation logic or test. |
+| [TestLocal_IsListenServer](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L656) | [is_ws_listen_server_matrix](../../crates/node/algo-config/src/lib.rs#L4858), [is_p2p_listen_server_matrix](../../crates/node/algo-config/src/lib.rs#L4879), [is_listen_server_is_the_or_of_ws_and_p2p](../../crates/node/algo-config/src/lib.rs#L4899), [is_hybrid_server_requires_both_addresses_and_the_mode_flag](../../crates/node/algo-config/src/lib.rs#L4913) | matched-1:many | Issue #949: `algo_config::is_ws_listen_server`/`is_p2p_listen_server`/`is_listen_server`/`is_hybrid_server` (plus `Local` method wrappers) port the full state matrix as free functions taking the WS/P2P listen addresses as explicit parameters, since algod-rust keeps those as CLI-flag concepts rather than `Local` fields (see the module doc note on `NetAddress`). Wired into `commands::participate::run`, replacing the prior ad hoc `effective_listen_address.is_some()` check. |
+| [TestLocal_RecalculateConnectionLimits](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L736) | — | not-implemented | go's `AdjustConnectionLimits` dynamically rebalances REST/incoming/P2P-hybrid connection-limit budgets against the process's file-descriptor ceiling. No equivalent exists in algod-rust; `algo-network`'s `request_tracker.rs` connection-limit tests enforce a single static configured limit, not FD-pressure-driven rebalancing. Issue #949 scoped this out (deferred to a follow-up — requires live FD/rlimit accounting, not pure config-derivation logic). |
+| [TestLocal_ValidateP2PHybridConfig](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L797) | [validate_p2p_hybrid_config_ok_when_both_addresses_and_public_address_set](../../crates/node/algo-config/src/lib.rs#L4938), [validate_p2p_hybrid_config_rejects_net_address_without_p2p_address](../../crates/node/algo-config/src/lib.rs#L4957), [validate_p2p_hybrid_config_rejects_missing_public_address](../../crates/node/algo-config/src/lib.rs#L4981) | matched-1:many | Issue #949: `algo_config::validate_p2p_hybrid_config`/`Local::validate_p2p_hybrid_config` port go's mismatched-address and missing-`PublicAddress` checks; wired into `commands::participate::run` as a startup-time rejection. |
 | [TestEnsureAbsDir](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L839) | — | not-implemented | No `ensureAbsGenesisDir` equivalent (absolute-path resolution + directory creation for a single genesis dir) found. |
 | [TestEnsureAndResolveGenesisDirs](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L869) | — | not-implemented | No `EnsureAndResolveGenesisDirs` equivalent (resolves/creates per-genesis-ID tracker/block/crash/stateproof/catchpoint directories) found in algod-rust. |
 | [TestEnsureAndResolveGenesisDirs_hierarchy](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/config/config_test.go#L899) | — | not-implemented | Same gap: no hot/cold data-dir hierarchy resolution. |
@@ -67,7 +67,7 @@ Scope: go-algorand test packages `config`, `protocol`, `protocol/test`, `protoco
 | [TestTagList](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/protocol/tags_test.go#L115) | [roundtrip_all_tags](../../crates/node/algo-network/src/tag.rs#L212) | matched-1:1 | |
 | [TestMaxSizesDefined](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/protocol/tags_test.go#L144) | [max_sizes_match_go](../../crates/node/algo-network/src/tag.rs#L245) | partial | Go asserts every tag in `TagList` has a nonzero max message size (exhaustive); Rust spot-checks 12 explicit tag values rather than iterating the full `ACTIVE_TAGS` set. |
 | [TestMaxSizesTested](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/protocol/tags_test.go#L154) | [max_sizes_match_go](../../crates/node/algo-network/src/tag.rs#L245) | partial | Go's test is a meta-test (AST-parses `node_test.go` to ensure every tag has its own `TestMaxSizesCorrect` assertion); Rust has no equivalent cross-file coverage-completeness check, only the direct spot-check values above. |
-| [TestLockdownTagList](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/protocol/tags_test.go#L273) | — | missing-test | Locks down the exact set of tags a node advertises as its "message of interest" list (backward-compat-sensitive). No equivalent locked-down allow-list test found in algod-rust's networking code. |
+| [TestLockdownTagList](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/protocol/tags_test.go#L273) | [lockdown_tag_list](../../crates/node/algo-network/src/tag.rs#L313) | matched-1:1 | Issue #949: a hardcoded, spelled-out tag list (not `Tag::ACTIVE_TAGS` compared against itself) pinning algod-rust's own advertised tag set, mirroring go's rationale exactly (a silent addition/removal must force a reviewer to touch this test). |
 | [TestMarshalUnmarshaltestSlice](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/protocol/test/msgp_gen_test.go#L16) | — | out-of-scope | Tests go's generated `msgp` codec for a synthetic fixture type (`testSlice`) used only to validate the codegen tool itself. algod-rust uses serde derive, not a generated-codec toolchain, so there is no analogous synthetic-type codegen test. |
 | [TestRandomizedEncodingtestSlice](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/protocol/test/msgp_gen_test.go#L37) | — | out-of-scope | Same synthetic-codegen-fixture rationale as above. |
 | [TestIdempotence](https://github.com/algorand/go-algorand/blob/v5.0.0-stable/protocol/transcode/core_test.go#L180) | [roundtrip_double_serde_fast_decode](../../crates/core/algo-codec/tests/fast_decode_conformance.rs#L146) | partial | Go tests its msgp<->JSON transcode CLI tool's idempotence on arbitrary objects generically. Rust's double round-trip test covers the analogous idempotence property, but only for block/`BlockResponse` types via its own fast-decoder, not a generic msgp<->JSON transcode tool (algod-rust has no such tool). |
@@ -170,30 +170,33 @@ Status counts: matched-1:1 = 18, matched-1:many = 21, missing-test = 6, not-impl
   each row's note. This is a distinct, previously-undocumented
   architectural gap — not covered by Phase 16 (which scoped only
   `config.Local`/`ConsensusParams`, not node subsystems).
-- **`config.Local` node-runtime derivations still missing, even after the
-  new `algo-config` crate.** Phase 16's original finding ("~58 of ~97
-  `Local` fields have no equivalent at all") is significantly narrowed by
-  `crates/node/algo-config` (76 tests covering versioned defaults,
-  migration, JSON load/save, catchpoint-tracking gates, etc.), but several
-  *behavioral* (not just field-storage) gaps remain unclosed: the full
-  `IsListenServer`/`IsWsListenServer`/`IsP2PListenServer`/`IsHybridServer`
-  state matrix, `AdjustConnectionLimits`/`RecalculateConnectionLimits`
-  FD-pressure rebalancing, `ValidateP2PHybridConfig`, and the whole
-  `EnsureAndResolveGenesisDirs`/`ResolveLogPaths` directory-resolution and
-  hot/cold-data-dir-migration mechanism (7 config-package rows,
-  not-implemented). The `HotDataDir`/`ColdDataDir`/etc. directory-splitting
-  subset was explicitly dispositioned as an architectural non-goal by
-  issue #749 (algod-rust's fixed two-file-pair storage design). The
-  remaining behavioral derivations — `IsListenServer`/`IsWsListenServer`/
-  `IsP2PListenServer`/`IsHybridServer`, `AdjustConnectionLimits`/
-  `RecalculateConnectionLimits`, `ValidateP2PHybridConfig` — are genuinely
-  untracked and filed as [issue #949](https://github.com/xarmian/algod-rust/issues/949).
-- **No `phonebook.json` / `config.json.example` files.** go-algorand loads
-  an optional phonebook include/exclude allow-list file and ships a
-  `config.json.example` regression-checked against compiled defaults;
-  algod-rust's in-memory `Phonebook` is populated only from DNS bootstrap,
-  and no example config file exists to check. The `phonebook.json` loader
-  is bundled into [issue #949](https://github.com/xarmian/algod-rust/issues/949).
+- **`config.Local` node-runtime derivations — mostly closed by issue #949,
+  FD-pressure rebalancing still open.** Phase 16's original finding ("~58
+  of ~97 `Local` fields have no equivalent at all") is significantly
+  narrowed by `crates/node/algo-config` (76 tests covering versioned
+  defaults, migration, JSON load/save, catchpoint-tracking gates, etc.).
+  [Issue #949](https://github.com/xarmian/algod-rust/issues/949) closed
+  the `IsListenServer`/`IsWsListenServer`/`IsP2PListenServer`/
+  `IsHybridServer` state matrix and `ValidateP2PHybridConfig` (both now
+  live in `algo_config` and wired into `commands::participate::run`),
+  plus the `phonebook.json` loader and `TestLockdownTagList`-equivalent
+  (see below). Still open: `AdjustConnectionLimits`/
+  `RecalculateConnectionLimits` FD-pressure rebalancing (deferred —
+  requires live FD/rlimit accounting, not pure config-derivation logic;
+  see the row's note) and the whole `EnsureAndResolveGenesisDirs`/
+  `ResolveLogPaths` directory-resolution and hot/cold-data-dir-migration
+  mechanism (7 config-package rows, not-implemented). The
+  `HotDataDir`/`ColdDataDir`/etc. directory-splitting subset was
+  explicitly dispositioned as an architectural non-goal by issue #749
+  (algod-rust's fixed two-file-pair storage design).
+- **`phonebook.json` loader closed by issue #949; `config.json.example`
+  still missing.** go-algorand loads an optional phonebook include-list
+  file (`{"Include": [...]}`) and ships a `config.json.example`
+  regression-checked against compiled defaults. `algo_network::
+  phonebook_file` now ports the loader/saver, wired into `Phonebook`
+  construction in both `commands::participate::run` and
+  `commands::relay::run`; no example config file exists to check (still
+  not-implemented, unrelated to #949's scope).
 - **No self-update mechanism.** `TestAlgodVsUpdatedVersions` tests
   go-algorand's S3-hosted-binary version-naming scheme; algod-rust ships no
   self-update mechanism at all (out-of-scope, architectural).
@@ -231,6 +234,7 @@ Status counts: matched-1:1 = 18, matched-1:many = 21, missing-test = 6, not-impl
   `pq.rs` models only Falcon-1024, with no dedicated ASCII-printability/
   uniqueness invariant test for the scheme-tag byte pair.
 - **`TestLockdownTagList` (backward-compat-locked message-of-interest tag
-  allow-list) has no algod-rust equivalent** — a missing-test gap worth
-  flagging since accidentally advertising a new tag to older peers is a
-  real backward-compatibility hazard.
+  allow-list) closed by issue #949** — `algo_network::tag::tests::
+  lockdown_tag_list` pins a hardcoded, spelled-out tag list against
+  `Tag::ACTIVE_TAGS`, matching go's rationale that a silent tag addition/
+  removal must force a reviewer to touch this test.

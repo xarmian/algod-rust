@@ -3334,6 +3334,188 @@ impl Local {
             self.gossip_fanout
         }
     }
+
+    // --- IsListenServer/IsHybridServer state matrix (issue #949) ----------
+    //
+    // Go's `Local.IsWsListenServer`/`IsP2PListenServer`/`IsListenServer`/
+    // `IsHybridServer` (`config/localTemplate.go:778-798`) all read
+    // `cfg.NetAddress`/`cfg.P2PHybridNetAddress` directly off the receiver,
+    // because go keeps every networking knob on the one `Local` struct.
+    // algod-rust deliberately does not (see the module docs' "Explicitly
+    // out of scope" note on `NetAddress`): the WS-gossip listen address is a
+    // `relay --bind-address`/`participate --listen-address` CLI-flag
+    // concept, and the operative P2P listen address for both `P2pOnly` and
+    // `Hybrid` mode is `participate --p2p-listen-address`
+    // (`P2PHybridNetAddress` on [`Local`] itself stays round-trip-only, per
+    // [`P2P_HYBRID_NET_ADDRESS`]'s doc comment). These methods take both
+    // addresses as parameters for that reason, so every call site can pass
+    // whatever CLI-resolved value is actually driving its `NetworkMode`
+    // instead of re-deriving the same boolean logic ad hoc (this is exactly
+    // the gap issue #949 found: `is_relay = net_address.is_some() &&
+    // relay_messages` and `is_listen_server =
+    // effective_listen_address.is_some()` computed inline at separate call
+    // sites rather than through one canonical function).
+
+    /// Go: `Local.IsWsListenServer` (`config/localTemplate.go:784`).
+    pub fn is_ws_listen_server(&self, net_address: Option<&str>) -> bool {
+        is_ws_listen_server(self.enable_p2p, self.enable_p2p_hybrid_mode, net_address)
+    }
+
+    /// Go: `Local.IsP2PListenServer` (`config/localTemplate.go:791`).
+    ///
+    /// `p2p_net_address` plays go's `P2PHybridNetAddress` role in `Hybrid`
+    /// mode; in `P2pOnly` mode (`enable_p2p && !enable_p2p_hybrid_mode`) go
+    /// reuses `NetAddress` itself for this, so pass the same value as
+    /// `net_address` in that mode (see [`Self::is_listen_server`]'s callers
+    /// for the exact pattern).
+    pub fn is_p2p_listen_server(
+        &self,
+        net_address: Option<&str>,
+        p2p_net_address: Option<&str>,
+    ) -> bool {
+        is_p2p_listen_server(
+            self.enable_p2p,
+            self.enable_p2p_hybrid_mode,
+            net_address,
+            p2p_net_address,
+        )
+    }
+
+    /// Go: `Local.IsListenServer` (`config/localTemplate.go:779`) — true if
+    /// this node is supposed to start a websocket or P2P server.
+    pub fn is_listen_server(
+        &self,
+        net_address: Option<&str>,
+        p2p_net_address: Option<&str>,
+    ) -> bool {
+        self.is_ws_listen_server(net_address)
+            || self.is_p2p_listen_server(net_address, p2p_net_address)
+    }
+
+    /// Go: `Local.IsHybridServer` (`config/localTemplate.go:796`) — true if
+    /// this node is configured to run a listening websocket network AND a
+    /// listening P2P network simultaneously.
+    pub fn is_hybrid_server(
+        &self,
+        net_address: Option<&str>,
+        p2p_net_address: Option<&str>,
+    ) -> bool {
+        is_hybrid_server(self.enable_p2p_hybrid_mode, net_address, p2p_net_address)
+    }
+
+    /// Go: `Local.ValidateP2PHybridConfig` (`config/localTemplate.go:801`) —
+    /// checks that `NetAddress`/`P2PHybridNetAddress` are both set or both
+    /// unset in hybrid mode, and that `PublicAddress` is set whenever either
+    /// is (hybrid mode's net-identity-challenge dedup depends on it).
+    pub fn validate_p2p_hybrid_config(
+        &self,
+        net_address: Option<&str>,
+        p2p_net_address: Option<&str>,
+    ) -> Result<(), P2PHybridConfigError> {
+        validate_p2p_hybrid_config(
+            self.enable_p2p_hybrid_mode,
+            net_address,
+            p2p_net_address,
+            &self.public_address,
+        )
+    }
+}
+
+/// `true` if `net_address` is `Some` and non-empty — go's `NetAddress != ""`
+/// check, adapted for algod-rust's `Option<&str>` CLI-flag representation of
+/// an address that go stores as a `String` defaulting to `""`.
+fn has_net_address(net_address: Option<&str>) -> bool {
+    net_address.is_some_and(|s| !s.is_empty())
+}
+
+/// Go: `Local.IsWsListenServer` (`config/localTemplate.go:784`) as a free
+/// function — see [`Local::is_ws_listen_server`] for why the address is a
+/// parameter rather than a `Local` field.
+pub fn is_ws_listen_server(
+    enable_p2p: bool,
+    enable_p2p_hybrid_mode: bool,
+    net_address: Option<&str>,
+) -> bool {
+    // 1. NetAddress is set and EnableP2P is not set
+    // 2. NetAddress is set and EnableP2PHybridMode is set, then EnableP2P is
+    //    overridden by EnableP2PHybridMode
+    has_net_address(net_address) && (!enable_p2p || enable_p2p_hybrid_mode)
+}
+
+/// Go: `Local.IsP2PListenServer` (`config/localTemplate.go:791`) as a free
+/// function — see [`Local::is_p2p_listen_server`] for why the addresses are
+/// parameters rather than `Local` fields.
+pub fn is_p2p_listen_server(
+    enable_p2p: bool,
+    enable_p2p_hybrid_mode: bool,
+    net_address: Option<&str>,
+    p2p_net_address: Option<&str>,
+) -> bool {
+    (enable_p2p && !enable_p2p_hybrid_mode && has_net_address(net_address))
+        || (enable_p2p_hybrid_mode && has_net_address(p2p_net_address))
+}
+
+/// Go: `Local.IsListenServer` (`config/localTemplate.go:779`) as a free
+/// function — see [`Local::is_listen_server`].
+pub fn is_listen_server(
+    enable_p2p: bool,
+    enable_p2p_hybrid_mode: bool,
+    net_address: Option<&str>,
+    p2p_net_address: Option<&str>,
+) -> bool {
+    is_ws_listen_server(enable_p2p, enable_p2p_hybrid_mode, net_address)
+        || is_p2p_listen_server(
+            enable_p2p,
+            enable_p2p_hybrid_mode,
+            net_address,
+            p2p_net_address,
+        )
+}
+
+/// Go: `Local.IsHybridServer` (`config/localTemplate.go:796`) as a free
+/// function — see [`Local::is_hybrid_server`].
+pub fn is_hybrid_server(
+    enable_p2p_hybrid_mode: bool,
+    net_address: Option<&str>,
+    p2p_net_address: Option<&str>,
+) -> bool {
+    enable_p2p_hybrid_mode && has_net_address(net_address) && has_net_address(p2p_net_address)
+}
+
+/// Go: `P2PHybridConfigError` (`config/localTemplate.go:817`) — the two
+/// ways [`validate_p2p_hybrid_config`] can reject a hybrid-mode config.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum P2PHybridConfigError {
+    /// Go: `"P2PHybridMode requires both NetAddress and P2PHybridNetAddress
+    /// to be set or unset"`.
+    #[error("P2PHybridMode requires both NetAddress and P2PHybridNetAddress to be set or unset")]
+    MismatchedAddresses,
+
+    /// Go: `"PublicAddress must be specified when EnableP2PHybridMode is
+    /// set"`.
+    #[error("PublicAddress must be specified when EnableP2PHybridMode is set")]
+    MissingPublicAddress,
+}
+
+/// Go: `Local.ValidateP2PHybridConfig` (`config/localTemplate.go:801`) as a
+/// free function — see [`Local::validate_p2p_hybrid_config`].
+pub fn validate_p2p_hybrid_config(
+    enable_p2p_hybrid_mode: bool,
+    net_address: Option<&str>,
+    p2p_net_address: Option<&str>,
+    public_address: &str,
+) -> Result<(), P2PHybridConfigError> {
+    if enable_p2p_hybrid_mode {
+        let net_set = has_net_address(net_address);
+        let p2p_set = has_net_address(p2p_net_address);
+        if net_set != p2p_set {
+            return Err(P2PHybridConfigError::MismatchedAddresses);
+        }
+        if (net_set || p2p_set) && public_address.is_empty() {
+            return Err(P2PHybridConfigError::MissingPublicAddress);
+        }
+    }
+    Ok(())
 }
 
 /// Go: `defaultRelayGossipFanout` (`config/config.go:88`) — the gossip
@@ -4654,5 +4836,153 @@ mod tests {
             ..Local::default()
         };
         assert_eq!(cfg.gossip_fanout_for_listen_server(), 0);
+    }
+
+    // --- IsListenServer/IsHybridServer state matrix (issue #949) ----------
+    //
+    // Every row below is a direct transcription of go's boolean tables in
+    // `config/localTemplate.go:778-798` (`IsWsListenServer`/
+    // `IsP2PListenServer`/`IsListenServer`/`IsHybridServer`), enumerating
+    // every combination of (enable_p2p, enable_p2p_hybrid_mode, net_address
+    // set?, p2p_net_address set?).
+
+    fn cfg_with_p2p(enable_p2p: bool, enable_p2p_hybrid_mode: bool) -> Local {
+        Local {
+            enable_p2p,
+            enable_p2p_hybrid_mode,
+            ..Local::default()
+        }
+    }
+
+    #[test]
+    fn is_ws_listen_server_matrix() {
+        // Plain WS mode (no P2P at all): listening iff NetAddress is set.
+        let ws_only = cfg_with_p2p(false, false);
+        assert!(!ws_only.is_ws_listen_server(None));
+        assert!(!ws_only.is_ws_listen_server(Some("")));
+        assert!(ws_only.is_ws_listen_server(Some(":4160")));
+
+        // Pure P2P mode (EnableP2P, not hybrid): WS listener never runs,
+        // regardless of NetAddress.
+        let p2p_only = cfg_with_p2p(true, false);
+        assert!(!p2p_only.is_ws_listen_server(Some(":4160")));
+        assert!(!p2p_only.is_ws_listen_server(None));
+
+        // Hybrid mode: EnableP2PHybridMode overrides EnableP2P, so the WS
+        // listener runs again whenever NetAddress is set.
+        let hybrid = cfg_with_p2p(true, true);
+        assert!(hybrid.is_ws_listen_server(Some(":4160")));
+        assert!(!hybrid.is_ws_listen_server(None));
+    }
+
+    #[test]
+    fn is_p2p_listen_server_matrix() {
+        // Plain WS mode: P2P listener never runs.
+        let ws_only = cfg_with_p2p(false, false);
+        assert!(!ws_only.is_p2p_listen_server(Some(":4160"), Some(":4190")));
+
+        // Pure P2P mode: listening iff NetAddress (go's dual-purpose field,
+        // `net_address` here) is set — the hybrid address is irrelevant.
+        let p2p_only = cfg_with_p2p(true, false);
+        assert!(p2p_only.is_p2p_listen_server(Some(":4160"), None));
+        assert!(!p2p_only.is_p2p_listen_server(None, None));
+        assert!(!p2p_only.is_p2p_listen_server(None, Some(":4190")));
+
+        // Hybrid mode: listening iff P2PHybridNetAddress is set — NetAddress
+        // is irrelevant here (it gates the WS side instead).
+        let hybrid = cfg_with_p2p(true, true);
+        assert!(hybrid.is_p2p_listen_server(None, Some(":4190")));
+        assert!(!hybrid.is_p2p_listen_server(Some(":4160"), None));
+    }
+
+    #[test]
+    fn is_listen_server_is_the_or_of_ws_and_p2p() {
+        // Hybrid mode with only the WS address set: still a listen server
+        // (via the WS side), even though the P2P side is not.
+        let hybrid = cfg_with_p2p(true, true);
+        assert!(hybrid.is_listen_server(Some(":4160"), None));
+        assert!(hybrid.is_listen_server(None, Some(":4190")));
+        assert!(!hybrid.is_listen_server(None, None));
+
+        // Non-hybrid, non-P2P, no address at all: not a listen server.
+        let ws_only = cfg_with_p2p(false, false);
+        assert!(!ws_only.is_listen_server(None, None));
+    }
+
+    #[test]
+    fn is_hybrid_server_requires_both_addresses_and_the_mode_flag() {
+        let hybrid = cfg_with_p2p(true, true);
+        assert!(hybrid.is_hybrid_server(Some(":4160"), Some(":4190")));
+        assert!(!hybrid.is_hybrid_server(Some(":4160"), None));
+        assert!(!hybrid.is_hybrid_server(None, Some(":4190")));
+        assert!(!hybrid.is_hybrid_server(None, None));
+
+        // Both addresses set, but hybrid mode itself is off: not a hybrid
+        // server (this would be `P2pOnly`'s `NetAddress`, unrelated to the
+        // WS side).
+        let p2p_only = cfg_with_p2p(true, false);
+        assert!(!p2p_only.is_hybrid_server(Some(":4160"), Some(":4190")));
+    }
+
+    // --- ValidateP2PHybridConfig (issue #949) ------------------------------
+
+    #[test]
+    fn validate_p2p_hybrid_config_ok_when_hybrid_mode_off() {
+        let cfg = cfg_with_p2p(false, false);
+        // Mismatched addresses would be an error in hybrid mode, but hybrid
+        // mode isn't even on, so this must pass.
+        assert!(cfg.validate_p2p_hybrid_config(Some(":4160"), None).is_ok());
+    }
+
+    #[test]
+    fn validate_p2p_hybrid_config_ok_when_both_addresses_and_public_address_set() {
+        let cfg = Local {
+            public_address: "node.example.com:4160".to_string(),
+            ..cfg_with_p2p(true, true)
+        };
+        assert!(cfg
+            .validate_p2p_hybrid_config(Some(":4160"), Some(":4190"))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_p2p_hybrid_config_ok_when_both_addresses_unset() {
+        // Hybrid mode configured but neither address given yet: go
+        // considers this valid too (both "set or unset").
+        let cfg = cfg_with_p2p(true, true);
+        assert!(cfg.validate_p2p_hybrid_config(None, None).is_ok());
+    }
+
+    #[test]
+    fn validate_p2p_hybrid_config_rejects_net_address_without_p2p_address() {
+        let cfg = Local {
+            public_address: "node.example.com:4160".to_string(),
+            ..cfg_with_p2p(true, true)
+        };
+        assert_eq!(
+            cfg.validate_p2p_hybrid_config(Some(":4160"), None),
+            Err(P2PHybridConfigError::MismatchedAddresses)
+        );
+    }
+
+    #[test]
+    fn validate_p2p_hybrid_config_rejects_p2p_address_without_net_address() {
+        let cfg = Local {
+            public_address: "node.example.com:4160".to_string(),
+            ..cfg_with_p2p(true, true)
+        };
+        assert_eq!(
+            cfg.validate_p2p_hybrid_config(None, Some(":4190")),
+            Err(P2PHybridConfigError::MismatchedAddresses)
+        );
+    }
+
+    #[test]
+    fn validate_p2p_hybrid_config_rejects_missing_public_address() {
+        let cfg = cfg_with_p2p(true, true); // public_address defaults to ""
+        assert_eq!(
+            cfg.validate_p2p_hybrid_config(Some(":4160"), Some(":4190")),
+            Err(P2PHybridConfigError::MissingPublicAddress)
+        );
     }
 }
