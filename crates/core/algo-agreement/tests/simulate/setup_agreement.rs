@@ -46,12 +46,13 @@ use std::sync::Arc;
 use algo_agreement::stubs::StubBlockValidator;
 use algo_agreement::{
     AccountSigningKeys, AsyncCryptoVerifier, Clock, CryptoVerifier, NoOpValidator, Parameters,
-    RandomSource, Service, ServiceHandle, AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG,
-    VOTE_BUNDLE_TAG,
+    ProposeBroadcastHook, RandomSource, Service, ServiceHandle, AGREEMENT_VOTE_TAG,
+    PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 use algo_types::{ConsensusParams, Round};
 
 use super::activity_monitor::ActivityMonitor;
+use super::propose_broadcast_gate::ProposeBroadcastGate;
 use super::suspendable_validator::SuspendableBlockValidator;
 use super::test_account::{generate_n_accounts, TestAccount};
 use super::test_factory::{AutoBlockFactory, TestKeyManager};
@@ -182,6 +183,21 @@ pub fn setup_agreement(n: usize) -> AgreementCluster {
     setup_agreement_with_version_fn(n, None)
 }
 
+/// Like [`setup_agreement`], but installs `propose_gate` (issue #1035) as
+/// every node's `Service::with_propose_broadcast_hook` — a single,
+/// cluster-wide pause point on outbound proposal-payload broadcasts. Used by
+/// scenarios (`SlowPayloadsPreDeadline`/`PostDeadline`) that need to arm
+/// `pocket_all_compound` strictly BEFORE a specific round's proposal reaches
+/// the network, without also needing a suspendable validator (unlike the
+/// `8ba23942` regression — see [`setup_agreement_with_validator_and_propose_gate`]
+/// for that combination).
+pub fn setup_agreement_with_propose_gate(
+    n: usize,
+    propose_gate: Arc<ProposeBroadcastGate>,
+) -> AgreementCluster {
+    setup_agreement_inner(n, None, Some(propose_gate))
+}
+
 /// Like [`setup_agreement`], but installs `version_fn` (if given) on every
 /// node's [`TestLedger`] via [`TestLedger::with_version_fn`] — mirrors go's
 /// `setupAgreement(t, numNodes, traceLevel, ledgerFactory)` where
@@ -192,6 +208,14 @@ pub fn setup_agreement(n: usize) -> AgreementCluster {
 pub fn setup_agreement_with_version_fn(
     n: usize,
     version_fn: Option<Arc<dyn Fn(Round) -> String + Send + Sync>>,
+) -> AgreementCluster {
+    setup_agreement_inner(n, version_fn, None)
+}
+
+fn setup_agreement_inner(
+    n: usize,
+    version_fn: Option<Arc<dyn Fn(Round) -> String + Send + Sync>>,
+    propose_gate: Option<Arc<ProposeBroadcastGate>>,
 ) -> AgreementCluster {
     let buf_capacity = 1000;
     let consensus_version = algo_types::CONSENSUS_V41;
@@ -270,7 +294,12 @@ pub fn setup_agreement_with_version_fn(
             signing_keys,
         };
 
-        let handle = Service::new(this_params).start();
+        let mut service = Service::new(this_params);
+        if let Some(gate) = propose_gate.clone() {
+            let hook: ProposeBroadcastHook = Arc::new(move || gate.on_broadcast());
+            service = service.with_propose_broadcast_hook(hook);
+        }
+        let handle = service.start();
         clocks.push(clock);
         handles.push(handle);
     }
@@ -312,6 +341,31 @@ pub fn setup_agreement_with_version_fn(
 pub fn setup_agreement_with_validator(
     n: usize,
     validator: SuspendableBlockValidator,
+) -> AgreementCluster<SuspendableBlockValidator> {
+    build_cluster_with_validator(n, validator, None)
+}
+
+/// Like [`setup_agreement_with_validator`], but additionally installs
+/// `propose_gate` as every node's `Service::with_propose_broadcast_hook`
+/// (issue #1035) — a single, cluster-wide pause point on outbound
+/// proposal-payload broadcasts. Used by scenarios (the `8ba23942`
+/// regression) that need to arm a suspension/pocketing setup strictly
+/// BEFORE a specific round/period transition's proposal reaches the
+/// network, not just after the previous round's `wait_for_quiet` settles —
+/// see `propose_broadcast_gate.rs`'s module doc comment for why
+/// `wait_for_quiet` alone is provably too late for that.
+pub fn setup_agreement_with_validator_and_propose_gate(
+    n: usize,
+    validator: SuspendableBlockValidator,
+    propose_gate: Arc<ProposeBroadcastGate>,
+) -> AgreementCluster<SuspendableBlockValidator> {
+    build_cluster_with_validator(n, validator, Some(propose_gate))
+}
+
+fn build_cluster_with_validator(
+    n: usize,
+    validator: SuspendableBlockValidator,
+    propose_gate: Option<Arc<ProposeBroadcastGate>>,
 ) -> AgreementCluster<SuspendableBlockValidator> {
     let buf_capacity = 1000;
     let consensus_version = algo_types::CONSENSUS_V41;
@@ -373,7 +427,12 @@ pub fn setup_agreement_with_validator(
             signing_keys,
         };
 
-        let handle = Service::new(this_params).start();
+        let mut service = Service::new(this_params);
+        if let Some(gate) = propose_gate.clone() {
+            let hook: ProposeBroadcastHook = Arc::new(move || gate.on_broadcast());
+            service = service.with_propose_broadcast_hook(hook);
+        }
+        let handle = service.start();
         clocks.push(clock);
         handles.push(handle);
     }

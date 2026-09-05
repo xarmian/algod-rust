@@ -49,6 +49,7 @@
 pub mod activity_monitor;
 pub mod blackhole_network;
 pub mod instant_clock;
+pub mod propose_broadcast_gate;
 pub mod setup_agreement;
 pub mod suspendable_validator;
 pub mod test_account;

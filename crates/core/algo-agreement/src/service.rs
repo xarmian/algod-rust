@@ -71,6 +71,36 @@ use crate::types::{
 };
 
 // ---------------------------------------------------------------------------
+// Propose-broadcast hook
+// ---------------------------------------------------------------------------
+
+/// A test-observation hook invoked, once per outbound proposal-payload
+/// broadcast, immediately BEFORE that broadcast reaches the network layer.
+///
+/// This is new instrumentation with no go-algorand equivalent: go's test
+/// harness (`agreement/service_test.go`) drives a single goroutine, so its
+/// tests can synchronously arm interception (`pocketAllCompound`,
+/// `validator.suspend()`) between one round/period transition committing
+/// and the next round's proposal going out, relying on program order alone.
+/// algod-rust's multi-node test harness
+/// (`crates/core/algo-agreement/tests/simulate/`) drives real,
+/// independently-scheduled `Service` threads, so a node's own next proposal
+/// broadcast can already be in flight (or fully verified by every peer) by
+/// the time a driver thread regains control — see issue #1035 and
+/// `crates/core/algo-agreement/tests/simulate/testing_network.rs`'s module
+/// doc comment for the full investigation.
+///
+/// Scoped as narrowly as possible: the hook fires only around the network
+/// send of a node's OWN proposal-payload broadcast (`do_network_action`'s
+/// `ActionType::Broadcast` arm for `PROPOSAL_PAYLOAD_TAG`) — it is not
+/// consulted anywhere in `Player`'s state-machine logic, cannot affect what
+/// action the state machine decides to take, and does not fire for relayed
+/// (`ActionType::Relay`) proposal payloads that originated at a peer.
+/// Production callers (`bin/algod-rust`) never install one, so this is a
+/// pure no-op unless a test opts in via [`Service::with_propose_broadcast_hook`].
+pub type ProposeBroadcastHook = Arc<dyn Fn() + Send + Sync>;
+
+// ---------------------------------------------------------------------------
 // Parameters
 // ---------------------------------------------------------------------------
 
@@ -208,6 +238,10 @@ where
     /// [`Service::with_tracer`]. Driven every dispatch via
     /// `RootRouter::submit_top`'s `tracer` argument.
     tracer: Tracer,
+    /// Test-only hook fired before each outbound proposal-payload broadcast
+    /// — see [`ProposeBroadcastHook`]'s doc comment. `None` (the default
+    /// every production call site uses) preserves prior behavior exactly.
+    propose_broadcast_hook: Option<ProposeBroadcastHook>,
 }
 
 impl<N, L, K, BF, BV, R, M, C> Service<N, L, K, BF, BV, R, M, C>
@@ -229,7 +263,17 @@ where
             params,
             metrics: Arc::new(ParticipationMetrics::new()),
             tracer: Tracer::default(),
+            propose_broadcast_hook: None,
         }
+    }
+
+    /// Install a hook fired once, synchronously, immediately before each
+    /// outbound proposal-payload broadcast — see [`ProposeBroadcastHook`]'s
+    /// doc comment for exactly where and why. Test-only: no production call
+    /// site uses this.
+    pub fn with_propose_broadcast_hook(mut self, hook: ProposeBroadcastHook) -> Self {
+        self.propose_broadcast_hook = Some(hook);
+        self
     }
 
     /// Use a caller-supplied metrics collector instead of the one
@@ -275,6 +319,7 @@ where
         let quit = Arc::new(AtomicBool::new(false));
         let metrics = self.metrics.clone();
         let tracer = self.tracer.clone();
+        let propose_broadcast_hook = self.propose_broadcast_hook.clone();
 
         // Signal the network that the agreement service is ready.
         self.params.network.start();
@@ -429,6 +474,7 @@ where
                     vote_verifier,
                     clock_for_actions,
                     metrics_demux,
+                    propose_broadcast_hook,
                 );
             })
             .expect("failed to spawn agreement demux loop thread");
@@ -1233,6 +1279,7 @@ fn demux_loop<N, L, BV, C, M>(
     vote_verifier: Arc<AsyncVoteVerifier>,
     clock: Arc<dyn Clock>,
     metrics: Arc<ParticipationMetrics>,
+    propose_broadcast_hook: Option<ProposeBroadcastHook>,
 ) where
     N: AgreementNetwork + Send + Sync + 'static,
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
@@ -1265,6 +1312,7 @@ fn demux_loop<N, L, BV, C, M>(
             &vote_verifier,
             &clock,
             &metrics,
+            propose_broadcast_hook.as_ref(),
         );
 
         // Actions consumed — report queue drained.
@@ -1394,6 +1442,7 @@ fn do_actions<N, L, BV, C>(
     vote_verifier: &AsyncVoteVerifier,
     clock: &Arc<dyn Clock>,
     metrics: &ParticipationMetrics,
+    propose_broadcast_hook: Option<&ProposeBroadcastHook>,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
@@ -1411,6 +1460,7 @@ fn do_actions<N, L, BV, C>(
             vote_verifier,
             clock,
             metrics,
+            propose_broadcast_hook,
         );
     }
 }
@@ -1429,6 +1479,7 @@ fn do_action<N, L, BV, C>(
     vote_verifier: &AsyncVoteVerifier,
     clock: &Arc<dyn Clock>,
     metrics: &ParticipationMetrics,
+    propose_broadcast_hook: Option<&ProposeBroadcastHook>,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
@@ -1439,7 +1490,7 @@ fn do_action<N, L, BV, C>(
         Action::Noop(_) => {}
 
         Action::Network(ref na) => {
-            do_network_action(na, network, metrics);
+            do_network_action(na, network, metrics, propose_broadcast_hook);
         }
 
         Action::Crypto(ref ca) => {
@@ -1494,6 +1545,7 @@ fn do_network_action<N: AgreementNetwork>(
     na: &NetworkAction,
     network: &N,
     metrics: &ParticipationMetrics,
+    propose_broadcast_hook: Option<&ProposeBroadcastHook>,
 ) {
     match na.t {
         ActionType::BroadcastVotes => {
@@ -1517,6 +1569,20 @@ fn do_network_action<N: AgreementNetwork>(
         }
         ActionType::Broadcast => {
             if let Some((tag_str, data)) = encode_network_payload(na) {
+                // Fire the test-only checkpoint hook immediately before a
+                // node's OWN proposal-payload broadcast reaches the network
+                // — see `ProposeBroadcastHook`'s doc comment. Scoped to this
+                // one tag/action-type combination only: it does not fire for
+                // vote broadcasts, bundle broadcasts, or relayed (not
+                // locally originated) proposal payloads, and it cannot
+                // influence what `na` contains — the action was already
+                // fully decided by `Player` before `do_network_action` ever
+                // runs.
+                if tag_str == PROPOSAL_PAYLOAD_TAG {
+                    if let Some(hook) = propose_broadcast_hook {
+                        hook();
+                    }
+                }
                 let tag = Tag(tag_str);
                 if let Err(e) = network.broadcast(&tag, &data) {
                     warn!("failed to broadcast {}: {}", tag_str, e);
@@ -1791,7 +1857,7 @@ mod tests {
         StubBlockFactory, StubBlockValidator, StubCryptoVerifier, StubEventsProcessingMonitor,
         StubLedger, StubNetwork, StubRandomSource,
     };
-    use crate::traits::AgreementKeyManager;
+    use crate::traits::{AgreementError, AgreementKeyManager, Message, MessageHandle};
     use algo_types::{Address, ConsensusParams, Round};
     use std::time::Duration;
 
@@ -2359,6 +2425,7 @@ mod tests {
             &verifier,
             &clock,
             &metrics,
+            None,
         );
 
         let snap = metrics.snapshot();
@@ -2482,7 +2549,7 @@ mod tests {
             ..NetworkAction::default()
         };
 
-        do_network_action(&na, &network, &ParticipationMetrics::new());
+        do_network_action(&na, &network, &ParticipationMetrics::new(), None);
 
         // Ignore should not send anything.
         assert!(network.get_sent().is_empty());
@@ -2497,7 +2564,7 @@ mod tests {
             ..NetworkAction::default()
         };
 
-        do_network_action(&na, &network, &ParticipationMetrics::new());
+        do_network_action(&na, &network, &ParticipationMetrics::new(), None);
 
         let sent = network.get_sent();
         assert_eq!(sent.len(), 1);
@@ -2513,7 +2580,7 @@ mod tests {
             ..NetworkAction::default()
         };
 
-        do_network_action(&na, &network, &ParticipationMetrics::new());
+        do_network_action(&na, &network, &ParticipationMetrics::new(), None);
 
         let sent = network.get_sent();
         assert_eq!(sent.len(), 1);
@@ -2528,11 +2595,140 @@ mod tests {
             ..NetworkAction::default()
         };
 
-        do_network_action(&na, &network, &ParticipationMetrics::new());
+        do_network_action(&na, &network, &ParticipationMetrics::new(), None);
 
         // Should have recorded a disconnect.
         let disc = network.disconnected.lock().unwrap();
         assert_eq!(disc.len(), 1);
+    }
+
+    /// Pins issue #1035's hook: it must fire exactly once, and BEFORE the
+    /// underlying `network.broadcast` call, for an outbound
+    /// `PROPOSAL_PAYLOAD_TAG` broadcast — the checkpoint the multi-node test
+    /// harness needs between "a proposal was decided" and "it actually went
+    /// out."
+    #[test]
+    fn do_network_action_fires_propose_broadcast_hook_before_sending_a_proposal_payload() {
+        // A tiny local `AgreementNetwork` that records into a SHARED,
+        // ordered event log on every `broadcast` call — the same log the
+        // hook records into — so the test can assert relative ordering
+        // (hook-then-send) directly, not just call counts.
+        struct OrderRecordingNetwork {
+            log: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl AgreementNetwork for OrderRecordingNetwork {
+            fn messages(&self, _tag: &Tag) -> crossbeam_channel::Receiver<Message> {
+                crossbeam_channel::unbounded().1
+            }
+            fn broadcast(&self, _tag: &Tag, _data: &[u8]) -> Result<(), AgreementError> {
+                self.log.lock().unwrap().push("broadcast");
+                Ok(())
+            }
+            fn relay(
+                &self,
+                _handle: &MessageHandle,
+                _tag: &Tag,
+                _data: &[u8],
+            ) -> Result<(), AgreementError> {
+                Ok(())
+            }
+            fn disconnect(&self, _handle: &MessageHandle) {}
+            fn start(&self) {}
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let network = OrderRecordingNetwork {
+            log: Arc::clone(&log),
+        };
+        let na = NetworkAction {
+            t: ActionType::Broadcast,
+            tag: PROPOSAL_PAYLOAD_TAG.to_string(),
+            ..NetworkAction::default()
+        };
+
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fired2 = Arc::clone(&fired);
+        let log2 = Arc::clone(&log);
+        let hook: ProposeBroadcastHook = Arc::new(move || {
+            fired2.fetch_add(1, Ordering::SeqCst);
+            log2.lock().unwrap().push("hook");
+        });
+
+        do_network_action(&na, &network, &ParticipationMetrics::new(), Some(&hook));
+
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "hook must fire exactly once for a proposal-payload broadcast"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["hook", "broadcast"],
+            "hook must run strictly before the network send"
+        );
+    }
+
+    /// The hook is scoped to a node's OWN proposal-payload broadcast only —
+    /// it must not fire for a vote broadcast, nor for a RELAYED (not
+    /// locally-originated) proposal payload.
+    #[test]
+    fn do_network_action_hook_does_not_fire_for_votes_or_relays() {
+        let network = StubNetwork::new();
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let make_hook = |fired: &Arc<std::sync::atomic::AtomicUsize>| -> ProposeBroadcastHook {
+            let fired = Arc::clone(fired);
+            Arc::new(move || {
+                fired.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+
+        // A vote broadcast (not a proposal payload) must not trigger it.
+        let vote_action = NetworkAction {
+            t: ActionType::Broadcast,
+            tag: AGREEMENT_VOTE_TAG.to_string(),
+            ..NetworkAction::default()
+        };
+        let hook = make_hook(&fired);
+        do_network_action(
+            &vote_action,
+            &network,
+            &ParticipationMetrics::new(),
+            Some(&hook),
+        );
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+
+        // A RELAYED proposal payload (someone else's, being forwarded) must
+        // not trigger it either — only this node's own outbound Broadcast.
+        let relay_action = NetworkAction {
+            t: ActionType::Relay,
+            tag: PROPOSAL_PAYLOAD_TAG.to_string(),
+            ..NetworkAction::default()
+        };
+        let hook = make_hook(&fired);
+        do_network_action(
+            &relay_action,
+            &network,
+            &ParticipationMetrics::new(),
+            Some(&hook),
+        );
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+    }
+
+    /// `None` (every production call site) must behave exactly as before —
+    /// no panic, broadcast still happens.
+    #[test]
+    fn do_network_action_no_hook_installed_broadcasts_normally() {
+        let network = StubNetwork::new();
+        let na = NetworkAction {
+            t: ActionType::Broadcast,
+            tag: PROPOSAL_PAYLOAD_TAG.to_string(),
+            ..NetworkAction::default()
+        };
+
+        do_network_action(&na, &network, &ParticipationMetrics::new(), None);
+
+        assert_eq!(network.get_sent().len(), 1);
     }
 
     #[test]
