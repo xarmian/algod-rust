@@ -982,6 +982,17 @@ pub struct UnnamedCapacityTracker {
     /// ("bumps"/"startingBoxes"), used as the write-budget baseline.
     /// Mirrors go's `groupResourceTracker.startingBoxes`.
     starting_box_refs: u64,
+
+    // --- issue #1020: oversized unnamed-foreign-app program read budget ---
+    /// Extra read-budget bytes charged for each *unnamed* foreign app whose
+    /// approval+clear-state program exceeds the basic size limit, keyed by
+    /// app ID -- charged the moment the app is first referenced, even
+    /// before any box on it is ever touched. Mirrors go's
+    /// `ResourceTracker.appReadBudget` (`ledger/simulation/resources.go`,
+    /// `1088a2aad7e` / `v3.18.0-beta`). Populated (at most once per app ID)
+    /// by [`Self::add_app_read_budget`] and summed into
+    /// [`Self::used_read_budget`] alongside box read sizes.
+    app_read_budget: HashMap<u64, u64>,
 }
 
 impl UnnamedCapacityTracker {
@@ -1014,14 +1025,13 @@ impl UnnamedCapacityTracker {
             .saturating_sub(self.ref_count())
     }
 
-    /// Sum of read sizes recorded for every unnamed box observed so far.
-    /// Mirrors go's `ResourceTracker.usedReadBudget` (the `appReadBudget`
-    /// half of that function is issue #1006's still-open
-    /// oversized-unnamed-foreign-app-program gap, tracked separately -- see
-    /// the issue's "What algod-rust must do" section).
+    /// Sum of read sizes recorded for every unnamed box observed so far,
+    /// plus every oversized unnamed-foreign-app program's charged read
+    /// budget (issue #1020). Mirrors go's `ResourceTracker.usedReadBudget`.
     fn used_read_budget(&self) -> u64 {
         self.box_read_sizes
             .values()
+            .chain(self.app_read_budget.values())
             .fold(0u64, |acc, v| acc.saturating_add(*v))
     }
 
@@ -1185,6 +1195,77 @@ impl UnnamedCapacityTracker {
         }
         self.seen_apps.insert(id);
         true
+    }
+
+    /// Mirrors go's `groupResourceTracker.addAppReadBudget`: charge this
+    /// app's oversized approval+clear-state program size against the
+    /// group's read-budget pool, unless it was already charged for this
+    /// `app_id` (idempotent, matching go's `appReadBudget[aid]` guard) or
+    /// `extra_read_bytes` is 0 (no charge needed, matching go's early
+    /// `extraReadBytes == 0` return before ever touching the map).
+    /// `extra_read_bytes` is the caller-precomputed
+    /// `large_program_extra_bytes(consensus, approval_len + clear_len)` for
+    /// `app_id` (0 if the app has no on-chain params, mirroring go's
+    /// `err != nil` early-return). Returns `false` if the resulting read
+    /// deficit can't be absorbed within capacity, rolling back the charge
+    /// entirely -- mirrors go's `rollback` closure deleting the map entry
+    /// and restoring `NumEmptyBoxRefs` (here, `deficit_empty_box_refs`) to
+    /// its pre-call value.
+    fn add_app_read_budget(
+        &mut self,
+        app_id: u64,
+        extra_read_bytes: u64,
+        bytes_per_box_ref: u64,
+    ) -> bool {
+        if self.app_read_budget.contains_key(&app_id) {
+            return true;
+        }
+        if extra_read_bytes == 0 {
+            return true;
+        }
+        let old_deficit_empty_box_refs = self.deficit_empty_box_refs;
+        self.app_read_budget.insert(app_id, extra_read_bytes);
+        // `can_remove_empty_ref = false`: this call never itself releases a
+        // ref, mirroring go's `reconcileReadBudget(ep.Proto.BytesPerBoxReference, false)`.
+        if self
+            .reconcile_read_budget(bytes_per_box_ref, false)
+            .is_some()
+        {
+            true
+        } else {
+            self.app_read_budget.remove(&app_id);
+            self.deficit_empty_box_refs = old_deficit_empty_box_refs;
+            false
+        }
+    }
+
+    /// Mirrors go's `groupResourceTracker.addApp`: charge this app's
+    /// read-budget first (see [`Self::add_app_read_budget`]), and only then
+    /// add the flat app-reference slot -- rolling back the read-budget
+    /// charge if the flat add subsequently fails, exactly as go's
+    /// `rollbackAppReadBudget()` closure does. A no-op (returns `true`
+    /// immediately) if `app_id` was already seen, matching go's
+    /// `resourcePolicy.AvailableApp` checking `hasApp` before ever calling
+    /// `addApp`/`addAppReadBudget`.
+    fn try_add_app_with_read_budget(
+        &mut self,
+        app_id: u64,
+        extra_read_bytes: u64,
+        bytes_per_box_ref: u64,
+    ) -> bool {
+        if self.seen_apps.contains(&app_id) {
+            return true;
+        }
+        let old_deficit_empty_box_refs = self.deficit_empty_box_refs;
+        if !self.add_app_read_budget(app_id, extra_read_bytes, bytes_per_box_ref) {
+            return false;
+        }
+        if self.try_add_app(app_id) {
+            return true;
+        }
+        self.app_read_budget.remove(&app_id);
+        self.deficit_empty_box_refs = old_deficit_empty_box_refs;
+        false
     }
 
     /// Returns `true` if `key` is already recorded (as either a concrete
@@ -1792,11 +1873,38 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             .map_or(true, |cap| cap.borrow_mut().try_add_asset(asset_id))
     }
 
-    /// See [`Self::capacity_allows_account`]; mirrors go's `addApp`.
+    /// See [`Self::capacity_allows_account`]; mirrors go's `addApp` plus its
+    /// `addAppReadBudget` (`ledger/simulation/resources.go`, `1088a2aad7e` /
+    /// `v3.18.0-beta`, issue #1020): before granting a genuinely new app
+    /// reference, charge that app's oversized approval+clear-state program
+    /// size against the same read-budget pool issue #1006 ported for boxes
+    /// -- even if no box on the app is ever touched. Only fetches the
+    /// app's on-chain program lengths when the app hasn't already been
+    /// seen this group, matching go's `hasApp` gate short-circuiting before
+    /// `addAppReadBudget`'s ledger lookup ever runs.
     fn capacity_allows_app(&self, app_id: u64) -> bool {
-        self.unnamed_capacity
-            .as_ref()
-            .map_or(true, |cap| cap.borrow_mut().try_add_app(app_id))
+        let Some(cap) = self.unnamed_capacity.as_ref() else {
+            return true;
+        };
+        let already_seen = cap.borrow().seen_apps.contains(&app_id);
+        let extra_read_bytes = if already_seen {
+            0
+        } else {
+            self.store
+                .get_app_params(app_id)
+                .map(|p| {
+                    algo_validate::large_program_extra_bytes(
+                        &self.consensus,
+                        p.approval_program.len() + p.clear_state_program.len(),
+                    ) as u64
+                })
+                .unwrap_or(0)
+        };
+        cap.borrow_mut().try_add_app_with_read_budget(
+            app_id,
+            extra_read_bytes,
+            self.consensus.bytes_per_box_reference,
+        )
     }
 
     /// See [`Self::capacity_allows_account`]; mirrors go's `addHolding`.
@@ -14201,5 +14309,171 @@ mod tests {
 
         ctx.consider_budget_program_writes().unwrap();
         assert_eq!(num_empty_box_refs(&tracker), 2, "ceil(1224/1024) = 2");
+    }
+
+    // --- Oversized unnamed-foreign-app program read budget (issue #1020) ---
+    //
+    // Pins go's `TestUnnamedResourcesBigProgramReadBudget`/
+    // `TestUnnamedResourcesLargeUnnamedAppReadBudget`
+    // (`ledger/simulation/simulation_eval_test.go`, `1088a2aad7e` /
+    // `v3.18.0-beta`): an *unnamed* foreign app's oversized approval+clear-
+    // state program must charge extra read-budget the moment the app is
+    // first referenced -- even before any box on that app is ever touched
+    // -- competing for the same read-budget pool issue #1006 ported for
+    // boxes.
+
+    #[test]
+    fn unnamed_capacity_add_app_read_budget_no_charge_when_program_not_oversized() {
+        let mut t = tracker_with(generous_capacity());
+        assert!(t.add_app_read_budget(42, 0, 100));
+        assert_eq!(t.used_read_budget(), 0);
+        assert_eq!(t.deficit_empty_box_refs, 0);
+        assert!(t.app_read_budget.is_empty());
+    }
+
+    #[test]
+    fn unnamed_capacity_add_app_read_budget_charges_once_per_app() {
+        let mut t = tracker_with(generous_capacity());
+        // 150 extra bytes over the free tier, 100 bytes/ref: ceil(150/100)=2.
+        assert!(t.add_app_read_budget(42, 150, 100));
+        assert_eq!(t.used_read_budget(), 150);
+        assert_eq!(
+            t.deficit_empty_box_refs, 2,
+            "a fresh charge with zero starting box refs needs the whole 150 bytes covered"
+        );
+        // A repeat reference to the same app (matching go's
+        // `appReadBudget[aid]` idempotency guard) must not double-charge,
+        // even if called with a different `extra_read_bytes` value.
+        assert!(t.add_app_read_budget(42, 999, 100));
+        assert_eq!(t.used_read_budget(), 150);
+        assert_eq!(t.deficit_empty_box_refs, 2);
+    }
+
+    #[test]
+    fn unnamed_capacity_add_app_read_budget_rolls_back_when_capacity_exhausted() {
+        let mut cap = generous_capacity();
+        cap.max_boxes = 1;
+        cap.max_total_refs = 100;
+        let mut t = tracker_with(cap);
+        // 150 extra bytes needs 2 empty refs, but only 1 box slot remains.
+        assert!(
+            !t.add_app_read_budget(42, 150, 100),
+            "2 empty refs needed but max_boxes=1"
+        );
+        assert!(
+            t.app_read_budget.is_empty(),
+            "the charge must be rolled back entirely on capacity failure"
+        );
+        assert_eq!(t.deficit_empty_box_refs, 0);
+        assert_eq!(t.used_read_budget(), 0);
+    }
+
+    /// Build a `LedgerAvmContext` executing `app_id` (a small, unremarkable
+    /// program) with unnamed-resource capacity tracking enabled, and a
+    /// second app `foreign_app_id` on the ledger with the given combined
+    /// approval+clear-state program length -- reachable only via unnamed
+    /// resolution (not named in `foreign_apps`/`access`).
+    /// `zero_free_program_tier` is applied so every byte of
+    /// `foreign_program_len` counts as "extra", matching this module's
+    /// other program-size tests.
+    fn make_unnamed_app_read_budget_context<'a>(
+        store: &'a mut LedgerState,
+        app_id: u64,
+        foreign_app_id: u64,
+        foreign_program_len: usize,
+        capacity: crate::simulation::trace::ResourceCapacity,
+        bytes_per_box_ref: u64,
+    ) -> (
+        LedgerAvmContext<'a, LedgerState>,
+        Rc<RefCell<UnnamedCapacityTracker>>,
+    ) {
+        store.set_app_params(
+            foreign_app_id,
+            algo_types::AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: vec![0u8; foreign_program_len],
+                ..Default::default()
+            },
+        );
+        let (mut ctx, tracker) =
+            make_unnamed_box_io_context(store, app_id, capacity, bytes_per_box_ref);
+        zero_free_program_tier(&mut ctx);
+        (ctx, tracker)
+    }
+
+    #[test]
+    fn resolve_app_charges_read_budget_for_oversized_unnamed_foreign_app() {
+        let mut store = LedgerState::new();
+        // 150 extra bytes, 100 bytes/ref: ceil(150/100)=2.
+        let (ctx, tracker) = make_unnamed_app_read_budget_context(
+            &mut store,
+            1000,
+            2000,
+            150,
+            generous_capacity(),
+            100,
+        );
+        assert_eq!(ctx.resolve_app(2000).unwrap(), 2000);
+        assert_eq!(num_empty_box_refs(&tracker), 2);
+        assert!(
+            tracker.borrow().seen_apps.contains(&2000),
+            "the app itself must also be recorded as an unnamed access"
+        );
+    }
+
+    #[test]
+    fn resolve_app_charges_read_budget_only_once_per_app() {
+        let mut store = LedgerState::new();
+        let (ctx, tracker) = make_unnamed_app_read_budget_context(
+            &mut store,
+            1000,
+            2000,
+            150,
+            generous_capacity(),
+            100,
+        );
+        assert_eq!(ctx.resolve_app(2000).unwrap(), 2000);
+        assert_eq!(num_empty_box_refs(&tracker), 2);
+        // Referencing the same already-seen app again must not double the
+        // charge (matches go's "referencing a second large app" scenario
+        // in `TestUnnamedResourcesBigProgramReadBudget`, applied here to a
+        // repeat of the *same* app for a minimal, deterministic pin).
+        assert_eq!(ctx.resolve_app(2000).unwrap(), 2000);
+        assert_eq!(num_empty_box_refs(&tracker), 2);
+    }
+
+    #[test]
+    fn resolve_app_ignores_read_budget_for_non_oversized_foreign_app() {
+        let mut store = LedgerState::new();
+        // With `zero_free_program_tier` applied, an empty program is the
+        // only length that contributes 0 extra bytes -- so no empty ref
+        // should ever be charged for it.
+        let (ctx, tracker) = make_unnamed_app_read_budget_context(
+            &mut store,
+            1000,
+            2000,
+            0,
+            generous_capacity(),
+            100,
+        );
+        assert_eq!(ctx.resolve_app(2000).unwrap(), 2000);
+        assert_eq!(num_empty_box_refs(&tracker), 0);
+    }
+
+    #[test]
+    fn resolve_app_rolls_back_app_read_budget_when_capacity_exhausted() {
+        let mut store = LedgerState::new();
+        let mut cap = generous_capacity();
+        cap.max_boxes = 1; // only 1 box slot: the 2 empty refs needed can't fit
+        let (ctx, tracker) =
+            make_unnamed_app_read_budget_context(&mut store, 1000, 2000, 150, cap, 100);
+        let err = ctx.resolve_app(2000).unwrap_err();
+        assert_eq!(format!("{err}"), "AVM: unavailable App 2000");
+        assert!(
+            !tracker.borrow().seen_apps.contains(&2000),
+            "the app reference itself must also be rolled back, not just the read budget"
+        );
+        assert!(tracker.borrow().app_read_budget.is_empty());
+        assert_eq!(num_empty_box_refs(&tracker), 0);
     }
 }
