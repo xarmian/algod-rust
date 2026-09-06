@@ -587,6 +587,63 @@ fn state_proof_verification_context_round_trip_synthetic() {
     }
 }
 
+/// Issue #1059: `algo_codec::StateProofVerificationContext` gained a
+/// `Serialize` impl so `catchpoint/importer.rs`'s `rmp_serde::to_vec_named`
+/// re-encode path can use this one shared type instead of maintaining a
+/// third hand-copied mirror in `catchpoint::types`. Confirm: (1) the
+/// rename tags match go's `spround`/`vc`/`pw`/`v`, (2) only `version` is
+/// omitted when empty — the exact behavior
+/// `catchpoint::types::StateProofVerificationContext` had before this
+/// consolidation, which the importer's re-encode path must not change —
+/// and (3) the type round-trips through `rmp_serde`'s own Serialize impl
+/// (not just the hand-rolled canonical encoder exercised above).
+#[test]
+fn state_proof_verification_context_serialize_via_rmp_serde_matches_prior_shape() {
+    let ctx = StateProofVerificationContext {
+        last_attested_round: 120,
+        voters_commitment: Vec::new(),
+        online_total_weight: 100,
+        version: String::new(),
+    };
+    let bytes = rmp_serde::to_vec_named(&ctx).expect("serialize via rmp_serde");
+    let val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..]).expect("decode as rmpv");
+    let map = val.as_map().expect("must encode as a map");
+    let keys: Vec<&str> = map.iter().map(|(k, _)| k.as_str().unwrap()).collect();
+    assert!(keys.contains(&"spround"), "missing spround tag: {keys:?}");
+    assert!(keys.contains(&"vc"), "missing vc tag: {keys:?}");
+    assert!(keys.contains(&"pw"), "missing pw tag: {keys:?}");
+    assert!(
+        !keys.contains(&"v"),
+        "empty version must be omitted from the wire, matching \
+         catchpoint::types::StateProofVerificationContext's prior \
+         skip_serializing_if behavior: {keys:?}"
+    );
+
+    let round_tripped: StateProofVerificationContext =
+        rmp_serde::from_slice(&bytes).expect("decode via rmp_serde");
+    assert_eq!(round_tripped, ctx);
+
+    // A non-empty version must be present on the wire.
+    let ctx_with_version = StateProofVerificationContext {
+        version: "future".into(),
+        ..ctx
+    };
+    let bytes_with_version =
+        rmp_serde::to_vec_named(&ctx_with_version).expect("serialize via rmp_serde");
+    let val_with_version: rmpv::Value =
+        rmpv::decode::read_value(&mut &bytes_with_version[..]).expect("decode as rmpv");
+    let map_with_version = val_with_version.as_map().expect("must encode as a map");
+    assert!(
+        map_with_version
+            .iter()
+            .any(|(k, _)| k.as_str() == Some("v")),
+        "non-empty version must be present: {map_with_version:?}"
+    );
+    let round_tripped_with_version: StateProofVerificationContext =
+        rmp_serde::from_slice(&bytes_with_version).expect("decode via rmp_serde");
+    assert_eq!(round_tripped_with_version, ctx_with_version);
+}
+
 fn decode_state_proof_verification_context_value(
     data: &[u8],
 ) -> Result<StateProofVerificationContext, String> {
