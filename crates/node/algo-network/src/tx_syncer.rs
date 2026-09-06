@@ -52,7 +52,7 @@
 //! [PLAN-33 · P2P & Gossip Completion]: #
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::HashSet,
     fmt,
     sync::{Arc, Mutex},
     time::Duration,
@@ -82,6 +82,16 @@ pub struct TxSyncerConfig {
     pub sync_timeout: Duration,
     /// Capacity of the recently-seen txid LRU.
     pub seen_cache_size: usize,
+    /// Interval at which the recently-seen txid cache rotates its
+    /// generations in the background, bounding how long a stale entry
+    /// can survive when traffic is too low to ever hit `seen_cache_size`.
+    ///
+    /// Mirrors go's `txSaltedCache.Start(ctx, 60*time.Second)`
+    /// (`data/txHandler.go`), which hardcodes a 60-second refresh for its
+    /// salted dup-detection cache rather than exposing it in
+    /// `config.json` — kept the same way here rather than as a new
+    /// `algo_config::NodeConfig` field. See [`SeenTxCache::rotate`].
+    pub seen_cache_rotate_interval: Duration,
     /// Server-side cap on response size (bytes). Surfaced here so the
     /// skeleton owns the full configuration surface; enforced by the
     /// tx-service endpoint when it lands.
@@ -112,6 +122,7 @@ impl Default for TxSyncerConfig {
             sync_interval: Duration::from_secs(60),
             sync_timeout: Duration::from_secs(30),
             seen_cache_size: 100_000,
+            seen_cache_rotate_interval: Duration::from_secs(60),
             server_response_size: 1_000_000,
             server_max_concurrent_requests: 64,
             server_capacity_per_peer: 4,
@@ -264,28 +275,51 @@ impl SolicitedTxHandler for NoOpSolicitedTxHandler {
 // Seen-hash LRU
 // ---------------------------------------------------------------------------
 
-/// Bounded FIFO cache of recently-seen incoming txids.
+/// Bounded, generation-rotating cache of recently-seen incoming txids.
 ///
 /// Used by the follow-up TX-tag handler (TASK-69) and local-broadcast
 /// path (TASK-70) to reject duplicate txids cheaply without round-tripping
 /// to the pool. Clonable via `Arc` — every caller sees the same cache.
 ///
-/// The eviction policy is FIFO (insertion order), not true LRU. This
-/// matches what we need in practice (keep the most recent N) while
-/// staying cheap: `O(1)` insert, `O(1)` membership test, no
-/// reshuffling on read.
+/// Mirrors the two-generation design of go's `digestCache`/`txSaltedCache`
+/// (`data/txDupCache.go`): a `cur` generation that new entries are
+/// inserted into and a `prev` generation that is only ever read from.
+/// Reaching `capacity` in `cur` rotates `cur` into `prev` (dropping the
+/// previous `prev` outright) and starts a fresh, empty `cur` — so an
+/// entry is guaranteed visible for at least one full generation and
+/// guaranteed gone after two, i.e. the cache holds between `capacity` and
+/// `2 * capacity` entries at any moment. This is a deliberate looser bound
+/// than the old strict "exactly the `capacity` most recent" FIFO: it is
+/// what lets [`rotate`](Self::rotate) be called on a fixed wall-clock
+/// schedule (see [`TxSyncer::start`]) *independently* of insertion volume
+/// and still bound worst-case memory the same way go's does, instead of
+/// depending entirely on traffic to trigger eviction.
+///
+/// algod-rust keys this cache by the transaction's own [`Digest`]
+/// directly rather than go's `blake2b(msg || salt)` scheme — go hashes
+/// arbitrary-length raw gossip bytes down to a fixed-size digest and
+/// rotates the salt so a peer can't precompute colliding inputs across
+/// node restarts/long uptimes; algod-rust never hashes raw bytes here; a
+/// txid is already a fixed-size, collision-resistant digest, so there is
+/// no raw-bytes-to-hash step for a salt to protect. The rotation
+/// (schedule + manual) is ported for its actual purpose per the issue
+/// this addresses — bounding memory growth and stale-entry lifetime over
+/// long uptimes — without a salt this cache has no use for.
 pub struct SeenTxCache {
     capacity: usize,
     inner: Mutex<SeenTxCacheInner>,
 }
 
 struct SeenTxCacheInner {
-    seen: HashSet<Digest>,
-    order: VecDeque<Digest>,
+    /// Generation new entries are inserted into.
+    cur: HashSet<Digest>,
+    /// Previous generation — read-only until the next rotation drops it.
+    prev: HashSet<Digest>,
 }
 
 impl SeenTxCache {
-    /// Create a cache that retains up to `capacity` txids.
+    /// Create a cache that retains between `capacity` and `2 * capacity`
+    /// txids.
     ///
     /// `capacity == 0` is treated as `1` — a zero-capacity cache would be a
     /// silent footgun for callers who pass an unset config value.
@@ -295,8 +329,8 @@ impl SeenTxCache {
         Self {
             capacity,
             inner: Mutex::new(SeenTxCacheInner {
-                seen: HashSet::with_capacity(capacity),
-                order: VecDeque::with_capacity(capacity),
+                cur: HashSet::with_capacity(capacity),
+                prev: HashSet::new(),
             }),
         }
     }
@@ -307,38 +341,28 @@ impl SeenTxCache {
     /// it was last evicted, or `false` if it was already present.
     pub fn insert(&self, txid: Digest) -> bool {
         let mut g = self.inner.lock().expect("SeenTxCache mutex poisoned");
-        if !g.seen.insert(txid) {
+        if g.cur.contains(&txid) || g.prev.contains(&txid) {
             return false;
         }
-        g.order.push_back(txid);
-        while g.order.len() > self.capacity {
-            if let Some(oldest) = g.order.pop_front() {
-                g.seen.remove(&oldest);
-            } else {
-                break;
-            }
+        if g.cur.len() >= self.capacity {
+            Self::rotate_locked(&mut g, self.capacity);
         }
+        g.cur.insert(txid);
         true
     }
 
     /// Returns `true` if `txid` is currently in the cache.
     #[must_use]
     pub fn contains(&self, txid: &Digest) -> bool {
-        self.inner
-            .lock()
-            .expect("SeenTxCache mutex poisoned")
-            .seen
-            .contains(txid)
+        let g = self.inner.lock().expect("SeenTxCache mutex poisoned");
+        g.cur.contains(txid) || g.prev.contains(txid)
     }
 
-    /// Current number of entries.
+    /// Current number of entries across both generations.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("SeenTxCache mutex poisoned")
-            .order
-            .len()
+        let g = self.inner.lock().expect("SeenTxCache mutex poisoned");
+        g.cur.len() + g.prev.len()
     }
 
     /// Returns `true` if the cache has no entries.
@@ -347,10 +371,30 @@ impl SeenTxCache {
         self.len() == 0
     }
 
-    /// Configured maximum number of entries.
+    /// Configured per-generation capacity. The cache as a whole retains up
+    /// to `2 * capacity()` entries between rotations.
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Rotate generations now: `prev` is discarded, `cur` becomes the new
+    /// `prev`, and a fresh empty `cur` is installed.
+    ///
+    /// This is the manual counterpart to the scheduled rotation
+    /// [`TxSyncer::start`] runs on `TxSyncerConfig::seen_cache_rotate_interval`
+    /// — mirrors go's `txSaltedCache.Remix` (`data/txHandler.go`'s
+    /// on-demand rotation call), which the same production code path also
+    /// invokes on a fixed schedule via `salter`.
+    pub fn rotate(&self) {
+        let mut g = self.inner.lock().expect("SeenTxCache mutex poisoned");
+        Self::rotate_locked(&mut g, self.capacity);
+    }
+
+    /// Locked rotation step shared by capacity-triggered and manual/
+    /// scheduled rotation. Caller holds `self.inner`'s lock.
+    fn rotate_locked(g: &mut SeenTxCacheInner, capacity: usize) {
+        g.prev = std::mem::replace(&mut g.cur, HashSet::with_capacity(capacity));
     }
 }
 
@@ -488,16 +532,19 @@ impl TxSyncer {
         let pool = self.pool.clone();
         let peer_source = self.peer_source.clone();
         let handler = self.handler.clone();
+        let seen = self.seen.clone();
 
         // Defensive clamp: `tokio::time::interval` panics on a zero
         // duration. A bad config should degrade to "effectively busy"
         // rather than crash the sync loop on startup.
         let tick_interval = config.sync_interval.max(MIN_TICK_INTERVAL);
+        let rotate_interval = config.seen_cache_rotate_interval.max(MIN_TICK_INTERVAL);
 
         let task = tokio::spawn(async move {
             debug!(
                 interval = ?tick_interval,
                 timeout = ?config.sync_timeout,
+                rotate_interval = ?rotate_interval,
                 "TxSyncer loop started",
             );
             let mut ticker = time::interval(tick_interval);
@@ -508,12 +555,24 @@ impl TxSyncer {
             // it so our first *real* round waits the full `sync_interval`.
             ticker.tick().await;
 
+            // Scheduled seen-cache rotation — mirrors go's `txSaltedCache`
+            // `salter` goroutine (`data/txHandler.go`), which rotates the
+            // dup-detection cache on a fixed wall-clock schedule
+            // independently of the (unrelated) sync-round ticker above.
+            let mut rotate_ticker = time::interval(rotate_interval);
+            rotate_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            rotate_ticker.tick().await;
+
             loop {
                 select! {
                     biased;
                     () = cancel.cancelled() => {
                         debug!("TxSyncer loop cancelled");
                         return;
+                    }
+                    _ = rotate_ticker.tick() => {
+                        seen.rotate();
+                        debug!("TxSyncer seen-cache rotated (scheduled)");
                     }
                     _ = ticker.tick() => {
                         // Race the sync round against cancellation too.
@@ -986,17 +1045,41 @@ mod tests {
     }
 
     #[test]
-    fn seen_cache_evicts_oldest_past_capacity() {
+    fn seen_cache_rotates_generation_past_capacity() {
+        // Two-generation contract (mirrors go's `digestCache`/
+        // `txSaltedCache`): reaching `capacity` in the current generation
+        // rotates it into `prev` rather than evicting a single oldest
+        // entry — an item survives at least one full generation and is
+        // only guaranteed gone after two.
         let c = SeenTxCache::new(3);
         assert!(c.insert(d(1)));
         assert!(c.insert(d(2)));
         assert!(c.insert(d(3)));
-        assert!(c.insert(d(4))); // evicts d(1)
-        assert!(!c.contains(&d(1)));
+        assert_eq!(c.len(), 3);
+
+        // Past capacity: rotates cur -> prev, d(1..3) remain visible.
+        assert!(c.insert(d(4)));
+        assert!(c.contains(&d(1)), "first generation still live in `prev`");
         assert!(c.contains(&d(2)));
         assert!(c.contains(&d(3)));
         assert!(c.contains(&d(4)));
-        assert_eq!(c.len(), 3);
+        assert_eq!(c.len(), 4);
+
+        // Fill the second generation to capacity too.
+        assert!(c.insert(d(5)));
+        assert!(c.insert(d(6)));
+        assert_eq!(c.len(), 6);
+
+        // One more insert rotates again: the first generation is now gone.
+        assert!(c.insert(d(7)));
+        assert!(!c.contains(&d(1)));
+        assert!(!c.contains(&d(2)));
+        assert!(!c.contains(&d(3)));
+        assert!(c.contains(&d(4)));
+        assert!(c.contains(&d(5)));
+        assert!(c.contains(&d(6)));
+        assert!(c.contains(&d(7)));
+        assert_eq!(c.len(), 4);
     }
 
     #[test]
@@ -1004,9 +1087,46 @@ mod tests {
         let c = SeenTxCache::new(0);
         assert_eq!(c.capacity(), 1);
         assert!(c.insert(d(1)));
-        assert!(c.insert(d(2))); // evicts d(1)
+        // Rotates: d(1) moves into `prev` and is still visible there.
+        assert!(c.insert(d(2)));
+        assert!(
+            c.contains(&d(1)),
+            "still visible in the previous generation"
+        );
+        assert!(c.contains(&d(2)));
+        // Second rotation: d(1)'s generation is now dropped.
+        assert!(c.insert(d(3)));
         assert!(!c.contains(&d(1)));
         assert!(c.contains(&d(2)));
+        assert!(c.contains(&d(3)));
+    }
+
+    #[test]
+    fn seen_cache_manual_rotate_moves_current_to_previous() {
+        // Mirrors go's `TestTxHandlerSaltedCacheManual`
+        // (`data/txDupCache_test.go`): `rotate()` on demand ages the
+        // current generation into `prev` without waiting for capacity.
+        let c = SeenTxCache::new(20);
+        assert!(c.insert(d(1)));
+        assert!(c.insert(d(2)));
+        assert_eq!(c.len(), 2);
+
+        c.rotate();
+        assert!(c.contains(&d(1)), "rotated entries still visible in `prev`");
+        assert!(c.contains(&d(2)));
+
+        assert!(c.insert(d(3)));
+        assert_eq!(c.len(), 3);
+
+        // A second rotate drops the pre-rotate generation entirely.
+        c.rotate();
+        assert!(!c.contains(&d(1)));
+        assert!(!c.contains(&d(2)));
+        assert!(
+            c.contains(&d(3)),
+            "still in the generation rotated into `prev`"
+        );
+        assert_eq!(c.len(), 1);
     }
 
     // ── TxSyncer lifecycle ──────────────────────────────────────
@@ -1056,6 +1176,45 @@ mod tests {
         let b = syncer.seen_cache();
         a.insert(d(7));
         assert!(b.contains(&d(7)));
+    }
+
+    /// Mirrors go's `TestTxHandlerSaltedCacheScheduled`
+    /// (`data/txDupCache_test.go`): with a short
+    /// `seen_cache_rotate_interval`, the background loop rotates the seen
+    /// cache on its own schedule — an entry inserted once must eventually
+    /// disappear even though it is never re-inserted and capacity is
+    /// never reached, because two scheduled rotations elapse.
+    #[tokio::test]
+    async fn txsyncer_scheduled_rotation_ages_out_seen_entries() {
+        let cfg = TxSyncerConfig {
+            // Long enough that no real sync round ever fires during this
+            // test — only rotation is under test here.
+            sync_interval: Duration::from_secs(60),
+            seen_cache_rotate_interval: Duration::from_millis(20),
+            ..TxSyncerConfig::default()
+        };
+        let syncer = TxSyncer::new(
+            cfg,
+            Arc::new(FakePool(Vec::new())),
+            Arc::new(EmptyPeerSource),
+            Arc::new(NoOpSolicitedTxHandler),
+        );
+
+        let seen = syncer.seen_cache();
+        seen.insert(d(42));
+        assert!(seen.contains(&d(42)));
+
+        syncer.start();
+        // Two rotation intervals: first moves cur -> prev (still visible),
+        // second drops that generation for good. Pad generously against
+        // scheduler jitter.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        syncer.stop().await;
+
+        assert!(
+            !seen.contains(&d(42)),
+            "entry must be aged out after two scheduled rotations"
+        );
     }
 
     /// Regression: `stop()` must not wait for an in-flight peer.sync to
