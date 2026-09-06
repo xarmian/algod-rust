@@ -299,8 +299,12 @@ pub struct AlgodNodeInterface {
     /// early with [`NodeError::Timeout`] so in-flight
     /// `wait-for-block-after` handlers don't hold the REST server's
     /// graceful-shutdown future open until their own 60s deadline
-    /// expires. Unset for read-only / test contexts — the adapter
-    /// still polls until the caller-supplied timeout arrives.
+    /// expires. Also exposed via [`NodeInterface::shutdown_signal`] so
+    /// the default `get_state_proof_transaction_for_round` scan
+    /// (`crates/node/algo-rest-api/src/node.rs`) interrupts promptly on
+    /// shutdown too (issue #1079). Unset for read-only / test contexts —
+    /// the adapter still polls/scans until the caller-supplied timeout
+    /// arrives.
     shutdown_token: Option<CancellationToken>,
     genesis_id: String,
     genesis_hash: Digest,
@@ -1176,6 +1180,10 @@ impl NodeInterface for AlgodNodeInterface {
 
     fn upgrade_threshold(&self) -> u64 {
         DEFAULT_UPGRADE_THRESHOLD
+    }
+
+    fn shutdown_signal(&self) -> Option<&CancellationToken> {
+        self.shutdown_token.as_ref()
     }
 
     async fn wait_for_round(&self, round: u64) -> Result<(), NodeError> {
@@ -4619,6 +4627,34 @@ mod tests {
             }
             other => panic!("expected Timeout(shutdown), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shutdown_signal_reflects_the_configured_token() {
+        // `NodeInterface::shutdown_signal` is what
+        // `get_state_proof_transaction_for_round`'s default scan
+        // (`crates/node/algo-rest-api/src/node.rs`) polls to interrupt
+        // promptly on shutdown (issue #1079). The real adapter must wire
+        // it to the same `shutdown_token` that `wait_for_round` already
+        // uses, not a separate/disconnected signal.
+        let token = CancellationToken::new();
+        let adapter = make_adapter().with_shutdown_token(token.clone());
+
+        let signal = adapter
+            .shutdown_signal()
+            .expect("adapter configured with a shutdown token");
+        assert!(!signal.is_cancelled());
+        token.cancel();
+        assert!(
+            signal.is_cancelled(),
+            "shutdown_signal() must observe the same token wait_for_round uses"
+        );
+    }
+
+    #[test]
+    fn shutdown_signal_is_none_without_a_configured_token() {
+        let adapter = make_adapter();
+        assert!(adapter.shutdown_signal().is_none());
     }
 
     #[tokio::test]

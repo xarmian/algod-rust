@@ -2112,26 +2112,40 @@ pub async fn get_light_block_header_proof<N: NodeInterface>(
         return error::internal_error("given round is greater than the latest round");
     }
 
-    // Get the state proof transaction that covers this round.
-    let (first_attested_round, last_attested_round) =
-        match node.get_state_proof_transaction_for_round(round).await {
-            Ok(range) => range,
-            Err(NodeError::NotFound(msg)) => return error::not_found(msg),
-            // State proof tracking isn't implemented yet (issue #462), so
-            // the default `NodeInterface::get_state_proof_transaction_for_round`
-            // always returns `NotImplemented`. From this endpoint's
-            // perspective that's indistinguishable from go's own "no state
-            // proof covers this round" 404 (the only case currently
-            // verifiable — no state proofs exist yet on a fresh localnet
-            // either way) -- surfacing a 500 here would be a real,
-            // avoidable conformance mismatch. Once state proof tracking is
-            // implemented, `NotImplemented` will simply stop being
-            // returned and this arm becomes unreachable in practice.
-            Err(NodeError::NotImplemented(_)) => {
-                return error::not_found("no state proof covers the given round")
-            }
-            Err(e) => return error::internal_error(e.to_string()),
-        };
+    // Get the state proof transaction that covers this round. Bounded by
+    // a 1-minute timeout matching go-algorand's `context.WithTimeout` around
+    // `GetStateProofTransactionForRound` (`daemon/algod/api/server/v2/
+    // handlers.go`'s `GetLightBlockHeaderProof`) -- see issue #1079 /
+    // `TestStateproofTransactionForRoundTimeouts`. A node shutdown is
+    // handled inside the scan itself via `NodeInterface::shutdown_signal`
+    // (also surfaced as `NodeError::Timeout`), matching go's `ErrShutdown`/
+    // `ErrTimeout` both being distinct from the 404 "no state proof found"
+    // case.
+    let (first_attested_round, last_attested_round) = match tokio::time::timeout(
+        Duration::from_secs(60),
+        node.get_state_proof_transaction_for_round(round),
+    )
+    .await
+    {
+        Ok(Ok(range)) => range,
+        Ok(Err(NodeError::NotFound(msg))) => return error::not_found(msg),
+        // State proof tracking isn't implemented yet (issue #462), so
+        // the default `NodeInterface::get_state_proof_transaction_for_round`
+        // always returns `NotImplemented`. From this endpoint's
+        // perspective that's indistinguishable from go's own "no state
+        // proof covers this round" 404 (the only case currently
+        // verifiable — no state proofs exist yet on a fresh localnet
+        // either way) -- surfacing a 500 here would be a real,
+        // avoidable conformance mismatch. Once state proof tracking is
+        // implemented, `NotImplemented` will simply stop being
+        // returned and this arm becomes unreachable in practice.
+        Ok(Err(NodeError::NotImplemented(_))) => {
+            return error::not_found("no state proof covers the given round")
+        }
+        Ok(Err(NodeError::Timeout(msg))) => return error::timeout(msg),
+        Ok(Err(e)) => return error::internal_error(e.to_string()),
+        Err(_elapsed) => return error::timeout("operation timed out"),
+    };
 
     let state_proof_interval = last_attested_round
         .saturating_sub(first_attested_round)

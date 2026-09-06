@@ -135,6 +135,13 @@ struct MockNode {
     txn_group_deltas: Option<BTreeMap<u64, Vec<algo_rest_api::node::TxnGroupDeltaWithIds>>>,
     /// State proof transaction results, keyed by round. Returns (first_attested, last_attested).
     state_proof_txns: BTreeMap<u64, (u64, u64)>,
+    /// When true, `get_state_proof_transaction_for_round` blocks forever
+    /// (via `wait_notify`, like `MockWaitBehavior::WaitForever`) instead of
+    /// consulting `state_proof_txns` -- used to pin the REST handler's own
+    /// 1-minute timeout wrapper (see
+    /// `get_light_block_header_proof_returns_408_on_timeout`, issue #1079 /
+    /// go's `TestStateproofTransactionForRoundTimeouts`).
+    state_proof_scan_hangs: bool,
     /// Supply info to return from get_supply().
     supply_info: Option<SupplyInfo>,
     /// State proof data results, keyed by round.
@@ -234,6 +241,7 @@ impl Clone for MockNode {
             block_raw_msgpack: self.block_raw_msgpack.clone(),
             txn_group_deltas: self.txn_group_deltas.clone(),
             state_proof_txns: self.state_proof_txns.clone(),
+            state_proof_scan_hangs: self.state_proof_scan_hangs,
             supply_info: self.supply_info.clone(),
             state_proof_data: self.state_proof_data.clone(),
             pending_txns: self.pending_txns.clone(),
@@ -348,6 +356,7 @@ impl MockNode {
             block_raw_msgpack: BTreeMap::new(),
             txn_group_deltas: None,
             state_proof_txns: BTreeMap::new(),
+            state_proof_scan_hangs: false,
             supply_info: None,
             state_proof_data: BTreeMap::new(),
             pending_txns: Vec::new(),
@@ -535,6 +544,15 @@ impl MockNode {
         let mut node = Self::synced();
         node.protocol_info_behavior =
             MockProtocolInfoBehavior::Err("ledger unavailable".to_string());
+        node
+    }
+
+    /// Return a mock node whose `get_state_proof_transaction_for_round`
+    /// never resolves -- used to pin the `GetLightBlockHeaderProof`
+    /// handler's own 1-minute timeout wrapper (issue #1079).
+    fn state_proof_scan_hangs() -> Self {
+        let mut node = Self::synced();
+        node.state_proof_scan_hangs = true;
         node
     }
 
@@ -961,6 +979,13 @@ impl NodeInterface for MockNode {
         &self,
         round: u64,
     ) -> Result<(u64, u64), NodeError> {
+        if self.state_proof_scan_hangs {
+            // Never resolves on its own -- the REST handler's
+            // `tokio::time::timeout` wrapper is what's under test here,
+            // mirroring `MockWaitBehavior::WaitForever`.
+            self.wait_notify.notified().await;
+            unreachable!("wait_notify is never signalled by these tests");
+        }
         match self.state_proof_txns.get(&round) {
             Some(result) => Ok(*result),
             None => Err(NodeError::NotFound(
@@ -5454,6 +5479,43 @@ async fn get_light_block_header_proof_no_state_proof() {
         "should return error when no state proof is available, got {}",
         resp.status()
     );
+}
+
+#[tokio::test]
+async fn get_light_block_header_proof_returns_408_on_timeout() {
+    // Mirrors go-algorand's `TestStateproofTransactionForRoundTimeouts`
+    // (`daemon/algod/api/server/v2/test/handlers_test.go`): an
+    // in-progress state-proof scan that outlives its deadline must be
+    // interrupted, not run to completion. Here that deadline is the
+    // `GetLightBlockHeaderProof` handler's own 1-minute
+    // `tokio::time::timeout` wrapper (issue #1079) rather than the scan's
+    // internal round-by-round check, since `MockNode`'s
+    // `get_state_proof_transaction_for_round` bypasses the default
+    // trait scan entirely -- exactly like go's test drives the shared
+    // `GetStateProofTransactionForRound` function directly with an
+    // already-expired `context.WithTimeout`.
+    tokio::time::pause();
+
+    let node = MockNode::state_proof_scan_hangs();
+    let server = TestServer::start(node).await;
+
+    let client = server.client.clone();
+    let url = server.url("/v2/blocks/1/lightheader/proof");
+    let token = server.api_token.clone();
+
+    let handle = tokio::spawn(async move {
+        client
+            .get(url)
+            .header("X-Algo-API-Token", token)
+            .send()
+            .await
+            .unwrap()
+    });
+
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+
+    let resp = handle.await.unwrap();
+    assert_eq!(resp.status(), 408);
 }
 
 #[tokio::test]
