@@ -1680,6 +1680,28 @@ fn suspended_block_validator_stalls_verification_and_resume_unblocks_it_five_nod
 /// no-quiescence-wait loop cannot guarantee which; callers must not assume
 /// a round commit happened, only that SOME node's next outbound proposal
 /// broadcast is now held at the checkpoint.
+fn arm_and_catch_next_proposal_broadcast(
+    clocks: &[Arc<crate::simulate::testing_clock::TestingClock>],
+    gate: &ProposeBroadcastGate,
+    timeout: Duration,
+) {
+    gate.arm();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        for clock in clocks {
+            clock.try_fire(TimeoutType::Deadline);
+        }
+        if gate.wait_for_pause(1, Duration::from_millis(200)) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected at least one node's next proposal broadcast to reach \
+             the propose-broadcast checkpoint within {timeout:?}"
+        );
+    }
+}
+
 /// Serializes the three heaviest tests in this file — the ones that spin up
 /// a 5-node cluster AND hard-fail if the propose-broadcast checkpoint isn't
 /// reached within a real-time budget
@@ -1704,28 +1726,6 @@ fn suspended_block_validator_stalls_verification_and_resume_unblocks_it_five_nod
 /// event) are left free to run concurrently with each other and with these
 /// three.
 static HEAVY_PROPOSE_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn arm_and_catch_next_proposal_broadcast(
-    clocks: &[Arc<crate::simulate::testing_clock::TestingClock>],
-    gate: &ProposeBroadcastGate,
-    timeout: Duration,
-) {
-    gate.arm();
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        for clock in clocks {
-            clock.try_fire(TimeoutType::Deadline);
-        }
-        if gate.wait_for_pause(1, Duration::from_millis(200)) {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "expected at least one node's next proposal broadcast to reach \
-             the propose-broadcast checkpoint within {timeout:?}"
-        );
-    }
-}
 
 /// Port of go-algorand's
 /// `TestAgreementRegression_WrongPeriodPayloadVerificationCancellation_8ba23942`
