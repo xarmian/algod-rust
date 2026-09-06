@@ -408,15 +408,49 @@ impl P2pHost {
     /// await [`P2pHost::next_event`] for the resulting
     /// `SwarmEvent::ConnectionEstablished` (or `OutgoingConnectionError`).
     ///
+    /// Always allocates a fresh local port for the outbound connection
+    /// (see [`DialOpts::allocate_new_port`]) rather than rust-libp2p's own
+    /// default of best-effort reusing this host's *listening* port as the
+    /// dial's local source port (`PortUse::Reuse` —
+    /// `libp2p_swarm::dial_opts::WithoutPeerIdWithAddress`'s/
+    /// `WithPeerId`'s default, since neither `P2pHost::new` nor this
+    /// method ever opts into port reuse itself). That default exists to
+    /// support NAT hole-punching (DCUtR: reusing the externally-mapped
+    /// listen port lets a peer behind a NAT dial out using the same
+    /// mapping a remote peer's simultaneous-connect attempt targets) —
+    /// this crate does not implement AutoNAT/DCUtR (see this module's
+    /// `set_dht_mode` doc comment), so nothing here needs it, and it is
+    /// actively harmful in the meantime: when two `P2pHost`s configured as
+    /// mutual bootstrap peers (issue #1067) dial each other at close to
+    /// the same instant, both sides' outbound sockets bind to their own
+    /// listen port before connecting, so the resulting connection is
+    /// `local_listen_port <-> remote_listen_port` on *both* sides — the
+    /// same 4-tuple from each host's perspective. The two dial attempts
+    /// then race as a genuine TCP simultaneous-open on that shared
+    /// 4-tuple, and each side's Noise/multistream-select stack proceeds
+    /// as the *initiator* on what the OS has collapsed into one shared
+    /// TCP stream, corrupting the handshake on both sides (`Handshake
+    /// failed: input error` — reproduced by
+    /// `tests::mutual_simultaneous_dial_still_establishes_a_secure_connection`).
+    /// Forcing a fresh ephemeral port per dial (mirroring go-algorand's
+    /// own `dialNode`, which never reuses its listen socket for outbound
+    /// dials either) keeps every outbound connection's local port
+    /// disjoint from this host's listen port, so a mutual dial always
+    /// produces two independent 4-tuples — exactly like two peers dialing
+    /// in only one direction, which this crate's other tests already
+    /// cover.
+    ///
     /// Go: `serviceImpl.dialNode` (minus connection-manager protection,
     /// which belongs to the mesh-maintenance logic added by later sub-issues).
     pub fn dial(&mut self, addr: Multiaddr) -> Result<(), P2pError> {
-        self.swarm
-            .dial(addr.clone())
-            .map_err(|source| P2pError::Dial {
-                addr: addr.to_string(),
-                source: Box::new(source),
-            })
+        let dial_opts = libp2p::swarm::dial_opts::DialOpts::unknown_peer_id()
+            .address(addr.clone())
+            .allocate_new_port()
+            .build();
+        self.swarm.dial(dial_opts).map_err(|source| P2pError::Dial {
+            addr: addr.to_string(),
+            source: Box::new(source),
+        })
     }
 
     /// Await and return the next swarm event. Drives the underlying
@@ -879,6 +913,112 @@ mod tests {
         }
 
         assert!(dialer.connected_peers().contains(&listener_peer_id));
+    }
+
+    /// TDD anchor for issue #1067: two `P2pHost`s that **each** dial the
+    /// other at (effectively) the same instant — mirroring
+    /// `--p2p-bootstrap-peers` configuring both sides of a pair to list
+    /// each other, as `bin/algod-rust/tests/p2p_multi_node_consensus.rs`
+    /// does for issue #827's harness — must both still reach a secure
+    /// `ConnectionEstablished` on at least one resulting connection, not
+    /// fail the underlying Noise handshake on either side.
+    ///
+    /// Every other test in this module (`two_nodes_dial_and_establish_secure_connection`
+    /// included) only ever dials in one direction, so this is the first
+    /// coverage of the simultaneous/mutual-dial path at all. Each side is
+    /// driven on its own spawned task on a genuinely multi-threaded
+    /// runtime (real OS-thread parallelism, not single-task cooperative
+    /// polling) — the failure reported in #1067 is a race that needs true
+    /// simultaneity between both sides' dial and handshake I/O, which a
+    /// single task round-robining two futures via `tokio::select!` does
+    /// not reliably reproduce. A single attempt is deliberate: looping
+    /// this same-process race dozens of times in a tight loop was found
+    /// to manufacture its own, unrelated flakiness on this crate's
+    /// Windows dev environment (rapid-fire loopback socket churn
+    /// exhausting the ephemeral port range into `WSAECONNABORTED`, a
+    /// Windows-loopback-only artifact of the stress rather than of
+    /// #1067's actual bug — a single iteration in a fresh process never
+    /// reproduced it across 15/15 runs, while 5 iterations in one process
+    /// did in 4/15). One real attempt per test run is enough to catch the
+    /// regression (confirmed failing against the pre-fix code) without
+    /// that self-inflicted noise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mutual_simultaneous_dial_still_establishes_a_secure_connection() {
+        let mut host_a = new_test_host();
+        let mut host_b = new_test_host();
+
+        let addr_a = start_listening(&mut host_a).await;
+        let addr_b = start_listening(&mut host_b).await;
+
+        let peer_a = host_a.peer_id();
+        let peer_b = host_b.peer_id();
+
+        let dial_a_to_b = addr_b.with(libp2p::multiaddr::Protocol::P2p(peer_b));
+        let dial_b_to_a = addr_a.with(libp2p::multiaddr::Protocol::P2p(peer_a));
+
+        host_a.dial(dial_a_to_b).expect("a dials b");
+        host_b.dial(dial_b_to_a).expect("b dials a");
+
+        let task_a = tokio::spawn(async move {
+            let mut connected = false;
+            let mut errors: Vec<String> = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            while !connected {
+                tokio::select! {
+                    ev = host_a.next_event() => {
+                        match ev {
+                            SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == peer_b => {
+                                connected = true;
+                            }
+                            SwarmEvent::OutgoingConnectionError { error, .. } => {
+                                errors.push(format!("outgoing: {error}"));
+                            }
+                            SwarmEvent::IncomingConnectionError { error, .. } => {
+                                errors.push(format!("incoming: {error}"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => break,
+                }
+            }
+            (connected, errors)
+        });
+        let task_b = tokio::spawn(async move {
+            let mut connected = false;
+            let mut errors: Vec<String> = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            while !connected {
+                tokio::select! {
+                    ev = host_b.next_event() => {
+                        match ev {
+                            SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == peer_a => {
+                                connected = true;
+                            }
+                            SwarmEvent::OutgoingConnectionError { error, .. } => {
+                                errors.push(format!("outgoing: {error}"));
+                            }
+                            SwarmEvent::IncomingConnectionError { error, .. } => {
+                                errors.push(format!("incoming: {error}"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => break,
+                }
+            }
+            (connected, errors)
+        });
+
+        let (a_connected, a_dial_errors) = task_a.await.expect("task a panicked");
+        let (b_connected, b_dial_errors) = task_b.await.expect("task b panicked");
+
+        assert!(
+            a_connected && b_connected,
+            "timed out waiting for both sides to establish a secure connection under mutual dial \
+             (a_connected={a_connected}, b_connected={b_connected}, \
+             a_dial_errors={a_dial_errors:?}, b_dial_errors={b_dial_errors:?})"
+        );
     }
 
     #[test]
