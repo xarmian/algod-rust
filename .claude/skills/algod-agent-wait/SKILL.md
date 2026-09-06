@@ -33,15 +33,23 @@ notification at a time is the anti-pattern this skill replaces.
    anti-pause instructions in the prompt, "never call `gh pr merge`
    yourself").
 2. Immediately — in the same turn, without waiting for the agent's first
-   notification — kick off `scripts/wait_for_issue_pr.sh` as a **coordinator
-   -side** background Bash command:
+   notification — kick off a **coordinator-side** background wait: either
+   `scripts/wait_for_issue_pr.sh` (Bash tool) or `scripts/wait_for_issue_pr.ps1`
+   (PowerShell tool) — both do the identical poll, use whichever shell is
+   working reliably in the moment (Bash's `cmd.exe` invocation has been
+   flaky on this Windows machine before; fall back to PowerShell if so):
 
    ```bash
    cd "c:\Users\ludovit.scholtz\source\repos\scholtz\algod-rust" && \
    bash scripts/wait_for_issue_pr.sh <issue-number> 1800 20
    ```
+   ```powershell
+   Set-Location "c:\Users\ludovit.scholtz\source\repos\scholtz\algod-rust"
+   pwsh -File scripts/wait_for_issue_pr.ps1 -IssueNumber <issue-number> -TimeoutSeconds 1800 -PollIntervalSeconds 20
+   ```
 
-   Run this with `run_in_background: true`. The Bash tool's own `timeout`
+   Run this with `run_in_background: true` on whichever tool you used.
+   The tool's own `timeout` parameter caps out at 600000ms (600s)
    parameter caps out at 600000ms (600s) regardless of what you pass — it
    is NOT the same budget as the script's own internal timeout argument.
    Always pass the script an internal timeout of ≤570 (leaving headroom
@@ -99,19 +107,28 @@ action. If you genuinely need to change the plan mid-wait (the user asks
 something else), that's fine — but return to relying on the pending
 notification rather than adding a parallel manual poll.
 
-## Waiting on a *known* PR number: `wait_for_pr_checks.sh`
+## Waiting on a *known* PR number: `wait_for_pr_checks.sh` / `.ps1`
 
 Once a PR already exists (you have its number — from a merge-conflict
 rebase you just pushed, from an agent's own report, from `gh pr list`),
 use `scripts/wait_for_pr_checks.sh <pr-number> [timeout] [poll-interval]`
-the same way: one `run_in_background: true` Bash call, one `RESULT:` line,
-one `task-notification`. It skips `wait_for_issue_pr.sh`'s phase 1
-(finding the PR) since you already know the number.
+(Bash tool) or `scripts/wait_for_pr_checks.ps1 -PrNumber <n> [-TimeoutSeconds ...] [-PollIntervalSeconds ...]`
+(PowerShell tool) the same way: one `run_in_background: true` call, one
+`RESULT:` line, one `task-notification`. It skips `wait_for_issue_pr`'s
+phase 1 (finding the PR) since you already know the number.
 
 ```bash
 cd "c:\Users\ludovit.scholtz\source\repos\scholtz\algod-rust" && \
 bash scripts/wait_for_pr_checks.sh 1036 570 20
 ```
+```powershell
+Set-Location "c:\Users\ludovit.scholtz\source\repos\scholtz\algod-rust"
+pwsh -File scripts/wait_for_pr_checks.ps1 -PrNumber 1036 -TimeoutSeconds 570 -PollIntervalSeconds 20
+```
+
+Use whichever shell is working reliably in the moment — the goal is one
+backgrounded call and one notification, not narrating progress in either
+shell.
 
 **Never wait for CI by repeatedly calling `ScheduleWakeup` (or any other
 "check now, reschedule for N minutes later" loop) instead.** Each firing
