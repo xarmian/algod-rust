@@ -51,13 +51,13 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 827 | 26% |
+| `matched-1:1` | 828 | 26% |
 | `partial` | 738 | 23% |
 | `matched-1:many` | 615 | 19% |
 | `out-of-scope` | 455 | 14% |
 | `matched-many:1` | 209 | 7% |
 | `missing-test` | 181 | 6% |
-| `not-implemented` | 154 | 5% |
+| `not-implemented` | 153 | 5% |
 
 **335 rows (`not-implemented` + `missing-test`, 11%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
@@ -73,7 +73,7 @@ were triaged into tracked issues.
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 84 | 156 | 6 | 123 | 11 | 45 | 24 |
 | Transactions core (`data/transactions`) | [parity_txn_core.md](phase17/parity_txn_core.md) | 173 | 48 | 33 | 0 | 70 | 8 | 13 | 1 |
-| Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 45 | 102 | 44 | 132 | 5 | 7 | 168 |
+| Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 46 | 102 | 44 | 132 | 4 | 7 | 168 |
 | Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 32 | 25 | 0 | 6 | 2 | 2 | 1 |
 | Agreement protocol (`agreement`) | [parity_agreement.md](phase17/parity_agreement.md) | 326 | 146 | 37 | 77 | 49 | 0 | 14 | 3 |
 | e2e integration (`test/e2e-go`) | [parity_e2e.md](phase17/parity_e2e.md) | 195 | 48 | 23 | 0 | 65 | 0 | 33 | 26 |
