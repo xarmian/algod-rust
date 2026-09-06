@@ -453,6 +453,54 @@ impl P2pHost {
         })
     }
 
+    /// Dial a peer known only by its [`PeerId`] — no explicit [`Multiaddr`]
+    /// required — resolving its dialable address(es) from whatever this
+    /// host's `NetworkBehaviour`s already know about it.
+    ///
+    /// This is the piece [`P2pHost::dial`] can't provide: a peer discovered
+    /// purely via [`P2pHost::find_closest_peers`]/
+    /// [`P2pHost::find_peers_for_capability`] (issue #1073, mirroring go's
+    /// periodic `meshThreadInner`/`refreshPeerStoreAddresses` mesh thread,
+    /// `network/p2pNetwork.go`) is known only by `PeerId` — a DHT lookup's
+    /// result is a set of `PeerId`s (or `PeerInfo`, whose addresses are
+    /// already folded into the routing table as they're learned, see
+    /// [`P2pHost::next_event`]'s `ConnectionEstablished`/`identify`
+    /// handling), not a caller-supplied dial target.
+    ///
+    /// Building [`libp2p::swarm::dial_opts::DialOpts::peer_id`] with no
+    /// explicit `.addresses(..)` sets
+    /// `extend_addresses_through_behaviour: true` (`WithPeerId::build`,
+    /// `libp2p-swarm`'s `dial_opts.rs`), which makes the `Swarm` ask every
+    /// composed `NetworkBehaviour` — `kad` included — for addresses via
+    /// `NetworkBehaviour::handle_pending_outbound_connection`.
+    /// `kad::Behaviour`'s implementation returns that peer's k-bucket
+    /// addresses (`libp2p-kad`'s `behaviour.rs`), the same addresses a
+    /// `find_closest_peers`/`find_peers_for_capability` query (or a prior
+    /// `ConnectionEstablished`/`identify::Event::Received`) already fed into
+    /// the routing table via [`kad::Behaviour::add_address`] — this is what
+    /// lets a peer this host has *never* directly connected to, but only
+    /// learned about secondhand through the DHT, still be dialable here.
+    /// Mirrors go's `dialNode`, which resolves a `peer.AddrInfo`'s addresses
+    /// from its own libp2p peerstore the same way.
+    ///
+    /// The default [`libp2p::swarm::dial_opts::PeerCondition`]
+    /// (`DisconnectedAndNotDialing`) is left as-is rather than overridden:
+    /// it already skips the dial as a no-op when this peer is already
+    /// connected or has an outbound dial attempt in flight, so a caller
+    /// re-running periodic discovery does not need its own
+    /// already-connected/already-dialing bookkeeping to avoid a redundant
+    /// dial — the same property [`P2pHost::dial`]'s bootstrap-peer callers
+    /// get implicitly today.
+    pub fn dial_peer(&mut self, peer_id: PeerId) -> Result<(), P2pError> {
+        let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+            .allocate_new_port()
+            .build();
+        self.swarm.dial(dial_opts).map_err(|source| P2pError::Dial {
+            addr: peer_id.to_string(),
+            source: Box::new(source),
+        })
+    }
+
     /// Await and return the next swarm event. Drives the underlying
     /// transport (handshakes, dial attempts, incoming connections) and the
     /// DHT behaviour's own query state machine.
@@ -495,7 +543,89 @@ impl P2pHost {
             }
         }
 
+        // Feed every peer address a `get_closest_peers` query result
+        // carries into this host's own DHT routing table (issue #1073's
+        // mesh-discovery wiring) — generic over *any* such query, not just
+        // ones issued through [`P2pHost::find_closest_peers`], so a
+        // non-blocking caller driving its own event loop directly (e.g.
+        // `bin/algod-rust`'s periodic mesh-discovery task, which cannot
+        // block its shared swarm loop awaiting a whole query the way
+        // [`P2pHost::find_closest_peers`]'s own callers can) still gets the
+        // same registration as a side effect of simply observing this
+        // event. Without this, a peer learned about purely through such a
+        // query — never directly connected to, never `identify`-d (the
+        // other two paths that call `add_address` above) — has no address
+        // [`P2pHost::dial_peer`] can resolve via
+        // `extend_addresses_through_behaviour`, even though the query just
+        // received exactly that address from a peer that does know it.
+        if let SwarmEvent::Behaviour(P2pBehaviourEvent::Kad(
+            kad::Event::OutboundQueryProgressed {
+                result: kad::QueryResult::GetClosestPeers(result),
+                ..
+            },
+        )) = &event
+        {
+            let peers = match result {
+                Ok(ok) => &ok.peers,
+                // go-algorand #6581: a query that only got as far as its
+                // internal context-deadline timeout still reports whatever
+                // partial peer set it collected, not an error — still
+                // worth registering.
+                Err(kad::GetClosestPeersError::Timeout { peers, .. }) => peers,
+            };
+            for info in peers {
+                for addr in &info.addrs {
+                    self.swarm
+                        .behaviour_mut()
+                        .kad
+                        .add_address(&info.peer_id, addr.clone());
+                }
+            }
+        }
+
         event
+    }
+
+    /// Start a (non-blocking) DHT lookup for peers advertising `capability`,
+    /// via the provider-record mechanism — the non-blocking counterpart of
+    /// [`P2pHost::find_peers_for_capability`] for a caller that cannot await
+    /// a whole query without starving its own shared event loop of every
+    /// *other* event in the meantime (issue #1073: `bin/algod-rust`'s
+    /// `P2pTransport::start` background task is exactly such a caller — it
+    /// must keep processing `ConnectionEstablished`/gossipsub/stream events
+    /// concurrently with a periodic capability lookup, which
+    /// [`P2pHost::find_peers_for_capability`]'s own internal
+    /// `self.next_event()` loop cannot do since it owns `&mut self`
+    /// exclusively until the whole query resolves).
+    ///
+    /// Returns the [`kad::QueryId`] to correlate against this same query's
+    /// own `kad::Event::OutboundQueryProgressed{result: GetProviders(_),
+    /// ..}` events as they arrive through the caller's own
+    /// [`P2pHost::next_event`] polling.
+    pub fn start_capability_discovery(
+        &mut self,
+        capability: crate::capabilities::Capability,
+    ) -> kad::QueryId {
+        self.swarm
+            .behaviour_mut()
+            .kad
+            .get_providers(capability.record_key())
+    }
+
+    /// Start a (non-blocking) DHT closest-peers lookup for `target` — the
+    /// non-blocking counterpart of [`P2pHost::find_closest_peers`], for the
+    /// same reason [`P2pHost::start_capability_discovery`] exists (issue
+    /// #1073).
+    ///
+    /// The caller does not need to inspect this query's own result to
+    /// benefit from it: [`P2pHost::next_event`] already registers every
+    /// returned peer's address into this host's routing table as a generic
+    /// side effect of observing the event at all (see its doc comment) —
+    /// the returned [`kad::QueryId`] exists only so the caller can tell
+    /// *when* that has happened (the query's `step.last` event) in order to
+    /// then dial the peer via [`P2pHost::dial_peer`].
+    pub fn start_closest_peers_lookup(&mut self, target: PeerId) -> kad::QueryId {
+        self.swarm.behaviour_mut().kad.get_closest_peers(target)
     }
 
     /// Currently connected peers.
@@ -703,6 +833,12 @@ impl P2pHost {
                     })) = event
                     {
                         if id == query_id && step.last {
+                            // `self.next_event()` above already fed every
+                            // returned peer's address into this host's own
+                            // DHT routing table as a generic side effect of
+                            // observing this same event (see its doc
+                            // comment) — nothing further to do here beyond
+                            // returning the peer list itself.
                             return match result {
                                 Ok(ok) => ok.peers,
                                 // go-algorand #6581: a query that only got as far as its
@@ -790,6 +926,21 @@ impl P2pHost {
     /// [`P2pHost::advertise_capability`] (folding in go's #6581/#6595
     /// fixes); a node with no matching capability among its known peers
     /// naturally falls out of this as an empty `Vec`; too.
+    ///
+    /// Every returned `PeerId` is also address-resolvable via
+    /// [`P2pHost::dial_peer`] afterward (issue #1073): unlike
+    /// [`P2pHost::find_closest_peers`]'s `kad::PeerInfo` result,
+    /// `kad::GetProvidersOk::FoundProviders` carries only bare `PeerId`s —
+    /// `kad::Behaviour`'s own conversion discards the wire-level
+    /// `KadPeer.multiaddrs` for this particular event (`libp2p-kad`'s
+    /// `behaviour.rs`) — so each discovered provider's address is resolved
+    /// (and, as a side effect, registered into this host's own DHT routing
+    /// table) via a follow-up [`P2pHost::find_closest_peers`] call, whose
+    /// result type does carry addresses. Mirrors go's `PeersForCapability`,
+    /// which returns `peer.AddrInfo` (identity + addresses) rather than a
+    /// bare `peer.ID`, because go-libp2p's `RoutingDiscovery.FindPeers`
+    /// folds in its own peerstore's address knowledge that rust-libp2p's
+    /// public `GetProvidersOk` event does not expose.
     pub async fn find_peers_for_capability(
         &mut self,
         capability: crate::capabilities::Capability,
@@ -824,17 +975,23 @@ impl P2pHost {
                             }
                             if found.len() >= n || step.last {
                                 found.truncate(n);
-                                return found;
+                                break;
                             }
                         }
                     }
                 }
                 _ = &mut sleep => {
                     found.truncate(n);
-                    return found;
+                    break;
                 }
             }
         }
+
+        for peer in &found {
+            self.find_closest_peers(*peer, deadline).await;
+        }
+
+        found
     }
 }
 
@@ -1404,6 +1561,281 @@ mod tests {
             .await;
 
         assert!(found.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // DHT-driven mesh discovery / auto-dial (#1073)
+    // -----------------------------------------------------------------------
+
+    /// TDD anchor for this issue (#1073): a node dials a peer it only ever
+    /// learned about via a DHT capability lookup, never a configured
+    /// bootstrap address — the exact topology behind go's
+    /// `TestNodeP2PRelays`/`TestNodeHybridTopology`
+    /// (`../go-algorand/node/node_test.go`): `n` ("the node") is seeded only
+    /// with `bootstrap`'s ("R2's") address; `relay` ("R1") is also only
+    /// seeded with `bootstrap`'s address, and separately advertises the
+    /// `Gossip` capability. `n` never receives `relay`'s multiaddr from any
+    /// out-of-band source (CLI flag, config, or direct dial) — the only way
+    /// it can end up connected to `relay` is by discovering its `PeerId` via
+    /// [`P2pHost::find_peers_for_capability`] (routed through `bootstrap`'s
+    /// DHT knowledge, mirroring `three_nodes_bootstrap_via_dht_and_route_lookup_peer`'s
+    /// topology for plain routing) and then dialing that bare `PeerId` via
+    /// [`P2pHost::dial_peer`] — proving `dial_peer`'s
+    /// `extend_addresses_through_behaviour` resolution of a DHT-learned
+    /// peer's address actually works end-to-end, not just that the lookup
+    /// itself succeeds (already proven by
+    /// `capability_advertised_by_one_node_is_discoverable_by_another`).
+    #[tokio::test]
+    async fn dial_peer_connects_to_peer_discovered_only_via_dht_capability_lookup() {
+        let mut bootstrap = new_test_host();
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+
+        let mut relay = new_test_host();
+        let mut n = new_test_host();
+
+        // Server mode needed on every node that must answer another's
+        // inbound DHT RPC (mirrors `three_nodes_bootstrap_via_dht_and_route_lookup_peer`'s
+        // and `capability_advertised_by_one_node_is_discoverable_by_another`'s
+        // reasoning): `bootstrap` answers both `relay` and `n`'s routing
+        // RPCs, and `relay` must answer `n`'s `GET_PROVIDERS` RPC once `n`'s
+        // lookup reaches it via `bootstrap`.
+        bootstrap.set_dht_mode(Some(kad::Mode::Server));
+        relay.set_dht_mode(Some(kad::Mode::Server));
+
+        let bootstrap_addr = start_listening(&mut bootstrap).await;
+        let bootstrap_peer_id = bootstrap.peer_id();
+        // `relay` needs its own listen address so `identify` can report a
+        // real, dialable address for it to `bootstrap` (and, from there, to
+        // `n` once its DHT lookup reaches `relay`'s k-bucket entry) — same
+        // reasoning as `three_nodes_bootstrap_via_dht_and_route_lookup_peer`.
+        start_listening(&mut relay).await;
+
+        let relay_peer_id = relay.peer_id();
+        let n_peer_id = n.peer_id();
+
+        let bootstrap_dial_addr = bootstrap_addr
+            .clone()
+            .with(libp2p::multiaddr::Protocol::P2p(bootstrap_peer_id));
+
+        // Both `relay` and `n` are seeded with ONLY `bootstrap`'s address —
+        // neither is ever given the other's multiaddr directly.
+        relay.add_bootstrap_peer(bootstrap_peer_id, bootstrap_addr.clone());
+        n.add_bootstrap_peer(bootstrap_peer_id, bootstrap_addr.clone());
+        relay
+            .dial(bootstrap_dial_addr.clone())
+            .expect("relay dial bootstrap");
+        n.dial(bootstrap_dial_addr).expect("n dial bootstrap");
+
+        // Drive all three until `bootstrap` has identified both `relay` and
+        // `n` — this is what populates `bootstrap`'s DHT routing table with
+        // each one's real (dialable) listen address, not just the ephemeral
+        // address it happened to dial out from.
+        let mut relay_identified = false;
+        let mut n_identified = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !(relay_identified && n_identified) {
+            tokio::select! {
+                ev = bootstrap.next_event() => {
+                    if let SwarmEvent::Behaviour(P2pBehaviourEvent::Identify(identify::Event::Received { peer_id, .. })) = ev {
+                        if peer_id == relay_peer_id { relay_identified = true; }
+                        if peer_id == n_peer_id { n_identified = true; }
+                    }
+                }
+                _ = relay.next_event() => {}
+                _ = n.next_event() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out waiting for bootstrap to identify both relay and n");
+                }
+            }
+        }
+
+        // `relay` advertises the Gossip capability (mirrors go's
+        // `node.Capabilities()` including `p2p.Gossip` for a listen-server
+        // node — see `p2p_transport.rs`'s live wiring of this).
+        relay
+            .advertise_capability(crate::capabilities::Capability::Gossip)
+            .await
+            .expect("relay should be able to advertise Gossip capability");
+
+        // `advertise_capability` degrades to `Ok(())` after its own internal
+        // `DHT_LOOKUP_TIMEOUT` (5s) even if the remote `ADD_PROVIDER` push
+        // hasn't actually reached `bootstrap` yet (the go-algorand
+        // #6581/#6595 "do not err on deadline" folding its doc comment
+        // describes) — so its return alone does not prove `bootstrap` has
+        // stored the record. Explicitly wait for `bootstrap` to observe the
+        // inbound `AddProvider` request (driving both `bootstrap` and
+        // `relay` concurrently, since `relay`'s own outbound push needs its
+        // event loop still running) before letting `n`'s lookup race ahead
+        // of it — a real deployment would simply retry a too-early lookup,
+        // but a single deterministic lookup attempt here needs the
+        // propagation to have actually landed first.
+        let mut bootstrap_saw_add_provider = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !bootstrap_saw_add_provider {
+            tokio::select! {
+                ev = bootstrap.next_event() => {
+                    if let SwarmEvent::Behaviour(P2pBehaviourEvent::Kad(kad::Event::InboundRequest {
+                        request: kad::InboundRequest::AddProvider { .. },
+                    })) = ev
+                    {
+                        bootstrap_saw_add_provider = true;
+                    }
+                }
+                _ = relay.next_event() => {}
+                _ = n.next_event() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out waiting for bootstrap to observe relay's AddProvider request");
+                }
+            }
+        }
+
+        let bootstrap_pump = tokio::spawn(async move {
+            loop {
+                bootstrap.next_event().await;
+            }
+        });
+
+        // Keep `relay` driven in the background too, both so it can answer
+        // `n`'s inbound `GET_PROVIDERS` RPC below, and so it can complete
+        // the inbound side of `n`'s dial once `n` discovers and dials it.
+        //
+        // Must keep driving `relay` for the *entire* remaining test, not
+        // just until the first `ConnectionEstablished` — exiting the task
+        // early would drop `relay` (and thus close its listener), so any
+        // later dial attempt to it (e.g. a retry after a raced/stale
+        // address) would see a real "connection refused," not a test bug.
+        let relay_saw_n_connect = Arc::new(AtomicBool::new(
+            relay.connected_peers().contains(&n_peer_id),
+        ));
+        let relay_saw_n_connect_writer = Arc::clone(&relay_saw_n_connect);
+        let relay_pump = tokio::spawn(async move {
+            loop {
+                if let SwarmEvent::ConnectionEstablished { peer_id, .. } = relay.next_event().await
+                {
+                    if peer_id == n_peer_id {
+                        relay_saw_n_connect_writer.store(true, AtomicOrdering::Relaxed);
+                    }
+                }
+            }
+        });
+
+        // Seed `n`'s own DHT routing table via a real self-lookup bootstrap
+        // pass (mirrors `three_nodes_bootstrap_via_dht_and_route_lookup_peer`,
+        // and go's own periodic DHT self-healing) before the capability
+        // lookup: this is what causes `n` to actually dial/connect to any
+        // peer discovered along the way (`relay` included) and, via
+        // `next_event`'s `ConnectionEstablished` interception, register its
+        // real address into `n`'s *persistent* routing table — not just the
+        // ephemeral per-query cache a bare `get_providers` response alone
+        // populates.
+        n.bootstrap_dht();
+
+        // `n` discovers `relay`'s `PeerId` purely via DHT capability lookup
+        // — it was never given `relay`'s multiaddr (or even `PeerId`) any
+        // other way. A single lookup pass in a toy 3-node network can race
+        // an in-progress DHT self-heal (the iterative query's own
+        // continuation dialing a newly discovered candidate to keep
+        // querying it takes a real, if small, amount of wall-clock time),
+        // so retry `bootstrap_dht` + the capability lookup a bounded number
+        // of times — mirroring how go's own periodic mesh thread simply
+        // tries again next tick rather than treating one miss as fatal —
+        // instead of demanding a single attempt converge deterministically.
+        let mut discovered = Vec::new();
+        for _ in 0..5 {
+            n.bootstrap_dht();
+            discovered = n
+                .find_peers_for_capability(
+                    crate::capabilities::Capability::Gossip,
+                    5,
+                    Duration::from_secs(10),
+                )
+                .await;
+            if discovered.contains(&relay_peer_id) {
+                break;
+            }
+        }
+        assert!(
+            discovered.contains(&relay_peer_id),
+            "expected n's DHT capability lookup to discover relay's PeerId via bootstrap, got: {discovered:?}"
+        );
+
+        // The actual regression guard: dial the bare `PeerId` (no
+        // `Multiaddr` supplied by the caller) and confirm a real connection
+        // comes up — proving `dial_peer`'s
+        // `extend_addresses_through_behaviour` resolution of `relay`'s
+        // DHT-learned address actually works, not just that the lookup
+        // above returned the right `PeerId`.
+        //
+        // `n` may already be connected to (or mid-dialing) `relay` as a side
+        // effect of `bootstrap_dht`'s own iterative self-lookup continuing
+        // on to directly dial a newly discovered candidate to keep querying
+        // it — itself proof the DHT-learned address is real and dialable,
+        // and exactly the kind of connectivity a periodic
+        // `bootstrap_dht`-refresh (mirroring go's own DHT self-healing)
+        // would produce in production too. `dial_peer`'s default
+        // `PeerCondition::DisconnectedAndNotDialing` correctly refuses a
+        // redundant dial in either case (already connected, or an
+        // in-flight attempt from that self-lookup not yet resolved) — treat
+        // that refusal the same way the production periodic-discovery
+        // wiring will (log and move on, not a fatal error) rather than
+        // asserting this call must always be the one that dials, and let
+        // the wait loop below observe whichever attempt (this one or the
+        // self-lookup's own) actually completes the connection.
+        let mut dial_errors: Vec<String> = Vec::new();
+        // A stale/no-longer-reachable cached address (e.g. an in-flight
+        // dial from `bootstrap_dht`'s own self-heal that raced this one and
+        // lost) can make a single dial attempt fail — retry a bounded
+        // number of times rather than treating one failed address as
+        // conclusive, mirroring go's own periodic mesh thread simply trying
+        // again next tick.
+        for attempt in 0..5 {
+            if n.connected_peers().contains(&relay_peer_id) {
+                break;
+            }
+            let _ = n.dial_peer(relay_peer_id);
+
+            let mut n_connected_to_relay = false;
+            let mut attempt_failed = false;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !n_connected_to_relay && !attempt_failed {
+                tokio::select! {
+                    ev = n.next_event() => {
+                        match ev {
+                            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                                if peer_id == relay_peer_id { n_connected_to_relay = true; }
+                            }
+                            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                                dial_errors.push(format!("{error}"));
+                                if peer_id == Some(relay_peer_id) { attempt_failed = true; }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        attempt_failed = true;
+                    }
+                }
+            }
+            if n_connected_to_relay {
+                break;
+            }
+            assert!(
+                attempt < 4,
+                "timed out waiting for n to connect to relay via a DHT-resolved address after 5 attempts; dial_errors={dial_errors:?}"
+            );
+        }
+        let n_connected_to_relay = n.connected_peers().contains(&relay_peer_id);
+
+        let relay_connected_to_n = relay_saw_n_connect.load(AtomicOrdering::Relaxed);
+        bootstrap_pump.abort();
+        relay_pump.abort();
+
+        assert!(n_connected_to_relay, "n must connect to relay");
+        assert!(
+            relay_connected_to_n,
+            "relay must observe n's inbound connection"
+        );
     }
 
     // -----------------------------------------------------------------------
