@@ -178,17 +178,11 @@ pub struct ExportOptions {
     /// Round of the block whose header digest anchors the label
     /// (`CatchpointFileHeader.BlocksRound`, and the round in the label).
     ///
-    /// In go-algorand this is always `balances_round + catchpoint_lookback`
-    /// (`ledger/catchpointtracker.go`'s `finishCatchpoint`,
-    /// `ledger/catchupaccessor.go`'s `StoreBalancesRound`) -- the automatic,
-    /// interval-driven export path (`SqliteLedger::maybe_spawn_automatic_catchpoint`,
-    /// issue #1054) sets the two rounds this far apart, matching what a real
-    /// go-algorand catchup client's `StoreBalancesRound` expects. This
-    /// crate's own [`super::verify::verify_catchpoint`] currently requires
-    /// `acctrounds('acctbase') == label round` instead (a latent bug tracked
-    /// as issue #1056), so an export meant to be re-verified through *this*
-    /// crate's own import+verify round trip must still keep the two rounds
-    /// equal until that lands.
+    /// In go-algorand this is `balances_round + catchpoint_lookback` for
+    /// every catchpoint above the lookback window. This crate's
+    /// [`super::verify::verify_catchpoint`] checks `acctrounds('acctbase')`
+    /// against `balances_round` (not this field), so `blocks_round` and
+    /// `balances_round` may legitimately differ (issue #1056).
     pub blocks_round: u64,
 
     /// 32-byte digest of the block header at `blocks_round`.

@@ -427,8 +427,20 @@ pub struct SyncOrchestrator {
     backend: Box<dyn SyncBackend>,
     /// Path where the downloaded catchpoint file is stored.
     catchpoint_file_path: Option<PathBuf>,
-    /// Parsed catchpoint label (round + hash).
+    /// Parsed catchpoint label round (== `blocks_round`, the round of the
+    /// block whose header digest anchors the label — used for block/lookback
+    /// downloads, which need the actual block round, not the account
+    /// snapshot round). See [`Self::balances_round`] for the round that
+    /// `acctrounds('acctbase')` is stamped with after import; the two are
+    /// legitimately different (`blocks_round == balances_round +
+    /// CatchpointLookback`, go-algorand's shorter-deltas-lookback design).
     catchpoint_round: Option<u64>,
+    /// The account-snapshot round (`CatchpointFileHeader.balances_round`),
+    /// set once the import phase reads the catchpoint file header.
+    /// `CatchpointImporter::atomic_cutover` stamps `acctrounds('acctbase')`
+    /// from this value, so post-import validation must check against it —
+    /// not against [`Self::catchpoint_round`] (issue #1056).
+    balances_round: Option<u64>,
     /// The catchpoint label string in use.
     resolved_label: Option<String>,
     /// Block header digest extracted from the catchpoint file header.
@@ -466,6 +478,7 @@ impl SyncOrchestrator {
             backend: Box::new(backend),
             catchpoint_file_path: None,
             catchpoint_round: None,
+            balances_round: None,
             resolved_label: None,
             block_header_digest: None,
             accounts_imported: 0,
@@ -775,6 +788,11 @@ impl SyncOrchestrator {
         // Extract header to get block_header_digest and rewards_level.
         let header = self.extract_header(&file_path)?;
 
+        // Store the account-snapshot round for post-import validation
+        // (issue #1056) — this is what acctrounds('acctbase') gets stamped
+        // with, not self.catchpoint_round (the label's blocks_round).
+        self.balances_round = Some(header.balances_round);
+
         // Store block header digest for the verify phase.
         if header.block_header_digest.len() == 32 {
             let mut arr = [0u8; 32];
@@ -929,9 +947,15 @@ impl SyncOrchestrator {
             .max(verify_result.kvs_count);
 
         // Step 2: Post-import validation (non-critical warnings).
-        let catchpoint_round = self.catchpoint_round.unwrap_or(0);
+        //
+        // Uses balances_round (the account snapshot round that
+        // `acctrounds('acctbase')` is stamped with by
+        // `CatchpointImporter::atomic_cutover`), not catchpoint_round (the
+        // label's blocks_round) — the two are legitimately different by
+        // go-algorand design (issue #1056).
+        let balances_round = self.balances_round.unwrap_or(0);
         let warnings =
-            validate_post_import(&conn, catchpoint_round).map_err(|e| AlgoError::Ledger {
+            validate_post_import(&conn, balances_round).map_err(|e| AlgoError::Ledger {
                 message: format!("post-import validation error: {e}"),
             })?;
 
@@ -1743,8 +1767,9 @@ impl SyncOrchestrator {
             self.run_import_ledger()?;
         } else {
             // When resuming past import, we still need the block_header_digest
-            // for verification. Extract it from the catchpoint file if available.
-            if self.block_header_digest.is_none() {
+            // and balances_round for verification. Extract them from the
+            // catchpoint file if available.
+            if self.block_header_digest.is_none() || self.balances_round.is_none() {
                 if let Some(ref file_path) = self.catchpoint_file_path {
                     if file_path.exists() {
                         if let Ok(header) = self.extract_header(file_path) {
@@ -1753,6 +1778,7 @@ impl SyncOrchestrator {
                                 arr.copy_from_slice(&header.block_header_digest);
                                 self.block_header_digest = Some(arr);
                             }
+                            self.balances_round = Some(header.balances_round);
                         }
                     }
                 }
@@ -2329,6 +2355,147 @@ mod tests {
             assert!(pair[1].1 >= pair[0].1, "acquired regressed: {snaps:?}");
         }
         assert_eq!(after_total_set.last().unwrap().1, 6);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A backend whose `download_catchpoint` copies a pre-built local
+    /// catchpoint file to the requested destination, so tests can drive
+    /// `run_download_ledger`/`run_import_ledger`/`run_verify_ledger` against
+    /// a real exported file without a network round trip.
+    struct FakeFileCopyBackend {
+        source_file: std::path::PathBuf,
+    }
+
+    impl SyncBackend for FakeFileCopyBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            std::fs::copy(&self.source_file, dest_path).map_err(|e| AlgoError::Ledger {
+                message: format!("fake copy failed: {e}"),
+            })?;
+            Ok(())
+        }
+
+        fn fetch_block_raw(&self, _round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// TDD for issue #1056: a full download -> import -> verify round trip
+    /// through the sync orchestrator must succeed for a catchpoint whose
+    /// label round (`blocks_round`) differs from the account snapshot round
+    /// (`balances_round`) — the real-world case once `blocks_round ==
+    /// balances_round + CatchpointLookback` (go-algorand's shorter-deltas-
+    /// lookback design). Before the fix, `run_verify_ledger` threaded the
+    /// label's `blocks_round` (`self.catchpoint_round`) into
+    /// `validate_post_import`'s `expected_round`, which is compared against
+    /// `acctrounds('acctbase')` (stamped from `balances_round`) and always
+    /// mismatched for any catchpoint above the lookback window.
+    #[test]
+    fn full_sync_round_trip_verifies_when_blocks_round_differs_from_balances_round() {
+        use crate::catchpoint::writer::{export_catchpoint_file, ExportOptions};
+
+        const BALANCES_ROUND: u64 = 1000;
+        const CATCHPOINT_LOOKBACK: u64 = 320;
+        const BLOCKS_ROUND: u64 = BALANCES_ROUND + CATCHPOINT_LOOKBACK;
+        const BLOCK_DIGEST: [u8; 32] = [9u8; 32];
+
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-fullroundtrip-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Build a minimal (empty) source ledger and export it with
+        // balances_round != blocks_round, matching go-algorand's real
+        // catchpoint-label shape.
+        let src = Connection::open_in_memory().unwrap();
+        src.execute_batch(
+            "CREATE TABLE accountbase (
+                addrid INTEGER PRIMARY KEY NOT NULL,
+                address BLOB NOT NULL,
+                data BLOB,
+                normalizedonlinebalance INTEGER
+            );
+            CREATE TABLE resources (
+                addrid INTEGER NOT NULL, aidx INTEGER NOT NULL,
+                data BLOB NOT NULL, ctype INTEGER NOT NULL DEFAULT -1,
+                PRIMARY KEY (addrid, aidx)
+            ) WITHOUT ROWID;
+            CREATE TABLE kvstore (key BLOB PRIMARY KEY, value BLOB);
+            CREATE TABLE onlineaccounts (
+                address BLOB NOT NULL, updround INTEGER NOT NULL,
+                normalizedonlinebalance INTEGER NOT NULL, votelastvalid INTEGER NOT NULL,
+                data BLOB NOT NULL, PRIMARY KEY (address, updround)
+            );
+            CREATE TABLE onlineroundparamstail (rnd INTEGER PRIMARY KEY NOT NULL, data BLOB NOT NULL);
+            CREATE TABLE stateproofverification (
+                lastattestedround INTEGER PRIMARY KEY NOT NULL,
+                verificationcontext BLOB NOT NULL
+            );
+            CREATE TABLE accounttotals (
+                id TEXT PRIMARY KEY, online INTEGER, onlinerewardunits INTEGER,
+                offline INTEGER, offlinerewardunits INTEGER,
+                notparticipating INTEGER, notparticipatingrewardunits INTEGER,
+                rewardslevel INTEGER
+            );",
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO accounttotals VALUES('', 0, 0, 0, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let catchpoint_path = dir.join("source-catchpoint.tar.gz");
+        let export_options = ExportOptions {
+            balances_round: BALANCES_ROUND,
+            blocks_round: BLOCKS_ROUND,
+            block_header_digest: BLOCK_DIGEST,
+            ..Default::default()
+        };
+        let export_result =
+            export_catchpoint_file(&src, &catchpoint_path, &export_options).unwrap();
+        assert!(export_result.label.starts_with(&format!("{BLOCKS_ROUND}#")));
+
+        let db_path = dir.join("ledger");
+        let mut config = test_config(db_path, 1);
+        config.catchpoint_label = Some(export_result.label.clone());
+
+        let mut orchestrator = SyncOrchestrator::with_backend(
+            config,
+            FakeFileCopyBackend {
+                source_file: catchpoint_path,
+            },
+        );
+
+        orchestrator.run_download_ledger().unwrap();
+        assert_eq!(orchestrator.catchpoint_round, Some(BLOCKS_ROUND));
+
+        orchestrator.run_import_ledger().unwrap();
+        assert_eq!(orchestrator.balances_round, Some(BALANCES_ROUND));
+
+        // Before the fix, this failed with an "acctrounds mismatch" error
+        // (blocks_round threaded into validate_post_import's expected_round
+        // instead of balances_round).
+        orchestrator.run_verify_ledger().unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }

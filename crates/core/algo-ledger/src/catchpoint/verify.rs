@@ -1169,19 +1169,31 @@ pub fn verify_catchpoint(
     use crate::catchpoint::state_keys;
     let stored_label = read_catchpointstate_str(conn, state_keys::CATCHUP_LABEL)?;
     let version = read_catchpointstate_int(conn, state_keys::CATCHUP_VERSION)? as u64;
-    let _balances_round =
-        read_catchpointstate_int(conn, state_keys::CATCHUP_BALANCES_ROUND)? as u64;
+    let balances_round = read_catchpointstate_int(conn, state_keys::CATCHUP_BALANCES_ROUND)? as u64;
 
     // Step 2: Parse the stored label to extract round.
+    //
+    // NOTE: `parsed_label.round` is the label's round, i.e. `blocks_round`
+    // (the round of the block whose header digest anchors the label). It is
+    // legitimately different from `balances_round` (the account snapshot
+    // round) by design: go-algorand sets
+    // `blocks_round == balances_round + CatchpointLookback` for every
+    // catchpoint above the lookback window (`ledger/catchpointtracker.go`'s
+    // `finishCatchpoint`, `ledger/catchupaccessor.go`'s
+    // `StoreBalancesRound`). `round` below is used only for label
+    // reconstruction (Step 8), never compared against `acctrounds`.
     let parsed_label = parse_catchpoint_label(&stored_label)?;
     let round = parsed_label.round;
 
-    // Step 3: Read acctrounds to verify consistency.
+    // Step 3: Read acctrounds to verify consistency against balances_round
+    // (not the label's round/blocks_round — see the NOTE above).
+    // `CatchpointImporter::atomic_cutover` stamps `acctrounds('acctbase')`
+    // from `header.balances_round`, so the two must agree here.
     let db_balances_round = read_acctrounds(conn, "acctbase")? as u64;
-    if db_balances_round != round {
+    if db_balances_round != balances_round {
         return Err(CatchpointError::VerificationError(format!(
             "acctrounds mismatch: acctrounds says round {db_balances_round}, \
-             but catchpoint label says round {round}"
+             but catchpointstate balances round is {balances_round}"
         )));
     }
 
