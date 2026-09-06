@@ -71,7 +71,7 @@ NEEDS_BOOTSTRAP=0
 if [ ! -f "$NETROOT/network.json" ]; then
     NEEDS_BOOTSTRAP=1
 else
-    for node in Node1 Node2 Node3 Node4Rust; do
+    for node in Node1 Node2 Node3 Node4Rust Node5Go; do
         if [ ! -d "$NETROOT/$node" ]; then
             echo "==> detected half-built netroot/ (missing $node) — rebuilding"
             NEEDS_BOOTSTRAP=1
@@ -121,7 +121,7 @@ fi
 # reachable from sibling containers. Rewrite each Node's config.json to
 # bind to 0.0.0.0 on predictable ports, and blank out DNSBootstrapID so
 # the nodes don't try to reach mainnet/testnet relays from the private net.
-for node in Node1 Node2 Node3 Node4Rust; do
+for node in Node1 Node2 Node3 Node4Rust Node5Go; do
     if [ ! -d "$NETROOT/$node" ]; then
         echo "error: $NETROOT/$node missing after bootstrap — rerun with stop.sh --purge and try again" >&2
         exit 1
@@ -130,7 +130,11 @@ for node in Node1 Node2 Node3 Node4Rust; do
     # Node4Rust's data dir is never handed to an algod container — the
     # Rust node only reads its genesis + `.partkey` out of it — but keep
     # NetAddress honest: it dials out and accepts no inbound peers.
-    if [ "$node" = "Node4Rust" ]; then
+    # Node5Go (issue #955 live-verification harness, opt-in via
+    # PHASE6_ENABLE_CATCHPOINT_INTEROP) is a real go-algorand node that
+    # only ever dials out to rust-node-4 to exercise its catchpoint-serving
+    # endpoint — it accepts no inbound peers either.
+    if [ "$node" = "Node4Rust" ] || [ "$node" = "Node5Go" ]; then
         NET_ADDRESS=""
     else
         NET_ADDRESS="0.0.0.0:4161"
@@ -216,6 +220,37 @@ if [ "${PHASE6_ENABLE_STATE_PROOF_WORKER:-0}" = "1" ]; then
     printf '{"EnableStateProofWorker": true}' > "$RUST_DATA_DIR/config.json"
 fi
 
+# -- 4d. Optional opt-in catchpoint-interop harness (issue #955) -----------
+# Off by default. Set PHASE6_ENABLE_CATCHPOINT_INTEROP=1 to have
+# rust-node-4 generate real catchpoint files every
+# PHASE6_CATCHPOINT_INTERVAL rounds (default 4) and serve them over its
+# classic WS-gossip transport's `CatchpointService` (issue #955's
+# `rpcs.LedgerService` port), and to bring up a 5th, real go-algorand node
+# (`go-node-5`, `Node5Go` in template.json) whose *only* configured peer is
+# rust-node-4 — so a `POST /v2/catchup/<label>` against go-node-5 exercises
+# algod-rust's server-side endpoint with go-algorand's own unmodified
+# `catchup.CatchpointCatchupService`/`ledgerFetcher` client code. Merged
+# with (rather than clobbering) any `config.json` the state-proof-worker
+# block above already wrote.
+if [ "${PHASE6_ENABLE_CATCHPOINT_INTEROP:-0}" = "1" ]; then
+    CATCHPOINT_INTERVAL="${PHASE6_CATCHPOINT_INTERVAL:-4}"
+    echo "==> enabling catchpoint generation + serving on rust-node-4 (interval=$CATCHPOINT_INTERVAL)"
+    mkdir -p "$RUST_DATA_DIR/catchpoints"
+    EXISTING_CFG="{}"
+    [ -f "$RUST_DATA_DIR/config.json" ] && EXISTING_CFG="$(cat "$RUST_DATA_DIR/config.json")"
+    python3 -c "
+import json, sys
+cfg = json.loads(sys.argv[1])
+cfg.update({
+    'EnableLedgerService': True,
+    'CatchpointDir': '/data/catchpoints',
+    'CatchpointInterval': int(sys.argv[2]),
+    'CatchpointTracking': 2,
+})
+print(json.dumps(cfg))
+" "$EXISTING_CFG" "$CATCHPOINT_INTERVAL" | tr -d '\r' > "$RUST_DATA_DIR/config.json"
+fi
+
 # -- 5. Start the Go nodes, then the Rust node -----------------------------
 cd "$ROOT"
 export PHASE6_GENESIS_ID="$GENESIS_ID"
@@ -261,6 +296,11 @@ if [ "${PHASE6_SKIP_BUILD:-0}" = "1" ]; then
 else
     echo "==> docker compose up -d --build rust-node-4"
     docker compose up -d --build rust-node-4
+fi
+
+if [ "${PHASE6_ENABLE_CATCHPOINT_INTEROP:-0}" = "1" ]; then
+    echo "==> docker compose up -d go-node-5 (catchpoint-interop client, issue #955)"
+    docker compose --profile catchpoint-interop up -d go-node-5
 fi
 
 echo ""

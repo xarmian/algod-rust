@@ -217,6 +217,13 @@ services:
       - --genesis-hash=${PHASE6_GENESIS_HASH:-}
       - --network=phase6net
       - --peers=go-node-1:4161,go-node-2:4161,go-node-3:4161
+      # Issue #955 catchpoint-interop harness: an inbound WS-gossip
+      # listener so a real go-algorand node (go-node-5, opt-in via the
+      # `catchpoint-interop` compose profile) can reach this node's
+      # `CatchpointService` HTTP endpoint at
+      # rust-node-4:4162/v1/{genesisID}/ledger/{round}. Harmless when
+      # go-node-5 isn't started -- just an extra unused listener.
+      - --listen-address=0.0.0.0:4162
       - --rest-listen=0.0.0.0:8080
       - --data-dir=/data
     ports:
@@ -237,6 +244,52 @@ services:
       timeout: 3s
       retries: 60
       start_period: 20s
+    restart: unless-stopped
+    networks:
+      - phase6net
+
+  # Issue #955 live-verification: a real, unmodified go-algorand node whose
+  # *only* configured peer is rust-node-4, used to exercise algod-rust's
+  # server-side catchpoint-serving endpoint (`CatchpointService`, go's
+  # `rpcs.LedgerService`) with go's own `catchup.CatchpointCatchupService`
+  # client code (`POST /v2/catchup/{catchpoint}` on this node). Not part of
+  # the default `docker compose up` — only started when
+  # `scripts/start.sh`'s PHASE6_ENABLE_CATCHPOINT_INTEROP=1 opt-in is set
+  # (`docker compose --profile catchpoint-interop up -d go-node-5`).
+  go-node-5:
+    image: algorand/algod:5.0.0-stable
+    container_name: phase6-go-node-5
+    profiles:
+      - catchpoint-interop
+    environment:
+      - ALGORAND_DATA=/algod/data
+      - ALGOD_PORT=8080
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      # Deliberately rust-node-4 ONLY -- this node's catchpoint-catchup
+      # peer selector (`makeCatchpointPeerSelector`'s
+      # `PeersPhonebookRelays` class) must have no other relay candidate,
+      # so a `POST /v2/catchup/<label>` can only ever be served by
+      # algod-rust's `CatchpointService`.
+      - PEER_ADDRESS=rust-node-4:4162
+    ports:
+      - "127.0.0.1:4005:8080"
+    volumes:
+      - ./netroot/Node5Go:/algod/data
+    depends_on:
+      rust-node-4:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 30
     restart: unless-stopped
     networks:
       - phase6net
