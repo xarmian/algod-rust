@@ -68,6 +68,14 @@ pub const MAX_LAYER_LEN: usize = MAX_NUM_LEAVES_ON_ENCODED_TREE;
 /// repo's hash types produce).
 pub const MAX_HASH_DIGEST_SIZE: usize = crate::sumhash::SUMHASH512_DIGEST_SIZE;
 
+/// msgp wire-format constants used by the max-size estimators below,
+/// matching go-algorand's `github.com/algorand/msgp/msgp` package (`size.go`):
+/// worst-case encoded sizes for each wire type.
+const MSGP_ARRAY_HEADER_SIZE: usize = 5;
+const MSGP_BYTES_PREFIX_SIZE: usize = 5;
+const MSGP_UINT8_SIZE: usize = 2;
+const MSGP_UINT16_SIZE: usize = 3;
+
 /// Domain separation prefix for Merkle array internal nodes.
 const MA_PREFIX: &[u8] = b"MA";
 
@@ -110,6 +118,29 @@ impl HashType {
             Self::Sumhash => 64,
             Self::Sha256 => 32,
             Self::Sha512 => 64,
+        }
+    }
+
+    /// Lowercase name for this hash type, matching go-algorand's
+    /// `crypto.HashType.String()`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha512_256 => "sha512_256",
+            Self::Sumhash => "sumhash",
+            Self::Sha256 => "sha256",
+            Self::Sha512 => "sha512",
+        }
+    }
+
+    /// Parse a hash type from its lowercase name, matching go-algorand's
+    /// `crypto.UnmarshalHashType`.
+    pub fn from_name(s: &str) -> Result<Self, MerkleError> {
+        match s {
+            "sha512_256" => Ok(Self::Sha512_256),
+            "sumhash" => Ok(Self::Sumhash),
+            "sha256" => Ok(Self::Sha256),
+            "sha512" => Ok(Self::Sha512),
+            other => Err(MerkleError::UnsupportedHashType(other.to_string())),
         }
     }
 }
@@ -237,6 +268,9 @@ pub enum MerkleError {
         len: usize,
         max: usize,
     },
+    /// A hash-type name did not match any known `HashType`, matching
+    /// go-algorand's `crypto.UnmarshalHashType` error.
+    UnsupportedHashType(String),
 }
 
 impl std::fmt::Display for MerkleError {
@@ -265,6 +299,7 @@ impl std::fmt::Display for MerkleError {
                 f,
                 "decoded length {len} for field {field} exceeds allocation bound {max}"
             ),
+            Self::UnsupportedHashType(name) => write!(f, "HashType not supported: {name}"),
         }
     }
 }
@@ -325,6 +360,10 @@ impl SingleLeafProof {
     }
 
     /// Concatenate the verification path into a single byte slice.
+    ///
+    /// This converts an empty element in the path (occurring when the tree
+    /// is not a full tree) into a sequence of zero bytes, matching
+    /// go-algorand's `SingleLeafProof.GetConcatenatedProof`.
     pub fn get_concatenated_proof(&self) -> Vec<u8> {
         let digest_size = self.proof.hash_factory.digest_size();
         let mut result = vec![0u8; digest_size * self.proof.tree_depth as usize];
@@ -336,6 +375,77 @@ impl SingleLeafProof {
         }
         result
     }
+}
+
+/// Reconstruct a `SingleLeafProof` from a hash-type name and a concatenated
+/// proof buffer (as produced by [`SingleLeafProof::get_concatenated_proof`]).
+///
+/// Matches go-algorand's `crypto/merklearray/proof.go`'s
+/// `ProofDataToSingleLeafProof`. Returns
+/// `MerkleError::ProofLengthDigestSizeMismatch` if `proof_bytes`'s length is
+/// not a multiple of the hash type's digest size.
+pub fn proof_data_to_single_leaf_proof(
+    hash_type_name: &str,
+    mut proof_bytes: &[u8],
+) -> Result<SingleLeafProof, MerkleError> {
+    let hash_type = HashType::from_name(hash_type_name)?;
+    let hash_factory = HashFactory::new(hash_type);
+    let digest_size = hash_factory.digest_size();
+
+    if proof_bytes.len() % digest_size != 0 {
+        return Err(MerkleError::ProofLengthDigestSizeMismatch);
+    }
+
+    let mut path = Vec::new();
+    let mut tree_depth: u8 = 0;
+    while !proof_bytes.is_empty() {
+        let (chunk, rest) = proof_bytes.split_at(digest_size);
+        path.push(chunk.to_vec());
+        proof_bytes = rest;
+        // Matches Go's `proof.TreeDepth++` on a uint8: wraps rather than
+        // panics if somehow handed more than 255 digest-sized chunks.
+        tree_depth = tree_depth.wrapping_add(1);
+    }
+
+    Ok(SingleLeafProof {
+        proof: Proof {
+            path,
+            hash_factory,
+            tree_depth,
+        },
+    })
+}
+
+/// Maximum msgp-encoded size of a `GenericDigest`, matching go-algorand's
+/// `crypto.GenericDigestMaxSize()`.
+pub fn generic_digest_max_size() -> usize {
+    MSGP_BYTES_PREFIX_SIZE + MAX_HASH_DIGEST_SIZE
+}
+
+/// Maximum msgp-encoded size of a `HashFactory`, matching go-algorand's
+/// `crypto.HashFactoryMaxSize()`.
+pub fn hash_factory_max_size() -> usize {
+    1 + 2 + MSGP_UINT16_SIZE
+}
+
+/// Maximum msgp-encoded size of a `Proof` struct whose `path` contains `n`
+/// digests, matching go-algorand's `crypto/merklearray/proof.go`'s
+/// `ProofMaxSizeByElements`. This is necessary because the struct's
+/// allocbounds are theoretical bounds, but individual message types (e.g.
+/// state-proof signature parts) have smaller valid bounds.
+pub fn proof_max_size_by_elements(n: usize) -> usize {
+    let mut s = 1 + 4;
+    // Calculating size of slice: Proof.path
+    s += MSGP_ARRAY_HEADER_SIZE + n * generic_digest_max_size();
+    s += 4 + hash_factory_max_size() + 3 + MSGP_UINT8_SIZE;
+    s
+}
+
+/// Maximum msgp-encoded size of a `Proof`, matching go-algorand's
+/// auto-generated `ProofMaxSize()` (`crypto/merklearray/msgp_gen.go`), which
+/// bounds `Proof.path` at `MaxNumLeavesOnEncodedTree/2` elements.
+pub fn proof_max_size() -> usize {
+    proof_max_size_by_elements(MAX_PROOF_PATH_LEN)
 }
 
 // ── Tree ─────────────────────────────────────────────────────────────
@@ -2441,5 +2551,100 @@ mod tests {
                 "mismatched root on VC KAT {idx}"
             );
         }
+    }
+
+    // ── Concatenated proof round-trip tests ───────────────────────────
+    // Mirrors go-algorand's crypto/merklearray/proof_test.go:
+    // TestConcatenatedProofsMissingChild / TestConcatenatedProofsFullTree /
+    // TestConcatenatedProofsOneLeaf / TestProofDeserializationError /
+    // TestMaxSizeCalculation.
+
+    /// Reconstruct a proof path from a flat concatenated buffer, mirroring
+    /// go's `proof_test.go`'s local `recomputePath` helper (used to sanity
+    /// check `GetConcatenatedProof`'s output independently of
+    /// `proof_data_to_single_leaf_proof`).
+    fn recompute_path(mut p: &[u8], digest_size: usize) -> Vec<GenericDigest> {
+        let mut path = Vec::new();
+        while !p.is_empty() {
+            let (chunk, rest) = p.split_at(digest_size);
+            path.push(chunk.to_vec());
+            p = rest;
+        }
+        path
+    }
+
+    fn run_concatenated_proof_round_trip(num_leaves: usize, prove_idx: u64) {
+        let data: Vec<[u8; 32]> = (0..num_leaves)
+            .map(|i| {
+                let mut buf = [0u8; 32];
+                buf[0] = i as u8;
+                buf[1] = 0xAB;
+                buf
+            })
+            .collect();
+        let arr = TestArray(data.clone());
+        let factory = HashFactory::new(HashType::Sha512_256);
+        let tree = build(&arr, factory).unwrap();
+
+        let p = tree.prove_single_leaf(prove_idx).unwrap();
+        let concatenated = p.get_concatenated_proof();
+        let computed_path = recompute_path(&concatenated, factory.digest_size());
+
+        // The concatenated proof, reassembled by hand, verifies correctly.
+        let hand_reassembled = Proof {
+            tree_depth: p.proof.tree_depth,
+            path: computed_path,
+            hash_factory: p.proof.hash_factory,
+        };
+        let elem = TestMessage(data[prove_idx as usize].to_vec());
+        verify(&tree.root(), &[(prove_idx, &elem)], &hand_reassembled)
+            .expect("hand-reassembled concatenated proof should verify");
+
+        // `proof_data_to_single_leaf_proof` reconstructs the same proof from
+        // the concatenated bytes plus the hash-type name alone.
+        let recomputed =
+            proof_data_to_single_leaf_proof(p.proof.hash_factory.hash_type.as_str(), &concatenated)
+                .expect("valid concatenated proof should decode");
+        assert_eq!(recomputed.proof.tree_depth, p.proof.tree_depth);
+
+        verify(&tree.root(), &[(prove_idx, &elem)], &recomputed.proof)
+            .expect("proof reconstructed from concatenated bytes should verify");
+    }
+
+    #[test]
+    fn test_concatenated_proofs_missing_child() {
+        // 7 leaves: proving leaf 6 crosses a level with a missing sibling.
+        run_concatenated_proof_round_trip(7, 6);
+    }
+
+    #[test]
+    fn test_concatenated_proofs_full_tree() {
+        // 8 leaves: a perfectly full tree, no missing children anywhere.
+        run_concatenated_proof_round_trip(8, 6);
+    }
+
+    #[test]
+    fn test_concatenated_proofs_one_leaf() {
+        run_concatenated_proof_round_trip(1, 0);
+    }
+
+    #[test]
+    fn test_proof_deserialization_error() {
+        // 1 byte is not a multiple of SHA-256's 32-byte digest size.
+        let err = proof_data_to_single_leaf_proof(HashType::Sha256.as_str(), &[1u8])
+            .expect_err("mismatched-length proof bytes must be rejected");
+        assert_eq!(err, MerkleError::ProofLengthDigestSizeMismatch);
+    }
+
+    #[test]
+    fn test_max_size_calculation() {
+        // Ensure the manually specified ProofMaxSizeByElements matches the
+        // (here, hand-derived rather than autogenerated) ProofMaxSize --
+        // mirrors go's cross-check between the manual and msgp-generated
+        // implementations.
+        assert_eq!(
+            proof_max_size_by_elements(MAX_NUM_LEAVES_ON_ENCODED_TREE / 2),
+            proof_max_size()
+        );
     }
 }
