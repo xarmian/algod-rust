@@ -607,6 +607,15 @@ pub fn validate_transaction_wellformed(
 
     // ── State proof well-formedness (Go: StateProofTxnFields.wellFormed, stateproof.go) ──
     if txn.txn_type == "stpf" {
+        // Go: transaction.go's WellFormed, StateProofTx case — checked before
+        // StateProofTxnFields.wellFormed. State proofs are disabled entirely
+        // (StateProofInterval == 0) prior to consensus v34; reject outright
+        // rather than falling through to the per-field checks below.
+        if params.state_proof_interval == 0 {
+            return Err(AlgoError::Validation {
+                message: "state proofs not supported".to_string(),
+            });
+        }
         if txn.sender != algo_types::Address::STATE_PROOF_SENDER {
             return Err(AlgoError::Validation {
                 message: "sender must be the state-proof sender".to_string(),
@@ -4329,5 +4338,22 @@ mod tests {
         let txn = make_stpf_txn();
         let params = v42_params();
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    /// Parity with go-algorand's `TestUnsupportedStateProof`
+    /// (`data/transactions/stateproof_test.go`): an `stpf` transaction is
+    /// rejected outright — before any per-field check — when the active
+    /// consensus params have `StateProofInterval == 0` (state proofs
+    /// disabled, e.g. pre-v34 consensus versions). Issue #1078.
+    #[test]
+    fn test_stpf_rejected_when_state_proofs_not_supported() {
+        let txn = make_stpf_txn();
+        let mut params = v42_params();
+        params.state_proof_interval = 0;
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("state proofs not supported"),
+            "unexpected error: {err}"
+        );
     }
 }
