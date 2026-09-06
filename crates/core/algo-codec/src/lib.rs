@@ -35,8 +35,9 @@ pub use canonical::{
     canonical_encode_state_proof_verification_context, canonical_encode_state_schema,
     canonical_encode_teal_key_value, canonical_encode_transaction, canonical_encode_tx_group,
     canonical_encode_txtail_round, canonical_encode_txtail_round_lease,
-    canonical_encode_unauthenticated_proposal, resource_flags, BaseOnlineAccountData,
-    OnlineRoundParamsData, ResourcesData, StateProofVerificationContext,
+    canonical_encode_unauthenticated_proposal, decode_state_proof_verification_context,
+    resource_flags, BaseOnlineAccountData, OnlineRoundParamsData, ResourcesData,
+    StateProofVerificationContext,
 };
 pub use digest::{
     compute_block_digest, compute_block_header_digest, compute_block_header_digest_512,

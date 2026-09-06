@@ -1261,15 +1261,31 @@ pub fn canonical_encode_online_round_params_data(d: &OnlineRoundParamsData) -> V
 /// weight, and the consensus protocol active at the attestation.
 ///
 /// PLAN-36 G8 (TASK-125).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Carries a `serde::Deserialize` impl (issue #1057) so this one struct
+/// definition serves both directions: [`canonical_encode_state_proof_verification_context`]
+/// for writing (go's canonical, sorted-key encoding) and
+/// [`decode_state_proof_verification_context`] for reading back an
+/// arbitrary msgpack encoding of the same shape (go's own encoder doesn't
+/// sort keys the way our canonical encoder does, and `rmp_serde` decodes
+/// by field name regardless of on-wire key order). Every reader/writer of
+/// the `stateproofverification.verificationcontext` BLOB column
+/// (`apply_stateproof.rs`'s tracker and `catchpoint/verify.rs`'s
+/// catchpoint-export path) shares this definition rather than maintaining
+/// separate mirrors.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct StateProofVerificationContext {
     /// Last round this verifier attests to. Codec: `spround`.
+    #[serde(rename = "spround", default)]
     pub last_attested_round: u64,
     /// Voters' Merkle-root commitment. Codec: `vc`.
+    #[serde(rename = "vc", default, with = "serde_bytes")]
     pub voters_commitment: Vec<u8>,
     /// Total online weight at attestation time. Codec: `pw`.
+    #[serde(rename = "pw", default)]
     pub online_total_weight: u64,
     /// Consensus protocol version active at the attestation. Codec: `v`.
+    #[serde(rename = "v", default)]
     pub version: String,
 }
 
@@ -1303,6 +1319,24 @@ pub fn canonical_encode_state_proof_verification_context(
     m.add_string("v", &c.version);
     m.add_var_bytes("vc", &c.voters_commitment);
     m.encode()
+}
+
+/// Decode a `stateproofverification.verificationcontext` BLOB (or a
+/// catchpoint file's `stateProofVerificationContext.msgpack` element) back
+/// into a [`StateProofVerificationContext`] (issue #1057).
+///
+/// Uses `rmp_serde`, matching by field name (`"spround"`/`"vc"`/`"pw"`/`"v"`)
+/// rather than position, so it accepts both this crate's own canonical,
+/// sorted-key encoding (from [`canonical_encode_state_proof_verification_context`])
+/// and go's own (unsorted) msgpack encoding of the same
+/// `ledgercore.StateProofVerificationContext` shape.
+pub fn decode_state_proof_verification_context(
+    bytes: &[u8],
+) -> Result<StateProofVerificationContext, algo_error::AlgoError> {
+    rmp_serde::from_slice(bytes).map_err(|e| algo_error::AlgoError::Codec {
+        source: Box::new(e),
+        context: "failed to decode state proof verification context from msgpack".into(),
+    })
 }
 
 /// Canonically encode AssetParams as a nested msgpack map.
