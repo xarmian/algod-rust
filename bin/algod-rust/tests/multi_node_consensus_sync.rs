@@ -221,6 +221,109 @@ fn build_online_genesis_with_proto(proto: &str) -> OnlineGenesis {
     }
 }
 
+/// Two independently-staked online accounts, each holding half of genesis
+/// online stake, plus the shared genesis.json both nodes boot from.
+///
+/// Built for issue #1066: `TestNodeP2P_NetProtoVersions`-shaped two-node
+/// scenarios need each side to hold its OWN participation key and its OWN
+/// (non-trivial) share of online stake -- unlike [`build_online_genesis`],
+/// where a single account holds 100% and the other node never votes at all.
+struct TwoVoterGenesis {
+    genesis_json: String,
+    participation_a: Participation,
+    participation_b: Participation,
+}
+
+/// Build a genesis.json with TWO online staking accounts (each 50% of
+/// online stake, each with its own real VRF + one-time-signature key) plus
+/// the fee sink and rewards pool. Mirrors [`build_online_genesis`] but with
+/// two independently-signing voters instead of one.
+fn build_two_voter_genesis() -> TwoVoterGenesis {
+    fn make_account(first_valid: Round, last_valid: Round) -> (Address, Participation) {
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let address = Address(sk.verifying_key().to_bytes());
+        let participation = Participation::generate(
+            address,
+            first_valid,
+            last_valid,
+            /* key_dilution */ 0,
+            /* key_lifetime */ 0,
+        )
+        .expect("generate online participation key");
+        (address, participation)
+    }
+
+    let first_valid = Round(0);
+    let last_valid = Round(10_000);
+    let (addr_a, participation_a) = make_account(first_valid, last_valid);
+    let (addr_b, participation_b) = make_account(first_valid, last_valid);
+
+    let alloc_state = |addr: &Address, p: &Participation| {
+        format!(
+            r#"{{
+      "addr": "{addr}",
+      "comment": "stake",
+      "state": {{
+        "algo": {algos},
+        "onl": 1,
+        "sel": "{sel}",
+        "vote": "{vote}",
+        "voteKD": {vote_kd},
+        "voteFst": {vote_fst},
+        "voteLst": {vote_lst}
+      }}
+    }}"#,
+            addr = addr,
+            algos = STAKE_ACCOUNT_ALGOS / 2,
+            sel = BASE64_STANDARD.encode(p.vrf_pubkey().0),
+            vote = BASE64_STANDARD.encode(p.voting.verifier()),
+            vote_kd = p.key_dilution,
+            vote_fst = first_valid.0,
+            vote_lst = last_valid.0,
+        )
+    };
+
+    let genesis_json = format!(
+        r#"{{
+  "network": "{network}",
+  "id": "{id}",
+  "proto": "{proto}",
+  "fees": "{fee_sink}",
+  "rwd": "{rewards_pool}",
+  "alloc": [
+    {alloc_a},
+    {alloc_b},
+    {{
+      "addr": "{fee_sink}",
+      "comment": "FeeSink",
+      "state": {{ "algo": 0, "onl": 0 }}
+    }},
+    {{
+      "addr": "{rewards_pool}",
+      "comment": "RewardsPool",
+      "state": {{ "algo": {rewards_algos}, "onl": 0 }}
+    }}
+  ]
+}}"#,
+        network = NETWORK_NAME,
+        id = GENESIS_ID,
+        proto = algo_types::consensus::CONSENSUS_V41,
+        fee_sink = FEE_SINK_ADDR,
+        rewards_pool = REWARDS_POOL_ADDR,
+        alloc_a = alloc_state(&addr_a, &participation_a),
+        alloc_b = alloc_state(&addr_b, &participation_b),
+        rewards_algos = REWARDS_POOL_ALGOS,
+    );
+
+    TwoVoterGenesis {
+        genesis_json,
+        participation_a,
+        participation_b,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Port allocation
 // ---------------------------------------------------------------------------
@@ -1263,5 +1366,102 @@ async fn follower_catches_up_via_live_catchpoint_catchup_from_a_real_catchpoint(
         hash_a, hash_b,
         "node B's block at the catchpoint round {catchpoint_round} (reached at round \
          {round_b_after} via live catchpoint catchup) does not match node A's"
+    );
+}
+
+/// Issue #1066 live reproduction/regression: two independently-staked,
+/// independently-signing `algod-rust participate` processes, each holding
+/// 50% of genesis online stake plus its own real VRF + one-time-signature
+/// participation key, both proposing/voting over the classic WebSocket
+/// gossip transport. Round 1 must certify.
+///
+/// Before the fix, round 1 never certified: `participate::run` resolved
+/// `BlockValidatorBridge`'s "expected" genesis id/hash from the raw
+/// `--genesis-id`/`--genesis-hash` CLI values (here, `GENESIS_ID` = "v1"
+/// and no `--genesis-hash` at all, i.e. the all-zero default) instead of
+/// the genesis actually seeded into the ledger, whose block-0 header (and
+/// therefore every descendant block, per `prev.genesis_id.clone()` in
+/// `algo_ledger::block_header`) carries the real combined
+/// `"{network}-{id}"` id and non-zero hash
+/// (`algo_ledger::genesis::make_genesis_block`). Every peer's proposal
+/// payload — including a second, independently-signing voter's, which is
+/// the only proposal this node did NOT author itself — is checked against
+/// that wrong "expected" value in `algo_validate::block::validate_block`'s
+/// genesis-consistency check, so it was always rejected. Confirmed live
+/// (issue #1066 investigation): instrumenting
+/// `BlockValidatorBridge::validate` showed exactly one call, on the
+/// non-proposing side, for round 1, with
+/// `expected_genesis_id="v1" block_genesis_id="algod-rust-sync-test-v1"
+/// genesis_hash_match=false` — i.e. the peer's real proposal, rejected on
+/// both fields. A lone 100%-stake voter never hits this path at all
+/// (it never needs to validate anyone else's proposal), which is why the
+/// existing single-voter tests in this file never caught it.
+#[tokio::test]
+#[ignore = "spawns child algod-rust processes and runs real BFT agreement; run with --ignored"]
+async fn two_independently_staked_voters_reach_quorum() {
+    let genesis = build_two_voter_genesis();
+
+    let gossip_a = alloc_loopback_port();
+    let rest_a = alloc_loopback_port();
+    let gossip_b = alloc_loopback_port();
+    let rest_b = alloc_loopback_port();
+
+    let mut node_a = spawn_participate_node(
+        gossip_a,
+        rest_a,
+        &genesis.genesis_json,
+        Some(&genesis.participation_a),
+        None,
+    );
+    let mut node_b = spawn_participate_node(
+        gossip_b,
+        rest_b,
+        &genesis.genesis_json,
+        Some(&genesis.participation_b),
+        Some(&format!("127.0.0.1:{gossip_a}")),
+    );
+
+    let client = http_client();
+    let overall_deadline = Instant::now() + Duration::from_secs(120);
+
+    wait_for_rest_ready(&client, &node_a.rest_addr, overall_deadline).await;
+    wait_for_rest_ready(&client, &node_b.rest_addr, overall_deadline).await;
+    let token_a = read_api_token(&node_a.data_dir_path, overall_deadline).await;
+    let token_b = read_api_token(&node_b.data_dir_path, overall_deadline).await;
+
+    let round_a = wait_for_round(
+        &client,
+        &node_a.rest_addr,
+        &token_a,
+        1,
+        overall_deadline,
+        "node A",
+    )
+    .await;
+    let round_b = wait_for_round(
+        &client,
+        &node_b.rest_addr,
+        &token_b,
+        1,
+        overall_deadline,
+        "node B",
+    )
+    .await;
+
+    let compare_round = round_a.min(round_b);
+    let hash_a = get_block_hash(&client, &node_a.rest_addr, &token_a, compare_round).await;
+    let hash_b = get_block_hash(&client, &node_b.rest_addr, &token_b, compare_round).await;
+
+    if hash_a != hash_b {
+        dump_node_logs(&node_a, "A");
+        dump_node_logs(&node_b, "B");
+    }
+    node_b.shutdown();
+    node_a.shutdown();
+
+    assert_eq!(
+        hash_a, hash_b,
+        "node A and node B (each 50% of genesis online stake, independently \
+         signing) disagree on round {compare_round}'s block hash"
     );
 }

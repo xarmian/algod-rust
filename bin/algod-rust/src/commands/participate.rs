@@ -3613,6 +3613,52 @@ fn resolve_partkey_imports(
     Ok(out)
 }
 
+/// Resolve the genesis id/hash `BlockValidatorBridge` should treat as
+/// "expected" for every proposal payload it validates, reconciling the
+/// CLI-derived placeholder (`cli_genesis_id`/`cli_genesis_hash`, resolved
+/// from `--genesis-id`/`--genesis-hash`/`--network` before the ledger is
+/// even open) against what the ledger's own genesis actually is.
+///
+/// Issue #1066 root cause: prior to this reconciliation, `participate::run`
+/// passed the raw CLI placeholder straight into `BlockValidatorBridge`
+/// unconditionally. But the real genesis id baked into block 0's header
+/// (and propagated to every later round via `prev.genesis_id.clone()`,
+/// `algo_ledger::block_header`) is the *combined*
+/// `format!("{network}-{id}", genesis.network, genesis.id)`
+/// (`algo_ledger::genesis::make_genesis_block`) — not the bare
+/// `--genesis-id` value, and not necessarily accompanied by a matching
+/// `--genesis-hash` (most CLI invocations omit it, defaulting to
+/// `[0u8; 32]`). Whenever those differ, `algo_validate::block::validate_block`'s
+/// genesis-consistency check rejects every peer's proposal payload — a
+/// proposal this node did not author and therefore cannot skip validating,
+/// unlike its own. A lone, 100%-stake voter never exercises this path at
+/// all (it never needs to validate anyone else's proposal), which is why
+/// this stayed invisible in every single-voter multi-node test; it
+/// surfaces the moment a second, independently-signing voter's proposal
+/// must be validated to reach cert quorum. Confirmed live: instrumenting
+/// `BlockValidatorBridge::validate` in a two-voter reproduction showed
+/// exactly one call, for round 1 on the non-proposing side, with
+/// `expected_genesis_id="v1" block_genesis_id="algod-rust-sync-test-v1"
+/// genesis_hash_match=false`.
+///
+/// Once the ledger has a real genesis (freshly seeded, or already
+/// persisted from a prior run), its own `genesis_id()`/`genesis_hash()`
+/// are authoritative and must win. Only a brand-new ledger with no genesis
+/// at all yet (pure catchup from peers, genesis still unknown) falls back
+/// to the CLI-resolved placeholder.
+fn resolve_effective_genesis_expectations(
+    cli_genesis_id: String,
+    cli_genesis_hash: [u8; 32],
+    ledger_genesis_id: &str,
+    ledger_genesis_hash: &[u8; 32],
+) -> (String, [u8; 32]) {
+    if ledger_genesis_id.is_empty() {
+        (cli_genesis_id, cli_genesis_hash)
+    } else {
+        (ledger_genesis_id.to_string(), *ledger_genesis_hash)
+    }
+}
+
 /// Seed `accountbase` + `accounttotals` from a `genesis.json` when the ledger
 /// is brand new.
 ///
@@ -3758,7 +3804,16 @@ pub async fn run(
         anyhow::bail!("invalid P2P hybrid configuration: {e}");
     }
     // Resolve genesis ID: use the provided value, or look it up by network name.
-    let resolved_genesis_id = match genesis_id {
+    //
+    // This is only a placeholder until the ledger is opened below: it is
+    // either the raw `--genesis-id` CLI value or a known-network lookup,
+    // NEITHER of which is guaranteed to equal the real, combined genesis id
+    // (`"{network}-{id}"`, `algo_ledger::genesis::make_genesis_block`) that
+    // ends up in block 0's header and every descendant block thereafter
+    // (`prev.genesis_id.clone()`, `algo_ledger::block_header`). See the
+    // override right after the ledger is opened/seeded for why this
+    // distinction is consensus-critical, not cosmetic.
+    let mut resolved_genesis_id = match genesis_id {
         Some(id) if !id.is_empty() => id.to_string(),
         _ => genesis_id_for(network)
             .ok_or_else(|| {
@@ -3770,8 +3825,11 @@ pub async fn run(
             .to_string(),
     };
 
-    // Parse genesis hash (default to zeros if not provided).
-    let genesis_hash = match genesis_hash_hex {
+    // Parse genesis hash (default to zeros if not provided). Same
+    // placeholder caveat as `resolved_genesis_id` above: a fresh network
+    // booted from `--genesis-json` almost never also passes a matching
+    // `--genesis-hash`, so this defaults to all-zero here.
+    let mut genesis_hash = match genesis_hash_hex {
         Some(hex_str) => parse_genesis_hash(hex_str)?,
         None => [0u8; 32],
     };
@@ -3905,6 +3963,16 @@ pub async fn run(
     if let Some(genesis_path) = genesis_json_path {
         seed_ledger_from_genesis(&mut sqlite_ledger, genesis_path, latest)?;
     }
+
+    // Issue #1066: the CLI-derived placeholders resolved above must not be
+    // trusted once the ledger has a real genesis on disk. See
+    // `resolve_effective_genesis_expectations`'s doc comment for why.
+    (resolved_genesis_id, genesis_hash) = resolve_effective_genesis_expectations(
+        resolved_genesis_id,
+        genesis_hash,
+        sqlite_ledger.genesis_id(),
+        sqlite_ledger.genesis_hash(),
+    );
 
     let ledger = Arc::new(Mutex::new(sqlite_ledger));
 
@@ -5089,6 +5157,76 @@ mod tests {
     use serde_bytes::ByteBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
+
+    // ── Issue #1066: genesis-expectation reconciliation ─────────────
+
+    /// TDD regression for issue #1066: a mismatched CLI placeholder (a bare
+    /// `--genesis-id` with the all-zero default `--genesis-hash`) must be
+    /// overridden by the ledger's own, authoritative genesis once one
+    /// exists — otherwise `BlockValidatorBridge` rejects every peer's real
+    /// proposal payload (see `resolve_effective_genesis_expectations`'s doc
+    /// comment for the full mechanism). Before the fix this function did
+    /// not exist and `participate::run` used the CLI placeholder
+    /// unconditionally; this test pins the corrected behavior directly.
+    #[test]
+    fn resolve_effective_genesis_expectations_prefers_ledger_once_seeded() {
+        let cli_genesis_id = "v1".to_string();
+        let cli_genesis_hash = [0u8; 32];
+        let ledger_genesis_id = "algod-rust-sync-test-v1";
+        let ledger_genesis_hash = [0x42u8; 32];
+
+        let (resolved_id, resolved_hash) = resolve_effective_genesis_expectations(
+            cli_genesis_id,
+            cli_genesis_hash,
+            ledger_genesis_id,
+            &ledger_genesis_hash,
+        );
+
+        assert_eq!(
+            resolved_id, ledger_genesis_id,
+            "must use the ledger's real combined genesis id, not the bare CLI placeholder"
+        );
+        assert_eq!(
+            resolved_hash, ledger_genesis_hash,
+            "must use the ledger's real genesis hash, not the CLI's all-zero default"
+        );
+    }
+
+    /// A ledger with no genesis yet (pure catchup from peers, genesis still
+    /// unknown) must fall back to the CLI-resolved placeholder rather than
+    /// an empty id / all-zero hash it doesn't actually have.
+    #[test]
+    fn resolve_effective_genesis_expectations_falls_back_when_ledger_has_no_genesis_yet() {
+        let cli_genesis_id = "testnet-v1.0".to_string();
+        let cli_genesis_hash = [0x11u8; 32];
+
+        let (resolved_id, resolved_hash) = resolve_effective_genesis_expectations(
+            cli_genesis_id.clone(),
+            cli_genesis_hash,
+            "",
+            &[0u8; 32],
+        );
+
+        assert_eq!(resolved_id, cli_genesis_id);
+        assert_eq!(resolved_hash, cli_genesis_hash);
+    }
+
+    /// When the CLI placeholder already happens to match the ledger's real
+    /// genesis (e.g. `--genesis-id` given as the already-combined
+    /// `"{network}-{id}"` string), the ledger's value still wins and is
+    /// identical, so this is a no-op in effect -- guards against a
+    /// regression that special-cases "already equal" incorrectly.
+    #[test]
+    fn resolve_effective_genesis_expectations_is_noop_when_cli_already_matches_ledger() {
+        let id = "mainnet-v1.0".to_string();
+        let hash = [0x99u8; 32];
+
+        let (resolved_id, resolved_hash) =
+            resolve_effective_genesis_expectations(id.clone(), hash, &id, &hash);
+
+        assert_eq!(resolved_id, id);
+        assert_eq!(resolved_hash, hash);
+    }
 
     // ── Helper: create an in-memory ledger ──────────────────────────
     fn test_ledger() -> Arc<Mutex<SqliteLedger>> {
