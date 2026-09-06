@@ -26,7 +26,6 @@ use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
 use algo_types::{
     Address, HeartbeatProof, LogicSig, MultisigSig, PQDelegatedProgram, PQSig, SignedTransaction,
-    PQ_SCHEME_FALCON1024,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha512_256};
@@ -136,7 +135,11 @@ pub fn validate_pqsig_scheme(pqsig: &PQSig, consensus: &ConsensusParams) -> Resu
             message: "pq signature is blank".into(),
         });
     }
-    if pqsig.scheme != PQ_SCHEME_FALCON1024 {
+    // Reject any scheme tag not in the registered dispatch table (Go:
+    // `LookupPQScheme` miss → `ErrPQSchemeNotSupported`) before checking
+    // whether it's consensus-enabled -- an unregistered tag has no verifier
+    // to dispatch to regardless of what the consensus params say.
+    if algo_consensus_crypto::lookup_pq_scheme(pqsig.scheme).is_none() {
         return Err(AlgoError::Validation {
             message: format!("pq signature scheme not supported: {:?}", pqsig.scheme),
         });
@@ -207,17 +210,21 @@ fn verify_pqsig_bytes(
         });
     }
 
-    let ok =
-        algo_falcon::falcon_verify(&pqsig.public_key, &pqsig.signature, message).map_err(|e| {
-            AlgoError::Validation {
-                message: format!("pq falcon signature verification error: {e}"),
-            }
+    // `validate_pqsig_envelope` above already confirmed `pqsig.scheme` is a
+    // registered scheme, so this lookup cannot miss -- dispatch through it
+    // (rather than calling `algo_falcon::falcon_verify` directly) so this is
+    // the single place scheme-specific PQ verification is chosen, mirroring
+    // go's `stxnCoreChecks`'s use of `LookupPQScheme` at the call site.
+    let verifier = algo_consensus_crypto::lookup_pq_scheme(pqsig.scheme).ok_or_else(|| {
+        AlgoError::Validation {
+            message: format!("pq signature scheme not supported: {:?}", pqsig.scheme),
+        }
+    })?;
+    verifier
+        .verify(message, &pqsig.public_key, &pqsig.signature)
+        .map_err(|e| AlgoError::Validation {
+            message: format!("pq falcon signature verification failed: {e}"),
         })?;
-    if !ok {
-        return Err(AlgoError::Validation {
-            message: "pq falcon signature verification failed".into(),
-        });
-    }
 
     Ok(())
 }
@@ -1122,7 +1129,9 @@ pub fn logic_sig_group_size_check(
 mod tests {
     use super::*;
     use algo_avm::group::GroupBudget;
-    use algo_types::{Address, MultisigSubsig, PQAddressSalt, Round, Transaction};
+    use algo_types::{
+        Address, MultisigSubsig, PQAddressSalt, Round, Transaction, PQ_SCHEME_FALCON1024,
+    };
     use ed25519_dalek::SigningKey;
     use serde_bytes::ByteBuf;
 
