@@ -63,8 +63,9 @@ mod simulate;
 
 use algo_agreement::{
     Action, ActionType, AsyncPseudonode, ConsensusVersionView, CredentialArrivalHistory, Event,
-    EventType, LedgerWriter, MessageEvent, Player, ProposalValue, Pseudonode, RootRouter,
-    TimeoutEvent, BOTTOM, CERT, DYNAMIC_FILTER_CREDENTIAL_ARRIVAL_HISTORY, SOFT,
+    EventType, LedgerWriter, MessageEvent, Player, ProposalValue, Pseudonode, RootRouter, Step,
+    TimeoutEvent, BOTTOM, CERT, DYNAMIC_FILTER_CREDENTIAL_ARRIVAL_HISTORY, NEXT,
+    PROPOSAL_PAYLOAD_TAG, SOFT, VOTE_BUNDLE_TAG,
 };
 use algo_types::{ConsensusParams, Round, CONSENSUS_V41};
 
@@ -351,6 +352,202 @@ fn simulate_cert_expect_ensure_assemble(
     ensure
 }
 
+/// Mirrors go's `simulateNextExpectRecover`: submitting a batch of real
+/// next-step votes for `bottom` should yield exactly one `assemble` action
+/// (bottom-quorum recovery into a fresh period).
+fn simulate_next_expect_recover(h: &mut RealPlayerHarness, batch: Vec<Event>) {
+    let mut cert_actions = Vec::new();
+    for e in batch {
+        cert_actions.extend(submit(h, e));
+    }
+
+    let assembles_sent = cert_actions
+        .iter()
+        .filter(|a| matches!(a, Action::Pseudonode(pa) if pa.t == ActionType::Assemble))
+        .count();
+    assert_eq!(assembles_sent, 1, "expected exactly one assemble action");
+}
+
+/// Mirrors go's `simulateTimeoutExpectAlarm`: firing a timeout with no
+/// proposal on hand yet produces no actions at all (nothing to soft-vote
+/// for), and the player is not left napping.
+fn simulate_timeout_expect_alarm(h: &mut RealPlayerHarness) {
+    let res = submit(h, make_timeout_event());
+    assert!(
+        res.iter().all(|a| a.action_type() == ActionType::Noop),
+        "got some non-noop action: {res:?}"
+    );
+    assert!(!h.player.napping, "player is napping");
+}
+
+/// Mirrors go's `simulateTimeoutExpectNext`: firing a timeout at/after the
+/// `cert` step (not napping) attests exactly one next-vote for `expected` at
+/// `step`.
+fn simulate_timeout_expect_next(h: &mut RealPlayerHarness, expected: ProposalValue, step: Step) {
+    let res = submit(h, make_timeout_event());
+    assert_eq!(res.len(), 1, "wrong number of actions on next timeout");
+    match &res[0] {
+        Action::Pseudonode(a) => {
+            assert_eq!(a.t, ActionType::Attest, "action is not attest");
+            assert_eq!(a.proposal, expected, "bad next vote");
+            assert_eq!(a.step, step, "bad next step");
+        }
+        other => panic!("expected a pseudonode attest action, got {other:?}"),
+    }
+    assert!(!h.player.napping, "player is napping");
+}
+
+/// Mirrors go's `simulateTimeoutExpectNextNap`: firing a timeout while
+/// advancing past a next-vote step (not yet napping) arms the random "nap"
+/// deadline and produces no actions.
+fn simulate_timeout_expect_next_nap(h: &mut RealPlayerHarness) {
+    let res = submit(h, make_timeout_event());
+    assert!(res.is_empty(), "some action emitted while arming the nap");
+    assert!(h.player.napping, "player is not napping");
+}
+
+/// Mirrors go's `simulateTimeoutExpectNextPartitioned`: once the player is
+/// `partitioned()` (step >= `PARTITION_STEP` or period >= 3), firing the
+/// (now-expired) nap timeout additionally re-broadcasts the freshest vote
+/// bundle (and, in period 0, the staged/pinned payload) via
+/// `partition_policy` ahead of the next-vote attestation.
+fn simulate_timeout_expect_next_partitioned(
+    h: &mut RealPlayerHarness,
+    expected: ProposalValue,
+    step: Step,
+) {
+    let res = submit(h, make_timeout_event());
+    assert!(
+        res.len() == 2 || res.len() == 3,
+        "wrong number of actions, expected 2 or 3, got {}",
+        res.len()
+    );
+
+    let (bundle_action, attest_action) = if res.len() == 3 {
+        match &res[1] {
+            Action::Network(na) => {
+                assert_eq!(na.t, ActionType::Broadcast, "action 1.5 is not broadcast");
+                assert_eq!(
+                    na.tag, PROPOSAL_PAYLOAD_TAG,
+                    "action 1.5 has no proposal payload tag"
+                );
+            }
+            other => panic!("expected a network broadcast action, got {other:?}"),
+        }
+        (&res[0], &res[2])
+    } else {
+        (&res[0], &res[1])
+    };
+
+    match bundle_action {
+        Action::Network(na) => {
+            assert_eq!(na.t, ActionType::Broadcast, "action 1 is not broadcast");
+            assert_eq!(na.tag, VOTE_BUNDLE_TAG, "action 1 has no vote bundle tag");
+            assert_eq!(
+                na.unauthenticated_bundle.proposal, expected,
+                "bad bundle proposal"
+            );
+        }
+        other => panic!("expected a network broadcast action, got {other:?}"),
+    }
+
+    match attest_action {
+        Action::Pseudonode(a) => {
+            assert_eq!(a.t, ActionType::Attest, "action 2 is not attest");
+            assert_eq!(a.proposal, expected, "bad next vote");
+            assert_eq!(a.step, step, "bad next step");
+        }
+        other => panic!("expected a pseudonode attest action, got {other:?}"),
+    }
+
+    assert!(!h.player.napping, "player is napping");
+}
+
+/// Mirrors go's `simulateSoftExpectNoAttest`: submitting soft votes that
+/// arrive too late (after the player already moved on to `next`) must not
+/// produce a cert-vote attestation.
+fn simulate_soft_expect_no_attest(h: &mut RealPlayerHarness, batch: Vec<Event>) {
+    let mut soft_actions = Vec::new();
+    for e in batch {
+        soft_actions.extend(submit(h, e));
+    }
+    assert!(
+        !soft_actions
+            .iter()
+            .any(|a| a.action_type() == ActionType::Attest),
+        "attestation sent"
+    );
+}
+
+/// Mirrors go's `simulateProposalVotes`: submit each proposal-vote event,
+/// discarding the resulting actions (used when only the payload submission's
+/// actions matter for the assertion that follows).
+fn simulate_proposal_votes(h: &mut RealPlayerHarness, batch: Vec<Event>) {
+    for e in batch {
+        submit(h, e);
+    }
+}
+
+/// Mirrors go's `simulateProposalPayloads`: submit each proposal-payload
+/// event and, whenever it is relayed, confirm the relayed payload's value
+/// (block digest + encoding digest) matches `expected`.
+fn simulate_proposal_payloads(
+    h: &mut RealPlayerHarness,
+    expected: ProposalValue,
+    batch: Vec<Event>,
+) {
+    for e in batch {
+        let received_value = match &e {
+            Event::Message(me) => me
+                .input
+                .proposal
+                .as_ref()
+                .map(|p| p.unauthenticated_proposal.value()),
+            _ => None,
+        };
+        let res = submit(h, e);
+        for a in &res {
+            if a.action_type() != ActionType::Relay {
+                continue;
+            }
+            if expected != BOTTOM {
+                if let Some(rv) = &received_value {
+                    assert_eq!(
+                        rv.block_digest, expected.block_digest,
+                        "wrong payload relayed (block digest)"
+                    );
+                    assert_eq!(
+                        rv.encoding_digest, expected.encoding_digest,
+                        "wrong payload relayed (encoding digest)"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Mirrors go's `simulateSynchronousRoundRecovery`: a bottom-quorum next
+/// threshold recovers the player into period 1, which then completes a full
+/// uncontested round exactly like `simulate_single_synchronous_round`.
+fn simulate_synchronous_round_recovery(h: &mut RealPlayerHarness) {
+    let next_event_batch = generate_vote_events(h, NEXT, BOTTOM);
+    simulate_next_expect_recover(h, next_event_batch);
+
+    let (vote_batch, payload_batch, lowest_proposal) = generate_proposal_events(h);
+    let soft_batch = generate_vote_events(h, SOFT, lowest_proposal);
+    let cert_batch = generate_vote_events(h, CERT, lowest_proposal);
+
+    simulate_proposals(h, vote_batch, payload_batch);
+    simulate_timeout_expect_soft(h, lowest_proposal);
+    simulate_soft_expect_attest(h, lowest_proposal, soft_batch);
+
+    let act = simulate_cert_expect_ensure_assemble(h, lowest_proposal, cert_batch);
+    h.ledger.ensure_block(
+        &act.payload.unauthenticated_proposal.block,
+        &act.certificate,
+    );
+}
+
 /// Mirrors go's `simulateSingleSynchronousRound`: a full, uncontested round
 /// — every real account proposes, the lowest credential wins, soft and
 /// cert thresholds are reached in period 0, and the resulting block is
@@ -403,4 +600,114 @@ fn player_synchronous_twenty_rounds() {
         );
     }
     assert_eq!(h.ledger.next_round(), Round(start_round.0 + 20));
+}
+
+/// Port of go-algorand's `TestPlayerOffsetStart` (`agreement/player_test.go:440`)
+/// — the player starts mid-period, with no proposal ever having arrived (an
+/// "offset start", e.g. after loading persisted state or fast-forwarding).
+/// The first filter timeout finds nothing to soft-vote for (a no-op alarm),
+/// the second (cert-step) timeout casts a bottom next-vote, and every
+/// subsequent timeout walks the "nap" mechanic: arm a random deadline
+/// (`Napping = true`, no action), then fire it to cast the next bottom vote
+/// for the next step and re-arm. A bottom next-vote quorum then recovers the
+/// player into a fresh period, after which 5 ordinary rounds complete
+/// normally.
+///
+/// This is the first of the two theme-1 scenarios that needed the player's
+/// zero-value-`Deadline`/"nap" mechanics beyond what `TestPlayerSynchronous`
+/// exercised. No `Player` divergence found: `Player::handle`'s `timeout`
+/// branch already walks soft -> cert -> next -> nap -> next+1 -> nap -> ...
+/// exactly like go's `player.go` (see `crates/core/algo-agreement/src/player.rs`'s
+/// `handle` timeout match), and the bottom next-vote quorum recovery is
+/// already wired through the existing vote/threshold machinery proven by
+/// `player_synchronous_twenty_rounds` and the `setupP`-harness edge-case
+/// tests. Verified across repeated standalone runs (deterministic: the
+/// harness drives a single un-threaded `Player` with a fixed
+/// `random_entropy`, so the "nap" deadline's exact duration never affects
+/// which step is reached, only how the driver's clock would have been
+/// scheduled in production).
+#[test]
+fn player_offset_start() {
+    let mut h = test_player_setup();
+
+    simulate_timeout_expect_alarm(&mut h);
+    simulate_timeout_expect_next(&mut h, BOTTOM, NEXT);
+
+    for i in 1..10u64 {
+        simulate_timeout_expect_next_nap(&mut h);
+        simulate_timeout_expect_next(&mut h, BOTTOM, Step(NEXT.0 + i));
+    }
+
+    simulate_synchronous_round_recovery(&mut h);
+
+    for _ in 0..5 {
+        simulate_single_synchronous_round(&mut h);
+    }
+}
+
+/// Port of go-algorand's `TestPlayerLateBlockProposalPeriod0`
+/// (`agreement/player_test.go:460`) — period 0's proposal payloads arrive
+/// late (only after the soft-vote and next-vote-for-bottom timeouts have
+/// already fired), so the round can only be won by relaying/re-proposing
+/// once the soft-vote committee has already moved on to `next`. The soft
+/// votes that do eventually arrive are too late to produce a cert
+/// attestation (the player is already past `soft`), and once the payloads
+/// finally arrive they're relayed (not acted on directly, since there's no
+/// pending soft/cert threshold yet). The subsequent "nap" loop exercises
+/// both branches of `player.partitioned()`: below `PARTITION_STEP` it casts
+/// a plain next-vote exactly like `TestPlayerOffsetStart`, and once the
+/// step reaches `PARTITION_STEP` (`NEXT + 3`) `partition_policy` additionally
+/// re-broadcasts the freshest vote bundle (and the now-staged period-0
+/// payload) ahead of every subsequent next-vote. A cert-vote quorum for the
+/// (late-arriving) proposal then commits the round via `ensure`+`assemble`,
+/// after which 5 ordinary rounds complete normally.
+///
+/// This is the second of the two theme-1 scenarios that needed dedicated
+/// investigation of the player's deadline/"nap" mechanics plus
+/// `player.partitioned()`-gated branching. No `Player` divergence found:
+/// `Player::partitioned` (`step >= PARTITION_STEP || period >= Period(3)`)
+/// and `Player::partition_policy` (broadcasting the freshest bundle plus the
+/// staged/pinned period-0 payload) in `crates/core/algo-agreement/src/player.rs`
+/// already match go's `player.partitioned()`/`player.partitionPolicy` exactly,
+/// and were already exercised by existing unit tests
+/// (`player.rs`'s `player_partitioned_by_step`/`player_partitioned_by_period`
+/// and permutation coverage) — this test additionally proves the branching
+/// is reached and produces the right actions when driven end-to-end through
+/// the real vote/proposal/threshold machinery with real accounts. Verified
+/// across repeated standalone runs.
+#[test]
+fn player_late_block_proposal_period0() {
+    let mut h = test_player_setup();
+
+    let (proposal_vote_batch, proposal_payload_batch, lowest_proposal) =
+        generate_proposal_events(&mut h);
+    let soft_batch = generate_vote_events(&mut h, SOFT, lowest_proposal);
+    let cert_batch = generate_vote_events(&mut h, CERT, lowest_proposal);
+
+    simulate_proposal_votes(&mut h, proposal_vote_batch);
+    simulate_timeout_expect_soft(&mut h, lowest_proposal);
+    simulate_soft_expect_no_attest(&mut h, soft_batch);
+    simulate_timeout_expect_next(&mut h, BOTTOM, NEXT);
+
+    simulate_proposal_payloads(&mut h, lowest_proposal, proposal_payload_batch);
+
+    for i in 1..10u64 {
+        simulate_timeout_expect_next_nap(&mut h);
+        let step = Step(NEXT.0 + i);
+        if !h.player.partitioned() {
+            simulate_timeout_expect_next(&mut h, lowest_proposal, step);
+        } else {
+            simulate_timeout_expect_next_partitioned(&mut h, lowest_proposal, step);
+        }
+    }
+
+    let act = simulate_cert_expect_ensure_assemble(&mut h, lowest_proposal, cert_batch);
+    h.ledger.ensure_block(
+        &act.payload.unauthenticated_proposal.block,
+        &act.certificate,
+    );
+
+    for _ in 0..5 {
+        simulate_single_synchronous_round(&mut h);
+    }
 }
