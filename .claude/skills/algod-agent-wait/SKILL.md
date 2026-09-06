@@ -1,5 +1,22 @@
 # algod-rust: waiting on a dispatched issue-fix agent
 
+**MANDATORY, not optional: every single time you dispatch an `Agent` for an
+algod-issue-fix task in this repo, your very next tool call — same turn —
+is launching the matching `wait_for_issue_pr.sh`/`wait_for_pr_checks.sh`
+background script.** Session history shows this rule getting silently
+dropped mid-session more than once: the coordinator falls back to just
+replying to each of the *dispatched agent's own* internal task-notifications
+("waiting for the CI poll", "still waiting on the build") with a fresh
+one-line reply each time. That is the exact anti-pattern this skill exists
+to eliminate, just one level removed — the dispatched agent's own internal
+polling-and-pausing cycle bubbles a notification up to the coordinator on
+every pause, and mirroring each one back with "Waiting." is indistinguishable
+from the nudge-loop this file already forbids. **Do not narrate a dispatched
+agent's internal progress. Ever.** If you notice yourself writing "Waiting"
+or "Continuing to wait" in response to a task-notification from an agent
+whose PR you don't yet have a coordinator-side wait script running against,
+stop and launch the script instead of replying again.
+
 Use this whenever you (the coordinator) have dispatched a background `Agent`
 to work an issue via the `algod-issue-fix` workflow, and need to know when
 it has produced a mergeable PR. Do **not** wait for the dispatched agent to
