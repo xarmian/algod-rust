@@ -82,13 +82,37 @@ action. If you genuinely need to change the plan mid-wait (the user asks
 something else), that's fine — but return to relying on the pending
 notification rather than adding a parallel manual poll.
 
-## Why not just poll `gh pr checks` yourself inline
+## Waiting on a *known* PR number: `wait_for_pr_checks.sh`
 
-You can — for a single already-known PR number this is often simpler (see
-`/pr-ship`'s inline loop). This skill's script exists specifically for the
-**dispatch-and-wait** case, where you don't yet know the PR number and the
-alternative is depending on the agent to tell you, which is exactly the
-unreliable step this replaces.
+Once a PR already exists (you have its number — from a merge-conflict
+rebase you just pushed, from an agent's own report, from `gh pr list`),
+use `scripts/wait_for_pr_checks.sh <pr-number> [timeout] [poll-interval]`
+the same way: one `run_in_background: true` Bash call, one `RESULT:` line,
+one `task-notification`. It skips `wait_for_issue_pr.sh`'s phase 1
+(finding the PR) since you already know the number.
+
+```bash
+cd "c:\Users\ludovit.scholtz\source\repos\scholtz\algod-rust" && \
+bash scripts/wait_for_pr_checks.sh 1036 570 20
+```
+
+**Never wait for CI by repeatedly calling `ScheduleWakeup` (or any other
+"check now, reschedule for N minutes later" loop) instead.** Each firing
+re-invokes a full agent turn — from the user's side this looks identical
+to the agent nudge-loop this skill exists to replace, just retargeted at
+a GitHub API call instead of a stalled agent. `ScheduleWakeup` is for
+open-ended/dynamic pacing where there is no single bounded condition to
+wait on; "is this PR's CI done yet" is exactly the kind of bounded
+condition a background shell loop already expresses correctly, so express
+it that way and let the one notification drive the next action.
+
+## Why not just poll `gh pr checks` yourself inline, turn after turn
+
+You can technically re-run `gh pr checks <n>` by hand each turn, but don't
+— it costs one full round trip per check, identical in kind to the
+disallowed `ScheduleWakeup` loop above. Always prefer backgrounding
+`wait_for_pr_checks.sh` (known PR number) or `wait_for_issue_pr.sh`
+(PR not yet known) over any manual or scheduled re-polling.
 
 ## Merge-conflict note
 

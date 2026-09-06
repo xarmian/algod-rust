@@ -36,6 +36,26 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   (Makefile targets, scripts/) over ad-hoc `go build`/`go test` invocations —
   they encode required native-dependency setup.
 
+## Issue-fix dispatch: one at a time, one open PR at a time
+
+- When working through the open-issue backlog (Phase 17 or otherwise),
+  fix and land issues **sequentially, not in parallel batches**. Dispatch
+  a single agent/effort for one issue, get its PR merged (or its branch
+  closed as a duplicate/abandoned), and sync `main` — only then start the
+  next issue.
+- **Do not open a new pull request while a previous one from this backlog
+  work is still open.** Every issue-fix PR in this repo touches the same
+  shared tracking files (`docs/PHASE17_TEST_PARITY.md`,
+  `docs/epics/Epic-27-Test-Parity-Audit.md`, and the relevant
+  `docs/phase17/parity_*.md`), so parallel PRs against them reliably
+  produce merge conflicts on every single one — conflicts that are pure
+  overhead, not a signal of any real problem with the work. Running
+  agents in parallel has also produced duplicate PRs for the same issue
+  (two agents independently dispatched after one's worktree was silently
+  garbage-collected mid-task).
+- Before opening a new PR, check `gh pr list --state open` — if anything
+  is open, finish/merge/close it first rather than adding to the pile.
+
 ## Golden Fixtures
 
 - Fixture files under `crates/**/fixtures/` are compared byte-for-byte against
