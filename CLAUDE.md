@@ -56,6 +56,31 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
 - Before opening a new PR, check `gh pr list --state open` — if anything
   is open, finish/merge/close it first rather than adding to the pile.
 
+## Waiting on CI or a dispatched agent: never narrate every notification
+
+- A dispatched agent's own background wait (CI polling, a long build, a
+  multi-node test run) produces a stream of near-identical
+  `task-notification`s like "still waiting on task X" as it re-polls. Do
+  **not** reply to each one with a fresh coordinator-side message like
+  "Continuing to wait." — that reproduces, one level up, the exact
+  polling-noise problem this file's CI-wait guidance exists to eliminate.
+  Silently let a routine "still in progress, no new artifact" notification
+  pass without emitting a text turn, unless you are taking a concrete
+  action in response (nudging a falsely-paused agent, checking its
+  worktree directly because progress looks stalled, merging a PR it just
+  produced). A text reply should mean something happened, not "the last
+  known state is unchanged."
+- If a run seems to be taking unusually long, check the worktree directly
+  (`git status`/`git log` in `.claude/worktrees/agent-<id>`, or `df -h`)
+  rather than repeating the notification back with a one-line
+  acknowledgement — a real check either surfaces something actionable or
+  confirms genuine progress, whereas a bare acknowledgement does neither.
+- Use `scripts/wait_for_issue_pr.sh` / `scripts/wait_for_pr_checks.sh`
+  (see the `algod-agent-wait` skill) for the coordinator's own CI waits;
+  a dispatched agent doing its own internal polling is a separate matter
+  — that agent's chatter is not something the coordinator needs to
+  re-echo turn by turn.
+
 ## Golden Fixtures
 
 - Fixture files under `crates/**/fixtures/` are compared byte-for-byte against
