@@ -673,6 +673,21 @@ pub trait NodeInterface: Send + Sync + 'static {
         Err(NodeError::NotImplemented("get_block_header"))
     }
 
+    /// Cancellation signal that fires when the node is shutting down.
+    ///
+    /// Long-scanning default methods (currently
+    /// [`NodeInterface::get_state_proof_transaction_for_round`]) poll this
+    /// once per unit of work to interrupt promptly on shutdown, mirroring
+    /// go-algorand's `v2.Handlers.Shutdown` channel threaded into
+    /// `GetStateProofTransactionForRound`
+    /// (`daemon/algod/api/server/v2/handlers.go`). Returns `None` by
+    /// default -- an implementor with no shutdown signal to offer (e.g.
+    /// test doubles) is unaffected and keeps the pre-existing
+    /// scan-bound-only behavior.
+    fn shutdown_signal(&self) -> Option<&tokio_util::sync::CancellationToken> {
+        None
+    }
+
     /// Find the state proof transaction that covers the given round.
     ///
     /// Scans blocks from `round + 1` up to the latest round looking for
@@ -695,11 +710,16 @@ pub trait NodeInterface: Send + Sync + 'static {
     ///
     /// Bounded by [`STATE_PROOF_SCAN_ROUND_LIMIT`] rounds to guarantee
     /// termination on a request for a very old round with no state proof
-    /// ever covering it, mirroring the intent (not the exact mechanism) of
-    /// go's caller-supplied `ctx`/`stop` cancellation -- this trait has no
-    /// cancellation parameter, so a fixed scan bound is used instead of
-    /// threading a cancellation token through every `NodeInterface`
-    /// implementor for what is, in practice, a bounded local block scan.
+    /// ever covering it, mirroring go's caller-supplied `ctx` deadline.
+    /// The scan also checks [`NodeInterface::shutdown_signal`] once per
+    /// round, mirroring go's `stop <-chan struct{}` check inside
+    /// `GetStateProofTransactionForRound`'s loop
+    /// (`daemon/algod/api/server/v2/handlers.go`) so a node shutdown
+    /// interrupts an in-progress scan promptly instead of running it to
+    /// the bound (see issue #1079 /
+    /// `TestStateproofTransactionForRoundShutsDown`). Implementors that
+    /// don't override `shutdown_signal` get the pre-existing
+    /// scan-bound-only behavior unchanged.
     async fn get_state_proof_transaction_for_round(
         &self,
         round: u64,
@@ -723,6 +743,14 @@ pub trait NodeInterface: Send + Sync + 'static {
         let scan_end = latest_round.min(round.saturating_add(STATE_PROOF_SCAN_ROUND_LIMIT));
 
         for r in (round + 1)..=scan_end {
+            if let Some(token) = self.shutdown_signal() {
+                if token.is_cancelled() {
+                    return Err(NodeError::Timeout(
+                        "get_state_proof_transaction_for_round: node is shutting down".to_string(),
+                    ));
+                }
+            }
+
             let block = match self.get_block(r).await {
                 Ok(b) => b,
                 Err(NodeError::NotFound(_)) => continue,
@@ -1219,6 +1247,28 @@ mod tests {
         last_round: u64,
         blocks: BTreeMap<u64, Block>,
         block_headers: BTreeMap<u64, BlockHeader>,
+        /// Optional shutdown signal, exercised by the
+        /// `get_state_proof_transaction_for_round_stops_promptly_*` tests
+        /// below. `None` for every other test in this module, matching
+        /// [`NodeInterface::shutdown_signal`]'s default of "no signal
+        /// available."
+        shutdown: Option<tokio_util::sync::CancellationToken>,
+        /// Counts `get_block` calls, so tests can assert the scan stopped
+        /// immediately on a cancelled signal instead of merely returning
+        /// the right error after scanning anyway.
+        get_block_calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl MinimalNode {
+        fn new(last_round: u64) -> Self {
+            MinimalNode {
+                last_round,
+                blocks: BTreeMap::new(),
+                block_headers: BTreeMap::new(),
+                shutdown: None,
+                get_block_calls: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
     }
 
     fn base_status(last_round: u64) -> NodeStatus {
@@ -1305,6 +1355,8 @@ mod tests {
             })
         }
         async fn get_block(&self, round: u64) -> Result<Block, NodeError> {
+            self.get_block_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.blocks
                 .get(&round)
                 .cloned()
@@ -1315,6 +1367,9 @@ mod tests {
                 .get(&round)
                 .cloned()
                 .ok_or_else(|| NodeError::NotFound(format!("header {round} not found")))
+        }
+        fn shutdown_signal(&self) -> Option<&tokio_util::sync::CancellationToken> {
+            self.shutdown.as_ref()
         }
     }
 
@@ -1339,11 +1394,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_state_proof_transaction_for_round_finds_covering_state_proof() {
-        let mut node = MinimalNode {
-            last_round: 100,
-            blocks: BTreeMap::new(),
-            block_headers: BTreeMap::new(),
-        };
+        let mut node = MinimalNode::new(100);
         for r in 0..=100 {
             node.block_headers.insert(r, header_at(r));
         }
@@ -1361,11 +1412,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_state_proof_transaction_for_round_not_found_when_no_covering_proof() {
-        let mut node = MinimalNode {
-            last_round: 100,
-            blocks: BTreeMap::new(),
-            block_headers: BTreeMap::new(),
-        };
+        let mut node = MinimalNode::new(100);
         for r in 0..=100 {
             node.block_headers.insert(r, header_at(r));
             node.blocks.insert(
@@ -1383,11 +1430,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_state_proof_transaction_for_round_short_circuits_when_state_proofs_disabled() {
-        let mut node = MinimalNode {
-            last_round: 100,
-            blocks: BTreeMap::new(),
-            block_headers: BTreeMap::new(),
-        };
+        let mut node = MinimalNode::new(100);
         // v7 predates state proofs (state_proof_interval == 0).
         node.block_headers.insert(
             10,
@@ -1404,11 +1447,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_state_proof_transaction_for_round_ignores_non_matching_sender_and_range() {
-        let mut node = MinimalNode {
-            last_round: 100,
-            blocks: BTreeMap::new(),
-            block_headers: BTreeMap::new(),
-        };
+        let mut node = MinimalNode::new(100);
         for r in 0..=100 {
             node.block_headers.insert(r, header_at(r));
         }
@@ -1430,5 +1469,63 @@ mod tests {
 
         let result = node.get_state_proof_transaction_for_round(10).await;
         assert!(matches!(result, Err(NodeError::NotFound(_))));
+    }
+
+    /// Mirrors go-algorand's `TestStateproofTransactionForRoundShutsDown`
+    /// (`daemon/algod/api/server/v2/test/handlers_test.go`): an
+    /// already-fired shutdown signal must interrupt the scan on its very
+    /// first iteration -- returning promptly with a shutdown error --
+    /// rather than scanning up to `latest_round` /
+    /// [`STATE_PROOF_SCAN_ROUND_LIMIT`] regardless.
+    #[tokio::test]
+    async fn get_state_proof_transaction_for_round_stops_promptly_when_shutdown_signal_cancelled() {
+        let mut node = MinimalNode::new(1_000_000);
+        node.block_headers.insert(10, header_at(10));
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        node.shutdown = Some(token);
+
+        let result = node.get_state_proof_transaction_for_round(10).await;
+
+        match result {
+            Err(NodeError::Timeout(msg)) => {
+                assert!(
+                    msg.contains("shutting down"),
+                    "expected a shutdown message, got {msg:?}"
+                );
+            }
+            other => panic!("expected Timeout(shutting down), got {other:?}"),
+        }
+        // The very first loop iteration must observe the cancellation
+        // before ever fetching a block -- proving the scan was
+        // interrupted, not merely that it happened to finish with the
+        // right error after scanning regardless.
+        assert_eq!(
+            node.get_block_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "shutdown signal should short-circuit before any get_block call"
+        );
+    }
+
+    /// A `shutdown_signal` that exists but hasn't fired yet must not
+    /// change behavior -- the scan proceeds normally and finds the
+    /// covering state proof.
+    #[tokio::test]
+    async fn get_state_proof_transaction_for_round_ignores_uncancelled_shutdown_signal() {
+        let mut node = MinimalNode::new(100);
+        for r in 0..=100 {
+            node.block_headers.insert(r, header_at(r));
+        }
+        let block20 = Block {
+            round: algo_types::Round(20),
+            payset: vec![state_proof_txn(Address::STATE_PROOF_SENDER, 1, 16)],
+            ..Default::default()
+        };
+        node.blocks.insert(20, block20);
+        node.shutdown = Some(tokio_util::sync::CancellationToken::new());
+
+        let result = node.get_state_proof_transaction_for_round(10).await;
+        assert_eq!(result.unwrap(), (1, 16));
     }
 }
