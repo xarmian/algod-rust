@@ -3496,6 +3496,60 @@ impl SqliteLedger {
     }
 
     pub fn commit_block(&mut self) -> Result<(), AlgoError> {
+        let result = self.commit_block_uncleaned();
+        if result.is_err() {
+            self.reset_after_failed_commit();
+        }
+        result
+    }
+
+    /// Undo whatever `commit_block_uncleaned` left behind when it failed
+    /// partway through (issue #1081).
+    ///
+    /// Mirrors go-algorand's catchpoint tracker: it retries DB writes on
+    /// SQLite-busy/lock contention under sustained fast-round production
+    /// rather than failing outright, and #6190 fixed a real bug in that
+    /// retry path -- a failed `commitRound` attempt left the in-memory
+    /// `balancesTrie` cache out of sync with the (rolled-back) DB, so the
+    /// next retry corrupted the trie (duplicate/missing hash errors).
+    /// `clearCommitRoundRetry`/`handleCommitError` reset the trie on any
+    /// commit failure so the next attempt starts clean.
+    ///
+    /// algod-rust's commits are synchronous rather than retried by a
+    /// generic DB-transaction wrapper, so the equivalent bug shows up
+    /// differently: without this cleanup, a failed `commit_block()` left
+    /// the SQL transaction dangling open (nothing had issued a `ROLLBACK`)
+    /// and `self.trie` reflecting mutations that were never durably
+    /// committed. The very next `begin_block()` call -- exactly what a
+    /// caller retrying after a transient DB-busy failure does -- then
+    /// failed with "cannot start a transaction within a transaction",
+    /// permanently wedging the ledger; `AgreementLedgerBridge::try_commit_block`
+    /// even silently fell back to writing outside any transaction at all
+    /// rather than surfacing the wedge.
+    ///
+    /// `ROLLBACK`'s own error is ignored: certain fatal errors (disk full,
+    /// I/O faults) can cause SQLite to auto-abort the transaction already,
+    /// in which case an explicit `ROLLBACK` just reports "cannot rollback -
+    /// no transaction is active". Either way the transaction is no longer
+    /// usable, so the rest of this cleanup runs unconditionally.
+    fn reset_after_failed_commit(&mut self) {
+        let _ = self.conn.execute_batch("ROLLBACK");
+        self.pre_mutations.clear();
+        self.pending_totals_delta = AccountTotalsDelta::default();
+        self.pending_online_touched.clear();
+        if let Some(snapshot) = self.lease_snapshot.take() {
+            self.lease_table = snapshot;
+        }
+        self.in_block = false;
+        // Reload the trie from the last committed state -- any in-memory
+        // mutations `commit_block_uncleaned` applied belong to the round
+        // that just failed to commit.
+        if self.trie.is_some() {
+            let _ = self.load_trie();
+        }
+    }
+
+    fn commit_block_uncleaned(&mut self) -> Result<(), AlgoError> {
         // Flush chain-level state to meta table.
         self.flush_chain_state()?;
 
@@ -9261,6 +9315,83 @@ mod tests {
             ledger.last_committed_round().unwrap(),
             None,
             "a failed commit must not silently advance the committed round"
+        );
+    }
+
+    #[test]
+    fn commit_block_failure_does_not_wedge_the_next_begin_block() {
+        // Regression test for issue #1081: go-algorand's catchpoint tracker
+        // retries DB writes on SQLite-busy/lock contention rather than
+        // failing outright, and #6190 fixed a real bug in that retry path --
+        // a failed commitRound attempt left the in-memory balancesTrie cache
+        // out of sync with the (rolled-back) DB, corrupting the trie on the
+        // very next retry (`clearCommitRoundRetry`/`handleCommitError` reset
+        // it). algod-rust has the same class of bug, just surfacing
+        // differently because commits are synchronous here: before this fix,
+        // `commit_block()` left the SQL transaction dangling open (and
+        // `self.trie` stale) whenever it failed partway through, since
+        // nothing issued a ROLLBACK. The next `begin_block()` call -- exactly
+        // what a caller retrying after a transient DB-busy failure would do
+        // under sustained fast-round production -- then failed with "cannot
+        // start a transaction within a transaction", permanently wedging the
+        // ledger (some callers, e.g. `AgreementLedgerBridge::try_commit_block`,
+        // even silently fell back to writing outside any transaction at all
+        // rather than surfacing the wedge).
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.begin_block().unwrap();
+        ledger.set_account(
+            &Address([9u8; 32]),
+            AccountData {
+                micro_algos: 100,
+                ..Default::default()
+            },
+        );
+
+        // `PRAGMA query_only` stands in for a transient DB-busy/lock failure
+        // partway through commit (this crate has no fault-injection VFS; see
+        // `commit_block_propagates_a_write_failure_instead_of_swallowing_it`
+        // above for the same substitute).
+        ledger
+            .conn
+            .execute_batch("PRAGMA query_only = ON;")
+            .unwrap();
+        ledger
+            .commit_block()
+            .expect_err("the forced failure must surface as an error");
+        ledger
+            .conn
+            .execute_batch("PRAGMA query_only = OFF;")
+            .unwrap();
+
+        // The failed commit must not leave a dangling open transaction: a
+        // retry (or the next round entirely) must be able to start cleanly.
+        ledger.begin_block().expect(
+            "begin_block after a failed commit_block must not be wedged by a dangling \
+             open transaction left over from the failed attempt",
+        );
+        ledger.set_account(
+            &Address([9u8; 32]),
+            AccountData {
+                micro_algos: 200,
+                ..Default::default()
+            },
+        );
+        ledger
+            .commit_block()
+            .expect("the retried commit must succeed once the transient failure clears");
+        assert_eq!(
+            ledger.last_committed_round().unwrap(),
+            Some(1),
+            "the retried commit must be durably recorded"
+        );
+        assert_eq!(
+            ledger
+                .get_account(&Address([9u8; 32]))
+                .expect("account must exist after the retried commit")
+                .micro_algos,
+            200,
+            "the retried round's state must be the one actually persisted"
         );
     }
 
