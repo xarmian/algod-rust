@@ -45,6 +45,34 @@
 //! immediately deletes; this deletes everything including the file just
 //! written) and `-1` means "unlimited" (matches
 //! `config.Local.CatchpointFileHistoryLength`'s doc comment).
+//!
+//! # Crash-safety vs. go's persisted first-stage/unfinished-catchpoints
+//! # tables (issue #1080)
+//!
+//! Go additionally persists a `CatchpointStateWritingFirstStageInfo` flag
+//! and an `unfinishedcatchpoints` table (`ledger/store/trackerdb/sqlitedriver/catchpoint.go`)
+//! so that a restart can detect and *redo* an interrupted first-stage or
+//! second-stage generation (`ledger/catchpointtracker.go`'s
+//! `finishFirstStageAfterCrash` / `finishCatchpointsAfterCrash`). That
+//! machinery exists because go splits generation into two stages that run
+//! at different rounds (`CatchpointLookback` rounds apart) and persists an
+//! intermediate artifact between them; algod-rust's `maybe_spawn_automatic_catchpoint`
+//! has no such split -- it recomputes everything in one shot, synchronously
+//! triggered by `round % interval == 0`, from already-committed and durable
+//! ledger state -- so there is no intermediate cross-round artifact for a
+//! persisted table to protect, and porting go's schema verbatim would track
+//! state that no code path here ever needs to resume. That part of the gap
+//! is architectural and out of scope.
+//!
+//! What *is* in scope, and was a real gap until this issue: a crash or
+//! `kill -9` during [`super::writer::export_catchpoint_file`]'s own
+//! internal stage-1 scratch-file write left a `*.stage1.tmp` file on disk
+//! forever, since it isn't a valid catchpoint (so it's never served or
+//! counted toward retention) but also was never swept by
+//! [`prune_catchpoint_files`] (see [`is_stale_write_temp_file`]) -- a
+//! narrower, single-file version of the "corrupted/partial file surviving a
+//! restart" gap the issue asked about, now closed the same way the
+//! final-archive `.tmp` file already was (issue #794).
 
 use std::path::{Path, PathBuf};
 
@@ -95,7 +123,31 @@ fn parse_round_from_filename(name: &str) -> Option<u64> {
 /// still-running export's temp file never reaches this scan because
 /// `maybe_spawn_automatic_catchpoint` never overlaps two exports and prune
 /// only runs after one has already finished.
+///
+/// This also recognizes the *stage-1* scratch file
+/// (`*.catchpoint.tar[.gz].stage1.tmp`, [`super::writer::export_catchpoint_file`]'s
+/// `stage1_path_for`) as stale for exactly the same reason (issue #1080): a
+/// crash between that file's creation and its normal end-of-export removal
+/// (either the `Ok`/`Err` cleanup in `export_catchpoint_file` itself, or the
+/// final `repack` step folding it into the published archive) leaves it on
+/// disk permanently, since -- unlike go-algorand, which persists a
+/// `CatchpointStateWritingFirstStageInfo` flag and an `unfinishedcatchpoints`
+/// table so a restart can detect and redo an interrupted first/second stage
+/// (`../go-algorand/ledger/catchpointtracker.go`'s `finishFirstStageAfterCrash`
+/// / `finishCatchpointsAfterCrash`) -- algod-rust's single-stage,
+/// filename-keyed scheme has no persisted "generation in progress" flag of
+/// its own and nothing else ever revisits a past round's scratch file.
+/// Without this, a killed/crashed process leaks one `.stage1.tmp` file per
+/// interrupted attempt, forever; sweeping it here on the very next prune
+/// pass closes that gap using the same mechanism already used for the
+/// final-archive `.tmp` file, appropriate for an architecture that has no
+/// separate first/second stage to resume -- see this module's doc comment
+/// and issue #1080 for why replicating go's persisted-table approach itself
+/// remains out of scope.
 fn is_stale_write_temp_file(name: &str) -> bool {
+    if let Some(rest) = name.strip_suffix(".stage1.tmp") {
+        return rest.ends_with(".catchpoint.tar.gz") || rest.ends_with(".catchpoint.tar");
+    }
     name.strip_suffix(".tmp")
         .map(|rest| rest.ends_with(".catchpoint.tar.gz") || rest.ends_with(".catchpoint.tar"))
         .unwrap_or(false)
@@ -315,11 +367,15 @@ mod tests {
         assert!(!is_stale_write_temp_file("20000.catchpoint.tar"));
         assert!(!is_stale_write_temp_file("README.txt"));
         // The *other* scratch convention (`export_catchpoint_file`'s stage-1
-        // archive) is a distinct, already-cleaned-up-by-the-exporter file
-        // and must not be swept here.
-        assert!(!is_stale_write_temp_file(
+        // archive) is normally cleaned up by the exporter itself on both the
+        // success and the in-process-error paths, but a hard crash or a
+        // killed process skips that cleanup entirely -- so it must also be
+        // recognized as stale here (issue #1080), the same way the
+        // final-archive `.tmp` file already is.
+        assert!(is_stale_write_temp_file(
             "20000.catchpoint.tar.gz.stage1.tmp"
         ));
+        assert!(is_stale_write_temp_file("20000.catchpoint.tar.stage1.tmp"));
     }
 
     #[test]
@@ -375,6 +431,57 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(remaining, vec!["20000.catchpoint.tar.gz".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage-1 crash-mid-generation cleanup (issue #1080)
+    //
+    // `export_catchpoint_file` writes its chunked scratch archive to
+    // `<final-name>.stage1.tmp` before it has a completed header to prepend,
+    // and only removes that scratch file itself once stage 2 (`repack`) has
+    // either succeeded or the pipeline has returned a normal `Err`. A process
+    // crash or `kill -9` during stage 1 skips that removal entirely, so
+    // without this the file survives every future run untouched: it doesn't
+    // parse as a real catchpoint round (so it's never served or counted
+    // against retention), but nothing ever revisits or deletes it either --
+    // a permanent, unbounded disk-space leak, one file per interrupted
+    // attempt. This is the "real crash-mid-generation gap" investigation
+    // question from issue #1080.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prune_removes_stale_stage1_scratch_file_left_by_a_crash_mid_first_stage() {
+        let dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-prune-stale-stage1-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        touch(&dir, &catchpoint_filename(10_000));
+        // Simulates `export_catchpoint_file`'s `stage1_path_for` scratch file
+        // for a round-20000 export that was killed before stage 1 finished
+        // (so it never reached the `Ok`/`Err` cleanup, nor `repack`, which
+        // would otherwise have removed it).
+        touch(&dir, "20000.catchpoint.tar.gz.stage1.tmp");
+
+        let removed = prune_catchpoint_files(&dir, -1).unwrap();
+        assert_eq!(
+            removed,
+            vec![dir.join("20000.catchpoint.tar.gz.stage1.tmp")]
+        );
+
+        let remaining: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(remaining.contains(&"10000.catchpoint.tar.gz".to_string()));
+        assert!(
+            !remaining.iter().any(|n| n.contains("stage1.tmp")),
+            "a crash-leftover stage-1 scratch file must not survive a prune pass: {remaining:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
