@@ -57,23 +57,20 @@
 //!
 //! - **Two independently-staked P2P voters jointly reaching quorum**, the
 //!   literal shape of go's `TestNodeP2P_NetProtoVersions` (each of two nodes
-//!   holding half of online stake, both proposing/voting). Attempting that
-//!   shape directly surfaced a real, **transport-independent** stall: with
-//!   two separate `algod-rust` processes each holding 50% of online stake,
-//!   round 1 never certifies even after several minutes and many agreement
-//!   periods -- soft-vote bundles repeatedly fail to "cause a significant
-//!   state change" and no cert bundle ever assembles, even though both
-//!   nodes' votes are observably received and accepted (not merely
-//!   deduplicated) by each side's `algo_agreement::service`. This reproduces
-//!   identically over the classic WS-gossip transport (not attempted by
-//!   `multi_node_consensus_sync.rs`, whose leader always holds 100% of stake
-//!   alone and therefore never needs a second voter's contribution), so it
-//!   is a real gap in cross-process multi-voter vote/certificate aggregation
-//!   in `algo-agreement`, not a defect in the P2P transport this issue is
-//!   about. Filed separately as issue #1066 rather than chased down inside
-//!   this already-large P2P-harness pass;
-//!   this test instead proves the transport-carries-real-agreement property
-//!   with the single-voter shape that is already known to work reliably.
+//!   holding half of online stake, both proposing/voting), used to be an
+//!   open gap here: attempting it directly surfaced a real,
+//!   **transport-independent** stall (round 1 never certified even after
+//!   several minutes, despite both nodes' votes being observably received
+//!   and accepted by each side's `algo_agreement::service`), root-caused to
+//!   a `participate`-CLI-vs-ledger genesis id/hash mismatch rejecting every
+//!   peer-authored proposal (`algo_validate::block::validate_block`'s
+//!   genesis-consistency check) and filed as issue #1066. Now that that fix
+//!   (`resolve_effective_genesis_expectations`) has landed,
+//!   `p2p_two_independently_staked_voters_reach_quorum` below proves this
+//!   shape does work over the P2P transport too (issue #1070) -- still not
+//!   covered is go's specific differing-`EnableVoteCompression`-version
+//!   negotiation, since `P2pTransport` has no CLI/config knob to disable
+//!   vote-compression negotiation per node today.
 //! - **`TestNodeP2PRelays`** -- a 3-node `R1 (DHT) -> R2 (phonebook) <- N`
 //!   topology where a non-relay participant must *discover* a second relay
 //!   purely via the Kademlia DHT (no direct multiaddr for it at all).
@@ -220,6 +217,97 @@ fn build_online_genesis() -> OnlineGenesis {
         genesis_json: serde_json::to_string_pretty(&genesis).expect("encode genesis.json"),
         stake_address,
         participation,
+    }
+}
+
+/// Two independently-staked online accounts, each holding half of genesis
+/// online stake, plus the shared genesis.json both nodes boot from. The P2P
+/// counterpart of `multi_node_consensus_sync.rs`'s `TwoVoterGenesis`/
+/// `build_two_voter_genesis` (issue #1066), needed here for issue #1070's
+/// P2P-transport two-voter quorum test -- go's `TestNodeP2P_NetProtoVersions`
+/// literal shape of two nodes each holding half of online stake.
+///
+/// Not extracted into a shared helper module with `multi_node_consensus_sync.rs`:
+/// each `tests/*.rs` file here compiles as its own independent test binary
+/// crate (Rust integration-test items are not visible across files), the two
+/// files already build their genesis JSON with different idioms (raw
+/// `format!` templates there vs. `serde_json::json!` here, matching each
+/// file's own existing style), and use different `NETWORK_NAME`/stake
+/// constants -- so sharing would mean introducing a new `tests/common/`
+/// module purely to save ~50 lines of straightforward, test-only JSON
+/// construction, at the cost of coupling two otherwise-independent
+/// integration-test binaries together. Duplicating (adapted to this file's
+/// own `serde_json::json!` style) is the better trade here.
+struct TwoVoterGenesis {
+    genesis_json: String,
+    participation_a: Participation,
+    participation_b: Participation,
+}
+
+fn build_two_voter_genesis() -> TwoVoterGenesis {
+    fn make_account(first_valid: Round, last_valid: Round) -> (Address, Participation) {
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let address = Address(sk.verifying_key().to_bytes());
+        let participation = Participation::generate(
+            address,
+            first_valid,
+            last_valid,
+            /* key_dilution */ 0,
+            /* key_lifetime */ 0,
+        )
+        .expect("generate online participation key");
+        (address, participation)
+    }
+
+    let first_valid = Round(0);
+    let last_valid = Round(10_000);
+    let (addr_a, participation_a) = make_account(first_valid, last_valid);
+    let (addr_b, participation_b) = make_account(first_valid, last_valid);
+
+    let alloc_state = |addr: &Address, p: &Participation| {
+        serde_json::json!({
+            "addr": addr.to_string(),
+            "comment": "stake",
+            "state": {
+                "algo": STAKE_ACCOUNT_ALGOS / 2,
+                "onl": 1,
+                "sel": BASE64_STANDARD.encode(p.vrf_pubkey().0),
+                "vote": BASE64_STANDARD.encode(p.voting.verifier()),
+                "voteKD": p.key_dilution,
+                "voteFst": first_valid.0,
+                "voteLst": last_valid.0,
+            }
+        })
+    };
+
+    let genesis = serde_json::json!({
+        "network": NETWORK_NAME,
+        "id": GENESIS_ID,
+        "proto": algo_types::consensus::CONSENSUS_V41,
+        "fees": FEE_SINK_ADDR,
+        "rwd": REWARDS_POOL_ADDR,
+        "alloc": [
+            alloc_state(&addr_a, &participation_a),
+            alloc_state(&addr_b, &participation_b),
+            {
+                "addr": FEE_SINK_ADDR,
+                "comment": "FeeSink",
+                "state": { "algo": 0, "onl": 0 }
+            },
+            {
+                "addr": REWARDS_POOL_ADDR,
+                "comment": "RewardsPool",
+                "state": { "algo": REWARDS_POOL_ALGOS, "onl": 0 }
+            },
+        ],
+    });
+
+    TwoVoterGenesis {
+        genesis_json: serde_json::to_string_pretty(&genesis).expect("encode genesis.json"),
+        participation_a,
+        participation_b,
     }
 }
 
@@ -612,5 +700,129 @@ async fn p2p_follower_syncs_to_leader_via_real_agreement() {
         "node B's synced block at round {compare_round} does not match node A's over the P2P \
          transport (stake account {})",
         online.stake_address
+    );
+}
+
+/// The P2P-transport counterpart of `multi_node_consensus_sync.rs`'s
+/// `two_independently_staked_voters_reach_quorum` (issue #1066): two
+/// independently-staked, independently-signing `algod-rust participate`
+/// processes, each holding 50% of genesis online stake plus its own real
+/// VRF + one-time-signature participation key, both proposing/voting --
+/// this time entirely over the libp2p P2P transport instead of the classic
+/// WS-gossip one. Round 1 must certify and both nodes must agree on its
+/// block hash. This is the literal shape go-algorand's
+/// `TestNodeP2P_NetProtoVersions` (`node/node_test.go`) depends on, closing
+/// the one gap `p2p_follower_syncs_to_leader_via_real_agreement`'s module
+/// doc comment above left open.
+///
+/// This test was blocked on two now-fixed bugs (issue #1070):
+///
+/// - Issue #1066: `participate::run` resolved `BlockValidatorBridge`'s
+///   "expected" genesis id/hash from the raw `--genesis-id`/
+///   `--genesis-hash` CLI values instead of the genesis actually seeded
+///   into the ledger, so every peer's proposal (the only proposal a node
+///   did not author itself) was rejected on a genesis-id/hash mismatch,
+///   and round 1 never certified. Transport-independent -- lives in the
+///   shared `algo_validate::block::validate_block` path -- so this fix
+///   (`resolve_effective_genesis_expectations`) unblocks the P2P shape
+///   exactly as it did the classic-transport one.
+/// - Issue #1067: a separate, P2P-transport-specific bug where two
+///   `P2pHost`s dialing each other at close to the same instant corrupted
+///   the Noise handshake on both sides (`PortUse::Reuse` colliding both
+///   sides' outbound sockets onto their own listen port). Sidestepped here
+///   the same way `p2p_follower_syncs_to_leader_via_real_agreement` does:
+///   only node B dials node A (`--p2p-bootstrap-peers` on B only, none on
+///   A) -- a single bidirectional connection established from one side is
+///   sufficient for gossipsub to carry both nodes' votes/proposals in both
+///   directions once connected, so the mutual-simultaneous-dial race this
+///   test does not need to exercise never triggers. Issue #1067's own fix
+///   (`P2pHost::dial` now uses `DialOpts::allocate_new_port()`) has its own
+///   dedicated regression test in `crates/node/algo-p2p/src/host.rs`.
+#[tokio::test]
+#[ignore = "spawns two real algod-rust processes over the libp2p P2P transport and runs \
+            real BFT agreement; run with --ignored"]
+async fn p2p_two_independently_staked_voters_reach_quorum() {
+    let genesis = build_two_voter_genesis();
+
+    let p2p_port_a = alloc_loopback_port();
+    let rest_a = alloc_loopback_port();
+    let p2p_port_b = alloc_loopback_port();
+    let rest_b = alloc_loopback_port();
+
+    let data_dir_a = tempfile::Builder::new()
+        .prefix("algod-rust-p2p-voter-a-")
+        .tempdir()
+        .expect("tempdir for node A");
+    let data_dir_b = tempfile::Builder::new()
+        .prefix("algod-rust-p2p-voter-b-")
+        .tempdir()
+        .expect("tempdir for node B");
+
+    // Node A's identity must be known before either process starts, since
+    // node B dials it directly by multiaddr. Only node B dials -- node A
+    // never dials out -- to avoid the mutual-simultaneous-dial race fixed
+    // by, but not needed to be re-exercised by, issue #1067.
+    let peer_id_a = pregenerate_p2p_identity(data_dir_a.path());
+    let multiaddr_a = p2p_multiaddr(p2p_port_a, peer_id_a);
+
+    let mut node_a = spawn_p2p_participate_node(
+        data_dir_a,
+        p2p_port_a,
+        rest_a,
+        &genesis.genesis_json,
+        Some(&genesis.participation_a),
+        None,
+    );
+    let mut node_b = spawn_p2p_participate_node(
+        data_dir_b,
+        p2p_port_b,
+        rest_b,
+        &genesis.genesis_json,
+        Some(&genesis.participation_b),
+        Some(&multiaddr_a),
+    );
+
+    let client = http_client();
+    let overall_deadline = Instant::now() + Duration::from_secs(120);
+
+    wait_for_rest_ready(&client, &node_a.rest_addr, overall_deadline).await;
+    wait_for_rest_ready(&client, &node_b.rest_addr, overall_deadline).await;
+    let token_a = read_api_token(&node_a.data_dir_path, overall_deadline).await;
+    let token_b = read_api_token(&node_b.data_dir_path, overall_deadline).await;
+
+    let round_a = wait_for_round(
+        &client,
+        &node_a.rest_addr,
+        &token_a,
+        1,
+        overall_deadline,
+        "node A",
+    )
+    .await;
+    let round_b = wait_for_round(
+        &client,
+        &node_b.rest_addr,
+        &token_b,
+        1,
+        overall_deadline,
+        "node B",
+    )
+    .await;
+
+    let compare_round = round_a.min(round_b);
+    let hash_a = get_block_hash(&client, &node_a.rest_addr, &token_a, compare_round).await;
+    let hash_b = get_block_hash(&client, &node_b.rest_addr, &token_b, compare_round).await;
+
+    if hash_a != hash_b {
+        dump_node_logs(&node_a, "A");
+        dump_node_logs(&node_b, "B");
+    }
+    node_b.shutdown();
+    node_a.shutdown();
+
+    assert_eq!(
+        hash_a, hash_b,
+        "node A and node B (each 50% of genesis online stake, independently signing, over the \
+         P2P transport) disagree on round {compare_round}'s block hash"
     );
 }
