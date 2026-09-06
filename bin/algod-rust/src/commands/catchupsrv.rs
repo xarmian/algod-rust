@@ -125,13 +125,26 @@ fn block_full_path(dir: &Path, version: &str, genesis_id: &str, round: u64) -> P
         .join(block_to_path(round))
 }
 
+/// Byte-identical response to Go's `net/http` `http.NotFound(w, r)` — status
+/// 404, body `"404 page not found\n"`, `Content-Type: text/plain;
+/// charset=utf-8` — which go-algorand's `cmd/catchupsrv/main.go` uses for
+/// both a missing block file and an unparseable round string.
+fn go_http_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "404 page not found\n",
+    )
+        .into_response()
+}
+
 async fn serve_block(
     State(state): State<ServerState>,
     AxumPath((version, genesis_id, round_str)): AxumPath<(String, String, String)>,
 ) -> Response {
     let round = match string_to_block(&round_str) {
         Ok(r) => r,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return go_http_not_found(),
     };
 
     let path = block_full_path(&state.dir, &version, &genesis_id, round);
@@ -142,7 +155,7 @@ async fn serve_block(
             data,
         )
             .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => go_http_not_found(),
     }
 }
 
@@ -265,6 +278,12 @@ mod tests {
         );
         let resp = reqwest::get(&url).await.unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers().get(reqwest::header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(&body[..], b"404 page not found\n");
     }
 
     #[tokio::test]
@@ -280,5 +299,11 @@ mod tests {
         let url = format!("http://{addr}/v1/test-genesis-v1/block/not-a-round");
         let resp = reqwest::get(&url).await.unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers().get(reqwest::header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(&body[..], b"404 page not found\n");
     }
 }
