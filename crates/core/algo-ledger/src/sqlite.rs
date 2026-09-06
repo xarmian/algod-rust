@@ -777,6 +777,102 @@ fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
     Ok(acct)
 }
 
+/// Encode `account`'s online-relevant fields to the byte form stored in
+/// `onlineaccounts.data`.
+///
+/// This is a **different Go struct** than [`encode_account_data`]'s
+/// `trackerdb.BaseAccountData` (`accountbase.data`): go's
+/// `onlineaccounts.data` column holds `trackerdb.BaseOnlineAccountData`
+/// (`InsertOnlineAccount(addr, normBalance, data BaseOnlineAccountData,
+/// ...)`, `../go-algorand/ledger/store/trackerdb/interface.go:159`) --
+/// only the embedded `BaseVotingData` (codec `A`-`F`) plus five
+/// online-specific fields (codec `V`-`Z`), with **no** `status`/asset-count/
+/// box-count fields at all. Before this fix, [`insert_online_account_row`]
+/// called [`encode_account_data`] here by mistake, writing full
+/// `BaseAccountData` bytes (codec `a`-`q`) into a column go-algorand's own
+/// strict msgpack decoder expects to contain only `BaseOnlineAccountData`
+/// fields -- harmless for algod-rust's own round-trip (its decode side made
+/// the same mistake symmetrically) but a real wire-format break for any
+/// consumer that decodes these bytes with go's actual schema, most
+/// notably a real go-algorand node fetching an algod-rust-exported
+/// catchpoint file's online-accounts chunk (`getCatchpointStream`'s output
+/// round-trips this column's bytes near-verbatim -- see
+/// `catchpoint::writer::read_online_accounts`), which failed decoding with
+/// go's `"Unknown field: a"` (found via live interop verification, issue
+/// #955).
+pub(crate) fn encode_online_account_data(acct: &AccountData) -> Vec<u8> {
+    algo_codec::canonical_encode_base_online_account_data(&to_base_online_account_data(acct))
+}
+
+/// Project `acct`'s `BaseOnlineAccountData`-equivalent fields (the same
+/// subset [`encode_online_account_data`] serializes). Also used to compare
+/// "did the online-relevant data actually change" independently of
+/// `AccountData`'s many other (non-online) fields -- see
+/// `record_online_account_history`'s use of this for that comparison,
+/// instead of a whole-`AccountData` `!=` that would spuriously fire on
+/// every unrelated field (e.g. an asset opt-in) touching an online account.
+fn to_base_online_account_data(acct: &AccountData) -> algo_codec::BaseOnlineAccountData {
+    algo_codec::BaseOnlineAccountData {
+        vote_id: acct.vote_id.unwrap_or_default(),
+        selection_id: acct.selection_id.unwrap_or_default(),
+        vote_first_valid: acct.vote_first_valid,
+        vote_last_valid: acct.vote_last_valid,
+        vote_key_dilution: acct.vote_key_dilution,
+        state_proof_id: acct.state_proof_id.unwrap_or([0u8; 64]),
+        last_proposed: acct.last_proposed,
+        last_heartbeat: acct.last_heartbeat,
+        incentive_eligible: acct.incentive_eligible,
+        micro_algos: acct.micro_algos,
+        rewards_base: acct.rewards_base,
+    }
+}
+
+/// Decode `onlineaccounts.data` bytes (Go's `trackerdb.BaseOnlineAccountData`
+/// shape -- see [`encode_online_account_data`]) back into the subset of
+/// [`AccountData`] fields it carries.
+///
+/// `status` is not a `BaseOnlineAccountData` field in Go -- a row's
+/// "online" vs. "offline marker" meaning is carried entirely by whether its
+/// voting data is empty (matches [`is_voting_empty`] and the "zero entry
+/// means offline" convention `record_online_account_history` and Go's own
+/// `onlineAccountsNewRoundImpl` both use), so this reconstructs `status`
+/// from that rather than persisting it as a field.
+fn decode_online_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
+    let base =
+        crate::catchpoint::msgp_compat::decode_base_online_account_data(data).map_err(|e| {
+            AlgoError::Ledger {
+                message: format!("decode onlineaccounts data error: {e}"),
+            }
+        })?;
+
+    let zero32 = [0u8; 32];
+    let zero64 = [0u8; 64];
+    let vote_id = (base.vote_id != zero32).then_some(base.vote_id);
+    let selection_id = (base.selection_id != zero32).then_some(base.selection_id);
+    let state_proof_id = (base.state_proof_id != zero64).then_some(base.state_proof_id);
+
+    let mut acct = AccountData {
+        micro_algos: base.micro_algos,
+        rewards_base: base.rewards_base,
+        vote_id,
+        selection_id,
+        state_proof_id,
+        vote_first_valid: base.vote_first_valid,
+        vote_last_valid: base.vote_last_valid,
+        vote_key_dilution: base.vote_key_dilution,
+        incentive_eligible: base.incentive_eligible,
+        last_proposed: base.last_proposed,
+        last_heartbeat: base.last_heartbeat,
+        ..Default::default()
+    };
+    acct.status = if is_voting_empty(&acct) {
+        AccountStatus::Offline
+    } else {
+        AccountStatus::Online
+    };
+    Ok(acct)
+}
+
 // ---------------------------------------------------------------------------
 // Resource msgpack helpers
 // ---------------------------------------------------------------------------
@@ -4408,13 +4504,19 @@ impl SqliteLedger {
                 }
                 Some(blob) => {
                     let prev_account =
-                        decode_account_data(&blob).map_err(|e| AlgoError::Ledger {
+                        decode_online_account_data(&blob).map_err(|e| AlgoError::Ledger {
                             message: format!(
                                 "record_online_account_history: decode latest row error: {e}"
                             ),
                         })?;
                     if new_online {
-                        if prev_account != new_account {
+                        // Compare only the `BaseOnlineAccountData`-equivalent
+                        // subset (not full `AccountData` equality) so an
+                        // unrelated field change (e.g. an asset opt-in)
+                        // doesn't spuriously look like a voting-data change.
+                        if to_base_online_account_data(&prev_account)
+                            != to_base_online_account_data(&new_account)
+                        {
                             self.insert_online_account_row(&addr, round, &new_account)?;
                         }
                     } else if !is_voting_empty(&prev_account) {
@@ -4446,7 +4548,7 @@ impl SqliteLedger {
         account: &AccountData,
     ) -> Result<(), AlgoError> {
         let nob = account_nob_i64(account);
-        let data = encode_account_data(account);
+        let data = encode_online_account_data(account);
         self.conn
             .execute(
                 "INSERT INTO onlineaccounts \
@@ -4520,7 +4622,7 @@ impl SqliteLedger {
                 let (addr_bytes, updround, data) = row.map_err(|e| AlgoError::Ledger {
                     message: format!("prune_online_account_history_before read row error: {e}"),
                 })?;
-                let account = decode_account_data(&data).map_err(|e| AlgoError::Ledger {
+                let account = decode_online_account_data(&data).map_err(|e| AlgoError::Ledger {
                     message: format!("prune_online_account_history_before decode error: {e}"),
                 })?;
                 if is_voting_empty(&account) {
@@ -4883,7 +4985,7 @@ impl SqliteLedger {
             })?;
 
         match data {
-            Some(d) => decode_account_data(&d)
+            Some(d) => decode_online_account_data(&d)
                 .map(Some)
                 .map_err(|e| AlgoError::Ledger {
                     message: format!("decode onlineaccounts data error: {e}"),
@@ -8714,6 +8816,143 @@ mod tests {
         assert_eq!(
             rows, 1,
             "no history row change -> no new onlineaccounts row for round 2"
+        );
+    }
+
+    /// Live mixed-cluster verification (issue #955) caught a real
+    /// wire-format bug: `onlineaccounts.data` was encoded with
+    /// go's `trackerdb.BaseAccountData` codec (`accountbase`'s tags,
+    /// `a`..`q`/`A`..`F`) instead of `trackerdb.BaseOnlineAccountData`
+    /// (only `A`..`F`/`V`..`Z`) -- harmless for algod-rust's own
+    /// self-consistent round-trip, but a real go-algorand node's strict
+    /// msgpack decoder rejected it with `"Unknown field: a"` once these
+    /// bytes reached it verbatim through an exported catchpoint file's
+    /// online-accounts chunk (`catchpoint::writer::read_online_accounts`
+    /// splices `onlineaccounts.data` through unmodified). Pin the exact
+    /// byte shape go expects: only uppercase `A`-`F`/`V`-`Z` keys, never
+    /// any of `BaseAccountData`'s lowercase `a`-`q` keys.
+    #[test]
+    fn onlineaccounts_row_uses_base_online_account_data_wire_shape_not_base_account_data() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                status: AccountStatus::Online,
+                vote_id: Some([1u8; 32]),
+                selection_id: Some([2u8; 32]),
+                vote_first_valid: 1,
+                vote_last_valid: 100_000,
+                vote_key_dilution: 10_000,
+                total_created_assets: 3, // a BaseAccountData-only field
+                ..Default::default()
+            },
+        );
+        ledger.commit_block().unwrap();
+
+        let blob: Vec<u8> = ledger
+            .conn
+            .query_row(
+                "SELECT data FROM onlineaccounts WHERE address = ?1",
+                params![addr.0.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let val: rmpv::Value = rmpv::decode::read_value(&mut &blob[..]).unwrap();
+        let rmpv::Value::Map(pairs) = val else {
+            panic!("expected a msgpack map");
+        };
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str().unwrap()).collect();
+
+        // Every key must be one of BaseOnlineAccountData's own tags.
+        for key in &keys {
+            assert!(
+                matches!(
+                    *key,
+                    "A" | "B" | "C" | "D" | "E" | "F" | "V" | "W" | "X" | "Y" | "Z"
+                ),
+                "onlineaccounts.data key {key:?} is not a BaseOnlineAccountData codec tag \
+                 (found bytes from the wrong Go struct -- BaseAccountData's 'a'..'q'/'z' tags \
+                 must never appear here)"
+            );
+        }
+        // A real go-algorand strict decoder rejects exactly this: a
+        // lowercase `a` tag (BaseAccountData's `Status`) is `Unknown
+        // field: a` against BaseOnlineAccountData's schema.
+        assert!(
+            !keys.contains(&"a"),
+            "must not carry BaseAccountData's lowercase tags"
+        );
+
+        // And the fix must still round-trip correctly through algod-rust's
+        // own read path.
+        let recorded = ledger
+            .get_online_account_at_round(&addr, 1)
+            .unwrap()
+            .expect("row must exist");
+        assert_eq!(recorded.micro_algos, 10_000_000);
+        assert_eq!(recorded.vote_last_valid, 100_000);
+        assert_eq!(recorded.status, AccountStatus::Online);
+    }
+
+    /// Companion to `commit_block_skips_unchanged_online_account_snapshot`:
+    /// a change to a field `BaseOnlineAccountData` doesn't carry at all
+    /// (e.g. `total_created_assets`, an asset-opt-in-style field) must
+    /// still skip writing a new `onlineaccounts` row, matching go's
+    /// "create an update only if the online-relevant data changed" branch.
+    /// Comparing whole `AccountData` structs (rather than just the
+    /// `BaseOnlineAccountData`-equivalent subset) would wrongly treat this
+    /// as a change and write a redundant row every round.
+    #[test]
+    fn commit_block_skips_online_snapshot_when_only_unrelated_field_changes() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([9u8; 32]);
+        let online = AccountData {
+            micro_algos: 10_000_000,
+            status: AccountStatus::Online,
+            vote_id: Some([1u8; 32]),
+            selection_id: Some([2u8; 32]),
+            vote_first_valid: 1,
+            vote_last_valid: 100_000,
+            vote_key_dilution: 10_000,
+            ..Default::default()
+        };
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.set_account(&addr, online.clone());
+        ledger.commit_block().unwrap();
+
+        // Round 2: same online-relevant data, but a resource-only field
+        // (not part of BaseOnlineAccountData at all) changed.
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(2));
+        ledger.set_account(
+            &addr,
+            AccountData {
+                total_created_assets: 1,
+                ..online
+            },
+        );
+        ledger.commit_block().unwrap();
+
+        let rows: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
+                params![addr.0.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "an unrelated (non-BaseOnlineAccountData) field change must not append a new \
+             onlineaccounts row"
         );
     }
 

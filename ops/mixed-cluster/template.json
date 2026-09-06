@@ -39,6 +39,11 @@
             "Wallets": [
                 { "Name": "Wallet4", "ParticipationOnly": false }
             ]
+        },
+        {
+            "Name": "Node5Go",
+            "IsRelay": false,
+            "Wallets": []
         }
     ]
 }
