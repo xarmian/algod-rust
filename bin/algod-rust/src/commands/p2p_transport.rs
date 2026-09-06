@@ -127,6 +127,13 @@ const ALGORAND_WS_SUPPORTED_VERSIONS: &[&str] = &["2.2"];
 /// rather than reimplementing the vpack state machine.
 const DEFAULT_VOTE_COMPRESSION_TABLE_SIZE: u32 = 2048;
 
+/// Interval between periodic DHT-driven peer-discovery/mesh-maintenance
+/// passes (issue #1073). Mirrors go's `meshThreadInterval`
+/// (`network/mesh.go`, default `time.Minute`) — the period between
+/// `P2PNetwork`'s `meshThreadInner`/`refreshPeerStoreAddresses` calls that
+/// dial newly DHT-discovered peers advertising the `Gossip` capability.
+const DHT_MESH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Everything [`P2pTransport`] tracks for one currently-established
 /// `/algorand-ws/2.2.0` stream peer: the outgoing frame sender
 /// [`P2pTransport::stream_broadcast`] fans agreement traffic out to, and
@@ -1083,6 +1090,27 @@ impl P2pTransport {
             host.bootstrap_dht();
         }
 
+        // Advertise this node's Gossip capability on the DHT (issue #1073)
+        // so other nodes' periodic mesh-discovery tick (below) can find and
+        // dial it purely via DHT capability lookup — mirrors go's
+        // `node.Capabilities()`/`P2PNetwork.Start` (`network/p2pNetwork.go`:
+        // `if caps := n.nodeInfo.Capabilities(); len(caps) > 0 && ... {
+        // n.capabilitiesDiscovery.AdvertiseCapabilities(caps...) }`) and
+        // `node.go`'s `AlgorandFullNode.Capabilities()`, which only includes
+        // `p2p.Gossip` when `EnableGossipService && IsListenServer()`.
+        // `EnableGossipService` itself isn't yet a tracked config knob in
+        // this crate (go defaults it to `true`) — a pre-existing gap
+        // tracked separately, not introduced here — so this mirrors that
+        // default by gating on `is_listen_server` alone.
+        if cfg.enable_dht_providers && cfg.is_listen_server {
+            if let Err(e) = host
+                .advertise_capability(algo_p2p::Capability::Gossip)
+                .await
+            {
+                tracing::warn!(error = %e, "failed to advertise P2P Gossip capability on DHT");
+            }
+        }
+
         for topic in algo_p2p::ALL_TOPICS {
             host.gossipsub_subscribe(topic)
                 .map_err(|e| anyhow::anyhow!("failed to subscribe to {topic}: {e}"))?;
@@ -1201,10 +1229,121 @@ impl P2pTransport {
         let sp_for_task = Arc::clone(&stream_peers);
         let gen_counter_for_task = Arc::clone(&stream_generation);
         let identity_tracker_for_task = Arc::clone(&identity_tracker);
+        // Periodic DHT-driven mesh discovery (issue #1073): captured before
+        // `cfg` is otherwise consumed below (`cfg.network_id` moves into
+        // `Self` at the end of this function).
+        let enable_dht_providers = cfg.enable_dht_providers;
         let task = tokio::spawn(async move {
+            // Mirrors go's `meshThreadInterval` (`network/mesh.go`, default
+            // `time.Minute`) — the period between `P2PNetwork`'s
+            // `meshThreadInner`/`refreshPeerStoreAddresses` passes. Ticking
+            // immediately on the first iteration (tokio's default
+            // `interval` behavior) mirrors go's own `Start` sending an
+            // immediate `meshRequest{}` before the ticker-driven periodic
+            // passes begin.
+            let mut mesh_discovery_interval = tokio::time::interval(DHT_MESH_REFRESH_INTERVAL);
+            // Tracks this task's own in-flight DHT queries so the
+            // `event = host.next_event()` arm below can recognize their
+            // results as they stream in, without ever blocking this select
+            // loop on a whole query the way `P2pHost::find_peers_for_capability`/
+            // `find_closest_peers`'s own internal polling loops would (issue
+            // #1073: this loop must keep processing every *other* event —
+            // `ConnectionEstablished`, gossipsub messages, inbound streams —
+            // concurrently with mesh discovery, which those blocking
+            // helpers can't do since they hold `&mut host` exclusively
+            // until their own query resolves).
+            let mut pending_capability_query: Option<libp2p::kad::QueryId> = None;
+            let mut pending_address_queries: std::collections::HashMap<
+                libp2p::kad::QueryId,
+                PeerId,
+            > = std::collections::HashMap::new();
             loop {
                 tokio::select! {
+                    // Only ticks (and only ever queries) when
+                    // `enable_dht_providers` is set — this is a `const`
+                    // condition for the lifetime of this task, so gating the
+                    // whole branch on it (rather than checking inside the
+                    // body) means the interval is simply never polled at
+                    // all when DHT discovery is disabled.
+                    _ = mesh_discovery_interval.tick(), if enable_dht_providers => {
+                        // Mirrors go's `refreshPeerStoreAddresses`/
+                        // `capabilitiesDiscovery.PeersForCapability(p2p.Gossip,
+                        // n.config.GossipFanout)`: (re)start a DHT lookup for
+                        // peers advertising the `Gossip` capability. Fires and
+                        // forgets — the query's own progress events arrive
+                        // through the same `host.next_event()` arm below,
+                        // which drives the rest of the discover-then-dial
+                        // pipeline without this branch ever blocking on it.
+                        // A still-pending query from the previous tick (this
+                        // host answering very slowly, or `DHT_MESH_REFRESH_INTERVAL`
+                        // set unrealistically low) is simply superseded —
+                        // its eventual late result, if any, safely matches
+                        // nothing once `pending_capability_query` has moved
+                        // on to the new id.
+                        pending_capability_query = Some(host.start_capability_discovery(algo_p2p::Capability::Gossip));
+                    }
                     event = host.next_event() => {
+                        // Issue #1073: drive the non-blocking discover-then-dial
+                        // pipeline off of whichever DHT query progress events
+                        // this task itself started above — checked before the
+                        // large per-event-type match below since neither of
+                        // these query kinds needs any of that match's other
+                        // handling (they're `Kad` events, disjoint from the
+                        // `ConnectionEstablished`/gossipsub/etc. arms there).
+                        if let SwarmEvent::Behaviour(P2pBehaviourEvent::Kad(libp2p::kad::Event::OutboundQueryProgressed {
+                            id,
+                            result: libp2p::kad::QueryResult::GetProviders(Ok(libp2p::kad::GetProvidersOk::FoundProviders { providers, .. })),
+                            step,
+                            ..
+                        })) = &event
+                        {
+                            if pending_capability_query == Some(*id) {
+                                for peer_id in providers {
+                                    let peer_id = *peer_id;
+                                    if peer_id != local_peer_id
+                                        && !cp.lock().expect("connected_peers mutex poisoned").contains(&peer_id)
+                                    {
+                                        // Resolve this discovered peer's dialable
+                                        // address (a bare `GetProviders` result
+                                        // carries no address, see
+                                        // `P2pHost::find_peers_for_capability`'s doc
+                                        // comment) via a follow-up closest-peers
+                                        // lookup — its own progress event (below)
+                                        // both registers the address (generically,
+                                        // via `P2pHost::next_event`) and signals
+                                        // when it's safe to dial.
+                                        let query = host.start_closest_peers_lookup(peer_id);
+                                        pending_address_queries.insert(query, peer_id);
+                                    }
+                                }
+                                if step.last {
+                                    pending_capability_query = None;
+                                }
+                            }
+                        }
+                        if let SwarmEvent::Behaviour(P2pBehaviourEvent::Kad(libp2p::kad::Event::OutboundQueryProgressed {
+                            id,
+                            result: libp2p::kad::QueryResult::GetClosestPeers(_),
+                            step,
+                            ..
+                        })) = &event
+                        {
+                            if step.last {
+                                if let Some(peer_id) = pending_address_queries.remove(id) {
+                                    // `dial_peer`'s own default
+                                    // `PeerCondition::DisconnectedAndNotDialing`
+                                    // already skips a peer this host is already
+                                    // connected to or mid-dialing (e.g. a
+                                    // concurrent `bootstrap_dht` self-heal beat
+                                    // this to it), so no extra bookkeeping is
+                                    // needed here beyond that.
+                                    match host.dial_peer(peer_id) {
+                                        Ok(()) => tracing::info!(%peer_id, "P2P: dialing peer discovered via DHT Gossip-capability lookup"),
+                                        Err(e) => tracing::debug!(%peer_id, error = %e, "P2P: skipped dialing DHT-discovered peer"),
+                                    }
+                                }
+                            }
+                        }
                         match event {
                             SwarmEvent::NewListenAddr { address, .. } => {
                                 la.lock().expect("listen_addrs mutex poisoned").push(address);
