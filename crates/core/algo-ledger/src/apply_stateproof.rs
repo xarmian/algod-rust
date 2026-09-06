@@ -316,7 +316,7 @@ pub fn record_state_proof_verification_context<L: LedgerStore>(
     };
     store.put_state_proof_verification_context(
         last_attested_round,
-        &encode_verification_context(&ctx),
+        &encode_verification_context(last_attested_round, &ctx),
     )
 }
 
@@ -336,46 +336,43 @@ pub(crate) fn prune_state_proof_verification_contexts<L: LedgerStore>(
     store.delete_state_proof_verification_contexts_before(new_state_proof_next)
 }
 
-/// Encode a [`VerificationContext`] to a plain binary blob for the
-/// verification-context tracker's local store. Internal, node-private
-/// format — this data never crosses the wire or affects consensus (it's a
-/// pure verification-context cache), so byte-level parity with go's own DB
-/// blob encoding isn't required, only matching read/write/lookup behavior.
-fn encode_verification_context(ctx: &VerificationContext) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + 4 + ctx.voters_commitment.len() + 4 + ctx.version.len());
-    out.extend_from_slice(&ctx.online_total_weight.to_le_bytes());
-    out.extend_from_slice(&(ctx.voters_commitment.len() as u32).to_le_bytes());
-    out.extend_from_slice(&ctx.voters_commitment);
-    out.extend_from_slice(&(ctx.version.len() as u32).to_le_bytes());
-    out.extend_from_slice(ctx.version.as_bytes());
-    out
+/// Encode a [`VerificationContext`] for the verification-context tracker's
+/// `stateproofverification.verificationcontext` BLOB column.
+///
+/// Issue #1057: this must match go's real `ledgercore.StateProofVerificationContext`
+/// msgpack shape byte-for-byte-compatible encoding — the exact same column
+/// is read back by `catchpoint/verify.rs`'s `read_sp_verification_contexts`
+/// (via `rmp_serde`, matched by field name) when computing the catchpoint
+/// label's state-proof-verification component. A hand-rolled, non-msgpack
+/// format here (the pre-fix behavior) is unparseable by that reader and
+/// breaks automatic catchpoint export as soon as this table has any rows
+/// (past the first state-proof interval). Delegates to the same canonical
+/// encoder `catchpoint/verify.rs` uses when *writing* a fresh catchpoint's
+/// SP-verification blob, so both paths produce identical bytes for
+/// identical logical content.
+fn encode_verification_context(last_attested_round: u64, ctx: &VerificationContext) -> Vec<u8> {
+    let full = algo_codec::StateProofVerificationContext {
+        last_attested_round,
+        voters_commitment: ctx.voters_commitment.clone(),
+        online_total_weight: ctx.online_total_weight,
+        version: ctx.version.clone(),
+    };
+    algo_codec::canonical_encode_state_proof_verification_context(&full)
 }
 
+/// Decode a [`VerificationContext`] out of the `stateproofverification`
+/// BLOB column, using the same shared decoder as
+/// `catchpoint/verify.rs`'s catchpoint-export reader (issue #1057). The
+/// `last_attested_round` field carried on the wire is discarded here since
+/// callers already know it (it's the lookup key), matching
+/// [`VerificationContext`]'s doc comment.
 fn decode_verification_context(bytes: &[u8]) -> Result<VerificationContext, String> {
-    let mut pos = 0usize;
-    let take = |pos: &mut usize, n: usize, bytes: &[u8]| -> Result<Vec<u8>, String> {
-        let end = pos.checked_add(n).ok_or("length overflow")?;
-        let slice = bytes.get(*pos..end).ok_or("truncated")?.to_vec();
-        *pos = end;
-        Ok(slice)
-    };
-
-    let weight_bytes = take(&mut pos, 8, bytes)?;
-    let online_total_weight = u64::from_le_bytes(weight_bytes.try_into().unwrap());
-
-    let commit_len_bytes = take(&mut pos, 4, bytes)?;
-    let commit_len = u32::from_le_bytes(commit_len_bytes.try_into().unwrap()) as usize;
-    let voters_commitment = take(&mut pos, commit_len, bytes)?;
-
-    let ver_len_bytes = take(&mut pos, 4, bytes)?;
-    let ver_len = u32::from_le_bytes(ver_len_bytes.try_into().unwrap()) as usize;
-    let ver_bytes = take(&mut pos, ver_len, bytes)?;
-    let version = String::from_utf8(ver_bytes).map_err(|e| e.to_string())?;
-
+    let full =
+        algo_codec::decode_state_proof_verification_context(bytes).map_err(|e| e.to_string())?;
     Ok(VerificationContext {
-        voters_commitment,
-        online_total_weight,
-        version,
+        voters_commitment: full.voters_commitment,
+        online_total_weight: full.online_total_weight,
+        version: full.version,
     })
 }
 
@@ -798,10 +795,10 @@ mod tests {
             version: CONSENSUS_V41.to_string(),
         };
         store
-            .put_state_proof_verification_context(256, &encode_verification_context(&ctx))
+            .put_state_proof_verification_context(256, &encode_verification_context(256, &ctx))
             .unwrap();
         store
-            .put_state_proof_verification_context(512, &encode_verification_context(&ctx))
+            .put_state_proof_verification_context(512, &encode_verification_context(512, &ctx))
             .unwrap();
 
         prune_state_proof_verification_contexts(&mut store, 512).unwrap();

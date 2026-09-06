@@ -312,40 +312,18 @@ fn encode_msgpack_array(elements: &[Vec<u8>]) -> Vec<u8> {
     buf
 }
 
-/// Local type for decoding `StateProofVerificationContext` from DB blobs,
-/// including the `v` (version) field that the shared type in `types.rs` omits.
-///
-/// Fields match Go's `ledgercore.StateProofVerificationContext` codec tags.
-/// Sorted key order: `"pw"`, `"spround"`, `"v"`, `"vc"`.
-#[derive(serde::Deserialize)]
-struct SpVerificationCtxFull {
-    #[serde(rename = "spround", default)]
-    last_attested_round: u64,
-    #[serde(rename = "vc", default)]
-    voters_commitment: serde_bytes::ByteBuf,
-    #[serde(rename = "pw", default)]
-    online_total_weight: u64,
-    #[serde(rename = "v", default)]
-    version: String,
-}
-
 /// Canonically encode a single `StateProofVerificationContext` as msgpack.
 ///
 /// PLAN-36 G8 (TASK-125) promoted this to a public encoder in
-/// `algo-codec`. This helper now adapts the decoder-side
-/// [`SpVerificationCtxFull`] (which carries the `version` field
-/// alongside the trio in the shared catchpoint types) into the public
-/// [`algo_codec::StateProofVerificationContext`] and delegates. The
-/// catchpoint label hash and the trackerdb BLOB write path now share
-/// the same byte producer.
-fn encode_sp_verification_context(ctx: &SpVerificationCtxFull) -> Vec<u8> {
-    let public = algo_codec::StateProofVerificationContext {
-        last_attested_round: ctx.last_attested_round,
-        voters_commitment: ctx.voters_commitment.to_vec(),
-        online_total_weight: ctx.online_total_weight,
-        version: ctx.version.clone(),
-    };
-    algo_codec::canonical_encode_state_proof_verification_context(&public)
+/// `algo-codec`. Issue #1057 additionally promoted the decoder-side shape
+/// itself: this now delegates straight to
+/// [`algo_codec::canonical_encode_state_proof_verification_context`] over
+/// the shared [`algo_codec::StateProofVerificationContext`] (no more
+/// locally-duplicated struct) — both the catchpoint label hash and the
+/// `apply_stateproof.rs` trackerdb BLOB writer produce identical bytes for
+/// identical logical content.
+fn encode_sp_verification_context(ctx: &algo_codec::StateProofVerificationContext) -> Vec<u8> {
+    algo_codec::canonical_encode_state_proof_verification_context(ctx)
 }
 
 /// Canonically encode the SP verification wrapper struct.
@@ -353,7 +331,9 @@ fn encode_sp_verification_context(ctx: &SpVerificationCtxFull) -> Vec<u8> {
 /// Go type: `catchpointStateProofVerificationContext` with key `"spd"`.
 /// The wrapper has a single field `"spd"` containing an array of SP contexts.
 /// Uses omitempty: the `"spd"` field is omitted if the array is empty.
-fn encode_sp_verification_wrapper(contexts: &[SpVerificationCtxFull]) -> Vec<u8> {
+fn encode_sp_verification_wrapper(
+    contexts: &[algo_codec::StateProofVerificationContext],
+) -> Vec<u8> {
     let mut entries: Vec<(&str, Vec<u8>)> = Vec::new();
     if !contexts.is_empty() {
         let encoded_elements: Vec<Vec<u8>> = contexts
@@ -414,7 +394,7 @@ pub fn build_sp_verification_blob(conn: &Connection) -> Result<Vec<u8>, Catchpoi
 /// by `lastattestedround` (matching Go's iteration order).
 fn read_sp_verification_contexts(
     conn: &Connection,
-) -> Result<Vec<SpVerificationCtxFull>, CatchpointError> {
+) -> Result<Vec<algo_codec::StateProofVerificationContext>, CatchpointError> {
     let mut stmt = conn
         .prepare(
             "SELECT verificationContext FROM stateproofverification \
@@ -438,7 +418,7 @@ fn read_sp_verification_contexts(
         let blob = row.map_err(|e| {
             CatchpointError::VerificationError(format!("read stateproofverification row: {e}"))
         })?;
-        let ctx: SpVerificationCtxFull = rmp_serde::from_slice(&blob).map_err(|e| {
+        let ctx = algo_codec::decode_state_proof_verification_context(&blob).map_err(|e| {
             CatchpointError::VerificationError(format!(
                 "decode state proof verification context: {e}"
             ))
@@ -2180,9 +2160,9 @@ mod tests {
 
     #[test]
     fn encode_sp_verification_context_key_order() {
-        let ctx = SpVerificationCtxFull {
+        let ctx = algo_codec::StateProofVerificationContext {
             last_attested_round: 256,
-            voters_commitment: serde_bytes::ByteBuf::from(vec![0xAA; 32]),
+            voters_commitment: vec![0xAA; 32],
             online_total_weight: 1_000_000,
             version: "v41".to_string(),
         };
@@ -2207,9 +2187,9 @@ mod tests {
 
     #[test]
     fn encode_sp_verification_wrapper_with_data() {
-        let ctx = SpVerificationCtxFull {
+        let ctx = algo_codec::StateProofVerificationContext {
             last_attested_round: 100,
-            voters_commitment: serde_bytes::ByteBuf::from(vec![0xBB; 16]),
+            voters_commitment: vec![0xBB; 16],
             online_total_weight: 500,
             version: String::new(), // empty -> omitted
         };
