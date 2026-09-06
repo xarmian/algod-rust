@@ -178,10 +178,11 @@ pub struct ExportOptions {
     /// Round of the block whose header digest anchors the label
     /// (`CatchpointFileHeader.BlocksRound`, and the round in the label).
     ///
-    /// In go-algorand this is `balances_round + catchpoint_lookback`. This
-    /// crate's [`super::verify::verify_catchpoint`] requires
-    /// `acctrounds('acctbase') == label round`, so an export that is meant to
-    /// be re-verified after import must keep the two rounds equal.
+    /// In go-algorand this is `balances_round + catchpoint_lookback` for
+    /// every catchpoint above the lookback window. This crate's
+    /// [`super::verify::verify_catchpoint`] checks `acctrounds('acctbase')`
+    /// against `balances_round` (not this field), so `blocks_round` and
+    /// `balances_round` may legitimately differ (issue #1056).
     pub blocks_round: u64,
 
     /// 32-byte digest of the block header at `blocks_round`.

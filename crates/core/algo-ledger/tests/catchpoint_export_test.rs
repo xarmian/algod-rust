@@ -303,9 +303,11 @@ fn build_source_db() -> Connection {
 fn export_options() -> ExportOptions {
     ExportOptions {
         balances_round: BALANCES_ROUND,
-        // verify_catchpoint requires acctrounds('acctbase') == label round,
-        // and the importer sets acctrounds from BalancesRound, so the two
-        // rounds must agree for a self-consistent round trip.
+        // Most tests in this file don't care about the lookback offset, so
+        // they keep blocks_round == balances_round for simplicity.
+        // `export_then_import_verifies_when_blocks_round_differs_from_balances_round`
+        // below specifically covers the real-world case where the two
+        // differ (issue #1056).
         blocks_round: BALANCES_ROUND,
         block_header_digest: BLOCK_DIGEST,
         ..Default::default()
@@ -410,6 +412,54 @@ fn export_then_import_round_trips_state_and_label() {
     // this same post-import count once the Merkle trie verification
     // succeeds — see `crate::sync::SyncOrchestrator::run_verify_ledger`.
     assert_eq!(verified.kvs_count, 4);
+}
+
+/// TDD for issue #1056: `verify_catchpoint` must accept a real-world
+/// catchpoint whose `blocks_round` (the label's round, used to anchor the
+/// block header digest) differs from `balances_round` (the account
+/// snapshot round, which `acctrounds('acctbase')` is stamped with by
+/// `CatchpointImporter::atomic_cutover`).
+///
+/// go-algorand's `blocks_round == balances_round + CatchpointLookback`
+/// (320 by default) for every catchpoint above the lookback window — see
+/// `ledger/catchpointtracker.go`'s `finishCatchpoint` and
+/// `ledger/catchupaccessor.go`'s `StoreBalancesRound`/`VerifyCatchpoint`.
+/// Before the fix, `verify_catchpoint` incorrectly compared
+/// `acctrounds('acctbase')` (== `balances_round`) against the label's
+/// `round` (== `blocks_round`) and rejected every such catchpoint.
+#[test]
+fn export_then_import_verifies_when_blocks_round_differs_from_balances_round() {
+    const CATCHPOINT_LOOKBACK: u64 = 320;
+    let blocks_round = BALANCES_ROUND + CATCHPOINT_LOOKBACK;
+
+    let src = build_source_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catchpoint.tar.gz");
+
+    let options = ExportOptions {
+        blocks_round,
+        ..export_options()
+    };
+    let result = export_catchpoint_file(&src, &path, &options).unwrap();
+
+    // The label round is blocks_round, not balances_round.
+    assert!(result.label.starts_with(&format!("{blocks_round}#")));
+
+    let dst = Connection::open_in_memory().unwrap();
+    let import = import_catchpoint_file(&dst, &path, REWARD_UNITS).unwrap();
+    // The importer stamps acctrounds('acctbase') from balances_round.
+    assert_eq!(import.round, BALANCES_ROUND);
+
+    // verify_catchpoint must succeed even though acctrounds('acctbase')
+    // (balances_round) and the label's round (blocks_round) legitimately
+    // differ by design.
+    let verified = verify_catchpoint(&dst, &BLOCK_DIGEST).unwrap();
+    assert!(
+        verified.success,
+        "expected {} computed {}",
+        verified.expected_label, verified.computed_label
+    );
+    assert_eq!(verified.expected_label, result.label);
 }
 
 /// TDD for issue #941: `import_catchpoint_file_with_progress` must report a
