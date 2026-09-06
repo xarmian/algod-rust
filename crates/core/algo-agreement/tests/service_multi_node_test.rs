@@ -1680,6 +1680,31 @@ fn suspended_block_validator_stalls_verification_and_resume_unblocks_it_five_nod
 /// no-quiescence-wait loop cannot guarantee which; callers must not assume
 /// a round commit happened, only that SOME node's next outbound proposal
 /// broadcast is now held at the checkpoint.
+/// Serializes the three heaviest tests in this file — the ones that spin up
+/// a 5-node cluster AND hard-fail if the propose-broadcast checkpoint isn't
+/// reached within a real-time budget
+/// (`regression_wrong_period_payload_verification_cancellation_8ba23942_
+/// five_node`, `slow_payloads_pre_deadline_five_node`,
+/// `slow_payloads_post_deadline_five_node`). `cargo test`'s default
+/// per-binary parallelism otherwise happily schedules all three at once (15+
+/// real `Service`/crypto-verifier threads on top of everything else the test
+/// binary is doing), and under `cargo test --workspace` — every other
+/// crate's suite ALSO competing for the same CPUs — that was enough to make
+/// even a 300-second wait genuinely insufficient for any of the three
+/// checkpoint-catch loops to observe a single scheduled proposal broadcast:
+/// a reproduced `cargo test --workspace` run failed all three simultaneously
+/// with the identical "expected at least one node's next proposal broadcast
+/// to reach the propose-broadcast checkpoint" timeout (see issue #1035's
+/// closing comment / `docs/phase17/parity_agreement.md`'s row for these
+/// tests). That is a genuine resource-contention finding, not a bug in the
+/// checkpoint mechanism or something specific to the post-deadline
+/// scenario — trading this file's own internal parallelism on just these
+/// three tests for reliability is the fix: the other ~10 five-node-cluster
+/// tests in this file (no hard real-time budget on a single checkpoint
+/// event) are left free to run concurrently with each other and with these
+/// three.
+static HEAVY_PROPOSE_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn arm_and_catch_next_proposal_broadcast(
     clocks: &[Arc<crate::simulate::testing_clock::TestingClock>],
     gate: &ProposeBroadcastGate,
@@ -1758,6 +1783,9 @@ fn arm_and_catch_next_proposal_broadcast(
 ///    fully healthy, not just unstuck for one round.
 #[test]
 fn regression_wrong_period_payload_verification_cancellation_8ba23942_five_node() {
+    let _heavy_guard = HEAVY_PROPOSE_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let validator = SuspendableBlockValidator::new();
     let propose_gate = ProposeBroadcastGate::new();
     let cluster = setup_agreement_with_validator_and_propose_gate(
@@ -1873,9 +1901,7 @@ fn regression_wrong_period_payload_verification_cancellation_8ba23942_five_node(
     // and the round-recovery assertions below are what actually verify the
     // regression is fixed.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while cluster.pending_proposal_validations() == 0
-        && std::time::Instant::now() < deadline
-    {
+    while cluster.pending_proposal_validations() == 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
 
@@ -1924,6 +1950,9 @@ fn regression_wrong_period_payload_verification_cancellation_8ba23942_five_node(
 /// the round commits normally.
 #[test]
 fn slow_payloads_pre_deadline_five_node() {
+    let _heavy_guard = HEAVY_PROPOSE_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let propose_gate = ProposeBroadcastGate::new();
     let cluster = setup_agreement_with_propose_gate(5, Arc::clone(&propose_gate));
     let start_round = cluster.start_round;
@@ -1998,22 +2027,119 @@ fn slow_payloads_pre_deadline_five_node() {
     sanity_check(&cluster, start_round, total_rounds);
 }
 
-// `TestAgreementSlowPayloadsPostDeadline` (`agreement/service_test.go:2094`)
-// was attempted using the same `arm_and_catch_next_proposal_broadcast`
-// checkpoint as the two scenarios above, and its structure worked reliably
-// in isolation and under this file's own full-package-concurrent runs (10+
-// consecutive standalone passes, clean concurrent `-p algo-agreement` runs).
-// It was NOT landed: across repeated `cargo test --workspace` runs (every
-// crate's suite executing together, not just this package's), it
-// intermittently (but reproducibly, on the SAME test each time it occurred)
-// failed the initial checkpoint-catch with a timeout even at a 300-second
-// budget, while `slow_payloads_pre_deadline_five_node` and
-// `regression_wrong_period_payload_verification_cancellation_8ba23942_five_node`
-// (both using the identical checkpoint mechanism) did not. Whether this is a
-// genuine, scenario-specific weakness or an artifact of this specific
-// investigation's heavy background tooling load was not conclusively
-// determined given the time available — issue #1035 stays open over this
-// unmet criterion; see `docs/phase17/parity_agreement.md`'s row for this
-// test for the precise writeup. Left `missing-test` rather than landed at a
-// confidence level
-// below this harness's established bar.
+/// Port of go-algorand's `TestAgreementSlowPayloadsPostDeadline`
+/// (`agreement/service_test.go:2094`) — like `slow_payloads_pre_deadline_
+/// five_node` above, but the pocketed proposal is left unreachable for a
+/// FULL extra period (forced past its own `Deadline` timeout into period 1,
+/// not just re-fired within the same period) before recovery, so the
+/// replayed batch spans a now-stale period-0 payload as well as period 1's —
+/// closer in shape to the `8ba23942` regression above (minus its
+/// validator-suspension leg), which is why this test reuses that
+/// regression's bounded `compound_pocket_len`-polling period-forcing loop
+/// rather than `slow_payloads_pre_deadline_five_node`'s single bare fire.
+#[test]
+fn slow_payloads_post_deadline_five_node() {
+    let _heavy_guard = HEAVY_PROPOSE_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let propose_gate = ProposeBroadcastGate::new();
+    let cluster = setup_agreement_with_propose_gate(5, Arc::clone(&propose_gate));
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    // Two ordinary rounds, proving the cluster is healthy first.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    // Catch the next proposal broadcast at the checkpoint and pocket it
+    // (go's "run round and then start pocketing payloads ... (takes effect
+    // next round)").
+    arm_and_catch_next_proposal_broadcast(&cluster.clocks, &propose_gate, Duration::from_secs(300));
+    cluster.network.pocket_all_compound();
+    propose_gate.release();
+    cluster.wait_for_quiet();
+    let stuck_round = current_round(&cluster);
+    assert!(
+        stuck_round.0 >= round.0,
+        "round must not have gone BACKWARDS while catching the checkpoint"
+    );
+    round = stuck_round;
+
+    // Force the round past its own Deadline timeout into period 1 — unlike
+    // `slow_payloads_pre_deadline_five_node` above, this leaves the round's
+    // proposal unreachable for a FULL extra period rather than just
+    // re-firing within period 0, so period 1's own freshly-generated
+    // proposal is ALSO pocketed automatically (`pocket_all_compound` stays
+    // armed continuously). Bounded-polls `compound_pocket_len` for progress,
+    // mirroring `8ba23942`'s period-forcing loop, rather than asserting a
+    // hard-coded fire count — this harness's real-thread timing means one
+    // bare fire isn't always enough to observe period 1's proposal reach the
+    // network layer.
+    for target_len in 1..=2 {
+        for _ in 0..40 {
+            if cluster.network.compound_pocket_len() >= target_len {
+                break;
+            }
+            // Fires unconditionally, not gated on `has_pending` — see
+            // `arm_and_catch_next_proposal_broadcast`'s doc comment for why
+            // that gate stalls indefinitely once a period repeats a
+            // `filter_timeout`/`deadline_timeout` duration already fired.
+            for clock in &cluster.clocks {
+                clock.try_fire(TimeoutType::Deadline);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            cluster.network.compound_pocket_len() >= target_len,
+            "expected at least {target_len} pocketed proposal(s) (period 0 \
+             and period 1) for round {round:?}, got {}",
+            cluster.network.compound_pocket_len()
+        );
+    }
+    // `round` must not have advanced while every one of its periods'
+    // proposals is pocketed.
+    assert_eq!(
+        current_round(&cluster),
+        round,
+        "round must not commit while every one of its periods' proposals is pocketed"
+    );
+
+    // Recover: release every pocketed proposal (spanning both periods) at
+    // once — go's "recover in period 1". The round must commit off
+    // whichever proposal is actually current; the stale period-0 payload's
+    // late arrival must not corrupt anything or prevent convergence.
+    let pocketed = cluster.network.stop_pocketing_compound();
+    cluster.network.repair_all();
+    assert!(
+        pocketed.len() >= 2,
+        "expected proposals from both period 0 and period 1 to have been \
+         pocketed, got {}",
+        pocketed.len()
+    );
+    cluster.network.replay_all(&pocketed);
+    round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+
+    // Two more ordinary rounds, proving the cluster is fully healthy
+    // afterward.
+    for _ in 0..2 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    cluster.shutdown();
+    // Go asserts exactly `sanityCheck(startRound, 6, ledgers)`; this port
+    // reads the actual round count back dynamically rather than hard-coding
+    // it — see `regression_wrong_period_payload_verification_cancellation_
+    // 8ba23942_five_node`'s doc comment for why (this harness's real-thread
+    // `pump_until_new_round` can commit more than one round per call).
+    let total_rounds = round.0 - start_round.0;
+    assert!(
+        total_rounds >= 5,
+        "expected at least 5 rounds to have committed (2 initial + 1 \
+         recovered + 2 final), got {total_rounds}"
+    );
+    sanity_check(&cluster, start_round, total_rounds);
+}
