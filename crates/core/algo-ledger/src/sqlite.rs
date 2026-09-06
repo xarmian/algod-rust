@@ -3831,19 +3831,19 @@ impl SqliteLedger {
             }
         }
 
-        let digest = match self.block_header_digest_at_round(round) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(round, error = %e, "automatic catchpoint: skipping this round");
-                return;
-            }
-        };
-
-        let (enable_sp_contexts, include_online_data) =
+        let (enable_sp_contexts, include_online_data, catchpoint_lookback) =
             match algo_types::consensus_params_for_version(&self.protocol) {
                 Some(p) => (
                     p.enable_catchpoints_with_sp_contexts,
                     p.enable_catchpoints_with_online_accounts,
+                    // go: `StoreBalancesRound` falls back to `MaxBalLookback`
+                    // when `CatchpointLookback` is unset (pre-v33 protocols
+                    // never set it) -- `ledger/catchupaccessor.go`.
+                    if p.catchpoint_lookback != 0 {
+                        p.catchpoint_lookback
+                    } else {
+                        p.max_bal_lookback
+                    },
                 ),
                 None => {
                     tracing::warn!(
@@ -3852,9 +3852,42 @@ impl SqliteLedger {
                         "automatic catchpoint: unrecognized consensus version; \
                          falling back to the pre-SP-contexts (V6) file format"
                     );
-                    (false, false)
+                    (false, false, crate::catchpoint::DEFAULT_MAX_BAL_LOOKBACK)
                 }
             };
+
+        // go-algorand's real catchpoint-catchup client always computes
+        // `balancesRound = blocksRound - CatchpointLookback`
+        // (`ledger/catchupaccessor.go`'s `StoreBalancesRound`,
+        // `ledger/catchpointtracker.go`'s `finishCatchpoint`) and fails that
+        // `uint64` subtraction with an underflow for any label round at or
+        // below the lookback. algod-rust's synchronous architecture has no
+        // separate "accounts round" snapshot to source a byte-faithful
+        // `balances_round` file from (go's two-phase
+        // `generateCatchpointData`-at-`accountsRound` /
+        // `finishCatchpoint`-at-`round` pipeline), so this is the
+        // simplified-but-wire-compatible design from issue #1054: skip
+        // exporting entirely below the threshold, and above it stamp the
+        // correct round *numbers* (content still reflects the live `round`
+        // snapshot, not genuinely historical `balances_round` state).
+        if round <= catchpoint_lookback {
+            tracing::debug!(
+                round,
+                catchpoint_lookback,
+                "automatic catchpoint: round is within CatchpointLookback of genesis \
+                 (balances_round would underflow); skipping export"
+            );
+            return;
+        }
+        let balances_round = round - catchpoint_lookback;
+
+        let digest = match self.block_header_digest_at_round(round) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(round, error = %e, "automatic catchpoint: skipping this round");
+                return;
+            }
+        };
 
         // Open the read-only snapshot connection *now*, synchronously —
         // this is fast (no data is read yet, just the file open + a
@@ -3881,7 +3914,7 @@ impl SqliteLedger {
         let dir = cfg.dir.clone();
         let history_length = cfg.file_history_length;
         let opts = crate::catchpoint::ExportOptions {
-            balances_round: round,
+            balances_round,
             blocks_round: round,
             block_header_digest: digest,
             include_online_data,
