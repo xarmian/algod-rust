@@ -1262,18 +1262,35 @@ pub fn canonical_encode_online_round_params_data(d: &OnlineRoundParamsData) -> V
 ///
 /// PLAN-36 G8 (TASK-125).
 ///
-/// Carries a `serde::Deserialize` impl (issue #1057) so this one struct
-/// definition serves both directions: [`canonical_encode_state_proof_verification_context`]
-/// for writing (go's canonical, sorted-key encoding) and
-/// [`decode_state_proof_verification_context`] for reading back an
-/// arbitrary msgpack encoding of the same shape (go's own encoder doesn't
-/// sort keys the way our canonical encoder does, and `rmp_serde` decodes
-/// by field name regardless of on-wire key order). Every reader/writer of
-/// the `stateproofverification.verificationcontext` BLOB column
+/// Carries `serde::Deserialize` (issue #1057) and `serde::Serialize`
+/// (issue #1059) impls so this one struct definition serves every
+/// direction any caller needs: [`canonical_encode_state_proof_verification_context`]
+/// for go-canonical, sorted-key writing; [`decode_state_proof_verification_context`]
+/// for reading back an arbitrary msgpack encoding of the same shape (go's
+/// own encoder doesn't sort keys the way our canonical encoder does, and
+/// `rmp_serde` decodes by field name regardless of on-wire key order); and
+/// the derived `Serialize` for `catchpoint/importer.rs`'s
+/// `rmp_serde::to_vec_named` decode/re-encode of a catchpoint file's
+/// `stateProofVerificationContext.msgpack` entry, previously served by a
+/// third hand-maintained mirror in `catchpoint::types`. Every reader/writer
+/// of the go `ledgercore.StateProofVerificationContext` shape — the
+/// `stateproofverification.verificationcontext` BLOB column
 /// (`apply_stateproof.rs`'s tracker and `catchpoint/verify.rs`'s
-/// catchpoint-export path) shares this definition rather than maintaining
-/// separate mirrors.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+/// catchpoint-export path) and the catchpoint-file importer — shares this
+/// one definition rather than maintaining separate mirrors.
+///
+/// The `version` field is omitted from the derived `Serialize` output when
+/// empty (`skip_serializing_if`), matching go's own encoding: the real
+/// `ledgercore.StateProofVerificationContext` carries a struct-level
+/// `codec:",omitempty,omitemptyarray"` tag
+/// (`../go-algorand/ledger/ledgercore/stateproofverification.go:28`). The
+/// other three fields intentionally do *not* get the same treatment here —
+/// this mirrors the exact behavior the pre-consolidation
+/// `catchpoint::types::StateProofVerificationContext` mirror had, which
+/// the importer's `rmp_serde::to_vec_named` re-encode path (an internal
+/// SQLite-storage round trip, not a wire format go-algorand ever reads)
+/// must not change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StateProofVerificationContext {
     /// Last round this verifier attests to. Codec: `spround`.
     #[serde(rename = "spround", default)]
@@ -1285,7 +1302,7 @@ pub struct StateProofVerificationContext {
     #[serde(rename = "pw", default)]
     pub online_total_weight: u64,
     /// Consensus protocol version active at the attestation. Codec: `v`.
-    #[serde(rename = "v", default)]
+    #[serde(rename = "v", default, skip_serializing_if = "String::is_empty")]
     pub version: String,
 }
 

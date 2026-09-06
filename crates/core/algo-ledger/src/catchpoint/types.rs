@@ -692,34 +692,18 @@ impl Default for CatchpointBaseOnlineAccountData {
 ///
 /// The `stateProofVerificationContext.msgpack` tar entry contains this wrapper,
 /// which holds an array of individual verification contexts.
+///
+/// Issue #1059: the per-context shape used to be a fourth hand-maintained
+/// mirror of go's `ledgercore.StateProofVerificationContext` local to this
+/// module; it now delegates to the one shared
+/// [`algo_codec::StateProofVerificationContext`] that `apply_stateproof.rs`
+/// and `catchpoint/verify.rs` already used, so the catchpoint-file
+/// importer's decode/re-encode path shares that same definition too.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatchpointStateProofVerificationWrapper {
     /// Array of state proof verification contexts.
     #[serde(rename = "spd", default)]
-    pub data: Vec<StateProofVerificationContext>,
-}
-
-/// A single state proof verification context.
-/// Corresponds to Go's `ledgercore.StateProofVerificationContext`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StateProofVerificationContext {
-    /// Last attested round for this state proof verification context.
-    #[serde(rename = "spround", default)]
-    pub last_attested_round: u64,
-
-    /// Voters commitment (vector commitment root).
-    #[serde(rename = "vc", default)]
-    pub voters_commitment: ByteBuf,
-
-    /// Online total weight (total stake attesting).
-    #[serde(rename = "pw", default)]
-    pub online_total_weight: u64,
-
-    /// Version field for the verification context.
-    /// Go codec tag: `"v"`. Must be preserved during decode/re-encode to
-    /// avoid corrupting the state proof verification hash.
-    #[serde(rename = "v", default, skip_serializing_if = "String::is_empty")]
-    pub version: String,
+    pub data: Vec<algo_codec::StateProofVerificationContext>,
 }
 
 /// Decoded form of Go's `OnlineRoundParamsData` from `ledgercore/totals.go`.

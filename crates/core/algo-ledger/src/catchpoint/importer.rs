@@ -1485,9 +1485,9 @@ mod tests {
         let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
         importer.prepare_staging().unwrap();
 
-        let ctx = super::super::types::StateProofVerificationContext {
+        let ctx = algo_codec::StateProofVerificationContext {
             last_attested_round: 120,
-            voters_commitment: ByteBuf::from(Vec::new()),
+            voters_commitment: Vec::new(),
             online_total_weight: 100,
             ..Default::default()
         };
@@ -1517,7 +1517,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rnd, 120);
-        let decoded: super::super::types::StateProofVerificationContext =
+        let decoded: algo_codec::StateProofVerificationContext =
             rmp_serde::from_slice(&blob).unwrap();
         assert_eq!(decoded.last_attested_round, ctx.last_attested_round);
         assert_eq!(decoded.online_total_weight, ctx.online_total_weight);
