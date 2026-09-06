@@ -53,5 +53,6 @@ pub use verify::{
 };
 pub use writer::{
     export_catchpoint_file, select_catchpoint_file_version, ExportOptions, ExportResult,
-    BALANCES_PER_CATCHPOINT_FILE_CHUNK, RESOURCES_PER_CATCHPOINT_FILE_CHUNK,
+    BALANCES_PER_CATCHPOINT_FILE_CHUNK, DEFAULT_MAX_BAL_LOOKBACK,
+    RESOURCES_PER_CATCHPOINT_FILE_CHUNK,
 };
