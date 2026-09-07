@@ -31,8 +31,28 @@ use algo_types::{SignedTransaction, TealValue, TxnType};
 use sha2::{Digest, Sha512_256};
 
 use crate::context::AvmContext;
-use crate::fields::GlobalField;
-use crate::txn_fields::read_txn_field;
+use crate::fields::{BlockField, GlobalField};
+use crate::machine::AvmValue;
+use crate::txn_fields::{check_available_round, read_txn_field};
+
+/// Block-history lookback source for LogicSig ("stateless") evaluation.
+///
+/// Mirrors go-algorand's `LedgerForSignature` (`data/transactions/logic/
+/// eval.go`): a deliberately narrow view of the ledger -- "it only exposes
+/// things that consensus has already agreed upon, so it is 'stateless' for
+/// signature purposes" -- that both `txn FirstValidTime` and the `block`
+/// opcode's `BlkTimestamp` field read from, regardless of whether the
+/// currently-running program is a LogicSig or an application. Only the
+/// timestamp field is exposed here because it's the only block-history data
+/// `FirstValidTime` needs; the other `block` fields (seed, branch, etc.)
+/// remain unavailable in LogicSig mode pending broader wiring (tracked
+/// separately -- see issue referenced in `LogicSigAvmContext::block_field`).
+pub trait SigBlockSource {
+    /// Returns the timestamp of the block at `round`, matching go's
+    /// `BlockHeader.TimeStamp`. Errors (e.g. "no block header access",
+    /// pruned/unknown round) propagate to the caller as the opcode's error.
+    fn block_timestamp(&self, round: u64) -> Result<i64, AlgoError>;
+}
 
 /// Domain separation prefix for program hashing.
 const PROGRAM_PREFIX: &[u8] = b"Program";
@@ -89,6 +109,12 @@ pub struct LogicSigAvmContext<'a> {
     genesis_hash: [u8; 32],
     /// Consensus parameters for the current protocol version.
     consensus: ConsensusParams,
+    /// Optional block-history lookback source, used by `txn FirstValidTime`
+    /// and `block BlkTimestamp`. `None` matches go-algorand's
+    /// `NoHeaderLedger` default (no real ledger wired in): both opcodes
+    /// error with "no block header access", exactly as go does when no
+    /// `LedgerForSignature` is available.
+    sig_ledger: Option<&'a dyn SigBlockSource>,
 }
 
 impl<'a> LogicSigAvmContext<'a> {
@@ -130,7 +156,17 @@ impl<'a> LogicSigAvmContext<'a> {
             program_hash: hash,
             genesis_hash,
             consensus,
+            sig_ledger: None,
         }
+    }
+
+    /// Attach a block-history lookback source, enabling `txn FirstValidTime`
+    /// and `block BlkTimestamp` for this evaluation. Builder-style so
+    /// existing callers that don't need block history (the overwhelming
+    /// majority -- most LogicSigs never touch these fields) are unaffected.
+    pub fn with_sig_ledger(mut self, sig_ledger: &'a dyn SigBlockSource) -> Self {
+        self.sig_ledger = Some(sig_ledger);
+        self
     }
 }
 
@@ -223,6 +259,26 @@ impl<'a> AvmContext for LogicSigAvmContext<'a> {
             });
         }
         let stxn = &self.group[group_index];
+        // FirstValidTime (field 3): timestamp of block(FirstValid-1). Go's
+        // `data/transactions/logic/eval.go` opTxn case reads this via
+        // `cx.SigLedger.BlockHdr`, available in *both* App and Sig mode
+        // (it's "not really a field of a txn, but ... 'stateless'" -- see
+        // go's `TestTxnFirstValidTime`). `read_txn_field` has no ledger
+        // access, so intercept here exactly as `LedgerAvmContext` does for
+        // App mode, delegating to `block_field` (which applies the same
+        // availability-window check against the *currently executing*
+        // transaction, not `stxn`, matching go's `cx.txn`-based
+        // `availableRound`).
+        if field == 3 {
+            let round = stxn.txn.first_valid.0.saturating_sub(1);
+            let value = self.block_field(round, BlockField::BlkTimestamp as u8)?;
+            return match value {
+                AvmValue::Uint64(ts) => Ok(TealValue::Uint(ts)),
+                AvmValue::Bytes(_) => Err(AlgoError::Avm {
+                    message: "internal error: BlkTimestamp returned Bytes".to_string(),
+                }),
+            };
+        }
         read_txn_field(stxn, field, array_index, group_index)
     }
 
@@ -232,6 +288,48 @@ impl<'a> AvmContext for LogicSigAvmContext<'a> {
 
     fn group_index(&self) -> usize {
         self.group_index
+    }
+
+    // ---- Block field access ----
+
+    /// Used by `block` (0xd1) and, via `txn_field`, by `txn FirstValidTime`.
+    ///
+    /// Only `BlkTimestamp` is implemented -- the one field `FirstValidTime`
+    /// needs. The other `block` fields (seed, branch, fee sink, etc.) stay
+    /// unavailable in LogicSig mode: go-algorand's `block` opcode is
+    /// `modeAny` and does support them there too, but wiring full
+    /// `BlockHeader` access (not just timestamp) into the LogicSig
+    /// evaluation path is tracked as a separate follow-up.
+    fn block_field(&self, round: u64, field: u8) -> Result<AvmValue, AlgoError> {
+        let bf = BlockField::from_u8(field)?;
+        if bf != BlockField::BlkTimestamp {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "block field {field} not available in LogicSig mode (only BlkTimestamp is)"
+                ),
+            });
+        }
+        // Availability window is bounds-checked against the *currently
+        // executing* transaction (`self.group_index`), matching go's
+        // `cx.txn`-based `availableRound` -- not the (possibly `gtxn`-
+        // referenced) transaction whose FirstValidTime is being read.
+        let cur_txn = &self.group[self.group_index].txn;
+        let checked_round = check_available_round(
+            round,
+            cur_txn.first_valid.0,
+            cur_txn.last_valid.0,
+            self.consensus.max_txn_life,
+        )?;
+        let sig_ledger = self.sig_ledger.ok_or_else(|| AlgoError::Avm {
+            message: "no block header access".to_string(),
+        })?;
+        let ts = sig_ledger.block_timestamp(checked_round)?;
+        if ts < 0 {
+            return Err(AlgoError::Avm {
+                message: format!("block({checked_round}) timestamp {ts} < 0"),
+            });
+        }
+        Ok(AvmValue::Uint64(ts as u64))
     }
 
     // ---- LogicSig arguments ----
@@ -581,5 +679,244 @@ mod tests {
                 "unexpected error for field {field_byte}: {msg}"
             );
         }
+    }
+
+    // ---- FirstValidTime / block_field tests ----
+    //
+    // Ported from go-algorand's `TestTxnFirstValidTime`
+    // (`data/transactions/logic/eval_test.go#L362`), which deliberately runs
+    // in `ModeSig` with the app-mode `Ledger` set to `nil` to prove
+    // `FirstValidTime` works from `SigLedger` alone -- "it's not really a
+    // field of a txn, but since it looks at the past of the blockchain, it
+    // is 'stateless'". `MockSigLedger` here plays the role of go's fake test
+    // `Ledger.BlockHdr`, whose `TimeStamp = 100 + 9*round/2` formula is
+    // reused verbatim so the `== 104` / `== 109` assertions carry over
+    // unchanged.
+
+    /// Test double for [`SigBlockSource`]. Errors for any round with no
+    /// stored timestamp, matching go's fake ledger having no header for
+    /// round 0 (`BlockHdr` is only ever queried for rounds `>= 1` once
+    /// `check_available_round` has run, but this also lets tests simulate
+    /// "header missing" independent of the availability window).
+    struct MockSigLedger {
+        timestamps: std::collections::HashMap<u64, i64>,
+    }
+
+    impl MockSigLedger {
+        fn new() -> Self {
+            MockSigLedger {
+                timestamps: std::collections::HashMap::new(),
+            }
+        }
+
+        /// Seed round -> timestamp using go's fake-ledger formula:
+        /// `TimeStamp = 100 + 9*round/2`.
+        fn with_formula_rounds(rounds: impl IntoIterator<Item = u64>) -> Self {
+            let mut ledger = Self::new();
+            for round in rounds {
+                ledger
+                    .timestamps
+                    .insert(round, 100 + (9 * round as i64) / 2);
+            }
+            ledger
+        }
+    }
+
+    impl SigBlockSource for MockSigLedger {
+        fn block_timestamp(&self, round: u64) -> Result<i64, AlgoError> {
+            self.timestamps
+                .get(&round)
+                .copied()
+                .ok_or_else(|| AlgoError::Avm {
+                    message: format!("no block header for round {round}"),
+                })
+        }
+    }
+
+    /// FirstValid=current-10, LastValid=current+10: comfortably inside the
+    /// availability window.
+    #[test]
+    fn first_valid_time_basic_window() {
+        let current = 1000u64;
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.first_valid = algo_types::Round(current - 10);
+        stxn.txn.last_valid = algo_types::Round(current + 10);
+        let group = vec![stxn];
+        let ledger = MockSigLedger::with_formula_rounds([current - 11]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default())
+            .with_sig_ledger(&ledger);
+
+        assert!(ctx.txn_field(0, 3, None).is_ok());
+    }
+
+    /// FirstValid == current: still available (round `current - 1`).
+    #[test]
+    fn first_valid_time_first_valid_equals_current() {
+        let current = 1000u64;
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.first_valid = algo_types::Round(current);
+        stxn.txn.last_valid = algo_types::Round(current + 10);
+        let group = vec![stxn];
+        let ledger = MockSigLedger::with_formula_rounds([current - 1]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default())
+            .with_sig_ledger(&ledger);
+
+        assert!(ctx.txn_field(0, 3, None).is_ok());
+    }
+
+    /// FirstValid = current - MaxTxnLife, LastValid = current: exactly at
+    /// the oldest edge of the window (still available).
+    #[test]
+    fn first_valid_time_oldest_edge_of_window() {
+        let current = 2000u64;
+        let max_txn_life = 1000u64;
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.first_valid = algo_types::Round(current - max_txn_life);
+        stxn.txn.last_valid = algo_types::Round(current);
+        let group = vec![stxn];
+        let ledger = MockSigLedger::with_formula_rounds([current - max_txn_life - 1]);
+        let consensus = ConsensusParams {
+            max_txn_life,
+            ..ConsensusParams::default()
+        };
+        let ctx =
+            LogicSigAvmContext::new(&group, 0, &[0x01], vec![], consensus).with_sig_ledger(&ledger);
+
+        assert!(ctx.txn_field(0, 3, None).is_ok());
+    }
+
+    /// FirstValid = current - MaxTxnLife, LastValid = current + 1: the
+    /// requested round now falls one below `firstAvail`, so it's
+    /// unavailable -- go's comment notes this scenario "isn't really even
+    /// possible because lifetime is too big" but nothing enforces that, so
+    /// the error path is still reachable and must match go's wording.
+    #[test]
+    fn first_valid_time_errors_is_not_available() {
+        let current = 2000u64;
+        let max_txn_life = 1000u64;
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.first_valid = algo_types::Round(current - max_txn_life);
+        stxn.txn.last_valid = algo_types::Round(current + 1);
+        let group = vec![stxn];
+        let ledger = MockSigLedger::new(); // header shouldn't even be queried
+        let consensus = ConsensusParams {
+            max_txn_life,
+            ..ConsensusParams::default()
+        };
+        let ctx =
+            LogicSigAvmContext::new(&group, 0, &[0x01], vec![], consensus).with_sig_ledger(&ledger);
+
+        let err = ctx.txn_field(0, 3, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("is not available"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Beginning-of-chain-life cases, ported from go's low-round assertions:
+    /// `FirstValid=2` -> round 1 -> timestamp 104; `FirstValid=3` -> round 2
+    /// -> timestamp 109 (go's fake-ledger formula `100 + 9*round/2`).
+    #[test]
+    fn first_valid_time_early_chain_life_values() {
+        let ledger = MockSigLedger::with_formula_rounds([1, 2]);
+        let consensus = ConsensusParams::default();
+
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.first_valid = algo_types::Round(2);
+        stxn.txn.last_valid = algo_types::Round(100);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], consensus.clone())
+            .with_sig_ledger(&ledger);
+        assert_eq!(ctx.txn_field(0, 3, None).unwrap(), TealValue::Uint(104));
+
+        let mut stxn2 = make_pay_stxn([0x10; 32]);
+        stxn2.txn.first_valid = algo_types::Round(3);
+        stxn2.txn.last_valid = algo_types::Round(100);
+        let group2 = vec![stxn2];
+        let ctx2 = LogicSigAvmContext::new(&group2, 0, &[0x01], vec![], consensus)
+            .with_sig_ledger(&ledger);
+        assert_eq!(ctx2.txn_field(0, 3, None).unwrap(), TealValue::Uint(109));
+    }
+
+    /// FirstValid=1 -> requested round 0, which is never available even
+    /// though the naive range check would allow it -- "round 0 doesn't
+    /// exist!" (go's comment, verbatim rationale).
+    #[test]
+    fn first_valid_time_round_zero_never_available() {
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.first_valid = algo_types::Round(1);
+        stxn.txn.last_valid = algo_types::Round(100);
+        let group = vec![stxn];
+        let ledger = MockSigLedger::new();
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default())
+            .with_sig_ledger(&ledger);
+
+        let err = ctx.txn_field(0, 3, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("round 0 is not available"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// FirstValid=1, LastValid=1+MaxTxnLife: glassbox case where
+    /// `firstAvail` computes to depend on `LastValid - Lifetime - 1`, which
+    /// again lands on round 0 -- still must be rejected.
+    #[test]
+    fn first_valid_time_glassbox_first_avail_zero() {
+        let consensus = ConsensusParams::default();
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.first_valid = algo_types::Round(1);
+        stxn.txn.last_valid = algo_types::Round(1 + consensus.max_txn_life);
+        let group = vec![stxn];
+        let ledger = MockSigLedger::new();
+        let ctx =
+            LogicSigAvmContext::new(&group, 0, &[0x01], vec![], consensus).with_sig_ledger(&ledger);
+
+        let err = ctx.txn_field(0, 3, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("round 0 is not available"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// No sig-ledger attached at all: matches go's `NoHeaderLedger`
+    /// behavior ("no block header access") when a program is evaluated in
+    /// true isolation, independent of the availability-window check.
+    #[test]
+    fn first_valid_time_errors_without_sig_ledger() {
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.first_valid = algo_types::Round(100);
+        stxn.txn.last_valid = algo_types::Round(200);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
+
+        let err = ctx.txn_field(0, 3, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("no block header access"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `block BlkTimestamp` works the same way as `txn FirstValidTime` in
+    /// LogicSig mode (both resolve through `block_field`), but other block
+    /// fields remain unavailable.
+    #[test]
+    fn block_field_timestamp_and_other_fields() {
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.first_valid = algo_types::Round(100);
+        stxn.txn.last_valid = algo_types::Round(200);
+        let group = vec![stxn];
+        let ledger = MockSigLedger::with_formula_rounds([50]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default())
+            .with_sig_ledger(&ledger);
+
+        let ts = ctx.block_field(50, BlockField::BlkTimestamp as u8).unwrap();
+        assert_eq!(ts, AvmValue::Uint64(100 + 9 * 50 / 2));
+
+        let err = ctx.block_field(50, BlockField::BlkSeed as u8).unwrap_err();
+        assert!(
+            format!("{err}").contains("not available in LogicSig mode"),
+            "unexpected error: {err}"
+        );
     }
 }
