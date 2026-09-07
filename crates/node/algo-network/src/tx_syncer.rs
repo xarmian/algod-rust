@@ -358,6 +358,19 @@ impl SeenTxCache {
         g.cur.contains(txid) || g.prev.contains(txid)
     }
 
+    /// Remove `txid` from the cache, from either generation, if present.
+    ///
+    /// Mirrors go-algorand's `TxHandler.deleteFromCaches` (`data/txHandler.go`):
+    /// used to roll back an eagerly-inserted entry when a later admission
+    /// step drops the message anyway (e.g. a full backlog queue — issue
+    /// #1096), so a legitimately-dropped message isn't permanently
+    /// poisoned as "seen" and can be resubmitted once there's room.
+    pub fn remove(&self, txid: &Digest) {
+        let mut g = self.inner.lock().expect("SeenTxCache mutex poisoned");
+        g.cur.remove(txid);
+        g.prev.remove(txid);
+    }
+
     /// Current number of entries across both generations.
     #[must_use]
     pub fn len(&self) -> usize {
