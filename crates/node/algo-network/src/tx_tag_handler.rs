@@ -135,20 +135,97 @@
 //! behavior is unchanged from before issue #821: no per-app rate limiting
 //! is applied.
 //!
+//! ## Canonical-form dedup / anti-censoring cache and cache rotation (issue #1084)
+//!
+//! go-algorand's `TxHandler.processIncomingTxn` runs every decoded group
+//! through `incomingTxGroupCanonicalDedup` (`data/txHandler.go`), which
+//! re-encodes the group deterministically (`SignedTxn.MarshalMsg`,
+//! concatenated for a multi-txn group) and drops the message if that
+//! canonical digest has already been seen — *before* the group ever
+//! reaches rate limiting or verification. The function's own comment
+//! (`dedupCanonical`) explains why: without this, an adversary could
+//! resubmit a semantically-identical group under a different *raw* byte
+//! encoding (non-canonical field ordering, or simply a different wire
+//! framing) and force the node to redundantly re-verify/re-relay it —
+//! `TestTxHandlerProcessIncomingCensoring` pins that a re-signed variant
+//! (a genuinely different signed group) is admitted, while a
+//! non-canonically-*re-encoded* copy of the exact same signed group is
+//! not.
+//!
+//! [`TxTagHandler::with_canonical_cache`] attaches this behavior, keyed
+//! on `SHA512/256` over the concatenated
+//! [`canonical_encode_signed_transaction`] bytes of every txn in the
+//! group (mirrors `MarshalMsg`'s deterministic struct-field encoding —
+//! re-derived from the *decoded* values, so it is insensitive to
+//! whatever raw wire encoding the sender actually used). This check runs
+//! immediately after decoding, before the existing txid-based
+//! [`SeenTxCache`] fast path, mirroring go's ordering
+//! (`incomingTxGroupCanonicalDedup` before `incomingTxGroupAppRateLimit`).
+//! Unlike the txid-based `SeenTxCache` (which only records a group once
+//! [`TransactionPool::remember`] *succeeds*), the canonical cache records
+//! eagerly at decode time — so it catches a second copy of the exact
+//! same signed bytes arriving while the first copy's `remember` call is
+//! still in flight (or has failed), which the existing seen-cache cannot.
+//! A different signature over the same txn body — go's "forged
+//! signature, ensure accepted" case — hashes to a different canonical
+//! digest and is therefore never suppressed by this cache; it is still
+//! free to be rejected later by signature verification, exactly as go's
+//! test expects.
+//!
+//! The canonical cache reuses [`SeenTxCache`] itself (issue #1083's
+//! `cur`/`prev` two-generation rotation with a `capacity`-triggered
+//! rotate and an explicit manual [`SeenTxCache::rotate`]) rather than
+//! introducing a second cache type — the eviction/rotation semantics
+//! [`TestTxHandlerProcessIncomingCacheRotation`] pins (drop survives one
+//! rotation via `prev`, is gone after two) are identical to what
+//! `SeenTxCache` already implements and has dedicated tests for in
+//! `tx_syncer.rs`. When a canonical cache is attached with the *same*
+//! `Arc` a [`TxSyncer`] is also periodically rotating (via
+//! `TxSyncerConfig::seen_cache_rotate_interval`), the canonical cache
+//! gets the same scheduled-rotation behavior
+//! (`TestTxHandlerProcessIncomingCacheRotation`'s "scheduled" case) for
+//! free; [`SeenTxCache::rotate`] remains available for a manual/ad-hoc
+//! rotation policy instead.
+//!
+//! Without a canonical cache attached (the default from
+//! [`TxTagHandler::new`]), behavior is unchanged: no canonical-form dedup
+//! runs, exactly as before issue #1084.
+//!
+//! **Not ported** — backlog-drop-on-full-queue
+//! (`TestTxHandlerProcessIncomingCacheBacklogDrop`): go's `TxHandler`
+//! enqueues onto a bounded `backlogQueue` channel with a non-blocking
+//! `select`/`default`, and on a full queue drops the message *and* rolls
+//! back its (already-inserted) cache entries via `deleteFromCaches` so a
+//! legitimately-dropped message can be resubmitted later without being
+//! permanently poisoned as "seen". algod-rust's inbound path has no
+//! equivalent bounded backlog queue to overflow: a decoded, admitted
+//! group goes straight to `tokio::task::spawn_blocking` (see the "Pool
+//! call" section below) rather than through an intermediate fixed-size
+//! channel, so there is no structural analogue of "the queue is full" to
+//! port this onto. Retrofitting a bounded backlog purely to reproduce
+//! this drop policy would be a materially bigger architectural change
+//! than the other two behaviors (a new queue, a consumer task, and a
+//! rollback path for every cache this handler maintains) rather than a
+//! few dozen lines, so it is left as a follow-up rather than forced in
+//! here — see the issue tracker for the follow-up filed alongside this
+//! change.
+//!
 //! [`Multiplexer`]: crate::handler::Multiplexer
 //! [`TransactionPool`]: algo_pool::TransactionPool
 //! [`DOC-23`]: #
 //! [`TxSyncer`]: crate::tx_syncer::TxSyncer
+//! [`canonical_encode_signed_transaction`]: algo_codec::canonical_encode_signed_transaction
 
 use std::io::Cursor;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sha2::{Digest as Sha2DigestTrait, Sha512_256};
 use tracing::{debug, warn};
 
-use algo_codec::compute_txn_id;
+use algo_codec::{canonical_encode_signed_transaction, compute_txn_id};
 use algo_pool::{AppRateLimiter, TransactionPool};
-use algo_types::SignedTransaction;
+use algo_types::{Digest, SignedTransaction};
 use algo_validate::{BatchVerifier, BatchVerifyRequest, SpecialAddresses, VerificationContext};
 
 use crate::forwarding_policy::ForwardingPolicy;
@@ -261,6 +338,7 @@ pub struct TxTagHandler {
     app_limiter: Option<Arc<AppRateLimiter>>,
     app_limiter_congestion_threshold: usize,
     batch_verifier: Option<Arc<BatchVerifier>>,
+    canonical_cache: Option<Arc<SeenTxCache>>,
 }
 
 impl std::fmt::Debug for TxTagHandler {
@@ -273,6 +351,7 @@ impl std::fmt::Debug for TxTagHandler {
                 &self.app_limiter_congestion_threshold,
             )
             .field("batch_verifier_enabled", &self.batch_verifier.is_some())
+            .field("canonical_cache_enabled", &self.canonical_cache.is_some())
             .finish()
     }
 }
@@ -296,6 +375,7 @@ impl TxTagHandler {
             app_limiter: None,
             app_limiter_congestion_threshold: 0,
             batch_verifier: None,
+            canonical_cache: None,
         }
     }
 
@@ -346,11 +426,45 @@ impl TxTagHandler {
         self
     }
 
+    /// Attach a canonical-form dedup cache (issue #1084), mirroring
+    /// go-algorand's `TxHandler.txCanonicalCache`. See the module doc's
+    /// "Canonical-form dedup / anti-censoring cache" section for the full
+    /// behavioral contract.
+    ///
+    /// `cache` reuses [`SeenTxCache`] itself — it is a *separate* instance
+    /// from the txid-keyed `seen` cache passed to [`Self::new`] (the two
+    /// serve different purposes and are keyed differently), but nothing
+    /// stops sharing the same `Arc` with a [`TxSyncer`]'s own periodic
+    /// rotation if a caller wants scheduled rotation for free; see the
+    /// module doc.
+    ///
+    /// [`TxSyncer`]: crate::tx_syncer::TxSyncer
+    #[must_use]
+    pub fn with_canonical_cache(mut self, cache: Arc<SeenTxCache>) -> Self {
+        self.canonical_cache = Some(cache);
+        self
+    }
+
     /// Returns a reference to the shared seen-tx cache.
     #[must_use]
     pub fn seen_cache(&self) -> Arc<SeenTxCache> {
         self.seen.clone()
     }
+}
+
+/// Compute the canonical-form dedup digest for a decoded TX group (issue
+/// #1084), mirroring go-algorand's `dedupCanonical`: `SHA512/256` over the
+/// concatenation of each txn's canonical (`MarshalMsg`-equivalent)
+/// encoding, re-derived from the *decoded* values rather than the
+/// original wire bytes. Two groups with byte-identical decoded values
+/// (including signatures) always hash to the same digest, regardless of
+/// what raw encoding either sender used.
+fn canonical_group_digest(group: &[SignedTransaction]) -> Digest {
+    let mut hasher = Sha512_256::new();
+    for tx in group {
+        hasher.update(canonical_encode_signed_transaction(tx));
+    }
+    Digest(hasher.finalize().into())
 }
 
 /// Build a [`BatchVerifyRequest`] for pre-admission signature verification
@@ -426,6 +540,29 @@ impl MessageHandler for TxTagHandler {
                 };
             }
         };
+
+        // Canonical-form dedup / anti-censoring gate (issue #1084),
+        // mirroring go's `incomingTxGroupCanonicalDedup` — runs
+        // immediately after decoding, before the txid-based fast path
+        // below, and keys on the full signed encoding (signature
+        // included) so a re-signed variant of the same txn body is never
+        // suppressed here. See the module doc for the full contract.
+        if let Some(cache) = &self.canonical_cache {
+            let digest = canonical_group_digest(&group);
+            if !cache.insert(digest) {
+                debug!(
+                    sender = %msg.sender,
+                    group_len = group.len(),
+                    "TxTagHandler: dropped by canonical-form dedup cache",
+                );
+                return OutgoingMessage {
+                    action: ForwardingPolicy::Ignore,
+                    tag: Tag::Transaction,
+                    payload: Vec::new(),
+                    topics: None,
+                };
+            }
+        }
 
         // Compute txids once up front — `compute_txn_id` hashes the
         // Transaction body (not the signature), so we can dedup
@@ -1024,17 +1161,18 @@ mod batch_verifier_wiring_tests {
     use algo_pool::traits::{BlockEvaluator, PoolLedger};
     use algo_pool::{PoolConfig, TransactionPool};
     use algo_types::{Address, Block, BlockHeader, ConsensusParams, Round, TxnType};
-    use algo_validate::{BatchVerifier, BatchVerifierConfig, BatchVerifyRequest, VerifiedTransactionCache};
+    use algo_validate::{
+        BatchVerifier, BatchVerifierConfig, BatchVerifyRequest, VerifiedTransactionCache,
+    };
 
     use super::*;
     use crate::tx_syncer::SeenTxCache;
 
     /// Test-only alias for a `BatchVerifier::spawn_with_verifier` closure
     /// (the real crate uses an equivalent private alias internally).
-    type TestVerifyFn =
-        dyn Fn(&BatchVerifyRequest, &VerifiedTransactionCache) -> Result<(), AlgoError>
-            + Send
-            + Sync;
+    type TestVerifyFn = dyn Fn(&BatchVerifyRequest, &VerifiedTransactionCache) -> Result<(), AlgoError>
+        + Send
+        + Sync;
 
     /// Minimal stub ledger/evaluator, replicated from
     /// `app_rate_limiter_wiring_tests::StubLedger` above -- `remember`
@@ -1190,7 +1328,11 @@ mod batch_verifier_wiring_tests {
         let out = handler.handle(msg).await;
 
         assert_eq!(out.action, ForwardingPolicy::Ignore);
-        assert_eq!(pool.pending_count(), 0, "a failed-verification group must admit nothing");
+        assert_eq!(
+            pool.pending_count(),
+            0,
+            "a failed-verification group must admit nothing"
+        );
         assert!(
             !pool.pending_tx_ids().contains(&txid),
             "a failed-verification group must never reach the pool"
@@ -1228,9 +1370,8 @@ mod batch_verifier_wiring_tests {
             cache,
             verify_fn,
         ));
-        let handler = Arc::new(
-            TxTagHandler::new(pool.clone(), seen).with_batch_verifier(verifier.clone()),
-        );
+        let handler =
+            Arc::new(TxTagHandler::new(pool.clone(), seen).with_batch_verifier(verifier.clone()));
 
         let tx1 = make_payment_txn(3, 1);
         let tx2 = make_payment_txn(4, 2);
@@ -1260,5 +1401,264 @@ mod batch_verifier_wiring_tests {
             .unwrap_or_else(|_| panic!("verifier still shared"))
             .shutdown()
             .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: canonical-form dedup / anti-censoring cache and cache rotation
+// (issue #1084)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod canonical_cache_wiring_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use algo_error::AlgoError;
+    use algo_pool::traits::{BlockEvaluator, PoolLedger};
+    use algo_pool::{PoolConfig, TransactionPool};
+    use algo_types::{Address, Block, BlockHeader, ConsensusParams, Round, TxnType};
+
+    use super::*;
+    use crate::tx_syncer::SeenTxCache;
+
+    /// Stub ledger/evaluator, replicated from
+    /// `app_rate_limiter_wiring_tests::StubLedger` — `fail` lets a test
+    /// force `remember` to fail deterministically, `calls` counts every
+    /// time the evaluator actually runs a group so tests can prove
+    /// whether a resend reached it or was dropped upstream.
+    struct StubLedger {
+        round: Round,
+        fail: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PoolLedger for StubLedger {
+        fn latest(&self) -> Round {
+            self.round
+        }
+        fn block_hdr(&self, _round: Round) -> Result<BlockHeader, AlgoError> {
+            Ok(BlockHeader::default())
+        }
+        fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, AlgoError> {
+            Ok(ConsensusParams::default())
+        }
+        fn start_evaluator(
+            &self,
+            _hdr: BlockHeader,
+            _payset_hint: usize,
+            _max_txn_bytes_per_block: usize,
+        ) -> Result<Box<dyn BlockEvaluator>, AlgoError> {
+            Ok(Box::new(StubEvaluator {
+                round: self.round.next(),
+                fail: self.fail.clone(),
+                calls: self.calls.clone(),
+            }))
+        }
+    }
+
+    struct StubEvaluator {
+        round: Round,
+        fail: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl BlockEvaluator for StubEvaluator {
+        fn round(&self) -> Round {
+            self.round
+        }
+        fn pay_set_size(&self) -> usize {
+            0
+        }
+        fn test_transaction_group(&self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Ok(())
+        }
+        fn transaction_group(&mut self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err(AlgoError::Validation {
+                    message: "stub eval failure".to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+            Ok(Block::default())
+        }
+        fn reset_txn_bytes(&mut self) {}
+    }
+
+    fn make_pool() -> (Arc<TransactionPool>, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        let fail = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ledger: Arc<dyn PoolLedger> = Arc::new(StubLedger {
+            round: Round(1),
+            fail: fail.clone(),
+            calls: calls.clone(),
+        });
+        let pool = Arc::new(TransactionPool::new(PoolConfig::default(), ledger));
+        pool.on_new_block(&Block::default(), &std::collections::HashSet::new());
+        (pool, fail, calls)
+    }
+
+    fn make_payment_txn(sender_byte: u8, note: u8, fee: u64) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = TxnType::Pay;
+        stx.txn.sender = Address([sender_byte; 32]);
+        stx.txn.fee = fee;
+        stx.txn.first_valid = Round(1);
+        stx.txn.last_valid = Round(1_000);
+        stx.txn.note = serde_bytes::ByteBuf::from(vec![note]);
+        stx
+    }
+
+    fn encode_group(group: &[SignedTransaction]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for tx in group {
+            let bytes = rmp_serde::to_vec_named(tx).expect("encode stxn");
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
+    fn incoming(group: &[SignedTransaction], sender: &str) -> IncomingMessage {
+        let data = encode_group(group);
+        IncomingMessage::new(Tag::Transaction, data, sender.to_string(), 0)
+    }
+
+    /// The canonical cache must drop an exact resend of the same signed
+    /// bytes even when the first attempt's `remember` failed — proving
+    /// this is a genuinely independent gate from the txid-based
+    /// `SeenTxCache` (which only records a group once `remember`
+    /// succeeds, so it alone would let this resend straight through).
+    #[tokio::test]
+    async fn drops_exact_resend_even_after_remember_failed() {
+        let (pool, fail, calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let canonical = Arc::new(SeenTxCache::new(1024));
+        let handler = TxTagHandler::new(pool.clone(), seen).with_canonical_cache(canonical);
+
+        fail.store(true, Ordering::SeqCst);
+        let tx = make_payment_txn(1, 1, 1_000_000);
+        let msg1 = incoming(std::slice::from_ref(&tx), "1.2.3.4:4160");
+        let out1 = handler.handle(msg1).await;
+        assert_eq!(out1.action, ForwardingPolicy::Ignore);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "first attempt must reach the evaluator"
+        );
+
+        // Resend the exact same bytes — must be dropped by the canonical
+        // cache before ever reaching the evaluator again.
+        let msg2 = incoming(std::slice::from_ref(&tx), "1.2.3.4:4160");
+        let out2 = handler.handle(msg2).await;
+        assert_eq!(out2.action, ForwardingPolicy::Ignore);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exact resend must be dropped by the canonical cache, not reach the evaluator again"
+        );
+    }
+
+    /// A different signature over the *same* txn body must not be
+    /// suppressed by the canonical cache — go's "forged signature, ensure
+    /// accepted" case (`TestTxHandlerProcessIncomingCensoring`).
+    #[tokio::test]
+    async fn admits_forged_signature_variant_of_a_cached_group() {
+        let (pool, fail, calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let canonical = Arc::new(SeenTxCache::new(1024));
+        let handler = TxTagHandler::new(pool.clone(), seen).with_canonical_cache(canonical);
+
+        fail.store(true, Ordering::SeqCst);
+        let mut tx = make_payment_txn(2, 1, 1_000_000);
+        let msg1 = incoming(std::slice::from_ref(&tx), "5.6.7.8:4160");
+        let out1 = handler.handle(msg1).await;
+        assert_eq!(out1.action, ForwardingPolicy::Ignore);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Same body, different signature bytes: different canonical
+        // digest, must reach the evaluator again.
+        tx.sig = [7u8; 64];
+        let msg2 = incoming(std::slice::from_ref(&tx), "5.6.7.8:4160");
+        let out2 = handler.handle(msg2).await;
+        assert_eq!(out2.action, ForwardingPolicy::Ignore);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a re-signed variant of the same txn body must not be suppressed by the canonical cache"
+        );
+    }
+
+    /// Two manual rotations forget a previously-cached group, letting an
+    /// identical resend through again — mirrors
+    /// `TestTxHandlerProcessIncomingCacheRotation`'s "manual" sub-test:
+    /// one rotation is not enough (the entry survives via `prev`), a
+    /// second one is.
+    #[tokio::test]
+    async fn two_rotations_let_an_exact_resend_through_again() {
+        let (pool, fail, calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let canonical = Arc::new(SeenTxCache::new(1024));
+        let handler = TxTagHandler::new(pool.clone(), seen).with_canonical_cache(canonical.clone());
+
+        // `remember` must fail throughout, so the txid-based `seen` cache
+        // (which only records on success) never itself starts
+        // suppressing the resends — this test isolates the *canonical*
+        // cache's rotation behavior specifically.
+        fail.store(true, Ordering::SeqCst);
+        let tx = make_payment_txn(3, 1, 1_000_000);
+
+        let msg1 = incoming(std::slice::from_ref(&tx), "9.9.9.9:4160");
+        let out1 = handler.handle(msg1).await;
+        assert_eq!(out1.action, ForwardingPolicy::Ignore);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // One rotation: entry moved from `cur` into `prev`, still live.
+        canonical.rotate();
+        let msg2 = incoming(std::slice::from_ref(&tx), "9.9.9.9:4160");
+        let out2 = handler.handle(msg2).await;
+        assert_eq!(out2.action, ForwardingPolicy::Ignore);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one rotation must not yet forget the entry (still visible via prev)"
+        );
+
+        // Second rotation: the old `prev` (holding the entry) is
+        // discarded outright.
+        canonical.rotate();
+        let msg3 = incoming(std::slice::from_ref(&tx), "9.9.9.9:4160");
+        let out3 = handler.handle(msg3).await;
+        assert_eq!(out3.action, ForwardingPolicy::Ignore);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "two rotations must forget the entry, admitting an exact resend again"
+        );
+    }
+
+    /// Without a canonical cache attached, behavior is unchanged: repeat
+    /// resends of the same bytes still reach the evaluator every time
+    /// (only the txid-based `SeenTxCache`, keyed on success, applies —
+    /// and it never records a `remember` failure).
+    #[tokio::test]
+    async fn no_canonical_cache_attached_does_not_dedup_on_resend() {
+        let (pool, fail, calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let handler = TxTagHandler::new(pool.clone(), seen);
+
+        fail.store(true, Ordering::SeqCst);
+        let tx = make_payment_txn(4, 1, 1_000_000);
+        let msg1 = incoming(std::slice::from_ref(&tx), "1.1.1.1:4160");
+        handler.handle(msg1).await;
+        let msg2 = incoming(std::slice::from_ref(&tx), "1.1.1.1:4160");
+        handler.handle(msg2).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "without a canonical cache attached, both resends must reach the evaluator"
+        );
     }
 }
