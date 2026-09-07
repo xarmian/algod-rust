@@ -34,6 +34,7 @@ use crate::bytecode;
 use crate::context::AvmContext;
 use crate::group::GroupBudget;
 use crate::machine::{AvmMachine, AvmValue, ExecMode, OpcodeCoverage};
+use crate::opcode::{self, CostKind};
 use crate::tracer::{EvalTracer, ProgramType};
 
 /// SHA-512/256 hash of program bytes, matching go-algorand's
@@ -317,6 +318,61 @@ pub fn run_clear_state_program(
     }
 }
 
+/// First TEAL version where back-branches (e.g. a `bnz`/`b` that jumps
+/// backward) are allowed. Mirrors go-algorand's `backBranchEnabledVersion`
+/// (`data/transactions/logic/opcodes.go:45`), which gates the static-cost
+/// preflight below.
+const BACK_BRANCH_ENABLED_VERSION: u8 = 4;
+
+/// Static-cost preflight check for pre-v4 LogicSig programs, mirroring
+/// go-algorand's `check()`/`checkStep()` (`data/transactions/logic/eval.go`,
+/// `check` at ~line 1548 and `checkStep` at ~line 1845).
+///
+/// Before back-branches were introduced (v0-v3), a TEAL program's control
+/// flow could still jump *forward* (`bnz`/`bz`/`b`), so its true dynamic
+/// execution cost can be lower than the sum of every opcode in the program.
+/// go-algorand nonetheless rejects a pre-v4 program purely on that pessimistic
+/// *static* linear-program-order cost sum -- counting even opcodes a taken
+/// branch would skip at actual runtime -- because a static cost model can't
+/// otherwise guarantee an upper bound once branches exist. From v4
+/// (`backBranchEnabledVersion`) on, only the real dynamic execution cost
+/// (tracked opcode-by-opcode by `AvmMachine::charge_cost` during `run`) is
+/// checked, so this preflight is a no-op for v4+.
+///
+/// `program.instructions` is already a linear, non-branch-following
+/// disassembly (see [`bytecode::parse`]), so this simply walks it in program
+/// order and sums each instruction's declared static cost -- exactly what
+/// go's `checkStep` does one opcode at a time via `deets.Cost(...)`.
+///
+/// Returns an error mirroring go's `"pc=%3d static cost budget of %d
+/// exceeded"` as soon as the running sum exceeds `max_cost`.
+fn static_cost_check(program: &bytecode::Program, max_cost: i64) -> Result<(), AlgoError> {
+    if program.version >= BACK_BRANCH_ENABLED_VERSION {
+        return Ok(());
+    }
+    let mut static_cost: i64 = 0;
+    for instr in &program.instructions {
+        if let Some(spec) = opcode::resolve_spec(instr.opcode, instr.sub_opcode) {
+            // Every opcode available before v4 has a static declared cost --
+            // dynamic-cost opcodes (e.g. `ec_pairing_check`, `sha512`) were
+            // all introduced at v5+ -- so there's nothing to do for the
+            // `CostKind::Dynamic` case here; it simply can't occur.
+            if let CostKind::Static(cost) = spec.cost {
+                static_cost += cost as i64;
+            }
+        }
+        if static_cost > max_cost {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "pc={} static cost budget of {max_cost} exceeded",
+                    instr.offset
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Run a LogicSig program.
 ///
 /// LogicSig programs execute in `ExecMode::LogicSig` mode, which disallows
@@ -354,6 +410,9 @@ pub fn run_logicsig_program(
 
     let parsed = bytecode::parse(program)?;
     let budget_before = budget.remaining();
+    // Pre-v4 static-cost preflight (go's `check()`/`checkStep()`); a no-op
+    // for v4+, which relies solely on the dynamic cost tracked below.
+    static_cost_check(&parsed, budget_before)?;
     let mut machine = AvmMachine::new(parsed, ExecMode::LogicSig, budget_before);
 
     match machine.run(ctx) {
@@ -583,6 +642,13 @@ pub fn run_logicsig_program_with_tracer(
         }
     };
     let budget_before = budget.remaining();
+    // Pre-v4 static-cost preflight (go's `check()`/`checkStep()`); a no-op
+    // for v4+, which relies solely on the dynamic cost tracked below.
+    if let Err(e) = static_cost_check(&parsed, budget_before) {
+        tracer.before_program(ProgramType::LogicSig, program_trace_hash(program));
+        tracer.after_program(ProgramType::LogicSig, false, Some(&e.to_string()));
+        return Err(e);
+    }
     let mut machine = AvmMachine::new(parsed, ExecMode::LogicSig, budget_before);
 
     tracer.before_program(ProgramType::LogicSig, program_trace_hash(program));
@@ -994,5 +1060,114 @@ mod tests {
         let pass = run_logicsig_program(&raw, &mut ctx, &mut budget).unwrap();
         assert!(pass);
         assert_eq!(budget.remaining(), 2 * LOGICSIG_BUDGET - 3);
+    }
+
+    // ── Static-cost preflight (issue #1118), ported from go-algorand's
+    // TestBackwardCompatTEALv1 (`data/transactions/logic/backwardCompat_test.go:253`) ──
+    //
+    // The pinned program below is the exact `programV1` fixture from that
+    // test -- an escrow-style LogicSig exercising a broad slice of v1
+    // opcodes (`ed25519verify`, `intcblock`/`bytecblock`, hashing,
+    // `gtxn`/`global` field reads, `bnz`). The same fixture is used by
+    // `assembler.rs`'s `test_backward_compat_teal_v1_assembly` (issue #1112)
+    // to pin assembler byte-parity; here it pins the *cost* boundary instead.
+    //
+    // NOTE on scope: go's frozen v0/v1 boundary is 2139 (reject) / 2140
+    // (accept) because pre-v2 TEAL charged the hash opcodes
+    // (`sha256`/`keccak256`/`sha512_256`) a *lower* static cost (7/26/9)
+    // than v2+ (35/130/45) -- see `data/transactions/logic/opcodes.go:535-545`.
+    // algod-rust's opcode table (`opcode.rs`) is not yet version-gated for
+    // those pre-v2 costs; it always charges the v2+ numbers. So the v0/v1
+    // boundary (2139/2140) is not reachable with this program until that
+    // separate gap is closed (tracked as a follow-up). The v2/v3 boundary
+    // (2307/2308) and the v4 dynamic-cost boundary (2306/2307, checked via
+    // ordinary `AvmMachine::charge_cost` during real execution, not the
+    // static preflight) already use the v2+ numbers and are pinned below
+    // exactly as go pins them.
+    const PROGRAM_V1_HEX: &str = "01200500010220ffffffffffffffffff012608014120559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd0142201f675bff07515f5df96737194ea945c36c41e7b4fcef307b7cd4d0e602a6911101432034b99f8dde1ba273c0a28cf5b2e4dbe497f8cb2453de0c8ba6d578c9431a62cb0100200000000000000000000000000000000000000000000000000000000000000000280129122a022b1210270403270512102d2e2f041022082209230a230b240c220d230e230f231022112312231314301525121617182319231a221b21041c1d12222312242512102104231210482829122a2b121027042706121048310031071331013102121022310413103105310613103108311613103109310a1210310b310f1310310c310d1210310e31101310311131121310311331141210311531171210483300003300071333000133000212102233000413103300053300061310330008330016131033000933000a121033000b33000f131033000c33000d121033000e3300101310330011330012131033001333001412103300153300171210483200320112320232041310320327071210350034001040000100234912";
+
+    fn program_v1_bytes(version: u8) -> Vec<u8> {
+        let mut program = hex::decode(PROGRAM_V1_HEX).expect("bad pinned program_v1 hex");
+        program[0] = version;
+        program
+    }
+
+    #[test]
+    fn test_static_cost_check_v2_program_frozen_boundary() {
+        // Go: `testLogicBytes(t, opsV2.Program, optSigParams(maxCost(2307),
+        // stxn), "static cost", "")` / `maxCost(2308)` succeeds.
+        let program = program_v1_bytes(2);
+        let parsed = bytecode::parse(&program).unwrap();
+        assert_eq!(parsed.version, 2);
+
+        let err = static_cost_check(&parsed, 2307).unwrap_err();
+        assert!(
+            err.to_string().contains("static cost"),
+            "unexpected error: {err}"
+        );
+        static_cost_check(&parsed, 2308).expect("2308 must clear the static budget");
+    }
+
+    #[test]
+    fn test_static_cost_check_v3_program_matches_v2_boundary() {
+        // Go's comment: "Costs for v2 programs should be higher... Eval
+        // doesn't fail, but it would be ok (better?) if it did" -- v3 has
+        // not yet enabled back-branches either, so it is still checked
+        // statically and shares v2's cost table.
+        let program = program_v1_bytes(3);
+        let parsed = bytecode::parse(&program).unwrap();
+
+        assert!(static_cost_check(&parsed, 2307).is_err());
+        assert!(static_cost_check(&parsed, 2308).is_ok());
+    }
+
+    #[test]
+    fn test_static_cost_check_v4_is_noop_relies_on_dynamic_tracking() {
+        // Go: from `backBranchEnabledVersion` (4) on, `check()` skips the
+        // static-sum rejection entirely -- only real dynamic execution cost
+        // (tracked by `AvmMachine::charge_cost`) is checked. A max_cost of 0
+        // would fail instantly if the static preflight still applied.
+        let program = program_v1_bytes(4);
+        let parsed = bytecode::parse(&program).unwrap();
+        assert_eq!(parsed.version, 4);
+
+        static_cost_check(&parsed, 0).expect("static preflight must be a no-op for v4+");
+    }
+
+    #[test]
+    fn test_run_logicsig_program_rejects_pre_v4_static_overrun_before_execution() {
+        // End-to-end wiring check: `run_logicsig_program` must reject a
+        // pre-v4 program whose static cost sum exceeds the pooled budget
+        // *before* running it, exactly mirroring go's two-phase
+        // `CheckSignature` (static) then `EvalSignature` (dynamic) -- even
+        // though algod-rust merges both phases into one call.
+        let program = program_v1_bytes(2);
+        let mut ctx = NullContext;
+
+        let mut too_small = GroupBudget::with_remaining(2307);
+        let err = run_logicsig_program(&program, &mut ctx, &mut too_small).unwrap_err();
+        assert!(
+            err.to_string().contains("static cost"),
+            "unexpected error: {err}"
+        );
+        // The static preflight rejects before any opcode executes, so the
+        // budget must be untouched (go's `check()` never mutates `cx.cost`
+        // it only compares against a separately-computed `staticCost`).
+        assert_eq!(too_small.remaining(), 2307);
+
+        let mut just_enough = GroupBudget::with_remaining(2308);
+        // This program depends on real ed25519 signature / group-transaction
+        // fields to *approve*; NullContext can't satisfy that, so this run
+        // is expected to error out during dynamic execution (unresolved
+        // txn/global fields) -- what matters here is that it gets *past*
+        // the static preflight (a "static cost" error) rather than being
+        // rejected by it.
+        let result = run_logicsig_program(&program, &mut ctx, &mut just_enough);
+        if let Err(e) = result {
+            assert!(
+                !e.to_string().contains("static cost"),
+                "2308 must clear the static preflight, got: {e}"
+            );
+        }
     }
 }

@@ -67,6 +67,17 @@ impl GroupBudget {
         }
     }
 
+    /// Create a budget with an arbitrary starting `remaining` value.
+    ///
+    /// Test-only: exercises budget-boundary behavior (e.g. the pre-v4
+    /// static-cost preflight in `eval::static_cost_check`) against small,
+    /// pinned budget values that the real `LOGICSIG_BUDGET`/
+    /// `APP_BUDGET_PER_CALL` constants can't reach.
+    #[cfg(test)]
+    pub(crate) fn with_remaining(remaining: i64) -> Self {
+        GroupBudget { remaining }
+    }
+
     /// Consume `cost` units from the budget.
     ///
     /// Returns an error if the budget would go negative.
