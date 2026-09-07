@@ -495,6 +495,77 @@ pub fn compute_resource_capacity(
     }
 }
 
+/// The `Max*` capacity fields of go-algorand's per-transaction
+/// `ResourceTracker` (`ledger/simulation/resources.go`'s
+/// `makeTxnResourceTracker`), computed for one transaction in a group.
+///
+/// Unlike [`ResourceCapacity`], this omits `max_boxes` and
+/// `max_cross_product_references`: go's `groupResourceTracker` tracks boxes
+/// and asset-holding/app-local cross-products purely at the group level
+/// (`hasBox`/`addBox`/`hasHolding`/`addHolding`/`hasLocal`/`addLocal` always
+/// consult `globalResources`, never `localTxnResources`), so no
+/// local-vs-global split is needed for those two categories (issue #1128).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxnResourceCapacity {
+    /// Largest number of additional new accounts this transaction alone
+    /// could accept as a purely local (non-group-shared) resource.
+    pub max_accounts: usize,
+    /// Largest number of additional new assets this transaction alone
+    /// could accept as a purely local resource.
+    pub max_assets: usize,
+    /// Largest number of additional new apps this transaction alone could
+    /// accept as a purely local resource.
+    pub max_apps: usize,
+    /// Largest number of additional new references of any kind this
+    /// transaction alone could accept as a purely local resource.
+    pub max_total_refs: usize,
+}
+
+/// Compute the per-transaction `Max*` capacity fields for every transaction
+/// in a group, mirroring go-algorand's `makeTxnResourceTracker`
+/// (`ledger/simulation/resources.go`, `1088a2aad7e` / `v3.18.0-beta`).
+///
+/// A non-`appl` transaction contributes the zero tracker (matching go's
+/// early return), since only application calls can name/consume unnamed
+/// resources. Used by [`crate::avm_context::UnnamedCapacityTracker::new`] to
+/// size the per-transaction local trackers that back the local-vs-global
+/// unnamed-resource split (issue #1128).
+pub fn compute_txn_resource_capacity(
+    txgroup: &[SignedTransaction],
+    consensus: &ConsensusParams,
+) -> Vec<TxnResourceCapacity> {
+    txgroup
+        .iter()
+        .map(|stxn| {
+            let txn = &stxn.txn;
+            if txn.txn_type != "appl" {
+                return TxnResourceCapacity::default();
+            }
+            let n_accounts = txn.accounts.as_ref().map_or(0, |v| v.len());
+            let n_foreign_apps = txn.foreign_apps.as_ref().map_or(0, |v| v.len());
+            let n_foreign_assets = txn.foreign_assets.as_ref().map_or(0, |v| v.len());
+            let n_boxes = txn.boxes.as_ref().map_or(0, |v| v.len());
+            TxnResourceCapacity {
+                max_accounts: (consensus.max_app_txn_accounts + consensus.max_app_txn_foreign_apps)
+                    .saturating_sub(n_accounts)
+                    .saturating_sub(n_foreign_apps),
+                max_assets: consensus
+                    .max_app_txn_foreign_assets
+                    .saturating_sub(n_foreign_assets),
+                max_apps: consensus
+                    .max_app_txn_foreign_apps
+                    .saturating_sub(n_foreign_apps),
+                max_total_refs: consensus
+                    .max_app_total_txn_references
+                    .saturating_sub(n_accounts)
+                    .saturating_sub(n_foreign_assets)
+                    .saturating_sub(n_foreign_apps)
+                    .saturating_sub(n_boxes),
+            }
+        })
+        .collect()
+}
+
 /// Hard limit on how many bytes a transaction may log during simulation when
 /// `allow_more_logging` is enabled. Mirrors go-algorand's
 /// `simulation.LogBytesLimit`.

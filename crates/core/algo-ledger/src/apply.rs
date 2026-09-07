@@ -4293,6 +4293,10 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                             .map(|p| p.version)
                             .unwrap_or(0),
                     );
+                    // Issue #1128: this is a top-level call (no caller), so
+                    // unnamed-resource group sharing is purely this
+                    // transaction's own program-version eligibility.
+                    avm_ctx.init_top_level_sharing();
                     avm_ctx.fee_sink = ctx.fee_sink;
                     avm_ctx.txn_counter = ctx.txn_counter.get();
                     avm_ctx.fee_credit = ctx.fee_credit.get();
@@ -4458,6 +4462,10 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         .map(|p| p.version)
                         .unwrap_or(0),
                 );
+                // Issue #1128: this is a top-level call (no caller), so
+                // unnamed-resource group sharing is purely this
+                // transaction's own program-version eligibility.
+                avm_ctx.init_top_level_sharing();
                 avm_ctx.fee_sink = ctx.fee_sink;
                 avm_ctx.txn_counter = ctx.txn_counter.get();
                 avm_ctx.fee_credit = ctx.fee_credit.get();
