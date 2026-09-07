@@ -22,6 +22,7 @@ mod catchpoint_download;
 mod client;
 pub mod gossip_block_source;
 pub mod http_block_fetcher;
+pub mod http_over_stream;
 mod parallel_fetch;
 pub mod ranked_catchpoint_source;
 mod traits;
@@ -31,6 +32,10 @@ pub use catchpoint_download::{CatchpointDownloadConfig, CatchpointDownloader, Do
 pub use client::{AlgodClient, ClientConfig};
 pub use gossip_block_source::{decode_block_cert, GossipBlockSource, GossipBlockSourceConfig};
 pub use http_block_fetcher::{HttpBlockFetchError, HttpBlockFetcher, BLOCK_RESPONSE_CONTENT_TYPE};
+pub use http_over_stream::{
+    build_get_request, build_head_request, read_http_response_head, write_request,
+    AsyncDuplexStream, BoxedDuplexStream, HttpPeerTransport, RawHttpResponseHead,
+};
 pub use parallel_fetch::{ParallelBlockFetcher, DEFAULT_CONCURRENCY};
 pub use ranked_catchpoint_source::RankedCatchpointSource;
 pub use traits::BlockSource;

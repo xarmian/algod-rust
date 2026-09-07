@@ -1017,12 +1017,18 @@ pub struct P2pTransport {
     /// [`P2pTransport::open_http_stream`]. Mirrors go's `p2pHTTPRoundTripper`
     /// opening a fresh stream per outbound HTTP request.
     ///
-    /// No production caller exists yet — this transport only *serves*
-    /// `/algorand-http/1.0.0` today (issue #1024's scope); the client side
-    /// (e.g. a future `BlockServiceCustomFallbackEndpoints`-style P2P
-    /// redirect-follow fetcher, noted as unblocked by this issue) is a
-    /// deliberately separate follow-up. Exercised directly by this module's
-    /// own tests in the meantime.
+    /// Used by [`P2pHttpPeerTransport`] (issue #1127) to route
+    /// `algo-rest-client`'s catchpoint HEAD-probe/download requests over
+    /// this transport instead of plain-TCP `reqwest`.
+    ///
+    /// No production call site wires `P2pHttpPeerTransport` into node
+    /// startup yet — threading a running `P2pTransport` into
+    /// `catchpoint_sync.rs`'s `AlgodSyncBackend` (constructed from CLI
+    /// flags today, with no P2P awareness at all) is a separate,
+    /// structurally distinct integration left as a follow-up (see issue
+    /// #1127's PR). Exercised end-to-end by this module's own tests in the
+    /// meantime, exactly as `open_http_stream` already was before this
+    /// issue.
     #[allow(dead_code)]
     http_stream_control: libp2p_stream::Control,
     _task: tokio::task::JoinHandle<()>,
@@ -1591,8 +1597,9 @@ impl P2pTransport {
     /// P2P-transport HTTP-over-libp2p-stream protocol directly: write a raw
     /// HTTP/1.1 request onto the returned stream and read a raw HTTP/1.1
     /// response back, exactly as go's `p2pHTTPRoundTripper`
-    /// (`network/p2p/http.go`) does over its own per-request stream. Used
-    /// today by this module's own tests; a future
+    /// (`network/p2p/http.go`) does over its own per-request stream. Used by
+    /// [`P2pHttpPeerTransport`] (issue #1127, catchpoint HEAD-probe/download
+    /// over P2P) and this module's own tests; a future
     /// `BlockServiceCustomFallbackEndpoints`-style P2P redirect-follow
     /// client (noted as unblocked by issue #955/#1024) would use the same
     /// entry point.
@@ -1845,6 +1852,59 @@ async fn serve_p2p_http_stream(peer_id: PeerId, stream: P2pRawStream, router: Ro
         .await
     {
         tracing::debug!(%peer_id, error = %e, "P2P HTTP stream connection error");
+    }
+}
+
+/// [`algo_rest_client::http_over_stream::HttpPeerTransport`] implementation
+/// wrapping a [`P2pTransport`] (issue #1127) — the client-side counterpart
+/// of [`serve_p2p_http_stream`] above, and the piece that lets
+/// `algo-rest-client`'s `CatchpointDownloader`/`RankedCatchpointSource`
+/// (which cannot depend on `algo-p2p`/`libp2p` — see
+/// `algo_rest_client::http_over_stream`'s module doc comment) route a
+/// catchpoint HEAD probe / full download through this crate's real P2P
+/// transport: `open_stream` opens a fresh `/algorand-http/1.0.0` stream via
+/// [`P2pTransport::open_http_stream`] (mirroring go's
+/// `p2pHTTPRoundTripper` opening one stream per request) and adapts it to
+/// `tokio`'s `AsyncRead`/`AsyncWrite` via `tokio_util::compat`, exactly as
+/// [`serve_p2p_http_stream`] already does for the server side.
+///
+/// No production call site constructs this yet — threading a live
+/// `P2pTransport` into `catchpoint_sync.rs`'s `AlgodSyncBackend` (which is
+/// constructed from CLI flags today, with no P2P awareness at all) is a
+/// separate, structurally distinct integration left as a follow-up (see
+/// issue #1127's PR). Exercised end-to-end by this module's own tests in
+/// the meantime.
+#[allow(dead_code)]
+pub struct P2pHttpPeerTransport {
+    transport: Arc<P2pTransport>,
+}
+
+impl P2pHttpPeerTransport {
+    /// Wrap `transport` for use as an
+    /// [`algo_rest_client::http_over_stream::HttpPeerTransport`].
+    #[allow(dead_code)]
+    pub fn new(transport: Arc<P2pTransport>) -> Self {
+        Self { transport }
+    }
+}
+
+#[async_trait]
+impl algo_rest_client::http_over_stream::HttpPeerTransport for P2pHttpPeerTransport {
+    async fn open_stream(
+        &self,
+        peer: &str,
+    ) -> algo_error::Result<algo_rest_client::http_over_stream::BoxedDuplexStream> {
+        let peer_id: PeerId = peer.parse().map_err(|e| algo_error::AlgoError::Network {
+            message: format!("invalid P2P peer id {peer:?}: {e}"),
+        })?;
+        let stream = self
+            .transport
+            .open_http_stream(peer_id)
+            .await
+            .map_err(|e| algo_error::AlgoError::Network {
+                message: format!("failed to open P2P HTTP stream to {peer}: {e}"),
+            })?;
+        Ok(Box::new(stream.compat()))
     }
 }
 
@@ -2637,6 +2697,105 @@ mod tests {
             response_str.ends_with(std::str::from_utf8(&plain).unwrap()),
             "expected the decompressed catchpoint bytes as the response body, got: {response_str}"
         );
+    }
+
+    /// End-to-end proof for issue #1127, mirroring go-algorand's
+    /// `TestLedgerFetcherP2P` (`catchup/ledgerFetcher_test.go`): a real
+    /// `algo-rest-client` `CatchpointDownloader` built with
+    /// `with_p2p_transport`/[`P2pHttpPeerTransport`] must be able to both
+    /// probe (`headLedger`-equivalent) and fully download
+    /// (`downloadLedger`-equivalent) a catchpoint served over a real libp2p
+    /// `/algorand-http/1.0.0` stream — the same
+    /// `CatchpointService`-over-P2P setup the raw-stream test above proves
+    /// works at the protocol level, exercised here through the actual
+    /// production client code path instead of hand-written HTTP bytes.
+    #[tokio::test]
+    async fn catchpoint_downloader_probes_and_downloads_over_real_p2p_transport() {
+        use algo_network::catchpoint_service::CatchpointService;
+        use std::io::Write as _;
+
+        let (listener, dialer) = connected_pair().await;
+
+        let plain = b"real-p2p-catchpoint-tarball-bytes-0123456789".to_vec();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&plain).expect("gzip write");
+        let gz_bytes = encoder.finish().expect("gzip finish");
+
+        let ledger = Arc::new(FixedRoundCatchpoint {
+            round: 11,
+            gz_bytes: gz_bytes.clone(),
+        });
+        let catchpoint_service = CatchpointService::new(ledger, "test-1127".to_string());
+        GossipNode::register_http_handler(&listener, "/", catchpoint_service.http_router());
+
+        let listener_peer_id = listener.peer_id();
+        let transport: Arc<dyn algo_rest_client::http_over_stream::HttpPeerTransport> =
+            Arc::new(P2pHttpPeerTransport::new(Arc::new(dialer)));
+
+        let downloader = algo_rest_client::CatchpointDownloader::with_p2p_transport(
+            &listener_peer_id.to_string(),
+            transport,
+            algo_rest_client::CatchpointDownloadConfig {
+                max_retries: 5,
+                retry_delay: Duration::from_millis(50),
+                min_bytes_per_second: 0,
+                ..algo_rest_client::CatchpointDownloadConfig::default()
+            },
+        );
+
+        // headLedger-equivalent: probe availability with a plain HEAD first
+        // (retrying briefly — the P2P `/algorand-http/1.0.0` acceptor above
+        // may not be registered on the listener's swarm loop yet the very
+        // instant `connected_pair()` returns).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match downloader.probe_availability("test-1127", 11).await {
+                Ok(()) => break,
+                Err(e) if tokio::time::Instant::now() < deadline => {
+                    tracing::debug!(error = %e, "retrying P2P catchpoint probe");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("probe_availability over real P2P transport failed: {e}"),
+            }
+        }
+
+        // A round with no catchpoint must still classify as NotFound over
+        // the real transport, exactly as the reqwest path does for a 404.
+        let missing = downloader.probe_availability("test-1127", 999).await;
+        assert!(
+            matches!(missing, Err(algo_error::AlgoError::NotFound(_))),
+            "expected NotFound for an unavailable round over P2P, got {missing:?}"
+        );
+
+        // downloadLedger-equivalent: the full transfer must land the exact
+        // decompressed catchpoint bytes on disk.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-p2p-catchpoint-e2e-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint.tar.gz");
+        let result = downloader
+            .download::<fn(algo_rest_client::DownloadProgress)>("test-1127", 11, &dest, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "download over real P2P transport failed: {:?}",
+            result.err()
+        );
+        // `CatchpointDownloader` always sends `Accept-Encoding: gzip` (both
+        // the `reqwest` and P2P paths), so — mirroring go's client, and
+        // `catchpoint_service.rs`'s own `http_returns_raw_gzip_when_accept_encoding_gzip`
+        // test — the server returns the still-compressed tarball bytes
+        // unchanged rather than decompressing server-side; decompression is
+        // the caller's job downstream. The downloaded file must therefore
+        // match the original gzip bytes, not the plaintext.
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            gz_bytes,
+            "downloaded file must match the original gzip-compressed catchpoint bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[tokio::test]
