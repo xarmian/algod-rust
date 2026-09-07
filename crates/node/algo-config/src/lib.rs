@@ -429,20 +429,29 @@ static BLOCK_DB_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || 
 static CRASH_DB_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
 
 /// Go: `LogFileDir string` `version[31]:""` (`localTemplate.go:125`, "If
-/// not specified, the node will use the ColdDataDir"). **Documented
-/// no-op**, same pattern as [`STATEPROOF_DIR`]: algod-rust has no
-/// file-based log-archival subsystem to redirect (logging currently goes
-/// to stdout/tracing subscribers configured at process startup, not a
-/// rotated `node.log` file the way go's `logging.CreateGlobalLogger`
-/// resolves via `ResolveLogPaths`). Round-trips through `config.json` for
-/// forward compatibility; real wiring is deferred to whichever future
-/// issue adds file-based log output.
+/// not specified, the node will use the ColdDataDir"). **Formally
+/// retired as a no-op** (issue #1137, decided after auditing this repo's
+/// own deployment tooling): algod-rust logs exclusively to
+/// stdout/`tracing` subscribers configured at process startup (see
+/// `bin/algod-rust/src/main.rs`), and every piece of operational tooling
+/// in this repo (`docker/docker-compose*.yml`, `ops/mixed-cluster*/`)
+/// already captures node output via `docker logs`/stdout redirection, not
+/// a rotated on-disk `node.log` file the way go's
+/// `logging.CreateGlobalLogger` resolves via `ResolveLogPaths`. Adding a
+/// parallel file-rotation subsystem would duplicate what every
+/// containerized/systemd-supervised deployment of this node already gets
+/// from its log driver, for no operational benefit. The field still
+/// round-trips through `config.json` for forward/backward compatibility
+/// with go-algorand config files, but is deliberately, permanently
+/// ignored — see `docs/PROJECT_SCOPE.md`'s Operational Readiness section
+/// for the recorded decision.
 static LOG_FILE_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
 
 /// Go: `LogArchiveDir string` `version[31]:""` (`localTemplate.go:129`, "If
-/// not specified, the node will use the ColdDataDir"). **Documented
-/// no-op** — see [`LOG_FILE_DIR`]'s doc comment; algod-rust has no
-/// log-archival subsystem to redirect either half of.
+/// not specified, the node will use the ColdDataDir"). **Formally retired
+/// as a no-op** — see [`LOG_FILE_DIR`]'s doc comment (issue #1137);
+/// algod-rust has no log-archival subsystem to redirect either half of,
+/// by deliberate design rather than an open TODO.
 static LOG_ARCHIVE_DIR: VersionedDefault<String> = VersionedDefault::new(&[(31, || String::new())]);
 
 /// Go: `CatchpointInterval uint64` `version[7]:"10000"` (`localTemplate.go:399`).
@@ -1844,15 +1853,15 @@ pub struct Local {
     #[serde(rename = "CrashDBDir", default = "default_crash_db_dir")]
     pub crash_db_dir: String,
 
-    /// Go: `LogFileDir`. **Documented no-op** — see this field's
-    /// `VersionedDefault` doc comment. Round-trips through `config.json`
-    /// for forward compatibility.
+    /// Go: `LogFileDir`. **Formally retired as a no-op** (issue #1137) —
+    /// see this field's `VersionedDefault` doc comment. Round-trips
+    /// through `config.json` for forward compatibility.
     #[serde(rename = "LogFileDir", default = "default_log_file_dir")]
     pub log_file_dir: String,
 
-    /// Go: `LogArchiveDir`. **Documented no-op** — see this field's
-    /// `VersionedDefault` doc comment. Round-trips through `config.json`
-    /// for forward compatibility.
+    /// Go: `LogArchiveDir`. **Formally retired as a no-op** (issue #1137)
+    /// — see this field's `VersionedDefault` doc comment. Round-trips
+    /// through `config.json` for forward compatibility.
     #[serde(rename = "LogArchiveDir", default = "default_log_archive_dir")]
     pub log_archive_dir: String,
 
@@ -4310,6 +4319,25 @@ mod tests {
         .expect("parses");
         assert_eq!(cfg.catchpoint_dir, "/data/catchpoints");
         assert_eq!(cfg.stateproof_dir, "/data/stateproof");
+    }
+
+    /// Issue #1137: `LogFileDir`/`LogArchiveDir` were formally retired as
+    /// permanent no-ops rather than wired up to real file-based log
+    /// output (algod-rust logs to stdout/tracing subscribers only, and
+    /// every deployment tool this repo ships — `docker/docker-compose*.yml`,
+    /// `ops/mixed-cluster*/` — already captures node output via
+    /// `docker logs`/stdout redirection, not an on-disk `node.log`).
+    /// Pin that the fields still round-trip through `config.json` for
+    /// forward/backward compatibility with go-algorand config files, even
+    /// though setting them has no observable effect on algod-rust.
+    #[test]
+    fn log_file_dir_and_log_archive_dir_round_trip_through_json_as_documented_no_op() {
+        let cfg = Local::load_from_str(
+            r#"{"LogFileDir": "/data/logs", "LogArchiveDir": "/data/logs/archive"}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.log_file_dir, "/data/logs");
+        assert_eq!(cfg.log_archive_dir, "/data/logs/archive");
     }
 
     /// TDD anchor for issue #953: the hot/cold/per-resource data-dir

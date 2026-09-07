@@ -88,6 +88,25 @@ The node supports:
 - snapshots
 - protocol upgrades
 
+**Logging model (decided in issue #1137):** algod-rust logs exclusively to
+stdout via `tracing`/`tracing-subscriber` (configured once at process
+startup in `bin/algod-rust/src/main.rs`, controlled by `RUST_LOG`) — it
+does not implement go-algorand's file-based log-archival subsystem
+(`logging.CreateGlobalLogger`/`ResolveLogPaths`, which writes a rotated
+on-disk `node.log`). This is a deliberate, permanent design decision, not
+an open gap: every deployment mechanism this repo ships for algod-rust
+(`docker/docker-compose*.yml`, `ops/mixed-cluster*/`) already captures a
+running node's full output via `docker logs`/stdout redirection rather
+than reading an on-disk log file, matching the standard
+containerized/systemd-supervised operational model (stdout logs collected
+by the container runtime or init system, not rotated in-process). Adding
+file-based log rotation would duplicate that existing log-capture path
+for no operational benefit. Consequently, `config.json`'s `LogFileDir`/
+`LogArchiveDir` fields are accepted and round-tripped (for compatibility
+with go-algorand config files) but permanently ignored — see
+`algo_config::Local::log_file_dir`/`log_archive_dir` in
+`crates/node/algo-config/src/lib.rs` for the field-level disposition.
+
 ## Security and Reliability
 
 The Rust node must:
