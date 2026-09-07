@@ -59,6 +59,23 @@ pub fn hash_program(logic: &[u8]) -> Address {
 /// Used when verifying LMsig delegation: `"MsigProgram" || addr || program`.
 const MSIG_PROGRAM_PREFIX: &[u8] = b"MsigProgram";
 
+/// Maximum number of arguments to a LogicSig, enforced at TEAL-eval entry.
+///
+/// Matches go-algorand's `transactions.EvalMaxArgs`
+/// (`data/transactions/logicsig.go`), checked in `EvalSignatureFull`
+/// (`data/transactions/logic/eval.go`) -- see `TestTooManyArgs`
+/// (`data/transactions/logic/eval_test.go`).
+const EVAL_MAX_ARGS: usize = 255;
+
+/// Maximum size of a single LogicSig argument, enforced at TEAL-eval entry.
+///
+/// Matches go-algorand's `transactions.MaxLogicSigArgSize` (`data/
+/// transactions/logicsig.go`), which is `config.MaxAVMBytesSize` -- the
+/// same 4096-byte ceiling as [`algo_avm::opcode::MAX_STRING_SIZE`]. Checked
+/// in `EvalSignatureFull` -- see `TestArgTooLarge`
+/// (`data/transactions/logic/eval_test.go`).
+const MAX_LOGIC_SIG_ARG_SIZE: usize = algo_avm::opcode::MAX_STRING_SIZE;
+
 /// Domain separation prefix for one-time signature batch subkey (level 1).
 /// Used to sign `OneTimeSignatureSubkeyBatchID` under the master vote key.
 const OT1_PREFIX: &[u8] = b"OT1";
@@ -692,6 +709,32 @@ pub fn verify_logicsig_with_tracer(
         .as_ref()
         .map(|a| a.iter().map(|b| b.to_vec()).collect())
         .unwrap_or_default();
+
+    // Eval-time argument limits (Go: `EvalSignatureFull`,
+    // `data/transactions/logic/eval.go`): checked at the same point go does
+    // -- right before the TEAL program runs, independent of the earlier
+    // structural/size sanity checks above, which bound the whole LogicSig
+    // (program + args combined) rather than the argument count/per-arg size.
+    if lsig.args.is_some() {
+        if args.len() > EVAL_MAX_ARGS {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "LogicSig has too many arguments: {} > {EVAL_MAX_ARGS}",
+                    args.len()
+                ),
+            });
+        }
+        for arg in &args {
+            if arg.len() > MAX_LOGIC_SIG_ARG_SIZE {
+                return Err(AlgoError::Validation {
+                    message: format!(
+                        "LogicSig argument too large: {} > {MAX_LOGIC_SIG_ARG_SIZE}",
+                        arg.len()
+                    ),
+                });
+            }
+        }
+    }
 
     let mut ctx = LogicSigAvmContext::new(group, group_index, &lsig.logic, args, consensus.clone());
 
@@ -3302,6 +3345,100 @@ mod tests {
         assert!(
             err.to_string().contains("no signature"),
             "expected a no-signature error, got: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #1109: LogicSig eval-time arg-count/arg-size limits, ported
+    // from go's `TestTooManyArgs`/`TestArgTooLarge`
+    // (`data/transactions/logic/eval_test.go`). Both use a trivial
+    // always-accepting contract-account LogicSig ("int 1") so that, absent
+    // the fix, the program would otherwise pass -- isolating the two new
+    // checks from everything else `verify_logicsig` does.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn verify_logicsig_too_many_args_rejected() {
+        let program = int1_program();
+        let addr = hash_program(&program);
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            // go: `transactions.EvalMaxArgs + 1` empty args.
+            args: Some(vec![ByteBuf::from(Vec::new()); EVAL_MAX_ARGS + 1]),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(addr),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+
+        let consensus = ConsensusParams::default();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus)
+            .expect_err("a LogicSig with more than EvalMaxArgs arguments must be rejected");
+        assert!(
+            err.to_string().contains("too many arguments"),
+            "expected a too-many-arguments error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_logicsig_arg_too_large_rejected() {
+        let program = int1_program();
+        let addr = hash_program(&program);
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            // go: a single arg of `transactions.MaxLogicSigArgSize + 1` bytes.
+            args: Some(vec![ByteBuf::from(vec![0u8; MAX_LOGIC_SIG_ARG_SIZE + 1])]),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(addr),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+
+        let consensus = ConsensusParams::default();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus)
+            .expect_err("a LogicSig argument exceeding MaxLogicSigArgSize must be rejected");
+        assert!(
+            err.to_string().contains("argument too large"),
+            "expected an argument-too-large error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_logicsig_args_at_limits_accepted() {
+        // Exactly at both limits (EvalMaxArgs count, MaxLogicSigArgSize each)
+        // must still pass -- the checks are strictly-greater-than, matching
+        // go's `len(...) > transactions.EvalMaxArgs` / `len(arg) >
+        // transactions.MaxLogicSigArgSize`.
+        let program = int1_program();
+        let addr = hash_program(&program);
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            args: Some(vec![
+                ByteBuf::from(vec![0u8; MAX_LOGIC_SIG_ARG_SIZE]);
+                EVAL_MAX_ARGS
+            ]),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(addr),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+
+        let consensus = ConsensusParams::default();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        assert!(
+            verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus).is_ok(),
+            "args exactly at both limits must be accepted"
         );
     }
 
