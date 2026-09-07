@@ -250,6 +250,11 @@ pub struct WebsocketNetworkConfig {
     /// from the per-IP connection-rate limiter (default: `true`, matching
     /// go's `DisableLocalhostConnectionRateLimit`).
     pub disable_localhost_connection_rate_limit: bool,
+
+    /// Whether the relay router logs every incoming HTTP request (default:
+    /// `false`, matching go's `EnableRequestLogger`). See
+    /// [`crate::request_logger`] for what gets logged and why.
+    pub enable_request_logger: bool,
 }
 
 /// Default block-service memory cap: 500,000,000 bytes.
@@ -291,6 +296,7 @@ impl Default for WebsocketNetworkConfig {
             outgoing_message_filter_bucket_count: 3,
             outgoing_message_filter_bucket_size: 128,
             disable_localhost_connection_rate_limit: true,
+            enable_request_logger: false,
         }
     }
 }
@@ -942,6 +948,17 @@ impl WebsocketNetwork {
         };
         for (path, handler) in handlers {
             app = app.nest(&path, handler);
+        }
+
+        // Issue #1088 / go's `EnableRequestLogger`: log every incoming HTTP
+        // request (method, URI, status, client, instance name, user agent)
+        // when explicitly enabled. Applied last so it wraps the whole
+        // router, matching go's placement ("place it at the bottom of the
+        // http processing" — `network/requestLogger.go`'s doc comment).
+        if self.config.enable_request_logger {
+            app = app.layer(axum::middleware::from_fn(
+                crate::request_logger::request_logger_middleware,
+            ));
         }
 
         app

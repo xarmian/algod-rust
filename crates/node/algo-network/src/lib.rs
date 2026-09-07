@@ -26,6 +26,7 @@ pub mod bloom;
 pub mod broadcast;
 pub mod catchpoint_service;
 pub mod compression;
+pub mod conn_perf_monitor;
 pub mod connect;
 pub mod errors;
 pub mod fd_limits;
@@ -35,6 +36,7 @@ pub mod handler;
 pub mod handshake;
 pub mod health_service;
 pub mod identity;
+pub mod limitcaller;
 pub mod listener;
 pub mod message;
 pub mod msg_of_interest;
@@ -42,6 +44,7 @@ pub mod net_prio;
 pub mod peer_features;
 pub mod peer_ranker;
 pub mod reconnect;
+pub mod request_logger;
 pub mod tag;
 pub mod topics;
 pub mod ws_peer;
@@ -102,6 +105,14 @@ pub use compression::{
 
 // Framing
 pub use framing::{decode_frame, encode_frame, NetworkError};
+
+// Connection performance monitor (issue #1088)
+pub use conn_perf_monitor::{
+    ConnectionPerformanceMonitor, NetworkAdvanceMonitor, PmPeerStatistics, PmStage, PmStatistics,
+};
+
+// Outbound connection-rate-limiting wrapper (issue #1088)
+pub use limitcaller::{rate_limited_call, RateLimitError, DEFAULT_QUEUEING_TIMEOUT};
 
 // Forwarding policy
 pub use forwarding_policy::ForwardingPolicy;
@@ -233,6 +244,14 @@ pub use health_service::{health_check, health_router, HealthResponse, HEALTH_SER
 
 // Semaphore-based TCP connection limiter
 pub use listener::{ConnectionGuard, RejectingLimitListener, RESERVED_HEALTH_SERVICE_CONNECTIONS};
+
+// ---------------------------------------------------------------------------
+// Re-exports: HTTP request-logging middleware (issue #1088)
+// ---------------------------------------------------------------------------
+
+pub use request_logger::{
+    build_request_details, request_logger_middleware, HttpRequestDetails, RawRequestDetails,
+};
 
 // ---------------------------------------------------------------------------
 // Re-exports: WebsocketNetwork coordinator (Epic 33b)
