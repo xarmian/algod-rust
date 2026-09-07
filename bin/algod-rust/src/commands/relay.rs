@@ -642,6 +642,9 @@ pub async fn run(
             as usize,
         disable_localhost_connection_rate_limit: node_config
             .disable_localhost_connection_rate_limit,
+        // Issue #1088: wires go's `EnableRequestLogger` through to the
+        // relay's HTTP request-logging middleware (`request_logger.rs`).
+        enable_request_logger: node_config.enable_request_logger,
         ..Default::default()
     };
 

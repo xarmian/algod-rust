@@ -42,6 +42,7 @@
 //! `dnsaddr/resolve.go`, `peerstore/peerstore.go`, `pubsub.go`,
 //! `capabilities.go`).
 
+pub mod addr;
 pub mod capabilities;
 pub mod conn_limits;
 pub mod dht;
@@ -57,6 +58,7 @@ pub mod pubsub;
 pub mod streams;
 pub mod wsproto;
 
+pub use addr::{is_multiaddr, parse_host_or_url, parse_host_or_url_or_multiaddr, AddrParseError};
 pub use capabilities::Capability;
 pub use conn_limits::{
     address_filter, derive_conn_limits, is_ip_unspecified, needs_address_filter,
