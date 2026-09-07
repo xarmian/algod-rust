@@ -4675,6 +4675,13 @@ pub async fn run(
         (NetworkMode::Hybrid, Some(p2p)) => Arc::new(dual_gossip_node::DualGossipNode::new(
             gossip_node.clone() as Arc<dyn GossipNode>,
             p2p.clone() as Arc<dyn GossipNode>,
+            // Issue #1133: reuse the P2P transport's own identity key as
+            // the signer for the WS leg's netidentity challenges, so a
+            // peer connecting over both transports presents the same
+            // verified key on each and can be recognized as a duplicate
+            // — mirroring go's `NewHybridP2PNetwork` signing its WS
+            // network's identity scheme with `p2pnet.PeerIDSigner()`.
+            p2p.identity_signing_key(),
         )),
         _ => gossip_node.clone() as Arc<dyn GossipNode>,
     };

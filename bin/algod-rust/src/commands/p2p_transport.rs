@@ -966,6 +966,9 @@ fn split_peer_id(addr: &Multiaddr) -> (Multiaddr, Option<PeerId>) {
 /// mode, where both transports must carry the same traffic.
 pub struct P2pTransport {
     peer_id: PeerId,
+    /// The Ed25519 signing key underlying `peer_id` — see
+    /// [`P2pTransport::identity_signing_key`]'s doc comment (issue #1133).
+    identity_signing_key: ed25519_dalek::SigningKey,
     /// Reused as this transport's `GossipNode::get_genesis_id()` — P2P
     /// gossipsub topics are keyed by protocol tag, not genesis ID, so no
     /// consumer of this transport as a `GossipNode` actually depends on
@@ -1061,6 +1064,9 @@ impl P2pTransport {
         let mut host = P2pHost::new(&identity_cfg, &cfg.network_id, &host_cfg)
             .map_err(|e| anyhow::anyhow!("failed to build P2P host: {e}"))?;
         let peer_id = host.peer_id();
+        // Same key `peer_id` is derived from — see
+        // `P2pTransport::identity_signing_key`'s doc comment (issue #1133).
+        let identity_signing_key = host.identity_signing_key().clone();
 
         if let Some(addr) = &cfg.listen_multiaddr {
             host.listen(addr.clone())
@@ -1503,6 +1509,7 @@ impl P2pTransport {
 
         Ok(Self {
             peer_id,
+            identity_signing_key,
             network_id: cfg.network_id,
             listen_addrs,
             connected_peers,
@@ -1519,6 +1526,20 @@ impl P2pTransport {
     /// This transport's libp2p `PeerId`.
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// This transport's Ed25519 identity-signing key — the same key
+    /// [`P2pTransport::peer_id`] is derived from
+    /// (`algo_p2p::to_identity_signing_key`). Exposed so `Hybrid`-mode
+    /// startup (`participate.rs`) can hand it to
+    /// [`crate::commands::dual_gossip_node::DualGossipNode`], which drives
+    /// `algo_network::identity`'s netidentity challenge/response/
+    /// verification scheme with it on the WS leg — mirroring go's
+    /// `NewHybridP2PNetwork`, which signs its WS network's identity
+    /// challenges with `p2pnet.PeerIDSigner()` (`network/hybridNetwork.go:73`,
+    /// issue #1133).
+    pub fn identity_signing_key(&self) -> ed25519_dalek::SigningKey {
+        self.identity_signing_key.clone()
     }
 
     /// Addresses this host has confirmed it is listening on (populated as
