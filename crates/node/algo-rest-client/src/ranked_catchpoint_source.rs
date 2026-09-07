@@ -63,22 +63,34 @@ use algo_network::peer_ranker::{
     PeersRetriever, PEER_RANK_DOWNLOAD_FAILED, PEER_RANK_NO_CATCHPOINT_FOR_ROUND,
 };
 
+use crate::http_over_stream::HttpPeerTransport;
 use crate::{CatchpointDownloadConfig, CatchpointDownloader, DownloadProgress};
 
-/// Presents a fixed list of candidate base URLs to the peer ranker, all
-/// under the `PhonebookRelays` class — [`make_catchpoint_peer_selector`]'s
+/// Presents the live list of candidate peer identities (HTTP base URLs
+/// and/or, since issue #1127, P2P peer IDs added via
+/// [`RankedCatchpointSource::push_p2p_peer`]) to the peer ranker, all under
+/// the `PhonebookRelays` class — [`make_catchpoint_peer_selector`]'s
 /// preferred (tolerance-3) class, matching go's real catchpoint peer
 /// selector topology. algod-rust has no relay/archival distinction for
 /// catchpoint candidate peers at this layer, so the fallback
 /// `PhonebookArchivalNodes` class (tolerance 10) always reports empty.
+///
+/// A live `Mutex<Vec<String>>` (rather than the fixed `Vec` this held
+/// before #1127) so [`RankedCatchpointSource::push_p2p_peer`] can extend the
+/// candidate pool after construction — mirroring
+/// `crate::gossip_block_source::GossipPeersRetriever`'s identical live-list
+/// pattern for block-fetch peers.
 struct StaticUrlRetriever {
-    urls: Vec<String>,
+    urls: StdMutex<Vec<String>>,
 }
 
 impl PeersRetriever for StaticUrlRetriever {
     fn get_peers(&self, class: PeerClassKind) -> Vec<String> {
         if class == PeerClassKind::PhonebookRelays {
-            self.urls.clone()
+            self.urls
+                .lock()
+                .expect("peer url list lock poisoned")
+                .clone()
         } else {
             Vec::new()
         }
@@ -89,7 +101,9 @@ impl PeersRetriever for StaticUrlRetriever {
 /// historical download performance, so a peer that fails or is slow is
 /// deprioritized in favor of a better-ranked one on the next attempt.
 pub struct RankedCatchpointSource {
-    downloaders: HashMap<String, CatchpointDownloader>,
+    downloaders: StdMutex<HashMap<String, Arc<CatchpointDownloader>>>,
+    retriever: Arc<StaticUrlRetriever>,
+    config: CatchpointDownloadConfig,
     selector: StdMutex<ClassBasedPeerSelector>,
 }
 
@@ -104,20 +118,62 @@ impl RankedCatchpointSource {
         for (url, token) in peers {
             downloaders.insert(
                 url.clone(),
-                CatchpointDownloader::with_config(url, token, config.clone()),
+                Arc::new(CatchpointDownloader::with_config(
+                    url,
+                    token,
+                    config.clone(),
+                )),
             );
             urls.push(url.clone());
         }
-        let retriever: Arc<dyn PeersRetriever> = Arc::new(StaticUrlRetriever { urls });
+        let retriever = Arc::new(StaticUrlRetriever {
+            urls: StdMutex::new(urls),
+        });
         Self {
-            downloaders,
-            selector: StdMutex::new(make_catchpoint_peer_selector(retriever)),
+            downloaders: StdMutex::new(downloaders),
+            selector: StdMutex::new(make_catchpoint_peer_selector(
+                Arc::clone(&retriever) as Arc<dyn PeersRetriever>
+            )),
+            retriever,
+            config,
         }
+    }
+
+    /// Add a P2P-backed candidate catchpoint peer (issue #1127): its
+    /// [`CatchpointDownloader`] routes HTTP requests over `transport`
+    /// (e.g. `bin/algod-rust`'s `P2pTransport::open_http_stream`) instead of
+    /// plain-TCP `reqwest`, keyed by `peer_id` (the transport's own peer
+    /// identity, e.g. a libp2p `PeerId`'s string form) rather than a URL.
+    ///
+    /// The new peer joins the same `PhonebookRelays`-class candidate pool
+    /// [`Self::new`]'s HTTP peers already occupy and is ranked by the same
+    /// [`ClassBasedPeerSelector`] machinery — a P2P-sourced peer that fails
+    /// or is slow is deprioritized exactly the way an HTTP-sourced one
+    /// already is (this method's whole point: extending, not duplicating,
+    /// #901's existing ranking wiring).
+    pub fn push_p2p_peer(&self, peer_id: String, transport: Arc<dyn HttpPeerTransport>) {
+        let downloader = Arc::new(CatchpointDownloader::with_p2p_transport(
+            &peer_id,
+            transport,
+            self.config.clone(),
+        ));
+        self.downloaders
+            .lock()
+            .expect("downloaders map lock poisoned")
+            .insert(peer_id.clone(), downloader);
+        self.retriever
+            .urls
+            .lock()
+            .expect("peer url list lock poisoned")
+            .push(peer_id);
     }
 
     /// Number of candidate peers configured.
     pub fn peer_count(&self) -> usize {
-        self.downloaders.len()
+        self.downloaders
+            .lock()
+            .expect("downloaders map lock poisoned")
+            .len()
     }
 
     /// Upper bound on pre-flight probe attempts in [`Self::check_ledger_download`]
@@ -178,7 +234,14 @@ impl RankedCatchpointSource {
                 Ok(p) => p,
                 Err(_) => break,
             };
-            let downloader = match self.downloaders.get(&psp.peer_id) {
+            let downloader = {
+                let guard = self
+                    .downloaders
+                    .lock()
+                    .expect("downloaders map lock poisoned");
+                guard.get(&psp.peer_id).cloned()
+            };
+            let downloader = match downloader {
                 Some(d) => d,
                 None => continue,
             };
@@ -234,7 +297,12 @@ impl RankedCatchpointSource {
         dest_path: &Path,
         progress_cb: Option<&(dyn Fn(DownloadProgress) + Send + Sync)>,
     ) -> Result<()> {
-        if self.downloaders.is_empty() {
+        if self
+            .downloaders
+            .lock()
+            .expect("downloaders map lock poisoned")
+            .is_empty()
+        {
             return Err(AlgoError::Network {
                 message: "no catchpoint peers available for ranked download".into(),
             });
@@ -254,6 +322,8 @@ impl RankedCatchpointSource {
         const RETRY_ATTEMPTS_PER_PEER: usize = 5;
         let attempts = self
             .downloaders
+            .lock()
+            .expect("downloaders map lock poisoned")
             .len()
             .saturating_mul(RETRY_ATTEMPTS_PER_PEER);
         let mut last_err = None;
@@ -270,7 +340,14 @@ impl RankedCatchpointSource {
                 Ok(p) => p,
                 Err(_) => break,
             };
-            let downloader = match self.downloaders.get(&psp.peer_id) {
+            let downloader = {
+                let guard = self
+                    .downloaders
+                    .lock()
+                    .expect("downloaders map lock poisoned");
+                guard.get(&psp.peer_id).cloned()
+            };
+            let downloader = match downloader {
                 Some(d) => d,
                 None => continue,
             };
@@ -659,5 +736,152 @@ mod tests {
             "download() must propagate a check_ledger_download failure rather than falling \
              through to a real transfer attempt"
         );
+    }
+
+    // -- push_p2p_peer (issue #1127) --
+
+    /// A minimal [`crate::http_over_stream::HttpPeerTransport`] mock, mirroring
+    /// `catchpoint_download.rs`'s own `MockP2pTransport` test double — kept
+    /// as a separate, smaller copy here rather than shared `pub(crate)` test
+    /// scaffolding, since each module's mock only needs to prove its own
+    /// module's wiring (this one only ever needs a single canned response
+    /// per source).
+    struct MockP2pTransport {
+        respond_with: Vec<u8>,
+        streams_opened: AtomicUsize,
+    }
+
+    impl MockP2pTransport {
+        fn new(respond_with: Vec<u8>) -> Self {
+            Self {
+                respond_with,
+                streams_opened: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::http_over_stream::HttpPeerTransport for MockP2pTransport {
+        async fn open_stream(
+            &self,
+            _peer: &str,
+        ) -> algo_error::Result<crate::http_over_stream::BoxedDuplexStream> {
+            self.streams_opened.fetch_add(1, Ordering::SeqCst);
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let response = self.respond_with.clone();
+            tokio::spawn(async move {
+                let mut sink = [0u8; 4096];
+                let _ = server.read(&mut sink).await;
+                let _ = server.write_all(&response).await;
+                let _ = server.flush().await;
+                let _ = server.shutdown().await;
+            });
+            Ok(Box::new(client))
+        }
+    }
+
+    fn ok_get_response(body: &[u8]) -> Vec<u8> {
+        let mut resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/x-algorand-ledger-v2.1\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(body);
+        resp
+    }
+
+    fn not_found_response() -> Vec<u8> {
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()
+    }
+
+    /// TDD regression for issue #1127's second acceptance criterion:
+    /// `RankedCatchpointSource`'s peer ranking must observe a P2P-sourced
+    /// peer added via `push_p2p_peer` the same way it already does for
+    /// HTTP-sourced peers (constructed via `new`) — a P2P peer that always
+    /// fails must be deprioritized in favor of a reliable HTTP peer already
+    /// in the pool, using the exact same `ClassBasedPeerSelector` machinery
+    /// (not a separate, P2P-specific ranking path).
+    ///
+    /// Mirrors go-algorand's `TestLedgerFetcherP2P` shape at the
+    /// `RankedCatchpointSource` level: a mixed pool of HTTP and P2P-derived
+    /// peers must both be usable as catchpoint download candidates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_p2p_peer_joins_the_same_ranked_pool_as_http_peers() {
+        const BODY: &[u8] = b"catchpoint-file-bytes-0123456789";
+        let (good_url, good_requests) = spawn_always_succeeding_server(BODY).await;
+
+        let src = RankedCatchpointSource::new(&[(good_url, String::new())], fast_retry_config());
+        assert_eq!(src.peer_count(), 1);
+
+        let bad_p2p = Arc::new(MockP2pTransport::new(not_found_response()));
+        src.push_p2p_peer(
+            "12D3KooWbadp2ppeer".to_string(),
+            bad_p2p.clone() as Arc<dyn crate::http_over_stream::HttpPeerTransport>,
+        );
+        assert_eq!(
+            src.peer_count(),
+            2,
+            "push_p2p_peer must add to the same candidate pool new() populated"
+        );
+
+        const ROUNDS: u64 = 8;
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-ranked-catchpoint-p2p-mixed-{}",
+            std::process::id()
+        ));
+        for round in 1..=ROUNDS {
+            let dest = tmp_dir.join(format!("catchpoint-{round}.tar.gz"));
+            let result = src.download("test-v1.0", round, &dest, None).await;
+            assert!(
+                result.is_ok(),
+                "round {round} should have succeeded via the reliable HTTP peer even with a \
+                 failing P2P peer in the same pool, got {:?}",
+                result.err()
+            );
+        }
+
+        assert!(
+            bad_p2p.streams_opened.load(Ordering::SeqCst) <= 2,
+            "the always-404 P2P peer should be deprioritized after failing, but had {} \
+             streams opened",
+            bad_p2p.streams_opened.load(Ordering::SeqCst)
+        );
+        assert!(
+            good_requests.load(Ordering::SeqCst) >= ROUNDS as usize - 2,
+            "the reliable HTTP peer should serve almost every round, got {} of {ROUNDS}",
+            good_requests.load(Ordering::SeqCst)
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// The mirror image of the test above: a P2P peer that actually has the
+    /// catchpoint must be usable as the sole successful source, proving
+    /// `push_p2p_peer`'s downloader really does route through the abstract
+    /// transport end-to-end (probe + full download), not just get counted
+    /// in `peer_count()`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_p2p_peer_alone_can_serve_a_full_download() {
+        const BODY: &[u8] = b"p2p-only-catchpoint-file-bytes";
+        let src = RankedCatchpointSource::new(&[], fast_retry_config());
+
+        let good_p2p = Arc::new(MockP2pTransport::new(ok_get_response(BODY)));
+        src.push_p2p_peer(
+            "12D3KooWgoodp2ppeer".to_string(),
+            good_p2p as Arc<dyn crate::http_over_stream::HttpPeerTransport>,
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-ranked-catchpoint-p2p-only-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint.tar.gz");
+
+        let result = src.download("test-v1.0", 1, &dest, None).await;
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

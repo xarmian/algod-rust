@@ -19,10 +19,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use algo_error::{AlgoError, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
+
+use crate::http_over_stream::{
+    build_get_request, build_head_request, read_http_response_head, write_request,
+    BoxedDuplexStream, HttpPeerTransport,
+};
 
 /// Default chunk size for streaming reads (64 KiB).
 const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
@@ -114,11 +121,27 @@ impl CatchpointDownloadConfig {
 /// `GET /v1/{genesisID}/ledger/{round}` where `round` is **base-36 encoded**.
 ///
 /// See `go-algorand/rpcs/ledgerService.go` for the server implementation.
+///
+/// ## Transport
+///
+/// By default (`new`/`with_config`) this issues plain-TCP HTTP requests via
+/// `reqwest` against `base_url`. [`Self::with_p2p_transport`] instead routes
+/// the *same* HTTP-shaped requests (`HEAD`/`GET .../ledger/{round}`) over an
+/// [`HttpPeerTransport`] (issue #1127) — algod-rust's counterpart to
+/// go-algorand's `TestLedgerFetcherP2P`, which proves `headLedger`/
+/// `downloadLedger` work unchanged against a P2P-derived `network.HTTPPeer`.
+/// See `crate::http_over_stream`'s module doc comment for why this is a
+/// pluggable trait rather than a direct `algo-p2p` dependency.
 pub struct CatchpointDownloader {
     base_url: String,
     token: String,
     http: reqwest::Client,
     config: CatchpointDownloadConfig,
+    /// When set, HTTP requests are carried over this transport instead of
+    /// plain-TCP `reqwest`, addressed by `base_url` as the transport's own
+    /// peer identity (e.g. a libp2p `PeerId`'s string form) rather than a
+    /// URL.
+    p2p_transport: Option<Arc<dyn HttpPeerTransport>>,
 }
 
 impl CatchpointDownloader {
@@ -139,6 +162,32 @@ impl CatchpointDownloader {
             token: token.to_string(),
             http,
             config,
+            p2p_transport: None,
+        }
+    }
+
+    /// Create a downloader that routes its HTTP requests over `transport`
+    /// (e.g. `bin/algod-rust`'s `P2pTransport::open_http_stream`, wrapped in
+    /// an [`HttpPeerTransport`] impl) instead of plain-TCP `reqwest`.
+    ///
+    /// `peer_id` is the transport's own peer identity (not a URL) — for the
+    /// P2P implementation, a libp2p `PeerId`'s string form.
+    pub fn with_p2p_transport(
+        peer_id: &str,
+        transport: Arc<dyn HttpPeerTransport>,
+        config: CatchpointDownloadConfig,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .expect("failed to build HTTP client for catchpoint downloads");
+
+        Self {
+            base_url: peer_id.to_string(),
+            token: String::new(),
+            http,
+            config,
+            p2p_transport: Some(transport),
         }
     }
 
@@ -186,6 +235,12 @@ impl CatchpointDownloader {
         let path = format!("/v1/{genesis_id}/ledger/{round_b36}");
 
         debug!(round, %round_b36, genesis_id, "starting catchpoint download");
+
+        if let Some(transport) = self.p2p_transport.clone() {
+            return self
+                .p2p_download(transport.as_ref(), &path, round, dest_path, progress_cb)
+                .await;
+        }
 
         // Ensure the parent directory exists (once, not per attempt).
         if let Some(parent) = dest_path.parent() {
@@ -412,6 +467,11 @@ impl CatchpointDownloader {
     pub async fn probe_availability(&self, genesis_id: &str, round: u64) -> Result<()> {
         let round_b36 = radix_fmt(round, 36);
         let path = format!("/v1/{genesis_id}/ledger/{round_b36}");
+
+        if let Some(transport) = &self.p2p_transport {
+            return self.p2p_probe_availability(transport.as_ref(), &path).await;
+        }
+
         let url = format!("{}{}", self.base_url, path);
 
         let mut request = self.http.head(&url);
@@ -435,6 +495,296 @@ impl CatchpointDownloader {
             source: Box::new(std::io::Error::other(format!("HTTP {status}"))),
             context: format!("catchpoint HEAD {path}"),
         })
+    }
+
+    /// [`Self::probe_availability`]'s P2P-transport path: builds and sends a
+    /// raw `HEAD` request over `transport` and classifies the response the
+    /// same way the `reqwest` path above does.
+    async fn p2p_probe_availability(
+        &self,
+        transport: &dyn HttpPeerTransport,
+        path: &str,
+    ) -> Result<()> {
+        let request = build_head_request(path, &self.base_url);
+        let mut stream = transport
+            .open_stream(&self.base_url)
+            .await
+            .map_err(|e| p2p_open_error(&self.base_url, e))?;
+        write_request(&mut stream, &request).await?;
+        let head = read_http_response_head(&mut stream).await?;
+
+        if (200..300).contains(&head.status) {
+            return Ok(());
+        }
+        if head.status == 404 {
+            return Err(AlgoError::NotFound(format!(
+                "catchpoint HEAD {path} (P2P peer {})",
+                self.base_url
+            )));
+        }
+        Err(AlgoError::RestClient {
+            source: Box::new(std::io::Error::other(format!("HTTP {}", head.status))),
+            context: format!("catchpoint HEAD {path} (P2P peer {})", self.base_url),
+        })
+    }
+
+    /// [`Self::download`]'s P2P-transport path: retries a full `GET`
+    /// transfer (mirroring the `reqwest` path's `attempt`/backoff loop)
+    /// with the response body streamed directly to `dest_path`'s temp file
+    /// rather than buffered in memory — catchpoint files can be 500MB+, and
+    /// [`crate::http_over_stream`]'s raw-stream reader hands back only the
+    /// parsed head plus whatever body bytes were prefetched while scanning
+    /// for it, exactly so the remaining body can still be streamed in
+    /// bounded chunks.
+    async fn p2p_download<F>(
+        &self,
+        transport: &dyn HttpPeerTransport,
+        path: &str,
+        round: u64,
+        dest_path: &Path,
+        progress_cb: Option<F>,
+    ) -> Result<()>
+    where
+        F: Fn(DownloadProgress),
+    {
+        if let Some(parent) = dest_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                AlgoError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to create parent directory {}: {e}",
+                        parent.display()
+                    ),
+                ))
+            })?;
+        }
+
+        let tmp_path = dest_path.with_extension("tmp");
+        let mut backoff = self.config.retry_delay;
+
+        for attempt in 0..=self.config.max_retries {
+            let result = self
+                .p2p_download_attempt(transport, path, &tmp_path, &progress_cb)
+                .await;
+
+            match result {
+                Ok(()) => {
+                    tokio::fs::rename(&tmp_path, dest_path).await.map_err(|e| {
+                        AlgoError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "failed to rename {} -> {}: {e}",
+                                tmp_path.display(),
+                                dest_path.display()
+                            ),
+                        ))
+                    })?;
+                    info!(round, path = %dest_path.display(), "catchpoint download complete (P2P)");
+                    return Ok(());
+                }
+                // A 404 (the peer confirmed it doesn't have this round) is
+                // never worth retrying, mirroring `get_with_retry`'s
+                // immediate-return behavior for the same status.
+                Err(e @ AlgoError::NotFound(_)) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(e);
+                }
+                Err(e) if attempt < self.config.max_retries => {
+                    warn!(
+                        attempt = attempt + 1,
+                        max = self.config.max_retries,
+                        error = %e,
+                        round,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "catchpoint download (P2P): transfer interrupted, retrying rather than \
+                         aborting catchup"
+                    );
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        unreachable!("retry loop always returns on its last iteration")
+    }
+
+    /// One full P2P download attempt: open a fresh stream (mirroring go's
+    /// `p2pHTTPRoundTripper` opening one stream per request), send the
+    /// `GET`, read the head, then stream the body to `tmp_path` in chunks.
+    async fn p2p_download_attempt<F>(
+        &self,
+        transport: &dyn HttpPeerTransport,
+        path: &str,
+        tmp_path: &Path,
+        progress_cb: &Option<F>,
+    ) -> Result<()>
+    where
+        F: Fn(DownloadProgress),
+    {
+        let request = build_get_request(path, &self.base_url, true);
+        let mut stream = transport
+            .open_stream(&self.base_url)
+            .await
+            .map_err(|e| p2p_open_error(&self.base_url, e))?;
+        write_request(&mut stream, &request).await?;
+        let head = read_http_response_head(&mut stream).await?;
+
+        if head.status == 404 {
+            return Err(AlgoError::NotFound(format!(
+                "catchpoint GET {path} (P2P peer {})",
+                self.base_url
+            )));
+        }
+        if !(200..300).contains(&head.status) {
+            return Err(AlgoError::RestClient {
+                source: Box::new(std::io::Error::other(format!("HTTP {}", head.status))),
+                context: format!("catchpoint GET {path} (P2P peer {})", self.base_url),
+            });
+        }
+
+        let total_bytes = head.content_length();
+        self.p2p_stream_body_to_file(
+            stream,
+            head.prefetched_body,
+            total_bytes,
+            tmp_path,
+            progress_cb,
+        )
+        .await
+    }
+
+    /// Copy a P2P response body to `tmp_path`, starting with any
+    /// `prefetched_body` bytes already read off the stream while parsing
+    /// the head, then reading further chunks (applying the same stall
+    /// window and quantized progress reporting the `reqwest` path uses)
+    /// until `total_bytes` have been written (when `Content-Length` was
+    /// present) or the stream reaches EOF (when it was not).
+    async fn p2p_stream_body_to_file<F>(
+        &self,
+        mut stream: BoxedDuplexStream,
+        prefetched_body: Vec<u8>,
+        total_bytes: Option<u64>,
+        tmp_path: &Path,
+        progress_cb: &Option<F>,
+    ) -> Result<()>
+    where
+        F: Fn(DownloadProgress),
+    {
+        let mut file = tokio::fs::File::create(tmp_path).await.map_err(|e| {
+            AlgoError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to create temp file {}: {e}", tmp_path.display()),
+            ))
+        })?;
+
+        let mut bytes_downloaded: u64 = 0;
+        let mut bytes_since_progress: usize = 0;
+        let stall_window = self.config.stall_window();
+        let report_every = self.config.chunk_size.max(1);
+
+        if !prefetched_body.is_empty() {
+            write_download_chunk(&mut file, &prefetched_body, tmp_path).await?;
+            bytes_downloaded += prefetched_body.len() as u64;
+            bytes_since_progress += prefetched_body.len();
+        }
+
+        let mut buf = vec![0u8; report_every.clamp(1, 64 * 1024)];
+        loop {
+            if let Some(total) = total_bytes {
+                if bytes_downloaded >= total {
+                    break;
+                }
+            }
+
+            let read_fut = stream.read(&mut buf);
+            let n = match stall_window {
+                Some(window) => match tokio::time::timeout(window, read_fut).await {
+                    Ok(r) => r.map_err(|e| p2p_stream_io_error("reading response body", e))?,
+                    Err(_) => {
+                        warn!(
+                            bytes_downloaded,
+                            stall_window_secs = window.as_secs_f64(),
+                            path = %tmp_path.display(),
+                            "catchpoint download (P2P): no data received within the stall \
+                             window, treating as a recoverable interruption"
+                        );
+                        return Err(AlgoError::RestClient {
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!(
+                                    "no bytes received within {:.1}s (min download speed not met)",
+                                    window.as_secs_f64()
+                                ),
+                            )),
+                            context: format!(
+                                "stalled reading P2P chunk at offset {bytes_downloaded}"
+                            ),
+                        });
+                    }
+                },
+                None => read_fut
+                    .await
+                    .map_err(|e| p2p_stream_io_error("reading response body", e))?,
+            };
+
+            if n == 0 {
+                if let Some(total) = total_bytes {
+                    if bytes_downloaded < total {
+                        return Err(AlgoError::RestClient {
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                format!(
+                                    "connection closed after {bytes_downloaded} of {total} \
+                                     expected bytes"
+                                ),
+                            )),
+                            context: "streaming P2P catchpoint response body".into(),
+                        });
+                    }
+                }
+                break;
+            }
+
+            write_download_chunk(&mut file, &buf[..n], tmp_path).await?;
+            bytes_downloaded += n as u64;
+            bytes_since_progress += n;
+
+            if bytes_since_progress >= report_every {
+                bytes_since_progress = 0;
+                if let Some(cb) = progress_cb {
+                    cb(DownloadProgress {
+                        bytes_downloaded,
+                        total_bytes,
+                    });
+                }
+            }
+        }
+
+        file.flush().await.map_err(|e| {
+            AlgoError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to flush {}: {e}", tmp_path.display()),
+            ))
+        })?;
+
+        if let Some(cb) = progress_cb {
+            cb(DownloadProgress {
+                bytes_downloaded,
+                total_bytes,
+            });
+        }
+
+        debug!(
+            bytes_downloaded,
+            "catchpoint file written to {} (P2P)",
+            tmp_path.display()
+        );
+        Ok(())
     }
 
     /// Execute a GET request with retry and exponential backoff.
@@ -517,6 +867,50 @@ impl CatchpointDownloader {
 /// Check if a reqwest error is transient and worth retrying.
 fn is_retryable(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout()
+}
+
+/// Write one chunk to the in-progress download's temp file, wrapping any
+/// I/O failure with enough context to diagnose which file/offset it hit.
+async fn write_download_chunk(
+    file: &mut tokio::fs::File,
+    chunk: &[u8],
+    tmp_path: &Path,
+) -> Result<()> {
+    file.write_all(chunk).await.map_err(|e| {
+        AlgoError::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "failed to write {} bytes to {}: {e}",
+                chunk.len(),
+                tmp_path.display()
+            ),
+        ))
+    })
+}
+
+/// Wrap a failure to open a P2P HTTP stream to `peer` with enough context to
+/// diagnose which peer/attempt it was, matching the classification
+/// `reqwest`'s own connect failures get. `HttpPeerTransport::open_stream`
+/// already returns `Result<_, AlgoError>` (never `NotFound` — this is a
+/// connection-establishment failure, not an HTTP response), so this only
+/// needs to add context, not reclassify.
+fn p2p_open_error(peer: &str, err: AlgoError) -> AlgoError {
+    AlgoError::RestClient {
+        source: Box::new(std::io::Error::other(format!(
+            "opening P2P HTTP stream to {peer}: {err}"
+        ))),
+        context: format!("opening P2P HTTP stream to {peer}"),
+    }
+}
+
+/// Wrap a raw I/O failure reading/writing a P2P stream as an
+/// [`AlgoError::RestClient`], matching `is_recoverable_stream_error`'s
+/// expectations for the retry loop above.
+fn p2p_stream_io_error(context: &str, err: std::io::Error) -> AlgoError {
+    AlgoError::RestClient {
+        source: Box::new(err),
+        context: format!("{context} over P2P stream"),
+    }
 }
 
 /// Check whether an error from streaming a catchpoint response body is a
@@ -973,5 +1367,231 @@ mod tests {
         let result = dl.probe_availability("test-v1.0", 1).await;
 
         assert!(matches!(result, Err(AlgoError::RestClient { .. })));
+    }
+
+    // -- P2P transport (issue #1127) --
+    //
+    // Mirrors go-algorand's `TestLedgerFetcherP2P` (`catchup/ledgerFetcher_test.go`):
+    // that test doesn't exercise a separate binary wire protocol, it proves
+    // the *same* HTTP-shaped `ledgerFetcher.headLedger`/`downloadLedger`
+    // code works unchanged against a P2P-derived HTTP peer. These tests pin
+    // the equivalent claim for `CatchpointDownloader`: `probe_availability`/
+    // `download` behave identically whether `HttpPeerTransport` is backed by
+    // plain TCP or (as `bin/algod-rust`'s real `P2pHttpPeerTransport` does)
+    // an HTTP-over-libp2p stream — proven here with an in-memory
+    // `tokio::io::duplex`-backed transport standing in for the real libp2p
+    // stream, since this crate deliberately has no `algo-p2p`/`libp2p`
+    // dependency (see `crate::http_over_stream`'s module doc comment). The
+    // real libp2p wiring is proven end-to-end by
+    // `bin/algod-rust`'s own P2P transport tests.
+
+    /// An [`HttpPeerTransport`] backed by an in-memory duplex pipe per
+    /// `open_stream` call: `respond_with` is written back for every request
+    /// received on that stream (byte-for-byte), simulating a peer's HTTP
+    /// server without a real socket. `requests_seen` counts how many
+    /// streams were opened, so tests can assert on failover behavior.
+    struct MockP2pTransport {
+        respond_with: Vec<u8>,
+        streams_opened: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockP2pTransport {
+        fn new(respond_with: Vec<u8>) -> Self {
+            Self {
+                respond_with,
+                streams_opened: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn streams_opened(&self) -> usize {
+            self.streams_opened.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::http_over_stream::HttpPeerTransport for MockP2pTransport {
+        async fn open_stream(
+            &self,
+            _peer: &str,
+        ) -> Result<crate::http_over_stream::BoxedDuplexStream> {
+            self.streams_opened.fetch_add(1, Ordering::SeqCst);
+            let (client, mut server) = tokio::io::duplex(4 * 1024 * 1024);
+            let response = self.respond_with.clone();
+            tokio::spawn(async move {
+                // Drain (and ignore) whatever request bytes arrive, mirroring
+                // a real HTTP/1.1 server reading the request off the same
+                // stream it writes the response back on. `read` (not
+                // `read_to_end`) is enough — the client always sends a
+                // complete, bounded request and this mock never needs to
+                // inspect it.
+                let mut sink = [0u8; 4096];
+                let _ = server.read(&mut sink).await;
+                let _ = server.write_all(&response).await;
+                let _ = server.flush().await;
+                let _ = server.shutdown().await;
+            });
+            Ok(Box::new(client))
+        }
+    }
+
+    fn ok_head_response() -> Vec<u8> {
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/x-algorand-ledger-v2.1\r\n\
+          Content-Length: 0\r\n\r\n"
+            .to_vec()
+    }
+
+    fn not_found_response() -> Vec<u8> {
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()
+    }
+
+    fn ok_get_response(body: &[u8]) -> Vec<u8> {
+        let mut resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/x-algorand-ledger-v2.1\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(body);
+        resp
+    }
+
+    /// TDD regression for issue #1127, headLedger-equivalent shape: a
+    /// `CatchpointDownloader` built with [`CatchpointDownloader::with_p2p_transport`]
+    /// must route `probe_availability`'s HEAD probe over the abstract
+    /// transport (not `reqwest`) and report success for a 200 response —
+    /// this must fail against pre-#1127 code, which has no
+    /// `with_p2p_transport` constructor at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_availability_succeeds_over_p2p_transport() {
+        let transport: Arc<dyn crate::http_over_stream::HttpPeerTransport> =
+            Arc::new(MockP2pTransport::new(ok_head_response()));
+        let dl = CatchpointDownloader::with_p2p_transport(
+            "12D3KooWtestpeer",
+            Arc::clone(&transport),
+            CatchpointDownloadConfig::default(),
+        );
+
+        let result = dl.probe_availability("test-v1.0", 7).await;
+        assert!(result.is_ok(), "expected success, got {result:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_availability_maps_404_to_not_found_over_p2p_transport() {
+        let transport: Arc<dyn crate::http_over_stream::HttpPeerTransport> =
+            Arc::new(MockP2pTransport::new(not_found_response()));
+        let dl = CatchpointDownloader::with_p2p_transport(
+            "12D3KooWtestpeer",
+            transport,
+            CatchpointDownloadConfig::default(),
+        );
+
+        let result = dl.probe_availability("test-v1.0", 7).await;
+        assert!(matches!(result, Err(AlgoError::NotFound(_))));
+    }
+
+    /// TDD regression for issue #1127, downloadLedger-equivalent shape: a
+    /// full `download()` over the abstract P2P transport must write the
+    /// exact body bytes to `dest_path`, exercising both the "prefetched
+    /// body already read while parsing the head" and "further chunked
+    /// reads" paths (the mock's response is written as one contiguous
+    /// buffer, so `read_http_response_head`'s single `stream.read()` call
+    /// typically captures the whole small body as prefetched bytes here —
+    /// the large-body test below forces the chunked-read path instead).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_succeeds_over_p2p_transport() {
+        const BODY: &[u8] = b"p2p-catchpoint-tarball-bytes-0123456789";
+        let transport: Arc<dyn crate::http_over_stream::HttpPeerTransport> =
+            Arc::new(MockP2pTransport::new(ok_get_response(BODY)));
+        let dl = CatchpointDownloader::with_p2p_transport(
+            "12D3KooWtestpeer",
+            transport,
+            CatchpointDownloadConfig {
+                min_bytes_per_second: 0,
+                ..CatchpointDownloadConfig::default()
+            },
+        );
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("algod-rust-catchpoint-p2p-{}", std::process::id()));
+        let dest = tmp_dir.join("catchpoint-p2p.tar.gz");
+
+        let result = dl
+            .download::<fn(DownloadProgress)>("test-v1.0", 7, &dest, None)
+            .await;
+        assert!(result.is_ok(), "expected success, got {result:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Forces the chunked (non-prefetched) body-read path: a body larger
+    /// than `chunk_size` with a small `duplex` buffer between the mock
+    /// server and client all but guarantees `read_http_response_head`'s
+    /// initial read only captures the head, and the loop in
+    /// `p2p_stream_body_to_file` must then read the remainder across
+    /// multiple `stream.read()` calls.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_over_p2p_transport_streams_a_multi_chunk_body() {
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let transport: Arc<dyn crate::http_over_stream::HttpPeerTransport> =
+            Arc::new(MockP2pTransport::new(ok_get_response(&body)));
+        let dl = CatchpointDownloader::with_p2p_transport(
+            "12D3KooWtestpeer",
+            transport,
+            CatchpointDownloadConfig {
+                chunk_size: 4096,
+                min_bytes_per_second: 0,
+                ..CatchpointDownloadConfig::default()
+            },
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-p2p-large-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-p2p-large.tar.gz");
+
+        let result = dl
+            .download::<fn(DownloadProgress)>("test-v1.0", 9, &dest, None)
+            .await;
+        assert!(result.is_ok(), "expected success, got {result:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_maps_404_to_not_found_over_p2p_transport_without_retrying() {
+        let mock = Arc::new(MockP2pTransport::new(not_found_response()));
+        let dl = CatchpointDownloader::with_p2p_transport(
+            "12D3KooWtestpeer",
+            mock.clone() as Arc<dyn crate::http_over_stream::HttpPeerTransport>,
+            CatchpointDownloadConfig {
+                max_retries: 3,
+                retry_delay: Duration::from_millis(1),
+                min_bytes_per_second: 0,
+                ..CatchpointDownloadConfig::default()
+            },
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-p2p-404-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-p2p-404.tar.gz");
+
+        let result = dl
+            .download::<fn(DownloadProgress)>("test-v1.0", 1, &dest, None)
+            .await;
+        assert!(matches!(result, Err(AlgoError::NotFound(_))));
+        // The unavailable-round classification must not be retried, mirroring
+        // `get_with_retry`'s immediate 404 return: exactly one stream was
+        // opened, not `1 + max_retries`.
+        assert_eq!(
+            mock.streams_opened(),
+            1,
+            "a 404 must not be retried across additional P2P stream attempts"
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
