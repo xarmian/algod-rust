@@ -69,6 +69,7 @@
 
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::gossipsub::{self, MessageId, TopicHash};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
@@ -77,7 +78,7 @@ use libp2p::{identify, kad, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBu
 use crate::conn_limits::{derive_conn_limits, ConnLimitConfig};
 use crate::dht;
 use crate::errors::P2pError;
-use crate::identity::IdentityConfig;
+use crate::identity::{to_identity_signing_key, IdentityConfig};
 use crate::metrics::GossipsubMetrics;
 use crate::pubsub::{derive_algorand_gossipsub_params, GossipsubMeshParams, IWANT_FOLLOWUP_TIME};
 
@@ -262,6 +263,13 @@ pub struct P2pHost {
     /// [`crate::metrics::GossipsubMetrics`] for why this lives here rather
     /// than on `gossipsub::Behaviour` itself (issue #1085).
     gossipsub_metrics: GossipsubMetrics,
+    /// The raw Ed25519 signing key underlying this host's identity
+    /// keypair (`identity::to_identity_signing_key`), kept alongside the
+    /// swarm — which takes ownership of the `Keypair` itself — so a
+    /// hybrid-mode caller can drive `algo_network::identity`'s netidentity
+    /// challenge scheme with this same key (issue #1133), mirroring go's
+    /// `P2PNetwork.PeerIDSigner()`.
+    identity_signing_key: SigningKey,
 }
 
 impl P2pHost {
@@ -281,6 +289,11 @@ impl P2pHost {
     ) -> Result<Self, P2pError> {
         let keypair = crate::identity::get_or_create_keypair(identity_cfg)?;
         let local_peer_id = keypair.public().to_peer_id();
+        // Captured before `keypair` is moved into `SwarmBuilder` below —
+        // the swarm takes ownership of it and exposes no way to read it
+        // back out, so this is this host's only chance to derive the
+        // netidentity-scheme signer (issue #1133).
+        let identity_signing_key = to_identity_signing_key(&keypair)?;
         let kad_config = dht::dht_config(network_id);
         let host_cfg = *host_cfg;
 
@@ -359,6 +372,7 @@ impl P2pHost {
             applied_connection_limits: conn_limits_cfg,
             applied_gossipsub_params: gossipsub_params,
             gossipsub_metrics: GossipsubMetrics::new(),
+            identity_signing_key,
         })
     }
 
@@ -389,6 +403,17 @@ impl P2pHost {
     /// key. Go: `serviceImpl.ID()`.
     pub fn peer_id(&self) -> PeerId {
         *self.swarm.local_peer_id()
+    }
+
+    /// This host's Ed25519 identity-signing key, i.e. the same key
+    /// [`P2pHost::peer_id`] is derived from — see
+    /// [`crate::identity::to_identity_signing_key`]. Exposed so a
+    /// hybrid-mode caller (issue #1133) can drive
+    /// `algo_network::identity`'s netidentity challenge/response/
+    /// verification scheme with this transport's own peer identity,
+    /// mirroring go's `P2PNetwork.PeerIDSigner()`.
+    pub fn identity_signing_key(&self) -> &SigningKey {
+        &self.identity_signing_key
     }
 
     /// Start listening on `addr`. Go: `serviceImpl.Start()`.

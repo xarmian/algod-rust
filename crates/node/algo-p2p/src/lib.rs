@@ -72,7 +72,9 @@ pub use host::{
     DHT_LOOKUP_TIMEOUT, DIAL_TIMEOUT,
 };
 pub use httpproto::ALGORAND_HTTP_PROTOCOL;
-pub use identity::{get_or_create_keypair, IdentityConfig, DEFAULT_PRIV_KEY_FILENAME};
+pub use identity::{
+    get_or_create_keypair, to_identity_signing_key, IdentityConfig, DEFAULT_PRIV_KEY_FILENAME,
+};
 pub use identity_tracker::IdentityTracker;
 pub use metrics::{GossipsubMetrics, GossipsubTagCounts};
 pub use peerstore::{PersistentPeerStore, DEFAULT_PEERSTORE_FILENAME};

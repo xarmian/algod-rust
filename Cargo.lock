@@ -475,6 +475,7 @@ dependencies = [
 name = "algo-p2p"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "futures-util",
  "hex",
  "hickory-resolver 0.25.2",

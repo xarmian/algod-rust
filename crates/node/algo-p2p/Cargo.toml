@@ -25,6 +25,12 @@ libp2p = { version = "0.54", features = [
 # on `P2pBehaviour` (host.rs) uses — a hard compile error, not a version
 # warning. Bump this only in lockstep with the `libp2p` facade version above.
 libp2p-stream = "0.2.0-alpha"
+# Used to derive the raw Ed25519 signing key underlying a `libp2p::identity`
+# `Keypair`, for `identity::to_identity_signing_key` (issue #1133) — the
+# adapter that lets the P2P transport's own peer identity drive
+# `algo_network::identity`'s netidentity challenge/response/verification
+# scheme in hybrid mode, mirroring go's `network/p2p.PeerIDChallengeSigner`.
+ed25519-dalek.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 futures-util.workspace = true
