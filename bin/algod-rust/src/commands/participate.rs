@@ -385,6 +385,10 @@ struct ParticipateAgreementControl {
     pool: Arc<TransactionPool>,
     round_advanced: Arc<std::sync::Condvar>,
     participation_metrics: Arc<algo_agreement::ParticipationMetrics>,
+    /// Per-message-type agreement handled/dropped counters (issue #1134).
+    /// Held here (rather than solely inside `AgreementNetworkBridge`) so
+    /// counts survive across `build_cycle` rebuilding the bridge.
+    agreement_message_counters: Arc<algo_network::AgreementMessageCounters>,
     enable_agreement_reporting: bool,
     enable_agreement_time_metrics: bool,
     network_mode: NetworkMode,
@@ -408,7 +412,11 @@ impl ParticipateAgreementControl {
             self.p2p_active_gossip_node.clone(),
             self.rt_handle.clone(),
             self.agreement_network_config.clone(),
-        );
+        )
+        // Issue #1134: share this control's counters across rebuilds so
+        // handled/dropped-by-type counts don't reset every time
+        // `build_cycle` reconstructs the bridge.
+        .with_message_counters(self.agreement_message_counters.clone());
 
         let network_advancer: Arc<dyn NetworkAdvancer> = Arc::new(GossipNetworkAdvancer {
             node: self.p2p_active_gossip_node.clone(),
@@ -642,6 +650,7 @@ impl ParticipateAgreementControl {
             pool: self.pool.clone(),
             round_advanced: self.round_advanced.clone(),
             participation_metrics: self.participation_metrics.clone(),
+            agreement_message_counters: self.agreement_message_counters.clone(),
             enable_agreement_reporting: self.enable_agreement_reporting,
             enable_agreement_time_metrics: self.enable_agreement_time_metrics,
             network_mode: self.network_mode,
@@ -4296,6 +4305,12 @@ pub async fn run(
         PoolConfig::default(),
         pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
     ));
+    // Issue #1134: inbound-gossip tx-handler per-tag `pool.remember()`
+    // failure counters, shared across every `TxTagHandler` this node
+    // registers (WS-gossip and P2P both route inbound TX traffic through
+    // their own handler instance -- see the `TxTagHandler::new(...)` call
+    // sites below), mirroring go's single node-wide `TxHandler` counter.
+    let tx_pool_remember_counter = Arc::new(algo_network::TxPoolRememberCounter::new());
     // StreamToBatch-equivalent async worker pool (issue #1017) wired into
     // the live gossip tx-admission path (issue #1043): every inbound TX-tag
     // group is routed through this shared pool for signature verification
@@ -4438,7 +4453,8 @@ pub async fn run(
 
     let mut ws_tx_tag_handler =
         algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
-            .with_batch_verifier(batch_verifier.clone());
+            .with_batch_verifier(batch_verifier.clone())
+            .with_remember_counter(tx_pool_remember_counter.clone());
     if let Some(limiter) = &app_rate_limiter {
         ws_tx_tag_handler = ws_tx_tag_handler
             .with_app_rate_limiter(limiter.clone(), app_rate_limiter_congestion_threshold);
@@ -4626,7 +4642,8 @@ pub async fn run(
         // handler is actually registered here to produce one.
         let mut p2p_tx_tag_handler =
             algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
-                .with_batch_verifier(batch_verifier.clone());
+                .with_batch_verifier(batch_verifier.clone())
+                .with_remember_counter(tx_pool_remember_counter.clone());
         if let Some(limiter) = &app_rate_limiter {
             p2p_tx_tag_handler = p2p_tx_tag_handler
                 .with_app_rate_limiter(limiter.clone(), app_rate_limiter_congestion_threshold);
@@ -4767,6 +4784,12 @@ pub async fn run(
     // adapter is built first and must share the very same collector the
     // agreement service will later write to (`Service::with_metrics` below).
     let participation_metrics = Arc::new(algo_agreement::ParticipationMetrics::new());
+    // Issue #1134: agreement per-message-type handled/dropped counters,
+    // created alongside `participation_metrics` for the same reason -- the
+    // REST adapter (built below) and the `ParticipateAgreementControl`
+    // (which threads it into every `AgreementNetworkBridge` rebuild) must
+    // share this exact collector.
+    let agreement_message_counters = Arc::new(algo_network::AgreementMessageCounters::new());
 
     // -----------------------------------------------------------------------
     // 3d. Build the `ParticipateAgreementControl` (issue #940) — the
@@ -4804,6 +4827,7 @@ pub async fn run(
         pool: pool.clone(),
         round_advanced: round_advanced.clone(),
         participation_metrics: participation_metrics.clone(),
+        agreement_message_counters: agreement_message_counters.clone(),
         enable_agreement_reporting: node_config.enable_agreement_reporting,
         enable_agreement_time_metrics: node_config.enable_agreement_time_metrics,
         network_mode,
@@ -4872,6 +4896,11 @@ pub async fn run(
             .with_broadcaster(broadcaster.clone())
             .with_shutdown_token(shutdown_token.clone())
             .with_participation_metrics(participation_metrics.clone())
+            // Issue #1134: agreement handled/dropped-by-type and inbound-
+            // gossip txpool remember-error counters, alongside the
+            // participation metrics above.
+            .with_agreement_message_counters(agreement_message_counters.clone())
+            .with_tx_pool_remember_counter(tx_pool_remember_counter.clone())
             // `GET /v2/node/peers` (issue #673): the WS gossip network is
             // always constructed (even in P2P-only mode it just reports no
             // connections — the "no leak" guarantee above), so it's always
@@ -10410,6 +10439,7 @@ mod tests {
             pool,
             round_advanced: Arc::new(std::sync::Condvar::new()),
             participation_metrics: Arc::new(algo_agreement::ParticipationMetrics::new()),
+            agreement_message_counters: Arc::new(algo_network::AgreementMessageCounters::new()),
             enable_agreement_reporting: false,
             enable_agreement_time_metrics: false,
             network_mode: NetworkMode::WsOnly,

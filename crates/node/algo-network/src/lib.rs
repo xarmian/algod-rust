@@ -283,9 +283,9 @@ pub use broadcast::{
 
 // Bridge adapting GossipNode to algo-agreement's AgreementNetwork trait
 pub use agreement_network::{
-    agreement_tag_to_network_tag, network_tag_to_agreement_tag, AgreementNetworkBridge,
-    AgreementNetworkConfig, DEFAULT_BUNDLE_QUEUE_LEN, DEFAULT_PROPOSAL_QUEUE_LEN,
-    DEFAULT_VOTE_QUEUE_LEN,
+    agreement_tag_to_network_tag, network_tag_to_agreement_tag, AgreementMessageCounters,
+    AgreementNetworkBridge, AgreementNetworkConfig, DEFAULT_BUNDLE_QUEUE_LEN,
+    DEFAULT_PROPOSAL_QUEUE_LEN, DEFAULT_VOTE_QUEUE_LEN,
 };
 
 // ---------------------------------------------------------------------------
@@ -326,7 +326,9 @@ pub use tx_sync_client::{GossipTxSyncPeerSource, HttpTxSyncClient};
 // ---------------------------------------------------------------------------
 
 // Decoder + MessageHandler for inbound TX-tagged gossip messages
-pub use tx_tag_handler::{decode_tx_message, TxTagError, TxTagHandler, MAX_TX_GROUP_SIZE};
+pub use tx_tag_handler::{
+    decode_tx_message, TxPoolRememberCounter, TxTagError, TxTagHandler, MAX_TX_GROUP_SIZE,
+};
 
 // ---------------------------------------------------------------------------
 // Re-exports: Local txn broadcast (Plan 33, gap G1 — outbound half)

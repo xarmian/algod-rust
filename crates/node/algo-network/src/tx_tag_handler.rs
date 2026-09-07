@@ -246,7 +246,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use algo_codec::{canonical_encode_signed_transaction, compute_txn_id};
-use algo_pool::{AppRateLimiter, TransactionPool};
+use algo_pool::{classify_pool_error, AppRateLimiter, PoolErrorTag, TransactionPool};
 use algo_types::{Digest, SignedTransaction};
 use algo_validate::{BatchVerifier, BatchVerifyRequest, SpecialAddresses, VerificationContext};
 
@@ -255,6 +255,77 @@ use crate::handler::MessageHandler;
 use crate::message::{IncomingMessage, OutgoingMessage};
 use crate::tag::Tag;
 use crate::tx_syncer::SeenTxCache;
+
+// ---------------------------------------------------------------------------
+// TxPoolRememberCounter — per-tag inbound-gossip `pool.remember()` failure
+// counter (issue #1134)
+// ---------------------------------------------------------------------------
+
+/// Per-[`PoolErrorTag`] counter for inbound gossip transaction groups that
+/// [`TransactionPool::remember`] rejected, mirroring go-algorand's
+/// `data/txHandler.go`:
+/// `transactionMessageTxPoolRememberCounter = metrics.NewTagCounter(
+/// "algod_transaction_messages_txpool_remember_err_{TAG}", "Number of
+/// transaction messages not remembered by txpool b/c of {TAG}",
+/// pools.TxPoolErrTags...)`, incremented in `TxHandler.postProcessCheckedTxn`
+/// at `transactionMessageTxPoolRememberCounter.Add(pools.ClassifyTxPoolError(err), 1)`
+/// — the exact go-side call site [`ingest_group`] below is the structural
+/// analogue of (decoded gossip group -> `pool.Remember`/`pool.remember` ->
+/// classify the failure).
+///
+/// Lock-free fixed-size array indexed by [`PoolErrorTag`], same pattern as
+/// `algo_pool::TxPoolReevalCounter`.
+#[derive(Debug, Default)]
+pub struct TxPoolRememberCounter {
+    counts: [AtomicU64; PoolErrorTag::ALL.len()],
+}
+
+impl TxPoolRememberCounter {
+    /// A fresh, all-zero counter set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn index_of(tag: PoolErrorTag) -> usize {
+        PoolErrorTag::ALL
+            .iter()
+            .position(|t| *t == tag)
+            .expect("PoolErrorTag::ALL is exhaustive over PoolErrorTag")
+    }
+
+    /// Record one inbound gossip group rejected by `pool.remember()`,
+    /// classified as `tag`. Go:
+    /// `transactionMessageTxPoolRememberCounter.Add(ClassifyTxPoolError(err), 1)`.
+    pub fn record(&self, tag: PoolErrorTag) {
+        self.counts[Self::index_of(tag)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current count for `tag`. Zero for a tag nothing has been recorded
+    /// for yet.
+    pub fn count(&self, tag: PoolErrorTag) -> u64 {
+        self.counts[Self::index_of(tag)].load(Ordering::Relaxed)
+    }
+
+    /// Render as Prometheus text exposition format, substituting the
+    /// literal tag into `algod_transaction_messages_txpool_remember_err_{TAG}`
+    /// — not as a label — matching go's `metrics.TagCounter` naming
+    /// convention.
+    pub fn to_prometheus_text(&self) -> String {
+        let mut out = String::with_capacity(96 * PoolErrorTag::ALL.len());
+        for tag in PoolErrorTag::ALL {
+            let name = format!(
+                "algod_transaction_messages_txpool_remember_err_{}",
+                tag.as_str()
+            );
+            out.push_str(&format!(
+                "# HELP {name} Number of transaction messages not remembered by txpool b/c of {}.\n# TYPE {name} counter\n{name} {}\n",
+                tag.as_str(),
+                self.count(*tag)
+            ));
+        }
+        out
+    }
+}
 
 /// Maximum number of signed transactions in a single TX-tag message.
 ///
@@ -363,6 +434,7 @@ pub struct TxTagHandler {
     canonical_cache: Option<Arc<SeenTxCache>>,
     backlog_tx: Option<mpsc::Sender<BacklogItem>>,
     backlog_dropped: Arc<AtomicU64>,
+    remember_counter: Arc<TxPoolRememberCounter>,
 }
 
 impl std::fmt::Debug for TxTagHandler {
@@ -415,6 +487,7 @@ impl TxTagHandler {
             canonical_cache: None,
             backlog_tx: None,
             backlog_dropped: Arc::new(AtomicU64::new(0)),
+            remember_counter: Arc::new(TxPoolRememberCounter::new()),
         }
     }
 
@@ -493,6 +566,10 @@ impl TxTagHandler {
     /// the receiving half of the channel for the lifetime of the
     /// returned handler, so this must be called from within a Tokio
     /// runtime. `capacity` is clamped to at least 1.
+    ///
+    /// Call [`Self::with_remember_counter`] (if attaching a shared one)
+    /// *before* this method — the spawned worker captures whichever
+    /// [`TxPoolRememberCounter`] is attached at the moment this is called.
     #[must_use]
     pub fn with_backlog_queue(mut self, capacity: usize) -> Self {
         let (tx, rx) = mpsc::channel(capacity.max(1));
@@ -501,9 +578,30 @@ impl TxTagHandler {
             self.pool.clone(),
             self.seen.clone(),
             self.app_limiter.clone(),
+            self.remember_counter.clone(),
         ));
         self.backlog_tx = Some(tx);
         self
+    }
+
+    /// Attach a shared [`TxPoolRememberCounter`] (issue #1134), so its
+    /// counts are shared (and thus node-wide, matching go's single
+    /// `TxHandler`) across multiple `TxTagHandler` instances registered on
+    /// different transports (e.g. one per WS-gossip and one per P2P — see
+    /// [`Self::with_app_rate_limiter`]'s doc comment for the same sharing
+    /// rationale). Without this, [`Self::new`]'s fresh, unshared counter is
+    /// used.
+    #[must_use]
+    pub fn with_remember_counter(mut self, counter: Arc<TxPoolRememberCounter>) -> Self {
+        self.remember_counter = counter;
+        self
+    }
+
+    /// The per-tag `pool.remember()` failure counters this handler updates.
+    /// Exposed so `GET /metrics` can render them (issue #1134).
+    #[must_use]
+    pub fn remember_counter(&self) -> &Arc<TxPoolRememberCounter> {
+        &self.remember_counter
     }
 
     /// Returns a reference to the shared seen-tx cache.
@@ -756,6 +854,7 @@ impl MessageHandler for TxTagHandler {
                 &self.pool,
                 &self.seen,
                 &self.app_limiter,
+                &self.remember_counter,
                 group,
                 txids,
                 msg.sender.clone(),
@@ -794,6 +893,7 @@ async fn ingest_group(
     pool: &Arc<TransactionPool>,
     seen: &Arc<SeenTxCache>,
     app_limiter: &Option<Arc<AppRateLimiter>>,
+    remember_counter: &Arc<TxPoolRememberCounter>,
     group: Vec<SignedTransaction>,
     txids: Vec<Digest>,
     sender: String,
@@ -823,6 +923,10 @@ async fn ingest_group(
                 error = %e,
                 "TxTagHandler: pool rejected inbound TX group",
             );
+            // Issue #1134: mirrors go's `postProcessCheckedTxn` calling
+            // `transactionMessageTxPoolRememberCounter.Add(ClassifyTxPoolError(err), 1)`
+            // on a `Remember` failure.
+            remember_counter.record(classify_pool_error(&e));
             if let (Some(limiter), Some(group)) = (app_limiter, group_for_penalty) {
                 let origin = origin_bytes(&sender);
                 limiter.penalize_eval_error(&group, &origin);
@@ -847,12 +951,14 @@ async fn backlog_worker(
     pool: Arc<TransactionPool>,
     seen: Arc<SeenTxCache>,
     app_limiter: Option<Arc<AppRateLimiter>>,
+    remember_counter: Arc<TxPoolRememberCounter>,
 ) {
     while let Some(item) = rx.recv().await {
         ingest_group(
             &pool,
             &seen,
             &app_limiter,
+            &remember_counter,
             item.group,
             item.txids,
             item.sender,
@@ -992,6 +1098,42 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert!(!a.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // TxPoolRememberCounter (issue #1134)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn remember_counter_starts_at_zero_for_every_tag() {
+        let c = TxPoolRememberCounter::new();
+        for tag in algo_pool::PoolErrorTag::ALL {
+            assert_eq!(c.count(*tag), 0);
+        }
+    }
+
+    #[test]
+    fn remember_counter_record_increments_only_matching_tag() {
+        let c = TxPoolRememberCounter::new();
+        c.record(algo_pool::PoolErrorTag::Overspend);
+        c.record(algo_pool::PoolErrorTag::Overspend);
+        c.record(algo_pool::PoolErrorTag::Cap);
+
+        assert_eq!(c.count(algo_pool::PoolErrorTag::Overspend), 2);
+        assert_eq!(c.count(algo_pool::PoolErrorTag::Cap), 1);
+        assert_eq!(c.count(algo_pool::PoolErrorTag::Fee), 0);
+    }
+
+    #[test]
+    fn remember_counter_prometheus_text_uses_tag_in_series_name() {
+        let c = TxPoolRememberCounter::new();
+        c.record(algo_pool::PoolErrorTag::TealReject);
+        let text = c.to_prometheus_text();
+
+        assert!(text.contains("algod_transaction_messages_txpool_remember_err_teal_reject 1\n"));
+        assert!(text
+            .contains("# TYPE algod_transaction_messages_txpool_remember_err_teal_reject counter"));
+        assert!(!text.contains("tag=\""));
     }
 }
 
@@ -1221,6 +1363,18 @@ mod app_rate_limiter_wiring_tests {
         let out = handler.handle(msg).await;
         assert_eq!(out.action, ForwardingPolicy::Ignore);
         assert_eq!(pool.pending_count(), 0, "failed remember admits nothing");
+
+        // Issue #1134: the failed `remember()` must also increment the
+        // per-tag remember-error counter (go: `transactionMessageTxPoolRememberCounter`).
+        // The stub evaluator's generic failure message matches no known
+        // substring in `classify_pool_error`, so it falls into `EvalGeneric`.
+        assert_eq!(
+            handler
+                .remember_counter()
+                .count(algo_pool::PoolErrorTag::EvalGeneric),
+            1,
+            "remember counter should record one EvalGeneric rejection"
+        );
 
         // Now let remember succeed again, and prime congestion with an
         // unrelated txn.

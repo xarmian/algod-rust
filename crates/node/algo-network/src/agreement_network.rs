@@ -42,6 +42,7 @@
 //! - `agreement/gossip/network.go` — `networkImpl`, `WrapNetwork`, `Start`,
 //!   `Messages`, `Broadcast`, `Relay`, `Disconnect`
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -162,6 +163,101 @@ pub fn network_tag_to_agreement_tag(tag: &Tag) -> Option<AgreementTag> {
 }
 
 // ---------------------------------------------------------------------------
+// AgreementMessageCounters — per-message-type handled/dropped counters
+// ---------------------------------------------------------------------------
+
+/// Per-message-type (`"vote"` / `"proposal"` / `"bundle"`) handled/dropped
+/// counters for inbound agreement gossip messages (issue #1134).
+///
+/// Mirrors go's `agreement/gossip/network.go`:
+/// `messagesHandledByType = metrics.NewTagCounter("algod_agreement_handled_{TAG}", ...)`
+/// and `messagesDroppedByType = metrics.NewTagCounter("algod_agreement_dropped_{TAG}", ...)`,
+/// both incremented in `networkImpl.processMessage` at exactly the point
+/// [`ChannelForwarder::handle`] below forwards (or drops) an inbound
+/// vote/proposal/bundle message.
+///
+/// A fixed-size atomic pair per known message type — the tag set is exactly
+/// the three agreement message types and is known at compile time, so a
+/// lock-free array avoids the `Mutex<BTreeMap<..>>` pattern used where the
+/// tag set is open-ended (e.g. `algo_p2p::metrics::GossipsubMetrics`).
+#[derive(Debug, Default)]
+pub struct AgreementMessageCounters {
+    handled: [AtomicU64; 3],
+    dropped: [AtomicU64; 3],
+}
+
+/// The three agreement message types, in the fixed order the counter
+/// arrays are indexed by. Mirrors go's `agreementVoteMessageType`,
+/// `agreementProposalMessageType`, `agreementBundleMessageType` constants.
+const AGREEMENT_MESSAGE_TYPES: [&str; 3] = ["vote", "proposal", "bundle"];
+
+impl AgreementMessageCounters {
+    /// A fresh, all-zero counter set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn index_of(msg_type: &str) -> Option<usize> {
+        AGREEMENT_MESSAGE_TYPES.iter().position(|t| *t == msg_type)
+    }
+
+    /// Record one message of `msg_type` successfully handed off to the
+    /// agreement service. Go: `messagesHandledByType.Add(msgType, 1)`.
+    pub fn record_handled(&self, msg_type: &str) {
+        if let Some(i) = Self::index_of(msg_type) {
+            self.handled[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record one message of `msg_type` dropped because its channel was
+    /// full. Go: `messagesDroppedByType.Add(msgType, 1)`.
+    pub fn record_dropped(&self, msg_type: &str) {
+        if let Some(i) = Self::index_of(msg_type) {
+            self.dropped[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Current handled count for `msg_type`. Zero for an unknown type or a
+    /// type nothing has been recorded for yet.
+    pub fn handled(&self, msg_type: &str) -> u64 {
+        Self::index_of(msg_type)
+            .map(|i| self.handled[i].load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Current dropped count for `msg_type`. Zero for an unknown type or a
+    /// type nothing has been recorded for yet.
+    pub fn dropped(&self, msg_type: &str) -> u64 {
+        Self::index_of(msg_type)
+            .map(|i| self.dropped[i].load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Render as Prometheus text exposition format:
+    /// `algod_agreement_handled_{TAG}` / `algod_agreement_dropped_{TAG}` per
+    /// message type, substituting the literal tag into the metric name —
+    /// not as a label — matching go's `metrics.TagCounter` naming
+    /// convention (see `algo_p2p::metrics::GossipsubMetrics` for the same
+    /// pattern already established in this workspace).
+    pub fn to_prometheus_text(&self) -> String {
+        let mut out = String::with_capacity(512);
+        for (name_prefix, help_verb, counts) in [
+            ("algod_agreement_handled", "handled", &self.handled),
+            ("algod_agreement_dropped", "dropped", &self.dropped),
+        ] {
+            for (i, tag) in AGREEMENT_MESSAGE_TYPES.iter().enumerate() {
+                let name = format!("{name_prefix}_{tag}");
+                out.push_str(&format!(
+                    "# HELP {name} Number of agreement {tag} messages {help_verb}.\n# TYPE {name} counter\n{name} {}\n",
+                    counts[i].load(Ordering::Relaxed)
+                ));
+            }
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Channel handler — forwards incoming gossip messages into mpsc channels
 // ---------------------------------------------------------------------------
 
@@ -175,11 +271,23 @@ pub fn network_tag_to_agreement_tag(tag: &Tag) -> Option<AgreementTag> {
 /// `select { case submit <- msg: ... default: dropped++ }` pattern).
 struct ChannelForwarder {
     sender: crossbeam_channel::Sender<Message>,
+    /// The agreement message type this forwarder handles (`"vote"` /
+    /// `"proposal"` / `"bundle"`), used to key [`AgreementMessageCounters`].
+    msg_type: &'static str,
+    counters: Arc<AgreementMessageCounters>,
 }
 
 impl ChannelForwarder {
-    fn new(sender: crossbeam_channel::Sender<Message>) -> Self {
-        Self { sender }
+    fn new(
+        sender: crossbeam_channel::Sender<Message>,
+        msg_type: &'static str,
+        counters: Arc<AgreementMessageCounters>,
+    ) -> Self {
+        Self {
+            sender,
+            msg_type,
+            counters,
+        }
     }
 }
 
@@ -200,7 +308,13 @@ impl MessageHandler for ChannelForwarder {
         };
 
         // Non-blocking send — drop if channel is full (matches Go behavior).
-        let _ = self.sender.try_send(agreement_msg);
+        // Issue #1134: mirrors go's `processMessage` incrementing
+        // `messagesHandledByType`/`messagesDroppedByType` at exactly this
+        // decision point.
+        match self.sender.try_send(agreement_msg) {
+            Ok(()) => self.counters.record_handled(self.msg_type),
+            Err(_) => self.counters.record_dropped(self.msg_type),
+        }
 
         // Always return Ignore — agreement handles relay/broadcast decisions
         // itself through the AgreementNetwork trait methods.
@@ -265,6 +379,13 @@ pub struct AgreementNetworkBridge {
     proposal_tx: crossbeam_channel::Sender<Message>,
     /// Sender end of the bundle channel.
     bundle_tx: crossbeam_channel::Sender<Message>,
+
+    /// Per-message-type handled/dropped counters (issue #1134), shared with
+    /// every [`ChannelForwarder`] this bridge registers. Defaults to a
+    /// fresh, all-zero set; [`Self::with_message_counters`] lets a caller
+    /// supply one that survives across bridge rebuilds (e.g. an agreement
+    /// service that periodically reconstructs its `AgreementNetworkBridge`).
+    message_counters: Arc<AgreementMessageCounters>,
 }
 
 impl AgreementNetworkBridge {
@@ -292,12 +413,30 @@ impl AgreementNetworkBridge {
             vote_tx,
             proposal_tx,
             bundle_tx,
+            message_counters: Arc::new(AgreementMessageCounters::new()),
         }
     }
 
     /// Creates a new bridge with default queue lengths.
     pub fn with_defaults(net: Arc<dyn GossipNode>, rt_handle: tokio::runtime::Handle) -> Self {
         Self::new(net, rt_handle, AgreementNetworkConfig::default())
+    }
+
+    /// Attach a shared [`AgreementMessageCounters`] (issue #1134), e.g. one
+    /// owned by the caller so its counts survive across repeated
+    /// `AgreementNetworkBridge` rebuilds. Builder-style, matching the rest
+    /// of this crate's optional-collaborator attachment methods
+    /// (`TxTagHandler::with_app_rate_limiter` etc.).
+    #[must_use]
+    pub fn with_message_counters(mut self, counters: Arc<AgreementMessageCounters>) -> Self {
+        self.message_counters = counters;
+        self
+    }
+
+    /// The handled/dropped-by-type counters this bridge's forwarders update.
+    /// Exposed so `GET /metrics` can render them (issue #1134).
+    pub fn message_counters(&self) -> &Arc<AgreementMessageCounters> {
+        &self.message_counters
     }
 }
 
@@ -412,15 +551,27 @@ impl AgreementNetwork for AgreementNetworkBridge {
         let handlers = vec![
             TaggedMessageHandler {
                 tag: Tag::AgreementVote,
-                handler: Arc::new(ChannelForwarder::new(self.vote_tx.clone())),
+                handler: Arc::new(ChannelForwarder::new(
+                    self.vote_tx.clone(),
+                    "vote",
+                    self.message_counters.clone(),
+                )),
             },
             TaggedMessageHandler {
                 tag: Tag::ProposalPayload,
-                handler: Arc::new(ChannelForwarder::new(self.proposal_tx.clone())),
+                handler: Arc::new(ChannelForwarder::new(
+                    self.proposal_tx.clone(),
+                    "proposal",
+                    self.message_counters.clone(),
+                )),
             },
             TaggedMessageHandler {
                 tag: Tag::VoteBundle,
-                handler: Arc::new(ChannelForwarder::new(self.bundle_tx.clone())),
+                handler: Arc::new(ChannelForwarder::new(
+                    self.bundle_tx.clone(),
+                    "bundle",
+                    self.message_counters.clone(),
+                )),
             },
         ];
 
@@ -499,7 +650,8 @@ mod tests {
     #[tokio::test]
     async fn channel_forwarder_delivers_message() {
         let (tx, rx) = crossbeam_channel::bounded(10);
-        let forwarder = ChannelForwarder::new(tx);
+        let counters = Arc::new(AgreementMessageCounters::new());
+        let forwarder = ChannelForwarder::new(tx, "vote", counters.clone());
 
         let incoming = IncomingMessage::new(
             Tag::AgreementVote,
@@ -517,13 +669,19 @@ mod tests {
         let msg = rx.try_recv().expect("should have received a message");
         assert_eq!(msg.data, vec![1, 2, 3]);
         assert!(msg.handle.is_some(), "handle should contain metadata");
+
+        // Issue #1134: a successfully forwarded message increments the
+        // handled-by-type counter, not the dropped one.
+        assert_eq!(counters.handled("vote"), 1);
+        assert_eq!(counters.dropped("vote"), 0);
     }
 
     #[tokio::test]
     async fn channel_forwarder_drops_when_full() {
         // Channel with capacity 1
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let forwarder = ChannelForwarder::new(tx);
+        let counters = Arc::new(AgreementMessageCounters::new());
+        let forwarder = ChannelForwarder::new(tx, "proposal", counters.clone());
 
         // Fill the channel
         let msg1 =
@@ -543,6 +701,70 @@ mod tests {
             rx.try_recv().is_err(),
             "second message should have been dropped"
         );
+
+        // Issue #1134: the first message is handled, the second (which
+        // found the channel full) is dropped — mirrors go's
+        // `messagesHandledByType`/`messagesDroppedByType` split.
+        assert_eq!(counters.handled("proposal"), 1);
+        assert_eq!(counters.dropped("proposal"), 1);
+    }
+
+    // -- AgreementMessageCounters tests (issue #1134) ------------------------
+
+    #[test]
+    fn agreement_message_counters_start_at_zero() {
+        let c = AgreementMessageCounters::new();
+        for t in ["vote", "proposal", "bundle"] {
+            assert_eq!(c.handled(t), 0);
+            assert_eq!(c.dropped(t), 0);
+        }
+    }
+
+    #[test]
+    fn agreement_message_counters_record_per_type_independently() {
+        let c = AgreementMessageCounters::new();
+        c.record_handled("vote");
+        c.record_handled("vote");
+        c.record_dropped("bundle");
+
+        assert_eq!(c.handled("vote"), 2);
+        assert_eq!(c.dropped("vote"), 0);
+        assert_eq!(c.handled("proposal"), 0);
+        assert_eq!(c.dropped("bundle"), 1);
+    }
+
+    #[test]
+    fn agreement_message_counters_unknown_type_is_noop() {
+        let c = AgreementMessageCounters::new();
+        c.record_handled("XX");
+        c.record_dropped("XX");
+        assert_eq!(c.handled("XX"), 0);
+        assert_eq!(c.dropped("XX"), 0);
+    }
+
+    #[test]
+    fn agreement_message_counters_prometheus_text_uses_tag_in_series_name() {
+        let c = AgreementMessageCounters::new();
+        c.record_handled("vote");
+        c.record_dropped("bundle");
+        c.record_dropped("bundle");
+        let text = c.to_prometheus_text();
+
+        assert!(text.contains("algod_agreement_handled_vote 1\n"));
+        assert!(text.contains("algod_agreement_dropped_bundle 2\n"));
+        assert!(text.contains("algod_agreement_handled_proposal 0\n"));
+        assert!(text.contains("# TYPE algod_agreement_handled_vote counter"));
+        assert!(!text.contains("tag=\""));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_message_counters_default_to_fresh_zero_set() {
+        let gossip = Arc::new(MockGossipNode::new());
+        let bridge = AgreementNetworkBridge::with_defaults(
+            gossip.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        assert_eq!(bridge.message_counters().handled("vote"), 0);
     }
 
     // -- MessageMetadata extraction tests ------------------------------------
