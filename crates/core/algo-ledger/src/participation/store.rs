@@ -40,6 +40,7 @@
 //! - **State proof**: stored as raw bytes (opaque blob).
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use algo_consensus_crypto::merklesig::{self, index_to_round, FalconSigner};
 use algo_consensus_crypto::{OneTimeSignatureSecrets, VrfKeypair};
@@ -119,12 +120,40 @@ const DELETE_STATE_PROOF_KEYS_BEFORE: &str =
 // ParticipationStore
 // ---------------------------------------------------------------------------
 
+/// A single key-updated event subscriber callback.
+type KeyUpdatedCallback = Box<dyn Fn(ParticipationID) + Send>;
+
 /// SQLite-backed participation key registry.
 ///
 /// Mirrors go-algorand's `participationDB` with synchronous operations
 /// (no background write thread).
 pub struct ParticipationStore {
     conn: Connection,
+
+    /// Callbacks fired whenever a participation key's persisted state
+    /// changes (insert / register / record / delete / voting-secret
+    /// update). Mirrors go-algorand's `registerOp`/write-queue mechanism
+    /// (`../go-algorand/data/account/participationRegistry.go`,
+    /// `TestRegisterUpdatedEvent`), which pushes a batch of
+    /// `updatingParticipationRecord`s through the async write queue every
+    /// time a key is registered or otherwise updated. algod-rust's store is
+    /// synchronous (no write queue), so the notification fires inline,
+    /// immediately after the write commits.
+    key_updated_subscribers: Mutex<Vec<KeyUpdatedCallback>>,
+
+    /// The most recent error produced by a mutating operation, if any.
+    ///
+    /// Mirrors go-algorand's `participationDB.writeThread`, which
+    /// accumulates the last write error from its async queue and returns
+    /// (then resets) it on the next `Flush()` call
+    /// (`../go-algorand/data/account/participationRegistry.go`,
+    /// `TestFlushResetsLastError`). algod-rust's operations already return
+    /// their `Result` synchronously to the caller, but this field lets a
+    /// caller that isn't checking every individual `Result` (e.g. a
+    /// fire-and-forget background task) observe and clear the last failure
+    /// later via [`take_last_error`](Self::take_last_error), the same way
+    /// `Flush` does.
+    last_error: Mutex<Option<String>>,
 }
 
 impl ParticipationStore {
@@ -144,7 +173,11 @@ impl ParticipationStore {
         conn.execute_batch(CREATE_KEYSETS)?;
         conn.execute_batch(CREATE_ROLLING)?;
         conn.execute_batch(CREATE_STATE_PROOF_KEYS)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            key_updated_subscribers: Mutex::new(Vec::new()),
+            last_error: Mutex::new(None),
+        })
     }
 
     /// Open (or create) a store backed by the given file path.
@@ -186,6 +219,64 @@ impl ParticipationStore {
         Self::new(conn)
     }
 
+    // -- Key-updated event subscription --------------------------------------
+
+    /// Register a callback to be invoked whenever a participation key's
+    /// persisted state changes (insert, register, record, delete, or a
+    /// voting-secret update).
+    ///
+    /// Mirrors go-algorand's registry pushing `updatingParticipationRecord`
+    /// batches through its async write queue on every key update
+    /// (`../go-algorand/data/account/participationRegistry.go`,
+    /// `TestRegisterUpdatedEvent`). Multiple subscribers may be registered;
+    /// each is invoked, in registration order, once per updated
+    /// `ParticipationID`.
+    pub fn subscribe_key_updated<F>(&self, callback: F)
+    where
+        F: Fn(ParticipationID) + Send + 'static,
+    {
+        self.key_updated_subscribers
+            .lock()
+            .unwrap()
+            .push(Box::new(callback));
+    }
+
+    /// Notify all subscribers that `id`'s persisted state changed.
+    fn notify_key_updated(&self, id: ParticipationID) {
+        let subscribers = self.key_updated_subscribers.lock().unwrap();
+        for callback in subscribers.iter() {
+            callback(id);
+        }
+    }
+
+    // -- Last-error state -----------------------------------------------------
+
+    /// Record `message` as the most recent mutating-operation failure.
+    fn set_last_error(&self, message: String) {
+        *self.last_error.lock().unwrap() = Some(message);
+    }
+
+    /// Return the most recent mutating-operation error, if any, clearing it.
+    ///
+    /// Mirrors go-algorand's `participationDB.Flush`, which returns the
+    /// latest error accumulated by the async write queue and resets it to
+    /// `nil` so the next `Flush` doesn't re-report a stale failure
+    /// (`../go-algorand/data/account/participationRegistry.go`,
+    /// `TestFlushResetsLastError`). A second call with no intervening
+    /// failure returns `None`.
+    pub fn take_last_error(&self) -> Option<String> {
+        self.last_error.lock().unwrap().take()
+    }
+
+    /// Run a mutating operation, recording its error (if any) via
+    /// [`set_last_error`](Self::set_last_error) before propagating it.
+    fn track_error<T>(&self, result: Result<T, rusqlite::Error>) -> Result<T, rusqlite::Error> {
+        if let Err(ref e) = result {
+            self.set_last_error(e.to_string());
+        }
+        result
+    }
+
     // -- CRUD ---------------------------------------------------------------
 
     /// Insert a participation key, returning its computed `ParticipationID`.
@@ -202,7 +293,19 @@ impl ParticipationStore {
         participation: &Participation,
     ) -> Result<ParticipationID, rusqlite::Error> {
         let id = participation.id();
+        let result = self.insert_impl(id, participation);
+        let result = self.track_error(result);
+        if result.is_ok() {
+            self.notify_key_updated(id);
+        }
+        result
+    }
 
+    fn insert_impl(
+        &self,
+        id: ParticipationID,
+        participation: &Participation,
+    ) -> Result<ParticipationID, rusqlite::Error> {
         // VRF: store the 32-byte seed so we can reconstruct later.
         let vrf_seed = participation.vrf.sk.seed().to_vec();
 
@@ -445,6 +548,19 @@ impl ParticipationStore {
         id: &ParticipationID,
         secrets: &OneTimeSignatureSecrets,
     ) -> Result<(), rusqlite::Error> {
+        let result = self.update_voting_secrets_impl(id, secrets);
+        let result = self.track_error(result);
+        if result.is_ok() {
+            self.notify_key_updated(*id);
+        }
+        result
+    }
+
+    fn update_voting_secrets_impl(
+        &self,
+        id: &ParticipationID,
+        secrets: &OneTimeSignatureSecrets,
+    ) -> Result<(), rusqlite::Error> {
         let pk: Option<i64> = self
             .conn
             .query_row(SELECT_PK, params![id.0.as_slice()], |row| row.get(0))
@@ -466,6 +582,15 @@ impl ParticipationStore {
 
     /// Delete a participation key by ID. Returns `true` if a row was deleted.
     pub fn delete(&self, id: &ParticipationID) -> Result<bool, rusqlite::Error> {
+        let result = self.delete_impl(id);
+        let result = self.track_error(result);
+        if matches!(result, Ok(true)) {
+            self.notify_key_updated(*id);
+        }
+        result
+    }
+
+    fn delete_impl(&self, id: &ParticipationID) -> Result<bool, rusqlite::Error> {
         let pk: Option<i64> = self
             .conn
             .query_row(SELECT_PK, params![id.0.as_slice()], |row| row.get(0))
@@ -528,6 +653,32 @@ impl ParticipationStore {
     /// Matches Go's `Register` logic: deactivates any currently-active keys
     /// for the same account by setting their `effectiveLast = on_round - 1`.
     pub fn register(&self, id: &ParticipationID, on_round: Round) -> Result<(), rusqlite::Error> {
+        let result = self.register_impl(id, on_round);
+        match self.track_error(result) {
+            Ok(deactivated) => {
+                // Mirrors go-algorand's `registerOp`, which pushes the whole
+                // `updated` map (the newly-registered key plus every key it
+                // deactivated) through the write queue as one key-updated
+                // event batch (`TestRegisterUpdatedEvent`).
+                self.notify_key_updated(*id);
+                for other in deactivated {
+                    self.notify_key_updated(other);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Implementation of [`register`](Self::register). Returns the list of
+    /// other `ParticipationID`s (for the same account) that were
+    /// deactivated as a side effect, so the caller can fire a key-updated
+    /// notification for each of them too.
+    fn register_impl(
+        &self,
+        id: &ParticipationID,
+        on_round: Round,
+    ) -> Result<Vec<ParticipationID>, rusqlite::Error> {
         let pk: Option<i64> = self
             .conn
             .query_row(SELECT_PK, params![id.0.as_slice()], |row| row.get(0))
@@ -557,9 +708,33 @@ impl ParticipationStore {
 
         let tx = self.conn.unchecked_transaction()?;
 
-        // Deactivate other currently-active keys for the same account.
+        // Find other currently-active keys for the same account that this
+        // registration will deactivate, so we can report their IDs.
         // A key is "active" if effectiveLastRound != 0 AND effectiveFirstRound <= on
         // AND on <= effectiveLastRound.
+        let mut stmt = tx.prepare(
+            "SELECT k.participationID FROM Keysets k
+             INNER JOIN Rolling r ON k.pk = r.pk
+             WHERE k.account = ?1
+               AND k.pk != ?2
+               AND r.effectiveLastRound IS NOT NULL
+               AND r.effectiveLastRound != 0
+               AND r.effectiveFirstRound <= ?3
+               AND ?3 <= r.effectiveLastRound",
+        )?;
+        let deactivated: Vec<ParticipationID> = stmt
+            .query_map(params![account_blob, pk, on], |row| {
+                let raw: Vec<u8> = row.get(0)?;
+                let mut buf = [0u8; 32];
+                if raw.len() == 32 {
+                    buf.copy_from_slice(&raw);
+                }
+                Ok(ParticipationID(buf))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        // Deactivate those keys.
         tx.execute(
             "UPDATE Rolling SET effectiveLastRound = ?1
              WHERE pk IN (
@@ -583,11 +758,25 @@ impl ParticipationStore {
 
         tx.commit()?;
 
-        Ok(())
+        Ok(deactivated)
     }
 
     /// Record that a participation action was taken for a key at a given round.
     pub fn record(
+        &self,
+        id: &ParticipationID,
+        round: Round,
+        action: ParticipationAction,
+    ) -> Result<(), rusqlite::Error> {
+        let result = self.record_impl(id, round, action);
+        let result = self.track_error(result);
+        if result.is_ok() {
+            self.notify_key_updated(*id);
+        }
+        result
+    }
+
+    fn record_impl(
         &self,
         id: &ParticipationID,
         round: Round,
@@ -665,7 +854,25 @@ impl ParticipationStore {
         round: Round,
         action: ParticipationAction,
     ) -> Result<(), rusqlite::Error> {
-        let sql = "SELECT k.pk FROM Keysets k
+        let result = self.record_for_account_impl(account, round, action);
+        let result = self.track_error(result);
+        match result {
+            Ok(Some(id)) => {
+                self.notify_key_updated(id);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn record_for_account_impl(
+        &self,
+        account: &Address,
+        round: Round,
+        action: ParticipationAction,
+    ) -> Result<Option<ParticipationID>, rusqlite::Error> {
+        let sql = "SELECT k.pk, k.participationID FROM Keysets k
                    INNER JOIN Rolling r ON k.pk = r.pk
                    WHERE k.account = ?1
                      AND r.effectiveLastRound IS NOT NULL
@@ -673,18 +880,18 @@ impl ParticipationStore {
                      AND r.effectiveFirstRound <= ?2
                      AND ?2 <= r.effectiveLastRound";
         let mut stmt = self.conn.prepare(sql)?;
-        let pks: Vec<i64> = stmt
+        let matches: Vec<(i64, Vec<u8>)> = stmt
             .query_map(params![account.0.as_slice(), round.0 as i64], |row| {
-                row.get(0)
+                Ok((row.get(0)?, row.get(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let pk = match pks.len() {
+        let (pk, id) = match matches.len() {
             0 => {
                 // No active key for this account — no-op per Go behavior.
-                return Ok(());
+                return Ok(None);
             }
-            1 => pks[0],
+            1 => matches.into_iter().next().unwrap(),
             _ => {
                 // Multiple active keys is a bug — return error like Go.
                 return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -703,7 +910,12 @@ impl ParticipationStore {
         };
 
         self.conn.execute(update_sql, params![round_val, pk])?;
-        Ok(())
+
+        let mut id_buf = [0u8; 32];
+        if id.len() == 32 {
+            id_buf.copy_from_slice(&id);
+        }
+        Ok(Some(ParticipationID(id_buf)))
     }
 
     // -- State proof key persistence ----------------------------------------
@@ -1737,5 +1949,194 @@ mod tests {
             full.state_proof_secrets.is_none(),
             "secrets should be None for keys without state proof"
         );
+    }
+
+    // -- Key-updated event subscription tests --------------------------------
+    //
+    // Mirrors go-algorand's `TestRegisterUpdatedEvent`
+    // (`../go-algorand/data/account/participationRegistry_test.go`), which
+    // verifies that registering a key pushes an update for both the newly
+    // registered key and any other key it deactivates.
+
+    #[test]
+    fn key_updated_subscriber_fires_on_insert() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<ParticipationID>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        store.subscribe_key_updated(move |id| seen_clone.lock().unwrap().push(id));
+
+        let part = make_test_participation(1, 100, 200, 10);
+        let id = store.insert(&part).unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec![id]);
+    }
+
+    #[test]
+    fn key_updated_subscriber_fires_on_register() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation(1, 100, 200, 10);
+        let id = store.insert(&part).unwrap();
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<ParticipationID>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        store.subscribe_key_updated(move |updated| seen_clone.lock().unwrap().push(updated));
+
+        store.register(&id, Round(150)).unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec![id]);
+    }
+
+    #[test]
+    fn key_updated_subscriber_fires_for_deactivated_keys() {
+        // Two keys for the same account. Registering the second one must
+        // notify for both the newly-registered key and the key it
+        // deactivates — matching go's `registerOp.updated` map, which
+        // includes every touched `ParticipationID` in one event batch.
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let p1 = make_test_participation(1, 100, 300, 10);
+        let p2 = Participation {
+            parent: Address([1u8; 32]),
+            vrf: VrfKeypair::from_seed([2u8; 32]),
+            voting: algo_consensus_crypto::OneTimeSignatureSecrets::generate(0, 10),
+            first_valid: Round(200),
+            last_valid: Round(400),
+            key_dilution: 10,
+            state_proof_secrets: None,
+        };
+        let id1 = store.insert(&p1).unwrap();
+        let id2 = store.insert(&p2).unwrap();
+        store.register(&id1, Round(150)).unwrap();
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<ParticipationID>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        store.subscribe_key_updated(move |updated| seen_clone.lock().unwrap().push(updated));
+
+        // Registering id2 at round 200 deactivates id1.
+        store.register(&id2, Round(200)).unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "expected an event for both keys");
+        assert!(seen.contains(&id1));
+        assert!(seen.contains(&id2));
+    }
+
+    #[test]
+    fn key_updated_subscriber_does_not_fire_on_failed_register() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation(1, 100, 200, 10);
+        let id = store.insert(&part).unwrap();
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<ParticipationID>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        store.subscribe_key_updated(move |updated| seen_clone.lock().unwrap().push(updated));
+
+        // Round 50 is before firstValid=100 — register fails.
+        assert!(store.register(&id, Round(50)).is_err());
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a failed register must not fire a key-updated event"
+        );
+    }
+
+    #[test]
+    fn key_updated_subscriber_fires_on_delete() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation(1, 100, 200, 10);
+        let id = store.insert(&part).unwrap();
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<ParticipationID>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        store.subscribe_key_updated(move |updated| seen_clone.lock().unwrap().push(updated));
+
+        store.delete(&id).unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec![id]);
+    }
+
+    #[test]
+    fn key_updated_subscriber_multiple_subscribers_all_fire() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation(1, 100, 200, 10);
+
+        let count_a = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_b = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_a_clone = count_a.clone();
+        let count_b_clone = count_b.clone();
+        store.subscribe_key_updated(move |_| {
+            count_a_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        store.subscribe_key_updated(move |_| {
+            count_b_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        store.insert(&part).unwrap();
+
+        assert_eq!(count_a.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(count_b.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // -- Persistent last-flush-error state tests ------------------------------
+    //
+    // Mirrors go-algorand's `TestFlushResetsLastError`
+    // (`../go-algorand/data/account/participationRegistry_test.go`), which
+    // verifies that a failed async write is surfaced exactly once, by the
+    // next `Flush()` call, and is then reset.
+
+    #[test]
+    fn last_error_none_when_nothing_failed() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        assert!(store.take_last_error().is_none());
+    }
+
+    #[test]
+    fn last_error_recorded_and_reset_by_take_last_error() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation(1, 100, 200, 10);
+        let id = store.insert(&part).unwrap();
+
+        // Round 50 is before firstValid=100 — this fails and should be
+        // recorded as the last error.
+        assert!(store.register(&id, Round(50)).is_err());
+
+        let last_error = store.take_last_error();
+        assert!(
+            last_error.is_some(),
+            "the failed register should have recorded a last error"
+        );
+
+        // Mirrors `TestFlushResetsLastError`: after being read once, the
+        // error resets — a second read with no intervening failure is None.
+        assert!(
+            store.take_last_error().is_none(),
+            "take_last_error should reset after being read"
+        );
+    }
+
+    #[test]
+    fn last_error_records_failed_insert() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation(1, 100, 200, 10);
+        store.insert(&part).unwrap();
+
+        // Inserting the same participation ID again fails (UNIQUE
+        // constraint) and should populate last_error.
+        assert!(store.insert(&part).is_err());
+        assert!(store.take_last_error().is_some());
+    }
+
+    #[test]
+    fn last_error_unaffected_by_successful_operations() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation(1, 100, 200, 10);
+        let id = store.insert(&part).unwrap();
+
+        // A successful operation must not leave a stale error behind.
+        store.register(&id, Round(150)).unwrap();
+        assert!(store.take_last_error().is_none());
     }
 }
