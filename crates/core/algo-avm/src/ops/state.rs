@@ -2413,6 +2413,123 @@ mod tests {
         );
     }
 
+    // ── Self-mutation of an app's own local state (issue #1110) ───
+    //
+    // Mirrors go-algorand's `TestSelfMutateV8`/`TestSelfMutateV9AndUp`
+    // (`data/transactions/logic/evalStateful_test.go` lines 3892/3934):
+    // an app account that is opted into *itself* (its address passed as a
+    // raw 32-byte value, not an `Accounts` array index -- exactly what
+    // `global CurrentApplicationAddress` pushes) cannot mutate its own
+    // local state below `sharedResourcesVersion` (v9) because
+    // `mutableAccountReference` (`data/transactions/logic/eval.go`) has no
+    // `txn.Accounts` slot to encode the write against; reads are
+    // unaffected. From v9 on, `mutableAccountReference` falls through to
+    // accept any address the group's resource-availability rules allow,
+    // and the write is recorded via `EvalDelta.SharedAccts` (see
+    // `encode_eval_delta_routes_raw_account_to_shared_accts` in
+    // `algo_ledger::eval_delta`, which pins the exact index/`sa` layout
+    // go's `TestSelfMutateV9AndUp` asserts against).
+
+    #[test]
+    fn self_mutate_v8_rejects_own_address_local_put_and_del_but_allows_get() {
+        let self_addr = test_addr(0x0D);
+        let mut ctx = TestStateContext::new(888);
+        ctx.local_state
+            .insert((self_addr, 888, b"hey".to_vec()), TealValue::Uint(77));
+
+        // pushbytes self_addr, pushbytes "hey", pushint 42, app_local_put
+        let mut put_code = vec![0x80, 0x20];
+        put_code.extend_from_slice(&self_addr);
+        put_code.extend_from_slice(&[0x80, 0x03]);
+        put_code.extend_from_slice(b"hey");
+        put_code.extend_from_slice(&[0x81, 42]);
+        put_code.push(0x66); // app_local_put
+        let raw = prog(8, &put_code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let err = step_n(&mut m, &mut ctx, 4).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid Account reference for mutation"),
+            "unexpected error: {err}"
+        );
+
+        // pushbytes self_addr, pushbytes "hey", app_local_del
+        let mut del_code = vec![0x80, 0x20];
+        del_code.extend_from_slice(&self_addr);
+        del_code.extend_from_slice(&[0x80, 0x03]);
+        del_code.extend_from_slice(b"hey");
+        del_code.push(0x68); // app_local_del
+        let raw = prog(8, &del_code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid Account reference for mutation"),
+            "unexpected error: {err}"
+        );
+
+        // But reads still work: pushbytes self_addr, pushbytes "hey", app_local_get
+        let mut get_code = vec![0x80, 0x20];
+        get_code.extend_from_slice(&self_addr);
+        get_code.extend_from_slice(&[0x80, 0x03]);
+        get_code.extend_from_slice(b"hey");
+        get_code.push(0x62); // app_local_get
+        let raw = prog(8, &get_code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        assert_eq!(m.stack, vec![AvmValue::Uint64(77)]);
+    }
+
+    #[test]
+    fn self_mutate_v9_allows_own_address_local_put_and_del() {
+        let self_addr = test_addr(0x0E);
+        let mut ctx = TestStateContext::new(888);
+        ctx.local_state
+            .insert((self_addr, 888, b"hey".to_vec()), TealValue::Uint(77));
+
+        // pushbytes self_addr, pushbytes "hey", pushint 42, app_local_put
+        let mut put_code = vec![0x80, 0x20];
+        put_code.extend_from_slice(&self_addr);
+        put_code.extend_from_slice(&[0x80, 0x03]);
+        put_code.extend_from_slice(b"hey");
+        put_code.extend_from_slice(&[0x81, 42]);
+        put_code.push(0x66); // app_local_put
+                             // pushbytes self_addr, pushbytes "hey", app_local_get
+        put_code.extend_from_slice(&[0x80, 0x20]);
+        put_code.extend_from_slice(&self_addr);
+        put_code.extend_from_slice(&[0x80, 0x03]);
+        put_code.extend_from_slice(b"hey");
+        put_code.push(0x62); // app_local_get
+        let raw = prog(9, &put_code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 7).unwrap();
+        assert_eq!(m.stack, vec![AvmValue::Uint64(42)]);
+
+        // Now delete it: pushbytes self_addr, pushbytes "hey", app_local_del
+        let mut del_code = vec![0x80, 0x20];
+        del_code.extend_from_slice(&self_addr);
+        del_code.extend_from_slice(&[0x80, 0x03]);
+        del_code.extend_from_slice(b"hey");
+        del_code.push(0x68); // app_local_del
+                             // pushbytes self_addr, pushbytes "hey", app_local_get
+        del_code.extend_from_slice(&[0x80, 0x20]);
+        del_code.extend_from_slice(&self_addr);
+        del_code.extend_from_slice(&[0x80, 0x03]);
+        del_code.extend_from_slice(b"hey");
+        del_code.push(0x62); // app_local_get
+        let raw = prog(9, &del_code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 6).unwrap();
+        // Deleted key reads back as uint64(0), matching `app_local_get`'s
+        // not-found default.
+        assert_eq!(m.stack, vec![AvmValue::Uint64(0)]);
+    }
+
     #[test]
     fn test_app_local_put_and_get() {
         let addr = test_addr(0x0A);
