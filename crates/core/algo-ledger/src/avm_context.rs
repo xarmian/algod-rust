@@ -916,6 +916,29 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// Resources (accounts/assets/apps) shared by sibling transactions in
     /// `group`, computed once at construction. See [`GroupResources`].
     pub(crate) group_resources: GroupResources,
+    /// Whether *unnamed*-resource accesses recorded from this point on may
+    /// be satisfied from the group-shared pool of [`UnnamedCapacityTracker`],
+    /// rather than only the local pool of the top-level transaction at
+    /// [`Self::txn_root_index`]. Mirrors go-algorand's `evalTracer.BeforeProgram`
+    /// (`ledger/simulation/tracer.go`, issue #1128), which computes
+    /// `globalSharing` by walking the current program's caller chain for any
+    /// frame with `ProgramVersion() >= sharedResourcesVersion`. For a
+    /// top-level context (no caller) this collapses to `program_version >=
+    /// SHARED_RESOURCES_VERSION` (set via [`Self::init_top_level_sharing`]);
+    /// an inner context ORs its own version-eligibility onto the caller's
+    /// already-computed value (set directly by `execute_inner_appl`), since
+    /// go's loop walks from the current frame up through every ancestor.
+    global_sharing: bool,
+    /// The top-level transaction's index within [`Self::group`] that owns
+    /// this call's *local* unnamed-resource pool -- fixed for the lifetime
+    /// of a top-level transaction and every inner call it makes. Mirrors
+    /// go-algorand's `resourcePolicy.txnRootIndex`, set once per top-level
+    /// transaction (`ep.GetCaller() == nil`) and left unchanged by inner
+    /// calls (`ledger/simulation/tracer.go`'s `BeforeTxn`). Defaults to
+    /// [`Self::group_index`] at construction, correct for every top-level
+    /// call site; inner contexts have it overwritten by `execute_inner_appl`
+    /// with the caller's own `txn_root_index` (not the inner sibling index).
+    txn_root_index: usize,
 }
 
 /// Shared accumulator type for per-round box deltas. See
@@ -993,14 +1016,71 @@ pub struct UnnamedCapacityTracker {
     /// by [`Self::add_app_read_budget`] and summed into
     /// [`Self::used_read_budget`] alongside box read sizes.
     app_read_budget: HashMap<u64, u64>,
+
+    // --- issue #1128: per-transaction local-vs-group-shared split ---
+    /// Per-top-level-transaction local resource pools, mirroring go's
+    /// `groupResourceTracker.localTxnResources`. Index `i` holds the
+    /// accounts/assets/apps recorded under `global_sharing = false` for the
+    /// top-level transaction at group index `i` -- visible only to that
+    /// transaction and its inner calls, never to siblings, unless promoted
+    /// into the group-shared pool above (`seen_accounts`/`seen_assets`/
+    /// `seen_apps`) by a later `global_sharing = true` access.
+    ///
+    /// Sized to the submitted group's length by [`Self::new`] (the only
+    /// production constructor); empty when built via `..Default::default()`
+    /// (as this crate's own unit tests below do, to hand-construct a tracker
+    /// with a fixed [`crate::simulation::trace::ResourceCapacity`] rather
+    /// than deriving it from a real group). The `*_at` methods below treat
+    /// an empty `local_txn` as "no split" and fall back to the pre-#1128,
+    /// group-only behavior, so those existing tests are unaffected.
+    local_txn: Vec<LocalTxnResources>,
+}
+
+/// One top-level transaction's local (non-group-shared) unnamed-resource
+/// pool. See [`UnnamedCapacityTracker::local_txn`].
+#[derive(Debug, Default)]
+struct LocalTxnResources {
+    /// This transaction's own `Max*` capacity, from
+    /// [`crate::simulation::trace::compute_txn_resource_capacity`] (mirrors
+    /// go's `makeTxnResourceTracker`). Zero for a non-`appl` transaction.
+    capacity: crate::simulation::trace::TxnResourceCapacity,
+    seen_accounts: HashSet<[u8; 32]>,
+    seen_assets: HashSet<u64>,
+    seen_apps: HashSet<u64>,
+}
+
+impl LocalTxnResources {
+    fn new(capacity: crate::simulation::trace::TxnResourceCapacity) -> Self {
+        LocalTxnResources {
+            capacity,
+            ..Default::default()
+        }
+    }
+
+    /// go-algorand `ResourceTracker.refCount`, restricted to this local
+    /// tracker: boxes/cross-products never appear here (see
+    /// [`UnnamedCapacityTracker::local_txn`]'s doc comment), so this is
+    /// simply the flat account/asset/app count.
+    fn ref_count(&self) -> usize {
+        self.seen_accounts.len() + self.seen_assets.len() + self.seen_apps.len()
+    }
 }
 
 impl UnnamedCapacityTracker {
-    /// Build a tracker for the given group, precomputing its `Max*`
-    /// capacity via [`crate::simulation::trace::compute_resource_capacity`].
+    /// Build a tracker for the given group, precomputing its group-wide
+    /// `Max*` capacity via
+    /// [`crate::simulation::trace::compute_resource_capacity`] and each
+    /// member transaction's own local `Max*` capacity via
+    /// [`crate::simulation::trace::compute_txn_resource_capacity`] (issue
+    /// #1128).
     pub fn new(txgroup: &[SignedTransaction], consensus: &ConsensusParams) -> Self {
+        let local_txn = crate::simulation::trace::compute_txn_resource_capacity(txgroup, consensus)
+            .into_iter()
+            .map(LocalTxnResources::new)
+            .collect();
         UnnamedCapacityTracker {
             capacity: crate::simulation::trace::compute_resource_capacity(txgroup, consensus),
+            local_txn,
             ..Default::default()
         }
     }
@@ -1197,6 +1277,211 @@ impl UnnamedCapacityTracker {
         true
     }
 
+    // --- issue #1128: local-vs-group-shared dispatch ---
+    //
+    // The `*_at` methods below are the group-level entry points -- mirroring
+    // go's `groupResourceTracker.hasAccount`/`addAccount` (and the
+    // asset/app equivalents), each parameterized by `global_sharing` (is
+    // the *current* AVM program, and every caller in its call stack,
+    // running at `SHARED_RESOURCES_VERSION`+?) and `txn_index` (the owning
+    // top-level transaction's index in the group). When `global_sharing` is
+    // true (or `local_txn` is empty -- see its doc comment), these behave
+    // exactly like the pre-#1128 flat `try_add_*`/`seen_*` methods above,
+    // consulting/mutating the shared group pool. Otherwise they consult/
+    // mutate only `local_txn[txn_index]`, and a *new* local addition also
+    // shrinks the shared group pool by one slot (go's `removeAccountSlot`/
+    // `removeAssetSlot`/`removeAppSlot`) -- reflecting that a resource
+    // pinned locally can no longer also be satisfied from the group pool.
+
+    /// Mirrors go's `groupResourceTracker.hasAccount`.
+    fn has_account_at(&self, addr: [u8; 32], global_sharing: bool, txn_index: usize) -> bool {
+        if global_sharing || self.local_txn.is_empty() {
+            return self.seen_accounts.contains(&addr)
+                || self
+                    .local_txn
+                    .iter()
+                    .any(|l| l.seen_accounts.contains(&addr));
+        }
+        self.local_txn[txn_index].seen_accounts.contains(&addr)
+    }
+
+    /// Mirrors go's `groupResourceTracker.addAccount`.
+    fn try_add_account_at(
+        &mut self,
+        addr: [u8; 32],
+        global_sharing: bool,
+        txn_index: usize,
+    ) -> bool {
+        if self.has_account_at(addr, global_sharing, txn_index) {
+            return true;
+        }
+        if global_sharing || self.local_txn.is_empty() {
+            return self.try_add_account(addr);
+        }
+        let local = &self.local_txn[txn_index];
+        if local.seen_accounts.len() >= local.capacity.max_accounts
+            || local.ref_count() >= local.capacity.max_total_refs
+        {
+            return false;
+        }
+        self.local_txn[txn_index].seen_accounts.insert(addr);
+        // A resource already tracked globally is redundant once assigned
+        // locally: remove it and refund its slot (go's `addAccount`
+        // deleting from `globalResources.Accounts` before reverting
+        // `MaxAccounts`/`MaxTotalRefs`).
+        if self.seen_accounts.remove(&addr) {
+            self.capacity.max_accounts += 1;
+            self.capacity.max_total_refs += 1;
+        }
+        if self.remove_account_slot() {
+            return true;
+        }
+        self.local_txn[txn_index].seen_accounts.remove(&addr);
+        false
+    }
+
+    /// Mirrors go's `ResourceTracker.removeAccountSlot`.
+    fn remove_account_slot(&mut self) -> bool {
+        if self.seen_accounts.len() >= self.capacity.max_accounts
+            || self.ref_count() >= self.capacity.max_total_refs
+        {
+            return false;
+        }
+        self.capacity.max_accounts -= 1;
+        self.capacity.max_total_refs -= 1;
+        true
+    }
+
+    /// Mirrors go's `groupResourceTracker.hasAsset`.
+    fn has_asset_at(&self, id: u64, global_sharing: bool, txn_index: usize) -> bool {
+        if global_sharing || self.local_txn.is_empty() {
+            return self.seen_assets.contains(&id)
+                || self.local_txn.iter().any(|l| l.seen_assets.contains(&id));
+        }
+        self.local_txn[txn_index].seen_assets.contains(&id)
+    }
+
+    /// Mirrors go's `groupResourceTracker.addAsset`.
+    fn try_add_asset_at(&mut self, id: u64, global_sharing: bool, txn_index: usize) -> bool {
+        if self.has_asset_at(id, global_sharing, txn_index) {
+            return true;
+        }
+        if global_sharing || self.local_txn.is_empty() {
+            return self.try_add_asset(id);
+        }
+        let local = &self.local_txn[txn_index];
+        if local.seen_assets.len() >= local.capacity.max_assets
+            || local.ref_count() >= local.capacity.max_total_refs
+        {
+            return false;
+        }
+        self.local_txn[txn_index].seen_assets.insert(id);
+        if self.seen_assets.remove(&id) {
+            self.capacity.max_assets += 1;
+            self.capacity.max_total_refs += 1;
+        }
+        if self.remove_asset_slot() {
+            return true;
+        }
+        self.local_txn[txn_index].seen_assets.remove(&id);
+        false
+    }
+
+    /// Mirrors go's `ResourceTracker.removeAssetSlot`.
+    fn remove_asset_slot(&mut self) -> bool {
+        if self.seen_assets.len() >= self.capacity.max_assets
+            || self.ref_count() >= self.capacity.max_total_refs
+        {
+            return false;
+        }
+        self.capacity.max_assets -= 1;
+        self.capacity.max_total_refs -= 1;
+        true
+    }
+
+    /// Mirrors go's `groupResourceTracker.hasApp`.
+    fn has_app_at(&self, id: u64, global_sharing: bool, txn_index: usize) -> bool {
+        if global_sharing || self.local_txn.is_empty() {
+            return self.seen_apps.contains(&id)
+                || self.local_txn.iter().any(|l| l.seen_apps.contains(&id));
+        }
+        self.local_txn[txn_index].seen_apps.contains(&id)
+    }
+
+    /// Mirrors go's `groupResourceTracker.addApp`'s flat app-slot handling
+    /// (the read-budget charge is a separate, always-global step -- see
+    /// [`Self::try_add_app_with_read_budget_at`]).
+    fn try_add_app_at(&mut self, id: u64, global_sharing: bool, txn_index: usize) -> bool {
+        if self.has_app_at(id, global_sharing, txn_index) {
+            return true;
+        }
+        if global_sharing || self.local_txn.is_empty() {
+            return self.try_add_app(id);
+        }
+        let local = &self.local_txn[txn_index];
+        if local.seen_apps.len() >= local.capacity.max_apps
+            || local.ref_count() >= local.capacity.max_total_refs
+        {
+            return false;
+        }
+        self.local_txn[txn_index].seen_apps.insert(id);
+        if self.seen_apps.remove(&id) {
+            self.capacity.max_apps += 1;
+            self.capacity.max_total_refs += 1;
+        }
+        if self.remove_app_slot() {
+            return true;
+        }
+        self.local_txn[txn_index].seen_apps.remove(&id);
+        false
+    }
+
+    /// Mirrors go's `ResourceTracker.removeAppSlot` (also gives back an
+    /// account slot: an app reference makes its own account available too).
+    fn remove_app_slot(&mut self) -> bool {
+        if self.seen_apps.len() >= self.capacity.max_apps
+            || self.ref_count() >= self.capacity.max_total_refs
+        {
+            return false;
+        }
+        self.capacity.max_apps -= 1;
+        self.capacity.max_total_refs -= 1;
+        if self.capacity.max_accounts > 0 {
+            self.capacity.max_accounts -= 1;
+        }
+        true
+    }
+
+    /// Mirrors go's `groupResourceTracker.addApp`: charge this app's
+    /// read-budget first (see [`Self::add_app_read_budget`] -- always
+    /// global, regardless of `global_sharing`, since read/write I/O budget
+    /// is a group-wide resource), and only then add the flat app-reference
+    /// slot via [`Self::try_add_app_at`] -- rolling back the read-budget
+    /// charge if that subsequently fails, exactly as go's
+    /// `rollbackAppReadBudget()` closure does.
+    fn try_add_app_with_read_budget_at(
+        &mut self,
+        app_id: u64,
+        extra_read_bytes: u64,
+        bytes_per_box_ref: u64,
+        global_sharing: bool,
+        txn_index: usize,
+    ) -> bool {
+        if self.has_app_at(app_id, global_sharing, txn_index) {
+            return true;
+        }
+        let old_deficit_empty_box_refs = self.deficit_empty_box_refs;
+        if !self.add_app_read_budget(app_id, extra_read_bytes, bytes_per_box_ref) {
+            return false;
+        }
+        if self.try_add_app_at(app_id, global_sharing, txn_index) {
+            return true;
+        }
+        self.app_read_budget.remove(&app_id);
+        self.deficit_empty_box_refs = old_deficit_empty_box_refs;
+        false
+    }
+
     /// Mirrors go's `groupResourceTracker.addAppReadBudget`: charge this
     /// app's oversized approval+clear-state program size against the
     /// group's read-budget pool, unless it was already charged for this
@@ -1237,35 +1522,6 @@ impl UnnamedCapacityTracker {
             self.deficit_empty_box_refs = old_deficit_empty_box_refs;
             false
         }
-    }
-
-    /// Mirrors go's `groupResourceTracker.addApp`: charge this app's
-    /// read-budget first (see [`Self::add_app_read_budget`]), and only then
-    /// add the flat app-reference slot -- rolling back the read-budget
-    /// charge if the flat add subsequently fails, exactly as go's
-    /// `rollbackAppReadBudget()` closure does. A no-op (returns `true`
-    /// immediately) if `app_id` was already seen, matching go's
-    /// `resourcePolicy.AvailableApp` checking `hasApp` before ever calling
-    /// `addApp`/`addAppReadBudget`.
-    fn try_add_app_with_read_budget(
-        &mut self,
-        app_id: u64,
-        extra_read_bytes: u64,
-        bytes_per_box_ref: u64,
-    ) -> bool {
-        if self.seen_apps.contains(&app_id) {
-            return true;
-        }
-        let old_deficit_empty_box_refs = self.deficit_empty_box_refs;
-        if !self.add_app_read_budget(app_id, extra_read_bytes, bytes_per_box_ref) {
-            return false;
-        }
-        if self.try_add_app(app_id) {
-            return true;
-        }
-        self.app_read_budget.remove(&app_id);
-        self.deficit_empty_box_refs = old_deficit_empty_box_refs;
-        false
     }
 
     /// Returns `true` if `key` is already recorded (as either a concrete
@@ -1730,6 +1986,18 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             // after construction, once the program bytes are parsed.
             program_version: 0,
             group_resources,
+            // Defaults to `false` (no group-shared unnamed-resource pool)
+            // until `init_top_level_sharing` (top level) or
+            // `execute_inner_appl` (inner calls) sets the real value once
+            // the executing program's version is known -- see the field's
+            // own doc comment.
+            global_sharing: false,
+            // Correct as-is for every top-level call site (`group_index` is
+            // exactly go's `txnRootIndex` there); inner contexts have this
+            // overwritten by `execute_inner_appl` with the caller's own
+            // `txn_root_index`, not this constructor's `group_index` (which
+            // for an inner call is the *inner-group* sibling index).
+            txn_root_index: group_index,
         }
     }
 
@@ -1742,6 +2010,19 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// call site.
     pub fn set_program_version(&mut self, version: u8) {
         self.program_version = version;
+    }
+
+    /// Activate group-wide *unnamed*-resource sharing for a **top-level**
+    /// transaction context once its program version is known (call after
+    /// [`Self::set_program_version`]). Mirrors go-algorand's `evalTracer.
+    /// BeforeProgram` computing `globalSharing` for a call with no caller
+    /// (`ep.GetCaller() == nil`): with no caller chain to walk, that's
+    /// simply `self.program_version >= SHARED_RESOURCES_VERSION`. Inner
+    /// calls set `global_sharing` directly instead (OR'd with their
+    /// caller's) -- see `execute_inner_appl`, which does not call this
+    /// method.
+    pub fn init_top_level_sharing(&mut self) {
+        self.global_sharing = self.program_version >= SHARED_RESOURCES_VERSION;
     }
 
     /// Override the per-program log limits (simulation `allow_more_logging`).
@@ -1859,18 +2140,23 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// tracking is enabled) has room for one more account; `true`
     /// unconditionally when no tracker is attached, so callers built without
     /// [`Self::enable_unnamed_capacity_tracking`] keep the pre-#970,
-    /// unbounded-reporting behavior. Mirrors go's `ResourceTracker.addAccount`.
+    /// unbounded-reporting behavior. Mirrors go's `ResourceTracker.addAccount`
+    /// via `groupResourceTracker.addAccount`, dispatched by this call's
+    /// `global_sharing`/`txn_root_index` (issue #1128).
     fn capacity_allows_account(&self, account: [u8; 32]) -> bool {
-        self.unnamed_capacity
-            .as_ref()
-            .map_or(true, |cap| cap.borrow_mut().try_add_account(account))
+        self.unnamed_capacity.as_ref().map_or(true, |cap| {
+            cap.borrow_mut()
+                .try_add_account_at(account, self.global_sharing, self.txn_root_index)
+        })
     }
 
-    /// See [`Self::capacity_allows_account`]; mirrors go's `addAsset`.
+    /// See [`Self::capacity_allows_account`]; mirrors go's `addAsset` via
+    /// `groupResourceTracker.addAsset`.
     fn capacity_allows_asset(&self, asset_id: u64) -> bool {
-        self.unnamed_capacity
-            .as_ref()
-            .map_or(true, |cap| cap.borrow_mut().try_add_asset(asset_id))
+        self.unnamed_capacity.as_ref().map_or(true, |cap| {
+            cap.borrow_mut()
+                .try_add_asset_at(asset_id, self.global_sharing, self.txn_root_index)
+        })
     }
 
     /// See [`Self::capacity_allows_account`]; mirrors go's `addApp` plus its
@@ -1879,14 +2165,16 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// reference, charge that app's oversized approval+clear-state program
     /// size against the same read-budget pool issue #1006 ported for boxes
     /// -- even if no box on the app is ever touched. Only fetches the
-    /// app's on-chain program lengths when the app hasn't already been
-    /// seen this group, matching go's `hasApp` gate short-circuiting before
-    /// `addAppReadBudget`'s ledger lookup ever runs.
+    /// app's on-chain program lengths when the app hasn't already been seen
+    /// in this call's local-vs-global scope, matching go's `hasApp` gate
+    /// short-circuiting before `addAppReadBudget`'s ledger lookup ever runs.
     fn capacity_allows_app(&self, app_id: u64) -> bool {
         let Some(cap) = self.unnamed_capacity.as_ref() else {
             return true;
         };
-        let already_seen = cap.borrow().seen_apps.contains(&app_id);
+        let already_seen =
+            cap.borrow()
+                .has_app_at(app_id, self.global_sharing, self.txn_root_index);
         let extra_read_bytes = if already_seen {
             0
         } else {
@@ -1900,10 +2188,12 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 })
                 .unwrap_or(0)
         };
-        cap.borrow_mut().try_add_app_with_read_budget(
+        cap.borrow_mut().try_add_app_with_read_budget_at(
             app_id,
             extra_read_bytes,
             self.consensus.bytes_per_box_reference,
+            self.global_sharing,
+            self.txn_root_index,
         )
     }
 
@@ -3386,6 +3676,13 @@ fn execute_inner_appl<L: LedgerStore>(
     log_limits: (u64, u64),
     unnamed_tracking: Option<Arc<NamedGroupResources>>,
     unnamed_capacity: Option<Rc<RefCell<UnnamedCapacityTracker>>>,
+    // Issue #1128: the calling context's own unnamed-resource sharing scope,
+    // propagated to the child so it can compute its own `global_sharing`
+    // (OR'd with its own program version) and keep the same
+    // `txn_root_index` -- mirrors go's caller-chain walk in `evalTracer.
+    // BeforeProgram` and `txnRootIndex` staying fixed across inner calls.
+    caller_global_sharing: bool,
+    caller_txn_root_index: usize,
     kv_mods_recorder: Option<KvModsRecorder>,
     // ── Inner-group sibling context (issue #714) ──
     //
@@ -3508,6 +3805,16 @@ fn execute_inner_appl<L: LedgerStore>(
             .map(|p| p.version)
             .unwrap_or(0),
     );
+    // Issue #1128: `global_sharing` is the caller's own value OR'd with this
+    // program's own version-eligibility -- mirrors go's `evalTracer.
+    // BeforeProgram` walking from the current frame up through every caller
+    // for any `ProgramVersion() >= sharedResourcesVersion`, which is
+    // equivalent to this top-down OR-accumulation since the walk includes
+    // the current frame itself. `txn_root_index` is inherited unchanged
+    // (go's `txnRootIndex` is only ever set at a top-level call).
+    inner_ctx.global_sharing =
+        caller_global_sharing || inner_ctx.program_version >= SHARED_RESOURCES_VERSION;
+    inner_ctx.txn_root_index = caller_txn_root_index;
     inner_ctx.caller_app_id_val = caller_app_id;
     inner_ctx.caller_app_address_val = app_address(caller_app_id);
     inner_ctx.depth = caller_depth + 1;
@@ -5584,6 +5891,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     (self.max_log_calls, self.max_log_size),
                     self.unnamed_tracking.clone(),
                     self.unnamed_capacity.clone(),
+                    self.global_sharing,
+                    self.txn_root_index,
                     self.kv_mods_recorder.clone(),
                     siblings_snapshot,
                     i,
@@ -13741,6 +14050,223 @@ mod tests {
             !t.try_add_box((3, b"c".to_vec())),
             "box_count is already 2 == max_boxes"
         );
+    }
+
+    // --- Local-vs-group-shared unnamed-resource split (issue #1128) ---
+    //
+    // Direct ports of go-algorand's `TestAppAccounts`/`TestGlobalVsLocalResources`
+    // (`ledger/simulation/resources_test.go`), exercised against
+    // `UnnamedCapacityTracker`'s `*_at` methods the way go's tests exercise
+    // `groupResourceTracker`'s `has*`/`add*` directly (not through the
+    // higher-level `resourcePolicy`/`AvmContext` layer).
+
+    /// Small, hand-computable consensus params so per-txn and group-wide
+    /// capacity numbers don't interfere with the specific handful of
+    /// accesses each test below makes. `max_tx_group_size` matches the
+    /// group sizes used (1 or 3), so `compute_resource_capacity`'s
+    /// "unused txn slots pad the group" term is zero and doesn't need to be
+    /// hand-verified too.
+    fn resource_split_consensus(max_tx_group_size: usize) -> ConsensusParams {
+        ConsensusParams {
+            max_tx_group_size,
+            max_app_txn_accounts: 4,
+            max_app_txn_foreign_apps: 4,
+            max_app_txn_foreign_assets: 4,
+            max_app_box_references: 4,
+            max_app_total_txn_references: 20,
+            ..ConsensusParams::default()
+        }
+    }
+
+    fn appl_stub() -> SignedTransaction {
+        make_appl_txn([9u8; 32], 0, vec![], vec![], vec![])
+    }
+
+    /// Ports go's `TestAppAccounts`: for both `global_sharing` cases,
+    /// against a single-transaction group, an account added at index 0
+    /// becomes visible via `has_account_at`, and an app added afterward is
+    /// independently visible via `has_app_at` -- exercised through both
+    /// `global_sharing = false` (local-only) and `global_sharing = true`
+    /// (group-shared) to confirm the split doesn't change same-scope
+    /// visibility.
+    #[test]
+    fn unnamed_capacity_app_accounts_visible_within_own_sharing_scope() {
+        let consensus = resource_split_consensus(1);
+        let app_id = 12345u64;
+        let app_account = app_address(app_id);
+
+        for &global_sharing in &[false, true] {
+            let group = vec![appl_stub()];
+            let mut t = UnnamedCapacityTracker::new(&group, &consensus);
+
+            assert!(!t.has_app_at(app_id, global_sharing, 0));
+            assert!(!t.has_account_at(app_account, global_sharing, 0));
+
+            assert!(t.try_add_account_at(app_account, global_sharing, 0));
+
+            assert!(!t.has_app_at(app_id, global_sharing, 0));
+            assert!(t.has_account_at(app_account, global_sharing, 0));
+
+            assert!(t.try_add_app_at(app_id, global_sharing, 0));
+
+            assert!(t.has_app_at(app_id, global_sharing, 0));
+            assert!(t.has_account_at(app_account, global_sharing, 0));
+        }
+    }
+
+    /// Ports go's `TestGlobalVsLocalResources` (accounts sub-case): a
+    /// resource added under `global_sharing = false` lands in that txn's own
+    /// local pool, invisible to a sibling also using `global_sharing =
+    /// false`; a resource added under `global_sharing = true` lands in the
+    /// group-shared pool, visible to any `global_sharing = true` access; and
+    /// re-adding an already-group-shared resource under `global_sharing =
+    /// false` moves it out of the shared pool into the requesting txn's
+    /// local one (go's `addAccount` redundant-in-global cleanup).
+    #[test]
+    fn unnamed_capacity_global_vs_local_accounts() {
+        let account1 = [1u8; 32];
+        let account2 = [2u8; 32];
+        let consensus = resource_split_consensus(3);
+        let group = vec![appl_stub(), appl_stub(), appl_stub()];
+        let mut t = UnnamedCapacityTracker::new(&group, &consensus);
+
+        assert!(t.seen_accounts.is_empty());
+        assert!(t.local_txn[0].seen_accounts.is_empty());
+        assert!(t.local_txn[1].seen_accounts.is_empty());
+        assert!(t.local_txn[2].seen_accounts.is_empty());
+
+        assert!(t.try_add_account_at(account1, false, 0));
+
+        // account1 lands in txn 0's local pool only.
+        assert!(t.seen_accounts.is_empty());
+        assert_eq!(t.local_txn[0].seen_accounts, HashSet::from([account1]));
+        assert!(t.local_txn[1].seen_accounts.is_empty());
+        assert!(t.local_txn[2].seen_accounts.is_empty());
+
+        // Txn 1, group-sharing-eligible, CAN see account1: go's `hasAccount`
+        // under `globalSharing=true` consults every local tracker too, not
+        // just the group-shared pool.
+        assert!(t.has_account_at(account1, true, 1));
+
+        assert!(t.try_add_account_at(account2, true, 1));
+
+        // account2 lands in the group-shared pool.
+        assert_eq!(t.seen_accounts, HashSet::from([account2]));
+        assert_eq!(t.local_txn[0].seen_accounts, HashSet::from([account1]));
+        assert!(t.local_txn[1].seen_accounts.is_empty());
+        assert!(t.local_txn[2].seen_accounts.is_empty());
+
+        // Txn 2, not group-sharing-eligible, cannot see either account.
+        assert!(!t.has_account_at(account1, false, 2));
+        assert!(!t.has_account_at(account2, false, 2));
+
+        assert!(t.try_add_account_at(account1, false, 2));
+
+        // account1 also lands in txn 2's own local pool (a separate slot
+        // from txn 0's).
+        assert_eq!(t.seen_accounts, HashSet::from([account2]));
+        assert_eq!(t.local_txn[0].seen_accounts, HashSet::from([account1]));
+        assert!(t.local_txn[1].seen_accounts.is_empty());
+        assert_eq!(t.local_txn[2].seen_accounts, HashSet::from([account1]));
+
+        assert!(t.try_add_account_at(account2, false, 2));
+
+        // account2 moves from the group-shared pool into txn 2's local pool.
+        assert!(t.seen_accounts.is_empty());
+        assert_eq!(t.local_txn[0].seen_accounts, HashSet::from([account1]));
+        assert!(t.local_txn[1].seen_accounts.is_empty());
+        assert_eq!(
+            t.local_txn[2].seen_accounts,
+            HashSet::from([account1, account2])
+        );
+    }
+
+    /// Ports go's `TestGlobalVsLocalResources` (assets sub-case). See
+    /// [`unnamed_capacity_global_vs_local_accounts`] for the narrative.
+    #[test]
+    fn unnamed_capacity_global_vs_local_assets() {
+        let asset1 = 100u64;
+        let asset2 = 200u64;
+        let consensus = resource_split_consensus(3);
+        let group = vec![appl_stub(), appl_stub(), appl_stub()];
+        let mut t = UnnamedCapacityTracker::new(&group, &consensus);
+
+        assert!(t.try_add_asset_at(asset1, false, 0));
+        assert_eq!(t.local_txn[0].seen_assets, HashSet::from([asset1]));
+        assert!(t.seen_assets.is_empty());
+
+        assert!(t.has_asset_at(asset1, true, 1));
+        assert!(t.try_add_asset_at(asset2, true, 1));
+        assert_eq!(t.seen_assets, HashSet::from([asset2]));
+
+        assert!(!t.has_asset_at(asset1, false, 2));
+        assert!(!t.has_asset_at(asset2, false, 2));
+        assert!(t.try_add_asset_at(asset1, false, 2));
+        assert_eq!(t.local_txn[2].seen_assets, HashSet::from([asset1]));
+        assert_eq!(t.seen_assets, HashSet::from([asset2]));
+
+        assert!(t.try_add_asset_at(asset2, false, 2));
+        assert!(t.seen_assets.is_empty());
+        assert_eq!(t.local_txn[2].seen_assets, HashSet::from([asset1, asset2]));
+    }
+
+    /// Ports go's `TestGlobalVsLocalResources` (apps sub-case). See
+    /// [`unnamed_capacity_global_vs_local_accounts`] for the narrative.
+    #[test]
+    fn unnamed_capacity_global_vs_local_apps() {
+        let app1 = 100u64;
+        let app2 = 200u64;
+        let consensus = resource_split_consensus(3);
+        let group = vec![appl_stub(), appl_stub(), appl_stub()];
+        let mut t = UnnamedCapacityTracker::new(&group, &consensus);
+
+        assert!(t.try_add_app_at(app1, false, 0));
+        assert_eq!(t.local_txn[0].seen_apps, HashSet::from([app1]));
+        assert!(t.seen_apps.is_empty());
+
+        assert!(t.has_app_at(app1, true, 1));
+        assert!(t.try_add_app_at(app2, true, 1));
+        assert_eq!(t.seen_apps, HashSet::from([app2]));
+
+        assert!(!t.has_app_at(app1, false, 2));
+        assert!(!t.has_app_at(app2, false, 2));
+        assert!(t.try_add_app_at(app1, false, 2));
+        assert_eq!(t.local_txn[2].seen_apps, HashSet::from([app1]));
+        assert_eq!(t.seen_apps, HashSet::from([app2]));
+
+        assert!(t.try_add_app_at(app2, false, 2));
+        assert!(t.seen_apps.is_empty());
+        assert_eq!(t.local_txn[2].seen_apps, HashSet::from([app1, app2]));
+    }
+
+    /// Regression guard for the actual bug in issue #1128: before the
+    /// local-vs-global split, a resource added by one top-level transaction
+    /// under non-group-sharing semantics was visible to *every* transaction
+    /// in the group, regardless of that transaction's own group-sharing
+    /// eligibility. Pins that a resource added locally by txn 0 stays
+    /// invisible to txn 1 when txn 1 is *not* group-sharing-eligible, even
+    /// though the old flat tracker would have shown it as available.
+    #[test]
+    fn unnamed_capacity_local_resource_not_visible_to_non_sharing_sibling() {
+        let consensus = resource_split_consensus(2);
+        let group = vec![appl_stub(), appl_stub()];
+        let mut t = UnnamedCapacityTracker::new(&group, &consensus);
+
+        let account = [7u8; 32];
+        assert!(t.try_add_account_at(account, false, 0));
+
+        // Txn 1 isn't group-sharing-eligible (e.g. its own program is below
+        // SHARED_RESOURCES_VERSION and no caller in its chain is either):
+        // it must not see txn 0's local-only account as already-available.
+        assert!(!t.has_account_at(account, false, 1));
+
+        // It can still separately name the same underlying address as its
+        // *own* local resource (consuming its own local capacity, not
+        // reusing/sharing txn 0's slot) -- confirming the two pools are
+        // genuinely independent, not merely "deduped away".
+        assert!(t.try_add_account_at(account, false, 1));
+        assert_eq!(t.local_txn[0].seen_accounts, HashSet::from([account]));
+        assert_eq!(t.local_txn[1].seen_accounts, HashSet::from([account]));
     }
 
     // --- Opcode-failure enforcement once unnamed-resource capacity is
