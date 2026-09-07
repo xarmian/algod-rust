@@ -416,6 +416,21 @@ pub fn validate_block_with_cache(
             // Skipped entirely when `already_verified` — this exact group
             // was already checked (and cached) under this exact
             // `VerificationContext` (issue #1017).
+            //
+            // No `SigBlockSource` is threaded through here (issue #1116):
+            // `validate_block`/`validate_block_with_cache` are deliberately
+            // stateless -- no `LedgerStore` reference reaches this function
+            // at all, all the way up through `BlockValidatorBridge`
+            // (`algo-agreement::block_validator_bridge`), which itself holds
+            // no ledger. Giving real block validation a ledger reference
+            // would mean restructuring that bridge (and everything that
+            // constructs it) to carry one, which is a larger architectural
+            // change than this issue's minimal-surface fix scope. A
+            // LogicSig using `txn FirstValidTime`/`block BlkTimestamp`
+            // therefore still errors with "no block header access" during
+            // real block validation, matching pool admission's disposition
+            // above (`verified_txn_cache.rs`) -- both are documented gaps,
+            // not silent ones.
             if !already_verified {
                 if let Err(e) = verify_transaction_signature(
                     stx,

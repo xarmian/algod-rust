@@ -438,6 +438,19 @@ fn verify_transaction_group_cached_inner(
         return Ok(());
     }
 
+    // No `SigBlockSource` is threaded through here (issue #1116): pool
+    // admission has no `LedgerStore` reference in scope at all -- this
+    // module, like `block.rs`, is deliberately stateless (Go's pool
+    // equivalent, `data/pool/transactionPool.go`, calls the same
+    // `Ledger`-backed `verify.TxnGroup` the block evaluator uses, so this is
+    // a real behavioral gap, not just an unused parameter). A LogicSig using
+    // `txn FirstValidTime`/`block BlkTimestamp` therefore still errors with
+    // "no block header access" at pool-admission time; giving the pool real
+    // ledger access would mean threading a store reference through this
+    // crate's admission API (`algo-validate` is a dependency of `algo-ledger`,
+    // not the reverse, so it can't hold a concrete `LedgerStore` itself) --
+    // out of scope for this issue's minimal-surface fix. Tracked as a
+    // follow-up rather than silently left undocumented.
     let mut lsig_budget = GroupBudget::for_logicsig(txgroup.len());
     for (group_index, stx) in txgroup.iter().enumerate() {
         verify_transaction_signature(stx, txgroup, group_index, &mut lsig_budget, consensus)?;

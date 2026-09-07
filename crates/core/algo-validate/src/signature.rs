@@ -19,7 +19,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use algo_avm::group::GroupBudget;
-use algo_avm::logicsig_context::LogicSigAvmContext;
+use algo_avm::logicsig_context::{LogicSigAvmContext, SigBlockSource};
 use algo_avm::{run_logicsig_program, run_logicsig_program_with_tracer, EvalTracer};
 use algo_codec::canonical_encode_transaction;
 use algo_error::AlgoError;
@@ -542,13 +542,18 @@ pub fn verify_logicsig(
     budget: &mut GroupBudget,
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
-    verify_logicsig_with_tracer(stx, lsig, group, group_index, budget, consensus, None)
+    verify_logicsig_with_tracer(stx, lsig, group, group_index, budget, consensus, None, None)
 }
 
 /// Like [`verify_logicsig`], but threads an optional [`EvalTracer`] through the
 /// TEAL program execution so the simulation engine can capture logic-sig opcode
-/// traces. All callers that don't need a trace use [`verify_logicsig`], which
-/// passes `None`.
+/// traces, and an optional [`SigBlockSource`] so `txn FirstValidTime`/`block
+/// BlkTimestamp` resolve against real block-header history when a caller has
+/// one available (issue #1116). All callers that don't need either use
+/// [`verify_logicsig`], which passes `None` for both -- matching go-algorand's
+/// `NoHeaderLedger` default, so a caller with no ledger access (e.g. isolated
+/// LogicSig checks) is unaffected and those two opcodes still error with "no
+/// block header access" exactly as before.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_logicsig_with_tracer(
     stx: &SignedTransaction,
@@ -558,6 +563,7 @@ pub fn verify_logicsig_with_tracer(
     budget: &mut GroupBudget,
     consensus: &ConsensusParams,
     tracer: Option<&mut dyn EvalTracer>,
+    sig_ledger: Option<&dyn SigBlockSource>,
 ) -> Result<(), AlgoError> {
     // ── Structural sanity checks (Go: logicSigSanityCheckBatchPrep) ──
     // Empty program is always invalid.
@@ -737,6 +743,9 @@ pub fn verify_logicsig_with_tracer(
     }
 
     let mut ctx = LogicSigAvmContext::new(group, group_index, &lsig.logic, args, consensus.clone());
+    if let Some(sig_ledger) = sig_ledger {
+        ctx = ctx.with_sig_ledger(sig_ledger);
+    }
 
     // Run the program, capturing an opcode trace when a tracer is supplied
     // (simulation `exec-trace`). The untraced path is identical aside from the
@@ -939,13 +948,27 @@ pub fn verify_transaction_signature(
     lsig_budget: &mut GroupBudget,
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
-    verify_transaction_signature_with_tracer(stx, group, group_index, lsig_budget, consensus, None)
+    verify_transaction_signature_with_tracer(
+        stx,
+        group,
+        group_index,
+        lsig_budget,
+        consensus,
+        None,
+        None,
+    )
 }
 
 /// Like [`verify_transaction_signature`], but threads an optional [`EvalTracer`]
 /// through the LogicSig program execution so the simulation engine can capture
-/// logic-sig opcode traces. The tracer is only consulted on the LogicSig path;
-/// for single-sig and multisig transactions it is ignored.
+/// logic-sig opcode traces, and an optional [`SigBlockSource`] (issue #1116)
+/// so a LogicSig's `txn FirstValidTime`/`block BlkTimestamp` resolve against
+/// real block-header history when the caller has ledger access (e.g.
+/// simulation, which has a `LedgerStore` in scope). Both are only consulted
+/// on the LogicSig path; for single-sig and multisig transactions they are
+/// ignored. `None` for `sig_ledger` matches go-algorand's `NoHeaderLedger`
+/// default and leaves behavior unchanged for every existing caller.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_transaction_signature_with_tracer(
     stx: &SignedTransaction,
     group: &[SignedTransaction],
@@ -953,6 +976,7 @@ pub fn verify_transaction_signature_with_tracer(
     lsig_budget: &mut GroupBudget,
     consensus: &ConsensusParams,
     tracer: Option<&mut dyn EvalTracer>,
+    sig_ledger: Option<&dyn SigBlockSource>,
 ) -> Result<(), AlgoError> {
     // Pre-activation gate (mirrors go's `stxnCoreChecks`, commit `fc46c74ef`
     // "transactions: disallow empty pq signatures"): hard-reject BEFORE any
@@ -1025,6 +1049,7 @@ pub fn verify_transaction_signature_with_tracer(
             lsig_budget,
             consensus,
             tracer,
+            sig_ledger,
         );
     }
 
