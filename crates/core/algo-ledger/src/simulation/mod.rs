@@ -57,8 +57,7 @@ use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{Address, Round, SignedTransaction};
 use algo_validate::{
     check_txn_group, is_free_heartbeat, validate_pqsig_envelope, validate_pqsig_scheme,
-    validate_transaction_wellformed, verify_transaction_signature,
-    verify_transaction_signature_with_tracer, SpecialAddresses,
+    validate_transaction_wellformed, verify_transaction_signature_with_tracer, SpecialAddresses,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -66,7 +65,7 @@ use crate::apply::{
     apply_transaction_with_budget, check_authorizer, compute_group_fee_credit_and_residue,
     ApplyContext, ApplyMode, AvmEvalOverrides, BoxBudgetState, GroupInfo,
 };
-use crate::avm_context::{NamedGroupResources, UnnamedCapacityTracker};
+use crate::avm_context::{NamedGroupResources, StoreSigBlockSource, UnnamedCapacityTracker};
 use crate::store_trait::LedgerStore;
 
 /// Fixed proxy signing key seed (first 32 bytes of go-algorand's `proxySigner`).
@@ -1158,6 +1157,13 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         let mut logicsig_traces: Vec<Option<TransactionTrace>> = vec![None; verify_group.len()];
         let mut logicsig_budgets: Vec<u64> = vec![0; verify_group.len()];
         let mut budget = GroupBudget::for_logicsig(verify_group.len());
+        // Real block-header lookback for LogicSig `txn FirstValidTime`/`block
+        // BlkTimestamp` (issue #1116, following up on #1111's AVM-context-only
+        // primitive): simulation has a real `LedgerStore` in scope (`self.store`),
+        // so unlike block validation and pool admission (which stay stateless,
+        // see `algo_validate::block.rs`/`verified_txn_cache.rs`), it can supply
+        // one.
+        let sig_block_source = StoreSigBlockSource::new(&*self.store);
         for (i, stx) in verify_group.iter().enumerate() {
             let budget_before = budget.remaining();
             let result = if trace_config.is_enabled() && stx.lsig.is_some() {
@@ -1169,11 +1175,20 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     &mut budget,
                     consensus,
                     Some(&mut lsig_tracer),
+                    Some(&sig_block_source),
                 );
                 logicsig_traces[i] = lsig_tracer.into_transaction_trace();
                 r
             } else {
-                verify_transaction_signature(stx, &verify_group, i, &mut budget, consensus)
+                verify_transaction_signature_with_tracer(
+                    stx,
+                    &verify_group,
+                    i,
+                    &mut budget,
+                    consensus,
+                    None,
+                    Some(&sig_block_source),
+                )
             };
             // A non-LogicSig transaction consumes no LogicSig budget, leaving
             // the delta at 0.

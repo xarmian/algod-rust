@@ -6264,6 +6264,49 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 }
 
 // ---------------------------------------------------------------------------
+// StoreSigBlockSource
+// ---------------------------------------------------------------------------
+
+/// [`algo_avm::logicsig_context::SigBlockSource`] implementation backed by a
+/// real [`LedgerStore`], for wiring `txn FirstValidTime`/`block BlkTimestamp`
+/// into LogicSig ("stateless") evaluation in production call sites that have
+/// store access (issue #1116, following up on #1111's AVM-context-only
+/// primitive).
+///
+/// Mirrors go-algorand's real `LedgerForSignature` implementation
+/// (`ledger/ledgercore` -- backed by the same block-header store App-mode
+/// evaluation uses) and this file's own `LedgerAvmContext::block_field`
+/// `BlkTimestamp` branch above, minus the availability-window check: unlike
+/// `LedgerAvmContext` (which has direct access to the executing
+/// transaction's `FirstValid`/`LastValid` to bound the lookback itself),
+/// [`algo_avm::logicsig_context::LogicSigAvmContext::block_field`] already
+/// performs that `check_available_round` bound *before* calling
+/// [`SigBlockSource::block_timestamp`], so this type only needs to resolve
+/// an already-validated round to its header's timestamp.
+pub struct StoreSigBlockSource<'a, L: LedgerStore> {
+    store: &'a L,
+}
+
+impl<'a, L: LedgerStore> StoreSigBlockSource<'a, L> {
+    /// Wrap a store reference for LogicSig block-history lookback.
+    pub fn new(store: &'a L) -> Self {
+        Self { store }
+    }
+}
+
+impl<'a, L: LedgerStore> algo_avm::logicsig_context::SigBlockSource for StoreSigBlockSource<'a, L> {
+    fn block_timestamp(&self, round: u64) -> Result<i64, AlgoError> {
+        let hdr = self
+            .store
+            .get_block_header(round)?
+            .ok_or_else(|| AlgoError::Avm {
+                message: format!("block header for round {round} not found"),
+            })?;
+        Ok(hdr.timestamp)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
