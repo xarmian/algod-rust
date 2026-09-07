@@ -4436,8 +4436,9 @@ pub async fn run(
     .with_peer_limiter(tx_sync_peer_limiter);
     gossip_node.register_http_handler("/", tx_sync_service.http_router());
 
-    let mut ws_tx_tag_handler = algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
-        .with_batch_verifier(batch_verifier.clone());
+    let mut ws_tx_tag_handler =
+        algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
+            .with_batch_verifier(batch_verifier.clone());
     if let Some(limiter) = &app_rate_limiter {
         ws_tx_tag_handler = ws_tx_tag_handler
             .with_app_rate_limiter(limiter.clone(), app_rate_limiter_congestion_threshold);
@@ -4820,6 +4821,14 @@ pub async fn run(
                 genesis_hash,
                 concurrency: 8,
                 catchpoint_peer_urls: Vec::new(),
+                // Issue #1130: hand the live catchup fetcher this node's
+                // own running P2P transport (if P2P is enabled and
+                // connected) so `AlgodSyncBackend`'s `RankedCatchpointSource`
+                // gains every currently-connected P2P peer as a catchpoint
+                // candidate alongside `catchup_opts.url`. `None` in
+                // `WsOnly` mode (`p2p_transport` is `None` there) — the
+                // existing HTTP-only wiring is completely unaffected.
+                p2p_transport: p2p_transport.clone(),
             };
             let runner = Arc::new(crate::live_catchup::OrchestratorCatchupRunner::new(
                 live_catchup_params,

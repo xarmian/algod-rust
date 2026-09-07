@@ -496,6 +496,11 @@ async fn run_start(
                 genesis_hash: gh,
                 concurrency: 8,
                 catchpoint_peer_urls: Vec::new(),
+                // `node start --follow` doesn't run a P2P transport yet
+                // (see `crate::commands::p2p_transport`'s module doc
+                // comment on `participate` being the only P2P call site
+                // today) — HTTP-peer-only, unaffected by issue #1130.
+                p2p_transport: None,
             };
             let runner = Arc::new(OrchestratorCatchupRunner::new(params));
             let manager =
