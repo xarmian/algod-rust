@@ -1205,8 +1205,19 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 // prepends a `"validation error: "` prefix (see
                 // `algo_error::AlgoError`'s `Display` impl), so match on
                 // substring containment rather than the bare message.
-                let is_format_failure = message
-                    .contains("transaction has no signature (no sig, msig, lsig, or pqsig)")
+                //
+                // A LogicSig runtime evaluation failure (bad opcode args,
+                // type mismatch, overflow, etc.) surfaces as
+                // `AlgoError::AvmLogicSig` rather than the generic
+                // `Validation` wrapper -- `verify_logicsig_with_tracer`
+                // (`algo_validate::signature`) propagates it unwrapped so
+                // its structured pc/group-index/eval-states diagnostics
+                // (issue #1113) survive, so it can't be recognized by the
+                // `"LogicSig program error:"` message substring below and
+                // is matched on the error variant instead.
+                let is_format_failure = matches!(e, AlgoError::AvmLogicSig { .. })
+                    || message
+                        .contains("transaction has no signature (no sig, msig, lsig, or pqsig)")
                     || message.contains("signedtxn should have only one type of signature, found")
                     || message.contains("LogicSig program rejected the transaction")
                     || message.contains("LogicSig program error:");

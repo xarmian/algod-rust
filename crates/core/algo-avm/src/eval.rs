@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 
-use algo_error::AlgoError;
+use algo_error::{AlgoError, AvmDiagnosticValue, AvmEvalStateDump};
 use algo_types::consensus::ConsensusParams;
 use algo_types::{Address, SignedTransaction, TealValue};
 
@@ -114,6 +114,75 @@ fn scratch_snapshot(scratch: &[AvmValue]) -> [TealValue; 256] {
 /// An all-zero scratch row, matching a fresh machine's initial scratch space.
 fn empty_scratch() -> [TealValue; 256] {
     std::array::from_fn(|_| TealValue::Uint(0))
+}
+
+/// Build the structured `eval-states` diagnostic attribute for a LogicSig
+/// evaluation failure, mirroring go-algorand's `cx.evalStates()`
+/// (`data/transactions/logic/eval.go`).
+///
+/// go threads a shared `pastScratch` array across every transaction in the
+/// group, so a failure on transaction N can report every sibling's scratch
+/// space up through N. algod-rust's LogicSig evaluator verifies each
+/// transaction's delegated program independently and does not carry that
+/// cross-transaction state, so only the failing transaction's own dump
+/// (`group_index`) is populated here; earlier entries are present (to match
+/// go's `states[0..=group_index]` shape) but empty.
+fn logicsig_eval_states(machine: &AvmMachine, group_index: usize) -> Vec<AvmEvalStateDump> {
+    let mut states = vec![AvmEvalStateDump::default(); group_index + 1];
+    states[group_index] = dump_eval_state(machine);
+    states
+}
+
+/// Snapshot a machine's stack and scratch space into structured diagnostic
+/// values, trimming the scratch dump to one past the highest non-zero/
+/// non-empty slot -- matching go's `evalStates()` trimming so an untouched
+/// scratch space reports as empty rather than 256 zero entries.
+fn dump_eval_state(machine: &AvmMachine) -> AvmEvalStateDump {
+    let stack = machine.stack.iter().map(avm_value_to_diagnostic).collect();
+
+    let mut last_non_empty: Option<usize> = None;
+    for (i, v) in machine.scratch.iter().enumerate() {
+        let is_empty =
+            matches!(v, AvmValue::Uint64(0)) || matches!(v, AvmValue::Bytes(b) if b.is_empty());
+        if !is_empty {
+            last_non_empty = Some(i);
+        }
+    }
+    let scratch = match last_non_empty {
+        Some(last) => machine.scratch[..=last]
+            .iter()
+            .map(avm_value_to_diagnostic)
+            .collect(),
+        None => Vec::new(),
+    };
+
+    AvmEvalStateDump { scratch, stack }
+}
+
+fn avm_value_to_diagnostic(v: &AvmValue) -> AvmDiagnosticValue {
+    match v {
+        AvmValue::Uint64(u) => AvmDiagnosticValue::Uint(*u),
+        AvmValue::Bytes(b) => AvmDiagnosticValue::Bytes(b.clone()),
+    }
+}
+
+/// Wrap a raw AVM evaluation error with go-algorand-style structured
+/// diagnostics (pc, group index, per-transaction eval-state dump) -- mirrors
+/// `cx.evalError()` (`data/transactions/logic/eval.go`), which attaches the
+/// same attributes to every LogicSig evaluation failure.
+fn attach_logicsig_error_details(
+    err: AlgoError,
+    machine: &AvmMachine,
+    group_index: usize,
+) -> AlgoError {
+    let message = err.to_string();
+    AlgoError::AvmLogicSig {
+        source: Box::new(err),
+        message,
+        pc: machine.pc,
+        group_index,
+        eval_states: logicsig_eval_states(machine, group_index),
+    }
 }
 
 impl AvmResult {
@@ -355,6 +424,7 @@ pub fn run_logicsig_program(
     let parsed = bytecode::parse(program)?;
     let budget_before = budget.remaining();
     let mut machine = AvmMachine::new(parsed, ExecMode::LogicSig, budget_before);
+    let group_index = ctx.group_index();
 
     match machine.run(ctx) {
         Ok(pass) => {
@@ -367,7 +437,10 @@ pub fn run_logicsig_program(
             // Deduct cost consumed up to the point of failure.
             let cost_used = budget_before - machine.budget;
             let _ = budget.consume(cost_used);
-            Err(e)
+            // Attach go-algorand-style structured diagnostics (pc,
+            // group-index, eval-states) -- see `TestLogicErrorDetails`
+            // (go's `data/transactions/logic/eval_test.go`).
+            Err(attach_logicsig_error_details(e, &machine, group_index))
         }
     }
 }
@@ -584,6 +657,7 @@ pub fn run_logicsig_program_with_tracer(
     };
     let budget_before = budget.remaining();
     let mut machine = AvmMachine::new(parsed, ExecMode::LogicSig, budget_before);
+    let group_index = ctx.group_index();
 
     tracer.before_program(ProgramType::LogicSig, program_trace_hash(program));
 
@@ -601,7 +675,9 @@ pub fn run_logicsig_program_with_tracer(
             let msg = e.to_string();
             tracer.after_program(ProgramType::LogicSig, false, Some(&msg));
             tracer.record_program_cost(ProgramType::LogicSig, machine.cost);
-            Err(e)
+            // Attach go-algorand-style structured diagnostics -- see the
+            // matching comment in `run_logicsig_program`.
+            Err(attach_logicsig_error_details(e, &machine, group_index))
         }
     }
 }

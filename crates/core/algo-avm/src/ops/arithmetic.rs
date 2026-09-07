@@ -106,10 +106,21 @@ pub fn op_ge(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(),
 }
 
 /// `==` (0x12): pop b, pop a — both must be same type. Push (a == b) as 0/1.
+///
+/// Checks the operand types *before* popping (peek, like go-algorand's
+/// `opEq`, `data/transactions/logic/eval.go`), rather than popping first
+/// and failing afterward. This isn't behaviorally observable for a program
+/// that goes on to succeed or reject cleanly, but it does mean a
+/// type-mismatch error leaves both operands on the stack -- which
+/// `AlgoError::AvmLogicSig`'s `eval_states` dump (see issue #1113) then
+/// reports, matching go's `TestLogicErrorDetails`.
 pub fn op_eq(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = machine.pop_any()?;
-    let a = machine.pop_any()?;
-    let result = match (&a, &b) {
+    let len = machine.stack.len();
+    if len < 2 {
+        // Same underflow error `pop_any()` would have produced.
+        return machine.pop_any().map(|_| ());
+    }
+    let result = match (&machine.stack[len - 2], &machine.stack[len - 1]) {
         (AvmValue::Uint64(va), AvmValue::Uint64(vb)) => va == vb,
         (AvmValue::Bytes(va), AvmValue::Bytes(vb)) => va == vb,
         _ => {
@@ -118,14 +129,21 @@ pub fn op_eq(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(),
             ))
         }
     };
-    machine.push(AvmValue::Uint64(if result { 1 } else { 0 }))
+    machine.stack.truncate(len - 1);
+    machine.stack[len - 2] = AvmValue::Uint64(if result { 1 } else { 0 });
+    Ok(())
 }
 
 /// `!=` (0x13): pop b, pop a — both must be same type. Push (a != b) as 0/1.
+///
+/// Peeks before popping, matching go — see the parallel comment on
+/// [`op_eq`].
 pub fn op_neq(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
-    let b = machine.pop_any()?;
-    let a = machine.pop_any()?;
-    let result = match (&a, &b) {
+    let len = machine.stack.len();
+    if len < 2 {
+        return machine.pop_any().map(|_| ());
+    }
+    let result = match (&machine.stack[len - 2], &machine.stack[len - 1]) {
         (AvmValue::Uint64(va), AvmValue::Uint64(vb)) => va != vb,
         (AvmValue::Bytes(va), AvmValue::Bytes(vb)) => va != vb,
         _ => {
@@ -134,7 +152,9 @@ pub fn op_neq(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<()
             ))
         }
     };
-    machine.push(AvmValue::Uint64(if result { 1 } else { 0 }))
+    machine.stack.truncate(len - 1);
+    machine.stack[len - 2] = AvmValue::Uint64(if result { 1 } else { 0 });
+    Ok(())
 }
 
 /// `!` (0x14): pop a (uint), push (a == 0) as 0/1.
