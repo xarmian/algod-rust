@@ -5371,4 +5371,42 @@ mod tests {
             1_200
         );
     }
+
+    // --- config.json.example regression check (issue #1086) --------------
+    //
+    // Mirrors go-algorand's `TestLocal_ConfigExampleIsCorrect`
+    // (`config/config_test.go:212`), which decodes `installer/config.json.example`
+    // onto a zero-valued `Local{}` and asserts the result equals `defaultLocal`.
+    // That go test's real regression-catching power comes from decoding onto a
+    // *zero-valued* struct rather than a defaulted one: any field the example
+    // omits stays zero, so an example that drifts out of sync with a field's
+    // real default fails the comparison.
+    //
+    // algod-rust's `Local` instead gives every field its own
+    // `#[serde(default = "...")]`, so decoding the example through the normal
+    // `Deserialize` impl would fill in every gap from the compiled defaults
+    // regardless of what the file actually contains — even `{}` would "pass".
+    // To get the same regression-catching power, this test instead compares
+    // the example file's parsed JSON `Value` directly against
+    // `Local::default()`'s own full JSON serialization: any missing, extra,
+    // renamed, or stale-valued key in the example fails the comparison, and a
+    // key order difference does not (object `Value` equality is order-independent).
+    #[test]
+    fn config_json_example_matches_compiled_defaults() {
+        let example_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.json.example");
+        let example_text = fs::read_to_string(&example_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", example_path.display()));
+        let example: serde_json::Value =
+            serde_json::from_str(&example_text).expect("config.json.example must be valid JSON");
+
+        let default_text = Local::default().to_json_full().expect("serializes");
+        let default_value: serde_json::Value =
+            serde_json::from_str(&default_text).expect("Local::default() JSON always parses");
+
+        assert_eq!(
+            example, default_value,
+            "crates/node/algo-config/config.json.example has drifted from Local::default() \
+             — regenerate it from Local::default().to_json_full()"
+        );
+    }
 }
