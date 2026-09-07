@@ -152,7 +152,12 @@ pub fn find_and_sign_eligible_rounds<L: LedgerStore>(
             match part_store.get_for_round(&record.participation_id, Round(round)) {
                 Ok(Some(p)) => {
                     if let Some(secrets) = p.state_proof_secrets {
-                        secrets_holder.push((record.account, record.first_valid.0, record.last_valid.0, secrets));
+                        secrets_holder.push((
+                            record.account,
+                            record.first_valid.0,
+                            record.last_valid.0,
+                            secrets,
+                        ));
                     }
                 }
                 Ok(None) => {}
@@ -176,12 +181,14 @@ pub fn find_and_sign_eligible_rounds<L: LedgerStore>(
 
         let keys: Vec<StateProofSigningKey> = secrets_holder
             .iter()
-            .map(|(account, first_valid, last_valid, secrets)| StateProofSigningKey {
-                account: *account,
-                first_valid: *first_valid,
-                last_valid: *last_valid,
-                secrets,
-            })
+            .map(
+                |(account, first_valid, last_valid, secrets)| StateProofSigningKey {
+                    account: *account,
+                    first_valid: *first_valid,
+                    last_valid: *last_valid,
+                    secrets,
+                },
+            )
             .collect();
         let sigs = sign_state_proof_message(msg_hash, round, &keys, |addr| {
             db::sig_exists_in_db(sig_conn, round, addr).unwrap_or(false)
@@ -403,7 +410,8 @@ fn run_loop(
         };
         for sfa in sigs {
             let payload = sfa.to_msgpack();
-            if let Err(e) = rt_handle.block_on(gossip_node.broadcast(Tag::StateProofSig, payload, false, None))
+            if let Err(e) =
+                rt_handle.block_on(gossip_node.broadcast(Tag::StateProofSig, payload, false, None))
             {
                 warn!(round = sfa.round, error = %e, "stateproof: failed to broadcast own signature");
             }
@@ -440,12 +448,45 @@ fn run_loop(
                 l.get_block_header(current.0)
                     .ok()
                     .flatten()
-                    .map(|h| algo_ledger::block_header::state_proof_next_round(&h.state_proof_tracking))
+                    .map(|h| {
+                        algo_ledger::block_header::state_proof_next_round(&h.state_proof_tracking)
+                    })
                     .unwrap_or(0)
             };
             if needed_round > 0 {
                 if let Ok(mut rt) = runtime.lock() {
                     rt.prune(needed_round);
+                }
+
+                // 1c. Now that we know a state proof covering rounds before
+                // `needed_round` has been CONFIRMED ACCEPTED on-chain (this
+                // is the ledger's own committed `StateProofNextRound`
+                // tracking value, read a few lines up from an
+                // already-applied block header -- never a round this node
+                // merely built/broadcast itself), it's safe to permanently
+                // discard the state-proof keys that signed it. Matches go's
+                // `Worker.deleteProverData` -> `deleteStaleKeys`
+                // (`stateproof/builder.go:462-464,578-591`), which is
+                // likewise only ever invoked from the just-committed
+                // block's tracked `StateProofNextRound`. See
+                // `algo_ledger::stateproof_worker::state_proof_keys_prune_round`'s
+                // doc comment for why this must never fire on a
+                // merely-broadcast round (issue #1139).
+                match algo_ledger::stateproof_worker::prune_confirmed_state_proof_keys(
+                    part_store,
+                    needed_round,
+                ) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        info!(
+                            needed_round,
+                            deleted = n,
+                            "stateproof: pruned confirmed-accepted state-proof keys"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(needed_round, error = %e, "stateproof: failed to prune confirmed-accepted state-proof keys");
+                    }
                 }
             }
         }
@@ -459,7 +500,9 @@ fn run_loop(
             rt.try_build()
         };
         for (round, proof, message) in built {
-            let stx = build_state_proof_transaction(current.0, algo_types::consensus::consensus_params_for_version(
+            let stx = build_state_proof_transaction(
+                current.0,
+                algo_types::consensus::consensus_params_for_version(
                     // max_txn_life for the *current* protocol governs a
                     // freshly-submitted transaction's validity window --
                     // matches go's `config.Consensus[latestHeader.CurrentProtocol].MaxTxnLife`.
@@ -569,6 +612,20 @@ mod tests {
         store
             .put_block(hdr.round.0, &hdr.current_protocol, &bytes, &[])
             .unwrap();
+    }
+
+    /// Like [`tracking`] but also sets `StateProofNextRound` (the `"n"`
+    /// field) -- the value the live daemon's `run_loop` reads back out with
+    /// `algo_ledger::block_header::state_proof_next_round` to decide what's
+    /// safe to prune (issue #1139).
+    fn tracking_with_next_round(next_round: u64) -> Option<rmpv::Value> {
+        Some(rmpv::Value::Map(vec![(
+            rmpv::Value::from(0u64),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::from("n"),
+                rmpv::Value::from(next_round),
+            )]),
+        )]))
     }
 
     #[test]
@@ -705,6 +762,121 @@ mod tests {
             &mut next_round,
         );
         assert!(sigs.is_empty());
-        assert_eq!(next_round, 11, "advances past the disabled round without looping");
+        assert_eq!(
+            next_round, 11,
+            "advances past the disabled round without looping"
+        );
+    }
+
+    /// Issue #1139: end-to-end wiring check of the daemon's commit-reaction
+    /// pruning step -- read a committed block header's confirmed
+    /// `StateProofNextRound` (exactly like `run_loop`'s step 1b/1c does),
+    /// then feed it into `prune_confirmed_state_proof_keys` the same way
+    /// `run_loop` does. Confirms a participant's state-proof keys are kept
+    /// while no state proof has been confirmed accepted (`StateProofNextRound
+    /// == 0`, the ledger's default before any proof lands), and are pruned
+    /// only once a later block header shows a state proof was actually
+    /// confirmed accepted on-chain -- never merely built/broadcast.
+    #[test]
+    fn run_loop_prunes_state_proof_keys_only_after_ledger_confirms_acceptance() {
+        let mut store = LedgerState::new();
+        let part_store = ParticipationStore::open_in_memory().expect("part store");
+
+        // key_lifetime = 256 (default): keys at rounds 0, 256, 512, ...
+        let secrets =
+            merklesig::Secrets::new(0, 2048, merklesig::KEY_LIFETIME_DEFAULT).expect("mss keygen");
+        let addr = Address([9u8; 32]);
+        let part = Participation {
+            parent: addr,
+            vrf: algo_consensus_crypto::VrfKeypair::generate(),
+            voting: algo_consensus_crypto::OneTimeSignatureSecrets::generate(0, 10),
+            first_valid: Round(0),
+            last_valid: Round(2048),
+            key_dilution: 10,
+            state_proof_secrets: Some(secrets),
+        };
+        let id = part_store.insert(&part).expect("insert participation");
+
+        // Block header committed before any state proof has landed:
+        // StateProofNextRound == 0 -- the ledger's default, matching go's
+        // never-fires-on-a-fresh-chain case.
+        put_header(
+            &mut store,
+            &BlockHeader {
+                round: Round(500),
+                current_protocol: CONSENSUS_V41.to_string(),
+                state_proof_tracking: tracking_with_next_round(0),
+                ..BlockHeader::default()
+            },
+        );
+        let needed_round_before = store
+            .get_block_header(500)
+            .unwrap()
+            .map(|h| algo_ledger::block_header::state_proof_next_round(&h.state_proof_tracking))
+            .unwrap_or(0);
+        assert_eq!(needed_round_before, 0);
+        let deleted_before = algo_ledger::stateproof_worker::prune_confirmed_state_proof_keys(
+            &part_store,
+            needed_round_before,
+        )
+        .unwrap();
+        assert_eq!(
+            deleted_before, 0,
+            "must not prune before any state proof is confirmed accepted"
+        );
+        assert!(
+            part_store
+                .get_for_round(&id, Round(0))
+                .unwrap()
+                .and_then(|r| r.state_proof_secrets)
+                .is_some(),
+            "round-0 key must still exist"
+        );
+
+        // A later block header commits a StateProofNextRound of 520,
+        // meaning a state proof covering earlier rounds is now CONFIRMED
+        // ACCEPTED in the ledger (this is a committed, applied block header
+        // -- not a broadcast-but-unconfirmed proof).
+        put_header(
+            &mut store,
+            &BlockHeader {
+                round: Round(600),
+                current_protocol: CONSENSUS_V41.to_string(),
+                state_proof_tracking: tracking_with_next_round(520),
+                ..BlockHeader::default()
+            },
+        );
+        let needed_round_after = store
+            .get_block_header(600)
+            .unwrap()
+            .map(|h| algo_ledger::block_header::state_proof_next_round(&h.state_proof_tracking))
+            .unwrap_or(0);
+        assert_eq!(needed_round_after, 520);
+        let deleted_after = algo_ledger::stateproof_worker::prune_confirmed_state_proof_keys(
+            &part_store,
+            needed_round_after,
+        )
+        .unwrap();
+        assert_eq!(
+            deleted_after, 2,
+            "keys for rounds 0 and 256 are now safe to discard"
+        );
+        assert!(
+            part_store
+                .get_for_round(&id, Round(0))
+                .unwrap()
+                .and_then(|r| r.state_proof_secrets)
+                .map(|s| s.get_key(0).is_none())
+                .unwrap_or(true),
+            "round-0 key must now be pruned"
+        );
+        assert!(
+            part_store
+                .get_for_round(&id, Round(600))
+                .unwrap()
+                .and_then(|r| r.state_proof_secrets)
+                .is_some(),
+            "key covering the confirmed round must remain"
+        );
     }
 }
