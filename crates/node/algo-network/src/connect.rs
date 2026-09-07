@@ -37,6 +37,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use http::header::HeaderName;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
 
 use crate::errors::WsConnectError;
@@ -54,7 +55,7 @@ use crate::msg_of_interest::marshal_msg_of_interest;
 use crate::peer_features::{decode_peer_features, encode_peer_features, PeerFeatureFlags};
 use crate::phonebook::Phonebook;
 use crate::request_response::RequestTracker;
-use crate::tag::Tag;
+use crate::tag::{Tag, MAX_MESSAGE_LENGTH};
 use crate::ws_peer::{PeerHandle, WsPeer, WsPeerConfig};
 
 // ---------------------------------------------------------------------------
@@ -257,7 +258,22 @@ async fn try_connect_inner(
     // `rate_limited_call` (go: `limitcaller.Dialer`/`RateLimitingBoundTransport`),
     // which waits on the phonebook's per-address rate limiter before
     // attempting the connection and records the connection time on success.
+    //
+    // The dial passes an explicit `WebSocketConfig` bounding
+    // `max_message_size`/`max_frame_size` to `MAX_MESSAGE_LENGTH` — the
+    // largest legitimate per-tag limit (`Tag::max_message_size()`'s max,
+    // currently 6MiB for `VoteBundle`/`TopicMsgResp`). Without this,
+    // `tungstenite`'s own (much larger, tens-of-MiB) defaults apply, and a
+    // peer sending an oversized message gets its full payload buffered by
+    // the WS library before `framing::decode_frame`'s per-tag check ever
+    // runs (issue #1102). Go's `wsPeer.go` readLoop enforces the
+    // equivalent bound incrementally via `LimitedReaderSlurper`.
     let handshake_timeout = config.handshake_timeout;
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(MAX_MESSAGE_LENGTH),
+        max_frame_size: Some(MAX_MESSAGE_LENGTH),
+        ..WebSocketConfig::default()
+    };
     // Written as an explicit match (rather than `.map_err().and_then()`)
     // because clippy's `result_large_err` lint fires on a closure whose
     // `Result::Err` is `WsConnectError` (it carries a `tokio_tungstenite`
@@ -265,8 +281,11 @@ async fn try_connect_inner(
     // body; an explicit match avoids that false-positive-shaped closure
     // signature without boxing the error type just for this call site.
     let dial = move || async move {
-        match tokio::time::timeout(handshake_timeout, tokio_tungstenite::connect_async(request))
-            .await
+        match tokio::time::timeout(
+            handshake_timeout,
+            tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false),
+        )
+        .await
         {
             Ok(Ok(pair)) => Ok(pair),
             Ok(Err(e)) => Err(map_tungstenite_error(e)),
