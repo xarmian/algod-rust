@@ -294,7 +294,7 @@ impl AvmMachine {
         // declared cost, not the synthetic prefix-family stub's -- see
         // issue #698.
         if let Some(spec) = self.resolve_cost_spec(instr.opcode, instr.sub_opcode) {
-            if let CostKind::Static(cost) = spec.cost {
+            if let CostKind::Static(cost) = opcode::effective_cost(spec, self.version) {
                 self.charge_cost(cost)?;
             }
             // Dynamic cost is charged by the handler.
@@ -359,7 +359,7 @@ impl AvmMachine {
         // declared cost, not the synthetic prefix-family stub's -- see
         // issue #698.
         if let Some(spec) = self.resolve_cost_spec(instr.opcode, instr.sub_opcode) {
-            if let CostKind::Static(cost) = spec.cost {
+            if let CostKind::Static(cost) = opcode::effective_cost(spec, self.version) {
                 if let Err(e) = self.charge_cost(cost) {
                     let msg = e.to_string();
                     tracer.after_opcode(
@@ -687,6 +687,35 @@ mod tests {
         assert!(m.charge_cost(5).is_ok());
         assert_eq!(m.budget, 5);
         assert!(m.charge_cost(6).is_err());
+    }
+
+    /// `bytecblock{0xaa} bytec_0 sha256` -- exercises real (dynamic)
+    /// execution cost charging in `step`, not just the static preflight in
+    /// `eval.rs`. Matches go-algorand's per-version hash-opcode cost split
+    /// (`data/transactions/logic/opcodes.go:535-545`, issue #1121):
+    /// sha256 costs 7 at v1, 35 from v2 on.
+    fn bytec_sha256_program(version: u8) -> Vec<u8> {
+        prog(version, &[0x26, 0x01, 0x01, 0xaa, 0x28, 0x01])
+    }
+
+    #[test]
+    fn test_step_charges_pre_v2_sha256_cost() {
+        let program = parse(&bytec_sha256_program(1)).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 1000);
+        let mut ctx = NullContext;
+        m.run(&mut ctx).unwrap();
+        // bytecblock (1) + bytec_0 (1) + sha256 (7 pre-v2) = 9.
+        assert_eq!(m.cost, 9);
+    }
+
+    #[test]
+    fn test_step_charges_v2_plus_sha256_cost() {
+        let program = parse(&bytec_sha256_program(2)).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 1000);
+        let mut ctx = NullContext;
+        m.run(&mut ctx).unwrap();
+        // bytecblock (1) + bytec_0 (1) + sha256 (35 from v2 on) = 37.
+        assert_eq!(m.cost, 37);
     }
 
     /// Build a private single-prefix-family opcode table (mirroring the
