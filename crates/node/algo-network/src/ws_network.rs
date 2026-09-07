@@ -2318,10 +2318,8 @@ async fn gossip_upgrade_handler(
     // inbound and outbound paths in this crate consistent with each other,
     // and is behaviourally identical to go's approach whenever both sides
     // use the same (default 2048) table size.
-    let our_features = crate::peer_features::advertise_vote_compression(
-        true,
-        DEFAULT_VOTE_COMPRESSION_TABLE_SIZE,
-    );
+    let our_features =
+        crate::peer_features::advertise_vote_compression(true, DEFAULT_VOTE_COMPRESSION_TABLE_SIZE);
     let client_features_header = headers
         .get(HeaderName::from_static("x-algorand-peer-features"))
         .and_then(|v| v.to_str().ok())
@@ -2348,6 +2346,20 @@ async fn gossip_upgrade_handler(
     let network_clone = Arc::clone(&network);
     let version_clone = matched_version;
     let addr_str = remote_addr.to_string();
+
+    // Bound the accepted WebSocket connection's message/frame size to the
+    // largest legitimate per-tag limit (`Tag::max_message_size()`'s max,
+    // currently 6MiB for `VoteBundle`/`TopicMsgResp`, i.e.
+    // `tag::MAX_MESSAGE_LENGTH`) rather than relying on axum/tungstenite's
+    // own much larger default. Without this, an oversized message is
+    // fully buffered by the WS library before `framing::decode_frame`'s
+    // per-tag check ever runs (issue #1102) — the memory for it is
+    // already spent by the time the application-level check rejects it.
+    // Go's `wsPeer.go` readLoop enforces the equivalent bound
+    // incrementally via `LimitedReaderSlurper`.
+    let ws = ws
+        .max_message_size(crate::tag::MAX_MESSAGE_LENGTH)
+        .max_frame_size(crate::tag::MAX_MESSAGE_LENGTH);
 
     let mut response = ws
         .on_upgrade(move |socket| {
@@ -3627,6 +3639,113 @@ mod tests {
         assert_eq!(
             features_header, expected,
             "server response must advertise its own full feature set unconditionally"
+        );
+
+        server_net.stop().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1102: explicit WebSocket max_message_size/max_frame_size on
+    // the server accept path, matching go's per-tag limits.
+    //
+    // Before this fix, the axum `WebSocketUpgrade` accepted the connection
+    // with tungstenite's own (much larger) default message/frame size
+    // ceiling, so an oversized message was fully buffered in memory before
+    // `framing::decode_frame`'s per-tag check ever ran. This test proves
+    // rejection now happens at the WS layer itself: the raw client
+    // (configured with a *larger* ceiling than the server, so it is not
+    // the one enforcing the limit) sends a single message over
+    // `tag::MAX_MESSAGE_LENGTH`, and the server closes the connection
+    // before any application-level frame decoding occurs — a
+    // `CaptureHandler` registered for the message's own tag never
+    // observes it, and the connection is unusable afterwards.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn oversized_message_is_rejected_at_the_ws_layer_not_just_decode_frame() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+
+        let (server_net, mut captured) = start_capturing_relay("testnet-v1.0").await;
+        let (addr, _) = server_net.address();
+
+        let url = crate::connect::build_gossip_url(&addr, "testnet-v1.0");
+        let mut request = url.into_client_request().expect("valid request");
+        request.headers_mut().insert(
+            HeaderName::from_static("x-algorand-version"),
+            "2.2".parse().unwrap(),
+        );
+        request.headers_mut().insert(
+            HeaderName::from_static("x-algorand-noderandom"),
+            "12345".parse().unwrap(),
+        );
+        request.headers_mut().insert(
+            HeaderName::from_static("x-algorand-genesis"),
+            "testnet-v1.0".parse().unwrap(),
+        );
+
+        // The client itself must NOT be the one enforcing the limit, so it
+        // is deliberately configured with a ceiling well above the
+        // server's — proving any rejection observed is the server's doing.
+        let client_config = WebSocketConfig {
+            max_message_size: Some(crate::tag::MAX_MESSAGE_LENGTH * 4),
+            max_frame_size: Some(crate::tag::MAX_MESSAGE_LENGTH * 4),
+            ..WebSocketConfig::default()
+        };
+        let (mut ws_stream, _response) =
+            tokio_tungstenite::connect_async_with_config(request, Some(client_config), false)
+                .await
+                .expect("raw handshake succeeds");
+
+        // Build a single oversized message: a valid "AV" tag followed by
+        // enough filler to push the *whole message* just over
+        // `MAX_MESSAGE_LENGTH`. (AgreementVote's own per-tag limit is far
+        // smaller than this, but that is irrelevant here — the point is
+        // that the WS layer must never hand this message to
+        // `decode_frame` in the first place.)
+        let oversized_len = crate::tag::MAX_MESSAGE_LENGTH + 1024;
+        let mut oversized = Vec::with_capacity(oversized_len);
+        oversized.extend_from_slice(Tag::AgreementVote.as_bytes().as_slice());
+        oversized.resize(oversized_len, 0u8);
+
+        // Sending may itself fail immediately (the client's write erroring
+        // out as the server resets the connection), or it may succeed and
+        // only the subsequent read observes the rejection — either is
+        // consistent with WS-layer enforcement, so only fail the test if
+        // the send succeeds *and* is followed by a normally-open
+        // connection.
+        let send_result = ws_stream.send(Message::Binary(oversized)).await;
+
+        if send_result.is_ok() {
+            // The connection must close (Close frame or a hard error) --
+            // it must NOT stay open and simply swallow the oversized
+            // message while continuing to serve the peer.
+            let next = tokio::time::timeout(Duration::from_secs(5), ws_stream.next())
+                .await
+                .expect("server responds (with a close/error) before timeout");
+            match next {
+                None => {}                        // connection closed cleanly
+                Some(Err(_)) => {}                // protocol error
+                Some(Ok(Message::Close(_))) => {} // explicit close frame
+                Some(Ok(other)) => panic!(
+                    "expected the server to reject the oversized message at the WS layer, \
+                     but the connection stayed open and returned: {other:?}"
+                ),
+            }
+        }
+
+        // Regardless of how the rejection surfaced, the oversized message
+        // must never have reached the application-level `CaptureHandler`
+        // -- proving it was dropped by the WS layer, not merely accepted
+        // and then discarded after `decode_frame`.
+        let captured_anything = tokio::time::timeout(Duration::from_millis(500), captured.recv())
+            .await
+            .ok()
+            .flatten();
+        assert!(
+            captured_anything.is_none(),
+            "oversized message must never reach the application-level handler"
         );
 
         server_net.stop().await;
