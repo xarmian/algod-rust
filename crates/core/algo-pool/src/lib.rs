@@ -30,6 +30,7 @@ pub mod config;
 pub mod elastic_rate_limiter;
 pub mod error;
 pub mod fee;
+pub mod metrics;
 pub mod pool;
 pub mod status_cache;
 pub mod traits;
@@ -41,6 +42,7 @@ pub use elastic_rate_limiter::{
     CapacityGuard, CongestionManager, ElasticRateLimiter, ElasticRateLimiterError,
     RedCongestionManager,
 };
-pub use error::{PoolError, PoolErrorTag};
+pub use error::{classify_pool_error, PoolError, PoolErrorTag};
+pub use metrics::TxPoolReevalCounter;
 pub use pool::TransactionPool;
 pub use status_cache::StatusCache;

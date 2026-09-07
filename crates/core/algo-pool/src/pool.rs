@@ -155,6 +155,10 @@ pub struct TransactionPool {
 
     /// Whether the pool is shutting down.
     shutdown: AtomicBool,
+
+    /// Per-tag counters for transaction groups evicted during
+    /// re-evaluation (issue #1134), mirroring go's `txPoolReevalCounter`.
+    reeval_counter: crate::metrics::TxPoolReevalCounter,
 }
 
 impl TransactionPool {
@@ -198,6 +202,7 @@ impl TransactionPool {
             cond: Condvar::new(),
             fee_per_byte: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            reeval_counter: crate::metrics::TxPoolReevalCounter::new(),
         }
     }
 
@@ -206,6 +211,14 @@ impl TransactionPool {
     /// Return the current minimum fee-per-byte required to enter the pool.
     pub fn fee_per_byte(&self) -> u64 {
         self.fee_per_byte.load(Ordering::Relaxed)
+    }
+
+    /// Per-tag counters for transaction groups evicted during
+    /// re-evaluation (issue #1134). Go: `txPoolReevalCounter`. Exposed so
+    /// `GET /metrics` can render it alongside the pool's other
+    /// operational counters.
+    pub fn reeval_counter(&self) -> &crate::metrics::TxPoolReevalCounter {
+        &self.reeval_counter
     }
 
     /// Return the pool's backing [`PoolLedger`].
@@ -534,6 +547,12 @@ impl TransactionPool {
             // Try to re-evaluate the group through the new evaluator.
             let result = self.add_to_block_evaluator(txgroup, inner);
             if let Err(e) = result {
+                // Per-tag re-evaluation counter (issue #1134), mirroring
+                // go's `txPoolReevalCounter.Add(ClassifyTxPoolError(err), 1)`
+                // (`data/pools/transactionPool.go`).
+                self.reeval_counter
+                    .record(crate::error::classify_pool_error(&e));
+
                 // Record evicted transactions in the status cache.
                 let err_str = e.to_string();
                 for txn in txgroup {
@@ -2034,6 +2053,18 @@ mod tests {
             err_str.contains("rejected"),
             "error should mention rejection: {}",
             err_str
+        );
+
+        // Issue #1134: the eviction must also increment the per-tag
+        // re-evaluation counter (go: `txPoolReevalCounter`), classified the
+        // same way the status-cache error string was derived — a generic
+        // evaluator rejection message with no known substring match falls
+        // into `EvalGeneric`.
+        assert_eq!(
+            pool.reeval_counter()
+                .count(crate::error::PoolErrorTag::EvalGeneric),
+            1,
+            "reeval counter should record one EvalGeneric eviction"
         );
     }
 
