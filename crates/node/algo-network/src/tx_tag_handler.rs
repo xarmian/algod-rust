@@ -191,24 +191,44 @@
 //! [`TxTagHandler::new`]), behavior is unchanged: no canonical-form dedup
 //! runs, exactly as before issue #1084.
 //!
-//! **Not ported** — backlog-drop-on-full-queue
-//! (`TestTxHandlerProcessIncomingCacheBacklogDrop`): go's `TxHandler`
-//! enqueues onto a bounded `backlogQueue` channel with a non-blocking
-//! `select`/`default`, and on a full queue drops the message *and* rolls
-//! back its (already-inserted) cache entries via `deleteFromCaches` so a
-//! legitimately-dropped message can be resubmitted later without being
-//! permanently poisoned as "seen". algod-rust's inbound path has no
-//! equivalent bounded backlog queue to overflow: a decoded, admitted
-//! group goes straight to `tokio::task::spawn_blocking` (see the "Pool
-//! call" section below) rather than through an intermediate fixed-size
-//! channel, so there is no structural analogue of "the queue is full" to
-//! port this onto. Retrofitting a bounded backlog purely to reproduce
-//! this drop policy would be a materially bigger architectural change
-//! than the other two behaviors (a new queue, a consumer task, and a
-//! rollback path for every cache this handler maintains) rather than a
-//! few dozen lines, so it is left as a follow-up rather than forced in
-//! here — see the issue tracker for the follow-up filed alongside this
-//! change.
+//! ## Backlog admission queue and drop-on-full (issue #1096)
+//!
+//! go-algorand's `TxHandler.processIncomingTxn`/`validateIncomingTxMessage`
+//! enqueue each decoded, cache-admitted group onto a bounded
+//! `backlogQueue` channel via a non-blocking `select`/`default`. On a
+//! full queue the message is dropped and
+//! `transactionMessagesDroppedFromBacklog` is incremented, but critically
+//! `deleteFromCaches` also rolls back the cache entries that group had
+//! just been inserted under, so a legitimately-dropped message isn't
+//! permanently poisoned as "seen" and can be resubmitted once there's
+//! room. `TestTxHandlerProcessIncomingCacheBacklogDrop`
+//! (`data/txHandler_test.go`) pins this.
+//!
+//! [`TxTagHandler::with_backlog_queue`] attaches this behavior: a bounded
+//! `tokio::sync::mpsc` channel sits between "decoded, cache-admitted,
+//! rate-limit/verification-gated" and "submitted to the pool", with a
+//! background consumer task pulling from it and running the same
+//! `pool.remember`/seen-cache-insert/`penalize_eval_error` sequence the
+//! inline path below already runs when no queue is attached. A
+//! non-blocking `try_send` mirrors go's `select`/`default`: on success
+//! the group is now the consumer task's responsibility; on failure (the
+//! queue is full) the group is dropped, [`Self::backlog_dropped_count`]
+//! is incremented, and the canonical-cache entry this group was just
+//! admitted under (if a [`Self::with_canonical_cache`] cache is attached)
+//! is rolled back via [`SeenTxCache::remove`].
+//!
+//! Unlike go's `msgCache` (populated eagerly at raw-message-dedup time,
+//! before the canonical check even runs), algod-rust's txid-based `seen`
+//! cache (passed to [`Self::new`]) only records a group once
+//! `pool.remember` actually *succeeds* — see the "Pool call" section
+//! below — so it never holds an entry for a group that was dropped here
+//! and has nothing to roll back at this point in the pipeline. Only the
+//! canonical cache needs the rollback.
+//!
+//! Without a backlog queue attached (the default from [`TxTagHandler::new`]),
+//! behavior is unchanged from before issue #1096: every admitted group is
+//! submitted to the pool inline (via `spawn_blocking`, awaited) exactly
+//! as before, with no bounded queue to overflow.
 //!
 //! [`Multiplexer`]: crate::handler::Multiplexer
 //! [`TransactionPool`]: algo_pool::TransactionPool
@@ -217,10 +237,12 @@
 //! [`canonical_encode_signed_transaction`]: algo_codec::canonical_encode_signed_transaction
 
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use sha2::{Digest as Sha2DigestTrait, Sha512_256};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use algo_codec::{canonical_encode_signed_transaction, compute_txn_id};
@@ -339,6 +361,8 @@ pub struct TxTagHandler {
     app_limiter_congestion_threshold: usize,
     batch_verifier: Option<Arc<BatchVerifier>>,
     canonical_cache: Option<Arc<SeenTxCache>>,
+    backlog_tx: Option<mpsc::Sender<BacklogItem>>,
+    backlog_dropped: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for TxTagHandler {
@@ -352,8 +376,21 @@ impl std::fmt::Debug for TxTagHandler {
             )
             .field("batch_verifier_enabled", &self.batch_verifier.is_some())
             .field("canonical_cache_enabled", &self.canonical_cache.is_some())
+            .field("backlog_queue_enabled", &self.backlog_tx.is_some())
+            .field(
+                "backlog_dropped",
+                &self.backlog_dropped.load(Ordering::Relaxed),
+            )
             .finish()
     }
+}
+
+/// A decoded, admission-gated group queued for pool submission by
+/// [`TxTagHandler::with_backlog_queue`] (issue #1096).
+struct BacklogItem {
+    group: Vec<SignedTransaction>,
+    txids: Vec<Digest>,
+    sender: String,
 }
 
 impl TxTagHandler {
@@ -376,6 +413,8 @@ impl TxTagHandler {
             app_limiter_congestion_threshold: 0,
             batch_verifier: None,
             canonical_cache: None,
+            backlog_tx: None,
+            backlog_dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -445,10 +484,41 @@ impl TxTagHandler {
         self
     }
 
+    /// Attach a bounded backlog admission queue (issue #1096), mirroring
+    /// go-algorand's `TxHandler.backlogQueue`/`backlogWorker`. See the
+    /// module doc's "Backlog admission queue and drop-on-full" section
+    /// for the full behavioral contract.
+    ///
+    /// Spawns a background consumer task (via [`tokio::spawn`]) that owns
+    /// the receiving half of the channel for the lifetime of the
+    /// returned handler, so this must be called from within a Tokio
+    /// runtime. `capacity` is clamped to at least 1.
+    #[must_use]
+    pub fn with_backlog_queue(mut self, capacity: usize) -> Self {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        tokio::spawn(backlog_worker(
+            rx,
+            self.pool.clone(),
+            self.seen.clone(),
+            self.app_limiter.clone(),
+        ));
+        self.backlog_tx = Some(tx);
+        self
+    }
+
     /// Returns a reference to the shared seen-tx cache.
     #[must_use]
     pub fn seen_cache(&self) -> Arc<SeenTxCache> {
         self.seen.clone()
+    }
+
+    /// Number of groups dropped for arriving while the backlog queue
+    /// (see [`Self::with_backlog_queue`]) was full — the analogue of
+    /// go's `transactionMessagesDroppedFromBacklog` metric. Always `0`
+    /// when no backlog queue is attached.
+    #[must_use]
+    pub fn backlog_dropped_count(&self) -> u64 {
+        self.backlog_dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -547,6 +617,11 @@ impl MessageHandler for TxTagHandler {
         // below, and keys on the full signed encoding (signature
         // included) so a re-signed variant of the same txn body is never
         // suppressed here. See the module doc for the full contract.
+        // Recorded (only when a canonical cache is attached and this
+        // group was actually admitted by it, i.e. not an early-return
+        // dup above) so a later full-backlog-queue drop can roll this
+        // entry back — see the backlog-submission block below.
+        let mut canonical_digest: Option<Digest> = None;
         if let Some(cache) = &self.canonical_cache {
             let digest = canonical_group_digest(&group);
             if !cache.insert(digest) {
@@ -562,6 +637,7 @@ impl MessageHandler for TxTagHandler {
                     topics: None,
                 };
             }
+            canonical_digest = Some(digest);
         }
 
         // Compute txids once up front — `compute_txn_id` hashes the
@@ -645,60 +721,46 @@ impl MessageHandler for TxTagHandler {
             // correct error for that case itself.
         }
 
-        // Submit the whole group to the pool on the blocking executor.
-        // `TransactionPool::remember` is a synchronous mutex/condvar
-        // flow that can wait up to ~`timeout_on_new_block` (default
-        // 1 s) when the evaluator lags, so running it inline on a
-        // Tokio worker would stall peer dispatch under TX bursts. We
-        // offload to `spawn_blocking` so the async receive task can
-        // proceed to the next message immediately.
-        //
-        // On `Ok(())` we record the txids in the seen cache so
-        // subsequent duplicates short-circuit. On failure, the txids
-        // are NOT recorded — a bad-signed or otherwise rejected
-        // variant must not suppress a valid retransmission of the
-        // same Transaction body (txids are body-derived).
-        //
-        // Errors are logged and dropped; unsolicited inbound txns
-        // must never panic or propagate back to the dispatcher.
-        // Cloned only when a limiter is attached: `penalize_eval_error`
-        // needs the group's app ids after `remember` has moved `group`
-        // into the blocking task. Mirrors go's `postProcessCheckedTxn`
-        // calling `appLimiter.penalizeEvalError(wi.unverifiedTxGroup, ...)`
-        // on a `Remember` failure.
-        let group_for_penalty = self.app_limiter.is_some().then(|| group.clone());
-        let sender = msg.sender.clone();
-        let pool = self.pool.clone();
-        let result = tokio::task::spawn_blocking(move || pool.remember(group)).await;
-        match result {
-            Ok(Ok(())) => {
-                for id in &txids {
-                    self.seen.insert(*id);
+        // Hand the group off for pool submission -- either onto the
+        // bounded backlog queue (issue #1096, if attached) or, as
+        // before #1096, straight to `pool.remember()` inline.
+        if let Some(backlog_tx) = &self.backlog_tx {
+            let item = BacklogItem {
+                group,
+                txids,
+                sender: msg.sender.clone(),
+            };
+            // Non-blocking `try_send` mirrors go's `select { case
+            // backlogQueue <- wi: ... default: ... }`: a full queue
+            // drops the message rather than blocking this handler (and
+            // therefore this peer's whole dispatch loop).
+            if backlog_tx.try_send(item).is_err() {
+                self.backlog_dropped.fetch_add(1, Ordering::Relaxed);
+                // Roll back the canonical-cache entry this group was
+                // just admitted under so it isn't permanently poisoned
+                // as "seen" -- mirrors go's `deleteFromCaches`. The
+                // txid-based `seen` cache needs no rollback here: it
+                // only records on a successful `remember()`, which
+                // never happened for a group dropped before reaching
+                // the pool. See the module doc for the full rationale.
+                if let (Some(digest), Some(cache)) = (canonical_digest, &self.canonical_cache) {
+                    cache.remove(&digest);
                 }
                 debug!(
                     sender = %msg.sender,
-                    ingested = txids.len(),
-                    "TxTagHandler: group accepted",
+                    "TxTagHandler: dropped, backlog queue full",
                 );
             }
-            Ok(Err(e)) => {
-                warn!(
-                    sender = %msg.sender,
-                    error = %e,
-                    "TxTagHandler: pool rejected inbound TX group",
-                );
-                if let (Some(limiter), Some(group)) = (&self.app_limiter, group_for_penalty) {
-                    let origin = origin_bytes(&sender);
-                    limiter.penalize_eval_error(&group, &origin);
-                }
-            }
-            Err(join_err) => {
-                warn!(
-                    sender = %msg.sender,
-                    error = %join_err,
-                    "TxTagHandler: pool ingest task join failed",
-                );
-            }
+        } else {
+            ingest_group(
+                &self.pool,
+                &self.seen,
+                &self.app_limiter,
+                group,
+                txids,
+                msg.sender.clone(),
+            )
+            .await;
         }
 
         OutgoingMessage {
@@ -707,6 +769,95 @@ impl MessageHandler for TxTagHandler {
             payload: Vec::new(),
             topics: None,
         }
+    }
+}
+
+/// Submit `group` to `pool` on the blocking executor and apply the
+/// success/failure post-processing every ingestion path shares: record
+/// `txids` in `seen` on success, or penalize `app_limiter` (if attached)
+/// on failure. Shared by [`TxTagHandler::handle`]'s inline (no backlog
+/// queue) path and [`backlog_worker`]'s consumer loop.
+///
+/// `TransactionPool::remember` is a synchronous mutex/condvar flow that
+/// can wait up to ~`timeout_on_new_block` (default 1 s) when the
+/// evaluator lags, so running it inline on a Tokio worker would stall
+/// progress -- we offload to `spawn_blocking` so the caller's async task
+/// can proceed immediately once this completes.
+///
+/// On `Ok(())` the txids are recorded in the seen cache so subsequent
+/// duplicates short-circuit. On failure, the txids are NOT recorded — a
+/// bad-signed or otherwise rejected variant must not suppress a valid
+/// retransmission of the same Transaction body (txids are body-derived).
+/// Errors are logged and dropped; unsolicited inbound txns must never
+/// panic or propagate back to the dispatcher.
+async fn ingest_group(
+    pool: &Arc<TransactionPool>,
+    seen: &Arc<SeenTxCache>,
+    app_limiter: &Option<Arc<AppRateLimiter>>,
+    group: Vec<SignedTransaction>,
+    txids: Vec<Digest>,
+    sender: String,
+) {
+    // Cloned only when a limiter is attached: `penalize_eval_error` needs
+    // the group's app ids after `remember` has moved `group` into the
+    // blocking task. Mirrors go's `postProcessCheckedTxn` calling
+    // `appLimiter.penalizeEvalError(wi.unverifiedTxGroup, ...)` on a
+    // `Remember` failure.
+    let group_for_penalty = app_limiter.is_some().then(|| group.clone());
+    let pool_for_task = pool.clone();
+    let result = tokio::task::spawn_blocking(move || pool_for_task.remember(group)).await;
+    match result {
+        Ok(Ok(())) => {
+            for id in &txids {
+                seen.insert(*id);
+            }
+            debug!(
+                sender = %sender,
+                ingested = txids.len(),
+                "TxTagHandler: group accepted",
+            );
+        }
+        Ok(Err(e)) => {
+            warn!(
+                sender = %sender,
+                error = %e,
+                "TxTagHandler: pool rejected inbound TX group",
+            );
+            if let (Some(limiter), Some(group)) = (app_limiter, group_for_penalty) {
+                let origin = origin_bytes(&sender);
+                limiter.penalize_eval_error(&group, &origin);
+            }
+        }
+        Err(join_err) => {
+            warn!(
+                sender = %sender,
+                error = %join_err,
+                "TxTagHandler: pool ingest task join failed",
+            );
+        }
+    }
+}
+
+/// Background consumer for [`TxTagHandler::with_backlog_queue`] (issue
+/// #1096): pulls admitted groups off the bounded channel one at a time
+/// and runs them through [`ingest_group`], exactly mirroring go's
+/// `TxHandler.backlogWorker` draining `backlogQueue`.
+async fn backlog_worker(
+    mut rx: mpsc::Receiver<BacklogItem>,
+    pool: Arc<TransactionPool>,
+    seen: Arc<SeenTxCache>,
+    app_limiter: Option<Arc<AppRateLimiter>>,
+) {
+    while let Some(item) = rx.recv().await {
+        ingest_group(
+            &pool,
+            &seen,
+            &app_limiter,
+            item.group,
+            item.txids,
+            item.sender,
+        )
+        .await;
     }
 }
 
@@ -1660,5 +1811,290 @@ mod canonical_cache_wiring_tests {
             2,
             "without a canonical cache attached, both resends must reach the evaluator"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: backlog admission queue and drop-on-full (issue #1096)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod backlog_queue_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use algo_error::AlgoError;
+    use algo_pool::traits::{BlockEvaluator, PoolLedger};
+    use algo_pool::{PoolConfig, TransactionPool};
+    use algo_types::{Address, Block, BlockHeader, ConsensusParams, Round, TxnType};
+
+    use super::*;
+    use crate::tx_syncer::SeenTxCache;
+
+    /// Stub ledger/evaluator, replicated from
+    /// `canonical_cache_wiring_tests::StubLedger` -- `calls` counts every
+    /// time the evaluator actually runs a group so tests can prove
+    /// whether a group reached the pool or was dropped upstream.
+    struct StubLedger {
+        round: Round,
+        fail: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PoolLedger for StubLedger {
+        fn latest(&self) -> Round {
+            self.round
+        }
+        fn block_hdr(&self, _round: Round) -> Result<BlockHeader, AlgoError> {
+            Ok(BlockHeader::default())
+        }
+        fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, AlgoError> {
+            Ok(ConsensusParams::default())
+        }
+        fn start_evaluator(
+            &self,
+            _hdr: BlockHeader,
+            _payset_hint: usize,
+            _max_txn_bytes_per_block: usize,
+        ) -> Result<Box<dyn BlockEvaluator>, AlgoError> {
+            Ok(Box::new(StubEvaluator {
+                round: self.round.next(),
+                fail: self.fail.clone(),
+                calls: self.calls.clone(),
+            }))
+        }
+    }
+
+    struct StubEvaluator {
+        round: Round,
+        fail: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl BlockEvaluator for StubEvaluator {
+        fn round(&self) -> Round {
+            self.round
+        }
+        fn pay_set_size(&self) -> usize {
+            0
+        }
+        fn test_transaction_group(&self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Ok(())
+        }
+        fn transaction_group(&mut self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err(AlgoError::Validation {
+                    message: "stub eval failure".to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+            Ok(Block::default())
+        }
+        fn reset_txn_bytes(&mut self) {}
+    }
+
+    fn make_pool() -> (Arc<TransactionPool>, Arc<AtomicUsize>) {
+        let fail = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ledger: Arc<dyn PoolLedger> = Arc::new(StubLedger {
+            round: Round(1),
+            fail,
+            calls: calls.clone(),
+        });
+        let pool = Arc::new(TransactionPool::new(PoolConfig::default(), ledger));
+        pool.on_new_block(&Block::default(), &std::collections::HashSet::new());
+        (pool, calls)
+    }
+
+    fn make_payment_txn(sender_byte: u8, note: u8) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = TxnType::Pay;
+        stx.txn.sender = Address([sender_byte; 32]);
+        stx.txn.fee = 1_000_000;
+        stx.txn.first_valid = Round(1);
+        stx.txn.last_valid = Round(1_000);
+        stx.txn.note = serde_bytes::ByteBuf::from(vec![note]);
+        stx
+    }
+
+    fn encode_group(group: &[SignedTransaction]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for tx in group {
+            let bytes = rmp_serde::to_vec_named(tx).expect("encode stxn");
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
+    fn incoming(group: &[SignedTransaction], sender: &str) -> IncomingMessage {
+        let data = encode_group(group);
+        IncomingMessage::new(Tag::Transaction, data, sender.to_string(), 0)
+    }
+
+    /// Build a handler with a capacity-1 backlog queue whose receiver is
+    /// held open but never drained -- mirrors go's
+    /// `makeTestTxHandlerOrphanedWithContext` (backlog worker not
+    /// started) so the queue genuinely fills instead of racing a live
+    /// consumer task that would otherwise drain the first item before
+    /// the second `handle()` call observes the queue as full.
+    fn make_orphaned_handler(
+        pool: Arc<TransactionPool>,
+        canonical: Arc<SeenTxCache>,
+    ) -> (TxTagHandler, mpsc::Receiver<BacklogItem>) {
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let (tx, rx) = mpsc::channel(1);
+        let mut handler = TxTagHandler::new(pool, seen).with_canonical_cache(canonical);
+        handler.backlog_tx = Some(tx);
+        (handler, rx)
+    }
+
+    /// TDD regression for issue #1096, pinning go's exact
+    /// `TestTxHandlerProcessIncomingCacheBacklogDrop` semantics: with a
+    /// full capacity-1 backlog queue and no consumer draining it, a
+    /// second, distinct group is dropped, the drop counter increments by
+    /// exactly 1, and the canonical cache still holds exactly 1 entry
+    /// (the first group's) -- proving the dropped group's entry was
+    /// rolled back, not left dangling.
+    #[tokio::test]
+    async fn drop_on_full_backlog_rolls_back_canonical_cache() {
+        let (pool, _calls) = make_pool();
+        let canonical = Arc::new(SeenTxCache::new(1024));
+        let (handler, _rx) = make_orphaned_handler(pool, canonical.clone());
+
+        let tx1 = make_payment_txn(1, 1);
+        let out1 = handler
+            .handle(incoming(std::slice::from_ref(&tx1), "1.2.3.4:4160"))
+            .await;
+        assert_eq!(out1.action, ForwardingPolicy::Ignore);
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(handler.backlog_dropped_count(), 0);
+
+        let tx2 = make_payment_txn(2, 2);
+        let out2 = handler
+            .handle(incoming(std::slice::from_ref(&tx2), "1.2.3.4:4160"))
+            .await;
+        assert_eq!(out2.action, ForwardingPolicy::Ignore);
+
+        assert_eq!(
+            canonical.len(),
+            1,
+            "the dropped group's canonical-cache entry must be rolled back"
+        );
+        assert_eq!(
+            handler.backlog_dropped_count(),
+            1,
+            "drop counter must increment by exactly 1"
+        );
+    }
+
+    /// Proves the rollback in the test above actually un-poisons the
+    /// entry (rather than merely leaving the count unchanged by
+    /// coincidence): after a group is dropped for a full backlog queue,
+    /// resubmitting the *exact same bytes* once the queue has room again
+    /// must reach the evaluator, not be suppressed as an already-seen
+    /// canonical duplicate.
+    #[tokio::test]
+    async fn dropped_group_can_be_resubmitted_after_rollback() {
+        let (pool, calls) = make_pool();
+        let canonical = Arc::new(SeenTxCache::new(1024));
+        let (handler, mut rx) = make_orphaned_handler(pool, canonical.clone());
+
+        // Fill the capacity-1 queue with an unrelated filler group.
+        let filler = make_payment_txn(9, 9);
+        handler
+            .handle(incoming(std::slice::from_ref(&filler), "9.9.9.9:4160"))
+            .await;
+
+        // This group is dropped -- the queue is full and nothing is
+        // draining it yet.
+        let dropped = make_payment_txn(5, 5);
+        handler
+            .handle(incoming(std::slice::from_ref(&dropped), "5.5.5.5:4160"))
+            .await;
+        assert_eq!(handler.backlog_dropped_count(), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "nothing has been drained yet"
+        );
+
+        // Drain the filler out of the channel, freeing capacity.
+        rx.recv().await.expect("filler item present");
+
+        // Resubmit the exact same bytes that were dropped -- if the
+        // rollback worked, the canonical cache holds no entry for it and
+        // it is enqueued fresh (not suppressed as a dup).
+        handler
+            .handle(incoming(std::slice::from_ref(&dropped), "5.5.5.5:4160"))
+            .await;
+        assert_eq!(
+            handler.backlog_dropped_count(),
+            1,
+            "the resubmission must be enqueued, not dropped again"
+        );
+
+        let requeued = rx.recv().await.expect("resubmitted item present");
+        assert_eq!(requeued.sender, "5.5.5.5:4160");
+    }
+
+    /// Without a backlog queue attached, behavior is unchanged from
+    /// before issue #1096: every admitted group reaches the pool inline,
+    /// and the drop counter never moves.
+    #[tokio::test]
+    async fn no_backlog_queue_attached_admits_inline() {
+        let (pool, calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let handler = TxTagHandler::new(pool.clone(), seen);
+
+        let tx = make_payment_txn(1, 1);
+        let txid = compute_txn_id(&tx.txn);
+        let out = handler
+            .handle(incoming(std::slice::from_ref(&tx), "1.2.3.4:4160"))
+            .await;
+        assert_eq!(out.action, ForwardingPolicy::Ignore);
+        assert!(pool.pending_tx_ids().contains(&txid));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handler.backlog_dropped_count(), 0);
+    }
+
+    /// A capacity that comfortably fits every concurrently-admitted group
+    /// must let all of them reach the pool via the background consumer
+    /// task -- proving `with_backlog_queue` is a real end-to-end path,
+    /// not just an enqueue-and-drop stub.
+    #[tokio::test]
+    async fn backlog_queue_consumer_admits_to_pool() {
+        let (pool, calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let handler = TxTagHandler::new(pool.clone(), seen).with_backlog_queue(8);
+
+        let tx1 = make_payment_txn(1, 1);
+        let tx2 = make_payment_txn(2, 2);
+        let txid1 = compute_txn_id(&tx1.txn);
+        let txid2 = compute_txn_id(&tx2.txn);
+
+        let out1 = handler
+            .handle(incoming(std::slice::from_ref(&tx1), "1.1.1.1:4160"))
+            .await;
+        let out2 = handler
+            .handle(incoming(std::slice::from_ref(&tx2), "2.2.2.2:4160"))
+            .await;
+        assert_eq!(out1.action, ForwardingPolicy::Ignore);
+        assert_eq!(out2.action, ForwardingPolicy::Ignore);
+
+        // The consumer task runs concurrently -- poll briefly for it to
+        // catch up rather than asserting immediately.
+        for _ in 0..200 {
+            if pool.pending_tx_ids().contains(&txid1) && pool.pending_tx_ids().contains(&txid2) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(pool.pending_tx_ids().contains(&txid1));
+        assert!(pool.pending_tx_ids().contains(&txid2));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(handler.backlog_dropped_count(), 0);
     }
 }
