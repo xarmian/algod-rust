@@ -2015,6 +2015,48 @@ pub fn built_in_consensus_protocols() -> HashMap<String, ConsensusParams> {
         .collect()
 }
 
+/// Genesis network IDs go-algorand shortens per-upgrade wait-round delays
+/// for (Go: `config.Devnet`, `config.Betanet`, `config.Fnet` string
+/// constants — `config/config.go:35,38,44` — compared byte-for-byte against
+/// the genesis file's `network` field with no case-folding, exactly as Go's
+/// `ApplyShorterUpgradeRoundsForDevNetworks` does).
+const SHORTER_UPGRADE_ROUNDS_NETWORKS: [&str; 3] = ["devnet", "betanet", "fnet"];
+
+/// Port of go-algorand's `ApplyShorterUpgradeRoundsForDevNetworks`
+/// (`config/config.go:384-399`, first released in v4.1.0-beta): for the
+/// Devnet/Betanet/Fnet genesis networks, shortens every version's pending
+/// upgrade delay (`ApprovedUpgrades[v]`) down to that version's own
+/// `MinUpgradeWaitRounds` — but only where `MinUpgradeWaitRounds > 0` (the
+/// pre-v22 zero-value guard Go's `if p.MinUpgradeWaitRounds > 0` encodes).
+/// A no-op for every other network (Mainnet/Testnet included).
+///
+/// Mirrors Go's exact map-mutation semantics field-for-field even though
+/// this codebase models `ApprovedUpgrades` as `Option<(target, delay)>`
+/// rather than a full map (see [`ConsensusParams::approved_upgrade`]'s doc
+/// comment) — with at most one entry per version, "for every entry in the
+/// map" and "the map's one entry, if any" are the same operation.
+///
+/// Must run on the *built-in* table before any `consensus.json` overrides
+/// are merged on top, matching go-algorand's call order in
+/// `cmd/algod/main.go:204-212` ("the configurable consensus protocols file
+/// takes precedence over network-specific overrides") — see
+/// [`preload_configurable_consensus_protocols_with_base`].
+pub fn apply_shorter_upgrade_rounds_for_dev_networks(
+    table: &mut HashMap<String, ConsensusParams>,
+    network_id: &str,
+) {
+    if !SHORTER_UPGRADE_ROUNDS_NETWORKS.contains(&network_id) {
+        return;
+    }
+    for params in table.values_mut() {
+        if let Some((target, _delay)) = params.approved_upgrade {
+            if params.min_upgrade_wait_rounds > 0 {
+                params.approved_upgrade = Some((target, params.min_upgrade_wait_rounds));
+            }
+        }
+    }
+}
+
 /// Process-global, write-once-at-startup consensus-parameter override
 /// registry (issue #762). A fixed `HashMap<String, ConsensusParams>` (the
 /// full merged table `preload_configurable_consensus_protocols` already
@@ -2139,8 +2181,25 @@ pub fn merge_consensus_protocols(
 pub fn preload_configurable_consensus_protocols(
     data_dir: &Path,
 ) -> algo_error::Result<HashMap<String, ConsensusParams>> {
+    preload_configurable_consensus_protocols_with_base(data_dir, built_in_consensus_protocols())
+}
+
+/// Same as [`preload_configurable_consensus_protocols`], but merges
+/// `consensus.json` onto a caller-supplied `base` table instead of always
+/// starting from the untouched compile-time built-in table.
+///
+/// This is what lets `bin/algod-rust`'s startup apply
+/// [`apply_shorter_upgrade_rounds_for_dev_networks`] to the built-in table
+/// *first*, then merge `consensus.json` on top of the shortened result —
+/// matching go-algorand's call order (`cmd/algod/main.go:204-212`) where a
+/// `consensus.json` entry always wins over the network-conditional
+/// shortening, but a version the file never mentions keeps its shortened
+/// delay rather than silently reverting to the Mainnet-scale default.
+pub fn preload_configurable_consensus_protocols_with_base(
+    data_dir: &Path,
+    base: HashMap<String, ConsensusParams>,
+) -> algo_error::Result<HashMap<String, ConsensusParams>> {
     let path = data_dir.join(CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
-    let base = built_in_consensus_protocols();
 
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,

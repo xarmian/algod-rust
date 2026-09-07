@@ -323,11 +323,24 @@ async fn run_start(
         warn!("Follower running on a devMode network. Must submit txns to a different node.");
     }
 
+    // Shorten per-upgrade wait-round delays for the Devnet/Betanet/Fnet
+    // genesis networks (issue #1138; Go: `ApplyShorterUpgradeRoundsForDevNetworks`,
+    // `config/config.go`), a no-op for every other network (Mainnet/Testnet
+    // included). Applied to the *built-in* table before any `consensus.json`
+    // override is merged on top, mirroring go-algorand's exact call order in
+    // `cmd/algod/main.go:204-212` ("the configurable consensus protocols file
+    // takes precedence over network-specific overrides").
+    let mut consensus_base = algo_types::consensus::built_in_consensus_protocols();
+    algo_types::consensus::apply_shorter_upgrade_rounds_for_dev_networks(
+        &mut consensus_base,
+        &genesis.network,
+    );
+
     // Load `<data_dir>/consensus.json` (if present) and merge it onto the
-    // built-in consensus table (issue #750; Go:
+    // (possibly network-shortened) consensus table (issue #750; Go:
     // `PreloadConfigurableConsensusProtocols`, `config/config.go`). A missing
-    // file falls back to the built-in table unchanged; a malformed file is a
-    // real startup error rather than being silently ignored.
+    // file falls back to that table unchanged; a malformed file is a real
+    // startup error rather than being silently ignored.
     //
     // Installing the merge result via `install_consensus_overrides` (issue
     // #762) makes `consensus_params_for_version` itself override-aware, so
@@ -345,8 +358,11 @@ async fn run_start(
     let consensus_overrides_path =
         data_dir.join(algo_types::consensus::CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
     let consensus_protocols =
-        algo_types::consensus::preload_configurable_consensus_protocols(data_dir)
-            .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
+        algo_types::consensus::preload_configurable_consensus_protocols_with_base(
+            data_dir,
+            consensus_base,
+        )
+        .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
     algo_types::consensus::install_consensus_overrides(&consensus_protocols);
     if consensus_overrides_path.exists() {
         info!(path = %consensus_overrides_path.display(), "loaded consensus-parameter overrides");

@@ -3781,12 +3781,31 @@ pub async fn run(
     // `node.rs`'s write-once/thread-safety contract (see
     // `install_consensus_overrides`'s doc comment).
     if let Some(data_dir) = rest_opts.data_dir.as_deref() {
+        // Shorten per-upgrade wait-round delays for the Devnet/Betanet/Fnet
+        // genesis networks (issue #1138; Go:
+        // `ApplyShorterUpgradeRoundsForDevNetworks`, `config/config.go`), a
+        // no-op for every other network. `network` is the CLI `--network`
+        // value already used just below to resolve `genesis_id` -- the same
+        // proxy for the genesis network id `node.rs`'s `run_node` reads
+        // straight off a parsed `genesis.json`, since a real `genesis.json`
+        // is not necessarily parsed yet at this point in `participate::run`.
+        // Applied to the built-in table before any `consensus.json` override
+        // is merged on top, matching `node.rs`'s call order and
+        // go-algorand's own (`cmd/algod/main.go:204-212`).
+        let mut consensus_base = algo_types::consensus::built_in_consensus_protocols();
+        algo_types::consensus::apply_shorter_upgrade_rounds_for_dev_networks(
+            &mut consensus_base,
+            network,
+        );
+
         let consensus_overrides_path =
             data_dir.join(algo_types::consensus::CONFIGURABLE_CONSENSUS_PROTOCOLS_FILENAME);
-        let consensus_protocols = algo_types::consensus::preload_configurable_consensus_protocols(
-            data_dir,
-        )
-        .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
+        let consensus_protocols =
+            algo_types::consensus::preload_configurable_consensus_protocols_with_base(
+                data_dir,
+                consensus_base,
+            )
+            .map_err(|e| anyhow::anyhow!("loading {}: {e}", consensus_overrides_path.display()))?;
         algo_types::consensus::install_consensus_overrides(&consensus_protocols);
         if consensus_overrides_path.exists() {
             info!(path = %consensus_overrides_path.display(), "loaded consensus-parameter overrides");
