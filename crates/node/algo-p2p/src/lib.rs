@@ -51,6 +51,7 @@ pub mod host;
 pub mod httpproto;
 pub mod identity;
 pub mod identity_tracker;
+pub mod metrics;
 pub mod peerstore;
 pub mod pubsub;
 pub mod streams;
@@ -71,11 +72,13 @@ pub use host::{
 pub use httpproto::ALGORAND_HTTP_PROTOCOL;
 pub use identity::{get_or_create_keypair, IdentityConfig, DEFAULT_PRIV_KEY_FILENAME};
 pub use identity_tracker::IdentityTracker;
+pub use metrics::{GossipsubMetrics, GossipsubTagCounts};
 pub use peerstore::{PersistentPeerStore, DEFAULT_PEERSTORE_FILENAME};
 pub use pubsub::{
-    derive_algorand_gossipsub_params, ident_topic, topic_name_for_tag_code, GossipsubMeshParams,
-    AGREEMENT_VOTE_TOPIC, ALL_TOPICS, DIRECT_CONNECT_INITIAL_DELAY, IWANT_FOLLOWUP_TIME,
-    PROPOSAL_PAYLOAD_TOPIC, TX_TOPIC, VOTE_BUNDLE_TOPIC,
+    derive_algorand_gossipsub_params, ident_topic, tag_code_for_topic_name,
+    topic_name_for_tag_code, GossipsubMeshParams, AGREEMENT_VOTE_TOPIC, ALL_TOPICS,
+    DIRECT_CONNECT_INITIAL_DELAY, IWANT_FOLLOWUP_TIME, PROPOSAL_PAYLOAD_TOPIC, TX_TOPIC,
+    VOTE_BUNDLE_TOPIC,
 };
 pub use streams::{
     find_handler, should_initiate_stream, DispatchError, HandlerEntry, LogLevel, StreamHandlers,
