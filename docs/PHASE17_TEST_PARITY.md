@@ -54,14 +54,14 @@ per-area split of the former).
 | `matched-1:1` | 848 | 27% |
 | `partial` | 739 | 23% |
 | `matched-1:many` | 624 | 20% |
-| `out-of-scope` | 469 | 15% |
+| `out-of-scope` | 474 | 15% |
 | `matched-many:1` | 209 | 7% |
 | `missing-test` | 181 | 6% |
-| `not-implemented` | 109 | 3% |
+| `not-implemented` | 104 | 3% |
 
-**290 rows (`not-implemented` + `missing-test`, 9%) are real, actionable
+**285 rows (`not-implemented` + `missing-test`, 9%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
-implements but never tests. `partial` (740, 23%) is coverage that exists
+implements but never tests. `partial` (739, 23%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
 most are diminishing-returns edge cases. See
 [`docs/PHASE17_PROPOSAL.md`](PHASE17_PROPOSAL.md) for how the real gaps
@@ -83,8 +83,8 @@ were triaged into tracked issues.
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 106 | 21 | 47 | 62 | 17 | 14 | 7 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 23 | 25 | 0 | 30 | 35 | 1 | 5 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 20 | 7 | 0 | 20 | 11 | 0 | 60 |
-| Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 31 | 26 | 7 | 21 | 3 | 1 | 84 |
+| Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 31 | 26 | 7 | 21 | 0 | 1 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
-| Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 10 | 0 | 16 | 3 | 0 | 1 |
-| **Total** | | **3,179** | **848** | **624** | **209** | **739** | **109** | **181** | **469** |
+| Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 10 | 0 | 16 | 1 | 0 | 3 |
+| **Total** | | **3,179** | **848** | **624** | **209** | **739** | **104** | **181** | **474** |
 
