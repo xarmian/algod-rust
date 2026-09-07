@@ -426,7 +426,12 @@ fn static_cost_check(program: &bytecode::Program, max_cost: i64) -> Result<(), A
             // dynamic-cost opcodes (e.g. `ec_pairing_check`, `sha512`) were
             // all introduced at v5+ -- so there's nothing to do for the
             // `CostKind::Dynamic` case here; it simply can't occur.
-            if let CostKind::Static(cost) = spec.cost {
+            //
+            // `effective_cost` applies go's pre-v2 (`sha256`/`keccak256`/
+            // `sha512_256`) static cost bump: those three are cheaper at
+            // v0/v1 than the v2+ costs `OPCODE_TABLE` otherwise stores (see
+            // `opcode::effective_cost` doc comment / issue #1121).
+            if let CostKind::Static(cost) = opcode::effective_cost(spec, program.version) {
                 static_cost += cost as i64;
             }
         }
@@ -1148,18 +1153,17 @@ mod tests {
     // `assembler.rs`'s `test_backward_compat_teal_v1_assembly` (issue #1112)
     // to pin assembler byte-parity; here it pins the *cost* boundary instead.
     //
-    // NOTE on scope: go's frozen v0/v1 boundary is 2139 (reject) / 2140
-    // (accept) because pre-v2 TEAL charged the hash opcodes
-    // (`sha256`/`keccak256`/`sha512_256`) a *lower* static cost (7/26/9)
-    // than v2+ (35/130/45) -- see `data/transactions/logic/opcodes.go:535-545`.
-    // algod-rust's opcode table (`opcode.rs`) is not yet version-gated for
-    // those pre-v2 costs; it always charges the v2+ numbers. So the v0/v1
-    // boundary (2139/2140) is not reachable with this program until that
-    // separate gap is closed (tracked as a follow-up). The v2/v3 boundary
-    // (2307/2308) and the v4 dynamic-cost boundary (2306/2307, checked via
-    // ordinary `AvmMachine::charge_cost` during real execution, not the
-    // static preflight) already use the v2+ numbers and are pinned below
-    // exactly as go pins them.
+    // go's frozen v0/v1 boundary is 2139 (reject) / 2140 (accept) because
+    // pre-v2 TEAL charged the hash opcodes (`sha256`/`keccak256`/
+    // `sha512_256`) a *lower* static cost (7/26/9) than v2+ (35/130/45) --
+    // see `data/transactions/logic/opcodes.go:535-545`. `opcode::effective_cost`
+    // (issue #1121) applies that pre-v2 discount, so the v0/v1 boundary is
+    // now reachable with this program -- see `test_static_cost_check_v1_program_frozen_boundary`
+    // and `test_static_cost_check_v0_program_matches_v1_boundary` below. The
+    // v2/v3 boundary (2307/2308) and the v4 dynamic-cost boundary (2306/2307,
+    // checked via ordinary `AvmMachine::charge_cost` during real execution,
+    // not the static preflight) already use the v2+ numbers and are pinned
+    // below exactly as go pins them.
     const PROGRAM_V1_HEX: &str = "01200500010220ffffffffffffffffff012608014120559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd0142201f675bff07515f5df96737194ea945c36c41e7b4fcef307b7cd4d0e602a6911101432034b99f8dde1ba273c0a28cf5b2e4dbe497f8cb2453de0c8ba6d578c9431a62cb0100200000000000000000000000000000000000000000000000000000000000000000280129122a022b1210270403270512102d2e2f041022082209230a230b240c220d230e230f231022112312231314301525121617182319231a221b21041c1d12222312242512102104231210482829122a2b121027042706121048310031071331013102121022310413103105310613103108311613103109310a1210310b310f1310310c310d1210310e31101310311131121310311331141210311531171210483300003300071333000133000212102233000413103300053300061310330008330016131033000933000a121033000b33000f131033000c33000d121033000e3300101310330011330012131033001333001412103300153300171210483200320112320232041310320327071210350034001040000100234912";
 
     fn program_v1_bytes(version: u8) -> Vec<u8> {
@@ -1167,6 +1171,34 @@ mod tests {
         program[0] = version;
         program
     }
+
+    #[test]
+    fn test_static_cost_check_v1_program_frozen_boundary() {
+        // Go: `err = CheckSignature(0, optSigParams(maxCost(2139), stxn))`
+        // -> `"static cost"`; `maxCost(2140)` -> `NoError`
+        // (`backwardCompat_test.go:297-300`).
+        let program = program_v1_bytes(1);
+        let parsed = bytecode::parse(&program).unwrap();
+        assert_eq!(parsed.version, 1);
+
+        let err = static_cost_check(&parsed, 2139).unwrap_err();
+        assert!(
+            err.to_string().contains("static cost"),
+            "unexpected error: {err}"
+        );
+        static_cost_check(&parsed, 2140).expect("2140 must clear the static budget");
+    }
+
+    // NOTE on v0: go's `TestBackwardCompatTEALv1` also pins a version-byte-0
+    // program to the same 2139/2140 boundary (`opsByOpcode[0]` is built from
+    // the same v1 specs as `opsByOpcode[1]`, `opcodes.go:927,963-967`).
+    // `effective_cost`'s `version <= 1` guard already covers that case, but
+    // `bytecode::parse` unconditionally rejects a version-0 program
+    // (`"unsupported AVM version 0"`, `bytecode.rs:207`) as a pre-existing,
+    // unrelated gap -- algod-rust has never supported the version-byte-0
+    // encoding at all, in any code path. That gap is out of scope for this
+    // issue (#1121, hash-opcode static-cost version-gating) and is tracked
+    // separately.
 
     #[test]
     fn test_static_cost_check_v2_program_frozen_boundary() {

@@ -639,6 +639,38 @@ pub fn lookup(byte: u8) -> Option<&'static OpSpec> {
     OPCODE_TABLE[byte as usize].as_ref()
 }
 
+/// Returns `spec`'s static cost as charged for a program of the given
+/// `version`, applying the one known cost bump go-algorand ties to the AVM
+/// v1->v2 boundary rather than to an opcode's own `version` field.
+///
+/// [`OPCODE_TABLE`] is indexed by opcode byte only (one entry per byte), so
+/// it stores each hash opcode's *current* (v2+) cost. go-algorand's own
+/// table instead keys `(opcode, version)` and charges `sha256`/`keccak256`/
+/// `sha512_256` a lower cost at v0/v1: `costly(7)`/`costly(26)`/`costly(9)`
+/// there, versus `costly(35)`/`costly(130)`/`costly(45)` from v2 on
+/// (`data/transactions/logic/opcodes.go:535-545`, "Cost of these opcodes
+/// increases in AVM version 2 based on measured performance"). go-algorand
+/// also point[s] `opsByOpcode[0]` at the same v1 spec as `opsByOpcode[1]`
+/// (`opcodes.go:927,963-967`), so a v0 program is charged the same pre-v2
+/// costs as v1.
+///
+/// This is a lookup-time shim rather than a second table entry because it is
+/// -- per an audit of every cost-relevant change around go's commit
+/// `3a9bca479` -- the *only* opcode whose static cost differs by version;
+/// every other opcode's `version` field already doubles as "cost effective
+/// from this version on".
+pub fn effective_cost(spec: &OpSpec, version: u8) -> CostKind {
+    if version <= 1 {
+        match spec.opcode {
+            0x01 => return CostKind::Static(7),  // sha256 (pre-v2)
+            0x02 => return CostKind::Static(26), // keccak256 (pre-v2)
+            0x03 => return CostKind::Static(9),  // sha512_256 (pre-v2)
+            _ => {}
+        }
+    }
+    spec.cost
+}
+
 /// Resolve the effective [`OpSpec`] for an already-parsed instruction's
 /// `(opcode, sub_opcode)` pair, following multi-byte "prefix opcode"
 /// dispatch (e.g. the `app_box_*` family at `0xd4`) when `sub_opcode` is
@@ -842,6 +874,50 @@ mod tests {
         let spec = lookup_by_name("sha256").unwrap();
         assert_eq!(spec.opcode, 0x01);
         assert!(lookup_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_effective_cost_hash_opcodes_are_cheaper_pre_v2() {
+        // Matches go-algorand data/transactions/logic/opcodes.go:535-545:
+        // sha256/keccak256/sha512_256 cost 7/26/9 at v1, 35/130/45 from v2 on.
+        let sha256 = lookup(0x01).unwrap();
+        let keccak256 = lookup(0x02).unwrap();
+        let sha512_256 = lookup(0x03).unwrap();
+
+        assert_eq!(effective_cost(sha256, 1), CostKind::Static(7));
+        assert_eq!(effective_cost(keccak256, 1), CostKind::Static(26));
+        assert_eq!(effective_cost(sha512_256, 1), CostKind::Static(9));
+
+        // v0 shares v1's costs (go's `opsByOpcode[0]` mirrors `[1]`).
+        assert_eq!(effective_cost(sha256, 0), CostKind::Static(7));
+
+        for version in 2..=MAX_AVM_VERSION {
+            assert_eq!(effective_cost(sha256, version), CostKind::Static(35));
+            assert_eq!(effective_cost(keccak256, version), CostKind::Static(130));
+            assert_eq!(effective_cost(sha512_256, version), CostKind::Static(45));
+        }
+    }
+
+    #[test]
+    fn test_effective_cost_is_identity_for_unaffected_opcodes() {
+        // Every opcode other than sha256/keccak256/sha512_256 must be
+        // unaffected by `effective_cost` at any version -- the audit around
+        // go's commit `3a9bca479` found no other opcode with a version-gated
+        // static-cost bump (issue #1121).
+        for entry in OPCODE_TABLE.iter().filter_map(|o| o.as_ref()) {
+            if matches!(entry.opcode, 0x01..=0x03) {
+                continue;
+            }
+            for version in 0..=MAX_AVM_VERSION {
+                assert_eq!(
+                    effective_cost(entry, version),
+                    entry.cost,
+                    "opcode {} (0x{:02x}) changed cost at version {version}",
+                    entry.name,
+                    entry.opcode
+                );
+            }
+        }
     }
 
     #[test]
