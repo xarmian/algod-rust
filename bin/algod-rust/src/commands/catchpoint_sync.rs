@@ -26,13 +26,16 @@ use algo_codec::{
 };
 use algo_error::AlgoError;
 use algo_ledger::sync::{SyncBackend, SyncConfig, SyncOrchestrator};
+use algo_network::GossipNode;
 use algo_rest_client::{
     AlgodClient, BlockSource, CatchpointDownloader, GossipBlockSource, HttpBlockFetcher,
-    ParallelBlockFetcher, RankedCatchpointSource,
+    HttpPeerTransport, ParallelBlockFetcher, RankedCatchpointSource,
 };
 use algo_types::{Block, Round};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+use crate::commands::p2p_transport::{P2pHttpPeerTransport, P2pTransport};
 
 // ---------------------------------------------------------------------------
 // AlgodSyncBackend — real SyncBackend using AlgodClient
@@ -96,6 +99,75 @@ impl AlgodSyncBackend {
             algod_url: algod_url.to_string(),
             algod_token: algod_token.to_string(),
         }
+    }
+
+    /// Extends [`Self::with_catchpoint_peers`] with every peer a live,
+    /// running [`P2pTransport`] is currently connected to (issue #1130) —
+    /// the production wiring issue #1127 built the building blocks for
+    /// (`CatchpointDownloader::with_p2p_transport`/`HttpPeerTransport`,
+    /// `RankedCatchpointSource::push_p2p_peer`, `P2pHttpPeerTransport`) but
+    /// never called from a real node-startup path.
+    ///
+    /// Each connected peer is pushed into the same ranked candidate pool
+    /// [`RankedCatchpointSource::new`]'s HTTP peers already occupy, routed
+    /// through [`P2pHttpPeerTransport`] so its `CatchpointDownloader` speaks
+    /// HTTP-over-`/algorand-http/1.0.0` to that peer instead of plain-TCP
+    /// `reqwest` — mirroring issue #901's `create_peer_selector`
+    /// topology-wiring for block fetch (`GossipBlockFetcher`/
+    /// `P2pBlockFetcher` in `participate.rs`, which likewise reads
+    /// `P2pTransport`'s live peer set at fetch-call time rather than a
+    /// point-in-time snapshot).
+    ///
+    /// # Peer set: a snapshot taken once, at construction
+    ///
+    /// go's `CatchpointCatchupService.blocksDownloadPeerSelector`
+    /// (`catchup/catchpointService.go`, built via
+    /// `makeCatchpointPeerSelector(cs.net)`) re-queries `net.GetPeers(...)`
+    /// fresh on every `getNextPeer()` call for the run's whole duration
+    /// (`catchup/classBasedPeerSelector.go`'s `rankPooledPeerSelector` holds
+    /// only the live `peersRetriever` interface, never a copied peer list) —
+    /// so go's peer set really is continuously live for as long as one
+    /// catchup run lasts, not just at its start.
+    /// [`RankedCatchpointSource::push_p2p_peer`] (#1127) only supports
+    /// *adding* candidates — it has no removal/refresh API — so this
+    /// constructor instead takes a one-time snapshot of `p2p_transport`'s
+    /// currently-connected peers when the backend is built. That is an
+    /// acceptable approximation here (not a live-updating list *during* a
+    /// single run) because a fresh [`AlgodSyncBackend`] — and thus a fresh
+    /// snapshot — is built for every catchup attempt
+    /// (`build_algod_sync_backend` is called anew by every
+    /// `OrchestratorCatchupRunner::run`/standalone [`run`] invocation): a
+    /// peer that connects mid-run is missed for *that* run but present on
+    /// the next one. Making the peer set continuously live mid-run would
+    /// require `RankedCatchpointSource` itself to grow a peer-removal/
+    /// refresh API, a distinct change from this issue's node-startup wiring
+    /// — left as a follow-up.
+    fn with_catchpoint_peers_and_p2p(
+        algod_url: &str,
+        algod_token: &str,
+        extra_catchpoint_peer_urls: &[String],
+        p2p_transport: Option<&Arc<P2pTransport>>,
+    ) -> Self {
+        let backend =
+            Self::with_catchpoint_peers(algod_url, algod_token, extra_catchpoint_peer_urls);
+        if let Some(transport) = p2p_transport {
+            let http_transport: Arc<dyn HttpPeerTransport> =
+                Arc::new(P2pHttpPeerTransport::new(Arc::clone(transport)));
+            let peers = transport.get_peers(&[]);
+            let peer_count = peers.len();
+            for peer in peers {
+                backend
+                    .catchpoint_source
+                    .push_p2p_peer(peer.get_address().to_string(), Arc::clone(&http_transport));
+            }
+            if peer_count > 0 {
+                info!(
+                    peer_count,
+                    "wired connected P2P peer(s) into catchpoint download ranking"
+                );
+            }
+        }
+        backend
     }
 }
 
@@ -214,8 +286,14 @@ pub(crate) fn build_algod_sync_backend(
     algod_url: &str,
     algod_token: &str,
     extra_catchpoint_peer_urls: &[String],
+    p2p_transport: Option<&Arc<P2pTransport>>,
 ) -> impl SyncBackend {
-    AlgodSyncBackend::with_catchpoint_peers(algod_url, algod_token, extra_catchpoint_peer_urls)
+    AlgodSyncBackend::with_catchpoint_peers_and_p2p(
+        algod_url,
+        algod_token,
+        extra_catchpoint_peer_urls,
+        p2p_transport,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,5 +1363,110 @@ mod tests {
         assert_eq!(genesis_id_for_network("testnet"), Some("testnet-v1.0"));
         assert_eq!(genesis_id_for_network("devnet"), None);
         assert_eq!(genesis_id_for_network("custom"), None);
+    }
+
+    // -- P2P wiring (issue #1130) ------------------------------------------
+
+    /// Start two real libp2p [`P2pTransport`]s and connect `dialer` to
+    /// `listener`, mirroring `p2p_transport.rs`'s own `connected_pair` test
+    /// helper (kept private to that module, so duplicated here in miniature
+    /// rather than exported cross-module for one test).
+    async fn connected_p2p_pair() -> (P2pTransport, P2pTransport) {
+        use crate::commands::p2p_transport::P2pTransportConfig;
+        use libp2p::multiaddr::Protocol;
+
+        let listener = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1130".to_string(),
+            listen_multiaddr: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+            bootstrap_peers: vec![],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: false,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
+        })
+        .await
+        .expect("start listener");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while listener.listen_addrs().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let listen_addr = listener
+            .listen_addrs()
+            .first()
+            .cloned()
+            .expect("listener bound an address");
+        let dial_addr = listen_addr.with(Protocol::P2p(listener.peer_id()));
+
+        let dialer = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1130".to_string(),
+            listen_multiaddr: None,
+            bootstrap_peers: vec![dial_addr],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: false,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
+        })
+        .await
+        .expect("start dialer");
+
+        let mesh_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (listener.connected_peer_count() == 0 || dialer.connected_peer_count() == 0)
+            && tokio::time::Instant::now() < mesh_deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        (listener, dialer)
+    }
+
+    /// Issue #1130's core acceptance criterion: a real node-startup path
+    /// handing `AlgodSyncBackend`/`RankedCatchpointSource` at least one P2P
+    /// peer when the P2P transport is enabled and connected.
+    ///
+    /// Before this issue, `with_catchpoint_peers`/`build_algod_sync_backend`
+    /// had no P2P awareness at all — `catchpoint_source.peer_count()` could
+    /// only ever grow via `catchpoint_peer_urls`. This pins that a connected
+    /// `P2pTransport`'s peer is now also added, via
+    /// `with_catchpoint_peers_and_p2p`/`build_algod_sync_backend`'s new
+    /// `p2p_transport` parameter.
+    #[tokio::test]
+    async fn build_algod_sync_backend_wires_in_connected_p2p_peers() {
+        let (listener, dialer) = connected_p2p_pair().await;
+        let dialer = Arc::new(dialer);
+
+        // Baseline: no P2P transport -> exactly the one HTTP peer
+        // (`algod_url` itself) `with_catchpoint_peers` always includes.
+        let backend_no_p2p =
+            AlgodSyncBackend::with_catchpoint_peers_and_p2p("http://localhost:4001", "", &[], None);
+        assert_eq!(backend_no_p2p.catchpoint_source.peer_count(), 1);
+
+        // With a connected P2P transport: the HTTP peer plus every
+        // currently-connected P2P peer (here, exactly `listener`).
+        let backend_with_p2p = AlgodSyncBackend::with_catchpoint_peers_and_p2p(
+            "http://localhost:4001",
+            "",
+            &[],
+            Some(&dialer),
+        );
+        assert_eq!(
+            backend_with_p2p.catchpoint_source.peer_count(),
+            2,
+            "expected the HTTP peer plus the one connected P2P peer"
+        );
+
+        // WsOnly-mode parity check: `listener` was never given a P2P
+        // transport reference by this test, so its own would-be backend
+        // (not built here, but the code path `None` exercises above) stays
+        // completely unaffected by anything `dialer`'s connection did.
+        assert_eq!(listener.connected_peer_count(), 1);
     }
 }

@@ -413,7 +413,7 @@ impl LiveCatchupManager {
 /// Static parameters needed to run a catchpoint catchup against a peer,
 /// resolved once at node startup (algod URL/token, genesis identity, the
 /// ledger's on-disk prefix).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LiveCatchupParams {
     /// REST URL of the peer to fetch the catchpoint and blocks from.
     pub algod_url: String,
@@ -434,6 +434,37 @@ pub struct LiveCatchupParams {
     /// Extra ranked catchpoint-file peer URLs (issue #901), beyond
     /// `algod_url` itself.
     pub catchpoint_peer_urls: Vec<String>,
+    /// The node's live, running P2P transport, if P2P is enabled and
+    /// connected (issue #1130) — every currently-connected peer is added to
+    /// the same ranked catchpoint-file candidate pool `catchpoint_peer_urls`
+    /// populates, routed over `/algorand-http/1.0.0` instead of plain HTTP.
+    /// `None` when P2P isn't enabled (`NetworkMode::WsOnly`, the default) or
+    /// the call site has no P2P transport to offer (e.g. `node start
+    /// --follow`, which doesn't run a P2P transport at all yet) — in both
+    /// cases catchpoint download stays exactly as it was before this issue,
+    /// HTTP-peer-only.
+    pub p2p_transport: Option<Arc<crate::commands::p2p_transport::P2pTransport>>,
+}
+
+// `P2pTransport` deliberately does not implement `Debug` (it owns a
+// background swarm-driving task and several mutex-guarded live-state
+// fields not meaningful to print), so `LiveCatchupParams` can't `derive`
+// `Debug` — this manual impl reports only whether a P2P transport is
+// attached, mirroring how a bare `Option<T: !Debug>` field would normally
+// be elided from a derived impl.
+impl std::fmt::Debug for LiveCatchupParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveCatchupParams")
+            .field("algod_url", &self.algod_url)
+            .field("algod_token", &self.algod_token)
+            .field("db_path", &self.db_path)
+            .field("genesis_id", &self.genesis_id)
+            .field("genesis_hash", &self.genesis_hash)
+            .field("concurrency", &self.concurrency)
+            .field("catchpoint_peer_urls", &self.catchpoint_peer_urls)
+            .field("p2p_transport", &self.p2p_transport.is_some())
+            .finish()
+    }
 }
 
 /// Production [`CatchupRunner`]: builds a
@@ -464,6 +495,7 @@ impl CatchupRunner for OrchestratorCatchupRunner {
             &self.params.algod_url,
             &self.params.algod_token,
             &self.params.catchpoint_peer_urls,
+            self.params.p2p_transport.as_ref(),
         );
 
         let config = SyncConfig {
