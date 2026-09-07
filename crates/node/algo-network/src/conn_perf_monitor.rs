@@ -386,6 +386,26 @@ impl ConnectionPerformanceMonitor {
         self.pending_messages_buckets.len()
     }
 
+    /// Test-only hook that forces the monitor directly into `Stopped` with
+    /// an explicit, deterministic per-peer delay assignment. Used by
+    /// `ws_network.rs`'s issue #1105 disconnect-eligibility tests, which
+    /// need two *different* nonzero per-peer delays to prove
+    /// `check_existing_connections_need_disconnecting` picks the
+    /// worst-*eligible* peer rather than the worst overall — the real
+    /// `notify`/presync-penalty path (see
+    /// `check_existing_connections_need_disconnecting_drops_the_slowest_peer`)
+    /// can only ever produce one nonzero delay per run, so it can't build
+    /// that scenario. `pub(crate)` (not test-module-private) so the
+    /// `algo_network` crate's other test modules can reach it too.
+    #[cfg(test)]
+    pub(crate) fn force_stopped_with_delays(&mut self, delays: &[(String, i64)]) {
+        self.stage = PmStage::Stopped;
+        self.connection_delay = delays.iter().cloned().collect();
+        // Keep `ComparePeers` matching so the caller's `compare_peers`
+        // check doesn't trigger a `reset` that would wipe this back out.
+        self.monitored_connections = delays.iter().map(|(peer, _)| peer.clone()).collect();
+    }
+
     fn accumulate_message(&mut self, msg: &IncomingMessage, new_messages: bool) {
         let digest = generate_message_digest(&msg.tag, &msg.data);
 
