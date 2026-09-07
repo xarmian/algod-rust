@@ -85,15 +85,21 @@ pub enum AlgoError {
     #[error("AVM: {message}")]
     Avm { message: String },
 
-    /// A LogicSig evaluation failure, enriched with go-algorand-style
-    /// structured diagnostics (pc, group index, per-transaction
-    /// scratch/stack dump). Mirrors go's `EvalError` attributes, attached
-    /// by `cx.evalError()` (`data/transactions/logic/eval.go`) — see
-    /// `TestLogicErrorDetails` in go's `eval_test.go`. Wraps whatever
-    /// underlying error the AVM machine raised (usually [`AlgoError::Avm`])
-    /// as its source, so `Error::source()`/`Unwrap()`-style chaining still
-    /// reaches the original message.
-    #[error("AVM: {message}")]
+    /// An AVM evaluation failure, enriched with go-algorand-style structured
+    /// diagnostics (pc, group index, app index, per-transaction
+    /// scratch/stack dump). Mirrors go's `basics.SError`/`EvalError`
+    /// attributes, attached by `cx.evalError()`
+    /// (`data/transactions/logic/eval.go`) — see `TestLogicErrorDetails` in
+    /// go's `eval_test.go`. Despite the name (kept for compatibility with
+    /// its original LogicSig-only introduction in issue #1113), this variant
+    /// now also covers app-call (approval/clear-state program) evaluation
+    /// failures (issue #1135) — `app_index` distinguishes the two: `None`
+    /// for a LogicSig (`ModeSig`), `Some(app_id)` for an app call
+    /// (`ModeApp`), matching go's `if cx.runMode == ModeApp { ... }` gate.
+    /// Wraps whatever underlying error the AVM machine raised (usually
+    /// [`AlgoError::Avm`]) as its source, so `Error::source()`/`Unwrap()`-style
+    /// chaining still reaches the original message.
+    #[error("{message}")]
     AvmLogicSig {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -102,11 +108,16 @@ pub enum AlgoError {
         pc: usize,
         /// Index of the failing transaction within its group.
         group_index: usize,
+        /// The application ID, when this failure occurred while evaluating
+        /// an app-call program (`ModeApp`). `None` for a LogicSig failure
+        /// (`ModeSig`), mirroring go's `cx.runMode == ModeApp` gate on
+        /// attaching the `app-index` attribute.
+        app_index: Option<u64>,
         /// Scratch/stack dumps for transactions `0..=group_index`. Mirrors
-        /// go's `eval-states` attribute; unlike go, algod-rust's LogicSig
-        /// evaluator does not thread cross-transaction scratch state across
-        /// sibling delegated programs, so entries other than
-        /// `eval_states[group_index]` carry an empty dump.
+        /// go's `eval-states` attribute; unlike go, algod-rust's evaluators
+        /// do not thread cross-transaction scratch state across sibling
+        /// programs, so entries other than `eval_states[group_index]` carry
+        /// an empty dump.
         eval_states: Vec<AvmEvalStateDump>,
     },
 
@@ -115,3 +126,52 @@ pub enum AlgoError {
 }
 
 pub type Result<T> = std::result::Result<T, AlgoError>;
+
+/// A plain, `Clone`-able snapshot of [`AlgoError::AvmLogicSig`]'s structured
+/// diagnostics, for carrying pc/group-index/app-index/eval-states detail
+/// across API boundaries that need `Clone` (e.g. [`AlgoError`] itself is not
+/// `Clone` because it wraps a `Box<dyn Error>`) — notably
+/// `algo_avm::eval::AvmResult` and the REST API's error responses. Mirrors
+/// go's `basics.SError.Attrs`, threaded from `evalError()` through to
+/// `returnError()` (`daemon/algod/api/server/v2/utils.go`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AvmErrorDetail {
+    /// Instruction index at which evaluation failed.
+    pub pc: usize,
+    /// Index of the failing transaction within its group.
+    pub group_index: usize,
+    /// The application ID, for an app-call (`ModeApp`) failure; `None` for
+    /// a LogicSig (`ModeSig`) failure.
+    pub app_index: Option<u64>,
+    /// Scratch/stack dumps for transactions `0..=group_index`.
+    pub eval_states: Vec<AvmEvalStateDump>,
+}
+
+impl AlgoError {
+    /// Extract this error's structured AVM diagnostics, if it is (or wraps,
+    /// via `source()`) an [`AlgoError::AvmLogicSig`]. Mirrors go's
+    /// `errors.As(internal, &se)` unwrap in `returnError()`
+    /// (`daemon/algod/api/server/v2/utils.go:51`), which walks the error
+    /// chain looking for a `*basics.SError`.
+    pub fn avm_eval_detail(&self) -> Option<AvmErrorDetail> {
+        let mut cur: &(dyn std::error::Error + 'static) = self;
+        loop {
+            if let Some(AlgoError::AvmLogicSig {
+                pc,
+                group_index,
+                app_index,
+                eval_states,
+                ..
+            }) = cur.downcast_ref::<AlgoError>()
+            {
+                return Some(AvmErrorDetail {
+                    pc: *pc,
+                    group_index: *group_index,
+                    app_index: *app_index,
+                    eval_states: eval_states.clone(),
+                });
+            }
+            cur = cur.source()?;
+        }
+    }
+}

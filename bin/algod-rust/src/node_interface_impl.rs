@@ -1880,8 +1880,17 @@ impl NodeInterface for AlgodNodeInterface {
                 // Prime the evaluator before the first ingest (a fresh pool has
                 // none until the first block); idempotent thereafter.
                 pool.ensure_evaluator_primed();
-                pool.remember(tx_group)
-                    .map_err(|e| NodeError::BadRequest(format!("pool rejected group: {e}")))?;
+                pool.remember(tx_group).map_err(|e| {
+                    let message = format!("pool rejected group: {e}");
+                    // Preserve structured pc/group-index/app-index/eval-states
+                    // diagnostics from a rejected app-call or logicsig
+                    // program (issue #1135), matching go's `returnError()`
+                    // surfacing `basics.SError.Attrs` in `ErrorResponse.data`.
+                    match e.avm_eval_detail() {
+                        Some(detail) => NodeError::BadRequestWithDetail(message, detail.clone()),
+                        None => NodeError::BadRequest(message),
+                    }
+                })?;
                 match crate::dev_producer::produce_dev_block(&pool, &ledger, timestamp_offset) {
                     Ok((block, apply_data)) => {
                         // Cache per-txn ApplyData (created ids / eval delta) for

@@ -834,6 +834,7 @@ mod tests {
             logs,
             approved: true,
             error: None,
+            error_detail: None,
             coverage: algo_avm::machine::OpcodeCoverage::default(),
             scratch: crate::avm_context::default_scratch_row(),
         }

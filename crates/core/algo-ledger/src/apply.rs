@@ -4561,16 +4561,40 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     // go-algorand's `evalTracer.saveEvalDelta`.
                     ctx.failed_eval_delta
                         .set(crate::eval_delta::encode_eval_delta(&result, txn));
-                    return Err(AlgoError::Ledger {
-                        message: format!(
-                            "appl execute: app {} approval program rejected transaction{}",
-                            app_id,
-                            result
-                                .error
-                                .as_ref()
-                                .map(|e| format!(": {}", e))
-                                .unwrap_or_default()
-                        ),
+                    let message = format!(
+                        "appl execute: app {} approval program rejected transaction{}",
+                        app_id,
+                        result
+                            .error
+                            .as_ref()
+                            .map(|e| format!(": {}", e))
+                            .unwrap_or_default()
+                    );
+                    // When the approval program actually errored (as opposed
+                    // to a clean reject), preserve the structured
+                    // pc/group-index/app-index/eval-states diagnostics
+                    // `run_approval_program` attached to `result.error_detail`
+                    // (issue #1135) by re-wrapping them in an
+                    // `AlgoError::AvmLogicSig`, matching go's
+                    // `basics.Annotate`-based `evalError()`
+                    // (`data/transactions/logic/eval.go`) attaching the same
+                    // attributes regardless of how far up the call stack the
+                    // failure is reported. The message text is unchanged
+                    // either way -- only the error's structured attributes
+                    // (surfaced by the REST API's `ErrorResponse.data`, see
+                    // `algo_rest_api::error`) depend on this branch.
+                    return Err(match result.error_detail {
+                        Some(detail) => AlgoError::AvmLogicSig {
+                            source: Box::new(AlgoError::Ledger {
+                                message: message.clone(),
+                            }),
+                            message,
+                            pc: detail.pc,
+                            group_index: detail.group_index,
+                            app_index: detail.app_index,
+                            eval_states: detail.eval_states,
+                        },
+                        None => AlgoError::Ledger { message },
                     });
                 }
                 // Report the approval program's state changes / logs / inner txns.

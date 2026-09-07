@@ -53,13 +53,13 @@ per-area split of the former).
 |---|---|---|
 | `matched-1:1` | 853 | 27% |
 | `partial` | 743 | 23% |
-| `matched-1:many` | 630 | 20% |
+| `matched-1:many` | 635 | 20% |
 | `out-of-scope` | 544 | 17% |
 | `matched-many:1` | 209 | 7% |
 | `missing-test` | 188 | 6% |
-| `not-implemented` | 12 | 0% |
+| `not-implemented` | 7 | 0% |
 
-**200 rows (`not-implemented` + `missing-test`, 6%) are real, actionable
+**195 rows (`not-implemented` + `missing-test`, 6%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
 implements but never tests. `partial` (743, 23%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
@@ -80,11 +80,11 @@ were triaged into tracked issues.
 | Networking (`network`, `network/p2p`, ...) | [parity_network.md](phase17/parity_network.md) | 263 | 86 | 57 | 11 | 75 | 0 | 20 | 14 |
 | Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 89 | 35 | 16 | 60 | 0 | 34 | 42 |
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 59 | 64 | 1 | 10 | 0 | 0 | 10 |
-| Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 106 | 21 | 47 | 62 | 7 | 14 | 17 |
+| Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 106 | 26 | 47 | 62 | 2 | 14 | 17 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 24 | 26 | 0 | 31 | 5 | 3 | 30 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 21 | 7 | 0 | 23 | 0 | 1 | 66 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 31 | 26 | 7 | 21 | 0 | 1 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 11 | 0 | 16 | 0 | 0 | 3 |
-| **Total** | | **3,179** | **853** | **630** | **209** | **740** | **15** | **188** | **544** |
+| **Total** | | **3,179** | **853** | **635** | **209** | **740** | **10** | **188** | **544** |
 
