@@ -53,11 +53,11 @@ per-area split of the former).
 |---|---|---|
 | `matched-1:1` | 853 | 27% |
 | `partial` | 743 | 23% |
-| `matched-1:many` | 636 | 20% |
+| `matched-1:many` | 639 | 20% |
 | `out-of-scope` | 545 | 17% |
 | `matched-many:1` | 209 | 7% |
 | `missing-test` | 188 | 6% |
-| `not-implemented` | 5 | 0% |
+| `not-implemented` | 2 | 0% |
 
 **193 rows (`not-implemented` + `missing-test`, 6%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
@@ -81,10 +81,10 @@ were triaged into tracked issues.
 | Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 89 | 35 | 16 | 60 | 0 | 34 | 42 |
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 59 | 64 | 1 | 10 | 0 | 0 | 10 |
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 106 | 26 | 47 | 62 | 2 | 14 | 17 |
-| Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 24 | 27 | 0 | 31 | 3 | 3 | 31 |
+| Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 24 | 30 | 0 | 31 | 0 | 3 | 31 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 21 | 7 | 0 | 23 | 0 | 1 | 66 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 31 | 26 | 7 | 21 | 0 | 1 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 11 | 0 | 16 | 0 | 0 | 3 |
-| **Total** | | **3,179** | **853** | **636** | **209** | **740** | **8** | **188** | **545** |
+| **Total** | | **3,179** | **853** | **639** | **209** | **740** | **2** | **188** | **545** |
 

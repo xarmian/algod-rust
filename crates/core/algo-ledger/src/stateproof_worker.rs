@@ -465,7 +465,11 @@ pub mod db {
     }
 
     /// Matches go's `sigExistsInDB` (`db.go:147`).
-    pub fn sig_exists_in_db(conn: &Connection, round: u64, account: Address) -> rusqlite::Result<bool> {
+    pub fn sig_exists_in_db(
+        conn: &Connection,
+        round: u64,
+        account: Address,
+    ) -> rusqlite::Result<bool> {
         let exists: i64 = conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM sigs WHERE signer = ?1 AND sprnd = ?2)",
             params![account.0.as_slice(), round],
@@ -531,7 +535,10 @@ pub mod db {
 
     /// Pending sigs for exactly one round. Matches go's
     /// `getPendingSigsForRound` (`db.go:134`).
-    pub fn get_pending_sigs_for_round(conn: &Connection, round: u64) -> rusqlite::Result<Vec<PendingSig>> {
+    pub fn get_pending_sigs_for_round(
+        conn: &Connection,
+        round: u64,
+    ) -> rusqlite::Result<Vec<PendingSig>> {
         let mut stmt =
             conn.prepare("SELECT signer, sig, from_this_node FROM sigs WHERE sprnd = ?1")?;
         let rows = stmt.query_map(params![round], |row| {
@@ -566,7 +573,11 @@ pub mod db {
     /// [`sig_exists_in_db`]'s bool. Not present in go (go always uses the
     /// bool form) — provided for ergonomics only.
     #[allow(dead_code)]
-    fn signer_of(conn: &Connection, round: u64, account: Address) -> rusqlite::Result<Option<Address>> {
+    fn signer_of(
+        conn: &Connection,
+        round: u64,
+        account: Address,
+    ) -> rusqlite::Result<Option<Address>> {
         conn.query_row(
             "SELECT signer FROM sigs WHERE sprnd = ?1 AND signer = ?2",
             params![round, account.0.as_slice()],
@@ -642,7 +653,9 @@ pub struct ProverEntry {
 /// and construct the [`Prover`]/[`SigCollector`] pair.
 fn create_prover_entry<L: LedgerStore>(store: &L, round: u64) -> Result<ProverEntry, AlgoError> {
     let hdr = store.get_block_header(round)?.ok_or_else(|| {
-        ledger_err(format!("create_prover_entry: no block header for round {round}"))
+        ledger_err(format!(
+            "create_prover_entry: no block header for round {round}"
+        ))
     })?;
     let params = consensus_params_for_version(&hdr.current_protocol).ok_or_else(|| {
         ledger_err(format!(
@@ -765,7 +778,9 @@ impl StateProofRuntime {
     }
 
     pub fn signed_weight(&self, round: u64) -> Option<u64> {
-        self.provers.get(&round).map(|e| e.collector.prover.signed_weight())
+        self.provers
+            .get(&round)
+            .map(|e| e.collector.prover.signed_weight())
     }
 
     pub fn is_submitted(&self, round: u64) -> bool {
@@ -815,7 +830,10 @@ impl StateProofRuntime {
             if self.submitted.contains(&round) {
                 continue;
             }
-            let entry = self.provers.get_mut(&round).expect("round from provers keys");
+            let entry = self
+                .provers
+                .get_mut(&round)
+                .expect("round from provers keys");
             if !entry.collector.prover.ready() {
                 tracing::debug!(
                     round,
@@ -1004,6 +1022,103 @@ pub fn build_state_proof_transaction(
     }
 }
 
+// ── Key pruning (stateproof/builder.go's deleteStaleKeys) ────────────────
+
+/// If a state-proof key holder is still active at `needed_round`, returns
+/// the round *before which* that holder's state-proof keys are now safe to
+/// delete; returns `None` when nothing should be pruned (yet).
+///
+/// `needed_round` must be the ledger's own confirmed `StateProofNextRound`
+/// tracking value read from an **already-committed** block header --
+/// i.e. the round of a state proof that has actually landed on-chain, never
+/// a round that has merely been built/broadcast but not yet applied. This
+/// mirrors go's `Worker.deleteProverData`/`deleteStaleKeys`
+/// (`stateproof/builder.go:462-464,578-591`), which is likewise only ever
+/// invoked with the just-committed block's `StateProofTracking[...]
+/// .StateProofNextRound` -- see `OnBlockCommitted`'s caller in
+/// `builder.go`. Pruning against a merely-broadcast round would risk
+/// discarding a key that's still needed if the proof never actually lands
+/// (a fork, a missed round); `needed_round == 0` (state proofs not yet
+/// enabled / no proof ever confirmed) and a holder whose validity interval
+/// doesn't cover `needed_round` (`Participation.OverlapsInterval`,
+/// `participation.go:127`) both correctly yield `None` here, matching go.
+///
+/// The returned round is `firstRoundInKeyLifetime(needed_round,
+/// key_lifetime)` (`merklesignature.Verifier.FirstRoundInKeyLifetime`,
+/// via `GetStateProofSecretsForRound` + `Signer.FirstRoundInKeyLifetime`
+/// in `data/account/participationRegistry.go:786` /
+/// `stateproof/builder.go:581`) -- the start of the key-lifetime bucket
+/// that covers `needed_round`, so a key still reachable from a *future*
+/// eligible signing round within the same bucket (relevant whenever
+/// `key_lifetime > StateProofInterval`, see
+/// `TestKeysRemoveOnlyAfterStateProofAcceptedSmallIntervals`) is never
+/// deleted, only the buckets strictly before it.
+pub fn state_proof_keys_prune_round(
+    verifier: &merklesig::Verifier,
+    first_valid: algo_types::Round,
+    last_valid: algo_types::Round,
+    needed_round: u64,
+) -> Option<u64> {
+    if needed_round == 0 || verifier.key_lifetime == 0 {
+        return None;
+    }
+    if needed_round < first_valid.0 || needed_round > last_valid.0 {
+        return None;
+    }
+    Some(merklesig::first_round_in_key_lifetime(
+        needed_round,
+        verifier.key_lifetime,
+    ))
+}
+
+/// Prune every participant's used-and-now-safe-to-discard state-proof keys
+/// from `part_store`, gated on `needed_round` (the ledger's confirmed
+/// `StateProofNextRound`, see [`state_proof_keys_prune_round`]).
+///
+/// Mirrors go's `Worker.deleteProverData` calling `deleteStaleKeys` for
+/// every locally-held key (`stateproof/builder.go:546-591`). Returns the
+/// total number of key rows successfully deleted across all participants.
+/// A failure pruning one participant's keys is logged and skipped rather
+/// than aborting the whole pass -- matches go's `deleteStaleKeys`, which
+/// warns (`spw.log.Warnf`) and continues past a single participant's error.
+pub fn prune_confirmed_state_proof_keys(
+    part_store: &crate::participation::ParticipationStore,
+    needed_round: u64,
+) -> Result<usize, rusqlite::Error> {
+    if needed_round == 0 {
+        return Ok(0);
+    }
+    let records = part_store.get_all()?;
+    let mut total = 0;
+    for record in &records {
+        let Some(verifier) = record.state_proof_verifier.as_ref() else {
+            continue;
+        };
+        if let Some(prune_round) = state_proof_keys_prune_round(
+            verifier,
+            record.first_valid,
+            record.last_valid,
+            needed_round,
+        ) {
+            match part_store.delete_state_proof_keys_before(
+                &record.participation_id,
+                algo_types::Round(prune_round),
+            ) {
+                Ok(n) => total += n,
+                Err(e) => {
+                    tracing::warn!(
+                        participation_id = ?record.participation_id,
+                        round = prune_round,
+                        error = %e,
+                        "stateproof: failed to prune state-proof keys for participant"
+                    );
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,7 +1171,12 @@ mod tests {
         // round: still accepted (stalled-chain recovery path).
         let latest = 5000u64;
         let latest_sp_round = latest - (latest % interval);
-        assert!(meets_broadcast_policy(latest_sp_round, latest, interval, next));
+        assert!(meets_broadcast_policy(
+            latest_sp_round,
+            latest,
+            interval,
+            next
+        ));
         // Beyond threshold and not the latest state-proof round: rejected.
         assert!(!meets_broadcast_policy(2048, latest, interval, next));
         // Disabled: always rejected.
@@ -1109,7 +1229,9 @@ mod tests {
 
         // The produced signature genuinely verifies against addr_a's key.
         let verifier = secrets_a.get_verifier();
-        verifier.verify_bytes(round, &msg, &sigs[0].sig).expect("must verify");
+        verifier
+            .verify_bytes(round, &msg, &sigs[0].sig)
+            .expect("must verify");
     }
 
     #[test]
@@ -1129,7 +1251,12 @@ mod tests {
 
     // ── SigCollector (signature gathering) ───────────────────────────
 
-    fn build_collector(round: u64, msg: MessageHash, n: usize, weight: u64) -> (SigCollector, Vec<merklesig::Secrets>) {
+    fn build_collector(
+        round: u64,
+        msg: MessageHash,
+        n: usize,
+        weight: u64,
+    ) -> (SigCollector, Vec<merklesig::Secrets>) {
         let mut secrets_list = Vec::with_capacity(n);
         let mut participants = Vec::with_capacity(n);
         let mut addr_to_pos = BTreeMap::new();
@@ -1149,7 +1276,10 @@ mod tests {
             fn length(&self) -> u64 {
                 self.0.len() as u64
             }
-            fn marshal(&self, pos: u64) -> Result<Box<dyn merklearray::Hashable>, merklearray::MerkleError> {
+            fn marshal(
+                &self,
+                pos: u64,
+            ) -> Result<Box<dyn merklearray::Hashable>, merklearray::MerkleError> {
                 Ok(Box::new(self.0[pos as usize].clone()))
             }
         }
@@ -1187,7 +1317,10 @@ mod tests {
         early_collector
             .insert_sig(
                 Address([1u8; 32]),
-                early_secrets[0].get_signer(16).sign_bytes(&[1u8; 32]).unwrap(),
+                early_secrets[0]
+                    .get_signer(16)
+                    .sign_bytes(&[1u8; 32])
+                    .unwrap(),
                 true,
             )
             .unwrap();
@@ -1233,7 +1366,10 @@ mod tests {
         // signer) -- prune discards the now-moot round-16 entry.
         rt.prune(32);
         assert!(!rt.provers.contains_key(&16), "stale round must be pruned");
-        assert!(rt.provers.contains_key(&32), "still-needed round must survive");
+        assert!(
+            rt.provers.contains_key(&32),
+            "still-needed round must survive"
+        );
 
         // Now the ascending scan reaches round 32 immediately and builds it.
         let built = rt.try_build();
@@ -1249,7 +1385,9 @@ mod tests {
 
         let addr0 = Address([1u8; 32]);
         let sig = secrets_list[0].get_signer(round).sign_bytes(&msg).unwrap();
-        collector.insert_sig(addr0, sig, true).expect("valid signature must insert");
+        collector
+            .insert_sig(addr0, sig, true)
+            .expect("valid signature must insert");
         assert_eq!(collector.prover.signed_weight(), 100);
     }
 
@@ -1344,7 +1482,10 @@ mod tests {
         };
         db::add_pending_sig(&conn, 256, &psig).unwrap();
         assert!(db::sig_exists_in_db(&conn, 256, addr).unwrap());
-        assert!(!db::sig_exists_in_db(&conn, 512, addr).unwrap(), "different round");
+        assert!(
+            !db::sig_exists_in_db(&conn, 512, addr).unwrap(),
+            "different round"
+        );
     }
 
     #[test]
@@ -1580,13 +1721,151 @@ mod tests {
         assert_eq!(stx.txn.genesis_hash, [7u8; 32]);
         assert_eq!(stx.sig, [0u8; 64]);
         assert!(stx.msig.is_none() && stx.lsig.is_none());
+        assert_eq!(stx.txn.state_proof.as_ref().unwrap().signed_weight, 100);
         assert_eq!(
-            stx.txn.state_proof.as_ref().unwrap().signed_weight,
-            100
-        );
-        assert_eq!(
-            stx.txn.state_proof_message.as_ref().unwrap().last_attested_round,
+            stx.txn
+                .state_proof_message
+                .as_ref()
+                .unwrap()
+                .last_attested_round,
             512
+        );
+    }
+
+    // ── Key pruning (issue #1139) ───────────────────────────────────────
+
+    fn test_verifier(key_lifetime: u64) -> merklesig::Verifier {
+        merklesig::Verifier {
+            key_lifetime,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prune_round_none_before_any_state_proof_confirmed() {
+        // needed_round == 0 means the ledger has never confirmed a state
+        // proof (state_proof_next_round(0, latest) semantics) -- nothing is
+        // safe to prune yet, matching
+        // `TestKeysRemoveOnlyAfterStateProofAccepted`'s pre-confirmation
+        // assertion that no keys have been deleted at all.
+        let v = test_verifier(merklesig::KEY_LIFETIME_DEFAULT);
+        assert_eq!(
+            state_proof_keys_prune_round(&v, algo_types::Round(0), algo_types::Round(10_000), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn prune_round_none_outside_validity_interval() {
+        let v = test_verifier(merklesig::KEY_LIFETIME_DEFAULT);
+        // Holder's key isn't valid yet at needed_round.
+        assert_eq!(
+            state_proof_keys_prune_round(&v, algo_types::Round(1000), algo_types::Round(2000), 512),
+            None
+        );
+        // Holder's key already expired before needed_round.
+        assert_eq!(
+            state_proof_keys_prune_round(&v, algo_types::Round(0), algo_types::Round(256), 512),
+            None
+        );
+    }
+
+    #[test]
+    fn prune_round_small_interval_keeps_reused_bucket() {
+        // Mirrors TestKeysRemoveOnlyAfterStateProofAcceptedSmallIntervals:
+        // StateProofInterval=64 < KeyLifetime=256, so the first confirmed
+        // state proof round (128) falls inside the very first key-lifetime
+        // bucket ([0, 256)) -- nothing strictly before round 0 exists, so
+        // this must resolve to round 0 (i.e. a no-op prune), not round 128.
+        let v = test_verifier(merklesig::KEY_LIFETIME_DEFAULT);
+        let prune_round =
+            state_proof_keys_prune_round(&v, algo_types::Round(0), algo_types::Round(100_000), 128)
+                .expect("holder is active at needed_round");
+        assert_eq!(
+            prune_round, 0,
+            "must not cross into the still-in-use bucket"
+        );
+    }
+
+    #[test]
+    fn prune_round_large_interval_crosses_bucket_boundary() {
+        // Mirrors TestKeysRemoveOnlyAfterStateProofAcceptedLargeIntervals:
+        // StateProofInterval=260 > KeyLifetime=256, so the first confirmed
+        // state proof round (520) has moved past the first key-lifetime
+        // bucket -- keys for [0, 512) are now safe to discard.
+        let v = test_verifier(merklesig::KEY_LIFETIME_DEFAULT);
+        let prune_round =
+            state_proof_keys_prune_round(&v, algo_types::Round(0), algo_types::Round(100_000), 520)
+                .expect("holder is active at needed_round");
+        assert_eq!(prune_round, 512);
+    }
+
+    fn make_prune_test_participation(
+        seed_byte: u8,
+        first: u64,
+        last: u64,
+        key_lifetime: u64,
+    ) -> crate::participation::Participation {
+        crate::participation::Participation {
+            parent: Address([seed_byte; 32]),
+            vrf: algo_consensus_crypto::VrfKeypair::from_seed([seed_byte; 32]),
+            voting: algo_consensus_crypto::OneTimeSignatureSecrets::generate(0, 10),
+            first_valid: algo_types::Round(first),
+            last_valid: algo_types::Round(last),
+            key_dilution: 10,
+            state_proof_secrets: Some(merklesig::Secrets::new(first, last, key_lifetime).unwrap()),
+        }
+    }
+
+    #[test]
+    fn prune_confirmed_state_proof_keys_noop_before_confirmation() {
+        let part_store = crate::participation::ParticipationStore::open_in_memory().unwrap();
+        let part = make_prune_test_participation(1, 0, 100_000, merklesig::KEY_LIFETIME_DEFAULT);
+        part_store.insert(&part).unwrap();
+
+        // No state proof has ever been confirmed (needed_round == 0):
+        // nothing should be pruned.
+        let deleted = prune_confirmed_state_proof_keys(&part_store, 0).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn prune_confirmed_state_proof_keys_deletes_only_past_bucket() {
+        let part_store = crate::participation::ParticipationStore::open_in_memory().unwrap();
+        // key_lifetime = 256 (default); registers one key every 256 rounds
+        // from 0 to 2048.
+        let part = make_prune_test_participation(2, 0, 2048, merklesig::KEY_LIFETIME_DEFAULT);
+        let id = part_store.insert(&part).unwrap();
+
+        // A confirmed state proof at round 520 (StateProofInterval=260-style
+        // large-interval scenario) crosses into the third bucket ([512,
+        // 768)); the first two buckets' keys (rounds 0, 256) become safe to
+        // discard.
+        let deleted = prune_confirmed_state_proof_keys(&part_store, 520).unwrap();
+        assert_eq!(deleted, 2, "keys for rounds 0 and 256 should be pruned");
+
+        // The key covering the confirmed round itself, and everything
+        // after it, must remain retrievable.
+        let restored = part_store
+            .get_for_round(&id, algo_types::Round(600))
+            .unwrap()
+            .expect("key for round 600 should still exist");
+        assert!(restored.state_proof_secrets.is_some());
+    }
+
+    #[test]
+    fn prune_confirmed_state_proof_keys_keeps_reused_bucket_small_interval() {
+        let part_store = crate::participation::ParticipationStore::open_in_memory().unwrap();
+        let part = make_prune_test_participation(3, 0, 2048, merklesig::KEY_LIFETIME_DEFAULT);
+        part_store.insert(&part).unwrap();
+
+        // A confirmed state proof at round 128 (StateProofInterval=64-style
+        // small-interval scenario) is still inside the very first bucket
+        // ([0, 256)) -- nothing should be deleted.
+        let deleted = prune_confirmed_state_proof_keys(&part_store, 128).unwrap();
+        assert_eq!(
+            deleted, 0,
+            "round 128 is still within the first, still-live bucket"
         );
     }
 }
