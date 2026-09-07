@@ -648,6 +648,20 @@ impl OpStream {
                 continue;
             }
 
+            // Backward compatibility: v0/v1 do not allow a branch to land
+            // exactly past the last instruction (i.e. at the very end of
+            // the program). v2 lifted this restriction, matching go's
+            // `resolveLabels` (`assembler.go:2668-2672`): `if ops.Version <=
+            // 1 { if dest == ops.pending.Len() { ... "is too far away" } }`.
+            if self.version <= 1 && dest == raw.len() {
+                self.errors.push(AssemblyError {
+                    line: lr.line,
+                    col: 0,
+                    message: format!("label {:?} is too far away", lr.label),
+                });
+                continue;
+            }
+
             if lr.varint {
                 let opcode_pos = lr.position - 1;
                 if dest == opcode_pos {
@@ -3602,6 +3616,364 @@ mod tests {
             "expected a branch-too-far error, got {} errors (first: {:?})",
             errs.len(),
             errs.first()
+        );
+    }
+
+    // ── go-algorand's TestSemiColon (assembler_test.go:3582), issue #1112 ──
+    // `;` is a statement separator, equivalent to a newline -- not a
+    // comment marker. Locks the already-fixed `tokenize_line`/
+    // `next_statement` behavior against regression.
+
+    #[test]
+    fn test_semicolon_is_statement_separator_like_newline() {
+        // "pushint 0 ; pushint 1 ; +; int 3 ; *" must assemble identically
+        // to the newline-separated equivalent, with or without extra
+        // whitespace/blank statements around each `;`, and a `//` comment
+        // must still swallow everything after it on the line (including a
+        // `;` inside the comment).
+        let expected = assemble_string("#pragma version 8\npushint 0\npushint 1\n+\nint 3\n*\n")
+            .unwrap()
+            .program;
+
+        for source in [
+            "#pragma version 8\npushint 0 ; pushint 1 ; +; int 3 ; *\n",
+            "#pragma version 8\npushint 0; pushint 1; +; int 3; *; // comment; int 2\n",
+            "#pragma version 8\npushint 0; ; ; pushint 1 ; +; int 3 ; *//check\n",
+        ] {
+            let program = assemble_string(source).unwrap().program;
+            assert_eq!(
+                program, expected,
+                "semicolon-separated form {source:?} should assemble identically to the \
+                 newline-separated form"
+            );
+        }
+    }
+
+    #[test]
+    fn test_semicolon_before_pragma_in_comment_does_not_split_directive() {
+        // A `;` inside a `//` comment on a line before `#pragma version`
+        // must not be treated as a statement separator that would somehow
+        // affect directive parsing -- the whole comment line is discarded
+        // before tokens ever reach `next_statement`.
+        let expected = assemble_string("#pragma version 7\nint 1\n")
+            .unwrap()
+            .program;
+
+        for source in [
+            "// junk;\n#pragma version 7\nint 1\n",
+            "// junk;\n #pragma version 7\nint 1\n",
+        ] {
+            let program = assemble_string(source).unwrap().program;
+            assert_eq!(program, expected, "source {source:?}");
+        }
+    }
+
+    #[test]
+    fn test_semicolon_inside_string_literal_is_not_a_separator() {
+        // A `;` inside a quoted byte-string literal is part of the string,
+        // not a statement separator -- `byte "test;this"` must stay one
+        // token/statement, not split into `byte "test` and `this"`.
+        let expected = assemble_string("#pragma version 8\nbyte \"test;this\"\npop\n")
+            .unwrap()
+            .program;
+
+        for source in [
+            "#pragma version 8\nbyte \"test;this\"; pop;\n",
+            "#pragma version 8\nbyte \"test;this\"; ; pop;\n",
+            "#pragma version 8\nbyte \"test;this\";;;pop;\n",
+        ] {
+            let program = assemble_string(source).unwrap().program;
+            assert_eq!(program, expected, "source {source:?}");
+        }
+    }
+
+    // ── go-algorand's TestBackwardCompatAssemble (backwardCompat_test.go:
+    // 443), issue #1112 ─────────────────────────────────────────────────
+    // v1 (and the implicit-v1 default) disallow branching to a label that
+    // lands exactly at the end of the program (one past the last
+    // instruction); v2+ lifted that restriction.
+
+    #[test]
+    fn test_v1_label_at_end_of_program_is_ok_when_unreferenced() {
+        // A label that is simply never branched to is fine at any version
+        // -- only an actual branch landing there is restricted.
+        for source in ["int 1; done:\n", "#pragma version 1\nint 1; done:\n"] {
+            assemble_string(source).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_v1_branch_to_end_of_program_label_is_too_far_away() {
+        // v0/v1 (implicit-default and explicit) reject `bnz done` when
+        // `done:` is the very last thing in the program (dest == end of
+        // pending bytes); v2+ allows it.
+        let source = "int 1;\n int 1;\n bnz done;\n done:\n";
+        for prefixed in [source.to_string(), format!("#pragma version 1\n{source}")] {
+            let errs = expect_errors(&prefixed);
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("too far away") && e.message.contains("done")),
+                "expected a too-far-away error for {prefixed:?}, got: {errs:?}"
+            );
+        }
+
+        for version in 2..=MAX_AVM_VERSION {
+            let prefixed = format!("#pragma version {version}\n{source}");
+            assemble_string(&prefixed)
+                .unwrap_or_else(|e| panic!("v{version} should allow branch to program end: {e:?}"));
+        }
+    }
+
+    // ── go-algorand's TestBackwardCompatTEALv1 (backwardCompat_test.go:
+    // 253), issue #1112 ─────────────────────────────────────────────────
+    // Pins the exact v1 program bytes for a source exercising every AVM v1
+    // opcode, and that assembling the same source without an explicit
+    // version (implicit v1) or with an explicit `#pragma version 2`
+    // produces byte-identical output up to the version-byte prefix.
+
+    #[test]
+    fn test_backward_compat_teal_v1_program_bytes() {
+        let source_v1 = r"byte 0x41 // A
+sha256
+byte 0x559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd
+==
+byte 0x42
+keccak256
+byte 0x1f675bff07515f5df96737194ea945c36c41e7b4fcef307b7cd4d0e602a69111
+==
+&&
+byte 0x43
+sha512_256
+byte 0x34b99f8dde1ba273c0a28cf5b2e4dbe497f8cb2453de0c8ba6d578c9431a62cb
+==
+&&
+arg_0
+arg_1
+arg_2
+ed25519verify
+&&
+// should be a single 1 on the stack
+int 0
++
+int 0
+-
+int 1
+/
+int 1
+*
+// should be a single 1 on the stack
+int 2
+<
+int 0
+>
+int 1
+<=
+int 1
+>=
+int 1
+&&
+int 0
+||
+int 1
+==
+int 1
+!=
+!
+// should be a single 1 on the stack
+arg_3
+len
+int 32
+==
+itob
+btoi
+% // 1 % 1 = 0
+int 1
+|
+int 1
+&
+int 0
+^
+int 0xffffffffffffffff
+~
+mulw
+// should be a two zeros on the stack
+==
+intc_0
+intc_1
+==
+intc_2
+intc_3
+==
+&&
+intc 4
+int 1
+==
+&&
+pop  // consume intc_N comparisons and repeat for bytec_N
+bytec_0
+bytec_1
+==
+bytec_2
+bytec_3
+==
+&&
+bytec 4
+byte 0x00
+==
+&&
+pop
+// test all txn fields
+txn Sender
+txn Receiver
+!=
+txn Fee
+txn FirstValid
+==
+&&
+// disabled
+// txn FirstValidTime
+int 0
+txn LastValid
+!=
+&&
+txn Note
+txn Lease
+!=
+&&
+txn Amount
+txn GroupIndex
+!=
+&&
+txn CloseRemainderTo
+txn VotePK
+==
+&&
+txn SelectionPK
+txn Type
+!=
+&&
+txn VoteFirst
+txn VoteLast
+==
+&&
+txn VoteKeyDilution
+txn TypeEnum
+!=
+&&
+txn XferAsset
+txn AssetAmount
+!=
+&&
+txn AssetSender
+txn AssetReceiver
+==
+&&
+txn AssetCloseTo
+txn TxID
+==
+&&
+pop
+// repeat for gtxn
+gtxn 0 Sender
+gtxn 0 Receiver
+!=
+gtxn 0 Fee
+gtxn 0 FirstValid
+==
+&&
+// disabled
+// gtxn 0 FirstValidTime
+int 0
+gtxn 0 LastValid
+!=
+&&
+gtxn 0 Note
+gtxn 0 Lease
+!=
+&&
+gtxn 0 Amount
+gtxn 0 GroupIndex
+!=
+&&
+gtxn 0 CloseRemainderTo
+gtxn 0 VotePK
+==
+&&
+gtxn 0 SelectionPK
+gtxn 0 Type
+!=
+&&
+gtxn 0 VoteFirst
+gtxn 0 VoteLast
+==
+&&
+gtxn 0 VoteKeyDilution
+gtxn 0 TypeEnum
+!=
+&&
+gtxn 0 XferAsset
+gtxn 0 AssetAmount
+!=
+&&
+gtxn 0 AssetSender
+gtxn 0 AssetReceiver
+==
+&&
+gtxn 0 AssetCloseTo
+gtxn 0 TxID
+==
+&&
+pop
+// check global (these are set equal in defaultEvalProto())
+global MinTxnFee
+global MinBalance
+==
+global MaxTxnLife
+global GroupSize
+!=
+&&
+global ZeroAddress
+byte 0x0000000000000000000000000000000000000000000000000000000000000000
+==
+&&
+store 0
+load 0
+&&
+
+// wrap up, should be a two zeros on the stack
+bnz ok
+err
+ok:
+int 1
+dup
+==
+";
+        let program_v1_hex = "01200500010220ffffffffffffffffff012608014120559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd0142201f675bff07515f5df96737194ea945c36c41e7b4fcef307b7cd4d0e602a6911101432034b99f8dde1ba273c0a28cf5b2e4dbe497f8cb2453de0c8ba6d578c9431a62cb0100200000000000000000000000000000000000000000000000000000000000000000280129122a022b1210270403270512102d2e2f041022082209230a230b240c220d230e230f231022112312231314301525121617182319231a221b21041c1d12222312242512102104231210482829122a2b121027042706121048310031071331013102121022310413103105310613103108311613103109310a1210310b310f1310310c310d1210310e31101310311131121310311331141210311531171210483300003300071333000133000212102233000413103300053300061310330008330016131033000933000a121033000b33000f131033000c33000d121033000e3300101310330011330012131033001333001412103300153300171210483200320112320232041310320327071210350034001040000100234912";
+        let program_v1 = hex::decode(program_v1_hex).unwrap_or_else(|e| {
+            // The go fixture hex has an even count of chars; if this ever
+            // fails it means the pinned constant was mistyped, not a real
+            // assembler bug -- fail loudly rather than silently skipping.
+            panic!("bad pinned program_v1 hex: {e}")
+        });
+
+        // Assembling without an explicit version must produce byte-for-byte
+        // the historic v1 program (implicit-default version is 1).
+        let ops = assemble_string(source_v1).unwrap();
+        assert_eq!(
+            ops.program, program_v1,
+            "implicit-version assembly of the v1-opcode-exercising source must match the \
+             historic pinned v1 program bytes"
+        );
+
+        // Assembling the same source with an explicit `#pragma version 2`
+        // must match everywhere except the leading version byte.
+        let source_v2 = format!("#pragma version 2\n{source_v1}");
+        let ops_v2 = assemble_string(&source_v2).unwrap();
+        assert_eq!(ops_v2.program[0], 2);
+        assert_eq!(
+            &ops_v2.program[1..],
+            &program_v1[1..],
+            "v2 assembly must be byte-identical to the v1 program past the version byte"
         );
     }
 
