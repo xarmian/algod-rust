@@ -48,9 +48,11 @@ use crate::identity::{
     attach_challenge_header, build_identity_verification, generate_challenge,
     verify_challenge_response, IdentityChallengeValue,
 };
+use crate::limitcaller::{rate_limited_call, RateLimitError, DEFAULT_QUEUEING_TIMEOUT};
 use crate::message::OutgoingMessage;
 use crate::msg_of_interest::marshal_msg_of_interest;
 use crate::peer_features::{decode_peer_features, encode_peer_features, PeerFeatureFlags};
+use crate::phonebook::Phonebook;
 use crate::request_response::RequestTracker;
 use crate::tag::Tag;
 use crate::ws_peer::{PeerHandle, WsPeer, WsPeerConfig};
@@ -173,6 +175,33 @@ pub fn build_gossip_url(addr: &str, genesis_id: &str) -> String {
 ///
 /// Returns a [`PeerHandle`] on success, or a [`WsConnectError`] on failure.
 pub async fn try_connect(addr: &str, config: &ConnectConfig) -> Result<PeerHandle, WsConnectError> {
+    try_connect_inner(addr, config, None).await
+}
+
+/// Same as [`try_connect`], but the actual dial (steps 5 & 6 below) is
+/// wrapped in [`rate_limited_call`], consulting `phonebook`'s per-address
+/// rate limiter before attempting the connection and recording the
+/// connection time afterwards.
+///
+/// This is the Rust equivalent of go's outbound dial path in
+/// `network/wsNetwork.go`, where every outgoing `tryConnect` goes through
+/// `wn.dialer` — a `limitcaller.Dialer` wrapping `phonebook.GetConnectionWaitTime`/
+/// `UpdateConnectionTime` — rather than dialing the socket directly. Real
+/// call sites (the mesh-maintenance dial loop) should call this instead of
+/// [`try_connect`] once they have a `Phonebook` reference available.
+pub async fn try_connect_with_phonebook(
+    addr: &str,
+    config: &ConnectConfig,
+    phonebook: &Phonebook,
+) -> Result<PeerHandle, WsConnectError> {
+    try_connect_inner(addr, config, Some(phonebook)).await
+}
+
+async fn try_connect_inner(
+    addr: &str,
+    config: &ConnectConfig,
+    phonebook: Option<&Phonebook>,
+) -> Result<PeerHandle, WsConnectError> {
     // Step 1: Build gossip URL
     let gossip_url = build_gossip_url(addr, &config.genesis_id);
     tracing::debug!(url = %gossip_url, "connecting to peer");
@@ -222,22 +251,46 @@ pub async fn try_connect(addr: &str, config: &ConnectConfig) -> Result<PeerHandl
         USER_AGENT.parse().expect("valid header value"),
     );
 
-    // Steps 5 & 6: Dial WebSocket with handshake timeout
-    let connect_result = tokio::time::timeout(
-        config.handshake_timeout,
-        tokio_tungstenite::connect_async(request),
-    )
-    .await;
+    // Steps 5 & 6: Dial WebSocket with handshake timeout.
+    //
+    // When a `phonebook` is supplied, the dial itself is wrapped in
+    // `rate_limited_call` (go: `limitcaller.Dialer`/`RateLimitingBoundTransport`),
+    // which waits on the phonebook's per-address rate limiter before
+    // attempting the connection and records the connection time on success.
+    let handshake_timeout = config.handshake_timeout;
+    // Written as an explicit match (rather than `.map_err().and_then()`)
+    // because clippy's `result_large_err` lint fires on a closure whose
+    // `Result::Err` is `WsConnectError` (it carries a `tokio_tungstenite`
+    // error variant) when constructed via combinators inside the closure
+    // body; an explicit match avoids that false-positive-shaped closure
+    // signature without boxing the error type just for this call site.
+    let dial = move || async move {
+        match tokio::time::timeout(handshake_timeout, tokio_tungstenite::connect_async(request))
+            .await
+        {
+            Ok(Ok(pair)) => Ok(pair),
+            Ok(Err(e)) => Err(map_tungstenite_error(e)),
+            Err(_elapsed) => Err(WsConnectError::Timeout),
+        }
+    };
+
+    let connect_result = match phonebook {
+        Some(pb) => rate_limited_call(pb, addr, DEFAULT_QUEUEING_TIMEOUT, dial)
+            .await
+            .map_err(|e| match e {
+                RateLimitError::QueueingTimeout => WsConnectError::RateLimited,
+                RateLimitError::Inner(inner) => inner,
+            }),
+        None => dial().await,
+    };
 
     let (ws_stream, response) = match connect_result {
-        Ok(Ok((stream, resp))) => (stream, resp),
-        Ok(Err(e)) => {
-            return Err(map_tungstenite_error(e));
-        }
-        Err(_elapsed) => {
+        Ok((stream, resp)) => (stream, resp),
+        Err(WsConnectError::Timeout) => {
             tracing::warn!(addr = %addr, "connection timed out");
             return Err(WsConnectError::Timeout);
         }
+        Err(e) => return Err(e),
     };
 
     tracing::debug!(

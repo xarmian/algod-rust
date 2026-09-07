@@ -65,7 +65,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::broadcast::{BroadcastHandle, BroadcastPeer, BroadcastThread};
-use crate::connect::{try_connect, ConnectConfig};
+use crate::conn_perf_monitor::{ConnectionPerformanceMonitor, NetworkAdvanceMonitor};
+use crate::connect::{try_connect_with_phonebook, ConnectConfig};
 use crate::forwarding_policy::ForwardingPolicy;
 use crate::gossip_node::{GossipNode, Peer, PeerOption};
 use crate::handler::{Multiplexer, TaggedMessageHandler, TaggedMessageValidatorHandler};
@@ -121,6 +122,23 @@ const DEFAULT_MAX_PEER_INACTIVITY: Duration = Duration::from_secs(5 * 60);
 ///
 /// Matches Go's `maxMessageQueueDuration` of 25 seconds.
 const DEFAULT_SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(25);
+
+/// How long the network must go without an agreement-protocol advance
+/// before the clique-resolution fallback disconnects a random outgoing
+/// peer (issue #1101). Matches go's `cliqueResolveInterval`
+/// (`network/wsNetwork.go`).
+const CLIQUE_RESOLVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Returns the current time as nanoseconds since the Unix epoch, matching
+/// the clock [`crate::message::IncomingMessage::received_at`] is stamped
+/// with (see `ws_peer.rs`'s `now_ns` construction sites) — the same epoch
+/// [`ConnectionPerformanceMonitor`] expects for `reset`/`notify`.
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -429,6 +447,22 @@ pub struct WebsocketNetwork {
     /// Wrapped in `Arc` so it can be shared with the mesh connect adapter
     /// (which needs to relay messages from outbound peers to inbound peers).
     broadcast_thread: Arc<std::sync::Mutex<Option<BroadcastThread>>>,
+
+    // -------------------------------------------------------------------
+    // Outgoing-connection performance monitoring (issue #1101, wiring
+    // #1088's standalone `conn_perf_monitor` module into a live decision)
+    // -------------------------------------------------------------------
+    /// Watches outgoing peers' relative `AgreementVote` delivery timing to
+    /// find the consistently-slowest one. Mirrors go's
+    /// `wn.connPerfMonitor` (`network/wsNetwork.go`), fed by every outgoing
+    /// peer's receive loop and consulted by
+    /// [`WebsocketNetwork::check_existing_connections_need_disconnecting`].
+    conn_perf_monitor: Arc<std::sync::Mutex<ConnectionPerformanceMonitor>>,
+
+    /// Watchdog for detecting that the agreement protocol has stalled
+    /// (possible network clique). Mirrors go's
+    /// `outgoingConnsCloser.netAdvMonitor`.
+    network_advance_monitor: Arc<std::sync::Mutex<NetworkAdvanceMonitor>>,
 }
 
 impl WebsocketNetwork {
@@ -458,6 +492,10 @@ impl WebsocketNetwork {
             listen_addr: std::sync::Mutex::new(None),
             registered_handlers: std::sync::Mutex::new(Vec::new()),
             broadcast_thread: Arc::new(std::sync::Mutex::new(None)),
+            conn_perf_monitor: Arc::new(std::sync::Mutex::new(ConnectionPerformanceMonitor::new(
+                &[Tag::AgreementVote],
+            ))),
+            network_advance_monitor: Arc::new(std::sync::Mutex::new(NetworkAdvanceMonitor::new())),
         }
     }
 
@@ -654,6 +692,14 @@ impl WebsocketNetwork {
                     .expect("broadcast_thread lock poisoned");
                 guard.as_ref().map(|bt| bt.handle())
             };
+            // Issue #1101: go only feeds `connPerfMonitor.Notify` from
+            // *outgoing* peers (`network/wsPeer.go`'s `connMonitor` field is
+            // only set on outbound `wsPeer`s) — `add_peer` handles both
+            // directions (the inbound accept path and `mesh_connect`'s
+            // outbound dial), so only clone the monitor handle when this
+            // connection is outbound.
+            let conn_perf_monitor =
+                (direction == PeerDirection::Outbound).then(|| Arc::clone(&self.conn_perf_monitor));
 
             let recv_task = tokio::spawn(async move {
                 loop {
@@ -666,6 +712,11 @@ impl WebsocketNetwork {
                             match msg {
                                 Some(incoming) => {
                                     let tag = incoming.tag;
+                                    if let Some(ref mon) = conn_perf_monitor {
+                                        mon.lock()
+                                            .expect("conn_perf_monitor lock poisoned")
+                                            .notify(&incoming);
+                                    }
                                     // Save request data for Respond (hash_topics
                                     // needs the original payload).
                                     let request_data = incoming.data.clone();
@@ -902,7 +953,11 @@ impl WebsocketNetwork {
             };
 
             let addr_clone = addr.clone();
-            match try_connect(&addr_clone, &connect_config).await {
+            // Issue #1101: route this real dial through the phonebook's
+            // rate limiter too (this is the second real outbound dial path,
+            // used by `GossipNode::start()`/`request_connect_outgoing`
+            // rather than the periodic `MeshThread`).
+            match try_connect_with_phonebook(&addr_clone, &connect_config, &self.phonebook).await {
                 Ok(handle) => {
                     self.add_peer(handle, PeerDirection::Outbound, outgoing_filter)
                         .await;
@@ -922,6 +977,150 @@ impl WebsocketNetwork {
                 connecting.remove(&addr);
             }
         }
+    }
+
+    /// Checks whether an existing outgoing connection should be dropped for
+    /// being consistently the slowest, or (failing that) whether the
+    /// network looks "stuck" and a clique-resolution disconnect is due.
+    ///
+    /// Mirrors go's `outgoingConnsCloser.checkExistingConnectionsNeedDisconnecting`
+    /// (`network/connPerfMon.go`), wiring #1088's standalone
+    /// [`ConnectionPerformanceMonitor`] into a real decision (issue #1101).
+    /// Returns `true` if a peer was disconnected.
+    ///
+    /// One deliberate simplification versus go: go only considers a peer
+    /// eligible for a performance-based drop if it was marked
+    /// `throttledOutgoingConnection` at connect time (a fraction of
+    /// outgoing slots reserved via `wn.throttledOutgoingConnections`, so
+    /// the node can never shed *every* outgoing peer purely for being
+    /// "slow"). algod-rust does not yet port that eligibility counter, so
+    /// every outgoing peer is eligible here; the safety property go's
+    /// counter provides is instead preserved by only ever dropping the
+    /// single worst peer per monitoring cycle (never more), matching go's
+    /// own per-cycle behavior.
+    fn check_existing_connections_need_disconnecting(&self, target_conn_count: usize) -> bool {
+        let outgoing_peers = self.get_peers(&[PeerOption::PeersConnectedOut]);
+
+        if outgoing_peers.len() < target_conn_count {
+            // Not yet at target — reset monitoring and fall back to the
+            // clique-resolution check (go: `cc.connPerfMonitor.Reset(nil)`).
+            self.conn_perf_monitor
+                .lock()
+                .expect("conn_perf_monitor lock poisoned")
+                .reset(&[], now_ns());
+            return self.check_network_advance_disconnect(&outgoing_peers, CLIQUE_RESOLVE_INTERVAL);
+        }
+
+        let addrs: Vec<String> = outgoing_peers
+            .iter()
+            .map(|p| p.get_address().to_string())
+            .collect();
+
+        let stats = {
+            let mut mon = self
+                .conn_perf_monitor
+                .lock()
+                .expect("conn_perf_monitor lock poisoned");
+            if !mon.compare_peers(&addrs) {
+                // Different set of peers than last cycle — restart monitoring.
+                mon.reset(&addrs, now_ns());
+            }
+            mon.get_peers_statistics()
+        };
+
+        let stats = match stats {
+            Some(s) => s,
+            None => {
+                // Performance metrics are not yet ready.
+                return self
+                    .check_network_advance_disconnect(&outgoing_peers, CLIQUE_RESOLVE_INTERVAL);
+            }
+        };
+
+        // `peer_statistics` is sorted descending by delay (worst first).
+        let worst = match stats.peer_statistics.first() {
+            Some(w) if w.peer_delay > 0 => w,
+            _ => {
+                return self
+                    .check_network_advance_disconnect(&outgoing_peers, CLIQUE_RESOLVE_INTERVAL)
+            }
+        };
+
+        match outgoing_peers
+            .iter()
+            .find(|p| p.get_address() == worst.peer)
+        {
+            Some(peer) => {
+                tracing::info!(
+                    addr = %worst.peer,
+                    delay_ns = worst.peer_delay,
+                    first_message_pct = (worst.peer_first_message * 100.0) as i32,
+                    "network performance monitor: disconnecting slowest outgoing peer"
+                );
+                self.disconnect(Arc::clone(peer));
+                self.conn_perf_monitor
+                    .lock()
+                    .expect("conn_perf_monitor lock poisoned")
+                    .reset(&[], now_ns());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Clique-resolution fallback: if the agreement protocol hasn't
+    /// advanced within `clique_resolve_interval`, disconnect a randomly
+    /// chosen outgoing peer to try to escape a possible network clique.
+    ///
+    /// Mirrors go's `outgoingConnsCloser.checkNetworkAdvanceDisconnect`. The
+    /// interval is a parameter (production always passes
+    /// [`CLIQUE_RESOLVE_INTERVAL`] via
+    /// [`Self::check_existing_connections_need_disconnecting`]) purely so
+    /// tests can exercise this path without a real 5-minute wait.
+    fn check_network_advance_disconnect(
+        &self,
+        outgoing_peers: &[Arc<dyn Peer>],
+        clique_resolve_interval: Duration,
+    ) -> bool {
+        {
+            let adv = self
+                .network_advance_monitor
+                .lock()
+                .expect("network_advance_monitor lock poisoned");
+            if adv.last_advanced_within(clique_resolve_interval) {
+                return false;
+            }
+        }
+
+        if outgoing_peers.is_empty() {
+            return false;
+        }
+
+        // Mirrors go's `numOutgoingPending() > 0` guard — don't disconnect
+        // while we're already trying to extend the outgoing set.
+        if let Ok(connecting) = self.connecting.try_lock() {
+            if !connecting.is_empty() {
+                return false;
+            }
+        }
+
+        let idx = (rand::random::<u64>() % outgoing_peers.len() as u64) as usize;
+        let victim = &outgoing_peers[idx];
+        tracing::info!(
+            addr = %victim.get_address(),
+            "clique resolution: disconnecting random outgoing peer (no recent network advance)"
+        );
+        self.disconnect(Arc::clone(victim));
+        self.conn_perf_monitor
+            .lock()
+            .expect("conn_perf_monitor lock poisoned")
+            .reset(&[], now_ns());
+        // Mirrors go's `cc.net.OnNetworkAdvance()` at the end of
+        // `checkNetworkAdvanceDisconnect` — resets the watchdog clock so a
+        // single clique-resolution disconnect doesn't immediately repeat
+        // next cycle.
+        self.on_network_advance();
+        true
     }
 
     /// Build the axum router for relay mode.
@@ -1186,6 +1385,32 @@ impl WebsocketNetwork {
                         for addr in to_remove {
                             network.remove_peer(&addr).await;
                         }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Spawn the outgoing-connection-performance disconnect-check task.
+    ///
+    /// Periodically calls [`Self::check_existing_connections_need_disconnecting`]
+    /// on the same cadence as mesh maintenance (`mesh_interval`), mirroring
+    /// go's `meshThreadInner` calling `checkExistingConnectionsNeedDisconnecting`
+    /// on every mesh cycle (issue #1101).
+    fn spawn_disconnect_check_task(self: &Arc<Self>) -> JoinHandle<()> {
+        let network = Arc::clone(self);
+        let interval = network.config.mesh_interval;
+        let target_conn_count = network.config.gossip_fanout;
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = network.cancel.cancelled() => {
+                        tracing::debug!("disconnect-check task shutting down");
+                        break;
+                    }
+                    _ = tokio::time::sleep(interval) => {
+                        network.check_existing_connections_need_disconnecting(target_conn_count);
                     }
                 }
             }
@@ -1459,6 +1684,15 @@ impl GossipNode for WebsocketNetwork {
     }
 
     fn on_network_advance(&self) {
+        // Issue #1101: record the advance on the watchdog that
+        // `check_existing_connections_need_disconnecting`'s clique-resolution
+        // fallback consults, mirroring go's
+        // `outgoingConnsCloser.updateLastAdvance()`.
+        self.network_advance_monitor
+            .lock()
+            .expect("network_advance_monitor lock poisoned")
+            .update_last_advance();
+
         // Forward the notification to the MeshThread if it has been spawned.
         let guard = self.mesh_update_tx.try_lock();
         if let Ok(ref opt_tx) = guard {
@@ -1511,6 +1745,16 @@ struct NetworkConnectFn {
     outgoing_message_filter_enabled: bool,
     outgoing_message_filter_bucket_count: usize,
     outgoing_message_filter_bucket_size: usize,
+    /// Issue #1101: shared phonebook, threaded into the real dial so it can
+    /// go through [`try_connect_with_phonebook`]'s `rate_limited_call`
+    /// wrapping — mirroring go's `wn.dialer` (a `limitcaller.Dialer`
+    /// wrapping the phonebook's rate limiter) rather than dialing the
+    /// socket directly.
+    phonebook: Arc<Phonebook>,
+    /// Issue #1101: the network's outgoing-connection performance monitor,
+    /// fed every `AgreementVote` this dial's peer receives (mirroring go's
+    /// `connMonitor` field on outbound `wsPeer`s).
+    conn_perf_monitor: Arc<std::sync::Mutex<ConnectionPerformanceMonitor>>,
 }
 
 impl ConnectFn for NetworkConnectFn {
@@ -1522,6 +1766,8 @@ impl ConnectFn for NetworkConnectFn {
         let genesis_id = self.genesis_id.clone();
         let broadcast_thread = Arc::clone(&self.broadcast_thread);
         let incoming_message_filter = self.incoming_message_filter.clone();
+        let phonebook = Arc::clone(&self.phonebook);
+        let conn_perf_monitor = Arc::clone(&self.conn_perf_monitor);
         // Issue #803: build a fresh outgoing filter for *this* connection —
         // never reuse an instance across dials, or one peer's
         // `MsgDigestSkip` would suppress sends to a different peer.
@@ -1550,7 +1796,9 @@ impl ConnectFn for NetworkConnectFn {
                 ..ConnectConfig::default()
             };
 
-            match try_connect(&addr, &connect_config).await {
+            // Issue #1101: route the real dial through the phonebook's rate
+            // limiter, mirroring go's `wn.dialer` (`limitcaller.Dialer`).
+            match try_connect_with_phonebook(&addr, &connect_config, &phonebook).await {
                 Ok(mut handle) => {
                     let peer_addr = handle.remote_addr().to_string();
                     let incoming_rx = handle.take_incoming();
@@ -1597,6 +1845,15 @@ impl ConnectFn for NetworkConnectFn {
                                         match msg {
                                             Some(incoming) => {
                                                 let tag = incoming.tag;
+                                                // Issue #1101: this dial path is always
+                                                // outbound, so feed every message to the
+                                                // performance monitor unconditionally
+                                                // (mirrors go's `connMonitor` on outbound
+                                                // `wsPeer`s).
+                                                conn_perf_monitor
+                                                    .lock()
+                                                    .expect("conn_perf_monitor lock poisoned")
+                                                    .notify(&incoming);
                                                 let request_data = incoming.data.clone();
                                                 let relay_data = if broadcast_handle.is_some() {
                                                     Some((request_data.clone(), incoming.sender.clone()))
@@ -1740,6 +1997,8 @@ impl WebsocketNetwork {
             outgoing_message_filter_enabled: self.config.enable_outgoing_network_message_filtering,
             outgoing_message_filter_bucket_count: self.config.outgoing_message_filter_bucket_count,
             outgoing_message_filter_bucket_size: self.config.outgoing_message_filter_bucket_size,
+            phonebook: Arc::clone(&self.phonebook),
+            conn_perf_monitor: Arc::clone(&self.conn_perf_monitor),
         };
 
         let peer_counter = NetworkPeerCounter {
@@ -1760,11 +2019,13 @@ impl WebsocketNetwork {
 
         // Spawn the monitor task.
         let monitor_task = self.spawn_monitor_task();
+        let disconnect_check_task = self.spawn_disconnect_check_task();
 
         {
             let mut tasks = self.tasks.lock().await;
             tasks.push(mesh_task);
             tasks.push(monitor_task);
+            tasks.push(disconnect_check_task);
         }
 
         // Start the broadcast thread if relay mode is active.
@@ -3099,6 +3360,7 @@ mod tests {
     // passthrough would also satisfy that weaker check).
     // -----------------------------------------------------------------------
 
+    use crate::connect::try_connect;
     use crate::handler::MessageHandler;
     use crate::message::IncomingMessage;
     use crate::peer_features::{advertise_vote_compression, PeerFeatureFlags};
@@ -3166,7 +3428,9 @@ mod tests {
     /// `127.0.0.1:0`, registers a [`CaptureHandler`] for `AgreementVote` so
     /// the test can observe what the inbound read loop decoded, and returns
     /// the network plus the capture channel's receiver.
-    async fn start_capturing_relay(genesis_id: &str) -> (Arc<WebsocketNetwork>, mpsc::Receiver<Vec<u8>>) {
+    async fn start_capturing_relay(
+        genesis_id: &str,
+    ) -> (Arc<WebsocketNetwork>, mpsc::Receiver<Vec<u8>>) {
         let config = WebsocketNetworkConfig {
             genesis_id: genesis_id.to_string(),
             network_id: "testnet".to_string(),
@@ -3366,5 +3630,223 @@ mod tests {
         );
 
         server_net.stop().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1101: wiring `rate_limited_call` into the real outbound dial,
+    // and `ConnectionPerformanceMonitor`/`NetworkAdvanceMonitor` into a real
+    // disconnect decision.
+    // -----------------------------------------------------------------------
+
+    use crate::connect::try_connect_with_phonebook;
+
+    /// `try_connect_with_phonebook` must actually consult the phonebook's
+    /// rate limiter before dialing — not just accept a `Phonebook` argument
+    /// it ignores. A capacity-1 phonebook window forces the second dial to
+    /// the same address to measurably wait, exactly like
+    /// `limitcaller::rate_limited_call`'s own
+    /// `waits_out_the_rate_limit_window_before_calling` unit test, but
+    /// exercised through the *real* `connect.rs` dial call site (a bare TCP
+    /// port bound with no listener would prove nothing about wiring — this
+    /// dials a real, already-verified relay server end to end).
+    #[tokio::test]
+    async fn try_connect_with_phonebook_applies_rate_limiting_at_the_real_dial_site() {
+        let (server_net, _captured) = start_capturing_relay("testnet-v1.0").await;
+        let (addr, _) = server_net.address();
+
+        let window = Duration::from_millis(200);
+        let phonebook = Phonebook::new(1, window);
+        phonebook.replace_peer_list(std::slice::from_ref(&addr), "default", RELAY_ROLE);
+
+        let connect_config = ConnectConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            ..ConnectConfig::default()
+        };
+
+        let first = try_connect_with_phonebook(&addr, &connect_config, &phonebook)
+            .await
+            .expect("first dial succeeds immediately");
+        drop(first);
+
+        let start = std::time::Instant::now();
+        let second = try_connect_with_phonebook(&addr, &connect_config, &phonebook)
+            .await
+            .expect("second dial eventually succeeds");
+        let elapsed = start.elapsed();
+        drop(second);
+
+        assert!(
+            elapsed >= window / 2,
+            "second dial to a rate-limited address must actually wait, got {elapsed:?}"
+        );
+
+        server_net.stop().await;
+    }
+
+    /// Real integration test for
+    /// [`WebsocketNetwork::check_existing_connections_need_disconnecting`]:
+    /// four real outbound connections (to four independent relay servers)
+    /// are registered as this network's outgoing peers, the performance
+    /// monitor is driven (via its real `notify`/presync-penalty path, not a
+    /// mocked field) to a `Stopped` conclusion in which exactly one peer
+    /// never delivered a message during presync, and the disconnect
+    /// decision must remove precisely that peer from the live peer map.
+    #[tokio::test]
+    async fn check_existing_connections_need_disconnecting_drops_the_slowest_peer() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            gossip_fanout: 4,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let client_net = Arc::new(WebsocketNetwork::new(config, phonebook));
+
+        // Four independent relay servers so each outbound connection has a
+        // distinct remote address (the peer map is keyed by address).
+        let mut servers = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..4 {
+            let (server, _captured) = start_capturing_relay("testnet-v1.0").await;
+            let (addr, _) = server.address();
+            addrs.push(addr);
+            servers.push(server);
+        }
+
+        for addr in &addrs {
+            let connect_config = ConnectConfig {
+                genesis_id: "testnet-v1.0".to_string(),
+                ..ConnectConfig::default()
+            };
+            let handle = try_connect(addr, &connect_config)
+                .await
+                .expect("client connects to relay");
+            client_net
+                .add_peer(handle, PeerDirection::Outbound, None)
+                .await;
+        }
+
+        // Drive the monitor's presync-penalty path directly: with 4 peers,
+        // `no_msg_peers.len() < len/2` (1 < 2) takes the immediate
+        // Stopped-with-penalty branch rather than restarting the timer (see
+        // `conn_perf_monitor.rs`'s `notify_presync`). `addrs[3]` never sends
+        // a message, so it alone gets the undelivered-message penalty and
+        // must be the peer picked for disconnection.
+        let silent_peer = addrs[3].clone();
+        {
+            let mut mon = client_net.conn_perf_monitor.lock().unwrap();
+            mon.reset(&addrs, 0);
+            mon.notify(&IncomingMessage::new(
+                Tag::AgreementVote,
+                vec![1],
+                addrs[0].clone(),
+                1_000_000,
+            ));
+            mon.notify(&IncomingMessage::new(
+                Tag::AgreementVote,
+                vec![2],
+                addrs[1].clone(),
+                2_000_000,
+            ));
+            mon.notify(&IncomingMessage::new(
+                Tag::AgreementVote,
+                vec![3],
+                addrs[2].clone(),
+                3_000_000,
+            ));
+            // This message both crosses the presync deadline (10s in ns)
+            // and is itself from an already-seen peer, so `addrs[3]` is the
+            // only address whose `last_msg_time` never advanced.
+            mon.notify(&IncomingMessage::new(
+                Tag::AgreementVote,
+                vec![4],
+                addrs[0].clone(),
+                10_000_000_000,
+            ));
+            assert_eq!(
+                mon.stage(),
+                crate::conn_perf_monitor::PmStage::Stopped,
+                "synthetic message sequence must reach Stopped"
+            );
+        }
+
+        let disconnected = client_net.check_existing_connections_need_disconnecting(4);
+        assert!(disconnected, "the slowest peer must be disconnected");
+
+        let peers = client_net.peers.read().await;
+        assert!(
+            !peers.contains_key(&silent_peer),
+            "the peer that never sent a message during presync must be removed"
+        );
+        assert_eq!(
+            peers.len(),
+            3,
+            "exactly one peer should have been disconnected"
+        );
+        drop(peers);
+
+        for server in servers {
+            server.stop().await;
+        }
+    }
+
+    /// Below `target_conn_count`, the disconnect check must not drop any
+    /// peer for performance reasons — it resets the monitor and falls back
+    /// to the clique-resolution check, which (with a freshly-created
+    /// network-advance monitor) declines to disconnect.
+    #[tokio::test]
+    async fn check_existing_connections_need_disconnecting_below_target_does_not_drop_peers() {
+        let net = WebsocketNetwork::with_defaults("test", "test");
+        // No peers at all, but target is the default gossip fanout (4).
+        let disconnected = net.check_existing_connections_need_disconnecting(4);
+        assert!(!disconnected);
+    }
+
+    #[test]
+    fn check_network_advance_disconnect_no_peers_returns_false() {
+        let net = WebsocketNetwork::with_defaults("test", "test");
+        let disconnected = net.check_network_advance_disconnect(&[], Duration::from_millis(1));
+        assert!(!disconnected);
+    }
+
+    #[test]
+    fn check_network_advance_disconnect_within_interval_does_not_disconnect() {
+        let net = WebsocketNetwork::with_defaults("test", "test");
+        let peer: Arc<dyn Peer> = Arc::new(PeerRef {
+            addr: "10.0.0.1:4160".to_string(),
+        });
+        // Freshly constructed NetworkAdvanceMonitor's clock starts "now", so
+        // a generous interval must decline to disconnect.
+        let disconnected = net.check_network_advance_disconnect(&[peer], Duration::from_secs(300));
+        assert!(!disconnected);
+    }
+
+    #[tokio::test]
+    async fn check_network_advance_disconnect_disconnects_after_interval_elapses() {
+        let net = WebsocketNetwork::with_defaults("test", "test");
+        let peer_addr = "10.0.0.1:4160".to_string();
+        let peer: Arc<dyn Peer> = Arc::new(PeerRef {
+            addr: peer_addr.clone(),
+        });
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let disconnected = net.check_network_advance_disconnect(
+            std::slice::from_ref(&peer),
+            Duration::from_millis(1),
+        );
+        assert!(
+            disconnected,
+            "a tiny interval that has already elapsed must trigger clique resolution"
+        );
+
+        // Mirrors go's `cc.net.OnNetworkAdvance()` at the end of the real
+        // function — the watchdog clock must be reset so an immediate
+        // second call (interval not yet elapsed again) does not repeat.
+        let disconnected_again = net.check_network_advance_disconnect(
+            std::slice::from_ref(&peer),
+            Duration::from_millis(1),
+        );
+        assert!(!disconnected_again);
     }
 }
