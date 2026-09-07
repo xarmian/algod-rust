@@ -52,8 +52,8 @@ per-area split of the former).
 | status | count | share |
 |---|---|---|
 | `matched-1:1` | 849 | 27% |
-| `partial` | 740 | 23% |
-| `matched-1:many` | 625 | 20% |
+| `partial` | 739 | 23% |
+| `matched-1:many` | 626 | 20% |
 | `out-of-scope` | 474 | 15% |
 | `matched-many:1` | 209 | 7% |
 | `missing-test` | 181 | 6% |
@@ -61,7 +61,7 @@ per-area split of the former).
 
 **282 rows (`not-implemented` + `missing-test`, 9%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
-implements but never tests. `partial` (740, 23%) is coverage that exists
+implements but never tests. `partial` (739, 23%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
 most are diminishing-returns edge cases. See
 [`docs/PHASE17_PROPOSAL.md`](PHASE17_PROPOSAL.md) for how the real gaps
@@ -85,6 +85,6 @@ were triaged into tracked issues.
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 20 | 7 | 0 | 20 | 11 | 0 | 60 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 31 | 26 | 7 | 21 | 0 | 1 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
-| Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 10 | 0 | 17 | 0 | 0 | 3 |
-| **Total** | | **3,179** | **849** | **625** | **209** | **740** | **101** | **181** | **474** |
+| Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 11 | 0 | 16 | 0 | 0 | 3 |
+| **Total** | | **3,179** | **849** | **626** | **209** | **739** | **101** | **181** | **474** |
 
