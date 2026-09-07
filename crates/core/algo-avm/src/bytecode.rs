@@ -30,7 +30,8 @@ use crate::opcode::{self, ImmKind, MAX_AVM_VERSION};
 /// A parsed AVM program.
 #[derive(Debug, Clone)]
 pub struct Program {
-    /// AVM version (1..=MAX_AVM_VERSION).
+    /// AVM version (0..=MAX_AVM_VERSION). `0` is go-algorand's ancient v1
+    /// alias (see `parse`'s doc comment) rather than a distinct version.
     pub version: u8,
     /// Parsed instruction stream.
     pub instructions: Vec<Instruction>,
@@ -195,7 +196,13 @@ fn read_int16(data: &[u8], pos: usize) -> Result<i16, AlgoError> {
 
 /// Parse a TEAL program from raw bytes.
 ///
-/// The first byte is the version. The remaining bytes are the instruction stream.
+/// The first byte is the version. The remaining bytes are the instruction
+/// stream. Version `0` is accepted as go-algorand's backward-compatible
+/// alias for v1 (`data/transactions/logic/opcodes.go`'s `init()`: "v1
+/// allowed execution of program with version 0 ... version 0 array is
+/// populated with v1 opcodes with the version overwritten to 0") -- it
+/// predates the version-byte convention and is resolved against the v1
+/// opcode set exactly like a real version-1 program.
 pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
     if raw.is_empty() {
         return Err(AlgoError::Avm {
@@ -204,13 +211,28 @@ pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
     }
 
     let version = raw[0];
-    if version == 0 || version > MAX_AVM_VERSION {
+    if version > MAX_AVM_VERSION {
         return Err(AlgoError::Avm {
             message: format!(
-                "unsupported AVM version {version} (supported: 1..={MAX_AVM_VERSION})"
+                "unsupported AVM version {version} (supported: 0..={MAX_AVM_VERSION})"
             ),
         });
     }
+
+    // go-algorand treats version byte 0 as an alias for v1: `opsByOpcode[0]`/
+    // `OpsByName[0]` are populated from the same v1 `OpSpec` entries as
+    // `opsByOpcode[1]`/`OpsByName[1]`, with `Version` overwritten to 0
+    // (`data/transactions/logic/opcodes.go`'s `init()`, "Migration from v1 to
+    // v2 ... v1 allowed execution of program with version 0 ... To preserve
+    // backward compatibility version 0 array is populated with v1 opcodes
+    // with the version overwritten to 0"). This predates the version-byte
+    // convention itself and is exercised by
+    // `TestBackwardCompatTEALv1`/`backwardCompat_test.go:253`. Only the
+    // per-opcode version ceiling below needs the v0->v1 alias; every other
+    // version comparison in this codebase already treats `version <= 1`
+    // uniformly (see `opcode::effective_cost`), so `Program.version` itself
+    // stays the literal byte (0), not the aliased value.
+    let opcode_ceiling_version = version.max(1);
 
     let code = &raw[1..]; // instruction bytes (offsets are relative to this slice)
     let mut pc: usize = 0;
@@ -237,7 +259,7 @@ pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
         };
         pc += header_len;
 
-        if spec.version > version {
+        if spec.version > opcode_ceiling_version {
             return Err(AlgoError::Avm {
                 message: format!(
                     "opcode {} (0x{op_byte:02x}) requires AVM v{}, but program is v{version}",
@@ -495,8 +517,41 @@ mod tests {
     }
 
     #[test]
-    fn test_version_zero() {
-        assert!(parse(&[0]).is_err());
+    fn test_version_zero_is_accepted_as_v1_alias() {
+        // go-algorand: version byte 0 is a backward-compatible alias for v1
+        // (`opcodes.go`'s `init()` populates `opsByOpcode[0]`/`OpsByName[0]`
+        // from the same v1 `OpSpec`s as `opsByOpcode[1]`/`OpsByName[1]`).
+        // `bytecode::parse` must accept it and resolve v1 opcodes rather
+        // than unconditionally rejecting version 0 (issue #1124).
+        let p = parse(&[0]).expect("version 0 must parse as a v1 alias");
+        assert_eq!(p.version, 0, "Program.version keeps the literal byte");
+        assert!(p.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_version_zero_resolves_v1_opcodes_identically_to_v1() {
+        // `program_v1_bytes`-style parity: the same v1-era code parses to
+        // the same instructions whether the version byte is 0 or 1.
+        let code = &[0x20, 0x01, 0x01, 0x22, 0x08]; // intcblock 1; intc_0; +
+        let v0 = parse(&prog(0, code)).expect("version 0 program must parse");
+        let v1 = parse(&prog(1, code)).expect("version 1 program must parse");
+        assert_eq!(v0.instructions.len(), v1.instructions.len());
+        for (a, b) in v0.instructions.iter().zip(v1.instructions.iter()) {
+            assert_eq!(a.opcode, b.opcode);
+            assert_eq!(a.sub_opcode, b.sub_opcode);
+            assert_eq!(a.offset, b.offset);
+        }
+    }
+
+    #[test]
+    fn test_version_zero_rejects_opcode_introduced_after_v1() {
+        // An opcode that requires v2+ (`addw`, opcode 0x1e, version 2) must
+        // still be rejected under the v0 alias exactly as it would under a
+        // real v1 program -- v0 is an alias for v1's opcode set, not an
+        // escape hatch to newer opcodes.
+        let v2_only_code = &[0x1e]; // addw (AVM v2+)
+        assert!(parse(&prog(0, v2_only_code)).is_err());
+        assert!(parse(&prog(1, v2_only_code)).is_err());
     }
 
     #[test]

@@ -1189,16 +1189,27 @@ mod tests {
         static_cost_check(&parsed, 2140).expect("2140 must clear the static budget");
     }
 
-    // NOTE on v0: go's `TestBackwardCompatTEALv1` also pins a version-byte-0
-    // program to the same 2139/2140 boundary (`opsByOpcode[0]` is built from
-    // the same v1 specs as `opsByOpcode[1]`, `opcodes.go:927,963-967`).
-    // `effective_cost`'s `version <= 1` guard already covers that case, but
-    // `bytecode::parse` unconditionally rejects a version-0 program
-    // (`"unsupported AVM version 0"`, `bytecode.rs:207`) as a pre-existing,
-    // unrelated gap -- algod-rust has never supported the version-byte-0
-    // encoding at all, in any code path. That gap is out of scope for this
-    // issue (#1121, hash-opcode static-cost version-gating) and is tracked
-    // separately.
+    #[test]
+    fn test_static_cost_check_v0_program_matches_v1_boundary() {
+        // go's `TestBackwardCompatTEALv1` also pins a version-byte-0 program
+        // to the same 2139/2140 boundary (`opsByOpcode[0]` is built from the
+        // same v1 specs as `opsByOpcode[1]`, `opcodes.go:927,963-967`) --
+        // version 0 is go-algorand's backward-compatible alias for v1, not a
+        // distinct version. `bytecode::parse` now accepts version 0 as a v1
+        // alias (issue #1124) and `effective_cost`'s `version <= 1` guard
+        // (issue #1121) already charges it the pre-v2 hash-opcode costs, so
+        // the v0 half of go's frozen boundary is reachable here too.
+        let program = program_v1_bytes(0);
+        let parsed = bytecode::parse(&program).unwrap();
+        assert_eq!(parsed.version, 0);
+
+        let err = static_cost_check(&parsed, 2139).unwrap_err();
+        assert!(
+            err.to_string().contains("static cost"),
+            "unexpected error: {err}"
+        );
+        static_cost_check(&parsed, 2140).expect("2140 must clear the static budget");
+    }
 
     #[test]
     fn test_static_cost_check_v2_program_frozen_boundary() {
