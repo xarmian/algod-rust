@@ -4031,33 +4031,11 @@ fn check_state_schema_counts(
 /// go-algorand's `(*EvalContext).availableRound`
 /// (`data/transactions/logic/eval.go`).
 ///
-/// The window is `[firstAvail, lastAvail]` where `firstAvail` is bounded by
-/// `LastValid - MaxTxnLife - 1` (clamped to `1` early in the chain's life)
-/// and `lastAvail` is `FirstValid - 1` (clamped to `0`, meaning nothing is
-/// available, if `FirstValid == 0`).
-fn check_available_round(
-    round: u64,
-    first_valid: u64,
-    last_valid: u64,
-    max_txn_life: u64,
-) -> Result<u64, AlgoError> {
-    let mut first_avail = last_valid.saturating_sub(max_txn_life).saturating_sub(1);
-    if first_avail > last_valid || first_avail == 0 {
-        first_avail = 1;
-    }
-    let mut last_avail = first_valid.saturating_sub(1);
-    if last_avail > first_valid {
-        last_avail = 0;
-    }
-    if first_avail > round || round > last_avail {
-        return Err(AlgoError::Avm {
-            message: format!(
-                "round {round} is not available. It's outside [{first_avail}-{last_avail}]"
-            ),
-        });
-    }
-    Ok(round)
-}
+/// Shared with `LogicSigAvmContext` (algo-avm, Sig mode) -- see
+/// `algo_avm::txn_fields::check_available_round`'s doc for the window
+/// definition. Re-exported locally so existing call sites in this file
+/// don't need the `txn_fields::` prefix.
+use txn_fields::check_available_round;
 
 // ---------------------------------------------------------------------------
 // Helpers for reading transaction fields

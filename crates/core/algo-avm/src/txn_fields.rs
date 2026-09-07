@@ -68,9 +68,16 @@ pub fn read_txn_field(
         // FirstValid
         2 => Ok(TealValue::Uint(txn.first_valid.0)),
         // FirstValidTime — timestamp of block(FirstValid-1). AVM v7+.
-        // Requires block history access which is not yet implemented.
+        // Requires block history access, which this field-less helper has no
+        // way to provide. Both real `AvmContext` implementations
+        // (`LedgerAvmContext` in algo-ledger, `LogicSigAvmContext` here)
+        // intercept field 3 *before* delegating to `read_txn_field` and
+        // resolve it via their own block-history source (`block_field`), so
+        // this arm is only reached when no such source was wired in at all
+        // -- matching go-algorand's `NoHeaderLedger.BlockHdr`, which always
+        // errors "no block header access".
         3 => Err(AlgoError::Avm {
-            message: "FirstValidTime not yet supported (requires block history access)".to_string(),
+            message: "no block header access".to_string(),
         }),
         // LastValid
         4 => Ok(TealValue::Uint(txn.last_valid.0)),
@@ -481,4 +488,45 @@ pub fn read_txn_field(
             message: format!("unknown TxnField index: {field}"),
         }),
     }
+}
+
+/// Check that `round` falls within the window of block history the
+/// currently-executing transaction is allowed to access, matching
+/// go-algorand's `(*EvalContext).availableRound`
+/// (`data/transactions/logic/eval.go`).
+///
+/// The window is `[firstAvail, lastAvail]` where `firstAvail` is bounded by
+/// `LastValid - MaxTxnLife - 1` (clamped to `1` early in the chain's life)
+/// and `lastAvail` is `FirstValid - 1` (clamped to `0`, meaning nothing is
+/// available, if `FirstValid == 0`).
+///
+/// Shared by both `LedgerAvmContext` (algo-ledger, App mode) and
+/// `LogicSigAvmContext` (algo-avm, Sig mode) so the two block-history
+/// consumers (`block` opcode, `txn FirstValidTime`) apply exactly the same
+/// availability rule regardless of eval mode -- go-algorand's `block`
+/// opcode and `FirstValidTime` pseudo-field are both `modeAny`, backed by
+/// the same narrow `LedgerForSignature`/`SigLedger` interface in either
+/// mode.
+pub fn check_available_round(
+    round: u64,
+    first_valid: u64,
+    last_valid: u64,
+    max_txn_life: u64,
+) -> Result<u64, AlgoError> {
+    let mut first_avail = last_valid.saturating_sub(max_txn_life).saturating_sub(1);
+    if first_avail > last_valid || first_avail == 0 {
+        first_avail = 1;
+    }
+    let mut last_avail = first_valid.saturating_sub(1);
+    if last_avail > first_valid {
+        last_avail = 0;
+    }
+    if first_avail > round || round > last_avail {
+        return Err(AlgoError::Avm {
+            message: format!(
+                "round {round} is not available. It's outside [{first_avail}-{last_avail}]"
+            ),
+        });
+    }
+    Ok(round)
 }
