@@ -78,6 +78,7 @@ use crate::conn_limits::{derive_conn_limits, ConnLimitConfig};
 use crate::dht;
 use crate::errors::P2pError;
 use crate::identity::IdentityConfig;
+use crate::metrics::GossipsubMetrics;
 use crate::pubsub::{derive_algorand_gossipsub_params, GossipsubMeshParams, IWANT_FOLLOWUP_TIME};
 
 /// Default timeout applied to an outbound dial attempt.
@@ -257,6 +258,10 @@ pub struct P2pHost {
     /// [`P2pHost::applied_gossipsub_params`] (tests/diagnostics), for the
     /// same reason as `applied_connection_limits` above.
     applied_gossipsub_params: GossipsubMeshParams,
+    /// Per-Algorand-tag gossipsub send/receive counters — see
+    /// [`crate::metrics::GossipsubMetrics`] for why this lives here rather
+    /// than on `gossipsub::Behaviour` itself (issue #1085).
+    gossipsub_metrics: GossipsubMetrics,
 }
 
 impl P2pHost {
@@ -353,6 +358,7 @@ impl P2pHost {
             swarm,
             applied_connection_limits: conn_limits_cfg,
             applied_gossipsub_params: gossipsub_params,
+            gossipsub_metrics: GossipsubMetrics::new(),
         })
     }
 
@@ -370,6 +376,13 @@ impl P2pHost {
     /// [`derive_algorand_gossipsub_params`].
     pub fn applied_gossipsub_params(&self) -> GossipsubMeshParams {
         self.applied_gossipsub_params
+    }
+
+    /// Per-Algorand-tag gossipsub send/receive counters recorded so far —
+    /// see [`crate::metrics::GossipsubMetrics`]. Go: the per-tag Prometheus
+    /// series `pubsubMetricsTracer` (`network/metrics.go`) maintains.
+    pub fn gossipsub_metrics(&self) -> &GossipsubMetrics {
+        &self.gossipsub_metrics
     }
 
     /// This host's [`PeerId`], derived from its identity keypair's public
@@ -583,6 +596,24 @@ impl P2pHost {
             }
         }
 
+        // Go: `pubsubMetricsTracer.RecvRPC`, which counts an incoming
+        // message's bytes against its topic's tag as soon as the RPC
+        // carrying it is received — before the message is handed to the
+        // application's own validator (reported back separately via
+        // `report_message_validation_result`). `gossipsub::Event::Message`
+        // is rust-libp2p's equivalent per-message (already unwrapped from
+        // its RPC) observation point.
+        if let SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            message,
+            ..
+        })) = &event
+        {
+            if let Some(tag) = crate::pubsub::tag_code_for_topic_name(message.topic.as_str()) {
+                self.gossipsub_metrics
+                    .record_received(tag, message.data.len());
+            }
+        }
+
         event
     }
 
@@ -696,14 +727,29 @@ impl P2pHost {
         topic_name: &str,
         data: Vec<u8>,
     ) -> Result<MessageId, P2pError> {
-        self.swarm
+        let payload_len = data.len();
+        let result = self
+            .swarm
             .behaviour_mut()
             .gossipsub
             .publish(crate::pubsub::ident_topic(topic_name), data)
             .map_err(|source| P2pError::GossipsubPublish {
                 topic: topic_name.to_string(),
                 source: Box::new(source),
-            })
+            });
+        // Go: `pubsubMetricsTracer.SendRPC`, called for every RPC gossipsub
+        // actually hands to a peer connection. `publish()` fans the message
+        // out to this host's whole mesh in one call rather than per-peer
+        // RPCs, so — unlike go, which increments once per outbound RPC (one
+        // per mesh peer) — this counts once per logical publish; the
+        // byte/message-count *shape* (one series per tag) still matches,
+        // just not the exact multiplier for a multi-peer mesh.
+        if result.is_ok() {
+            if let Some(tag) = crate::pubsub::tag_code_for_topic_name(topic_name) {
+                self.gossipsub_metrics.record_sent(tag, payload_len);
+            }
+        }
+        result
     }
 
     /// Report the outcome of validating a received gossipsub message
@@ -1452,6 +1498,140 @@ mod tests {
         assert_eq!(
             received, payload,
             "expected the subscriber to receive the publisher's exact payload bytes via gossipsub"
+        );
+    }
+
+    /// TDD anchor for issue #1085: sending and receiving a `TX`-tagged
+    /// gossipsub message updates both sides' per-tag counters
+    /// ([`crate::metrics::GossipsubMetrics`]), mirroring go-algorand's
+    /// `pubsubMetricsTracer` (`network/metrics.go`) — the publisher's
+    /// `SendRPC`-equivalent count and the subscriber's `RecvRPC`-equivalent
+    /// count, both keyed by the `TX` tag derived from
+    /// [`crate::pubsub::TX_TOPIC`]. Uses the real TX topic (rather than
+    /// [`crate::pubsub::PROPOSAL_PAYLOAD_TOPIC`], as
+    /// [`published_message_reaches_subscribed_peer_via_gossipsub`] does)
+    /// since `TX` is the one tag go-algorand v5.0.0-stable itself gossips
+    /// and tracks metrics for.
+    #[tokio::test]
+    async fn gossipsub_publish_and_receive_update_per_tag_metrics() {
+        let mut publisher = new_test_host();
+        let mut subscriber = new_test_host();
+
+        let listen_addr = start_listening(&mut subscriber).await;
+        let subscriber_peer_id = subscriber.peer_id();
+        let dial_addr = listen_addr.with(libp2p::multiaddr::Protocol::P2p(subscriber_peer_id));
+
+        publisher
+            .gossipsub_subscribe(crate::pubsub::TX_TOPIC)
+            .expect("publisher subscribe");
+        subscriber
+            .gossipsub_subscribe(crate::pubsub::TX_TOPIC)
+            .expect("subscriber subscribe");
+
+        publisher.dial(dial_addr).expect("dial should be accepted");
+
+        let mut publisher_saw_subscriber = false;
+        let mut subscriber_saw_publisher = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !(publisher_saw_subscriber && subscriber_saw_publisher) {
+            tokio::select! {
+                ev = publisher.next_event() => {
+                    if let SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, .. })) = ev {
+                        if peer_id == subscriber_peer_id { publisher_saw_subscriber = true; }
+                    }
+                }
+                ev = subscriber.next_event() => {
+                    if let SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, .. })) = ev {
+                        subscriber_saw_publisher = true;
+                        let _ = peer_id;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out before both sides observed Subscribed");
+                }
+            }
+        }
+
+        // Before anything is published, both sides' TX counters are zero —
+        // proof the test below is measuring an actual increment, not a
+        // pre-existing nonzero baseline.
+        assert_eq!(
+            publisher.gossipsub_metrics().sent_for_tag("TX"),
+            crate::metrics::GossipsubTagCounts::default()
+        );
+        assert_eq!(
+            subscriber.gossipsub_metrics().received_for_tag("TX"),
+            crate::metrics::GossipsubTagCounts::default()
+        );
+
+        let subscriber_task = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                tokio::select! {
+                    ev = subscriber.next_event() => {
+                        if let SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                            propagation_source,
+                            message_id,
+                            ..
+                        })) = ev
+                        {
+                            subscriber.report_message_validation_result(
+                                &message_id,
+                                &propagation_source,
+                                MessageValidationResult::Accept,
+                            );
+                            return subscriber.gossipsub_metrics().received_for_tag("TX");
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return subscriber.gossipsub_metrics().received_for_tag("TX");
+                    }
+                }
+            }
+        });
+
+        let mesh_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < mesh_deadline {
+            tokio::select! {
+                _ = publisher.next_event() => {}
+                _ = tokio::time::sleep_until(mesh_deadline) => {}
+            }
+        }
+
+        let payload = b"serialized SignedTxn bytes".to_vec();
+        publisher
+            .gossipsub_publish(crate::pubsub::TX_TOPIC, payload.clone())
+            .expect("publish should be accepted by a meshed topic");
+
+        assert_eq!(
+            publisher.gossipsub_metrics().sent_for_tag("TX"),
+            crate::metrics::GossipsubTagCounts {
+                messages: 1,
+                bytes: payload.len() as u64,
+            },
+            "publisher's own sent-side counter should update synchronously on a successful publish"
+        );
+
+        let publisher_pump = tokio::spawn(async move {
+            loop {
+                publisher.next_event().await;
+            }
+        });
+
+        let received_counts = tokio::time::timeout(Duration::from_secs(15), subscriber_task)
+            .await
+            .expect("subscriber task timed out")
+            .expect("subscriber task panicked");
+
+        publisher_pump.abort();
+
+        assert_eq!(
+            received_counts,
+            crate::metrics::GossipsubTagCounts {
+                messages: 1,
+                bytes: payload.len() as u64,
+            },
+            "expected the subscriber's TX receive-side counter to record exactly one message of the published size"
         );
     }
 

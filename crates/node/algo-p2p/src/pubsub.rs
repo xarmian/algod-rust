@@ -99,6 +99,26 @@ pub fn topic_name_for_tag_code(tag_code: &str) -> Option<&'static str> {
     }
 }
 
+/// The inverse of [`topic_name_for_tag_code`]: recover the 2-character
+/// Algorand protocol tag code for one of this crate's gossipsub topic
+/// names. Returns `None` for a topic name this crate does not define
+/// (e.g. one a peer might publish to that this host doesn't recognize).
+///
+/// Used to map a gossipsub-level [`libp2p::gossipsub::TopicHash`] (identity
+/// hash, so its string form is the topic name itself — see
+/// [`ident_topic`]'s doc comment) back to the per-tag metric series go's
+/// `pubsubMetricsTracer` (`network/metrics.go`) tracks — see
+/// `crate::metrics::GossipsubMetrics`.
+pub fn tag_code_for_topic_name(topic_name: &str) -> Option<&'static str> {
+    match topic_name {
+        TX_TOPIC => Some("TX"),
+        AGREEMENT_VOTE_TOPIC => Some("AV"),
+        PROPOSAL_PAYLOAD_TOPIC => Some("PP"),
+        VOTE_BUNDLE_TOPIC => Some("VB"),
+        _ => None,
+    }
+}
+
 /// Build the [`IdentTopic`] for a topic name string.
 ///
 /// `IdentTopic` (identity-hashed topic) is what go-algorand's
@@ -285,6 +305,20 @@ mod tests {
     fn topic_name_for_tag_code_unknown_tag() {
         assert_eq!(topic_name_for_tag_code("MI"), None);
         assert_eq!(topic_name_for_tag_code(""), None);
+    }
+
+    #[test]
+    fn tag_code_for_topic_name_round_trips_topic_name_for_tag_code() {
+        for tag_code in ["TX", "AV", "PP", "VB"] {
+            let topic = topic_name_for_tag_code(tag_code).expect("known tag code");
+            assert_eq!(tag_code_for_topic_name(topic), Some(tag_code));
+        }
+    }
+
+    #[test]
+    fn tag_code_for_topic_name_unknown_topic() {
+        assert_eq!(tag_code_for_topic_name("algomi01"), None);
+        assert_eq!(tag_code_for_topic_name(""), None);
     }
 
     #[test]
