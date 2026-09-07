@@ -18,6 +18,59 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+//! Transaction/LogicSig/heartbeat authorization checks, including ed25519
+//! signature verification.
+//!
+//! ## ed25519 malleability-acceptance ruleset (issue #1136)
+//!
+//! go-algorand's single-signature ed25519 verify (`ed25519Verify`,
+//! `crypto/curve25519.go`) does **not** call libsodium's plain
+//! `crypto_sign_ed25519_verify_detached`. It deliberately calls
+//! `crypto_sign_ed25519_bv_compatible_verify_detached` instead, so that
+//! single-signature verification always agrees with go-algorand's batch
+//! verifier on the same signature -- avoiding a class of fork risk where
+//! two conforming nodes could disagree on whether a maliciously-crafted
+//! signature is valid.
+//!
+//! `bv_compatible` differs from `ed25519_dalek::Verifier::verify()`'s
+//! default (RFC 8032-ish, "cofactorless") ruleset in three ways, confirmed
+//! by porting go-algorand's `TestBatchVerifierTamingEdDSAsEdgeCases` /
+//! `TestBatchVerifierEd25519ConsensusTestData` / `TestBatchVerifierLibsodiumTestData`
+//! / `TestBatchVerifierFilippoVectors` vectors (`crypto/gobatchverifier_test.go`)
+//! through this module's actual verify path -- see the `bv_compatible_vectors`
+//! test module below:
+//!
+//! 1. **Cofactored vs. cofactorless verification equation.** `bv_compatible`
+//!    checks `[8][s]B == [8]R + [8][h]A'` (multiplying the *difference* by
+//!    the curve's cofactor, 8, before comparing to the identity element).
+//!    `ed25519_dalek::verify()` checks the stricter `[s]B == R + [h]A'`
+//!    with no cofactor multiplication. This means some signatures with a
+//!    torsion (small-order) component in `R` or `A` that go-algorand's
+//!    verify (and its batch verifier) **accepts** are **rejected** by
+//!    `ed25519_dalek::verify()` -- see "Taming the many EdDSAs" (Appendix
+//!    C) vectors #3-#6, all `expectedFail: false` under go's criteria
+//!    despite `S*B != R + h*A`.
+//! 2. **Small-order public key (`A`) rejection.** `bv_compatible` explicitly
+//!    rejects a small-order `A` (`ge25519_has_small_order(pk)`), which
+//!    `ed25519_dalek::verify()` does not check at all (only its
+//!    `verify_strict()` does, and that method keeps the *stricter*
+//!    cofactorless equation from point 1, so it does not reproduce
+//!    `bv_compatible` either).
+//! 3. **Non-canonical point encoding.** `bv_compatible` rejects a
+//!    non-canonically-encoded `A` (`ge25519_is_canonical_vartime(pk)`).
+//!    `ed25519_dalek::VerifyingKey::from_bytes` explicitly follows ZIP-215
+//!    decompression rules and accepts (mod-`p`-reduces) non-canonical `A`
+//!    encodings -- see its doc comment.
+//!
+//! Neither `ed25519_dalek::verify()` nor `verify_strict()` reproduces this
+//! ruleset, so [`ed25519_bv_compatible_verify`] implements it directly
+//! against `curve25519-dalek` primitives (the same crate `ed25519-dalek`
+//! itself builds on) and is used at every ed25519 signature-check call site
+//! in this module -- single-sig, multisig subsigs, LogicSig delegated sig,
+//! and heartbeat proofs -- so single-signature verification in algod-rust
+//! matches go-algorand's `ed25519Verify` bit-for-bit on the full ported
+//! vector corpus, closing the fork-risk gap described in issue #1136.
+
 use algo_avm::group::GroupBudget;
 use algo_avm::logicsig_context::{LogicSigAvmContext, SigBlockSource};
 use algo_avm::{run_logicsig_program, run_logicsig_program_with_tracer, EvalTracer};
@@ -27,8 +80,10 @@ use algo_types::consensus::ConsensusParams;
 use algo_types::{
     Address, HeartbeatProof, LogicSig, MultisigSig, PQDelegatedProgram, PQSig, SignedTransaction,
 };
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sha2::{Digest, Sha512_256};
+use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
+use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::IsIdentity;
+use sha2::{Digest, Sha512, Sha512_256};
 
 /// Domain separation prefix for transaction signing/verification.
 const TX_PREFIX: &[u8] = b"TX";
@@ -88,6 +143,76 @@ const OT2_PREFIX: &[u8] = b"OT2";
 /// Used to sign the block seed under the ephemeral key.
 const SEED_PREFIX: &[u8] = b"SD";
 
+/// Verify a raw ed25519 signature against libsodium's `bv_compatible`
+/// malleability-acceptance ruleset, matching go-algorand's `ed25519Verify`
+/// (`crypto/curve25519.go`, which calls
+/// `crypto_sign_ed25519_bv_compatible_verify_detached` rather than plain
+/// verification). See this module's doc comment for the full rationale and
+/// the exact rules this diverges from `ed25519_dalek::Verifier::verify()`
+/// on (issue #1136). This is the SOLE ed25519 verify primitive used by
+/// every signature-check call site in this module, mirroring go's
+/// `crypto/libsodium-fork/src/libsodium/crypto_sign/ed25519/ref10/
+/// open_bv_compat.c`'s `_crypto_sign_ed25519_bv_compatible_verify_detached`
+/// step for step:
+///
+/// 1. reject a non-canonical `S` (`s >= L`);
+/// 2. reject a non-canonically-encoded `R` (or one that doesn't decode to a
+///    valid curve point at all);
+/// 3. reject a non-canonically-encoded `A`, and reject a canonical but
+///    small-order `A` (this is the check `ed25519_dalek::verify()` doesn't
+///    perform at all, and `verify_strict()` only performs alongside a
+///    *different*, stricter verification equation -- see point 4);
+/// 4. compute `h = SHA512(R || A || M) mod L`, then accept iff
+///    `[8]([s]B - [h]A' - R)` is the identity element -- the *cofactored*
+///    verification equation, not `ed25519_dalek`'s cofactorless
+///    `[s]B == R + [h]A'`.
+#[allow(non_snake_case)]
+fn ed25519_bv_compatible_verify(pk_bytes: &[u8; 32], msg: &[u8], sig_bytes: &[u8; 64]) -> bool {
+    let mut r_bytes = [0u8; 32];
+    r_bytes.copy_from_slice(&sig_bytes[0..32]);
+    let mut s_bytes = [0u8; 32];
+    s_bytes.copy_from_slice(&sig_bytes[32..64]);
+
+    // 1. Canonical S: 0 <= s < L.
+    let s_scalar = match Option::<Scalar>::from(Scalar::from_canonical_bytes(s_bytes)) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    // 2. R must decode to a valid curve point AND be canonically encoded
+    // (re-compressing the decoded point must reproduce the original bytes).
+    let R = match CompressedEdwardsY(r_bytes).decompress() {
+        Some(p) => p,
+        None => return false,
+    };
+    if R.compress().0 != r_bytes {
+        return false;
+    }
+
+    // 3. A must decode to a valid curve point, be canonically encoded, and
+    // NOT have small order (this small-order rejection is the bv_compatible-
+    // specific check absent from ed25519_dalek's default `verify()`).
+    let A = match CompressedEdwardsY(*pk_bytes).decompress() {
+        Some(p) => p,
+        None => return false,
+    };
+    if A.compress().0 != *pk_bytes || A.is_small_order() {
+        return false;
+    }
+
+    // 4. h = SHA512(R || A || M) mod L.
+    let mut hasher = Sha512::new();
+    Digest::update(&mut hasher, r_bytes);
+    Digest::update(&mut hasher, pk_bytes);
+    Digest::update(&mut hasher, msg);
+    let h_wide: [u8; 64] = Digest::finalize(hasher).into();
+    let h = Scalar::from_bytes_mod_order_wide(&h_wide);
+
+    // Cofactored check: [8]([s]B - [h]A' - R) == identity.
+    let r_calc = EdwardsPoint::vartime_double_scalar_mul_basepoint(&(-h), &A, &s_scalar);
+    (r_calc - R).mul_by_cofactor().is_identity()
+}
+
 /// Verify a single ed25519 signature on a signed transaction.
 ///
 /// The signed message is `b"TX" || canonical_encode(txn)`.
@@ -99,17 +224,11 @@ pub fn verify_single_sig(stx: &SignedTransaction) -> Result<(), AlgoError> {
         });
     }
 
-    let signature = Signature::from_bytes(&stx.sig);
-
     // Use auth_addr (rekeyed) if present, otherwise sender IS the public key.
     let pk_bytes = match &stx.auth_addr {
         Some(addr) => addr.0,
         None => stx.txn.sender.0,
     };
-
-    let verifying_key = VerifyingKey::from_bytes(&pk_bytes).map_err(|e| AlgoError::Validation {
-        message: format!("invalid public key: {e}"),
-    })?;
 
     // Build the signed message: "TX" || canonical_encode(txn)
     let canonical = canonical_encode_transaction(&stx.txn);
@@ -117,11 +236,13 @@ pub fn verify_single_sig(stx: &SignedTransaction) -> Result<(), AlgoError> {
     msg.extend_from_slice(TX_PREFIX);
     msg.extend_from_slice(&canonical);
 
-    verifying_key
-        .verify(&msg, &signature)
-        .map_err(|e| AlgoError::Validation {
-            message: format!("ed25519 signature verification failed: {e}"),
+    if ed25519_bv_compatible_verify(&pk_bytes, &msg, &stx.sig) {
+        Ok(())
+    } else {
+        Err(AlgoError::Validation {
+            message: "ed25519 signature verification failed".into(),
         })
+    }
 }
 
 /// Verify a post-quantum (Falcon-1024) authorization proof over raw
@@ -360,18 +481,11 @@ fn verify_multisig_subsigs(msig: &MultisigSig, msg: &[u8], context: &str) -> Res
             continue;
         }
 
-        let signature = Signature::from_bytes(&subsig.signature);
-
-        let verifying_key =
-            VerifyingKey::from_bytes(&subsig.public_key).map_err(|e| AlgoError::Validation {
-                message: format!("invalid {context} public key: {e}"),
-            })?;
-
-        verifying_key
-            .verify(msg, &signature)
-            .map_err(|e| AlgoError::Validation {
-                message: format!("{context} subsig verification failed: {e}"),
-            })?;
+        if !ed25519_bv_compatible_verify(&subsig.public_key, msg, &subsig.signature) {
+            return Err(AlgoError::Validation {
+                message: format!("{context} subsig verification failed"),
+            });
+        }
 
         valid_count += 1;
     }
@@ -494,16 +608,11 @@ pub fn logicsig_sanity_check(stx: &SignedTransaction, lsig: &LogicSig) -> Result
         let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
         program_msg.extend_from_slice(PROGRAM_PREFIX);
         program_msg.extend_from_slice(&lsig.logic);
-        let signature = Signature::from_bytes(&lsig.sig);
-        let verifying_key =
-            VerifyingKey::from_bytes(&authorizer.0).map_err(|e| AlgoError::Validation {
-                message: format!("invalid logicsig delegated public key: {e}"),
-            })?;
-        verifying_key
-            .verify(&program_msg, &signature)
-            .map_err(|e| AlgoError::Validation {
-                message: format!("logicsig delegated signature verification failed: {e}"),
-            })?;
+        if !ed25519_bv_compatible_verify(&authorizer.0, &program_msg, &lsig.sig) {
+            return Err(AlgoError::Validation {
+                message: "logicsig delegated signature verification failed".into(),
+            });
+        }
     } else if let Some(msig) = &lsig.msig {
         let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
         program_msg.extend_from_slice(PROGRAM_PREFIX);
@@ -665,18 +774,12 @@ pub fn verify_logicsig_with_tracer(
                 lsig.sig.len()
             ),
         })?;
-        let signature = Signature::from_bytes(&sig_bytes);
 
-        let verifying_key =
-            VerifyingKey::from_bytes(&authorizer.0).map_err(|e| AlgoError::Validation {
-                message: format!("invalid logicsig delegated public key: {e}"),
-            })?;
-
-        verifying_key
-            .verify(&program_msg, &signature)
-            .map_err(|e| AlgoError::Validation {
-                message: format!("logicsig delegated signature verification failed: {e}"),
-            })?;
+        if !ed25519_bv_compatible_verify(&authorizer.0, &program_msg, &sig_bytes) {
+            return Err(AlgoError::Validation {
+                message: "logicsig delegated signature verification failed".into(),
+            });
+        }
     } else if let Some(msig) = &lsig.msig {
         // Mode 2: Delegated multisig — verify multisig on "Program" || logic.
         // Gated on `LogicSigMsig` (Go: `data/transactions/verify/txn.go`'s
@@ -876,15 +979,11 @@ pub fn verify_heartbeat_proof(
     batch_msg.extend_from_slice(OT1_PREFIX);
     batch_msg.extend_from_slice(&batch_id_encoded);
 
-    let vk_master =
-        VerifyingKey::from_bytes(&vote_id_bytes).map_err(|e| AlgoError::Validation {
-            message: format!("heartbeat proof: invalid vote_id key: {e}"),
-        })?;
-    vk_master
-        .verify(&batch_msg, &Signature::from_bytes(&pk2_sig))
-        .map_err(|e| AlgoError::Validation {
-            message: format!("heartbeat proof: PK2Sig verification failed: {e}"),
-        })?;
+    if !ed25519_bv_compatible_verify(&vote_id_bytes, &batch_msg, &pk2_sig) {
+        return Err(AlgoError::Validation {
+            message: "heartbeat proof: PK2Sig verification failed".into(),
+        });
+    }
 
     // 2. Verify PK1Sig: pk2 signs OffsetID(pk, batch, offset)
     let offset_id_encoded = encode_offset_id(&pk, batch, offset);
@@ -892,28 +991,22 @@ pub fn verify_heartbeat_proof(
     offset_msg.extend_from_slice(OT2_PREFIX);
     offset_msg.extend_from_slice(&offset_id_encoded);
 
-    let vk_batch = VerifyingKey::from_bytes(&pk2).map_err(|e| AlgoError::Validation {
-        message: format!("heartbeat proof: invalid pk2 key: {e}"),
-    })?;
-    vk_batch
-        .verify(&offset_msg, &Signature::from_bytes(&pk1_sig))
-        .map_err(|e| AlgoError::Validation {
-            message: format!("heartbeat proof: PK1Sig verification failed: {e}"),
-        })?;
+    if !ed25519_bv_compatible_verify(&pk2, &offset_msg, &pk1_sig) {
+        return Err(AlgoError::Validation {
+            message: "heartbeat proof: PK1Sig verification failed".into(),
+        });
+    }
 
     // 3. Verify Sig: pk signs "SD" || seed
     let mut seed_msg = Vec::with_capacity(SEED_PREFIX.len() + seed.len());
     seed_msg.extend_from_slice(SEED_PREFIX);
     seed_msg.extend_from_slice(seed);
 
-    let vk_ephemeral = VerifyingKey::from_bytes(&pk).map_err(|e| AlgoError::Validation {
-        message: format!("heartbeat proof: invalid pk key: {e}"),
-    })?;
-    vk_ephemeral
-        .verify(&seed_msg, &Signature::from_bytes(&sig))
-        .map_err(|e| AlgoError::Validation {
-            message: format!("heartbeat proof: Sig verification failed: {e}"),
-        })?;
+    if !ed25519_bv_compatible_verify(&pk, &seed_msg, &sig) {
+        return Err(AlgoError::Validation {
+            message: "heartbeat proof: Sig verification failed".into(),
+        });
+    }
 
     Ok(())
 }
@@ -1202,6 +1295,11 @@ pub fn logic_sig_group_size_check(
 
     Ok(())
 }
+
+/// Regression suite porting go-algorand's ed25519 malleability-acceptance
+/// test vectors (issue #1136) -- see `signature/bv_compatible_vectors.rs`.
+#[cfg(test)]
+mod bv_compatible_vectors;
 
 #[cfg(test)]
 mod tests {

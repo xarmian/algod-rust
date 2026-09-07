@@ -614,6 +614,7 @@ dependencies = [
  "algo-falcon",
  "algo-types",
  "criterion",
+ "curve25519-dalek",
  "ed25519-dalek",
  "hex",
  "rmp",
