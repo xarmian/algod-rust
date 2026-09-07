@@ -78,6 +78,12 @@ pub enum WsConnectError {
     #[error("connection timed out")]
     Timeout,
 
+    /// The phonebook's outbound connection rate limiter did not admit this
+    /// dial within the queueing timeout (issue #1101, mirroring go's
+    /// `limitcaller.ErrConnectionQueueingTimeout`).
+    #[error("rate-limited: queueing timeout waiting for phonebook connection slot")]
+    RateLimited,
+
     /// Algorand handshake error (protocol version, genesis, self-loop at header level).
     #[error("handshake failed: {0}")]
     Handshake(Box<HandshakeError>),
