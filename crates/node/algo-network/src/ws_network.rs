@@ -51,6 +51,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,6 +129,38 @@ const DEFAULT_SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(25);
 /// peer (issue #1101). Matches go's `cliqueResolveInterval`
 /// (`network/wsNetwork.go`).
 const CLIQUE_RESOLVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Reserve one slot from a capacity-limited "throttled outgoing connection"
+/// counter, mirroring go's decrement-and-restore-on-failure pattern
+/// (`wn.throttledOutgoingConnections.Add(int32(-1)) >= 0`,
+/// `network/wsNetwork.go:2166-2170`): decrement first, and if that leaves
+/// the counter negative, immediately give the slot back and report failure
+/// rather than leaving the counter permanently over-drawn.
+fn reserve_throttled_slot(counter: &AtomicI32) -> bool {
+    if counter.fetch_sub(1, Ordering::SeqCst) > 0 {
+        true
+    } else {
+        counter.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+}
+
+/// Return a peer's throttled-connection slot to the counter when that
+/// connection closes, if (and only if) it held one — mirrors go's
+/// `if peer.throttledOutgoingConnection { wn.throttledOutgoingConnections.Add(1) }`
+/// (`network/wsNetwork.go:2381-2382`).
+fn release_throttled_slot(counter: &AtomicI32, entry: &PeerEntry) {
+    release_throttled_slot_if_held(counter, entry.throttled_outgoing_connection);
+}
+
+/// The pure counter-side logic behind [`release_throttled_slot`], split out
+/// so it can be unit-tested without constructing a full [`PeerEntry`]
+/// (which needs a live [`PeerHandle`]).
+fn release_throttled_slot_if_held(counter: &AtomicI32, held_a_slot: bool) {
+    if held_a_slot {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 /// Returns the current time as nanoseconds since the Unix epoch, matching
 /// the clock [`crate::message::IncomingMessage::received_at`] is stamped
@@ -365,6 +398,16 @@ struct PeerEntry {
     /// single connection's dedup state for diagnostics/tests without
     /// affecting any other peer's.
     outgoing_filter: Option<Arc<MessageFilter>>,
+    /// Whether this connection holds a slot from
+    /// [`WebsocketNetwork::throttled_outgoing_connections`], assigned once
+    /// at connect time. Mirrors go's `wsPeer.throttledOutgoingConnection`
+    /// (`network/wsPeer.go`) — always `false` for inbound connections, since
+    /// go only ever assigns this on the outgoing-dial path
+    /// (`network/wsNetwork.go:2166-2181`). Only a peer with this flag set is
+    /// eligible for a performance-based disconnect in
+    /// [`WebsocketNetwork::check_existing_connections_need_disconnecting`]
+    /// (issue #1105).
+    throttled_outgoing_connection: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -463,6 +506,16 @@ pub struct WebsocketNetwork {
     /// (possible network clique). Mirrors go's
     /// `outgoingConnsCloser.netAdvMonitor`.
     network_advance_monitor: Arc<std::sync::Mutex<NetworkAdvanceMonitor>>,
+
+    /// Capacity-limited counter of outgoing-connection slots still eligible
+    /// to be marked `throttled_outgoing_connection` at connect time. Mirrors
+    /// go's `wn.throttledOutgoingConnections` (`network/wsNetwork.go:242`),
+    /// seeded in [`Self::new`] from `gossip_fanout` and relay-mode exactly
+    /// like go's `Start()` (`wsNetwork.go:704-712`): half of `gossip_fanout`
+    /// for a relay, all of it for a non-relay. Only a bounded fraction of
+    /// outgoing peers can ever be eligible for a performance-based
+    /// disconnect (issue #1105) — this is what enforces that bound.
+    throttled_outgoing_connections: Arc<AtomicI32>,
 }
 
 impl WebsocketNetwork {
@@ -476,6 +529,17 @@ impl WebsocketNetwork {
                 config.incoming_message_filter_bucket_size,
             ))
         });
+        // Mirrors go's `Start()` seeding of `wn.throttledOutgoingConnections`
+        // (`network/wsNetwork.go:704-712`): half of `GossipFanout` for a
+        // relay (`net_address` set and `relay_messages` on — go's
+        // `wn.relayMessages`, computed the same way as
+        // `effective_relay_messages()` below), all of it for a non-relay.
+        let effective_relay_messages = config.net_address.is_some() || config.relay_messages;
+        let throttled_outgoing_connections_seed = if effective_relay_messages {
+            (config.gossip_fanout / 2) as i32
+        } else {
+            config.gossip_fanout as i32
+        };
         Self {
             config,
             peers: Arc::new(RwLock::new(HashMap::new())),
@@ -496,6 +560,9 @@ impl WebsocketNetwork {
                 &[Tag::AgreementVote],
             ))),
             network_advance_monitor: Arc::new(std::sync::Mutex::new(NetworkAdvanceMonitor::new())),
+            throttled_outgoing_connections: Arc::new(AtomicI32::new(
+                throttled_outgoing_connections_seed,
+            )),
         }
     }
 
@@ -658,6 +725,12 @@ impl WebsocketNetwork {
         // sending Respond messages back (e.g. UniEnsBlockReq responses).
         let peer_sender = handle.sender();
 
+        // Issue #1105: only outgoing connections are ever eligible to hold a
+        // throttled-connection slot (go only assigns
+        // `throttledOutgoingConnection` on the outgoing-dial path).
+        let throttled_outgoing_connection = direction == PeerDirection::Outbound
+            && reserve_throttled_slot(&self.throttled_outgoing_connections);
+
         // Store the peer entry.
         {
             let mut peers = self.peers.write().await;
@@ -667,6 +740,7 @@ impl WebsocketNetwork {
                     handle,
                     direction,
                     outgoing_filter,
+                    throttled_outgoing_connection,
                 },
             );
         }
@@ -700,6 +774,9 @@ impl WebsocketNetwork {
             // connection is outbound.
             let conn_perf_monitor =
                 (direction == PeerDirection::Outbound).then(|| Arc::clone(&self.conn_perf_monitor));
+            // Issue #1105: needed on every removal path below to release
+            // this connection's throttled-connection slot, if it holds one.
+            let throttled_outgoing_connections = Arc::clone(&self.throttled_outgoing_connections);
 
             let recv_task = tokio::spawn(async move {
                 loop {
@@ -792,6 +869,10 @@ impl WebsocketNetwork {
                                             tracing::info!(addr = %peer_addr, "handler requested disconnect");
                                             let mut guard = peers.write().await;
                                             if let Some(entry) = guard.remove(&peer_addr) {
+                                                release_throttled_slot(
+                                                    &throttled_outgoing_connections,
+                                                    &entry,
+                                                );
                                                 entry.handle.close();
                                             }
                                             break;
@@ -804,6 +885,10 @@ impl WebsocketNetwork {
                                     tracing::info!(addr = %peer_addr, "peer incoming channel closed, removing");
                                     let mut guard = peers.write().await;
                                     if let Some(entry) = guard.remove(&peer_addr) {
+                                        release_throttled_slot(
+                                            &throttled_outgoing_connections,
+                                            &entry,
+                                        );
                                         entry.handle.close();
                                     }
                                     break;
@@ -829,6 +914,7 @@ impl WebsocketNetwork {
         };
 
         if let Some(entry) = entry {
+            release_throttled_slot(&self.throttled_outgoing_connections, &entry);
             entry.handle.close();
             tracing::info!(addr = %addr, "peer removed from network");
             true
@@ -985,19 +1071,22 @@ impl WebsocketNetwork {
     ///
     /// Mirrors go's `outgoingConnsCloser.checkExistingConnectionsNeedDisconnecting`
     /// (`network/connPerfMon.go`), wiring #1088's standalone
-    /// [`ConnectionPerformanceMonitor`] into a real decision (issue #1101).
-    /// Returns `true` if a peer was disconnected.
+    /// [`ConnectionPerformanceMonitor`] into a real decision (issue #1101),
+    /// gated by the `throttled_outgoing_connection` eligibility flag
+    /// assigned at connect time from [`Self::throttled_outgoing_connections`]
+    /// (issue #1105). Returns `true` if a peer was disconnected.
     ///
-    /// One deliberate simplification versus go: go only considers a peer
-    /// eligible for a performance-based drop if it was marked
-    /// `throttledOutgoingConnection` at connect time (a fraction of
-    /// outgoing slots reserved via `wn.throttledOutgoingConnections`, so
-    /// the node can never shed *every* outgoing peer purely for being
-    /// "slow"). algod-rust does not yet port that eligibility counter, so
-    /// every outgoing peer is eligible here; the safety property go's
-    /// counter provides is instead preserved by only ever dropping the
-    /// single worst peer per monitoring cycle (never more), matching go's
-    /// own per-cycle behavior.
+    /// Only a peer marked `throttled_outgoing_connection` is eligible for a
+    /// performance-based drop — mirroring go's
+    /// `if wsPeer.throttledOutgoingConnection && leastPerformingPeer == nil`
+    /// loop exactly: `peer_statistics` is sorted worst-first, and the first
+    /// *eligible* entry in that order is picked (which is not necessarily
+    /// the single worst peer overall, if a worse-but-ineligible peer sorts
+    /// ahead of it). Since only a bounded fraction of outgoing slots are
+    /// ever throttle-eligible (half of `gossip_fanout` for a relay, all of
+    /// it for a non-relay), the node can never shed *every* outgoing peer
+    /// this way — falling back to [`Self::check_network_advance_disconnect`]
+    /// when no eligible peer is found.
     fn check_existing_connections_need_disconnecting(&self, target_conn_count: usize) -> bool {
         let outgoing_peers = self.get_peers(&[PeerOption::PeersConnectedOut]);
 
@@ -1037,10 +1126,32 @@ impl WebsocketNetwork {
             }
         };
 
-        // `peer_statistics` is sorted descending by delay (worst first).
-        let worst = match stats.peer_statistics.first() {
-            Some(w) if w.peer_delay > 0 => w,
-            _ => {
+        // Issue #1105: only a peer holding a throttled-connection slot is
+        // eligible for a performance-based disconnect (go:
+        // `wsPeer.throttledOutgoingConnection`).
+        let throttled_addrs: HashSet<String> = match self.peers.try_read() {
+            Ok(peers) => peers
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.direction == PeerDirection::Outbound
+                        && entry.throttled_outgoing_connection
+                })
+                .map(|(addr, _)| addr.clone())
+                .collect(),
+            Err(_) => HashSet::new(),
+        };
+
+        // `peer_statistics` is sorted descending by delay (worst first);
+        // pick the first *eligible* entry in that order, matching go's
+        // `if wsPeer.throttledOutgoingConnection && leastPerformingPeer == nil`
+        // loop.
+        let worst = match stats
+            .peer_statistics
+            .iter()
+            .find(|w| w.peer_delay > 0 && throttled_addrs.contains(&w.peer))
+        {
+            Some(w) => w,
+            None => {
                 return self
                     .check_network_advance_disconnect(&outgoing_peers, CLIQUE_RESOLVE_INTERVAL)
             }
@@ -1524,6 +1635,7 @@ impl GossipNode for WebsocketNetwork {
         let peers = self.peers.try_write();
         if let Ok(mut peers) = peers {
             if let Some(entry) = peers.remove(&addr) {
+                release_throttled_slot(&self.throttled_outgoing_connections, &entry);
                 entry.handle.close();
                 tracing::info!(addr = %addr, "peer disconnected");
             }
@@ -1541,6 +1653,7 @@ impl GossipNode for WebsocketNetwork {
     fn disconnect_peers(&self) {
         if let Ok(mut peers) = self.peers.try_write() {
             for (addr, entry) in peers.drain() {
+                release_throttled_slot(&self.throttled_outgoing_connections, &entry);
                 entry.handle.close();
                 tracing::debug!(addr = %addr, "peer disconnected (disconnect_peers)");
             }
@@ -1755,6 +1868,11 @@ struct NetworkConnectFn {
     /// fed every `AgreementVote` this dial's peer receives (mirroring go's
     /// `connMonitor` field on outbound `wsPeer`s).
     conn_perf_monitor: Arc<std::sync::Mutex<ConnectionPerformanceMonitor>>,
+    /// Issue #1105: the network's shared throttled-outgoing-connection slot
+    /// counter (mirrors go's `wn.throttledOutgoingConnections`) — every mesh
+    /// dial is an outgoing connection, so `try_dial` reserves a slot for it
+    /// on connect and releases it on every removal path below.
+    throttled_outgoing_connections: Arc<AtomicI32>,
 }
 
 impl ConnectFn for NetworkConnectFn {
@@ -1768,6 +1886,7 @@ impl ConnectFn for NetworkConnectFn {
         let incoming_message_filter = self.incoming_message_filter.clone();
         let phonebook = Arc::clone(&self.phonebook);
         let conn_perf_monitor = Arc::clone(&self.conn_perf_monitor);
+        let throttled_outgoing_connections = Arc::clone(&self.throttled_outgoing_connections);
         // Issue #803: build a fresh outgoing filter for *this* connection —
         // never reuse an instance across dials, or one peer's
         // `MsgDigestSkip` would suppress sends to a different peer.
@@ -1803,6 +1922,11 @@ impl ConnectFn for NetworkConnectFn {
                     let peer_addr = handle.remote_addr().to_string();
                     let incoming_rx = handle.take_incoming();
 
+                    // Issue #1105: this dial path is always outbound, so
+                    // it's always eligible to reserve a throttled slot.
+                    let throttled_outgoing_connection =
+                        reserve_throttled_slot(&throttled_outgoing_connections);
+
                     // Store the peer entry.
                     {
                         let mut guard = peers.write().await;
@@ -1812,6 +1936,7 @@ impl ConnectFn for NetworkConnectFn {
                                 handle,
                                 direction: PeerDirection::Outbound,
                                 outgoing_filter: outgoing_message_filter,
+                                throttled_outgoing_connection,
                             },
                         );
                     }
@@ -1827,6 +1952,8 @@ impl ConnectFn for NetworkConnectFn {
                         let recv_cancel = cancel.clone();
                         let recv_peers = Arc::clone(&peers);
                         let recv_addr = peer_addr;
+                        let recv_throttled_outgoing_connections =
+                            Arc::clone(&throttled_outgoing_connections);
                         let broadcast_handle: Option<BroadcastHandle> = {
                             let guard = broadcast_thread
                                 .lock()
@@ -1899,6 +2026,10 @@ impl ConnectFn for NetworkConnectFn {
                                                         tracing::info!(addr = %recv_addr, "handler requested disconnect (mesh)");
                                                         let mut guard = recv_peers.write().await;
                                                         if let Some(entry) = guard.remove(&recv_addr) {
+                                                            release_throttled_slot(
+                                                                &recv_throttled_outgoing_connections,
+                                                                &entry,
+                                                            );
                                                             entry.handle.close();
                                                         }
                                                         break;
@@ -1910,6 +2041,10 @@ impl ConnectFn for NetworkConnectFn {
                                                 tracing::info!(addr = %recv_addr, "peer incoming channel closed, removing");
                                                 let mut guard = recv_peers.write().await;
                                                 if let Some(entry) = guard.remove(&recv_addr) {
+                                                    release_throttled_slot(
+                                                        &recv_throttled_outgoing_connections,
+                                                        &entry,
+                                                    );
                                                     entry.handle.close();
                                                 }
                                                 break;
@@ -1999,6 +2134,7 @@ impl WebsocketNetwork {
             outgoing_message_filter_bucket_size: self.config.outgoing_message_filter_bucket_size,
             phonebook: Arc::clone(&self.phonebook),
             conn_perf_monitor: Arc::clone(&self.conn_perf_monitor),
+            throttled_outgoing_connections: Arc::clone(&self.throttled_outgoing_connections),
         };
 
         let peer_counter = NetworkPeerCounter {
@@ -2318,10 +2454,8 @@ async fn gossip_upgrade_handler(
     // inbound and outbound paths in this crate consistent with each other,
     // and is behaviourally identical to go's approach whenever both sides
     // use the same (default 2048) table size.
-    let our_features = crate::peer_features::advertise_vote_compression(
-        true,
-        DEFAULT_VOTE_COMPRESSION_TABLE_SIZE,
-    );
+    let our_features =
+        crate::peer_features::advertise_vote_compression(true, DEFAULT_VOTE_COMPRESSION_TABLE_SIZE);
     let client_features_header = headers
         .get(HeaderName::from_static("x-algorand-peer-features"))
         .and_then(|v| v.to_str().ok())
@@ -3800,6 +3934,244 @@ mod tests {
         // No peers at all, but target is the default gossip fanout (4).
         let disconnected = net.check_existing_connections_need_disconnecting(4);
         assert!(!disconnected);
+    }
+
+    /// Issue #1105: `check_existing_connections_need_disconnecting` must
+    /// only ever disconnect a peer marked `throttled_outgoing_connection`
+    /// — mirroring go's
+    /// `if wsPeer.throttledOutgoingConnection && leastPerformingPeer == nil`
+    /// loop, which walks `peer_statistics` worst-first and picks the first
+    /// *eligible* entry, not necessarily the single worst peer overall.
+    ///
+    /// `gossip_fanout: 2` on a non-relay node seeds
+    /// `throttled_outgoing_connections` to 2 (go:
+    /// `wsNetwork.go:704-712`), so only the first two of four connected
+    /// peers are eligible. [`ConnectionPerformanceMonitor::force_stopped_with_delays`]
+    /// deterministically assigns `addrs[3]` (connected 4th, ineligible) the
+    /// single worst delay and `addrs[1]` (connected 2nd, eligible) the
+    /// second-worst — a real `notify`/presync run can only ever produce one
+    /// nonzero delay per cycle, so it can't build this two-distinct-delays
+    /// scenario (see
+    /// `check_existing_connections_need_disconnecting_drops_the_slowest_peer`
+    /// for that simpler, single-delay case).
+    #[tokio::test]
+    async fn check_existing_connections_need_disconnecting_skips_ineligible_worst_peer() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            gossip_fanout: 2,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let client_net = Arc::new(WebsocketNetwork::new(config, phonebook));
+
+        let mut servers = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..4 {
+            let (server, _captured) = start_capturing_relay("testnet-v1.0").await;
+            let (addr, _) = server.address();
+            addrs.push(addr);
+            servers.push(server);
+        }
+
+        for addr in &addrs {
+            let connect_config = ConnectConfig {
+                genesis_id: "testnet-v1.0".to_string(),
+                ..ConnectConfig::default()
+            };
+            let handle = try_connect(addr, &connect_config)
+                .await
+                .expect("client connects to relay");
+            client_net
+                .add_peer(handle, PeerDirection::Outbound, None)
+                .await;
+        }
+
+        // Sanity-check the eligibility assignment itself before exercising
+        // the disconnect decision: only the first two connections reserved
+        // a throttled slot.
+        {
+            let peers = client_net.peers.read().await;
+            assert!(peers[&addrs[0]].throttled_outgoing_connection);
+            assert!(peers[&addrs[1]].throttled_outgoing_connection);
+            assert!(!peers[&addrs[2]].throttled_outgoing_connection);
+            assert!(!peers[&addrs[3]].throttled_outgoing_connection);
+        }
+
+        let worst_ineligible = addrs[3].clone();
+        let second_worst_eligible = addrs[1].clone();
+        {
+            let mut mon = client_net.conn_perf_monitor.lock().unwrap();
+            mon.force_stopped_with_delays(&[
+                (addrs[0].clone(), 0),
+                (second_worst_eligible.clone(), 5_000_000_000),
+                (addrs[2].clone(), 0),
+                (worst_ineligible.clone(), 10_000_000_000),
+            ]);
+        }
+
+        let disconnected = client_net.check_existing_connections_need_disconnecting(4);
+        assert!(
+            disconnected,
+            "an eligible peer must still be disconnected even though the worst \
+             overall peer is ineligible"
+        );
+
+        let peers = client_net.peers.read().await;
+        assert!(
+            !peers.contains_key(&second_worst_eligible),
+            "the worst *eligible* peer must be the one disconnected"
+        );
+        assert!(
+            peers.contains_key(&worst_ineligible),
+            "the worst peer overall must survive — it never held a throttled slot"
+        );
+        assert_eq!(peers.len(), 3);
+        drop(peers);
+
+        for server in servers {
+            server.stop().await;
+        }
+    }
+
+    /// Issue #1105: when *no* outgoing peer is eligible (none hold a
+    /// throttled slot), the performance-based disconnect must not fire at
+    /// all — even though a peer with a nonzero delay exists — and must fall
+    /// back to [`WebsocketNetwork::check_network_advance_disconnect`]
+    /// (which itself declines, since the network-advance monitor was just
+    /// created).
+    #[tokio::test]
+    async fn check_existing_connections_need_disconnecting_drops_nobody_when_none_eligible() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            gossip_fanout: 0,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let client_net = Arc::new(WebsocketNetwork::new(config, phonebook));
+
+        let mut servers = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..2 {
+            let (server, _captured) = start_capturing_relay("testnet-v1.0").await;
+            let (addr, _) = server.address();
+            addrs.push(addr);
+            servers.push(server);
+        }
+
+        for addr in &addrs {
+            let connect_config = ConnectConfig {
+                genesis_id: "testnet-v1.0".to_string(),
+                ..ConnectConfig::default()
+            };
+            let handle = try_connect(addr, &connect_config)
+                .await
+                .expect("client connects to relay");
+            client_net
+                .add_peer(handle, PeerDirection::Outbound, None)
+                .await;
+        }
+
+        {
+            let peers = client_net.peers.read().await;
+            assert!(
+                !peers[&addrs[0]].throttled_outgoing_connection,
+                "gossip_fanout: 0 must seed zero throttled slots"
+            );
+            assert!(!peers[&addrs[1]].throttled_outgoing_connection);
+        }
+
+        {
+            let mut mon = client_net.conn_perf_monitor.lock().unwrap();
+            mon.force_stopped_with_delays(&[
+                (addrs[0].clone(), 10_000_000_000),
+                (addrs[1].clone(), 0),
+            ]);
+        }
+
+        let disconnected = client_net.check_existing_connections_need_disconnecting(2);
+        assert!(
+            !disconnected,
+            "no peer is eligible, so nothing should be disconnected"
+        );
+
+        let peers = client_net.peers.read().await;
+        assert_eq!(peers.len(), 2, "both peers must remain connected");
+        drop(peers);
+
+        for server in servers {
+            server.stop().await;
+        }
+    }
+
+    /// Issue #1105: the throttled-slot counter itself must mirror go's
+    /// decrement-and-restore-on-failure semantics
+    /// (`wn.throttledOutgoingConnections.Add(int32(-1)) >= 0`) — reserving
+    /// beyond capacity must not leave the counter permanently negative, and
+    /// releasing a slot (peer close) must give it back so a later
+    /// connection can reserve it again.
+    #[test]
+    fn throttled_slot_reserve_and_release_mirrors_go_counter_semantics() {
+        let counter = AtomicI32::new(1);
+
+        // First reservation succeeds (counter: 1 -> 0).
+        assert!(reserve_throttled_slot(&counter));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Second reservation fails and restores the counter rather than
+        // leaving it at -1 (go: `wn.throttledOutgoingConnections.Add(1)` in
+        // the `else` branch).
+        assert!(!reserve_throttled_slot(&counter));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Releasing a slot that *was* held gives it back.
+        release_throttled_slot_if_held(&counter, true);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Releasing a slot that was *not* held is a no-op.
+        release_throttled_slot_if_held(&counter, false);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Issue #1105: `throttled_outgoing_connections` must be seeded from
+    /// `gossip_fanout` and relay-mode exactly like go's `Start()`
+    /// (`network/wsNetwork.go:704-712`): half of `gossip_fanout` (rounded
+    /// down) for a relay, all of it for a non-relay.
+    #[test]
+    fn throttled_outgoing_connections_seeded_from_gossip_fanout_and_relay_mode() {
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+
+        let non_relay = WebsocketNetwork::new(
+            WebsocketNetworkConfig {
+                gossip_fanout: 5,
+                relay_messages: false,
+                net_address: None,
+                ..Default::default()
+            },
+            Arc::clone(&phonebook),
+        );
+        assert_eq!(
+            non_relay
+                .throttled_outgoing_connections
+                .load(Ordering::SeqCst),
+            5
+        );
+
+        let relay = WebsocketNetwork::new(
+            WebsocketNetworkConfig {
+                gossip_fanout: 5,
+                relay_messages: true,
+                net_address: Some("127.0.0.1:0".to_string()),
+                ..Default::default()
+            },
+            Arc::clone(&phonebook),
+        );
+        assert_eq!(
+            relay.throttled_outgoing_connections.load(Ordering::SeqCst),
+            2,
+            "relay seeding must floor-divide gossip_fanout by 2"
+        );
     }
 
     #[test]
