@@ -20,6 +20,34 @@
 
 use thiserror::Error;
 
+/// A single AVM value captured for structured diagnostics on a LogicSig
+/// evaluation failure. Mirrors go-algorand's untyped `stackValue.asAny()`
+/// (`data/transactions/logic/eval.go`), which is always either a uint64 or
+/// a byte slice — kept independent of `algo_types::TealValue` to avoid a
+/// dependency cycle (`algo-types` already depends on `algo-error`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AvmDiagnosticValue {
+    /// An unsigned 64-bit integer value.
+    Uint(u64),
+    /// A byte-string value.
+    Bytes(Vec<u8>),
+}
+
+/// One transaction's scratch space and operand stack, captured at the point
+/// of a LogicSig evaluation failure. Mirrors go-algorand's `evalState`
+/// struct (`data/transactions/logic/eval.go`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AvmEvalStateDump {
+    /// Scratch-space slots, trimmed to one past the highest non-zero/
+    /// non-empty index (matching go's `evalStates()` trimming); empty if
+    /// every slot is still at its zero value.
+    pub scratch: Vec<AvmDiagnosticValue>,
+    /// Operand stack contents at the point of failure. Only ever populated
+    /// for the failing transaction itself — matching go, which keeps only
+    /// the *currently executing* program's stack live in `eval-states`.
+    pub stack: Vec<AvmDiagnosticValue>,
+}
+
 #[derive(Debug, Error)]
 pub enum AlgoError {
     #[error("codec error: {context}")]
@@ -56,6 +84,31 @@ pub enum AlgoError {
 
     #[error("AVM: {message}")]
     Avm { message: String },
+
+    /// A LogicSig evaluation failure, enriched with go-algorand-style
+    /// structured diagnostics (pc, group index, per-transaction
+    /// scratch/stack dump). Mirrors go's `EvalError` attributes, attached
+    /// by `cx.evalError()` (`data/transactions/logic/eval.go`) — see
+    /// `TestLogicErrorDetails` in go's `eval_test.go`. Wraps whatever
+    /// underlying error the AVM machine raised (usually [`AlgoError::Avm`])
+    /// as its source, so `Error::source()`/`Unwrap()`-style chaining still
+    /// reaches the original message.
+    #[error("AVM: {message}")]
+    AvmLogicSig {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+        message: String,
+        /// Instruction index at which evaluation failed.
+        pc: usize,
+        /// Index of the failing transaction within its group.
+        group_index: usize,
+        /// Scratch/stack dumps for transactions `0..=group_index`. Mirrors
+        /// go's `eval-states` attribute; unlike go, algod-rust's LogicSig
+        /// evaluator does not thread cross-transaction scratch state across
+        /// sibling delegated programs, so entries other than
+        /// `eval_states[group_index]` carry an empty dump.
+        eval_states: Vec<AvmEvalStateDump>,
+    },
 
     #[error("network error: {message}")]
     Network { message: String },

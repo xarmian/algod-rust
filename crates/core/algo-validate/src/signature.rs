@@ -741,13 +741,23 @@ pub fn verify_logicsig_with_tracer(
     // Run the program, capturing an opcode trace when a tracer is supplied
     // (simulation `exec-trace`). The untraced path is identical aside from the
     // tracer callbacks.
-    let pass = match tracer {
+    let run_result = match tracer {
         Some(tracer) => run_logicsig_program_with_tracer(&lsig.logic, &mut ctx, budget, tracer),
         None => run_logicsig_program(&lsig.logic, &mut ctx, budget),
-    }
-    .map_err(|e| AlgoError::Validation {
-        message: format!("LogicSig program error: {e}"),
-    })?;
+    };
+    let pass = match run_result {
+        Ok(pass) => pass,
+        // A structured evaluation failure (pc/group-index/eval-states --
+        // see issue #1113) is propagated as-is rather than collapsed into a
+        // generic `Validation` error, so callers can still recover the
+        // diagnostics go-algorand's `EvalError` attaches.
+        Err(e @ AlgoError::AvmLogicSig { .. }) => return Err(e),
+        Err(e) => {
+            return Err(AlgoError::Validation {
+                message: format!("LogicSig program error: {e}"),
+            })
+        }
+    };
 
     if !pass {
         return Err(AlgoError::Validation {
@@ -1172,6 +1182,7 @@ pub fn logic_sig_group_size_check(
 mod tests {
     use super::*;
     use algo_avm::group::GroupBudget;
+    use algo_error::AvmDiagnosticValue;
     use algo_types::{
         Address, MultisigSubsig, PQAddressSalt, Round, Transaction, PQ_SCHEME_FALCON1024,
     };
@@ -1331,6 +1342,95 @@ mod tests {
             ..Default::default()
         };
         assert!(logicsig_sanity_check(&bad, &lsig).is_err());
+    }
+
+    /// Port of go-algorand's `TestLogicErrorDetails`
+    /// (`data/transactions/logic/eval_test.go`): a LogicSig evaluation
+    /// failure must carry structured diagnostics -- program counter, group
+    /// index, and a scratch-space/stack dump -- not just a bare message.
+    /// See issue #1113.
+    #[test]
+    fn verify_logicsig_error_carries_structured_details() {
+        // Mirrors go's `badsource` (built with `notrack()` there to bypass
+        // its assembler's static type checker): store an int and a byte
+        // string into scratch, then attempt `==` on mismatched types. The
+        // Rust assembler statically rejects this same mismatch at assemble
+        // time (`type_track.rs`), so the raw bytecode is hand-built here to
+        // reach the identical *runtime* type-mismatch path go's test
+        // exercises.
+        //
+        //   pushint 5; store 10          -- int 5; store 10
+        //   pushbytes 0x01020300; store 15  -- byte 0x01020300; store 15
+        //   pushint 100                  -- int 100
+        //   pushbytes 0x0201             -- byte 0x0201
+        //   ==                            -- type mismatch
+        let program: Vec<u8> = vec![
+            8, // version
+            0x81, 5, // pushint 5
+            0x35, 10, // store 10
+            0x80, 4, 0x01, 0x02, 0x03, 0x00, // pushbytes 0x01020300
+            0x35, 15, // store 15
+            0x81, 100, // pushint 100
+            0x80, 2, 0x02, 0x01, // pushbytes 0x0201
+            0x12, // ==
+        ];
+
+        // Contract-account authorization so evaluation actually runs
+        // (mode 4: sender == SHA512/256(\"Program\" || logic)).
+        let mut msg = Vec::new();
+        msg.extend_from_slice(PROGRAM_PREFIX);
+        msg.extend_from_slice(&program);
+        let hash = Sha512_256::digest(&msg);
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&hash);
+
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(Address(addr)),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+
+        let err = verify_lsig(&stx, &lsig).expect_err("type-mismatch == must fail");
+        match err {
+            AlgoError::AvmLogicSig {
+                group_index,
+                eval_states,
+                pc,
+                ..
+            } => {
+                assert_eq!(group_index, 0, "single-txn group: group-index must be 0");
+                assert!(pc > 0, "pc should point at (or past) the failing opcode");
+                assert_eq!(
+                    eval_states.len(),
+                    1,
+                    "eval-states must have one entry per txn up to group_index"
+                );
+
+                let state = &eval_states[0];
+                // Stack at failure: [100, 0x0201] (0x0201 popped second, on top).
+                assert_eq!(
+                    state.stack,
+                    vec![
+                        AvmDiagnosticValue::Uint(100),
+                        AvmDiagnosticValue::Bytes(vec![0x02, 0x01]),
+                    ]
+                );
+                // Scratch trimmed to one past slot 15: slots 10 and 15 set,
+                // everything else at its zero value.
+                assert_eq!(state.scratch.len(), 16);
+                assert_eq!(state.scratch[10], AvmDiagnosticValue::Uint(5));
+                assert_eq!(
+                    state.scratch[15],
+                    AvmDiagnosticValue::Bytes(vec![0x01, 0x02, 0x03, 0x00])
+                );
+                assert_eq!(state.scratch[0], AvmDiagnosticValue::Uint(0));
+            }
+            other => panic!("expected AlgoError::AvmLogicSig, got {other:?}"),
+        }
     }
 
     #[test]
