@@ -3630,6 +3630,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             logs: self.logs.clone(),
             approved,
             error: None,
+            error_detail: None,
             coverage: algo_avm::OpcodeCoverage::default(),
             // Not this context's own machine-level scratch (this method has
             // no access to it -- `self.scratch` only holds *sibling* rows

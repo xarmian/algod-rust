@@ -65,6 +65,21 @@ pub enum NodeError {
     #[error("{0}")]
     BadRequest(String),
 
+    /// Same as [`NodeError::BadRequest`], but for a failure whose
+    /// underlying `AlgoError` carried go-algorand-style structured AVM
+    /// eval diagnostics (pc/group-index/app-index/eval-states -- mirrors
+    /// go's `basics.SError`/`EvalError` attributes, surfaced by
+    /// `daemon/algod/api/server/v2/utils.go`'s `returnError()`). Kept as a
+    /// separate variant (rather than widening `BadRequest` itself) so the
+    /// many other call sites that construct a bare `BadRequest(String)`
+    /// from a message with no underlying `AlgoError` don't all need a
+    /// `None` placeholder. `error::ledger_error_response` and the
+    /// `raw_transaction`/`simulate` handlers match on this variant to
+    /// populate `ErrorResponse.data` (issue #1135); everything else
+    /// (`Display`, other handlers) treats it identically to `BadRequest`.
+    #[error("{0}")]
+    BadRequestWithDetail(String, algo_error::AvmErrorDetail),
+
     /// Operation timed out — handlers map to 408.
     #[error("{0}")]
     Timeout(String),

@@ -85,6 +85,20 @@ pub enum PoolError {
     #[error("TransactionPool.ingest: {0}")]
     Evaluator(String),
 
+    /// Same as [`PoolError::Evaluator`], but for a failure whose underlying
+    /// `AlgoError` carried go-algorand-style structured AVM eval
+    /// diagnostics (pc/group-index/app-index/eval-states, mirroring go's
+    /// `basics.SError`/`EvalError` attributes -- see
+    /// `AlgoError::avm_eval_detail`). Kept as a separate variant (rather
+    /// than widening `Evaluator` itself) so the ~10 other call sites that
+    /// construct a bare `Evaluator(String)` from a message with no
+    /// underlying `AlgoError` don't all need a `None` placeholder. Callers
+    /// that need the detail (the REST API's `ErrorResponse.data`, issue
+    /// #1135) match on this variant explicitly; everything else (metrics
+    /// classification, `Display`) treats it identically to `Evaluator`.
+    #[error("TransactionPool.ingest: {0}")]
+    EvaluatorWithDetail(String, algo_error::AvmErrorDetail),
+
     /// The transaction's lease is already recorded for the sender within
     /// the relevant round window.
     ///
@@ -103,6 +117,22 @@ pub enum PoolError {
     /// matching Go's `fmt.Errorf("TransactionPool.Remember: %w", err)`.
     #[error("TransactionPool.Remember: {0}")]
     Remember(Box<PoolError>),
+}
+
+impl PoolError {
+    /// Extract structured AVM eval diagnostics (pc/group-index/app-index/
+    /// eval-states), if this error (or one it wraps via `Remember`)
+    /// originated from an `AlgoError::AvmLogicSig`-carrying evaluator
+    /// failure. Used by callers that need to surface go-algorand's
+    /// `basics.SError`-equivalent attributes further up the stack (the
+    /// REST API's `ErrorResponse.data`, issue #1135).
+    pub fn avm_eval_detail(&self) -> Option<&algo_error::AvmErrorDetail> {
+        match self {
+            PoolError::EvaluatorWithDetail(_, detail) => Some(detail),
+            PoolError::Remember(inner) => inner.avm_eval_detail(),
+            _ => None,
+        }
+    }
 }
 
 /// Helper to format the fee error message identically to Go's
@@ -228,6 +258,7 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
         PoolError::DuplicateTxn(_) => PoolErrorTag::TxId,
         PoolError::AlreadyInLedger(_) => PoolErrorTag::TxId,
         PoolError::Evaluator(msg) => classify_evaluator_message(msg),
+        PoolError::EvaluatorWithDetail(msg, _) => classify_evaluator_message(msg),
         PoolError::LeaseConflict {
             in_block_evaluator, ..
         } => {

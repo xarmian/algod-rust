@@ -2622,7 +2622,16 @@ pub async fn raw_transaction<N: NodeInterface>(
 
     // Broadcast
     if let Err(e) = node.broadcast_signed_tx_group(txgroup).await {
-        return error::bad_request(e.to_string());
+        // A rejected/erroring app-call or logicsig-authorized transaction
+        // carries structured pc/group-index/app-index/eval-states
+        // diagnostics (issue #1135) -- surface them in `ErrorResponse.data`,
+        // matching go's `returnError()` copying `basics.SError.Attrs`.
+        return match e {
+            NodeError::BadRequestWithDetail(msg, detail) => {
+                error::bad_request_with_detail(msg, &detail)
+            }
+            e => error::bad_request(e.to_string()),
+        };
     }
 
     // Return txid of first transaction (for backwards compatibility)
@@ -3251,6 +3260,13 @@ pub async fn simulate_transaction<N: NodeInterface>(
         Ok(response) => format::encode_response(&response, resp_format),
         Err(NodeError::NotFound(msg)) => error::not_found(msg),
         Err(NodeError::BadRequest(msg)) => error::bad_request(msg),
+        // A simulated app-call/logicsig failure carrying structured
+        // pc/group-index/app-index/eval-states diagnostics (issue #1135) --
+        // matches go's `returnError()` copying `basics.SError.Attrs` into
+        // `ErrorResponse.Data`.
+        Err(NodeError::BadRequestWithDetail(msg, detail)) => {
+            error::bad_request_with_detail(msg, &detail)
+        }
         Err(NodeError::NotImplemented(method)) => {
             error::internal_error(format!("{method} not implemented"))
         }

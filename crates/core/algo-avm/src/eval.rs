@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 
-use algo_error::{AlgoError, AvmDiagnosticValue, AvmEvalStateDump};
+use algo_error::{AlgoError, AvmDiagnosticValue, AvmErrorDetail, AvmEvalStateDump};
 use algo_types::consensus::ConsensusParams;
 use algo_types::{Address, SignedTransaction, TealValue};
 
@@ -88,6 +88,14 @@ pub struct AvmResult {
     pub approved: bool,
     /// If set, indicates a runtime error (as opposed to a clean rejection).
     pub error: Option<String>,
+    /// Structured go-algorand-style diagnostics (pc/group-index/app-index/
+    /// eval-states) for `error`, when the failure was an AVM evaluation
+    /// error. Mirrors `basics.SError`'s attributes, attached by go's
+    /// `cx.evalError()` (`data/transactions/logic/eval.go`) and surfaced by
+    /// the REST API's `returnError()` -- see issue #1135. `None` for a
+    /// clean rejection (no error at all) or a non-AVM failure (e.g. a
+    /// parse/version-check error caught before the machine ran).
+    pub error_detail: Option<AvmErrorDetail>,
     /// Opcode coverage from this execution run.
     pub coverage: OpcodeCoverage,
     /// The program's final scratch-space contents (all 256 slots), as left
@@ -168,13 +176,16 @@ fn avm_value_to_diagnostic(v: &AvmValue) -> AvmDiagnosticValue {
 }
 
 /// Wrap a raw AVM evaluation error with go-algorand-style structured
-/// diagnostics (pc, group index, per-transaction eval-state dump) -- mirrors
-/// `cx.evalError()` (`data/transactions/logic/eval.go`), which attaches the
-/// same attributes to every LogicSig evaluation failure.
-fn attach_logicsig_error_details(
+/// diagnostics (pc, group index, app index, per-transaction eval-state
+/// dump) -- mirrors `cx.evalError()` (`data/transactions/logic/eval.go`),
+/// which attaches the same attributes to every AVM evaluation failure,
+/// LogicSig or app-call alike (`app_index` is only attached when
+/// `cx.runMode == ModeApp`, i.e. `app_index.is_some()` here).
+fn attach_eval_error_details(
     err: AlgoError,
     machine: &AvmMachine,
     group_index: usize,
+    app_index: Option<u64>,
 ) -> AlgoError {
     let message = err.to_string();
     AlgoError::AvmLogicSig {
@@ -182,8 +193,29 @@ fn attach_logicsig_error_details(
         message,
         pc: machine.pc,
         group_index,
+        app_index,
         eval_states: logicsig_eval_states(machine, group_index),
     }
+}
+
+/// Attach structured diagnostics to an app-call evaluation failure and
+/// return a `Clone`-able [`AvmErrorDetail`] snapshot for `AvmResult::error_detail`,
+/// alongside the (unchanged-format) display message for `AvmResult::error`
+/// -- `run_approval_program`/`run_clear_state_program` report failures via
+/// `AvmResult { error, .. }`, not `Err`, so the structured diagnostics need
+/// a `Clone`-friendly carrier rather than the `AlgoError` itself.
+fn app_call_error_detail(
+    err: AlgoError,
+    machine: &AvmMachine,
+    group_index: usize,
+    app_index: u64,
+) -> (String, AvmErrorDetail) {
+    let wrapped = attach_eval_error_details(err, machine, group_index, Some(app_index));
+    let message = wrapped.to_string();
+    let detail = wrapped
+        .avm_eval_detail()
+        .expect("attach_eval_error_details always produces AlgoError::AvmLogicSig");
+    (message, detail)
 }
 
 impl AvmResult {
@@ -196,6 +228,7 @@ impl AvmResult {
             logs: Vec::new(),
             approved: false,
             error: None,
+            error_detail: None,
             coverage: OpcodeCoverage::default(),
             scratch: empty_scratch(),
         }
@@ -254,6 +287,7 @@ pub fn run_approval_program(
                 logs: ctx.take_logs(),
                 approved: pass,
                 error: None,
+                error_detail: None,
                 coverage,
                 scratch,
             };
@@ -265,6 +299,16 @@ pub fn run_approval_program(
             let cost_used = budget_before - machine.budget;
             // Ignore consume error here -- we already have the real error.
             let _ = budget.consume(cost_used);
+
+            // Attach go-algorand-style structured diagnostics
+            // (pc/group-index/app-index/eval-states) before the machine
+            // state below is snapshotted -- mirrors `cx.evalError()`
+            // (`data/transactions/logic/eval.go`), which annotates every
+            // AVM evaluation failure this way, not just LogicSig ones
+            // (issue #1135).
+            let app_index = ctx.current_app_id();
+            let (message, detail) =
+                app_call_error_detail(e, &machine, ctx.group_index(), app_index);
 
             // Preserve whatever global/local state, logs, and inner
             // transactions accumulated before the failing opcode, matching
@@ -282,7 +326,8 @@ pub fn run_approval_program(
                 inner_transactions: ctx.take_inner_transactions(),
                 logs: ctx.take_logs(),
                 approved: false,
-                error: Some(e.to_string()),
+                error: Some(message),
+                error_detail: Some(detail),
                 coverage,
                 scratch,
             };
@@ -348,6 +393,7 @@ pub fn run_clear_state_program(
                 logs: ctx.take_logs(),
                 approved: true,
                 error: None,
+                error_detail: None,
                 coverage,
                 scratch,
             }
@@ -378,10 +424,13 @@ pub fn run_clear_state_program(
             // clean reject and a runtime error. Scratch space is unaffected
             // by this EvalDelta-suppression rule -- see the `scratch` field
             // doc.
+            let app_index = ctx.current_app_id();
+            let (msg, detail) = app_call_error_detail(e, &machine, ctx.group_index(), app_index);
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result.scratch = scratch_snapshot(&machine.scratch);
-            result.error = Some(e.to_string());
+            result.error = Some(msg);
+            result.error_detail = Some(detail);
             result
         }
     }
@@ -504,7 +553,7 @@ pub fn run_logicsig_program(
             // Attach go-algorand-style structured diagnostics (pc,
             // group-index, eval-states) -- see `TestLogicErrorDetails`
             // (go's `data/transactions/logic/eval_test.go`).
-            Err(attach_logicsig_error_details(e, &machine, group_index))
+            Err(attach_eval_error_details(e, &machine, group_index, None))
         }
     }
 }
@@ -565,6 +614,7 @@ pub fn run_approval_program_with_tracer(
                 logs: ctx.take_logs(),
                 approved: pass,
                 error: None,
+                error_detail: None,
                 coverage,
                 scratch,
             };
@@ -574,7 +624,10 @@ pub fn run_approval_program_with_tracer(
             let cost_used = budget_before - machine.budget;
             let _ = budget.consume(cost_used);
 
-            let msg = e.to_string();
+            // Attach structured diagnostics before consuming `e` -- see the
+            // matching comment in the non-tracer variant above.
+            let app_index = ctx.current_app_id();
+            let (msg, detail) = app_call_error_detail(e, &machine, ctx.group_index(), app_index);
             tracer.after_program(ProgramType::Approval, false, Some(&msg));
             tracer.record_program_cost(ProgramType::Approval, machine.cost);
 
@@ -589,6 +642,7 @@ pub fn run_approval_program_with_tracer(
                 logs: ctx.take_logs(),
                 approved: false,
                 error: Some(msg),
+                error_detail: Some(detail),
                 coverage,
                 scratch,
             };
@@ -648,6 +702,7 @@ pub fn run_clear_state_program_with_tracer(
                 logs: ctx.take_logs(),
                 approved: true,
                 error: None,
+                error_detail: None,
                 coverage,
                 scratch,
             }
@@ -664,7 +719,8 @@ pub fn run_clear_state_program_with_tracer(
             result
         }
         Err(e) => {
-            let msg = e.to_string();
+            let app_index = ctx.current_app_id();
+            let (msg, detail) = app_call_error_detail(e, &machine, ctx.group_index(), app_index);
             tracer.after_program(ProgramType::ClearState, false, Some(&msg));
             tracer.record_program_cost(ProgramType::ClearState, machine.cost);
             // Does NOT preserve partial state on error — see the matching
@@ -677,6 +733,7 @@ pub fn run_clear_state_program_with_tracer(
             result.coverage = machine.opcode_coverage();
             result.scratch = scratch_snapshot(&machine.scratch);
             result.error = Some(msg);
+            result.error_detail = Some(detail);
             result
         }
     }
@@ -748,7 +805,7 @@ pub fn run_logicsig_program_with_tracer(
             tracer.record_program_cost(ProgramType::LogicSig, machine.cost);
             // Attach go-algorand-style structured diagnostics -- see the
             // matching comment in `run_logicsig_program`.
-            Err(attach_logicsig_error_details(e, &machine, group_index))
+            Err(attach_eval_error_details(e, &machine, group_index, None))
         }
     }
 }
@@ -820,6 +877,7 @@ mod tests {
             logs: vec![b"hello".to_vec()],
             approved: true,
             error: None,
+            error_detail: None,
             coverage: OpcodeCoverage::default(),
             scratch: empty_scratch(),
         };
@@ -888,6 +946,41 @@ mod tests {
         let result = run_approval_program(&raw, &mut ctx, &mut budget).unwrap();
         assert!(!result.approved);
         assert!(result.error.is_some());
+    }
+
+    /// Issue #1135: an app-call (approval program) runtime error must carry
+    /// the same structured pc/group-index/app-index/eval-states diagnostics
+    /// the LogicSig path already attached (issue #1113) -- go's
+    /// `cx.evalError()` (`data/transactions/logic/eval.go`) annotates every
+    /// AVM evaluation failure this way, not just `ModeSig` ones. This
+    /// pinned the correct behavior before `AvmResult::error_detail` /
+    /// `attach_eval_error_details`'s app_index generalization existed --
+    /// verified failing (returning `None`) against the pre-fix code.
+    #[test]
+    fn test_approval_program_runtime_error_carries_structured_detail() {
+        // pushbytes "hi"; log; err -- several opcodes execute before the
+        // unconditional runtime error, so pc must be nonzero.
+        let raw = prog(6, &[0x80, 0x02, b'h', b'i', 0xb0, 0x00]);
+        let mut ctx = LoggingContext::default();
+        let mut budget = GroupBudget::new(1);
+
+        let result = run_approval_program(&raw, &mut ctx, &mut budget).unwrap();
+        assert!(!result.approved);
+        let detail = result
+            .error_detail
+            .expect("app-call runtime error must carry structured detail");
+        assert!(detail.pc > 0, "pc should point at (or past) the err opcode");
+        assert_eq!(detail.group_index, 0, "single-txn group: group-index must be 0");
+        assert_eq!(
+            detail.app_index,
+            Some(ctx.current_app_id()),
+            "app-call failure must attach app-index (unlike a LogicSig failure)"
+        );
+        assert_eq!(
+            detail.eval_states.len(),
+            1,
+            "eval-states must have one entry per txn up to group_index"
+        );
     }
 
     #[test]
@@ -1010,6 +1103,28 @@ mod tests {
         assert!(result.local_deltas.is_empty());
         assert!(result.inner_transactions.is_empty());
         assert!(result.logs.is_empty());
+    }
+
+    /// Issue #1135: a ClearState program's runtime error must still carry
+    /// structured pc/group-index/app-index/eval-states diagnostics on
+    /// `AvmResult::error_detail`, even though (unlike an approval program)
+    /// go-algorand swallows the failure and never fails the outer
+    /// transaction for it -- the structured detail exists for callers that
+    /// want failure visibility (e.g. a future exec-trace/simulate surface),
+    /// independent of whether the txn itself fails.
+    #[test]
+    fn test_clear_state_program_error_carries_structured_detail() {
+        let raw = prog(6, &[0x80, 0x02, b'h', b'i', 0xb0, 0x00]);
+        let mut ctx = LoggingContext::default();
+
+        let result = run_clear_state_program(&raw, &mut ctx, &ConsensusParams::default());
+        assert!(!result.approved);
+        let detail = result
+            .error_detail
+            .expect("ClearState runtime error must carry structured detail");
+        assert!(detail.pc > 0);
+        assert_eq!(detail.group_index, 0);
+        assert_eq!(detail.app_index, Some(ctx.current_app_id()));
     }
 
     #[test]

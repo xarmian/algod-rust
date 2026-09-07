@@ -661,12 +661,19 @@ impl TransactionPool {
         // Feed to the evaluator.
         if let Some(ref mut evaluator) = inner.evaluator {
             evaluator.transaction_group(txgroup).map_err(|e| {
+                // Capture structured pc/group-index/app-index/eval-states
+                // diagnostics before `e` is consumed by `to_string()` below
+                // -- see `AlgoError::avm_eval_detail` (issue #1135), which
+                // walks `e`'s source chain for an `AlgoError::AvmLogicSig`.
+                let detail = e.avm_eval_detail();
                 let message = e.to_string();
                 if message.contains("duplicate lease") || message.contains("overlapping lease") {
                     PoolError::LeaseConflict {
                         message,
                         in_block_evaluator: reevaluating,
                     }
+                } else if let Some(detail) = detail {
+                    PoolError::EvaluatorWithDetail(message, detail)
                 } else {
                     PoolError::Evaluator(message)
                 }
