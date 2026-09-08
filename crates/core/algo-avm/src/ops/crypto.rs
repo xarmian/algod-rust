@@ -215,8 +215,14 @@ fn parse_json_object(json_text: &[u8]) -> Result<HashMap<String, Vec<u8>>, AlgoE
         }
     }
 
-    // Validate as a JSON object using serde_json.
-    let value: serde_json::Value = serde_json::from_slice(json_text)
+    // Validate as a JSON object using serde_json. serde_json's own string
+    // decoding treats an unpaired UTF-16 surrogate escape (`\uD800` with no
+    // matching low surrogate) as a hard parse error, but go's decoder does
+    // not (see `sanitize_unpaired_surrogates` below) — neutralize those
+    // escapes first so the *structural* validation below (which is the only
+    // thing this step is for) doesn't reject a document go would accept.
+    let sanitized = sanitize_unpaired_surrogates(json_text);
+    let value: serde_json::Value = serde_json::from_slice(&sanitized)
         .map_err(|e| avm_err(format!("invalid json text, {e}")))?;
 
     match value {
@@ -232,6 +238,229 @@ fn parse_json_object(json_text: &[u8]) -> Result<HashMap<String, Vec<u8>>, AlgoE
     // This preserves exact whitespace and nested structure (matching Go's
     // json.RawMessage behavior).
     extract_top_level_entries(json_text)
+}
+
+/// Rewrite every `\uXXXX` escape inside a JSON string literal that denotes an
+/// unpaired UTF-16 surrogate (a high surrogate `\uD800`-`\uDBFF` with no
+/// immediately-following low-surrogate escape, or a lone low surrogate
+/// `\uDC00`-`\uDFFF`) to `�`, leaving everything else byte-for-byte
+/// identical (each replacement is exactly 6 bytes, same as the escape it
+/// replaces).
+///
+/// This exists solely to let `serde_json`'s structural well-formedness check
+/// pass on documents go-algorand accepts: go's JSON scanner (the pre-decode
+/// syntax check `encoding/json.Unmarshal` runs first) only validates that a
+/// `\u` escape is followed by 4 hex digits — it does not check UTF-16
+/// surrogate pairing at all. Surrogate validity is purely a *decode-time*
+/// concern in go, handled leniently (replaced with U+FFFD, never an error;
+/// see `Unmarshal`'s doc comment in `encoding/json/decode.go`). `serde_json`,
+/// by contrast, rejects invalid pairing during its single-pass parse because
+/// a Rust `String`/`Value` cannot represent an unpaired surrogate. Since this
+/// function's output is used only for the structural check (the raw,
+/// unmodified bytes are still what's stored and returned to the AVM program),
+/// neutralizing just the surrogate-pairing signal here does not loosen any
+/// other validation — malformed escapes, non-hex `\u` digits, unescaped
+/// control characters, trailing commas, etc. are all still caught exactly as
+/// before.
+fn sanitize_unpaired_surrogates(bytes: &[u8]) -> Vec<u8> {
+    let len = bytes.len();
+    let mut out = Vec::with_capacity(len);
+    let mut i = 0;
+    let mut in_string = false;
+
+    while i < len {
+        let b = bytes[i];
+
+        if !in_string {
+            out.push(b);
+            if b == b'"' {
+                in_string = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' {
+            out.push(b);
+            in_string = false;
+            i += 1;
+            continue;
+        }
+
+        if b == b'\\' && i + 1 < len {
+            if bytes[i + 1] == b'u' {
+                if let Some(hi) = read_hex4(bytes, i + 2) {
+                    if is_high_surrogate(hi) {
+                        // A valid pair needs an immediately-following \u
+                        // escape decoding to a low surrogate.
+                        let paired = read_hex4(bytes, i + 8)
+                            .filter(|&lo| is_low_surrogate(lo))
+                            .is_some()
+                            && bytes.get(i + 6) == Some(&b'\\')
+                            && bytes.get(i + 7) == Some(&b'u');
+                        if paired {
+                            out.extend_from_slice(&bytes[i..i + 12]);
+                            i += 12;
+                        } else {
+                            out.extend_from_slice(b"\\uFFFD");
+                            i += 6;
+                        }
+                        continue;
+                    } else if is_low_surrogate(hi) {
+                        // A lone low surrogate is never valid on its own.
+                        out.extend_from_slice(b"\\uFFFD");
+                        i += 6;
+                        continue;
+                    } else {
+                        out.extend_from_slice(&bytes[i..i + 6]);
+                        i += 6;
+                        continue;
+                    }
+                }
+                // Malformed \u escape (not 4 hex digits) — pass the
+                // backslash+'u' through unchanged and let serde_json reject
+                // it as it did before.
+            }
+            // Any other escape (\\, \", \/, \b, \f, \n, \r, \t, or a
+            // malformed one) — pass the backslash and following byte
+            // through unchanged.
+            out.push(bytes[i]);
+            out.push(bytes[i + 1]);
+            i += 2;
+            continue;
+        }
+
+        out.push(b);
+        i += 1;
+    }
+
+    out
+}
+
+/// Parse exactly 4 ASCII hex digits starting at `pos`, returning `None` if
+/// out of range or not all hex digits (matches go's `getu4`).
+fn read_hex4(bytes: &[u8], pos: usize) -> Option<u32> {
+    let slice = bytes.get(pos..pos + 4)?;
+    if !slice.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    // `slice` is ASCII hex digits, so this is always valid UTF-8.
+    u32::from_str_radix(std::str::from_utf8(slice).ok()?, 16).ok()
+}
+
+fn is_high_surrogate(cp: u32) -> bool {
+    (0xD800..=0xDBFF).contains(&cp)
+}
+
+fn is_low_surrogate(cp: u32) -> bool {
+    (0xDC00..=0xDFFF).contains(&cp)
+}
+
+/// Decode a quoted JSON string literal (including the surrounding `"`s) into
+/// its content, matching go's `encoding/json` `unquoteBytes` semantics
+/// (`data/transactions/logic` relies on `json.Unmarshal` for the actual
+/// `json_ref` `JSONString` value decode): standard JSON escapes are decoded
+/// normally, and a `\uXXXX` escape that is an unpaired UTF-16 surrogate is
+/// replaced with U+FFFD instead of erroring (go never treats invalid
+/// surrogate pairing as a decode error — see `Unmarshal`'s doc comment).
+///
+/// The input is assumed to have already passed [`parse_json_object`]'s
+/// structural validation, so malformed escapes are not expected here; this
+/// still returns an error defensively rather than panicking if one is found.
+fn decode_json_string_lenient(quoted: &[u8]) -> Result<String, AlgoError> {
+    if quoted.len() < 2 || quoted[0] != b'"' || quoted[quoted.len() - 1] != b'"' {
+        return Err(avm_err("invalid json text, expected a string value"));
+    }
+    let inner = &quoted[1..quoted.len() - 1];
+    let s = std::str::from_utf8(inner)
+        .map_err(|_| avm_err("invalid json text, string is not valid UTF-8"))?;
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        if bytes[i] != b'\\' {
+            // Copy one full UTF-8 codepoint through unchanged.
+            let ch = s[i..]
+                .chars()
+                .next()
+                .ok_or_else(|| avm_err("invalid json text, invalid utf-8"))?;
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        if i + 1 >= len {
+            return Err(avm_err("invalid json text, unterminated escape"));
+        }
+        match bytes[i + 1] {
+            b'"' => {
+                out.push('"');
+                i += 2;
+            }
+            b'\\' => {
+                out.push('\\');
+                i += 2;
+            }
+            b'/' => {
+                out.push('/');
+                i += 2;
+            }
+            b'b' => {
+                out.push('\u{8}');
+                i += 2;
+            }
+            b'f' => {
+                out.push('\u{c}');
+                i += 2;
+            }
+            b'n' => {
+                out.push('\n');
+                i += 2;
+            }
+            b'r' => {
+                out.push('\r');
+                i += 2;
+            }
+            b't' => {
+                out.push('\t');
+                i += 2;
+            }
+            b'u' => {
+                let hi = read_hex4(bytes, i + 2)
+                    .ok_or_else(|| avm_err("invalid json text, invalid unicode escape"))?;
+                i += 6;
+                if is_high_surrogate(hi) {
+                    let pair = if bytes.get(i) == Some(&b'\\') && bytes.get(i + 1) == Some(&b'u') {
+                        read_hex4(bytes, i + 2).filter(|&lo| is_low_surrogate(lo))
+                    } else {
+                        None
+                    };
+                    match pair {
+                        Some(lo) => {
+                            let cp = 0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00);
+                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                            i += 6;
+                        }
+                        None => out.push('\u{FFFD}'),
+                    }
+                } else if is_low_surrogate(hi) {
+                    // Lone low surrogate: replaced, matching go.
+                    out.push('\u{FFFD}');
+                } else {
+                    out.push(char::from_u32(hi).unwrap_or('\u{FFFD}'));
+                }
+            }
+            other => {
+                return Err(avm_err(format!(
+                    "invalid json text, invalid escape character: {}",
+                    other as char
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Extract top-level key-value pairs from a JSON object, preserving raw byte
@@ -284,8 +513,7 @@ fn extract_top_level_entries(json_text: &[u8]) -> Result<HashMap<String, Vec<u8>
         let key_start = i; // points to opening '"'
         let key_end = skip_json_string(bytes, i)?; // points past closing '"'
         let key_slice = &bytes[key_start..key_end];
-        let key: String = serde_json::from_slice(key_slice)
-            .map_err(|e| avm_err(format!("invalid json text, {e}")))?;
+        let key = decode_json_string_lenient(key_slice)?;
 
         // Check for duplicate keys.
         if !seen_keys.insert(key.clone()) {
@@ -474,8 +702,10 @@ pub fn op_json_ref(machine: &mut AvmMachine, instruction: &Instruction) -> Resul
 
     match ref_type {
         JSONRefType::JSONString => {
-            // Parse the raw value as a JSON string.
-            let value: String = serde_json::from_slice(raw_value)
+            // Parse the raw value as a JSON string, tolerating an unpaired
+            // UTF-16 surrogate escape the way go's json.Unmarshal does
+            // (replaced with U+FFFD rather than erroring).
+            let value = decode_json_string_lenient(raw_value)
                 .map_err(|e| avm_err(format!("json_ref JSONString: {e}")))?;
             machine.push(AvmValue::Bytes(value.into_bytes()))
         }
@@ -2086,6 +2316,91 @@ mod tests {
         assert!(result.is_ok());
         let map = result.unwrap();
         assert!(map.contains_key("k\\ey"));
+    }
+
+    // ── ported from go-algorand's jsonspec_test.go TestParseEscapedInvalidChar
+    // (issue #1169): go's JSON decoder never treats an unpaired UTF-16
+    // surrogate escape as a *parse* error — surrogate validity is a semantic
+    // concern handled only when a string's content is actually decoded
+    // (`encoding/json`'s documented behavior: "invalid UTF-16 surrogate
+    // pairs are not treated as an error. Instead, they are replaced by the
+    // Unicode replacement character U+FFFD."). algod-rust's upfront
+    // full-document validation was stricter and rejected these programs
+    // outright. ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_json_escaped_valid_surrogate_pair_accepted() {
+        // TestParseEscapedInvalidChar case 1: a properly paired surrogate
+        // escape is accepted, and the raw (unescaped) bytes are preserved
+        // exactly, matching Go's json.RawMessage semantics.
+        let text = "{\"key0\": \"\\uD801\\udc37\"}".as_bytes();
+        let result = parse_json_object(text);
+        assert!(
+            result.is_ok(),
+            "valid surrogate pair should parse: {result:?}"
+        );
+        let map = result.unwrap();
+        assert_eq!(
+            map.get("key0").map(|v| v.as_slice()),
+            Some("\"\\uD801\\udc37\"".as_bytes())
+        );
+    }
+
+    #[test]
+    fn test_parse_json_escaped_unpaired_surrogate_accepted() {
+        // TestParseEscapedInvalidChar case 2/3: two unpaired high surrogates
+        // followed by a literal char is still accepted by go's parser (the
+        // invalid codepoints stay in the raw, unescaped message); it is not
+        // a parse-time error.
+        let text = "{\"key0\": \"\\uD800\\uD800n\"}".as_bytes();
+        let result = parse_json_object(text);
+        assert!(
+            result.is_ok(),
+            "unpaired surrogate escape should parse: {result:?}"
+        );
+        let map = result.unwrap();
+        assert_eq!(
+            map.get("key0").map(|v| v.as_slice()),
+            Some("\"\\uD800\\uD800n\"".as_bytes())
+        );
+    }
+
+    #[test]
+    fn test_json_ref_unpaired_surrogate_decodes_to_replacement_char() {
+        // Beyond parseJSON accepting the text: when json_ref JSONString
+        // actually decodes the value, go's json.Unmarshal substitutes
+        // U+FFFD for each unpaired surrogate rather than erroring.
+        let json = "{\"key0\": \"\\uD800\\uD800n\"}".as_bytes();
+        let mut code = Vec::new();
+        pushbytes(&mut code, json);
+        pushbytes(&mut code, b"key0");
+        code.push(0x5f); // json_ref
+        code.push(0x00); // JSONString
+
+        let expected = "\u{FFFD}\u{FFFD}n";
+        pushbytes(&mut code, expected.as_bytes());
+        code.extend_from_slice(&[0x12, 0x43]); // ==, return
+        let m = run_prog(8, &code).unwrap();
+        assert!(m.pass, "json_ref should accept unpaired surrogate escapes");
+    }
+
+    #[test]
+    fn test_json_ref_valid_surrogate_pair_decodes_correctly() {
+        // A correctly paired surrogate escape still decodes to the real
+        // codepoint (U+10437, DESERET CAPITAL LETTER YEE) exactly as go
+        // would via json.Unmarshal.
+        let json = "{\"key0\": \"\\uD801\\udc37\"}".as_bytes();
+        let mut code = Vec::new();
+        pushbytes(&mut code, json);
+        pushbytes(&mut code, b"key0");
+        code.push(0x5f); // json_ref
+        code.push(0x00); // JSONString
+
+        let expected = "\u{10437}";
+        pushbytes(&mut code, expected.as_bytes());
+        code.extend_from_slice(&[0x12, 0x43]); // ==, return
+        let m = run_prog(8, &code).unwrap();
+        assert!(m.pass, "json_ref should decode a valid surrogate pair");
     }
 
     // -----------------------------------------------------------------------

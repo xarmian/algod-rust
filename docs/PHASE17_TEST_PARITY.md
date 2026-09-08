@@ -53,10 +53,10 @@ per-area split of the former).
 |---|---|---|
 | `matched-1:1` | 943 | 30% |
 | `partial` | 760 | 24% |
-| `matched-1:many` | 655 | 21% |
+| `matched-1:many` | 656 | 21% |
 | `out-of-scope` | 580 | 18% |
 | `matched-many:1` | 210 | 7% |
-| `missing-test` | 21 | 1% |
+| `missing-test` | 20 | 1% |
 | `not-implemented` | 10 | 0% |
 
 **31 rows (`not-implemented` + `missing-test`, 1%) are real, actionable
@@ -71,7 +71,7 @@ were triaged into tracked issues.
 
 | area | file | total | 1:1 | 1:many | many:1 | partial | not-impl | missing-test | out-of-scope |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 108 | 167 | 6 | 123 | 0 | 21 | 24 |
+| AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 108 | 168 | 6 | 123 | 0 | 20 | 24 |
 | Transactions core (`data/transactions`) | [parity_txn_core.md](phase17/parity_txn_core.md) | 173 | 54 | 37 | 0 | 70 | 0 | 0 | 12 |
 | Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 49 | 103 | 44 | 134 | 0 | 0 | 173 |
 | Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 35 | 26 | 0 | 6 | 0 | 0 | 1 |
@@ -86,5 +86,5 @@ were triaged into tracked issues.
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 32 | 26 | 7 | 21 | 0 | 0 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 11 | 0 | 16 | 0 | 0 | 3 |
-| **Total** | | **3,179** | **941** | **653** | **210** | **761** | **10** | **24** | **580** |
+| **Total** | | **3,179** | **941** | **654** | **210** | **761** | **10** | **23** | **580** |
 
