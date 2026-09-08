@@ -758,8 +758,24 @@ static ENABLE_DEVELOPER_API: VersionedDefault<bool> = VersionedDefault::new(&[(9
 //   `algo_network::TxSyncPeerLimiter`, driven by its own
 //   `TxSyncerConfig`/`TxSyncPeerLimiter::new` parameters, not these
 //   `config.Local` fields (issue #860). Porting these 4 as additional
-//   `config.json`-surfaced knobs for that already-wired mechanism remains a
-//   judgment-called non-goal for now, same as `CatchpointDir`'s
+//   `config.json`-surfaced knobs for that already-wired mechanism remained a
+//   judgment-called non-goal — until issue #1190 revisited `TxBacklogSize`/
+//   `TxBacklogReservedCapacityPerPeer`/`EnableTxBacklogRateLimiting` from a
+//   different angle: not the ERL/RED fairness mechanism itself, but the
+//   plain *queue-capacity* formula go computes alongside it
+//   (`txBacklogSize := Config.TxBacklogSize; if
+//   Config.EnableTxBacklogRateLimiting { txBacklogSize +=
+//   (Config.IncomingConnectionsLimit * Config.TxBacklogReservedCapacityPerPeer) }`,
+//   `data/txHandler.go:154-158`) — a straightforward, ERL-independent
+//   reconciliation with algod-rust's existing (differently-surfaced)
+//   `RestConfig::async_backlog_size`/`TxTagHandler::with_backlog_queue`
+//   knobs. Those 3 fields are now real config-plumbed knobs (see
+//   [`TX_BACKLOG_SIZE`]'s doc comment); the true per-peer
+//   fairness/reservation guarantee (go's `util.NewElasticRateLimiter`) is
+//   still not built and is filed as its own follow-up, issue #1195. The 2
+//   fields with no queue-sizing role at all (`TxBacklogRateLimitingCongestionPct`,
+//   `TxBacklogAppRateLimitingCountERLDrops`) stay out of scope, same
+//   judgment call as before, same as `CatchpointDir`'s
 //   hot/cold-directory-splitting group above — not silently dropped, just
 //   not plumbed through `config.Local` yet.
 // - `EnableAssembleStats`/`EnableProcessBlockStats`/`MaxBlockHistoryLookback`
@@ -870,6 +886,54 @@ static TX_BACKLOG_APP_RATE_LIMITING_CONGESTION_PCT: VersionedDefault<i64> =
 /// `AppRateLimiter` to its `TxTagHandler`s at all (issue #821).
 static ENABLE_TX_BACKLOG_APP_RATE_LIMITING: VersionedDefault<bool> =
     VersionedDefault::new(&[(32, || true)]);
+
+/// Go: `TxBacklogSize int` `version[27]:"26000"` (`localTemplate.go:269-271`)
+/// — "the queue size used for receiving transactions. default of 26000 to
+/// approximate 1 block of transactions." Issue #1190: wired into
+/// [`crate::tx_backlog_queue_capacity`]-style call sites' base capacity —
+/// see `bin/algod-rust/src/commands/participate.rs`'s
+/// `tx_backlog_queue_capacity_from_local` (feeds
+/// `algo_network::TxTagHandler::with_backlog_queue`) and
+/// `RestConfig::async_backlog_size`'s doc comment (this field is now the
+/// single source of truth for `POST /v2/transactions/async`'s admission
+/// window too, with `async_backlog_size` layered on top as an explicit
+/// override).
+static TX_BACKLOG_SIZE: VersionedDefault<i64> = VersionedDefault::new(&[(27, || 26_000)]);
+
+/// Go: `TxBacklogReservedCapacityPerPeer int` `version[27]:"20"`
+/// (`localTemplate.go:240-241`) — "how much dedicated serving capacity the
+/// TxBacklog gives each peer." Issue #1190: wired into
+/// `tx_backlog_queue_capacity_from_local`'s `IncomingConnectionsLimit *
+/// this` addition to the base `TxBacklogSize`, applied only when
+/// [`ENABLE_TX_BACKLOG_RATE_LIMITING`] is set — mirrors go's
+/// `txBacklogSize := Config.TxBacklogSize; if
+/// Config.EnableTxBacklogRateLimiting { txBacklogSize +=
+/// (Config.IncomingConnectionsLimit * Config.TxBacklogReservedCapacityPerPeer)
+/// }` (`data/txHandler.go:154-158`). This only ports the *queue-sizing*
+/// half of go's behavior; go's `TxBacklogReservedCapacityPerPeer` also
+/// seeds a per-peer fairness guarantee via `util.NewElasticRateLimiter`
+/// (`data/txHandler.go:189-199`) that has no algod-rust equivalent yet on
+/// the gossip-push admission path (`TxTagHandler`'s pool-occupancy-based
+/// backlog queue has no notion of "this peer's reserved slots") — deferred
+/// to its own follow-up (issue #1195) rather than built here, since it
+/// needs its own per-peer admission-tracking design, not a reconciliation
+/// of existing knobs.
+static TX_BACKLOG_RESERVED_CAPACITY_PER_PEER: VersionedDefault<i64> =
+    VersionedDefault::new(&[(27, || 20)]);
+
+/// Go: `EnableTxBacklogRateLimiting bool` `version[27]:"false"
+/// version[30]:"true"` (`localTemplate.go:265-267`) — "controls if a rate
+/// limiter and congestion manager should be attached to the tx backlog
+/// enqueue process." Issue #1190: gates the `TxBacklogReservedCapacityPerPeer`
+/// queue-size addition in `tx_backlog_queue_capacity_from_local` (see that
+/// static's doc comment for the full go trace and the scope of what is/
+/// isn't ported). Note this is a *different* flag from the already-wired
+/// `EnableTxBacklogAppRateLimiting` (issue #821) — go itself keeps these as
+/// two independent toggles gating two independent mechanisms (an
+/// ElasticRateLimiter/RED congestion manager here vs. the per-app rate
+/// limiter there).
+static ENABLE_TX_BACKLOG_RATE_LIMITING: VersionedDefault<bool> =
+    VersionedDefault::new(&[(27, || false), (30, || true)]);
 
 /// Go: `TxPoolSize int` `version[0]:"50000" version[5]:"15000" version[23]:"75000"`
 /// (`localTemplate.go:273-274`). Issue #1149: wired into
@@ -1799,6 +1863,15 @@ fn default_tx_backlog_app_rate_limiting_congestion_pct() -> i64 {
 fn default_enable_tx_backlog_app_rate_limiting() -> bool {
     ENABLE_TX_BACKLOG_APP_RATE_LIMITING.at(LATEST_VERSION)
 }
+fn default_tx_backlog_size() -> i64 {
+    TX_BACKLOG_SIZE.at(LATEST_VERSION)
+}
+fn default_tx_backlog_reserved_capacity_per_peer() -> i64 {
+    TX_BACKLOG_RESERVED_CAPACITY_PER_PEER.at(LATEST_VERSION)
+}
+fn default_enable_tx_backlog_rate_limiting() -> bool {
+    ENABLE_TX_BACKLOG_RATE_LIMITING.at(LATEST_VERSION)
+}
 fn default_tx_pool_size() -> i64 {
     TX_POOL_SIZE.at(LATEST_VERSION)
 }
@@ -2588,6 +2661,35 @@ pub struct Local {
     )]
     pub enable_tx_backlog_app_rate_limiting: bool,
 
+    /// Go: `TxBacklogSize`. Issue #1190: wired into
+    /// `tx_backlog_queue_capacity_from_local`'s base capacity (feeding
+    /// `algo_network::TxTagHandler::with_backlog_queue`) and, as an
+    /// explicit-override fallback, `RestConfig::async_backlog_size` — see
+    /// [`TX_BACKLOG_SIZE`]'s doc comment.
+    #[serde(rename = "TxBacklogSize", default = "default_tx_backlog_size")]
+    pub tx_backlog_size: i64,
+
+    /// Go: `TxBacklogReservedCapacityPerPeer`. Issue #1190: wired into
+    /// `tx_backlog_queue_capacity_from_local`'s per-peer queue-size
+    /// addition (gated by `enable_tx_backlog_rate_limiting`) — see
+    /// [`TX_BACKLOG_RESERVED_CAPACITY_PER_PEER`]'s doc comment for the
+    /// scope of what is and isn't ported (queue sizing only, not the
+    /// per-peer fairness/reservation enforcement itself).
+    #[serde(
+        rename = "TxBacklogReservedCapacityPerPeer",
+        default = "default_tx_backlog_reserved_capacity_per_peer"
+    )]
+    pub tx_backlog_reserved_capacity_per_peer: i64,
+
+    /// Go: `EnableTxBacklogRateLimiting`. Issue #1190: gates the
+    /// `tx_backlog_reserved_capacity_per_peer` queue-size addition — see
+    /// [`ENABLE_TX_BACKLOG_RATE_LIMITING`]'s doc comment.
+    #[serde(
+        rename = "EnableTxBacklogRateLimiting",
+        default = "default_enable_tx_backlog_rate_limiting"
+    )]
+    pub enable_tx_backlog_rate_limiting: bool,
+
     /// Go: `TxPoolSize`. Issue #1149: wired into
     /// `algo_pool::PoolConfig::pool_size` — see [`TX_POOL_SIZE`]'s doc
     /// comment.
@@ -3189,6 +3291,10 @@ impl Local {
             tx_backlog_app_rate_limiting_congestion_pct:
                 TX_BACKLOG_APP_RATE_LIMITING_CONGESTION_PCT.at(version),
             enable_tx_backlog_app_rate_limiting: ENABLE_TX_BACKLOG_APP_RATE_LIMITING.at(version),
+            tx_backlog_size: TX_BACKLOG_SIZE.at(version),
+            tx_backlog_reserved_capacity_per_peer: TX_BACKLOG_RESERVED_CAPACITY_PER_PEER
+                .at(version),
+            enable_tx_backlog_rate_limiting: ENABLE_TX_BACKLOG_RATE_LIMITING.at(version),
             tx_pool_size: TX_POOL_SIZE.at(version),
             tx_pool_exponential_increase_factor: TX_POOL_EXPONENTIAL_INCREASE_FACTOR.at(version),
             proposal_assembly_time: PROPOSAL_ASSEMBLY_TIME.at(version),
@@ -3600,6 +3706,19 @@ impl Local {
             migrate_field(
                 &mut self.enable_tx_backlog_app_rate_limiting,
                 &ENABLE_TX_BACKLOG_APP_RATE_LIMITING,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.tx_backlog_size, &TX_BACKLOG_SIZE, cur, next);
+            migrate_field(
+                &mut self.tx_backlog_reserved_capacity_per_peer,
+                &TX_BACKLOG_RESERVED_CAPACITY_PER_PEER,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_tx_backlog_rate_limiting,
+                &ENABLE_TX_BACKLOG_RATE_LIMITING,
                 cur,
                 next,
             );
@@ -4553,6 +4672,12 @@ mod tests {
         assert_eq!(d.tx_backlog_app_tx_per_second_rate, 100);
         assert_eq!(d.tx_backlog_app_rate_limiting_congestion_pct, 10);
         assert!(d.enable_tx_backlog_app_rate_limiting);
+        assert_eq!(d.tx_backlog_size, 26_000);
+        assert_eq!(d.tx_backlog_reserved_capacity_per_peer, 20);
+        assert!(
+            d.enable_tx_backlog_rate_limiting,
+            "go's version-30 default (true), not the pre-version-30 value of false"
+        );
         assert!(!d.enable_assemble_stats);
         assert!(!d.enable_process_block_stats);
         assert_eq!(d.max_block_history_lookback, 0);
@@ -4723,6 +4848,59 @@ mod tests {
         assert!(
             !cfg.enable_runtime_metrics,
             "tag default is false; migrating past version 22 changes nothing observable here"
+        );
+    }
+
+    /// `EnableTxBacklogRateLimiting` (issue #1190) carries two tags
+    /// (`version[27]:"false" version[30]:"true"`): a config loaded before
+    /// version 27 sees the Rust zero value (`false`, matching Go's
+    /// untagged zero value); replaying through version 27 keeps `false`;
+    /// replaying past version 30 flips it to `true`.
+    #[test]
+    fn enable_tx_backlog_rate_limiting_migrates_at_version_27_and_30_boundaries() {
+        assert!(!Local::default_at_version(0).enable_tx_backlog_rate_limiting);
+        assert!(!Local::default_at_version(27).enable_tx_backlog_rate_limiting);
+        assert!(Local::default_at_version(30).enable_tx_backlog_rate_limiting);
+
+        let mut cfg = Local::default_at_version(27);
+        assert!(!cfg.enable_tx_backlog_rate_limiting);
+        cfg.migrate().expect("migrates");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert!(
+            cfg.enable_tx_backlog_rate_limiting,
+            "migrating past version 30 flips the tag default to true"
+        );
+    }
+
+    /// `EnableTxBacklogRateLimiting`'s version-30 tag must not clobber an
+    /// operator who explicitly enabled it before version 30 (when its own
+    /// default was still `false`) — same `migrate_field` "still equal to
+    /// the old default" guard already pinned for
+    /// `dns_security_flags_explicit_override_survives_migration`'s
+    /// integer-valued analogue.
+    #[test]
+    fn enable_tx_backlog_rate_limiting_explicit_override_survives_migration() {
+        let mut cfg = Local::default_at_version(27);
+        cfg.enable_tx_backlog_rate_limiting = true; // explicit override, not the v27 default of false
+        cfg.migrate().expect("migrates");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert!(cfg.enable_tx_backlog_rate_limiting);
+    }
+
+    /// `TxBacklogSize`/`TxBacklogReservedCapacityPerPeer` (issue #1190) are
+    /// single-tag (`version[27]`) fields: no value before version 27, then
+    /// go's documented defaults (26000, 20) from version 27 onward.
+    #[test]
+    fn tx_backlog_size_and_reserved_capacity_per_peer_default_from_version_27() {
+        assert_eq!(Local::default_at_version(0).tx_backlog_size, 0);
+        assert_eq!(
+            Local::default_at_version(0).tx_backlog_reserved_capacity_per_peer,
+            0
+        );
+        assert_eq!(Local::default_at_version(27).tx_backlog_size, 26_000);
+        assert_eq!(
+            Local::default_at_version(27).tx_backlog_reserved_capacity_per_peer,
+            20
         );
     }
 
@@ -5336,17 +5514,21 @@ mod tests {
         // (`EnableRuntimeMetrics`/`EnableNetDevMetrics`, #776) — removed
         // from this list, since it now round-trips through `config.json`
         // like every other field.
+        // Issue #1190 (split from #1149) closed three more:
+        // `TxBacklogSize`/`TxBacklogReservedCapacityPerPeer`/
+        // `EnableTxBacklogRateLimiting` are now wired into
+        // `tx_backlog_queue_capacity_from_local`
+        // (`bin/algod-rust/src/commands/participate.rs`), reconciled with
+        // `RestConfig::async_backlog_size` as documented on
+        // [`TX_BACKLOG_SIZE`] — removed from this list.
         const NOT_YET_PORTED: &[&str] = &[
             "AccountUpdatesStatsInterval",
             "EnableAccountUpdatesStats",
-            "EnableTxBacklogRateLimiting",
             "EnableVerbosedTransactionSyncLogging",
             "ForceFetchTransactions",
             "NetAddress",
             "TransactionSyncDataExchangeRate",
             "TransactionSyncSignificantMessageThreshold",
-            "TxBacklogReservedCapacityPerPeer",
-            "TxBacklogSize",
         ];
 
         let fixture_text = include_str!("../fixtures/config-v27.json");
