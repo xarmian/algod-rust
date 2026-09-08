@@ -28,6 +28,8 @@ use std::collections::BTreeMap;
 
 use serde_bytes::ByteBuf;
 
+use algo_avm::eval::run_approval_program;
+use algo_avm::group::GroupBudget;
 use algo_avm::{parse, AvmMachine, ExecMode};
 use algo_ledger::{LedgerAvmContext, LedgerState};
 use algo_types::{
@@ -1375,4 +1377,73 @@ fn global_creator_address() {
 
     let result = run_with_context(6, &code, &mut ctx).unwrap();
     assert!(result, "global CreatorAddress should be [1;32]");
+}
+
+/// Port of go-algorand's `TestApplicationsDisallowOldTeal`
+/// (`data/transactions/logic/evalStateful_test.go`): a program below
+/// `appsEnabledVersion` (2) must not be usable as an application's approval
+/// program -- go-algorand's `computeMinAvmVersion` unconditionally raises the
+/// group's minimum required AVM version to 2 whenever the group contains an
+/// `ApplicationCallTx`, which every Application-mode program's own
+/// transaction is by construction. Versions 0 and 1 must be rejected with
+/// go's exact error text; version 2 (the floor) must be accepted.
+///
+/// Regression test for issue #1177: `LedgerAvmContext::min_avm_version()`
+/// never overrode the trait's default of 0, so this floor was never enforced
+/// for Application-mode programs.
+#[test]
+fn applications_disallow_old_teal() {
+    let sender = [0xAA; 32];
+
+    // `int 1` -- intcblock [1]; intc_0. Valid opcode encoding since v1 (no
+    // `return` opcode, matching go's `int 1` source in the same go test --
+    // pre-v2 programs approve by leaving a nonzero value on top of the
+    // stack at the end of execution).
+    let code: &[u8] = &[0x20, 0x01, 0x01, 0x22];
+
+    for v in 0u8..2 {
+        let txn = make_appl_txn(sender, 42);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        let program = prog(v, code);
+        let mut budget = GroupBudget::new(1);
+
+        let err = run_approval_program(&program, &mut ctx, &mut budget).expect_err(&format!(
+            "v{v} program must be rejected as an approval program"
+        ));
+        let message = err.to_string();
+        assert!(
+            message.contains("program version must be >= 2"),
+            "unexpected error for v{v} program: {message}"
+        );
+    }
+
+    // v2 (the floor) must be accepted.
+    let txn = make_appl_txn(sender, 42);
+    let mut store = LedgerState::new();
+    let mut ctx = make_context(&mut store, vec![txn]);
+    let program = prog(2, code);
+    let mut budget = GroupBudget::new(1);
+    let result = run_approval_program(&program, &mut ctx, &mut budget)
+        .expect("v2 program must be accepted as an approval program");
+    assert!(result.approved, "v2 int-1 program should approve");
+}
+
+/// LogicSig-mode `LedgerAvmContext`s are unaffected by the Application-mode
+/// floor: `min_avm_version()` stays at 0 (no floor) when `app_mode` is
+/// false, since LogicSig evaluation computes its own group-wide floor via
+/// `logicsig_context::compute_min_avm_version` rather than
+/// `LedgerAvmContext`.
+#[test]
+fn logicsig_mode_context_has_no_apps_enabled_version_floor() {
+    let sender = [0xAA; 32];
+    let txn = make_appl_txn(sender, 42);
+    let mut store = LedgerState::new();
+    let ctx = make_lsig_context(&mut store, vec![txn]);
+
+    assert_eq!(
+        algo_avm::AvmContext::min_avm_version(&ctx),
+        0,
+        "LogicSig-mode LedgerAvmContext must not enforce the appsEnabledVersion floor"
+    );
 }
