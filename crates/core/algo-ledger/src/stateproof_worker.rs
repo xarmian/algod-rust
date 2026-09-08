@@ -1694,6 +1694,54 @@ mod tests {
         assert!(SigFromAddr::from_msgpack(&[0xFF, 0xFF]).is_err());
     }
 
+    /// go: `TestRandomizedEncodingsigFromAddr` (`stateproof/msgp_gen_test.go`)
+    /// runs `protocol.RunEncodingTest`, which round-trips many randomly
+    /// generated `sigFromAddr` values (including the all-zero/all-omitted
+    /// case) through `MarshalMsg`/`UnmarshalMsg`/`Skip`. `sig_from_addr_round_trips_through_msgpack`
+    /// above already covers one fixed instance (go's
+    /// `TestMarshalUnmarshalsigFromAddr`); this closes the "randomized,
+    /// many combinations of populated/omitted fields" half by round-tripping
+    /// the cross product of several distinct signer addresses, rounds
+    /// (including `0`, which go's `omitempty` field tags special-case, and
+    /// `u64::MAX`), and both a populated and an empty (default) signature
+    /// (phase17 `parity_config_proto_sp.md`, `TestRandomizedEncodingsigFromAddr`).
+    #[test]
+    fn sig_from_addr_randomized_roundtrip_over_field_combinations() {
+        let addresses = [
+            Address::default(),    // every field zero/omitted
+            Address([0xFFu8; 32]), // every byte set
+            Address([7u8; 32]),    // an arbitrary non-trivial pattern
+        ];
+        let rounds = [0u64, 1, 12_345, u64::MAX];
+        let sigs = [merklesig::Signature::default(), dummy_sig()];
+
+        let mut cases_checked = 0usize;
+        for &signer_address in &addresses {
+            for &round in &rounds {
+                for sig in &sigs {
+                    let sfa = SigFromAddr {
+                        signer_address,
+                        round,
+                        sig: sig.clone(),
+                    };
+                    let wire = sfa.to_msgpack();
+                    let decoded = SigFromAddr::from_msgpack(&wire).unwrap_or_else(|e| {
+                        panic!("decode failed for address={signer_address:?} round={round}: {e}")
+                    });
+                    assert_eq!(decoded.signer_address, sfa.signer_address);
+                    assert_eq!(decoded.round, sfa.round);
+                    assert_eq!(decoded.sig.signature, sfa.sig.signature);
+                    assert_eq!(
+                        decoded.sig.vector_commitment_index,
+                        sfa.sig.vector_commitment_index
+                    );
+                    cases_checked += 1;
+                }
+            }
+        }
+        assert_eq!(cases_checked, addresses.len() * rounds.len() * sigs.len());
+    }
+
     // ── build_state_proof_transaction ────────────────────────────────
 
     #[test]
