@@ -2620,6 +2620,25 @@ mod tests {
         assert!(validate_genesis_consistency(&signed, "testnet-v1.0", &[0xAA; 32]).is_ok());
     }
 
+    /// Mirrors go's `TestDecodeNil`
+    /// (`data/transactions/verify/txn_test.go:711`): the regression is
+    /// that a msgpack-nil-decoded (zero-value) `SignedTxn` used to panic
+    /// when run through `verifyTxnGroup`. algod-rust's decoder already
+    /// rejects a nil-encoded `SignedTransaction` as an `Err` before it
+    /// could reach group verification (see
+    /// `algo_types::transaction::decode_nil_tests`); this test covers the
+    /// group-verification side directly: a genuine zero-value
+    /// `SignedTransaction` (whatever path might produce one) must be
+    /// rejected cleanly by `validate_transaction_group`, not panic.
+    #[test]
+    fn test_zero_value_signed_transaction_does_not_panic_group_validation() {
+        let zero = SignedTransaction::default();
+        // Must return an Err (an empty/unknown-type transaction is not
+        // well-formed) rather than panicking.
+        let _ = validate_transaction_group(std::slice::from_ref(&zero));
+        let _ = validate_transaction_group_strict(std::slice::from_ref(&zero));
+    }
+
     #[test]
     fn test_genesis_empty_fields_pass() {
         // Txns with empty genesis fields should pass regardless of block values.

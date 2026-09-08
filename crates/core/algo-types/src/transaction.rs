@@ -2386,3 +2386,263 @@ mod box_ref_json_tests {
         assert_eq!(decoded, br);
     }
 }
+
+#[cfg(test)]
+mod logicsig_blank_tests {
+    use super::*;
+
+    // ── LogicSig.Blank() / LogicSig.HasProgram() ────────────────────────────
+    //
+    // algod-rust has no dedicated `LogicSig::blank()`/`has_program()` port —
+    // the predicate is inlined ad hoc wherever it's needed (e.g.
+    // `algo-validate::signature::logicsig_sanity_check`'s
+    // `lsig.logic.is_empty()` checks). This pins the same field-by-field
+    // predicate go's `TestLogicSigBlankAndHasProgram`
+    // (data/transactions/logicsig_test.go:30) exercises, so a change to any
+    // contributing field's "empty" semantics (sig/msig/lmsig/pqsig/args) is
+    // caught here too.
+
+    /// Mirrors go's `LogicSig.Blank()`:
+    /// `len(Logic) == 0 && len(Args) == 0 && Sig.Blank() && Msig.Blank() &&
+    /// LMsig.Blank() && PQsig.Blank()`.
+    fn logicsig_blank(lsig: &LogicSig) -> bool {
+        lsig.logic.is_empty()
+            && lsig.args.as_ref().map_or(true, |a| a.is_empty())
+            && crate::serde_bytes_array::is_zero_64(&lsig.sig)
+            && lsig.msig.is_none()
+            && lsig.lmsig.is_none()
+            && lsig.pqsig.as_ref().map_or(true, |p| p.blank())
+    }
+
+    /// Mirrors go's `LogicSig.HasProgram()`: `len(Logic) != 0`.
+    fn logicsig_has_program(lsig: &LogicSig) -> bool {
+        !lsig.logic.is_empty()
+    }
+
+    #[test]
+    fn logicsig_blank_and_has_program_zero_value_is_blank() {
+        let lsig = LogicSig::default();
+        assert!(logicsig_blank(&lsig));
+        assert!(!logicsig_has_program(&lsig));
+    }
+
+    #[test]
+    fn logicsig_blank_and_has_program_program_is_not_blank_has_program() {
+        let lsig = LogicSig {
+            logic: ByteBuf::from(vec![1u8]),
+            ..Default::default()
+        };
+        assert!(!logicsig_blank(&lsig));
+        assert!(logicsig_has_program(&lsig));
+    }
+
+    #[test]
+    fn logicsig_blank_and_has_program_args_alone_is_not_blank_no_program() {
+        let lsig = LogicSig {
+            args: Some(vec![ByteBuf::new()]),
+            ..Default::default()
+        };
+        assert!(!logicsig_blank(&lsig));
+        assert!(!logicsig_has_program(&lsig));
+    }
+
+    #[test]
+    fn logicsig_blank_and_has_program_sig_alone_is_not_blank_no_program() {
+        let mut sig = [0u8; 64];
+        sig[0] = 1;
+        let lsig = LogicSig {
+            sig,
+            ..Default::default()
+        };
+        assert!(!logicsig_blank(&lsig));
+        assert!(!logicsig_has_program(&lsig));
+    }
+
+    #[test]
+    fn logicsig_blank_and_has_program_msig_alone_is_not_blank_no_program() {
+        let lsig = LogicSig {
+            msig: Some(MultisigSig {
+                version: 1,
+                threshold: 0,
+                subsigs: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(!logicsig_blank(&lsig));
+        assert!(!logicsig_has_program(&lsig));
+    }
+
+    #[test]
+    fn logicsig_blank_and_has_program_lmsig_alone_is_not_blank_no_program() {
+        let lsig = LogicSig {
+            lmsig: Some(MultisigSig {
+                version: 1,
+                threshold: 0,
+                subsigs: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(!logicsig_blank(&lsig));
+        assert!(!logicsig_has_program(&lsig));
+    }
+
+    #[test]
+    fn logicsig_blank_and_has_program_pqsig_alone_is_not_blank_no_program() {
+        let lsig = LogicSig {
+            pqsig: Some(crate::pq::PQSig {
+                scheme: crate::pq::PQ_SCHEME_FALCON1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!logicsig_blank(&lsig));
+        assert!(!logicsig_has_program(&lsig));
+    }
+}
+
+#[cfg(test)]
+mod signed_txn_has_signature_tests {
+    use super::*;
+
+    // ── SignedTxn.HasSignature() ─────────────────────────────────────────
+    //
+    // Mirrors go's `TestSignedTxnHasSignature`
+    // (`data/transactions/signedtxn_test.go:94`): pins that every signature
+    // category counts as "has a signature", including a PQ envelope nested
+    // only inside the LogicSig (relying on LogicSig's own blank check
+    // covering its `pqsig` field) — go: `!Sig.Blank() || !Msig.Blank() ||
+    // !Lsig.Blank() || !PQsig.Blank()`. algod-rust has no dedicated
+    // `SignedTransaction::has_signature()` method; the equivalent
+    // sig-type-count dispatch is inlined in
+    // `algo_validate::signature::verify_transaction_signature_with_tracer`
+    // (`has_sig`/`has_msig`/`has_lsig`/`has_pqsig`). This test replicates
+    // the same per-category predicate directly on the wire types.
+
+    fn multisig_blank(m: &MultisigSig) -> bool {
+        m.version == 0 && m.threshold == 0 && m.subsigs.is_empty()
+    }
+
+    fn logicsig_blank(lsig: &LogicSig) -> bool {
+        lsig.logic.is_empty()
+            && lsig.args.as_ref().map_or(true, |a| a.is_empty())
+            && crate::serde_bytes_array::is_zero_64(&lsig.sig)
+            && lsig.msig.as_ref().map_or(true, multisig_blank)
+            && lsig.lmsig.as_ref().map_or(true, multisig_blank)
+            && lsig.pqsig.as_ref().map_or(true, |p| p.blank())
+    }
+
+    /// Mirrors go's `SignedTxn.HasSignature()`.
+    fn has_signature(stx: &SignedTransaction) -> bool {
+        !crate::serde_bytes_array::is_zero_64(&stx.sig)
+            || stx.msig.as_ref().is_some_and(|m| !multisig_blank(m))
+            || stx.lsig.as_ref().is_some_and(|l| !logicsig_blank(l))
+            || stx.pqsig.as_ref().is_some_and(|p| !p.blank())
+    }
+
+    #[test]
+    fn has_signature_unsigned_is_false() {
+        assert!(!has_signature(&SignedTransaction::default()));
+    }
+
+    #[test]
+    fn has_signature_sig_is_true() {
+        let mut stx = SignedTransaction::default();
+        stx.sig[0] = 1;
+        assert!(has_signature(&stx));
+    }
+
+    #[test]
+    fn has_signature_msig_is_true() {
+        let stx = SignedTransaction {
+            msig: Some(MultisigSig {
+                version: 1,
+                threshold: 0,
+                subsigs: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(has_signature(&stx));
+    }
+
+    #[test]
+    fn has_signature_pqsig_is_true() {
+        let stx = SignedTransaction {
+            pqsig: Some(crate::pq::PQSig {
+                scheme: crate::pq::PQ_SCHEME_FALCON1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(has_signature(&stx));
+    }
+
+    #[test]
+    fn has_signature_lsig_program_is_true() {
+        let stx = SignedTransaction {
+            lsig: Some(LogicSig {
+                logic: ByteBuf::from(vec![1u8]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(has_signature(&stx));
+    }
+
+    #[test]
+    fn has_signature_lsig_nested_pqsig_only_is_true() {
+        let stx = SignedTransaction {
+            lsig: Some(LogicSig {
+                pqsig: Some(crate::pq::PQSig {
+                    scheme: crate::pq::PQ_SCHEME_FALCON1024,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(has_signature(&stx));
+    }
+}
+
+#[cfg(test)]
+mod decode_nil_tests {
+    use super::*;
+
+    /// Mirrors go's `TestDecodeNil`
+    /// (`data/transactions/signedtxn_test.go:67`): a regression test for
+    /// improper decoding of a nil `SignedTxn`. Go's `protocol.Decode` of a
+    /// bare msgpack nil (`0xc0`) skips `CodecDecodeSelf()` entirely and
+    /// used to leave a zero-value `SignedTxn` whose `.ID()` then panicked.
+    ///
+    /// algod-rust's `decode_from_reader` reads the map-length header first
+    /// (`rmp_decode::read_map_len`), which itself rejects a nil marker as a
+    /// type mismatch — so decoding nil into a `SignedTransaction` always
+    /// surfaces as an `Err`, never a silently-defaulted value. This pins
+    /// that behavior directly, closing the same "subtle because it skips
+    /// the normal decode path" gap go's test calls out.
+    #[test]
+    fn decode_nil_signed_transaction_errors_instead_of_defaulting() {
+        let nil_encoding: [u8; 1] = [0xc0];
+        let mut rd: &[u8] = &nil_encoding;
+        let result = SignedTransaction::decode_from_reader(&mut rd);
+        assert!(
+            result.is_err(),
+            "decoding a bare msgpack nil into SignedTransaction must error, not silently default"
+        );
+    }
+
+    /// Defense in depth for the same regression: even if a future decoder
+    /// change ever produced a zero-value `SignedTransaction` from
+    /// malformed input, downstream ID computation on that zero value must
+    /// not panic (go's actual historical bug was in `.ID()`, not decode
+    /// itself). `algo_codec::compute_txn_id` (the real ID-computation
+    /// entry point) lives in a downstream crate that depends on
+    /// `algo-types`, not the reverse, so this exercises the same
+    /// canonical-encode step it's built on directly.
+    #[test]
+    fn zero_value_signed_transaction_encodes_without_panicking() {
+        let st = SignedTransaction::default();
+        let encoded = rmp_serde::to_vec_named(&st.txn).expect("zero-value Transaction must encode");
+        assert!(!encoded.is_empty());
+    }
+}

@@ -1384,6 +1384,25 @@ mod tests {
         assert!(store.register(&id, Round(300)).is_err());
     }
 
+    /// Mirrors go's `TestParticipation_RegisterInvalidID`
+    /// (`data/account/participationRegistry_test.go:421`): registering a
+    /// `ParticipationID` that was never inserted fails with
+    /// `ErrParticipationIDNotFound` (`register_impl`'s `SELECT_PK` lookup
+    /// returns no rows, surfaced as `rusqlite::Error::QueryReturnedNoRows`).
+    #[test]
+    fn register_unknown_id_fails() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        // Never inserted into the store.
+        let part = make_test_participation(0, 250_000, 3_000_000, 0);
+        let unknown_id = part.id();
+
+        let err = store.register(&unknown_id, Round(10_000_000)).unwrap_err();
+        assert!(
+            matches!(err, rusqlite::Error::QueryReturnedNoRows),
+            "expected QueryReturnedNoRows for an unregistered ID, got: {err:?}"
+        );
+    }
+
     #[test]
     fn record_vote_and_block_proposal() {
         let store = ParticipationStore::open_in_memory().unwrap();
@@ -1773,6 +1792,43 @@ mod tests {
             restored_secrets.ephemeral_keys[0].pk,
             part.state_proof_secrets.as_ref().unwrap().ephemeral_keys[0].pk,
             "first falcon public key should match"
+        );
+    }
+
+    /// Mirrors go's `TestAddingSecretTwice`
+    /// (`data/account/participationRegistry_test.go:1008`): appending the
+    /// same `(round, key)` pair to `StateProofKeys` twice fails — go
+    /// surfaces this as a SQLite `UNIQUE constraint failed` error on
+    /// `Flush()`; algod-rust's `StateProofKeys` table declares
+    /// `PRIMARY KEY (pk, round)` (see `CREATE_STATE_PROOF_KEYS` above), so
+    /// the second `append_state_proof_keys_with_rounds` call for the same
+    /// round fails synchronously (no separate flush step).
+    #[test]
+    fn append_state_proof_keys_with_rounds_same_round_twice_fails() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation_with_state_proof(3, 0, 4096, 32);
+        let id = store.insert(&part).unwrap();
+
+        let signer = part.state_proof_secrets.as_ref().unwrap().ephemeral_keys[0].clone();
+        // A round far outside `[first_valid, last_valid]` (0..4096) so it
+        // can't collide with any of the ephemeral-key rounds `insert()`
+        // already persisted for `part.state_proof_secrets` above.
+        let keys = [(10_000_000u64, signer)];
+
+        // First append succeeds.
+        assert!(store
+            .append_state_proof_keys_with_rounds(&id, &keys)
+            .unwrap());
+
+        // Appending the exact same round again must fail (primary-key
+        // collision on (pk, round)), mirroring go's UNIQUE-constraint error.
+        let err = store
+            .append_state_proof_keys_with_rounds(&id, &keys)
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("unique")
+                || err.to_string().to_lowercase().contains("constraint"),
+            "expected a uniqueness/constraint violation, got: {err}"
         );
     }
 

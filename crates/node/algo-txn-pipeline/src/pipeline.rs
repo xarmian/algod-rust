@@ -143,3 +143,45 @@ impl TxnPipeline {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use algo_types::Address;
+    use std::str::FromStr;
+
+    /// Mirrors go's `TestTransaction_EstimateEncodedSize`
+    /// (`data/transactions/transaction_test.go:42`): a byte-for-byte pin of
+    /// `Transaction.EstimateEncodedSize()` for a specific payment
+    /// transaction, wrapped in a single-sig `SignedTxn` with a nonzero
+    /// placeholder signature (go: `crypto.Signature{1}`). algod-rust's
+    /// `estimate_fee` is the client-side port of that same estimate (used
+    /// by `goal-rust clerk send`'s suggested-fee computation); passing
+    /// `fee_per_byte = 1, min_fee = 0` recovers the raw encoded byte count
+    /// go's test asserts directly (`require.Equal(t, 200, ...)`).
+    #[test]
+    fn estimate_fee_pins_go_reference_encoded_size() {
+        let addr = Address::from_str("NDQCJNNY5WWWFLP4GFZ7MEF2QJSMZYK6OWIV2AQ7OMAVLEFCGGRHFPKJJA")
+            .expect("valid checksum address");
+
+        // 10-byte note (content doesn't affect the msgpack `bin` header's
+        // byte length, only its declared length does — matches go's random
+        // 10-byte buffer with a fixed byte count).
+        let note = serde_bytes::ByteBuf::from(vec![0u8; 10]);
+
+        let max_txn_life = 1_000u64; // v42 (current consensus) MaxTxnLife.
+        let txn = Transaction {
+            txn_type: "pay".into(),
+            sender: addr,
+            fee: 100,
+            first_valid: algo_types::Round(1000),
+            last_valid: algo_types::Round(1000 + max_txn_life),
+            note,
+            receiver: addr,
+            amount: 100,
+            ..Default::default()
+        };
+
+        assert_eq!(estimate_fee(&txn, 1, 0), 200);
+    }
+}

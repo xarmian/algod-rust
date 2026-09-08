@@ -573,6 +573,37 @@ mod tests {
         assert_eq!(next.rewards_residue, expected_residue);
     }
 
+    /// Mirrors go's `TestNextRewardsRateWithFixPoolBalanceInsufficient`
+    /// (`data/bookkeeping/block_test.go:817`): when the incentive pool
+    /// balance (19) is smaller than `MinBalance + RewardsResidue` (10 + 21
+    /// = 31), the refreshed rate saturates to 0 (not a negative/wrapped
+    /// value) — proving `saturating_sub` here matches go's
+    /// `MicroAlgos.SubSaturate` rather than plain unsigned subtraction.
+    #[test]
+    fn test_nrs_fix_pool_balance_insufficient_saturates_rate_to_zero() {
+        let params = algo_types::ConsensusParams {
+            pending_residue_rewards: true,
+            rewards_calculation_fix: true,
+            min_balance: 10,
+            ..params_for(algo_types::consensus::CONSENSUS_V31)
+        };
+        let prev = RewardsState {
+            rewards_level: 4,
+            rewards_rate: 80,
+            rewards_residue: 21,
+            rewards_recalculation_round: 100,
+        };
+        let next = next_rewards_state(prev, 100, &params, 19, 10);
+
+        assert_eq!(next.rewards_rate, 0, "pool balance below MinBalance+residue must saturate to 0");
+        assert_eq!(next.rewards_level, 6);
+        assert_eq!(next.rewards_residue, 1);
+        assert_eq!(
+            next.rewards_recalculation_round,
+            100u64.wrapping_add(params.rewards_rate_refresh_interval)
+        );
+    }
+
     #[test]
     fn test_nrs_zero_rate_keeps_level() {
         // No recalc this round, rate 0 → level/residue unchanged.

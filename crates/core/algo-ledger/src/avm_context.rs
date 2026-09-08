@@ -6630,6 +6630,47 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    // ── app_address() (go: `AppIndex.ToBeHashed()` / `AppIndex.Address()`) ─
+    //
+    // Mirrors go's `TestAppIndexHashing`
+    // (`data/basics/userBalance_test.go:102`): the app-index-to-address
+    // hashing preimage is `"appID" || app_id.to_be_bytes()`, and a specific
+    // app ID's derived address is pinned against a value independently
+    // computed with algosdk.
+
+    #[test]
+    fn app_address_preimage_matches_go_low_app_id() {
+        // go: AppIndex(12).ToBeHashed() -> buf == 0x00..0x0c (8 bytes, BE).
+        let mut hasher = Sha512_256::new();
+        hasher.update(b"appID");
+        hasher.update([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c]);
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(app_address(12), expected);
+    }
+
+    #[test]
+    fn app_address_preimage_matches_go_shifted_app_id() {
+        // go: AppIndex(12 << 16).ToBeHashed() -> buf == 0x00 00 00 00 00 0c 00 00.
+        let app_id: u64 = 12 << 16;
+        let mut hasher = Sha512_256::new();
+        hasher.update(b"appID");
+        hasher.update([0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00]);
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(app_address(app_id), expected);
+    }
+
+    #[test]
+    fn app_address_matches_known_algosdk_value() {
+        // Value pinned by go's test comment:
+        //   python -c "import algosdk.encoding as e; print(e.encode_address(
+        //       e.checksum(b'appID'+(77).to_bytes(8, 'big'))))"
+        let addr = Address(app_address(77));
+        assert_eq!(
+            addr.to_string(),
+            "PCYUFPA2ZTOYWTP43MX2MOX2OWAIAXUDNC2WFCXAGMRUZ3DYD6BWFDL5YM"
+        );
+    }
+
     /// Helper: build a simple payment transaction.
     fn make_pay_txn(sender: [u8; 32], receiver: [u8; 32], amount: u64) -> SignedTransaction {
         use serde_bytes::ByteBuf;
