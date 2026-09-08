@@ -1390,6 +1390,28 @@ static ENABLE_RUNTIME_METRICS: VersionedDefault<bool> = VersionedDefault::new(&[
 /// `algo_rest_api::process_metrics::NetDevMetricsSnapshot`.
 static ENABLE_NET_DEV_METRICS: VersionedDefault<bool> = VersionedDefault::new(&[(34, || false)]);
 
+/// Go: `EnableMetricReporting bool` `version[0]:"false"` (`localTemplate.go:213-214`,
+/// "determines if the metrics service for a node is to be enabled...").
+/// **Formally retired as a no-op** (issue #1188, split from #1149) —
+/// investigated against `daemon/algod/server.go:346-352` and
+/// `util/metrics/service.go`/`reporter.go`: this flag does **not** gate
+/// `/metrics` route registration (unconditional in both go-algorand's API
+/// server and algod-rust's) nor counter population (that's
+/// `EnableRuntimeMetrics`/`EnableNetDevMetrics`, issue #776, wired into
+/// `algo_rest_api::process_metrics` for real). It gates a third, distinct
+/// thing: whether go-algorand starts `metrics.MetricService`'s
+/// `ReporterLoop`, a background goroutine that POSTs the process's
+/// Prometheus registry to `NodeExporterListenAddress` and, on failure,
+/// shells out to spawn the external `NodeExporterPath` binary
+/// (`util/metrics/reporter.go`'s `tryInvokeNodeExporter`). Both of those
+/// config fields were already formally retired in #1149 — algod-rust
+/// exposes `/metrics` directly rather than shelling out to a
+/// child-process node_exporter — so the loop this flag would gate has no
+/// counterpart subsystem here either. Round-trips through `config.json`
+/// for forward/backward compatibility, matching the other retired fields'
+/// precedent (issue #1137).
+static ENABLE_METRIC_REPORTING: VersionedDefault<bool> = VersionedDefault::new(&[(0, || false)]);
+
 // --- Remaining networking fields (issue #768, follow-up to #748) -----------
 //
 // #748 scoped down `config.Local`'s full networking-field enumeration to
@@ -1971,6 +1993,9 @@ fn default_enable_runtime_metrics() -> bool {
 }
 fn default_enable_netdev_metrics() -> bool {
     ENABLE_NET_DEV_METRICS.at(LATEST_VERSION)
+}
+fn default_enable_metric_reporting() -> bool {
+    ENABLE_METRIC_REPORTING.at(LATEST_VERSION)
 }
 
 /// Convert go's `BaseLoggerDebugLevel` (`config.Local`, go's `logging.Level`
@@ -2635,6 +2660,18 @@ pub struct Local {
     )]
     pub enable_catchup_from_archive_servers: bool,
 
+    /// Go: `EnableMetricReporting`. **Formally retired as a no-op** (issue
+    /// #1188, split from #1149) — see [`ENABLE_METRIC_REPORTING`]'s doc
+    /// comment: it gates go-algorand's external node_exporter reporting
+    /// loop, not `/metrics` route mounting or counter population, and the
+    /// node_exporter integration itself is already retired (`NodeExporterPath`
+    /// / `NodeExporterListenAddress`, issue #1149).
+    #[serde(
+        rename = "EnableMetricReporting",
+        default = "default_enable_metric_reporting"
+    )]
+    pub enable_metric_reporting: bool,
+
     /// Go: `IsIndexerActive`. **Formally retired as a no-op** (issue
     /// #1149), and dead upstream too — see [`IS_INDEXER_ACTIVE`]'s doc
     /// comment.
@@ -3162,6 +3199,7 @@ impl Local {
             enable_block_service_fallback_to_archiver: ENABLE_BLOCK_SERVICE_FALLBACK_TO_ARCHIVER
                 .at(version),
             enable_catchup_from_archive_servers: ENABLE_CATCHUP_FROM_ARCHIVE_SERVERS.at(version),
+            enable_metric_reporting: ENABLE_METRIC_REPORTING.at(version),
             is_indexer_active: IS_INDEXER_ACTIVE.at(version),
             network_message_trace_server: NETWORK_MESSAGE_TRACE_SERVER.at(version),
             node_exporter_path: NODE_EXPORTER_PATH.at(version),
@@ -5084,6 +5122,23 @@ mod tests {
         assert_eq!(cfg.suggested_fee_sliding_window_size, 50);
     }
 
+    /// TDD anchor for issue #1188: `EnableMetricReporting` is formally
+    /// retired as a documented no-op. It gates a distinct upstream
+    /// mechanism from `EnableRuntimeMetrics`/`EnableNetDevMetrics` (an
+    /// external node_exporter reporting loop, not counter population or
+    /// `/metrics` route mounting), but that mechanism's own config fields
+    /// were already retired in #1149 — see [`ENABLE_METRIC_REPORTING`]'s
+    /// doc comment for the full investigation. It must still round-trip
+    /// through `config.json` like every other retired field.
+    #[test]
+    fn issue_1188_enable_metric_reporting_round_trips_through_json_as_documented_no_op() {
+        let cfg = Local::load_from_str(r#"{"EnableMetricReporting": true}"#).expect("parses");
+        assert!(cfg.enable_metric_reporting);
+
+        let cfg = Local::default_at_version(27);
+        assert!(!cfg.enable_metric_reporting);
+    }
+
     /// TDD anchor for issue #1149: `StorageEngine` has no `version[N]` tag
     /// before 28, so an operator on an older-versioned `config.json` who
     /// never set it sees an empty string until migration carries them past
@@ -5274,10 +5329,16 @@ mod tests {
         // per-subcommand CLI flag instead — see the module-level doc
         // comment's "Explicitly out of scope" section), so it stays listed
         // here permanently, not as an open gap.
+        // Issue #1188 (split from #1149) closed one more: `EnableMetricReporting`
+        // formally retired as a documented no-op — it gates go-algorand's
+        // external node_exporter reporting loop (already-retired #1149
+        // territory), not `/metrics` route mounting or counter population
+        // (`EnableRuntimeMetrics`/`EnableNetDevMetrics`, #776) — removed
+        // from this list, since it now round-trips through `config.json`
+        // like every other field.
         const NOT_YET_PORTED: &[&str] = &[
             "AccountUpdatesStatsInterval",
             "EnableAccountUpdatesStats",
-            "EnableMetricReporting",
             "EnableTxBacklogRateLimiting",
             "EnableVerbosedTransactionSyncLogging",
             "ForceFetchTransactions",

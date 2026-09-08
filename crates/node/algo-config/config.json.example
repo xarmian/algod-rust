@@ -47,6 +47,7 @@
   "EnableDeveloperAPI": false,
   "EnableExperimentalAPI": false,
   "EnableFollowMode": false,
+  "EnableMetricReporting": false,
   "EnableGossipBlockService": true,
   "EnableGossipService": true,
   "EnableIncomingMessageFilter": false,
