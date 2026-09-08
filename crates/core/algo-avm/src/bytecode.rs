@@ -184,6 +184,42 @@ pub fn read_varuint(data: &[u8], pos: usize) -> Result<(u64, usize), AlgoError> 
     }
 }
 
+/// Validate a `count` read from an attacker-controlled varint (the declared
+/// item count of `intcblock`/`bytecblock`/`pushints`/`pushbytess`) against
+/// the actual bytes remaining in `code`, and return it as a trusted `usize`
+/// *before* the caller uses it to size a `Vec::with_capacity` allocation.
+///
+/// Every list entry -- a varuint (`intcblock`/`pushints`) or a
+/// varuint-length-prefixed byte string (`bytecblock`/`pushbytess`) -- needs
+/// at least 1 byte of encoding, so `count` can never legitimately exceed the
+/// number of bytes left in the program after the count varint itself
+/// (`code.len() - (pos + header_len)`). Without this check, a crafted
+/// program can encode a near-`u64::MAX` count and crash the process via a
+/// `Vec::with_capacity` capacity-overflow panic or an attempted
+/// multi-exabyte allocation (issue #1164) -- go-algorand's equivalent
+/// parsers (`parseIntImmArgs`/`parseByteImmArgs`,
+/// `data/transactions/logic/assembler.go`) reject the same malformed input
+/// cleanly via an analogous "too many items" bound check before allocating.
+fn check_const_list_count(
+    code: &[u8],
+    pos: usize,
+    header_len: usize,
+    count: u64,
+    op_name: &str,
+) -> Result<usize, AlgoError> {
+    // `pos + header_len <= code.len()` always holds here: `read_varuint`
+    // only returns `Ok` once it has consumed bytes strictly within `code`.
+    let remaining = (code.len() - (pos + header_len)) as u64;
+    if count > remaining {
+        return Err(AlgoError::Avm {
+            message: format!(
+                "{op_name}: const list with too many items ({count} declared, only {remaining} bytes remain)"
+            ),
+        });
+    }
+    Ok(count as usize)
+}
+
 /// Read a big-endian int16 from `data` at `pos`.
 fn read_int16(data: &[u8], pos: usize) -> Result<i16, AlgoError> {
     if pos + 2 > data.len() {
@@ -386,7 +422,7 @@ fn parse_immediates(
 
         ImmKind::IntcBlock => {
             let (count, mut consumed) = read_varuint(code, pos)?;
-            let count = count as usize;
+            let count = check_const_list_count(code, pos, consumed, count, "intcblock")?;
             let mut values = Vec::with_capacity(count);
             for _ in 0..count {
                 let (val, n) = read_varuint(code, pos + consumed)?;
@@ -398,7 +434,7 @@ fn parse_immediates(
 
         ImmKind::BytecBlock => {
             let (count, mut consumed) = read_varuint(code, pos)?;
-            let count = count as usize;
+            let count = check_const_list_count(code, pos, consumed, count, "bytecblock")?;
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
                 let (len, hdr) = read_varuint(code, pos + consumed)?;
@@ -421,7 +457,7 @@ fn parse_immediates(
 
         ImmKind::PushInts => {
             let (count, mut consumed) = read_varuint(code, pos)?;
-            let count = count as usize;
+            let count = check_const_list_count(code, pos, consumed, count, "pushints")?;
             let mut values = Vec::with_capacity(count);
             for _ in 0..count {
                 let (val, n) = read_varuint(code, pos + consumed)?;
@@ -433,7 +469,7 @@ fn parse_immediates(
 
         ImmKind::PushBytess => {
             let (count, mut consumed) = read_varuint(code, pos)?;
-            let count = count as usize;
+            let count = check_const_list_count(code, pos, consumed, count, "pushbytess")?;
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
                 let (len, hdr) = read_varuint(code, pos + consumed)?;
@@ -1035,5 +1071,95 @@ mod tests {
         assert_eq!(p.instructions[0].offset, 0);
         assert_eq!(p.instructions[1].offset, 2);
         assert_eq!(p.instructions[2].offset, 4);
+    }
+
+    /// Port of go-algorand's `TestShortBytecblock2`
+    /// (`data/transactions/logic/eval_test.go:3385`): four hand-crafted
+    /// malformed `bytecblock` programs whose declared item count is either
+    /// near `u64::MAX` (the first two) or otherwise wildly exceeds the
+    /// bytes actually remaining in the program (all four). go-algorand
+    /// rejects all four cleanly with a "const bytes list" error
+    /// (`errTooManyItems`/`errShortByteImmArgs`,
+    /// `data/transactions/logic/assembler.go`'s `parseByteImmArgs`) rather
+    /// than crashing.
+    ///
+    /// Before the fix for issue #1164, the first two programs crashed this
+    /// process outright (`Vec::with_capacity` on a near-`u64::MAX` count is
+    /// a capacity-overflow panic / OOM abort) rather than returning `Err` --
+    /// which is exactly why this test exists: `parse` returning `Err` is
+    /// the *fixed* behavior, not the historical one.
+    #[test]
+    fn test_short_bytecblock2_rejected_cleanly() {
+        let sources = [
+            "02260180fe83f88fe0bf80ff01aa",
+            "01260180fe83f88fe0bf80ff01aa",
+            "0026efbfbdefbfbd02",
+            "0026efbfbdefbfbd30",
+        ];
+        for src in sources {
+            let raw = hex::decode(src).expect("valid hex fixture");
+            let result = parse(&raw);
+            assert!(
+                result.is_err(),
+                "program {src} must be rejected, not silently accepted"
+            );
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("bytecblock") || msg.contains("bytes"),
+                "unexpected error for {src}: {msg}"
+            );
+        }
+    }
+
+    /// Fuzz-style regression guard for issue #1164: a `bytecblock` (or
+    /// `intcblock`/`pushints`/`pushbytess`) whose declared item count is
+    /// encoded as the maximal 10-byte varuint (decoding to `u64::MAX`) must
+    /// be rejected with a clean `Err`, never a panic/abort, regardless of
+    /// how few bytes actually remain in the program.
+    #[test]
+    fn test_extreme_varuint_count_rejected_without_panic_or_abort() {
+        // u64::MAX encoded as a 10-byte LEB128 varuint.
+        let max_varuint = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+
+        // intcblock (0x20): count=u64::MAX, then nothing.
+        let mut intcblock_code = vec![0x20];
+        intcblock_code.extend_from_slice(&max_varuint);
+        assert!(parse(&prog(1, &intcblock_code)).is_err());
+
+        // bytecblock (0x26): count=u64::MAX, then nothing.
+        let mut bytecblock_code = vec![0x26];
+        bytecblock_code.extend_from_slice(&max_varuint);
+        assert!(parse(&prog(1, &bytecblock_code)).is_err());
+
+        // pushints (0x83): count=u64::MAX, then nothing.
+        let mut pushints_code = vec![0x83];
+        pushints_code.extend_from_slice(&max_varuint);
+        assert!(parse(&prog(8, &pushints_code)).is_err());
+
+        // pushbytess (0x82): count=u64::MAX, then nothing.
+        let mut pushbytess_code = vec![0x82];
+        pushbytess_code.extend_from_slice(&max_varuint);
+        assert!(parse(&prog(8, &pushbytess_code)).is_err());
+    }
+
+    /// The bound must be exact, not just "doesn't crash": a count equal to
+    /// the actual number of trailing 1-byte varuint entries is still
+    /// accepted (each entry is the minimal single-byte varuint `0x00`).
+    #[test]
+    fn test_const_list_count_at_exact_boundary_is_accepted() {
+        let mut code = vec![0x20]; // intcblock
+        crate::assembler::write_varuint_to_vec(&mut code, 3); // count=3
+        code.extend_from_slice(&[0x00, 0x00, 0x00]); // 3 single-byte entries
+        let p = parse(&prog(1, &code)).expect("exact boundary count must parse");
+        assert_eq!(
+            p.instructions[0].immediates,
+            Immediates::IntBlock(vec![0, 0, 0])
+        );
+
+        // One more than the bytes available must be rejected.
+        let mut code = vec![0x20]; // intcblock
+        crate::assembler::write_varuint_to_vec(&mut code, 4); // count=4
+        code.extend_from_slice(&[0x00, 0x00, 0x00]); // only 3 entries present
+        assert!(parse(&prog(1, &code)).is_err());
     }
 }
