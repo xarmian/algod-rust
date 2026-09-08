@@ -2513,19 +2513,18 @@ pub(crate) fn pool_config_from_local(local: &algo_config::Local) -> PoolConfig {
 /// }
 /// ```
 ///
-/// This only ports the queue-*sizing* half of go's behavior: when
+/// This ports the queue-*sizing* half of go's behavior: when
 /// `EnableTxBacklogRateLimiting` is set, the base `TxBacklogSize` is
 /// widened by `IncomingConnectionsLimit * TxBacklogReservedCapacityPerPeer`
 /// extra room, exactly as go computes its own `backlogQueue` channel
-/// capacity. It does **not** port go's `util.NewElasticRateLimiter`
-/// per-peer *reservation/fairness* guarantee (the other half of what
-/// `EnableTxBacklogRateLimiting` gates in go, `data/txHandler.go:189-199`)
-/// — algod-rust's `TxTagHandler` backlog queue has no notion of "this
-/// peer's reserved slots" yet, so a peer flooding the queue can still
-/// exhaust the widened capacity before another peer's traffic is admitted.
-/// Building that fairness guarantee is real, separate design work, filed
-/// as its own follow-up (issue #1195) rather than absorbed here — see
-/// `algo_config`'s `TX_BACKLOG_RESERVED_CAPACITY_PER_PEER` doc comment.
+/// capacity. The other half of what `EnableTxBacklogRateLimiting` gates in
+/// go — `util.NewElasticRateLimiter`'s per-peer *reservation/fairness*
+/// guarantee (`data/txHandler.go:189-199`) — is a separate mechanism, now
+/// built as [`algo_network::TxBacklogPeerLimiter`] (issue #1195) and wired
+/// alongside this capacity at both `TxTagHandler` construction call sites
+/// below (WS-gossip and P2P), gated by the same
+/// `enable_tx_backlog_rate_limiting` flag; see that struct's module doc for
+/// the full design.
 pub(crate) fn tx_backlog_queue_capacity_from_local(local: &algo_config::Local) -> usize {
     let mut capacity = local.tx_backlog_size.max(0) as usize;
     if local.enable_tx_backlog_rate_limiting {
@@ -4604,11 +4603,41 @@ pub async fn run(
     // in `MakeTxHandler` and reused across transports.
     let tx_backlog_queue_capacity = tx_backlog_queue_capacity_from_local(&node_config);
 
+    // Per-peer backlog-admission fairness gate (issue #1195), go's
+    // `util.ElasticRateLimiter`/`erlClientMapper` analogue
+    // (`data/txHandler.go:189-199`): guarantees a single flooding peer
+    // cannot exhaust another peer's `TxBacklogReservedCapacityPerPeer`
+    // reserved share of the shared backlog queue computed just above.
+    // Shared (same `Arc`) across every `TxTagHandler` registered below
+    // (WS-gossip and, if enabled, the libp2p P2P transport) so one
+    // node-wide reservation pool sees traffic from both transports,
+    // mirroring go's single `TxHandler.erl`. `TxBacklogServiceRateWindowSeconds`
+    // is reused verbatim (not reimplemented) for the sliding window
+    // `algo_pool::RedCongestionManager` uses once congestion control
+    // engages, exactly as issue #821 already wired it for
+    // `app_rate_limiter` above. See
+    // `algo_network::tx_tag_handler::TxBacklogPeerLimiter`'s module doc
+    // for the full design, including why `MaxConnectionsPerIP` and
+    // `TxBacklogRateLimitingCongestionPct` are deliberately not wired in
+    // here.
+    let tx_backlog_peer_limiter = node_config.enable_tx_backlog_rate_limiting.then(|| {
+        Arc::new(algo_network::TxBacklogPeerLimiter::new(
+            tx_backlog_queue_capacity,
+            node_config.tx_backlog_reserved_capacity_per_peer.max(0) as usize,
+            std::time::Duration::from_secs(
+                node_config.tx_backlog_service_rate_window_seconds.max(0) as u64,
+            ),
+        ))
+    });
+
     let mut ws_tx_tag_handler =
         algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
             .with_batch_verifier(batch_verifier.clone())
-            .with_remember_counter(tx_pool_remember_counter.clone())
-            .with_backlog_queue(tx_backlog_queue_capacity);
+            .with_remember_counter(tx_pool_remember_counter.clone());
+    if let Some(limiter) = &tx_backlog_peer_limiter {
+        ws_tx_tag_handler = ws_tx_tag_handler.with_backlog_peer_limiter(limiter.clone());
+    }
+    let mut ws_tx_tag_handler = ws_tx_tag_handler.with_backlog_queue(tx_backlog_queue_capacity);
     if let Some(limiter) = &app_rate_limiter {
         ws_tx_tag_handler = ws_tx_tag_handler
             .with_app_rate_limiter(limiter.clone(), app_rate_limiter_congestion_threshold);
@@ -4801,8 +4830,12 @@ pub async fn run(
         let mut p2p_tx_tag_handler =
             algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
                 .with_batch_verifier(batch_verifier.clone())
-                .with_remember_counter(tx_pool_remember_counter.clone())
-                .with_backlog_queue(tx_backlog_queue_capacity);
+                .with_remember_counter(tx_pool_remember_counter.clone());
+        if let Some(limiter) = &tx_backlog_peer_limiter {
+            p2p_tx_tag_handler = p2p_tx_tag_handler.with_backlog_peer_limiter(limiter.clone());
+        }
+        let mut p2p_tx_tag_handler =
+            p2p_tx_tag_handler.with_backlog_queue(tx_backlog_queue_capacity);
         if let Some(limiter) = &app_rate_limiter {
             p2p_tx_tag_handler = p2p_tx_tag_handler
                 .with_app_rate_limiter(limiter.clone(), app_rate_limiter_congestion_threshold);

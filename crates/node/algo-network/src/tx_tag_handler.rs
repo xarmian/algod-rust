@@ -238,7 +238,8 @@
 
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sha2::{Digest as Sha2DigestTrait, Sha512_256};
@@ -246,7 +247,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use algo_codec::{canonical_encode_signed_transaction, compute_txn_id};
-use algo_pool::{classify_pool_error, AppRateLimiter, PoolErrorTag, TransactionPool};
+use algo_pool::{
+    classify_pool_error, AppRateLimiter, CapacityGuard, ElasticRateLimiter,
+    ElasticRateLimiterError, PoolErrorTag, TransactionPool,
+};
 use algo_types::{Digest, SignedTransaction};
 use algo_validate::{BatchVerifier, BatchVerifyRequest, SpecialAddresses, VerificationContext};
 
@@ -324,6 +328,202 @@ impl TxPoolRememberCounter {
             ));
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TxBacklogPeerLimiter — per-peer backlog-admission fairness gate
+// (issue #1195)
+// ---------------------------------------------------------------------------
+
+/// Free-shared-capacity threshold (as a percentage of the limiter's
+/// `max_capacity`) below which congestion control is enabled, and at/above
+/// which it is disabled again. Mirrors go's `TxBacklogRateLimitingCongestionPct`
+/// default (50%, `config/localTemplate.go:251`) — that field itself is not
+/// config-plumbed here (see [`TxBacklogPeerLimiter`]'s doc comment), same
+/// deliberate choice `crate::tx_sync_service::TxSyncPeerLimiter` already
+/// made for its own (differently-scoped) `CONGESTION_THRESHOLD_PCT`.
+const BACKLOG_CONGESTION_THRESHOLD_PCT: usize = 50;
+
+/// Per-peer admission-fairness gate for [`TxTagHandler::with_backlog_queue`]
+/// (issue #1195), the push-side analogue of
+/// [`crate::tx_sync_service::TxSyncPeerLimiter`]'s pull-side gate. Both wrap
+/// [`algo_pool::ElasticRateLimiter`] — see that module's doc comment for the
+/// full algorithm — but this one guards admission onto `TxTagHandler`'s
+/// *own* inbound gossip backlog queue, exactly mirroring go's real
+/// `TxHandler.erl`/`incomingMsgErlCheck` (`data/txHandler.go:189-199,
+/// 640-659`) rather than needing an architectural workaround: unlike
+/// [`crate::tx_syncer::TxSyncer`]'s pull-based sync path (which has no
+/// reachable "unsolicited incoming transaction" admission point, see
+/// `algo_pool::elastic_rate_limiter`'s module doc), `TxTagHandler` genuinely
+/// *is* algod-rust's push-based, peer-unsolicited transaction-relay
+/// ingestion path — the direct structural analogue of go's
+/// `TxHandler.processIncomingTxn`. So this is a real, direct port of go's
+/// mechanism, not a redesigned mirror image of it.
+///
+/// ## Wiring (mirrors go's `processIncomingTxn`/`incomingMsgErlCheck`)
+///
+/// * Each distinct peer (keyed by [`backlog_peer_key`], go's
+///   `erlClientMapper` IP-bucketing analogue) gets a small guaranteed
+///   reservation (`capacity_per_peer`, go's `TxBacklogReservedCapacityPerPeer`)
+///   out of a shared pool (`max_capacity`) — so one peer relaying many
+///   groups back-to-back cannot exhaust capacity another, already-active
+///   peer has reserved for itself (see this module's
+///   `backlog_peer_limiter_protects_reserved_share_from_a_flooding_peer`
+///   test).
+/// * [`TxTagHandler::handle`] calls [`Self::admit`] *before* the group is
+///   handed to the bounded `mpsc` channel [`TxTagHandler::with_backlog_queue`]
+///   attaches: a rejected admission drops the group exactly like a full
+///   `mpsc` channel would (same [`TxTagHandler::backlog_dropped_count`]
+///   counter, mirroring go incrementing the same
+///   `transactionMessagesDroppedFromBacklog` metric from both
+///   `incomingMsgErlCheck`'s no-capacity path and the `mpsc`-queue-full
+///   path).
+/// * A consumed capacity unit is released back (via [`Self::release_unserved`])
+///   immediately if the group never actually reaches the queue (the `mpsc`
+///   channel was momentarily full despite ERL admitting it) — mirrors go's
+///   `processIncomingTxn` `defer`: `if !accepted && capguard != nil {
+///   capguard.Release() }`.
+/// * Once a group *is* enqueued, its capacity unit stays held until
+///   [`TxTagHandler`]'s background consumer dequeues it, at which point
+///   [`Self::release_and_serve`] both returns the unit and records the
+///   service-rate event — mirrors go's `backlogWorker` releasing
+///   `wi.capguard` and calling `wi.capguard.Served()` immediately after
+///   dequeuing (`data/txHandler.go:331-365`), *not* after the group finishes
+///   pool processing. A capacity unit therefore measures "how long this
+///   group sat in the queue before being picked up", the same signal go's
+///   port measures.
+/// * Congestion control toggles on falling free-shared-capacity, exactly
+///   like [`crate::tx_sync_service::TxSyncPeerLimiter`] (see that struct's
+///   doc comment for the shared rationale on using free-shared-capacity
+///   rather than a raw queue-depth read as the congestion signal).
+///
+/// ## Deliberately deferred (see issue #1195's own acceptance criteria)
+///
+/// * **Exact `erlClientMapper` parity.** go's mapper bounds how many
+///   distinct connection objects register under one IP
+///   (`erlClientMapper.maxClients`, fed by `MaxConnectionsPerIP`) purely as
+///   a map-capacity bookkeeping hint with no observable effect on
+///   `ConsumeCapacity` itself — every connection from the same IP already
+///   shares one `erlIPClient`, and therefore one reservation, regardless of
+///   `maxClients`. [`backlog_peer_key`] achieves the same IP-level
+///   reservation-sharing directly (by keying on IP alone) without porting
+///   the connection-object bookkeeping around it, since that bookkeeping
+///   has no effect on the fairness property this gate exists to guarantee.
+/// * **`TxBacklogRateLimitingCongestionPct`/`TxBacklogAppRateLimitingCountERLDrops`**
+///   remain out of `algo_config::Local` (see `algo_config`'s doc comment on
+///   [`TX_BACKLOG_RESERVED_CAPACITY_PER_PEER`]-adjacent fields) — this gate
+///   uses [`BACKLOG_CONGESTION_THRESHOLD_PCT`], a hardcoded default matching
+///   go's own default value, the same judgment call
+///   `crate::tx_sync_service::TxSyncPeerLimiter` already made.
+///
+/// [`TX_BACKLOG_RESERVED_CAPACITY_PER_PEER`]: algo_config
+pub struct TxBacklogPeerLimiter {
+    erl: Mutex<ElasticRateLimiter<String>>,
+    max_capacity: usize,
+}
+
+impl TxBacklogPeerLimiter {
+    /// Creates a peer-fairness limiter with `max_capacity` total
+    /// concurrently-admittable backlog-queue slots, of which
+    /// `capacity_per_peer` units are set aside as a guaranteed reservation
+    /// for each distinct peer (by [`backlog_peer_key`]) the first time it
+    /// is seen. `service_rate_window` sizes the sliding window
+    /// [`algo_pool::RedCongestionManager`] uses to estimate arrival/service
+    /// rates once congestion control is enabled. `max_capacity` should
+    /// typically be [`TxTagHandler::with_backlog_queue`]'s own `capacity`
+    /// argument, so admission into the ERL and admission into the `mpsc`
+    /// channel it guards are sized consistently.
+    #[must_use]
+    pub fn new(
+        max_capacity: usize,
+        capacity_per_peer: usize,
+        service_rate_window: Duration,
+    ) -> Self {
+        let max_capacity = max_capacity.max(1);
+        Self {
+            erl: Mutex::new(ElasticRateLimiter::new(
+                max_capacity,
+                capacity_per_peer,
+                service_rate_window,
+            )),
+            max_capacity,
+        }
+    }
+
+    /// Attempts to admit one backlog-queue slot for `peer_key`. Mirrors
+    /// go's `incomingMsgErlCheck`'s congestion-control toggle (using
+    /// free-shared-capacity rather than a raw queue-depth read as the
+    /// signal — see this struct's doc comment).
+    fn admit(&self, peer_key: &str) -> Result<CapacityGuard<String>, ElasticRateLimiterError> {
+        let mut erl = self
+            .erl
+            .lock()
+            .expect("TxBacklogPeerLimiter mutex poisoned");
+        let was_congested =
+            Self::shared_pool_congested(erl.shared_capacity_len(), self.max_capacity);
+        let (is_cm_enabled, res) = erl.consume_capacity(&peer_key.to_string());
+        if res.is_err() || (!is_cm_enabled && was_congested) {
+            erl.enable_congestion_control();
+        } else if !was_congested {
+            erl.disable_congestion_control();
+        }
+        res
+    }
+
+    /// Returns `guard`'s capacity unit to its origin queue and records a
+    /// service-rate event, mirroring go's `backlogWorker` calling
+    /// `wi.capguard.Release()` then `wi.capguard.Served()` immediately
+    /// after dequeuing a work item (*not* after it finishes pool
+    /// processing).
+    fn release_and_serve(&self, mut guard: CapacityGuard<String>) {
+        let mut erl = self
+            .erl
+            .lock()
+            .expect("TxBacklogPeerLimiter mutex poisoned");
+        let _ = erl.release(&mut guard);
+        erl.served(Instant::now());
+    }
+
+    /// Returns `guard`'s capacity unit to its origin queue without
+    /// recording a service event — mirrors go's `processIncomingTxn`
+    /// `defer`, releasing capacity for a group that was admitted by ERL but
+    /// never actually reached the backlog queue (e.g. the `mpsc` channel
+    /// was momentarily full).
+    fn release_unserved(&self, mut guard: CapacityGuard<String>) {
+        let mut erl = self
+            .erl
+            .lock()
+            .expect("TxBacklogPeerLimiter mutex poisoned");
+        let _ = erl.release(&mut guard);
+    }
+
+    fn shared_pool_congested(free: usize, max_capacity: usize) -> bool {
+        free.saturating_mul(100) / max_capacity.max(1) < BACKLOG_CONGESTION_THRESHOLD_PCT
+    }
+}
+
+impl std::fmt::Debug for TxBacklogPeerLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxBacklogPeerLimiter")
+            .field("max_capacity", &self.max_capacity)
+            .finish()
+    }
+}
+
+/// Derives the client key [`TxBacklogPeerLimiter`] reserves capacity under
+/// from a gossip message's sender address string. Strips the port exactly
+/// like [`origin_bytes`] — mirroring go's `erlClientMapper` bucketing every
+/// connection from the same source IP under one shared `erlIPClient` (and
+/// therefore one reservation) for ERL purposes, regardless of how many
+/// distinct logical connections that IP has open. Falls back to the raw
+/// sender string when it doesn't parse as a `host:port` socket address
+/// (e.g. a synthetic/test sender, or a P2P peer-id string) — still
+/// deterministic per distinct sender, just not IP-bucketed in that case.
+fn backlog_peer_key(sender: &str) -> String {
+    match sender.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr.ip().to_string(),
+        Err(_) => sender.to_string(),
     }
 }
 
@@ -435,6 +635,7 @@ pub struct TxTagHandler {
     backlog_tx: Option<mpsc::Sender<BacklogItem>>,
     backlog_dropped: Arc<AtomicU64>,
     remember_counter: Arc<TxPoolRememberCounter>,
+    backlog_peer_limiter: Option<Arc<TxBacklogPeerLimiter>>,
 }
 
 impl std::fmt::Debug for TxTagHandler {
@@ -453,6 +654,10 @@ impl std::fmt::Debug for TxTagHandler {
                 "backlog_dropped",
                 &self.backlog_dropped.load(Ordering::Relaxed),
             )
+            .field(
+                "backlog_peer_limiter_enabled",
+                &self.backlog_peer_limiter.is_some(),
+            )
             .finish()
     }
 }
@@ -463,6 +668,12 @@ struct BacklogItem {
     group: Vec<SignedTransaction>,
     txids: Vec<Digest>,
     sender: String,
+    /// Capacity unit held against a [`TxBacklogPeerLimiter`] (issue #1195),
+    /// if one is attached. Released — and the service event recorded — when
+    /// [`backlog_worker`] dequeues this item; released without a service
+    /// event if this item is constructed but never successfully enqueued
+    /// (see [`TxTagHandler::handle`]'s backlog-submission block).
+    peer_guard: Option<CapacityGuard<String>>,
 }
 
 impl TxTagHandler {
@@ -488,6 +699,7 @@ impl TxTagHandler {
             backlog_tx: None,
             backlog_dropped: Arc::new(AtomicU64::new(0)),
             remember_counter: Arc::new(TxPoolRememberCounter::new()),
+            backlog_peer_limiter: None,
         }
     }
 
@@ -567,9 +779,10 @@ impl TxTagHandler {
     /// returned handler, so this must be called from within a Tokio
     /// runtime. `capacity` is clamped to at least 1.
     ///
-    /// Call [`Self::with_remember_counter`] (if attaching a shared one)
-    /// *before* this method — the spawned worker captures whichever
-    /// [`TxPoolRememberCounter`] is attached at the moment this is called.
+    /// Call [`Self::with_remember_counter`]/[`Self::with_backlog_peer_limiter`]
+    /// (if attaching either) *before* this method — the spawned worker
+    /// captures whichever [`TxPoolRememberCounter`]/[`TxBacklogPeerLimiter`]
+    /// is attached at the moment this is called.
     #[must_use]
     pub fn with_backlog_queue(mut self, capacity: usize) -> Self {
         let (tx, rx) = mpsc::channel(capacity.max(1));
@@ -579,8 +792,40 @@ impl TxTagHandler {
             self.seen.clone(),
             self.app_limiter.clone(),
             self.remember_counter.clone(),
+            self.backlog_peer_limiter.clone(),
         ));
         self.backlog_tx = Some(tx);
+        self
+    }
+
+    /// Attach a [`TxBacklogPeerLimiter`] (issue #1195), gating admission
+    /// onto the bounded backlog queue [`Self::with_backlog_queue`] attaches
+    /// so a single flooding peer cannot exhaust another peer's guaranteed
+    /// reserved share of it. See [`TxBacklogPeerLimiter`]'s doc comment for
+    /// the full behavioral contract, and `bin/algod-rust/src/commands/participate.rs`
+    /// for how `config.json`'s `TxBacklogReservedCapacityPerPeer`/
+    /// `TxBacklogServiceRateWindowSeconds`/`EnableTxBacklogRateLimiting` feed
+    /// its construction.
+    ///
+    /// `limiter` should typically be shared (same `Arc`) across every
+    /// `TxTagHandler` instance registered on this node (same sharing
+    /// rationale as [`Self::with_app_rate_limiter`]'s `limiter`), so one
+    /// node-wide reservation pool sees traffic from every transport — but
+    /// unlike that limiter, each `TxTagHandler`'s *own* `mpsc` backlog
+    /// channel is still transport-local (WS-gossip and P2P each get their
+    /// own bounded queue via their own `with_backlog_queue` call), so
+    /// `max_capacity` passed to [`TxBacklogPeerLimiter::new`] should match
+    /// whichever single `capacity` value is passed to every transport's
+    /// `with_backlog_queue` call in practice (algod-rust computes one
+    /// shared `tx_backlog_queue_capacity` and reuses it verbatim for both).
+    ///
+    /// Must be called *before* [`Self::with_backlog_queue`] — see that
+    /// method's doc comment. Without this attached, admission onto the
+    /// backlog queue is unchanged from before issue #1195: first-come,
+    /// first-served, drop-on-full with no per-peer notion.
+    #[must_use]
+    pub fn with_backlog_peer_limiter(mut self, limiter: Arc<TxBacklogPeerLimiter>) -> Self {
+        self.backlog_peer_limiter = Some(limiter);
         self
     }
 
@@ -823,16 +1068,50 @@ impl MessageHandler for TxTagHandler {
         // bounded backlog queue (issue #1096, if attached) or, as
         // before #1096, straight to `pool.remember()` inline.
         if let Some(backlog_tx) = &self.backlog_tx {
+            // Per-peer admission-fairness gate (issue #1195), mirroring
+            // go's `processIncomingTxn` calling `incomingMsgErlCheck`
+            // *before* the group is handed to the backlog channel: a
+            // rejected admission (the peer's reserved share -- and, once
+            // exhausted, its fair share of the shared pool -- is used up)
+            // drops the group exactly like a full `mpsc` channel would,
+            // via the same drop-counter/cache-rollback path below.
+            let mut peer_guard: Option<CapacityGuard<String>> = None;
+            if let Some(limiter) = &self.backlog_peer_limiter {
+                let peer_key = backlog_peer_key(&msg.sender);
+                match limiter.admit(&peer_key) {
+                    Ok(guard) => peer_guard = Some(guard),
+                    Err(_) => {
+                        self.backlog_dropped.fetch_add(1, Ordering::Relaxed);
+                        if let (Some(digest), Some(cache)) =
+                            (canonical_digest, &self.canonical_cache)
+                        {
+                            cache.remove(&digest);
+                        }
+                        debug!(
+                            sender = %msg.sender,
+                            "TxTagHandler: dropped by backlog peer-fairness limiter",
+                        );
+                        return OutgoingMessage {
+                            action: ForwardingPolicy::Ignore,
+                            tag: Tag::Transaction,
+                            payload: Vec::new(),
+                            topics: None,
+                        };
+                    }
+                }
+            }
+
             let item = BacklogItem {
                 group,
                 txids,
                 sender: msg.sender.clone(),
+                peer_guard,
             };
             // Non-blocking `try_send` mirrors go's `select { case
             // backlogQueue <- wi: ... default: ... }`: a full queue
             // drops the message rather than blocking this handler (and
             // therefore this peer's whole dispatch loop).
-            if backlog_tx.try_send(item).is_err() {
+            if let Err(err) = backlog_tx.try_send(item) {
                 self.backlog_dropped.fetch_add(1, Ordering::Relaxed);
                 // Roll back the canonical-cache entry this group was
                 // just admitted under so it isn't permanently poisoned
@@ -843,6 +1122,17 @@ impl MessageHandler for TxTagHandler {
                 // the pool. See the module doc for the full rationale.
                 if let (Some(digest), Some(cache)) = (canonical_digest, &self.canonical_cache) {
                     cache.remove(&digest);
+                }
+                // This item was already admitted by the ERL gate above
+                // (if attached) but never actually reached the queue --
+                // release its capacity unit now rather than leaking it
+                // until this peer's *next* message, mirroring go's
+                // `processIncomingTxn` `defer`: `if !accepted &&
+                // capguard != nil { capguard.Release() }`.
+                if let (Some(limiter), Some(guard)) =
+                    (&self.backlog_peer_limiter, err.into_inner().peer_guard)
+                {
+                    limiter.release_unserved(guard);
                 }
                 debug!(
                     sender = %msg.sender,
@@ -946,22 +1236,39 @@ async fn ingest_group(
 /// #1096): pulls admitted groups off the bounded channel one at a time
 /// and runs them through [`ingest_group`], exactly mirroring go's
 /// `TxHandler.backlogWorker` draining `backlogQueue`.
+///
+/// If a [`TxBacklogPeerLimiter`] (issue #1195) is attached, each item's
+/// capacity unit is released back — and its service event recorded — the
+/// moment it is dequeued here, mirroring go's `backlogWorker` calling
+/// `wi.capguard.Release()` then `wi.capguard.Served()` immediately after
+/// pulling a work item off `backlogQueue`, *before* `checkAlreadyCommitted`
+/// or any further processing (`data/txHandler.go:331-365`).
 async fn backlog_worker(
     mut rx: mpsc::Receiver<BacklogItem>,
     pool: Arc<TransactionPool>,
     seen: Arc<SeenTxCache>,
     app_limiter: Option<Arc<AppRateLimiter>>,
     remember_counter: Arc<TxPoolRememberCounter>,
+    peer_limiter: Option<Arc<TxBacklogPeerLimiter>>,
 ) {
     while let Some(item) = rx.recv().await {
+        let BacklogItem {
+            group,
+            txids,
+            sender,
+            peer_guard,
+        } = item;
+        if let (Some(limiter), Some(guard)) = (&peer_limiter, peer_guard) {
+            limiter.release_and_serve(guard);
+        }
         ingest_group(
             &pool,
             &seen,
             &app_limiter,
             &remember_counter,
-            item.group,
-            item.txids,
-            item.sender,
+            group,
+            txids,
+            sender,
         )
         .await;
     }
@@ -2250,5 +2557,177 @@ mod backlog_queue_tests {
         assert!(pool.pending_tx_ids().contains(&txid2));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(handler.backlog_dropped_count(), 0);
+    }
+
+    // ── TxBacklogPeerLimiter (issue #1195) ──────────────────────────────
+
+    /// Builds a handler with a [`TxBacklogPeerLimiter`] attached and a
+    /// generously-sized (never-fills) orphaned backlog queue, so every
+    /// drop this test observes is attributable to the ERL admission gate
+    /// itself rather than a full `mpsc` channel -- the equivalent
+    /// isolation `make_orphaned_handler` gives the plain-queue tests
+    /// above.
+    fn make_peer_limited_handler(
+        pool: Arc<TransactionPool>,
+        limiter: Arc<TxBacklogPeerLimiter>,
+    ) -> (TxTagHandler, mpsc::Receiver<BacklogItem>) {
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let (tx, rx) = mpsc::channel(100);
+        let mut handler = TxTagHandler::new(pool, seen).with_backlog_peer_limiter(limiter);
+        handler.backlog_tx = Some(tx);
+        (handler, rx)
+    }
+
+    /// TDD anchor for issue #1195: a flooding peer must not be able to
+    /// exhaust another peer's guaranteed reserved share of the backlog
+    /// queue.
+    ///
+    /// `max_capacity=4`, `capacity_per_peer=2`. The "quiet" peer opens its
+    /// reservation and consumes its first of 2 reserved units. The "noisy"
+    /// peer then floods: its own first two messages open and drain its own
+    /// 2-unit reservation (drawing the last of the shared pool to do so),
+    /// and every message after that is rejected once the shared pool is
+    /// empty -- proving the flood is capped, not merely slowed. Crucially,
+    /// the quiet peer's *second* message -- drawn from its own untouched
+    /// reservation -- is still admitted afterward, even though the shared
+    /// pool the noisy peer drained is completely empty. Nothing drains the
+    /// queue in this test (orphaned, no consumer task), so this isolates
+    /// the ERL gate's admission decisions from the `mpsc` channel and from
+    /// any capacity the background worker's dequeue-time release would
+    /// otherwise return.
+    #[tokio::test]
+    async fn backlog_peer_limiter_protects_reserved_share_from_a_flooding_peer() {
+        let (pool, _calls) = make_pool();
+        let limiter = Arc::new(TxBacklogPeerLimiter::new(
+            4,
+            2,
+            std::time::Duration::from_secs(10),
+        ));
+        let (handler, mut rx) = make_peer_limited_handler(pool, limiter);
+
+        // Quiet peer's first message: opens its reservation, consumes 1 of
+        // its 2 reserved units.
+        let quiet1 = make_payment_txn(1, 1);
+        handler
+            .handle(incoming(std::slice::from_ref(&quiet1), "1.1.1.1:4160"))
+            .await;
+        assert_eq!(
+            handler.backlog_dropped_count(),
+            0,
+            "quiet peer's first message must be admitted"
+        );
+
+        // Noisy peer floods 4 messages. Its first 2 open and fully drain
+        // its own reservation (2 units, drawn from what's left of the
+        // shared pool: max_capacity(4) - quiet's reservation(2) = 2). The
+        // remaining 2 fall through to the now-empty shared pool and are
+        // dropped.
+        for i in 0..4u8 {
+            let noisy = make_payment_txn(100 + i, i);
+            handler
+                .handle(incoming(std::slice::from_ref(&noisy), "2.2.2.2:4160"))
+                .await;
+        }
+        assert_eq!(
+            handler.backlog_dropped_count(),
+            2,
+            "noisy peer's flood must be capped at its own reservation plus the drained shared pool"
+        );
+
+        // Quiet peer's second message draws from its own reservation's
+        // last unit -- untouched by the noisy peer's flood -- and must
+        // still be admitted despite the shared pool being fully drained.
+        let quiet2 = make_payment_txn(2, 2);
+        handler
+            .handle(incoming(std::slice::from_ref(&quiet2), "1.1.1.1:4160"))
+            .await;
+        assert_eq!(
+            handler.backlog_dropped_count(),
+            2,
+            "quiet peer's reserved second message must not be starved by the flood"
+        );
+
+        // Sanity: exactly 4 groups (quiet x2, noisy x2) actually reached
+        // the backlog queue; the other 2 noisy groups never got that far.
+        let mut senders = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            senders.push(item.sender);
+        }
+        assert_eq!(senders.len(), 4);
+        assert_eq!(
+            senders.iter().filter(|s| s.starts_with("1.1.1.1")).count(),
+            2
+        );
+        assert_eq!(
+            senders.iter().filter(|s| s.starts_with("2.2.2.2")).count(),
+            2
+        );
+    }
+
+    /// A capacity unit consumed by the ERL gate but never actually
+    /// enqueued (the `mpsc` channel itself was full) must be released
+    /// immediately rather than leaked -- otherwise a peer's *next*
+    /// legitimate message would incorrectly find its reservation still
+    /// exhausted. Mirrors go's `processIncomingTxn` `defer` releasing
+    /// `capguard` when `!accepted`.
+    #[tokio::test]
+    async fn backlog_peer_limiter_releases_capacity_when_mpsc_queue_is_full() {
+        let (pool, _calls) = make_pool();
+        // capacity_per_peer=1 so a single peer's reservation is exactly 1
+        // unit -- easy to prove it comes back after a full-queue drop.
+        let limiter = Arc::new(TxBacklogPeerLimiter::new(
+            4,
+            1,
+            std::time::Duration::from_secs(10),
+        ));
+        let seen = Arc::new(SeenTxCache::new(1024));
+        // A capacity-1 `mpsc` channel, orphaned (nothing drains it), so
+        // the *second* message from the same peer is ERL-admitted (it has
+        // no reservation yet on the first call, so the first call opens
+        // one and drains it into the channel) but then rejected by the
+        // full `mpsc` channel.
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut handler = TxTagHandler::new(pool, seen).with_backlog_peer_limiter(limiter.clone());
+        handler.backlog_tx = Some(tx);
+
+        let tx1 = make_payment_txn(1, 1);
+        handler
+            .handle(incoming(std::slice::from_ref(&tx1), "1.1.1.1:4160"))
+            .await;
+        assert_eq!(handler.backlog_dropped_count(), 0, "first message admitted");
+
+        // Second message from the same peer: its 1-unit reservation is
+        // already exhausted (msg1 consumed it), so ERL falls back to the
+        // shared pool -- which has room and admits it -- but the `mpsc`
+        // channel is still full since nothing has drained msg1 out of it
+        // yet, so this message is dropped there instead.
+        let tx2 = make_payment_txn(2, 2);
+        handler
+            .handle(incoming(std::slice::from_ref(&tx2), "1.1.1.1:4160"))
+            .await;
+        assert_eq!(
+            handler.backlog_dropped_count(),
+            1,
+            "second message dropped by the full mpsc channel"
+        );
+
+        // Drain the one item that did make it onto the queue.
+        let queued = rx.try_recv().expect("first message reached the queue");
+        assert_eq!(queued.sender, "1.1.1.1:4160");
+
+        // If the second message's capacity unit was correctly released
+        // back on the full-queue drop (rather than leaked), a *third*
+        // message from the same peer -- after freeing `mpsc` capacity by
+        // draining the first item above -- must be admitted again rather
+        // than immediately rejected by a starved reservation.
+        let tx3 = make_payment_txn(3, 3);
+        handler
+            .handle(incoming(std::slice::from_ref(&tx3), "1.1.1.1:4160"))
+            .await;
+        assert_eq!(
+            handler.backlog_dropped_count(),
+            1,
+            "third message must be admitted once mpsc capacity is free again"
+        );
     }
 }
