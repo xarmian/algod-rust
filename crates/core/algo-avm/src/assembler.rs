@@ -2201,13 +2201,22 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                     }
                 }
                 ops.pending.push(val);
-            } else {
+            } else if is_field_group_immediate(mnemonic, 0) {
                 ops.record_error(
                     ops.source_line,
                     0,
                     format!("{} unknown field: {:?}", mnemonic, args[0]),
                 );
                 // Remove the opcode we just pushed since the arg is invalid
+                ops.pending.pop();
+            } else {
+                // Plain numeric immediate (load, store, frame_dig, ...):
+                // report the actual parse/range error rather than a
+                // generic "unknown field" -- there's no field name to speak
+                // of here, matching go's byteImm/int8Imm error text.
+                let e =
+                    parse_uint8_or_int8(args[0], mnemonic).expect_err("Ok already handled above");
+                ops.record_error(ops.source_line, 0, format!("{mnemonic} {e}"));
                 ops.pending.pop();
             }
         }
@@ -2545,6 +2554,59 @@ fn resolve_field_immediate_at(
     }
 }
 
+/// True iff `(mnemonic, imm_index)` is one of [`resolve_field_immediate_at`]'s
+/// field-group immediates (a `txn`-style field name, an `ecdsa_verify`
+/// curve, etc.) -- mirrors that function's match arms without doing the
+/// resolution, so a plain numeric-immediate opcode like `load`/`store`/
+/// `frame_dig` (no group at all) can be told apart from a field-group
+/// opcode that was given an unrecognized field name (e.g. `txn BadField`).
+/// go-algorand keeps this same distinction (assembler.go:1203-1273): a
+/// group immediate that fails to resolve reports `"unknown field"`, while a
+/// plain immediate that fails to parse reports the parse error itself.
+fn is_field_group_immediate(mnemonic: &str, imm_index: usize) -> bool {
+    matches!(
+        (mnemonic, imm_index),
+        ("txn", 0)
+            | ("txna", 0)
+            | ("txnas", 0)
+            | ("itxn", 0)
+            | ("itxna", 0)
+            | ("itxnas", 0)
+            | ("itxn_field", 0)
+            | ("gtxn", 1)
+            | ("gtxna", 1)
+            | ("gtxns", 0)
+            | ("gtxnsa", 0)
+            | ("gtxnas", 1)
+            | ("gtxnsas", 0)
+            | ("gitxn", 1)
+            | ("gitxna", 1)
+            | ("gitxnas", 1)
+            | ("global", 0)
+            | ("asset_holding_get", 0)
+            | ("asset_params_get", 0)
+            | ("app_params_get", 0)
+            | ("app_params_set", 0)
+            | ("acct_params_get", 0)
+            | ("voter_params_get", 0)
+            | ("ecdsa_verify", 0)
+            | ("ecdsa_pk_decompress", 0)
+            | ("ecdsa_pk_recover", 0)
+            | ("ec_add", 0)
+            | ("ec_scalar_mul", 0)
+            | ("ec_pairing_check", 0)
+            | ("ec_multi_scalar_mul", 0)
+            | ("ec_subgroup_check", 0)
+            | ("ec_map_to", 0)
+            | ("base64_decode", 0)
+            | ("json_ref", 0)
+            | ("vrf_verify", 0)
+            | ("block", 0)
+            | ("mimc", 0)
+            | ("poseidon2", 0)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Named integer constants (txn types, OnCompletion)
 // ---------------------------------------------------------------------------
@@ -2590,24 +2652,31 @@ fn parse_named_int(name: &str) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 fn parse_uint8_or_int8(s: &str, mnemonic: &str) -> Result<u8, String> {
-    // For frame_dig and frame_bury, the immediate is an int8 encoded as uint8
+    // frame_dig/frame_bury are the *only* opcodes in go-algorand whose
+    // immediate is `immInt8` (opcodes.go:713-714) -- a signed byte in
+    // -128..=127, encoded on the wire as its two's-complement `u8` bit
+    // pattern. go's `int8Imm` (assembler.go:1098) parses with
+    // `strconv.ParseInt(value, 10, 8)`, which itself rejects anything
+    // outside that range (rather than falling back to an unsigned parse),
+    // so e.g. `frame_dig 128` must fail to assemble, not silently succeed
+    // by being read as an unsigned byte.
     if mnemonic == "frame_dig" || mnemonic == "frame_bury" {
-        if let Ok(v) = s.parse::<i8>() {
-            return Ok(v as u8);
-        }
+        return s
+            .parse::<i8>()
+            .map(|v| v as u8)
+            .map_err(|_| format!("unable to parse {s:?} as int8"));
     }
-    // Try unsigned first
-    if let Ok(v) = s.parse::<u64>() {
-        if v > 255 {
-            return Err(format!("value beyond 255: {v}"));
-        }
-        return Ok(v as u8);
+    // Every other opcode with a plain byte immediate (load, store, ...) uses
+    // go's `byteImm` (assembler.go:1087), which parses with
+    // `strconv.ParseUint(value, 0, 64)` -- unsigned only. A negative literal
+    // therefore fails to parse rather than wrapping into the `u8` range
+    // (e.g. `load -100` must be rejected, not silently reinterpreted as
+    // `load 156`), and a value over 255 is a distinct "beyond 255" error.
+    match s.parse::<u64>() {
+        Ok(v) if v > 255 => Err(format!("i beyond 255: {v}")),
+        Ok(v) => Ok(v as u8),
+        Err(_) => Err(format!("unable to parse {s:?} as integer")),
     }
-    // Try signed for int8 fields
-    if let Ok(v) = s.parse::<i8>() {
-        return Ok(v as u8);
-    }
-    Err(format!("unable to parse {:?} as integer", s))
 }
 
 fn parse_u64(s: &str) -> Result<u64, String> {
@@ -3328,6 +3397,77 @@ mod tests {
             errs.iter()
                 .any(|e| e.message == "arg expects 1 immediate argument"),
             "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_immediate_ranges_load_store_ok() {
+        // TestAssembleImmediateRanges: values within range assemble fine.
+        // `store`'s immediate is an unsigned byte, so 0 is in range;
+        // `load`'s max is 255.
+        assert!(assemble_string("#pragma version 8\nint 1; store 0;\n").is_ok());
+        assert!(assemble_string("#pragma version 8\nload 255;\n").is_ok());
+    }
+
+    #[test]
+    fn test_immediate_ranges_load_store_out_of_range() {
+        // TestAssembleImmediateRanges: go's `byteImm` (assembler.go:1087)
+        // parses `load`/`store`'s scratch-slot immediate with
+        // `strconv.ParseUint` -- unsigned only, 0..=255. A negative literal
+        // must fail to parse (not wrap into the u8 range, e.g. `load -100`
+        // must NOT silently become `load 156`), and a value over 255 is a
+        // distinct "beyond 255" error.
+        let errs = expect_errors("#pragma version 8\nint 1; store -1000;\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.starts_with("store") && e.message.contains("unable to parse")),
+            "store -1000: expected an 'unable to parse' error, got: {errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nload -100;\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.starts_with("load") && e.message.contains("unable to parse")),
+            "load -100: expected an 'unable to parse' error, got: {errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nint 1; store 256;\n");
+        assert!(
+            errs.iter().any(|e| e.message == "store i beyond 255: 256"),
+            "store 256: expected 'store i beyond 255: 256', got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_immediate_ranges_frame_dig_bury_ok() {
+        // TestAssembleImmediateRanges: frame_dig/frame_bury take a signed
+        // int8 immediate (-128..=127); the full range assembles fine.
+        assert!(assemble_string("#pragma version 8\nframe_dig -1;\n").is_ok());
+        assert!(assemble_string("#pragma version 8\nframe_dig 127;\n").is_ok());
+        assert!(assemble_string("#pragma version 8\nint 1; frame_bury -128;\n").is_ok());
+    }
+
+    #[test]
+    fn test_immediate_ranges_frame_dig_bury_out_of_range() {
+        // TestAssembleImmediateRanges: go's `int8Imm` (assembler.go:1098)
+        // parses with `strconv.ParseInt(value, 10, 8)`, which itself
+        // rejects anything outside -128..=127 -- `frame_dig 128` and
+        // `frame_bury -129` must be rejected at assembly time, not
+        // silently accepted with a truncated/wrapped immediate byte.
+        let errs = expect_errors("#pragma version 8\nframe_dig 128;\n");
+        assert!(
+            errs.iter().any(
+                |e| e.message.starts_with("frame_dig") && e.message.contains("unable to parse")
+            ),
+            "frame_dig 128: expected an 'unable to parse' error, got: {errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nint 1; frame_bury -129;\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.starts_with("frame_bury")
+                    && e.message.contains("unable to parse")),
+            "frame_bury -129: expected an 'unable to parse' error, got: {errs:?}"
         );
     }
 
