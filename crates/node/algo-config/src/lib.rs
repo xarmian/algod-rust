@@ -330,6 +330,19 @@ static DISABLE_API_AUTH: VersionedDefault<bool> = VersionedDefault::new(&[(30, |
 /// Go: `EnableGossipService bool` `version[33]:"true"` (`localTemplate.go:407`).
 static ENABLE_GOSSIP_SERVICE: VersionedDefault<bool> = VersionedDefault::new(&[(33, || true)]);
 
+/// Go: `DisableNetworking bool` `version[16]:"false"` (`localTemplate.go:516`,
+/// "disables all the incoming and outgoing communication a node would
+/// perform. This is useful for certain testing situations."). Wired: when
+/// `true`, `relay`/`participate` skip opening the WS-gossip listener,
+/// dialing/DNS-discovering any WS-gossip peers, and starting the libp2p P2P
+/// transport, plus `relay`'s block-catchup loop -- mirroring go's
+/// `node.go`/`follower_node.go` `startNetwork` closures, both of which skip
+/// `node.net.Start()` entirely under this flag (`catchup/service.go` and
+/// `wsNetwork.go:380`/`2133` are the other upstream call sites, all gating
+/// the same "no networking at all" behavior). See
+/// `bin/algod-rust/src/commands/network_common.rs::networking_active`.
+static DISABLE_NETWORKING: VersionedDefault<bool> = VersionedDefault::new(&[(16, || false)]);
+
 /// Go: `EnableLedgerService bool` `version[7]:"false"` (`localTemplate.go:411`).
 /// algod-rust has no ledger-serving HTTP service yet (no equivalent to go's
 /// `LedgerService` full-ledger/catchpoint-over-the-wire endpoint) — this
@@ -1165,23 +1178,29 @@ static ENABLE_AGREEMENT_TIME_METRICS: VersionedDefault<bool> =
 //    `BaseLoggerDebugLevel`, `CadaverSizeTarget`/`CadaverDirectory`,
 //    `LogSizeLimit`/`LogArchiveName`/`LogArchiveMaxAge`, `EnableProfiler`,
 //    `EnableTopAccountsReporting`.
-// 2. Fields deliberately NOT added at all: `PeerConnectionsUpdateInterval`,
-//    `HeartbeatUpdateInterval`, `EnableAccountUpdatesStats`,
+// 2. Fields deliberately NOT added at all (as of #756): `EnableAccountUpdatesStats`,
 //    `AccountUpdatesStatsInterval`. Each one's *only* upstream effect is
 //    feeding the remote-telemetry-reporting pipeline this issue declines to
-//    build (`network/wsNetwork.go`'s `sendPeerConnectionsTelemetryStatus`
-//    checks `log.GetTelemetryEnabled()` and returns immediately when
-//    telemetry is off; `cmd/algod/main.go`'s heartbeat goroutine calls
-//    `log.EventWithDetails`; `ledger/acctupdates.go:2291` calls
-//    `au.log.Metrics(telemetryspec.Accounts, ...)` — all three are
-//    telemetry-event emission, gated on a telemetry subsystem algod-rust
-//    doesn't have). Since algod-rust has no telemetry client for these
-//    intervals to govern, adding them as inert round-trip fields would
-//    misrepresent them as "will matter once you set them" — unlike the
-//    fields above (which have *some* independent local meaning: log
-//    verbosity, cadaver file rotation, etc.), these four have none. Same
-//    disposition pattern as the networking fields already excluded in the
-//    module docs above (message-hash-bucket dedup filtering, etc.).
+//    build (`ledger/acctupdates.go:2291` calls
+//    `au.log.Metrics(telemetryspec.Accounts, ...)`, telemetry-event emission
+//    gated on a telemetry subsystem algod-rust doesn't have). Since
+//    algod-rust has no telemetry client for these to govern, adding them as
+//    inert round-trip fields would misrepresent them as "will matter once
+//    you set them" — unlike the fields above (which have *some* independent
+//    local meaning: log verbosity, cadaver file rotation, etc.), these two
+//    have none. Same disposition pattern as the networking fields already
+//    excluded in the module docs above (message-hash-bucket dedup
+//    filtering, etc.).
+//
+// `PeerConnectionsUpdateInterval`/`HeartbeatUpdateInterval` were also in
+// category 2 as of #756, but issue #1189 (part of the from-scratch #830
+// field-by-field audit, independent of #756's own scope decision) revisited
+// them: every `config.Local` field must at least round-trip through
+// `config.json` for an operator's real file (category 1's bar), even one
+// whose *only* upstream effect remains the same no-op-for-algod-rust
+// telemetry pipeline #756 already declined to build. They're added below as
+// documented no-ops with that rationale spelled out per field, rather than
+// left entirely absent from `Local`.
 
 /// Go: `TelemetryToLog bool` `version[5]:"true"` (`localTemplate.go:374-375`).
 /// **Documented no-op**: controls whether telemetry-tagged log lines are
@@ -1278,6 +1297,71 @@ static ENABLE_PROFILER: VersionedDefault<bool> = VersionedDefault::new(&[(0, || 
 /// but is never read for any behavior.
 static ENABLE_TOP_ACCOUNTS_REPORTING: VersionedDefault<bool> =
     VersionedDefault::new(&[(0, || false)]);
+
+/// Go: `PeerConnectionsUpdateInterval int` `version[5]:"3600"`
+/// (`localTemplate.go:358`). **Documented no-op** (issue #1189, see the
+/// category-2 note above): its only upstream consumer is
+/// `network/wsNetwork.go`'s `peerConnectionStater.sendPeerConnectionsTelemetryStatus`
+/// (also `network/p2pNetwork.go:260`'s identical wiring for the P2P
+/// transport), which returns immediately when `!log.GetTelemetryEnabled()`
+/// and otherwise periodically emits a `telemetryspec.PeerConnectionsEvent`
+/// to the remote-telemetry-reporting pipeline #756 already declined to
+/// build. Round-trips through `config.json` for forward compatibility;
+/// would gain real meaning only if a future issue adds that pipeline.
+static PEER_CONNECTIONS_UPDATE_INTERVAL: VersionedDefault<i64> =
+    VersionedDefault::new(&[(5, || 3_600)]);
+
+/// Go: `HeartbeatUpdateInterval int` `version[27]:"600"` (`localTemplate.go:362`).
+/// **Documented no-op** (issue #1189, see the category-2 note above):
+/// despite the name, this does not gate the AVM-level participation
+/// heartbeat-transaction machinery algod-rust already has
+/// (`crates/core/algo-ledger/src/heartbeat.rs`,
+/// `bin/algod-rust/src/commands/heartbeat_service.rs`) — go's own
+/// consensus-level heartbeat-challenge cadence is derived from
+/// `ConsensusParams.HeartbeatInterval`, an unrelated field. This config
+/// knob's only consumer is `cmd/algod/main.go`'s "Send a heartbeat event
+/// every 10 minutes as a sign of life" goroutine, which calls
+/// `log.EventWithDetails` on a ticker — pure remote-telemetry-reporting
+/// emission, the same pipeline #756 already declined to build. Round-trips
+/// through `config.json` for forward compatibility; would gain real meaning
+/// only if a future issue adds that pipeline.
+static HEARTBEAT_UPDATE_INTERVAL: VersionedDefault<i64> = VersionedDefault::new(&[(27, || 600)]);
+
+/// Go: `ParticipationKeysRefreshInterval time.Duration` `version[16]:"60000000000"`
+/// (`localTemplate.go:510`, 60s in nanoseconds). **Documented no-op**
+/// (issue #1189): unlike every other field in this no-op group, this one
+/// has no consumer anywhere in go-algorand's `v5.0.0-stable` production
+/// code at all -- not even a telemetry-gated one. (`grep -rn
+/// ParticipationKeysRefreshInterval` across the pinned go-algorand tree
+/// turns up only its own struct-tag/default-value declarations, test files
+/// that set it directly on a `config.Local` struct literal bypassing
+/// `config.json` entirely, and installer/testdata config fixtures -- no
+/// `node/`, `data/account/`, or daemon code path ever reads it.) It is
+/// genuinely vestigial upstream, not merely telemetry-gated; round-trips
+/// through `config.json` for forward compatibility only, matching go's own
+/// (non-)behavior exactly.
+static PARTICIPATION_KEYS_REFRESH_INTERVAL: VersionedDefault<i64> =
+    VersionedDefault::new(&[(16, || 60_000_000_000)]);
+
+/// Go: `EnablePingHandler bool` `version[6]:"true"` (`localTemplate.go:388`,
+/// "controls whether the gossip node would respond to ping messages with a
+/// pong message."). **Documented no-op** (issue #1189): like
+/// `ParticipationKeysRefreshInterval`, this field has no consumer anywhere
+/// in go-algorand's `v5.0.0-stable` production code -- `grep -rn
+/// PingHandler` across the pinned tree turns up only the struct-tag/default
+/// declarations and `network/wsNetwork_test.go` setting it directly on a
+/// `WebsocketNetwork.config` struct field in-process (never through
+/// `config.json`). go's gorilla/websocket connections never call
+/// `SetPingHandler` to install a custom handler gated on this flag --
+/// gorilla's *default* automatic pong response applies unconditionally
+/// regardless of this field's value, so real go-algorand nodes always
+/// answer WS-protocol pings the same way no matter what this is set to.
+/// Actually wiring `algo_network::ws_peer` to suppress
+/// `tokio-tungstenite`'s automatic pong below this flag (as originally
+/// proposed) would therefore make algod-rust *diverge* from go's real
+/// behavior, not match it. Round-trips through `config.json` for forward
+/// compatibility, matching go's own (non-)behavior exactly.
+static ENABLE_PING_HANDLER: VersionedDefault<bool> = VersionedDefault::new(&[(6, || true)]);
 
 // --- Metrics fields (issue #776, follow-up to #756) -------------------------
 //
@@ -1527,6 +1611,9 @@ fn default_disable_api_auth() -> bool {
 }
 fn default_enable_gossip_service() -> bool {
     ENABLE_GOSSIP_SERVICE.at(LATEST_VERSION)
+}
+fn default_disable_networking() -> bool {
+    DISABLE_NETWORKING.at(LATEST_VERSION)
 }
 fn default_enable_ledger_service() -> bool {
     ENABLE_LEDGER_SERVICE.at(LATEST_VERSION)
@@ -1801,6 +1888,18 @@ fn default_enable_profiler() -> bool {
 fn default_enable_top_accounts_reporting() -> bool {
     ENABLE_TOP_ACCOUNTS_REPORTING.at(LATEST_VERSION)
 }
+fn default_peer_connections_update_interval() -> i64 {
+    PEER_CONNECTIONS_UPDATE_INTERVAL.at(LATEST_VERSION)
+}
+fn default_heartbeat_update_interval() -> i64 {
+    HEARTBEAT_UPDATE_INTERVAL.at(LATEST_VERSION)
+}
+fn default_participation_keys_refresh_interval() -> i64 {
+    PARTICIPATION_KEYS_REFRESH_INTERVAL.at(LATEST_VERSION)
+}
+fn default_enable_ping_handler() -> bool {
+    ENABLE_PING_HANDLER.at(LATEST_VERSION)
+}
 fn default_public_address() -> String {
     PUBLIC_ADDRESS.at(LATEST_VERSION)
 }
@@ -2004,6 +2103,14 @@ pub struct Local {
         default = "default_enable_gossip_service"
     )]
     pub enable_gossip_service: bool,
+
+    /// Go: `DisableNetworking`. Wired: when `true`, `relay`/`participate`
+    /// skip opening the WS-gossip listener, dialing/DNS-discovering WS-gossip
+    /// peers, and starting the libp2p P2P transport, plus `relay`'s
+    /// block-catchup loop — see [`DISABLE_NETWORKING`]'s doc comment and
+    /// `bin/algod-rust/src/commands/network_common.rs::networking_active`.
+    #[serde(rename = "DisableNetworking", default = "default_disable_networking")]
+    pub disable_networking: bool,
 
     /// Go: `EnableLedgerService`. **Documented no-op**: algod-rust has no
     /// ledger-serving HTTP service to gate yet (see this field's
@@ -2729,6 +2836,41 @@ pub struct Local {
     )]
     pub enable_top_accounts_reporting: bool,
 
+    /// Go: `PeerConnectionsUpdateInterval`. **Documented no-op** (issue
+    /// #1189) — see [`PEER_CONNECTIONS_UPDATE_INTERVAL`]'s doc comment.
+    #[serde(
+        rename = "PeerConnectionsUpdateInterval",
+        default = "default_peer_connections_update_interval"
+    )]
+    pub peer_connections_update_interval: i64,
+
+    /// Go: `HeartbeatUpdateInterval`. **Documented no-op** (issue #1189) —
+    /// see [`HEARTBEAT_UPDATE_INTERVAL`]'s doc comment. Not to be confused
+    /// with the consensus-level heartbeat-challenge machinery
+    /// (`heartbeat_service.rs`), which this field does not gate.
+    #[serde(
+        rename = "HeartbeatUpdateInterval",
+        default = "default_heartbeat_update_interval"
+    )]
+    pub heartbeat_update_interval: i64,
+
+    /// Go: `ParticipationKeysRefreshInterval`. **Documented no-op** (issue
+    /// #1189) — see [`PARTICIPATION_KEYS_REFRESH_INTERVAL`]'s doc comment;
+    /// unlike every other no-op field in this file, upstream itself never
+    /// consumes this one either.
+    #[serde(
+        rename = "ParticipationKeysRefreshInterval",
+        default = "default_participation_keys_refresh_interval"
+    )]
+    pub participation_keys_refresh_interval: i64,
+
+    /// Go: `EnablePingHandler`. **Documented no-op** (issue #1189) — see
+    /// [`ENABLE_PING_HANDLER`]'s doc comment; upstream itself never consumes
+    /// this field either (gorilla/websocket's automatic pong applies
+    /// unconditionally), so there is no real behavior to match by wiring it.
+    #[serde(rename = "EnablePingHandler", default = "default_enable_ping_handler")]
+    pub enable_ping_handler: bool,
+
     // --- Remaining networking fields (issue #768) ------------------------
     /// Go: `PublicAddress`. Round-trip only — see the module note above
     /// [`PUBLIC_ADDRESS`].
@@ -2946,6 +3088,7 @@ impl Local {
             tls_key_file: TLS_KEY_FILE.at(version),
             disable_api_auth: DISABLE_API_AUTH.at(version),
             enable_gossip_service: ENABLE_GOSSIP_SERVICE.at(version),
+            disable_networking: DISABLE_NETWORKING.at(version),
             enable_ledger_service: ENABLE_LEDGER_SERVICE.at(version),
             enable_block_service: ENABLE_BLOCK_SERVICE.at(version),
             enable_gossip_block_service: ENABLE_GOSSIP_BLOCK_SERVICE.at(version),
@@ -3050,6 +3193,10 @@ impl Local {
             log_archive_max_age: LOG_ARCHIVE_MAX_AGE.at(version),
             enable_profiler: ENABLE_PROFILER.at(version),
             enable_top_accounts_reporting: ENABLE_TOP_ACCOUNTS_REPORTING.at(version),
+            peer_connections_update_interval: PEER_CONNECTIONS_UPDATE_INTERVAL.at(version),
+            heartbeat_update_interval: HEARTBEAT_UPDATE_INTERVAL.at(version),
+            participation_keys_refresh_interval: PARTICIPATION_KEYS_REFRESH_INTERVAL.at(version),
+            enable_ping_handler: ENABLE_PING_HANDLER.at(version),
             public_address: PUBLIC_ADDRESS.at(version),
             p2p_hybrid_net_address: P2P_HYBRID_NET_ADDRESS.at(version),
             announce_participation_key: ANNOUNCE_PARTICIPATION_KEY.at(version),
@@ -3163,6 +3310,7 @@ impl Local {
                 cur,
                 next,
             );
+            migrate_field(&mut self.disable_networking, &DISABLE_NETWORKING, cur, next);
             migrate_field(
                 &mut self.enable_ledger_service,
                 &ENABLE_LEDGER_SERVICE,
@@ -3571,6 +3719,30 @@ impl Local {
             migrate_field(
                 &mut self.enable_top_accounts_reporting,
                 &ENABLE_TOP_ACCOUNTS_REPORTING,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.peer_connections_update_interval,
+                &PEER_CONNECTIONS_UPDATE_INTERVAL,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.heartbeat_update_interval,
+                &HEARTBEAT_UPDATE_INTERVAL,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.participation_keys_refresh_interval,
+                &PARTICIPATION_KEYS_REFRESH_INTERVAL,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_ping_handler,
+                &ENABLE_PING_HANDLER,
                 cur,
                 next,
             );
@@ -5087,7 +5259,16 @@ mod tests {
         // also removed from this list, since they now round-trip through
         // `config.json` like every other field), and the remaining 15
         // deferred to category-3 follow-up issues (a real `Local` field
-        // doesn't exist for them yet, so they stay listed below).
+        // doesn't exist for them yet, so they stay listed below). Issue
+        // #1189 (split from #1149) closed 5 more of those 15:
+        // `DisableNetworking` wired into `relay`/`participate`'s network
+        // startup (see [`DISABLE_NETWORKING`]); `EnablePingHandler`,
+        // `HeartbeatUpdateInterval`, `ParticipationKeysRefreshInterval`, and
+        // `PeerConnectionsUpdateInterval` formally retired as documented
+        // no-ops (each has no real-behavior consumer even in go-algorand
+        // itself, or only feeds the remote-telemetry pipeline #756 already
+        // declined to build — see each field's `VersionedDefault` doc
+        // comment) — all 5 removed from this list.
         // `NetAddress` is a special case: issue #788 already decided it
         // deliberately has no `Local` field at all (kept as a
         // per-subcommand CLI flag instead — see the module-level doc
@@ -5095,17 +5276,12 @@ mod tests {
         // here permanently, not as an open gap.
         const NOT_YET_PORTED: &[&str] = &[
             "AccountUpdatesStatsInterval",
-            "DisableNetworking",
             "EnableAccountUpdatesStats",
             "EnableMetricReporting",
-            "EnablePingHandler",
             "EnableTxBacklogRateLimiting",
             "EnableVerbosedTransactionSyncLogging",
             "ForceFetchTransactions",
-            "HeartbeatUpdateInterval",
             "NetAddress",
-            "ParticipationKeysRefreshInterval",
-            "PeerConnectionsUpdateInterval",
             "TransactionSyncDataExchangeRate",
             "TransactionSyncSignificantMessageThreshold",
             "TxBacklogReservedCapacityPerPeer",
@@ -5492,14 +5668,62 @@ mod tests {
     /// otherwise unaffected.
     #[test]
     fn telemetry_only_fields_are_accepted_but_ignored_not_modeled() {
+        // `PeerConnectionsUpdateInterval`/`HeartbeatUpdateInterval` were
+        // promoted to real (documented-no-op) `Local` fields by issue #1189
+        // -- see `telemetry_only_no_op_fields_still_round_trip` below for
+        // their coverage. `EnableAccountUpdatesStats`/
+        // `AccountUpdatesStatsInterval` remain genuinely unmodeled (#756).
         let cfg = Local::load_from_str(
-            r#"{"PeerConnectionsUpdateInterval": 60, "HeartbeatUpdateInterval": 30, "EnableAccountUpdatesStats": true, "AccountUpdatesStatsInterval": 1}"#,
+            r#"{"EnableAccountUpdatesStats": true, "AccountUpdatesStatsInterval": 1}"#,
         )
         .expect("unknown JSON keys are ignored, not rejected");
         // Nothing to assert on the ignored keys themselves (they have no
         // field) -- confirm the rest of the config still loaded at its
         // ordinary defaults, i.e. parsing wasn't otherwise disrupted.
         assert_eq!(cfg, Local::default());
+    }
+
+    /// Issue #1189: `PeerConnectionsUpdateInterval`/`HeartbeatUpdateInterval`/
+    /// `ParticipationKeysRefreshInterval`/`EnablePingHandler` are documented
+    /// no-ops (no algod-rust behavior reads them), but unlike the still-fully
+    /// -unmodeled telemetry fields above, they now have real `Local` fields
+    /// that must actually round-trip a non-default operator override through
+    /// `config.json` -- proving they're modeled, not silently swallowed.
+    #[test]
+    fn telemetry_only_no_op_fields_still_round_trip() {
+        // `"Version": LATEST_VERSION` avoids `migrate()`'s well-known
+        // trample edge case (documented on `migrate_field`): an explicit
+        // override that happens to equal a field's *pre-tag* default (here,
+        // `EnablePingHandler: false` matches `bool::default()` before its
+        // v6 tag applies) is indistinguishable from "never touched" and
+        // would otherwise get silently advanced forward during migration —
+        // exactly mirroring go's own `migrate()` behavior, not a bug in
+        // this test.
+        let cfg = Local::load_from_str(&format!(
+            r#"{{"Version": {LATEST_VERSION}, "PeerConnectionsUpdateInterval": 60, "HeartbeatUpdateInterval": 30, "ParticipationKeysRefreshInterval": 5000000000, "EnablePingHandler": false}}"#
+        ))
+        .expect("parses");
+        assert_eq!(cfg.peer_connections_update_interval, 60);
+        assert_eq!(cfg.heartbeat_update_interval, 30);
+        assert_eq!(cfg.participation_keys_refresh_interval, 5_000_000_000);
+        assert!(!cfg.enable_ping_handler);
+
+        let json = cfg.to_json_full().expect("serializes");
+        let round_tripped = Local::load_from_str(&json).expect("re-parses");
+        assert_eq!(cfg, round_tripped);
+    }
+
+    /// Issue #1189: default values at each field's own version boundary
+    /// match go's `local_defaults.go` exactly.
+    #[test]
+    fn telemetry_only_no_op_fields_default_at_version() {
+        assert_eq!(PEER_CONNECTIONS_UPDATE_INTERVAL.at(LATEST_VERSION), 3_600);
+        assert_eq!(HEARTBEAT_UPDATE_INTERVAL.at(LATEST_VERSION), 600);
+        assert_eq!(
+            PARTICIPATION_KEYS_REFRESH_INTERVAL.at(LATEST_VERSION),
+            60_000_000_000
+        );
+        assert!(ENABLE_PING_HANDLER.at(LATEST_VERSION));
     }
 
     // -----------------------------------------------------------------
