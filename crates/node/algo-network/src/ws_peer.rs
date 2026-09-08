@@ -130,7 +130,14 @@ const PING_LENGTH: usize = 8;
 /// without receiving an explicit message-of-interest update.
 ///
 /// Matches `defaultSendMessageTags` in `go-algorand/network/wsPeer.go`.
-fn default_send_message_tags() -> HashSet<Tag> {
+///
+/// `pub(crate)`: also used by [`crate::ws_network`]'s `wantTXGossip`
+/// role-narrowing logic (issue #1156) as the seed set that
+/// `register_message_interest`/`deregister_message_interest` copy into
+/// `messages_of_interest` the first time either is called — mirrors go's
+/// `maps.Copy(wn.messagesOfInterest, defaultSendMessageTags)`
+/// (`network/wsNetwork.go`).
+pub(crate) fn default_send_message_tags() -> HashSet<Tag> {
     let mut tags = HashSet::new();
     tags.insert(Tag::AgreementVote);
     tags.insert(Tag::MsgDigestSkip);
@@ -720,6 +727,17 @@ impl PeerHandle {
         let (send_bulk_tx, mut send_bulk_rx) = mpsc::channel::<WriteCommand>(SEND_BUFFER_LENGTH);
         let (incoming_tx, incoming_rx) = mpsc::channel(MSGS_IN_READ_BUFFER_PER_PEER);
 
+        // Issue #1156: this connection's own view of what the *inbound*
+        // peer wants to receive, applied by the write loop below. Mirrors
+        // the outbound path's identically-named field
+        // (`WsPeer::send_message_tags`) — before this fix, the inbound
+        // write loop never consulted any such state (`WriteCommand::
+        // UpdateFilter` was a hardcoded no-op here), so an accepted
+        // (dialed-in) peer's `MsgOfInterest` narrowing — e.g. a
+        // non-participating dialer deregistering `TX` gossip — was
+        // silently ignored by a relay accepting that connection.
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+
         // Stateful vote compression negotiation, shared between the read and
         // write loops below — see `WsPeer::start`'s identical setup for the
         // outbound path.
@@ -802,6 +820,43 @@ impl PeerHandle {
                                         Some(p) => p,
                                         None => continue,
                                     };
+
+                                    // --- MI (MsgOfInterest) handling ---
+                                    // The peer is telling us which tags it
+                                    // wants to receive; route the update to
+                                    // our own write loop via the high-prio
+                                    // channel (matches the outbound read
+                                    // loop's identical handling above, and
+                                    // Go's writeLoopSendMsg, which applies
+                                    // MI updates through the peer's send
+                                    // channel to avoid locking).
+                                    if tag == Tag::MsgOfInterest {
+                                        match unmarshal_msg_of_interest(&payload) {
+                                            Ok(new_tags) => {
+                                                let cmd = WriteCommand::UpdateFilter(new_tags);
+                                                if let Err(e) =
+                                                    read_send_high_prio_tx.send(cmd).await
+                                                {
+                                                    tracing::warn!(
+                                                        addr = %read_addr,
+                                                        error = %e,
+                                                        "inbound read loop: failed to enqueue MI \
+                                                         filter update, write loop may have closed"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    addr = %read_addr,
+                                                    error = %e,
+                                                    "inbound read loop: bad MI message, disconnecting"
+                                                );
+                                                read_closing.cancel();
+                                                break;
+                                            }
+                                        }
+                                        continue;
+                                    }
 
                                     // --- MsgDigestSkip handling ---
                                     // The peer is telling us it already has a
@@ -898,6 +953,7 @@ impl PeerHandle {
                                     sm,
                                     &mut ws_writer,
                                     &outgoing_filter,
+                                    &send_message_tags,
                                     features,
                                     vote_table_size,
                                     &stateful_vote_enabled,
@@ -912,7 +968,9 @@ impl PeerHandle {
                                     break;
                                 }
                             }
-                            Some(WriteCommand::UpdateFilter(_)) => { /* no-op for inbound */ }
+                            Some(WriteCommand::UpdateFilter(new_tags)) => {
+                                apply_inbound_filter_update(&send_message_tags, new_tags).await;
+                            }
                             Some(WriteCommand::VpAbort) => {
                                 send_vp_abort_axum(&mut ws_writer, &write_addr).await;
                             }
@@ -926,6 +984,7 @@ impl PeerHandle {
                                     sm,
                                     &mut ws_writer,
                                     &outgoing_filter,
+                                    &send_message_tags,
                                     features,
                                     vote_table_size,
                                     &stateful_vote_enabled,
@@ -940,7 +999,9 @@ impl PeerHandle {
                                     break;
                                 }
                             }
-                            Some(WriteCommand::UpdateFilter(_)) => {}
+                            Some(WriteCommand::UpdateFilter(new_tags)) => {
+                                apply_inbound_filter_update(&send_message_tags, new_tags).await;
+                            }
                             Some(WriteCommand::VpAbort) => {
                                 send_vp_abort_axum(&mut ws_writer, &write_addr).await;
                             }
@@ -977,6 +1038,29 @@ impl PeerHandle {
     }
 }
 
+/// Applies an inbound peer's `MI` update to this connection's own
+/// `send_message_tags` — the inbound-write-loop counterpart of the
+/// outbound path's `WriteCommand::UpdateFilter` handling in
+/// [`process_write_command`] (issue #1156: this used to be a hardcoded
+/// no-op for inbound connections, so an accepted peer's narrowed interest
+/// set — e.g. a non-participating dialer deregistering `TX` — was silently
+/// ignored).
+///
+/// Always preserves the control tags needed for protocol operation
+/// (`MsgOfInterest`, `NetIDVerification`), same defense-in-depth as the
+/// outbound path: go's `wsPeer.writeLoopSendMsg` replaces `sendMessageTag`
+/// verbatim, but without these two tags the peer could never update its
+/// interest again, and identity re-verification would break.
+async fn apply_inbound_filter_update(
+    send_message_tags: &Arc<RwLock<HashSet<Tag>>>,
+    mut new_tags: HashSet<Tag>,
+) {
+    new_tags.insert(Tag::MsgOfInterest);
+    new_tags.insert(Tag::NetIDVerification);
+    let mut tags = send_message_tags.write().await;
+    *tags = new_tags;
+}
+
 /// Sends a single outgoing data message on the axum inbound write loop:
 /// applies the outgoing dedup filter, vpack-compresses `AgreementVote`
 /// payloads (mirroring [`compress_outgoing_vote`]/`try_compress_vote` on the
@@ -991,6 +1075,7 @@ async fn write_inbound_data_message(
     sm: SendMessage,
     ws_writer: &mut SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>,
     outgoing_filter: &Option<Arc<MessageFilter>>,
+    send_message_tags: &Arc<RwLock<HashSet<Tag>>>,
     features: PeerFeatureFlags,
     vote_table_size: u32,
     stateful_vote_enabled: &Arc<AtomicBool>,
@@ -999,11 +1084,21 @@ async fn write_inbound_data_message(
 ) -> Result<(), ()> {
     use futures_util::SinkExt;
 
+    let tag = sm.msg.tag;
+
+    // Issue #1156: message-of-interest filter — the peer is not interested
+    // in this tag, silently drop (mirrors the outbound write loop's
+    // identical check in `process_write_command`).
+    {
+        let tags = send_message_tags.read().await;
+        if !tags.contains(&tag) {
+            return Ok(());
+        }
+    }
+
     if outgoing_filter_suppresses(&sm.msg, outgoing_filter) {
         return Ok(());
     }
-
-    let tag = sm.msg.tag;
     let vote_compressed = if tag == Tag::AgreementVote
         && features.contains(PeerFeatureFlags::COMPRESSED_VOTE_VPACK)
         && !sm.msg.payload.is_empty()

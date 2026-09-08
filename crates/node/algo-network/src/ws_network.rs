@@ -51,7 +51,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,13 +78,14 @@ use crate::message::OutgoingMessage;
 use crate::message_filter::{
     dedup_safe_tag, generate_message_digest, MessageFilter, MESSAGE_FILTER_SIZE,
 };
+use crate::msg_of_interest::marshal_msg_of_interest;
 use crate::peer_role::{ARCHIVAL_ROLE, RELAY_ROLE};
 use crate::phonebook::Phonebook;
 use crate::request_response::{encode_uvarint, hash_topics, RESPONSE_HASH_FIELD};
 use crate::request_tracker::ConnectionTracker;
 use crate::tag::Tag;
 use crate::topics::{Topic, Topics};
-use crate::ws_peer::PeerHandle;
+use crate::ws_peer::{default_send_message_tags, PeerHandle};
 
 // ---------------------------------------------------------------------------
 // Constants (matching go-algorand defaults)
@@ -161,6 +162,36 @@ fn release_throttled_slot_if_held(counter: &AtomicI32, held_a_slot: bool) {
         counter.fetch_add(1, Ordering::SeqCst);
     }
 }
+
+// ---------------------------------------------------------------------------
+// wantTXGossip role-transition narrowing (issue #1156)
+// ---------------------------------------------------------------------------
+
+/// Reports the node-role facts that drive dynamic transaction-gossip
+/// narrowing/widening.
+///
+/// Mirrors go's `NodeInfo` interface (`network/wsNetwork.go`) — narrowed
+/// here to only the one method [`WebsocketNetwork`] actually consults.
+/// When no implementation is registered via
+/// [`WebsocketNetwork::set_node_info`], the network behaves like go's
+/// `nopeNodeInfo` fallback: never participating.
+pub trait NodeInfo: Send + Sync {
+    /// Returns `true` if this node holds live participation keys and may
+    /// vote on blocks or propose blocks — i.e. it needs the transaction
+    /// pool populated via gossip even though it isn't a relay.
+    fn is_participating(&self) -> bool;
+}
+
+/// `wantTXGossip` has not yet been decided — the initial state for a
+/// non-relay, non-force-fetch node before its first role-transition
+/// refresh. Matches go's `wantTXGossipUnk`.
+pub const WANT_TX_GOSSIP_UNK: u8 = 0;
+/// This node currently wants (and has registered interest in) `TX` gossip.
+/// Matches go's `wantTXGossipYes`.
+pub const WANT_TX_GOSSIP_YES: u8 = 1;
+/// This node currently does not want `TX` gossip and has deregistered
+/// interest in it. Matches go's `wantTXGossipNo`.
+pub const WANT_TX_GOSSIP_NO: u8 = 2;
 
 /// Returns the current time as nanoseconds since the Unix epoch, matching
 /// the clock [`crate::message::IncomingMessage::received_at`] is stamped
@@ -306,6 +337,20 @@ pub struct WebsocketNetworkConfig {
     /// `false`, matching go's `EnableRequestLogger`). See
     /// [`crate::request_logger`] for what gets logged and why.
     pub enable_request_logger: bool,
+
+    /// Force this node to keep subscribing to transaction gossip
+    /// (`TX`) even though it is neither a relay nor participating
+    /// (default: `false`).
+    ///
+    /// Matches Go's `ForceFetchTransactions`. Setting this pins
+    /// `wantTXGossip` to "yes" at startup and disables the dynamic
+    /// role-transition narrowing entirely (`OnNetworkAdvance` never wakes
+    /// the refresh loop while this is set — see
+    /// [`WebsocketNetwork::on_network_advance`]), the same way go's
+    /// `postMessagesOfInterestThread` gates on
+    /// `!wn.relayMessages && !wn.config.ForceFetchTransactions`
+    /// (`network/wsNetwork.go`).
+    pub force_fetch_transactions: bool,
 }
 
 /// Default block-service memory cap: 500,000,000 bytes.
@@ -348,6 +393,7 @@ impl Default for WebsocketNetworkConfig {
             outgoing_message_filter_bucket_size: 128,
             disable_localhost_connection_rate_limit: true,
             enable_request_logger: false,
+            force_fetch_transactions: false,
         }
     }
 }
@@ -516,6 +562,32 @@ pub struct WebsocketNetwork {
     /// outgoing peers can ever be eligible for a performance-based
     /// disconnect (issue #1105) — this is what enforces that bound.
     throttled_outgoing_connections: Arc<AtomicI32>,
+
+    // -------------------------------------------------------------------
+    // wantTXGossip role-transition narrowing (issue #1156)
+    // -------------------------------------------------------------------
+    /// Node-role oracle consulted by the MOI refresh loop. `None` behaves
+    /// like go's `nopeNodeInfo` (never participating). Set via
+    /// [`Self::set_node_info`].
+    node_info: Arc<std::sync::Mutex<Option<Arc<dyn NodeInfo>>>>,
+
+    /// Current transaction-gossip subscription state (one of
+    /// [`WANT_TX_GOSSIP_UNK`]/[`WANT_TX_GOSSIP_YES`]/[`WANT_TX_GOSSIP_NO`]).
+    /// Mirrors go's `wn.wantTXGossip`.
+    want_tx_gossip: Arc<AtomicU8>,
+
+    /// This node's own advertised message-of-interest tag set, sent to
+    /// peers whenever it is customized. `None` means "never customized" —
+    /// mirrors go's nullable `wn.messagesOfInterest` map, which stays `nil`
+    /// (and so nothing gets pushed to peers) until the first
+    /// `register_message_interest`/`deregister_message_interest` call.
+    messages_of_interest: Arc<RwLock<Option<HashSet<Tag>>>>,
+
+    /// Sender for on-demand MOI-refresh requests (mirrors go's
+    /// `wn.messagesOfInterestRefresh`), woken by
+    /// [`Self::on_network_advance`]. Lazily initialized when
+    /// [`Self::start_arc`] spawns the refresh loop.
+    messages_of_interest_refresh_tx: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 impl WebsocketNetwork {
@@ -540,6 +612,16 @@ impl WebsocketNetwork {
         } else {
             config.gossip_fanout as i32
         };
+        // Mirrors go's `setup()`: `if wn.relayMessages || wn.config.ForceFetchTransactions
+        // { wn.wantTXGossip.Store(wantTXGossipYes) }` (`network/wsNetwork.go:601-604`).
+        // A plain non-relay, non-force node starts "undecided" — its first
+        // `OnNetworkAdvance`-triggered refresh decides based on
+        // `is_participating()`.
+        let want_tx_gossip_seed = if effective_relay_messages || config.force_fetch_transactions {
+            WANT_TX_GOSSIP_YES
+        } else {
+            WANT_TX_GOSSIP_UNK
+        };
         Self {
             config,
             peers: Arc::new(RwLock::new(HashMap::new())),
@@ -563,6 +645,10 @@ impl WebsocketNetwork {
             throttled_outgoing_connections: Arc::new(AtomicI32::new(
                 throttled_outgoing_connections_seed,
             )),
+            node_info: Arc::new(std::sync::Mutex::new(None)),
+            want_tx_gossip: Arc::new(AtomicU8::new(want_tx_gossip_seed)),
+            messages_of_interest: Arc::new(RwLock::new(None)),
+            messages_of_interest_refresh_tx: Mutex::new(None),
         }
     }
 
@@ -630,6 +716,97 @@ impl WebsocketNetwork {
     pub async fn peer_outgoing_message_filter(&self, addr: &str) -> Option<Arc<MessageFilter>> {
         let peers = self.peers.read().await;
         peers.get(addr).and_then(|e| e.outgoing_filter.clone())
+    }
+
+    /// Registers the [`NodeInfo`] oracle consulted by the `wantTXGossip`
+    /// role-transition refresh loop (issue #1156). Mirrors go's
+    /// `WebsocketNetwork.nodeInfo` field, normally wired to the node's
+    /// participation-key registry. Not calling this leaves the network
+    /// behaving like go's `nopeNodeInfo` fallback (never participating).
+    pub fn set_node_info(&self, node_info: Arc<dyn NodeInfo>) {
+        *self.node_info.lock().expect("node_info lock poisoned") = Some(node_info);
+    }
+
+    /// Whether this node currently holds live participation keys, per the
+    /// registered [`NodeInfo`] oracle (`false` if none is registered).
+    /// Mirrors go's `wn.nodeInfo.IsParticipating()`.
+    fn is_participating(&self) -> bool {
+        self.node_info
+            .lock()
+            .expect("node_info lock poisoned")
+            .as_ref()
+            .is_some_and(|info| info.is_participating())
+    }
+
+    /// Current `wantTXGossip` state — one of [`WANT_TX_GOSSIP_UNK`]/
+    /// [`WANT_TX_GOSSIP_YES`]/[`WANT_TX_GOSSIP_NO`]. Exposed mainly for
+    /// tests; mirrors go's `wn.wantTXGossip.Load()`.
+    pub fn want_tx_gossip(&self) -> u8 {
+        self.want_tx_gossip.load(Ordering::SeqCst)
+    }
+
+    /// Adds `tag` to this node's advertised message-of-interest set and
+    /// pushes the updated set to every currently-connected peer. Mirrors
+    /// go's `registerMessageInterest` (`network/wsNetwork.go`).
+    ///
+    /// The first call on a network that has never customized its interest
+    /// set seeds it from [`default_send_message_tags`] first (go's
+    /// `maps.Copy(wn.messagesOfInterest, defaultSendMessageTags)`).
+    async fn register_message_interest(&self, tag: Tag) {
+        let encoded = {
+            let mut moi = self.messages_of_interest.write().await;
+            let set = moi.get_or_insert_with(default_send_message_tags);
+            set.insert(tag);
+            marshal_msg_of_interest(&set.iter().copied().collect::<Vec<_>>())
+        };
+        self.push_message_of_interest_update(encoded).await;
+    }
+
+    /// Removes `tag` from this node's advertised message-of-interest set
+    /// and pushes the updated set to every currently-connected peer.
+    /// Mirrors go's `DeregisterMessageInterest`.
+    async fn deregister_message_interest(&self, tag: Tag) {
+        let encoded = {
+            let mut moi = self.messages_of_interest.write().await;
+            let set = moi.get_or_insert_with(default_send_message_tags);
+            set.remove(&tag);
+            marshal_msg_of_interest(&set.iter().copied().collect::<Vec<_>>())
+        };
+        self.push_message_of_interest_update(encoded).await;
+    }
+
+    /// Sends an already-encoded `MI` payload to every currently-connected
+    /// peer, high-priority (mirrors go's `updateMessagesOfInterestEnc`
+    /// iterating `wn.peerSnapshot` and go's `wsPeer.sendMessagesOfInterest`,
+    /// which queues on the peer's high-priority send path).
+    async fn push_message_of_interest_update(&self, encoded: Vec<u8>) {
+        let peers = self.peers.read().await;
+        for entry in peers.values() {
+            let msg = OutgoingMessage::new(Tag::MsgOfInterest, encoded.clone());
+            if let Err(e) = entry.handle.send_priority(msg) {
+                tracing::debug!(error = %e, "failed to push messages-of-interest update to peer");
+            }
+        }
+    }
+
+    /// Runs one `wantTXGossip` role-transition decision — the body of go's
+    /// `postMessagesOfInterestThread` loop iteration
+    /// (`network/wsNetwork.go`): if this node is now participating and
+    /// wasn't already subscribed to `TX` gossip, register interest in it;
+    /// if it is no longer participating and was subscribed, deregister it.
+    /// A no-op if the state hasn't changed since the last refresh.
+    async fn refresh_want_tx_gossip(&self) {
+        let participating = self.is_participating();
+        let current = self.want_tx_gossip.load(Ordering::SeqCst);
+        if participating && current != WANT_TX_GOSSIP_YES {
+            self.register_message_interest(Tag::Transaction).await;
+            self.want_tx_gossip
+                .store(WANT_TX_GOSSIP_YES, Ordering::SeqCst);
+        } else if !participating && current != WANT_TX_GOSSIP_NO {
+            self.deregister_message_interest(Tag::Transaction).await;
+            self.want_tx_gossip
+                .store(WANT_TX_GOSSIP_NO, Ordering::SeqCst);
+        }
     }
 
     /// Returns a reference to the connection tracker.
@@ -1832,6 +2009,21 @@ impl GossipNode for WebsocketNetwork {
                 let _ = tx.try_send(MeshRequest { done: None });
             }
         }
+
+        // Issue #1156: wake the `wantTXGossip` refresh loop — but only for a
+        // node that might actually need to narrow/widen its TX-gossip
+        // subscription. Mirrors go's exact gate,
+        // `!wn.relayMessages && !wn.config.ForceFetchTransactions`
+        // (`network/wsNetwork.go`'s `OnNetworkAdvance`): a relay or a
+        // force-fetch node already pinned `wantTXGossip` to "yes" at
+        // startup and never re-evaluates it.
+        if !self.effective_relay_messages() && !self.config.force_fetch_transactions {
+            if let Ok(guard) = self.messages_of_interest_refresh_tx.try_lock() {
+                if let Some(tx) = guard.as_ref() {
+                    let _ = tx.try_send(());
+                }
+            }
+        }
     }
 
     fn get_genesis_id(&self) -> &str {
@@ -2137,6 +2329,40 @@ impl WebsocketNetwork {
         {
             let mut guard = self.mesh_update_tx.lock().await;
             *guard = Some(mesh_tx);
+        }
+
+        // Issue #1156: create the `wantTXGossip` refresh channel and spawn
+        // its consumer loop, unconditionally — mirrors go's `Start()`
+        // (`wn.messagesOfInterestRefresh = make(chan struct{}, 2)` +
+        // `go wn.postMessagesOfInterestThread()`, `network/wsNetwork.go`),
+        // which always launches the goroutine regardless of relay/force-fetch
+        // config; `on_network_advance`'s gate is what makes it a no-op for
+        // those roles, not skipping the spawn itself.
+        let (moi_tx, mut moi_rx) = mpsc::channel::<()>(2);
+        {
+            let mut guard = self.messages_of_interest_refresh_tx.lock().await;
+            *guard = Some(moi_tx);
+        }
+        let moi_task = {
+            let network = Arc::clone(self);
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        received = moi_rx.recv() => {
+                            match received {
+                                Some(()) => network.refresh_want_tx_gossip().await,
+                                None => break,
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        {
+            let mut tasks = self.tasks.lock().await;
+            tasks.push(moi_task);
         }
 
         // Build ConnectFn and PeerCounter adapters.
@@ -4589,5 +4815,454 @@ mod tests {
         assert_eq!(net.config.incoming_connections_limit, 0);
 
         net.stop().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // wantTXGossip role-transition narrowing (issue #1156)
+    //
+    // Ports go's TestWebsocketNetworkTXMessageOfInterestForceTx/_NPN/_PN
+    // (network/wsNetwork_test.go:3286,3369,3474). netA is a plain listening
+    // node that broadcasts a handful of AV/PP/TX/VB messages; netB is the
+    // dialing side under test, whose TX-gossip subscription this issue's fix
+    // narrows/widens based on role. Verified via netB's *own* received
+    // message counts, mirroring go's approach of counting what actually
+    // arrived rather than inspecting internal filter state directly.
+    // -----------------------------------------------------------------------
+    mod want_tx_gossip_tests {
+        use super::*;
+        use crate::connect::try_connect_with_phonebook;
+        use crate::handler::MessageHandler;
+        use crate::message::IncomingMessage;
+        use std::collections::HashMap as StdHashMap;
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Mutex as StdMutex;
+
+        /// Counts arrivals per tag and notifies `done` once `expected_total`
+        /// messages have arrived (any tag) — mirrors go's `msgCounters` map
+        /// + `messageArriveWg` pairing.
+        struct CountingHandler {
+            counts: Arc<StdMutex<StdHashMap<Tag, u32>>>,
+            remaining: Arc<AtomicU32>,
+            done: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl MessageHandler for CountingHandler {
+            async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+                {
+                    let mut counts = self.counts.lock().expect("counts lock poisoned");
+                    *counts.entry(msg.tag).or_insert(0) += 1;
+                }
+                if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    self.done.notify_one();
+                }
+                OutgoingMessage {
+                    action: ForwardingPolicy::Ignore,
+                    tag: msg.tag,
+                    payload: Vec::new(),
+                    topics: None,
+                }
+            }
+        }
+
+        /// Starts a plain listening `WebsocketNetwork` that netB will dial
+        /// into — matches go's `netA := makeTestWebsocketNode(t)`.
+        async fn start_net_a(genesis_id: &str) -> Arc<WebsocketNetwork> {
+            let config = WebsocketNetworkConfig {
+                genesis_id: genesis_id.to_string(),
+                network_id: "testnet".to_string(),
+                net_address: Some("127.0.0.1:0".to_string()),
+                ..Default::default()
+            };
+            let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+            let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+            net.start_relay_server()
+                .await
+                .expect("netA relay server starts");
+            net
+        }
+
+        /// Connects `net_b` out to `addr_a` and registers the resulting
+        /// peer in `net_b`'s own peer table — the dialing side of go's
+        /// `netB.Start()` (whose mesh thread would otherwise perform this
+        /// dial), done explicitly so the test doesn't depend on mesh-thread
+        /// timing.
+        async fn connect_b_to_a(net_b: &Arc<WebsocketNetwork>, addr_a: &str) {
+            let connect_config = ConnectConfig {
+                genesis_id: net_b.config.genesis_id.clone(),
+                ..ConnectConfig::default()
+            };
+            let handle = try_connect_with_phonebook(addr_a, &connect_config, net_b.phonebook())
+                .await
+                .expect("netB connects to netA");
+            net_b.add_peer(handle, PeerDirection::Outbound, None).await;
+        }
+
+        /// Registers a [`CountingHandler`] on `net` for every default
+        /// send-message tag (mirrors go's
+        /// `for tag := range defaultSendMessageTags { ... }`), returning
+        /// the shared counts map and a `Notify` fired once
+        /// `expected_total` messages have arrived.
+        fn register_counting_handlers(
+            net: &Arc<WebsocketNetwork>,
+            expected_total: u32,
+        ) -> (
+            Arc<StdMutex<StdHashMap<Tag, u32>>>,
+            Arc<tokio::sync::Notify>,
+        ) {
+            let counts = Arc::new(StdMutex::new(StdHashMap::new()));
+            let done = Arc::new(tokio::sync::Notify::new());
+            let remaining = Arc::new(AtomicU32::new(expected_total));
+            let dispatch: Vec<TaggedMessageHandler> = default_send_message_tags()
+                .into_iter()
+                .map(|tag| TaggedMessageHandler {
+                    tag,
+                    handler: Arc::new(CountingHandler {
+                        counts: Arc::clone(&counts),
+                        remaining: Arc::clone(&remaining),
+                        done: Arc::clone(&done),
+                    }),
+                })
+                .collect();
+            net.register_handlers(dispatch);
+            (counts, done)
+        }
+
+        /// Notifies once, on the first message it handles — used as a
+        /// one-shot arrival fence.
+        struct NotifyHandler {
+            notify: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl MessageHandler for NotifyHandler {
+            async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+                self.notify.notify_one();
+                OutgoingMessage {
+                    action: ForwardingPolicy::Ignore,
+                    tag: msg.tag,
+                    payload: Vec::new(),
+                    topics: None,
+                }
+            }
+        }
+
+        /// Fences on netA having actually applied netB's latest
+        /// message-of-interest update, mirroring go's own synchronization
+        /// idiom in these tests (`netB.Broadcast(AgreementVoteTag, ...)`
+        /// then `messageFilterArriveWg.Wait()`, `network/wsNetwork_test.go`):
+        /// `register_message_interest`/`deregister_message_interest` push
+        /// the `MI` update on netB's *high-priority* send queue, and the
+        /// write loop always drains high-priority before bulk — so an
+        /// `AgreementVote` marker broadcast queued (bulk) *after* the MI
+        /// update is guaranteed to leave netB, and be processed by netA's
+        /// single-threaded read loop, strictly after that update. Once
+        /// netA's handler observes the marker, its per-peer
+        /// `send_message_tags` for netB is already up to date.
+        async fn wait_for_moi_propagation(
+            net_a: &Arc<WebsocketNetwork>,
+            net_b: &Arc<WebsocketNetwork>,
+        ) {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            net_a.register_handlers(vec![TaggedMessageHandler {
+                tag: Tag::AgreementVote,
+                handler: Arc::new(NotifyHandler {
+                    notify: Arc::clone(&notify),
+                }),
+            }]);
+            net_b
+                .broadcast(Tag::AgreementVote, vec![9, 9, 9, 9, 9], false, None)
+                .await
+                .expect("netB can broadcast the fence marker");
+            tokio::time::timeout(Duration::from_secs(5), notify.notified())
+                .await
+                .expect("netA observed the MOI-fence marker");
+        }
+
+        /// Broadcasts `tag` from `net_a` and yields briefly afterward.
+        ///
+        /// This crate's inbound read loop drains incoming frames into a
+        /// small (10-slot, [`crate::ws_peer::MSGS_IN_READ_BUFFER_PER_PEER`]
+        /// is private but this mirrors its size) per-peer channel and
+        /// drops on backpressure rather than blocking — a deliberate
+        /// bounded-buffer choice, not a bug this issue is about. A tight
+        /// loop of 20 unpaced broadcasts can fill that buffer faster than
+        /// the consumer task drains it; go's equivalent test does not hit
+        /// this because go's channel is far larger. Pacing sends keeps
+        /// this test about `wantTXGossip` narrowing, not about buffer
+        /// sizing.
+        async fn broadcast_paced(net_a: &Arc<WebsocketNetwork>, tag: Tag) {
+            net_a
+                .broadcast(tag, vec![0, 1, 2, 3, 4], false, None)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        /// Waits (bounded) for `net`'s peer count to reach at least
+        /// `expected` — `handle_gossip_websocket` registers an accepted
+        /// inbound peer asynchronously (spawned off the axum handshake
+        /// task), so a broadcast issued right after the dialing side's
+        /// `try_connect` returns can otherwise race ahead of netA's own
+        /// peer-table update.
+        async fn wait_for_peer_count(net: &Arc<WebsocketNetwork>, expected: usize) {
+            for _ in 0..100 {
+                if net.peer_count().await >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("peer count did not reach {expected} in time");
+        }
+
+        /// Waits (bounded) for `net`'s `want_tx_gossip()` to reach
+        /// `expected`, mirroring go's 100x10ms poll loop in the NPN/PN
+        /// tests.
+        async fn wait_for_want_tx_gossip(net: &Arc<WebsocketNetwork>, expected: u8) {
+            for _ in 0..100 {
+                if net.want_tx_gossip() == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!(
+                "want_tx_gossip did not reach {expected} in time (last seen {})",
+                net.want_tx_gossip()
+            );
+        }
+
+        /// A [`NodeInfo`] stub that always reports participating — mirrors
+        /// go's `participatingNodeInfo`.
+        struct ParticipatingNodeInfo;
+        impl NodeInfo for ParticipatingNodeInfo {
+            fn is_participating(&self) -> bool {
+                true
+            }
+        }
+
+        /// go: `TestWebsocketNetworkTXMessageOfInterestForceTx`
+        /// (`network/wsNetwork_test.go:3286`). `ForceFetchTransactions`
+        /// pins `wantTXGossip` to "yes" at startup and disables the
+        /// refresh loop entirely — netB must receive every broadcast tag,
+        /// TX included, and `OnNetworkAdvance` must not change that.
+        #[tokio::test]
+        async fn force_fetch_transactions_always_receives_tx() {
+            let net_a = start_net_a("testnet-v1.0").await;
+            let (addr_a, listening) = net_a.address();
+            assert!(listening);
+
+            let config_b = WebsocketNetworkConfig {
+                genesis_id: "testnet-v1.0".to_string(),
+                network_id: "testnet".to_string(),
+                force_fetch_transactions: true,
+                ..Default::default()
+            };
+            let phonebook_b = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+            let net_b = Arc::new(WebsocketNetwork::new(config_b, phonebook_b));
+            net_b.start_arc().await.expect("netB starts");
+            assert_eq!(net_b.want_tx_gossip(), WANT_TX_GOSSIP_YES);
+
+            connect_b_to_a(&net_b, &addr_a).await;
+            wait_for_peer_count(&net_a, 1).await;
+
+            let (counts, done) = register_counting_handlers(&net_b, 5 * 4);
+
+            // OnNetworkAdvance is a no-op for a force-fetch node (the
+            // refresh gate excludes it) — call it anyway to prove that.
+            net_b.on_network_advance();
+            assert_eq!(net_b.want_tx_gossip(), WANT_TX_GOSSIP_YES);
+
+            for _ in 0..5 {
+                broadcast_paced(&net_a, Tag::AgreementVote).await;
+                broadcast_paced(&net_a, Tag::Transaction).await;
+                broadcast_paced(&net_a, Tag::ProposalPayload).await;
+                broadcast_paced(&net_a, Tag::VoteBundle).await;
+            }
+
+            tokio::time::timeout(Duration::from_secs(5), done.notified())
+                .await
+                .expect("all 20 messages arrived at netB");
+
+            {
+                let counts = counts.lock().expect("counts lock poisoned");
+                assert_eq!(counts.len(), 4, "{counts:?}");
+                for count in counts.values() {
+                    assert_eq!(*count, 5);
+                }
+            }
+
+            net_a.stop().await;
+            net_b.stop().await;
+        }
+
+        /// go: `TestWebsocketNetworkTXMessageOfInterestNPN`
+        /// (`network/wsNetwork_test.go:3369`). A plain non-relay,
+        /// non-force-fetch, non-participating node must deregister TX
+        /// interest once `OnNetworkAdvance` triggers the first refresh —
+        /// `TX` broadcasts from netA must be dropped, every other default
+        /// tag must still arrive.
+        #[tokio::test]
+        async fn npn_narrows_and_drops_tx() {
+            let net_a = start_net_a("testnet-v1.0").await;
+            let (addr_a, listening) = net_a.address();
+            assert!(listening);
+
+            let config_b = WebsocketNetworkConfig {
+                genesis_id: "testnet-v1.0".to_string(),
+                network_id: "testnet".to_string(),
+                ..Default::default()
+            };
+            let phonebook_b = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+            let net_b = Arc::new(WebsocketNetwork::new(config_b, phonebook_b));
+            net_b.start_arc().await.expect("netB starts");
+            assert!(!net_b.effective_relay_messages());
+            assert_eq!(net_b.want_tx_gossip(), WANT_TX_GOSSIP_UNK);
+
+            connect_b_to_a(&net_b, &addr_a).await;
+            wait_for_peer_count(&net_a, 1).await;
+
+            let (counts, done) = register_counting_handlers(&net_b, 5 * 3);
+
+            net_b.on_network_advance();
+            wait_for_want_tx_gossip(&net_b, WANT_TX_GOSSIP_NO).await;
+            wait_for_moi_propagation(&net_a, &net_b).await;
+
+            for _ in 0..5 {
+                broadcast_paced(&net_a, Tag::AgreementVote).await;
+                broadcast_paced(&net_a, Tag::Transaction).await; // dropped
+                broadcast_paced(&net_a, Tag::ProposalPayload).await;
+                broadcast_paced(&net_a, Tag::VoteBundle).await;
+            }
+
+            tokio::time::timeout(Duration::from_secs(5), done.notified())
+                .await
+                .expect("all 15 non-TX messages arrived at netB");
+
+            // Give any stray TX delivery a moment to show up before asserting.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            {
+                let counts = counts.lock().expect("counts lock poisoned");
+                assert_eq!(counts.len(), 3, "{counts:?}");
+                assert!(
+                    !counts.contains_key(&Tag::Transaction),
+                    "TX must be dropped: {counts:?}"
+                );
+                for count in counts.values() {
+                    assert_eq!(*count, 5);
+                }
+            }
+
+            net_a.stop().await;
+            net_b.stop().await;
+        }
+
+        /// go: `TestWebsocketNetworkTXMessageOfInterestPN`
+        /// (`network/wsNetwork_test.go:3474`). A non-relay,
+        /// non-force-fetch node whose [`NodeInfo`] reports participating
+        /// must (re)register TX interest on the first refresh —
+        /// `wantTXGossip` transitions Unk -> Yes and every default tag,
+        /// TX included, arrives.
+        #[tokio::test]
+        async fn pn_participating_receives_tx() {
+            let net_a = start_net_a("testnet-v1.0").await;
+            let (addr_a, listening) = net_a.address();
+            assert!(listening);
+
+            let config_b = WebsocketNetworkConfig {
+                genesis_id: "testnet-v1.0".to_string(),
+                network_id: "testnet".to_string(),
+                ..Default::default()
+            };
+            let phonebook_b = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+            let net_b = Arc::new(WebsocketNetwork::new(config_b, phonebook_b));
+            net_b.set_node_info(Arc::new(ParticipatingNodeInfo));
+            net_b.start_arc().await.expect("netB starts");
+            assert!(!net_b.effective_relay_messages());
+            assert_eq!(net_b.want_tx_gossip(), WANT_TX_GOSSIP_UNK);
+
+            connect_b_to_a(&net_b, &addr_a).await;
+            wait_for_peer_count(&net_a, 1).await;
+
+            let (counts, done) = register_counting_handlers(&net_b, 5 * 4);
+
+            net_b.on_network_advance();
+            wait_for_want_tx_gossip(&net_b, WANT_TX_GOSSIP_YES).await;
+            wait_for_moi_propagation(&net_a, &net_b).await;
+
+            for _ in 0..5 {
+                broadcast_paced(&net_a, Tag::AgreementVote).await;
+                broadcast_paced(&net_a, Tag::Transaction).await;
+                broadcast_paced(&net_a, Tag::ProposalPayload).await;
+                broadcast_paced(&net_a, Tag::VoteBundle).await;
+            }
+
+            tokio::time::timeout(Duration::from_secs(5), done.notified())
+                .await
+                .expect("all 20 messages arrived at netB");
+
+            {
+                let counts = counts.lock().expect("counts lock poisoned");
+                assert_eq!(counts.len(), 4, "{counts:?}");
+                for count in counts.values() {
+                    assert_eq!(*count, 5);
+                }
+            }
+
+            net_a.stop().await;
+            net_b.stop().await;
+        }
+
+        // -------------------------------------------------------------
+        // Startup seeding / NodeInfo plumbing (unit-level, no sockets)
+        // -------------------------------------------------------------
+
+        #[test]
+        fn want_tx_gossip_seeded_yes_for_relay() {
+            let config = WebsocketNetworkConfig {
+                genesis_id: "test".to_string(),
+                net_address: Some("127.0.0.1:0".to_string()),
+                ..Default::default()
+            };
+            let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+            let net = WebsocketNetwork::new(config, phonebook);
+            assert_eq!(net.want_tx_gossip(), WANT_TX_GOSSIP_YES);
+        }
+
+        #[test]
+        fn want_tx_gossip_seeded_yes_for_force_fetch_transactions() {
+            let config = WebsocketNetworkConfig {
+                genesis_id: "test".to_string(),
+                force_fetch_transactions: true,
+                ..Default::default()
+            };
+            let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+            let net = WebsocketNetwork::new(config, phonebook);
+            assert_eq!(net.want_tx_gossip(), WANT_TX_GOSSIP_YES);
+        }
+
+        #[test]
+        fn want_tx_gossip_seeded_unk_for_plain_non_relay() {
+            let config = WebsocketNetworkConfig {
+                genesis_id: "test".to_string(),
+                ..Default::default()
+            };
+            let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+            let net = WebsocketNetwork::new(config, phonebook);
+            assert_eq!(net.want_tx_gossip(), WANT_TX_GOSSIP_UNK);
+        }
+
+        #[test]
+        fn is_participating_false_without_node_info() {
+            let net = WebsocketNetwork::with_defaults("test", "test");
+            assert!(!net.is_participating());
+        }
+
+        #[test]
+        fn is_participating_true_with_registered_node_info() {
+            let net = WebsocketNetwork::with_defaults("test", "test");
+            net.set_node_info(Arc::new(ParticipatingNodeInfo));
+            assert!(net.is_participating());
+        }
     }
 }
