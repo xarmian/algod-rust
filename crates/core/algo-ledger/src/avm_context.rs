@@ -4729,6 +4729,18 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         key: &[u8],
         value: TealValue,
     ) -> Result<(), AlgoError> {
+        // Enforce key length first, matching go-algorand's opAppLocalPut
+        // (`data/transactions/logic/eval.go`), which checks this before
+        // even resolving the account reference.
+        if key.len() > self.consensus.max_app_key_len {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "key too long: length was {}, maximum is {}",
+                    key.len(),
+                    self.consensus.max_app_key_len
+                ),
+            });
+        }
         // Matches `app_local_get`/`app_opted_in`'s tracking call: a
         // local-state *write* to an unnamed (account, app) pair must be
         // recorded too, not just reads (issue #974's
@@ -4756,6 +4768,30 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             pre,
             Some(value.clone()),
         );
+        // Enforce maximum value length and combined key+value length,
+        // matching go-algorand's opAppLocalPut -- checked before the write
+        // is applied (go checks these before calling `Ledger.SetLocal`).
+        if let TealValue::Bytes(b) = &value {
+            if b.len() > self.consensus.max_app_bytes_value_len {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "value too long for key {}: length was {}",
+                        box_name_hex(key),
+                        b.len()
+                    ),
+                });
+            }
+            let sum = key.len() + b.len();
+            if sum > self.consensus.max_app_sum_key_value_lens {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "key/value total too long for key {}: sum was {}",
+                        box_name_hex(key),
+                        sum
+                    ),
+                });
+            }
+        }
         local.key_value.insert(key.to_vec(), value.clone());
         check_state_schema_counts(&local.key_value, &local.schema)?;
         self.store.set_app_local_state(&addr, app_id, local);
@@ -4810,6 +4846,17 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         key: &[u8],
         value: TealValue,
     ) -> Result<(), AlgoError> {
+        // Enforce key length first, matching go-algorand's opAppGlobalPut
+        // (`data/transactions/logic/eval.go`).
+        if key.len() > self.consensus.max_app_key_len {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "key too long: length was {}, maximum is {}",
+                    key.len(),
+                    self.consensus.max_app_key_len
+                ),
+            });
+        }
         let mut p = self
             .store
             .get_app_params(app_id)
@@ -4826,6 +4873,30 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             pre,
             Some(value.clone()),
         );
+        // Enforce maximum value length and combined key+value length,
+        // matching go-algorand's opAppGlobalPut -- checked before the write
+        // is applied (go checks these before calling `Ledger.SetGlobal`).
+        if let TealValue::Bytes(b) = &value {
+            if b.len() > self.consensus.max_app_bytes_value_len {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "value too long for key {}: length was {}",
+                        box_name_hex(key),
+                        b.len()
+                    ),
+                });
+            }
+            let sum = key.len() + b.len();
+            if sum > self.consensus.max_app_sum_key_value_lens {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "key/value total too long for key {}: sum was {}",
+                        box_name_hex(key),
+                        sum
+                    ),
+                });
+            }
+        }
         p.global_state.insert(key.to_vec(), value.clone());
         check_state_schema_counts(&p.global_state, &p.global_state_schema)?;
         self.store.set_app_params(app_id, p);
@@ -7123,6 +7194,14 @@ mod tests {
         );
         let mut ctx = make_context(&mut store, vec![txn]);
         ctx.app_id = 42;
+        // Use realistic key/value length limits (ConsensusParams::default()
+        // leaves them at 0, which would otherwise trip the new "key too
+        // long" check on issue #1178's length enforcement before ever
+        // reaching the schema-count check this test targets).
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
 
         assert!(ctx.app_global_put(42, b"a", TealValue::Uint(1)).is_ok());
         let err = ctx
@@ -7130,6 +7209,200 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string().contains("exceeds schema integer count"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── app_global_put / app_local_put length limits (issue #1178,
+    // TestAppLocalGlobalErrorCases in go-algorand) ─────────────────────
+
+    #[test]
+    fn app_global_put_rejects_key_too_long() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.set_app_params(
+            42,
+            algo_types::AppParams {
+                creator: Address([10u8; 32]),
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 42;
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+
+        let oversized_key = vec![b'v'; ctx.consensus.max_app_key_len + 1];
+        let err = ctx
+            .app_global_put(42, &oversized_key, TealValue::Uint(1))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("key too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn app_global_put_rejects_value_too_long() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.set_app_params(
+            42,
+            algo_types::AppParams {
+                creator: Address([10u8; 32]),
+                global_state_schema: algo_types::StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 42;
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+
+        let oversized_value = vec![b'v'; ctx.consensus.max_app_bytes_value_len + 1];
+        let err = ctx
+            .app_global_put(42, b"foo", TealValue::Bytes(oversized_value))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("value too long for key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn app_global_put_rejects_combined_key_value_too_long() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.set_app_params(
+            42,
+            algo_types::AppParams {
+                creator: Address([10u8; 32]),
+                global_state_schema: algo_types::StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 42;
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        // Override to a value below MaxAppBytesValueLen but small enough
+        // that key ("foo", 3 bytes) + value trips the combined-length cap,
+        // matching go's test override of MaxAppSumKeyValueLens.
+        ctx.consensus.max_app_sum_key_value_lens = 2;
+
+        let err = ctx
+            .app_global_put(42, b"foo", TealValue::Bytes(b"foo".to_vec()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("key/value total too long for key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn app_local_put_rejects_key_too_long() {
+        let sender = [10u8; 32];
+        let txn = make_pay_txn(sender, [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.set_app_local_state(
+            &Address(sender),
+            42,
+            algo_types::AppLocalState {
+                schema: algo_types::StateSchema::default(),
+                key_value: std::collections::BTreeMap::new(),
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 42;
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+
+        let oversized_key = vec![b'v'; ctx.consensus.max_app_key_len + 1];
+        let err = ctx
+            .app_local_put(&sender, 42, &oversized_key, TealValue::Uint(1))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("key too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn app_local_put_rejects_value_too_long() {
+        let sender = [10u8; 32];
+        let txn = make_pay_txn(sender, [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.set_app_local_state(
+            &Address(sender),
+            42,
+            algo_types::AppLocalState {
+                schema: algo_types::StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                key_value: std::collections::BTreeMap::new(),
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 42;
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+
+        let oversized_value = vec![b'v'; ctx.consensus.max_app_bytes_value_len + 1];
+        let err = ctx
+            .app_local_put(&sender, 42, b"foo", TealValue::Bytes(oversized_value))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("value too long for key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn app_local_put_rejects_combined_key_value_too_long() {
+        let sender = [10u8; 32];
+        let txn = make_pay_txn(sender, [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.set_app_local_state(
+            &Address(sender),
+            42,
+            algo_types::AppLocalState {
+                schema: algo_types::StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                key_value: std::collections::BTreeMap::new(),
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 42;
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        ctx.consensus.max_app_sum_key_value_lens = 2;
+
+        let err = ctx
+            .app_local_put(&sender, 42, b"foo", TealValue::Bytes(b"foo".to_vec()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("key/value total too long for key"),
             "unexpected error: {err}"
         );
     }
