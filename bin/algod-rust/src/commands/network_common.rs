@@ -96,6 +96,23 @@ pub fn resolve_gossip_fanout(
     peers_count.max(base.max(0) as usize)
 }
 
+/// Whether a transport that would otherwise be active (per its own
+/// mode-selection logic) should actually listen and/or dial out, folding in
+/// `DisableNetworking` (issue #1189, go: `DisableNetworking bool`
+/// `version[16]:"false"`) on top of that decision. Go: `node.go`'s and
+/// `follower_node.go`'s identical `startNetwork` closures both skip
+/// `node.net.Start()` entirely under this flag ("disables all the incoming
+/// and outgoing communication a node would perform"), regardless of what
+/// mode the network would otherwise have run in.
+///
+/// `relay` (unconditionally a listen server) and `participate`
+/// (mode-dependent, via `p2p_transport::NetworkMode::ws_listener_active`/
+/// `p2p_active`) both call this with the same precedence:
+/// `DisableNetworking` always wins over an otherwise-active mode.
+pub fn networking_active(mode_active: bool, disable_networking: bool) -> bool {
+    mode_active && !disable_networking
+}
+
 /// Map a network name to its genesis ID.
 ///
 /// Returns `None` for unknown networks.
@@ -207,5 +224,31 @@ mod tests {
         let cfg = algo_config::Local::default();
         assert_eq!(resolve_gossip_fanout(&cfg, true, 12), 12);
         assert_eq!(resolve_gossip_fanout(&cfg, false, 12), 12);
+    }
+
+    // --- `networking_active` (issue #1189) ----------------------------------
+
+    /// An otherwise-active transport stays active when `DisableNetworking`
+    /// is off — the stock default case.
+    #[test]
+    fn networking_active_stays_active_when_not_disabled() {
+        assert!(networking_active(true, false));
+    }
+
+    /// `DisableNetworking: true` overrides an otherwise-active transport —
+    /// the core parity fix (go: `!cfg.DisableNetworking` guards
+    /// `node.net.Start()`).
+    #[test]
+    fn networking_active_disabled_overrides_an_active_mode() {
+        assert!(!networking_active(true, true));
+    }
+
+    /// A transport that was never active for its own mode-selection reasons
+    /// (e.g. `P2pOnly` mode asking about the WS listener) stays inactive
+    /// either way.
+    #[test]
+    fn networking_active_inactive_mode_stays_inactive_either_way() {
+        assert!(!networking_active(false, false));
+        assert!(!networking_active(false, true));
     }
 }

@@ -39,7 +39,7 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::commands::network_common::{
-    genesis_id_for, resolve_automatic_catchpoint_config, resolve_gossip_fanout,
+    genesis_id_for, networking_active, resolve_automatic_catchpoint_config, resolve_gossip_fanout,
     resolve_unsigned_limit,
 };
 
@@ -577,13 +577,28 @@ pub async fn run(
         "starting relay node"
     );
 
+    // Issue #1189: `DisableNetworking` -- a relay is unconditionally a
+    // listen server, so `networking_active(true, ...)` reduces to just
+    // `!node_config.disable_networking`, but goes through the same helper
+    // `participate` uses for consistency. When disabled, no listener opens,
+    // no peer is ever dialed, and the block-catchup loop never starts
+    // (below) -- mirroring go's `node.go`/`follower_node.go` `startNetwork`
+    // closures, which skip `node.net.Start()` entirely under this flag.
+    let relay_networking_active = networking_active(true, node_config.disable_networking);
+    if !relay_networking_active {
+        warn!(
+            "DisableNetworking is true in config.json; relay will not listen, dial any peers, \
+             or run block catchup"
+        );
+    }
+
     // Build phonebook and seed with any initial peer addresses.
     let phonebook = Arc::new(Phonebook::new(
         rate_limit as usize,
         Duration::from_secs(rate_limit_window_seconds),
     ));
 
-    if !peers.is_empty() {
+    if relay_networking_active && !peers.is_empty() {
         phonebook.replace_peer_list(peers, "cli", RELAY_ROLE);
         info!(count = peers.len(), "added initial peer addresses");
     }
@@ -591,15 +606,17 @@ pub async fn run(
     // `phonebook.json`'s `Include` allow-list (issue #949, go:
     // `config.LoadPhonebook`) — see `commands::participate::run`'s
     // identical wiring for the full rationale.
-    if let Some(dir) = data_dir {
-        match algo_network::phonebook_file::load_phonebook(dir) {
-            Ok(entries) if !entries.is_empty() => {
-                info!(count = entries.len(), "loaded phonebook.json include list");
-                phonebook.add_persistent_peers(&entries, "phonebook.json", RELAY_ROLE);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!(error = %e, "failed to load phonebook.json; continuing without it");
+    if relay_networking_active {
+        if let Some(dir) = data_dir {
+            match algo_network::phonebook_file::load_phonebook(dir) {
+                Ok(entries) if !entries.is_empty() => {
+                    info!(count = entries.len(), "loaded phonebook.json include list");
+                    phonebook.add_persistent_peers(&entries, "phonebook.json", RELAY_ROLE);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, "failed to load phonebook.json; continuing without it");
+                }
             }
         }
     }
@@ -608,7 +625,7 @@ pub async fn run(
     let config = WebsocketNetworkConfig {
         genesis_id: resolved_genesis_id.clone(),
         network_id: network.to_string(),
-        net_address: Some(bind_address.to_string()),
+        net_address: relay_networking_active.then(|| bind_address.to_string()),
         relay_messages: true,
         incoming_connections_limit: incoming_limit,
         max_connections_per_ip: max_per_ip,
@@ -871,7 +888,7 @@ pub async fn run(
     // Spawn the background block catchup task that fetches committed blocks
     // from peer relays via HTTP and stores them in the local SQLite ledger.
     let catchup_cancel = tokio_util::sync::CancellationToken::new();
-    let catchup_task = if !peers.is_empty() {
+    let catchup_task = if relay_networking_active && !peers.is_empty() {
         let cancel = catchup_cancel.clone();
         let ledger_for_catchup = Arc::clone(&ledger);
         let genesis = resolved_genesis_id.clone();
@@ -881,7 +898,9 @@ pub async fn run(
             block_catchup_loop(ledger_for_catchup, peer_list, genesis, notify, cancel).await;
         }))
     } else {
-        warn!("no peers configured; block catchup is disabled");
+        if relay_networking_active {
+            warn!("no peers configured; block catchup is disabled");
+        }
         None
     };
 

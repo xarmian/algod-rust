@@ -63,7 +63,7 @@ use tracing::{debug, info, warn};
 
 use crate::commands::dual_gossip_node;
 use crate::commands::network_common::{
-    genesis_id_for, resolve_automatic_catchpoint_config, resolve_gossip_fanout,
+    genesis_id_for, networking_active, resolve_automatic_catchpoint_config, resolve_gossip_fanout,
 };
 use crate::commands::p2p_transport::{NetworkMode, P2pOptions, P2pTransport, P2pTransportConfig};
 use crate::config::RestConfig;
@@ -4163,15 +4163,25 @@ pub async fn run(
     // (`ws_only_runs_ws_listener_and_no_p2p`, `p2p_only_runs_no_ws_listener`,
     // `hybrid_runs_both`).
     // -----------------------------------------------------------------------
-    let ws_active = network_mode.ws_listener_active();
+    // Issue #1189: `DisableNetworking` always wins over an otherwise-active
+    // mode — see `networking_active`'s doc comment.
+    let ws_active = networking_active(
+        network_mode.ws_listener_active(),
+        node_config.disable_networking,
+    );
     let effective_listen_address = if ws_active {
         listen_address.map(|s| s.to_string())
     } else {
-        if listen_address.is_some() {
+        if listen_address.is_some() && !node_config.disable_networking {
             warn!(
                 "P2P-only mode is active (--enable-p2p without --enable-p2p-hybrid-mode); \
                  ignoring --listen-address — no WS-gossip listener will be opened. Use \
                  --p2p-listen-address instead."
+            );
+        } else if listen_address.is_some() {
+            warn!(
+                "DisableNetworking is true in config.json; ignoring --listen-address — no \
+                 WS-gossip listener will be opened and no peers will be dialed."
             );
         }
         None
@@ -4628,7 +4638,11 @@ pub async fn run(
     // below (a `DualGossipNode` fan-out in `Hybrid` mode) — see
     // `crate::commands::dual_gossip_node`'s module doc comment.
     // -----------------------------------------------------------------------
-    let p2p_transport: Option<Arc<P2pTransport>> = if network_mode.p2p_active() {
+    // Issue #1189: `DisableNetworking` also gates the libp2p P2P transport,
+    // not just the WS-gossip stack — same `networking_active` precedence as
+    // `ws_active` above.
+    let p2p_active = networking_active(network_mode.p2p_active(), node_config.disable_networking);
+    let p2p_transport: Option<Arc<P2pTransport>> = if p2p_active {
         let listen_multiaddr = resolved_p2p
             .listen_address
             .as_deref()
