@@ -202,9 +202,16 @@ fn v13_sha512_program_executes() {
     let program = parse(&raw).expect("parse");
 
     let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
-    machine
-        .run(&mut NullContext)
-        .expect("v13 sha512 program must execute");
+    // Step through the real instructions only, without the implicit-end
+    // pass/fail check: the program deliberately falls off the end with a
+    // lone *bytes* digest on the stack (not the single int the strict
+    // check now requires), since this test only cares that the sha512
+    // opcode executed and pushed a well-formed result.
+    while !machine.finished && machine.pc < machine.program.instructions.len() {
+        machine
+            .step(&mut NullContext)
+            .expect("v13 sha512 program must execute");
+    }
 
     let top = machine.pop_bytes().expect("stack top");
     assert_eq!(top.len(), 64, "sha512 output must be 64 bytes");
@@ -288,9 +295,14 @@ fn v13_sumhash512_program_executes() {
     let program = parse(&raw).expect("parse");
 
     let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
-    machine
-        .run(&mut NullContext)
-        .expect("v13 sumhash512 program must execute");
+    // See v13_sha512_program_executes: this deliberately leaves a bytes
+    // digest (not an int) on the stack, so step past the real
+    // instructions only and skip the strict implicit-end check.
+    while !machine.finished && machine.pc < machine.program.instructions.len() {
+        machine
+            .step(&mut NullContext)
+            .expect("v13 sumhash512 program must execute");
+    }
 
     let top = machine.pop_bytes().expect("stack top");
     assert_eq!(top.len(), 64, "sumhash512 output must be 64 bytes");

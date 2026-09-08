@@ -278,8 +278,7 @@ impl AvmMachine {
 
         // If PC is past end of instructions, program finishes.
         if self.pc >= self.program.instructions.len() {
-            self.finish_implicit();
-            return Ok(());
+            return self.finish_implicit();
         }
 
         let instr = self.program.instructions[self.pc].clone();
@@ -339,8 +338,7 @@ impl AvmMachine {
 
         // If PC is past end of instructions, program finishes.
         if self.pc >= self.program.instructions.len() {
-            self.finish_implicit();
-            return Ok(());
+            return self.finish_implicit();
         }
 
         let instr = self.program.instructions[self.pc].clone();
@@ -576,12 +574,33 @@ impl AvmMachine {
         }
     }
 
-    /// Handle implicit program termination (PC past end of instructions).
+    /// Handle implicit program termination (PC past end of instructions,
+    /// i.e. the program did not end with an explicit `return`).
     ///
-    /// Pass if top of stack is truthy; reject if stack is empty or top is falsy.
-    fn finish_implicit(&mut self) {
+    /// Mirrors go-algorand's post-loop check in `EvalContract`
+    /// (`data/transactions/logic/eval.go`): the final stack must contain
+    /// exactly one item, and that item must be an integer (not bytes).
+    /// Pass iff that integer is non-zero; a wrong stack shape/type is a
+    /// hard error, not merely a reject (`TestStackLeftover`,
+    /// `TestStackBytesLeftover`).
+    fn finish_implicit(&mut self) -> Result<(), AlgoError> {
         self.finished = true;
-        self.pass = self.stack.last().is_some_and(|v| v.is_truthy());
+        self.pass = false;
+
+        if self.stack.len() != 1 {
+            return Err(AlgoError::Avm {
+                message: format!("stack len is {} instead of 1", self.stack.len()),
+            });
+        }
+        match &self.stack[0] {
+            AvmValue::Uint64(v) => {
+                self.pass = *v != 0;
+                Ok(())
+            }
+            AvmValue::Bytes(_) => Err(AlgoError::Avm {
+                message: "stack finished with bytes not int".to_string(),
+            }),
+        }
     }
 }
 
@@ -703,7 +722,13 @@ mod tests {
         let program = parse(&bytec_sha256_program(1)).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 1000);
         let mut ctx = NullContext;
-        m.run(&mut ctx).unwrap();
+        // The program falls off the end with a lone *bytes* value (the
+        // sha256 digest) on the stack, which the implicit-end check now
+        // correctly rejects (`stack finished with bytes not int`) -- but
+        // that check runs only after every opcode's cost has already been
+        // charged, so `m.cost` below is unaffected. This test cares only
+        // about cost accounting, not the final pass/reject outcome.
+        let _ = m.run(&mut ctx);
         // bytecblock (1) + bytec_0 (1) + sha256 (7 pre-v2) = 9.
         assert_eq!(m.cost, 9);
     }
@@ -713,7 +738,9 @@ mod tests {
         let program = parse(&bytec_sha256_program(2)).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 1000);
         let mut ctx = NullContext;
-        m.run(&mut ctx).unwrap();
+        // See test_step_charges_pre_v2_sha256_cost: the lone leftover bytes
+        // value now errors at the implicit-end check, after cost is charged.
+        let _ = m.run(&mut ctx);
         // bytecblock (1) + bytec_0 (1) + sha256 (35 from v2 on) = 37.
         assert_eq!(m.cost, 37);
     }
@@ -860,22 +887,25 @@ mod tests {
 
     #[test]
     fn test_empty_program_rejects() {
-        // Empty program (no instructions) should reject (no value on stack).
+        // Empty program (no instructions): the stack is empty at the
+        // implicit end, which go-algorand's check rejects with a hard
+        // error ("stack len is 0 instead of 1"), not a silent reject.
         let program = Program {
             version: 1,
             instructions: vec![],
         };
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        let result = m.run(&mut NullContext).unwrap();
-        assert!(!result);
+        let result = m.run(&mut NullContext);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_step_after_finished() {
-        let program = Program {
-            version: 1,
-            instructions: vec![],
-        };
+        // intcblock [1], intc_0 -> falls off the end with exactly one int
+        // left on the stack, so implicit finish passes cleanly and `run`
+        // succeeds; a *subsequent* `step` call must still error.
+        let raw = prog(2, &[0x20, 0x01, 0x01, 0x22]);
+        let program = parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
         m.run(&mut NullContext).unwrap();
         assert!(m.step(&mut NullContext).is_err());
@@ -912,16 +942,45 @@ mod tests {
     }
 
     #[test]
+    fn test_stack_leftover_errors() {
+        // Port of go-algorand's TestStackLeftover
+        // (data/transactions/logic/eval_test.go): "int 1; int 1" falls off
+        // the end with two items left on the stack. go-algorand's
+        // implicit-end check requires exactly one -- this must error, not
+        // silently pass with `Ok(true)`.
+        let raw = prog(2, &[0x20, 0x01, 0x01, 0x22, 0x22]);
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
+        let result = m.run(&mut NullContext);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stack_bytes_leftover_errors() {
+        // Port of go-algorand's TestStackBytesLeftover
+        // (data/transactions/logic/eval_test.go): "byte 0x10101010" falls
+        // off the end with a single leftover *bytes* value. go-algorand's
+        // implicit-end check requires that lone item be an integer -- this
+        // must error, not silently pass/reject based on truthiness.
+        let raw = prog(2, &[0x26, 0x01, 0x04, 0x10, 0x10, 0x10, 0x10, 0x28]);
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
+        let result = m.run(&mut NullContext);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_assert_with_truthy_value() {
-        // pushint 1, assert -> finishes without error, then implicit end
-        // But assert doesn't set finished -- it just errors if zero.
-        // After assert, PC advances, hits end-of-program with empty stack -> reject.
+        // pushint 1, assert -> assert pops the 1 and doesn't set finished,
+        // so PC advances and hits end-of-program with an *empty* stack.
+        // go-algorand's implicit-end check requires exactly one item left
+        // (`stack len is %d instead of 1`), so this errors rather than
+        // silently rejecting -- see TestStackLeftover.
         let raw = prog(3, &[0x81, 0x01, 0x44]);
         let program = parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        let result = m.run(&mut NullContext).unwrap();
-        // After assert, stack is empty, program ends -> reject.
-        assert!(!result);
+        let result = m.run(&mut NullContext);
+        assert!(result.is_err());
     }
 
     #[test]

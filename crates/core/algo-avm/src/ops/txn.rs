@@ -302,7 +302,15 @@ mod tests {
         let raw = prog(version, code);
         let program = bytecode::parse(&raw)?;
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
-        m.run(ctx)?;
+        // Step only through the real instructions, stopping short of the
+        // implicit-end pass/fail check -- these tests assert on the stack
+        // an opcode dispatch left behind, not on program-end acceptance
+        // semantics (`AvmMachine::finish_implicit`, which now requires
+        // exactly one leftover *int*; many of these fixtures intentionally
+        // leave a bytes value or several values on the stack to inspect).
+        while !m.finished && m.pc < m.program.instructions.len() {
+            m.step(ctx)?;
+        }
         Ok(m)
     }
 

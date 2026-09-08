@@ -42,7 +42,25 @@ fn run_lsig(version: u8, code: &[u8]) -> Result<AvmMachine, algo_error::AlgoErro
     let raw = prog(version, code);
     let program = parse(&raw)?;
     let mut m = AvmMachine::new(program, ExecMode::LogicSig, 100_000);
-    m.run(&mut NullContext)?;
+    // Step only through the real instructions, stopping short of the
+    // implicit-end pass/fail check -- most callers of this helper assert
+    // on the raw stack an opcode sequence leaves behind (often several
+    // items, or a bytes value), not on program-end acceptance semantics.
+    // `AvmMachine::finish_implicit` now requires exactly one leftover
+    // *int* (go-algorand's `TestStackLeftover`/`TestStackBytesLeftover`
+    // check); tests of that specific behavior call `run_pass` instead.
+    while !m.finished && m.pc < m.program.instructions.len() {
+        m.step(&mut NullContext)?;
+    }
+    if !m.finished {
+        // Fell off the end without an explicit `return`. Compute `pass`
+        // the old lenient way (truthy top-of-stack) purely so callers that
+        // inspect `m.pass` after a multi-item-leftover sequence still see
+        // a sensible value -- this helper intentionally doesn't apply the
+        // strict implicit-end shape/type check.
+        m.finished = true;
+        m.pass = m.stack.last().is_some_and(|v| v.is_truthy());
+    }
     Ok(m)
 }
 
@@ -2099,8 +2117,12 @@ fn implicit_end_falsy() {
 
 #[test]
 fn implicit_end_empty_stack() {
-    // Empty program with version 1 -> no instructions -> reject
-    assert!(!run_pass(1, &[]).unwrap());
+    // Empty program with version 1 -> no instructions -> the stack is
+    // empty at the implicit end. go-algorand's implicit-end check
+    // requires exactly one leftover item ("stack len is %d instead of
+    // 1"), so this errors rather than merely rejecting -- see
+    // TestStackLeftover (data/transactions/logic/eval_test.go).
+    assert!(run_pass(1, &[]).is_err());
 }
 
 // ===========================================================================

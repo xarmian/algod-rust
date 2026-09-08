@@ -970,7 +970,10 @@ mod tests {
             .error_detail
             .expect("app-call runtime error must carry structured detail");
         assert!(detail.pc > 0, "pc should point at (or past) the err opcode");
-        assert_eq!(detail.group_index, 0, "single-txn group: group-index must be 0");
+        assert_eq!(
+            detail.group_index, 0,
+            "single-txn group: group-index must be 0"
+        );
         assert_eq!(
             detail.app_index,
             Some(ctx.current_app_id()),
@@ -1233,15 +1236,18 @@ mod tests {
     }
 
     #[test]
-    fn test_logicsig_program_empty_stack_rejects() {
-        // A program with version byte only (no instructions) -- empty stack
-        // should reject (pass = false).
+    fn test_logicsig_program_empty_stack_errors() {
+        // A program with version byte only (no instructions) -- the stack
+        // is empty at the implicit end. go-algorand's implicit-end check
+        // requires exactly one leftover item ("stack len is %d instead of
+        // 1"), so this is a hard error, not merely `pass = false` --
+        // see TestStackLeftover (data/transactions/logic/eval_test.go).
         let raw = prog(1, &[]);
         let mut ctx = NullContext;
         let mut budget = GroupBudget::for_logicsig(1);
 
-        let pass = run_logicsig_program(&raw, &mut ctx, &mut budget).unwrap();
-        assert!(!pass);
+        let result = run_logicsig_program(&raw, &mut ctx, &mut budget);
+        assert!(result.is_err());
     }
 
     #[test]
