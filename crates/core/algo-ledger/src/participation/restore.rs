@@ -424,4 +424,58 @@ mod tests {
         let err = parse_vrf_msgpack(&blob).unwrap_err();
         assert!(err.contains("2-entry map"), "{err}");
     }
+
+    /// Small deterministic xorshift64* PRNG so this randomized round-trip
+    /// test doesn't need a `rand` dev-dependency.
+    fn next_u64(state: &mut u64) -> u64 {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn fill_pseudo_random(state: &mut u64, out: &mut [u8]) {
+        for chunk in out.chunks_mut(8) {
+            let bytes = next_u64(state).to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    }
+
+    /// Encode a `{PK: bin32, SK: bin64}` fixmap the same way go's
+    /// `crypto.VRFSecrets`/algod-rust's `encode_vrf_blob`
+    /// (`participation/persist.rs`) do.
+    fn encode_vrf_msgpack_for_test(pk: &[u8; 32], sk: &[u8; 64]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 5 + 32 + 5 + 64);
+        buf.push(0x82); // fixmap(2)
+        buf.extend_from_slice(&[0xa2, b'P', b'K', 0xc4, 0x20]);
+        buf.extend_from_slice(pk);
+        buf.extend_from_slice(&[0xa2, b'S', b'K', 0xc4, 0x40]);
+        buf.extend_from_slice(sk);
+        buf
+    }
+
+    #[test]
+    fn test_vrf_msgpack_randomized_roundtrip() {
+        // TestRandomizedEncodingVRFSecrets (crypto/msgp_gen_test.go): a
+        // `VRFSecrets`-shaped `{PK, SK}` blob with random field values must
+        // decode back to exactly the bytes it was encoded from. go's
+        // `VRFSecrets` has no standalone Rust wrapper type (VRF key
+        // material is generated/used via `algo_consensus_crypto::vrf`
+        // functions directly), but this crate's ad hoc `{PK, SK}` msgpack
+        // codec (`parse_vrf_msgpack`, shared shape with `persist.rs`'s
+        // `encode_vrf_blob`) is the functional equivalent, so round-trip it
+        // with randomized keys the way go's generated-codec fuzz test does.
+        let mut state = 0xD1B5_4A32_D192_ED03u64; // fixed seed, deterministic test
+        for _ in 0..200 {
+            let mut pk = [0u8; 32];
+            let mut sk = [0u8; 64];
+            fill_pseudo_random(&mut state, &mut pk);
+            fill_pseudo_random(&mut state, &mut sk);
+
+            let blob = encode_vrf_msgpack_for_test(&pk, &sk);
+            let (decoded_pk, decoded_sk) = parse_vrf_msgpack(&blob).expect("parse should succeed");
+            assert_eq!(decoded_pk, pk.to_vec());
+            assert_eq!(decoded_sk, sk.to_vec());
+        }
+    }
 }

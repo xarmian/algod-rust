@@ -2071,6 +2071,142 @@ mod tests {
         assert!(repr[12..].iter().all(|&b| b == 0));
     }
 
+    // ── Phase 17 missing-test sweep (batch 6, docs/phase17/parity_crypto.md) ──
+
+    #[test]
+    fn test_verifier_fixed_length_representation_equals_raw_pubkey() {
+        // TestVerificationBytes (crypto/falconWrapper_test.go): the
+        // verifying key's fixed-length hashable representation must equal
+        // the raw Falcon public key bytes.
+        let seed = [9u8; algo_falcon::FALCON_SEED_SIZE];
+        let (pk, sk) = algo_falcon::falcon_keygen(&seed).expect("keygen should succeed");
+
+        let mut signer = FalconSigner {
+            pk: [0u8; FALCON_DET1024_PUBKEY_SIZE],
+            sk: [0u8; FALCON_DET1024_PRIVKEY_SIZE],
+        };
+        signer.pk.copy_from_slice(&pk);
+        signer.sk.copy_from_slice(&sk);
+
+        let verifier = signer.get_verifying_key();
+        assert_eq!(
+            verifier.get_fixed_length_hashable_representation(),
+            &signer.pk[..]
+        );
+    }
+
+    #[test]
+    fn test_signature_fixed_length_representation_len_is_snark_fixed_regardless_of_path_length() {
+        // TestSimulateSignatureVerification / TestSimulateSignatureVerificationOneEphemeralKey
+        // (crypto/stateproof/prover_test.go): the SNARK-facing fixed-length
+        // signature representation must always be exactly 4366 bytes --
+        // 2 (schemeId) + 1538 (Falcon CT sig) + 1793 (Falcon pubkey) + 8
+        // (vector commitment idx) + 1 (proof tree_depth) + 16*64 (proof
+        // path, always fully padded to MAX_ENCODED_TREE_DEPTH regardless of
+        // the real path length) -- both when the ephemeral-key tree has a
+        // non-trivial path and when it has exactly one key (path_len 0).
+
+        // Many-keys case: 51-round window, key_lifetime 1 -> depth-6 VC tree
+        // (matches go's `generateTestSigner(50, 100, 1)` / expectedPathLen 6).
+        let secrets_many = Secrets::new(50, 100, 1).expect("Secrets::new should succeed");
+        let sig_many = secrets_many
+            .get_signer(55)
+            .sign_bytes(b"testMessage")
+            .expect("sign_bytes should succeed");
+        assert_eq!(
+            sig_many.proof.proof.tree_depth, 6,
+            "sanity: many-key tree should have a non-trivial path"
+        );
+        let repr_many = sig_many
+            .get_fixed_length_hashable_representation()
+            .expect("representation should succeed");
+        assert_eq!(repr_many.len(), 4366);
+
+        // One-key case: a single-round window has exactly one ephemeral key
+        // (matches go's expectedPathLen 0).
+        let secrets_one = Secrets::new(256, 256, 256).expect("Secrets::new should succeed");
+        let sig_one = secrets_one
+            .get_signer(256)
+            .sign_bytes(b"testMessage")
+            .expect("sign_bytes should succeed");
+        assert_eq!(
+            sig_one.proof.proof.tree_depth, 0,
+            "sanity: one-key tree should have a trivial (empty) path"
+        );
+        let repr_one = sig_one
+            .get_fixed_length_hashable_representation()
+            .expect("representation should succeed");
+        assert_eq!(
+            repr_one.len(),
+            4366,
+            "fixed-length representation must stay 4366 bytes even with an empty proof path"
+        );
+
+        // scheme ID prefix is always 0 (Falcon-only).
+        assert_eq!(&repr_many[0..2], &[0u8, 0]);
+        assert_eq!(&repr_one[0..2], &[0u8, 0]);
+    }
+
+    #[test]
+    fn test_empty_window_verifier_commitment_is_not_zero() {
+        // TestEmptyVerifier (crypto/merklesignature/merkleSignatureScheme_test.go):
+        // a real Verifier for a window with zero keys still has a non-zero
+        // commitment (vector-commitment property: the VC tree always has at
+        // least one leaf, even when padded entirely with the "MB" bottom
+        // element).
+        let secrets = Secrets::new(8, 9, 5).expect("Secrets::new should succeed");
+        let verifier = secrets.get_verifier();
+        assert!(!commitment_is_empty(&verifier.commitment));
+    }
+
+    #[test]
+    fn test_verifier_zero_key_lifetime_rejected_then_succeeds_with_lifetime_one() {
+        // TestVerifierKeyLifetimeError (crypto/merklesignature/merkleSignatureScheme_test.go).
+        let secrets = Secrets::new(8, 12, 1).expect("Secrets::new should succeed");
+        let mut verifier = secrets.get_verifier();
+
+        verifier.key_lifetime = 0;
+        let result = verifier.verify_bytes(0, b"", &Signature::default());
+        assert!(matches!(
+            result,
+            Err(MerkleSignatureError::KeyLifetimeIsZero)
+        ));
+
+        verifier.key_lifetime = 1;
+        let sig = secrets
+            .get_signer(10)
+            .sign_bytes(b"hello")
+            .expect("sign_bytes should succeed");
+        verifier
+            .verify_bytes(10, b"hello", &sig)
+            .expect("verify_bytes should succeed once key_lifetime is valid");
+    }
+
+    #[test]
+    fn test_check_merkle_signature_scheme_params_matches_go_errors() {
+        // TestErrors (crypto/merklesignature/posdivs_test.go): direct
+        // coverage of `check_merkle_signature_scheme_params` (go's
+        // `checkMerkleSignatureSchemeParams`) across its three cases.
+        let first_valid = 101u64;
+        let round = first_valid - 1;
+        let key_lifetime = round / 2;
+        assert!(matches!(
+            check_merkle_signature_scheme_params(first_valid, round, key_lifetime),
+            Err(MerkleSignatureError::InvalidRound(_))
+        ));
+
+        let key_lifetime = 0;
+        assert!(matches!(
+            check_merkle_signature_scheme_params(first_valid, round, key_lifetime),
+            Err(MerkleSignatureError::KeyLifetimeIsZero)
+        ));
+
+        let key_lifetime = 107;
+        let round = 107;
+        let first_valid = 107;
+        assert!(check_merkle_signature_scheme_params(first_valid, round, key_lifetime).is_ok());
+    }
+
     #[test]
     fn test_commitment_is_empty() {
         let empty: Commitment = [0u8; MERKLE_SIGNATURE_SCHEME_ROOT_SIZE];

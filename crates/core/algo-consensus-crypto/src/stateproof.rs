@@ -1111,6 +1111,73 @@ mod tests {
         }
     }
 
+    // ── Phase 17 missing-test sweep (batch 6, docs/phase17/parity_crypto.md) ──
+
+    #[test]
+    fn test_coin_choice_seed_hash_rep_has_fixed_length() {
+        // TestCoinFixedLengthHash (crypto/stateproof/coinGenerator_test.go):
+        // the coin-choice seed's HashRep (domain prefix + serialized fields)
+        // must always be exactly 180 bytes -- 3 ("spc" HashID) + 1 (version)
+        // + 64 (partCommitment, HashSize = SumhashDigestSize) + 8
+        // (lnProvenWeight) + 64 (sigCommitment) + 8 (signedWeight) + 32
+        // (MessageHash data). If this ever changes, the SNARK
+        // prover/verifier's circuit needs updating too (per go's own
+        // comment on this test).
+        let part_commitment: GenericDigest = [0xABu8; 64].to_vec();
+        let sig_commitment: GenericDigest = [0xCDu8; 64].to_vec();
+        let data: MessageHash = [0xEFu8; 32];
+
+        let choice = CoinChoiceSeed {
+            part_commitment: &part_commitment,
+            ln_proven_weight: 454197,
+            sig_commitment: &sig_commitment,
+            signed_weight: 1 << 10,
+            data,
+        };
+
+        let (prefix, hashed_data) = choice.to_be_hashed();
+        assert_eq!(prefix, STATE_PROOF_COIN);
+        let rep_len = prefix.len() + hashed_data.len();
+        assert_eq!(rep_len, 180);
+    }
+
+    #[test]
+    fn test_hash_coin_stays_in_bounds_and_is_roughly_uniform() {
+        // TestHashCoin (crypto/stateproof/coinGenerator_test.go): every coin
+        // drawn from the generator must be `< signed_weight`, and across
+        // many draws the distribution across slots must be roughly uniform
+        // (not, e.g., always landing in a single slot).
+        const NUM_SLOTS: usize = 32;
+        let mut slots = [0u32; NUM_SLOTS];
+
+        let part_commitment: GenericDigest = [0x11u8; 64].to_vec();
+        let sig_commitment: GenericDigest = [0x22u8; 64].to_vec();
+        let data: MessageHash = [0x33u8; 32];
+
+        let choice = CoinChoiceSeed {
+            part_commitment: &part_commitment,
+            ln_proven_weight: 1,
+            sig_commitment: &sig_commitment,
+            signed_weight: NUM_SLOTS as u64,
+            data,
+        };
+        let mut coin_gen = make_coin_generator(&choice);
+
+        for _ in 0..1000u32 {
+            let coin = coin_gen.get_next_coin();
+            assert!(
+                (coin as usize) < NUM_SLOTS,
+                "hashCoin out of bounds: {coin}"
+            );
+            slots[coin as usize] += 1;
+        }
+
+        for (i, &count) in slots.iter().enumerate() {
+            assert!(count >= 3, "slot {i} too low: {count}");
+            assert!(count <= 100, "slot {i} too high: {count}");
+        }
+    }
+
     #[test]
     fn ln_int_approximation_matches_known_values() {
         // ln(1) = 0
@@ -1511,6 +1578,160 @@ mod tests {
         verifier
             .verify(round, msg, &proof)
             .expect("prover-built proof must verify");
+    }
+
+    #[test]
+    fn test_verify_rejects_position_with_no_reveal() {
+        // TestVerifyRevelForEachPosition (crypto/stateproof/verifier_test.go):
+        // pointing a revealed position at an index with no corresponding
+        // `Reveals` entry must be rejected with `NoRevealInPos`.
+        let round = 0u64;
+        let msg = [9u8; 32];
+        let weight = 1_000_000u64;
+        let n = 30;
+        let (secrets_list, participants, part_tree) = build_prover_participants(n, round, weight);
+        let part_commit = part_tree.root();
+        let proven_weight = (n as u64 * weight) / 2;
+        let strength_target = 256u64;
+
+        let mut prover = Prover::make_prover(
+            msg,
+            round,
+            proven_weight,
+            participants.clone(),
+            part_tree,
+            strength_target,
+        )
+        .expect("make_prover");
+
+        // Only participants 0..27 sign; 27, 28, 29 never do.
+        for pos in 0..27u64 {
+            let signer = secrets_list[pos as usize].get_signer(round);
+            let sig = signer.sign_bytes(&msg).expect("sign");
+            prover.is_valid(pos, &sig, true).expect("is_valid");
+            prover.add(pos, sig).expect("add");
+        }
+        assert!(prover.ready());
+
+        let mut proof = prover.create_proof().expect("create_proof");
+        let verifier =
+            Verifier::new(part_commit, proven_weight, strength_target).expect("verifier");
+        verifier
+            .verify(round, msg, &proof)
+            .expect("genuine proof must verify before tampering");
+
+        // Point a revealed position at participant 27, who never signed and
+        // so has no entry in `reveals`.
+        assert!(!proof.reveals.contains_key(&27));
+        proof.positions_to_reveal[0] = 27;
+
+        let err = verifier
+            .verify(round, msg, &proof)
+            .expect_err("must reject a revealed position with no matching reveal");
+        assert!(matches!(err, StateProofError::NoRevealInPos(27)));
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_coin_slot() {
+        // TestVerifyWrongCoinSlot (crypto/stateproof/verifier_test.go): the
+        // verifier must open reveals in the specific order given by
+        // `positions_to_reveal`, checking each against the coin sequence --
+        // swapping two revealed positions so a later reveal is opened for
+        // an earlier coin must be rejected with `CoinNotInRange`.
+        let round = 0u64;
+        let msg = [9u8; 32];
+        let weight = 1_000_000u64;
+        let n = 30;
+        let (secrets_list, participants, part_tree) = build_prover_participants(n, round, weight);
+        let part_commit = part_tree.root();
+        let proven_weight = (n as u64 * weight) / 2;
+        let strength_target = 256u64;
+
+        let mut prover = Prover::make_prover(
+            msg,
+            round,
+            proven_weight,
+            participants.clone(),
+            part_tree,
+            strength_target,
+        )
+        .expect("make_prover");
+        for pos in 0..n as u64 {
+            let signer = secrets_list[pos as usize].get_signer(round);
+            let sig = signer.sign_bytes(&msg).expect("sign");
+            prover.is_valid(pos, &sig, true).expect("is_valid");
+            prover.add(pos, sig).expect("add");
+        }
+        assert!(prover.ready());
+
+        let mut proof = prover.create_proof().expect("create_proof");
+        assert!(
+            proof.positions_to_reveal.len() >= 2,
+            "test needs at least 2 revealed positions, got {}",
+            proof.positions_to_reveal.len()
+        );
+        let verifier =
+            Verifier::new(part_commit, proven_weight, strength_target).expect("verifier");
+        verifier
+            .verify(round, msg, &proof)
+            .expect("genuine proof must verify before tampering");
+
+        // Recompute the first coin the verifier will draw, then find a
+        // later revealed position whose SigSlot range does NOT cover it.
+        let choice = CoinChoiceSeed {
+            part_commitment: &verifier.participants_commitment,
+            ln_proven_weight: verifier.ln_proven_weight,
+            sig_commitment: &proof.sig_commit,
+            signed_weight: proof.signed_weight,
+            data: msg,
+        };
+        let mut coin_gen = make_coin_generator(&choice);
+        let coin = coin_gen.get_next_coin();
+
+        let coin_at_0 = proof.positions_to_reveal[0];
+        let mut swap_j = None;
+        for j in 1..proof.positions_to_reveal.len() {
+            let reveal = &proof.reveals[&proof.positions_to_reveal[j]];
+            let l = reveal.sig_slot.l;
+            let weight = reveal.part.weight;
+            if !(l <= coin && coin < l + weight) {
+                swap_j = Some(j);
+                break;
+            }
+        }
+        let j = swap_j.expect("test needs a later reveal whose range excludes the first coin");
+
+        proof.positions_to_reveal[0] = proof.positions_to_reveal[j];
+        proof.positions_to_reveal[j] = coin_at_0;
+
+        let err = verifier
+            .verify(round, msg, &proof)
+            .expect_err("must reject a reveal opened out of coin order");
+        assert!(matches!(err, StateProofError::CoinNotInRange { .. }));
+    }
+
+    #[test]
+    fn test_verifier_equality_matches_reconstruction_from_ln_proven_weight() {
+        // TestEqualVerifiers (crypto/stateproof/verifier_test.go): a
+        // Verifier built from a raw proven_weight must be field-for-field
+        // identical to one built directly from that weight's precomputed
+        // ln approximation (`MkVerifier` vs `MkVerifierWithLnProvenWeight`).
+        let proven_weight = 1u64;
+        let strength_target = 0u64;
+        let commitment: GenericDigest = vec![7u8; 64];
+
+        let verifier =
+            Verifier::new(commitment.clone(), proven_weight, strength_target).expect("verifier");
+        let ln_proven_weight = ln_int_approximation(proven_weight).expect("ln approx");
+        let verifier2 =
+            Verifier::with_ln_proven_weight(commitment.clone(), ln_proven_weight, strength_target);
+
+        assert_eq!(verifier.strength_target, verifier2.strength_target);
+        assert_eq!(verifier.ln_proven_weight, verifier2.ln_proven_weight);
+        assert_eq!(
+            verifier.participants_commitment,
+            verifier2.participants_commitment
+        );
     }
 
     #[test]

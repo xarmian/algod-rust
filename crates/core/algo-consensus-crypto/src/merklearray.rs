@@ -2323,6 +2323,257 @@ mod tests {
         assert!(proof.path.is_empty());
     }
 
+    // ── Phase 17 missing-test sweep (batch 6, docs/phase17/parity_crypto.md) ──
+
+    #[test]
+    fn test_hash_factory_new_hash_digest_sizes_match_go_hash_types() {
+        // TestHashFactoryCreatingNewHashes (crypto/hashes_test.go): each
+        // HashFactory hash type must produce digests of its documented size.
+        for (hash_type, expected_size) in [
+            (HashType::Sha512_256, 32usize),
+            (HashType::Sumhash, 64),
+            (HashType::Sha256, 32),
+        ] {
+            let factory = HashFactory::new(hash_type);
+            assert_eq!(factory.digest_size(), expected_size);
+            let digest = factory.hash_bytes(&[b""]);
+            assert_eq!(digest.len(), expected_size);
+        }
+    }
+
+    /// A minimal `Hashable` whose byte length is caller-chosen, mirroring
+    /// go's `testToBeHashed` (`crypto/util_test.go`).
+    struct SizedMessage(usize);
+    impl Hashable for SizedMessage {
+        fn to_be_hashed(&self) -> (&[u8], Vec<u8>) {
+            (b"MX", vec![self.0 as u8; self.0])
+        }
+    }
+
+    /// Concatenate a `Hashable`'s domain prefix and data, matching go's
+    /// `crypto.HashRep`.
+    fn hash_rep(h: &dyn Hashable) -> Vec<u8> {
+        let (prefix, data) = h.to_be_hashed();
+        let mut out = Vec::with_capacity(prefix.len() + data.len());
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    fn test_hash_rep_concatenation_matches_individual_encodings() {
+        // TestHashRepToBuff (crypto/util_test.go): appending several
+        // HashRep-style encodings into one shared growing buffer must
+        // produce exactly the same bytes as concatenating each one computed
+        // individually.
+        let sizes = [32usize, 64, 512, 1024];
+        let mut buffer = Vec::new();
+        for &size in &sizes {
+            buffer.extend_from_slice(&hash_rep(&SizedMessage(size)));
+        }
+
+        let mut pos = 0;
+        for &size in &sizes {
+            let data = hash_rep(&SizedMessage(size));
+            assert_eq!(&buffer[pos..pos + data.len()], data.as_slice());
+            pos += data.len();
+        }
+        assert_eq!(pos, buffer.len());
+    }
+
+    #[test]
+    fn test_build_propagates_array_marshal_error() {
+        // TestErrorInMarshal (crypto/merklearray/merkle_test.go): `build()`
+        // must propagate the underlying `Array::marshal` error rather than
+        // panicking or silently dropping it.
+        struct Nonmarshalable(usize);
+        impl Array for Nonmarshalable {
+            fn length(&self) -> u64 {
+                self.0 as u64
+            }
+            fn marshal(&self, _pos: u64) -> Result<Box<dyn Hashable>, MerkleError> {
+                Err(MerkleError::ArrayError("can't be marshaled".to_string()))
+            }
+        }
+
+        let arr = Nonmarshalable(1);
+        let result = build(&arr, HashFactory::new(HashType::Sha512_256));
+        match result {
+            Err(MerkleError::ArrayError(msg)) => assert!(msg.contains("can't be marshaled")),
+            other => panic!("expected ArrayError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_prove_duplicate_indices_dedups_and_still_verifies() {
+        // TestProveDuplicateLeaves (crypto/merklearray/merkle_test.go):
+        // `prove(&[i, i])` with a duplicated index must not error, and the
+        // resulting proof must still verify, for both plain and VC trees.
+        let data: Vec<[u8; 32]> = (0..4u8).map(|i| [i; 32]).collect();
+        let arr = TestArray(data.clone());
+        let factory = HashFactory::new(HashType::Sha512_256);
+
+        let tree = build(&arr, factory).unwrap();
+        let proof = tree.prove(&[3, 3]).unwrap();
+        let root = tree.root();
+        let elem = TestMessage(data[3].to_vec());
+        verify(&root, &[(3, &elem)], &proof).expect("plain tree verify with duplicate-index proof");
+
+        let vc_tree = build_vector_commitment_tree(&arr, factory).unwrap();
+        let vc_proof = vc_tree.prove(&[3, 3]).unwrap();
+        let vc_root = vc_tree.root();
+        let vc_elem = TestMessage(data[3].to_vec());
+        verify_vector_commitment(&vc_root, &[(3, &vc_elem)], &vc_proof)
+            .expect("VC tree verify with duplicate-index proof");
+    }
+
+    #[test]
+    fn test_tree_depth_field_matches_go_expected_depths_across_sizes() {
+        // TestTreeDepthField (crypto/merklearray/merkle_test.go):
+        // `prove(&[])`'s `tree_depth` for empty/1/2/3-element arrays, for
+        // both plain and VC trees.
+        let sizes_and_depths: [(usize, u8); 4] = [(0, 0), (1, 0), (2, 1), (3, 2)];
+        for (size, expected_depth) in sizes_and_depths {
+            let data: Vec<[u8; 32]> = (0..size as u8).map(|i| [i; 32]).collect();
+            let arr = TestArray(data);
+            let factory = HashFactory::new(HashType::Sha512_256);
+
+            let vc_tree = build_vector_commitment_tree(&arr, factory).unwrap();
+            let p = vc_tree.prove(&[]).unwrap();
+            assert_eq!(p.tree_depth, expected_depth, "VC tree size {size}");
+
+            let tree = build(&arr, factory).unwrap();
+            let p = tree.prove(&[]).unwrap();
+            assert_eq!(p.tree_depth, expected_depth, "plain tree size {size}");
+        }
+    }
+
+    #[test]
+    fn test_single_leaf_proof_msgpack_roundtrip_nonempty() {
+        // TestMarshalUnmarshalSingleLeafProof (crypto/merklearray/
+        // msgp_gen_test.go): encode -> decode round trip for a real
+        // (non-empty-path) SingleLeafProof, not just the empty-shape check
+        // `proof_encode_empty` covers.
+        let data: Vec<[u8; 32]> = (0..8u8).map(|i| [i; 32]).collect();
+        let arr = TestArray(data);
+        let factory = HashFactory::new(HashType::Sha512_256);
+        let tree = build(&arr, factory).unwrap();
+        let slp = tree.prove_single_leaf(3).unwrap();
+
+        let encoded = slp.encode_msgpack();
+        let (decoded, consumed) = SingleLeafProof::decode_msgpack(&encoded).expect("decode");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, slp);
+    }
+
+    #[test]
+    fn test_single_leaf_proof_fixed_length_representation_fully_populated_at_max_depth() {
+        // TestProofSerializationMaxTree (crypto/merklearray/proof_test.go):
+        // at the maximum encodable tree depth, the fixed-length proof
+        // representation is fully populated -- every MAX_ENCODED_TREE_DEPTH
+        // path slot holds a real sibling digest, none of the zero-padding
+        // shorter trees produce.
+        let n = 1usize << MAX_ENCODED_TREE_DEPTH; // 65536 leaves
+        let data: Vec<[u8; 32]> = (0..n)
+            .map(|i| {
+                let mut d = [0u8; 32];
+                d[0] = (i & 0xFF) as u8;
+                d[1] = ((i >> 8) & 0xFF) as u8;
+                d
+            })
+            .collect();
+        let arr = TestArray(data);
+        let factory = HashFactory::new(HashType::Sha512_256);
+        let tree = build_vector_commitment_tree(&arr, factory).unwrap();
+
+        let slp = tree.prove_single_leaf(0).unwrap();
+        assert_eq!(slp.proof.tree_depth as usize, MAX_ENCODED_TREE_DEPTH);
+        assert_eq!(slp.proof.path.len(), MAX_ENCODED_TREE_DEPTH);
+
+        let repr = slp.get_fixed_length_hashable_representation();
+        let digest_size = factory.digest_size();
+        let expected_len = 1 + MAX_ENCODED_TREE_DEPTH * digest_size;
+        assert_eq!(repr.len(), expected_len);
+        assert_eq!(repr[0], MAX_ENCODED_TREE_DEPTH as u8);
+
+        for i in 0..MAX_ENCODED_TREE_DEPTH {
+            let start = 1 + i * digest_size;
+            let slot = &repr[start..start + digest_size];
+            assert!(
+                slot.iter().any(|&b| b != 0),
+                "path slot {i} unexpectedly all-zero at max tree depth"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vc_array_sizes_match_go_expected_path_len_and_padded_len() {
+        // TestVcSizes (crypto/merklearray/vectorCommitmentArray_test.go):
+        // `pathLen`/`paddedLen`/`Length()` for a spread of array sizes.
+        let cases: &[(usize, u8, u64)] = &[
+            (0, 1, 1),
+            (1, 1, 1),
+            (2, 1, 2),
+            (3, 2, 4),
+            (4, 2, 4),
+            (5, 3, 8),
+            (9, 4, 16),
+            (15, 4, 16),
+            (16, 4, 16),
+            (17, 5, 32),
+        ];
+        for &(size, expected_path_len, expected_padded_len) in cases {
+            let data: Vec<[u8; 32]> = (0..size as u8).map(|i| [i; 32]).collect();
+            let arr = TestArray(data);
+            let vc = VectorCommitmentArray::new(&arr);
+            assert_eq!(vc.path_len, expected_path_len, "size {size}");
+            assert_eq!(vc.padded_len, expected_padded_len, "size {size}");
+            assert_eq!(vc.length(), expected_padded_len, "size {size}");
+        }
+    }
+
+    #[test]
+    fn test_vc_array_padded_leaf_hash_matches_direct_element_hash() {
+        // TestVcArrayPadding (crypto/merklearray/vectorCommitmentArray_test.go):
+        // hashing a VC-array's marshaled leaf at the bit-reversed index for
+        // a real element must equal directly hashing that element with the
+        // "MX" (protocol.Message) prefix.
+        let data: Vec<[u8; 32]> = (0..11u8).map(|i| [i; 32]).collect();
+        let arr = TestArray(data.clone());
+        let vc = VectorCommitmentArray::new(&arr);
+
+        let factory = HashFactory::new(HashType::Sha512_256);
+        let expected = factory.hash_bytes(&[b"MX", &data[1][..]]);
+
+        let idx = merkle_tree_to_vector_commitment_index(1, 4).unwrap();
+        let leaf = vc.marshal(idx).unwrap();
+        let (prefix, leaf_data) = leaf.to_be_hashed();
+        let actual = factory.hash_bytes(&[prefix, &leaf_data]);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_sig_part_proof_max_size_matches_go_constant() {
+        // TestSigPartProofMaxSize (crypto/stateproof/weights_test.go): go's
+        // hardcoded `SigPartProofMaxSize = 35353` constant
+        // (crypto/stateproof/structs.go) must equal
+        // `ProofMaxSizeByElements(StateProofTopVoters/2)`, where
+        // `StateProofTopVoters` is bounded at 1024 (config.Consensus's
+        // allocbound, config/consensus.go). algod-rust doesn't define a
+        // named `SigPartProofMaxSize` constant of its own (proof-size DoS
+        // protection is enforced structurally via the decode-time bound
+        // checks tested above), but the underlying element-count-to-max-size
+        // function is byte-exact with go's, so this pins the same
+        // cross-check go's test does.
+        const STATE_PROOF_TOP_VOTERS: usize = 1024;
+        const SIG_PART_PROOF_MAX_SIZE: usize = 35353;
+        assert_eq!(
+            proof_max_size_by_elements(STATE_PROOF_TOP_VOTERS / 2),
+            SIG_PART_PROOF_MAX_SIZE
+        );
+    }
+
     // ── Known-answer tests (KATs) ─────────────────────────────────────
     //
     // These vectors are copied verbatim from go-algorand's

@@ -1592,6 +1592,24 @@ mod tests {
     }
 
     #[test]
+    fn ed25519_bv_compatible_verify_rejects_zero_signature_and_zero_pubkey() {
+        // TestVerifyZeros (crypto/curve25519_test.go): a zero signature
+        // against a zero public key must never verify, for any message.
+        // A zero-byte pubkey decompresses to a small-order curve point, so
+        // `ed25519_bv_compatible_verify`'s small-order-A rejection (issue
+        // #1136) fires regardless of the (also zero) signature bytes.
+        let pk = [0u8; 32];
+        let sig = [0u8; 64];
+        for x in 0u8..255 {
+            let msg = [x];
+            assert!(
+                !ed25519_bv_compatible_verify(&pk, &msg, &sig),
+                "zero sig with zero pk unexpectedly verified message {x:#x}"
+            );
+        }
+    }
+
+    #[test]
     fn verify_correct_single_sig() {
         let key = test_signing_key();
         let pk = key.verifying_key();
