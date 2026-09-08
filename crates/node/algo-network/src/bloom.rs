@@ -453,4 +453,38 @@ mod tests {
         let expected = size_bits.div_ceil(8) + 8;
         assert_eq!(binary_marshal_length(10, 0.01), expected);
     }
+
+    /// go: `TestIncompressible` (`util/bloom/bloom_test.go`) fills a filter
+    /// sized for 150,000 elements to its `Optimal` false-positive-rate
+    /// target, then checks that DEFLATE (level 9) can't shrink the
+    /// marshaled bytes by more than 1% -- a Bloom filter's bit-data should
+    /// look statistically like random noise once it's this full, so a
+    /// general-purpose compressor gains it nothing. This guards against a
+    /// future change (e.g. a weaker hash, a non-uniform bit layout)
+    /// silently making the filter's output compressible/lower-entropy than
+    /// intended (phase17 `parity_util.md`, `TestIncompressible`).
+    #[test]
+    fn incompressible_when_full() {
+        use std::io::Write;
+
+        let num_elements = 150_000usize;
+        let (size_bits, num_hashes) = Filter::optimal(num_elements, 1e-10);
+        let mut filter = Filter::new(size_bits, num_hashes, 1234);
+        for i in 0u32..num_elements as u32 {
+            filter.set(&i.to_be_bytes());
+        }
+        let filter_bytes = filter.marshal_binary();
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(9));
+        encoder.write_all(&filter_bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert!(
+            compressed.len() >= filter_bytes.len() * 99 / 100,
+            "compressed {} -> {} (more than 1% shrinkage; filter bit-data is unexpectedly compressible)",
+            filter_bytes.len(),
+            compressed.len()
+        );
+    }
 }

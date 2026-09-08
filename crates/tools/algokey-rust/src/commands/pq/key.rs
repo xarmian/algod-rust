@@ -381,6 +381,19 @@ mod tests {
         assert!(err.contains("not compliant"), "{err}");
     }
 
+    /// go: `TestPQDecodePrivateKeyRejectsMnemonic` (`cmd/algokey/pq_test.go`)
+    /// feeds 25-word mnemonic text into `decodePQPrivateKeyFileBytes` and
+    /// asserts `errPQKeyMalformed`. A mnemonic is plain ASCII text, not a
+    /// msgpack-encoded `pqSigningMaterial` map, so decoding it must fail
+    /// the same "malformed" way as any other non-msgpack/wrong-shaped
+    /// input (phase17 `parity_tools_cmd.md`, `TestPQDecodePrivateKeyRejectsMnemonic`).
+    #[test]
+    fn decode_rejects_mnemonic_shaped_text() {
+        let mnemonic = b"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let err = decode_pq_signing_material(mnemonic).unwrap_err();
+        assert!(err.contains("malformed"), "{err}");
+    }
+
     #[test]
     fn write_then_read_round_trips_through_disk() {
         let dir = tempfile::tempdir().unwrap();

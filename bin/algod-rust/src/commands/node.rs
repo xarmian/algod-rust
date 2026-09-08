@@ -1250,4 +1250,58 @@ mod follower_resource_path_tests {
             "block db must follow the explicit BlockDBDir override"
         );
     }
+
+    /// go: `TestEnsureAndResolveGenesisDirsError`
+    /// (`config/config_test.go`) chmods a temp dir to write-denied
+    /// (`0200`) and asserts `EnsureAndResolveGenesisDirs` fails with a
+    /// "permission denied" error rather than silently creating nothing.
+    /// `resolve_resource_paths` itself is a pure, infallible path-string
+    /// computation (phase17 `parity_config_proto_sp.md`'s own note on this
+    /// row), so go's constructor-error scenario doesn't map onto it
+    /// directly -- but the real fallible step is the wiring call site's
+    /// `create_dir_all` in [`open_resource_ledger`] (the same function
+    /// `default_resource_paths_follower` above exercises on the happy
+    /// path), which had no negative test. This closes that gap the same
+    /// way `create_genesis_ledger_dir_fails_with_permission_denied_on_readonly_parent`
+    /// (this file, `run_start_tests`) already closed it for the
+    /// genesis-directory creation step.
+    ///
+    /// Unix-only: Windows ACLs don't honor the same `chmod`-based
+    /// write-denial this go test (and this port of it) rely on.
+    #[cfg(unix)]
+    #[test]
+    fn open_resource_ledger_fails_with_permission_denied_on_readonly_tracker_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let ledger_prefix = genesis_relative_prefix(root.path());
+        std::fs::create_dir_all(ledger_prefix.parent().unwrap()).unwrap();
+
+        // A `TrackerDBDir` override pointing at a not-yet-created child of a
+        // write-denied parent: `create_dir_all` must fail rather than
+        // silently succeed or panic, mirroring go's `os.Chmod(dir, 0200)`.
+        let readonly_parent = root.path().join("readonly_parent");
+        std::fs::create_dir_all(&readonly_parent).unwrap();
+        let tracker_dir = readonly_parent.join("custom_tracker");
+        std::fs::set_permissions(&readonly_parent, std::fs::Permissions::from_mode(0o200))
+            .expect("chmod parent dir to write-only");
+
+        let cfg = algo_config::Local {
+            tracker_db_dir: tracker_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let result = open_resource_ledger(&ledger_prefix, &cfg);
+
+        // Restore permissions before the `TempDir` guard tries to clean up,
+        // mirroring go's own permission restoration.
+        std::fs::set_permissions(&readonly_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("restore parent dir permissions");
+
+        let err = result.expect_err("directory creation under a write-only parent must fail");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("permission denied"),
+            "expected a permission-denied error, got: {msg}"
+        );
+    }
 }

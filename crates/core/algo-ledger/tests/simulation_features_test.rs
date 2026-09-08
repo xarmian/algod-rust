@@ -220,6 +220,190 @@ fn extra_opcode_budget_at_limit_accepted() {
     );
 }
 
+/// v6 program that runs `reps` iterations of `int 1; pop` (cost 2 each),
+/// then `int 1` to approve (cost 1) -- an unconditionally expensive
+/// approval program with a precisely-controllable total opcode cost of
+/// `2 * reps + 1`.
+fn expensive_program(reps: usize) -> Vec<u8> {
+    let mut source = String::from("#pragma version 6\n");
+    for _ in 0..reps {
+        source.push_str("int 1\npop\n");
+    }
+    source.push_str("int 1\n");
+    algo_avm::assembler::assemble_string(&source)
+        .expect("expensive_program must assemble")
+        .program
+}
+
+/// go: `TestAppCallWithExtraBudgetReturningPC`
+/// (`ledger/simulation/simulation_eval_test.go`) runs a two-app-call group
+/// with `ExtraOpcodeBudget` and PC-trace both enabled, and checks that each
+/// transaction's own opcode PC trace is reported correctly even though the
+/// group's opcode budget is shared/pooled across transactions. algod-rust's
+/// extra-budget accounting (`extra_opcode_budget_at_limit_accepted`) and its
+/// PC tracing (`simulation_trace_test.rs`) are each tested individually but
+/// not together on a multi-transaction group -- this closes that gap (phase17
+/// `parity_ledger_sim.md`, `TestAppCallWithExtraBudgetReturningPC`).
+#[test]
+fn extra_opcode_budget_with_trace_reports_per_txn_pc_trace() {
+    let sender = Address([0xAA; 32]);
+    let mut state = setup_state(sender);
+
+    // Cheap app: costs 1 opcode ("int 1").
+    register_app(&mut state, sender, 100, expensive_program(0));
+    // Expensive app: 700 reps of `int 1; pop` + a final `int 1` = cost 1402.
+    // Alone this exceeds the default per-app-call budget of 700, so it can
+    // only succeed by drawing on the group's pooled/extra budget.
+    register_app(&mut state, sender, 200, expensive_program(700));
+
+    let extra_opcode_budget = 100;
+    let request = SimulationRequest {
+        txn_groups: vec![vec![make_appl_txn(sender, 100), make_appl_txn(sender, 200)]],
+        allow_empty_signatures: true,
+        extra_opcode_budget,
+        trace_config: algo_ledger::simulation::ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: false,
+        },
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("group must succeed with the pooled + extra budget");
+
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "group should succeed: {:?}",
+        group.failure_message
+    );
+    assert_eq!(group.txn_results.len(), 2);
+    assert_eq!(
+        result.eval_overrides.extra_opcode_budget,
+        extra_opcode_budget
+    );
+    // Total budget made available to the group: 700 per app call + extra.
+    assert_eq!(group.app_budget_added, 700 * 2 + extra_opcode_budget as u64);
+    assert_eq!(group.txn_results[0].app_budget_consumed, 1);
+    // 700 reps of `int 1; pop` + a final `int 1`: the assembler hoists the
+    // repeated `1` literal into an `intcblock` (cost 1) once it's reused
+    // this many times, so the total is `2*700 + 2` = 1402, not the naive
+    // `2*700 + 1`.
+    assert_eq!(group.txn_results[1].app_budget_consumed, 1402);
+    assert_eq!(
+        group.app_budget_consumed,
+        group.txn_results[0].app_budget_consumed + group.txn_results[1].app_budget_consumed
+    );
+
+    // Each transaction's own PC trace should be independently present and
+    // correctly sized, regardless of the other transaction's budget draw.
+    let cheap_trace = group.txn_results[0]
+        .trace
+        .as_ref()
+        .expect("cheap txn should have a trace")
+        .approval_program_trace
+        .as_ref()
+        .expect("cheap txn should have an approval program trace");
+    assert_eq!(cheap_trace.opcodes.len(), 1, "one `int 1` opcode");
+    assert_eq!(cheap_trace.opcodes[0].pc, 0);
+
+    let expensive_trace = group.txn_results[1]
+        .trace
+        .as_ref()
+        .expect("expensive txn should have a trace")
+        .approval_program_trace
+        .as_ref()
+        .expect("expensive txn should have an approval program trace");
+    assert_eq!(expensive_trace.opcodes.len(), 1402);
+    // PCs are monotonically increasing byte offsets into the program.
+    assert_eq!(expensive_trace.opcodes[0].pc, 0);
+    assert!(
+        expensive_trace
+            .opcodes
+            .windows(2)
+            .all(|w| w[1].pc > w[0].pc),
+        "PC trace must be strictly increasing for a branch-free program"
+    );
+}
+
+/// go: `TestAppCallWithExtraBudgetOverBudget`
+/// (`ledger/simulation/simulation_eval_test.go`) adds a small amount of
+/// `ExtraOpcodeBudget` to a two-app-call group -- enough to matter, but not
+/// enough to cover the group's total opcode cost -- and checks the group
+/// still fails with go's "dynamic cost budget exceeded" message while the
+/// per-transaction partial `AppBudgetConsumed`/`AppBudgetAdded` accounting
+/// for the txn that ran out is still reported. algod-rust's AVM reports the
+/// same condition with its own wording ("cost budget exceeded: budget is
+/// {budget} after charging {cost}", `algo-avm/src/machine.rs`) rather than
+/// go's exact string, so this asserts on the shared substring instead of a
+/// byte-identical message (phase17 `parity_ledger_sim.md`,
+/// `TestAppCallWithExtraBudgetOverBudget`).
+#[test]
+fn extra_opcode_budget_insufficient_still_fails_with_partial_accounting() {
+    let sender = Address([0xAA; 32]);
+    let mut state = setup_state(sender);
+
+    // Cheap app: costs 1 opcode ("int 1").
+    register_app(&mut state, sender, 100, expensive_program(0));
+    // Expensive app: 703 reps of `int 1; pop` + a final `int 1`, well beyond
+    // what the default pooled budget (1400) plus a small extra of 5 (1405)
+    // can cover.
+    register_app(&mut state, sender, 200, expensive_program(703));
+
+    let extra_opcode_budget = 5;
+    let request = SimulationRequest {
+        txn_groups: vec![vec![make_appl_txn(sender, 100), make_appl_txn(sender, 200)]],
+        allow_empty_signatures: true,
+        extra_opcode_budget,
+        ..Default::default()
+    };
+
+    let result = simulate(&mut state, request).expect("request itself is well-formed");
+    let group = &result.txn_groups[0];
+
+    let failure_message = group
+        .failure_message
+        .as_deref()
+        .expect("group must fail: insufficient extra budget");
+    assert!(
+        failure_message.contains("cost budget exceeded"),
+        "expected a cost-budget-exceeded failure, got: {failure_message}"
+    );
+    assert_eq!(
+        group.failed_at,
+        Some(vec![1]),
+        "the expensive (second) txn is the one that runs out of budget"
+    );
+    assert_eq!(
+        result.eval_overrides.extra_opcode_budget,
+        extra_opcode_budget
+    );
+    assert_eq!(group.app_budget_added, 700 * 2 + extra_opcode_budget as u64);
+    // The cheap txn fully completes (cost 1); the expensive txn's reported
+    // consumption is whatever it executed before running out, and together
+    // they must self-consistently sum to the group total, without exceeding
+    // what was made available.
+    assert_eq!(group.txn_results[0].app_budget_consumed, 1);
+    assert!(group.txn_results[1].app_budget_consumed > 0);
+    assert_eq!(
+        group.app_budget_consumed,
+        group.txn_results[0].app_budget_consumed + group.txn_results[1].app_budget_consumed
+    );
+    // The group failed precisely because it ran the budget out, so the
+    // reported consumption reaches (or, having charged the one opcode that
+    // pushed it negative, slightly exceeds) what was made available.
+    assert!(
+        group.app_budget_consumed >= group.app_budget_added,
+        "consumed ({}) should reach the available budget ({}) when the group fails on budget",
+        group.app_budget_consumed,
+        group.app_budget_added
+    );
+}
+
 // ---------------------------------------------------------------------------
 // allow_more_logging
 // ---------------------------------------------------------------------------

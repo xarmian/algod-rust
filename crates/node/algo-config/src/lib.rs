@@ -4409,6 +4409,122 @@ mod tests {
         assert!(!at34.enable_p2p_hybrid_mode);
     }
 
+    /// go: `TestLocal_ConfigInvariant` (`config/config_test.go`) pins a
+    /// checked-in `config-v27.json` fixture (a full, byte-for-byte snapshot
+    /// of every field that existed by that historical config version) and
+    /// asserts it decodes to exactly `GetVersionedDefaultLocalConfig(27)`
+    /// -- a regression guard against accidentally changing a shipped
+    /// version's compiled-in defaults. Go's decode leaves any field absent
+    /// from the JSON at the language zero value (a plain `Local{}` target,
+    /// no per-field fallback), which is fine there because the fixture
+    /// lists every field that existed at v27.
+    ///
+    /// `crates/node/algo-config/fixtures/config-v27.json` is that same
+    /// go-algorand fixture (`test/testdata/configs/config-v27.json`,
+    /// v5.0.0-stable), copied verbatim. algod-rust's `Local` can't be
+    /// compared the same whole-struct way: unlike go, a JSON key absent
+    /// here falls back to *that field's own latest-version default*
+    /// (`#[serde(default = "...")]`, documented on `Local` -- this is what
+    /// lets [`Local::load_from_str`]/[`Local::load_from_path`] treat an
+    /// unset `config.json` field as "use the current sensible default", not
+    /// "zero"), so fields added to `Local` after v27 legitimately decode to
+    /// their latest default rather than v27's (correctly zero/untagged)
+    /// value when the whole struct is deserialized directly. The fixture
+    /// itself only ever lists fields that existed at v27, so the real
+    /// go-parity invariant is: for exactly the keys the fixture names, the
+    /// parsed value matches [`Local::default_at_version`]`(27)`'s
+    /// corresponding field -- checked here key-by-key via each side's JSON
+    /// form (phase17 `parity_config_proto_sp.md`, `TestLocal_ConfigInvariant`).
+    #[test]
+    fn config_v27_fixture_matches_versioned_default() {
+        // go's `Local` has fields `algo-config`'s `Local` doesn't port yet
+        // (telemetry/debug knobs like `DeadlockDetection`,
+        // `AccountUpdatesStatsInterval`; alternate-pool-implementation
+        // knobs like `TxPoolSize`/`TxPoolExponentialIncreaseFactor`; a
+        // `NodeExporterPath`/`NodeExporterListenAddress` Prometheus
+        // exporter; etc. -- discovered while porting this test, tracked
+        // for follow-up rather than fixed here). Comparing the *whole*
+        // struct would make this test permanently red on every one of
+        // those, so it checks equality only for the fixture keys `Local`
+        // actually has a field for -- still a real regression guard for
+        // every field that *is* ported, matching this crate's field-by-field
+        // audit approach elsewhere (`docs/PHASE16_VALIDATION.md`).
+        const NOT_YET_PORTED: &[&str] = &[
+            "AccountUpdatesStatsInterval",
+            "CatchupBlockValidateMode",
+            "DeadlockDetection",
+            "DeadlockDetectionThreshold",
+            "DisableNetworking",
+            "EnableAccountUpdatesStats",
+            "EnableBlockServiceFallbackToArchiver",
+            "EnableCatchupFromArchiveServers",
+            "EnableMetricReporting",
+            "EnablePingHandler",
+            "EnableTxBacklogRateLimiting",
+            "EnableVerbosedTransactionSyncLogging",
+            "ForceFetchTransactions",
+            "HeartbeatUpdateInterval",
+            "IsIndexerActive",
+            "NetAddress",
+            "NetworkMessageTraceServer",
+            "NodeExporterListenAddress",
+            "NodeExporterPath",
+            "ParticipationKeysRefreshInterval",
+            "PeerConnectionsUpdateInterval",
+            "PeerPingPeriodSeconds",
+            "ProposalAssemblyTime",
+            "ReconnectTime",
+            "RunHosted",
+            "StorageEngine",
+            "SuggestedFeeBlockHistory",
+            "SuggestedFeeSlidingWindowSize",
+            "TransactionSyncDataExchangeRate",
+            "TransactionSyncSignificantMessageThreshold",
+            "TxBacklogReservedCapacityPerPeer",
+            "TxBacklogSize",
+            "TxPoolExponentialIncreaseFactor",
+            "TxPoolSize",
+            "VerifiedTranscationsCacheSize",
+        ];
+
+        let fixture_text = include_str!("../fixtures/config-v27.json");
+        let fixture_value: serde_json::Value =
+            serde_json::from_str(fixture_text).expect("config-v27.json fixture must parse");
+        let fixture_map = fixture_value.as_object().expect("fixture is a JSON object");
+        assert!(
+            !fixture_map.is_empty(),
+            "fixture must actually list fields to make this test meaningful"
+        );
+
+        let expected_value = serde_json::to_value(Local::default_at_version(27))
+            .expect("Local::default_at_version(27) must serialize");
+        let expected_map = expected_value
+            .as_object()
+            .expect("serialized Local is a JSON object");
+
+        let mut fields_checked = 0usize;
+        for (key, fixture_field_value) in fixture_map {
+            if NOT_YET_PORTED.contains(&key.as_str()) {
+                continue;
+            }
+            let expected_field_value = expected_map
+                .get(key)
+                .unwrap_or_else(|| panic!("Local has no field for fixture key {key:?}"));
+            assert_eq!(
+                fixture_field_value, expected_field_value,
+                "field {key:?}: fixture value {fixture_field_value:?} != \
+                 default_at_version(27) value {expected_field_value:?}"
+            );
+            fields_checked += 1;
+        }
+        assert_eq!(
+            fields_checked,
+            fixture_map.len() - NOT_YET_PORTED.len(),
+            "every not-yet-ported field must actually appear in the fixture, \
+             so this exclusion list can't silently grow stale"
+        );
+    }
+
     // --- Partial JSON overlay ------------------------------------------
 
     #[test]
