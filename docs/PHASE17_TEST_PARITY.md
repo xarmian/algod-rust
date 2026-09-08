@@ -51,17 +51,17 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 892 | 28% |
-| `partial` | 748 | 24% |
+| `matched-1:1` | 896 | 28% |
+| `partial` | 756 | 24% |
 | `matched-1:many` | 649 | 20% |
-| `out-of-scope` | 559 | 18% |
+| `out-of-scope` | 580 | 18% |
 | `matched-many:1` | 209 | 7% |
-| `missing-test` | 112 | 4% |
+| `missing-test` | 79 | 2% |
 | `not-implemented` | 10 | 0% |
 
-**122 rows (`not-implemented` + `missing-test`, 4%) are real, actionable
+**89 rows (`not-implemented` + `missing-test`, 3%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
-implements but never tests. `partial` (749, 24%) is coverage that exists
+implements but never tests. `partial` (756, 24%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
 most are diminishing-returns edge cases. See
 [`docs/PHASE17_PROPOSAL.md`](PHASE17_PROPOSAL.md) for how the real gaps
@@ -76,7 +76,7 @@ were triaged into tracked issues.
 | Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 49 | 103 | 44 | 134 | 0 | 0 | 173 |
 | Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 35 | 26 | 0 | 6 | 0 | 0 | 1 |
 | Agreement protocol (`agreement`) | [parity_agreement.md](phase17/parity_agreement.md) | 326 | 156 | 37 | 77 | 49 | 0 | 0 | 7 |
-| e2e integration (`test/e2e-go`) | [parity_e2e.md](phase17/parity_e2e.md) | 195 | 48 | 23 | 0 | 65 | 0 | 33 | 26 |
+| e2e integration (`test/e2e-go`) | [parity_e2e.md](phase17/parity_e2e.md) | 195 | 52 | 23 | 0 | 73 | 0 | 0 | 47 |
 | Networking (`network`, `network/p2p`, ...) | [parity_network.md](phase17/parity_network.md) | 263 | 96 | 57 | 11 | 76 | 8 | 0 | 15 |
 | Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 89 | 35 | 16 | 60 | 0 | 34 | 42 |
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 59 | 64 | 1 | 10 | 0 | 0 | 10 |
@@ -86,5 +86,5 @@ were triaged into tracked issues.
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 32 | 26 | 7 | 21 | 0 | 0 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 11 | 0 | 16 | 0 | 0 | 3 |
-| **Total** | | **3,179** | **891** | **649** | **209** | **749** | **10** | **112** | **559** |
+| **Total** | | **3,179** | **896** | **649** | **209** | **756** | **10** | **79** | **580** |
 
