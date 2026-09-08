@@ -36,8 +36,10 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use http::header::HeaderName;
+use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::MaybeTlsStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::errors::WsConnectError;
@@ -65,6 +67,11 @@ use crate::ws_peer::{PeerHandle, WsPeer, WsPeerConfig};
 /// Default handshake timeout — matches Go's `websocket.Dialer.HandshakeTimeout`
 /// of 45 seconds in `tryConnect`.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Default cap on the outbound dial's HTTP upgrade response header size —
+/// matches Go's `wsMaxHeaderBytes` constant (`network/wsNetwork.go:115`).
+/// `0` disables the check entirely, mirroring Go's `TestMaxHeaderSize`.
+pub const DEFAULT_MAX_HEADER_BYTES: usize = 4096;
 
 /// User-Agent header value identifying this client.
 const USER_AGENT: &str = "algod-rust/0.1.0";
@@ -111,6 +118,25 @@ pub struct ConnectConfig {
     /// Optional per-peer configuration (filters, request timeout, etc.).
     /// When `None`, uses `WsPeerConfig::default()`.
     pub peer_config: Option<WsPeerConfig>,
+
+    /// Cap, in bytes, on the outbound dial's HTTP upgrade response headers
+    /// (status line + headers, up to and including the `\r\n\r\n`
+    /// terminator) — Go's `wsMaxHeaderBytes`/`websocket.Dialer.MaxHeaderSize`
+    /// (`network/wsNetwork.go`). `0` disables the check. Defaults to
+    /// [`DEFAULT_MAX_HEADER_BYTES`] (4096, matching Go).
+    ///
+    /// Only enforced for plain (`ws://`) connections. Neither
+    /// `tokio-tungstenite` nor `tungstenite` expose a way to bound just the
+    /// handshake-response-reading phase of their own dial helpers without
+    /// changing the resulting stream's type, so this cap is enforced by a
+    /// small reimplementation of the wire exchange directly against the raw
+    /// `TcpStream` (see `dial_with_header_cap`). A `wss://` response's
+    /// header bytes are TLS ciphertext at the TCP layer, and capping those
+    /// would require driving the TLS handshake through that same manual
+    /// path too — out of scope here — so `wss://` connections fall back to
+    /// the previous (uncapped beyond `tungstenite`'s own internal 64 KiB
+    /// `AttackCheck`) behavior.
+    pub max_header_bytes: usize,
 }
 
 impl Default for ConnectConfig {
@@ -126,6 +152,7 @@ impl Default for ConnectConfig {
             our_features: PeerFeatureFlags::COMPRESSED_PROPOSAL,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             peer_config: None,
+            max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
         }
     }
 }
@@ -280,15 +307,16 @@ async fn try_connect_inner(
     // error variant) when constructed via combinators inside the closure
     // body; an explicit match avoids that false-positive-shaped closure
     // signature without boxing the error type just for this call site.
+    let max_header_bytes = config.max_header_bytes;
     let dial = move || async move {
         match tokio::time::timeout(
             handshake_timeout,
-            tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false),
+            dial_with_header_cap(request, ws_config, max_header_bytes),
         )
         .await
         {
             Ok(Ok(pair)) => Ok(pair),
-            Ok(Err(e)) => Err(map_tungstenite_error(e)),
+            Ok(Err(e)) => Err(e),
             Err(_elapsed) => Err(WsConnectError::Timeout),
         }
     };
@@ -468,6 +496,219 @@ async fn try_connect_inner(
 }
 
 // ---------------------------------------------------------------------------
+// Header-size-capped dial
+// ---------------------------------------------------------------------------
+
+/// Dial `request`'s target, applying [`ConnectConfig::max_header_bytes`] to
+/// the HTTP upgrade response when the connection is plain (`ws://`).
+///
+/// This is the Rust equivalent of Go's outbound dial going through a
+/// `websocket.Dialer` configured with `MaxHeaderSize: wn.wsMaxHeaderBytes`
+/// (`network/wsNetwork.go`'s `tryConnect`). Neither `tokio-tungstenite` nor
+/// `tungstenite` expose an equivalent knob (their handshake reader is capped
+/// only by a hardcoded, much larger 64 KiB `AttackCheck`), and there is no
+/// way to layer a byte-counting wrapper around just the handshake phase of
+/// their own dial helpers: the returned stream type would no longer be the
+/// bare `MaybeTlsStream<TcpStream>` that [`crate::ws_peer::WsPeer`] is built
+/// against, and `tokio`'s `TcpStream` offers no supported way to peel such a
+/// wrapper back off afterward.
+///
+/// So for the plain (`ws://`) case, this reimplements the handshake's wire
+/// exchange directly against the raw `TcpStream` — using tungstenite's own
+/// public building blocks ([`generate_request`], [`derive_accept_key`],
+/// [`Response::try_parse`]) rather than reimplementing HTTP/WebSocket
+/// framing — so the size cap can be enforced while accumulating the
+/// response, and the same untouched `TcpStream` still ends up wrapped in a
+/// plain `WebSocketStream<MaybeTlsStream<TcpStream>>` via
+/// [`tokio_tungstenite::WebSocketStream::from_partially_read`] once the
+/// header is known to fit.
+///
+/// Only plain (`ws://`) connections are covered: a `wss://` response's
+/// header bytes are TLS ciphertext at the TCP layer, and correctly capping
+/// them would require driving the TLS handshake through this same manual
+/// path too — out of scope here (see [`ConnectConfig::max_header_bytes`]'s
+/// doc comment) — so `wss://` falls back to the previous (uncapped beyond
+/// `tungstenite`'s own internal 64 KiB bound) behavior.
+///
+/// [`generate_request`]: tokio_tungstenite::tungstenite::handshake::client::generate_request
+/// [`derive_accept_key`]: tokio_tungstenite::tungstenite::handshake::derive_accept_key
+/// [`Response::try_parse`]: tokio_tungstenite::tungstenite::handshake::machine::TryParse::try_parse
+async fn dial_with_header_cap(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    ws_config: WebSocketConfig,
+    max_header_bytes: usize,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    WsConnectError,
+> {
+    let scheme = request.uri().scheme_str().unwrap_or("ws");
+    if scheme != "ws" || max_header_bytes == 0 {
+        return tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false)
+            .await
+            .map_err(map_tungstenite_error);
+    }
+
+    let host = request
+        .uri()
+        .host()
+        .ok_or_else(|| WsConnectError::TcpFailure("request URL has no host".to_string()))?
+        .to_string();
+    let port = request.uri().port_u16().unwrap_or(80);
+
+    let mut tcp = TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(WsConnectError::Io)?;
+
+    // `generate_request` validates the mandatory WS headers are present
+    // (`into_client_request()` already set them — see `build_gossip_url`'s
+    // caller in `try_connect_inner`) and serializes every remaining header
+    // (including this crate's own X-Algorand-* ones) unchanged.
+    let (raw_request, key) =
+        tokio_tungstenite::tungstenite::handshake::client::generate_request(request)
+            .map_err(WsConnectError::Tungstenite)?;
+    let accept_key = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, &raw_request)
+        .await
+        .map_err(WsConnectError::Io)?;
+
+    let (response, leftover) = read_capped_response(&mut tcp, max_header_bytes).await?;
+    verify_handshake_response(&response, &accept_key)?;
+
+    let ws_stream = tokio_tungstenite::WebSocketStream::from_partially_read(
+        MaybeTlsStream::Plain(tcp),
+        leftover,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        Some(ws_config),
+    )
+    .await;
+
+    Ok((ws_stream, response))
+}
+
+/// Read from `tcp` until a complete HTTP response head has been parsed,
+/// enforcing `max_header_bytes` as a hard cap on how many bytes may arrive
+/// before that happens — the actual behavior being ported from go's
+/// `wsMaxHeaderBytes`/`websocket.Dialer.MaxHeaderSize`
+/// (`network/wsNetwork.go`), which bounds the `bufio.Reader` used to parse
+/// the HTTP response during `tryConnect`'s dial.
+///
+/// Returns the parsed response and any bytes already read past the header
+/// terminator (the start of the WebSocket frame stream, when the peer's
+/// first TCP segment happens to carry both) — the `part` argument
+/// [`tokio_tungstenite::WebSocketStream::from_partially_read`] needs so
+/// those bytes aren't lost.
+async fn read_capped_response(
+    tcp: &mut TcpStream,
+    max_header_bytes: usize,
+) -> Result<
+    (
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+        Vec<u8>,
+    ),
+    WsConnectError,
+> {
+    use tokio_tungstenite::tungstenite::handshake::client::Response;
+    use tokio_tungstenite::tungstenite::handshake::machine::TryParse;
+
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(tcp, &mut chunk)
+            .await
+            .map_err(WsConnectError::Io)?;
+        if n == 0 {
+            return Err(WsConnectError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "peer closed the connection during the WebSocket handshake",
+            )));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+
+        match Response::try_parse(&buf) {
+            Ok(Some((consumed, response))) => {
+                // `consumed` is exactly the header bytes (status line +
+                // headers + terminator) tungstenite parsed off the front of
+                // `buf` — checked here (rather than only in the `Ok(None)`
+                // branch below) because a fast peer can deliver the entire
+                // response in the very first `read()`, skipping the
+                // incremental "still incomplete" path entirely. `buf.len()`
+                // itself isn't the right thing to cap at this point: it may
+                // already include leftover bytes read past the terminator
+                // (the start of the first WS frame), which aren't header
+                // bytes and shouldn't count against the cap.
+                if consumed > max_header_bytes {
+                    return Err(WsConnectError::HeaderTooLarge {
+                        max: max_header_bytes,
+                    });
+                }
+                let leftover = buf.split_off(consumed);
+                return Ok((response, leftover));
+            }
+            Ok(None) => {
+                if buf.len() > max_header_bytes {
+                    return Err(WsConnectError::HeaderTooLarge {
+                        max: max_header_bytes,
+                    });
+                }
+            }
+            Err(e) => return Err(WsConnectError::Tungstenite(e)),
+        }
+    }
+}
+
+/// Validate a raw-parsed handshake response the way
+/// `tungstenite::handshake::client::VerifyData::verify_response` would
+/// (that type is private to the `tungstenite` crate, so this reimplements
+/// just the checks relevant here: RFC 6455 section 4.1's status/`Upgrade`/
+/// `Connection`/`Sec-WebSocket-Accept` requirements). A non-101 status is
+/// mapped through [`map_tungstenite_error`] so 412/429/508 responses are
+/// still translated to [`WsConnectError::GenesisMismatch`]/
+/// [`WsConnectError::TooManyRequests`]/[`WsConnectError::SelfLoop`] exactly
+/// as they are on the `wss://`/uncapped path.
+// `WsConnectError`'s `Tungstenite` variant carries a full tungstenite
+// `Error`, which trips clippy's `result_large_err` — same false-positive
+// shape as `try_connect_inner`'s `dial` closure (see its comment); this
+// return type isn't performance-sensitive enough to warrant boxing the
+// error just for this call site.
+#[allow(clippy::result_large_err)]
+fn verify_handshake_response(
+    response: &tokio_tungstenite::tungstenite::handshake::client::Response,
+    expected_accept_key: &str,
+) -> Result<(), WsConnectError> {
+    if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
+        return Err(map_tungstenite_error(
+            tokio_tungstenite::tungstenite::Error::Http(response.clone()),
+        ));
+    }
+
+    let headers = response.headers();
+    let upgrade_ok = headers
+        .get("Upgrade")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|h| h.eq_ignore_ascii_case("websocket"));
+    let connection_ok = headers
+        .get("Connection")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|h| h.eq_ignore_ascii_case("Upgrade"));
+    let accept_ok = headers
+        .get("Sec-WebSocket-Accept")
+        .and_then(|h| h.to_str().ok())
+        == Some(expected_accept_key);
+
+    if !upgrade_ok || !connection_ok || !accept_ok {
+        return Err(WsConnectError::UpgradeRejected(
+            "response missing or mismatching Upgrade/Connection/Sec-WebSocket-Accept headers"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -581,6 +822,7 @@ fn filter_ascii(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // -----------------------------------------------------------------------
     // URL building tests
@@ -806,6 +1048,156 @@ mod tests {
         let config = ConnectConfig::default();
         assert_eq!(config.handshake_timeout, DEFAULT_HANDSHAKE_TIMEOUT);
         assert_eq!(config.handshake_timeout.as_secs(), 45);
+    }
+
+    #[test]
+    fn connect_config_default_max_header_bytes_matches_go() {
+        // Go: `wsMaxHeaderBytes = 4096` (network/wsNetwork.go).
+        let config = ConnectConfig::default();
+        assert_eq!(config.max_header_bytes, 4096);
+        assert_eq!(config.max_header_bytes, DEFAULT_MAX_HEADER_BYTES);
+    }
+
+    // -----------------------------------------------------------------------
+    // read_capped_response tests (ported from go's `TestMaxHeaderSize`,
+    // network/wsNetwork_test.go:4077 — adapted to exercise the raw-response
+    // reader `dial_with_header_cap` uses directly, rather than an inner
+    // `websocket.Dialer`'s own config knob, since neither
+    // `tokio-tungstenite` nor `tungstenite` expose one)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_capped_response_passes_when_response_fits_under_default_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut server, _) = listener.accept().await.unwrap();
+            server
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let result = read_capped_response(&mut client, DEFAULT_MAX_HEADER_BYTES).await;
+        match result {
+            Ok((response, leftover)) => {
+                assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+                assert!(leftover.is_empty());
+            }
+            Err(e) => panic!("expected cap check to pass: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_capped_response_fails_when_response_exceeds_a_small_cap() {
+        // Mirrors go's `netA.wsMaxHeaderBytes = 128` case: a normal
+        // handshake response is well over 128 bytes and has no header
+        // terminator within that budget.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut server, _) = listener.accept().await.unwrap();
+            let mut body = String::from("HTTP/1.1 101 Switching Protocols\r\n");
+            for i in 0..20 {
+                body.push_str(&format!("X-Padding-{i}: 0123456789abcdef\r\n"));
+            }
+            body.push_str("\r\n");
+            server.write_all(body.as_bytes()).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let result = read_capped_response(&mut client, 128).await;
+        match result {
+            Err(WsConnectError::HeaderTooLarge { max }) => assert_eq!(max, 128),
+            other => panic!("expected HeaderTooLarge, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_capped_response_preserves_bytes_read_past_the_terminator() {
+        // A single TCP segment commonly carries the handshake response
+        // *and* the start of the first WS frame together; those extra
+        // bytes must come back as `leftover`, not be silently dropped,
+        // since `dial_with_header_cap` feeds them to
+        // `WebSocketStream::from_partially_read` as the frame decoder's
+        // initial buffer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut server, _) = listener.accept().await.unwrap();
+            let mut body =
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n".to_vec();
+            body.extend_from_slice(b"EXTRA-FRAME-BYTES");
+            server.write_all(&body).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (_, leftover) = read_capped_response(&mut client, DEFAULT_MAX_HEADER_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(leftover, b"EXTRA-FRAME-BYTES");
+    }
+
+    /// A non-upgrade response, padded well past any small header cap. Used
+    /// to distinguish "the size cap rejected this" (`HeaderTooLarge`) from
+    /// "tungstenite rejected the handshake for an unrelated reason" (e.g.
+    /// non-101 status) without needing to compute a valid
+    /// `Sec-WebSocket-Accept` (which would need a `sha1` dependency this
+    /// crate doesn't otherwise carry) for a genuinely successful handshake.
+    fn oversized_non_upgrade_response() -> String {
+        let mut resp = String::from("HTTP/1.1 400 Bad Request\r\n");
+        for i in 0..20 {
+            resp.push_str(&format!("X-Padding-{i}: 0123456789abcdef\r\n"));
+        }
+        resp.push_str("\r\n");
+        resp
+    }
+
+    #[tokio::test]
+    async fn header_size_cap_disabled_when_zero_lets_oversized_headers_through() {
+        // Mirrors go's `netA.wsMaxHeaderBytes = 0` case: setting the cap to
+        // 0 disables the check entirely, so a response whose headers would
+        // otherwise blow a small budget must reach tungstenite's own
+        // handshake parsing unmolested — driven through
+        // `dial_with_header_cap` end-to-end (not just
+        // `enforce_header_size_cap` in isolation) so the `max_header_bytes
+        // == 0` short-circuit in `dial_with_header_cap` itself is what's
+        // under test. The response is deliberately not a valid upgrade (a
+        // real one needs a `Sec-WebSocket-Accept` this test has no way to
+        // compute without a new dependency), so the dial still fails — the
+        // assertion is that it fails for a *different* reason than
+        // `HeaderTooLarge`, proving the cap itself was bypassed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut server, _) = listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 4096];
+            let _ = server.read(&mut req_buf).await.unwrap();
+            server
+                .write_all(oversized_non_upgrade_response().as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let request = format!("ws://{addr}/v1/test-v1.0/gossip")
+            .into_client_request()
+            .unwrap();
+        let ws_config = WebSocketConfig::default();
+        let result = dial_with_header_cap(request, ws_config, 0).await;
+        assert!(
+            !matches!(result, Err(WsConnectError::HeaderTooLarge { .. })),
+            "max_header_bytes = 0 must disable the size cap, got: {result:?}"
+        );
+        assert!(
+            result.is_err(),
+            "a non-upgrade 400 response should still fail the handshake for another reason"
+        );
+        server.await.unwrap();
     }
 
     // -----------------------------------------------------------------------

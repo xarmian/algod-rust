@@ -134,6 +134,7 @@ async fn build_connect_config() -> ConnectConfig {
         our_features: PeerFeatureFlags::COMPRESSED_PROPOSAL,
         handshake_timeout: Duration::from_secs(30),
         peer_config: None,
+        max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
     }
 }
 

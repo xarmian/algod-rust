@@ -4795,6 +4795,72 @@ mod tests {
         server_net.stop().await;
     }
 
+    /// Go: `TestMaxHeaderSize` (`network/wsNetwork_test.go:4077`) —
+    /// `ConnectConfig::max_header_bytes` caps the HTTP upgrade response
+    /// header size on the outbound dial (issue #1158). Ported as three
+    /// phases against a real relay, exactly like go's test: the default cap
+    /// connects fine, a too-small cap rejects the same connection, and `0`
+    /// disables the check again.
+    #[tokio::test]
+    async fn max_header_size_caps_outbound_dial_header_bytes() {
+        let (server_net, _captured) = start_capturing_relay("testnet-v1.0").await;
+        let (addr, _) = server_net.address();
+
+        // Phase 1: the default cap (matching go's real default) connects
+        // normally — a real relay's handshake response headers are far
+        // smaller than 4096 bytes.
+        let default_config = ConnectConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            ..ConnectConfig::default()
+        };
+        let handle = try_connect(&addr, &default_config)
+            .await
+            .expect("default max_header_bytes must not reject a normal handshake");
+        handle.close();
+
+        // Phase 2: a cap far smaller than any real handshake response's
+        // headers must reject the connection (go: `netA.wsMaxHeaderBytes =
+        // 128`).
+        // Even a bare `HTTP/1.1 101 Switching Protocols\r\n` status line
+        // alone is 35 bytes, well before any of the mandatory `Upgrade`/
+        // `Connection`/`Sec-WebSocket-Accept` headers or algod-rust's own
+        // Algorand handshake headers (genesis ID, node random, peer
+        // features, ...) are even counted — so 16 bytes is well below what
+        // any real relay response can possibly fit under, unlike go's test
+        // (128 bytes), which only needs to beat gorilla's default response
+        // shape.
+        let tiny_cap_config = ConnectConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            max_header_bytes: 16,
+            ..ConnectConfig::default()
+        };
+        let result = try_connect(&addr, &tiny_cap_config).await;
+        match result {
+            Err(crate::errors::WsConnectError::HeaderTooLarge { max: 16 }) => {}
+            Err(e) => panic!("expected HeaderTooLarge {{ max: 16 }}, got a different error: {e}"),
+            Ok(handle) => {
+                handle.close();
+                panic!(
+                    "a 16-byte cap must reject a real relay's handshake headers, but it connected"
+                )
+            }
+        }
+
+        // Phase 3: `max_header_bytes = 0` disables the check again (go:
+        // `netA.wsMaxHeaderBytes = 0`), so the same relay connects fine.
+        let disabled_config = ConnectConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            max_header_bytes: 0,
+            ..ConnectConfig::default()
+        };
+        let handle = try_connect(&addr, &disabled_config)
+            .await
+            .expect("max_header_bytes = 0 must disable the cap");
+        handle.close();
+
+        server_net.stop().await;
+    }
+
     /// Go: `TestGetPeersFiltersSelf` (`network/p2pNetwork_test.go`) — a
     /// node's own address, even if present in its peer store, must never
     /// come back out of `GetPeers`.

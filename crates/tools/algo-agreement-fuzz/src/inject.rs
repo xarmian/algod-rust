@@ -108,6 +108,7 @@ fn throwaway_config(cfg: &InjectorConfig) -> ConnectConfig {
         our_features: PeerFeatureFlags::COMPRESSED_PROPOSAL,
         handshake_timeout: cfg.handshake_timeout,
         peer_config: None,
+        max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
     }
 }
 
