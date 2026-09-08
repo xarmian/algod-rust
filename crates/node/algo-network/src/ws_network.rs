@@ -1337,6 +1337,25 @@ impl WebsocketNetwork {
         // with a listen address configured but `--relay-messages` unset
         // silently accepted no inbound connections — a real conformance
         // gap (issue #748).
+        //
+        // Separately, go's `Start()` also skips binding the listener
+        // entirely when `IncomingConnectionsLimit == 0`
+        // (`wn.relayMessages && wn.config.IncomingConnectionsLimit != 0` —
+        // `network/wsNetwork.go:692`, pinned by
+        // `TestWebsocketNetworkStartZeroIncomingDoesNotListen`,
+        // `network/wsNetwork_test.go:287`): a node configured to accept
+        // zero incoming connections doesn't open a listening socket at
+        // all, so `Address()` reports not-connected. Mirror that here —
+        // this only gates the listener bind, not outbound dialing (see
+        // `mesh_connect`/`request_connect_outgoing`, which don't call this
+        // function at all) — issue #1155.
+        if self.config.incoming_connections_limit == 0 {
+            tracing::debug!(
+                addr = %bind_addr,
+                "incoming_connections_limit is 0; not binding relay listener"
+            );
+            return Ok(());
+        }
 
         // Build optional TLS acceptor from config.
         let tls_acceptor = self.build_tls_acceptor()?;
@@ -4497,32 +4516,21 @@ mod tests {
     }
 
     /// Go: `TestWebsocketNetworkStartZeroIncomingDoesNotListen`
-    /// (`network/wsNetwork_test.go`) — with `IncomingConnectionsLimit == 0`,
-    /// go's `wsNetwork.Start()` never binds a TCP listener at all
+    /// (`network/wsNetwork_test.go:287`) — with `IncomingConnectionsLimit
+    /// == 0`, go's `wsNetwork.Start()` never binds a TCP listener at all
     /// (`netA.listener` stays `nil`, `Address()` reports `connected ==
     /// false`).
     ///
-    /// algod-rust's `start_relay_server` deliberately binds whenever
-    /// `net_address` is set, independent of
-    /// `incoming_connections_limit` (see that function's own doc comment:
-    /// binding is gated on `net_address`/`IsListenServer()` only, matching
-    /// go's *own* `wn.relayMessages` gating rule, not on the connection
-    /// count) — issue #748 fixed a prior bug where the two were
-    /// incorrectly coupled. `incoming_connections_limit == 0` here still
-    /// binds the listener (so a health check remains reachable — see
-    /// `RESERVED_HEALTH_SERVICE_CONNECTIONS`), it just accepts zero
-    /// *application* connections via `RejectingLimitListener`.
-    ///
-    /// This is a real behavioral divergence from go's exact assertion
-    /// (`netA.listener` is nil / `Address()` unconnected) discovered while
-    /// porting this test, not a straightforward "same behavior, different
-    /// mechanism" case like the self-loop test above — flagged in this
-    /// batch's PR description as a follow-up candidate. This test pins
-    /// down algod-rust's actual (intentionally different) behavior: the
-    /// listener binds and `Address()` reports connected, but a real
-    /// connection attempt is rejected by the zero-capacity limiter.
+    /// Previously (issue #1155) `start_relay_server` bound the listener
+    /// whenever `net_address` was set, independent of
+    /// `incoming_connections_limit`, so a node configured for zero
+    /// incoming connections still opened and reported a listening socket
+    /// — a real divergence from go's exact behavior. Now the listener
+    /// bind is additionally gated on `incoming_connections_limit != 0`,
+    /// matching `wn.relayMessages && wn.config.IncomingConnectionsLimit !=
+    /// 0` (`network/wsNetwork.go:692`).
     #[tokio::test]
-    async fn zero_incoming_connections_limit_still_binds_listener_but_accepts_no_peers() {
+    async fn zero_incoming_connections_limit_does_not_bind_listener() {
         let config = WebsocketNetworkConfig {
             genesis_id: "test".to_string(),
             network_id: "testnet".to_string(),
@@ -4535,13 +4543,50 @@ mod tests {
         let net = Arc::new(WebsocketNetwork::new(config, phonebook));
         net.start_relay_server().await.expect("relay server starts");
 
-        // Unlike go, algod-rust still binds and reports "connected" here --
-        // see this test's doc comment for why.
+        // Matching go: no listener bound, so `Address()` reports
+        // not-connected.
         let (_addr, connected) = net.address();
         assert!(
-            connected,
-            "algod-rust binds the listener regardless of incoming_connections_limit (unlike go)"
+            !connected,
+            "algod-rust must not bind a listener when incoming_connections_limit == 0, matching go"
         );
+
+        net.stop().await;
+    }
+
+    /// Companion to the test above (issue #1155 acceptance criteria):
+    /// `incoming_connections_limit == 0` gates the *listener* only —
+    /// outbound dialing must still work normally. `start_relay_server`
+    /// returning early doesn't touch `mesh_connect`/
+    /// `request_connect_outgoing`, which are the outbound-dial path and
+    /// don't call `start_relay_server` at all; this test just pins that a
+    /// zero-limit, listen-configured network still reports itself ready to
+    /// dial out (no listener needed for outbound connections) and that
+    /// `net_address` alone doesn't get cleared by the early return.
+    #[tokio::test]
+    async fn zero_incoming_connections_limit_leaves_outbound_dialing_unaffected() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "test".to_string(),
+            network_id: "testnet".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            incoming_connections_limit: 0,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+        net.start_relay_server().await.expect("relay server starts");
+
+        // No listener bound...
+        let (_addr, connected) = net.address();
+        assert!(!connected);
+
+        // ...but the config driving outbound dialing (mesh_connect) is
+        // untouched: relay_messages / incoming_connections_limit are still
+        // exactly what the caller configured, and the network is not in
+        // any error/stopped state that would block `mesh_connect`.
+        assert!(net.effective_relay_messages());
+        assert_eq!(net.config.incoming_connections_limit, 0);
 
         net.stop().await;
     }
