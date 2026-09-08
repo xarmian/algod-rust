@@ -820,6 +820,54 @@ mod tests {
     }
 
     #[test]
+    fn algo_count_randomized_msgpack_roundtrip() {
+        // Port of go-algorand's `ledger/ledgercore/msgp_gen_test.go`'s
+        // `TestRandomizedEncodingAlgoCount`
+        // (`protocol.RunEncodingTest(t, &AlgoCount{})`): a batch of
+        // pseudo-random `AlgoCount` values, including boundary values (zero,
+        // u64::MAX), must all round-trip through msgpack unchanged. Uses a
+        // small deterministic LCG rather than pulling in a `rand`
+        // dependency for this crate -- only the round-trip property matters,
+        // not any specific sequence.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next_u64(&mut self) -> u64 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                self.0
+            }
+        }
+        let mut rng = Lcg(0x1234_5678_9abc_def0);
+
+        let mut samples = vec![
+            AlgoCount::default(),
+            AlgoCount {
+                money: u64::MAX,
+                reward_units: u64::MAX,
+            },
+            AlgoCount {
+                money: 1,
+                reward_units: 0,
+            },
+            AlgoCount {
+                money: 0,
+                reward_units: 1,
+            },
+        ];
+        for _ in 0..64 {
+            samples.push(AlgoCount {
+                money: rng.next_u64(),
+                reward_units: rng.next_u64(),
+            });
+        }
+
+        for sample in &samples {
+            let bytes = rmp_serde::to_vec_named(sample).expect("msgpack serialize");
+            let round_tripped: AlgoCount = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+            assert_eq!(&round_tripped, sample, "round-trip mismatch for {sample:?}");
+        }
+    }
+
+    #[test]
     fn account_totals_zero_value_omits_all_fields_from_msgpack() {
         // Regression for the same conformance bug fixed in
         // `crate::state_delta::AccountTotals` (issue #824 theme 5): before

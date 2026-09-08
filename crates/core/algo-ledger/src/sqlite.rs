@@ -10858,6 +10858,36 @@ mod tests {
     }
 
     #[test]
+    fn get_block_header_for_round_beyond_stored_history_returns_no_entry() {
+        // Analogous to go's `ledger/tracker_test.go`'s
+        // `TestTrackers_AccountUpdatesLedgerEvaluatorNoBlockHdr`: a minimal
+        // evaluator-ledger wrapper (`accountUpdatesLedgerEvaluator`) whose
+        // only committed state is a `prevHeader` returns go's
+        // `ledgercore.ErrNoEntry{}` -- not stale/wrong data, not a panic --
+        // when asked for a header at a round it never saw.
+        //
+        // algod-rust doesn't have a distinct "evaluator ledger" wrapper type
+        // (go's `accountUpdatesLedgerEvaluator` is folded into the single
+        // `LedgerStore`/`SqliteLedger` abstraction here), so this exercises
+        // the same "no entry" contract directly against `SqliteLedger`: a
+        // store that has only ever recorded round 10 must resolve any other
+        // round -- including one *below* what's stored, matching go's round
+        // 99 lookup on an evaluator whose only round is its zero-value
+        // `prevHeader` -- to "no entry" (`Ok(None)`), never an error or
+        // fabricated data.
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger
+            .put_block(10, "v41", b"header-bytes", b"block-bytes")
+            .unwrap();
+
+        assert_eq!(ledger.get_block_header_data(99).unwrap(), None);
+        assert_eq!(ledger.get_block_header(99).unwrap(), None);
+        // The one round that *is* stored still resolves correctly -- the
+        // "no entry" result above is round-specific, not a wholesale outage.
+        assert!(ledger.get_block_header_data(10).unwrap().is_some());
+    }
+
+    #[test]
     fn test_put_get_txtail() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
         let data = b"txtail-payload";

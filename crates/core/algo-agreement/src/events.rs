@@ -1482,6 +1482,103 @@ pub const PIPELINED_MESSAGE_TIMESTAMP: Duration = Duration::from_nanos(1);
 mod tests {
     use super::*;
 
+    // ---- ConsensusVersionView / FreshnessData msgpack codec parity ----
+    //
+    // Port of go-algorand's `agreement/msgp_gen_test.go`'s
+    // `TestMarshalUnmarshalConsensusVersionView` /
+    // `TestRandomizedEncodingConsensusVersionView` and
+    // `TestMarshalUnmarshalfreshnessData` /
+    // `TestRandomizedEncodingfreshnessData`. Both Rust types already derive
+    // `Serialize`/`Deserialize`; these tests pin the msgpack round-trip
+    // explicitly (a specific value, plus a small deterministic-PRNG batch in
+    // place of go's `protocol.RunEncodingTest` fuzzing).
+
+    struct TestLcg(u64);
+    impl TestLcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            self.0
+        }
+        fn next_bool(&mut self) -> bool {
+            self.next_u64() & 1 == 1
+        }
+    }
+
+    #[test]
+    fn consensus_version_view_marshal_unmarshal_msgpack_roundtrip() {
+        let view = ConsensusVersionView {
+            err: Some("lookup failed".to_string()),
+            version: "v41".to_string(),
+        };
+        let bytes = rmp_serde::to_vec_named(&view).expect("msgpack serialize");
+        let round_tripped: ConsensusVersionView =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, view);
+
+        let no_err = ConsensusVersionView {
+            err: None,
+            version: "v42".to_string(),
+        };
+        let bytes = rmp_serde::to_vec_named(&no_err).expect("msgpack serialize");
+        let round_tripped: ConsensusVersionView =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, no_err);
+    }
+
+    #[test]
+    fn consensus_version_view_randomized_msgpack_roundtrip() {
+        let mut rng = TestLcg(0x5EED_5EED_5EED_5EED);
+        for i in 0..32 {
+            let view = ConsensusVersionView {
+                err: if rng.next_bool() {
+                    Some(format!("err-{}", rng.next_u64()))
+                } else {
+                    None
+                },
+                version: format!("v{}", i + (rng.next_u64() % 50)),
+            };
+            let bytes = rmp_serde::to_vec_named(&view).expect("msgpack serialize");
+            let round_tripped: ConsensusVersionView =
+                rmp_serde::from_slice(&bytes).expect("msgpack decode");
+            assert_eq!(round_tripped, view, "round-trip mismatch for {view:?}");
+        }
+    }
+
+    #[test]
+    fn freshness_data_marshal_unmarshal_msgpack_roundtrip() {
+        let fd = FreshnessData {
+            player_round: Round(1234),
+            player_period: Period(5),
+            player_step: Step(3),
+            player_last_concluding: Step(7),
+        };
+        let bytes = rmp_serde::to_vec_named(&fd).expect("msgpack serialize");
+        let round_tripped: FreshnessData = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, fd);
+
+        let zero = FreshnessData::default();
+        let bytes = rmp_serde::to_vec_named(&zero).expect("msgpack serialize");
+        let round_tripped: FreshnessData = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, zero);
+    }
+
+    #[test]
+    fn freshness_data_randomized_msgpack_roundtrip() {
+        let mut rng = TestLcg(0xABCD_EF01_2345_6789);
+        for _ in 0..32 {
+            let fd = FreshnessData {
+                player_round: Round(rng.next_u64()),
+                player_period: Period(rng.next_u64()),
+                player_step: Step(rng.next_u64()),
+                player_last_concluding: Step(rng.next_u64()),
+            };
+            let bytes = rmp_serde::to_vec_named(&fd).expect("msgpack serialize");
+            let round_tripped: FreshnessData =
+                rmp_serde::from_slice(&bytes).expect("msgpack decode");
+            assert_eq!(round_tripped, fd, "round-trip mismatch for {fd:?}");
+        }
+    }
+
     #[test]
     fn event_type_display() {
         assert_eq!(format!("{}", EventType::None), "none");

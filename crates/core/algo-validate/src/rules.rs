@@ -1750,6 +1750,69 @@ mod tests {
     }
 
     #[test]
+    fn test_payment_validation_random_batch_rejects_bad_windows() {
+        // Port of go-algorand's `ledger/apply/payment_test.go`'s
+        // `TestPaymentValidation`: generate a batch of well-formed payment
+        // transactions (`generateTestPays`), then for each one, confirm that
+        // (a) widening the window past `MaxTxnLife` and (b) an inverted
+        // window (`LastValid < FirstValid`) are both rejected by well-formed
+        // validation. Uses a small deterministic LCG in place of go's
+        // `math/rand/v2` -- only the property (both mutations always reject)
+        // matters, not any particular sequence.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                // Numerical Recipes LCG constants.
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                self.0 >> 33
+            }
+            fn next_range(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+
+        let mut rng = Lcg(0xC0FF_EE12_3456_789A);
+
+        for _ in 0..100 {
+            let amount = rng.next_range(1000);
+            let fee = MIN_TXN_FEE + rng.next_range(10);
+            let issuance = 50 + rng.next_range(30);
+            let expiry = issuance + 10;
+
+            let mut txn = Transaction {
+                txn_type: "pay".into(),
+                sender: TEST_SENDER,
+                fee,
+                first_valid: Round(issuance),
+                last_valid: Round(expiry),
+                ..Default::default()
+            };
+            let _ = amount; // amount doesn't affect window validation; kept for fidelity with go's generator.
+
+            // Base transaction is well-formed.
+            assert!(
+                validate_transaction_rules(&txn, false).is_ok(),
+                "freshly generated payment txn should be well-formed: {txn:?}"
+            );
+
+            // Widening the window past MAX_TXN_LIFE must be rejected.
+            let mut large_window = txn.clone();
+            large_window.last_valid = Round(large_window.last_valid.0 + MAX_TXN_LIFE);
+            assert!(
+                validate_transaction_rules(&large_window, false).is_err(),
+                "transaction with large window verified incorrectly: {large_window:?}"
+            );
+
+            // An inverted window (last_valid < first_valid) must be rejected.
+            txn.last_valid = Round(txn.first_valid.0 - 1);
+            assert!(
+                validate_transaction_rules(&txn, false).is_err(),
+                "transaction with bad window verified incorrectly: {txn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_note_too_large_fails() {
         // `validate_transaction_rules` uses ConsensusParams::default() (v42),
         // which has MaxAbsoluteTxnNoteBytes = 4096 (size-pricing enabled).
