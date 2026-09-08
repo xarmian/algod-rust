@@ -51,15 +51,15 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 941 | 30% |
+| `matched-1:1` | 943 | 30% |
 | `partial` | 761 | 24% |
 | `matched-1:many` | 653 | 21% |
 | `out-of-scope` | 580 | 18% |
 | `matched-many:1` | 210 | 7% |
-| `missing-test` | 24 | 1% |
+| `missing-test` | 22 | 1% |
 | `not-implemented` | 10 | 0% |
 
-**34 rows (`not-implemented` + `missing-test`, 1%) are real, actionable
+**32 rows (`not-implemented` + `missing-test`, 1%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
 implements but never tests. `partial` (761, 24%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
@@ -71,7 +71,7 @@ were triaged into tracked issues.
 
 | area | file | total | 1:1 | 1:many | many:1 | partial | not-impl | missing-test | out-of-scope |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 106 | 165 | 6 | 124 | 0 | 24 | 24 |
+| AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 108 | 165 | 6 | 124 | 0 | 22 | 24 |
 | Transactions core (`data/transactions`) | [parity_txn_core.md](phase17/parity_txn_core.md) | 173 | 54 | 37 | 0 | 70 | 0 | 0 | 12 |
 | Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 49 | 103 | 44 | 134 | 0 | 0 | 173 |
 | Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 35 | 26 | 0 | 6 | 0 | 0 | 1 |
