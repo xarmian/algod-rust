@@ -27,6 +27,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use algo_error::AlgoError;
 use algo_types::{
@@ -2220,6 +2221,16 @@ pub struct SqliteLedger {
     /// `Ledger.GetLastCatchpointLabel`) — the spawned thread itself only
     /// holds a read-only snapshot connection and cannot write it directly.
     catchpoint_worker: Option<std::thread::JoinHandle<Option<String>>>,
+
+    /// Periodic "AccountUpdates telemetry event" config (issue #1187), set
+    /// via [`Self::configure_account_updates_stats`]. `None` (the default)
+    /// disables the feature entirely — matching go's
+    /// `EnableAccountUpdatesStats == false` — with zero per-commit overhead
+    /// beyond one `Option` check.
+    acctupdates_stats: Option<crate::acctupdates_stats::AccountUpdatesStatsConfig>,
+    /// Tracks whether `acctupdates_stats`'s interval has elapsed since the
+    /// last emitted event — go's `accountUpdates.lastMetricsLogTime`.
+    acctupdates_stats_gate: crate::acctupdates_stats::AccountUpdatesStatsGate,
 }
 
 /// In-memory accumulator for the per-round change to the `accounttotals`
@@ -2651,6 +2662,8 @@ impl SqliteLedger {
             pending_online_touched: std::collections::HashSet::new(),
             catchpoint_auto: None,
             catchpoint_worker: None,
+            acctupdates_stats: None,
+            acctupdates_stats_gate: crate::acctupdates_stats::AccountUpdatesStatsGate::default(),
         })
     }
 
@@ -3550,12 +3563,25 @@ impl SqliteLedger {
     }
 
     fn commit_block_uncleaned(&mut self) -> Result<(), AlgoError> {
+        // Issue #1187: decide once, up front, whether this round's commit
+        // is due for the periodic AccountUpdates telemetry-equivalent
+        // event -- go's `prepareCommit` deciding `dcc.updateStats` before
+        // timing any of the phases below (`ledger/acctupdates.go`). Marking
+        // "due" now (not after gathering the sample) matches go setting
+        // `au.lastMetricsLogTime = now` at decision time.
+        let log_acctupdates_stats = self
+            .acctupdates_stats
+            .map(|cfg| self.acctupdates_stats_gate.due(cfg.interval))
+            .unwrap_or(false);
+        let mut acctupdates_sample = crate::acctupdates_stats::AccountUpdatesStatsSample::default();
+
         // Flush chain-level state to meta table.
         self.flush_chain_state()?;
 
         // Issue #523: flush this block's accumulated `accounttotals` delta —
         // must run before COMMIT so it lands atomically with the account
         // writes it summarizes, and rolls back with them on failure.
+        let accounts_writing_start = log_acctupdates_stats.then(Instant::now);
         self.flush_pending_account_totals_delta()?;
 
         // Issue #519: append this round's online-supply snapshot to
@@ -3570,6 +3596,13 @@ impl SqliteLedger {
         // aggregate for any round the last catchpoint import didn't cover.
         self.record_online_supply_snapshot()?;
 
+        // Capture the touched-account count before `record_online_account_history`
+        // consumes (and clears) `pending_online_touched` — algod-rust's
+        // closest per-round equivalent to go's `UpdatedAccountsCount`.
+        if log_acctupdates_stats {
+            acctupdates_sample.updated_accounts_count = self.pending_online_touched.len() as u64;
+        }
+
         // Issue #960: append per-account online-status history rows to
         // `onlineaccounts` on every commit, not just catchpoint import.
         // Mirrors go-algorand's `onlineAccounts.newBlockImpl` +
@@ -3579,6 +3612,9 @@ impl SqliteLedger {
         // per-round online-status lookups) silently fell back to current
         // state for any round the last catchpoint import didn't cover.
         self.record_online_account_history()?;
+        if let Some(start) = accounts_writing_start {
+            acctupdates_sample.accounts_writing_duration = start.elapsed();
+        }
 
         // Persist the trie if enabled. Paged commit via the same SQLite
         // transaction we're about to COMMIT — page writes happen against
@@ -3586,8 +3622,12 @@ impl SqliteLedger {
         // dropped the legacy `merkle_trie` single-blob table; the
         // runtime no longer creates, reads, or writes it.
         if let Some(ref mut trie) = self.trie {
+            let trie_commit_start = log_acctupdates_stats.then(Instant::now);
             let committer = crate::merkle_committer::SqliteMerkleCommitter::active(&self.conn);
             trie.commit(&committer)?;
+            if let Some(start) = trie_commit_start {
+                acctupdates_sample.merkle_trie_update_duration = start.elapsed();
+            }
             // PLAN-144 TASK-147: bound runtime cache memory. On the
             // first commit for a freshly-built (`rebuild_trie_from_db`)
             // trie the cache has no lazy loader installed — install one
@@ -3637,14 +3677,26 @@ impl SqliteLedger {
             }
         }
 
+        let database_commit_start = log_acctupdates_stats.then(Instant::now);
         self.conn
             .execute_batch("COMMIT")
             .map_err(|e| AlgoError::Ledger {
                 message: format!("commit block error: {e}"),
             })?;
+        if let Some(start) = database_commit_start {
+            acctupdates_sample.database_commit_duration = start.elapsed();
+        }
         // The committed lease changes stand; discard the rollback snapshot.
         self.lease_snapshot = None;
         self.in_block = false;
+
+        // Issue #1187: emit the periodic AccountUpdates telemetry-equivalent
+        // event now that the commit has actually succeeded — go's
+        // `postCommit` logging `dcc.stats` after `commitRound` returns.
+        if log_acctupdates_stats {
+            acctupdates_sample.start_round = self.current_round.0;
+            crate::acctupdates_stats::log_event(&acctupdates_sample);
+        }
 
         // Issue #770: automatic interval-driven catchpoint generation.
         // Fire-and-forget on a background OS thread — deliberately placed
@@ -3713,6 +3765,23 @@ impl SqliteLedger {
         cfg: Option<crate::catchpoint::AutoCatchpointConfig>,
     ) {
         self.catchpoint_auto = cfg.filter(|c| c.interval > 0);
+    }
+
+    /// Configure (or disable, with `None`) the periodic "AccountUpdates
+    /// telemetry event" (issue #1187). Callers resolve
+    /// `enable_account_updates_stats`/`account_updates_stats_interval`
+    /// from `algo_config::Local` once at node startup and call this before
+    /// the live apply loop starts — see
+    /// `crate::acctupdates_stats`'s module doc comment for the full
+    /// go-parity mapping.
+    pub fn configure_account_updates_stats(
+        &mut self,
+        cfg: Option<crate::acctupdates_stats::AccountUpdatesStatsConfig>,
+    ) {
+        self.acctupdates_stats = cfg;
+        // A fresh gate so a reconfiguration (e.g. a config reload) doesn't
+        // inherit a stale "last logged" timestamp from a prior interval.
+        self.acctupdates_stats_gate = crate::acctupdates_stats::AccountUpdatesStatsGate::default();
     }
 
     /// Block until any in-flight automatic catchpoint export finishes.
@@ -7104,6 +7173,154 @@ impl LedgerStore for SqliteLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // Periodic AccountUpdates telemetry event (issue #1187)
+    // ---------------------------------------------------------------------
+
+    /// Minimal `tracing_subscriber::Layer` that records every event's
+    /// target and field values, so tests can assert on the periodic
+    /// AccountUpdates stats event without go-algorand's own dedicated
+    /// telemetry-event stream to hook into — algod-rust's equivalent is a
+    /// plain `tracing::info!` (`crate::acctupdates_stats::log_event`), so
+    /// this is the test-side analogue of go's `logging/telemetryspec`
+    /// tests intercepting `Logger.Metrics`.
+    struct CapturingLayer {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        target: String,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CapturingLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visitor(std::collections::BTreeMap<String, String>);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    self.0.insert(field.name().to_string(), value.to_string());
+                }
+            }
+            let mut visitor = Visitor(Default::default());
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(CapturedEvent {
+                target: event.metadata().target().to_string(),
+                fields: visitor.0,
+            });
+        }
+    }
+
+    fn acctupdates_stats_events(run: impl FnOnce()) -> Vec<CapturedEvent> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = CapturingLayer {
+            events: events.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, run);
+
+        let captured = events.lock().unwrap().clone();
+        captured
+            .into_iter()
+            .filter(|e| e.target == "algo_ledger::acctupdates_stats")
+            .collect()
+    }
+
+    #[test]
+    fn acctupdates_stats_disabled_emits_no_event() {
+        let acct_events = acctupdates_stats_events(|| {
+            let mut ledger = SqliteLedger::open_in_memory().unwrap();
+            // Not configured at all -- must behave exactly like go's
+            // `EnableAccountUpdatesStats == false`.
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(Round(1));
+            ledger.commit_block().unwrap();
+        });
+        assert!(
+            acct_events.is_empty(),
+            "no AccountUpdates stats event should fire when disabled: {acct_events:?}"
+        );
+    }
+
+    #[test]
+    fn acctupdates_stats_enabled_emits_one_event_per_commit_when_interval_is_zero() {
+        let acct_events = acctupdates_stats_events(|| {
+            let mut ledger = SqliteLedger::open_in_memory().unwrap();
+            ledger.configure_account_updates_stats(Some(
+                crate::acctupdates_stats::AccountUpdatesStatsConfig {
+                    interval: std::time::Duration::ZERO,
+                },
+            ));
+
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(Round(1));
+            ledger.commit_block().unwrap();
+
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(Round(2));
+            ledger.commit_block().unwrap();
+        });
+
+        // A zero interval is always "due" (mirrors go's
+        // `now.Sub(lastMetricsLogTime) >= 0` always holding), so both
+        // commits should log.
+        assert_eq!(
+            acct_events.len(),
+            2,
+            "expected one event per commit with a zero interval: {acct_events:?}"
+        );
+        assert_eq!(acct_events[0].fields.get("start_round").unwrap(), "1");
+        assert_eq!(acct_events[0].fields.get("rounds_count").unwrap(), "1");
+        assert_eq!(acct_events[1].fields.get("start_round").unwrap(), "2");
+    }
+
+    #[test]
+    fn acctupdates_stats_enabled_skips_events_within_the_configured_interval() {
+        let acct_events = acctupdates_stats_events(|| {
+            let mut ledger = SqliteLedger::open_in_memory().unwrap();
+            ledger.configure_account_updates_stats(Some(
+                crate::acctupdates_stats::AccountUpdatesStatsConfig {
+                    // Long enough that a same-test run of three back-to-back
+                    // commits can never cross it by accident.
+                    interval: std::time::Duration::from_secs(3600),
+                },
+            ));
+
+            for round in 1..=3u64 {
+                ledger.begin_block().unwrap();
+                ledger.set_current_round(Round(round));
+                ledger.commit_block().unwrap();
+            }
+        });
+
+        // The first commit is always due (go's `lastMetricsLogTime` starts
+        // at the zero value); the next two must be suppressed since the
+        // 1-hour interval hasn't elapsed.
+        assert_eq!(
+            acct_events.len(),
+            1,
+            "only the first commit should log within the interval: {acct_events:?}"
+        );
+        assert_eq!(acct_events[0].fields.get("start_round").unwrap(), "1");
+    }
 
     // ---------------------------------------------------------------------
     // Storage config wiring (issue #749): synchronous mode, vacuum,

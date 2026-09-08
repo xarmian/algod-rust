@@ -63,7 +63,8 @@ use tracing::{debug, info, warn};
 
 use crate::commands::dual_gossip_node;
 use crate::commands::network_common::{
-    genesis_id_for, networking_active, resolve_automatic_catchpoint_config, resolve_gossip_fanout,
+    genesis_id_for, networking_active, resolve_account_updates_stats_config,
+    resolve_automatic_catchpoint_config, resolve_gossip_fanout,
 };
 use crate::commands::p2p_transport::{NetworkMode, P2pOptions, P2pTransport, P2pTransportConfig};
 use crate::config::RestConfig;
@@ -4041,6 +4042,18 @@ pub async fn run(
             "automatic catchpoint generation enabled"
         );
         sqlite_ledger.configure_automatic_catchpoints(Some(auto_cfg));
+    }
+
+    // Issue #1187: periodic AccountUpdates telemetry-equivalent `tracing`
+    // event, wired into the live block-apply loop via `commit_block`. A
+    // no-op unless `config.json` resolves `EnableAccountUpdatesStats` to
+    // `true` (see `resolve_account_updates_stats_config`).
+    if let Some(stats_cfg) = resolve_account_updates_stats_config(&node_config) {
+        info!(
+            interval = ?stats_cfg.interval,
+            "AccountUpdates telemetry event enabled"
+        );
+        sqlite_ledger.configure_account_updates_stats(Some(stats_cfg));
     }
 
     // Reject anything but a fully populated block archive before
