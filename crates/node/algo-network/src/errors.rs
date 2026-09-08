@@ -78,6 +78,17 @@ pub enum WsConnectError {
     #[error("connection timed out")]
     Timeout,
 
+    /// The peer's HTTP upgrade response headers exceeded the configured
+    /// size cap before a header terminator (`\r\n\r\n`) was observed.
+    /// Mirrors go's `wsMaxHeaderBytes`/`websocket.Dialer.MaxHeaderSize`
+    /// (`network/wsNetwork.go`), which bounds the `bufio.Reader` used to
+    /// parse the HTTP response during `tryConnect`'s dial.
+    #[error("HTTP response headers exceeded the {max}-byte size cap")]
+    HeaderTooLarge {
+        /// The configured cap, in bytes.
+        max: usize,
+    },
+
     /// The phonebook's outbound connection rate limiter did not admit this
     /// dial within the queueing timeout (issue #1101, mirroring go's
     /// `limitcaller.ErrConnectionQueueingTimeout`).

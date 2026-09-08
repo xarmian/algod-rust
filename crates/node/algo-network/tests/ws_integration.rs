@@ -190,6 +190,7 @@ async fn default_connect_config() -> ConnectConfig {
         our_features: PeerFeatureFlags::COMPRESSED_PROPOSAL,
         handshake_timeout: Duration::from_secs(15),
         peer_config: None,
+        max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
     }
 }
 
@@ -523,6 +524,7 @@ async fn test_reconnect_supervisor_connects() {
                     our_features: PeerFeatureFlags::empty(),
                     handshake_timeout: Duration::from_secs(10),
                     peer_config: None,
+                    max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
                 };
 
                 let handle = try_connect(&addr, &config)
@@ -611,6 +613,7 @@ async fn test_reconnect_after_failure() {
                     our_features: PeerFeatureFlags::empty(),
                     handshake_timeout: Duration::from_secs(10),
                     peer_config: None,
+                    max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
                 };
 
                 let handle = try_connect(&real_addr, &config)

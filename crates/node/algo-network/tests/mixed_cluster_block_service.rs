@@ -190,6 +190,7 @@ async fn test_rust_relay_forwards_messages() {
         our_features: PeerFeatureFlags::COMPRESSED_PROPOSAL,
         handshake_timeout: Duration::from_secs(15),
         peer_config: None,
+        max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
     };
 
     let mut handle = try_connect(rust_relay_host_port, &config)
