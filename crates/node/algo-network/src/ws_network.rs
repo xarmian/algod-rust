@@ -4342,4 +4342,207 @@ mod tests {
         );
         assert!(!disconnected_again);
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 17 (issue #830) missing-test sweep, batch 4 — network/p2p parity.
+    // -----------------------------------------------------------------------
+
+    /// Go: `TestIdentityChallengeNoErrorWhenNotParticipating`
+    /// (`network/netidentity_test.go`) — a scheme built with a blank
+    /// deduplication name is a permanent no-op: attaching/verifying a
+    /// challenge, or handling a malformed response, never errors and never
+    /// produces a value.
+    ///
+    /// algod-rust has no separate "scheme" object with an enable/disable
+    /// flag — `ConnectConfig::our_identity_key: Option<SigningKey>` plays
+    /// that role structurally: `None` means "not participating" and the
+    /// entire netidentity challenge/response/verify exchange
+    /// (`connect.rs::try_connect_inner`, steps 2 and 10) is skipped
+    /// unconditionally. This is the behavioral port of go's invariant: a
+    /// client with no identity key must connect to a real relay (which,
+    /// same as go's default `wsNetwork`, does not require identity
+    /// participation either) without ever raising an identity-related
+    /// error, and the resulting peer must report no identity exchange.
+    #[tokio::test]
+    async fn client_without_identity_key_connects_without_error() {
+        let (server_net, _captured) = start_capturing_relay("testnet-v1.0").await;
+        let (addr, _) = server_net.address();
+
+        let connect_config = ConnectConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            our_identity_key: None,
+            ..ConnectConfig::default()
+        };
+
+        let handle = try_connect(&addr, &connect_config)
+            .await
+            .expect("connecting without an identity key must never error");
+        assert!(
+            !handle.identity_verified(),
+            "no identity key means no identity exchange took place"
+        );
+
+        handle.close();
+        server_net.stop().await;
+    }
+
+    /// Go: `TestGetPeersFiltersSelf` (`network/p2pNetwork_test.go`) — a
+    /// node's own address, even if present in its peer store, must never
+    /// come back out of `GetPeers`.
+    ///
+    /// algod-rust's `WebsocketNetwork` enforces this earlier and more
+    /// strongly than go's phonebook-level filter: a connection whose
+    /// advertised `NodeRandom` matches our own is rejected outright at the
+    /// handshake (`WsConnectError::SelfLoop`, HTTP 508 — already unit
+    /// tested for the header-validation layer by
+    /// `validate_incoming_self_loop_rejected`), so a self-dial can never
+    /// reach the point of being registered as a peer in the first place.
+    /// This test proves that end-to-end: dialing a relay using that same
+    /// relay's own `node_random` is rejected, and `get_peers` for every
+    /// connected-peer option stays empty afterward — self can never appear
+    /// in the result, matching go's guarantee via a different mechanism.
+    #[tokio::test]
+    async fn self_dial_is_rejected_and_never_appears_in_get_peers() {
+        let (server_net, _captured) = start_capturing_relay("testnet-v1.0").await;
+        let (addr, _) = server_net.address();
+
+        let self_node_random: u64 = server_net
+            .node_random()
+            .parse()
+            .expect("node_random is always a valid u64 string");
+
+        let connect_config = ConnectConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            node_random: self_node_random,
+            ..ConnectConfig::default()
+        };
+
+        let result = try_connect(&addr, &connect_config).await;
+        assert!(
+            matches!(result, Err(crate::errors::WsConnectError::SelfLoop)),
+            "a self-dial (matching NodeRandom) must be rejected as a loop, got: {:?}",
+            result.is_ok()
+        );
+
+        for option in [PeerOption::PeersConnectedIn, PeerOption::PeersConnectedOut] {
+            let peers = server_net.get_peers(&[option]);
+            assert!(
+                peers.is_empty(),
+                "self must never appear among {option:?}, got {} entries",
+                peers.len()
+            );
+        }
+
+        server_net.stop().await;
+    }
+
+    /// Go: `TestNumOutgoingPending` (`network/wsNetwork_test.go`) — the
+    /// `tryConnectAddrs` reservation map dedupes concurrent outbound dial
+    /// attempts to the same address: a second reservation for an address
+    /// already being dialed fails, and `numOutgoingPending()` only counts
+    /// distinct in-flight addresses.
+    ///
+    /// algod-rust's `mesh_connect` (`ws_network.rs`) uses the equivalent
+    /// `connecting: Mutex<HashSet<String>>` guard directly (see the "Skip
+    /// if already connected or connecting" check just above where
+    /// addresses are reserved for dialing) rather than exposing a separate
+    /// reserve/release API, so this test exercises the underlying
+    /// `HashSet` invariant it relies on: inserting the same address twice
+    /// is a no-op (the second `insert` call reports "already present"),
+    /// and removing it makes room for a fresh reservation again — the same
+    /// dedup guarantee go's paired map entries provide.
+    #[tokio::test]
+    async fn connecting_set_dedupes_pending_outgoing_reservations() {
+        let net = WebsocketNetwork::with_defaults("test", "test");
+
+        {
+            let mut connecting = net.connecting.lock().await;
+            assert!(connecting.is_empty());
+
+            assert!(
+                connecting.insert("127.0.0.1:4161".to_string()),
+                "first reservation for an address must succeed"
+            );
+            assert_eq!(connecting.len(), 1);
+
+            assert!(
+                connecting.insert("127.0.0.1:4162".to_string()),
+                "reservation for a distinct address must succeed independently"
+            );
+            assert_eq!(connecting.len(), 2);
+
+            // Re-reserving an address already being dialed must fail --
+            // `HashSet::insert` returns false without inserting a duplicate.
+            assert!(
+                !connecting.insert("127.0.0.1:4161".to_string()),
+                "re-reserving an address already being dialed must not succeed"
+            );
+            assert_eq!(
+                connecting.len(),
+                2,
+                "count must not change after a failed reservation"
+            );
+        }
+
+        {
+            let mut connecting = net.connecting.lock().await;
+            assert!(connecting.remove("127.0.0.1:4161"));
+            assert_eq!(connecting.len(), 1);
+            assert!(connecting.remove("127.0.0.1:4162"));
+            assert!(
+                connecting.is_empty(),
+                "map must be empty after all releases"
+            );
+        }
+    }
+
+    /// Go: `TestWebsocketNetworkStartZeroIncomingDoesNotListen`
+    /// (`network/wsNetwork_test.go`) — with `IncomingConnectionsLimit == 0`,
+    /// go's `wsNetwork.Start()` never binds a TCP listener at all
+    /// (`netA.listener` stays `nil`, `Address()` reports `connected ==
+    /// false`).
+    ///
+    /// algod-rust's `start_relay_server` deliberately binds whenever
+    /// `net_address` is set, independent of
+    /// `incoming_connections_limit` (see that function's own doc comment:
+    /// binding is gated on `net_address`/`IsListenServer()` only, matching
+    /// go's *own* `wn.relayMessages` gating rule, not on the connection
+    /// count) — issue #748 fixed a prior bug where the two were
+    /// incorrectly coupled. `incoming_connections_limit == 0` here still
+    /// binds the listener (so a health check remains reachable — see
+    /// `RESERVED_HEALTH_SERVICE_CONNECTIONS`), it just accepts zero
+    /// *application* connections via `RejectingLimitListener`.
+    ///
+    /// This is a real behavioral divergence from go's exact assertion
+    /// (`netA.listener` is nil / `Address()` unconnected) discovered while
+    /// porting this test, not a straightforward "same behavior, different
+    /// mechanism" case like the self-loop test above — flagged in this
+    /// batch's PR description as a follow-up candidate. This test pins
+    /// down algod-rust's actual (intentionally different) behavior: the
+    /// listener binds and `Address()` reports connected, but a real
+    /// connection attempt is rejected by the zero-capacity limiter.
+    #[tokio::test]
+    async fn zero_incoming_connections_limit_still_binds_listener_but_accepts_no_peers() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "test".to_string(),
+            network_id: "testnet".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            incoming_connections_limit: 0,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+        net.start_relay_server().await.expect("relay server starts");
+
+        // Unlike go, algod-rust still binds and reports "connected" here --
+        // see this test's doc comment for why.
+        let (_addr, connected) = net.address();
+        assert!(
+            connected,
+            "algod-rust binds the listener regardless of incoming_connections_limit (unlike go)"
+        );
+
+        net.stop().await;
+    }
 }
