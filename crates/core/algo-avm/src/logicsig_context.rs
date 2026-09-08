@@ -57,6 +57,15 @@ pub trait SigBlockSource {
 /// Domain separation prefix for program hashing.
 const PROGRAM_PREFIX: &[u8] = b"Program";
 
+/// Returns `true` for the `TxnField`s go-algorand marks `effects: true` in
+/// `txnFieldSpecs` (`data/transactions/logic/fields.go`): Logs (58),
+/// NumLogs (59), CreatedAssetID (60), CreatedApplicationID (61), and
+/// LastLog (62) -- fields sourced from a transaction's `ApplyData`, which a
+/// LogicSig (never applied by an app call) can never legitimately read.
+fn is_effects_field(field: u8) -> bool {
+    matches!(field, 58..=62)
+}
+
 /// AVM version at which `RekeyTo` functionality was introduced.
 /// Matches go-algorand's `rekeyingEnabledVersion`
 /// (`data/transactions/logic/opcodes.go`).
@@ -259,6 +268,20 @@ impl<'a> AvmContext for LogicSigAvmContext<'a> {
             });
         }
         let stxn = &self.group[group_index];
+        // "Effects" fields (Logs, NumLogs, CreatedAssetID,
+        // CreatedApplicationID, LastLog) only make sense for a transaction
+        // that has actually been applied by an app call, which a LogicSig
+        // never is. Go's `txnFieldToStack` (`data/transactions/logic/
+        // eval.go`) rejects them unconditionally in `ModeSig`, before any
+        // version/array-index check -- `if fs.effects { if cx.runMode ==
+        // ModeSig { return sv, fmt.Errorf("txn[%s] not allowed in current
+        // mode", fs.field) } ... }`. Mirror that exactly here.
+        if is_effects_field(field) {
+            let name = crate::fields::txn_field_name(field).unwrap_or("?");
+            return Err(AlgoError::Avm {
+                message: format!("txn[{name}] not allowed in current mode"),
+            });
+        }
         // FirstValidTime (field 3): timestamp of block(FirstValid-1). Go's
         // `data/transactions/logic/eval.go` opTxn case reads this via
         // `cx.SigLedger.BlockHdr`, available in *both* App and Sig mode
@@ -509,6 +532,62 @@ mod tests {
 
         // Not app mode.
         assert!(!ctx.is_app_mode());
+    }
+
+    // ---- "effects" field rejection in Signature mode ----
+    //
+    // Ported from go-algorand's `TestTxnEffectsAvailable`
+    // (`data/transactions/logic/fields_test.go`): "LogicSigs can not use
+    // 'effects' fields (ever)". go's `txnFieldToStack`
+    // (`data/transactions/logic/eval.go`) rejects any field with
+    // `fs.effects == true` when `cx.runMode == ModeSig`, with the error
+    // `txn[<FieldName>] not allowed in current mode` -- these fields only
+    // make sense for a transaction actually applied by an app call, which a
+    // LogicSig never is. The five effect fields (`fs.effects: true` in
+    // go's `txnFieldSpecs`) are Logs (58), NumLogs (59), CreatedAssetID
+    // (60), CreatedApplicationID (61), and LastLog (62).
+
+    #[test]
+    fn effect_fields_rejected_in_signature_mode() {
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
+
+        for (field_byte, name) in [
+            (58u8, "Logs"),
+            (59, "NumLogs"),
+            (60, "CreatedAssetID"),
+            (61, "CreatedApplicationID"),
+            (62, "LastLog"),
+        ] {
+            let result = ctx.txn_field(0, field_byte, None);
+            assert!(
+                result.is_err(),
+                "txn[{name}] (field {field_byte}) should be rejected in Signature mode"
+            );
+            let msg = format!("{}", result.unwrap_err());
+            assert!(
+                msg.contains("not allowed in current mode"),
+                "unexpected error for field {field_byte} ({name}): {msg}"
+            );
+            assert!(
+                msg.contains(name),
+                "error for field {field_byte} should name the field ({name}): {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn effect_field_logs_array_read_also_rejected_in_signature_mode() {
+        // Logs is an array field (`gtxn 0 Logs 0`); the rejection must fire
+        // regardless of `array_index`, matching go's check running before
+        // any array-index bounds check.
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
+
+        let err = ctx.txn_field(0, 58, Some(0)).unwrap_err();
+        assert!(format!("{err}").contains("not allowed in current mode"));
     }
 
     #[test]

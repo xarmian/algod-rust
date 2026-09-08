@@ -75,7 +75,12 @@ fn all_opcode_entries() -> Vec<(u8, Option<u8>, Mode, u8)> {
 
 /// Build a minimal single-instruction program for a given opcode entry, then
 /// run it through `check_program`'s static mode gate.
-fn check_mode_only(opcode: u8, sub_opcode: Option<u8>, version: u8, mode: Mode) -> Result<(), algo_error::AlgoError> {
+fn check_mode_only(
+    opcode: u8,
+    sub_opcode: Option<u8>,
+    version: u8,
+    mode: Mode,
+) -> Result<(), algo_error::AlgoError> {
     let program = Program {
         version: version.max(1),
         instructions: vec![Instruction {

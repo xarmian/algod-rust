@@ -41,8 +41,8 @@
 //! doesn't slip through unnoticed.
 
 use algo_avm::fields::{
-    AcctParamsField, AppParamsField, AssetHoldingField, AssetParamsField, BlockField,
-    GlobalField, TxnField,
+    AcctParamsField, AppParamsField, AssetHoldingField, AssetParamsField, BlockField, GlobalField,
+    TxnField,
 };
 use algo_avm::opcode::{lookup_by_name, MAX_AVM_VERSION};
 
@@ -255,8 +255,8 @@ fn app_params_field_set_version_never_precedes_get_version() {
 /// `assetHoldingFieldSpecs` does -- no more, no fewer.
 #[test]
 fn asset_holding_field_table_matches_opcode_debut_version_with_no_separate_gate() {
-    let spec = lookup_by_name("asset_holding_get")
-        .expect("asset_holding_get must be a registered opcode");
+    let spec =
+        lookup_by_name("asset_holding_get").expect("asset_holding_get must be a registered opcode");
     assert_eq!(
         spec.version, 2,
         "asset_holding_get must debut at v2, matching go's assetHoldingFieldSpecs pin"
