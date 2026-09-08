@@ -219,6 +219,35 @@ mod tests {
         assert_eq!(a.canonical_encode(), b.canonical_encode());
     }
 
+    /// Mirrors go's `TestFirstFieldsAreCommitteeSeed`
+    /// (`data/bookkeeping/lightBlockHeader_test.go:49`): the `seed` field
+    /// ("0" codec tag) sorts lexicographically first among this struct's
+    /// keys ("0" < "1" < "gh" < "r" < "tc"), so when `seed` is populated its
+    /// raw 32 bytes land immediately after the map header and the "0"
+    /// fixstr+bin-header prefix — i.e. right at the start of the encoded
+    /// buffer, not reordered behind any other populated field.
+    #[test]
+    fn canonical_encode_places_seed_bytes_first_when_populated() {
+        let seed = *b"123456789a";
+        let mut seed32 = [0u8; 32];
+        seed32[..seed.len()].copy_from_slice(&seed);
+
+        let h = LightBlockHeader {
+            seed: seed32,
+            round: 200,
+            genesis_hash: [0x42u8; 32],
+            ..Default::default()
+        };
+        let encoded = h.canonical_encode();
+
+        // fixmap header (1 byte) + "0" fixstr key (2 bytes: 0xa1 0x30) +
+        // bin8 header for a 32-byte payload (2 bytes: 0xc4 0x20) = 5 bytes
+        // of framing before the seed's raw content, matching go's
+        // `strings.HasPrefix(string(o[5:]), "123456789a")` offset exactly.
+        assert_eq!(&encoded[..5], &[0x83, 0xa1, 0x30, 0xc4, 0x20]);
+        assert_eq!(&encoded[5..5 + seed.len()], &seed);
+    }
+
     #[test]
     fn distinct_headers_encode_differently() {
         let a = LightBlockHeader {

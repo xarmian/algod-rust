@@ -685,6 +685,36 @@ mod tests {
         assert_eq!(root, expected_root);
     }
 
+    /// Mirrors go's `TestSignedTxnInBlockHash`
+    /// (`data/transactions/signedtxn_test.go:83`): `crypto.HashObj(&stib)`
+    /// must equal `stib.Hash()` — i.e. the domain-separated STIB hash is
+    /// exactly `SHA512/256("STIB" || canonical_encode(stib))`, deterministic,
+    /// and sensitive to the wrapped transaction's content (here: the
+    /// sender address).
+    #[test]
+    fn compute_stib_hash_matches_independently_recomputed_domain_separated_hash() {
+        let stx = minimal_signed_txn(1000);
+
+        // Recompute the same hash independently (not via compute_stib_hash)
+        // to prove the function really is SHA512/256("STIB" || canonical
+        // encoding), not just an opaque deterministic value.
+        let canonical = canonical_encode_signed_txn_in_block(&stx);
+        let mut hasher = Sha512_256::new();
+        hasher.update(b"STIB");
+        hasher.update(&canonical);
+        let expected: Hash = hasher.finalize().into();
+
+        assert_eq!(compute_stib_hash(&stx), expected);
+
+        // Deterministic: hashing the same value twice yields the same hash.
+        assert_eq!(compute_stib_hash(&stx), compute_stib_hash(&stx));
+
+        // Sensitive to content: a different sender must change the hash.
+        let mut stx2 = stx.clone();
+        stx2.txn.sender = algo_types::Address([0x42u8; 32]);
+        assert_ne!(compute_stib_hash(&stx), compute_stib_hash(&stx2));
+    }
+
     #[test]
     fn two_txn_payset_root_is_internal_of_two_leaves() {
         let stx1 = minimal_signed_txn(1000);

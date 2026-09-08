@@ -511,4 +511,120 @@ mod tests {
 
         verifier.shutdown().await;
     }
+
+    /// Same shape as [`valid_request`] but with a zeroed-out signature —
+    /// a "bad" group that real verification must reject.
+    fn invalid_request(note: u64) -> BatchVerifyRequest {
+        let mut req = valid_request(note);
+        req.group[0].sig = [0u8; 64];
+        req
+    }
+
+    /// Mirrors go's `TestStreamToBatch` (`data/transactions/verify/
+    /// txnBatch_test.go:168`): basic end-to-end functionality of the
+    /// async batch-verification pool at scale — a large mix of valid and
+    /// invalid single-txn groups, submitted concurrently, must each come
+    /// back with the correct accept/reject outcome (not just "doesn't
+    /// crash"), and the pool must shut down cleanly afterward.
+    #[tokio::test]
+    async fn stream_to_batch_large_mixed_batch_round_trips_correctly() {
+        let cache = Arc::new(VerifiedTransactionCache::new(4096));
+        let verifier = Arc::new(BatchVerifier::spawn(
+            BatchVerifierConfig {
+                num_workers: 4,
+                max_batch_size: 32,
+                batch_linger: Duration::from_millis(5),
+                ..Default::default()
+            },
+            cache,
+        ));
+
+        let num_txns = 400u64;
+        let mut handles = Vec::with_capacity(num_txns as usize);
+        for i in 0..num_txns {
+            let v = Arc::clone(&verifier);
+            let expect_ok = i % 2 == 0;
+            let request = if expect_ok {
+                valid_request(i)
+            } else {
+                invalid_request(i)
+            };
+            handles.push(tokio::spawn(async move {
+                let result = v.verify(request).await;
+                (expect_ok, result.is_ok())
+            }));
+        }
+
+        for h in handles {
+            let (expect_ok, got_ok) = h.await.expect("task must not panic");
+            assert_eq!(
+                expect_ok, got_ok,
+                "verification outcome must match the group's actual validity"
+            );
+        }
+
+        Arc::try_unwrap(verifier)
+            .unwrap_or_else(|_| panic!("no other Arc<BatchVerifier> clones should remain"))
+            .shutdown()
+            .await;
+    }
+
+    /// Representative slice of go's `TestStreamToBatchCases`
+    /// (`data/transactions/verify/txnBatch_test.go:179`): a handful of the
+    /// table's signature-related cases — a valid single-sig group passes,
+    /// a group with a zeroed (missing) signature is rejected, and a group
+    /// whose signature has been tampered with (byte flipped) is rejected.
+    /// The stateproof/multisig/logicsig branches of go's larger table are
+    /// covered individually elsewhere in this crate (`signature.rs`'s
+    /// dispatch tests); this pins that the pool surfaces those same
+    /// pass/fail outcomes end-to-end through `BatchVerifier`, not just
+    /// through direct `verify_transaction_signature` calls.
+    #[tokio::test]
+    async fn stream_to_batch_cases_valid_missing_and_tampered_signature() {
+        let cache = Arc::new(VerifiedTransactionCache::new(100));
+        let verifier = BatchVerifier::spawn(BatchVerifierConfig::default(), cache);
+
+        // Valid signature: accepted.
+        assert!(verifier.verify(valid_request(1)).await.is_ok());
+
+        // Zero (missing) signature: rejected.
+        assert!(verifier.verify(invalid_request(2)).await.is_err());
+
+        // Tampered signature (one byte flipped from a real, valid one):
+        // rejected.
+        let mut tampered = valid_request(3);
+        tampered.group[0].sig[0] ^= 0xFF;
+        assert!(verifier.verify(tampered).await.is_err());
+
+        verifier.shutdown().await;
+    }
+
+    /// Mirrors go's `TestStreamToBatchIdel` (`data/transactions/verify/
+    /// txnBatch_test.go:281`): starting the pool and submitting nothing
+    /// for longer than its batch-linger interval (so the linger timer
+    /// fires with an empty batch) must not wedge it — a transaction
+    /// submitted afterward still verifies normally.
+    #[tokio::test]
+    async fn stream_to_batch_survives_idle_period_before_first_submission() {
+        let cache = Arc::new(VerifiedTransactionCache::new(100));
+        let verifier = BatchVerifier::spawn(
+            BatchVerifierConfig {
+                num_workers: 1,
+                batch_linger: Duration::from_millis(10),
+                ..Default::default()
+            },
+            cache,
+        );
+
+        // Idle well past several linger intervals with no submissions.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let result = verifier.verify(valid_request(1)).await;
+        assert!(
+            result.is_ok(),
+            "a submission after an idle period must still verify: {result:?}"
+        );
+
+        verifier.shutdown().await;
+    }
 }

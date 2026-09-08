@@ -729,6 +729,121 @@ mod tests {
         }
     }
 
+    // ── signature_fee_contribution (PQ) ─────────────────────────────
+    //
+    // Mirrors go's `TestSignedTxnFeeFactorPQSignatureContribution`
+    // (`data/transactions/signedtxn_test.go:121`): only a non-blank PQ
+    // signature (top-level or LogicSig-delegated) contributes a fee
+    // surcharge; every other signature category (plain sig/msig/lsig, an
+    // unrecognized PQ scheme, or a PQ+regular-sig combo) contributes
+    // either zero or exactly the known-scheme's fixed contribution.
+
+    #[test]
+    fn signature_fee_contribution_regular_sig_is_zero() {
+        let p = v42();
+        let mut stx = make_stxn("pay", 1000);
+        stx.sig[0] = 1;
+        assert_eq!(signature_fee_contribution(&stx, &p), 0);
+    }
+
+    #[test]
+    fn signature_fee_contribution_msig_is_zero() {
+        let p = v42();
+        let mut stx = make_stxn("pay", 1000);
+        stx.msig = Some(algo_types::MultisigSig {
+            version: 1,
+            threshold: 0,
+            subsigs: Vec::new(),
+        });
+        assert_eq!(signature_fee_contribution(&stx, &p), 0);
+    }
+
+    #[test]
+    fn signature_fee_contribution_lsig_without_pqsig_is_zero() {
+        let p = v42();
+        let mut stx = make_stxn("pay", 1000);
+        stx.lsig = Some(algo_types::LogicSig {
+            logic: serde_bytes::ByteBuf::from(vec![1u8]),
+            ..Default::default()
+        });
+        assert_eq!(signature_fee_contribution(&stx, &p), 0);
+    }
+
+    #[test]
+    fn signature_fee_contribution_unknown_pq_scheme_is_zero() {
+        let p = v42();
+        let mut stx = make_stxn("pay", 1000);
+        stx.pqsig = Some(algo_types::pq::PQSig {
+            scheme: *b"x1",
+            ..Default::default()
+        });
+        assert_eq!(signature_fee_contribution(&stx, &p), 0);
+    }
+
+    #[test]
+    fn signature_fee_contribution_top_level_pqsig_charges_known_scheme() {
+        let p = v42();
+        let mut stx = make_stxn("pay", 1000);
+        stx.pqsig = Some(algo_types::pq::PQSig {
+            scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+            ..Default::default()
+        });
+        assert_eq!(
+            signature_fee_contribution(&stx, &p),
+            p.pq_scheme_fee_contribution(algo_types::pq::PQ_SCHEME_FALCON1024)
+        );
+    }
+
+    #[test]
+    fn signature_fee_contribution_delegated_lsig_pqsig_charges_known_scheme() {
+        let p = v42();
+        let mut stx = make_stxn("pay", 1000);
+        stx.lsig = Some(algo_types::LogicSig {
+            logic: serde_bytes::ByteBuf::from(vec![1u8]),
+            pqsig: Some(algo_types::pq::PQSig {
+                scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            signature_fee_contribution(&stx, &p),
+            p.pq_scheme_fee_contribution(algo_types::pq::PQ_SCHEME_FALCON1024)
+        );
+    }
+
+    #[test]
+    fn signature_fee_contribution_delegated_lsig_unknown_pq_scheme_is_zero() {
+        let p = v42();
+        let mut stx = make_stxn("pay", 1000);
+        stx.lsig = Some(algo_types::LogicSig {
+            logic: serde_bytes::ByteBuf::from(vec![1u8]),
+            pqsig: Some(algo_types::pq::PQSig {
+                scheme: *b"x1",
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(signature_fee_contribution(&stx, &p), 0);
+    }
+
+    #[test]
+    fn signature_fee_contribution_top_level_pqsig_and_regular_sig_still_charges() {
+        // A top-level pqsig takes precedence over a (spuriously) also-set
+        // Sig field: signature_fee_contribution checks pqsig first.
+        let p = v42();
+        let mut stx = make_stxn("pay", 1000);
+        stx.sig[0] = 1;
+        stx.pqsig = Some(algo_types::pq::PQSig {
+            scheme: algo_types::pq::PQ_SCHEME_FALCON1024,
+            ..Default::default()
+        });
+        assert_eq!(
+            signature_fee_contribution(&stx, &p),
+            p.pq_scheme_fee_contribution(algo_types::pq::PQ_SCHEME_FALCON1024)
+        );
+    }
+
     #[test]
     fn summarize_fees_ordinary_group() {
         let p = v42();

@@ -1183,6 +1183,28 @@ mod tests {
         assert!(!meets_broadcast_policy(256, latest, 0, next));
     }
 
+    /// Mirrors go's `TestRoundDownToMultipleOf`
+    /// (`data/basics/units_test.go:216`): pins the `round - (round % n)`
+    /// round-down-to-a-multiple formula this module inlines at
+    /// [`meets_broadcast_policy`] (and go's `Worker.RoundDownToMultipleOf`
+    /// callers in `stateproof/builder.go`) — algod-rust has no standalone
+    /// `RoundDownToMultipleOf` helper; the arithmetic is inlined at each
+    /// call site instead, so this test exercises the formula directly.
+    #[test]
+    fn round_down_to_multiple_of_matches_go_invariants() {
+        let r = 24u64;
+        for n in 1..100u64 {
+            let mul = r - (r % n);
+            assert!(mul <= r, "round-down must not exceed the input round");
+            assert_eq!(mul % n, 0, "result must be an exact multiple of n");
+            if r < n {
+                assert_eq!(mul, 0, "rounding down below n must yield 0");
+            } else if r == n {
+                assert_eq!(mul, n, "rounding down at exactly n must yield n");
+            }
+        }
+    }
+
     // ── Per-account signing ──────────────────────────────────────────
 
     #[test]
