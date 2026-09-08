@@ -41,9 +41,10 @@
 //! doesn't slip through unnoticed.
 
 use algo_avm::fields::{
-    AcctParamsField, AppParamsField, AssetParamsField, BlockField, GlobalField, TxnField,
+    AcctParamsField, AppParamsField, AssetHoldingField, AssetParamsField, BlockField,
+    GlobalField, TxnField,
 };
-use algo_avm::opcode::MAX_AVM_VERSION;
+use algo_avm::opcode::{lookup_by_name, MAX_AVM_VERSION};
 
 /// Decode every byte 0..=255 through `from_u8`, returning `(index, version)`
 /// for every index the enum actually defines. Field enums are declared with
@@ -230,5 +231,49 @@ fn app_params_field_set_version_never_precedes_get_version() {
     assert!(
         any_settable,
         "expected at least one AppParamsField to be settable via app_params_set"
+    );
+}
+
+/// Mirrors go-algorand's `TestFieldVersions`
+/// (`data/transactions/logic/fields_test.go:369`), which is deliberately a
+/// narrow "this table needs no per-field version test" pin: it just
+/// confirms every entry of `assetHoldingFieldSpecs` shares the same debut
+/// version as the `asset_holding_get` opcode itself (v2), meaning no field
+/// in that table is gated later than the opcode -- if a future field addition
+/// changed that, go's comment says a dedicated
+/// `TestAssetHoldingFieldsVersions`-style test (like the app/asset-params
+/// ones) would be needed instead.
+///
+/// algod-rust's `AssetHoldingField` (unlike `TxnField`/`AssetParamsField`/
+/// etc.) has no separate `version()` method at all -- there is no Rust
+/// analogue of a per-field version table to regress, which is itself
+/// consistent with go's pinned invariant (every field shares the opcode's
+/// v2 debut, so no separate gate is needed). This test pins the two
+/// structural facts that make that consistency hold: `asset_holding_get`
+/// itself is a v2 opcode, and `AssetHoldingField` defines exactly the two
+/// contiguous fields (`AssetBalance = 0`, `AssetFrozen = 1`) go's
+/// `assetHoldingFieldSpecs` does -- no more, no fewer.
+#[test]
+fn asset_holding_field_table_matches_opcode_debut_version_with_no_separate_gate() {
+    let spec = lookup_by_name("asset_holding_get")
+        .expect("asset_holding_get must be a registered opcode");
+    assert_eq!(
+        spec.version, 2,
+        "asset_holding_get must debut at v2, matching go's assetHoldingFieldSpecs pin"
+    );
+
+    // Exactly two fields, decoding contiguously from 0.
+    assert_eq!(
+        AssetHoldingField::from_u8(0).unwrap(),
+        AssetHoldingField::AssetBalance
+    );
+    assert_eq!(
+        AssetHoldingField::from_u8(1).unwrap(),
+        AssetHoldingField::AssetFrozen
+    );
+    assert!(
+        AssetHoldingField::from_u8(2).is_err(),
+        "AssetHoldingField must define no field beyond index 1 -- a new field here \
+         would need its own version-gate test, mirroring go's comment on TestFieldVersions"
     );
 }
