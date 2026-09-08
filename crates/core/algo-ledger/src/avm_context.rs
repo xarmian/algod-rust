@@ -4779,6 +4779,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             .store
             .get_app_local_state(&addr, app_id)
             .and_then(|l| l.key_value.get(key).cloned());
+        let key_existed = pre.is_some();
         self.record_app_state_access(
             app_id,
             AppStateType::Local,
@@ -4792,8 +4793,12 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             local.key_value.remove(key);
             self.store.set_app_local_state(&addr, app_id, local);
         }
-        // Track delta for EvalDelta comparison.
-        if app_id == self.app_id {
+        // Track delta for EvalDelta comparison. Matching go-algorand's
+        // opAppLocalDel ("if deleting a non-existent value, don't record in
+        // EvalDelta, matching ledger behavior with previous BuildEvalDelta
+        // mechanism"), only record a delete when the key actually existed
+        // beforehand -- deleting a never-set key is a ledger no-op.
+        if app_id == self.app_id && key_existed {
             self.local_delta_tracker.insert((addr, key.to_vec()), None);
         }
         Ok(())
@@ -4836,6 +4841,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             .store
             .get_app_params(app_id)
             .and_then(|p| p.global_state.get(key).cloned());
+        let key_existed = pre.is_some();
         self.record_app_state_access(
             app_id,
             AppStateType::Global,
@@ -4849,8 +4855,12 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             p.global_state.remove(key);
             self.store.set_app_params(app_id, p);
         }
-        // Track delta for EvalDelta comparison.
-        if app_id == self.app_id {
+        // Track delta for EvalDelta comparison. Matching go-algorand's
+        // opAppGlobalDel ("if deleting a non-existent value, don't record in
+        // EvalDelta, matching ledger behavior with previous BuildEvalDelta
+        // mechanism"), only record a delete when the key actually existed
+        // beforehand -- deleting a never-set key is a ledger no-op.
+        if app_id == self.app_id && key_existed {
             self.global_delta_tracker.insert(key.to_vec(), None);
         }
         Ok(())
@@ -7640,6 +7650,104 @@ mod tests {
         // Write to non-opted-in app should fail
         let result = ctx.app_local_put(&sender, 99, b"x", TealValue::Uint(1));
         assert!(result.is_err());
+    }
+
+    /// go-algorand's `opAppGlobalDel` only records a `DeleteAction` EvalDelta
+    /// entry when the key actually existed beforehand (`eval.go`, "if
+    /// deleting a non-existent value, don't record in EvalDelta, matching
+    /// ledger behavior with previous BuildEvalDelta mechanism"). Deleting a
+    /// key that was never set is a ledger no-op and must not appear in the
+    /// EvalDelta at all -- port of go-algorand's `TestGlobalNonDelete`.
+    #[test]
+    fn app_global_del_nonexistent_key_records_no_delta() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.app_params.insert(
+            42,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: vec![],
+                clear_state_program: vec![],
+                global_state: BTreeMap::new(),
+                local_state_schema: StateSchema::default(),
+                global_state_schema: StateSchema::default(),
+                extra_program_pages: 0,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        // Deleting a key that was never set is a no-op...
+        ctx.app_global_del(42, b"none").unwrap();
+        assert_eq!(ctx.app_global_get(42, b"none").unwrap(), None);
+
+        // ...and must not be recorded in the EvalDelta.
+        let delta = algo_avm::context::AvmContext::take_global_delta(&mut ctx);
+        assert!(
+            delta.is_empty(),
+            "deleting a never-set global key must not record an EvalDelta entry, got {delta:?}"
+        );
+    }
+
+    /// Same as `app_global_del_nonexistent_key_records_no_delta` but for
+    /// `app_local_del` -- port of go-algorand's `TestLocalNonDelete`.
+    #[test]
+    fn app_local_del_nonexistent_key_records_no_delta() {
+        let sender = [10u8; 32];
+        let txn = make_pay_txn(sender, [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let local = AppLocalState {
+            schema: StateSchema::default(),
+            key_value: BTreeMap::new(),
+        };
+        store.app_local_states.insert((Address(sender), 42), local);
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        // Deleting a key that was never set is a no-op...
+        ctx.app_local_del(&sender, 42, b"none").unwrap();
+        assert_eq!(ctx.app_local_get(&sender, 42, b"none").unwrap(), None);
+
+        // ...and must not be recorded in the EvalDelta.
+        let deltas = algo_avm::context::AvmContext::take_local_deltas(&mut ctx);
+        assert!(
+            deltas.is_empty(),
+            "deleting a never-set local key must not record an EvalDelta entry, got {deltas:?}"
+        );
+    }
+
+    /// Sanity check that deleting a key that *does* exist still records the
+    /// delete in the EvalDelta -- guards against a fix that over-corrects
+    /// and suppresses all delete deltas.
+    #[test]
+    fn app_global_del_existing_key_still_records_delta() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let mut global = BTreeMap::new();
+        global.insert(b"counter".to_vec(), TealValue::Uint(5));
+        store.app_params.insert(
+            42,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: vec![],
+                clear_state_program: vec![],
+                global_state: global,
+                local_state_schema: StateSchema::default(),
+                global_state_schema: StateSchema {
+                    num_uint: 1,
+                    num_byte_slice: 0,
+                },
+                extra_program_pages: 0,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_global_del(42, b"counter").unwrap();
+
+        let delta = algo_avm::context::AvmContext::take_global_delta(&mut ctx);
+        assert_eq!(delta.get(b"counter".as_slice()), Some(&None));
     }
 
     // ---- balance/min_balance tests ----
