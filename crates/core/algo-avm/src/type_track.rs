@@ -381,6 +381,21 @@ const TYPE_TABLE: &[(&str, &[StackType], &[StackType])] = &[
     // actual expected type (`typeTxField`) whenever the field name is
     // recognized. ----
     ("itxn_field", &[Any], &[]),
+    // ---- `asset_holding_get`/`asset_params_get`/`app_params_get`/
+    // `acct_params_get` (opcodes.go:684-688, TestAssembleAsset): each pops a
+    // fixed-shape reference (asset_holding_get's `ai:aT`/`ii:aT` version
+    // split is handled in `refined_types` below, since it needs `ops.version`
+    // -- these table entries are the fallback used only when a mismatched
+    // arity leaves the refine function unable to run, e.g. dead code) and
+    // pushes `[value, didExist]`; the `value` slot (`StackAny` here) is
+    // refined by `refined_types` to the selected field's actual type
+    // whenever the field name is recognized, mirroring go's `ops.returns`
+    // call inside `asmDefault`'s group-immediate handling
+    // (`assembler.go:1240-1243`). ----
+    ("asset_holding_get", &[Any, Uint64], &[Any, Uint64]),
+    ("asset_params_get", &[Uint64], &[Any, Uint64]),
+    ("app_params_get", &[Uint64], &[Any, Uint64]),
+    ("acct_params_get", &[Any], &[Any, Uint64]),
 ];
 
 fn table_lookup(mnemonic: &str) -> Option<(&'static [StackType], &'static [StackType])> {
@@ -450,12 +465,17 @@ enum ScratchEffect {
 /// [`OpStream::type_stack_const`]'s doc comment for what this narrow slice
 /// of go's real bound-tracking does and doesn't reproduce). `scratch` is
 /// [`OpStream::scratch_space`], read (not mutated) here; the caller applies
-/// any returned [`ScratchEffect`] afterward.
+/// any returned [`ScratchEffect`] afterward. `version` is [`OpStream::version`],
+/// needed only by `asset_holding_get` to pick between its two versioned
+/// protos (see that match arm) -- go instead selects between two whole
+/// `OpSpec` entries by version (`getSpec`), which this module doesn't model
+/// for any other opcode.
 #[allow(clippy::type_complexity)]
 fn refined_types(
     stack: &[StackType],
     consts: &[Option<u64>],
     scratch: &[StackType; 256],
+    version: u8,
     mnemonic: &str,
     args: &[&str],
 ) -> Option<(
@@ -674,8 +694,126 @@ fn refined_types(
             None,
             None,
         )),
+        // `asset_holding_get` (opcodes.go:684-685, TestAssembleAsset): two
+        // versioned protos share the mnemonic -- `ii:aT` below
+        // `directRefEnabledVersion` (account is a foreign-accounts-array
+        // index, popped as `Uint64`), `ai:aT` from it on (account can also be
+        // a direct address `Bytes`/`Any` reference). `getSpec` picks the
+        // OpSpec by version in go; this module has no per-mnemonic versioned
+        // table, so the split is applied here instead. The pushed `value`
+        // slot (first return) is refined to the selected field's actual type
+        // (`AssetHoldingFields`, `fields.go:1355-1358`) when recognized,
+        // mirroring go's `ops.returns` call inside `asmDefault`'s
+        // group-immediate handling (`assembler.go:1240-1243`); the `didExist`
+        // flag (second return) is always `Uint64`.
+        "asset_holding_get" => {
+            const DIRECT_REF_ENABLED_VERSION: u8 = 4;
+            let args_override = if version < DIRECT_REF_ENABLED_VERSION {
+                vec![Uint64, Uint64]
+            } else {
+                vec![Any, Uint64]
+            };
+            let ret = args
+                .first()
+                .and_then(|f| asset_holding_field_type(f))
+                .map(|ty| vec![ty, Uint64]);
+            Some((Some(args_override), ret, None))
+        }
+        // `asset_params_get`/`app_params_get`/`acct_params_get`
+        // (opcodes.go:686-688, TestAssembleAsset): fixed (non-versioned) pop
+        // shape already covered by `TYPE_TABLE`; only the pushed `value`
+        // slot needs refining to the selected field's actual type
+        // (`AssetParamsFields`/`AppParamsFields`/`AcctParamsFields`,
+        // `fields.go:1444-1457,1550-1564,1714-1732`), same as
+        // `asset_holding_get` above.
+        "asset_params_get" => Some((
+            None,
+            args.first()
+                .and_then(|f| asset_params_field_type(f))
+                .map(|ty| vec![ty, Uint64]),
+            None,
+        )),
+        "app_params_get" => Some((
+            None,
+            args.first()
+                .and_then(|f| app_params_field_type(f))
+                .map(|ty| vec![ty, Uint64]),
+            None,
+        )),
+        "acct_params_get" => Some((
+            None,
+            args.first()
+                .and_then(|f| acct_params_field_type(f))
+                .map(|ty| vec![ty, Uint64]),
+            None,
+        )),
         _ => None,
     }
+}
+
+/// Mirrors go's `assetHoldingFieldSpecs[].ftype` (`fields.go:1355-1358`),
+/// used to refine `asset_holding_get`'s pushed value type to the selected
+/// field's actual type. Every recognized field collapses to `Uint64` at the
+/// `AVMType` level (`AssetFrozen`'s `StackBoolean` included -- see the
+/// `itxn_field_type` doc comment for why bound-refined types collapse this
+/// way); `None` for an unrecognized name, mirroring `!ok`.
+fn asset_holding_field_type(field_name: &str) -> Option<StackType> {
+    match field_name {
+        "AssetBalance" | "AssetFrozen" => Some(Uint64),
+        _ => None,
+    }
+}
+
+/// Mirrors go's `assetParamsFieldSpecs[].ftype` (`fields.go:1444-1457`).
+fn asset_params_field_type(field_name: &str) -> Option<StackType> {
+    Some(match field_name {
+        "AssetTotal" | "AssetDecimals" | "AssetDefaultFrozen" => Uint64,
+        "AssetUnitName" | "AssetName" | "AssetURL" | "AssetMetadataHash" | "AssetManager"
+        | "AssetReserve" | "AssetFreeze" | "AssetClawback" | "AssetCreator" => Bytes,
+        _ => return None,
+    })
+}
+
+/// Mirrors go's `appParamsFieldSpecs[].ftype` (`fields.go:1550-1564`).
+fn app_params_field_type(field_name: &str) -> Option<StackType> {
+    Some(match field_name {
+        "AppApprovalProgram"
+        | "AppClearStateProgram"
+        | "AppCreator"
+        | "AppAddress"
+        | "AppSizeSponsor" => Bytes,
+        "AppGlobalNumUint"
+        | "AppGlobalNumByteSlice"
+        | "AppLocalNumUint"
+        | "AppLocalNumByteSlice"
+        | "AppExtraProgramPages"
+        | "AppVersion"
+        | "AppForeignBoxReads"
+        | "AppFamilyBoxAccess" => Uint64,
+        _ => return None,
+    })
+}
+
+/// Mirrors go's `acctParamsFieldSpecs[].ftype` (`fields.go:1714-1732`).
+fn acct_params_field_type(field_name: &str) -> Option<StackType> {
+    Some(match field_name {
+        "AcctAuthAddr" => Bytes,
+        "AcctBalance"
+        | "AcctMinBalance"
+        | "AcctTotalNumUint"
+        | "AcctTotalNumByteSlice"
+        | "AcctTotalExtraAppPages"
+        | "AcctTotalAppsCreated"
+        | "AcctTotalAppsOptedIn"
+        | "AcctTotalAssetsCreated"
+        | "AcctTotalAssets"
+        | "AcctTotalBoxes"
+        | "AcctTotalBoxBytes"
+        | "AcctIncentiveEligible"
+        | "AcctLastProposed"
+        | "AcctLastHeartbeat" => Uint64,
+        _ => return None,
+    })
 }
 
 /// Mirrors go's `txnFieldSpecs[].ftype`'s `AVMType` (`fields.go:290-378`),
@@ -963,6 +1101,7 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
         &ops.type_stack,
         &ops.type_stack_const,
         &ops.scratch_space,
+        ops.version,
         mnemonic,
         args,
     );

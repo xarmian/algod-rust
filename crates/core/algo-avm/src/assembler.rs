@@ -3128,24 +3128,23 @@ mod tests {
 
     #[test]
     fn test_assemble_asset_holding_get_argument_errors() {
-        // TestAssembleAsset: a representative slice of asset_holding_get /
-        // asset_params_get assembler-level error paths -- wrong stack
-        // height, wrong immediate-argument count, and unknown field name.
-        //
-        // NOTE (found while porting this test, real parity gap): go's
-        // TestAssembleAsset also asserts that `byte 0x1234;
-        // asset_params_get AssetURL` is a *type* error ("asset_params_get
-        // ABC 1 arg 0 wanted type uint64..." -- the popped asset-id stack
-        // argument must be uint64, not []byte). algod-rust's assembler
-        // type-tracker (`type_track.rs`) has no arg-type entries at all for
-        // `asset_holding_get`/`asset_params_get`/`app_params_get`/
-        // `acct_params_get`, so this class of misuse assembles cleanly
-        // instead of being rejected at assembly time (it would presumably
-        // only surface, if at all, as a runtime type error in the AVM
-        // interpreter). Not fixed here -- this is a test-writing pass, not
-        // a functional change -- flagged for a follow-up issue instead.
+        // TestAssembleAsset: asset_holding_get / asset_params_get
+        // assembler-level error paths -- wrong stack height, wrong
+        // immediate-argument count, unknown field name, and (the class of
+        // misuse this test used to flag as a real parity gap, now fixed by
+        // `type_track.rs`'s `asset_holding_get`/`asset_params_get` refine
+        // arms) a wrong *stack-argument type*.
         for v in 2..=13u8 {
             let errs = expect_errors(&format!("#pragma version {v}\nasset_holding_get ABC 1\n"));
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("expects 2 stack arguments")),
+                "v{v}: {errs:?}"
+            );
+
+            let errs = expect_errors(&format!(
+                "#pragma version {v}\nint 1\nasset_holding_get ABC 1\n"
+            ));
             assert!(
                 errs.iter()
                     .any(|e| e.message.contains("expects 2 stack arguments")),
@@ -3171,7 +3170,132 @@ mod tests {
                     .contains("asset_holding_get unknown field: \"ABC\"")),
                 "v{v}: {errs:?}"
             );
+
+            // asset_params_get's popped asset-id argument must be uint64,
+            // not []byte -- trackStack runs *before* the immediate-count
+            // check (`spec.asm`/`asmDefault`'s `checkArgCount`), so this
+            // type mismatch is reported even though "ABC 1" is also the
+            // wrong immediate-argument count for asset_params_get.
+            let errs = expect_errors(&format!(
+                "#pragma version {v}\nbyte 0x1234\nasset_params_get ABC 1\n"
+            ));
+            assert!(
+                errs.iter().any(|e| e
+                    .message
+                    .contains("asset_params_get ABC 1 arg 0 wanted type uint64")),
+                "v{v}: {errs:?}"
+            );
+
+            // AssetUnitName is known (via the field-based return-type
+            // refinement) to push []byte, not uint64.
+            let errs = expect_errors(&format!(
+                "#pragma version {v}\nint 1\nasset_params_get AssetUnitName\npop\nint 1\n+\n"
+            ));
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("+ arg 0 wanted type uint64")),
+                "v{v}: {errs:?}"
+            );
+
+            // AssetTotal is known to push uint64, not []byte.
+            let errs = expect_errors(&format!(
+                "#pragma version {v}\nint 1\nasset_params_get AssetTotal\npop\nbyte 0x12\nconcat\n"
+            ));
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("concat arg 0 wanted type []byte")),
+                "v{v}: {errs:?}"
+            );
+
+            // testLine-style: "int 1" first supplies asset_params_get's
+            // single stack argument, isolating the immediate-count / unknown
+            // -field errors from any stack-height/type error.
+            let errs = expect_errors(&format!(
+                "#pragma version {v}\nint 1\nasset_params_get ABC 1\nint 1\n"
+            ));
+            assert!(
+                errs.iter().any(|e| e
+                    .message
+                    .contains("asset_params_get expects 1 immediate argument")),
+                "v{v}: {errs:?}"
+            );
+
+            let errs = expect_errors(&format!(
+                "#pragma version {v}\nint 1\nasset_params_get ABC\nint 1\n"
+            ));
+            assert!(
+                errs.iter().any(|e| e
+                    .message
+                    .contains("asset_params_get unknown field: \"ABC\"")),
+                "v{v}: {errs:?}"
+            );
         }
+    }
+
+    #[test]
+    fn test_assemble_asset_holding_get_direct_ref_version_gating() {
+        // TestAssembleAsset (via evalStateful_test.go's directRefEnabledVersion
+        // split): below v4, asset_holding_get's account argument is a
+        // foreign-accounts-array index (uint64 only); a []byte direct
+        // address reference is a type error. From v4 on, a []byte account
+        // reference is accepted (proto widens to `Any`).
+        let errs = expect_errors(
+            "#pragma version 3\nbyte 0x1234\nint 1\nasset_holding_get AssetBalance\n",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("arg 0 wanted type uint64")),
+            "{errs:?}"
+        );
+
+        assemble_string("#pragma version 4\nbyte 0x1234\nint 1\nasset_holding_get AssetBalance\n")
+            .expect("v4+ accepts a []byte direct account reference");
+    }
+
+    #[test]
+    fn test_assemble_app_params_get_and_acct_params_get_return_type_refinement() {
+        // TestAssembleAsset's asset_params_get field-type-refinement pattern
+        // extended to app_params_get / acct_params_get (same
+        // `type_track.rs` refine arms).
+        let errs = expect_errors(
+            "#pragma version 13\nint 1\napp_params_get AppApprovalProgram\npop\nint 1\n+\n",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("+ arg 0 wanted type uint64")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors(
+            "#pragma version 13\nint 1\napp_params_get AppGlobalNumUint\npop\nbyte 0x12\nconcat\n",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("concat arg 0 wanted type []byte")),
+            "{errs:?}"
+        );
+
+        // acct_params_get's popped account argument must overlap `Any`
+        // (always true), but its returned value is refined per field:
+        // AcctAuthAddr pushes []byte, not uint64.
+        let errs = expect_errors(
+            "#pragma version 13\nint 1\nacct_params_get AcctAuthAddr\npop\nint 1\n+\n",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("+ arg 0 wanted type uint64")),
+            "{errs:?}"
+        );
+
+        // app_params_get's popped app-id argument must be uint64, not
+        // []byte.
+        let errs = expect_errors("#pragma version 13\nbyte 0x1234\napp_params_get AppCreator\n");
+        assert!(
+            errs.iter().any(|e| e
+                .message
+                .contains("app_params_get AppCreator arg 0 wanted type uint64")),
+            "{errs:?}"
+        );
     }
 
     #[test]
