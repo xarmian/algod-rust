@@ -4395,6 +4395,15 @@ pub async fn run(
         // Issue #1157: wires go's `UseXForwardedForAddressField` through to
         // inbound connection tracking (`request_tracker.rs`).
         use_x_forwarded_for_address_field: node_config.use_x_forwarded_for_address_field.clone(),
+        // Issue #1191: wires go's `ForceFetchTransactions` through to
+        // `wantTXGossip` seeding, matching `network/wsNetwork.go`'s
+        // `wn.relayMessages || wn.config.ForceFetchTransactions` gate. This
+        // is the field's real effect on a non-relay participation node: it
+        // keeps a peer subscribed to `TX` gossip (and disables the dynamic
+        // role-transition narrowing) even though it neither relays nor
+        // participates, e.g. for an operator who wants full mempool
+        // visibility for local tooling.
+        force_fetch_transactions: node_config.force_fetch_transactions,
         ..Default::default()
     };
 

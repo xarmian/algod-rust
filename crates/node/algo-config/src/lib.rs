@@ -726,13 +726,27 @@ static ENABLE_DEVELOPER_API: VersionedDefault<bool> = VersionedDefault::new(&[(9
 //   by its own follow-up issue rather than absorbed here. These fields still
 //   round-trip through `config.json` and are threaded into the
 //   `TxSyncerConfig` `participate` constructs at startup.
-// - `EnableVerbosedTransactionSyncLogging`/`TransactionSyncDataExchangeRate`/
-//   `TransactionSyncSignificantMessageThreshold` are **not applicable**:
-//   investigated and confirmed dead in go-algorand v5.0.0-stable itself —
-//   these fields exist only in `config/localTemplate.go`/`local_defaults.go`
-//   with zero consumers anywhere in non-test Go source (no `txnsync`
-//   package, no adaptive rate-based tx-sync protocol at this pin; that
-//   experiment was retired upstream). Deliberately not added here.
+// - Issue #1191 (split from #1149) triaged the remaining 4
+//   `ForceFetchTransactions`/`TransactionSync*` fields:
+//   - `ForceFetchTransactions` has a real, live wiring point after all —
+//     `algo_network::WebsocketNetworkConfig::force_fetch_transactions`
+//     already exists and is fully implemented (pins `wantTXGossip` to "yes"
+//     at startup, mirroring go's `wn.relayMessages ||
+//     wn.config.ForceFetchTransactions` gate in `network/wsNetwork.go` and
+//     `network/p2pNetwork.go`); only the `config.json` plumbing from
+//     `Local` into that struct was missing. Now wired the same way as
+//     `EnableRequestLogger`/`UseXForwardedForAddressField` (issues
+//     #1088/#1157) in `bin/algod-rust/src/commands/{participate,relay}.rs`.
+//   - `EnableVerbosedTransactionSyncLogging`/`TransactionSyncDataExchangeRate`/
+//     `TransactionSyncSignificantMessageThreshold` remain **not applicable**:
+//     investigated and confirmed dead in go-algorand v5.0.0-stable itself —
+//     these fields exist only in `config/localTemplate.go`/`local_defaults.go`
+//     with zero consumers anywhere in non-test Go source (no `txnsync`
+//     package, no adaptive rate-based tx-sync protocol at this pin; that
+//     experiment was retired upstream). Now added as **documented no-op**
+//     fields (matching the `PeerConnectionsUpdateInterval`-style pattern,
+//     issue #1189) so they round-trip through `config.json` like every
+//     other field, rather than staying silently absent.
 // - The `TxBacklog*RateLimiting*`/congestion-manager group was originally a
 //   9-field block judged entirely out of scope here (issue #753). Issue
 //   #821 later found a genuine wiring point for the *app*-rate-limiter half
@@ -848,6 +862,45 @@ static TX_SYNC_INTERVAL_SECONDS: VersionedDefault<i64> = VersionedDefault::new(&
 /// (`localTemplate.go:324-325`). See `tx_sync_timeout_seconds`'s note.
 static TX_SYNC_SERVE_RESPONSE_SIZE: VersionedDefault<i64> =
     VersionedDefault::new(&[(3, || 1_000_000)]);
+
+/// Go: `ForceFetchTransactions bool` `version[17]:"false"`
+/// (`localTemplate.go:518-521`). Wired into
+/// `algo_network::WebsocketNetworkConfig::force_fetch_transactions` (issue
+/// #1191) — see that field's doc comment in `ws_network.rs` for the full
+/// `wantTXGossip` trace against go's `network/wsNetwork.go`/`p2pNetwork.go`.
+static FORCE_FETCH_TRANSACTIONS: VersionedDefault<bool> = VersionedDefault::new(&[(17, || false)]);
+
+/// Go: `EnableVerbosedTransactionSyncLogging bool` `version[17]:"false"`
+/// (`localTemplate.go:523-526`). **Documented no-op** (issue #1191):
+/// investigated and confirmed dead in go-algorand v5.0.0-stable itself.
+/// This field's only intended consumer was the `data/txnsync` package's
+/// verbose peer-message-exchange logging; no such package exists at this
+/// pin (`grep -rn EnableVerbosedTransactionSyncLogging` across non-test Go
+/// source hits only `config/localTemplate.go`/`config/local_defaults.go`).
+/// Round-trips through `config.json` for forward compatibility; would gain
+/// real meaning only if a future issue reintroduces an equivalent
+/// tx-sync-specific logging mode.
+static ENABLE_VERBOSED_TRANSACTION_SYNC_LOGGING: VersionedDefault<bool> =
+    VersionedDefault::new(&[(17, || false)]);
+
+/// Go: `TransactionSyncDataExchangeRate uint64` `version[17]:"0"`
+/// (`localTemplate.go:528-531`). **Documented no-op** (issue #1191), same
+/// upstream-dead-code finding as
+/// `enable_verbosed_transaction_sync_logging`: this field would override
+/// the auto-calculated peer-to-peer bandwidth exchange rate in go's
+/// (removed) adaptive `data/txnsync` protocol; no such rate-tracking
+/// mechanism exists in this codebase or in the pinned go-algorand tree to
+/// override. Round-trips through `config.json` for forward compatibility.
+static TRANSACTION_SYNC_DATA_EXCHANGE_RATE: VersionedDefault<u64> =
+    VersionedDefault::new(&[(17, || 0)]);
+
+/// Go: `TransactionSyncSignificantMessageThreshold uint64` `version[17]:"0"`
+/// (`localTemplate.go:533-536`). **Documented no-op** (issue #1191), same
+/// finding as `transaction_sync_data_exchange_rate` — the significance
+/// threshold that fed that same removed bandwidth-tracking mechanism.
+/// Round-trips through `config.json` for forward compatibility.
+static TRANSACTION_SYNC_SIGNIFICANT_MESSAGE_THRESHOLD: VersionedDefault<u64> =
+    VersionedDefault::new(&[(17, || 0)]);
 
 /// Go: `TxBacklogServiceRateWindowSeconds int` `version[27]:"10"`
 /// (`localTemplate.go:237-238`). Wired into
@@ -1848,6 +1901,18 @@ fn default_tx_sync_interval_seconds() -> i64 {
 fn default_tx_sync_serve_response_size() -> i64 {
     TX_SYNC_SERVE_RESPONSE_SIZE.at(LATEST_VERSION)
 }
+fn default_force_fetch_transactions() -> bool {
+    FORCE_FETCH_TRANSACTIONS.at(LATEST_VERSION)
+}
+fn default_enable_verbosed_transaction_sync_logging() -> bool {
+    ENABLE_VERBOSED_TRANSACTION_SYNC_LOGGING.at(LATEST_VERSION)
+}
+fn default_transaction_sync_data_exchange_rate() -> u64 {
+    TRANSACTION_SYNC_DATA_EXCHANGE_RATE.at(LATEST_VERSION)
+}
+fn default_transaction_sync_significant_message_threshold() -> u64 {
+    TRANSACTION_SYNC_SIGNIFICANT_MESSAGE_THRESHOLD.at(LATEST_VERSION)
+}
 fn default_tx_backlog_service_rate_window_seconds() -> i64 {
     TX_BACKLOG_SERVICE_RATE_WINDOW_SECONDS.at(LATEST_VERSION)
 }
@@ -2614,6 +2679,41 @@ pub struct Local {
     )]
     pub tx_sync_serve_response_size: i64,
 
+    /// Go: `ForceFetchTransactions`. Wired into
+    /// `algo_network::WebsocketNetworkConfig::force_fetch_transactions`
+    /// (issue #1191) — see [`FORCE_FETCH_TRANSACTIONS`]'s doc comment.
+    #[serde(
+        rename = "ForceFetchTransactions",
+        default = "default_force_fetch_transactions"
+    )]
+    pub force_fetch_transactions: bool,
+
+    /// Go: `EnableVerbosedTransactionSyncLogging`. **Documented no-op**
+    /// (issue #1191) — see
+    /// [`ENABLE_VERBOSED_TRANSACTION_SYNC_LOGGING`]'s doc comment.
+    #[serde(
+        rename = "EnableVerbosedTransactionSyncLogging",
+        default = "default_enable_verbosed_transaction_sync_logging"
+    )]
+    pub enable_verbosed_transaction_sync_logging: bool,
+
+    /// Go: `TransactionSyncDataExchangeRate`. **Documented no-op** (issue
+    /// #1191) — see [`TRANSACTION_SYNC_DATA_EXCHANGE_RATE`]'s doc comment.
+    #[serde(
+        rename = "TransactionSyncDataExchangeRate",
+        default = "default_transaction_sync_data_exchange_rate"
+    )]
+    pub transaction_sync_data_exchange_rate: u64,
+
+    /// Go: `TransactionSyncSignificantMessageThreshold`. **Documented
+    /// no-op** (issue #1191) — see
+    /// [`TRANSACTION_SYNC_SIGNIFICANT_MESSAGE_THRESHOLD`]'s doc comment.
+    #[serde(
+        rename = "TransactionSyncSignificantMessageThreshold",
+        default = "default_transaction_sync_significant_message_threshold"
+    )]
+    pub transaction_sync_significant_message_threshold: u64,
+
     /// Go: `TxBacklogServiceRateWindowSeconds`. Wired into
     /// `algo_pool::AppRateLimiter`'s sliding-window duration (issue #821)
     /// — see [`TX_BACKLOG_SERVICE_RATE_WINDOW_SECONDS`]'s doc comment.
@@ -3283,6 +3383,12 @@ impl Local {
             tx_sync_timeout_seconds: TX_SYNC_TIMEOUT_SECONDS.at(version),
             tx_sync_interval_seconds: TX_SYNC_INTERVAL_SECONDS.at(version),
             tx_sync_serve_response_size: TX_SYNC_SERVE_RESPONSE_SIZE.at(version),
+            force_fetch_transactions: FORCE_FETCH_TRANSACTIONS.at(version),
+            enable_verbosed_transaction_sync_logging: ENABLE_VERBOSED_TRANSACTION_SYNC_LOGGING
+                .at(version),
+            transaction_sync_data_exchange_rate: TRANSACTION_SYNC_DATA_EXCHANGE_RATE.at(version),
+            transaction_sync_significant_message_threshold:
+                TRANSACTION_SYNC_SIGNIFICANT_MESSAGE_THRESHOLD.at(version),
             tx_backlog_service_rate_window_seconds: TX_BACKLOG_SERVICE_RATE_WINDOW_SECONDS
                 .at(version),
             tx_backlog_app_tx_rate_limiter_max_size: TX_BACKLOG_APP_TX_RATE_LIMITER_MAX_SIZE
@@ -3676,6 +3782,30 @@ impl Local {
             migrate_field(
                 &mut self.tx_sync_serve_response_size,
                 &TX_SYNC_SERVE_RESPONSE_SIZE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.force_fetch_transactions,
+                &FORCE_FETCH_TRANSACTIONS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_verbosed_transaction_sync_logging,
+                &ENABLE_VERBOSED_TRANSACTION_SYNC_LOGGING,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.transaction_sync_data_exchange_rate,
+                &TRANSACTION_SYNC_DATA_EXCHANGE_RATE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.transaction_sync_significant_message_threshold,
+                &TRANSACTION_SYNC_SIGNIFICANT_MESSAGE_THRESHOLD,
                 cur,
                 next,
             );
@@ -4548,6 +4678,10 @@ mod tests {
             TX_SYNC_TIMEOUT_SECONDS.max_tag_version(),
             TX_SYNC_INTERVAL_SECONDS.max_tag_version(),
             TX_SYNC_SERVE_RESPONSE_SIZE.max_tag_version(),
+            FORCE_FETCH_TRANSACTIONS.max_tag_version(),
+            ENABLE_VERBOSED_TRANSACTION_SYNC_LOGGING.max_tag_version(),
+            TRANSACTION_SYNC_DATA_EXCHANGE_RATE.max_tag_version(),
+            TRANSACTION_SYNC_SIGNIFICANT_MESSAGE_THRESHOLD.max_tag_version(),
             ENABLE_ASSEMBLE_STATS.max_tag_version(),
             ENABLE_PROCESS_BLOCK_STATS.max_tag_version(),
             MAX_BLOCK_HISTORY_LOOKBACK.max_tag_version(),
@@ -4667,6 +4801,10 @@ mod tests {
         assert_eq!(d.tx_sync_timeout_seconds, 30);
         assert_eq!(d.tx_sync_interval_seconds, 60);
         assert_eq!(d.tx_sync_serve_response_size, 1_000_000);
+        assert!(!d.force_fetch_transactions);
+        assert!(!d.enable_verbosed_transaction_sync_logging);
+        assert_eq!(d.transaction_sync_data_exchange_rate, 0);
+        assert_eq!(d.transaction_sync_significant_message_threshold, 0);
         assert_eq!(d.tx_backlog_service_rate_window_seconds, 10);
         assert_eq!(d.tx_backlog_app_tx_rate_limiter_max_size, 1_048_576);
         assert_eq!(d.tx_backlog_app_tx_per_second_rate, 100);
@@ -5317,6 +5455,56 @@ mod tests {
         assert!(!cfg.enable_metric_reporting);
     }
 
+    /// TDD anchor for issue #1191: `ForceFetchTransactions` parses from
+    /// `config.json`, defaults to `false` at every version from its
+    /// `version[17]` tag onward, and — unlike the other three fields
+    /// triaged by this issue — is a *real* wired field: it feeds
+    /// `algo_network::WebsocketNetworkConfig::force_fetch_transactions` in
+    /// `bin/algod-rust/src/commands/{participate,relay}.rs`, which already
+    /// has full behavioral coverage (`force_fetch_transactions_always_receives_tx`,
+    /// `want_tx_gossip_seeded_yes_for_force_fetch_transactions` in
+    /// `ws_network.rs`). This test only proves the missing half: the
+    /// `config.json` -> `Local` plumbing this issue adds.
+    #[test]
+    fn issue_1191_force_fetch_transactions_round_trips_through_json() {
+        let cfg = Local::load_from_str(r#"{"ForceFetchTransactions": true}"#).expect("parses");
+        assert!(cfg.force_fetch_transactions);
+
+        let cfg = Local::default_at_version(17);
+        assert!(!cfg.force_fetch_transactions);
+        let cfg = Local::default_at_version(27);
+        assert!(!cfg.force_fetch_transactions);
+    }
+
+    /// TDD anchor for issue #1191: `EnableVerbosedTransactionSyncLogging`/
+    /// `TransactionSyncDataExchangeRate`/
+    /// `TransactionSyncSignificantMessageThreshold` are formally retired as
+    /// documented no-ops — investigated and confirmed dead in go-algorand
+    /// v5.0.0-stable itself (no `data/txnsync` package, no adaptive
+    /// bandwidth-tracking tx-sync protocol at this pin exists to override).
+    /// They must still round-trip through `config.json` like every other
+    /// retired field, same pattern as issue #1188's
+    /// `EnableMetricReporting` test above.
+    #[test]
+    fn issue_1191_dead_transaction_sync_fields_round_trip_through_json_as_documented_no_ops() {
+        let cfg = Local::load_from_str(
+            r#"{
+                "EnableVerbosedTransactionSyncLogging": true,
+                "TransactionSyncDataExchangeRate": 12345,
+                "TransactionSyncSignificantMessageThreshold": 6789
+            }"#,
+        )
+        .expect("parses");
+        assert!(cfg.enable_verbosed_transaction_sync_logging);
+        assert_eq!(cfg.transaction_sync_data_exchange_rate, 12345);
+        assert_eq!(cfg.transaction_sync_significant_message_threshold, 6789);
+
+        let cfg = Local::default_at_version(27);
+        assert!(!cfg.enable_verbosed_transaction_sync_logging);
+        assert_eq!(cfg.transaction_sync_data_exchange_rate, 0);
+        assert_eq!(cfg.transaction_sync_significant_message_threshold, 0);
+    }
+
     /// TDD anchor for issue #1149: `StorageEngine` has no `version[N]` tag
     /// before 28, so an operator on an older-versioned `config.json` who
     /// never set it sees an empty string until migration carries them past
@@ -5521,14 +5709,17 @@ mod tests {
         // (`bin/algod-rust/src/commands/participate.rs`), reconciled with
         // `RestConfig::async_backlog_size` as documented on
         // [`TX_BACKLOG_SIZE`] — removed from this list.
+        // Issue #1191 (split from #1149) closed the last 4: `ForceFetchTransactions`
+        // is now wired into `algo_network::WebsocketNetworkConfig::force_fetch_transactions`
+        // (see [`FORCE_FETCH_TRANSACTIONS`]); `EnableVerbosedTransactionSyncLogging`/
+        // `TransactionSyncDataExchangeRate`/`TransactionSyncSignificantMessageThreshold`
+        // formally retired as documented no-ops (investigated and confirmed
+        // dead in go-algorand v5.0.0-stable itself — see each field's
+        // `VersionedDefault` doc comment) — all 4 removed from this list.
         const NOT_YET_PORTED: &[&str] = &[
             "AccountUpdatesStatsInterval",
             "EnableAccountUpdatesStats",
-            "EnableVerbosedTransactionSyncLogging",
-            "ForceFetchTransactions",
             "NetAddress",
-            "TransactionSyncDataExchangeRate",
-            "TransactionSyncSignificantMessageThreshold",
         ];
 
         let fixture_text = include_str!("../fixtures/config-v27.json");
