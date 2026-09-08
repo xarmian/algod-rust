@@ -351,6 +351,18 @@ pub struct WebsocketNetworkConfig {
     /// `!wn.relayMessages && !wn.config.ForceFetchTransactions`
     /// (`network/wsNetwork.go`).
     pub force_fetch_transactions: bool,
+
+    /// HTTP header field name to trust for the client's real IP address
+    /// when this node runs behind a reverse proxy / load balancer (default:
+    /// `""`, disabled).
+    ///
+    /// Matches Go's `UseXForwardedForAddressField`. When non-empty, inbound
+    /// connection tracking/rate-limiting (per-IP connection count and
+    /// connection-rate window) key on the address extracted from this
+    /// header via [`crate::request_tracker::get_forwarded_connection_address`]
+    /// instead of the raw socket address, mirroring go's
+    /// `RequestTracker.remoteHostProxyFix` (`network/requestTracker.go`).
+    pub use_x_forwarded_for_address_field: String,
 }
 
 /// Default block-service memory cap: 500,000,000 bytes.
@@ -394,6 +406,7 @@ impl Default for WebsocketNetworkConfig {
             disable_localhost_connection_rate_limit: true,
             enable_request_logger: false,
             force_fetch_transactions: false,
+            use_x_forwarded_for_address_field: String::new(),
         }
     }
 }
@@ -515,6 +528,13 @@ pub struct WebsocketNetwork {
     /// Per-IP connection tracker for inbound connections.
     connection_tracker: Arc<ConnectionTracker>,
 
+    /// Set once a warning has been logged about
+    /// `use_x_forwarded_for_address_field` being configured but not
+    /// actually present on inbound request headers. Mirrors go's
+    /// `RequestTracker.misconfiguredUseForwardedForAddress` — logs the
+    /// warning at most once per node lifetime rather than once per request.
+    misconfigured_x_forwarded_for: std::sync::atomic::AtomicBool,
+
     /// The local listening address of the relay server once started.
     /// `None` when not in relay mode or before `start` completes.
     listen_addr: std::sync::Mutex<Option<SocketAddr>>,
@@ -635,6 +655,7 @@ impl WebsocketNetwork {
             tasks: Mutex::new(Vec::new()),
             node_random: node_random.to_string(),
             connection_tracker: Arc::new(ConnectionTracker::new(Duration::from_secs(1))),
+            misconfigured_x_forwarded_for: std::sync::atomic::AtomicBool::new(false),
             listen_addr: std::sync::Mutex::new(None),
             registered_handlers: std::sync::Mutex::new(Vec::new()),
             broadcast_thread: Arc::new(std::sync::Mutex::new(None)),
@@ -2508,10 +2529,11 @@ enum ValidationResult {
 /// Checks (matching Go's `ServeHTTP` flow):
 /// 1. Genesis ID in the URL path matches ours
 /// 2. Protocol version is compatible
-/// 3. Track the connection (atomically, before limit checks)
-/// 4. Per-IP connection limit
-/// 5. Per-IP rate limit
-/// 6. Self-loop detection (NodeRandom header)
+/// 3. Resolve the tracking address (raw socket, or X-Forwarded-For override)
+/// 4. Track the connection (atomically, before limit checks)
+/// 5. Per-IP connection limit
+/// 6. Per-IP rate limit
+/// 7. Self-loop detection (NodeRandom header)
 ///
 /// The connection is tracked at the start of validation so that concurrent
 /// handshakes from the same IP cannot all pass stale counters. If validation
@@ -2549,19 +2571,33 @@ fn validate_incoming_connection(
         }
     };
 
-    // 3. Track the connection BEFORE checking limits so that concurrent
-    //    handshakes from the same IP see each other's counts.
-    network.connection_tracker.track_connection(remote_ip);
+    // 3. Resolve the tracking address: when `use_x_forwarded_for_address_field`
+    // is configured, prefer the client address it names over the raw socket
+    // address, mirroring go's `remoteHostProxyFix` (`network/requestTracker.go:473-480`)
+    // — go applies this to `trackedRequest.remoteHost` before any of the
+    // limit checks below, so the connection-count/rate-limit state (and the
+    // localhost-rate-limit exemption) are all keyed on the proxy-reported
+    // address, not the load balancer's own socket address.
+    let tracking_ip = crate::request_tracker::get_forwarded_connection_address(
+        headers,
+        &network.config.use_x_forwarded_for_address_field,
+        &network.misconfigured_x_forwarded_for,
+    )
+    .unwrap_or(remote_ip);
 
-    // 4. Per-IP connection limit
+    // 4. Track the connection BEFORE checking limits so that concurrent
+    //    handshakes from the same IP see each other's counts.
+    network.connection_tracker.track_connection(tracking_ip);
+
+    // 5. Per-IP connection limit
     if !network
         .connection_tracker
-        .check_connection_limit(remote_ip, network.config.max_connections_per_ip)
+        .check_connection_limit(tracking_ip, network.config.max_connections_per_ip)
     {
         // Undo tracking — this request will not proceed.
-        network.connection_tracker.release_connection(remote_ip);
+        network.connection_tracker.release_connection(tracking_ip);
         tracing::warn!(
-            ip = %remote_ip,
+            ip = %tracking_ip,
             limit = network.config.max_connections_per_ip,
             "incoming connection: per-IP connection limit exceeded"
         );
@@ -2570,23 +2606,23 @@ fn validate_incoming_connection(
         );
     }
 
-    // 5. Rate limit — go's `DisableLocalhostConnectionRateLimit`
+    // 6. Rate limit — go's `DisableLocalhostConnectionRateLimit`
     // (`network/requestTracker.go:261,450`: `rateLimitedRemoteHost :=
     // (!cfg.DisableLocalhostConnectionRateLimit) || (!isLocalhost(host))`)
     // exempts loopback remotes from the rate limiter specifically (the
     // per-IP *connection-count* limit above still applies to localhost —
     // this only affects the rate-limit check).
     let rate_limited_remote =
-        !network.config.disable_localhost_connection_rate_limit || !remote_ip.is_loopback();
+        !network.config.disable_localhost_connection_rate_limit || !tracking_ip.is_loopback();
     if rate_limited_remote
         && !network
             .connection_tracker
-            .check_rate_limit(remote_ip, network.config.connections_rate_limiting_count)
+            .check_rate_limit(tracking_ip, network.config.connections_rate_limiting_count)
     {
         // Undo tracking — this request will not proceed.
-        network.connection_tracker.release_connection(remote_ip);
+        network.connection_tracker.release_connection(tracking_ip);
         tracing::warn!(
-            ip = %remote_ip,
+            ip = %tracking_ip,
             "incoming connection: rate limit exceeded"
         );
         return ValidationResult::Rejected(
@@ -2594,7 +2630,7 @@ fn validate_incoming_connection(
         );
     }
 
-    // 6. Self-loop detection
+    // 7. Self-loop detection
     let other_random = headers
         .get(HeaderName::from_static("x-algorand-noderandom"))
         .and_then(|v| v.to_str().ok())
@@ -3482,6 +3518,134 @@ mod tests {
             matches!(result, ValidationResult::Rejected(_)),
             "with the exemption off, loopback follows the same rate limit as any IP"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // X-Forwarded-For wiring (issue #1157)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_incoming_tracks_forwarded_address_when_configured() {
+        // With `use_x_forwarded_for_address_field` set, the per-IP
+        // connection tracker must key off the header-provided address
+        // rather than the raw socket address — mirroring go's
+        // `remoteHostProxyFix`.
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            max_connections_per_ip: 3,
+            connections_rate_limiting_count: 10,
+            use_x_forwarded_for_address_field: "X-Forwarded-For".to_string(),
+            ..Default::default()
+        };
+        let net = WebsocketNetwork::new(
+            config,
+            Arc::new(Phonebook::new(10, Duration::from_secs(60))),
+        );
+        // The load balancer's own socket address...
+        let socket_ip: std::net::IpAddr = "10.0.0.100".parse().unwrap();
+        // ...but the header names the real client.
+        let forwarded_ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+
+        let mut headers = valid_incoming_headers("forwarded-random");
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            "203.0.113.7".parse().unwrap(),
+        );
+
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, socket_ip);
+        assert!(matches!(result, ValidationResult::Ok { .. }));
+
+        // Tracked under the forwarded address, not the socket address.
+        assert_eq!(net.connection_tracker.active_count(forwarded_ip), 1);
+        assert_eq!(net.connection_tracker.active_count(socket_ip), 0);
+    }
+
+    #[test]
+    fn validate_incoming_falls_back_to_socket_ip_when_header_absent() {
+        // Configured but the proxy didn't actually set the header: falls
+        // back to the raw socket address rather than rejecting outright.
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            max_connections_per_ip: 3,
+            connections_rate_limiting_count: 10,
+            use_x_forwarded_for_address_field: "X-Forwarded-For".to_string(),
+            ..Default::default()
+        };
+        let net = WebsocketNetwork::new(
+            config,
+            Arc::new(Phonebook::new(10, Duration::from_secs(60))),
+        );
+        let socket_ip: std::net::IpAddr = "10.0.0.101".parse().unwrap();
+        let headers = valid_incoming_headers("forwarded-random-2");
+
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, socket_ip);
+        assert!(matches!(result, ValidationResult::Ok { .. }));
+        assert_eq!(net.connection_tracker.active_count(socket_ip), 1);
+    }
+
+    #[test]
+    fn validate_incoming_ignores_forwarded_header_when_unconfigured() {
+        // Default config (empty field name): the header must be ignored
+        // entirely, even if present — tracking stays on the socket address.
+        let net = make_relay_network("testnet-v1.0");
+        assert!(net.config.use_x_forwarded_for_address_field.is_empty());
+
+        let socket_ip: std::net::IpAddr = "10.0.0.102".parse().unwrap();
+        let mut headers = valid_incoming_headers("forwarded-random-3");
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            "203.0.113.9".parse().unwrap(),
+        );
+
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, socket_ip);
+        assert!(matches!(result, ValidationResult::Ok { .. }));
+        assert_eq!(net.connection_tracker.active_count(socket_ip), 1);
+        let forwarded_ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(net.connection_tracker.active_count(forwarded_ip), 0);
+    }
+
+    #[test]
+    fn validate_incoming_per_ip_limit_keyed_on_forwarded_address() {
+        // The per-IP connection limit itself must be enforced against the
+        // forwarded address, not the (shared, load-balancer) socket
+        // address — otherwise many distinct real clients behind one proxy
+        // would all collide on a single counter.
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            max_connections_per_ip: 3,
+            connections_rate_limiting_count: 100,
+            use_x_forwarded_for_address_field: "X-Forwarded-For".to_string(),
+            ..Default::default()
+        };
+        let net = WebsocketNetwork::new(
+            config,
+            Arc::new(Phonebook::new(10, Duration::from_secs(60))),
+        );
+        let socket_ip: std::net::IpAddr = "10.0.0.103".parse().unwrap();
+        let forwarded_ip: std::net::IpAddr = "203.0.113.8".parse().unwrap();
+
+        // Pre-track 3 connections directly under the forwarded address.
+        net.connection_tracker.track_connection(forwarded_ip);
+        net.connection_tracker.track_connection(forwarded_ip);
+        net.connection_tracker.track_connection(forwarded_ip);
+
+        let mut headers = valid_incoming_headers("forwarded-random-4");
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            "203.0.113.8".parse().unwrap(),
+        );
+
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, socket_ip);
+        assert!(matches!(result, ValidationResult::Rejected(_)));
+        // Rejected path releases the tracked connection back to 3.
+        assert_eq!(net.connection_tracker.active_count(forwarded_ip), 3);
+        assert_eq!(net.connection_tracker.active_count(socket_ip), 0);
     }
 
     #[test]

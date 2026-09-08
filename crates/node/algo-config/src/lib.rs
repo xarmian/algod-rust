@@ -1132,13 +1132,16 @@ static ENABLE_NET_DEV_METRICS: VersionedDefault<bool> = VersionedDefault::new(&[
 //   previously hardcoded a single bucket-size constant with no
 //   bucket-count knob and no incoming/outgoing split at all.
 // - `dns_security_flags`/`network_protocol_version`/
-//   `use_x_forwarded_for_address_field`/`disable_outgoing_connection_throttling`/
+//   `disable_outgoing_connection_throttling`/
 //   `block_service_custom_fallback_endpoints`/`enable_request_logger`/
 //   `fallback_dns_resolver_address`: round-trip only, no underlying
 //   DNS-response-validation, protocol-version-override,
-//   X-Forwarded-For-aware client-IP resolution, outgoing-throttle-disable,
-//   custom-fallback-endpoint, request-logging, or fallback-DNS-resolver
-//   subsystem exists to gate.
+//   outgoing-throttle-disable, custom-fallback-endpoint, request-logging,
+//   or fallback-DNS-resolver subsystem exists to gate.
+// - `use_x_forwarded_for_address_field`: wired into `algo_network`'s
+//   inbound connection tracker (issue #1157) — see
+//   `algo_network::request_tracker::get_forwarded_connection_address` and
+//   `WebsocketNetworkConfig::use_x_forwarded_for_address_field`.
 // - `disable_localhost_connection_rate_limit`: wired into the inbound
 //   connection-rate limiter (`algo_network::ConnectionTracker`) as a
 //   real behavioral fix — localhost connections previously got no
@@ -1229,7 +1232,11 @@ static NETWORK_PROTOCOL_VERSION: VersionedDefault<String> =
     VersionedDefault::new(&[(6, String::new)]);
 
 /// Go: `UseXForwardedForAddressField string` `version[0]:""`
-/// (`localTemplate.go:337`). Round-trip only — see the module note above.
+/// (`localTemplate.go:337`). Wired into `algo_network`'s inbound connection
+/// tracker (issue #1157): when non-empty, names the HTTP header trusted for
+/// the client's real address behind a reverse proxy/load balancer — see
+/// `algo_network::request_tracker::get_forwarded_connection_address` and
+/// `WebsocketNetworkConfig::use_x_forwarded_for_address_field`.
 static USE_X_FORWARDED_FOR_ADDRESS_FIELD: VersionedDefault<String> =
     VersionedDefault::new(&[(0, String::new)]);
 
@@ -2421,8 +2428,9 @@ pub struct Local {
     )]
     pub network_protocol_version: String,
 
-    /// Go: `UseXForwardedForAddressField`. Round-trip only — see
-    /// [`USE_X_FORWARDED_FOR_ADDRESS_FIELD`]'s doc comment.
+    /// Go: `UseXForwardedForAddressField`. See
+    /// [`USE_X_FORWARDED_FOR_ADDRESS_FIELD`]'s doc comment for how this is
+    /// wired into `algo_network`.
     #[serde(
         rename = "UseXForwardedForAddressField",
         default = "default_use_x_forwarded_for_address_field"
