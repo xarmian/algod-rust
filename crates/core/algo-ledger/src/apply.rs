@@ -1309,6 +1309,40 @@ fn collect_txn_addresses(
 /// real ledger store or a group-scoped [`crate::recording_store::RecordingStore`]
 /// wrapper, without duplicating it -- the caller picks which by choosing
 /// what `S` is instantiated with at the call site.
+/// Check that `stx` is "alive" at `round`: `round >= txn.FirstValid &&
+/// round <= txn.LastValid`. Matches go-algorand's
+/// `BlockHeader.Alive(txn.Header)` round-validity check
+/// (`data/bookkeeping/block.go:297-307`), called at the per-txn apply site
+/// gated on `eval.validate` (`ledger/eval/eval.go:1254-1258`, i.e. block
+/// validation of a newly-received block, not replay/re-execution of an
+/// already-certified block -- an already-certified block's txns were
+/// already proven alive when the block was first validated).
+///
+/// Only the round-liveness half of go's `Alive` is ported here; the
+/// genesis-hash/genesis-ID half is already covered separately by
+/// `algo_validate::validate_genesis_consistency`.
+pub(crate) fn check_txn_alive(round: Round, stx: &SignedTransaction) -> Result<(), AlgoError> {
+    let txn = &stx.txn;
+    if round < txn.first_valid || round > txn.last_valid {
+        let txid = algo_codec::compute_txn_id(txn);
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "transaction {} dead: round {} outside [{}, {}]{}",
+                txid,
+                round,
+                txn.first_valid,
+                txn.last_valid,
+                if round < txn.first_valid {
+                    " (early)"
+                } else {
+                    " (expired)"
+                }
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Check that the address that actually authorized `stx` (via a valid
 /// signature -- `stx.auth_addr` if set, else the sender) matches whatever
 /// address the sender has been rekeyed to per the ledger's account state.
@@ -1364,6 +1398,7 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
     for (gi_idx, stx) in group.iter().enumerate() {
         ctx.txn_index.set(*global_txn_idx);
         if ctx.validate {
+            check_txn_alive(Round(ctx.round), stx)?;
             check_authorizer(store, stx)?;
         }
         let gi = GroupInfo {
@@ -1513,6 +1548,9 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                 // Replay mode: process transactions individually (no AVM execution).
                 for stx in &block.payset {
                     if ctx.validate {
+                        if let Err(e) = check_txn_alive(Round(ctx.round), stx) {
+                            break 'block Err(e);
+                        }
                         if let Err(e) = check_authorizer(store, stx) {
                             break 'block Err(e);
                         }
@@ -5118,6 +5156,13 @@ mod tests {
         stx.txn.receiver = receiver;
         stx.txn.amount = amount;
         stx.txn.fee = fee;
+        // Issue #1152: default to a wide-open [FirstValid, LastValid]
+        // window so existing fixtures using this helper across a range of
+        // block rounds aren't spuriously rejected by the FirstValid/
+        // LastValid round-liveness check (`check_txn_alive`) now enforced
+        // in `ctx.validate` paths. Tests that specifically exercise
+        // liveness set `first_valid`/`last_valid` explicitly.
+        stx.txn.last_valid = Round(1_000_000);
         stx
     }
 
@@ -5351,6 +5396,164 @@ mod tests {
         };
         apply_block_validating(&mut state, &block2_good)
             .expect("spend declaring the correct post-rekey authorizer should succeed");
+    }
+
+    // ── FirstValid/LastValid round liveness (issue #1152, ported from
+    // go-algorand's `TestAlive`, `data/bookkeeping/block_test.go:1279`) ──
+    //
+    // go's `BlockHeader.Alive` is called at the per-txn apply site gated on
+    // `eval.validate` (`ledger/eval/eval.go:1254-1258` for the real apply
+    // path this mirrors). algod-rust's `ApplyMode::Replay` (used by
+    // `apply_block_validating`, exercised here) and `ApplyMode::Execute`
+    // dispatch through genuinely separate per-txn loops
+    // (`apply_block_impl`'s Replay branch vs. `apply_group_transactions`),
+    // so both need their own coverage -- a fix placed in only one would
+    // leave the other silently unguarded.
+
+    /// Builds a ledger whose `current_round` is `round - 1` (so `block`
+    /// with `round: Round(round)` passes `apply_block_impl`'s round-
+    /// monotonicity precheck) and applies a single `pay` from `sender` to
+    /// `receiver` with the given `[first_valid, last_valid]` window,
+    /// through the `ApplyMode::Replay`, `validate=true` path (matches
+    /// `apply_block_validating`).
+    fn apply_single_payment_at_round(
+        round: u64,
+        first_valid: u64,
+        last_valid: u64,
+    ) -> Result<(), AlgoError> {
+        use crate::store_trait::LedgerStore;
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (receiver, 100_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        state.set_current_round(Round(round - 1));
+
+        let mut stx = pay_txn(sender, receiver, 1_000, 1_000);
+        stx.txn.first_valid = Round(first_valid);
+        stx.txn.last_valid = Round(last_valid);
+        let block = Block {
+            round: Round(round),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stx],
+            ..Block::default()
+        };
+        apply_block_validating(&mut state, &block)
+    }
+
+    #[test]
+    fn alive_during_lifetime_is_accepted() {
+        // bh.Round = header.FirstValid + 1 in go's TestAlive.
+        apply_single_payment_at_round(101, 100, 150)
+            .expect("transaction should be alive during its lifetime");
+    }
+
+    #[test]
+    fn alive_at_issuance_is_accepted() {
+        // bh.Round = header.FirstValid in go's TestAlive.
+        apply_single_payment_at_round(100, 100, 150)
+            .expect("transaction should be alive at issuance (round == FirstValid)");
+    }
+
+    #[test]
+    fn alive_at_expiry_is_accepted() {
+        // bh.Round = header.LastValid in go's TestAlive.
+        apply_single_payment_at_round(150, 100, 150)
+            .expect("transaction should be alive at expiry (round == LastValid)");
+    }
+
+    #[test]
+    fn premature_transaction_one_round_before_first_valid_is_rejected() {
+        // bh.Round = header.FirstValid - 1 in go's TestAlive: go rejects
+        // this as premature (`TxnDeadError{Early: true}`). Before this
+        // fix, algod-rust's `ApplyMode::Replay` validate path had no code
+        // checking FirstValid at all and would have accepted this txn.
+        let err = apply_single_payment_at_round(99, 100, 150)
+            .expect_err("premature transaction (round == FirstValid - 1) must be rejected");
+        assert!(err.to_string().contains("dead"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn expired_transaction_one_round_after_last_valid_is_rejected() {
+        // bh.Round = header.LastValid + 1 in go's TestAlive.
+        let err = apply_single_payment_at_round(151, 100, 150)
+            .expect_err("expired transaction (round == LastValid + 1) must be rejected");
+        assert!(err.to_string().contains("dead"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn premature_transaction_rejected_in_execute_mode_too() {
+        // Same boundary as `premature_transaction_one_round_before_first_valid_is_rejected`,
+        // but through `ApplyMode::Execute`'s separate per-txn dispatch
+        // (`apply_group_transactions`) rather than `ApplyMode::Replay`'s --
+        // the two are independent code paths in algod-rust (unlike go,
+        // where both real-apply call sites share the same `eval.go`
+        // function), so this pins that the fix was not applied to only one
+        // of them.
+        use crate::store_trait::LedgerStore;
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (receiver, 100_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        state.set_current_round(Round(98));
+
+        let mut stx = pay_txn(sender, receiver, 1_000, 1_000);
+        stx.txn.first_valid = Round(100);
+        stx.txn.last_valid = Round(150);
+        let block = Block {
+            round: Round(99),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stx],
+            ..Block::default()
+        };
+        let err = apply_block_impl(
+            &mut state,
+            &block,
+            ApplyMode::Execute,
+            true,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("premature transaction must be rejected in Execute mode too");
+        assert!(err.to_string().contains("dead"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn liveness_check_skipped_outside_validate_mode() {
+        // Replay (validate=false) must not enforce liveness at all -- an
+        // already-certified block is trusted as-is, matching go's `if
+        // eval.validate` gate (mirrors `check_authorizer_skipped_outside_validate_mode`
+        // for the sibling authorizer check).
+        use crate::store_trait::LedgerStore;
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (receiver, 100_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        state.set_current_round(Round(98));
+
+        let mut stx = pay_txn(sender, receiver, 1_000, 1_000);
+        stx.txn.first_valid = Round(100);
+        stx.txn.last_valid = Round(150);
+        let block = Block {
+            round: Round(99),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stx],
+            ..Block::default()
+        };
+        apply_block(&mut state, &block).expect("replay (validate=false) must not enforce liveness");
     }
 
     #[test]

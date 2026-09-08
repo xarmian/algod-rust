@@ -403,15 +403,27 @@ fn pq_challenged_falcon_address_can_heartbeat_for_zero_fee_full_e2e() {
     let challenge_seed = pq_target.0;
     store_header(&mut state, challenge_round, &challenge_seed, genesis_hash);
 
-    // The heartbeat's own FirstValid round header (separate from the
-    // challenge round), carrying the seed the OTS proof signs over.
-    let hb_header_round = 1u64;
-    let hb_seed = [0x11u8; 32];
-    store_header(&mut state, hb_header_round, &hb_seed, genesis_hash);
-
     // Land inside the risky challenge window: (challenge+grace/2, challenge+grace].
     let apply_round = challenge_round + params.payouts_challenge_grace_period / 2 + 1;
     assert!(apply_round > challenge_round);
+
+    // The heartbeat's own FirstValid round header (separate from the
+    // challenge round), carrying the seed the OTS proof signs over.
+    // Issue #1152: must be realistically close to `apply_round` -- go's
+    // `heartbeat/service.go` builds a heartbeat's `[FirstValid, LastValid]`
+    // window from the node's *current* block header
+    // (`prepareHeartbeat(pr, latest)`, `FirstValid: latest.Round`), not
+    // from an arbitrary earlier round, since the heartbeat's own
+    // `hbLifetime` (10 rounds) window must actually cover the round it
+    // gets applied at. Before this fix, algod-rust's apply/validate paths
+    // had no check anywhere enforcing that -- so this test's `1`, ~1100
+    // rounds before `apply_round`, was silently accepted; now that
+    // `check_txn_alive`/`validate_block`'s liveness check exists, that
+    // stale header round correctly fails as "dead" and must be fixed to a
+    // realistic value instead.
+    let hb_header_round = apply_round - 1;
+    let hb_seed = [0x11u8; 32];
+    store_header(&mut state, hb_header_round, &hb_seed, genesis_hash);
 
     // `apply_block_validating` enforces round monotonicity against the
     // store's own `current_round` tracker (`expected = current_round + 1`).
