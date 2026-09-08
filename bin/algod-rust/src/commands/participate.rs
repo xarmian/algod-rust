@@ -2498,6 +2498,55 @@ pub(crate) fn pool_config_from_local(local: &algo_config::Local) -> PoolConfig {
     }
 }
 
+/// Computes the capacity passed to
+/// [`algo_network::TxTagHandler::with_backlog_queue`] from `config.json`'s
+/// `TxBacklogSize`/`TxBacklogReservedCapacityPerPeer`/
+/// `EnableTxBacklogRateLimiting` (issue #1190), mirroring go-algorand's
+/// `MakeTxHandler` exactly:
+///
+/// ```go
+/// // data/txHandler.go:154-158
+/// txBacklogSize := opts.Config.TxBacklogSize
+/// if opts.Config.EnableTxBacklogRateLimiting {
+///     txBacklogSize += (opts.Config.IncomingConnectionsLimit * opts.Config.TxBacklogReservedCapacityPerPeer)
+/// }
+/// ```
+///
+/// This only ports the queue-*sizing* half of go's behavior: when
+/// `EnableTxBacklogRateLimiting` is set, the base `TxBacklogSize` is
+/// widened by `IncomingConnectionsLimit * TxBacklogReservedCapacityPerPeer`
+/// extra room, exactly as go computes its own `backlogQueue` channel
+/// capacity. It does **not** port go's `util.NewElasticRateLimiter`
+/// per-peer *reservation/fairness* guarantee (the other half of what
+/// `EnableTxBacklogRateLimiting` gates in go, `data/txHandler.go:189-199`)
+/// — algod-rust's `TxTagHandler` backlog queue has no notion of "this
+/// peer's reserved slots" yet, so a peer flooding the queue can still
+/// exhaust the widened capacity before another peer's traffic is admitted.
+/// Building that fairness guarantee is real, separate design work, filed
+/// as its own follow-up (issue #1195) rather than absorbed here — see
+/// `algo_config`'s `TX_BACKLOG_RESERVED_CAPACITY_PER_PEER` doc comment.
+pub(crate) fn tx_backlog_queue_capacity_from_local(local: &algo_config::Local) -> usize {
+    let mut capacity = local.tx_backlog_size.max(0) as usize;
+    if local.enable_tx_backlog_rate_limiting {
+        capacity = capacity.saturating_add(
+            (local.incoming_connections_limit.max(0) as usize)
+                .saturating_mul(local.tx_backlog_reserved_capacity_per_peer.max(0) as usize),
+        );
+    }
+    capacity
+}
+
+/// Resolves `POST /v2/transactions/async`'s admission-window capacity
+/// (issue #1190): `config.json`'s `TxBacklogSize` is the single source of
+/// truth, with `[rest].async_backlog_size` (`RestConfig::async_backlog_size`)
+/// as an explicit, REST-server-specific override layered on top when set.
+pub(crate) fn resolve_async_backlog_size(
+    rest_override: Option<usize>,
+    local: &algo_config::Local,
+) -> usize {
+    rest_override.unwrap_or(local.tx_backlog_size.max(0) as usize)
+}
+
 impl PoolLedgerAdapter {
     /// Wrap a shared ledger as a pool ledger, at the built-in default
     /// verified-transaction-cache capacity. Real node-startup call sites
@@ -4525,10 +4574,19 @@ pub async fn run(
     .with_peer_limiter(tx_sync_peer_limiter);
     gossip_node.register_http_handler("/", tx_sync_service.http_router());
 
+    // `TxBacklogSize`/`TxBacklogReservedCapacityPerPeer`/
+    // `EnableTxBacklogRateLimiting` (issue #1190): the bounded backlog
+    // admission queue's real capacity, shared by every `TxTagHandler` this
+    // node registers below (WS-gossip and, if enabled, P2P), mirroring
+    // go's single node-wide `TxHandler.backlogQueue` capacity computed once
+    // in `MakeTxHandler` and reused across transports.
+    let tx_backlog_queue_capacity = tx_backlog_queue_capacity_from_local(&node_config);
+
     let mut ws_tx_tag_handler =
         algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
             .with_batch_verifier(batch_verifier.clone())
-            .with_remember_counter(tx_pool_remember_counter.clone());
+            .with_remember_counter(tx_pool_remember_counter.clone())
+            .with_backlog_queue(tx_backlog_queue_capacity);
     if let Some(limiter) = &app_rate_limiter {
         ws_tx_tag_handler = ws_tx_tag_handler
             .with_app_rate_limiter(limiter.clone(), app_rate_limiter_congestion_threshold);
@@ -4721,7 +4779,8 @@ pub async fn run(
         let mut p2p_tx_tag_handler =
             algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
                 .with_batch_verifier(batch_verifier.clone())
-                .with_remember_counter(tx_pool_remember_counter.clone());
+                .with_remember_counter(tx_pool_remember_counter.clone())
+                .with_backlog_queue(tx_backlog_queue_capacity);
         if let Some(limiter) = &app_rate_limiter {
             p2p_tx_tag_handler = p2p_tx_tag_handler
                 .with_app_rate_limiter(limiter.clone(), app_rate_limiter_congestion_threshold);
@@ -5000,9 +5059,10 @@ pub async fn run(
         if let Some(p2p) = &p2p_transport {
             adapter = adapter.with_p2p_network(p2p.clone() as Arc<dyn algo_network::GossipNode>);
         }
-        if let Some(capacity) = cfg.async_backlog_size {
-            adapter = adapter.with_async_backlog_capacity(capacity);
-        }
+        adapter = adapter.with_async_backlog_capacity(resolve_async_backlog_size(
+            cfg.async_backlog_size,
+            &node_config,
+        ));
         if let Some(mgr) = &catchup_manager {
             adapter = adapter.with_catchup_manager(mgr.clone());
         }
@@ -5328,6 +5388,100 @@ mod tests {
             cfg.proposal_assembly_time,
             default_cfg.proposal_assembly_time
         );
+    }
+
+    // ── Issue #1190: TxBacklogSize/TxBacklogReservedCapacityPerPeer/
+    // EnableTxBacklogRateLimiting wired into TxTagHandler::with_backlog_queue ──
+
+    /// TDD anchor for issue #1190: with `EnableTxBacklogRateLimiting` off
+    /// (go's pre-version-30 / an operator's explicit override), the queue
+    /// capacity is exactly `TxBacklogSize` — no per-peer addition — mirroring
+    /// go's `txBacklogSize := opts.Config.TxBacklogSize` with the `if
+    /// EnableTxBacklogRateLimiting` branch skipped (`data/txHandler.go:154-158`).
+    #[test]
+    fn tx_backlog_queue_capacity_from_local_uses_base_size_when_rate_limiting_disabled() {
+        let local = algo_config::Local {
+            tx_backlog_size: 26_000,
+            tx_backlog_reserved_capacity_per_peer: 20,
+            enable_tx_backlog_rate_limiting: false,
+            incoming_connections_limit: 2_400,
+            ..algo_config::Local::default()
+        };
+        assert_eq!(tx_backlog_queue_capacity_from_local(&local), 26_000);
+    }
+
+    /// TDD anchor for issue #1190: with `EnableTxBacklogRateLimiting` on,
+    /// the queue capacity is widened by `IncomingConnectionsLimit *
+    /// TxBacklogReservedCapacityPerPeer`, mirroring go's
+    /// `txBacklogSize += (opts.Config.IncomingConnectionsLimit *
+    /// opts.Config.TxBacklogReservedCapacityPerPeer)` exactly.
+    #[test]
+    fn tx_backlog_queue_capacity_from_local_adds_reserved_capacity_when_rate_limiting_enabled() {
+        let local = algo_config::Local {
+            tx_backlog_size: 26_000,
+            tx_backlog_reserved_capacity_per_peer: 20,
+            enable_tx_backlog_rate_limiting: true,
+            incoming_connections_limit: 2_400,
+            ..algo_config::Local::default()
+        };
+        // 26_000 + (2_400 * 20) = 74_000
+        assert_eq!(tx_backlog_queue_capacity_from_local(&local), 74_000);
+    }
+
+    /// A negative `IncomingConnectionsLimit` (go's pre-version-1 sentinel,
+    /// `-1`, meaning "unlimited") must not underflow/panic the `usize`
+    /// arithmetic — clamps to 0 via the same `.max(0)` pattern used
+    /// throughout this module for other go `int`-typed fields.
+    #[test]
+    fn tx_backlog_queue_capacity_from_local_clamps_negative_incoming_connections_limit() {
+        let local = algo_config::Local {
+            tx_backlog_size: 100,
+            tx_backlog_reserved_capacity_per_peer: 20,
+            enable_tx_backlog_rate_limiting: true,
+            incoming_connections_limit: -1,
+            ..algo_config::Local::default()
+        };
+        assert_eq!(tx_backlog_queue_capacity_from_local(&local), 100);
+    }
+
+    /// `Local::default()` (go's own v30+ defaults: `TxBacklogSize` 26 000,
+    /// `EnableTxBacklogRateLimiting` true, `TxBacklogReservedCapacityPerPeer`
+    /// 20, `IncomingConnectionsLimit` 2 400) must reproduce
+    /// `DEFAULT_ASYNC_BACKLOG_SIZE`-adjacent go behavior deterministically —
+    /// pinned here as a regression guard on the real defaults, not just the
+    /// arithmetic in isolation.
+    #[test]
+    fn tx_backlog_queue_capacity_from_local_default_matches_go_v30_plus_formula() {
+        let local = algo_config::Local::default();
+        assert!(local.enable_tx_backlog_rate_limiting);
+        assert_eq!(local.tx_backlog_size, 26_000);
+        assert_eq!(local.tx_backlog_reserved_capacity_per_peer, 20);
+        assert_eq!(
+            tx_backlog_queue_capacity_from_local(&local),
+            26_000 + (local.incoming_connections_limit.max(0) as usize) * 20
+        );
+    }
+
+    /// TDD anchor for issue #1190: with no `[rest].async_backlog_size`
+    /// override, `config.json`'s `TxBacklogSize` is used directly.
+    #[test]
+    fn resolve_async_backlog_size_falls_back_to_tx_backlog_size_when_unset() {
+        let local = algo_config::Local {
+            tx_backlog_size: 12_345,
+            ..algo_config::Local::default()
+        };
+        assert_eq!(resolve_async_backlog_size(None, &local), 12_345);
+    }
+
+    /// TDD anchor for issue #1190: an explicit `[rest].async_backlog_size`
+    /// override always wins over `config.json`'s `TxBacklogSize`.
+    #[test]
+    fn resolve_async_backlog_size_prefers_explicit_rest_override() {
+        let local = algo_config::Local {
+            tx_backlog_size: 12_345,
+            ..algo_config::Local::default()
+        };
+        assert_eq!(resolve_async_backlog_size(Some(42), &local), 42);
     }
 
     // ── Issue #1066: genesis-expectation reconciliation ─────────────

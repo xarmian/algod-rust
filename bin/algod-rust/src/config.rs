@@ -90,10 +90,20 @@ pub struct RestConfig {
 
     /// Bounded admission window for
     /// `POST /v2/transactions/async` (see
-    /// [`AlgodNodeInterface::with_async_backlog_capacity`]). Defaults
-    /// to `DEFAULT_ASYNC_BACKLOG_SIZE` (26 000) when unset — matching
-    /// go-algorand's `TxBacklogSize`. Operators on resource-constrained
-    /// hosts may want to lower this; busy relays may raise it.
+    /// [`AlgodNodeInterface::with_async_backlog_capacity`]).
+    ///
+    /// Issue #1190: `config.json`'s `TxBacklogSize` is the single source
+    /// of truth for this window (as it now is for the gossip-inbound
+    /// backlog queue too — see
+    /// `bin/algod-rust/src/commands/participate.rs`'s
+    /// `tx_backlog_queue_capacity_from_local`); when unset, node startup
+    /// falls back to `node_config.tx_backlog_size` (go default 26 000)
+    /// rather than a fixed constant. This field remains available as an
+    /// explicit, REST-server-specific *override* on top of that shared
+    /// default, for an operator who wants the REST async window sized
+    /// differently from the gossip backlog queue. Operators on
+    /// resource-constrained hosts may want to lower this; busy relays may
+    /// raise it.
     ///
     /// [`AlgodNodeInterface::with_async_backlog_capacity`]: crate::node_interface_impl::AlgodNodeInterface::with_async_backlog_capacity
     pub async_backlog_size: Option<usize>,
