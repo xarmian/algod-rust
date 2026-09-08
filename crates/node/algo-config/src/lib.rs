@@ -1702,6 +1702,27 @@ static ENABLE_DHT_PROVIDERS: VersionedDefault<bool> = VersionedDefault::new(&[(3
 /// Wired into `algo_p2p::dht`'s DHT construction.
 static DHT_MODE: VersionedDefault<String> = VersionedDefault::new(&[(38, String::new)]);
 
+/// Go: `EnableAccountUpdatesStats bool` `version[16]:"false"`
+/// (`localTemplate.go:503-504`, "specifies whether or not to emit the
+/// AccountUpdates telemetry event"). Gates go's periodic
+/// `telemetryspec.AccountsUpdateMetrics` event
+/// (`ledger/acctupdates.go`'s `prepareCommit`/`postCommit`). Wired into
+/// `SqliteLedger::configure_account_updates_stats` (issue #1187) — see
+/// `algo_ledger::acctupdates_stats`'s module doc comment for the full
+/// go-parity mapping of algod-rust's periodic `tracing` event.
+static ENABLE_ACCOUNT_UPDATES_STATS: VersionedDefault<bool> =
+    VersionedDefault::new(&[(16, || false)]);
+
+/// Go: `AccountUpdatesStatsInterval time.Duration` `version[16]:"5000000000"`
+/// (`localTemplate.go:506-507`, 5s in nanoseconds; "the time interval
+/// in nanoseconds between two consecutive accountUpdates telemetry
+/// events"). Nanoseconds (go's raw `time.Duration` JSON encoding), matching
+/// [`MAX_CATCHPOINT_DOWNLOAD_DURATION`]'s representation. Wired alongside
+/// [`ENABLE_ACCOUNT_UPDATES_STATS`] into
+/// `SqliteLedger::configure_account_updates_stats` (issue #1187).
+static ACCOUNT_UPDATES_STATS_INTERVAL: VersionedDefault<i64> =
+    VersionedDefault::new(&[(16, || 5_000_000_000)]);
+
 fn default_version() -> u32 {
     // Mirrors go's explicit `c.Version = 0 // Reset to 0 so we get the
     // version from the loaded file` (config.go:124) — a `version` key
@@ -2134,6 +2155,12 @@ fn default_enable_netdev_metrics() -> bool {
 }
 fn default_enable_metric_reporting() -> bool {
     ENABLE_METRIC_REPORTING.at(LATEST_VERSION)
+}
+fn default_enable_account_updates_stats() -> bool {
+    ENABLE_ACCOUNT_UPDATES_STATS.at(LATEST_VERSION)
+}
+fn default_account_updates_stats_interval() -> i64 {
+    ACCOUNT_UPDATES_STATS_INTERVAL.at(LATEST_VERSION)
 }
 
 /// Convert go's `BaseLoggerDebugLevel` (`config.Local`, go's `logging.Level`
@@ -3295,6 +3322,25 @@ pub struct Local {
         default = "default_enable_netdev_metrics"
     )]
     pub enable_netdev_metrics: bool,
+
+    /// Go: `EnableAccountUpdatesStats`. Wired into
+    /// `SqliteLedger::configure_account_updates_stats` (issue #1187) — see
+    /// [`ENABLE_ACCOUNT_UPDATES_STATS`]'s doc comment.
+    #[serde(
+        rename = "EnableAccountUpdatesStats",
+        default = "default_enable_account_updates_stats"
+    )]
+    pub enable_account_updates_stats: bool,
+
+    /// Go: `AccountUpdatesStatsInterval`. Nanoseconds. Wired alongside
+    /// `enable_account_updates_stats` into
+    /// `SqliteLedger::configure_account_updates_stats` (issue #1187) — see
+    /// [`ACCOUNT_UPDATES_STATS_INTERVAL`]'s doc comment.
+    #[serde(
+        rename = "AccountUpdatesStatsInterval",
+        default = "default_account_updates_stats_interval"
+    )]
+    pub account_updates_stats_interval: i64,
 }
 
 impl Default for Local {
@@ -3475,6 +3521,8 @@ impl Local {
             dht_mode: DHT_MODE.at(version),
             enable_runtime_metrics: ENABLE_RUNTIME_METRICS.at(version),
             enable_netdev_metrics: ENABLE_NET_DEV_METRICS.at(version),
+            enable_account_updates_stats: ENABLE_ACCOUNT_UPDATES_STATS.at(version),
+            account_updates_stats_interval: ACCOUNT_UPDATES_STATS_INTERVAL.at(version),
         }
     }
 
@@ -4149,6 +4197,18 @@ impl Local {
             migrate_field(
                 &mut self.enable_netdev_metrics,
                 &ENABLE_NET_DEV_METRICS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_account_updates_stats,
+                &ENABLE_ACCOUNT_UPDATES_STATS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.account_updates_stats_interval,
+                &ACCOUNT_UPDATES_STATS_INTERVAL,
                 cur,
                 next,
             );
@@ -5342,6 +5402,39 @@ mod tests {
     }
 
     #[test]
+    fn account_updates_stats_fields_default_at_version_16() {
+        // Both fields first appear at version 16 (`localTemplate.go`); a
+        // config predating that must still receive go's version-16
+        // defaults once migrated to `LATEST_VERSION`, matching
+        // `GetVersionedDefaultLocalConfig`'s behavior for every other
+        // field.
+        let cfg = Local::load_from_str(r#"{"Version": 0}"#).expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert!(!cfg.enable_account_updates_stats, "go's default is false");
+        assert_eq!(
+            cfg.account_updates_stats_interval, 5_000_000_000,
+            "go's default is 5s in nanoseconds"
+        );
+    }
+
+    #[test]
+    fn account_updates_stats_fields_explicit_override_survives_migration() {
+        let cfg = Local::load_from_str(
+            r#"{"Version": 0, "EnableAccountUpdatesStats": true, "AccountUpdatesStatsInterval": 60000000000}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert!(
+            cfg.enable_account_updates_stats,
+            "an explicit non-default override must survive migration"
+        );
+        assert_eq!(
+            cfg.account_updates_stats_interval, 60_000_000_000,
+            "an explicit non-default override must survive migration"
+        );
+    }
+
+    #[test]
     fn catchpoint_dir_and_stateproof_dir_round_trip_through_json() {
         let cfg = Local::load_from_str(
             r#"{"CatchpointDir": "/data/catchpoints", "StateproofDir": "/data/stateproof"}"#,
@@ -5657,9 +5750,9 @@ mod tests {
     #[test]
     fn config_v27_fixture_matches_versioned_default() {
         // go's `Local` has fields `algo-config`'s `Local` doesn't port yet
-        // (telemetry/debug knobs like `DeadlockDetection`,
-        // `AccountUpdatesStatsInterval`; alternate-pool-implementation
-        // knobs like `TxPoolSize`/`TxPoolExponentialIncreaseFactor`; a
+        // (telemetry/debug knobs like `DeadlockDetection`;
+        // alternate-pool-implementation knobs like
+        // `TxPoolSize`/`TxPoolExponentialIncreaseFactor`; a
         // `NodeExporterPath`/`NodeExporterListenAddress` Prometheus
         // exporter; etc. -- discovered while porting this test, tracked
         // for follow-up rather than fixed here). Comparing the *whole*
@@ -5716,11 +5809,13 @@ mod tests {
         // formally retired as documented no-ops (investigated and confirmed
         // dead in go-algorand v5.0.0-stable itself — see each field's
         // `VersionedDefault` doc comment) — all 4 removed from this list.
-        const NOT_YET_PORTED: &[&str] = &[
-            "AccountUpdatesStatsInterval",
-            "EnableAccountUpdatesStats",
-            "NetAddress",
-        ];
+        // Issue #1187 closed the last 2: `EnableAccountUpdatesStats`/
+        // `AccountUpdatesStatsInterval` are now wired into
+        // `SqliteLedger::configure_account_updates_stats` (see
+        // [`ENABLE_ACCOUNT_UPDATES_STATS`]/[`ACCOUNT_UPDATES_STATS_INTERVAL`])
+        // — removed from this list, leaving only the permanent `NetAddress`
+        // special case below.
+        const NOT_YET_PORTED: &[&str] = &["NetAddress"];
 
         let fixture_text = include_str!("../fixtures/config-v27.json");
         let fixture_value: serde_json::Value =
@@ -6090,39 +6185,12 @@ mod tests {
         assert!(cfg.enable_top_accounts_reporting);
     }
 
-    /// Deliberately-excluded telemetry-only fields (`PeerConnectionsUpdateInterval`,
-    /// `HeartbeatUpdateInterval`, `EnableAccountUpdatesStats`,
-    /// `AccountUpdatesStatsInterval`) must NOT round-trip through
-    /// `config.json` — an operator's file setting these keys should not
-    /// silently be accepted as if they had an effect, so an unknown-field
-    /// parse must not error (`serde_json` ignores unknown fields by
-    /// default) but the resulting `Local` must carry no field for them.
-    /// This test pins that "present in JSON, absent from `Local`" shape by
-    /// asserting the config still parses and the known-fields set is
-    /// otherwise unaffected.
-    #[test]
-    fn telemetry_only_fields_are_accepted_but_ignored_not_modeled() {
-        // `PeerConnectionsUpdateInterval`/`HeartbeatUpdateInterval` were
-        // promoted to real (documented-no-op) `Local` fields by issue #1189
-        // -- see `telemetry_only_no_op_fields_still_round_trip` below for
-        // their coverage. `EnableAccountUpdatesStats`/
-        // `AccountUpdatesStatsInterval` remain genuinely unmodeled (#756).
-        let cfg = Local::load_from_str(
-            r#"{"EnableAccountUpdatesStats": true, "AccountUpdatesStatsInterval": 1}"#,
-        )
-        .expect("unknown JSON keys are ignored, not rejected");
-        // Nothing to assert on the ignored keys themselves (they have no
-        // field) -- confirm the rest of the config still loaded at its
-        // ordinary defaults, i.e. parsing wasn't otherwise disrupted.
-        assert_eq!(cfg, Local::default());
-    }
-
     /// Issue #1189: `PeerConnectionsUpdateInterval`/`HeartbeatUpdateInterval`/
     /// `ParticipationKeysRefreshInterval`/`EnablePingHandler` are documented
-    /// no-ops (no algod-rust behavior reads them), but unlike the still-fully
-    /// -unmodeled telemetry fields above, they now have real `Local` fields
-    /// that must actually round-trip a non-default operator override through
-    /// `config.json` -- proving they're modeled, not silently swallowed.
+    /// no-ops (no algod-rust behavior reads them), but they have real
+    /// `Local` fields that must actually round-trip a non-default operator
+    /// override through `config.json` -- proving they're modeled, not
+    /// silently swallowed.
     #[test]
     fn telemetry_only_no_op_fields_still_round_trip() {
         // `"Version": LATEST_VERSION` avoids `migrate()`'s well-known

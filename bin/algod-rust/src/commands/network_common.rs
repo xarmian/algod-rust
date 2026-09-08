@@ -73,6 +73,26 @@ pub fn resolve_automatic_catchpoint_config(
     })
 }
 
+/// Resolve `config.json`'s `EnableAccountUpdatesStats`/
+/// `AccountUpdatesStatsInterval` into the
+/// [`algo_ledger::acctupdates_stats::AccountUpdatesStatsConfig`] the live
+/// block-apply loop needs, or `None` when the periodic AccountUpdates
+/// telemetry-equivalent event should stay disabled (issue #1187). Shared by
+/// `relay` and `participate`, mirroring
+/// [`resolve_automatic_catchpoint_config`] just above.
+pub fn resolve_account_updates_stats_config(
+    node_config: &algo_config::Local,
+) -> Option<algo_ledger::acctupdates_stats::AccountUpdatesStatsConfig> {
+    if !node_config.enable_account_updates_stats {
+        return None;
+    }
+    Some(algo_ledger::acctupdates_stats::AccountUpdatesStatsConfig {
+        interval: std::time::Duration::from_nanos(
+            node_config.account_updates_stats_interval.max(0) as u64,
+        ),
+    })
+}
+
 /// Resolve the effective `WebsocketNetworkConfig::gossip_fanout` for a
 /// command that may or may not be acting as a listen server, applying go's
 /// `enrichNetworkingConfig` `GossipFanout` bump (`config/config.go:170-179`,

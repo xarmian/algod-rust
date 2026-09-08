@@ -39,8 +39,8 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::commands::network_common::{
-    genesis_id_for, networking_active, resolve_automatic_catchpoint_config, resolve_gossip_fanout,
-    resolve_unsigned_limit,
+    genesis_id_for, networking_active, resolve_account_updates_stats_config,
+    resolve_automatic_catchpoint_config, resolve_gossip_fanout, resolve_unsigned_limit,
 };
 
 // ---------------------------------------------------------------------------
@@ -724,6 +724,18 @@ pub async fn run(
             "automatic catchpoint generation enabled"
         );
         sqlite_ledger.configure_automatic_catchpoints(Some(auto_cfg));
+    }
+
+    // Issue #1187: periodic AccountUpdates telemetry-equivalent `tracing`
+    // event, wired into the live block-apply loop via `commit_block`. A
+    // no-op unless `config.json` resolves `EnableAccountUpdatesStats` to
+    // `true` (see `resolve_account_updates_stats_config`).
+    if let Some(stats_cfg) = resolve_account_updates_stats_config(node_config) {
+        info!(
+            interval = ?stats_cfg.interval,
+            "AccountUpdates telemetry event enabled"
+        );
+        sqlite_ledger.configure_account_updates_stats(Some(stats_cfg));
     }
 
     // Optional: bootstrap genesis state when the ledger is fresh.

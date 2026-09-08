@@ -1,4 +1,5 @@
 {
+  "AccountUpdatesStatsInterval": 5000000000,
   "AccountsRebuildSynchronousMode": 1,
   "AgreementIncomingBundlesQueueLength": 15,
   "AgreementIncomingProposalsQueueLength": 50,
@@ -37,6 +38,7 @@
   "DisableLocalhostConnectionRateLimit": true,
   "DisableNetworking": false,
   "DisableOutgoingConnectionThrottling": false,
+  "EnableAccountUpdatesStats": false,
   "EnableAgreementReporting": false,
   "EnableAgreementTimeMetrics": false,
   "EnableAssembleStats": false,

@@ -18,6 +18,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+pub mod acctupdates_stats;
 pub mod agreement_bridge;
 pub mod agreement_key_manager;
 pub mod apply;
