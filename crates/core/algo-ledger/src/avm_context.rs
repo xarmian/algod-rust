@@ -7508,6 +7508,90 @@ mod tests {
         assert!(ctx.resolve_app(3).is_err());
     }
 
+    /// Mirrors go-algorand's `TestAssetDisambiguation`
+    /// (`data/transactions/logic/evalStateful_test.go:1433`): a low integer
+    /// naming an asset reference is interpreted as a direct asset ID when
+    /// that ID is itself available (named in `ForeignAssets`/etc), and only
+    /// falls back to 1-based slot-index interpretation when it is not.
+    #[test]
+    fn resolve_asset_disambiguates_low_value_as_id_or_slot_index() {
+        let sender = [10u8; 32];
+        // ForeignAssets = [255, 256]: id 1 is not itself available, so `1`
+        // means slot 1 (1-based) -> ForeignAssets[0] = 255.
+        let mut txn = make_appl_txn(sender, 42, vec![], vec![], vec![255, 256]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn.clone()]);
+        ctx.app_id = 42;
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V37,
+        )
+        .expect("v37 params");
+        assert_eq!(
+            ctx.resolve_asset(1).unwrap(),
+            255,
+            "1 is not a directly-available id, so it must resolve to slot 1 (ForeignAssets[0])"
+        );
+
+        // ForeignAssets = [1, 256]: id 1 IS itself available (named
+        // directly), so `1` now means the literal asset id 1, not slot 1
+        // (which would otherwise be ForeignAssets[0] = 1 too here, so use a
+        // second check with a value that would disambiguate: resolving `1`
+        // must short-circuit to the direct-id branch, not consult the slot
+        // table at all).
+        txn.txn.foreign_assets = Some(vec![1, 256]);
+        let mut store2 = LedgerState::new();
+        let mut ctx2 = make_context(&mut store2, vec![txn]);
+        ctx2.app_id = 42;
+        ctx2.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V37,
+        )
+        .expect("v37 params");
+        assert_eq!(
+            ctx2.resolve_asset(1).unwrap(),
+            1,
+            "1 is directly available as an id, so it must resolve to asset id 1, not a slot lookup"
+        );
+    }
+
+    /// Mirrors go-algorand's `TestAppDisambiguation`
+    /// (`data/transactions/logic/evalStateful_test.go:1519`): the same
+    /// disambiguation rule as `TestAssetDisambiguation`, for app references.
+    #[test]
+    fn resolve_app_disambiguates_low_value_as_id_or_slot_index() {
+        let sender = [10u8; 32];
+        // ForeignApps = [20, 256]: id 1 is not itself available (0 means
+        // "this app"), so `1` means slot 1 (1-based) -> ForeignApps[0] = 20.
+        let mut txn = make_appl_txn(sender, 42, vec![], vec![20, 256], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn.clone()]);
+        ctx.app_id = 42;
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V37,
+        )
+        .expect("v37 params");
+        assert_eq!(
+            ctx.resolve_app(1).unwrap(),
+            20,
+            "1 is not a directly-available app id, so it must resolve to slot 1 (ForeignApps[0])"
+        );
+
+        // ForeignApps = [1, 256]: id 1 IS itself available, so `1` means the
+        // literal app id 1.
+        txn.txn.foreign_apps = Some(vec![1, 256]);
+        let mut store2 = LedgerState::new();
+        let mut ctx2 = make_context(&mut store2, vec![txn]);
+        ctx2.app_id = 42;
+        ctx2.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V37,
+        )
+        .expect("v37 params");
+        assert_eq!(
+            ctx2.resolve_app(1).unwrap(),
+            1,
+            "1 is directly available as an app id, so it must resolve to app id 1, not a slot lookup"
+        );
+    }
+
     // ── AppForbidLowResources (v38+) activation boundary ────────────────
 
     #[test]

@@ -1814,6 +1814,132 @@ fn self_call_disallowed() {
     assert!(is_failure(&result), "self-call should be disallowed");
 }
 
+/// Indirect reentrancy is disallowed: mirrors go-algorand's
+/// `TestIndirectReentrancy`
+/// (`data/transactions/logic/evalAppTxn_test.go:1670`). The top-level app
+/// (id 888) calls app 222 via `itxn_submit`; app 222's own approval program
+/// then tries to call back into 888 -- an indirect self-call through an
+/// intermediary, not a direct one, so it must be caught by the ancestor-
+/// chain walk (`check_reentrancy`'s "re-enter" branch), not just the direct
+/// self-call check.
+#[test]
+fn indirect_reentrancy_disallowed() {
+    let sender = [0xAA; 32];
+    let top_app_id = 888u64;
+    let middle_app_id = 222u64;
+
+    let mut store = LedgerState::new();
+
+    // app 222's approval program: itxn_begin; call app 888; itxn_submit; int 1
+    let mut call_888 = Vec::new();
+    call_888.push(0xb1); // itxn_begin
+    call_888.extend(pushint(6)); // TypeEnum = appl
+    call_888.extend([0xb2, 16]);
+    call_888.extend(pushint(top_app_id)); // ApplicationID = 888
+    call_888.extend([0xb2, 24]);
+    call_888.push(0xb3); // itxn_submit
+    call_888.extend(pushint(1));
+    call_888.push(0x43); // return
+    let mut call_888_prog = vec![6u8];
+    call_888_prog.extend(call_888);
+
+    seed_app_with_programs(
+        &mut store,
+        middle_app_id,
+        Address([1u8; 32]),
+        call_888_prog,
+        prog(6, &[0x81, 0x01]),
+    );
+    let middle_addr = Address(app_address(middle_app_id));
+    fund_account(&mut store, middle_addr, 10_000_000);
+
+    seed_app_approve(&mut store, top_app_id, Address([1u8; 32]));
+    let top_addr = Address(app_address(top_app_id));
+    fund_account(&mut store, top_addr, 10_000_000);
+
+    // Top-level app (888) calls app 222, which itself calls back into 888.
+    let mut txn = make_appl_txn(sender, top_app_id);
+    txn.txn.foreign_apps = Some(vec![middle_app_id]);
+    let mut ctx = make_context(&mut store, vec![txn], top_app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 10_000;
+
+    let mut code = Vec::new();
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(6)); // TypeEnum = appl
+    code.extend([0xb2, 16]);
+    code.extend(pushint(middle_app_id)); // ApplicationID = 222
+    code.extend([0xb2, 24]);
+    code.push(0xb3); // itxn_submit
+    code.extend(pushint(1));
+    code.push(0x43);
+
+    let result = run_with_context(6, &code, &mut ctx);
+    assert!(
+        is_failure(&result),
+        "indirect reentrancy (888 -> 222 -> 888) should be disallowed"
+    );
+}
+
+/// `app_global_get_ex` can read another app's global state (not just the
+/// currently-executing app's own), resolved through the foreign-apps array.
+/// Mirrors go-algorand's `TestAppGlobalReadOtherApp`
+/// (`data/transactions/logic/evalStateful_test.go:2425`).
+#[test]
+fn app_global_get_ex_reads_other_app_state_via_foreign_apps_array() {
+    let sender = [0xAA; 32];
+    let running_app_id = 42u64;
+    let other_app_id = 1099u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, running_app_id, Address([1u8; 32]));
+
+    // App 100 has global state key "a" = 777, distinct from the running app.
+    let mut global = BTreeMap::new();
+    global.insert(b"a".to_vec(), algo_types::TealValue::Uint(777));
+    store.app_params.insert(
+        other_app_id,
+        AppParams {
+            creator: Address([2u8; 32]),
+            approval_program: prog(6, &[0x81, 0x01]),
+            clear_state_program: prog(6, &[0x81, 0x01]),
+            global_state: global,
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema {
+                num_uint: 1,
+                num_byte_slice: 0,
+            },
+            extra_program_pages: 0,
+            ..Default::default()
+        },
+    );
+
+    let mut txn = make_appl_txn(sender, running_app_id);
+    txn.txn.foreign_apps = Some(vec![other_app_id]);
+    let mut ctx = make_context(&mut store, vec![txn], running_app_id);
+
+    // ForeignApps = [100]; slot 1 (1-based) resolves to app 100, which is
+    // not the running app -- app_global_get_ex must read *its* state.
+    let source = r#"
+#pragma version 6
+int 1
+byte "a"
+app_global_get_ex
+assert
+int 777
+==
+"#;
+    let ops = algo_avm::assembler::assemble_string(source).expect("assemble");
+    let program = algo_avm::parse(&ops.program).expect("parse");
+    let mut machine = AvmMachine::new(program, ExecMode::Application, 20_000);
+    let result = machine.run(&mut ctx);
+    assert!(
+        matches!(result, Ok(true)),
+        "reading app 100's global state via app_global_get_ex should succeed and approve: {result:?}"
+    );
+}
+
 /// itxn_begin without itxn_submit then another itxn_begin should fail.
 #[test]
 fn double_itxn_begin_fails() {
