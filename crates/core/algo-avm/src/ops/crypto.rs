@@ -2726,6 +2726,91 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Phase 17 missing-test sweep (batch 6, docs/phase17/parity_crypto.md):
+    // secp256k1 recovery negative-fuzz coverage
+    // -----------------------------------------------------------------------
+
+    /// Small deterministic xorshift64* PRNG, used instead of pulling in a
+    /// `rand` dependency for these two fuzz-style regression tests.
+    fn next_u64(state: &mut u64) -> u64 {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn fill_pseudo_random(state: &mut u64, out: &mut [u8; 32]) {
+        for chunk in out.chunks_mut(8) {
+            let bytes = next_u64(state).to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    }
+
+    #[test]
+    fn test_ecdsa_pk_recover_random_signature_never_yields_target_pubkey() {
+        // TestRecoveryOfRandomSignature (crypto/secp256k1/secp256_test.go):
+        // recovering against a garbage (r, s, recid) triple can sometimes
+        // succeed, but must never "recover" back to an unrelated real
+        // pubkey.
+        use k256::ecdsa::SigningKey;
+        let sk = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
+        let target = sk.verifying_key().to_encoded_point(false);
+        let target_x = target.x().unwrap().to_vec();
+        let target_y = target.y().unwrap().to_vec();
+
+        let msg = [0x11u8; 32];
+        let mut state = 0x243F_6A88_85A3_08D3u64; // fixed seed, deterministic test
+        for _ in 0..200 {
+            let mut r = [0u8; 32];
+            let mut s = [0u8; 32];
+            fill_pseudo_random(&mut state, &mut r);
+            fill_pseudo_random(&mut state, &mut s);
+            for recid in 0..4u8 {
+                if let Ok((x, y)) = ecdsa_recover_secp256k1(&msg, &r, &s, recid) {
+                    assert!(
+                        !(x == target_x && y == target_y),
+                        "random garbage signature unexpectedly recovered the target pubkey"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_ecdsa_pk_recover_random_messages_against_valid_sig_never_yields_target_pubkey() {
+        // TestRandomMessagesAgainstValidSig (crypto/secp256k1/secp256_test.go):
+        // pairing a genuinely valid signature with unrelated random messages
+        // can sometimes recover *some* pubkey, but must never recover back
+        // to the original signer's pubkey.
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+        let sk = SigningKey::from_bytes(&[13u8; 32].into()).unwrap();
+        let vk = sk.verifying_key();
+        let target = vk.to_encoded_point(false);
+        let target_x = target.x().unwrap().to_vec();
+        let target_y = target.y().unwrap().to_vec();
+
+        let signed_msg = [0x22u8; 32];
+        let (sig, _recid) = sk.sign_prehash(&signed_msg).unwrap();
+        let sig_bytes = sig.to_bytes();
+        let r = &sig_bytes[..32];
+        let s = &sig_bytes[32..];
+
+        let mut state = 0x1319_8A2E_0370_7344u64; // fixed seed, deterministic test
+        for _ in 0..200 {
+            let mut random_msg = [0u8; 32];
+            fill_pseudo_random(&mut state, &mut random_msg);
+            for recid in 0..4u8 {
+                if let Ok((x, y)) = ecdsa_recover_secp256k1(&random_msg, r, s, recid) {
+                    assert!(
+                        !(x == target_x && y == target_y),
+                        "recovery against an unrelated random message unexpectedly yielded the signer's pubkey"
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // ECDSA internal helper tests
     // -----------------------------------------------------------------------
 

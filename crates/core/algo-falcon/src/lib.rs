@@ -459,6 +459,59 @@ mod tests {
         assert!(matches!(err, FalconError::InvalidSignatureSize(1)));
     }
 
+    // ── Phase 17 missing-test sweep (batch 6, docs/phase17/parity_crypto.md) ──
+
+    #[test]
+    fn test_falcon_convert_compressed_to_ct_differs_from_compressed_and_is_deterministic() {
+        // TestFalconsFormatConversion (crypto/falconWrapper_test.go): the
+        // fixed-width "CT" conversion of a compressed signature must be
+        // deterministic and distinct from the original compressed encoding.
+        let seed = [5u8; FALCON_SEED_SIZE];
+        let (_, privkey) = falcon_keygen(&seed).expect("keygen should succeed");
+        let msg = b"Neque porro quisquam est qui dolorem ipsum quia dolor sit amet";
+        let sig = falcon_sign(&privkey, msg).expect("sign should succeed");
+
+        let ct1 = falcon_convert_compressed_to_ct(&sig).expect("conversion should succeed");
+        let ct2 = falcon_convert_compressed_to_ct(&sig).expect("conversion should succeed");
+        assert_eq!(ct1, ct2, "CT conversion must be deterministic");
+        assert_eq!(ct1.len(), FALCON_DET1024_SIG_CT_SIZE);
+
+        assert_ne!(
+            sig.as_slice(),
+            &ct1[..],
+            "compressed and CT forms are different byte encodings of the same signature"
+        );
+    }
+
+    #[test]
+    fn test_falcon_salt_version_matches_current_then_diverges_on_corruption() {
+        // TestFalconSignature_ValidateVersion (crypto/falconWrapper_test.go):
+        // a freshly produced signature carries the current salt version;
+        // corrupting the salt-version byte changes what's parsed back.
+        let seed = [3u8; FALCON_SEED_SIZE];
+        let (_, privkey) = falcon_keygen(&seed).expect("keygen should succeed");
+        let msg = b"Neque porro quisquam est qui dolorem ipsum quia dolor sit amet";
+        let mut sig = falcon_sign(&privkey, msg).expect("sign should succeed");
+
+        let version = falcon_salt_version(&sig).expect("salt version should be extractable");
+        // MERKLE_SIGNATURE_SCHEME_SALT_VERSION (algo-consensus-crypto's
+        // stateproof.rs) is pinned to 0, matching go-algorand's
+        // falcon.CurrentSaltVersion -- mirror that same expectation here at
+        // the FFI layer.
+        assert_eq!(
+            version, 0,
+            "freshly produced signature should carry the current salt version"
+        );
+
+        sig[1] = sig[1].wrapping_add(1);
+        let corrupted_version =
+            falcon_salt_version(&sig).expect("corrupted sig salt byte should still parse");
+        assert_ne!(
+            corrupted_version, version,
+            "corrupting the salt-version byte must change the parsed version"
+        );
+    }
+
     /// Pins the seed size to go-algorand's post-`569ae3d4b` value.
     ///
     /// Upstream (`crypto/falconWrapper.go`): `FalconSeedSize` was changed from
