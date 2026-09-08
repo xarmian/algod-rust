@@ -2474,19 +2474,57 @@ pub(crate) struct PoolLedgerAdapter {
 /// Cache sizing mirrors go's default (`config.go`'s
 /// `TxPoolSize` * a small multiplier is roughly how go-algorand's node.go
 /// wires it up); a few thousand entries comfortably covers a block's worth
-/// of gossip traffic without unbounded growth.
+/// of gossip traffic without unbounded growth. Real node-startup call
+/// sites now size the cache from `config.json`'s
+/// `VerifiedTranscationsCacheSize` (issue #1149) via
+/// [`PoolLedgerAdapter::with_verified_txn_cache_size`] instead; this
+/// constant remains [`PoolLedgerAdapter::new`]'s default for tests that
+/// don't care about the exact capacity.
+#[cfg(test)]
 const VERIFIED_TXN_CACHE_SIZE: usize = 5000;
 
+/// Builds a [`PoolConfig`] from `config.json`'s `TxPoolSize`,
+/// `TxPoolExponentialIncreaseFactor`, and `ProposalAssemblyTime` (issue
+/// #1149), leaving every other `PoolConfig` field at
+/// [`PoolConfig::default`]'s value (no other field is `Local`-configurable
+/// yet). Shared by `node start` and `participate` so both real-node
+/// startup paths honor the same overrides.
+pub(crate) fn pool_config_from_local(local: &algo_config::Local) -> PoolConfig {
+    PoolConfig {
+        pool_size: local.tx_pool_size.max(0) as usize,
+        exponential_increase_factor: local.tx_pool_exponential_increase_factor,
+        proposal_assembly_time: Duration::from_nanos(local.proposal_assembly_time.max(0) as u64),
+        ..PoolConfig::default()
+    }
+}
+
 impl PoolLedgerAdapter {
-    /// Wrap a shared ledger as a pool ledger.
+    /// Wrap a shared ledger as a pool ledger, at the built-in default
+    /// verified-transaction-cache capacity. Real node-startup call sites
+    /// use [`Self::with_verified_txn_cache_size`] directly so
+    /// `config.json`'s `VerifiedTranscationsCacheSize` (issue #1149) can
+    /// override it; this constructor remains for tests that don't care
+    /// about the exact capacity.
+    #[cfg(test)]
     pub(crate) fn new(ledger: Arc<Mutex<SqliteLedger>>) -> Self {
+        Self::with_verified_txn_cache_size(ledger, VERIFIED_TXN_CACHE_SIZE)
+    }
+
+    /// Wrap a shared ledger as a pool ledger, using an explicit
+    /// verified-transaction-cache capacity instead of the built-in
+    /// [`VERIFIED_TXN_CACHE_SIZE`] default. Wired at node startup from
+    /// `config.json`'s `VerifiedTranscationsCacheSize` (issue #1149) — see
+    /// `algo_config::Local`'s `VERIFIED_TRANSCATIONS_CACHE_SIZE` doc
+    /// comment.
+    pub(crate) fn with_verified_txn_cache_size(
+        ledger: Arc<Mutex<SqliteLedger>>,
+        cache_size: usize,
+    ) -> Self {
         Self {
             ledger,
             dup_cache: Mutex::new(algo_ledger::txtail_cache::TxTailDupCache::new()),
             hdr_cache: Mutex::new(None),
-            verified_txn_cache: Arc::new(algo_validate::VerifiedTransactionCache::new(
-                VERIFIED_TXN_CACHE_SIZE,
-            )),
+            verified_txn_cache: Arc::new(algo_validate::VerifiedTransactionCache::new(cache_size)),
         }
     }
 }
@@ -4314,7 +4352,10 @@ pub async fn run(
     // The `SeenTxCache` is created here so it can be shared with the
     // TxSyncer when TASK-70 lands.
     // -------------------------------------------------------------------
-    let pool_ledger_adapter = Arc::new(PoolLedgerAdapter::new(ledger.clone()));
+    let pool_ledger_adapter = Arc::new(PoolLedgerAdapter::with_verified_txn_cache_size(
+        ledger.clone(),
+        node_config.verified_transcations_cache_size.max(0) as usize,
+    ));
     // Issue #1043: the `BatchVerifier` verifies against the *same*
     // `VerifiedTransactionCache` instance `PoolLedgerAdapter::start_evaluator`
     // hands each `SimpleBlockEvaluator` -- cloning the concrete adapter's
@@ -4324,7 +4365,7 @@ pub async fn run(
     // `pool.remember()`'s evaluator verifies it again.
     let verified_txn_cache = pool_ledger_adapter.verified_txn_cache.clone();
     let pool = Arc::new(TransactionPool::new(
-        PoolConfig::default(),
+        pool_config_from_local(&node_config),
         pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
     ));
     // Issue #1134: inbound-gossip tx-handler per-tag `pool.remember()`
@@ -4390,10 +4431,11 @@ pub async fn run(
     });
     // Mirrors go's `appLimiterBacklogThreshold = int(float64(TxBacklogSize) *
     // float64(TxBacklogAppRateLimitingCongestionPct) / 100)`, applied here
-    // to `PoolConfig::default().pool_size` since algod-rust's `TxTagHandler`
-    // checks pool occupancy rather than a separate backlog-queue depth (see
-    // that module's doc comment for why).
-    let app_rate_limiter_congestion_threshold = ((PoolConfig::default().pool_size as f64)
+    // to `node_config.tx_pool_size` (issue #1149: now `config.json`-driven
+    // rather than always `PoolConfig::default()`'s hardcoded value) since
+    // algod-rust's `TxTagHandler` checks pool occupancy rather than a
+    // separate backlog-queue depth (see that module's doc comment for why).
+    let app_rate_limiter_congestion_threshold = ((node_config.tx_pool_size.max(0) as f64)
         * (node_config
             .tx_backlog_app_rate_limiting_congestion_pct
             .max(0) as f64)
@@ -5227,6 +5269,52 @@ mod tests {
     use serde_bytes::ByteBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
+
+    // ── Issue #1149: TxPoolSize/TxPoolExponentialIncreaseFactor/
+    // ProposalAssemblyTime wired from config.json into PoolConfig ──────
+
+    /// TDD anchor for issue #1149: `pool_config_from_local` must carry
+    /// `config.json`'s `TxPoolSize`, `TxPoolExponentialIncreaseFactor`, and
+    /// `ProposalAssemblyTime` through to `PoolConfig`'s matching fields,
+    /// leaving every other `PoolConfig` field at its own default (no other
+    /// field is `Local`-configurable yet).
+    #[test]
+    fn pool_config_from_local_wires_pool_size_factor_and_assembly_time() {
+        let local = algo_config::Local {
+            tx_pool_size: 1234,
+            tx_pool_exponential_increase_factor: 7,
+            proposal_assembly_time: 999_000_000, // 999ms
+            ..algo_config::Local::default()
+        };
+
+        let cfg = pool_config_from_local(&local);
+        assert_eq!(cfg.pool_size, 1234);
+        assert_eq!(cfg.exponential_increase_factor, 7);
+        assert_eq!(cfg.proposal_assembly_time, Duration::from_millis(999));
+        // Every other field stays at PoolConfig::default().
+        let default_cfg = PoolConfig::default();
+        assert_eq!(cfg.expired_history, default_cfg.expired_history);
+        assert_eq!(cfg.timeout_on_new_block, default_cfg.timeout_on_new_block);
+    }
+
+    /// TDD anchor for issue #1149: `Local::default()` (go's own defaults)
+    /// must reproduce `PoolConfig::default()`'s pre-existing hardcoded
+    /// values exactly, so wiring this field doesn't silently change
+    /// behavior for operators who never override `config.json`.
+    #[test]
+    fn pool_config_from_local_default_matches_pool_config_default() {
+        let cfg = pool_config_from_local(&algo_config::Local::default());
+        let default_cfg = PoolConfig::default();
+        assert_eq!(cfg.pool_size, default_cfg.pool_size);
+        assert_eq!(
+            cfg.exponential_increase_factor,
+            default_cfg.exponential_increase_factor
+        );
+        assert_eq!(
+            cfg.proposal_assembly_time,
+            default_cfg.proposal_assembly_time
+        );
+    }
 
     // ── Issue #1066: genesis-expectation reconciliation ─────────────
 
