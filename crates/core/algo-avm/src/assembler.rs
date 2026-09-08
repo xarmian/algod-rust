@@ -2977,6 +2977,173 @@ mod tests {
     /// the named-field immediate resolves to the correct byte (`fields::
     /// app_params_field_by_name`, `AppForeignBoxReads` = 11) end-to-end
     /// through `assemble_string`, matching go-algorand's `asmAppParamsSet`.
+    // ── issue #830 Phase 17 missing-test sweep (parity_txn_logic.md),
+    // ported from go-algorand's assembler_test.go ─────────────────────
+
+    #[test]
+    fn test_assemble_default_version_is_one() {
+        // TestAssembleDefault: with no `#pragma version` line, the
+        // assembler defaults to version 1 -- and type-checking still runs
+        // at that default version, so `byte 0x...; int 1; +` (mixing a
+        // []byte value into a uint64-only opcode) is still a type error.
+        let source = "byte 0x1122334455\nint 1\n+\n";
+        let errs = expect_errors(source);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("+ arg 0 wanted type uint64")),
+            "{errs:?}"
+        );
+
+        // Confirm the default version really is 1: a v2+-only opcode (e.g.
+        // `txna`) used with no `#pragma version` must fail as "not
+        // available" at v1, not merely fail differently for some other
+        // reason.
+        let errs = expect_errors("txna Accounts 0\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("txna") && e.message.contains("v2")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_assemble_base64_byte_literal() {
+        // TestAssembleBase64: `byte base64 <lit>` and `byte b64 <lit>`
+        // decode identically, produce the raw decoded bytes in the
+        // assembled program, and round-trip through Disassemble ->
+        // re-assemble to the same bytecode (mirrors testProg's own
+        // round-trip check).
+        // (go's own TestAssembleBase64 uses a literal starting with `//`,
+        // which this crate's tokenizer treats as a line comment when it
+        // isn't glued to a preceding token -- an unrelated
+        // comment-vs-literal lexing nuance, not what this test is about --
+        // so this test encodes its own literal, not starting with `//`,
+        // instead of reusing go's exact sample string.)
+        use base64::Engine;
+        let expected: Vec<u8> = (0u8..32).collect();
+        let lit = base64::engine::general_purpose::STANDARD.encode(&expected);
+
+        for keyword in ["base64", "b64"] {
+            let source = format!("#pragma version 2\nbyte {keyword} {lit}\n");
+            let ops = assemble_string(&source).unwrap();
+            assert!(
+                ops.program
+                    .windows(expected.len())
+                    .any(|w| w == expected.as_slice()),
+                "decoded base64 bytes not found in assembled program for {keyword:?}: {:?}",
+                ops.program
+            );
+
+            let dis = crate::disassembler::disassemble(&ops.program).unwrap();
+            let ops2 = assemble_string(&dis).unwrap();
+            assert_eq!(
+                ops.program, ops2.program,
+                "disassemble/reassemble round-trip mismatch for {keyword:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_assemble_versions_txna_gating() {
+        // TestAssembleVersions: `txna Accounts 0` assembles at v2+ (it was
+        // introduced in v2) and is rejected with a "introduced in v2"-style
+        // message at v1.
+        assemble_string("#pragma version 2\ntxna Accounts 0\n").unwrap();
+        let errs = expect_errors("#pragma version 1\ntxna Accounts 0\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("txna") && e.message.contains("v2")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_assemble_asset_holding_get_argument_errors() {
+        // TestAssembleAsset: a representative slice of asset_holding_get /
+        // asset_params_get assembler-level error paths -- wrong stack
+        // height, wrong immediate-argument count, and unknown field name.
+        //
+        // NOTE (found while porting this test, real parity gap): go's
+        // TestAssembleAsset also asserts that `byte 0x1234;
+        // asset_params_get AssetURL` is a *type* error ("asset_params_get
+        // ABC 1 arg 0 wanted type uint64..." -- the popped asset-id stack
+        // argument must be uint64, not []byte). algod-rust's assembler
+        // type-tracker (`type_track.rs`) has no arg-type entries at all for
+        // `asset_holding_get`/`asset_params_get`/`app_params_get`/
+        // `acct_params_get`, so this class of misuse assembles cleanly
+        // instead of being rejected at assembly time (it would presumably
+        // only surface, if at all, as a runtime type error in the AVM
+        // interpreter). Not fixed here -- this is a test-writing pass, not
+        // a functional change -- flagged for a follow-up issue instead.
+        for v in 2..=13u8 {
+            let errs = expect_errors(&format!("#pragma version {v}\nasset_holding_get ABC 1\n"));
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("expects 2 stack arguments")),
+                "v{v}: {errs:?}"
+            );
+
+            let errs = expect_errors(&format!(
+                "#pragma version {v}\nint 1\nint 1\nasset_holding_get ABC 1\n"
+            ));
+            assert!(
+                errs.iter().any(|e| e
+                    .message
+                    .contains("asset_holding_get expects 1 immediate argument")),
+                "v{v}: {errs:?}"
+            );
+
+            let errs = expect_errors(&format!(
+                "#pragma version {v}\nint 1\nint 1\nasset_holding_get ABC\n"
+            ));
+            assert!(
+                errs.iter().any(|e| e
+                    .message
+                    .contains("asset_holding_get unknown field: \"ABC\"")),
+                "v{v}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_disassemble_single_op_no_duplicate_arg_0_entries() {
+        // TestDisassembleSingleOp: disassembling a program that is *only*
+        // `arg_0` must not produce a doubled/garbled `arg_0` entry in the
+        // output, and the disassembly must reassemble back to the same
+        // bytecode.
+        for v in 1..=13u8 {
+            let source = format!("#pragma version {v}\narg_0\n");
+            let ops = assemble_string(&source).unwrap();
+            let dis = crate::disassembler::disassemble(&ops.program).unwrap();
+            assert_eq!(
+                dis.matches("arg_0").count(),
+                1,
+                "v{v}: expected exactly one arg_0 entry in disassembly, got: {dis:?}"
+            );
+            let ops2 = assemble_string(&dis).unwrap();
+            assert_eq!(ops.program, ops2.program, "v{v}: round-trip mismatch");
+        }
+    }
+
+    #[test]
+    fn test_disassemble_last_label_round_trips() {
+        // TestDisassembleLastLabel: a label as the very last line of a
+        // program (nothing after it) must disassemble and reassemble
+        // cleanly -- the disassembler still emits the trailing label even
+        // though no instruction follows it.
+        for v in 2..=13u8 {
+            let source = format!("#pragma version {v}\nintcblock 1\nintc_0\nbnz label1\nlabel1:\n");
+            let ops = assemble_string(&source).unwrap();
+            let dis = crate::disassembler::disassemble(&ops.program).unwrap();
+            assert!(
+                dis.contains("label1:"),
+                "v{v}: expected trailing label in disassembly: {dis:?}"
+            );
+            let ops2 = assemble_string(&dis).unwrap();
+            assert_eq!(ops.program, ops2.program, "v{v}: round-trip mismatch");
+        }
+    }
+
     #[test]
     fn test_app_params_set_foreign_box_reads_assembles() {
         let source = "#pragma version 13\nint 1\napp_params_set AppForeignBoxReads\n";
@@ -4410,6 +4577,48 @@ dup
                 .message
                 .contains("#pragma autosalt true used with stateful opcodes"),
             "{:?}",
+            ops.warnings
+        );
+    }
+
+    #[test]
+    fn test_has_stateful_ops_detection_via_autosalt_warning() {
+        // TestHasStatefulOps: go exposes a standalone `HasStatefulOps(program
+        // []byte)` API and directly asserts it against `int 1` (false),
+        // `int 0; int 1; app_opted_in; err` (true), and
+        // `int 1; asset_params_get AssetURL; err` (true). algod-rust's
+        // equivalent detection is an internal `has_stateful_ops` field used
+        // only to gate the `#pragma autosalt true` warning (see
+        // `test_autosalt_true_with_stateful_ops_produces_warning` above) --
+        // there is no standalone public API to call directly. This test
+        // exercises the same detection logic through that one observable
+        // surface: `#pragma autosalt true` warns if and only if the program
+        // contains a stateful opcode, for each of go's three sample programs.
+        let stateless = "#pragma version 8\n#pragma autosalt true\nint 1\nreturn\n";
+        let ops = assemble_string(stateless).unwrap();
+        assert!(
+            ops.warnings.is_empty(),
+            "int 1 alone has no stateful ops, expected no autosalt warning: {:?}",
+            ops.warnings
+        );
+
+        let opted_in =
+            "#pragma version 8\n#pragma autosalt true\nint 0\nint 1\napp_opted_in\nerr\n";
+        let ops = assemble_string(opted_in).unwrap();
+        assert_eq!(
+            ops.warnings.len(),
+            1,
+            "app_opted_in is a stateful op, expected an autosalt warning: {:?}",
+            ops.warnings
+        );
+
+        let asset_url =
+            "#pragma version 8\n#pragma autosalt true\nint 1\nasset_params_get AssetURL\nerr\n";
+        let ops = assemble_string(asset_url).unwrap();
+        assert_eq!(
+            ops.warnings.len(),
+            1,
+            "asset_params_get is a stateful op, expected an autosalt warning: {:?}",
             ops.warnings
         );
     }

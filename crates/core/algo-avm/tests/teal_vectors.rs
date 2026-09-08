@@ -2261,3 +2261,138 @@ fn combined_hash_chain() {
     code.push(0x43); // return
     assert!(run_pass(3, &code).unwrap());
 }
+
+// ===========================================================================
+// Frame access bounds (issue #830 Phase 17 missing-test sweep,
+// parity_txn_logic.md), ported from go-algorand's frames_test.go
+// ===========================================================================
+
+/// Run a v8 (fpVersion) program in Application mode and return the raw
+/// `run()` result, without unwrapping -- these tests want to inspect the
+/// error, not just pass/fail.
+fn run_app(version: u8, code: &[u8]) -> Result<bool, algo_error::AlgoError> {
+    let raw = prog(version, code);
+    let program = parse(&raw).unwrap();
+    let mut m = AvmMachine::new(program, ExecMode::Application, 100_000);
+    m.run(&mut NullContext)
+}
+
+#[test]
+fn frame_access_above_stack_after_arg_popped_errors() {
+    // TestFrameAccessAboveStack: a subroutine with `proto 1 1` pops its one
+    // declared argument, then tries to `frame_dig -1` to read it back --
+    // but the argument is gone from the stack now, so the dig is reading
+    // *above* (past) the current stack top. Must be a runtime error.
+    //
+    // Layout:
+    //   0: pushint 1        (2 bytes)
+    //   2: callsub +1 -> 6  (3 bytes)
+    //   5: return           (1 byte, dead code -- callsub never returns here)
+    // main @ 6:
+    //   6: proto 1 1        (3 bytes)
+    //   9: pop               (1 byte)
+    //  10: frame_dig -1      (2 bytes)
+    let code: &[u8] = &[
+        0x81, 0x01, // pushint 1
+        0x88, 0x00, 0x01, // callsub +1 -> offset 6
+        0x43, // return (dead)
+        0x8a, 0x01, 0x01, // proto 1 1
+        0x48, // pop
+        0x8b, 0xff, // frame_dig -1
+    ];
+    let result = run_app(8, code);
+    assert!(
+        result.is_err(),
+        "frame_dig above the current stack top must error, got {result:?}"
+    );
+}
+
+#[test]
+fn app_mode_backward_branch_loop_doubles_to_sixteen() {
+    // TestAppLoop (evalStateful_test.go), happy-path half: "Double until >
+    // 10. Should be 16" -- a backward-branch loop executes correctly in
+    // Application mode, not just LogicSig mode (generic loop execution is
+    // already covered by the `TestLoop`-equivalent group; this pins the
+    // Application-mode-specific case go names separately).
+    //
+    // (go's source also reads `global CurrentApplicationID; pop` first --
+    // omitted here since it's orthogonal to what this test is actually
+    // checking, and already covered by dedicated `global` opcode tests.)
+    //
+    // pushint 1
+    // loop: pushint 2; *; dup; pushint 10; <; bnz loop
+    // pushint 16; ==; return
+    let code: &[u8] = &[
+        0x81, 0x01, // pushint 1
+        // loop @ offset 2:
+        0x81, 0x02, // pushint 2
+        0x0b, // *
+        0x49, // dup
+        0x81, 0x0a, // pushint 10
+        0x0c, // <
+        0x40, 0xff, 0xf6, // bnz loop (delta -10 -> offset 2)
+        0x81, 0x10, // pushint 16
+        0x12, // ==
+        0x43, // return
+    ];
+    let result = run_app(8, code).unwrap();
+    assert!(result, "doubling loop should terminate at 16 and pass");
+}
+
+#[test]
+fn app_mode_non_terminating_loop_exhausts_cost_budget() {
+    // TestAppLoop, "infinite loop" half: multiplying by 1 instead of 2
+    // never satisfies the `< 10` exit condition, so the loop runs forever
+    // and must be caught by the dynamic cost budget rather than looping
+    // the test process forever.
+    let code: &[u8] = &[
+        0x81, 0x01, // pushint 1
+        // loop @ offset 2:
+        0x81, 0x01, // pushint 1
+        0x0b, // *
+        0x49, // dup
+        0x81, 0x0a, // pushint 10
+        0x0c, // <
+        0x40, 0xff, 0xf6, // bnz loop (delta -10 -> offset 2)
+        0x81, 0x10, // pushint 16
+        0x12, // ==
+        0x43, // return
+    ];
+    let raw = prog(8, code);
+    let program = parse(&raw).unwrap();
+    let mut m = AvmMachine::new(program, ExecMode::Application, 500);
+    let result = m.run(&mut NullContext);
+    assert!(
+        result.is_err(),
+        "non-terminating loop must be stopped by the cost budget"
+    );
+}
+
+#[test]
+fn frame_access_below_stack_without_enough_args_errors() {
+    // TestFrameAccessBelowStack: `frame_dig -10` with no `proto` and only
+    // one argument on the stack digs far below the frame's actual base --
+    // must be a runtime error, not silently reading garbage / underflowing.
+    //
+    // Layout:
+    //   0: pushint 1        (2 bytes)
+    //   2: callsub +1 -> 6  (3 bytes)
+    //   5: return           (1 byte, dead code)
+    // main @ 6:
+    //   6: frame_dig -10    (2 bytes)
+    let code: &[u8] = &[
+        0x81,
+        0x01, // pushint 1
+        0x88,
+        0x00,
+        0x01, // callsub +1 -> offset 6
+        0x43, // return (dead)
+        0x8b,
+        (-10i8) as u8, // frame_dig -10
+    ];
+    let result = run_app(8, code);
+    assert!(
+        result.is_err(),
+        "frame_dig -10 below the frame base must error, got {result:?}"
+    );
+}

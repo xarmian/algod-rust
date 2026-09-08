@@ -162,6 +162,44 @@ fn opcode_count_is_monotonic_non_decreasing_by_version() {
 }
 
 #[test]
+fn opcode_table_every_entry_has_op_details() {
+    // TestOpSpecs (opcodes_test.go): `require.NotEmpty(t, spec.OpDetails,
+    // spec)` for every registered OpSpec -- go's OpDetails carries a spec's
+    // cost/mode/immediate-encoding metadata, and an accidentally
+    // zero-valued OpDetails (e.g. a copy-pasted entry that never got its
+    // `Modes`/`Size` fields filled in) would silently make that opcode
+    // uncallable or mis-costed. algod-rust's `OpSpec` doesn't carry a
+    // separate `OpDetails` substruct with its own zero value -- `mode`,
+    // `imm`, and `cost` are non-Optional required fields set at every
+    // table-entry construction site, so "empty OpDetails" has no Rust
+    // analog to regress into. The one field that *could* silently regress
+    // to a meaningless value is the `&'static str` mnemonic (an entry
+    // accidentally left as `""`), so that's what this sweep pins, across
+    // both ordinary entries and sub-opcode-family leaves.
+    for byte in 0u16..=255 {
+        let Some(spec) = lookup(byte as u8) else {
+            continue;
+        };
+        match spec.sub_ops {
+            Some(subs) => {
+                for sub in subs.iter().flatten() {
+                    assert!(
+                        !sub.name.is_empty(),
+                        "sub-opcode of {byte:#04x} has an empty name"
+                    );
+                }
+            }
+            None => {
+                assert!(
+                    !spec.name.is_empty(),
+                    "opcode {byte:#04x} has an empty name"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn opcode_table_every_name_reachable_at_its_declared_version() {
     // Every opcode that OpcodesByVersion(v) would include (version <= v)
     // must appear exactly once in that snapshot -- completeness, not just

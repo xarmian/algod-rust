@@ -6630,6 +6630,24 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    // TestExplicitConstants (backwardCompat_test.go), maxLogSize/maxLogCalls
+    // half: a drift canary pinning the literal values of go-algorand's
+    // maxLogSize/maxLogCalls. See `algo_avm::opcode::tests::
+    // test_explicit_constants_max_string_size` and
+    // `algo_avm::ops::bytes::tests::test_explicit_constants_max_byte_math_size`
+    // for the maxStringSize/maxByteMathSize halves.
+    #[test]
+    fn test_explicit_constants_max_log_size_and_calls() {
+        assert_eq!(
+            MAX_LOG_SIZE, 1024,
+            "constant changed, move it version dependent"
+        );
+        assert_eq!(
+            MAX_LOG_CALLS, 32,
+            "constant changed, move it version dependent"
+        );
+    }
+
     // ── app_address() (go: `AppIndex.ToBeHashed()` / `AppIndex.Address()`) ─
     //
     // Mirrors go's `TestAppIndexHashing`

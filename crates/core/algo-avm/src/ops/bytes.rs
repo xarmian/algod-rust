@@ -475,6 +475,19 @@ mod tests {
     use crate::bytecode::{Immediates, Instruction, Program};
     use crate::machine::{AvmMachine, AvmValue, ExecMode};
 
+    // TestExplicitConstants (backwardCompat_test.go), maxByteMathSize half:
+    // a drift canary pinning the literal value of go-algorand's
+    // maxByteMathSize. See `opcode::tests::test_explicit_constants_max_string_size`
+    // for the maxStringSize half and `algo_ledger::avm_context`'s own canary
+    // for maxLogSize/maxLogCalls.
+    #[test]
+    fn test_explicit_constants_max_byte_math_size() {
+        assert_eq!(
+            MAX_BIGINT_LEN, 64,
+            "constant changed, move it version dependent"
+        );
+    }
+
     /// Helper: create a machine with some values pre-pushed on the stack.
     fn machine_with_stack(stack: Vec<AvmValue>) -> AvmMachine {
         let program = Program {

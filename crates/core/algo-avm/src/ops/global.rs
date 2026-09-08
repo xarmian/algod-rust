@@ -172,6 +172,27 @@ mod tests {
     }
 
     #[test]
+    fn global_round_ge_one_passes() {
+        // TestRound (evalStateful_test.go): `global Round; int 1; >=` must
+        // pass in Application mode -- the field is readable and its value
+        // (per TestGlobalContext, 42) satisfies the `>= 1` sanity check
+        // go's test performs against a real ledger's actual current round.
+        let raw = prog(
+            8,
+            &[
+                0x32, 0x06, // global Round
+                0x81, 0x01, // pushint 1
+                0x0f, // >=
+                0x43, // return
+            ],
+        );
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
+        let result = m.run(&mut TestGlobalContext).unwrap();
+        assert!(result, "global Round >= 1 should pass");
+    }
+
+    #[test]
     fn global_zero_address_returns_bytes() {
         // Program: global ZeroAddress (field 3), pop, pushint 1, return
         // We pop the bytes (can't use return with bytes on AVM v1-style),

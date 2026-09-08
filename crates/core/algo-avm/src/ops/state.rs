@@ -1985,6 +1985,42 @@ mod tests {
         assert_eq!(m.stack[0], AvmValue::Uint64(0));
     }
 
+    #[test]
+    fn test_app_global_blank_key_round_trip() {
+        // TestBlankKey (evalStateful_test.go): a zero-length key (`byte ""`)
+        // is not a special case -- `app_global_get` on it is a normal
+        // not-found read (0) before any write, and `app_global_put`/
+        // `app_global_get` round-trip a value through it exactly like any
+        // other key.
+        let mut code = vec![];
+        // byte ""; app_global_get -> 0 (not found)
+        code.extend_from_slice(&[0x80, 0x00]); // pushbytes ""
+        code.push(0x64); // app_global_get
+                         // byte ""; int 7; app_global_put
+        code.extend_from_slice(&[0x80, 0x00]); // pushbytes ""
+        code.extend_from_slice(&[0x81, 0x07]); // pushint 7
+        code.push(0x67); // app_global_put
+                         // byte ""; app_global_get -> 7
+        code.extend_from_slice(&[0x80, 0x00]); // pushbytes ""
+        code.push(0x64); // app_global_get
+        let raw = prog(5, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        step_n(&mut m, &mut ctx, 7).unwrap();
+        assert_eq!(m.stack.len(), 2);
+        assert_eq!(
+            m.stack[0],
+            AvmValue::Uint64(0),
+            "blank key unwritten reads as 0"
+        );
+        assert_eq!(
+            m.stack[1],
+            AvmValue::Uint64(7),
+            "blank key round-trips like any other key"
+        );
+    }
+
     // ── resolve_mutable_account (issue #809) ──────────────────────
 
     #[test]
