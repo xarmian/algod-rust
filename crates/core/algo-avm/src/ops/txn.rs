@@ -590,6 +590,40 @@ mod tests {
         assert!(m.run(&mut ctx).is_err());
     }
 
+    #[test]
+    fn test_txn_bad_field_index_rejected() {
+        // TestTxnBadField: `txn` with an out-of-range raw field index (127,
+        // no such TxnField) must error with a message naming it as an
+        // invalid txn field, not silently succeed or panic.
+        let raw: &[u8] = &[0x01, 0x31, 0x7f]; // version 1, txn, field 127
+        let program = bytecode::parse(raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let result = m.run(&mut ctx);
+        assert!(result.is_err(), "txn with field 127 should error");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("invalid txn field"),
+            "expected an 'invalid txn field' error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_gtxn_bad_field_index_rejected() {
+        // TestGtxnBadField: same as above, for `gtxn <index> <field>`.
+        let raw: &[u8] = &[0x01, 0x33, 0x00, 0x7f]; // version 1, gtxn 0, field 127
+        let program = bytecode::parse(raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let result = m.run(&mut ctx);
+        assert!(result.is_err(), "gtxn with field 127 should error");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("invalid txn field"),
+            "expected an 'invalid txn field' error, got: {msg}"
+        );
+    }
+
     // --- Per-field version gating (issue #810) ---
     //
     // Matches go-algorand's shared `fetchField` check (`fs.version >

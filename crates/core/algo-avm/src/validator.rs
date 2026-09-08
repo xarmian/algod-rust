@@ -846,6 +846,22 @@ mod tests {
         assert!(check_program_version_allowed(1, 0).is_err());
     }
 
+    #[test]
+    fn test_wrong_proto_version_rejects_every_declared_version() {
+        // TestWrongProtoVersion (eval_test.go): a consensus params set with
+        // `LogicSigVersion = 0` ("LogicSig not supported") rejects *every*
+        // program version from 1 through the current max, not just v1.
+        // algod-rust's equivalent gate is `check_program_version_allowed`,
+        // consulted from `run_approval_program`/`run_logicsig_program` via
+        // `AvmContext::consensus_logic_sig_version()`.
+        for v in 1..=crate::opcode::MAX_AVM_VERSION {
+            let err = check_program_version_allowed(v, 0)
+                .expect_err(&format!("v{v} must be rejected when LogicSigVersion=0"));
+            let msg = format!("{err}");
+            assert!(msg.contains("ceiling 0"), "v{v}: {msg}");
+        }
+    }
+
     // ---- Pre-sharedResources tx.Access gating (go-algorand eval.go begin()) ----
 
     #[test]

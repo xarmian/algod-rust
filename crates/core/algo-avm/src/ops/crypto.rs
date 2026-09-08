@@ -1901,6 +1901,48 @@ mod tests {
         assert!(parse_json_object(json).is_err());
     }
 
+    // ── issue #830 Phase 17 missing-test sweep (parity_txn_logic.md),
+    // ported from go-algorand's jsonspec_test.go ──────────────────────
+
+    #[test]
+    fn test_parse_json_arrays() {
+        // TestParseArrays (jsonspec_test.go): a leading comma inside an
+        // array is invalid JSON and must be rejected; a trailing newline
+        // before the closing bracket is fine; a nested array is fine.
+        assert!(
+            parse_json_object(br#"{"key0": [,1,]}"#).is_err(),
+            "leading comma in array should be rejected"
+        );
+        assert!(
+            parse_json_object(b"{\"key0\":[1\n]}").is_ok(),
+            "newline before closing bracket should be accepted"
+        );
+        assert!(
+            parse_json_object(br#"{"key0": [[1]]}"#).is_ok(),
+            "nested array should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_parse_json_raw_non_unicode_char() {
+        // TestParseRawNonUnicodeChar (jsonspec_test.go): raw multi-byte
+        // UTF-8 inside a JSON string parses successfully; an incomplete
+        // \u escape (fewer than 4 hex digits) and a bare unquoted value
+        // (not `true`/`false`/`null`/a number) must both error.
+        assert!(
+            parse_json_object("{\"key0\": \"\u{03c0}\u{03b6}\u{03b8}\"}".as_bytes()).is_ok(),
+            "raw multi-byte UTF-8 in a string should parse"
+        );
+        assert!(
+            parse_json_object(br#"{"key0": "\uFF"}"#).is_err(),
+            "incomplete \\u escape should be rejected"
+        );
+        assert!(
+            parse_json_object(br#"{"key0": FF}"#).is_err(),
+            "bare unquoted non-literal value should be rejected"
+        );
+    }
+
     // ── JSON parser edge-case parity (issue #823 theme 2), ported from
     // go-algorand's jsonspec_test.go ────────────────────────────────
 

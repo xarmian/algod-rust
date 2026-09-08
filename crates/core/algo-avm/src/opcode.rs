@@ -796,6 +796,21 @@ pub fn defined_opcode_count() -> usize {
 mod tests {
     use super::*;
 
+    // TestExplicitConstants (backwardCompat_test.go): a drift canary
+    // pinning the literal numeric values of go-algorand's
+    // maxStringSize/maxByteMathSize/maxLogSize/maxLogCalls constants, so a
+    // future accidental change to any of these gets caught even though
+    // other tests only exercise the boundary behaviorally. maxByteMathSize
+    // is `crate::ops::bytes::MAX_BIGINT_LEN`; maxLogSize/maxLogCalls live
+    // in `algo_ledger::avm_context` (see the equivalent canary there).
+    #[test]
+    fn test_explicit_constants_max_string_size() {
+        assert_eq!(
+            MAX_STRING_SIZE, 4096,
+            "constant changed, make it version dependent"
+        );
+    }
+
     #[test]
     fn test_err_opcode() {
         let spec = lookup(0x00).unwrap();
