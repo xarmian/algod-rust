@@ -41,8 +41,11 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use http::{HeaderMap, HeaderName};
 
 // ---------------------------------------------------------------------------
 // ConnectionTracker
@@ -212,6 +215,92 @@ impl Default for ConnectionTracker {
     /// Creates a `ConnectionTracker` with a 1-second rate-limit window.
     fn default() -> Self {
         Self::new(Duration::from_secs(1))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// X-Forwarded-For client-address extraction
+// ---------------------------------------------------------------------------
+
+/// Extracts the client's "real" address from an HTTP header, when the node
+/// is configured to trust a reverse proxy / load balancer.
+///
+/// Mirrors go-algorand's `RequestTracker.getForwardedConnectionAddress`
+/// (`network/requestTracker.go:483-519`), gated by the same
+/// `UseXForwardedForAddressField` config knob (here:
+/// `use_x_forwarded_for_address_field`):
+///
+/// - An empty field name disables the feature entirely: returns `None`
+///   without touching `misconfigured_logged` or logging anything.
+/// - When the configured field name is (case-insensitively) the standard
+///   `X-Forwarded-For` header, this reads *all* occurrences of the header,
+///   takes the value of the *last* occurrence, splits it on commas (a proxy
+///   chain appends its own hop with a comma), and takes the last
+///   (right-most, i.e. nearest-to-us-hop) entry — matching go's exact
+///   "last header, last comma-separated value" parsing.
+/// - Any other field name is read as a single header value via
+///   `HeaderMap::get` (no comma-splitting) — matching go's
+///   `header.Get(field)` fallback for a non-standard field name.
+/// - An empty resolved value, or a value that fails `IpAddr` parsing, is
+///   treated as "no forwarded address": returns `None`. The "empty value"
+///   case is logged once per tracker lifetime (via `misconfigured_logged`,
+///   matching go's `atomic.Bool` + `CompareAndSwap(false, true)` gate) to
+///   warn about a proxy that isn't actually setting the configured header.
+pub fn get_forwarded_connection_address(
+    header: &HeaderMap,
+    use_x_forwarded_for_address_field: &str,
+    misconfigured_logged: &AtomicBool,
+) -> Option<IpAddr> {
+    if use_x_forwarded_for_address_field.is_empty() {
+        return None;
+    }
+
+    let header_name = HeaderName::from_bytes(use_x_forwarded_for_address_field.as_bytes()).ok()?;
+
+    let forwarded_for_string =
+        if use_x_forwarded_for_address_field.eq_ignore_ascii_case("X-Forwarded-For") {
+            // Use the last value from the last X-Forwarded-For header's list of
+            // values (go-algorand's documented behavior for the standard field).
+            let values: Vec<&str> = header
+                .get_all(&header_name)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            match values.last() {
+                Some(last) => last
+                    .rsplit(',')
+                    .next()
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default(),
+                None => String::new(),
+            }
+        } else {
+            header
+                .get(&header_name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+
+    if forwarded_for_string.is_empty() {
+        if misconfigured_logged
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            tracing::warn!(
+                field = %use_x_forwarded_for_address_field,
+                "UseForwardedForAddressField is configured, but no value was retrieved from header"
+            );
+        }
+        return None;
+    }
+
+    match forwarded_for_string.parse::<IpAddr>() {
+        Ok(ip) => Some(ip),
+        Err(_) => {
+            tracing::warn!(value = %forwarded_for_string, "unable to parse origin address");
+            None
+        }
     }
 }
 
@@ -521,5 +610,127 @@ mod tests {
     fn connection_tracker_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ConnectionTracker>();
+    }
+
+    // -- X-Forwarded-For extraction (ported from go-algorand's
+    // TestGetForwardedConnectionAddress, network/requestTracker_test.go:221)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn forwarded_address_disabled_when_field_unset() {
+        let header = HeaderMap::new();
+        let logged = AtomicBool::new(false);
+
+        let ip = get_forwarded_connection_address(&header, "", &logged);
+        assert!(ip.is_none());
+        // Disabled entirely: never touches the misconfigured-logging gate.
+        assert!(!logged.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn forwarded_address_custom_field_missing_warns_once() {
+        let header = HeaderMap::new();
+        let logged = AtomicBool::new(false);
+
+        let ip = get_forwarded_connection_address(&header, "X-Custom-Addr", &logged);
+        assert!(ip.is_none());
+        assert!(logged.load(Ordering::SeqCst));
+
+        // Second call: gate already tripped, must not attempt to log again
+        // (compare_exchange fails silently) but still resolves to None.
+        let ip = get_forwarded_connection_address(&header, "X-Custom-Addr", &logged);
+        assert!(ip.is_none());
+    }
+
+    #[test]
+    fn forwarded_address_custom_field_single_value_parses() {
+        let mut header = HeaderMap::new();
+        header.insert("X-Custom-Addr", "123.123.123.123".parse().unwrap());
+        let logged = AtomicBool::new(false);
+
+        let ip = get_forwarded_connection_address(&header, "X-Custom-Addr", &logged);
+        assert_eq!(ip, Some("123.123.123.123".parse::<IpAddr>().unwrap()));
+        assert!(!logged.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn forwarded_address_custom_field_list_not_split() {
+        // A non-standard field name is read as a single value via `get`,
+        // with no comma-splitting — go's "original behavior since the
+        // Release" per the upstream test's own comment.
+        let mut header = HeaderMap::new();
+        header.insert(
+            "X-Custom-Addr",
+            "123.123.123.123, 234.234.234.234".parse().unwrap(),
+        );
+        let logged = AtomicBool::new(false);
+
+        let ip = get_forwarded_connection_address(&header, "X-Custom-Addr", &logged);
+        assert!(ip.is_none());
+    }
+
+    #[test]
+    fn forwarded_address_x_forwarded_for_empty_warns() {
+        let header = HeaderMap::new();
+        let logged = AtomicBool::new(false);
+
+        let ip = get_forwarded_connection_address(&header, "X-Forwarded-For", &logged);
+        assert!(ip.is_none());
+        assert!(logged.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn forwarded_address_x_forwarded_for_single_value() {
+        let mut header = HeaderMap::new();
+        header.insert("X-Forwarded-For", "123.123.123.123".parse().unwrap());
+        let logged = AtomicBool::new(false);
+
+        let ip = get_forwarded_connection_address(&header, "X-Forwarded-For", &logged);
+        assert_eq!(ip, Some("123.123.123.123".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn forwarded_address_x_forwarded_for_list_uses_last_value() {
+        // Single header occurrence with a comma-separated proxy chain: the
+        // last (right-most) address is used — this is the new behavior go's
+        // test comment calls out explicitly.
+        let mut header = HeaderMap::new();
+        header.insert(
+            "X-Forwarded-For",
+            "123.123.123.123, 234.234.234.234".parse().unwrap(),
+        );
+        let logged = AtomicBool::new(false);
+
+        let ip = get_forwarded_connection_address(&header, "X-Forwarded-For", &logged);
+        assert_eq!(ip, Some("234.234.234.234".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn forwarded_address_x_forwarded_for_multiple_headers_uses_last_occurrence() {
+        // Multiple X-Forwarded-For header lines: use the last occurrence's
+        // value (then the last comma-separated entry within it).
+        let mut header = HeaderMap::new();
+        header.append("X-Forwarded-For", "10.0.0.1".parse().unwrap());
+        header.append(
+            "X-Forwarded-For",
+            "123.123.123.123, 234.234.234.234".parse().unwrap(),
+        );
+        let logged = AtomicBool::new(false);
+
+        let ip = get_forwarded_connection_address(&header, "X-Forwarded-For", &logged);
+        assert_eq!(ip, Some("234.234.234.234".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn forwarded_address_field_name_case_insensitive() {
+        // go canonicalizes via textproto.CanonicalMIMEHeaderKey before
+        // comparing to "X-Forwarded-For"; a lowercase config value must
+        // still hit the comma-splitting path.
+        let mut header = HeaderMap::new();
+        header.insert("x-forwarded-for", "1.2.3.4, 5.6.7.8".parse().unwrap());
+        let logged = AtomicBool::new(false);
+
+        let ip = get_forwarded_connection_address(&header, "x-forwarded-for", &logged);
+        assert_eq!(ip, Some("5.6.7.8".parse::<IpAddr>().unwrap()));
     }
 }

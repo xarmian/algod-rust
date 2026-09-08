@@ -4295,6 +4295,9 @@ pub async fn run(
         // Issue #1088: wires go's `EnableRequestLogger` through to the
         // relay's HTTP request-logging middleware (`request_logger.rs`).
         enable_request_logger: node_config.enable_request_logger,
+        // Issue #1157: wires go's `UseXForwardedForAddressField` through to
+        // inbound connection tracking (`request_tracker.rs`).
+        use_x_forwarded_for_address_field: node_config.use_x_forwarded_for_address_field.clone(),
         ..Default::default()
     };
 
