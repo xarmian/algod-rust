@@ -408,6 +408,23 @@ pub fn validate_block_with_cache(
                 });
             }
 
+            // Round liveness (Go: `BlockHeader.Alive`, `data/bookkeeping/block.go`,
+            // called from the standalone group-validator path at
+            // `ledger/eval/eval.go:2141`). `validate_transaction_wellformed`
+            // above only checks the txn's own [FirstValid, LastValid] window
+            // is internally consistent -- it has no `round` parameter and
+            // can't tell whether *this* block's round actually falls inside
+            // that window.
+            if round < stx.txn.first_valid.0 || round > stx.txn.last_valid.0 {
+                errors.push(BlockValidationError::TransactionValidationFailed {
+                    txn_index: idx,
+                    error: format!(
+                        "txn {} dead: round {} outside [{}, {}]",
+                        idx, round, stx.txn.first_valid.0, stx.txn.last_valid.0
+                    ),
+                });
+            }
+
             // Signature verification (includes LogicSig TEAL evaluation).
             // Pass the atomic group slice and intra-group index so that
             // LogicSig programs see correct `gtxn`, `global GroupSize`,
@@ -1047,6 +1064,162 @@ mod tests {
         );
         assert_eq!(result.txn_count, 1);
         assert!(result.total_txn_bytes > 0);
+    }
+
+    // ── FirstValid/LastValid round liveness (issue #1152, ported from
+    // go-algorand's `TestAlive`, `data/bookkeeping/block_test.go:1279`) ──
+    //
+    // This is the standalone group-validator path (go's `evalTxValidator`,
+    // `ledger/eval/eval.go:2141`) -- `validate_transaction_wellformed`
+    // alone only checks a txn's own [FirstValid, LastValid] window is
+    // internally consistent; it takes no `round` parameter and can't tell
+    // whether *this* block's round actually falls inside that window.
+
+    /// Like `make_signed_txn`, but with an overridable `[FirstValid,
+    /// LastValid]` window -- the window must be set BEFORE signing, since
+    /// the ed25519 signature covers the txn's canonical encoding (mutating
+    /// `first_valid`/`last_valid` post-signature, as a naive helper might,
+    /// would invalidate the signature and mask what's actually under test
+    /// behind a `SignatureVerificationFailed` instead of the liveness
+    /// check this is pinning).
+    fn make_signed_txn_with_window(
+        key: &SigningKey,
+        amount: u64,
+        first_valid: u64,
+        last_valid: u64,
+    ) -> SignedTransaction {
+        let pk = key.verifying_key();
+        let sender = Address(pk.to_bytes());
+        let txn = Transaction {
+            txn_type: "pay".into(),
+            sender,
+            fee: 1000,
+            first_valid: Round(first_valid),
+            last_valid: Round(last_valid),
+            amount,
+            receiver: Address([2u8; 32]),
+            genesis_id: "test-v1".into(),
+            genesis_hash: test_genesis_hash(),
+            ..Default::default()
+        };
+
+        let canonical = algo_codec::canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(2 + canonical.len());
+        msg.extend_from_slice(b"TX");
+        msg.extend_from_slice(&canonical);
+        let sig = key.sign(&msg);
+
+        let mut stripped_txn = txn;
+        stripped_txn.genesis_id = String::new();
+        stripped_txn.genesis_hash = [0u8; 32];
+
+        SignedTransaction {
+            txn: stripped_txn,
+            sig: sig.to_bytes(),
+            msig: None,
+            lsig: None,
+            pqsig: None,
+            auth_addr: None,
+            has_genesis_id: true,
+            has_genesis_hash: true,
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            eval_delta: None,
+            apply_data_config_asset: 0,
+            apply_data_application_id: 0,
+        }
+    }
+
+    /// Builds a block at `round` containing one otherwise-valid signed
+    /// `pay` txn whose `[FirstValid, LastValid]` window is
+    /// `[first_valid, last_valid]`, with a correctly recomputed payset
+    /// commitment (which depends on the txn's exact encoded bytes).
+    fn block_with_txn_window(round: u64, first_valid: u64, last_valid: u64) -> Block {
+        let key = test_signing_key();
+        let stx = make_signed_txn_with_window(&key, 5000, first_valid, last_valid);
+
+        let mut block = empty_block();
+        block.round = Round(round);
+        block.payset = vec![stx];
+        let root = compute_payset_merkle_root(&block);
+        block.txn_commitment = root;
+        block
+    }
+
+    #[test]
+    fn alive_during_lifetime_is_accepted() {
+        // bh.Round = header.FirstValid + 1 in go's TestAlive.
+        let block = block_with_txn_window(101, 100, 150);
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
+        assert!(
+            result.is_valid,
+            "transaction should be alive during its lifetime, errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn alive_at_issuance_is_accepted() {
+        // bh.Round = header.FirstValid in go's TestAlive.
+        let block = block_with_txn_window(100, 100, 150);
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
+        assert!(
+            result.is_valid,
+            "transaction should be alive at issuance (round == FirstValid), errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn alive_at_expiry_is_accepted() {
+        // bh.Round = header.LastValid in go's TestAlive.
+        let block = block_with_txn_window(150, 100, 150);
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
+        assert!(
+            result.is_valid,
+            "transaction should be alive at expiry (round == LastValid), errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn premature_transaction_one_round_before_first_valid_is_rejected() {
+        // bh.Round = header.FirstValid - 1 in go's TestAlive: go rejects
+        // this as premature. Before this fix, `validate_block` had no
+        // check anywhere comparing the block's round against a txn's
+        // FirstValid, and would have accepted this block.
+        let block = block_with_txn_window(99, 100, 150);
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
+        assert!(!result.is_valid, "premature transaction must be rejected");
+        assert!(
+            result.errors.iter().any(|e| matches!(
+                e,
+                BlockValidationError::TransactionValidationFailed { error, .. }
+                    if error.contains("dead")
+            )),
+            "expected a liveness TransactionValidationFailed error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn expired_transaction_one_round_after_last_valid_is_rejected() {
+        // bh.Round = header.LastValid + 1 in go's TestAlive.
+        let block = block_with_txn_window(151, 100, 150);
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
+        assert!(!result.is_valid, "expired transaction must be rejected");
+        assert!(
+            result.errors.iter().any(|e| matches!(
+                e,
+                BlockValidationError::TransactionValidationFailed { error, .. }
+                    if error.contains("dead")
+            )),
+            "expected a liveness TransactionValidationFailed error, got: {:?}",
+            result.errors
+        );
     }
 
     /// Issue #1017: a group already present in the `VerifiedTransactionCache`
