@@ -86,8 +86,9 @@ use algo_agreement::test_support::{
 };
 use algo_agreement::{
     Action, ActionType, Certificate, ConsensusVersionView, Event, EventType, InternalMessage,
-    MessageEvent, Proposal, ProposalValue, SerializableError, TimeoutEvent, UnauthenticatedBundle,
-    UnauthenticatedCredential, VoteAuthenticator, BOTTOM, CERT, NEXT, PROPOSE, SOFT,
+    MessageEvent, Proposal, ProposalValue, RoundInterruptionEvent, SerializableError, TimeoutEvent,
+    UnauthenticatedBundle, UnauthenticatedCredential, VoteAuthenticator, BOTTOM, CERT, NEXT,
+    PROPOSAL_PAYLOAD_TAG, PROPOSE, SOFT,
 };
 use algo_types::{ConsensusParams, Round, CONSENSUS_V41};
 
@@ -1435,5 +1436,171 @@ fn player_handles_pipelined_thresholds() {
         verified,
         "player should verify pipelined payload first seen in previous round; trace:\n{}",
         machine.trace()
+    );
+}
+
+/// Whether the trace contains a `Relay` network action carrying the
+/// proposal-payload tag (i.e. the player propagated a proposal payload).
+fn contains_payload_relay(machine: &IoAutomataConcretePlayer) -> bool {
+    machine.trace().contains_action_fn(|a| {
+        matches!(a, Action::Network(na) if na.t == ActionType::Relay && na.tag == PROPOSAL_PAYLOAD_TAG)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// A payload received from the network (payloadPresent) must be relayed.
+// Mirrors Go's `TestPlayerPropagatesProposalPayload` (`player_test.go`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn player_propagates_proposal_payload() {
+    let r = Round(209);
+    let p = algo_agreement::Period(0);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    let payload = algo_agreement::test_support::make_random_proposal_payload(r);
+    let pv = payload.unauthenticated_proposal.value();
+
+    // Store an arbitrary proposal vote so the player knows about `pv`.
+    send_votes(&mut machine, &mut helper, 1, r, p, PROPOSE, pv);
+
+    send_present(
+        &mut machine,
+        EventType::PayloadPresent,
+        InternalMessage {
+            unauthenticated_proposal: payload.unauthenticated_proposal.clone(),
+            ..InternalMessage::default()
+        },
+    );
+
+    assert!(
+        contains_payload_relay(&machine),
+        "player should relay payload on reception; trace:\n{}",
+        machine.trace()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A player's own verified payload (payloadVerified) must also be relayed.
+// Mirrors Go's `TestPlayerPropagatesOwnProposalPayload` (`player_test.go`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn player_propagates_own_proposal_payload() {
+    let r = Round(209);
+    let p = algo_agreement::Period(0);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    let payload = algo_agreement::test_support::make_random_proposal_payload(r);
+    let pv = payload.unauthenticated_proposal.value();
+
+    send_votes(&mut machine, &mut helper, 1, r, p, PROPOSE, pv);
+    send_payload_verified(&mut machine, &payload);
+
+    assert!(
+        contains_payload_relay(&machine),
+        "player should relay own payload; trace:\n{}",
+        machine.trace()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A payload for a future round must still be propagated once the player
+// advances into that round.
+// Mirrors Go's `TestPlayerPropagatesProposalPayloadFutureRound`
+// (`player_test.go`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn player_propagates_proposal_payload_future_round() {
+    let r = Round(209);
+    let p = algo_agreement::Period(0);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    let future_r = Round(r.0 + 1);
+    let payload = algo_agreement::test_support::make_random_proposal_payload(future_r);
+    let pv = payload.unauthenticated_proposal.value();
+
+    // A proposal vote and payload for round r+1, seen while still at round r.
+    send_votes(&mut machine, &mut helper, 1, future_r, p, PROPOSE, pv);
+    send_present(
+        &mut machine,
+        EventType::PayloadPresent,
+        InternalMessage {
+            unauthenticated_proposal: payload.unauthenticated_proposal.clone(),
+            ..InternalMessage::default()
+        },
+    );
+
+    // Advance to the next round.
+    machine
+        .transition(Event::RoundInterruption(RoundInterruptionEvent {
+            round: future_r,
+            proto: proto_view(),
+        }))
+        .expect("roundInterruption transition should not panic");
+
+    assert!(
+        contains_payload_relay(&machine),
+        "player should relay payload on new round; trace:\n{}",
+        machine.trace()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fast-forward on a soft threshold from a far-future period, then cert vote
+// once the late proposal vote + payload arrive.
+// Mirrors Go's `TestPlayerFFSoftThresholdLatePayloadCert` (`player_test.go`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn player_ff_soft_threshold_late_payload_cert() {
+    // A soft-threshold bundle for a period far ahead of the player's current
+    // period must fast-forward the player into that period (`enter_period`,
+    // `player.rs`'s `EventType::SoftThreshold` handler: `self.period <
+    // e.period` -> `enter_period`). Since no proposal vote/payload has been
+    // seen yet, the proposal isn't committable at fast-forward time, so no
+    // cert vote issues immediately. The subsequent proposal vote and payload
+    // (delivered *after* the fast-forward, at the new period) must still
+    // resolve to a cert vote once the payload makes the proposal
+    // committable.
+    let r = Round(201221);
+    let p = algo_agreement::Period(0);
+    let future_p = algo_agreement::Period(100);
+    let params = test_params();
+    let (_player, mut machine, mut helper) = setup_p(r, p, SOFT, &params);
+
+    let payload = algo_agreement::test_support::make_random_proposal_payload(r);
+    let pv = payload.unauthenticated_proposal.value();
+
+    // Soft threshold at a far-future period arrives first.
+    send_bundle_verified(&mut machine, &mut helper, r, future_p, SOFT, pv);
+    assert_eq!(
+        machine.player().period,
+        future_p,
+        "player did not fast forward to new period"
+    );
+    assert!(
+        !contains_cert_vote_for(&machine, r, future_p, pv),
+        "no cert vote should issue before the payload is known; trace:\n{}",
+        machine.trace()
+    );
+
+    // Now dispatch the late proposal vote and payload at the new period.
+    send_votes(&mut machine, &mut helper, 1, r, future_p, PROPOSE, pv);
+    send_payload_verified(&mut machine, &payload);
+
+    assert!(
+        contains_cert_vote_for(&machine, r, future_p, pv),
+        "player should issue cert vote after late payload delivery; trace:\n{}",
+        machine.trace()
+    );
+    assert_eq!(
+        machine.player().period,
+        future_p,
+        "player did not remain fast forwarded to new period"
     );
 }

@@ -1374,4 +1374,80 @@ mod tests {
         let v1 = ev.v1();
         assert_eq!(v1.raw_vote.proposal, test_proposal_2());
     }
+
+    // ---- ProposalVoteCounter msgpack codec parity ----
+    //
+    // Port of go-algorand's `agreement/msgp_gen_test.go`'s
+    // `TestMarshalUnmarshalproposalVoteCounter` /
+    // `TestRandomizedEncodingproposalVoteCounter`. `ProposalVoteCounter` is
+    // production state persisted as part of `VoteTracker` (not test-only
+    // scaffolding), so its msgpack round trip is pinned directly here.
+
+    #[test]
+    fn proposal_vote_counter_marshal_unmarshal_msgpack_roundtrip() {
+        let mut votes = HashMap::new();
+        let sender = Address([0x11; 32]);
+        votes.insert(
+            sender,
+            make_vote(sender, Round(5), Period(0), SOFT, test_proposal(), 7),
+        );
+        let counter = ProposalVoteCounter { count: 42, votes };
+
+        let bytes = rmp_serde::to_vec_named(&counter).expect("msgpack serialize");
+        let round_tripped: ProposalVoteCounter =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped.count, counter.count);
+        assert_eq!(round_tripped.votes.len(), counter.votes.len());
+        for (addr, vote) in &counter.votes {
+            let decoded_vote = round_tripped.votes.get(addr).expect("sender present");
+            assert_eq!(decoded_vote.raw_vote, vote.raw_vote);
+        }
+
+        let empty = ProposalVoteCounter::default();
+        let bytes = rmp_serde::to_vec_named(&empty).expect("msgpack serialize");
+        let round_tripped: ProposalVoteCounter =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped.count, 0);
+        assert!(round_tripped.votes.is_empty());
+    }
+
+    #[test]
+    fn proposal_vote_counter_randomized_msgpack_roundtrip() {
+        struct TestLcg(u64);
+        impl TestLcg {
+            fn next_u64(&mut self) -> u64 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                self.0
+            }
+        }
+        let mut rng = TestLcg(0x9E37_79B9_7F4A_7C15);
+
+        for n in 0..16u8 {
+            let mut votes = HashMap::new();
+            for i in 0..(n % 4) {
+                let sender = Address([i.wrapping_add(n).wrapping_add(1); 32]);
+                votes.insert(
+                    sender,
+                    make_vote(
+                        sender,
+                        Round(rng.next_u64()),
+                        Period(rng.next_u64() % 10),
+                        SOFT,
+                        test_proposal(),
+                        rng.next_u64() % 1000,
+                    ),
+                );
+            }
+            let counter = ProposalVoteCounter {
+                count: rng.next_u64(),
+                votes,
+            };
+
+            let bytes = rmp_serde::to_vec_named(&counter).expect("msgpack serialize");
+            let round_tripped: ProposalVoteCounter =
+                rmp_serde::from_slice(&bytes).expect("msgpack decode");
+            assert_eq!(round_tripped.count, counter.count);
+            assert_eq!(round_tripped.votes.len(), counter.votes.len());
+        }
+    }
 }
