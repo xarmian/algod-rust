@@ -1143,6 +1143,62 @@ mod tests {
         assert!(dialer.connected_peers().contains(&listener_peer_id));
     }
 
+    /// Go: `TestP2PGetPeersTransportConnections` (`network/p2pNetwork_test.go`)
+    /// — asserts a "transport connections" view distinct from the
+    /// gossip-peer view: exactly one connection is enumerated per side,
+    /// each carrying the correct direction (in on the listener, out on the
+    /// dialer), and the count is zero before the connection exists.
+    ///
+    /// `algo-p2p` has no separate gossip-peer abstraction of its own (that
+    /// layer lives above this crate, in the daemon's dual-transport
+    /// wiring), so [`P2pHost::connected_peers`] *is* this crate's
+    /// transport-connections accessor — this test is its dedicated unit
+    /// test: empty before dialing, and after a real connection is
+    /// established, each side's `connected_peers()` contains exactly the
+    /// other side's `PeerId` and nothing else.
+    #[tokio::test]
+    async fn connected_peers_reflects_established_connection_symmetrically() {
+        let mut listener = new_test_host();
+        let mut dialer = new_test_host();
+
+        assert!(listener.connected_peers().is_empty());
+        assert!(dialer.connected_peers().is_empty());
+
+        let listen_addr = start_listening(&mut listener).await;
+        let listener_peer_id = listener.peer_id();
+        let dialer_peer_id = dialer.peer_id();
+        let dial_addr = listen_addr.with(libp2p::multiaddr::Protocol::P2p(listener_peer_id));
+        dialer.dial(dial_addr).expect("dial should be accepted");
+
+        let mut dialer_connected = false;
+        let mut listener_connected = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !(dialer_connected && listener_connected) {
+            tokio::select! {
+                ev = dialer.next_event() => {
+                    if let SwarmEvent::ConnectionEstablished { .. } = ev { dialer_connected = true; }
+                }
+                ev = listener.next_event() => {
+                    if let SwarmEvent::ConnectionEstablished { .. } = ev { listener_connected = true; }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out before both sides observed ConnectionEstablished");
+                }
+            }
+        }
+
+        assert_eq!(
+            dialer.connected_peers(),
+            vec![listener_peer_id],
+            "the dialer's transport-connections view must contain exactly the listener"
+        );
+        assert_eq!(
+            listener.connected_peers(),
+            vec![dialer_peer_id],
+            "the listener's transport-connections view must contain exactly the dialer"
+        );
+    }
+
     /// TDD anchor for issue #1067: two `P2pHost`s that **each** dial the
     /// other at (effectively) the same instant — mirroring
     /// `--p2p-bootstrap-peers` configuring both sides of a pair to list
@@ -1766,6 +1822,44 @@ mod tests {
             .await;
 
         assert!(found.is_empty());
+    }
+
+    /// Go: `TestCapabilities_ExcludesSelf` (`network/p2p/capabilities_test.go`)
+    /// — a node performing a capability lookup never finds itself among the
+    /// results, even when it is itself a provider for that capability.
+    ///
+    /// Rather than go's two-node cluster (a peer discovers a real remote
+    /// provider, and separately never finds itself), this exercises the
+    /// exclusion directly and more strongly: a single host both advertises
+    /// and immediately queries the *same* capability against itself.
+    /// `start_providing` populates this host's own local Kademlia provider
+    /// store, so `get_providers`'s first (local) answer would include our
+    /// own `PeerId` if [`P2pHost::find_peers_for_capability`]'s
+    /// `*peer != local_peer_id` filter (`host.rs`, the loop over
+    /// `FoundProviders`) were ever removed or broken — this is the direct
+    /// regression guard for that filter.
+    #[tokio::test]
+    async fn find_peers_for_capability_excludes_self() {
+        let mut host = new_test_host();
+        host.set_dht_mode(Some(kad::Mode::Server));
+        let self_peer_id = host.peer_id();
+
+        host.advertise_capability(crate::capabilities::Capability::Archival)
+            .await
+            .expect("advertise should succeed against a store with capacity");
+
+        let found = host
+            .find_peers_for_capability(
+                crate::capabilities::Capability::Archival,
+                5,
+                Duration::from_millis(500),
+            )
+            .await;
+
+        assert!(
+            !found.contains(&self_peer_id),
+            "a node must never find itself when searching for a capability it advertises, got: {found:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

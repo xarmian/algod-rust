@@ -251,6 +251,47 @@ mod tests {
         assert!(result.is_err(), "missing explicit key path should error");
     }
 
+    /// Go: `TestGetPrivKeyUserSupplied` (`network/p2p/peerID_test.go`) — the
+    /// happy-path branch of `GetPrivKey`: when `P2PPrivateKeyLocation` (here,
+    /// `private_key_path`) points at an existing user-supplied key file,
+    /// `GetPrivKey` loads exactly that key rather than falling back to the
+    /// default path or generating a fresh one. Only the missing-file error
+    /// path (`explicit_private_key_path_errors_when_missing`, just above)
+    /// was previously exercised — this covers the success branch, mirroring
+    /// go's "write a key to a custom path, then confirm GetPrivKey loads it"
+    /// sequence via this module's own `write_keypair_to_file`/
+    /// `load_keypair_from_file` pair.
+    #[test]
+    fn explicit_private_key_path_loads_user_supplied_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-p2p-identity-user-supplied-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let custom_path = dir.join("foobar.pem");
+
+        // Generate a key and write it to the custom path ourselves (mirrors
+        // go's `generatePrivKey` + `writePrivateKeyToFile`), independent of
+        // `get_or_create_keypair`'s own generation path.
+        let generated = Keypair::generate_ed25519();
+        write_keypair_to_file(&custom_path, &generated).expect("write should succeed");
+
+        let cfg = IdentityConfig {
+            private_key_path: Some(custom_path),
+            data_dir: None,
+            persist_peer_id: false,
+        };
+        let loaded = get_or_create_keypair(&cfg).expect("should load the user-supplied key");
+
+        assert_eq!(
+            generated.public().to_peer_id(),
+            loaded.public().to_peer_id(),
+            "GetPrivKey must load exactly the user-supplied key, not generate a new one"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // -----------------------------------------------------------------------
     // `to_identity_signing_key` — mirrors go's `TestPeerIDChallengeSigner`
     // (`network/p2p/peerID_test.go`).

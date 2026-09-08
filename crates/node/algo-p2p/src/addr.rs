@@ -279,4 +279,119 @@ mod tests {
         assert_eq!(url.host_str(), Some("relay.example.com"));
         assert_eq!(url.port(), Some(4160));
     }
+
+    // -------------------------------------------------------------------
+    // Go: `TestPeerInfoFromAddr` / `TestPeerInfoFromAddrs`
+    // (`network/p2p/peerstore/utils_test.go`) and
+    // `TestP2PMultiaddrConversionToFrom` (`network/p2pNetwork_test.go`).
+    //
+    // go-libp2p needs an explicit `peer.AddrInfoFromP2pAddr`/
+    // `AddrInfoToP2pAddrs` step to split a `/.../p2p/<id>` multiaddr into
+    // a dialable `peer.AddrInfo` (and back) before its `host.Connect` will
+    // accept it. rust-libp2p has no equivalent split step: `Swarm::dial`
+    // (this crate's `P2pHost::dial`, `host.rs`) takes the *whole*
+    // multiaddr — including a trailing `/p2p/<peer-id>` component — and
+    // resolves the target `PeerId` internally
+    // (`DialOpts::unknown_peer_id().address(addr)`), so there is no
+    // isolated conversion function to port 1:1 (this row's own note
+    // already says as much). What both go tests actually pin down is
+    // parse validity/error-shape for the same table of multiaddr strings,
+    // and that a valid multiaddr with a `/p2p/<id>` suffix round-trips
+    // through parsing unchanged — both of which map directly onto
+    // `Multiaddr::from_str` (the primitive `is_multiaddr` above already
+    // wraps), so this ports that behavior instead of a function that
+    // doesn't exist here.
+    // -------------------------------------------------------------------
+
+    /// Go: `TestPeerInfoFromAddr`. Same table of valid/invalid multiaddr
+    /// strings; asserts parse success/failure exactly like go's
+    /// `PeerInfoFromAddr` (which itself starts with `ma.NewMultiaddr`).
+    #[test]
+    fn multiaddr_from_str_matches_peer_info_from_addr_table() {
+        let cases: &[(&str, bool)] = &[
+            ("/ip4/", false),
+            ("/ip4/1.2.3.4/tcp/AAAAAAA", false),
+            ("/ip4/1.2.3.4/tcp/443/AAAAAAA", false),
+            (
+                "/badprotocol/1.2.3.4/tcp/443/wss/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+                false,
+            ),
+            ("/ip4/1.2.3.4/tcp/4041/p2p/AAAAAAA", false),
+            (
+                "/ip4/ams-2.bootstrap.libp2p.io/tcp/443/wss/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+                false,
+            ),
+            (
+                "/dns4/ams-2.bootstrap.libp2p.io/tcp/443/wss/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+                true,
+            ),
+            (
+                "/ip4/147.75.83.83/tcp/4001/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Na",
+                true,
+            ),
+        ];
+
+        for (addr, should_parse) in cases {
+            let result = Multiaddr::from_str(addr);
+            assert_eq!(
+                result.is_ok(),
+                *should_parse,
+                "{addr}: expected parse success = {should_parse}, got {result:?}"
+            );
+        }
+    }
+
+    /// Go: `TestPeerInfoFromAddrs` — given a mixed batch of valid and
+    /// malformed multiaddr strings, exactly the valid ones parse and the
+    /// malformed ones are individually reported.
+    #[test]
+    fn multiaddr_from_str_partitions_a_batch_like_peer_info_from_addrs() {
+        let addrs = [
+            "/ip4/1.2.3.4/tcp/4041/p2p/AAAAAAA",
+            "/ip4/1.2.3.4/tcp/AAAAAAA",
+            "/dns4/ams-2.bootstrap.libp2p.io/tcp/443/wss/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+            "/ip4/147.75.83.83/tcp/4001/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Na",
+        ];
+
+        let (parsed, malformed): (Vec<_>, Vec<_>) =
+            addrs.iter().partition(|a| Multiaddr::from_str(a).is_ok());
+
+        assert_eq!(parsed.len(), 2, "expected exactly 2 valid multiaddrs");
+        assert_eq!(
+            malformed.len(),
+            2,
+            "expected exactly 2 malformed multiaddrs"
+        );
+        assert!(malformed.contains(&&"/ip4/1.2.3.4/tcp/4041/p2p/AAAAAAA"));
+        assert!(malformed.contains(&&"/ip4/1.2.3.4/tcp/AAAAAAA"));
+    }
+
+    /// Go: `TestP2PMultiaddrConversionToFrom` — a multiaddr carrying a
+    /// `/p2p/<peer-id>` suffix round-trips through parsing unchanged
+    /// (`ma.String() == a`), and the peer ID embedded in it is
+    /// extractable. In go this requires the explicit
+    /// `AddrInfoFromP2pAddr`/`AddrInfoToP2pAddrs` round trip (which drops
+    /// and restores the p2p component); here `Multiaddr` keeps the whole
+    /// address as one value and `iter()` finds the embedded `PeerId`
+    /// directly, without ever needing to split it off.
+    #[test]
+    fn multiaddr_with_peer_id_round_trips_and_extracts_peer_id() {
+        let a = "/ip4/192.168.1.1/tcp/8180/p2p/Qmewz5ZHN1AAGTarRbMupNPbZRfg3p5jUGoJ3JYEatJVVk";
+        let ma = Multiaddr::from_str(a).expect("valid multiaddr");
+        assert_eq!(
+            ma.to_string(),
+            a,
+            "round trip through parsing must be lossless"
+        );
+
+        let peer_id = ma.iter().find_map(|proto| match proto {
+            libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
+            _ => None,
+        });
+        assert_eq!(
+            peer_id.map(|p| p.to_string()),
+            Some("Qmewz5ZHN1AAGTarRbMupNPbZRfg3p5jUGoJ3JYEatJVVk".to_string()),
+            "the /p2p/<id> suffix must yield the same PeerId go's AddrInfoFromP2pAddr extracts"
+        );
+    }
 }
