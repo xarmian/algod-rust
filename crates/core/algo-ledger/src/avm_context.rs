@@ -6173,6 +6173,22 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         self.app_mode
     }
 
+    // An Application-mode program's own transaction is, by construction, an
+    // `ApplicationCallTx`, which unconditionally raises go-algorand's
+    // `computeMinAvmVersion` floor to `appsEnabledVersion` (=2) for every
+    // program run against it (`data/transactions/logic/eval.go`). Approval
+    // and clear-state programs are only ever run in app mode (never
+    // LogicSig), so this floor applies unconditionally here; LogicSig
+    // evaluation computes its own group-wide floor separately (see
+    // `logicsig_context::compute_min_avm_version`).
+    fn min_avm_version(&self) -> u64 {
+        if self.app_mode {
+            2
+        } else {
+            0
+        }
+    }
+
     fn current_app_id(&self) -> u64 {
         self.app_id
     }

@@ -266,6 +266,11 @@ pub fn run_approval_program(
     if let Some(&version) = program.first() {
         crate::validator::check_pre_shared_resources_access(version, ctx.txn_has_access())?;
     }
+    // Reject programs below the group's minimum required AVM version
+    // (go-algorand's computeMinAvmVersion floor; see AvmContext::min_avm_version).
+    if let Some(&version) = program.first() {
+        crate::validator::check_min_avm_version(version, ctx.min_avm_version())?;
+    }
 
     let parsed = bytecode::parse(program)?;
     let budget_before = budget.remaining();
@@ -366,6 +371,13 @@ pub fn run_clear_state_program(
     if !program.is_empty()
         && crate::validator::check_pre_shared_resources_access(program[0], ctx.txn_has_access())
             .is_err()
+    {
+        return AvmResult::empty();
+    }
+    // Reject programs below the group's minimum required AVM version
+    // (go-algorand's computeMinAvmVersion floor; see AvmContext::min_avm_version).
+    if !program.is_empty()
+        && crate::validator::check_min_avm_version(program[0], ctx.min_avm_version()).is_err()
     {
         return AvmResult::empty();
     }
@@ -581,6 +593,15 @@ pub fn run_approval_program_with_tracer(
             return Err(e);
         }
     }
+    // Reject programs below the group's minimum required AVM version
+    // (go-algorand's computeMinAvmVersion floor; see AvmContext::min_avm_version).
+    if let Some(&version) = program.first() {
+        if let Err(e) = crate::validator::check_min_avm_version(version, ctx.min_avm_version()) {
+            tracer.before_program(ProgramType::Approval, program_trace_hash(program));
+            tracer.after_program(ProgramType::Approval, false, Some(&e.to_string()));
+            return Err(e);
+        }
+    }
 
     let parsed = match bytecode::parse(program) {
         Ok(p) => p,
@@ -667,6 +688,15 @@ pub fn run_clear_state_program_with_tracer(
         if let Err(e) =
             crate::validator::check_program_version_allowed(program[0], consensus.logic_sig_version)
         {
+            tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
+            tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
+            return AvmResult::empty();
+        }
+    }
+    // Reject programs below the group's minimum required AVM version
+    // (go-algorand's computeMinAvmVersion floor; see AvmContext::min_avm_version).
+    if !program.is_empty() {
+        if let Err(e) = crate::validator::check_min_avm_version(program[0], ctx.min_avm_version()) {
             tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
             tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
             return AvmResult::empty();
