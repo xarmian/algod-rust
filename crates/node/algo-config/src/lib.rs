@@ -858,6 +858,204 @@ static TX_BACKLOG_APP_RATE_LIMITING_CONGESTION_PCT: VersionedDefault<i64> =
 static ENABLE_TX_BACKLOG_APP_RATE_LIMITING: VersionedDefault<bool> =
     VersionedDefault::new(&[(32, || true)]);
 
+/// Go: `TxPoolSize int` `version[0]:"50000" version[5]:"15000" version[23]:"75000"`
+/// (`localTemplate.go:273-274`). Issue #1149: wired into
+/// `algo_pool::PoolConfig::pool_size` at the two real node-startup call
+/// sites (`bin/algod-rust/src/commands/node.rs`,
+/// `bin/algod-rust/src/commands/participate.rs`), which previously always
+/// used `PoolConfig::default()`'s hardcoded `75_000` (already matching
+/// this field's latest-version default, so the wiring only changes
+/// behavior for operators who override it).
+static TX_POOL_SIZE: VersionedDefault<i64> =
+    VersionedDefault::new(&[(0, || 50_000), (5, || 15_000), (23, || 75_000)]);
+
+/// Go: `TxPoolExponentialIncreaseFactor uint64` `version[0]:"2"`
+/// (`localTemplate.go:231-232`, "should always be 2 in production").
+/// Issue #1149: wired into
+/// `algo_pool::PoolConfig::exponential_increase_factor` alongside
+/// [`TX_POOL_SIZE`].
+static TX_POOL_EXPONENTIAL_INCREASE_FACTOR: VersionedDefault<u64> =
+    VersionedDefault::new(&[(0, || 2)]);
+
+/// Go: `ProposalAssemblyTime time.Duration` `version[19]:"250000000"
+/// version[23]:"500000000"` (`localTemplate.go:538-539`). Nanoseconds (go's
+/// raw `time.Duration` JSON encoding), matching
+/// [`MAX_CATCHPOINT_DOWNLOAD_DURATION`]'s representation. Issue #1149:
+/// wired into `algo_pool::PoolConfig::proposal_assembly_time` at the same
+/// two call sites as [`TX_POOL_SIZE`] — previously always
+/// `PoolConfig::default()`'s hardcoded 500ms (already matching this
+/// field's latest-version default).
+static PROPOSAL_ASSEMBLY_TIME: VersionedDefault<i64> =
+    VersionedDefault::new(&[(19, || 250_000_000), (23, || 500_000_000)]);
+
+/// Go: `VerifiedTranscationsCacheSize int` `version[14]:"30000"
+/// version[23]:"150000"` (`localTemplate.go:475-476`). Issue #1149: wired
+/// into `PoolLedgerAdapter`'s verified-transaction-cache capacity
+/// (`bin/algod-rust/src/commands/participate.rs`,
+/// `bin/algod-rust/src/node_interface_impl.rs`,
+/// `bin/algod-rust/src/commands/node.rs`) — previously always the
+/// hardcoded `VERIFIED_TXN_CACHE_SIZE = 5000` constant (an interim
+/// placeholder chosen before this field existed at all, undersized
+/// relative to go's real default). Porting the field now makes the
+/// node-startup default match go's `150_000` at the current version,
+/// while still letting operators override it via `config.json` like
+/// every other versioned field.
+static VERIFIED_TRANSCATIONS_CACHE_SIZE: VersionedDefault<i64> =
+    VersionedDefault::new(&[(14, || 30_000), (23, || 150_000)]);
+
+// --- Issue #1149: formally-retired fields (documented no-ops) --------------
+//
+// The 15 fields below all round-trip through `config.json` (matching go's
+// exact field name and default) but are deliberately, permanently ignored
+// by algod-rust, following issue #1137's `LogFileDir`/`LogArchiveDir`
+// precedent. Each doc comment records why: either the underlying go
+// subsystem has no algod-rust equivalent by design (a separate Prometheus
+// exporter process, go's own deprecated-and-unused fields, a dev/test-only
+// bypass algod-rust never exposes), or (for three of them) the field has
+// already been *removed* from go-algorand's own `config.Local` as of the
+// current `v5.0.0-stable` pin — dead upstream too, not just here.
+
+/// Go: `CatchupBlockValidateMode int` `version[16]:"0"` (`localTemplate.go:488-500`,
+/// "a development and testing configuration used by the catchup service").
+/// **Formally retired as a no-op** (issue #1149): every bit this field can
+/// set (skip certificate verification / skip payset-hash verification /
+/// verify transaction signatures / verify apply data) trades correctness
+/// for catchup speed during development. algod-rust's catchup service
+/// always performs full validation — there is no dev-mode fast-path to
+/// gate, and none is planned, since weakening catchup validation is a
+/// security-relevant footgun this repo deliberately doesn't expose as a
+/// config knob.
+static CATCHUP_BLOCK_VALIDATE_MODE: VersionedDefault<i64> = VersionedDefault::new(&[(16, || 0)]);
+
+/// Go: `DeadlockDetection int` `version[1]:"0"` (`localTemplate.go:300-302`).
+/// **Formally retired as a no-op** (issue #1149): gates go's
+/// `go-deadlock`-based mutex-instrumentation debug build. Rust's ownership
+/// model statically prevents the double-lock/use-after-free bug class that
+/// tool targets, and algod-rust has no equivalent runtime lock-order
+/// tracer (tokio's async `Mutex`/`RwLock` have no comparable
+/// instrumentation hook) to wire this into — no near-term plan to add one
+/// purely to host a legacy debug knob.
+static DEADLOCK_DETECTION: VersionedDefault<i64> = VersionedDefault::new(&[(1, || 0)]);
+
+/// Go: `DeadlockDetectionThreshold int` `version[20]:"30"`
+/// (`localTemplate.go:304-305`). **Formally retired as a no-op** — see
+/// [`DEADLOCK_DETECTION`]'s doc comment; this is that debug feature's
+/// companion threshold-in-seconds field.
+static DEADLOCK_DETECTION_THRESHOLD: VersionedDefault<i64> = VersionedDefault::new(&[(20, || 30)]);
+
+/// Go: `EnableBlockServiceFallbackToArchiver bool` (present through at
+/// least go-algorand's v27 config snapshot; **no longer exists in
+/// `config/localTemplate.go` at the current `v5.0.0-stable` pin** —
+/// go-algorand itself removed this field from `config.Local`, so an old
+/// `config.json` with this key round-trips through Go's lenient
+/// unknown-field JSON decoding the same way it does here). **Formally
+/// retired as a no-op** (issue #1149): dead upstream, not just in
+/// algod-rust — no live go-algorand behavior remains for it to mirror.
+static ENABLE_BLOCK_SERVICE_FALLBACK_TO_ARCHIVER: VersionedDefault<bool> =
+    VersionedDefault::new(&[(0, || true)]);
+
+/// Go: `EnableCatchupFromArchiveServers bool` (present through at least
+/// go-algorand's v27 config snapshot; **no longer exists in
+/// `config/localTemplate.go` at the current `v5.0.0-stable` pin**).
+/// **Formally retired as a no-op** — see
+/// [`ENABLE_BLOCK_SERVICE_FALLBACK_TO_ARCHIVER`]'s doc comment; dead
+/// upstream too.
+static ENABLE_CATCHUP_FROM_ARCHIVE_SERVERS: VersionedDefault<bool> =
+    VersionedDefault::new(&[(0, || false)]);
+
+/// Go: `IsIndexerActive bool` (present through at least go-algorand's v27
+/// config snapshot; **no longer exists in `config/localTemplate.go` at the
+/// current `v5.0.0-stable` pin**). **Formally retired as a no-op** — see
+/// [`ENABLE_BLOCK_SERVICE_FALLBACK_TO_ARCHIVER`]'s doc comment; dead
+/// upstream too. (algod-rust has no built-in indexer to gate in any case —
+/// indexing is an external service in this project's architecture, same
+/// as go-algorand's.)
+static IS_INDEXER_ACTIVE: VersionedDefault<bool> = VersionedDefault::new(&[(0, || false)]);
+
+/// Go: `NetworkMessageTraceServer string` `version[13]:""`
+/// (`localTemplate.go:472-473`, "a host:port address to report graph
+/// propagation trace info to"). **Formally retired as a no-op** (issue
+/// #1149): a debug feature that streams gossip propagation traces to a
+/// separate trace-collector server. algod-rust has no such trace-collector
+/// integration and none is planned — the operational debugging story here
+/// is `tracing` spans/logs, not a bespoke wire protocol to a dedicated
+/// server.
+static NETWORK_MESSAGE_TRACE_SERVER: VersionedDefault<String> =
+    VersionedDefault::new(&[(13, || String::new())]);
+
+/// Go: `NodeExporterPath string` `version[0]:"./node_exporter"`
+/// (`localTemplate.go:225-226`). **Formally retired as a no-op** (issue
+/// #1149): the path to a *separate* Prometheus `node_exporter` binary
+/// go-algorand's tooling can spawn alongside itself. algod-rust exposes
+/// its own `/metrics` endpoint directly (`algo-rest-api`'s
+/// `handlers::metrics`) rather than shelling out to spawn an external
+/// exporter process — there is no child-process-launching subsystem here
+/// for this field to configure the path of.
+static NODE_EXPORTER_PATH: VersionedDefault<String> =
+    VersionedDefault::new(&[(0, || "./node_exporter".to_string())]);
+
+/// Go: `NodeExporterListenAddress string` `version[0]:":9100"`
+/// (`localTemplate.go:210-211`). **Formally retired as a no-op** — see
+/// [`NODE_EXPORTER_PATH`]'s doc comment; this is that external process's
+/// listen address, equally inapplicable.
+static NODE_EXPORTER_LISTEN_ADDRESS: VersionedDefault<String> =
+    VersionedDefault::new(&[(0, || ":9100".to_string())]);
+
+/// Go: `PeerPingPeriodSeconds int` `version[0]:"0"` (`localTemplate.go:70-71`,
+/// go's own comment: "PeerPingPeriodSeconds is deprecated and unused").
+/// **Formally retired as a no-op** (issue #1149): go-algorand itself has
+/// stopped using this field, so there is no live upstream behavior for
+/// algod-rust to mirror either.
+static PEER_PING_PERIOD_SECONDS: VersionedDefault<i64> = VersionedDefault::new(&[(0, || 0)]);
+
+/// Go: `ReconnectTime time.Duration` `version[0]:"60" version[1]:"60000000000"`
+/// (`localTemplate.go:57-58`, go's own comment: "ReconnectTime is
+/// deprecated and unused"). Nanoseconds (go's raw `time.Duration` JSON
+/// encoding) from version 1 onward. **Formally retired as a no-op** (issue
+/// #1149): deprecated-and-unused upstream, same as
+/// [`PEER_PING_PERIOD_SECONDS`]; algod-rust's own reconnection logic
+/// (`algo_network::reconnect::ExponentialBackoff`) uses its own
+/// jittered-exponential-backoff parameters instead of a fixed reconnect
+/// interval, matching go's actual (not this stale field's) reconnection
+/// behavior.
+static RECONNECT_TIME: VersionedDefault<i64> =
+    VersionedDefault::new(&[(0, || 60), (1, || 60_000_000_000)]);
+
+/// Go: `RunHosted bool` `version[3]:"false"` (`localTemplate.go:307-308`,
+/// "configures whether to run algod in Hosted mode (under algoh).
+/// Observed by `goal` for now."). **Formally retired as a no-op** (issue
+/// #1149): `algoh` (the go-algorand host supervisor daemon that manages
+/// multiple `algod` instances) has no algod-rust equivalent and none is
+/// planned — this repo's process-supervision story is
+/// container/systemd-level, not an in-repo hosting daemon.
+static RUN_HOSTED: VersionedDefault<bool> = VersionedDefault::new(&[(3, || false)]);
+
+/// Go: `StorageEngine string` `version[28]:"sqlite"` (`localTemplate.go:604-608`,
+/// "allows to control which type of storage to use for the ledger").
+/// **Formally retired as a no-op** (issue #1149): algod-rust's ledger has
+/// exactly one storage backend (`SqliteLedger`) with no pluggable-engine
+/// abstraction — there is nothing for this field to select between. If a
+/// second backend is ever added, this field should be revisited as a real
+/// selector at that point rather than spending the effort on the
+/// abstraction now.
+static STORAGE_ENGINE: VersionedDefault<String> =
+    VersionedDefault::new(&[(28, || "sqlite".to_string())]);
+
+/// Go: `SuggestedFeeBlockHistory int` `version[0]:"3"` (`localTemplate.go:234-235`,
+/// go's own comment: "SuggestedFeeBlockHistory is deprecated and unused").
+/// **Formally retired as a no-op** (issue #1149): deprecated-and-unused
+/// upstream. algod-rust's suggested-fee logic (`algo-rest-api`) doesn't
+/// use a block-history window at all.
+static SUGGESTED_FEE_BLOCK_HISTORY: VersionedDefault<i64> = VersionedDefault::new(&[(0, || 3)]);
+
+/// Go: `SuggestedFeeSlidingWindowSize uint32` `version[3]:"50"`
+/// (`localTemplate.go:321-322`, go's own comment: "SuggestedFeeSlidingWindowSize
+/// is deprecated and unused"). **Formally retired as a no-op** (issue
+/// #1149): deprecated-and-unused upstream, same as
+/// [`SUGGESTED_FEE_BLOCK_HISTORY`].
+static SUGGESTED_FEE_SLIDING_WINDOW_SIZE: VersionedDefault<u32> =
+    VersionedDefault::new(&[(3, || 50)]);
+
 /// Go: `EnableAssembleStats bool` `version[0]:""` (`localTemplate.go:315-316`).
 /// **Documented no-op** — see the module-level note above.
 static ENABLE_ASSEMBLE_STATS: VersionedDefault<bool> = VersionedDefault::new(&[(0, || false)]);
@@ -1491,6 +1689,63 @@ fn default_tx_backlog_app_rate_limiting_congestion_pct() -> i64 {
 }
 fn default_enable_tx_backlog_app_rate_limiting() -> bool {
     ENABLE_TX_BACKLOG_APP_RATE_LIMITING.at(LATEST_VERSION)
+}
+fn default_tx_pool_size() -> i64 {
+    TX_POOL_SIZE.at(LATEST_VERSION)
+}
+fn default_tx_pool_exponential_increase_factor() -> u64 {
+    TX_POOL_EXPONENTIAL_INCREASE_FACTOR.at(LATEST_VERSION)
+}
+fn default_proposal_assembly_time() -> i64 {
+    PROPOSAL_ASSEMBLY_TIME.at(LATEST_VERSION)
+}
+fn default_verified_transcations_cache_size() -> i64 {
+    VERIFIED_TRANSCATIONS_CACHE_SIZE.at(LATEST_VERSION)
+}
+fn default_catchup_block_validate_mode() -> i64 {
+    CATCHUP_BLOCK_VALIDATE_MODE.at(LATEST_VERSION)
+}
+fn default_deadlock_detection() -> i64 {
+    DEADLOCK_DETECTION.at(LATEST_VERSION)
+}
+fn default_deadlock_detection_threshold() -> i64 {
+    DEADLOCK_DETECTION_THRESHOLD.at(LATEST_VERSION)
+}
+fn default_enable_block_service_fallback_to_archiver() -> bool {
+    ENABLE_BLOCK_SERVICE_FALLBACK_TO_ARCHIVER.at(LATEST_VERSION)
+}
+fn default_enable_catchup_from_archive_servers() -> bool {
+    ENABLE_CATCHUP_FROM_ARCHIVE_SERVERS.at(LATEST_VERSION)
+}
+fn default_is_indexer_active() -> bool {
+    IS_INDEXER_ACTIVE.at(LATEST_VERSION)
+}
+fn default_network_message_trace_server() -> String {
+    NETWORK_MESSAGE_TRACE_SERVER.at(LATEST_VERSION)
+}
+fn default_node_exporter_path() -> String {
+    NODE_EXPORTER_PATH.at(LATEST_VERSION)
+}
+fn default_node_exporter_listen_address() -> String {
+    NODE_EXPORTER_LISTEN_ADDRESS.at(LATEST_VERSION)
+}
+fn default_peer_ping_period_seconds() -> i64 {
+    PEER_PING_PERIOD_SECONDS.at(LATEST_VERSION)
+}
+fn default_reconnect_time() -> i64 {
+    RECONNECT_TIME.at(LATEST_VERSION)
+}
+fn default_run_hosted() -> bool {
+    RUN_HOSTED.at(LATEST_VERSION)
+}
+fn default_storage_engine() -> String {
+    STORAGE_ENGINE.at(LATEST_VERSION)
+}
+fn default_suggested_fee_block_history() -> i64 {
+    SUGGESTED_FEE_BLOCK_HISTORY.at(LATEST_VERSION)
+}
+fn default_suggested_fee_sliding_window_size() -> u32 {
+    SUGGESTED_FEE_SLIDING_WINDOW_SIZE.at(LATEST_VERSION)
 }
 fn default_enable_assemble_stats() -> bool {
     ENABLE_ASSEMBLE_STATS.at(LATEST_VERSION)
@@ -2201,6 +2456,148 @@ pub struct Local {
     )]
     pub enable_tx_backlog_app_rate_limiting: bool,
 
+    /// Go: `TxPoolSize`. Issue #1149: wired into
+    /// `algo_pool::PoolConfig::pool_size` — see [`TX_POOL_SIZE`]'s doc
+    /// comment.
+    #[serde(rename = "TxPoolSize", default = "default_tx_pool_size")]
+    pub tx_pool_size: i64,
+
+    /// Go: `TxPoolExponentialIncreaseFactor`. Issue #1149: wired into
+    /// `algo_pool::PoolConfig::exponential_increase_factor` — see
+    /// [`TX_POOL_EXPONENTIAL_INCREASE_FACTOR`]'s doc comment.
+    #[serde(
+        rename = "TxPoolExponentialIncreaseFactor",
+        default = "default_tx_pool_exponential_increase_factor"
+    )]
+    pub tx_pool_exponential_increase_factor: u64,
+
+    /// Go: `ProposalAssemblyTime`. Issue #1149: wired into
+    /// `algo_pool::PoolConfig::proposal_assembly_time` — see
+    /// [`PROPOSAL_ASSEMBLY_TIME`]'s doc comment.
+    #[serde(
+        rename = "ProposalAssemblyTime",
+        default = "default_proposal_assembly_time"
+    )]
+    pub proposal_assembly_time: i64,
+
+    /// Go: `VerifiedTranscationsCacheSize`. Issue #1149: wired into
+    /// `PoolLedgerAdapter`'s verified-transaction-cache capacity — see
+    /// [`VERIFIED_TRANSCATIONS_CACHE_SIZE`]'s doc comment.
+    #[serde(
+        rename = "VerifiedTranscationsCacheSize",
+        default = "default_verified_transcations_cache_size"
+    )]
+    pub verified_transcations_cache_size: i64,
+
+    /// Go: `CatchupBlockValidateMode`. **Formally retired as a no-op**
+    /// (issue #1149) — see [`CATCHUP_BLOCK_VALIDATE_MODE`]'s doc comment.
+    #[serde(
+        rename = "CatchupBlockValidateMode",
+        default = "default_catchup_block_validate_mode"
+    )]
+    pub catchup_block_validate_mode: i64,
+
+    /// Go: `DeadlockDetection`. **Formally retired as a no-op** (issue
+    /// #1149) — see [`DEADLOCK_DETECTION`]'s doc comment.
+    #[serde(rename = "DeadlockDetection", default = "default_deadlock_detection")]
+    pub deadlock_detection: i64,
+
+    /// Go: `DeadlockDetectionThreshold`. **Formally retired as a no-op**
+    /// (issue #1149) — see [`DEADLOCK_DETECTION_THRESHOLD`]'s doc comment.
+    #[serde(
+        rename = "DeadlockDetectionThreshold",
+        default = "default_deadlock_detection_threshold"
+    )]
+    pub deadlock_detection_threshold: i64,
+
+    /// Go: `EnableBlockServiceFallbackToArchiver`. **Formally retired as a
+    /// no-op** (issue #1149), and dead upstream too — see
+    /// [`ENABLE_BLOCK_SERVICE_FALLBACK_TO_ARCHIVER`]'s doc comment.
+    #[serde(
+        rename = "EnableBlockServiceFallbackToArchiver",
+        default = "default_enable_block_service_fallback_to_archiver"
+    )]
+    pub enable_block_service_fallback_to_archiver: bool,
+
+    /// Go: `EnableCatchupFromArchiveServers`. **Formally retired as a
+    /// no-op** (issue #1149), and dead upstream too — see
+    /// [`ENABLE_CATCHUP_FROM_ARCHIVE_SERVERS`]'s doc comment.
+    #[serde(
+        rename = "EnableCatchupFromArchiveServers",
+        default = "default_enable_catchup_from_archive_servers"
+    )]
+    pub enable_catchup_from_archive_servers: bool,
+
+    /// Go: `IsIndexerActive`. **Formally retired as a no-op** (issue
+    /// #1149), and dead upstream too — see [`IS_INDEXER_ACTIVE`]'s doc
+    /// comment.
+    #[serde(rename = "IsIndexerActive", default = "default_is_indexer_active")]
+    pub is_indexer_active: bool,
+
+    /// Go: `NetworkMessageTraceServer`. **Formally retired as a no-op**
+    /// (issue #1149) — see [`NETWORK_MESSAGE_TRACE_SERVER`]'s doc comment.
+    #[serde(
+        rename = "NetworkMessageTraceServer",
+        default = "default_network_message_trace_server"
+    )]
+    pub network_message_trace_server: String,
+
+    /// Go: `NodeExporterPath`. **Formally retired as a no-op** (issue
+    /// #1149) — see [`NODE_EXPORTER_PATH`]'s doc comment.
+    #[serde(rename = "NodeExporterPath", default = "default_node_exporter_path")]
+    pub node_exporter_path: String,
+
+    /// Go: `NodeExporterListenAddress`. **Formally retired as a no-op**
+    /// (issue #1149) — see [`NODE_EXPORTER_LISTEN_ADDRESS`]'s doc comment.
+    #[serde(
+        rename = "NodeExporterListenAddress",
+        default = "default_node_exporter_listen_address"
+    )]
+    pub node_exporter_listen_address: String,
+
+    /// Go: `PeerPingPeriodSeconds`. **Formally retired as a no-op** (issue
+    /// #1149) — deprecated-and-unused upstream too, see
+    /// [`PEER_PING_PERIOD_SECONDS`]'s doc comment.
+    #[serde(
+        rename = "PeerPingPeriodSeconds",
+        default = "default_peer_ping_period_seconds"
+    )]
+    pub peer_ping_period_seconds: i64,
+
+    /// Go: `ReconnectTime`. **Formally retired as a no-op** (issue #1149)
+    /// — deprecated-and-unused upstream too, see [`RECONNECT_TIME`]'s doc
+    /// comment.
+    #[serde(rename = "ReconnectTime", default = "default_reconnect_time")]
+    pub reconnect_time: i64,
+
+    /// Go: `RunHosted`. **Formally retired as a no-op** (issue #1149) —
+    /// see [`RUN_HOSTED`]'s doc comment.
+    #[serde(rename = "RunHosted", default = "default_run_hosted")]
+    pub run_hosted: bool,
+
+    /// Go: `StorageEngine`. **Formally retired as a no-op** (issue #1149)
+    /// — see [`STORAGE_ENGINE`]'s doc comment.
+    #[serde(rename = "StorageEngine", default = "default_storage_engine")]
+    pub storage_engine: String,
+
+    /// Go: `SuggestedFeeBlockHistory`. **Formally retired as a no-op**
+    /// (issue #1149) — deprecated-and-unused upstream too, see
+    /// [`SUGGESTED_FEE_BLOCK_HISTORY`]'s doc comment.
+    #[serde(
+        rename = "SuggestedFeeBlockHistory",
+        default = "default_suggested_fee_block_history"
+    )]
+    pub suggested_fee_block_history: i64,
+
+    /// Go: `SuggestedFeeSlidingWindowSize`. **Formally retired as a no-op**
+    /// (issue #1149) — deprecated-and-unused upstream too, see
+    /// [`SUGGESTED_FEE_SLIDING_WINDOW_SIZE`]'s doc comment.
+    #[serde(
+        rename = "SuggestedFeeSlidingWindowSize",
+        default = "default_suggested_fee_sliding_window_size"
+    )]
+    pub suggested_fee_sliding_window_size: u32,
+
     /// Go: `EnableAssembleStats`. **Documented no-op** (issue #753) — see
     /// [`ENABLE_ASSEMBLE_STATS`]'s doc comment.
     #[serde(
@@ -2612,6 +3009,26 @@ impl Local {
             tx_backlog_app_rate_limiting_congestion_pct:
                 TX_BACKLOG_APP_RATE_LIMITING_CONGESTION_PCT.at(version),
             enable_tx_backlog_app_rate_limiting: ENABLE_TX_BACKLOG_APP_RATE_LIMITING.at(version),
+            tx_pool_size: TX_POOL_SIZE.at(version),
+            tx_pool_exponential_increase_factor: TX_POOL_EXPONENTIAL_INCREASE_FACTOR.at(version),
+            proposal_assembly_time: PROPOSAL_ASSEMBLY_TIME.at(version),
+            verified_transcations_cache_size: VERIFIED_TRANSCATIONS_CACHE_SIZE.at(version),
+            catchup_block_validate_mode: CATCHUP_BLOCK_VALIDATE_MODE.at(version),
+            deadlock_detection: DEADLOCK_DETECTION.at(version),
+            deadlock_detection_threshold: DEADLOCK_DETECTION_THRESHOLD.at(version),
+            enable_block_service_fallback_to_archiver: ENABLE_BLOCK_SERVICE_FALLBACK_TO_ARCHIVER
+                .at(version),
+            enable_catchup_from_archive_servers: ENABLE_CATCHUP_FROM_ARCHIVE_SERVERS.at(version),
+            is_indexer_active: IS_INDEXER_ACTIVE.at(version),
+            network_message_trace_server: NETWORK_MESSAGE_TRACE_SERVER.at(version),
+            node_exporter_path: NODE_EXPORTER_PATH.at(version),
+            node_exporter_listen_address: NODE_EXPORTER_LISTEN_ADDRESS.at(version),
+            peer_ping_period_seconds: PEER_PING_PERIOD_SECONDS.at(version),
+            reconnect_time: RECONNECT_TIME.at(version),
+            run_hosted: RUN_HOSTED.at(version),
+            storage_engine: STORAGE_ENGINE.at(version),
+            suggested_fee_block_history: SUGGESTED_FEE_BLOCK_HISTORY.at(version),
+            suggested_fee_sliding_window_size: SUGGESTED_FEE_SLIDING_WINDOW_SIZE.at(version),
             enable_assemble_stats: ENABLE_ASSEMBLE_STATS.at(version),
             enable_process_block_stats: ENABLE_PROCESS_BLOCK_STATS.at(version),
             max_block_history_lookback: MAX_BLOCK_HISTORY_LOOKBACK.at(version),
@@ -2997,6 +3414,85 @@ impl Local {
             migrate_field(
                 &mut self.enable_tx_backlog_app_rate_limiting,
                 &ENABLE_TX_BACKLOG_APP_RATE_LIMITING,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.tx_pool_size, &TX_POOL_SIZE, cur, next);
+            migrate_field(
+                &mut self.tx_pool_exponential_increase_factor,
+                &TX_POOL_EXPONENTIAL_INCREASE_FACTOR,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.proposal_assembly_time,
+                &PROPOSAL_ASSEMBLY_TIME,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.verified_transcations_cache_size,
+                &VERIFIED_TRANSCATIONS_CACHE_SIZE,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.catchup_block_validate_mode,
+                &CATCHUP_BLOCK_VALIDATE_MODE,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.deadlock_detection, &DEADLOCK_DETECTION, cur, next);
+            migrate_field(
+                &mut self.deadlock_detection_threshold,
+                &DEADLOCK_DETECTION_THRESHOLD,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_block_service_fallback_to_archiver,
+                &ENABLE_BLOCK_SERVICE_FALLBACK_TO_ARCHIVER,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.enable_catchup_from_archive_servers,
+                &ENABLE_CATCHUP_FROM_ARCHIVE_SERVERS,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.is_indexer_active, &IS_INDEXER_ACTIVE, cur, next);
+            migrate_field(
+                &mut self.network_message_trace_server,
+                &NETWORK_MESSAGE_TRACE_SERVER,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.node_exporter_path, &NODE_EXPORTER_PATH, cur, next);
+            migrate_field(
+                &mut self.node_exporter_listen_address,
+                &NODE_EXPORTER_LISTEN_ADDRESS,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.peer_ping_period_seconds,
+                &PEER_PING_PERIOD_SECONDS,
+                cur,
+                next,
+            );
+            migrate_field(&mut self.reconnect_time, &RECONNECT_TIME, cur, next);
+            migrate_field(&mut self.run_hosted, &RUN_HOSTED, cur, next);
+            migrate_field(&mut self.storage_engine, &STORAGE_ENGINE, cur, next);
+            migrate_field(
+                &mut self.suggested_fee_block_history,
+                &SUGGESTED_FEE_BLOCK_HISTORY,
+                cur,
+                next,
+            );
+            migrate_field(
+                &mut self.suggested_fee_sliding_window_size,
+                &SUGGESTED_FEE_SLIDING_WINDOW_SIZE,
                 cur,
                 next,
             );
@@ -4348,6 +4844,128 @@ mod tests {
         assert_eq!(cfg.log_archive_dir, "/data/logs/archive");
     }
 
+    /// TDD anchor for issue #1149's 15 formally-retired fields: every one
+    /// must still round-trip through `config.json` (an operator's explicit
+    /// override is preserved verbatim), even though none of them drive any
+    /// runtime behavior — matching `LogFileDir`/`LogArchiveDir`'s
+    /// documented-no-op precedent (issue #1137) above.
+    #[test]
+    fn issue_1149_retired_fields_round_trip_through_json_as_documented_no_ops() {
+        let cfg = Local::load_from_str(
+            r#"{
+                "CatchupBlockValidateMode": 7,
+                "DeadlockDetection": 1,
+                "DeadlockDetectionThreshold": 99,
+                "EnableBlockServiceFallbackToArchiver": false,
+                "EnableCatchupFromArchiveServers": true,
+                "IsIndexerActive": true,
+                "NetworkMessageTraceServer": "trace.example.com:1234",
+                "NodeExporterPath": "/usr/local/bin/node_exporter",
+                "NodeExporterListenAddress": ":9999",
+                "PeerPingPeriodSeconds": 42,
+                "ReconnectTime": 123456789,
+                "RunHosted": true,
+                "StorageEngine": "custom",
+                "SuggestedFeeBlockHistory": 10,
+                "SuggestedFeeSlidingWindowSize": 77
+            }"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.catchup_block_validate_mode, 7);
+        assert_eq!(cfg.deadlock_detection, 1);
+        assert_eq!(cfg.deadlock_detection_threshold, 99);
+        assert!(!cfg.enable_block_service_fallback_to_archiver);
+        assert!(cfg.enable_catchup_from_archive_servers);
+        assert!(cfg.is_indexer_active);
+        assert_eq!(cfg.network_message_trace_server, "trace.example.com:1234");
+        assert_eq!(cfg.node_exporter_path, "/usr/local/bin/node_exporter");
+        assert_eq!(cfg.node_exporter_listen_address, ":9999");
+        assert_eq!(cfg.peer_ping_period_seconds, 42);
+        assert_eq!(cfg.reconnect_time, 123_456_789);
+        assert!(cfg.run_hosted);
+        assert_eq!(cfg.storage_engine, "custom");
+        assert_eq!(cfg.suggested_fee_block_history, 10);
+        assert_eq!(cfg.suggested_fee_sliding_window_size, 77);
+    }
+
+    /// TDD anchor for issue #1149's retired-field defaults matching go's
+    /// `v27` fixture snapshot exactly (the same values
+    /// `config_v27_fixture_matches_versioned_default` no longer needs to
+    /// skip via `NOT_YET_PORTED`).
+    #[test]
+    fn issue_1149_retired_fields_default_at_version_27_matches_go_v27_fixture() {
+        let cfg = Local::default_at_version(27);
+        assert_eq!(cfg.catchup_block_validate_mode, 0);
+        assert_eq!(cfg.deadlock_detection, 0);
+        assert_eq!(cfg.deadlock_detection_threshold, 30);
+        assert!(cfg.enable_block_service_fallback_to_archiver);
+        assert!(!cfg.enable_catchup_from_archive_servers);
+        assert!(!cfg.is_indexer_active);
+        assert_eq!(cfg.network_message_trace_server, "");
+        assert_eq!(cfg.node_exporter_listen_address, ":9100");
+        assert_eq!(cfg.node_exporter_path, "./node_exporter");
+        assert_eq!(cfg.peer_ping_period_seconds, 0);
+        assert_eq!(cfg.reconnect_time, 60_000_000_000);
+        assert!(!cfg.run_hosted);
+        assert_eq!(cfg.storage_engine, "");
+        assert_eq!(cfg.suggested_fee_block_history, 3);
+        assert_eq!(cfg.suggested_fee_sliding_window_size, 50);
+    }
+
+    /// TDD anchor for issue #1149: `StorageEngine` has no `version[N]` tag
+    /// before 28, so an operator on an older-versioned `config.json` who
+    /// never set it sees an empty string until migration carries them past
+    /// version 28, exactly mirroring go's own behavior for a field whose
+    /// first tag is `version[28]`.
+    #[test]
+    fn storage_engine_migrates_to_sqlite_default_at_version_28() {
+        let cfg = Local::load_from_str(r#"{"Version": 20}"#).expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.storage_engine, "sqlite");
+    }
+
+    /// TDD anchor for issue #1149: `TxPoolSize` migrates through go's three
+    /// historical defaults (50 000 pre-version-5, 15 000 from version 5,
+    /// 75 000 from version 23) when an operator's `config.json` was never
+    /// touched, mirroring [`max_catchpoint_download_duration_migrates_from_2h_to_12h_default`].
+    #[test]
+    fn tx_pool_size_migrates_through_gos_historical_defaults() {
+        let cfg = Local::load_from_str(r#"{"Version": 0, "TxPoolSize": 50000}"#).expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.tx_pool_size, 75_000);
+
+        let cfg = Local::load_from_str(r#"{"Version": 5, "TxPoolSize": 15000}"#).expect("parses");
+        assert_eq!(cfg.tx_pool_size, 75_000);
+
+        let explicit =
+            Local::load_from_str(r#"{"Version": 0, "TxPoolSize": 12345}"#).expect("parses");
+        assert_eq!(
+            explicit.tx_pool_size, 12345,
+            "an explicit non-default override must survive migration"
+        );
+    }
+
+    /// TDD anchor for issue #1149: `ProposalAssemblyTime` migrates from
+    /// version 19's 250ms default to version 23's 500ms default.
+    #[test]
+    fn proposal_assembly_time_migrates_from_250ms_to_500ms_default() {
+        let cfg = Local::load_from_str(r#"{"Version": 19, "ProposalAssemblyTime": 250000000}"#)
+            .expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.proposal_assembly_time, 500_000_000);
+    }
+
+    /// TDD anchor for issue #1149: `VerifiedTranscationsCacheSize` migrates
+    /// from version 14's 30 000 default to version 23's 150 000 default.
+    #[test]
+    fn verified_transcations_cache_size_migrates_from_30000_to_150000_default() {
+        let cfg =
+            Local::load_from_str(r#"{"Version": 14, "VerifiedTranscationsCacheSize": 30000}"#)
+                .expect("parses");
+        assert_eq!(cfg.version, LATEST_VERSION);
+        assert_eq!(cfg.verified_transcations_cache_size, 150_000);
+    }
+
     /// TDD anchor for issue #953: the hot/cold/per-resource data-dir
     /// override fields must round-trip through `config.json` (partial
     /// overlay — only the fields present in the JSON change; the rest keep
@@ -4457,42 +5075,41 @@ mod tests {
         // actually has a field for -- still a real regression guard for
         // every field that *is* ported, matching this crate's field-by-field
         // audit approach elsewhere (`docs/PHASE16_VALIDATION.md`).
+        //
+        // Issue #1149 triaged the 34 fields that were here: 4 ported as real
+        // fields (`ProposalAssemblyTime`, `TxPoolSize`,
+        // `TxPoolExponentialIncreaseFactor`, `VerifiedTranscationsCacheSize`
+        // — removed from this list, wired into `algo_pool::PoolConfig`/
+        // `PoolLedgerAdapter` at node startup), 15 formally retired as
+        // documented no-op `Local` fields following issue #1137's
+        // `LogFileDir`/`LogArchiveDir` precedent (see each field's
+        // `VersionedDefault` doc comment for the retirement rationale —
+        // also removed from this list, since they now round-trip through
+        // `config.json` like every other field), and the remaining 15
+        // deferred to category-3 follow-up issues (a real `Local` field
+        // doesn't exist for them yet, so they stay listed below).
+        // `NetAddress` is a special case: issue #788 already decided it
+        // deliberately has no `Local` field at all (kept as a
+        // per-subcommand CLI flag instead — see the module-level doc
+        // comment's "Explicitly out of scope" section), so it stays listed
+        // here permanently, not as an open gap.
         const NOT_YET_PORTED: &[&str] = &[
             "AccountUpdatesStatsInterval",
-            "CatchupBlockValidateMode",
-            "DeadlockDetection",
-            "DeadlockDetectionThreshold",
             "DisableNetworking",
             "EnableAccountUpdatesStats",
-            "EnableBlockServiceFallbackToArchiver",
-            "EnableCatchupFromArchiveServers",
             "EnableMetricReporting",
             "EnablePingHandler",
             "EnableTxBacklogRateLimiting",
             "EnableVerbosedTransactionSyncLogging",
             "ForceFetchTransactions",
             "HeartbeatUpdateInterval",
-            "IsIndexerActive",
             "NetAddress",
-            "NetworkMessageTraceServer",
-            "NodeExporterListenAddress",
-            "NodeExporterPath",
             "ParticipationKeysRefreshInterval",
             "PeerConnectionsUpdateInterval",
-            "PeerPingPeriodSeconds",
-            "ProposalAssemblyTime",
-            "ReconnectTime",
-            "RunHosted",
-            "StorageEngine",
-            "SuggestedFeeBlockHistory",
-            "SuggestedFeeSlidingWindowSize",
             "TransactionSyncDataExchangeRate",
             "TransactionSyncSignificantMessageThreshold",
             "TxBacklogReservedCapacityPerPeer",
             "TxBacklogSize",
-            "TxPoolExponentialIncreaseFactor",
-            "TxPoolSize",
-            "VerifiedTranscationsCacheSize",
         ];
 
         let fixture_text = include_str!("../fixtures/config-v27.json");

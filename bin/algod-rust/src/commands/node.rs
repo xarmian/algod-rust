@@ -42,7 +42,7 @@ use algo_ledger::{
     make_genesis_block, parse_genesis_json, populate_store, seed_account_totals_from_genesis,
     SqliteLedger,
 };
-use algo_pool::{PoolConfig, TransactionPool};
+use algo_pool::TransactionPool;
 use algo_rest_api::node::BuildVersion;
 use algo_rest_api::server::{ApiServer, ApiServerConfig};
 use algo_types::Digest;
@@ -552,9 +552,11 @@ async fn run_start(
         .with_enable_netdev_metrics(file_config.enable_netdev_metrics);
     if dev_mode {
         let pool = Arc::new(TransactionPool::new(
-            PoolConfig::default(),
-            Arc::new(PoolLedgerAdapter::new(ledger.clone()))
-                as Arc<dyn algo_pool::traits::PoolLedger>,
+            crate::commands::participate::pool_config_from_local(&file_config),
+            Arc::new(PoolLedgerAdapter::with_verified_txn_cache_size(
+                ledger.clone(),
+                file_config.verified_transcations_cache_size.max(0) as usize,
+            )) as Arc<dyn algo_pool::traits::PoolLedger>,
         ));
         node_interface = node_interface.with_pool(pool).with_dev_mode();
         info!("dev mode enabled — each submitted transaction group produces a block");
