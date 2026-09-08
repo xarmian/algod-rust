@@ -665,6 +665,13 @@ pub async fn run(
         // Issue #1157: wires go's `UseXForwardedForAddressField` through to
         // inbound connection tracking (`request_tracker.rs`).
         use_x_forwarded_for_address_field: node_config.use_x_forwarded_for_address_field.clone(),
+        // Issue #1191: wires go's `ForceFetchTransactions` through to
+        // `wantTXGossip` seeding. A relay already sets `relay_messages:
+        // true` above (which alone forces `wantTXGossip` to "yes"), so this
+        // is a no-op in practice here, but it keeps the field threaded the
+        // same way as `p2pNetwork.go`'s identical `relayMessages ||
+        // ForceFetchTransactions` gate for consistency across commands.
+        force_fetch_transactions: node_config.force_fetch_transactions,
         ..Default::default()
     };
 
