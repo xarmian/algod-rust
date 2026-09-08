@@ -29,7 +29,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use algo_ledger::participation::{ParticipationID, ParticipationRecord};
-use algo_ledger::{StateDelta, StateDeltaSubset};
+use algo_ledger::{IncludedTransactions, StateDelta, StateDeltaSubset};
 use algo_rest_api::auth::generate_token;
 use algo_rest_api::node::{
     AccountLookup, AppResourceLookup, AppResourceWithIDs, ApplicationLookup, AssetLookup,
@@ -7566,6 +7566,84 @@ async fn get_txn_group_delta_endpoints_return_data_when_enabled() {
     assert_eq!(resp.status(), 404);
 }
 
+/// Pins go-algorand's `TestTxnGroupDeltasDevMode`
+/// (test/e2e-go/features/devmode/devmode_test.go): the group's `Txids` map
+/// must be identical whether fetched via the by-id endpoint
+/// (`GET /v2/deltas/txn/group/{id}`) or the by-round endpoint
+/// (`GET /v2/deltas/{round}/txn/group`), and `Txleases` must be omitted
+/// (nil) from both JSON responses. The go e2e test drives this against a
+/// live devmode network; here the same handler-level assertion is pinned
+/// directly against `NodeInterface::get_txn_group_delta` /
+/// `get_txn_group_deltas_for_round` without needing a live node.
+#[tokio::test]
+async fn get_txn_group_delta_txids_match_across_endpoints_and_txleases_omitted() {
+    let txn_id = Digest([0x22u8; 32]);
+    let id_str = txn_id.to_string();
+    let mut txids = std::collections::HashMap::new();
+    txids.insert(
+        txn_id,
+        IncludedTransactions {
+            last_valid: Round(1000),
+            intra: 0,
+        },
+    );
+    let delta = StateDeltaSubset {
+        txids,
+        ..Default::default()
+    };
+    let group = TxnGroupDeltaWithIds {
+        ids: vec![id_str.clone()],
+        delta,
+    };
+    let mut node = MockNode::synced();
+    let mut by_round = BTreeMap::new();
+    by_round.insert(1u64, vec![group]);
+    node.txn_group_deltas = Some(by_round);
+    let server = TestServer::start(node).await;
+
+    let get = |path: String| {
+        let c = server.client.clone();
+        let url = server.url(&path);
+        let tok = server.api_token.clone();
+        async move {
+            c.get(url)
+                .header("X-Algo-API-Token", &tok)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let by_id_resp = get(format!("/v2/deltas/txn/group/{id_str}")).await;
+    assert_eq!(by_id_resp.status(), 200);
+    let by_id_body: serde_json::Value = by_id_resp.json().await.unwrap();
+
+    let by_round_resp = get("/v2/deltas/1/txn/group".into()).await;
+    assert_eq!(by_round_resp.status(), 200);
+    let by_round_body: serde_json::Value = by_round_resp.json().await.unwrap();
+    let group_delta = &by_round_body["Deltas"][0]["Delta"];
+
+    // Txids must be identical across both endpoints.
+    assert_eq!(
+        by_id_body["Txids"], group_delta["Txids"],
+        "Txids must match between the by-id and by-round group-delta endpoints"
+    );
+    assert!(
+        !by_id_body["Txids"].as_object().unwrap().is_empty(),
+        "sanity: Txids should actually be populated in this fixture"
+    );
+
+    // Txleases must never appear in either JSON response.
+    assert!(
+        !by_id_body.as_object().unwrap().contains_key("Txleases"),
+        "by-id response must omit Txleases: {by_id_body:?}"
+    );
+    assert!(
+        !group_delta.as_object().unwrap().contains_key("Txleases"),
+        "by-round group delta must omit Txleases: {group_delta:?}"
+    );
+}
+
 #[tokio::test]
 async fn get_txn_group_deltas_for_round_requires_auth() {
     let server = TestServer::start(MockNode::synced()).await;
@@ -8318,6 +8396,45 @@ async fn start_catchup_already_in_progress() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+/// Pins go-algorand's `TestCatchpointCatchupErr`
+/// (test/e2e-go/features/catchup/catchpointCatchup_test.go): when the node
+/// cannot actually start a catchpoint catchup (there, because it has no
+/// peers left to fetch from after the primary node is stopped), the
+/// `POST /v2/catchup/{catchpoint}` REST call must surface that failure as an
+/// error response rather than silently succeeding, and the message must
+/// reference the requested catchpoint label — matching go's
+/// `node.MakeStartCatchpointError(catchpointLabel, err)` wording. The go e2e
+/// test drives this against a live two-node network with a blocking proxy;
+/// this pins the same REST-handler contract (`CatchupStartResult::StartError`
+/// -> HTTP 408 with the label+cause in the body) without needing one.
+#[tokio::test]
+async fn start_catchup_start_error_surfaces_failure() {
+    let hash = data_encoding::BASE32_NOPAD.encode(&[0xAB; 32]);
+    let catchpoint_url = format!("1000%23{hash}");
+    let catchpoint_decoded = format!("1000#{hash}");
+
+    let mut node = MockNode::synced();
+    node.catchup_start_result = Some(algo_rest_api::node::CatchupStartResult::StartError(
+        format!("unable to start catchup for {catchpoint_decoded}: no peers available"),
+    ));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .post(server.url(&format!("/v2/catchup/{catchpoint_url}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 408);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let message = body["message"].as_str().expect("error message present");
+    assert!(
+        message.contains(&catchpoint_decoded),
+        "error message should reference the requested catchpoint label: {message}"
+    );
 }
 
 #[tokio::test]
