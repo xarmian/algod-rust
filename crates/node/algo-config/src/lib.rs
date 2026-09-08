@@ -786,8 +786,11 @@ static ENABLE_DEVELOPER_API: VersionedDefault<bool> = VersionedDefault::new(&[(9
 //   knobs. Those 3 fields are now real config-plumbed knobs (see
 //   [`TX_BACKLOG_SIZE`]'s doc comment); the true per-peer
 //   fairness/reservation guarantee (go's `util.NewElasticRateLimiter`) is
-//   still not built and is filed as its own follow-up, issue #1195. The 2
-//   fields with no queue-sizing role at all (`TxBacklogRateLimitingCongestionPct`,
+//   now also built, as `algo_network::TxBacklogPeerLimiter` (issue #1195),
+//   reusing these same 3 fields plus `TxBacklogServiceRateWindowSeconds`
+//   (already plumbed above for the app-rate-limiter half) rather than
+//   surfacing any new knobs. The 2 fields with no queue-sizing or
+//   fairness-mechanism role at all (`TxBacklogRateLimitingCongestionPct`,
 //   `TxBacklogAppRateLimitingCountERLDrops`) stay out of scope, same
 //   judgment call as before, same as `CatchpointDir`'s
 //   hot/cold-directory-splitting group above — not silently dropped, just
@@ -962,15 +965,12 @@ static TX_BACKLOG_SIZE: VersionedDefault<i64> = VersionedDefault::new(&[(27, || 
 /// `txBacklogSize := Config.TxBacklogSize; if
 /// Config.EnableTxBacklogRateLimiting { txBacklogSize +=
 /// (Config.IncomingConnectionsLimit * Config.TxBacklogReservedCapacityPerPeer)
-/// }` (`data/txHandler.go:154-158`). This only ports the *queue-sizing*
-/// half of go's behavior; go's `TxBacklogReservedCapacityPerPeer` also
-/// seeds a per-peer fairness guarantee via `util.NewElasticRateLimiter`
-/// (`data/txHandler.go:189-199`) that has no algod-rust equivalent yet on
-/// the gossip-push admission path (`TxTagHandler`'s pool-occupancy-based
-/// backlog queue has no notion of "this peer's reserved slots") — deferred
-/// to its own follow-up (issue #1195) rather than built here, since it
-/// needs its own per-peer admission-tracking design, not a reconciliation
-/// of existing knobs.
+/// }` (`data/txHandler.go:154-158`). This ports the *queue-sizing* half of
+/// go's behavior. go's `TxBacklogReservedCapacityPerPeer` also seeds a
+/// per-peer fairness guarantee via `util.NewElasticRateLimiter`
+/// (`data/txHandler.go:189-199`) — issue #1195 built the algod-rust
+/// equivalent, `algo_network::TxBacklogPeerLimiter`, reusing this same
+/// field (as its `capacity_per_peer` argument) rather than a second knob.
 static TX_BACKLOG_RESERVED_CAPACITY_PER_PEER: VersionedDefault<i64> =
     VersionedDefault::new(&[(27, || 20)]);
 

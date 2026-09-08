@@ -327,7 +327,8 @@ pub use tx_sync_client::{GossipTxSyncPeerSource, HttpTxSyncClient};
 
 // Decoder + MessageHandler for inbound TX-tagged gossip messages
 pub use tx_tag_handler::{
-    decode_tx_message, TxPoolRememberCounter, TxTagError, TxTagHandler, MAX_TX_GROUP_SIZE,
+    decode_tx_message, TxBacklogPeerLimiter, TxPoolRememberCounter, TxTagError, TxTagHandler,
+    MAX_TX_GROUP_SIZE,
 };
 
 // ---------------------------------------------------------------------------
