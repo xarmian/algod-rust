@@ -706,6 +706,44 @@ mod tests {
         assert_eq!(resp.block.round.0, 5);
     }
 
+    /// Direct port of go's `TestUGetBlockWs` (`catchup/universalFetcher_test.go`):
+    /// a single peer serves the next round successfully, then the immediately
+    /// following (not-yet-existent) round is requested and must fail with an
+    /// error surfacing the peer's "not available" response — mirroring go's
+    /// `noBlockForRoundError{round: next+1, latest: next}` assertion. Unlike
+    /// the multi-peer failover tests above, this exercises exactly go's
+    /// single-peer, two-call sequence end-to-end through the real
+    /// `UnicastPeer::request` -> `make_block_request_topics` ->
+    /// `parse_block_response` -> `decode_block_cert` pipeline.
+    #[tokio::test]
+    async fn single_peer_no_block_for_next_round_returns_error() {
+        let next = 5u64;
+        let block_bytes = make_block_msgpack(next);
+        let cert_bytes = make_cert_msgpack();
+
+        // Only round `next` is configured; the peer has no data for
+        // `next + 1`, so MockPeer::request falls through to its default
+        // "requested block is not available" service-error response —
+        // the same shape go's block service returns for an unknown round.
+        let peer: Arc<dyn UnicastPeer> =
+            Arc::new(MockPeer::new("peer:4160").with_success(next, block_bytes, cert_bytes));
+
+        let src = GossipBlockSource::new(vec![peer]);
+
+        // First call: succeeds, matching go's `require.NoError` + block equality.
+        let resp = src.get_block(Round(next)).await.unwrap();
+        assert_eq!(resp.block.round.0, next);
+
+        // Second call: the peer has nothing for `next + 1`, so the fetch must
+        // fail with an error mentioning the peer's unavailability response.
+        let err = src.get_block(Round(next + 1)).await.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("not available"),
+            "expected an error mentioning block unavailability, got: {err_msg}"
+        );
+    }
+
     #[tokio::test]
     async fn ranked_selection_fails_over_when_the_chosen_peer_lacks_the_round() {
         // Each peer only has one of the two rounds configured. Ranked
