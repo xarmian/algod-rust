@@ -5580,7 +5580,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                             message: "inner appl: empty program".to_string(),
                         });
                     }
-                    let called_version = program[0] as u64;
+                    // Version prefix is a real LEB128 varuint, not a fixed
+                    // single byte (go's `transactions.ProgramVersion`,
+                    // issue #1216) -- `peek_version` returns `None` on an
+                    // undecodable/out-of-range prefix, which `bytecode::parse`
+                    // downstream in the eval path rejects properly; treat
+                    // that as version 0 here purely to keep this floor check
+                    // conservative (0 < any real `min_inner_appl_version`).
+                    let called_version =
+                        algo_avm::bytecode::peek_version(&program).unwrap_or(0) as u64;
                     if called_version < self.consensus.min_inner_appl_version {
                         return Err(AlgoError::Avm {
                             message: format!(
@@ -5612,7 +5620,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                                 .unwrap_or_default()
                         };
                         if !csp.is_empty() {
-                            let csv = csp[0] as u64;
+                            // See the `called_version` comment above --
+                            // same varuint-prefix decode (issue #1216).
+                            let csv = algo_avm::bytecode::peek_version(&csp).unwrap_or(0) as u64;
                             if csv < self.consensus.min_inner_appl_version {
                                 return Err(AlgoError::Avm {
                                     message: format!(
