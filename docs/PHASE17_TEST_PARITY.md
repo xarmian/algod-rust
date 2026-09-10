@@ -51,9 +51,9 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 1,006 | 32% |
+| `matched-1:1` | 1,007 | 32% |
 | `matched-1:many` | 744 | 23% |
-| `partial` | 616 | 19% |
+| `partial` | 615 | 19% |
 | `out-of-scope` | 592 | 19% |
 | `matched-many:1` | 221 | 7% |
 | `not-implemented` | 0 | 0% |
@@ -61,7 +61,7 @@ per-area split of the former).
 
 **0 rows (`not-implemented` + `missing-test`, 0%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
-implements but never tests. `partial` (616, 19%) is coverage that exists
+implements but never tests. `partial` (615, 19%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
 most are diminishing-returns edge cases. See
 [`docs/PHASE17_PROPOSAL.md`](PHASE17_PROPOSAL.md) for how the real gaps
@@ -82,9 +82,9 @@ were triaged into tracked issues.
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 60 | 66 | 1 | 7 | 0 | 0 | 10 |
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 127 | 35 | 45 | 42 | 0 | 0 | 25 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 25 | 35 | 0 | 28 | 0 | 0 | 31 |
-| Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 23 | 11 | 0 | 18 | 0 | 0 | 66 |
+| Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 24 | 11 | 0 | 17 | 0 | 0 | 66 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 36 | 28 | 7 | 15 | 0 | 0 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 13 | 0 | 14 | 0 | 0 | 3 |
-| **Total** | | **3,179** | **1006** | **744** | **221** | **616** | **0** | **0** | **592** |
+| **Total** | | **3,179** | **1007** | **744** | **221** | **615** | **0** | **0** | **592** |
 

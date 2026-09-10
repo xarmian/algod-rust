@@ -125,8 +125,7 @@ impl Filter {
         let hashes = self.hash(x);
         let n = (self.data.len() as u32) * 8;
         for h in hashes {
-            let bit = h % n;
-            self.data[(bit / 8) as usize] |= 1 << (bit % 8);
+            self.set_bit(h % n);
         }
     }
 
@@ -137,10 +136,24 @@ impl Filter {
     pub fn test(&self, x: &[u8]) -> bool {
         let hashes = self.hash(x);
         let n = (self.data.len() as u32) * 8;
-        hashes.into_iter().all(|h| {
-            let bit = h % n;
-            self.data[(bit / 8) as usize] & (1 << (bit % 8)) != 0
-        })
+        hashes.into_iter().all(|h| self.test_bit(h % n))
+    }
+
+    /// Set raw bit `bit` of the underlying storage. Go factors this out as
+    /// its own standalone `bitset` type (`util/bloom/bitset.go`) with a
+    /// dedicated exhaustive test (`TestBitset`, `bloom_test.go:22`); Rust
+    /// inlines the identical bit-index arithmetic here instead, since
+    /// `Filter` is the type's sole consumer. Factored out (rather than
+    /// left inline in `set`) so the same low-level bit sweep go's test
+    /// performs can be exercised directly against this production code —
+    /// see `bitset_sweep_matches_go_raw_bit_layout` below.
+    fn set_bit(&mut self, bit: u32) {
+        self.data[(bit / 8) as usize] |= 1 << (bit % 8);
+    }
+
+    /// Test raw bit `bit` of the underlying storage. See [`Self::set_bit`].
+    fn test_bit(&self, bit: u32) -> bool {
+        self.data[(bit / 8) as usize] & (1 << (bit % 8)) != 0
     }
 
     /// Number of hash probes configured for this filter.
@@ -402,6 +415,31 @@ mod tests {
         assert!(f.test(&a));
         assert!(f.test(&b));
         assert!(!f.test(b"not-a-member-xyz"));
+    }
+
+    /// go: `TestBitset` (`util/bloom/bloom_test.go:22`) -- exhaustively
+    /// walks all 1024 raw bit positions of a filter's underlying storage,
+    /// checking each bit is unset before `set` and set immediately after.
+    /// Go's `bitset` is a standalone type with its own dedicated test;
+    /// Rust's `Filter::set_bit`/`test_bit` (factored out of `set`/`test`
+    /// specifically to make this possible) provide the same low-level
+    /// primitive here. This sweeps the identical `0..1024` range go's test
+    /// does, directly against real production bit-indexing code -- the
+    /// existing hash-based `set`/`test` golden/round-trip tests only ever
+    /// exercise the handful of bit positions a given element's hashes
+    /// happen to land on, never every bit deterministically.
+    #[test]
+    fn bitset_sweep_matches_go_raw_bit_layout() {
+        let mut f = Filter::new(1024, 4, 1234);
+        for i in 0u32..1024 {
+            assert!(
+                !f.test_bit(i),
+                "bit {i} should not be set yet: {:?}",
+                f.data
+            );
+            f.set_bit(i);
+            assert!(f.test_bit(i), "bit {i} should be set");
+        }
     }
 
     #[test]
