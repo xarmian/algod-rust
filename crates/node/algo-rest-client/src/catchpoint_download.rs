@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use algo_error::{AlgoError, Result};
+use algo_network::LEDGER_RESPONSE_CONTENT_TYPE;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
@@ -647,6 +648,8 @@ impl CatchpointDownloader {
             });
         }
 
+        validate_p2p_ledger_content_type(&head.headers, path, &self.base_url)?;
+
         let total_bytes = head.content_length();
         self.p2p_stream_body_to_file(
             stream,
@@ -812,6 +815,7 @@ impl CatchpointDownloader {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
+                        validate_ledger_content_type(resp.headers(), path)?;
                         return Ok(resp);
                     }
                     if status.is_server_error() && attempt < self.config.max_retries {
@@ -867,6 +871,80 @@ impl CatchpointDownloader {
 /// Check if a reqwest error is transient and worth retrying.
 fn is_retryable(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout()
+}
+
+/// Validate a successful ledger-fetch response's `Content-Type` header
+/// before the body is read, mirroring go's `getPeerLedger`
+/// (`catchup/ledgerFetcher.go:143-154`): exactly one `Content-Type` header
+/// must be present, and its value must equal
+/// `rpcs.LedgerResponseContentType` (algod-rust:
+/// `algo_network::LEDGER_RESPONSE_CONTENT_TYPE`). Checked only on the
+/// `GET`/download path — go's `headLedger` (the HEAD pre-flight probe this
+/// crate's `probe_availability` mirrors) never inspects Content-Type at
+/// all, so `probe_availability` deliberately does not call this.
+fn validate_ledger_content_type(headers: &reqwest::header::HeaderMap, path: &str) -> Result<()> {
+    let mut content_types = headers.get_all(reqwest::header::CONTENT_TYPE).iter();
+    let first = content_types.next();
+    let count = first.iter().count() + content_types.count();
+
+    let value = match (count, first) {
+        (1, Some(v)) => v,
+        (count, _) => {
+            return Err(AlgoError::RestClient {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("http ledger fetcher invalid content type count {count}"),
+                )),
+                context: format!("catchpoint GET {path}"),
+            });
+        }
+    };
+
+    if value.as_bytes() != LEDGER_RESPONSE_CONTENT_TYPE.as_bytes() {
+        return Err(AlgoError::RestClient {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "http ledger fetcher response has an invalid content type : {}",
+                    String::from_utf8_lossy(value.as_bytes())
+                ),
+            )),
+            context: format!("catchpoint GET {path}"),
+        });
+    }
+
+    Ok(())
+}
+
+/// [`validate_ledger_content_type`]'s P2P-transport equivalent: same
+/// presence/value check, applied to the raw-stream head parser's
+/// `HashMap<String, String>` headers. Unlike `reqwest`'s `HeaderMap` (which
+/// preserves every header instance), `http_over_stream::parse_head` folds
+/// repeated header lines into a single map entry, so the "duplicate
+/// Content-Type header" case go's count check also catches isn't
+/// representable via this transport — only "missing" and "wrong value" are.
+fn validate_p2p_ledger_content_type(
+    headers: &std::collections::HashMap<String, String>,
+    path: &str,
+    peer: &str,
+) -> Result<()> {
+    match headers.get("content-type") {
+        Some(value) if value == LEDGER_RESPONSE_CONTENT_TYPE => Ok(()),
+        Some(value) => Err(AlgoError::RestClient {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("http ledger fetcher response has an invalid content type : {value}"),
+            )),
+            context: format!("catchpoint GET {path} (P2P peer {peer})"),
+        }),
+        None => Err(AlgoError::RestClient {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "http ledger fetcher invalid content type count 0",
+            )),
+            context: format!("catchpoint GET {path} (P2P peer {peer})"),
+        }),
+    }
 }
 
 /// Write one chunk to the in-progress download's temp file, wrapping any
@@ -991,7 +1069,8 @@ mod tests {
                     // Advertise the full length but only write a prefix, then
                     // drop the connection — an incomplete body.
                     let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-algorand-ledger-v2.1\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
                         full_body.len()
                     );
                     let _ = socket.write_all(header.as_bytes()).await;
@@ -1001,7 +1080,8 @@ mod tests {
                     drop(socket);
                 } else {
                     let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-algorand-ledger-v2.1\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
                         full_body.len()
                     );
                     let _ = socket.write_all(header.as_bytes()).await;
@@ -1071,10 +1151,7 @@ mod tests {
     /// classification across the retry loop, unlike
     /// `spawn_flaky_catchpoint_server` which changes behavior after N
     /// attempts.
-    async fn spawn_fixed_status_server(
-        status_line: &'static str,
-        body: &'static [u8],
-    ) -> String {
+    async fn spawn_fixed_status_server(status_line: &'static str, body: &'static [u8]) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1176,6 +1253,263 @@ mod tests {
              exhausted, got: {result:?}"
         );
         assert!(!dest.exists(), "no file should be left behind on failure");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // -- Content-Type validation (issue #1203, go's `getPeerLedger`'s
+    //    "exactly one Content-Type header, matching
+    //    `rpcs.LedgerResponseContentType`" check,
+    //    `catchup/ledgerFetcher.go:143-154`) --
+
+    /// A minimal raw-socket HTTP server that answers every GET with a `200`
+    /// whose header block is exactly `header_lines` (caller-supplied, so
+    /// tests can omit/duplicate/mis-value the `Content-Type` header) plus a
+    /// `Content-Length`-correct body.
+    async fn spawn_custom_headers_server(
+        header_lines: &'static str,
+        body: &'static [u8],
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\n{header_lines}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+                let _ = socket.flush().await;
+                drop(socket);
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// Mirrors go's `TestLedgerFetcherErrorResponseHandling`: a 200 response
+    /// with no `Content-Type` header at all must be rejected before the body
+    /// is accepted, not treated as a successful download.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_rejects_response_with_missing_content_type() {
+        let base_url = spawn_custom_headers_server("", b"not-a-catchpoint-file").await;
+
+        let dl = CatchpointDownloader::with_config(
+            &base_url,
+            "",
+            CatchpointDownloadConfig {
+                timeout: Duration::from_secs(5),
+                chunk_size: 16,
+                max_retries: 0,
+                retry_delay: Duration::from_millis(5),
+                min_bytes_per_second: 0,
+            },
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-missing-ct-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-missing-ct.tar.gz");
+
+        let result = dl
+            .download::<fn(DownloadProgress)>("test-v1.0", 1, &dest, None)
+            .await;
+
+        assert!(
+            matches!(result, Err(AlgoError::RestClient { .. })),
+            "a response with no Content-Type header must be rejected, got: {result:?}"
+        );
+        assert!(
+            !dest.exists(),
+            "no file should be written when Content-Type validation fails"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Mirrors go's `TestLedgerFetcherErrorResponseHandling`: a 200 response
+    /// with two `Content-Type` headers (even if both are the correct value)
+    /// must be rejected — go's check is a header *count* check first,
+    /// independent of the value(s).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_rejects_response_with_duplicate_content_type_headers() {
+        let base_url = spawn_custom_headers_server(
+            "Content-Type: application/x-algorand-ledger-v2.1\r\n\
+             Content-Type: application/x-algorand-ledger-v2.1\r\n",
+            b"not-a-catchpoint-file",
+        )
+        .await;
+
+        let dl = CatchpointDownloader::with_config(
+            &base_url,
+            "",
+            CatchpointDownloadConfig {
+                timeout: Duration::from_secs(5),
+                chunk_size: 16,
+                max_retries: 0,
+                retry_delay: Duration::from_millis(5),
+                min_bytes_per_second: 0,
+            },
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-dup-ct-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-dup-ct.tar.gz");
+
+        let result = dl
+            .download::<fn(DownloadProgress)>("test-v1.0", 1, &dest, None)
+            .await;
+
+        assert!(
+            matches!(result, Err(AlgoError::RestClient { .. })),
+            "a response with duplicate Content-Type headers must be rejected, got: {result:?}"
+        );
+        assert!(
+            !dest.exists(),
+            "no file should be written when Content-Type validation fails"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Mirrors go's `TestLedgerFetcherErrorResponseHandling`: a 200 response
+    /// with exactly one `Content-Type` header but the wrong value (e.g. a
+    /// captive portal or misconfigured proxy serving an HTML error page with
+    /// a 200 status) must be rejected before the body is streamed to disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_rejects_response_with_wrong_content_type_value() {
+        let base_url = spawn_custom_headers_server(
+            "Content-Type: text/html\r\n",
+            b"<html>not a catchpoint</html>",
+        )
+        .await;
+
+        let dl = CatchpointDownloader::with_config(
+            &base_url,
+            "",
+            CatchpointDownloadConfig {
+                timeout: Duration::from_secs(5),
+                chunk_size: 16,
+                max_retries: 0,
+                retry_delay: Duration::from_millis(5),
+                min_bytes_per_second: 0,
+            },
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-wrong-ct-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-wrong-ct.tar.gz");
+
+        let result = dl
+            .download::<fn(DownloadProgress)>("test-v1.0", 1, &dest, None)
+            .await;
+
+        assert!(
+            matches!(result, Err(AlgoError::RestClient { .. })),
+            "a response with the wrong Content-Type value must be rejected, got: {result:?}"
+        );
+        assert!(
+            !dest.exists(),
+            "no file should be written when Content-Type validation fails"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Regression: a single, correct `Content-Type` header must still
+    /// download successfully — the validation above must not reject the
+    /// happy path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_succeeds_with_a_single_correct_content_type_header() {
+        const BODY: &[u8] = b"catchpoint-file-bytes-0123456789";
+        let base_url = spawn_custom_headers_server(
+            "Content-Type: application/x-algorand-ledger-v2.1\r\n",
+            BODY,
+        )
+        .await;
+
+        let dl = CatchpointDownloader::with_config(
+            &base_url,
+            "",
+            CatchpointDownloadConfig {
+                timeout: Duration::from_secs(5),
+                chunk_size: 16,
+                max_retries: 0,
+                retry_delay: Duration::from_millis(5),
+                min_bytes_per_second: 0,
+            },
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-ok-ct-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-ok-ct.tar.gz");
+
+        let result = dl
+            .download::<fn(DownloadProgress)>("test-v1.0", 1, &dest, None)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a single correct Content-Type header must still download successfully, got: {result:?}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// The P2P-transport path (`p2p_download_attempt`) gets the same
+    /// value/presence check — proven here with a `MockP2pTransport`
+    /// response that lacks `Content-Type` entirely. Unlike the `reqwest`
+    /// path above, the raw-stream header parser (`http_over_stream::parse_head`)
+    /// folds duplicate header lines into a single `HashMap` entry (last
+    /// value wins), so a byte-for-byte "duplicate header" case isn't
+    /// representable through this transport — the missing/wrong-value cases
+    /// are.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_rejects_missing_content_type_over_p2p_transport() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata".to_vec();
+        let transport: Arc<dyn crate::http_over_stream::HttpPeerTransport> =
+            Arc::new(MockP2pTransport::new(response));
+        let dl = CatchpointDownloader::with_p2p_transport(
+            "12D3KooWtestpeer",
+            transport,
+            CatchpointDownloadConfig {
+                max_retries: 0,
+                min_bytes_per_second: 0,
+                ..CatchpointDownloadConfig::default()
+            },
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-p2p-missing-ct-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-p2p-missing-ct.tar.gz");
+
+        let result = dl
+            .download::<fn(DownloadProgress)>("test-v1.0", 1, &dest, None)
+            .await;
+
+        assert!(
+            matches!(result, Err(AlgoError::RestClient { .. })),
+            "a P2P response with no Content-Type header must be rejected, got: {result:?}"
+        );
+        assert!(!dest.exists());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
