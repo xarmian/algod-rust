@@ -196,6 +196,64 @@ fn account_new_creates_address_and_prints_go_text() {
     );
 }
 
+/// Parity with go-algorand's `TestAccountNewDuplicateErrs`
+/// (`test/e2e-go/cli/goal/account_test.go:59`): creating a second account
+/// with a friendly name that's already in use must fail (nonzero exit,
+/// nothing printed to stdout matching the success template) rather than
+/// silently overwrite or duplicate the existing entry.
+#[test]
+fn account_new_duplicate_name_errs() {
+    let (_t, dd, kmd_dir) = setup_data_dir();
+    let _g = spawn_kmd(&kmd_dir);
+    create_default_wallet(&dd);
+
+    let first = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args(["account", "new", "duplicate_account", "--password", "pw"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("account new");
+    assert!(first.status.success(), "first account new must succeed");
+
+    let second = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args(["account", "new", "duplicate_account", "--password", "pw"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("account new (duplicate)");
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        !second.status.success(),
+        "duplicate account new must fail; stdout={stdout:?}",
+    );
+    assert!(
+        !stdout.starts_with("Created new account with address "),
+        "no address should be printed for a duplicate account; got {stdout:?}",
+    );
+    assert!(
+        stderr.contains("The account name 'duplicate_account' is already taken"),
+        "stderr must use errorNameAlreadyTaken template; got {stderr:?}",
+    );
+
+    // accountList.json still has exactly one entry named duplicate_account.
+    let acct_json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dd.join("testnet-v1").join("accountList.json")).unwrap(),
+    )
+    .unwrap();
+    let accounts = acct_json.get("Accounts").unwrap().as_object().unwrap();
+    assert_eq!(
+        accounts
+            .values()
+            .filter(|v| *v == "duplicate_account")
+            .count(),
+        1,
+        "accountList must record duplicate_account exactly once; got {acct_json}",
+    );
+}
+
 #[test]
 fn account_rename_swaps_friendly_name() {
     let (_t, dd, kmd_dir) = setup_data_dir();

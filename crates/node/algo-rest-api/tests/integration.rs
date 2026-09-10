@@ -4023,6 +4023,23 @@ async fn account_info_includes_participation_keys() {
         !state_proof_key.is_empty(),
         "state proof key should be non-empty"
     );
+
+    // Parity with go-algorand's `TestStateProofInParticipationInfo`
+    // (`test/e2e-go/restAPI/stateproof/stateproofRestAPI_test.go:39`): the
+    // key returned over `/v2/accounts/{addr}` must round-trip the exact
+    // bytes that were set (go's test asserts `mssRoot == actual` after a
+    // real keyreg; this pins the same byte-exact identity through the
+    // handler directly).
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let decoded = STANDARD
+        .decode(state_proof_key)
+        .expect("state proof key should be valid base64");
+    assert_eq!(
+        decoded.as_slice(),
+        &state_proof_id[..],
+        "state-proof-key must round-trip the exact bytes set on the account"
+    );
 }
 
 /// Matches go-algorand's `TestNilStateProofInParticipationInfo`
@@ -6897,6 +6914,81 @@ async fn pending_transaction_info_with_local_state_delta() {
     assert_eq!(delta[0]["value"]["uint"].as_u64().unwrap(), 100);
 }
 
+/// Parity with go-algorand's `TestPendingTransactionInfoInnerTxnAssetCreate`
+/// (`test/e2e-go/restAPI/other/appsRestAPI_test.go:43`): an app call that
+/// issues an inner `acfg`-create must report the created asset's ID on the
+/// *inner* transaction's `asset-index` (not the outer app-call txn, which
+/// go's test asserts has both `ApplicationIndex` and `AssetIndex` nil).
+/// This exercises `convert_inner_txn`'s "itx"-array decoding path, which
+/// previously had no dedicated test.
+#[tokio::test]
+async fn pending_transaction_info_inner_txn_reports_created_asset_index() {
+    let mut node = MockNode::synced();
+    let stxn = make_test_signed_txn();
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+
+    // Build the inner txn's own SignedTransaction with apply_data_config_asset
+    // ("caid") set, matching what apply_acfg records for an inner asset
+    // create -- then encode it to msgpack and back to an rmpv::Value so it
+    // round-trips exactly the way the real ledger's "itx" wire data would.
+    let mut inner_stxn = make_test_signed_txn();
+    inner_stxn.txn.txn_type = TxnType::Acfg;
+    inner_stxn.apply_data_config_asset = 777;
+    let inner_bytes = rmp_serde::to_vec_named(&inner_stxn).expect("encode inner txn");
+    let inner_value =
+        rmpv::decode::read_value(&mut &inner_bytes[..]).expect("decode inner txn as rmpv");
+
+    let eval_delta = rmpv::Value::Map(vec![(
+        rmpv::Value::String("itx".into()),
+        rmpv::Value::Array(vec![inner_value]),
+    )]);
+
+    node.pending_txn_lookup.insert(
+        txid.0,
+        TxnWithStatus {
+            txn: stxn,
+            confirmed_round: 100,
+            pool_error: String::new(),
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: None,
+            eval_delta: Some(eval_delta),
+            logs: None,
+            inner_txns: None,
+        },
+    );
+    let server = TestServer::start(node).await;
+
+    let url = format!("/v2/transactions/pending/{}", txid_str);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    // Outer app-call txn: no application-index/asset-index of its own.
+    assert!(json.get("application-index").is_none());
+    assert!(json.get("asset-index").is_none());
+
+    let inner_txns = json
+        .get("inner-txns")
+        .expect("should have inner-txns")
+        .as_array()
+        .expect("inner-txns should be array");
+    assert_eq!(inner_txns.len(), 1);
+    assert_eq!(inner_txns[0]["asset-index"].as_u64().unwrap(), 777);
+    assert!(inner_txns[0].get("application-index").is_none());
+}
+
 #[tokio::test]
 async fn pending_transaction_info_with_logs_from_eval_delta() {
     let mut node = MockNode::synced();
@@ -8122,6 +8214,58 @@ async fn participation_list_with_records() {
     assert_eq!(obj["key"]["vote-first-valid"].as_u64().unwrap(), 100);
     assert_eq!(obj["key"]["vote-last-valid"].as_u64().unwrap(), 3_000_000);
     assert_eq!(obj["key"]["vote-key-dilution"].as_u64().unwrap(), 1000);
+}
+
+/// Parity with go-algorand's `TestStateProofParticipationKeysAPI`
+/// (`test/e2e-go/restAPI/stateproof/stateproofRestAPI_test.go:115`): a
+/// participation key record carrying a real state-proof-key commitment
+/// must report that exact commitment as `key.state-proof-key` on
+/// `GET /v2/participation` -- go's test compares the returned key's bytes
+/// against the local partkey file's `StateProofSecrets.GetVerifier().Commitment`.
+/// The existing `participation_list_with_records`/`mock_participation_record`
+/// fixture always left `state_proof_verifier: None`, so this field's
+/// presence and byte-exact value were never actually exercised by this
+/// endpoint.
+#[tokio::test]
+async fn participation_list_reports_state_proof_key_commitment() {
+    let mut node = MockNode::synced();
+    let mut record = mock_participation_record();
+    let mut commitment = [0u8; 64];
+    commitment[0] = 0xEE;
+    commitment[63] = 0x11;
+    record.state_proof_verifier = Some(algo_consensus_crypto::merklesig::Verifier {
+        commitment,
+        key_lifetime: 256,
+    });
+    node.participation_records.push(record);
+
+    let server = TestServer::start(node).await;
+    let resp = server
+        .client
+        .get(server.url("/v2/participation"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let arr: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let arr = arr.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+
+    let state_proof_key = arr[0]["key"]["state-proof-key"]
+        .as_str()
+        .expect("state-proof-key should be present and a string");
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let decoded = STANDARD
+        .decode(state_proof_key)
+        .expect("state-proof-key should be valid base64");
+    assert_eq!(
+        decoded.as_slice(),
+        &commitment[..],
+        "state-proof-key must be the exact commitment bytes from the participation record"
+    );
 }
 
 #[tokio::test]
