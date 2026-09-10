@@ -8320,6 +8320,47 @@ mod tests {
         assert!(stib.has_genesis_id, "STIB should set has_genesis_id flag");
     }
 
+    /// Mirrors go-algorand's `TestEncodeDecodeSignedTxn`
+    /// (`data/bookkeeping/block_test.go`): a signed txn whose genesis_id and
+    /// genesis_hash match the block header must round-trip byte-for-byte
+    /// through the STIB strip (`transaction_group`/`generate_block`) and
+    /// restore (`restore_genesis_fields`) cycle -- not just have the flag set
+    /// (already covered by `transaction_group_strips_genesis_fields` above),
+    /// but actually reconstruct the exact original `Transaction`.
+    #[test]
+    fn strip_and_restore_genesis_fields_round_trips_original_txn() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(122);
+        let (receiver, _) = test_keypair(123);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        let stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        let original_txn = stx.txn.clone();
+        let original_sig = stx.sig;
+
+        eval.transaction_group(&[stx]).unwrap();
+        let block = eval.generate_block(&[]).unwrap();
+
+        // Sanity: the STIB really did strip the genesis fields (same
+        // precondition `transaction_group_strips_genesis_fields` checks).
+        let mut restored = block.payset[0].clone();
+        assert!(restored.txn.genesis_id.is_empty());
+        assert_eq!(restored.txn.genesis_hash, [0u8; 32]);
+
+        eval.restore_genesis_fields(&mut restored);
+
+        assert_eq!(
+            restored.txn, original_txn,
+            "restoring genesis fields from a STIB must reproduce the exact original \
+             transaction, matching go's `require.Equal(t, tx, t2)`"
+        );
+        assert_eq!(
+            restored.sig, original_sig,
+            "restoring genesis fields must not disturb the signature"
+        );
+    }
+
     // ====================================================================
     // 12. Multi-transaction group test (T1)
     // ====================================================================

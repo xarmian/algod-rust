@@ -52,7 +52,9 @@
 //! `crates/node/algo-rest-api/tests/msgpack_model_roundtrip_test.rs`) plus a
 //! decoded-value equality check, since every type here derives `PartialEq`.
 
-use algo_types::{Address, BlockHeader, Round, StateProofMessage, StateSchema};
+use algo_types::{
+    Address, Block, BlockHeader, Round, SignedTransaction, StateProofMessage, StateSchema,
+};
 use serde_bytes::ByteBuf;
 
 fn assert_msgpack_roundtrips<T>(value: &T)
@@ -368,4 +370,37 @@ fn block_header_randomized_field_combinations_roundtrip() {
         };
         assert_msgpack_roundtrips(&v);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Block (~ go's bookkeeping.Block / data/bookkeeping/msgp_gen_test.go's
+// TestMarshalUnmarshalBlock / TestRandomizedEncodingBlock)
+// ---------------------------------------------------------------------------
+//
+// go's `bookkeeping.Block` is `BlockHeader` plus a `Payset` of transactions.
+// `BlockHeader`'s own fields are already covered directly above -- what's
+// new here is that the payset round-trips *alongside* header fields in the
+// same flat map-encoded struct (`algo_types::Block` models Go's embedded
+// `BlockHeader` + `Payset` as one flat struct rather than nesting, per its
+// doc comment), which the header-only tests above cannot exercise.
+
+#[test]
+fn block_zero_value_roundtrips() {
+    assert_msgpack_roundtrips(&Block::default());
+}
+
+#[test]
+fn block_with_payset_roundtrips() {
+    let v = Block {
+        round: Round(7),
+        genesis_id: "net-v1".to_string(),
+        genesis_hash: [9u8; 32],
+        current_protocol: "https://github.com/algorandfoundation/specs/tree/abc123".to_string(),
+        fee_sink: Address([1u8; 32]),
+        rewards_pool: Address([2u8; 32]),
+        txn_counter: 3,
+        payset: vec![SignedTransaction::default(), SignedTransaction::default()],
+        ..Block::default()
+    };
+    assert_msgpack_roundtrips(&v);
 }
