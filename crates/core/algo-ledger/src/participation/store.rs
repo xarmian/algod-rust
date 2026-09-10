@@ -1525,6 +1525,109 @@ mod tests {
             .unwrap();
     }
 
+    /// Mirrors the out-of-range half of go's
+    /// `TestParticipation_RecordInvalidActionAndOutOfRange`
+    /// (`data/account/participationRegistry_test.go:506`): recording past a
+    /// key's `lastValidRound` (here, `register`'s `on - 1` deactivation
+    /// round) finds no active key and is a no-op, exactly like recording for
+    /// an account that was never registered
+    /// (`record_for_account_no_active_key_is_noop`). Go's own test also
+    /// asserts an unknown-action-variant error at valid rounds, which has no
+    /// algod-rust analog since `ParticipationAction` is a closed Rust enum —
+    /// an invalid discriminant simply can't be constructed.
+    #[test]
+    fn record_for_account_round_past_last_valid_is_noop() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation(1, 0, 3_000_000, 0);
+        let id = store.insert(&part).unwrap();
+        store.register(&id, Round(0)).unwrap();
+
+        // Round 3_000_001 is one past lastValidRound=3_000_000 — no active
+        // key covers it, so recording is a silent no-op (matches go's
+        // ErrActiveKeyNotFound-at-the-caller-level semantics: nothing to
+        // update).
+        store
+            .record_for_account(
+                &Address([1u8; 32]),
+                Round(3_000_001),
+                ParticipationAction::Vote,
+            )
+            .unwrap();
+
+        let record = store.get(&id).unwrap().unwrap();
+        assert_eq!(
+            record.last_vote,
+            Round(0),
+            "out-of-range record() must not touch lastVoteRound"
+        );
+    }
+
+    /// Mirrors go's `TestParticipation_RecordMultipleUpdates`
+    /// (`data/account/participationRegistry_test.go:540`): if the DB ends up
+    /// in an inconsistent state with two keys simultaneously "active"
+    /// (overlapping `effectiveFirstRound..effectiveLastRound`) for the same
+    /// account, `Record`/`record_for_account` must refuse to guess which one
+    /// to update rather than silently updating one or both. Go surfaces this
+    /// as `ErrMultipleValidKeys`; algod-rust's `record_for_account_impl`
+    /// detects the same `matches.len() > 1` condition and returns an error
+    /// instead of updating anything.
+    #[test]
+    fn record_for_account_multiple_active_keys_errors() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let p1 = make_test_participation(1, 0, 3_000_000, 0);
+        let p2 = Participation {
+            parent: Address([1u8; 32]),
+            vrf: VrfKeypair::from_seed([2u8; 32]),
+            voting: algo_consensus_crypto::OneTimeSignatureSecrets::generate(0, 10),
+            first_valid: Round(1),
+            last_valid: Round(3_000_000),
+            key_dilution: 0,
+            state_proof_secrets: None,
+        };
+        let id1 = store.insert(&p1).unwrap();
+        let id2 = store.insert(&p2).unwrap();
+
+        // Register the first key normally.
+        store.register(&id1, Round(0)).unwrap();
+
+        // Force the DB into an inconsistent state by directly activating the
+        // second key over the same round range, bypassing `register`'s
+        // deactivation-of-others logic (mirrors go's test tampering with the
+        // registry's private cache to simulate DB corruption).
+        store
+            .conn
+            .execute(
+                "UPDATE Rolling SET effectiveFirstRound = ?1, effectiveLastRound = ?2
+                 WHERE pk = (SELECT pk FROM Keysets WHERE participationID = ?3)",
+                params![
+                    p2.first_valid.0 as i64,
+                    p2.last_valid.0 as i64,
+                    id2.0.as_slice()
+                ],
+            )
+            .unwrap();
+
+        // Sanity: both records are now active at round 5000.
+        let r1 = store.get(&id1).unwrap().unwrap();
+        let r2 = store.get(&id2).unwrap().unwrap();
+        assert!(r1.effective_first.0 <= 5000 && 5000 <= r1.effective_last.0);
+        assert!(r2.effective_first.0 <= 5000 && 5000 <= r2.effective_last.0);
+
+        let err = store
+            .record_for_account(&Address([1u8; 32]), Round(5000), ParticipationAction::Vote)
+            .unwrap_err();
+        assert!(
+            matches!(err, rusqlite::Error::QueryReturnedNoRows),
+            "expected the multiple-active-keys sentinel error, got: {err:?}"
+        );
+
+        // Neither record's lastVoteRound should have been touched.
+        let r1 = store.get(&id1).unwrap().unwrap();
+        let r2 = store.get(&id2).unwrap().unwrap();
+        assert_eq!(r1.last_vote, Round(0));
+        assert_eq!(r2.last_vote, Round(0));
+    }
+
     #[test]
     fn get_for_voting_round_filters_by_sql() {
         let store = ParticipationStore::open_in_memory().unwrap();

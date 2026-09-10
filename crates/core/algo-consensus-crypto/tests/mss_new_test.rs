@@ -182,6 +182,27 @@ fn key_set_is_deterministic_for_a_fixed_seed_table() {
     }
 }
 
+/// Mirrors go's `TestNonEmptyDisposableKeys`
+/// (`crypto/merklesignature/merkleSignatureScheme_test.go:194`): every
+/// generated ephemeral key must be a real (non-zero-value) `FalconSigner`,
+/// not a zeroed placeholder left over from a partially-filled key slot.
+#[test]
+fn generated_ephemeral_keys_are_never_zero_valued() {
+    let secrets =
+        Secrets::new(0, KEY_LIFETIME_DEFAULT * 4, KEY_LIFETIME_DEFAULT).expect("must succeed");
+    assert!(
+        !secrets.ephemeral_keys.is_empty(),
+        "expected at least one ephemeral key"
+    );
+    for (i, key) in secrets.ephemeral_keys.iter().enumerate() {
+        assert!(
+            !key.public_key().is_empty() && !key.private_key().is_empty(),
+            "ephemeral key at index {i} must not be the zero-value FalconSigner \
+             (empty public/private key bytes)"
+        );
+    }
+}
+
 #[test]
 fn empty_keys_builder_returns_empty_vec() {
     use algo_consensus_crypto::merklesignature::keys_builder;

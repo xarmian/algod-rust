@@ -2319,6 +2319,41 @@ mod tests {
             .expect("verify_bytes should succeed");
     }
 
+    /// Mirrors go's `TestSignatureStructure`
+    /// (`crypto/merklesignature/merkleSignatureScheme_test.go:218`): a
+    /// produced `Signature`'s `verifying_key` and `proof` fields must equal
+    /// the exact values independently derivable from the signing key and
+    /// tree — not merely values that happen to verify successfully.
+    #[test]
+    fn test_signature_structure_fields_match_key_and_tree_directly() {
+        let secrets = Secrets::new(256, 512, 256).expect("Secrets::new should succeed");
+        let round = 256;
+
+        let signer = secrets.get_signer(round);
+        let sig = signer
+            .sign_bytes(b"structure check")
+            .expect("sign_bytes should succeed");
+
+        let key = secrets
+            .get_key(round)
+            .expect("a signing key must exist for round 256");
+        assert_eq!(
+            sig.verifying_key,
+            key.get_verifying_key(),
+            "Signature.verifying_key must equal the signing key's own verifying key"
+        );
+
+        let expected_proof = secrets
+            .signer_context
+            .tree
+            .prove_single_leaf(sig.vector_commitment_index)
+            .expect("prove_single_leaf should succeed for the signature's own index");
+        assert_eq!(
+            sig.proof, expected_proof,
+            "Signature.proof must equal tree.prove_single_leaf(vector_commitment_index)"
+        );
+    }
+
     #[test]
     fn test_sign_and_verify_last_valid_round() {
         let secrets = Secrets::new(256, 512, 256).expect("Secrets::new should succeed");
