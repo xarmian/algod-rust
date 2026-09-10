@@ -267,30 +267,84 @@ fn read_int16(data: &[u8], pos: usize) -> Result<i16, AlgoError> {
     Ok(i16::from_be_bytes([data[pos], data[pos + 1]]))
 }
 
-/// Parse a TEAL program from raw bytes.
+/// Decode a TEAL program's version prefix as a full LEB128 varuint, matching
+/// go-algorand's `transactions.ProgramVersion` (`data/transactions/transaction.go`):
 ///
-/// The first byte is the version. The remaining bytes are the instruction
-/// stream. Version `0` is accepted as go-algorand's backward-compatible
-/// alias for v1 (`data/transactions/logic/opcodes.go`'s `init()`: "v1
-/// allowed execution of program with version 0 ... version 0 array is
-/// populated with v1 opcodes with the version overwritten to 0") -- it
-/// predates the version-byte convention and is resolved against the v1
-/// opcode set exactly like a real version-1 program.
-pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
+/// ```go
+/// func ProgramVersion(bytecode []byte) (version uint64, length int, err error) {
+///     if len(bytecode) == 0 {
+///         return 0, 0, errors.New("invalid program (empty)")
+///     }
+///     version, vlen := binary.Uvarint(bytecode)
+///     if vlen <= 0 {
+///         return 0, 0, errors.New("invalid version")
+///     }
+///     return version, vlen, nil
+/// }
+/// ```
+///
+/// go decodes the version as a real varuint, not a fixed single byte: any
+/// real assembler only ever emits a canonical single-byte encoding (every
+/// supported version is `< 128`, so no continuation bit is ever needed), but
+/// a non-canonical/padded encoding -- e.g. version 1 as `0x81 0x00` -- is
+/// still structurally valid and must decode to the same version, just with
+/// instructions starting one byte later (`length` bytes in, not a fixed 1).
+/// `vlen <= 0` is go's `binary.Uvarint` overflow signal (e.g. 10+
+/// continuation-bit bytes with no terminator within the 64-bit budget,
+/// go's `TestInvalidVersion`'s 12-byte all-`0xff` case) and is rejected with
+/// exactly `"invalid version"`, reproduced here via [`read_varuint`]'s
+/// existing overflow/truncation detection (issue #1216).
+///
+/// Returns `(version, vlen)`, where `vlen` is the number of raw bytes the
+/// version prefix consumed and where the instruction stream begins. The
+/// decoded `u64` is narrowed to `u8` only after the `MAX_AVM_VERSION`
+/// range check below, since every version this AVM actually supports fits.
+fn parse_version_prefix(raw: &[u8]) -> Result<(u8, usize), AlgoError> {
     if raw.is_empty() {
         return Err(AlgoError::Avm {
             message: "program is empty".to_string(),
         });
     }
 
-    let version = raw[0];
-    if version > MAX_AVM_VERSION {
+    let (version, vlen) = read_varuint(raw, 0).map_err(|_| AlgoError::Avm {
+        message: "invalid version".to_string(),
+    })?;
+    if version > MAX_AVM_VERSION as u64 {
         return Err(AlgoError::Avm {
             message: format!(
                 "unsupported AVM version {version} (supported: 0..={MAX_AVM_VERSION})"
             ),
         });
     }
+    Ok((version as u8, vlen))
+}
+
+/// Peek a program's declared AVM version without fully parsing it, for the
+/// pre-eval gating checks (`check_program_version_allowed`/
+/// `check_pre_shared_resources_access`/`check_min_avm_version`) that run
+/// before -- and independently of -- the full [`parse`] call. Returns `None`
+/// on an empty program or an undecodable/out-of-range version prefix; those
+/// cases are left for `parse` itself to reject with its proper error, so
+/// callers should simply skip the corresponding pre-check when this returns
+/// `None` rather than synthesizing a version.
+pub fn peek_version(raw: &[u8]) -> Option<u8> {
+    parse_version_prefix(raw).ok().map(|(version, _)| version)
+}
+
+/// Parse a TEAL program from raw bytes.
+///
+/// The version prefix is a LEB128 varuint (see [`parse_version_prefix`]),
+/// not a fixed single byte -- the instruction stream begins wherever that
+/// varuint ends (`vlen`, 1 byte for every canonical encoding any real
+/// assembler emits, more for a non-canonical padded one). Version `0` is
+/// accepted as go-algorand's backward-compatible alias for v1
+/// (`data/transactions/logic/opcodes.go`'s `init()`: "v1 allowed execution
+/// of program with version 0 ... version 0 array is populated with v1
+/// opcodes with the version overwritten to 0") -- it predates the
+/// version-byte convention and is resolved against the v1 opcode set
+/// exactly like a real version-1 program.
+pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
+    let (version, vlen) = parse_version_prefix(raw)?;
 
     // go-algorand treats version byte 0 as an alias for v1: `opsByOpcode[0]`/
     // `OpsByName[0]` are populated from the same v1 `OpSpec` entries as
@@ -307,7 +361,7 @@ pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
     // stays the literal byte (0), not the aliased value.
     let opcode_ceiling_version = version.max(1);
 
-    let code = &raw[1..]; // instruction bytes (offsets are relative to this slice)
+    let code = &raw[vlen..]; // instruction bytes (offsets are relative to this slice)
     let mut pc: usize = 0;
     let mut instructions = Vec::new();
 
@@ -647,6 +701,53 @@ mod tests {
     #[test]
     fn test_version_too_high() {
         assert!(parse(&[MAX_AVM_VERSION + 1]).is_err());
+    }
+
+    /// Port of go-algorand's `TestInvalidVersion`
+    /// (`data/transactions/logic/eval_test.go`): a 12-byte sequence of
+    /// continuation-bit-set `0xff` bytes has no terminating (high-bit-clear)
+    /// byte within the 10 bytes a 64-bit varuint can ever need, so
+    /// `transactions.ProgramVersion`'s `binary.Uvarint` call reports
+    /// `vlen <= 0` (overflow) and go rejects with exactly `"invalid
+    /// version"`. `bytecode::parse` must decode the version prefix via a
+    /// real varuint read (issue #1216) and surface that same wording, not
+    /// the generic "unsupported AVM version" text a fixed-`raw[0]` read
+    /// would produce (`0xff` = 255 happens to also exceed
+    /// `MAX_AVM_VERSION`, so the old code accidentally rejected too, but
+    /// via the wrong mechanism and the wrong message).
+    #[test]
+    fn test_invalid_version_all_0xff_matches_go_test_invalid_version() {
+        let raw = [0xffu8; 12];
+        let err = parse(&raw).unwrap_err().to_string();
+        assert!(
+            err.contains("invalid version"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    /// A non-canonical (padded) but structurally valid single-value varuint
+    /// version prefix -- version 1 encoded as two bytes (continuation bit
+    /// set on `0x81`, terminated by `0x00`) instead of the canonical
+    /// single-byte `0x01` -- must decode to version 1 with instructions
+    /// starting at byte offset 2, not the fixed offset 1 the old
+    /// `raw[0]`/`&raw[1..]` code always used. go-algorand's
+    /// `transactions.ProgramVersion` (`binary.Uvarint`) accepts this
+    /// encoding identically to the canonical one; only the returned `vlen`
+    /// (where instructions begin) differs.
+    #[test]
+    fn test_noncanonical_padded_version_prefix_accepted_with_correct_offset() {
+        // 0x81 0x00 = varuint(1) padded to 2 bytes, followed by a single
+        // `err` opcode (0x00) at what must be recognized as offset 0 of the
+        // instruction stream (raw byte offset 2).
+        let raw = [0x81u8, 0x00, 0x00];
+        let p = parse(&raw).expect("non-canonical 2-byte version prefix must be accepted");
+        assert_eq!(p.version, 1, "padded prefix must decode to version 1");
+        assert_eq!(p.instructions.len(), 1);
+        assert_eq!(
+            p.instructions[0].offset, 0,
+            "instruction offset is relative to the code slice, which must start at raw vlen=2"
+        );
+        assert_eq!(p.instructions[0].opcode, 0x00);
     }
 
     #[test]
