@@ -151,6 +151,77 @@ pub fn meets_broadcast_policy(
     sig_round == latest_state_proof_round
 }
 
+/// Select which pending (not-yet-formed-into-a-proof) signatures should be
+/// (re-)broadcast for round `brnd`, matching go's `Worker.broadcastSigs`
+/// (`builder.go:493`) for a *single* round of its `nextBroadcastRnd..
+/// newLatest` loop (`builder.go:470-474`).
+///
+/// Signature re-broadcasting happens in periods of `interval` rounds: in
+/// the first half of each period only this node's own signatures are
+/// candidates (the common path -- already covered by the daemon
+/// broadcasting once on signing/acceptance); in the second half, any
+/// signature this node has *seen* (from any signer) is a candidate. This
+/// recovers a signature lost to a one-shot gossip-propagation failure —
+/// the node keeps re-offering it until a state proof for that round is
+/// confirmed and the row is pruned (`db::delete_pending_sigs_before_round`).
+///
+/// Within the selected half, each candidate is further gated by a
+/// per-signer, address-based schedule (`addr64 % (interval / 2) == brnd %
+/// (interval / 2)`, `builder.go:524-527`) so that, across consecutive
+/// rounds, different signers' pending signatures get re-offered at
+/// different times rather than every pending signature firing on the same
+/// tick — load-balancing the rebroadcast traffic over the period instead of
+/// bursting it. `interval / 2 == 0` (only reachable with a degenerate
+/// `interval` of 0 or 1, which no real consensus version sets) disables
+/// this gate rather than dividing by zero, matching the fact that go's
+/// `uint64 % 0` would panic and is therefore never exercised upstream
+/// either.
+pub fn pending_sigs_to_broadcast(
+    conn: &rusqlite::Connection,
+    brnd: u64,
+    state_proof_next_round: u64,
+    interval: u64,
+) -> rusqlite::Result<Vec<SigFromAddr>> {
+    if interval == 0 {
+        return Ok(Vec::new());
+    }
+
+    let latest_state_proof_round = brnd - (brnd % interval);
+    let threshold = online_provers_threshold(state_proof_next_round, interval);
+    let only_from_this_node = brnd % interval < interval / 2;
+    let round_sigs = db::get_pending_sigs(
+        conn,
+        threshold,
+        latest_state_proof_round,
+        only_from_this_node,
+    )?;
+
+    let half = interval / 2;
+    let mut out = Vec::new();
+    for (rnd, sigs) in round_sigs {
+        // Signature is for a later round than brnd -- can happen during
+        // catchup or testing; a later call with a suitably high brnd will
+        // pick it up. Matches go's `if rnd > brnd { continue }`.
+        if rnd > brnd {
+            continue;
+        }
+        for sig in sigs {
+            if half != 0 {
+                let addr64 = u64::from_le_bytes(sig.signer.0[..8].try_into().unwrap());
+                if addr64 % half != brnd % half {
+                    continue;
+                }
+            }
+            out.push(SigFromAddr {
+                signer_address: sig.signer,
+                round: rnd,
+                sig: sig.sig,
+            });
+        }
+    }
+    Ok(out)
+}
+
 // ── Per-account signing (stateproof/signer.go's signStateProofMessage) ──
 
 /// A signature on a state-proof message hash, ready to be gathered into a
@@ -1817,6 +1888,123 @@ mod tests {
         .unwrap();
         let rounds = db::get_signature_rounds(&conn, 1000, 1000).unwrap();
         assert_eq!(rounds, vec![256]);
+    }
+
+    /// Issue #1231 (TDD): a signature this node has seen but which was lost
+    /// to a one-shot gossip-propagation failure (never marked
+    /// `from_this_node`, simulating "received from a peer, our own forward
+    /// attempt silently dropped") is NOT a candidate during the first half
+    /// of the `StateProofInterval` period (go only re-offers this node's
+    /// OWN signatures then), but eventually becomes one once the period
+    /// advances into its second half and this signer's address-based
+    /// schedule slot comes up -- exactly matching go's
+    /// `Worker.broadcastSigs` (`builder.go:493-543`). This pins the
+    /// liveness fix end to end via [`pending_sigs_to_broadcast`]: before
+    /// this issue, no equivalent function/call site existed anywhere in the
+    /// daemon, so a dropped broadcast for a still-pending round was never
+    /// retried.
+    #[test]
+    fn pending_sigs_to_broadcast_recovers_lost_broadcast_in_second_half() {
+        let conn = fresh_db();
+        const INTERVAL: u64 = 8; // half = 4
+        let mut addr = [0u8; 32];
+        addr[0] = 4; // addr64 (LE of first 8 bytes) == 4, so addr64 % 4 == 0
+        db::add_pending_sig(
+            &conn,
+            8,
+            &db::PendingSig {
+                signer: Address(addr),
+                sig: dummy_sig(),
+                from_this_node: false,
+            },
+        )
+        .unwrap();
+
+        // brnd = 8: first half of the period (8 % 8 == 0 < 4) -> only this
+        // node's own sigs are candidates. The peer-received sig is not
+        // ours, so it's excluded -- matching go's `broadcastSigs` querying
+        // `getPendingSigs(tx, threshold, latestStateProofRound, true)`.
+        let first_half = pending_sigs_to_broadcast(&conn, 8, 0, INTERVAL).unwrap();
+        assert!(
+            first_half.is_empty(),
+            "first-half tick must not re-offer a foreign signature"
+        );
+
+        // brnd = 9..11: still first half (9%8=1, 10%8=2, 11%8=3, all < 4) --
+        // still excluded regardless of the address schedule.
+        for brnd in [9u64, 10, 11] {
+            assert!(
+                pending_sigs_to_broadcast(&conn, brnd, 0, INTERVAL)
+                    .unwrap()
+                    .is_empty(),
+                "brnd={brnd} is still first-half, must stay excluded"
+            );
+        }
+
+        // brnd = 12: second half (12 % 8 == 4, not < 4) -- any seen
+        // signature is now a candidate, and this signer's schedule slot
+        // (addr64 % 4 == 0) lines up with brnd % 4 == 0. The lost broadcast
+        // is finally re-sent.
+        let second_half = pending_sigs_to_broadcast(&conn, 12, 0, INTERVAL).unwrap();
+        assert_eq!(
+            second_half.len(),
+            1,
+            "second-half tick with a matching address slot must recover the lost broadcast"
+        );
+        assert_eq!(second_half[0].signer_address, Address(addr));
+        assert_eq!(second_half[0].round, 8);
+
+        // brnd = 13: second half (13 % 8 == 5, not < 4), but 13 % 4 == 1 !=
+        // addr64 % 4 == 0 -- this signer's slot hasn't come up on this
+        // particular tick, load-balancing the rebroadcast traffic.
+        assert!(
+            pending_sigs_to_broadcast(&conn, 13, 0, INTERVAL)
+                .unwrap()
+                .is_empty(),
+            "a non-matching address slot must not fire every second-half tick"
+        );
+    }
+
+    #[test]
+    fn pending_sigs_to_broadcast_returns_empty_when_state_proofs_disabled() {
+        let conn = fresh_db();
+        db::add_pending_sig(
+            &conn,
+            8,
+            &db::PendingSig {
+                signer: Address([1u8; 32]),
+                sig: dummy_sig(),
+                from_this_node: true,
+            },
+        )
+        .unwrap();
+        assert!(pending_sigs_to_broadcast(&conn, 8, 0, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn pending_sigs_to_broadcast_skips_rounds_later_than_brnd() {
+        let conn = fresh_db();
+        // A signature for a round later than `brnd` can appear during
+        // catchup/testing; matches go's `if rnd > brnd { continue }`. Set
+        // state_proof_next_round high enough that `threshold` (which
+        // doesn't itself depend on brnd) still admits round 200 through the
+        // DB query, so this actually exercises the explicit `rnd > brnd`
+        // guard rather than the DB's own bounds.
+        db::add_pending_sig(
+            &conn,
+            200,
+            &db::PendingSig {
+                signer: Address([7u8; 32]),
+                sig: dummy_sig(),
+                from_this_node: true,
+            },
+        )
+        .unwrap();
+        assert!(pending_sigs_to_broadcast(&conn, 100, 200, 8)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
