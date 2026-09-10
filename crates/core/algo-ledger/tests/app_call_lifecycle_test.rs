@@ -667,6 +667,75 @@ fn test_appl_create_with_clear_state_on_completion_rejected_not_opted_in() {
 }
 
 // ---------------------------------------------------------------------------
+// TestDeleteNonExistentKeys (ledger/apptxn_test.go)
+//
+// The opcode-level tests (`test_app_global_del`/`test_app_local_del` in
+// algo-avm) already prove app_global_del/app_local_del are no-ops on a
+// missing key. Go's test additionally pins that the *encoded*
+// ApplyData.EvalDelta produced by such a no-op call carries zero entries
+// (not e.g. a spurious empty-value delta entry) -- this closes that
+// narrower gap.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_delete_nonexistent_keys_produces_empty_eval_delta() {
+    let creator = Address([1u8; 32]);
+    let other = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let app_id = 950u64;
+
+    let mut state = make_state(
+        &[(creator, 50_000_000), (other, 50_000_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let approval_src = "#pragma version 8
+byte \"missing_global\"
+app_global_del
+int 0
+byte \"missing_local\"
+app_local_del
+int 1
+";
+    let create = appl_create(
+        creator,
+        1_000,
+        app_id,
+        approval_src,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    let create_block = minimal_block(fee_sink, 1, vec![create]);
+    apply_block_capturing_apply_data(&mut state, &create_block, ApplyMode::Execute)
+        .expect("app creation must apply cleanly");
+
+    const ON_COMPLETION_OPT_IN: u64 = 1;
+    let optin = appl_call(other, 1_000, app_id, ON_COMPLETION_OPT_IN, None);
+    let optin_block = minimal_block(fee_sink, 2, vec![optin]);
+    let results = apply_block_capturing_apply_data(&mut state, &optin_block, ApplyMode::Execute)
+        .expect("opt-in call running the delete-on-missing-key program must apply cleanly");
+
+    match results[0].eval_delta.as_ref() {
+        None => {} // no eval delta at all is also a valid "empty" encoding
+        Some(dt) => {
+            let ed = parse_eval_delta(dt).expect("eval delta must parse");
+            assert_eq!(
+                ed.global_delta.as_ref().map(|m| m.len()).unwrap_or(0),
+                0,
+                "deleting a nonexistent global key must not produce a GlobalDelta entry"
+            );
+            assert_eq!(
+                ed.local_deltas.as_ref().map(|m| m.len()).unwrap_or(0),
+                0,
+                "deleting a nonexistent local key must not produce a LocalDeltas entry"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 6. TestAppInsMinBalance (ledger/eval_simple_test.go:1825)
 //
 // Min-balance accounting must scale correctly with several distinct

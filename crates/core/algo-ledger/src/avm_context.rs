@@ -14204,6 +14204,28 @@ mod tests {
     }
 
     #[test]
+    fn consider_budget_program_writes_rejects_oversized_create_optin_with_no_io_budget() {
+        // Port of go's `TestLargeProgramCreateOptInWriteBudget`: unlike the
+        // create+delete combination (which is fully exempt, see
+        // `consider_budget_program_writes_exempts_create_and_delete_in_same_txn`),
+        // create+opt-in is still a real "creating" write and must be charged
+        // the same write-budget check as a bare create.
+        let mut store = LedgerState::new();
+        let txn = make_program_txn(0, ON_COMPLETION_OPT_IN, 50, 10); // creating+optin, total 60 bytes
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = 1016;
+        zero_free_program_tier(&mut ctx);
+        ctx.boxes_initialized = true;
+        ctx.io_budget = 0;
+
+        let err = ctx.consider_budget_program_writes().unwrap_err();
+        assert_eq!(
+            format!("{err}"),
+            "AVM: write budget exceeded (60 > 0) while creating app 1016"
+        );
+    }
+
+    #[test]
     fn consider_budget_program_writes_rejects_oversized_update_with_correct_verb() {
         let mut store = LedgerState::new();
         let txn = make_program_txn(77, crate::apply::ON_COMPLETION_UPDATE, 200, 5); // updating, total 205 bytes
