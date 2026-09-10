@@ -920,6 +920,13 @@ pub enum LoadgenCommands {
         /// Where to write the key file (contains private keys; 0600 on unix).
         #[arg(long, short = 'o')]
         out: PathBuf,
+
+        /// Derive seeds from the sequential index 0..count instead of OS
+        /// randomness, so the same `count` always reproduces the same
+        /// addresses (go-algorand: `netgoal generate --deterministic` /
+        /// `shared/pingpong`'s `DeterministicKeys`).
+        #[arg(long)]
+        deterministic: bool,
     },
 
     /// Drive a cluster at a fixed transaction rate and emit a JSON report.

@@ -181,13 +181,21 @@ impl HickorySrvResolver {
     }
 
     /// Perform an SRV lookup using the given resolver, returning parsed
-    /// [`SrvRecord`]s.
+    /// [`SrvRecord`]s, sorted by priority and weight-randomized within each
+    /// priority tier (see [`sort_and_randomize_srv_records`]).
+    ///
+    /// `hickory_resolver`'s `srv_lookup` returns records in whatever order
+    /// the DNS response carried them in — unlike Go's `net.Resolver`/
+    /// `dnssec.Resolver` (`tools/network/resolver.go`'s `LookupSRV` doc
+    /// comment: "The returned records are sorted by priority and randomized
+    /// by weight within a priority"), it performs no RFC 2782 ordering, so
+    /// that ordering has to be applied here explicitly.
     async fn do_lookup(
         resolver: &TokioResolver,
         srv_name: &str,
     ) -> Result<Vec<SrvRecord>, ResolveError> {
         let lookup = resolver.srv_lookup(srv_name).await?;
-        let records = lookup
+        let mut records: Vec<SrvRecord> = lookup
             .iter()
             .filter_map(|srv| {
                 let mut target = srv.target().to_string();
@@ -209,7 +217,59 @@ impl HickorySrvResolver {
                 })
             })
             .collect();
+        sort_and_randomize_srv_records(&mut records);
         Ok(records)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 2782 priority sort + weighted randomization
+// ---------------------------------------------------------------------------
+
+/// Sort `records` by priority (ascending) and, within each priority tier,
+/// weighted-randomize the order per RFC 2782 — a direct port of go-algorand's
+/// `tools/network/dnssec.srvRecArray.sortAndRand()`
+/// (`tools/network/dnssec/sort.go`), which both go's stdlib `net.Resolver`
+/// and go-algorand's own `dnssec.Resolver` apply to every `LookupSRV` result.
+fn sort_and_randomize_srv_records(records: &mut [SrvRecord]) {
+    records.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| a.weight.cmp(&b.weight))
+    });
+
+    let mut i = 0usize;
+    for j in 1..records.len() {
+        if records[i].priority != records[j].priority {
+            randomize_weighted_range(records, i, j);
+            i = j;
+        }
+    }
+    randomize_weighted_range(records, i, records.len());
+}
+
+/// Weighted-random shuffle of `records[start..end]` (a single priority
+/// tier), per RFC 2782's SRV selection algorithm — a direct port of go's
+/// `srvRecArray.randomize`.
+fn randomize_weighted_range(records: &mut [SrvRecord], start: usize, end: usize) {
+    use rand::Rng;
+
+    let mut sum: u32 = records[start..end].iter().map(|r| r.weight as u32).sum();
+    let mut start = start;
+    let mut rng = rand::thread_rng();
+    while sum > 0 && end > start {
+        // Choose a uniform random number between 0 and the sum (inclusive).
+        let num = rng.gen_range(0..=sum);
+        let mut running_sum: u32 = 0;
+        for i in start..end {
+            running_sum += records[i].weight as u32;
+            if running_sum >= num {
+                records.swap(start, i);
+                break;
+            }
+        }
+        sum -= records[start].weight as u32;
+        start += 1;
     }
 }
 
@@ -662,6 +722,106 @@ mod tests {
         assert_eq!(result[1].weight, 40);
         assert_eq!(result[2].priority, 20);
         assert_eq!(result[2].weight, 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // sort_and_randomize_srv_records tests (RFC 2782 priority/weight order)
+    // -----------------------------------------------------------------------
+
+    /// Direct port of go-algorand's `tools/network/dnssec.TestSrvSort`
+    /// (`sort_test.go`): after sorting, records must be grouped by
+    /// ascending priority, and within the lowest-priority tier the
+    /// maximum-weight (0xFFFF) record must land first at least once in a
+    /// few attempts (weighted randomization means it isn't guaranteed on
+    /// every single run, same non-determinism go's own test tolerates).
+    #[test]
+    fn srv_sort_orders_by_priority_and_weight() {
+        fn rec(priority: u16, weight: u16) -> SrvRecord {
+            SrvRecord {
+                target: "t".to_string(),
+                port: 0,
+                priority,
+                weight,
+            }
+        }
+
+        let base = vec![
+            rec(4, 1),
+            rec(3, 1),
+            rec(1, 0xFFFF), // max possible weight, to increase ordering probability
+            rec(1, 1),
+            rec(1, 1),
+            rec(1, 1),
+            rec(1, 1),
+        ];
+
+        let mut saw_max_weight_first = false;
+        for _ in 0..8 {
+            let mut arr = base.clone();
+            sort_and_randomize_srv_records(&mut arr);
+
+            // Priority groups must always be in ascending order, and the
+            // last two entries (the singleton priority-3 and priority-4
+            // tiers) are always fixed regardless of randomization.
+            assert_eq!(arr[5], rec(3, 1));
+            assert_eq!(arr[6], rec(4, 1));
+            // The five priority-1 records occupy positions 0..5, in some
+            // weighted-random order.
+            let mut tier1 = arr[0..5].to_vec();
+            tier1.sort_by_key(|r| r.weight);
+            assert_eq!(
+                tier1,
+                vec![rec(1, 1), rec(1, 1), rec(1, 1), rec(1, 1), rec(1, 0xFFFF)]
+            );
+
+            if arr[0] == rec(1, 0xFFFF) {
+                saw_max_weight_first = true;
+            }
+        }
+        assert!(
+            saw_max_weight_first,
+            "the highest-weight record should sort first at least once across several attempts"
+        );
+    }
+
+    /// `sort_and_randomize_srv_records` must be a stable no-op reorder when
+    /// there is nothing to randomize (a single record, or all-zero weights
+    /// within a tier still get shuffled per RFC 2782, but a single-element
+    /// slice can't move).
+    #[test]
+    fn srv_sort_single_record_is_unchanged() {
+        let mut arr = vec![SrvRecord {
+            target: "solo.example.com".to_string(),
+            port: 4160,
+            priority: 1,
+            weight: 1,
+        }];
+        sort_and_randomize_srv_records(&mut arr);
+        assert_eq!(arr[0].target, "solo.example.com");
+    }
+
+    /// Zero-weight records within a priority tier must not panic (the
+    /// weighted-random loop's `sum > 0` guard should short-circuit
+    /// immediately, matching go's `randomize` behavior for an all-zero-weight
+    /// tier).
+    #[test]
+    fn srv_sort_zero_weight_tier_does_not_panic() {
+        let mut arr = vec![
+            SrvRecord {
+                target: "a".to_string(),
+                port: 1,
+                priority: 5,
+                weight: 0,
+            },
+            SrvRecord {
+                target: "b".to_string(),
+                port: 2,
+                priority: 5,
+                weight: 0,
+            },
+        ];
+        sort_and_randomize_srv_records(&mut arr);
+        assert_eq!(arr.len(), 2);
     }
 
     /// Verify the archival service SRV query pattern.

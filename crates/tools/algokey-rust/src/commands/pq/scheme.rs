@@ -180,6 +180,47 @@ mod tests {
         assert!(err.contains("not supported"), "{err}");
     }
 
+    /// Direct port of go-algorand's `cmd/algokey.TestPQSchemeRegistriesConsistent`
+    /// (`cmd/algokey/pq_test.go`): every scheme registered in algokey's own
+    /// signing-material registry (`derive_pq_signing_material_from_entropy`,
+    /// Go's `pqSchemeOpsByScheme`) must also be registered in the independent
+    /// `algo_consensus_crypto::pq_scheme` verifier registry (Go's
+    /// `crypto.LookupPQScheme`), and vice versa — the two registries must
+    /// never silently drift apart (e.g. algokey accepting a scheme tag the
+    /// verifier can't check, or the verifier accepting one algokey can never
+    /// produce a key for).
+    // Both loops below iterate over what is today a single-entry array on
+    // purpose (mirroring go's own hardcoded reverse-direction check and its
+    // single-entry `pqSchemeOpsByScheme` map): the point is to state "for
+    // every scheme algokey/the crypto registry supports", a set that grows
+    // to more than one element the moment a second PQ scheme is added.
+    #[allow(clippy::single_element_loop)]
+    #[test]
+    fn pq_scheme_registries_consistent() {
+        // Every scheme algokey's signing-material derivation supports must
+        // resolve in the independent crypto-package verifier registry.
+        for scheme in [PQ_SCHEME_FALCON1024] {
+            assert!(
+                algo_consensus_crypto::pq_scheme::lookup_pq_scheme(scheme).is_some(),
+                "algokey scheme {:?} missing from crypto registry",
+                String::from_utf8_lossy(&scheme)
+            );
+        }
+
+        // And the reverse: every scheme the crypto-package verifier registry
+        // supports must be one algokey can actually derive signing material
+        // for (only Falcon-1024 today, matching upstream's own hardcoded
+        // reverse-direction check).
+        for scheme in [PQ_SCHEME_FALCON1024] {
+            let entropy = [0u8; 32];
+            assert!(
+                derive_pq_signing_material_from_entropy(scheme, &entropy).is_ok(),
+                "basics scheme {:?} missing from algokey ops registry",
+                String::from_utf8_lossy(&scheme)
+            );
+        }
+    }
+
     #[test]
     fn generate_pq_signing_material_produces_valid_material_each_call() {
         let (entropy1, m1) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
