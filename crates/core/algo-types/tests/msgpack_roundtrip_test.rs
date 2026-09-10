@@ -225,6 +225,29 @@ fn block_header_populated_roundtrips() {
 }
 
 #[test]
+fn block_header_decodes_old_v32_wire_format() {
+    // Mirrors go-algorand's TestBlockHeader_Serialization
+    // (data/bookkeeping/block_test.go): decodes a real block header captured
+    // from a V32 e2e test, back when BlockHeader only carried the legacy
+    // SHA512/256 commitment (no txn256/txn512/prev512 fields, which were
+    // added later by EnableSha512BlockHash). A correct decoder must accept
+    // this older wire format and leave the newer fields at their zero value.
+    let hex_blk_hdr = "8fa3737074810081a16ecd0200a466656573c42007dacb4b6d9ed141b17576bd459ae6421d486da3d4ef2247c409a396b82ea221a466726163ce1dcd64fea367656ea7746573742d7631a26768c42032cb340d569e1f9e4d9690c1ba04d77759bae6f353e13af1becf42dcd7d3bdeba470726576c420a2270bc90e3cc48d56081b3b85c15d6a10e14303a6d42ca2537954ce90beec40a570726f746fa6667574757265a472617465ce0ee6b27fa3726e6402a6727763616c72ce0007a120a3727764c420ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa473656564c420a19005a25abad1ad28ec2298baeda9a17693a9ef12127a5ff3e5fa9258c7e9eba2746306a27473ce625ed0eaa374786ec420508f9330176e6064767b0fb7eb0e8bf68ffbaf995a4c7b37ca0217c5a82b4a60";
+    let bytes = hex::decode(hex_blk_hdr).expect("valid hex");
+    let hdr = BlockHeader::decode_from_reader(&mut bytes.as_slice())
+        .expect("must decode an old-format (pre-EnableSha512BlockHash) block header");
+
+    // Legacy SHA512/256 commitment ("txn" tag -> txn_commitment) must be set
+    // (present in the fixture, nonzero).
+    assert_ne!(hdr.txn_commitment, [0u8; 32]);
+    // The newer fields (added by EnableSha512BlockHash) are absent from this
+    // old fixture and must decode to their zero value, not error out.
+    assert_eq!(hdr.txn256, [0u8; 32]);
+    assert_eq!(hdr.txn512, [0u8; 64]);
+    assert_eq!(hdr.prev512, [0u8; 64]);
+}
+
+#[test]
 fn block_header_participation_updates_roundtrips() {
     // Mirrors go's TestMarshalUnmarshalParticipationUpdates non-empty case:
     // both ExpiredParticipationAccounts/AbsentParticipationAccounts (here,

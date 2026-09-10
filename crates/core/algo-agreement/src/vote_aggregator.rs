@@ -370,7 +370,7 @@ mod tests {
     use crate::events::{
         ConsensusVersionView, FilterableMessageEvent, FreshnessData, InternalMessage, MessageEvent,
     };
-    use crate::step::{Period, Step, SOFT};
+    use crate::step::{Period, Step, CERT, NEXT, SOFT};
     use crate::vote::{ProposalValue, RawVote};
     use algo_types::{Address, Digest, Round};
 
@@ -467,6 +467,34 @@ mod tests {
             },
             freshness_data: fresh_data,
         }
+    }
+
+    #[test]
+    fn vote_aggregator_msgpack_roundtrip() {
+        // Mirrors go-algorand's TestMarshalUnmarshalvoteAggregator /
+        // TestRandomizedEncodingvoteAggregator (agreement/msgp_gen_test.go):
+        // roundtrip a populated (non-default, with a real vote processed
+        // into per-round tracking state) voteAggregator through msgpack.
+        let mut agg = VoteAggregator::default();
+        let params = test_params();
+        let uv = make_uv(
+            Address([0x03; 32]),
+            Round(20),
+            Period(1),
+            SOFT,
+            test_proposal(),
+        );
+        let fresh_data = make_fresh_data(Round(20), Period(1), SOFT);
+        let event = make_vote_present_event(uv, fresh_data);
+        let _ = agg.handle(&event, &params);
+        // Force per-round state to exist even if the vote above was filtered
+        // for any reason, so the roundtrip genuinely exercises the nested map.
+        let _ = agg.tracker_for_round(Round(20));
+        assert!(agg.rounds.contains_key(&Round(20)));
+
+        let bytes = rmp_serde::to_vec_named(&agg).expect("msgpack serialize");
+        let decoded: VoteAggregator = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert!(decoded.rounds.contains_key(&Round(20)));
     }
 
     #[test]
@@ -841,6 +869,52 @@ mod tests {
     }
 
     // ---- Vote verified with error ----
+
+    #[test]
+    fn vote_aggregator_vote_verified_stale_round_filtered() {
+        // Mirrors go-algorand's TestVoteAggregatorFiltersVoteVerifiedStale
+        // (agreement/voteAggregator_test.go): a verified vote for a round
+        // far behind the player's current round must be filtered (not
+        // passed through as empty/accepted), while a verified vote in the
+        // player's current or next round is let through.
+        let mut agg = VoteAggregator::default();
+        let params = test_params();
+        let pv = test_proposal();
+        let fresh_data = make_fresh_data(Round(1), Period(0), CERT);
+
+        // A vote for round 100 (far stale relative to player round 1) must
+        // be filtered.
+        let stale_vote = make_verified_vote(Address([0x01; 32]), Round(100), Period(1), SOFT, pv, 0);
+        let event = make_vote_verified_event(stale_vote, fresh_data);
+        let result = agg.handle(&event, &params);
+        assert_eq!(
+            result.event_type(),
+            EventType::VoteFiltered,
+            "a verified vote far behind the player's round must be filtered"
+        );
+
+        // A vote in the player's current round (1) at a later period/step
+        // (period 1, next) must not be filtered.
+        let fresh_vote = make_verified_vote(Address([0x02; 32]), Round(1), Period(1), NEXT, pv, 0);
+        let event = make_vote_verified_event(fresh_vote, fresh_data);
+        let result = agg.handle(&event, &params);
+        assert_ne!(
+            result.event_type(),
+            EventType::VoteFiltered,
+            "a verified vote at the player's own round must not be filtered"
+        );
+
+        // A vote for the next round (2) must not be filtered either — the
+        // aggregator pipelines one round ahead.
+        let next_round_vote = make_verified_vote(Address([0x03; 32]), Round(2), Period(0), SOFT, pv, 0);
+        let event = make_vote_verified_event(next_round_vote, fresh_data);
+        let result = agg.handle(&event, &params);
+        assert_ne!(
+            result.event_type(),
+            EventType::VoteFiltered,
+            "a verified vote for the next round must not be filtered"
+        );
+    }
 
     #[test]
     fn vote_aggregator_vote_verified_error() {

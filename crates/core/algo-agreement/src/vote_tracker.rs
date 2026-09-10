@@ -716,6 +716,44 @@ mod tests {
     }
 
     #[test]
+    fn vote_tracker_msgpack_roundtrip() {
+        // Mirrors go-algorand's TestMarshalUnmarshalvoteTracker /
+        // TestRandomizedEncodingvoteTracker (agreement/msgp_gen_test.go):
+        // roundtrip a populated voteTracker — including an equivocator, so
+        // every field (voters/counts/equivocators/equivocators_count) is
+        // exercised — through msgpack.
+        let mut tracker = VoteTracker::default();
+        let params = test_params();
+        let sender = Address([0x01; 32]);
+
+        let vote1 = make_vote(sender, Round(1), Period(0), SOFT, test_proposal(), 1);
+        tracker.handle(
+            &Event::VoteAccepted(VoteAcceptedEvent {
+                vote: vote1,
+                proto: String::new(),
+            }),
+            &params,
+        );
+        let vote2 = make_vote(sender, Round(1), Period(0), SOFT, test_proposal_2(), 1);
+        tracker.handle(
+            &Event::VoteAccepted(VoteAcceptedEvent {
+                vote: vote2,
+                proto: String::new(),
+            }),
+            &params,
+        );
+        assert!(tracker.equivocators.contains_key(&sender));
+        assert!(tracker.equivocators_count > 0);
+
+        let bytes = rmp_serde::to_vec_named(&tracker).expect("msgpack serialize");
+        let decoded: VoteTracker = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(decoded.equivocators_count, tracker.equivocators_count);
+        assert!(decoded.equivocators.contains_key(&sender));
+        assert_eq!(decoded.voters.len(), tracker.voters.len());
+        assert_eq!(decoded.counts.len(), tracker.counts.len());
+    }
+
+    #[test]
     fn vote_tracker_dump_votes() {
         let mut tracker = VoteTracker::default();
         let params = test_params();

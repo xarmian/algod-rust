@@ -661,6 +661,87 @@ mod tests {
     }
 
     #[test]
+    fn block_assembler_msgpack_roundtrip() {
+        // Mirrors go-algorand's TestMarshalUnmarshalblockAssembler /
+        // TestRandomizedEncodingblockAssembler (agreement/msgp_gen_test.go):
+        // roundtrip a populated (non-default) blockAssembler through msgpack.
+        use crate::credential::{Credential, HashableCredential};
+        use crate::events::Proposal;
+        use crate::VRF_PROOF_SIZE;
+
+        let vote = Vote {
+            raw_vote: RawVote {
+                sender: Address([7u8; 32]),
+                round: Round(9),
+                period: Period(2),
+                step: crate::step::Step(3),
+                proposal: make_proposal_value(0x22),
+            },
+            cred: Credential {
+                weight: 5,
+                vrf_out: Digest([9u8; 32]),
+                domain_separation_enabled: true,
+                hashable: HashableCredential::default(),
+                proof: [0x11u8; VRF_PROOF_SIZE],
+            },
+            sig: algo_consensus_crypto::OneTimeSignature {
+                sig: [0x22u8; 64],
+                pk: [0x33u8; 32],
+                pk_sig_old: [0x44u8; 64],
+                pk2: [0x55u8; 32],
+                pk1_sig: [0x66u8; 64],
+                pk2_sig: [0x77u8; 64],
+            },
+            validated_at: std::time::Duration::from_millis(42),
+        };
+        let ba = BlockAssembler {
+            pipeline: UnauthenticatedProposal::default(),
+            filled: true,
+            payload: Some(Proposal {
+                unauthenticated_proposal: UnauthenticatedProposal {
+                    original_period: Period(4),
+                    ..UnauthenticatedProposal::default()
+                },
+                ..Default::default()
+            }),
+            assembled: true,
+            authenticators: vec![vote],
+        };
+        let bytes = rmp_serde::to_vec_named(&ba).expect("msgpack serialize");
+        let decoded: BlockAssembler = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(decoded.filled, ba.filled);
+        assert_eq!(decoded.assembled, ba.assembled);
+        assert_eq!(decoded.authenticators.len(), 1);
+        assert_eq!(decoded.authenticators[0].raw_vote.sender, Address([7u8; 32]));
+        assert_eq!(
+            decoded.payload.unwrap().unauthenticated_proposal.original_period,
+            Period(4)
+        );
+    }
+
+    #[test]
+    fn proposal_store_msgpack_roundtrip() {
+        // Mirrors go-algorand's TestMarshalUnmarshalproposalStore /
+        // TestRandomizedEncodingproposalStore (agreement/msgp_gen_test.go):
+        // roundtrip a populated (non-default) proposalStore through msgpack.
+        let mut store = ProposalStore::default();
+        let pv = make_proposal_value(0xaa);
+        store.relevant.insert(Period(0), pv);
+        store.pinned = make_proposal_value(0xbb);
+        store.assemblers.insert(pv, BlockAssembler::default());
+        store
+            .trackers
+            .insert(Period(1), ProposalTracker::default());
+
+        let bytes = rmp_serde::to_vec_named(&store).expect("msgpack serialize");
+        let decoded: ProposalStore = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(decoded.relevant.get(&Period(0)), Some(&pv));
+        assert_eq!(decoded.pinned, make_proposal_value(0xbb));
+        assert!(decoded.assemblers.contains_key(&pv));
+        assert!(decoded.trackers.contains_key(&Period(1)));
+    }
+
+    #[test]
     fn proposal_store_new_period() {
         let mut store = ProposalStore::default();
         let pv = make_proposal_value(0xaa);

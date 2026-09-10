@@ -453,6 +453,39 @@ mod tests {
     }
 
     #[test]
+    fn proposal_seeker_msgpack_roundtrip() {
+        // Mirrors go-algorand's TestMarshalUnmarshalproposalSeeker /
+        // TestRandomizedEncodingproposalSeeker (agreement/msgp_gen_test.go):
+        // roundtrip a populated (non-default, frozen-with-late-tracking)
+        // proposalSeeker through msgpack.
+        let seeker = ProposalSeeker::default();
+        let v1 = make_vote(Address([0x01; 32]), 0x10);
+        let (seeker, _, result) = seeker.accept(v1);
+        assert!(result.is_ok());
+        let seeker = seeker.freeze();
+        let v2 = make_vote(Address([0x02; 32]), 0x05);
+        let (seeker, _, _) = seeker.accept(v2);
+        assert!(seeker.frozen);
+
+        let bytes = rmp_serde::to_vec_named(&seeker).expect("msgpack serialize");
+        let decoded: ProposalSeeker = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(decoded.filled, seeker.filled);
+        assert_eq!(decoded.frozen, seeker.frozen);
+        assert_eq!(
+            decoded.lowest.raw_vote.sender,
+            seeker.lowest.raw_vote.sender
+        );
+        assert_eq!(
+            decoded.lowest_including_late.raw_vote.sender,
+            seeker.lowest_including_late.raw_vote.sender
+        );
+        assert_eq!(
+            decoded.has_lowest_including_late,
+            seeker.has_lowest_including_late
+        );
+    }
+
+    #[test]
     fn seeker_accept_first_vote() {
         let seeker = ProposalSeeker::default();
         let v = make_vote(Address([0x01; 32]), 0x10);

@@ -2874,6 +2874,41 @@ mod tests {
     }
 
     #[test]
+    fn canonical_encode_block_and_header_empty_is_one_byte() {
+        // Mirrors go-algorand's TestEmptyEncoding (data/bookkeeping/encoding_test.go):
+        // a zero-value Block and a zero-value BlockHeader each canonically
+        // encode to exactly one byte (msgpack empty fixmap 0x80).
+        let block = algo_types::Block::default();
+        let header_bytes = canonical_encode_block_header_from_block(&block);
+        assert_eq!(
+            header_bytes,
+            vec![0x80],
+            "zero-value BlockHeader must canonically encode to the empty msgpack map"
+        );
+        let block_bytes = canonical_encode_block(&block);
+        assert_eq!(
+            block_bytes,
+            vec![0x80],
+            "zero-value Block must canonically encode to the empty msgpack map"
+        );
+    }
+
+    #[test]
+    fn canonical_encode_account_data_empty_is_one_byte() {
+        // Mirrors go-algorand's TestEmptyEncoding (data/basics/userBalance_test.go):
+        // a zero-value AccountData/BalanceRecord canonically encodes to exactly
+        // one byte (msgpack empty fixmap 0x80), because every field is
+        // `omitempty`-equivalent and there is nothing to include.
+        let ad = AccountData::default();
+        let bytes = canonical_encode_account_data(&ad);
+        assert_eq!(
+            bytes,
+            vec![0x80],
+            "zero-value AccountData must canonically encode to the empty msgpack map"
+        );
+    }
+
+    #[test]
     fn canonical_encode_account_data_tags() {
         use algo_types::AccountStatus;
 

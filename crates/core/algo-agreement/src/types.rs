@@ -622,6 +622,37 @@ mod tests {
         assert_eq!(d.timeout_type, TimeoutType::Deadline);
     }
 
+    #[test]
+    fn deadline_msgpack_roundtrip() {
+        // Mirrors go-algorand's TestMarshalUnmarshalDeadline /
+        // TestRandomizedEncodingDeadline (agreement/msgp_gen_test.go):
+        // roundtrip a variety of non-default Deadline values through msgpack,
+        // not just construct a zero value.
+        let cases = [
+            Deadline {
+                duration: Duration::ZERO,
+                timeout_type: TimeoutType::Deadline,
+            },
+            Deadline {
+                duration: Duration::from_millis(1),
+                timeout_type: TimeoutType::FastRecovery,
+            },
+            Deadline {
+                duration: Duration::from_secs(3600) + Duration::from_nanos(123_456_789),
+                timeout_type: TimeoutType::Filter,
+            },
+            Deadline {
+                duration: Duration::from_millis(u64::from(u32::MAX)),
+                timeout_type: TimeoutType::Deadline,
+            },
+        ];
+        for d in cases {
+            let bytes = rmp_serde::to_vec_named(&d).expect("msgpack serialize");
+            let decoded: Deadline = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+            assert_eq!(decoded, d);
+        }
+    }
+
     // ---- Constants tests ----
 
     #[test]

@@ -470,6 +470,30 @@ mod tests {
     }
 
     #[test]
+    fn proposal_manager_msgpack_roundtrip() {
+        // Mirrors go-algorand's TestMarshalUnmarshalproposalManager /
+        // TestRandomizedEncodingproposalManager (agreement/msgp_gen_test.go):
+        // roundtrip a populated (non-default) proposalManager through
+        // msgpack, exercising the nested per-round `ProposalStore` map too.
+        let mut mgr = ProposalManager::default();
+        // Populate a per-round store via the crate-internal accessor.
+        let store = mgr.store_for_round(Round(9));
+        store.pinned = ProposalValue {
+            original_period: Period(1),
+            original_proposer: Address([0x44; 32]),
+            block_digest: Digest([0x55; 32]),
+            encoding_digest: Digest([0x66; 32]),
+        };
+
+        let bytes = rmp_serde::to_vec_named(&mgr).expect("msgpack serialize");
+        let mut decoded: ProposalManager = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(
+            decoded.store_for_round(Round(9)).pinned.original_proposer,
+            Address([0x44; 32])
+        );
+    }
+
+    #[test]
     fn proposal_manager_round_interruption() {
         let mut mgr = ProposalManager::default();
         let e = Event::RoundInterruption(RoundInterruptionEvent {
