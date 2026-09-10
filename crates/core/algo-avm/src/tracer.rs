@@ -171,6 +171,23 @@ pub trait EvalTracer {
     ) {
     }
 
+    /// Report that a `store`/`stores` opcode wrote to scratch slot `slot`.
+    ///
+    /// Called unconditionally whenever `store`/`stores` executes
+    /// successfully, regardless of whether the newly-written value equals
+    /// the slot's previous value -- mirroring go-algorand's tracer, which
+    /// hooks the `store`/`stores` opcode handling directly
+    /// (`ledger/simulation/tracer.go`'s `scratchSlots` field) rather than
+    /// diffing the scratch array before/after each opcode. A pure
+    /// before/after diff cannot distinguish "value unchanged because this
+    /// write reasserted the same value" from "value unchanged because
+    /// nothing wrote to this slot at all" -- both look identical in a
+    /// whole-array diff -- so a diff-only tracer misses a same-value
+    /// overwrite (go's own `TestSimulateScratchSlotChange` exploits exactly
+    /// this: it writes the same value to a slot via `store` then `stores`
+    /// and expects two separate recorded changes). The default is a no-op.
+    fn record_scratch_write(&mut self, _slot: usize) {}
+
     /// Report an application-state access for initial-state capture.
     ///
     /// Called by the ledger AVM context before each application global/local/box

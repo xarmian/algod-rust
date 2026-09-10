@@ -215,6 +215,15 @@ pub struct SimulationTracer {
     /// State changes (global/local writes/deletes) recorded during the current
     /// opcode, flushed into the opcode's trace unit at `after_opcode`.
     pending_state_changes: Vec<StateChange>,
+    /// Scratch slots reported via `record_scratch_write` for the opcode
+    /// currently being traced (`store`/`stores`, issue #1225), flushed into
+    /// the opcode's trace unit at `after_opcode`. Populated unconditionally
+    /// by the AVM machine whenever `store`/`stores` executes successfully,
+    /// regardless of whether the write changed the slot's value -- see
+    /// `EvalTracer::record_scratch_write`'s doc comment. Kept separate from
+    /// the before/after diff below so a same-value overwrite the diff can't
+    /// see is still recorded.
+    pending_scratch_writes: Vec<usize>,
     /// Total app opcode cost consumed by this transaction — the sum of every
     /// approval and clear-state program run under it, including inner app calls
     /// (which invoke `record_program_cost` on this same tracer). Mirrors
@@ -260,6 +269,7 @@ impl SimulationTracer {
             program_state_stack: Vec::new(),
             initial_states: InitialStatesAccumulator::default(),
             pending_state_changes: Vec::new(),
+            pending_scratch_writes: Vec::new(),
             app_cost_consumed: 0,
             unnamed_resources: UnnamedResourcesAccessed::default(),
             inner_txn_group_count: 0,
@@ -500,6 +510,10 @@ impl EvalTracer for SimulationTracer {
         // current program (avoids a double mutable borrow of `self`). Empty
         // unless `config.state` and a write/delete occurred.
         let state_changes = std::mem::take(&mut self.pending_state_changes);
+        // Drain scratch writes reported via `record_scratch_write` for this
+        // opcode (issue #1225). Empty unless `store`/`stores` just executed
+        // successfully.
+        let scratch_writes = std::mem::take(&mut self.pending_scratch_writes);
 
         let state = match self.current_program.as_mut() {
             Some(s) => s,
@@ -559,7 +573,11 @@ impl EvalTracer for SimulationTracer {
                     (AvmValueTrace::Bytes(a), AvmValueTrace::Bytes(b)) => a != b,
                     _ => true,
                 };
-                if changed {
+                // A slot the diff sees as changed, OR one `store`/`stores`
+                // reported writing to directly (issue #1225) -- matching
+                // go-algorand's unconditional-write semantics, since a
+                // same-value overwrite is invisible to the diff alone.
+                if changed || scratch_writes.contains(&i) {
                     unit.scratch_changes.push((i, new.clone()));
                 }
             }
@@ -577,6 +595,13 @@ impl EvalTracer for SimulationTracer {
         }
 
         state.trace.opcodes.push(unit);
+    }
+
+    fn record_scratch_write(&mut self, slot: usize) {
+        if !self.config.scratch {
+            return;
+        }
+        self.pending_scratch_writes.push(slot);
     }
 
     fn record_app_state_access(&mut self, access: &AppStateAccess<'_>) {
