@@ -2369,6 +2369,81 @@ fn inner_app_creation() {
     assert!(new_app.is_some(), "new app should exist in store");
 }
 
+/// Mirrors go-algorand's `TestInnerCreatedAppsAreCallable`: an app created
+/// via an inner transaction must be directly callable by a later, unrelated
+/// top-level transaction -- not merely present as a record in the store.
+/// `inner_app_creation` above only checks the record exists; this closes the
+/// documented follow-up-call gap.
+#[test]
+fn inner_created_app_is_callable_in_followup_txn() {
+    let sender = [0xAA; 32];
+    let app_a = 100u64;
+
+    let mut store = LedgerState::new();
+
+    // App A: creates a new app via inner txn
+    let new_app_approval = prog(6, &[0x81, 0x01]); // pushint 1
+    let new_app_clear = prog(6, &[0x81, 0x01]);
+
+    let mut a_code = Vec::new();
+    a_code.push(0xb1); // itxn_begin
+    a_code.extend(pushint(6)); // TypeEnum = appl
+    a_code.extend([0xb2, 16]);
+    a_code.extend(pushint(0)); // ApplicationID = 0 (create)
+    a_code.extend([0xb2, 24]);
+    a_code.extend(pushbytes(&new_app_approval));
+    a_code.extend([0xb2, 30]);
+    a_code.extend(pushbytes(&new_app_clear));
+    a_code.extend([0xb2, 31]);
+    a_code.push(0xb3); // itxn_submit
+    a_code.extend(pushint(1));
+    a_code.push(0x43); // return
+
+    let a_prog = prog(6, &a_code);
+    seed_app_with_programs(
+        &mut store,
+        app_a,
+        Address([1u8; 32]),
+        a_prog,
+        prog(6, &[0x81, 0x01]),
+    );
+
+    let app_a_addr = Address(app_address(app_a));
+    fund_account(&mut store, app_a_addr, 10_000_000);
+
+    let created_app_id = {
+        let txn = make_appl_txn(sender, app_a);
+        let mut ctx = make_context(&mut store, vec![txn], app_a);
+        ctx.fee_sink = Address([0xFE; 32]);
+        fund_account(ctx.store, Address([0xFE; 32]), 0);
+        ctx.fee_credit = 50_000;
+        ctx.txn_counter = 500;
+
+        let result = run_with_context(6, &a_code, &mut ctx).unwrap();
+        assert!(result, "creator app call should succeed");
+
+        let inner = ctx.inner_txns();
+        let id = inner[0][0].apply_data_application_id;
+        assert!(id > 0, "should have a created app ID");
+        id
+    };
+
+    assert!(
+        store.app_params.contains_key(&created_app_id),
+        "new app should exist in store"
+    );
+
+    // A brand-new, unrelated top-level transaction calling the app the
+    // previous transaction created via itxn_submit.
+    let followup_txn = make_appl_txn(sender, created_app_id);
+    let mut followup_ctx = make_context(&mut store, vec![followup_txn], created_app_id);
+    let followup_result = run_with_context(6, &[0x81, 0x01], &mut followup_ctx).unwrap();
+    assert!(
+        followup_result,
+        "app created via a prior transaction's inner txn must be callable by a later top-level transaction"
+    );
+}
+
 /// Fee credit with group: one pays extra, another pays 0.
 #[test]
 fn fee_credit_mixed_fees_in_group() {
