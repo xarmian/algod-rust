@@ -59,7 +59,7 @@
 //! ever consume one delivery per `recv`/`recv_timeout` call).
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -71,11 +71,14 @@ use algo_network::peer_features::{
 };
 use algo_network::topics::{Topic, Topics};
 use algo_network::vpack::{StatefulDecoder, StatefulEncoder, VOTE_COMPRESSION_ABORT_BYTE};
+use algo_network::ws_network::{
+    NodeInfo, WANT_TX_GOSSIP_NO, WANT_TX_GOSSIP_UNK, WANT_TX_GOSSIP_YES,
+};
 use algo_network::ws_peer::{compress_outgoing_vote, decompress_incoming_vote_core};
 use algo_network::{
-    encode_uvarint, hash_topics, ForwardingPolicy, GossipNode, IncomingMessage, Peer, PeerError,
-    PeerOption, RequestTracker, Router, Tag, DEFAULT_REQUEST_TIMEOUT, MAX_MESSAGE_QUEUE_DURATION,
-    RESPONSE_HASH_FIELD,
+    encode_uvarint, hash_topics, ForwardingPolicy, GossipNode, IncomingMessage,
+    NetworkAdvanceMonitor, Peer, PeerError, PeerOption, RequestTracker, Router, Tag,
+    DEFAULT_REQUEST_TIMEOUT, MAX_MESSAGE_QUEUE_DURATION, RESPONSE_HASH_FIELD,
 };
 use algo_p2p::{
     build_headers, handshake_inbound, handshake_outbound, libp2p_stream, read_frame,
@@ -1008,6 +1011,20 @@ pub struct P2pTransportConfig {
     /// `algo_config::Local::is_listen_server`), mirroring
     /// [`algo_p2p::derive_conn_limits`]'s own expectations.
     pub is_listen_server: bool,
+    /// Matches go's `P2PNetwork.relayMessages` (`network/p2pNetwork.go:245`,
+    /// `cfg.IsListenServer() || cfg.ForceRelayMessages`) — the caller is
+    /// expected to compute this itself the same way `is_listen_server` above
+    /// is, since it already has both inputs at hand (issue #1221). Drives
+    /// [`P2pTransport`]'s `wantTXGossip` seeding/transitions exactly like
+    /// `ws_network.rs`'s `WebsocketNetworkConfig::relay_messages` drives the
+    /// WS transport's own `want_tx_gossip` (issue #1156's precedent): a
+    /// relay always wants `TX` gossip and never re-evaluates it.
+    pub relay_messages: bool,
+    /// Matches go's `cfg.ForceFetchTransactions` — pins `wantTXGossip` to
+    /// "yes" unconditionally, same as `relay_messages` above, mirroring
+    /// `ws_network.rs`'s `WebsocketNetworkConfig::force_fetch_transactions`
+    /// (issue #1191's precedent for the WS transport).
+    pub force_fetch_transactions: bool,
 }
 
 /// Split a multiaddr into its dialable transport address and an optional
@@ -1108,11 +1125,50 @@ pub struct P2pTransport {
     /// issue.
     #[allow(dead_code)]
     http_stream_control: libp2p_stream::Control,
+    /// Watchdog fed by [`GossipNode::on_network_advance`] — mirrors go's
+    /// `outgoingConnsCloser.netAdvMonitor`/`NetworkAdvanceMonitor` (issue
+    /// #1221, closing the pre-existing `TestNetworkAdvanceMonitor` "not
+    /// wired" follow-up for this transport specifically; already wired for
+    /// the WS transport, see `ws_network.rs`'s matching field).
+    network_advance_monitor: Arc<std::sync::Mutex<NetworkAdvanceMonitor>>,
+    /// This transport's own combined `relayMessages` value (go:
+    /// `cfg.IsListenServer() || cfg.ForceRelayMessages`,
+    /// `P2pTransportConfig::relay_messages`'s doc comment) — cached so
+    /// [`Self::on_network_advance`] doesn't need to thread it through
+    /// separately. Never changes after construction.
+    relay_messages: bool,
+    /// This transport's own `cfg.ForceFetchTransactions` value. Never
+    /// changes after construction.
+    force_fetch_transactions: bool,
+    /// Node-role oracle consulted by `wantTXGossip` transitions — mirrors
+    /// `ws_network.rs`'s `WebsocketNetwork::node_info` (issue #1156's
+    /// precedent, reused rather than reinvented per issue #1221). `None`
+    /// behaves like go's `nopeNodeInfo` (never participating). Set via
+    /// [`Self::set_node_info`].
+    node_info: Arc<std::sync::Mutex<Option<Arc<dyn NodeInfo>>>>,
+    /// Current transaction-gossip subscription state — one of
+    /// [`WANT_TX_GOSSIP_UNK`]/[`WANT_TX_GOSSIP_YES`]/[`WANT_TX_GOSSIP_NO`].
+    /// Mirrors go's `P2PNetwork.wantTXGossip` and
+    /// `ws_network.rs`'s `WebsocketNetwork::want_tx_gossip`.
+    want_tx_gossip: Arc<AtomicU8>,
     _task: tokio::task::JoinHandle<()>,
 }
 
 enum P2pCommand {
     Publish(&'static str, Vec<u8>),
+    /// Subscribe (`true`) or unsubscribe (`false`) this host's gossipsub
+    /// membership on `TX_TOPIC` — issued by [`P2pTransport::on_network_advance`]
+    /// on a `want_tx_gossip` transition (issue #1221), since `host` (and so
+    /// the actual `gossipsub_subscribe`/`gossipsub_unsubscribe` calls) is
+    /// only reachable from inside this background task.
+    SetTxGossip(bool),
+    /// Test-only introspection: report whether `host`'s gossipsub
+    /// `Behaviour` currently holds a live subscription to the given topic.
+    /// Used to prove [`P2pCommand::SetTxGossip`] actually reached the real
+    /// `gossipsub::Behaviour`, not just this transport's own bookkeeping
+    /// flag.
+    #[cfg(test)]
+    QueryGossipsubSubscribed(&'static str, tokio::sync::oneshot::Sender<bool>),
 }
 
 impl P2pTransport {
@@ -1197,7 +1253,23 @@ impl P2pTransport {
             }
         }
 
+        // wantTXGossip seeding (issue #1221, mirrors go's `Start()`:
+        // `wantTXGossip := n.relayMessages || n.config.ForceFetchTransactions
+        // || n.nodeInfo.IsParticipating()` — `nodeInfo` is never wired before
+        // `start()` returns, so only the first two terms can seed the
+        // initial value here; a later participation change flows through
+        // `on_network_advance` instead, same split as `ws_network.rs`'s own
+        // `want_tx_gossip_seed`). AV/PP/VB have no go equivalent to gate and
+        // stay subscribed unconditionally, per this module's doc comment.
+        let want_tx_gossip_seed = if cfg.relay_messages || cfg.force_fetch_transactions {
+            WANT_TX_GOSSIP_YES
+        } else {
+            WANT_TX_GOSSIP_UNK
+        };
         for topic in algo_p2p::ALL_TOPICS {
+            if topic == algo_p2p::TX_TOPIC && want_tx_gossip_seed != WANT_TX_GOSSIP_YES {
+                continue;
+            }
             host.gossipsub_subscribe(topic)
                 .map_err(|e| anyhow::anyhow!("failed to subscribe to {topic}: {e}"))?;
         }
@@ -1574,6 +1646,29 @@ impl P2pTransport {
                                     tracing::debug!(topic, error = %e, "P2P publish failed");
                                 }
                             }
+                            Some(P2pCommand::SetTxGossip(want)) => {
+                                // Issue #1221: the actual gossipsub
+                                // subscribe/unsubscribe call — `host` only
+                                // lives inside this task, so
+                                // `on_network_advance` (sync, called from
+                                // outside) can only get here via `cmd_tx`.
+                                let result = if want {
+                                    host.gossipsub_subscribe(algo_p2p::TX_TOPIC)
+                                } else {
+                                    host.gossipsub_unsubscribe(algo_p2p::TX_TOPIC)
+                                };
+                                if let Err(e) = result {
+                                    tracing::warn!(
+                                        want_tx_gossip = want,
+                                        error = %e,
+                                        "P2P: failed to update TX gossipsub subscription"
+                                    );
+                                }
+                            }
+                            #[cfg(test)]
+                            Some(P2pCommand::QueryGossipsubSubscribed(topic, reply)) => {
+                                let _ = reply.send(host.gossipsub_is_subscribed(topic));
+                            }
                             None => break,
                         }
                     }
@@ -1593,6 +1688,11 @@ impl P2pTransport {
             identity_tracker,
             http_router,
             http_stream_control,
+            network_advance_monitor: Arc::new(std::sync::Mutex::new(NetworkAdvanceMonitor::new())),
+            relay_messages: cfg.relay_messages,
+            force_fetch_transactions: cfg.force_fetch_transactions,
+            node_info: Arc::new(std::sync::Mutex::new(None)),
+            want_tx_gossip: Arc::new(AtomicU8::new(want_tx_gossip_seed)),
             _task: task,
         })
     }
@@ -1705,6 +1805,65 @@ impl P2pTransport {
             .open_stream(peer, ALGORAND_HTTP_PROTOCOL)
             .await
             .map_err(|e| anyhow::anyhow!("failed to open P2P HTTP stream to {peer}: {e}"))
+    }
+
+    /// Registers the [`NodeInfo`] oracle consulted by the `wantTXGossip`
+    /// role-transition refresh (issue #1221, reusing issue #1156's
+    /// `ws_network.rs` precedent — see [`NodeInfo`]'s doc comment there).
+    /// Not calling this leaves this transport behaving like go's
+    /// `nopeNodeInfo` fallback (never participating).
+    ///
+    /// No production call site wires a concrete [`NodeInfo`] in yet — the
+    /// same pre-existing gap `ws_network.rs`'s own `set_node_info` has (see
+    /// this module's `on_network_advance` doc comment); exercised by this
+    /// module's own tests in the meantime, mirroring `http_stream_control`'s
+    /// doc comment for the same situation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_node_info(&self, node_info: Arc<dyn NodeInfo>) {
+        *self.node_info.lock().expect("node_info lock poisoned") = Some(node_info);
+    }
+
+    /// Whether this node currently holds live participation keys, per the
+    /// registered [`NodeInfo`] oracle (`false` if none is registered).
+    /// Mirrors go's `n.nodeInfo.IsParticipating()`.
+    fn is_participating(&self) -> bool {
+        self.node_info
+            .lock()
+            .expect("node_info lock poisoned")
+            .as_ref()
+            .is_some_and(|info| info.is_participating())
+    }
+
+    /// Current `wantTXGossip` state — one of [`WANT_TX_GOSSIP_UNK`]/
+    /// [`WANT_TX_GOSSIP_YES`]/[`WANT_TX_GOSSIP_NO`]. Exposed mainly for
+    /// tests; mirrors `ws_network.rs`'s `WebsocketNetwork::want_tx_gossip`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn want_tx_gossip(&self) -> u8 {
+        self.want_tx_gossip.load(AtomicOrdering::SeqCst)
+    }
+
+    /// Test-only introspection: whether `host`'s live `gossipsub::Behaviour`
+    /// currently holds a subscription to `tag`'s topic (`false` if `tag` has
+    /// no defined P2P topic). Round-trips through the background task via
+    /// [`P2pCommand::QueryGossipsubSubscribed`] since `host` only lives
+    /// there — proves [`Self::on_network_advance`]'s
+    /// [`P2pCommand::SetTxGossip`] actually reached the real gossipsub
+    /// subscription state, not just [`Self::want_tx_gossip`]'s bookkeeping
+    /// flag.
+    #[cfg(test)]
+    pub async fn is_gossipsub_subscribed(&self, tag: Tag) -> bool {
+        let Some(topic) = tag_to_topic(tag) else {
+            return false;
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self
+            .cmd_tx
+            .send(P2pCommand::QueryGossipsubSubscribed(topic, reply_tx))
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.await.unwrap_or(false)
     }
 
     /// Publish `data` on the gossipsub topic corresponding to `tag` and,
@@ -1905,8 +2064,43 @@ impl GossipNode for P2pTransport {
     }
 
     fn on_network_advance(&self) {
-        // No WS-style mesh-cycling concept at this layer — libp2p
-        // gossipsub manages its own mesh maintenance internally.
+        // Issue #1221: `P2PNetwork.OnNetworkAdvance` (go:
+        // `network/p2pNetwork.go:867-878`) does two things — this is *not*
+        // the WS transport's mesh-cycling `OnNetworkAdvance` (libp2p
+        // gossipsub manages its own mesh maintenance internally, so there is
+        // genuinely no equivalent of that here), it is a distinct method on
+        // go's P2P transport type with its own, different behavior.
+
+        // (1) Feed the clique-resolution watchdog — mirrors go's
+        // `n.outgoingConnsCloser.updateLastAdvance()`. This transport has no
+        // `check_network_advance_disconnect`-style consumer yet (unlike
+        // `ws_network.rs`), but wiring the watchdog itself closes the
+        // pre-existing `TestNetworkAdvanceMonitor` "not wired for P2P" note.
+        self.network_advance_monitor
+            .lock()
+            .expect("network_advance_monitor lock poisoned")
+            .update_last_advance();
+
+        // (2) Re-evaluate `wantTXGossip` — go:
+        // `new := n.relayMessages || n.config.ForceFetchTransactions ||
+        // n.nodeInfo.IsParticipating()`. A relay or force-fetch node already
+        // pinned `want_tx_gossip` to YES at start and never re-evaluates it
+        // (mirrors `ws_network.rs`'s identical short-circuit in its own
+        // `on_network_advance`).
+        if self.relay_messages || self.force_fetch_transactions {
+            return;
+        }
+        let participating = self.is_participating();
+        let current = self.want_tx_gossip.load(AtomicOrdering::SeqCst);
+        if participating && current != WANT_TX_GOSSIP_YES {
+            self.want_tx_gossip
+                .store(WANT_TX_GOSSIP_YES, AtomicOrdering::SeqCst);
+            let _ = self.cmd_tx.send(P2pCommand::SetTxGossip(true));
+        } else if !participating && current != WANT_TX_GOSSIP_NO {
+            self.want_tx_gossip
+                .store(WANT_TX_GOSSIP_NO, AtomicOrdering::SeqCst);
+            let _ = self.cmd_tx.send(P2pCommand::SetTxGossip(false));
+        }
     }
 
     fn get_genesis_id(&self) -> &str {
@@ -2197,6 +2391,8 @@ mod tests {
             gossip_fanout: 4,
             incoming_connections_limit: -1,
             is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
         })
         .await
         .expect("start p2p transport");
@@ -2228,6 +2424,8 @@ mod tests {
             gossip_fanout: 4,
             incoming_connections_limit: -1,
             is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
         })
         .await
         .expect("start p2p transport");
@@ -2243,6 +2441,11 @@ mod tests {
     /// immediately meshed, so callers publishing right after `dial()`
     /// reliably lose the message otherwise.
     async fn connected_pair() -> (P2pTransport, P2pTransport) {
+        // `relay_messages: true` so `TX` gossip is subscribed unconditionally
+        // at start, matching this helper's pre-issue-#1221 behavior — most
+        // of its callers exercise TX/AV/PP/VB propagation mechanics, not
+        // `wantTXGossip` gating itself (that has its own dedicated tests
+        // below).
         let listener = P2pTransport::start(P2pTransportConfig {
             network_id: "test-559".to_string(),
             listen_multiaddr: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
@@ -2255,6 +2458,8 @@ mod tests {
             gossip_fanout: 4,
             incoming_connections_limit: -1,
             is_listen_server: false,
+            relay_messages: true,
+            force_fetch_transactions: false,
         })
         .await
         .expect("start listener");
@@ -2282,6 +2487,8 @@ mod tests {
             gossip_fanout: 4,
             incoming_connections_limit: -1,
             is_listen_server: false,
+            relay_messages: true,
+            force_fetch_transactions: false,
         })
         .await
         .expect("start dialer");
@@ -2296,6 +2503,184 @@ mod tests {
         }
 
         (listener, dialer)
+    }
+
+    // -----------------------------------------------------------------------
+    // wantTXGossip TX-topic gating + NetworkAdvanceMonitor wiring (#1221)
+    // -----------------------------------------------------------------------
+
+    /// A [`NodeInfo`] test double whose `is_participating()` answer is
+    /// swapped at will, mirroring `ws_network.rs`'s own `TestNodeInfo`
+    /// (issue #1156's precedent).
+    struct TestNodeInfo {
+        participating: std::sync::atomic::AtomicBool,
+    }
+
+    impl NodeInfo for TestNodeInfo {
+        fn is_participating(&self) -> bool {
+            self.participating.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    fn plain_non_relay_config(network_id: &str) -> P2pTransportConfig {
+        P2pTransportConfig {
+            network_id: network_id.to_string(),
+            listen_multiaddr: None,
+            bootstrap_peers: vec![],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: false,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
+        }
+    }
+
+    /// TDD anchor for issue #1221: a plain non-relay, non-participating,
+    /// non-force-fetch P2P node must not subscribe to the `TX` gossipsub
+    /// topic at start — mirroring go's `P2PNetwork.Start()`
+    /// (`network/p2pNetwork.go:446-450`), which only calls
+    /// `n.service.Subscribe(p2p.TXTopicName, ...)` when `wantTXGossip` is
+    /// already true. Before this issue's fix, `P2pTransport::start`
+    /// subscribed every topic in `ALL_TOPICS` (including TX) unconditionally,
+    /// so this assertion fails against the old code.
+    #[tokio::test]
+    async fn plain_non_relay_node_does_not_subscribe_to_tx_topic_at_start() {
+        let transport = P2pTransport::start(plain_non_relay_config("test-1221-a"))
+            .await
+            .expect("start transport");
+
+        assert_eq!(
+            transport.want_tx_gossip(),
+            WANT_TX_GOSSIP_UNK,
+            "a plain non-relay node's wantTXGossip starts undecided, matching ws_network.rs's own seeding"
+        );
+        assert!(
+            !transport.is_gossipsub_subscribed(Tag::Transaction).await,
+            "a plain non-relay, non-participating, non-force-fetch node must not join TX gossip at start"
+        );
+    }
+
+    /// TDD anchor for issue #1221: `relay_messages` (go's combined
+    /// `cfg.IsListenServer() || cfg.ForceRelayMessages`) pins `wantTXGossip`
+    /// to "yes" and subscribes TX unconditionally at start, exactly like
+    /// `ws_network.rs`'s `want_tx_gossip_seeded_yes_for_relay`.
+    #[tokio::test]
+    async fn relay_node_subscribes_to_tx_topic_at_start() {
+        let transport = P2pTransport::start(P2pTransportConfig {
+            relay_messages: true,
+            ..plain_non_relay_config("test-1221-b")
+        })
+        .await
+        .expect("start transport");
+
+        assert_eq!(transport.want_tx_gossip(), WANT_TX_GOSSIP_YES);
+        assert!(transport.is_gossipsub_subscribed(Tag::Transaction).await);
+    }
+
+    /// TDD anchor for issue #1221: `on_network_advance` must subscribe the
+    /// TX topic on a false→true participation transition, and unsubscribe on
+    /// the reverse transition — mirroring go's `P2PNetwork.OnNetworkAdvance`
+    /// (`network/p2pNetwork.go:867-878`) and `ws_network.rs`'s own
+    /// `refresh_want_tx_gossip` (issue #1156's precedent, reused here rather
+    /// than reinvented).
+    #[tokio::test]
+    async fn on_network_advance_subscribes_and_unsubscribes_tx_topic_on_participation_change() {
+        let transport = P2pTransport::start(plain_non_relay_config("test-1221-c"))
+            .await
+            .expect("start transport");
+        assert!(!transport.is_gossipsub_subscribed(Tag::Transaction).await);
+
+        let node_info = Arc::new(TestNodeInfo {
+            participating: std::sync::atomic::AtomicBool::new(false),
+        });
+        transport.set_node_info(node_info.clone());
+
+        // Registering a non-participating NodeInfo and re-evaluating must
+        // stay a no-op (UNK -> NO is still "not subscribed", but exercises
+        // the transition path without a bug flipping it on by accident).
+        transport.on_network_advance();
+        assert_eq!(transport.want_tx_gossip(), WANT_TX_GOSSIP_NO);
+        assert!(!transport.is_gossipsub_subscribed(Tag::Transaction).await);
+
+        // false -> true: must subscribe.
+        node_info.participating.store(true, AtomicOrdering::SeqCst);
+        transport.on_network_advance();
+        assert_eq!(transport.want_tx_gossip(), WANT_TX_GOSSIP_YES);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !transport.is_gossipsub_subscribed(Tag::Transaction).await
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            transport.is_gossipsub_subscribed(Tag::Transaction).await,
+            "expected TX topic to be subscribed after a false->true participation transition"
+        );
+
+        // true -> false: must unsubscribe.
+        node_info.participating.store(false, AtomicOrdering::SeqCst);
+        transport.on_network_advance();
+        assert_eq!(transport.want_tx_gossip(), WANT_TX_GOSSIP_NO);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while transport.is_gossipsub_subscribed(Tag::Transaction).await
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !transport.is_gossipsub_subscribed(Tag::Transaction).await,
+            "expected TX topic to be unsubscribed after a true->false participation transition"
+        );
+    }
+
+    /// A relay/force-fetch node's `wantTXGossip` is already pinned to "yes"
+    /// at start and must never be re-evaluated — mirrors `ws_network.rs`'s
+    /// identical short-circuit and go's `n.relayMessages ||
+    /// n.config.ForceFetchTransactions || ...` OR-chain (the first two terms
+    /// short-circuit `nodeInfo.IsParticipating()` entirely).
+    #[tokio::test]
+    async fn on_network_advance_does_not_touch_tx_gossip_for_a_relay_node() {
+        let transport = P2pTransport::start(P2pTransportConfig {
+            relay_messages: true,
+            ..plain_non_relay_config("test-1221-d")
+        })
+        .await
+        .expect("start transport");
+        assert_eq!(transport.want_tx_gossip(), WANT_TX_GOSSIP_YES);
+
+        // No NodeInfo registered at all (implicitly non-participating) —
+        // if the relay short-circuit were missing, this would incorrectly
+        // flip wantTXGossip to NO.
+        transport.on_network_advance();
+        assert_eq!(
+            transport.want_tx_gossip(),
+            WANT_TX_GOSSIP_YES,
+            "a relay's wantTXGossip must stay pinned to YES regardless of participation status"
+        );
+        assert!(transport.is_gossipsub_subscribed(Tag::Transaction).await);
+    }
+
+    /// Issue #1221's other half: `on_network_advance` must feed the
+    /// `NetworkAdvanceMonitor` watchdog (closing the pre-existing
+    /// `TestNetworkAdvanceMonitor` "not wired for P2P" follow-up) — proven
+    /// indirectly here via the same "does not panic when called repeatedly"
+    /// smoke test `ws_network.rs`'s `on_network_advance_does_not_panic` uses,
+    /// since this transport exposes no `check_network_advance_disconnect`-style
+    /// consumer of the watchdog's state to assert against directly (this
+    /// layer has no WS-style mesh-cycling/clique-resolution concept — see
+    /// this module's `on_network_advance` doc comment).
+    #[tokio::test]
+    async fn on_network_advance_does_not_panic() {
+        let transport = P2pTransport::start(plain_non_relay_config("test-1221-e"))
+            .await
+            .expect("start transport");
+        transport.on_network_advance();
+        transport.on_network_advance();
     }
 
     /// A `MessageHandler` that records every message it receives into an
@@ -2506,6 +2891,8 @@ mod tests {
             gossip_fanout: 4,
             incoming_connections_limit: -1,
             is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
         })
         .await
         .expect("start listener");
@@ -2530,6 +2917,8 @@ mod tests {
             gossip_fanout: 4,
             incoming_connections_limit: -1,
             is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
         })
         .await
         .expect("start dialer");
@@ -3017,6 +3406,8 @@ mod tests {
             gossip_fanout: 4,
             incoming_connections_limit: -1,
             is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
         })
         .await
         .expect("start transport");
