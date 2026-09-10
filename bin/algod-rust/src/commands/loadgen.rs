@@ -151,14 +151,45 @@ impl KeyFile {
 
 /// Generate `count` fresh accounts and write them to `out` as JSON.
 pub fn gen_accounts(count: usize, out: &Path) -> anyhow::Result<()> {
+    gen_accounts_inner(count, false, out)
+}
+
+/// Like [`gen_accounts`], but with `--deterministic`: seeds are derived from
+/// the sequential index `0..count` instead of OS randomness, mirroring
+/// go-algorand's `shared/pingpong.deterministicAccounts`/`netgoal generate
+/// --deterministic` (`makeKeyFromSeed`/`randomDeterministicAccounts`'s
+/// seed construction: `binary.LittleEndian.PutUint64(seed[:], i)`, the rest
+/// zero-filled). Reproducible across runs from the same `count`, unlike the
+/// random path -- useful for scripted/CI load-test setups that need the
+/// same funded addresses every time.
+pub fn gen_accounts_deterministic(count: usize, out: &Path) -> anyhow::Result<()> {
+    gen_accounts_inner(count, true, out)
+}
+
+/// A single deterministic account seed for index `i`, matching go's
+/// `makeKeyFromSeed`/pingpong's per-index seed exactly:
+/// `binary.LittleEndian.PutUint64(seed[:], i)` with the remaining 24 bytes
+/// zero.
+pub fn deterministic_seed(index: u64) -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&index.to_le_bytes());
+    seed
+}
+
+fn gen_accounts_inner(count: usize, deterministic: bool, out: &Path) -> anyhow::Result<()> {
     if count == 0 {
         anyhow::bail!("--count must be at least 1");
     }
     let mut rng = rand::thread_rng();
     let mut accounts = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut seed = [0u8; 32];
-        rng.fill_bytes(&mut seed);
+    for i in 0..count {
+        let seed = if deterministic {
+            deterministic_seed(i as u64)
+        } else {
+            let mut seed = [0u8; 32];
+            rng.fill_bytes(&mut seed);
+            seed
+        };
         let signing = SigningKey::from_bytes(&seed);
         let address = Address(signing.verifying_key().to_bytes());
         accounts.push(AccountKey {
@@ -872,6 +903,62 @@ mod tests {
                 acct.address
             );
         }
+    }
+
+    /// Direct port of go-algorand's `shared/pingpong.TestDeterministicAccounts`:
+    /// deterministic seeds are derived purely from the sequential index
+    /// (`binary.LittleEndian.PutUint64(seed[:], i)`), so re-deriving the
+    /// same index always reproduces the same keypair, and generating
+    /// `count` deterministic accounts must match a keypair independently
+    /// derived from that same index -- exactly the property go's test
+    /// checks (`expectedPubKeys` built via `makeKeyFromSeed`, then checked
+    /// against `deterministicAccounts`'s output).
+    #[test]
+    fn deterministic_seed_matches_go_makekeyfromseed_construction() {
+        // Build the "expected" set the same way go's test does: index -> keypair.
+        let expected: std::collections::HashMap<[u8; 32], u64> = (0..100u64)
+            .map(|i| {
+                let signing = SigningKey::from_bytes(&deterministic_seed(i));
+                (signing.verifying_key().to_bytes(), i)
+            })
+            .collect();
+        assert_eq!(expected.len(), 100, "100 distinct deterministic keys");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("det.json");
+        gen_accounts_deterministic(20, &path).expect("gen deterministic");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let file: KeyFile = serde_json::from_str(&text).expect("parse");
+        assert_eq!(file.accounts.len(), 20);
+
+        let decoded = file.decode().expect("decode");
+        assert_eq!(decoded.len(), 20);
+        for acct in &decoded {
+            let pubkey = acct.signing.verifying_key().to_bytes();
+            assert!(
+                expected.contains_key(&pubkey),
+                "generated account {} not found in the independently-derived set",
+                acct.address
+            );
+        }
+
+        // Re-generating deterministically for the same count must
+        // reproduce byte-identical seeds every time.
+        let path2 = dir.path().join("det2.json");
+        gen_accounts_deterministic(20, &path2).expect("gen deterministic again");
+        let text2 = std::fs::read_to_string(&path2).expect("read");
+        assert_eq!(text, text2, "deterministic generation must be reproducible");
+    }
+
+    #[test]
+    fn deterministic_seed_is_little_endian_index_zero_padded() {
+        // Matches go's `binary.LittleEndian.PutUint64(seed[:], i)` exactly.
+        let seed = deterministic_seed(0x0102_0304_0506_0708);
+        assert_eq!(
+            &seed[..8],
+            &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+        );
+        assert_eq!(&seed[8..], &[0u8; 24]);
     }
 
     #[test]

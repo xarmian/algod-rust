@@ -588,8 +588,16 @@ async fn main() -> anyhow::Result<()> {
             commands::node::run(cmd).await?;
         }
         Commands::Loadgen { cmd } => match cmd {
-            cli::LoadgenCommands::GenAccounts { count, out } => {
-                commands::loadgen::gen_accounts(count, &out)?;
+            cli::LoadgenCommands::GenAccounts {
+                count,
+                out,
+                deterministic,
+            } => {
+                if deterministic {
+                    commands::loadgen::gen_accounts_deterministic(count, &out)?;
+                } else {
+                    commands::loadgen::gen_accounts(count, &out)?;
+                }
             }
             cli::LoadgenCommands::Run {
                 algod_urls,

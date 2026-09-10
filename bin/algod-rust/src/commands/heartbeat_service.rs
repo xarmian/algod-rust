@@ -518,4 +518,113 @@ mod tests {
         let id = one_time_id_for_round(500, 10);
         assert_eq!(id.batch, 50);
     }
+
+    // ── spawn/stop lifecycle (go: heartbeat/service_test.go TestStartStop) ──
+    //
+    // Go's `TestStartStop` builds a real `Service` over mocked
+    // `AccountManager`/`ledger`/`txnSink` collaborators, starts it, adds a
+    // block, then stops it -- checking only that construction, start, and
+    // stop don't hang or panic. `LocalTxBroadcaster::new` only needs trait
+    // objects (`PoolIngest`, `GossipNode`), not a full pool/`GossipNode`
+    // stack, so the equivalent lifecycle is directly portable here with
+    // minimal no-op mocks (the same shape `algo_network::local_tx_broadcast`'s
+    // own test module already uses for `submit_group` tests).
+    mod start_stop {
+        use super::*;
+        use algo_network::gossip_node::{GossipNode, Peer, PeerOption, Router};
+        use algo_network::handler::{TaggedMessageHandler, TaggedMessageValidatorHandler};
+        use algo_network::local_tx_broadcast::PoolIngest;
+        use algo_network::tag::Tag;
+        use async_trait::async_trait;
+
+        struct NoopPoolIngest;
+        #[async_trait]
+        impl PoolIngest for NoopPoolIngest {
+            async fn ingest(&self, _group: Vec<SignedTransaction>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        struct NoopGossipNode;
+        #[async_trait]
+        impl GossipNode for NoopGossipNode {
+            fn address(&self) -> (String, bool) {
+                (String::new(), false)
+            }
+            async fn broadcast(
+                &self,
+                _tag: Tag,
+                _data: Vec<u8>,
+                _wait: bool,
+                _except: Option<Arc<dyn Peer>>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+            async fn relay(
+                &self,
+                _tag: Tag,
+                _data: Vec<u8>,
+                _wait: bool,
+                _except: Option<Arc<dyn Peer>>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+            fn disconnect(&self, _peer: Arc<dyn Peer>) {}
+            fn disconnect_peers(&self) {}
+            async fn request_connect_outgoing(&self, _replace: bool) {}
+            fn get_peers(&self, _options: &[PeerOption]) -> Vec<Arc<dyn Peer>> {
+                Vec::new()
+            }
+            async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+            async fn stop(&self) {}
+            fn register_handlers(&self, _dispatch: Vec<TaggedMessageHandler>) {}
+            fn clear_handlers(&self) {}
+            fn register_validator_handlers(&self, _dispatch: Vec<TaggedMessageValidatorHandler>) {}
+            fn clear_validator_handlers(&self) {}
+            fn on_network_advance(&self) {}
+            fn get_genesis_id(&self) -> &str {
+                ""
+            }
+            fn register_http_handler(&self, _path: &str, _handler: Router) {}
+        }
+
+        /// Construct, start, add a "block" (advance the round condvar,
+        /// mirroring go's `ledger.addBlock`), then stop -- must return
+        /// promptly without hanging or panicking, the same property
+        /// `TestStartStop` checks.
+        #[test]
+        fn spawn_start_add_block_stop_does_not_hang() {
+            let ledger = Arc::new(Mutex::new(ledger_at_round(500, 0x11)));
+            let part_store = ParticipationStore::open_in_memory().expect("part store");
+            let ingest: Arc<dyn PoolIngest> = Arc::new(NoopPoolIngest);
+            let gossip: Arc<dyn GossipNode> = Arc::new(NoopGossipNode);
+            let seen = Arc::new(algo_network::tx_syncer::SeenTxCache::new(16));
+            let broadcaster = Arc::new(LocalTxBroadcaster::new(ingest, gossip, seen));
+            let round_advanced = Arc::new(Condvar::new());
+
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let rt_handle = rt.handle().clone();
+
+            let (stop, join) = spawn(
+                ledger,
+                part_store,
+                broadcaster,
+                Arc::clone(&round_advanced),
+                rt_handle,
+                Duration::from_millis(20),
+            );
+
+            // "add a block": notify the round-advanced condvar, same as
+            // `run_pool_block_follower`'s callers do after `put_block`.
+            round_advanced.notify_all();
+            std::thread::sleep(Duration::from_millis(50));
+
+            stop.store(true, Ordering::Relaxed);
+            round_advanced.notify_all();
+            join.join()
+                .expect("heartbeat-service thread must not panic");
+        }
+    }
 }
