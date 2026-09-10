@@ -443,6 +443,52 @@ mod tests {
         assert!(decode_signed_txn_stream(&too_deep_payload()).is_err());
     }
 
+    /// go: `TestMsgpDecode` (`protocol/codec_test.go`) round-trips a stream
+    /// of concatenated msgpack-encoded values through go's
+    /// `NewMsgpDecoderBytes`, checking (a) every value in the stream decodes
+    /// in order and (b) decoding stops cleanly (EOF) once the stream is
+    /// exhausted rather than erroring or looping. This exercises
+    /// `decode_signed_txn_stream`'s happy path directly — the only existing
+    /// test for it (`decode_signed_txn_stream_rejects_too_deep_payload`
+    /// above) covers just the depth-limit rejection branch.
+    #[test]
+    fn decode_signed_txn_stream_decodes_every_concatenated_value_then_stops_cleanly() {
+        let sender = algo_types::Address([0x11u8; 32]);
+        let mut stx_a = SignedTransaction::default();
+        stx_a.txn.txn_type = algo_types::TxnType::Pay;
+        stx_a.txn.sender = sender;
+        stx_a.txn.note = serde_bytes::ByteBuf::from(b"first".to_vec());
+        let mut stx_b = SignedTransaction::default();
+        stx_b.txn.txn_type = algo_types::TxnType::Pay;
+        stx_b.txn.sender = sender;
+        stx_b.txn.note = serde_bytes::ByteBuf::from(b"second".to_vec());
+        let mut stx_c = SignedTransaction::default();
+        stx_c.txn.txn_type = algo_types::TxnType::Pay;
+        stx_c.txn.sender = sender;
+        stx_c.txn.note = serde_bytes::ByteBuf::from(b"third".to_vec());
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&canonical_encode_signed_transaction(&stx_a));
+        stream.extend_from_slice(&canonical_encode_signed_transaction(&stx_b));
+        stream.extend_from_slice(&canonical_encode_signed_transaction(&stx_c));
+
+        let decoded = decode_signed_txn_stream(&stream).expect("multi-value stream decodes");
+        assert_eq!(decoded.len(), 3, "every concatenated value must decode");
+        assert_eq!(decoded[0], stx_a);
+        assert_eq!(decoded[1], stx_b);
+        assert_eq!(decoded[2], stx_c);
+
+        // No trailing/leftover data: the loop must stop cleanly at exactly
+        // the end of the stream rather than erroring on a phantom
+        // "remaining" value or requiring extra bytes.
+        assert_eq!(
+            stream.len(),
+            canonical_encode_signed_transaction(&stx_a).len()
+                + canonical_encode_signed_transaction(&stx_b).len()
+                + canonical_encode_signed_transaction(&stx_c).len()
+        );
+    }
+
     #[test]
     fn decode_block_response_rejects_too_deep_payload() {
         assert!(decode_block_response(&too_deep_payload()).is_err());

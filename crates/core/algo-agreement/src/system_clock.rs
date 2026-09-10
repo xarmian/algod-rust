@@ -228,6 +228,54 @@ mod tests {
         );
     }
 
+    /// go: `TestTimeoutTypes` (`util/timers/monotonic_test.go`) registers
+    /// several concurrently pending timeouts tagged with different
+    /// `TimeoutType` values and checks each fires independently, keyed by
+    /// its own channel rather than by type. `SystemClock::timeout_at`
+    /// currently ignores its `_timeout_type` parameter (every call gets its
+    /// own independent channel regardless of type — see the field's doc
+    /// comment), but this pins that two differently-typed, concurrently
+    /// pending timeouts really do fire independently of one another and
+    /// don't get conflated by type (phase17 `parity_util.md`,
+    /// `TestTimeoutTypes`).
+    #[test]
+    fn timeout_at_fires_independently_for_concurrently_pending_different_types() {
+        let clock = SystemClock::new();
+        // Deadline fires quickly; FastRecovery fires later; Filter never
+        // fires within the observation window (pathologically long delta).
+        let rx_deadline = clock.timeout_at(Duration::from_millis(10), TimeoutType::Deadline);
+        let rx_recovery = clock.timeout_at(Duration::from_millis(80), TimeoutType::FastRecovery);
+        let rx_filter = clock.timeout_at(Duration::MAX, TimeoutType::Filter);
+
+        // Deadline should fire first; FastRecovery and Filter must not have
+        // fired yet.
+        select! {
+            recv(rx_deadline) -> _ => {}
+            default(Duration::from_millis(200)) => panic!("Deadline timeout did not fire"),
+        }
+        assert!(
+            rx_recovery.recv_timeout(Duration::from_millis(1)).is_err(),
+            "FastRecovery fired too early, alongside Deadline"
+        );
+        assert!(
+            rx_filter.recv_timeout(Duration::from_millis(1)).is_err(),
+            "Filter (MAX delta) fired unexpectedly"
+        );
+
+        // FastRecovery should now fire on its own schedule, independent of
+        // Deadline having already fired.
+        select! {
+            recv(rx_recovery) -> _ => {}
+            default(Duration::from_millis(200)) => panic!("FastRecovery timeout did not fire"),
+        }
+        // Filter (never-firing channel from a MAX delta) still must not
+        // have fired.
+        assert!(
+            rx_filter.recv_timeout(Duration::from_millis(1)).is_err(),
+            "Filter (MAX delta) fired unexpectedly after the other two settled"
+        );
+    }
+
     #[test]
     fn since_progresses_between_zero_calls() {
         let clock = SystemClock::new();
