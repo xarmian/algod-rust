@@ -3752,6 +3752,29 @@ fn execute_inner_appl<L: LedgerStore>(
         });
     }
 
+    // ── ClearState: reject a caller trying to shortchange the shared budget ──
+    // go-algorand (`data/transactions/logic/eval.go:1244-1247`,
+    // `IsolateClearState`): even though ClearState always runs with its own
+    // isolated `MaxAppProgramCost` budget (it never draws from the shared
+    // pool -- see below), invoking one still requires the shared pooled
+    // budget to hold at least `MaxAppProgramCost` at the moment of the call.
+    // This is a plain `fmt.Errorf`, not a `logic.EvalError`, so unlike an
+    // ordinary ClearState program rejection it is NOT swallowed by
+    // `ledger/apply/application.go` -- it fails the entire outer transaction.
+    // A caller that burns down the shared budget before invoking an inner
+    // ClearState (mirrors go's TestInnerClearStateBadCaller) must not be
+    // able to "shortchange" the callee this way.
+    if on_completion == ON_COMPLETION_CLEAR_STATE
+        && *opcode_budget < consensus.max_app_program_cost as i64
+    {
+        return Err(AlgoError::Avm {
+            message: format!(
+                "attempted ClearState execution with low OpcodeBudget {}",
+                opcode_budget
+            ),
+        });
+    }
+
     // ── Load the program ──
     let app = store
         .get_app_params(effective_app_id)
@@ -10768,6 +10791,66 @@ mod tests {
         );
     }
 
+    // ---- Caller cannot shortchange an inner ClearState's budget ----
+
+    #[test]
+    fn inner_clearstate_rejected_when_shared_budget_below_max_app_program_cost() {
+        // Mirrors go-algorand's TestInnerClearStateBadCaller
+        // (ledger/apptxn_test.go): even though ClearState always runs with
+        // its own isolated MaxAppProgramCost budget, invoking one still
+        // requires the *shared* pooled budget to hold at least
+        // MaxAppProgramCost at the call site. A caller that has burned the
+        // shared budget down below that threshold must have the whole
+        // itxn_submit (and thus the outer transaction) rejected, not
+        // silently let the callee's ClearState "shortchange" run anyway.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_app_local_state(
+            &app_addr,
+            100,
+            AppLocalState {
+                schema: StateSchema::default(),
+                key_value: BTreeMap::new(),
+            },
+        );
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_apps_opted_in: 1,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        // Shared budget below max_app_program_cost (700 for the default
+        // consensus params) -- the "waster" scenario from the go test.
+        ctx.opcode_budget = 100;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100
+        ctx.itxn_field(25, TealValue::Uint(3)).unwrap(); // OnCompletion = ClearStateOC
+        let result = ctx.itxn_submit();
+
+        assert!(
+            result.is_err(),
+            "inner ClearState with a shortchanged shared budget must fail the outer transaction"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("low OpcodeBudget"), "unexpected error: {msg}");
+    }
+
     // ---- H4: Rollback snapshot covers appl accounts ----
 
     #[test]
@@ -13125,7 +13208,10 @@ mod tests {
         store.set_box(888, b"self", vec![0u8; 5]);
         let mut ctx = make_box_context(&mut store, 888, b"self");
         let err = ctx.box_replace(b"unlisted", 0, b"hi").unwrap_err();
-        assert_eq!(format!("{err}"), "AVM: invalid Box reference 0x756e6c6973746564");
+        assert_eq!(
+            format!("{err}"),
+            "AVM: invalid Box reference 0x756e6c6973746564"
+        );
     }
 
     #[test]
@@ -13151,7 +13237,10 @@ mod tests {
         store.set_box(888, b"self", vec![0u8; 5]);
         let mut ctx = make_box_context(&mut store, 888, b"self");
         let err = ctx.box_splice(b"unlisted", 0, 1, b"h").unwrap_err();
-        assert_eq!(format!("{err}"), "AVM: invalid Box reference 0x756e6c6973746564");
+        assert_eq!(
+            format!("{err}"),
+            "AVM: invalid Box reference 0x756e6c6973746564"
+        );
     }
 
     #[test]
