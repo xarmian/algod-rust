@@ -38,10 +38,6 @@ pub enum Error {
     /// Matches Go's `errInvalidThreshold`.
     #[error("invalid multisig threshold")]
     InvalidThreshold,
-    /// More than 255 public keys (would overflow Go's `uint8` count
-    /// and exceeds `maxMultisig`).
-    #[error("too many multisig public keys (max 255)")]
-    TooManyKeys,
     /// Caller-supplied signer doesn't appear in the public-key list.
     /// Matches Go's `errKeyNotExist`.
     #[error("signing key not found in multisig public-key list")]

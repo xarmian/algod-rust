@@ -53,9 +53,9 @@ per-area split of the former).
 |---|---|---|
 | `matched-1:1` | 980 | 31% |
 | `matched-1:many` | 720 | 23% |
-| `partial` | 678 | 21% |
+| `partial` | 677 | 21% |
 | `out-of-scope` | 588 | 18% |
-| `matched-many:1` | 213 | 7% |
+| `matched-many:1` | 214 | 7% |
 | `not-implemented` | 0 | 0% |
 | `missing-test` | 0 | 0% |
 
@@ -78,7 +78,7 @@ were triaged into tracked issues.
 | Agreement protocol (`agreement`) | [parity_agreement.md](phase17/parity_agreement.md) | 326 | 157 | 59 | 81 | 22 | 0 | 0 | 7 |
 | e2e integration (`test/e2e-go`) | [parity_e2e.md](phase17/parity_e2e.md) | 195 | 52 | 23 | 0 | 73 | 0 | 0 | 47 |
 | Networking (`network`, `network/p2p`, ...) | [parity_network.md](phase17/parity_network.md) | 263 | 98 | 60 | 11 | 76 | 0 | 0 | 18 |
-| Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 121 | 40 | 17 | 56 | 0 | 0 | 42 |
+| Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 121 | 40 | 18 | 55 | 0 | 0 | 42 |
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 60 | 66 | 1 | 7 | 0 | 0 | 10 |
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 119 | 32 | 46 | 54 | 0 | 0 | 23 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 25 | 34 | 0 | 29 | 0 | 0 | 31 |
@@ -86,5 +86,5 @@ were triaged into tracked issues.
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 36 | 28 | 7 | 15 | 0 | 0 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 13 | 0 | 14 | 0 | 0 | 3 |
-| **Total** | | **3,179** | **980** | **720** | **213** | **678** | **0** | **0** | **588** |
+| **Total** | | **3,179** | **980** | **720** | **214** | **677** | **0** | **0** | **588** |
 
