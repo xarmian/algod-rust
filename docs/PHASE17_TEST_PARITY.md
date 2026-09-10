@@ -51,9 +51,9 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 955 | 30% |
-| `partial` | 759 | 24% |
-| `matched-1:many` | 668 | 21% |
+| `matched-1:1` | 959 | 30% |
+| `partial` | 752 | 24% |
+| `matched-1:many` | 671 | 21% |
 | `out-of-scope` | 587 | 18% |
 | `matched-many:1` | 210 | 7% |
 | `not-implemented` | 0 | 0% |
@@ -61,7 +61,7 @@ per-area split of the former).
 
 **0 rows (`not-implemented` + `missing-test`, 0%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
-implements but never tests. `partial` (759, 24%) is coverage that exists
+implements but never tests. `partial` (752, 24%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
 most are diminishing-returns edge cases. See
 [`docs/PHASE17_PROPOSAL.md`](PHASE17_PROPOSAL.md) for how the real gaps
@@ -83,8 +83,8 @@ were triaged into tracked issues.
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 111 | 30 | 47 | 63 | 0 | 0 | 23 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 25 | 31 | 0 | 32 | 0 | 0 | 31 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 22 | 7 | 0 | 23 | 0 | 0 | 66 |
-| Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 32 | 26 | 7 | 21 | 0 | 0 | 87 |
+| Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 36 | 28 | 7 | 15 | 0 | 0 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
-| Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 11 | 0 | 16 | 0 | 0 | 3 |
-| **Total** | | **3,179** | **955** | **668** | **210** | **759** | **0** | **0** | **587** |
+| Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 12 | 0 | 15 | 0 | 0 | 3 |
+| **Total** | | **3,179** | **959** | **671** | **210** | **752** | **0** | **0** | **587** |
 

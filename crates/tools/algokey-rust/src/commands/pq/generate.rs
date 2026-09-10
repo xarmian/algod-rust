@@ -102,6 +102,27 @@ mod tests {
         // Keyfile must round-trip through the reader and validate.
         let read_back = super::super::key::read_pq_signing_material(&kf).unwrap();
         read_back.validate().unwrap();
+
+        // Mirrors go's `TestPQPrivateKeyFileStoresKeysNotEntropy`
+        // (`cmd/algokey/pq_test.go`): the printed mnemonic's underlying
+        // 32-byte entropy must never appear in the written keyfile's raw
+        // bytes — the file stores only the derived {public, private-key}
+        // pair, never the seed they were derived from (so leaking the
+        // keyfile alone can't recover the mnemonic).
+        let mnemonic_line = text
+            .lines()
+            .find(|l| l.starts_with("PQ private key mnemonic: "))
+            .expect("mnemonic line present")
+            .trim_start_matches("PQ private key mnemonic: ");
+        let entropy = algo_consensus_crypto::mnemonic_to_key(mnemonic_line)
+            .expect("printed mnemonic must decode back to entropy");
+        let keyfile_bytes = std::fs::read(&kf).unwrap();
+        assert!(
+            !keyfile_bytes
+                .windows(entropy.len())
+                .any(|w| w == entropy.as_slice()),
+            "keyfile bytes must not contain the mnemonic's raw entropy"
+        );
     }
 
     #[test]

@@ -331,6 +331,50 @@ mod tests {
         assert_eq!(decoded, m);
     }
 
+    /// Mirrors go's `TestRandomizedEncodingpqPublicMaterial`/
+    /// `TestRandomizedEncodingpqSigningMaterial` (`cmd/algokey/msgp_gen_test.go`,
+    /// via `protocol.RunEncodingTest`'s quickcheck-style randomized-field
+    /// generator): unlike [`encode_decode_round_trips`]'s single fixed
+    /// fixture, exercise `encode_pq_signing_material`/
+    /// `decode_pq_signing_material` against many randomized field values
+    /// (varying byte content, not just the one fixed pattern) each run, to
+    /// catch any bug not visible under one deterministic bit pattern (e.g.
+    /// one that only reproduces for specific byte values, such as 0x00/0xFF
+    /// hitting a length- or sign-related off-by-one in the hand-rolled
+    /// msgpack encode/decode).
+    #[test]
+    fn encode_decode_round_trips_randomized_fields() {
+        use rand::RngCore;
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..256 {
+            let mut public_key = vec![0u8; algo_falcon::FALCON_DET1024_PUBKEY_SIZE];
+            rng.fill_bytes(&mut public_key);
+            let mut private_key = vec![0u8; algo_falcon::FALCON_DET1024_PRIVKEY_SIZE];
+            rng.fill_bytes(&mut private_key);
+            let salt = PQAddressSalt((rng.next_u32() % 256) as u8);
+            // Randomize the scheme tag bytes too (decode/encode round-trip
+            // doesn't require a registered scheme — that's `validate()`'s
+            // job, exercised separately).
+            let mut scheme = [0u8; 2];
+            rng.fill_bytes(&mut scheme);
+
+            let m = PqSigningMaterial {
+                public: PqPublicMaterial {
+                    scheme,
+                    salt,
+                    public_key,
+                },
+                private_key,
+            };
+
+            let bytes = encode_pq_signing_material(&m);
+            let decoded = decode_pq_signing_material(&bytes)
+                .unwrap_or_else(|e| panic!("decode failed for randomized input {m:?}: {e}"));
+            assert_eq!(decoded, m, "round-trip mismatch for randomized input");
+        }
+    }
+
     #[test]
     fn validate_rejects_wrong_sized_public_key() {
         let mut m = sample(PQ_SCHEME_FALCON1024, 7, 1, 1);

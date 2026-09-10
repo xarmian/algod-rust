@@ -325,6 +325,97 @@ mod tests {
         assert!(signed.pqsig.is_some());
     }
 
+    /// Mirrors go's `TestPQSignAcceptsMnemonic` (`cmd/algokey/pq_test.go`):
+    /// exercises `pq sign --mnemonic` through the actual command surface
+    /// (`run_with_io`), not just the shared `resolve_pq_signing_context`
+    /// helper it delegates to (see `context.rs`'s
+    /// `resolve_from_mnemonic_matches_generate`).
+    #[test]
+    fn sign_accepts_mnemonic() {
+        let (entropy, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let mnemonic = algo_consensus_crypto::key_to_mnemonic(&entropy).unwrap();
+        let sender = signing.public.address();
+
+        let dir = tempfile::tempdir().unwrap();
+        let txfile = dir.path().join("in.tx");
+        let outfile = dir.path().join("out.tx");
+        std::fs::write(
+            &txfile,
+            canonical_encode_signed_transaction(&build_unsigned_txn(sender)),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            PqSignArgs {
+                keyfile: None,
+                mnemonic: Some(mnemonic),
+                scheme: "falcon-1024".to_string(),
+                txfile,
+                outfile: outfile.clone(),
+                overwrite: false,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::SUCCESS),
+            "stderr: {}",
+            String::from_utf8_lossy(&err)
+        );
+
+        let produced = std::fs::read(&outfile).unwrap();
+        let (signed, _) = decode_one_signed_txn(&produced).unwrap();
+        let pqsig = signed.pqsig.expect("pqsig must be set");
+        assert_eq!(
+            pqsig.public_key.as_slice(),
+            signing.public.public_key.as_slice()
+        );
+    }
+
+    /// Mirrors go's `TestPQSignRejectsUnsupportedMnemonicScheme`
+    /// (`cmd/algokey/pq_test.go`): the `--mnemonic` path on the `pq sign`
+    /// command surface itself must reject an unregistered `--scheme`, not
+    /// just the shared registry-check helper in isolation.
+    #[test]
+    fn sign_rejects_unsupported_mnemonic_scheme() {
+        let (entropy, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let mnemonic = algo_consensus_crypto::key_to_mnemonic(&entropy).unwrap();
+        let sender = signing.public.address();
+
+        let dir = tempfile::tempdir().unwrap();
+        let txfile = dir.path().join("in.tx");
+        let outfile = dir.path().join("out.tx");
+        std::fs::write(
+            &txfile,
+            canonical_encode_signed_transaction(&build_unsigned_txn(sender)),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            PqSignArgs {
+                keyfile: None,
+                mnemonic: Some(mnemonic),
+                scheme: "bogus-scheme-name".to_string(),
+                txfile,
+                outfile,
+                overwrite: false,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(out.is_empty(), "no signed output written on rejection");
+        assert!(
+            !String::from_utf8(err).unwrap().is_empty(),
+            "an error message must be printed"
+        );
+    }
+
     #[test]
     fn sign_rejects_empty_txfile() {
         let (_, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
