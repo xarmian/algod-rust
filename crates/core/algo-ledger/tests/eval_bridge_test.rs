@@ -511,6 +511,58 @@ fn clearstate_execute_program_rejects_still_clears_local_state() {
     assert_eq!(sender_acct.total_apps_opted_in, 0);
 }
 
+/// go-algorand's `TestLogsInBlock` (apptxn_test.go) asserts, among other
+/// things, that a ClearState program's `log` calls are dropped from
+/// `ApplyData.EvalDelta` when the program rejects -- go's
+/// `ledger/apply/application.go` swallows the ClearState `EvalError`/reject
+/// entirely (see CLAUDE.md's "Simulation EvalDelta-on-Error Semantics"),
+/// so the real ledger's `EvalDelta` for that inner txn stays empty even
+/// though the program actually executed a `log` before rejecting. Confirms
+/// `record_eval_delta_comparison`'s `!result.approved` branch (`apply.rs`)
+/// leaves `captured_eval_delta` at its `None` default rather than capturing
+/// the logs the program emitted before rejecting.
+#[test]
+fn clearstate_reject_drops_logs_emitted_before_rejection() {
+    let creator = Address([1u8; 32]);
+    let sender = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[(creator, 50_000_000), (sender, 50_000_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    // Clear-state program: log a message, then reject.
+    let log_then_reject = prog(AVM_V6, &[0x80, 1, b'x', 0xb0, 0x81, 0x00]);
+
+    let app_id = 202u64;
+    create_app(&mut state, app_id, creator, approval_program(), log_then_reject);
+
+    opt_in_account(&mut state, &sender, app_id);
+    assert!(state.get_app_local_state(&sender, app_id).is_some());
+
+    let ctx = execute_ctx(fee_sink, 1);
+    let stx = appl_clearstate_txn(sender, app_id, 1_000);
+
+    let apply_data = apply_transaction(&mut state, &stx, &ctx, 0)
+        .expect("ClearState should succeed even when the program rejects after logging");
+
+    // Local state is still cleared (existing behavior, reasserted here).
+    assert!(
+        state.get_app_local_state(&sender, app_id).is_none(),
+        "local state should be cleared even when clear-state program rejects"
+    );
+
+    // But the EvalDelta must stay empty -- the log the program emitted
+    // before rejecting must NOT surface in ApplyData, matching go's
+    // swallow-on-ClearState-failure semantics.
+    assert!(
+        apply_data.eval_delta.is_none(),
+        "a rejecting ClearState program's logs must not appear in ApplyData.EvalDelta, got {:?}",
+        apply_data.eval_delta
+    );
+}
+
 /// ClearState in Execute mode where program errors -- local state is STILL
 /// cleared.
 #[test]

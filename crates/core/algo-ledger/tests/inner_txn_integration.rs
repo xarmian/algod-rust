@@ -2245,6 +2245,65 @@ fn inner_txn_ids_computed() {
     assert!(!ids[0][0].is_zero(), "inner txn ID should be non-zero");
 }
 
+/// go-algorand's `TestNote` (apptxn_test.go) submits an inner pay carrying a
+/// `Note`, and the go test's whole point is that the note bytes it wrote
+/// come back byte-for-byte from the resulting inner transaction. The
+/// existing fee-residue test (`inner_group_usage_based_fee_shortfall_
+/// reports_net_amount`) exercises an oversized Note as a fee-usage input but
+/// never asserts the round-tripped value, so it doesn't actually pin this
+/// behavior. This closes that gap: read back `itxn Note` (field 5) via
+/// `itxn` and compare it byte-for-byte against the literal written with
+/// `itxn_field Note`, both in TEAL (`b==`) and via the Rust-side
+/// `ctx.inner_txns()` accessor.
+#[test]
+fn inner_txn_note_round_trips() {
+    let sender = [0xAA; 32];
+    let receiver = [0xBB; 32];
+    let app_id = 42u64;
+    let note: &[u8] = b"hello inner txn note";
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 10_000_000);
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 10_000;
+
+    let mut code = Vec::new();
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(1)); // TypeEnum = pay
+    code.extend([0xb2, 16]); // itxn_field TypeEnum
+    code.extend(pushbytes(&receiver));
+    code.extend([0xb2, 7]); // itxn_field Receiver
+    code.extend(pushint(100));
+    code.extend([0xb2, 8]); // itxn_field Amount
+    code.extend(pushbytes(note));
+    code.extend([0xb2, 5]); // itxn_field Note
+    code.push(0xb3); // itxn_submit
+
+    // itxn Note (field 5) must equal the literal note bytes written above.
+    code.extend([0xb4, 5]); // itxn Note
+    code.extend(pushbytes(note));
+    code.push(0xa8); // b==
+    code.push(0x43); // return
+
+    let result = run_with_context(6, &code, &mut ctx).unwrap();
+    assert!(result, "itxn Note should round-trip the written note bytes");
+
+    let inner = ctx.inner_txns();
+    assert_eq!(inner.len(), 1);
+    assert_eq!(inner[0].len(), 1);
+    assert_eq!(
+        inner[0][0].txn.note.as_slice(),
+        note,
+        "inner transaction's note field should match what itxn_field Note wrote"
+    );
+}
+
 /// Inner app creation (application_id == 0) creates new app.
 #[test]
 fn inner_app_creation() {
