@@ -69,7 +69,8 @@ use algo_ledger::participation::ParticipationStore;
 use algo_ledger::stateproof_message::generate_state_proof_message;
 use algo_ledger::stateproof_worker::{
     build_state_proof_transaction, db, is_eligible_signing_round, next_state_proof_round,
-    sign_state_proof_message, SigFromAddr, SigOutcome, StateProofRuntime, StateProofSigningKey,
+    pending_sigs_to_broadcast, sign_state_proof_message, SigFromAddr, SigOutcome,
+    StateProofRuntime, StateProofSigningKey,
 };
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::SqliteLedger;
@@ -211,6 +212,43 @@ pub fn find_and_sign_eligible_rounds<L: LedgerStore>(
             }
             info!(round, signer = %sfa.signer_address, "stateproof: signed state proof message");
             out.push(sfa);
+        }
+    }
+    out
+}
+
+/// For every round in `[*next_broadcast_round, current)`, select pending
+/// signatures for periodic re-broadcast via
+/// [`algo_ledger::stateproof_worker::pending_sigs_to_broadcast`], and
+/// advance `*next_broadcast_round` to `current`. Mirrors go's
+/// `Worker.builder`'s per-round `broadcastSigs` call
+/// (`stateproof/builder.go:470-474`): each round between the last
+/// observation and the current one is scanned exactly once, using the
+/// *current* block header's consensus params/`StateProofNextRound` for the
+/// whole batch (go does the same -- it recomputes these once from
+/// `newLatestHdr` per builder-loop iteration, not per historical round's own
+/// header).
+///
+/// This is the fix for issue #1231: before it, a signature broadcast lost to
+/// a one-shot gossip-propagation failure had no retry path anywhere in this
+/// daemon.
+pub fn find_and_broadcast_pending_sigs(
+    sig_conn: &rusqlite::Connection,
+    interval: u64,
+    state_proof_next_round: u64,
+    current: u64,
+    next_broadcast_round: &mut u64,
+) -> Vec<SigFromAddr> {
+    let mut out = Vec::new();
+    while *next_broadcast_round < current {
+        let brnd = *next_broadcast_round;
+        *next_broadcast_round += 1;
+
+        match pending_sigs_to_broadcast(sig_conn, brnd, state_proof_next_round, interval) {
+            Ok(sigs) => out.extend(sigs),
+            Err(e) => {
+                warn!(brnd, error = %e, "stateproof: failed to query pending signatures for rebroadcast");
+            }
         }
     }
     out
@@ -384,6 +422,17 @@ fn run_loop(
         next_state_proof_round(state_proof_next_round, latest.0)
     };
 
+    // Periodic pending-signature rebroadcast (issue #1231) starts scanning
+    // from the round observed at startup -- mirrors go's `Worker.builder`'s
+    // `nextBroadcastRnd := latest` (`stateproof/builder.go:440`).
+    let mut next_broadcast_round: u64 = {
+        let l = match ledger.lock() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        l.current_round().0
+    };
+
     while !stop.load(Ordering::Relaxed) {
         let current = {
             let l = match ledger.lock() {
@@ -418,6 +467,52 @@ fn run_loop(
             }
         }
 
+        // 1a. Periodically re-broadcast pending signatures for rounds that
+        // haven't yet formed a state proof (issue #1231) -- recovers a
+        // signature lost to a one-shot gossip-propagation failure. Mirrors
+        // go's `Worker.builder`'s per-round `broadcastSigs` call
+        // (`stateproof/builder.go:470-474`); reuses the same
+        // header/consensus-params lookup the pruning step below needs.
+        let (needed_round, interval) = {
+            let l = match ledger.lock() {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            l.get_block_header(current.0)
+                .ok()
+                .flatten()
+                .map(|h| {
+                    let needed =
+                        algo_ledger::block_header::state_proof_next_round(&h.state_proof_tracking);
+                    let interval = consensus_params_for_version(&h.current_protocol)
+                        .map(|p| p.state_proof_interval)
+                        .unwrap_or(0);
+                    (needed, interval)
+                })
+                .unwrap_or((0, 0))
+        };
+        let rebroadcast_sigs = {
+            let conn = match sig_conn.lock() {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            find_and_broadcast_pending_sigs(
+                &conn,
+                interval,
+                needed_round,
+                current.0,
+                &mut next_broadcast_round,
+            )
+        };
+        for sfa in rebroadcast_sigs {
+            let payload = sfa.to_msgpack();
+            if let Err(e) =
+                rt_handle.block_on(gossip_node.broadcast(Tag::StateProofSig, payload, false, None))
+            {
+                warn!(round = sfa.round, error = %e, "stateproof: failed to rebroadcast pending signature");
+            }
+        }
+
         // 1b. Prune stale in-progress provers before attempting to build.
         // `StateProofRuntime::try_build` scans `self.provers` in ascending
         // round order and stops at the first round that isn't ready yet
@@ -441,19 +536,8 @@ fn run_loop(
         // node (10% stake, plus real signature-gossip propagation delay)
         // ever finished gathering its own.
         {
-            let needed_round = {
-                let l = match ledger.lock() {
-                    Ok(l) => l,
-                    Err(_) => break,
-                };
-                l.get_block_header(current.0)
-                    .ok()
-                    .flatten()
-                    .map(|h| {
-                        algo_ledger::block_header::state_proof_next_round(&h.state_proof_tracking)
-                    })
-                    .unwrap_or(0)
-            };
+            // `needed_round` was already computed above for the rebroadcast
+            // step (1a) -- reuse it rather than re-reading the same header.
             if needed_round > 0 {
                 if let Ok(mut rt) = runtime.lock() {
                     rt.prune(needed_round);
@@ -878,6 +962,91 @@ mod tests {
                 .and_then(|r| r.state_proof_secrets)
                 .is_some(),
             "key covering the confirmed round must remain"
+        );
+    }
+
+    /// Issue #1231: wiring-level test for `find_and_broadcast_pending_sigs`
+    /// -- the function `run_loop`'s step 1a actually calls on every
+    /// iteration. Unlike `algo_ledger::stateproof_worker`'s own
+    /// `pending_sigs_to_broadcast_*` tests (which pin the pure, single-round
+    /// selection logic), this drives the daemon-loop call site itself
+    /// across several simulated ticks -- each call passing `current`
+    /// exactly as `run_loop` would (the ledger's `current_round().0`) and
+    /// threading `next_broadcast_round` through exactly as `run_loop`'s
+    /// mutable loop state does -- and proves two things end to end: (a) the
+    /// DB query bounds it derives (`threshold`/`max_round` via
+    /// `pending_sigs_to_broadcast`) are correct across a multi-round batch,
+    /// not just a single hand-picked round; and (b) a signature lost to a
+    /// one-shot broadcast failure (simulated here by it simply never having
+    /// been offered on the tick covering its own round) is picked back up
+    /// and re-sent on a strictly later tick once the round advances into
+    /// the interval's second half and this signer's address-based schedule
+    /// slot comes up.
+    #[test]
+    fn find_and_broadcast_pending_sigs_recovers_lost_broadcast_across_daemon_ticks() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::install_sigs_table(&conn).unwrap();
+
+        const INTERVAL: u64 = 8; // half = 4
+        let mut addr = [0u8; 32];
+        addr[0] = 4; // addr64 % 4 == 0
+        let sig = {
+            let secrets = merklesig::Secrets::new(1, 1, 1).unwrap();
+            secrets.get_signer(1).sign_bytes(&[1u8; 32]).unwrap()
+        };
+        db::add_pending_sig(
+            &conn,
+            8,
+            &db::PendingSig {
+                signer: Address(addr),
+                sig,
+                from_this_node: false,
+            },
+        )
+        .unwrap();
+
+        let mut next_broadcast_round = 8u64;
+
+        // Tick 1: the ledger has only advanced to round 9, so this call
+        // covers exactly brnd=8 -- the first-half tick for round 8's own
+        // period, where only this node's own signatures are candidates.
+        // The peer-received signature is excluded (simulating: it was
+        // never broadcast by us on this tick because it isn't ours to
+        // re-offer yet), and `next_broadcast_round` advances to 9.
+        let tick1 =
+            find_and_broadcast_pending_sigs(&conn, INTERVAL, 0, 9, &mut next_broadcast_round);
+        assert!(
+            tick1.is_empty(),
+            "first tick (covering only brnd=8, first-half) must not re-offer a foreign signature"
+        );
+        assert_eq!(next_broadcast_round, 9);
+
+        // Tick 2: the ledger has advanced further, to round 13. This call
+        // must scan every round in between (9, 10, 11, 12) exactly once --
+        // proving the wiring doesn't skip rounds between ticks (a coarser
+        // poll cadence than one tick per round must not create a gap in
+        // coverage). Round 12 is the interval's second half
+        // (12 % 8 == 4) with this signer's address slot (addr64 % 4 == 0
+        // matching 12 % 4 == 0), so the lost broadcast is recovered here.
+        let tick2 =
+            find_and_broadcast_pending_sigs(&conn, INTERVAL, 0, 13, &mut next_broadcast_round);
+        assert_eq!(next_broadcast_round, 13);
+        assert_eq!(
+            tick2.len(),
+            1,
+            "a later tick spanning the second-half/matching-slot round must recover the lost broadcast"
+        );
+        assert_eq!(tick2[0].signer_address, Address(addr));
+        assert_eq!(tick2[0].round, 8);
+
+        // Tick 3: no new rounds to scan (current == next_broadcast_round) --
+        // must not re-offer the same signature again on every subsequent
+        // tick once it's already been covered.
+        let tick3 =
+            find_and_broadcast_pending_sigs(&conn, INTERVAL, 0, 13, &mut next_broadcast_round);
+        assert!(
+            tick3.is_empty(),
+            "a tick with no new rounds must not re-scan already-covered rounds"
         );
     }
 }
