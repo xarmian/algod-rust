@@ -3920,6 +3920,22 @@ mod tests {
 
     // ── Payment well-formedness (issue #812) ─────────────────────
 
+    /// Mirrors go's `TestPaymentWellFormed`
+    /// (`data/transactions/payment_test.go:75`): a syntactically valid
+    /// payment (receiver set, non-zero amount, no self-close) passes
+    /// `validate_transaction_wellformed` -- the positive counterpart to the
+    /// payment-specific rejection cases pinned below
+    /// (`test_payment_close_to_self_rejected` et al., covering
+    /// `TestWellFormedPaymentErrors`).
+    #[test]
+    fn test_payment_wellformed_valid_payment_accepted() {
+        let mut txn = make_valid_txn();
+        txn.receiver = Address([0x30; 32]);
+        txn.amount = 1_000;
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
     #[test]
     fn test_payment_close_to_self_rejected() {
         let mut txn = make_valid_txn();

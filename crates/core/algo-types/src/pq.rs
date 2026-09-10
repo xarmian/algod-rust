@@ -266,6 +266,23 @@ mod tests {
         );
     }
 
+    /// Mirrors go's `TestPQSigAuthorizerAddress` (`data/transactions/pqsig_test.go:160`):
+    /// `PQSig::address()` derives the same address as calling
+    /// `pq_address(scheme, salt, public_key)` directly.
+    #[test]
+    fn pqsig_address_matches_pq_address_derivation() {
+        let sig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt: PQAddressSalt(7),
+            public_key: ByteBuf::from(vec![0x11u8; 32]),
+            signature: ByteBuf::from(vec![0x22u8; 16]),
+        };
+        assert_eq!(
+            sig.address(),
+            pq_address(sig.scheme, sig.salt, &sig.public_key)
+        );
+    }
+
     #[test]
     fn pq_delegated_program_to_be_signed_uses_pqprogram_domain_tag() {
         let dp = PQDelegatedProgram {
