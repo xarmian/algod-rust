@@ -255,7 +255,9 @@ use algo_types::{Digest, SignedTransaction};
 use algo_validate::{BatchVerifier, BatchVerifyRequest, SpecialAddresses, VerificationContext};
 
 use crate::forwarding_policy::ForwardingPolicy;
+use crate::gossip_node::{GossipNode, Peer};
 use crate::handler::MessageHandler;
+use crate::local_tx_broadcast::encode_tx_group;
 use crate::message::{IncomingMessage, OutgoingMessage};
 use crate::tag::Tag;
 use crate::tx_syncer::SeenTxCache;
@@ -636,6 +638,27 @@ pub struct TxTagHandler {
     backlog_dropped: Arc<AtomicU64>,
     remember_counter: Arc<TxPoolRememberCounter>,
     backlog_peer_limiter: Option<Arc<TxBacklogPeerLimiter>>,
+    net: Option<Arc<dyn GossipNode>>,
+}
+
+/// Minimal [`Peer`] wrapper carrying only an address string, used as the
+/// `except` argument to [`GossipNode::relay`] — [`TxTagHandler`] only ever
+/// needs to exclude the originating peer by address (mirroring go's
+/// `wi.rawmsg.Sender`), never anything else `Peer` exposes.
+struct AddrPeer(String);
+
+impl Peer for AddrPeer {
+    fn get_address(&self) -> &str {
+        &self.0
+    }
+
+    fn get_connection_latency(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn routing_addr(&self) -> &[u8] {
+        &[]
+    }
 }
 
 impl std::fmt::Debug for TxTagHandler {
@@ -658,6 +681,7 @@ impl std::fmt::Debug for TxTagHandler {
                 "backlog_peer_limiter_enabled",
                 &self.backlog_peer_limiter.is_some(),
             )
+            .field("relay_enabled", &self.net.is_some())
             .finish()
     }
 }
@@ -700,7 +724,36 @@ impl TxTagHandler {
             backlog_dropped: Arc::new(AtomicU64::new(0)),
             remember_counter: Arc::new(TxPoolRememberCounter::new()),
             backlog_peer_limiter: None,
+            net: None,
         }
+    }
+
+    /// Attach a [`GossipNode`] to relay successfully-admitted inbound
+    /// groups to this node's other peers, mirroring go-algorand's
+    /// `TxHandler.net.Relay(handler.ctx, protocol.TxnTag,
+    /// reencode(verifiedTxGroup), false, wi.rawmsg.Sender)`
+    /// (`data/txHandler.go`), called only after `pool.Remember` succeeds
+    /// and the group is not being processed in synchronous (locally
+    /// submitted) mode.
+    ///
+    /// Without this attached (the default from [`Self::new`]), an inbound
+    /// group is ingested into the local pool but never re-propagated to
+    /// other peers — a relay node's own peers other than the original
+    /// sender would never learn about the transaction via gossip at all,
+    /// unlike go. `net` should be the same [`GossipNode`] the transport
+    /// this handler is registered on serves gossip over (e.g. the
+    /// `WebsocketNetwork`/`Arc<dyn GossipNode>` passed to
+    /// [`crate::local_tx_broadcast::LocalTxBroadcaster::new`] for the same
+    /// node), so relay reaches this handler's actual peers.
+    ///
+    /// Must be called *before* [`Self::with_backlog_queue`] — like
+    /// [`Self::with_remember_counter`]/[`Self::with_backlog_peer_limiter`],
+    /// the spawned worker captures whichever `net` is attached at the
+    /// moment `with_backlog_queue` runs.
+    #[must_use]
+    pub fn with_relay(mut self, net: Arc<dyn GossipNode>) -> Self {
+        self.net = Some(net);
+        self
     }
 
     /// Attach an [`AppRateLimiter`] (issue #821), mirroring go-algorand's
@@ -793,6 +846,7 @@ impl TxTagHandler {
             self.app_limiter.clone(),
             self.remember_counter.clone(),
             self.backlog_peer_limiter.clone(),
+            self.net.clone(),
         ));
         self.backlog_tx = Some(tx);
         self
@@ -1145,6 +1199,7 @@ impl MessageHandler for TxTagHandler {
                 &self.seen,
                 &self.app_limiter,
                 &self.remember_counter,
+                &self.net,
                 group,
                 txids,
                 msg.sender.clone(),
@@ -1179,11 +1234,13 @@ impl MessageHandler for TxTagHandler {
 /// retransmission of the same Transaction body (txids are body-derived).
 /// Errors are logged and dropped; unsolicited inbound txns must never
 /// panic or propagate back to the dispatcher.
+#[allow(clippy::too_many_arguments)]
 async fn ingest_group(
     pool: &Arc<TransactionPool>,
     seen: &Arc<SeenTxCache>,
     app_limiter: &Option<Arc<AppRateLimiter>>,
     remember_counter: &Arc<TxPoolRememberCounter>,
+    net: &Option<Arc<dyn GossipNode>>,
     group: Vec<SignedTransaction>,
     txids: Vec<Digest>,
     sender: String,
@@ -1194,6 +1251,11 @@ async fn ingest_group(
     // `appLimiter.penalizeEvalError(wi.unverifiedTxGroup, ...)` on a
     // `Remember` failure.
     let group_for_penalty = app_limiter.is_some().then(|| group.clone());
+    // Cloned only when relay is attached: go re-encodes
+    // (`reencode(verifiedTxGroup)`) and relays the group to other peers
+    // only *after* `pool.Remember` succeeds — see the `Ok(Ok(()))` arm
+    // below.
+    let group_for_relay = net.is_some().then(|| group.clone());
     let pool_for_task = pool.clone();
     let result = tokio::task::spawn_blocking(move || pool_for_task.remember(group)).await;
     match result {
@@ -1206,6 +1268,44 @@ async fn ingest_group(
                 ingested = txids.len(),
                 "TxTagHandler: group accepted",
             );
+            // Issue found during the Phase 17 second-pass network audit
+            // (`docs/phase17/parity_network.md`'s `TestLineNetwork` row):
+            // mirrors go's `TxHandler.postProcessCheckedTxn` calling
+            // `handler.net.Relay(handler.ctx, protocol.TxnTag,
+            // reencode(verifiedTxGroup), false, wi.rawmsg.Sender)`
+            // immediately after a successful `Remember` — without this, a
+            // relay node ingests an inbound gossip group into its own
+            // pool but never re-propagates it to its *other* peers, so
+            // multi-hop gossip propagation across a relay chain silently
+            // never happens (a peer two hops from the originator never
+            // learns about the transaction at all). `except` excludes the
+            // sender by address only (an [`AddrPeer`]), matching go's
+            // `wi.rawmsg.Sender` — a full `Peer` is not otherwise needed
+            // here.
+            if let (Some(net), Some(group)) = (net, group_for_relay) {
+                match encode_tx_group(&group) {
+                    Ok(payload) => {
+                        let except: Arc<dyn Peer> = Arc::new(AddrPeer(sender.clone()));
+                        if let Err(e) = net
+                            .relay(Tag::Transaction, payload, false, Some(except))
+                            .await
+                        {
+                            debug!(
+                                sender = %sender,
+                                error = %e,
+                                "TxTagHandler: relay failed",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            sender = %sender,
+                            error = %e,
+                            "TxTagHandler: failed to re-encode group for relay",
+                        );
+                    }
+                }
+            }
         }
         Ok(Err(e)) => {
             warn!(
@@ -1250,6 +1350,7 @@ async fn backlog_worker(
     app_limiter: Option<Arc<AppRateLimiter>>,
     remember_counter: Arc<TxPoolRememberCounter>,
     peer_limiter: Option<Arc<TxBacklogPeerLimiter>>,
+    net: Option<Arc<dyn GossipNode>>,
 ) {
     while let Some(item) = rx.recv().await {
         let BacklogItem {
@@ -1266,6 +1367,7 @@ async fn backlog_worker(
             &seen,
             &app_limiter,
             &remember_counter,
+            &net,
             group,
             txids,
             sender,
