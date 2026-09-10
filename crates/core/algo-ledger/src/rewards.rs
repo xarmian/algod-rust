@@ -595,12 +595,105 @@ mod tests {
         };
         let next = next_rewards_state(prev, 100, &params, 19, 10);
 
-        assert_eq!(next.rewards_rate, 0, "pool balance below MinBalance+residue must saturate to 0");
+        assert_eq!(
+            next.rewards_rate, 0,
+            "pool balance below MinBalance+residue must saturate to 0"
+        );
         assert_eq!(next.rewards_level, 6);
         assert_eq!(next.rewards_residue, 1);
         assert_eq!(
             next.rewards_recalculation_round,
             100u64.wrapping_add(params.rewards_rate_refresh_interval)
+        );
+    }
+
+    /// Mirrors go's `TestNextRewardsRateWithFixMaxSpentOverOverflow`
+    /// (`data/bookkeeping/block_test.go:852`): `MinBalance + RewardsResidue`
+    /// itself overflows u64 (residue is already `MaxUint64`). go's
+    /// `OverflowTracker` catches the overflow and spends the *entire* pool
+    /// balance instead, saturating the refreshed rate to 0 -- proving
+    /// `next_rewards_state`'s `checked_add` fallback (spend the whole pool
+    /// on overflow, see the `max_spent_over` branch above) matches
+    /// bit-for-bit rather than silently wrapping.
+    #[test]
+    fn test_nrs_max_spent_over_overflow_spends_whole_pool() {
+        let params = algo_types::ConsensusParams {
+            pending_residue_rewards: true,
+            rewards_calculation_fix: true,
+            min_balance: 10,
+            ..params_for(algo_types::consensus::CONSENSUS_V31)
+        };
+        let prev = RewardsState {
+            rewards_level: 4,
+            rewards_rate: 80,
+            rewards_residue: u64::MAX,
+            rewards_recalculation_round: 100,
+        };
+        let next = next_rewards_state(prev, 100, &params, 9009, 10);
+
+        assert_eq!(
+            next.rewards_rate, 0,
+            "MinBalance+RewardsResidue overflow must spend the whole pool, saturating rate to 0"
+        );
+        assert_eq!(next.rewards_level, 4 + u64::MAX / 10);
+        assert_eq!(next.rewards_residue, u64::MAX % 10);
+        assert_eq!(
+            next.rewards_recalculation_round,
+            100u64.wrapping_add(params.rewards_rate_refresh_interval)
+        );
+    }
+
+    /// Mirrors go's `TestNextRewardsRateWithFixRewardsWithResidueOverflow`
+    /// (`data/bookkeeping/block_test.go:889`): `RewardsRate + RewardsResidue`
+    /// overflows u64 when computing the level advance (the recalculation
+    /// round doesn't match `next_round`, so no rate refresh happens this
+    /// round -- only the level-advance addition is under test). go abandons
+    /// the whole level-advance and returns the state unchanged rather than
+    /// wrapping.
+    #[test]
+    fn test_nrs_rewards_with_residue_overflow_leaves_state_unchanged() {
+        let params = algo_types::ConsensusParams {
+            pending_residue_rewards: true,
+            rewards_calculation_fix: true,
+            min_balance: 10,
+            ..params_for(algo_types::consensus::CONSENSUS_V31)
+        };
+        let state = RewardsState {
+            rewards_level: 4,
+            rewards_rate: 80,
+            rewards_residue: u64::MAX,
+            rewards_recalculation_round: 100,
+        };
+        // next_round = recalculation_round - 1: no refresh this round.
+        let next = next_rewards_state(state, 99, &params, 0, 1);
+        assert_eq!(
+            next, state,
+            "RewardsRate+RewardsResidue overflow must abandon the level advance, leaving state unchanged"
+        );
+    }
+
+    /// Mirrors go's `TestNextRewardsRateWithFixNextRewardLevelOverflow`
+    /// (`data/bookkeeping/block_test.go:916`): `RewardsLevel + (RewardsRate+
+    /// RewardsResidue)/totalRewardUnits` itself overflows u64. go abandons
+    /// the level advance and returns the state unchanged.
+    #[test]
+    fn test_nrs_next_reward_level_overflow_leaves_state_unchanged() {
+        let params = algo_types::ConsensusParams {
+            pending_residue_rewards: true,
+            rewards_calculation_fix: true,
+            min_balance: 10,
+            ..params_for(algo_types::consensus::CONSENSUS_V31)
+        };
+        let state = RewardsState {
+            rewards_level: u64::MAX,
+            rewards_rate: 0,
+            rewards_residue: 1,
+            rewards_recalculation_round: 100,
+        };
+        let next = next_rewards_state(state, 99, &params, 1000, 1);
+        assert_eq!(
+            next, state,
+            "RewardsLevel overflow on the level advance must leave state unchanged"
         );
     }
 

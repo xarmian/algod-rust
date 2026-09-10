@@ -898,6 +898,59 @@ mod tests {
         assert_eq!(hdr.next_protocol_switch_on, Round(0));
     }
 
+    /// Mirrors go's `TestUpgradeVariableDelay` (`data/bookkeeping/block_test.go`):
+    /// `apply_upgrade_vote` must reject a proposed `UpgradeDelay` outside
+    /// `[MinUpgradeWaitRounds, MaxUpgradeWaitRounds]` (including 0, when the
+    /// minimum is nonzero) and accept every delay within the inclusive
+    /// bounds. This exercises `apply_upgrade_vote`'s bounds-check branch
+    /// directly, which no other test in this file reaches (the switch-on/
+    /// activation tests only ever construct a vote with an in-range delay).
+    #[test]
+    fn apply_upgrade_vote_rejects_delay_outside_min_max_bounds() {
+        let params = ConsensusParams {
+            min_upgrade_wait_rounds: 3,
+            max_upgrade_wait_rounds: 7,
+            ..v41_params()
+        };
+        let prev_state = NextUpgradeState {
+            current_protocol: CONSENSUS_V41.to_string(),
+            next_protocol: String::new(),
+            next_protocol_approvals: 0,
+            next_protocol_vote_before: Round(0),
+            next_protocol_switch_on: Round(0),
+        };
+        let vote_with_delay = |delay: u64| NextUpgradeVote {
+            upgrade_propose: "proto1".to_string(),
+            upgrade_delay: delay,
+            upgrade_approve: false,
+        };
+
+        assert!(
+            apply_upgrade_vote(&prev_state, 10, &vote_with_delay(2), &params).is_err(),
+            "delay less than MinUpgradeWaitRounds must be rejected"
+        );
+        assert!(
+            apply_upgrade_vote(&prev_state, 10, &vote_with_delay(8), &params).is_err(),
+            "delay more than MaxUpgradeWaitRounds must be rejected"
+        );
+        assert!(
+            apply_upgrade_vote(&prev_state, 10, &vote_with_delay(5), &params).is_ok(),
+            "in-bounds delay must be accepted"
+        );
+        assert!(
+            apply_upgrade_vote(&prev_state, 10, &vote_with_delay(3), &params).is_ok(),
+            "minimal in-bounds delay must be accepted"
+        );
+        assert!(
+            apply_upgrade_vote(&prev_state, 10, &vote_with_delay(7), &params).is_ok(),
+            "maximal in-bounds delay must be accepted"
+        );
+        assert!(
+            apply_upgrade_vote(&prev_state, 10, &vote_with_delay(0), &params).is_err(),
+            "zero delay below a nonzero minimum must be rejected"
+        );
+    }
+
     #[test]
     fn carries_pending_proposal_before_decision() {
         // Pending proposal, but this round is neither the vote deadline nor the

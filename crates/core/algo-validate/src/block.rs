@@ -1445,6 +1445,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detect_validation_groups_reports_exact_sizes_and_boundary() {
+        // Mirrors go's `TestPaysetGroups` (`data/bookkeeping/block_test.go`):
+        // consecutive same-group-hash transactions merge into one group,
+        // standalone (zero-group) transactions each form a singleton group,
+        // and a run of exactly `MAX_GROUP_SIZE` is accepted -- proving the
+        // boundary is inclusive, not off-by-one -- while an immediately
+        // adjacent transaction with a *different* group hash correctly
+        // starts a brand-new group rather than being folded in or rejected.
+        let group_a = [0xAAu8; 32];
+        let mk = |sender: u8, group: [u8; 32]| SignedTransaction {
+            txn: Transaction {
+                txn_type: "pay".into(),
+                sender: Address([sender; 32]),
+                group,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // go's exact scenario: group(2), standalone, standalone, group(1) --
+        // sizes [2, 1, 1, 1].
+        let payset = vec![
+            mk(1, group_a),
+            mk(2, group_a),
+            mk(3, [0u8; 32]),
+            mk(4, [0u8; 32]),
+            mk(5, group_a),
+        ];
+        let groups = detect_validation_groups(&payset).expect("well-formed payset");
+        let sizes: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+        assert_eq!(sizes, vec![2, 1, 1, 1]);
+
+        // Boundary: exactly MAX_GROUP_SIZE consecutive same-group txns is
+        // accepted (not rejected as oversized), and a following txn with a
+        // distinct group hash starts a fresh, separate group.
+        let group_b = [0xBBu8; 32];
+        let group_c = [0xCCu8; 32];
+        let mut boundary_payset: Vec<SignedTransaction> = (0..crate::rules::MAX_GROUP_SIZE)
+            .map(|i| mk(i as u8 + 1, group_b))
+            .collect();
+        boundary_payset.push(mk(200, group_c));
+        let groups = detect_validation_groups(&boundary_payset)
+            .expect("a group of exactly MAX_GROUP_SIZE must be accepted");
+        let sizes: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+        assert_eq!(sizes, vec![crate::rules::MAX_GROUP_SIZE, 1]);
+    }
+
     // ── Tests for issue #62 fix #1: heartbeat proof verification in block validation ──
 
     #[test]
