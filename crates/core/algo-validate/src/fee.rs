@@ -929,6 +929,79 @@ mod tests {
         assert_eq!(paid, 2000);
     }
 
+    // Mirrors go's `TestSummarizeFees_BigNotes`
+    // (`data/transactions/transaction_test.go:525`): a single transaction
+    // whose Note exceeds the free cap pays a note surcharge that
+    // `summarize_fees` folds straight into `usage`, on top of the base
+    // one-unit factor -- exercised here through the actual group-level
+    // entry point rather than only through the lower-level
+    // `header_fee_contribution`/`txn_fee_factor_oversized_note_charges_surcharge`
+    // building blocks the `partial` row previously relied on.
+    #[test]
+    fn summarize_fees_big_note_surcharge() {
+        let p = v42();
+        let mut a = make_stxn("pay", 10_000);
+        a.txn.note = serde_bytes::ByteBuf::from(vec![0u8; p.max_txn_note_bytes + 1024]);
+        let group = vec![&a];
+        let (usage, paid) = summarize_fees(&group, &p);
+        assert_eq!(usage, ONE_MICROS + 1024 * p.per_byte_txn_surcharge);
+        assert_eq!(paid, 10_000);
+    }
+
+    // Mirrors go's `TestSummarizeFees_BigLogicSigProgram`
+    // (`data/transactions/transaction_test.go:719`): a single transaction
+    // with an oversized LogicSig program pays the pooled program-byte
+    // surcharge through `summarize_fees`'s group-level entry point (which
+    // folds in `logic_sig_program_fee_contribution` on top of each member's
+    // `txn_fee_factor`), not just via the lower-level
+    // `logic_sig_program_fee_contribution_over_pool_charges_surcharge` unit
+    // test the `partial` row previously relied on.
+    #[test]
+    fn summarize_fees_big_logicsig_program_surcharge() {
+        let p = v42();
+        let mut a = make_stxn("pay", 2_000);
+        a.lsig = Some(algo_types::LogicSig {
+            logic: serde_bytes::ByteBuf::from(vec![0u8; p.logic_sig_max_size as usize + 500]),
+            ..Default::default()
+        });
+        let group = vec![&a];
+        let (usage, paid) = summarize_fees(&group, &p);
+        assert_eq!(usage, ONE_MICROS + 500 * p.per_byte_txn_surcharge);
+        assert_eq!(paid, 2_000);
+    }
+
+    // Mirrors go's `TestFeeFactor_BigPrograms` /
+    // `TestSummarizeFees_BigPrograms`
+    // (`data/transactions/transaction_test.go:822` and `:1049`): an app-create
+    // transaction with an approval+clear-state program total that exceeds the
+    // extra-pages-adjusted free allowance pays a program-byte surcharge, both
+    // directly via `txn_fee_factor` and end-to-end via `summarize_fees`.
+    #[test]
+    fn txn_fee_factor_big_app_programs_charges_surcharge() {
+        let p = v42();
+        let limit = p.max_app_total_program_len * (1 + p.max_extra_app_program_pages as usize);
+        let mut txn = base_txn("appl");
+        txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![0u8; limit + 1024]));
+        txn.clear_state_program = Some(serde_bytes::ByteBuf::from(vec![0u8; 0]));
+        assert_eq!(
+            txn_fee_factor(&txn, &p),
+            ONE_MICROS + 1024 * p.per_byte_txn_surcharge
+        );
+    }
+
+    #[test]
+    fn summarize_fees_big_app_programs_surcharge() {
+        let p = v42();
+        let limit = p.max_app_total_program_len * (1 + p.max_extra_app_program_pages as usize);
+        let mut a = make_stxn("appl", 10_000);
+        a.txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![0u8; limit + 1024]));
+        a.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(vec![0u8; 0]));
+        let group = vec![&a];
+        let (usage, paid) = summarize_fees(&group, &p);
+        assert_eq!(usage, ONE_MICROS + 1024 * p.per_byte_txn_surcharge);
+        assert_eq!(paid, 10_000);
+    }
+
     #[test]
     fn logic_sig_program_fee_contribution_within_free_pool_is_zero() {
         let p = v42();

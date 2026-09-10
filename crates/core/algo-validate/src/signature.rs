@@ -3357,6 +3357,50 @@ mod tests {
         );
     }
 
+    /// Mirrors go's `TestTxnValidationPQSigWithAuthAddr`
+    /// (`data/transactions/verify/txn_test.go:389`): unlike
+    /// `pqsig_address_mismatch_rejected` above (which pins the rejection
+    /// direction), this pins the positive case -- a rekeyed account whose
+    /// `auth_addr` is correctly set to the PQ key's derived address is
+    /// accepted, even though `sender` itself differs from that address.
+    #[test]
+    fn pqsig_with_auth_addr_matching_is_accepted() {
+        let (pk, sk, salt, addr) = falcon_identity(6);
+        // The transaction is sent from a different (rekeyed) sender address;
+        // AuthAddr correctly points at the PQ key's own derived address.
+        let mut sender = addr;
+        sender.0[0] ^= 0xFF;
+        let mut txn = minimal_pay_txn(sender);
+        txn.rekey_to = Some(addr);
+
+        let canonical = canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+        msg.extend_from_slice(TX_PREFIX);
+        msg.extend_from_slice(&canonical);
+        let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(sig),
+        };
+        let stx = SignedTransaction {
+            txn,
+            pqsig: Some(pqsig),
+            auth_addr: Some(addr),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        assert!(
+            verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus).is_ok(),
+            "a correctly-set AuthAddr matching the PQ key's derived address must be accepted"
+        );
+    }
+
     #[test]
     fn pqsig_and_regular_sig_both_set_rejected() {
         // Two mutually-exclusive signature categories set at once (regular
