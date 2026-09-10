@@ -178,6 +178,50 @@ mod tests {
         .unwrap());
     }
 
+    /// Mirrors go's `TestPQSignProgramAcceptsMnemonic`
+    /// (`cmd/algokey/pq_test.go`): exercises `pq sign-program --mnemonic`
+    /// through the actual command surface (`run_with_io`), not just the
+    /// shared `resolve_pq_signing_context` helper (see `context.rs`'s
+    /// `resolve_from_mnemonic_matches_generate`).
+    #[test]
+    fn sign_program_accepts_mnemonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entropy, signing) = generate_pq_signing_material(PQ_SCHEME_FALCON1024).unwrap();
+        let mnemonic = algo_consensus_crypto::key_to_mnemonic(&entropy).unwrap();
+
+        let program_path = dir.path().join("prog.bin");
+        std::fs::write(&program_path, [0x08u8, 0x22, 0x00, 0xffu8]).unwrap();
+        let outfile = dir.path().join("out.lsig");
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            PqSignProgramArgs {
+                keyfile: None,
+                mnemonic: Some(mnemonic),
+                scheme: "falcon-1024".to_string(),
+                program: program_path.clone(),
+                outfile: outfile.clone(),
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::SUCCESS),
+            "stderr: {}",
+            String::from_utf8_lossy(&err)
+        );
+
+        let produced = std::fs::read(&outfile).unwrap();
+        let lsig: LogicSig = rmp_serde::from_slice(&produced).expect("decode LogicSig");
+        let pqsig = lsig.pqsig.expect("pqsig set");
+        assert_eq!(
+            pqsig.public_key.as_slice(),
+            signing.public.public_key.as_slice()
+        );
+    }
+
     #[test]
     fn sign_program_rejects_empty_program() {
         let dir = tempfile::tempdir().unwrap();

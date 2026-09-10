@@ -1064,6 +1064,122 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
+    /// A raw-socket HTTP server that always answers with a fixed status
+    /// line/body, across every connection it accepts — used to exercise
+    /// `CatchpointDownloader::download`'s (the `getPeerLedger`/
+    /// `downloadLedger` analog, go's `catchup/ledgerFetcher.go`) status-code
+    /// classification across the retry loop, unlike
+    /// `spawn_flaky_catchpoint_server` which changes behavior after N
+    /// attempts.
+    async fn spawn_fixed_status_server(
+        status_line: &'static str,
+        body: &'static [u8],
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let header = format!(
+                    "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+                let _ = socket.flush().await;
+                drop(socket);
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// Mirrors part of go's `TestLedgerFetcher`/`TestLedgerFetcherErrorResponseHandling`
+    /// (`catchup/ledgerFetcher_test.go`): a 404 GET response should surface
+    /// as `errNoLedgerForRound` (algod-rust: [`AlgoError::NotFound`]) and
+    /// must not be retried.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_maps_404_to_not_found_without_retrying() {
+        let base_url = spawn_fixed_status_server("HTTP/1.1 404 Not Found", b"").await;
+
+        let dl = CatchpointDownloader::with_config(
+            &base_url,
+            "",
+            CatchpointDownloadConfig {
+                timeout: Duration::from_secs(5),
+                chunk_size: 16,
+                max_retries: 3,
+                retry_delay: Duration::from_millis(10),
+                min_bytes_per_second: 0,
+            },
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-404-test-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-404.tar.gz");
+
+        let result = dl
+            .download::<fn(DownloadProgress)>("test-v1.0", 1, &dest, None)
+            .await;
+
+        assert!(
+            matches!(result, Err(AlgoError::NotFound(_))),
+            "expected NotFound for a 404 response, got: {result:?}"
+        );
+        assert!(!dest.exists(), "no file should be written on a 404");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Mirrors go's `TestLedgerFetcher`'s 500-response case: a persistent
+    /// server error should be retried (per `max_retries`) and, once
+    /// exhausted, surfaced as a non-`NotFound` REST-client error rather than
+    /// hanging or panicking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn download_maps_persistent_server_error_to_rest_client_error() {
+        let base_url =
+            spawn_fixed_status_server("HTTP/1.1 500 Internal Server Error", b"boom").await;
+
+        let dl = CatchpointDownloader::with_config(
+            &base_url,
+            "",
+            CatchpointDownloadConfig {
+                timeout: Duration::from_secs(5),
+                chunk_size: 16,
+                max_retries: 1,
+                retry_delay: Duration::from_millis(5),
+                min_bytes_per_second: 0,
+            },
+        );
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-catchpoint-500-test-{}",
+            std::process::id()
+        ));
+        let dest = tmp_dir.join("catchpoint-500.tar.gz");
+
+        let result = dl
+            .download::<fn(DownloadProgress)>("test-v1.0", 1, &dest, None)
+            .await;
+
+        assert!(
+            matches!(result, Err(AlgoError::RestClient { .. })),
+            "expected a RestClient error once retries on a persistent 500 are \
+             exhausted, got: {result:?}"
+        );
+        assert!(!dest.exists(), "no file should be left behind on failure");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
     #[test]
     fn test_radix_fmt_base36() {
         // 0
