@@ -3474,4 +3474,48 @@ mod tests {
             canonical_encode_state_proof_body,
         );
     }
+
+    fn gen_heartbeat_proof(rng: &mut ChaCha20Rng) -> HeartbeatProof {
+        let mut sig = [0u8; 64];
+        let mut pk = [0u8; 32];
+        let mut pk2 = [0u8; 32];
+        let mut pk1_sig = [0u8; 64];
+        let mut pk2_sig = [0u8; 64];
+        rng.fill_bytes(&mut sig);
+        rng.fill_bytes(&mut pk);
+        rng.fill_bytes(&mut pk2);
+        rng.fill_bytes(&mut pk1_sig);
+        rng.fill_bytes(&mut pk2_sig);
+        HeartbeatProof {
+            sig,
+            pk,
+            pk2,
+            pk1_sig,
+            pk2_sig,
+        }
+    }
+
+    /// Matches go's `TestMarshalUnmarshalHeartbeatProof`/
+    /// `TestRandomizedEncodingHeartbeatProof`
+    /// (`crypto/msgp_gen_test.go`): a full encode->decode round trip of the
+    /// wire `crypto.HeartbeatProof` type, exercising
+    /// `HeartbeatProof::decode_from_reader` (already used by production
+    /// `HeartbeatTxnFields` decoding) against
+    /// `canonical_encode_heartbeat_proof`'s output -- neither function had
+    /// a dedicated round-trip test pinning them against each other before.
+    #[test]
+    fn heartbeat_proof_randomized_roundtrip() {
+        let mut rng = ChaCha20Rng::seed_from_u64(0x9560_0004);
+        for i in 0..STATE_PROOF_ITERATIONS {
+            let original = gen_heartbeat_proof(&mut rng);
+            let encoded = canonical_encode_heartbeat_proof(&original);
+            let decoded = HeartbeatProof::decode_from_bytes(&encoded).unwrap_or_else(|e| {
+                panic!("iteration {i} (seed 0x9560_0004) failed to decode: {e}")
+            });
+            assert_eq!(
+                decoded, original,
+                "randomized msgpack round-trip mismatch at iteration {i}"
+            );
+        }
+    }
 }

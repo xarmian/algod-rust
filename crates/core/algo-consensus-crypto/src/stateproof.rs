@@ -1825,6 +1825,131 @@ mod tests {
         ));
     }
 
+    /// Build a bare `Prover` with only `sigs` populated, matching go's
+    /// `checkSigsArray`/`TestCoinIndexBetweenWeights` helpers, which
+    /// construct a `Prover{sigs: ...}` directly without going through
+    /// `MakeProver` at all.
+    fn bare_prover_with_sigs(sigs: Vec<ProverSigSlot>) -> Prover {
+        let (_, participants, part_tree) = build_prover_participants(0, 0, 0);
+        Prover {
+            data: [0u8; 32],
+            round: 0,
+            participants,
+            part_tree,
+            ln_proven_weight: 0,
+            proven_weight: 0,
+            strength_target: 0,
+            sigs,
+            signed_weight: 0,
+            cached_proof: None,
+        }
+    }
+
+    #[test]
+    fn coin_index_matches_go_check_sigs_array() {
+        // Matches go's TestCoinIndex (crypto/stateproof/prover_test.go):
+        // for a sigs array where slot i has l=i, weight=1, coin_index(i)
+        // must return i, for n = 1000, 1, 2, 3.
+        for &n in &[1000usize, 1, 2, 3] {
+            let sigs: Vec<ProverSigSlot> = (0..n)
+                .map(|i| ProverSigSlot {
+                    weight: 1,
+                    commit: SigSlotCommit {
+                        sig: merklesig::Signature::default(),
+                        l: i as u64,
+                    },
+                })
+                .collect();
+            let prover = bare_prover_with_sigs(sigs);
+            for i in 0..n {
+                let pos = prover
+                    .coin_index(i as u64)
+                    .unwrap_or_else(|e| panic!("coin_index({i}) for n={n} failed: {e:?}"));
+                assert_eq!(pos, i as u64, "n={n} i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn coin_index_matches_go_between_weights() {
+        // Matches go's TestCoinIndexBetweenWeights: 1000 slots each with
+        // weight 2 and cumulative `l`, coin_index(i) for i in [0, 2n) must
+        // return i/2, and coin_index(2n+1) is out of range.
+        let n = 1000usize;
+        let mut sigs = Vec::with_capacity(n);
+        let mut l = 0u64;
+        for _ in 0..n {
+            sigs.push(ProverSigSlot {
+                weight: 2,
+                commit: SigSlotCommit {
+                    sig: merklesig::Signature::default(),
+                    l,
+                },
+            });
+            l += 2;
+        }
+        let prover = bare_prover_with_sigs(sigs);
+        for i in 0..(2 * n) {
+            let pos = prover
+                .coin_index(i as u64)
+                .unwrap_or_else(|e| panic!("coin_index({i}) failed: {e:?}"));
+            assert_eq!(pos, (i / 2) as u64, "i={i}");
+        }
+        let err = prover
+            .coin_index((2 * n + 1) as u64)
+            .expect_err("coin weight beyond total weight must be a CoinIndexError");
+        assert!(matches!(err, StateProofError::CoinIndexError { .. }));
+    }
+
+    #[test]
+    fn voters_alloc_bound_matches_current_consensus_state_proof_top_voters() {
+        // Matches go's TestBuilder_StateProofTopVoters
+        // (crypto/stateproof/prover_test.go), which asserts
+        // `config.Consensus[protocol.ConsensusCurrentVersion].StateProofTopVoters
+        // == uint64(VotersAllocBound)` -- i.e. the crypto-package constant
+        // must never silently drift from the consensus parameter that
+        // governs how many top voters actually get committed into the
+        // participants tree. algod-rust previously had each side pinned
+        // separately (`VOTERS_ALLOC_BOUND` here, `state_proof_top_voters`
+        // asserted == 1024 in algo-types::consensus's own tests) but never
+        // cross-checked them against each other the way go's single test
+        // does.
+        let params =
+            algo_types::consensus_params_for_version(algo_types::CONSENSUS_CURRENT_VERSION)
+                .expect("current consensus version must resolve to params");
+        assert_eq!(
+            params.state_proof_top_voters, VOTERS_ALLOC_BOUND as u64,
+            "StateProofTopVoters consensus param must match VOTERS_ALLOC_BOUND"
+        );
+    }
+
+    #[test]
+    fn prover_is_valid_rejects_corrupted_salt_version() {
+        // Matches go's TestBuilder_AddRejectsInvalidSigVersion
+        // (crypto/stateproof/prover_test.go): corrupting the signature's
+        // salt-version byte (not the signed message) must be rejected by
+        // `IsValid` specifically as a salt-version mismatch, landing on a
+        // different branch than a bad-signature rejection.
+        let round = 0u64;
+        let msg = [7u8; 32];
+        let (secrets_list, participants, part_tree) = build_prover_participants(2, round, 100);
+        let prover =
+            Prover::make_prover(msg, round, 50, participants, part_tree, 0).expect("make_prover");
+        let mut sig = secrets_list[0]
+            .get_signer(round)
+            .sign_bytes(&msg)
+            .expect("sign");
+        // Byte 1 of the Falcon compressed signature encodes the salt
+        // version (byte 0 is the header) -- corrupt it directly, leaving
+        // the rest of the signature (and thus the Falcon verification
+        // itself) untouched.
+        sig.signature[1] = sig.signature[1].wrapping_add(1);
+        let err = prover
+            .is_valid(0, &sig, true)
+            .expect_err("corrupted salt version must be rejected");
+        assert_eq!(err, StateProofError::SaltVersionMismatch);
+    }
+
     #[test]
     fn prover_is_valid_rejects_zero_weight_participant() {
         let round = 0u64;
@@ -1874,5 +1999,23 @@ mod tests {
         let ln_pw = ln_int_approximation(1).unwrap();
         let err = num_reveals(2, ln_pw, u64::MAX / 2).unwrap_err();
         assert_eq!(err, StateProofError::TooManyReveals);
+    }
+
+    #[test]
+    fn num_reveals_rejects_negative_equation() {
+        // Matches go's TestVerifyZeroNumberOfRevealsEquation
+        // (crypto/stateproof/weights_test.go): for a signed weight barely
+        // above the proven weight (2^15 + 1 vs 2^15), the numReveals
+        // denominator computation goes negative and must be rejected with
+        // ErrNegativeNumOfRevealsEquation -- not confused with
+        // verify_weights's separate ZeroSignedWeight check, which this row
+        // was previously (mis)mapped to and which exercises an entirely
+        // different code path (signed_weight == 0, not a near-equal
+        // signed/proven weight pair).
+        let signed_weight = (1u64 << 15) + 1;
+        let proven_weight = 1u64 << 15;
+        let ln_pw = ln_int_approximation(proven_weight).unwrap();
+        let err = num_reveals(signed_weight, ln_pw, 256).unwrap_err();
+        assert_eq!(err, StateProofError::NegativeNumOfRevealsEquation);
     }
 }

@@ -366,6 +366,61 @@ mod tests {
     }
 
     #[test]
+    fn persist_secrets_twice_on_same_db_fails() {
+        // Matches go's TestFetchRestoreAllSecrets
+        // (crypto/merklesignature/persistentMerkleSignatureScheme_test.go):
+        // "make sure we exercise the path of the database being upgraded,
+        // but then we would also expect to fail the Persist since the
+        // entries are already there. This is an expected failure since
+        // Persist is only called on freshly created databases." Go asserts
+        // the second `Persist` call's error contains "failed to insert
+        // StateProof key number" -- Rust's `persist_secrets` doc comment
+        // already claims this same UNIQUE-index-driven idempotency
+        // guarantee, but until now nothing actually pinned it with a test.
+        let secrets = MssSecrets::new(256, 1024, 256).expect("mss new");
+        assert!(!secrets.ephemeral_keys.is_empty(), "test precondition");
+
+        let path = std::env::temp_dir().join(format!(
+            "algod-rust-mss-persist-{}-{}.sqlite",
+            "twice",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut db = ErasableDb::open(&path).unwrap();
+
+        {
+            let tx = db.conn_mut().transaction().unwrap();
+            part_install_database(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+
+        persist_secrets(&mut db, &secrets).expect("first persist must succeed");
+        let err = persist_secrets(&mut db, &secrets)
+            .expect_err("second persist on the same DB must fail");
+        // Underlying rusqlite error must be a UNIQUE/PRIMARY KEY constraint
+        // violation, matching go's SQL-level rejection (the id column and
+        // the round UNIQUE index both collide on a same-secrets re-persist).
+        let msg = err.to_string();
+        assert!(
+            msg.to_ascii_lowercase().contains("unique")
+                || msg.to_ascii_lowercase().contains("constraint"),
+            "expected a UNIQUE-constraint failure, got: {msg}"
+        );
+
+        // The table must still hold exactly the first persist's rows (the
+        // second attempt's transaction was rolled back entirely, not
+        // partially applied).
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM StateProofKeys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count as usize, secrets.ephemeral_keys.len());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn persist_rejects_zero_key_lifetime() {
         let mut secrets = MssSecrets::new(256, 1024, 256).expect("mss new");
         secrets.signer_context.key_lifetime = 0; // simulate corruption
