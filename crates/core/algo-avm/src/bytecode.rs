@@ -220,6 +220,43 @@ fn check_const_list_count(
     Ok(count as usize)
 }
 
+/// Reproduce go-algorand's pre-v13 `bytecblock`/`pushbytess` parsing bug
+/// (`EvalContext.byteImmArgs`, `data/transactions/logic/eval.go`): before
+/// the fix that shipped in v13, a byte-constant list whose *final* entry
+/// was empty **and** whose declared length ended exactly at the end of the
+/// program was rejected as `errShortByteImmArgs` ("const bytes list ran
+/// past end of program"), even though the entry fits -- an off-by-one in
+/// the original bounds check. go-algorand deliberately keeps reproducing
+/// this at versions below 13 for determinism on historical chain data
+/// (the fix only applies going forward), and stops applying it once
+/// `LogicSigVersion` reaches 13. algod-rust has no separate historical
+/// per-block "which interpreter version was live then" concept in this
+/// parser, so it gates on the program's own declared `version` byte --
+/// the same source already used by the `MAX_STRING_SIZE` check just above
+/// this call site.
+fn check_trailing_empty_byte_imm(
+    version: u8,
+    pos: usize,
+    consumed: usize,
+    code_len: usize,
+    entries: &[Vec<u8>],
+    op_name: &str,
+) -> Result<(), AlgoError> {
+    if version >= 13 {
+        return Ok(());
+    }
+    if pos + consumed == code_len {
+        if let Some(last) = entries.last() {
+            if last.is_empty() {
+                return Err(AlgoError::Avm {
+                    message: format!("{op_name}: const bytes list ran past end of program"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read a big-endian int16 from `data` at `pos`.
 fn read_int16(data: &[u8], pos: usize) -> Result<i16, AlgoError> {
     if pos + 2 > data.len() {
@@ -317,7 +354,7 @@ pub fn parse(raw: &[u8]) -> Result<Program, AlgoError> {
             spec.imm
         };
 
-        let (immediates, consumed) = parse_immediates(code, pc, imm_kind, spec.name)?;
+        let (immediates, consumed) = parse_immediates(code, pc, imm_kind, spec.name, version)?;
         pc += consumed;
 
         // go-algorand PR #6692 ("avm: improve byte constant immediate
@@ -372,6 +409,7 @@ fn parse_immediates(
     pos: usize,
     kind: ImmKind,
     op_name: &str,
+    version: u8,
 ) -> Result<(Immediates, usize), AlgoError> {
     match kind {
         ImmKind::None => Ok((Immediates::None, 0)),
@@ -452,6 +490,14 @@ fn parse_immediates(
                 entries.push(code[start..start + len].to_vec());
                 consumed += len;
             }
+            check_trailing_empty_byte_imm(
+                version,
+                pos,
+                consumed,
+                code.len(),
+                &entries,
+                "bytecblock",
+            )?;
             Ok((Immediates::ByteBlock(entries), consumed))
         }
 
@@ -487,6 +533,14 @@ fn parse_immediates(
                 entries.push(code[start..start + len].to_vec());
                 consumed += len;
             }
+            check_trailing_empty_byte_imm(
+                version,
+                pos,
+                consumed,
+                code.len(),
+                &entries,
+                "pushbytess",
+            )?;
             Ok((Immediates::PushBytess(entries), consumed))
         }
 
@@ -1161,5 +1215,62 @@ mod tests {
         crate::assembler::write_varuint_to_vec(&mut code, 4); // count=4
         code.extend_from_slice(&[0x00, 0x00, 0x00]); // only 3 entries present
         assert!(parse(&prog(1, &code)).is_err());
+    }
+
+    /// Port of go-algorand's `TestTrailingEmptyByteImm`
+    /// (`data/transactions/logic/eval_test.go`): a `bytecblock`/`pushbytess`
+    /// immediate list whose *final* constant is empty and whose declared
+    /// length ends exactly at the end of the program reproduces a
+    /// historical go-algorand parsing bug at versions before 13
+    /// (`EvalContext.byteImmArgs`, `data/transactions/logic/eval.go`) --
+    /// go-algorand deliberately treats that shape as
+    /// `errShortByteImmArgs` ("const bytes list ran past end of program")
+    /// pre-v13 for determinism on historical chain data, and stopped doing
+    /// so once the v13 fix (`checkByteImmArgs`/`parseByteImmArgs`,
+    /// `data/transactions/logic/assembler.go`) landed. algod-rust parses
+    /// the whole program in a single static pass (see the
+    /// `MAX_STRING_SIZE` comment above `parse`), so go's separate
+    /// Check()-vs-Eval() split collapses into `parse()`'s single return
+    /// value here.
+    #[test]
+    fn test_trailing_empty_byte_imm() {
+        for opcode in [0x26u8 /* bytecblock */, 0x82u8 /* pushbytess */] {
+            // "trailing": a single empty final constant, ending exactly at
+            // the end of the program -- rejected before v13, accepted at
+            // v13+.
+            let trailing_code = vec![opcode, 0x01, 0x00]; // count=1, len=0
+            let pre13 = parse(&prog(12, &trailing_code));
+            assert!(
+                pre13.is_err(),
+                "opcode {opcode:#x}: trailing empty constant must be rejected before v13"
+            );
+            let msg = pre13.unwrap_err().to_string();
+            assert!(
+                msg.contains("ran past end of program"),
+                "opcode {opcode:#x}: unexpected error message: {msg}"
+            );
+
+            let at13 = parse(&prog(13, &trailing_code));
+            assert!(
+                at13.is_ok(),
+                "opcode {opcode:#x}: trailing empty constant must be accepted at v13+: {:?}",
+                at13.err()
+            );
+
+            // "short": the declared length (5) genuinely runs past the end
+            // of the program -- a real overrun, rejected at every version.
+            let short_code = vec![opcode, 0x01, 0x05, 0x01, 0x02]; // count=1, len=5, only 2 bytes follow
+            assert!(parse(&prog(12, &short_code)).is_err());
+            assert!(parse(&prog(13, &short_code)).is_err());
+
+            // "mid": an empty constant that is *not* the final entry --
+            // must parse cleanly at every version even though it too ends
+            // exactly at the program boundary (guards against a naive
+            // "did the list reach exactly the end of the buffer" check
+            // misfiring on a non-trailing empty entry).
+            let mid_code = vec![opcode, 0x02, 0x00, 0x01, 0x61]; // count=2: [], "a"
+            assert!(parse(&prog(12, &mid_code)).is_ok());
+            assert!(parse(&prog(13, &mid_code)).is_ok());
+        }
     }
 }
