@@ -715,6 +715,61 @@ mod tests {
         assert_ne!(compute_stib_hash(&stx), compute_stib_hash(&stx2));
     }
 
+    /// Port of go's `TestTransactionIDChanges`
+    /// (`data/transactions/transaction_test.go:87`): the transaction ID is
+    /// `SHA512/256("TX" || canonical_encode(txn))`, so a change to any single
+    /// field of a transaction (not just the ones dedup already exercises)
+    /// must change its ID. Not exhaustive over every field, mirroring go's
+    /// own non-exhaustive note/amount/fee/lastvalid sample.
+    #[test]
+    fn compute_txid_changes_when_note_amount_fee_or_lastvalid_changes() {
+        let base = Transaction {
+            txn_type: "pay".into(),
+            sender: Address([0x01u8; 32]),
+            fee: 10_000,
+            first_valid: Round(100),
+            last_valid: Round(200),
+            note: vec![0x02].into(),
+            receiver: Address([0x03u8; 32]),
+            amount: 200_000,
+            close_remainder_to: Address([0x04u8; 32]),
+            ..Default::default()
+        };
+        let base_id = compute_txid(&base);
+
+        let mut with_note_changed = base.clone();
+        with_note_changed.note = vec![42].into();
+        assert_ne!(
+            compute_txid(&with_note_changed),
+            base_id,
+            "txid does not depend on note"
+        );
+
+        let mut with_amount_changed = base.clone();
+        with_amount_changed.amount += 1;
+        assert_ne!(
+            compute_txid(&with_amount_changed),
+            base_id,
+            "txid does not depend on amount"
+        );
+
+        let mut with_fee_changed = base.clone();
+        with_fee_changed.fee += 1;
+        assert_ne!(
+            compute_txid(&with_fee_changed),
+            base_id,
+            "txid does not depend on fee"
+        );
+
+        let mut with_last_valid_changed = base.clone();
+        with_last_valid_changed.last_valid = Round(base.last_valid.0 + 1);
+        assert_ne!(
+            compute_txid(&with_last_valid_changed),
+            base_id,
+            "txid does not depend on lastvalid"
+        );
+    }
+
     #[test]
     fn two_txn_payset_root_is_internal_of_two_leaves() {
         let stx1 = minimal_signed_txn(1000);
