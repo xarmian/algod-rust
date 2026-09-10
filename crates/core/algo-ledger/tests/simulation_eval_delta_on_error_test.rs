@@ -188,6 +188,151 @@ fn failing_appl_call_to_nonexistent_app_has_no_apply_data() {
 /// preserve its accumulated state too — go-algorand doesn't reset EvalDelta
 /// on a clean reject (only on an opcode failure), so the full delta computed
 /// before `return` is exactly what should be reported.
+/// Port of go's `TestErrorAfterClearStateError`
+/// (`ledger/simulation/simulation_eval_test.go`): a two-txn group where
+/// txn0 is a `ClearState` call whose program errors (swallowed per go's
+/// "clearing out is always allowed" rule — no EvalDelta, no group
+/// failure from that alone), immediately followed in the *same group* by
+/// txn1, an ordinary app call against the same app that itself cleanly
+/// rejects. The group's real failure must be attributed to txn1 (`failed_at
+/// == [1]`), and txn1's partial EvalDelta (the global-state write it made
+/// before rejecting) must still be preserved — proving the ClearState
+/// swallow doesn't interfere with normal reject/EvalDelta accounting for
+/// the transaction that follows it in the group.
+#[test]
+fn error_after_clear_state_error_fails_group_at_second_txn_not_first() {
+    use algo_types::AppLocalState;
+
+    let sender = Address([0xAA; 32]);
+    let user = Address([0xBB; 32]);
+    let mut state = setup_state(sender);
+    state.set_account(
+        &user,
+        AccountData {
+            micro_algos: 10_000_000,
+            ..Default::default()
+        },
+    );
+
+    // Mirrors go's `returnFirstAppArgProgram`: bump a global "counter" on
+    // every call, then (unless this is app creation or an OptIn) return
+    // the first application arg as the approval result. With no args at
+    // all (the ClearState call below), `txn ApplicationArgs 0` errors.
+    let program = algo_avm::assembler::assemble_string(
+        "#pragma version 6
+byte \"counter\"
+dup
+app_global_get
+int 1
++
+app_global_put
+
+txn ApplicationID
+bz end
+
+txn OnCompletion
+int OptIn
+==
+bnz end
+
+txn ApplicationArgs 0
+btoi
+return
+
+end:
+int 1
+return",
+    )
+    .expect("program must assemble")
+    .program;
+
+    let app_id = 100u64;
+    register_app(&mut state, sender, app_id, program.clone());
+    // The registered clear_state_program from `register_app` is a plain
+    // "int 1; return"; override it to match go's test (same program for
+    // both approval and clear state) so the ClearState call actually hits
+    // the ApplicationArgs-indexing error.
+    let mut app_params = state.get_app_params(app_id).expect("app registered").clone();
+    app_params.clear_state_program = program;
+    state.set_app_params(app_id, app_params);
+
+    // `user` is already opted in to the app (go's `env.OptIntoApp`) with
+    // the schema the program's global writes need.
+    state.app_local_states.insert(
+        (user, app_id),
+        AppLocalState {
+            schema: StateSchema {
+                num_uint: 1,
+                num_byte_slice: 0,
+            },
+            key_value: BTreeMap::new(),
+        },
+    );
+    let mut user_acct = state.get_account(&user).cloned().unwrap();
+    user_acct.total_apps_opted_in = 1;
+    state.set_account(&user, user_acct);
+
+    const ON_COMPLETION_CLEAR_STATE: u64 = 3;
+
+    let mut clear_state_txn = make_appl_txn(user, app_id);
+    clear_state_txn.txn.on_completion = ON_COMPLETION_CLEAR_STATE;
+    clear_state_txn.txn.app_arguments = None; // no app args -> ClearState program errors
+
+    let mut other_appl_call = make_appl_txn(user, app_id);
+    other_appl_call.txn.app_arguments = Some(vec![Some(serde_bytes::ByteBuf::from(vec![0u8]))]);
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![clear_state_txn, other_appl_call]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+
+    let result = simulate(&mut state, request).expect("simulation returns a result");
+    let group = &result.txn_groups[0];
+
+    assert!(
+        group.failure_message.is_some(),
+        "txn1's clean rejection must fail the group"
+    );
+    assert_eq!(
+        group.failed_at.as_deref(),
+        Some([1usize].as_slice()),
+        "the ClearState error (txn0) is swallowed; the real failure is txn1's reject"
+    );
+
+    // txn0 (ClearState): the error is swallowed, so no EvalDelta is
+    // preserved -- mirrors go's "No EvalDelta changes because the clear
+    // state failed".
+    let clear_state_result = &group.txn_results[0];
+    if let Some(apply_data) = clear_state_result.apply_data.as_ref() {
+        assert!(
+            apply_data.eval_delta.is_none()
+                || parse_eval_delta(apply_data.eval_delta.as_ref().unwrap())
+                    .unwrap()
+                    .global_delta
+                    .is_none(),
+            "a swallowed ClearState error must not surface a global-state EvalDelta"
+        );
+    }
+
+    // txn1 (ordinary app call, cleanly rejects): its partial global-state
+    // write (the "counter" bump) must still be preserved, same as
+    // `cleanly_rejecting_appl_call_preserves_full_state` above.
+    let other_result = &group.txn_results[1];
+    let apply_data = other_result
+        .apply_data
+        .as_ref()
+        .expect("partial ApplyData must be preserved on txn1's clean rejection");
+    let delta = parse_eval_delta(apply_data.eval_delta.as_ref().unwrap()).unwrap();
+    let global = delta
+        .global_delta
+        .expect("global_delta must be present: the counter bump happened before reject");
+    assert!(
+        global.contains_key(b"counter".as_slice()),
+        "counter key must be recorded"
+    );
+}
+
 #[test]
 fn cleanly_rejecting_appl_call_preserves_full_state() {
     let sender = Address([0xAA; 32]);

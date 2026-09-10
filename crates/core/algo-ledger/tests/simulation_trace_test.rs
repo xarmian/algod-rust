@@ -343,6 +343,84 @@ fn simulation_captures_state_change_on_global_write() {
     );
 }
 
+/// Local-state-write half of go's `TestAppLocalGlobalStateChange`
+/// (`ledger/simulation/simulation_eval_test.go`): with state-change tracing
+/// on, an app that writes *local* state (`app_local_put`) should record a
+/// per-opcode state change (`StateChangeKind::LocalState`), the same as
+/// `simulation_captures_state_change_on_global_write` above proves for
+/// global writes. Exercised through a live two-txn group (OptIn, then a
+/// NoOp call that writes local state) rather than only at the tracer's
+/// unit-test/accumulator level.
+#[test]
+fn simulation_captures_state_change_on_local_write() {
+    const ON_COMPLETION_OPT_IN: u64 = 1;
+
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+    // v8: int 0 (sender's local-state account index); pushbytes "w";
+    // pushint 42; app_local_put; pushint 1; return.
+    let approval = vec![
+        0x08, 0x81, 0x00, 0x80, 0x01, 0x77, 0x81, 0x2a, 0x66, 0x81, 0x01, 0x43,
+    ];
+    let mut state = setup_state(sender, app_id, approval);
+    // Allow one uint local write.
+    let mut params = state.get_app_params(app_id).expect("app exists").clone();
+    params.local_state_schema = StateSchema {
+        num_uint: 1,
+        num_byte_slice: 0,
+    };
+    state.set_app_params(app_id, params);
+
+    let mut opt_in_txn = make_appl_txn(sender, app_id);
+    opt_in_txn.txn.on_completion = ON_COMPLETION_OPT_IN;
+    let local_write_txn = make_appl_txn(sender, app_id);
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![opt_in_txn, local_write_txn]],
+        allow_empty_signatures: true,
+        trace_config: ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: true,
+        },
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("simulation should succeed");
+    assert!(
+        result.txn_groups[0].failure_message.is_none(),
+        "simulation should not fail: {:?}",
+        result.txn_groups[0].failure_message
+    );
+
+    let trace = result.txn_groups[0].txn_results[1]
+        .trace
+        .as_ref()
+        .expect("trace present on the local-write txn");
+    let approval = trace
+        .approval_program_trace
+        .as_ref()
+        .expect("approval trace present");
+
+    let changes: Vec<_> = approval
+        .opcodes
+        .iter()
+        .flat_map(|u| u.state_changes.iter())
+        .collect();
+    assert_eq!(changes.len(), 1, "expected exactly one state change");
+    assert_eq!(changes[0].kind, StateChangeKind::LocalState);
+    assert_eq!(changes[0].key, b"w");
+    assert!(
+        matches!(changes[0].new_value, Some(AvmValueTrace::Uint64(42))),
+        "expected written value 42, got {:?}",
+        changes[0].new_value
+    );
+}
+
 /// A group whose pooled fees are below the minimum must be rejected by the
 /// simulator's check() phase (matching go-algorand's verify.TxnGroup), not
 /// silently evaluated.
