@@ -624,6 +624,42 @@ fn export_splits_accounts_across_chunks() {
     assert!(verify_catchpoint(&dst, &BLOCK_DIGEST).unwrap().success);
 }
 
+/// go-algorand's `TestExactAccountChunk` (catchpointfilewriter_test.go) pins
+/// the boundary case where the row count is an *exact* multiple of the
+/// chunk size: the writer must stop after the last full chunk rather than
+/// emitting a spurious trailing empty chunk (an off-by-one in the
+/// `count % chunk_size == 0` case). `export_splits_accounts_across_chunks`
+/// above only exercises the general non-exact case (5 accounts / chunk 2 ->
+/// remainder 1); this pins the exact-multiple boundary specifically.
+#[test]
+fn export_exact_multiple_of_chunk_size_produces_no_trailing_empty_chunk() {
+    let src = build_source_db();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("exact_chunk.tar");
+
+    // 5 accounts with accounts_per_chunk == 5 is an exact multiple: must
+    // produce exactly 1 account chunk, never 2 (a spurious empty tail).
+    let opts = ExportOptions {
+        accounts_per_chunk: 5,
+        gzip: false,
+        ..export_options()
+    };
+    let result = export_catchpoint_file(&src, &path, &opts).unwrap();
+
+    // 5 accounts -> 1 chunk, 4 kvs -> 1 chunk, 3 online accounts -> 1 chunk,
+    // 3 round params -> 1 chunk. None of these leave a nonzero remainder
+    // against a chunk size of 5, so every category must collapse to
+    // exactly one chunk with no trailing empty one.
+    assert_eq!(
+        result.total_chunks, 4,
+        "an exact multiple of the chunk size must not emit a trailing empty chunk"
+    );
+
+    let dst = Connection::open_in_memory().unwrap();
+    import_catchpoint_file(&dst, &path, REWARD_UNITS).unwrap();
+    assert!(verify_catchpoint(&dst, &BLOCK_DIGEST).unwrap().success);
+}
+
 #[test]
 fn export_splits_oversized_account_resources() {
     let src = build_source_db();
