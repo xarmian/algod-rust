@@ -2305,6 +2305,7 @@ mod tests {
                 encoding_digest: algo_types::Digest([0xbb; 32]),
             },
             votes: vec![],
+            equivocation_votes: vec![],
         };
         let ea = EnsureAction {
             payload: crate::events::Proposal::default(),
@@ -2350,6 +2351,7 @@ mod tests {
                 encoding_digest: algo_types::Digest([0xbb; 32]),
             },
             votes: vec![],
+            equivocation_votes: vec![],
         };
         let ea = EnsureAction {
             payload: crate::events::Proposal::default(),
@@ -2390,6 +2392,7 @@ mod tests {
                     encoding_digest: algo_types::Digest([0xbb; 32]),
                 },
                 votes: vec![],
+                equivocation_votes: vec![],
             },
             vote_validated_at: Duration::ZERO,
             dynamic_filter_timeout: Duration::ZERO,
@@ -2449,6 +2452,7 @@ mod tests {
                 encoding_digest: algo_types::Digest([0xbb; 32]),
             },
             votes: vec![],
+            equivocation_votes: vec![],
         };
         let ea = EnsureAction {
             payload: crate::events::Proposal {
@@ -2491,6 +2495,7 @@ mod tests {
                 encoding_digest: algo_types::Digest([0xbb; 32]),
             },
             votes: vec![],
+            equivocation_votes: vec![],
         };
 
         let stub_vb = StubValidatedBlock {
@@ -2528,6 +2533,7 @@ mod tests {
             period: Period(0),
             proposal: crate::vote::ProposalValue::default(),
             votes: vec![],
+            equivocation_votes: vec![],
         };
         let sda = StageDigestAction {
             certificate: cert.clone(),

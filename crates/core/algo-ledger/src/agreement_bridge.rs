@@ -1098,6 +1098,7 @@ mod tests {
                 encoding_digest: Digest([0xbb; 32]),
             },
             votes: vec![],
+            equivocation_votes: vec![],
         }
     }
 
@@ -1177,6 +1178,7 @@ mod tests {
                     encoding_digest: Digest([0x22; 32]),
                 },
                 votes: vec![],
+                equivocation_votes: vec![],
             }
         };
 
