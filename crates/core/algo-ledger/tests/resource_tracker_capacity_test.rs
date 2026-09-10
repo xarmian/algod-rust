@@ -380,3 +380,143 @@ fn balance_opcode_fails_end_to_end_once_account_capacity_exhausted() {
         "unexpected failure message: {failure}"
     );
 }
+
+/// Port of `TestUnnamedResourcesCreatedAppsAndAssets`
+/// (`ledger/simulation/simulation_eval_test.go`): a holding/local-state
+/// cross-product between a wholly unnamed account and an asset/app that was
+/// *created earlier in this same simulation* must NOT be reported in
+/// `unnamed_resources_accessed`'s `asset_holdings`/`app_locals` sets, even
+/// though the account itself still is -- go's comment on the expected
+/// `ResourceTracker` is explicit: "These should remain nil, since
+/// cross-product references for newly created resources should not be
+/// counted against the group's resource limits."
+///
+/// This is the negative-case sibling of `unnamed_resources_asset_holding_access`
+/// (`simulation_gaps_test.rs`, issue #991), which pins the *positive* case
+/// (an unnamed account crossed with an already-named, pre-existing asset
+/// IS reported) -- together they prove the exclusion in `note_holding_access`/
+/// `note_local_access` (`avm_context.rs`) is scoped to created resources
+/// specifically, not a blanket bug that silently drops every cross-product.
+///
+/// Simplified from go's literal 3-top-level-txn group (a real `acfg`
+/// creating an asset, a real `appl` creating an app, then a third `appl`
+/// call referencing both via `gtxn N CreatedAssetID`/`CreatedApplicationID`)
+/// to a single top-level app call that itxn-creates the asset and the app
+/// itself, mirroring the itxn-based creation pattern this file's other
+/// group-created-app tests already use -- `created_assets`/`created_apps`
+/// tracking is populated identically either way, and the itxn shape avoids
+/// needing a full 3-txn signed-group harness just to reach the same AVM
+/// state. Also not swept across logic versions 9..current (go's `for v :=
+/// 9; v <= logic.LogicVersion` loop) -- v9 (the version this exclusion was
+/// introduced for) is sufficient to prove the exclusion exists and stays
+/// scoped correctly; the per-version sweep is architecture-identical at
+/// every version above 9.
+#[test]
+fn unnamed_resources_created_apps_and_assets_cross_product_excluded() {
+    let sender = Address([0xAA; 32]);
+    let other = Address([0xCC; 32]);
+    let app_a = 1001u64;
+    let mut state = base_state();
+    // Real genesis for a protocol with `AppForbidLowResources` starts
+    // `TxnCounter` at 1000 (`data/bookkeeping/block.go`), so every
+    // newly-created asset/app ID is already >255 and never trips the
+    // `check_forbidden_low_resource` guard this test doesn't otherwise
+    // exercise -- `base_state()` bypasses genesis entirely, so set it
+    // explicitly here the same way a real chain on this protocol would.
+    state.txn_counter = 1000;
+    fund(&mut state, sender, 20_000_000);
+    fund(&mut state, other, 20_000_000);
+    fund(&mut state, Address(app_address(app_a)), 10_000_000);
+
+    // B's program: on create (ApplicationID == 0), just approve.
+    let b_approval = assemble("#pragma version 9\nint 1\n");
+    let b_clear = assemble("#pragma version 9\nint 1\n");
+
+    // A's program: itxn-create an asset, then itxn-create app B, then
+    // check `other`'s holding of the new asset and opt-in to the new app --
+    // both cross-products with a resource created earlier in this same
+    // simulation.
+    let a_src = format!(
+        "#pragma version 9
+itxn_begin
+int acfg
+itxn_field TypeEnum
+int 100
+itxn_field ConfigAssetTotal
+itxn_submit
+itxn CreatedAssetID
+store 0
+
+itxn_begin
+int appl
+itxn_field TypeEnum
+byte 0x{}
+itxn_field ApprovalProgram
+byte 0x{}
+itxn_field ClearStateProgram
+itxn_submit
+itxn CreatedApplicationID
+store 1
+
+addr {other}
+load 0
+asset_holding_get AssetBalance
+!
+assert
+!
+assert
+
+addr {other}
+load 1
+app_opted_in
+!
+assert
+
+int 1
+",
+        hex::encode(&b_approval),
+        hex::encode(&b_clear),
+    );
+    let a_approval = assemble(&a_src);
+    let a_clear = assemble("#pragma version 9\nint 1\n");
+    register_app(&mut state, sender, app_a, a_approval, a_clear);
+
+    let mut txn = appl_txn(sender, app_a, 0);
+    // Covers the pooled fees for A's two itxns (acfg create + appl create)
+    // plus A itself.
+    txn.fee = 4000;
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![SignedTransaction {
+            txn,
+            ..Default::default()
+        }]],
+        allow_empty_signatures: true,
+        allow_unnamed_resources: true,
+        ..Default::default()
+    };
+    let result = simulate(&mut state, request).expect("simulation should succeed");
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "cross-product access on group-created resources must succeed under \
+         allow_unnamed_resources: {:?}",
+        group.failure_message
+    );
+    let unnamed = group
+        .unnamed_resources_accessed
+        .as_ref()
+        .expect("the wholly unnamed `other` account must still be reported");
+    assert!(
+        unnamed.accounts.contains(&other),
+        "the account itself is genuinely unnamed and must still be tracked: {unnamed:?}"
+    );
+    assert!(
+        unnamed.asset_holdings.is_empty(),
+        "a holding cross-product with a group-created asset must not be reported: {unnamed:?}"
+    );
+    assert!(
+        unnamed.app_locals.is_empty(),
+        "a local cross-product with a group-created app must not be reported: {unnamed:?}"
+    );
+}

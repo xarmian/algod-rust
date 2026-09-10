@@ -1538,6 +1538,62 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Port of `TestRedirectExceptions`'s other half: a real HTTP client
+    /// following a genuine redirect *chain* eventually gives up. go's test
+    /// configures a node's own fallback endpoint to point back at itself
+    /// (`BlockServiceCustomFallbackEndpoints = nodeB.rootURL()`), so every
+    /// block-not-available request redirects right back to the same node,
+    /// forever -- and asserts the standard Go `net/http` client's default
+    /// 10-redirect cap kicks in ("stopped after 10 redirects"). This spins
+    /// up a real `axum::serve` server on an ephemeral port (unlike this
+    /// file's other redirect tests, which drive the router directly via
+    /// `oneshot` and so never exercise a real client's redirect-following
+    /// behavior at all) whose own fallback endpoint is itself, and checks a
+    /// real `reqwest::Client` (default redirect policy: also a 10-hop cap)
+    /// gives up with a "too many redirects" error rather than looping
+    /// forever.
+    #[tokio::test]
+    async fn http_client_gives_up_after_too_many_redirects_to_self() {
+        let ledger = Arc::new(MockLedger::new());
+        ledger.add_block(1, b"\x80".to_vec(), b"\x80".to_vec());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+
+        let service = BlockService::new(
+            ledger,
+            "testnet-v1.0".to_string(),
+            DEFAULT_BLOCK_SERVICE_MEM_CAP,
+        )
+        .with_custom_fallback_endpoints(&addr.to_string());
+        let app = service.http_router();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Round 5 doesn't exist -- every request redirects back to this
+        // same server's fallback endpoint (itself), forever.
+        let uri = format!(
+            "http://{addr}/v1/testnet-v1.0/block/{}",
+            format_round_base36(5)
+        );
+        let client = reqwest::Client::new();
+        let result = client.get(&uri).send().await;
+
+        server.abort();
+
+        let err = result.expect_err(
+            "a self-redirect loop must eventually give up, not loop forever or succeed",
+        );
+        assert!(
+            err.is_redirect(),
+            "expected a too-many-redirects error, got: {err}"
+        );
+    }
+
     /// Port of `TestBlockServiceRedirect`: a bare `host:port` fallback
     /// endpoint redirects to an `http://` URL built from it, at the go-shaped
     /// block-query path.

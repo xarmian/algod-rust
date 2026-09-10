@@ -527,6 +527,56 @@ mod tests {
         }
     }
 
+    /// Port of go's `TestConnectionLimiterForwardsError`
+    /// (`daemon/algod/api/server/lib/middlewares/connectionLimiter_test.go`):
+    /// below the limit, the guard is a transparent pass-through -- whatever
+    /// response the inner handler produces (not just a plain `200 OK`, as
+    /// `hard_limit_guard_admits_below_limit_and_releases_slot` above checks)
+    /// comes back unchanged, exactly as go's middleware forwards the inner
+    /// handler's `error` via `next(ctx)`'s return value untouched. axum's
+    /// `middleware::Next` has no separate `Result`-typed error channel the
+    /// way echo's `HandlerFunc` does (a handler's failure is already an
+    /// ordinary `Response`, e.g. produced by `IntoResponse` on an error
+    /// type), so the analogous property here is that `connection_hard_limit_guard`
+    /// must not alter a non-2xx response on its way back through --
+    /// previously only ever exercised with a handler that always returns
+    /// `200 OK`.
+    #[tokio::test]
+    async fn hard_limit_guard_forwards_handler_error_response_unchanged() {
+        use axum::body::{to_bytes, Body};
+        use axum::extract::Request;
+        use axum::middleware::Next;
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let limit = 1u64;
+        let router = Router::new()
+            .route(
+                "/x",
+                get(|| async { (StatusCode::IM_A_TEAPOT, "handler error").into_response() }),
+            )
+            .layer(axum::middleware::from_fn(
+                move |req: Request, next: Next| {
+                    let in_flight = in_flight.clone();
+                    async move { connection_hard_limit_guard(limit, in_flight, req, next).await }
+                },
+            ));
+
+        let resp = router
+            .oneshot(Request::builder().uri("/x").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::IM_A_TEAPOT,
+            "the handler's own error response must pass through the guard unchanged"
+        );
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"handler error");
+    }
+
     /// A request that arrives while `limit` slots are already held
     /// (simulated directly via the shared counter, since driving true
     /// concurrency deterministically through a oneshot service is racy)
