@@ -2043,12 +2043,25 @@ fn asm_intc_block(ops: &mut OpStream, args: &[&str]) {
     for v in &vals {
         write_varuint_to_vec(&mut ops.pending, *v);
     }
-    if ops.has_pseudo_int {
-        ops.record_error(ops.source_line, 0, "intcblock following int".into());
+    // Mirrors go's `asmIntCBlock` (assembler.go:912-926): a manual intcblock
+    // reached only through unconditionally-diverted control flow (dead code,
+    // e.g. after an unconditional `b`/`callsub`/`retsub`/`err`/`return` and
+    // before the next label) does not become the "currently live" intcblock
+    // that `int`/`intc N` resolve against -- go's own `int` literal lookup
+    // (`TestManualCBlocksPreBackBranch`) keeps "seeing" the last *reachable*
+    // manual cblock instead. `type_track_deadcode` (set by branch/flow
+    // opcodes, cleared at the next label) is computed in the same pass
+    // just before this runs (`process_statement` calls
+    // `type_track::track_instruction` first), so it accurately reflects
+    // reachability here.
+    if !ops.type_track_deadcode {
+        if ops.has_pseudo_int {
+            ops.record_error(ops.source_line, 0, "intcblock following int".into());
+        }
+        ops.intc_refs.clear();
+        ops.intc = vals;
+        ops.cnt_intc_block += 1;
     }
-    ops.intc_refs.clear();
-    ops.intc = vals;
-    ops.cnt_intc_block += 1;
 }
 
 fn asm_bytec_block(ops: &mut OpStream, args: &[&str]) {
@@ -2088,16 +2101,20 @@ fn asm_bytec_block(ops: &mut OpStream, args: &[&str]) {
         ops.pending.extend_from_slice(bv);
     }
 
-    if ops.has_pseudo_byte {
-        ops.record_error(
-            ops.source_line,
-            0,
-            "bytecblock following byte/addr/method".into(),
-        );
+    // Mirrors go's `asmByteCBlock` (assembler.go:960-976): same
+    // dead-code-skip rule as `asm_intc_block` above, for byte constants.
+    if !ops.type_track_deadcode {
+        if ops.has_pseudo_byte {
+            ops.record_error(
+                ops.source_line,
+                0,
+                "bytecblock following byte/addr/method".into(),
+            );
+        }
+        ops.bytec_refs.clear();
+        ops.bytec = vals;
+        ops.cnt_bytec_block += 1;
     }
-    ops.bytec_refs.clear();
-    ops.bytec = vals;
-    ops.cnt_bytec_block += 1;
 }
 
 fn asm_regular(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
@@ -4627,6 +4644,147 @@ dup
         assert!(result.is_err());
         let msg = format!("{:?}", result.err().unwrap());
         assert!(msg.contains("too big") && msg.contains("4096"), "{msg}");
+    }
+
+    // Ports go's `TestManualCBlocksPreBackBranch`
+    // (`data/transactions/logic/assembler_test.go:1440`): before
+    // `backBranchEnabledVersion` (v4), an `int`/`byte` literal resolves
+    // against the most recently *reachable* manual cblock, not simply the
+    // most recently *parsed* one. A manual cblock sitting in dead code
+    // (unconditionally unreachable, e.g. right after a `b` and before the
+    // next label) must not become the "currently live" block -- found and
+    // fixed a real gap: `asm_intc_block`/`asm_bytec_block` previously
+    // updated `cnt_intc_block`/`ops.intc` (and the byte equivalents)
+    // unconditionally, so a dead-code manual cblock silently became "the"
+    // live block, causing `int`/`byte` literals that matched the *live*
+    // block's values to spuriously error ("value ... used with manual
+    // intcblocks") or, worse, literals absent from the live block but
+    // present nowhere real to silently succeed via a `pushint`/`pushbytes`
+    // fallback instead of go's "value ... does not appear in existing
+    // intcblock" rejection. Fixed to mirror go's `asmIntCBlock`/
+    // `asmByteCBlock` (`assembler.go:912-976`) exactly: skip the
+    // live-block update whenever `OpStream::type_track_deadcode` is set,
+    // which is already tracked in the same single assembly pass (via
+    // `type_track::track_instruction`, run just before instruction
+    // assembly in `process_statement`) for the branch-merge type-tracking
+    // work in issue #829.
+    #[test]
+    fn test_manual_cblocks_pre_back_branch_dead_intcblock_sees_live_block() {
+        // "intcblock 10 20; int 10;" -- single manual block, no dead code.
+        let src = "#pragma version 3\nintcblock 10 20\nint 10\nreturn\n";
+        assert!(assemble_string(src).is_ok());
+
+        // "intcblock 10 20; int 30;" -- 30 isn't in the (only, live) block.
+        let src = "#pragma version 3\nintcblock 10 20\nint 30\nreturn\n";
+        let err = assemble_string(src).err().unwrap();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("value 30 does not appear in existing intcblock"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_manual_cblocks_pre_back_branch_dead_intcblock_ignored_by_int() {
+        // The second intcblock is dead (unreachable past the unconditional
+        // `b skip`) -- `int 10`/`int 3` must "see" only the first, live
+        // block ({10, 20}), exactly like go.
+        let live_val =
+            "#pragma version 3\nintcblock 10 20\nb skip\nintcblock 3 4 5\nskip:\nint 10\nreturn\n";
+        let ops = assemble_string(live_val).expect("live value must assemble");
+        // intc_0 (0x22) references the live block's first slot (10), not a
+        // pushint/pushbytes fallback and not the dead block's slot 0 (3).
+        assert!(
+            ops.program.windows(1).any(|w| w == [0x22]),
+            "expected intc_0 reference in {:?}",
+            ops.program
+        );
+
+        // 3 only appears in the *dead* block -- go still rejects this with
+        // "value 3 does not appear in existing intcblock" because the dead
+        // block was never adopted as live. Before the fix, algod-rust
+        // instead silently accepted this via a `pushint` fallback (treating
+        // two-manual-cblocks-seen as "unknowable", same as the *reachable*
+        // multi-block case) -- a real assembler/consensus-relevant gap
+        // versus go's "the intcblock in effect is unknowable" behavior only
+        // applying when the second block is actually reachable.
+        let dead_val =
+            "#pragma version 3\nintcblock 10 20\nb skip\nintcblock 3 4 5\nskip:\nint 3\nreturn\n";
+        let err = assemble_string(dead_val).err().unwrap();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("value 3 does not appear in existing intcblock"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_manual_cblocks_pre_back_branch_reachable_second_intcblock_is_unknowable() {
+        // Here the second intcblock is reachable (via a *conditional*
+        // `bz`), so which block is "in effect" is genuinely unknowable at
+        // assembly time -- go forces `intc`/`pushint` instead of `int`.
+        // backBranchEnabledVersion-1 (v3) has `pushint` available, so this
+        // still succeeds (falls back to pushint rather than an intc ref).
+        let src = "#pragma version 3\nintcblock 10 20\ntxn NumAppArgs\nbz skip\nintcblock 3 4 5\nskip:\nint 10\nreturn\n";
+        assert!(assemble_string(src).is_ok());
+
+        // backBranchEnabledVersion-2 (v2) has no pushint -- go rejects with
+        // "int 10 used with manual intcblocks. Use intc."
+        let src = "#pragma version 2\nintcblock 10 20\ntxn NumAppArgs\nbz skip\nintcblock 3 4 5\nskip:\nint 10\nreturn\n";
+        let err = assemble_string(src).err().unwrap();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("int 10 used with manual intcblocks. Use intc."),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_manual_cblocks_pre_back_branch_dead_code_byte_analog() {
+        // Same dead-code-ignored behavior for `byte`/manual `bytecblock`.
+        let live_val = "#pragma version 3\nbytecblock 0x10 0x20\nb skip\nbytecblock 0x03 0x04 0x05\nskip:\nbyte 0x10\nlen\nreturn\n";
+        assert!(
+            assemble_string(live_val).is_ok(),
+            "{:?}",
+            assemble_string(live_val).err()
+        );
+
+        let dead_val = "#pragma version 3\nbytecblock 0x10 0x20\nb skip\nbytecblock 0x03 0x04 0x05\nskip:\nbyte 0x03\nlen\nreturn\n";
+        let err = assemble_string(dead_val).err().unwrap();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("value 0x03 does not appear in existing bytecblock"),
+            "{msg}"
+        );
+    }
+
+    // Ports go's `TestManualCBlockEval`
+    // (`data/transactions/logic/eval_test.go`, referenced from
+    // `TestManualCBlocks`' doc comment): a manual `intcblock`/`bytecblock`
+    // placed entirely in dead code (after an unconditional `b` to a label
+    // preceding any use) must not suppress the assembler's normal
+    // auto-inserted-constant-block behavior for `int`/`byte` literals
+    // appearing later in *live* code -- they compile exactly as if the
+    // dead manual block were never there.
+    #[test]
+    fn test_manual_cblock_eval_dead_intcblock_does_not_block_auto_insertion() {
+        let src =
+            "#pragma version 2\nb skip\nintcblock 10\nskip:\nint 4\nint 4\n+\nint 8\n==\nreturn\n";
+        assert!(
+            assemble_string(src).is_ok(),
+            "{:?}",
+            assemble_string(src).err()
+        );
+    }
+
+    #[test]
+    fn test_manual_cblock_eval_dead_bytecblock_does_not_block_auto_insertion() {
+        let src = "#pragma version 2\nb skip\nbytecblock 0x11\nskip:\nbyte 0x2222\nbyte 0x2222\nconcat\nlen\nint 4\n==\nreturn\n";
+        assert!(
+            assemble_string(src).is_ok(),
+            "{:?}",
+            assemble_string(src).err()
+        );
     }
 
     #[test]
