@@ -191,7 +191,10 @@ fn wire_node(net: &Arc<WebsocketNetwork>) -> InProcNode {
     net.multiplexer()
         .register_handlers(vec![TaggedMessageHandler {
             tag: Tag::Transaction,
-            handler: Arc::new(TxTagHandler::new(pool.clone(), seen.clone())),
+            handler: Arc::new(
+                TxTagHandler::new(pool.clone(), seen.clone())
+                    .with_relay(net.clone() as Arc<dyn GossipNode>),
+            ),
         }]);
 
     let broadcaster = Arc::new(LocalTxBroadcaster::new(
@@ -322,6 +325,101 @@ async fn txn_propagates_from_a_to_b_via_gossip() {
     );
 
     // Clean shutdown.
+    net_b.stop().await;
+    net_a.stop().await;
+}
+
+/// go's `TestLineNetwork` (`network/wsNetwork_test.go`) builds an N-node
+/// relay chain (A—B—C—...) and asserts a message submitted at one end
+/// propagates all the way to the other, proving multi-hop forwarding (not
+/// just direct-peer delivery). Phase 17 second-pass audit
+/// (`docs/phase17/parity_network.md`'s `TestLineNetwork` row) found the
+/// only existing Rust coverage was the two-node, single-hop case above —
+/// which cannot distinguish "gossip delivered directly" from "gossip
+/// forwarded through an intermediate relay", the actual thing go's test
+/// exists to catch (a relay that receives but fails to *re-broadcast* a
+/// message to its other peers).
+///
+/// Topology: A (relay) — B (relay, dials A) — C (non-relay participant,
+/// dials B only — never talks to A directly). A submits a txn locally; C
+/// can only see it if B actually forwards A's gossip broadcast onward,
+/// exercising `WebsocketNetwork`'s relay-forwarding path
+/// (`ws_network.rs`'s inbound-message relay logic — see
+/// `TestForceMessageRelaying`'s row/tests for the underlying forwarding
+/// primitive this test now proves end-to-end over two real hops instead of
+/// one).
+#[tokio::test]
+async fn txn_propagates_across_three_hop_relay_chain() {
+    init_tracing();
+
+    // Node A: relay, the chain's origin.
+    let net_a = build_node("test-v1.0", true);
+    let node_a = wire_node(&net_a);
+    net_a.start_arc().await.expect("node A start");
+    let (a_addr, listening_a) = net_a.address();
+    assert!(listening_a, "node A should be listening");
+
+    // Node B: relay, dials A. Must forward A's broadcasts to C.
+    let net_b = build_node("test-v1.0", true);
+    let node_b = wire_node(&net_b);
+    connect_to(&net_b, &a_addr).await;
+    net_b.start_arc().await.expect("node B start");
+    let (b_addr, listening_b) = net_b.address();
+    assert!(listening_b, "node B should be listening");
+    net_b.request_connect_outgoing(false).await;
+
+    // Node C: plain participant, dials B only — never learns about A.
+    let net_c = build_node("test-v1.0", false);
+    let node_c = wire_node(&net_c);
+    connect_to(&net_c, &b_addr).await;
+    net_c.start_arc().await.expect("node C start");
+    net_c.request_connect_outgoing(false).await;
+
+    // Wait for the full chain to connect: A<->B and B<->C.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if net_a.peer_count().await >= 1
+            && net_b.peer_count().await >= 2
+            && net_c.peer_count().await >= 1
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(net_a.peer_count().await >= 1, "A should have peer B");
+    assert!(net_b.peer_count().await >= 2, "B should have peers A and C");
+    assert!(net_c.peer_count().await >= 1, "C should have peer B");
+
+    // Submit at A — the far end of the chain from C.
+    let tx = make_tx(0x77);
+    let txid = compute_txn_id(&tx.txn);
+    let returned = node_a
+        .broadcaster
+        .submit_group(vec![tx])
+        .await
+        .expect("local submit should succeed");
+    assert_eq!(returned, txid, "submit_group should return first txid");
+
+    // B (one hop from A) should see it via direct gossip.
+    let appeared_b = wait_for_txid(&node_b.pool, &txid, Duration::from_secs(5)).await;
+    assert!(
+        appeared_b,
+        "node B's pool did not see the txid within 5 s — pending: {:?}",
+        node_b.pool.pending_tx_ids(),
+    );
+
+    // C (two hops from A, never directly connected to A) must receive it
+    // via B's re-broadcast — the actual multi-hop assertion.
+    let appeared_c = wait_for_txid(&node_c.pool, &txid, Duration::from_secs(5)).await;
+    assert!(
+        appeared_c,
+        "node C's pool did not see the txid within 5 s despite never \
+         connecting to A directly — B failed to relay it onward; pending: {:?}",
+        node_c.pool.pending_tx_ids(),
+    );
+
+    // Clean shutdown.
+    net_c.stop().await;
     net_b.stop().await;
     net_a.stop().await;
 }

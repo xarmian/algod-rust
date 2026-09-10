@@ -4633,7 +4633,17 @@ pub async fn run(
     let mut ws_tx_tag_handler =
         algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
             .with_batch_verifier(batch_verifier.clone())
-            .with_remember_counter(tx_pool_remember_counter.clone());
+            .with_remember_counter(tx_pool_remember_counter.clone())
+            // Phase 17 network-parity deep pass (`TestLineNetwork` row,
+            // `docs/phase17/parity_network.md`): relay an inbound gossip
+            // group to this node's *other* WS-gossip peers (excluding the
+            // sender) once it is admitted into the pool, mirroring go's
+            // `TxHandler.net.Relay(...)` — see `TxTagHandler::with_relay`'s
+            // doc comment. `WebsocketNetwork::relay` itself already
+            // no-ops when this node isn't relaying messages
+            // (`effective_relay_messages()`), matching go's
+            // `wn.relayMessages` gate.
+            .with_relay(gossip_node.clone() as Arc<dyn GossipNode>);
     if let Some(limiter) = &tx_backlog_peer_limiter {
         ws_tx_tag_handler = ws_tx_tag_handler.with_backlog_peer_limiter(limiter.clone());
     }
@@ -4772,36 +4782,38 @@ pub async fn run(
             .clone()
             .or_else(|| ledger_path.parent().map(Path::to_path_buf));
 
-        let transport = P2pTransport::start(P2pTransportConfig {
-            network_id: network.to_string(),
-            listen_multiaddr,
-            bootstrap_peers,
-            persist_peer_id: resolved_p2p.persist_peer_id,
-            data_dir: p2p_data_dir,
-            // `config.json`'s `P2PPrivateKeyLocation` (issue #768): a
-            // custom path override for the P2P peer-ID private key file,
-            // alongside the existing `--p2p-persist-peer-id` flag. Empty
-            // (go's default) means "use the data-dir-derived default".
-            private_key_path: (!node_config.p2p_private_key_location.is_empty())
-                .then(|| PathBuf::from(&node_config.p2p_private_key_location)),
-            enable_dht_providers: node_config.enable_dht_providers,
-            dht_mode: node_config.dht_mode.clone(),
-            // Issue #952: fed to `algo_p2p::derive_conn_limits`/
-            // `derive_algorand_gossipsub_params` via `P2pHostConfig`,
-            // mirroring the exact same `GossipFanout`/
-            // `IsListenServer`/`IncomingConnectionsLimit` inputs go's
-            // `MakeHost`/`makePubSub` derive their own connection-manager/
-            // resource-manager/gossipsub-mesh tuning from — the same
-            // `resolve_gossip_fanout`/`is_listen_server` already computed
-            // above for `net_config` (go shares one `cfg.GossipFanout`
-            // across both the WS and P2P transports).
-            gossip_fanout: resolve_gossip_fanout(&node_config, is_listen_server, peers.len())
-                as i64,
-            incoming_connections_limit: resolved_net.incoming_connections_limit as i64,
-            is_listen_server,
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to start P2P transport: {e}"))?;
+        let transport = Arc::new(
+            P2pTransport::start(P2pTransportConfig {
+                network_id: network.to_string(),
+                listen_multiaddr,
+                bootstrap_peers,
+                persist_peer_id: resolved_p2p.persist_peer_id,
+                data_dir: p2p_data_dir,
+                // `config.json`'s `P2PPrivateKeyLocation` (issue #768): a
+                // custom path override for the P2P peer-ID private key file,
+                // alongside the existing `--p2p-persist-peer-id` flag. Empty
+                // (go's default) means "use the data-dir-derived default".
+                private_key_path: (!node_config.p2p_private_key_location.is_empty())
+                    .then(|| PathBuf::from(&node_config.p2p_private_key_location)),
+                enable_dht_providers: node_config.enable_dht_providers,
+                dht_mode: node_config.dht_mode.clone(),
+                // Issue #952: fed to `algo_p2p::derive_conn_limits`/
+                // `derive_algorand_gossipsub_params` via `P2pHostConfig`,
+                // mirroring the exact same `GossipFanout`/
+                // `IsListenServer`/`IncomingConnectionsLimit` inputs go's
+                // `MakeHost`/`makePubSub` derive their own connection-manager/
+                // resource-manager/gossipsub-mesh tuning from — the same
+                // `resolve_gossip_fanout`/`is_listen_server` already computed
+                // above for `net_config` (go shares one `cfg.GossipFanout`
+                // across both the WS and P2P transports).
+                gossip_fanout: resolve_gossip_fanout(&node_config, is_listen_server, peers.len())
+                    as i64,
+                incoming_connections_limit: resolved_net.incoming_connections_limit as i64,
+                is_listen_server,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to start P2P transport: {e}"))?,
+        );
 
         // Give the swarm a brief moment to confirm its listen address (if
         // any) before logging, so the "listening" log line is accurate
@@ -4830,7 +4842,13 @@ pub async fn run(
         let mut p2p_tx_tag_handler =
             algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
                 .with_batch_verifier(batch_verifier.clone())
-                .with_remember_counter(tx_pool_remember_counter.clone());
+                .with_remember_counter(tx_pool_remember_counter.clone())
+                // Same relay wiring as the WS-gossip handler above, over
+                // the P2P transport's own `GossipNode` impl (which fans a
+                // relayed `TX` message out over gossipsub, go's real P2P
+                // relay path for the `TX` tag — see `p2p_transport.rs`'s
+                // module doc).
+                .with_relay(transport.clone() as Arc<dyn GossipNode>);
         if let Some(limiter) = &tx_backlog_peer_limiter {
             p2p_tx_tag_handler = p2p_tx_tag_handler.with_backlog_peer_limiter(limiter.clone());
         }
@@ -4870,7 +4888,7 @@ pub async fn run(
             transport.register_http_handler("/", service.http_router());
         }
 
-        Some(Arc::new(transport))
+        Some(transport)
     } else {
         None
     };
