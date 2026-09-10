@@ -54,12 +54,12 @@ per-area split of the former).
 | `matched-1:1` | 953 | 30% |
 | `partial` | 765 | 24% |
 | `matched-1:many` | 663 | 21% |
-| `out-of-scope` | 585 | 18% |
+| `out-of-scope` | 587 | 18% |
 | `matched-many:1` | 210 | 7% |
-| `not-implemented` | 2 | 0% |
 | `missing-test` | 1 | 0% |
+| `not-implemented` | 0 | 0% |
 
-**3 rows (`not-implemented` + `missing-test`, 0%) are real, actionable
+**1 rows (`not-implemented` + `missing-test`, 0%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
 implements but never tests. `partial` (765, 24%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
@@ -80,11 +80,11 @@ were triaged into tracked issues.
 | Networking (`network`, `network/p2p`, ...) | [parity_network.md](phase17/parity_network.md) | 263 | 98 | 60 | 11 | 76 | 0 | 0 | 18 |
 | Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 117 | 36 | 17 | 64 | 0 | 0 | 42 |
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 59 | 64 | 1 | 10 | 0 | 0 | 10 |
-| Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 111 | 30 | 47 | 63 | 2 | 0 | 21 |
+| Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 111 | 30 | 47 | 63 | 0 | 0 | 23 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 25 | 31 | 0 | 32 | 0 | 0 | 31 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 22 | 7 | 0 | 23 | 0 | 0 | 66 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 32 | 26 | 7 | 21 | 0 | 0 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 11 | 0 | 16 | 0 | 0 | 3 |
-| **Total** | | **3,179** | **953** | **663** | **210** | **765** | **2** | **1** | **585** |
+| **Total** | | **3,179** | **953** | **663** | **210** | **765** | **0** | **1** | **587** |
 
