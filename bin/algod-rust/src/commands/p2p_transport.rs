@@ -61,7 +61,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use algo_network::gossip_node::UnicastPeer;
 use algo_network::handler::{Multiplexer, TaggedMessageHandler, TaggedMessageValidatorHandler};
@@ -74,7 +74,8 @@ use algo_network::vpack::{StatefulDecoder, StatefulEncoder, VOTE_COMPRESSION_ABO
 use algo_network::ws_peer::{compress_outgoing_vote, decompress_incoming_vote_core};
 use algo_network::{
     encode_uvarint, hash_topics, ForwardingPolicy, GossipNode, IncomingMessage, Peer, PeerError,
-    PeerOption, RequestTracker, Router, Tag, DEFAULT_REQUEST_TIMEOUT, RESPONSE_HASH_FIELD,
+    PeerOption, RequestTracker, Router, Tag, DEFAULT_REQUEST_TIMEOUT, MAX_MESSAGE_QUEUE_DURATION,
+    RESPONSE_HASH_FIELD,
 };
 use algo_p2p::{
     build_headers, handshake_inbound, handshake_outbound, libp2p_stream, read_frame,
@@ -134,6 +135,14 @@ const DEFAULT_VOTE_COMPRESSION_TABLE_SIZE: u32 = 2048;
 /// dial newly DHT-discovered peers advertising the `Gossip` capability.
 const DHT_MESH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// One outbound `(tag, payload)` pair queued for a stream peer's writer
+/// task, plus the `Instant` it was enqueued at (issue #1220) — the P2P
+/// stream's counterpart of `ws_peer.rs`'s `SendMessage::enqueued`, used to
+/// bound the writer task's `write_frame` call to the remaining slice of
+/// [`MAX_MESSAGE_QUEUE_DURATION`] so a stalled peer (TCP/stream accepts the
+/// write but never drains it) cannot pin the writer task open indefinitely.
+type P2pOutboundMsg = (Tag, Vec<u8>, Instant);
+
 /// Everything [`P2pTransport`] tracks for one currently-established
 /// `/algorand-ws/2.2.0` stream peer: the outgoing frame sender
 /// [`P2pTransport::stream_broadcast`] fans agreement traffic out to, and
@@ -143,16 +152,20 @@ const DHT_MESH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// `request_tracker`, since a P2P `/algorand-ws` stream is a
 /// request/response-capable channel exactly like a WS peer connection.
 struct StreamPeerHandle {
-    /// Sends an (unframed, uncompressed) `(tag, payload)` pair to this
-    /// peer's writer task. Framing (`algo_network::framing::encode_frame`)
+    /// Sends an (unframed, uncompressed) `(tag, payload, enqueued)` triple
+    /// to this peer's writer task. Framing (`algo_network::framing::encode_frame`)
     /// and, for `AgreementVote`, vpack compression now happen inside the
     /// writer task itself (issue #925) rather than at the call site, since
     /// vote compression state (the stateful encoder's LRU table) is
     /// per-peer — a single pre-framed/pre-compressed buffer can no longer
     /// be computed once and cloned out to every peer, mirroring
     /// `ws_peer.rs`'s `write_loop`, which frames+compresses per outgoing
-    /// message, per peer.
-    tx: mpsc::UnboundedSender<(Tag, Vec<u8>)>,
+    /// message, per peer. `enqueued` (issue #1220) is the timestamp this
+    /// message was pushed onto the channel, used by `spawn_ws_peer`'s
+    /// writer task to bound the outbound `write_frame` call to the
+    /// remaining slice of `MAX_MESSAGE_QUEUE_DURATION`, mirroring
+    /// `ws_peer.rs`'s `SendMessage::enqueued`.
+    tx: mpsc::UnboundedSender<P2pOutboundMsg>,
     /// Correlates outbound unicast requests (see [`P2pTransport::unicast_peers`])
     /// to this peer's `TopicMsgResp` replies.
     request_tracker: Arc<RequestTracker>,
@@ -207,6 +220,37 @@ struct StreamPeerHandle {
 /// does.
 type StreamPeers = Arc<Mutex<StreamManager<StreamPeerHandle>>>;
 
+/// `write_frame`, bounded by `budget` (issue #1220).
+///
+/// go's watchdog (`wsPeer.checkSlowWritingPeer`, `network/wsPeer.go:1014`,
+/// driven by `checkSlowWritingPeers`, `network/wsNetwork.go:1309`)
+/// force-disconnects a peer whose currently in-flight write has blocked past
+/// `maxMessageQueueDuration` (25s) — this stream had no equivalent at all
+/// (unlike the classic WS-gossip transport's `ws_peer.rs`, whose
+/// `process_write_command` at least checked *pre-write* staleness): a peer
+/// that keeps this stream's underlying substream open but stops reading
+/// could block the writer task's `write_frame` (`write_all`+`flush`)
+/// indefinitely. Wrapping the call in `tokio::time::timeout` bounds it
+/// without a second timer/task, matching the fix applied to
+/// `ws_peer.rs::process_write_command`'s `WriteCommand::Data` arm.
+///
+/// On a timeout, the caller must treat the peer exactly like any other
+/// `write_frame` error (tear the stream down, do not attempt to reuse
+/// `write_half`) — a timed-out write can leave a partial length-prefixed
+/// frame (or just the 4-byte length header) written but not the rest of the
+/// body, and this connection has no framing-resync mechanism.
+async fn timed_write_frame<S: libp2p::futures::AsyncWrite + Unpin>(
+    stream: &mut S,
+    body: &[u8],
+    budget: Duration,
+) -> Result<(), ()> {
+    match tokio::time::timeout(budget, write_frame(stream, body)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(()),
+        Err(_elapsed) => Err(()),
+    }
+}
+
 /// Run the post-handshake read/write loop for one peer's `/algorand-ws`
 /// stream: registers a [`StreamPeerHandle`] in `stream_peers` (its sender is
 /// what [`P2pTransport::stream_broadcast`] fans agreement traffic out to,
@@ -232,7 +276,7 @@ fn spawn_ws_peer(
 ) {
     #[cfg(not(test))]
     let _ = initiated_locally;
-    let (tx, mut rx) = mpsc::unbounded_channel::<(Tag, Vec<u8>)>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<P2pOutboundMsg>();
     let request_tracker = Arc::new(RequestTracker::new());
     // A clone of `tx` outlives the map insertion below so the reader half
     // (see the `Respond` handling further down, and the VP-abort send on a
@@ -315,7 +359,7 @@ fn spawn_ws_peer(
             // vpack stateful encoder state, owned exclusively by this task
             // — mirrors `ws_peer.rs`'s `write_loop`.
             let mut stateful_encoder: Option<StatefulEncoder> = None;
-            while let Some((tag, payload)) = rx.recv().await {
+            while let Some((tag, payload, enqueued)) = rx.recv().await {
                 // Optionally vpack-compress AV (AgreementVote) tag
                 // payloads. Mirrors go-algorand's `wsPeerMsgCodec.compress()`
                 // via the exact same shared core `ws_peer.rs` uses for the
@@ -337,7 +381,21 @@ fn spawn_ws_peer(
                             &[VOTE_COMPRESSION_ABORT_BYTE],
                         ) {
                             Ok(abort_frame) => {
-                                if write_frame(&mut write_half, &abort_frame).await.is_err() {
+                                // Not itself subject to queueing (generated
+                                // synchronously here), so it gets the full
+                                // budget — same reasoning as `ws_peer.rs`'s
+                                // `send_vp_abort`, which is likewise
+                                // unbounded on the classic transport (a
+                                // vote-compression abort is rare control
+                                // traffic, not a queued message).
+                                if timed_write_frame(
+                                    &mut write_half,
+                                    &abort_frame,
+                                    MAX_MESSAGE_QUEUE_DURATION,
+                                )
+                                .await
+                                .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -370,7 +428,20 @@ fn spawn_ws_peer(
                     }
                 };
 
-                if write_frame(&mut write_half, &frame).await.is_err() {
+                // Bound the write to the remaining slice of this message's
+                // MAX_MESSAGE_QUEUE_DURATION budget (issue #1220) — mirrors
+                // `ws_peer.rs`'s `process_write_command` fix for the classic
+                // WS-gossip transport: this stream is raw `AsyncWrite`
+                // (`write_frame` does `write_all`+`flush`), so a peer that
+                // stops reading can otherwise block this task's underlying
+                // `.await` indefinitely, just like an unguarded
+                // `sink.send()` could on the tungstenite path.
+                let remaining_budget =
+                    MAX_MESSAGE_QUEUE_DURATION.saturating_sub(enqueued.elapsed());
+                if timed_write_frame(&mut write_half, &frame, remaining_budget)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -418,8 +489,11 @@ fn spawn_ws_peer(
                             &remote_addr,
                         );
                         if need_abort {
-                            let _ =
-                                reply_tx.send((Tag::VotePacked, vec![VOTE_COMPRESSION_ABORT_BYTE]));
+                            let _ = reply_tx.send((
+                                Tag::VotePacked,
+                                vec![VOTE_COMPRESSION_ABORT_BYTE],
+                                Instant::now(),
+                            ));
                         }
                         match result {
                             Some(p) => p,
@@ -500,7 +574,7 @@ fn spawn_ws_peer(
                             encode_uvarint(request_hash),
                         ));
                         let serialized = response_topics.marshal();
-                        let _ = reply_tx.send((Tag::TopicMsgResp, serialized));
+                        let _ = reply_tx.send((Tag::TopicMsgResp, serialized, Instant::now()));
                     }
                 }
             }
@@ -705,7 +779,7 @@ struct P2pUnicastPeer {
     /// the same channel [`P2pTransport::stream_broadcast`] uses. See
     /// [`StreamPeerHandle::tx`]'s doc comment for why framing/compression
     /// now happen in the writer task rather than at the call site.
-    tx: mpsc::UnboundedSender<(Tag, Vec<u8>)>,
+    tx: mpsc::UnboundedSender<P2pOutboundMsg>,
     request_tracker: Arc<RequestTracker>,
     request_timeout: Duration,
 }
@@ -734,7 +808,7 @@ impl UnicastPeer for P2pUnicastPeer {
     async fn request(&self, tag: Tag, topics: Topics) -> Result<Topics, PeerError> {
         let (serialized, hash, rx) = self.request_tracker.prepare_request(topics).await;
 
-        if self.tx.send((tag, serialized)).is_err() {
+        if self.tx.send((tag, serialized, Instant::now())).is_err() {
             self.request_tracker.cancel_request(hash).await;
             return Err(PeerError::ConnectionClosed);
         }
@@ -763,7 +837,7 @@ impl UnicastPeer for P2pUnicastPeer {
         ));
         let serialized = response_topics.marshal();
         self.tx
-            .send((Tag::TopicMsgResp, serialized))
+            .send((Tag::TopicMsgResp, serialized, Instant::now()))
             .map_err(|_| PeerError::ConnectionClosed)
     }
 }
@@ -1669,12 +1743,13 @@ impl P2pTransport {
     /// single pre-framed buffer can no longer be computed once here and
     /// cloned out to every peer.
     fn stream_broadcast(&self, tag: Tag, data: &[u8]) {
+        let enqueued = Instant::now();
         let peers = self
             .stream_peers
             .lock()
             .expect("stream_peers mutex poisoned");
         for (_, handle) in peers.iter() {
-            let _ = handle.tx.send((tag, data.to_vec()));
+            let _ = handle.tx.send((tag, data.to_vec(), enqueued));
         }
     }
 
@@ -3244,5 +3319,68 @@ mod tests {
         assert_eq!(decode_tag, Tag::AgreementVote);
 
         drop(client_read);
+    }
+
+    // -------------------------------------------------------------------
+    // Blocked outbound write is bounded (issue #1220)
+    // -------------------------------------------------------------------
+
+    /// An `AsyncWrite` whose `poll_write`/`poll_flush` never resolve —
+    /// simulates a `/algorand-ws` libp2p stream peer that keeps the
+    /// substream open but stops reading, so `write_frame`'s underlying
+    /// `write_all`/`flush` would otherwise block forever. Mirrors
+    /// `algo_network::ws_peer`'s own `BlockedWsHalf` test double (used to
+    /// pin the identical fix on the classic WS-gossip transport), adapted
+    /// to `futures_util::AsyncWrite` since this transport's `write_frame`
+    /// is raw-stream framing rather than a WebSocket sink.
+    struct BlockedAsyncWrite;
+
+    impl libp2p::futures::AsyncWrite for BlockedAsyncWrite {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// `timed_write_frame` against a stream whose write blocks forever must
+    /// fail within `budget`, not hang indefinitely — the P2P-stream
+    /// counterpart of `algo_network::ws_peer`'s
+    /// `write_command_blocked_send_times_out`, proving `spawn_ws_peer`'s
+    /// writer task got the same fix as the classic WS-gossip transport
+    /// (acceptance criterion: "same gap checked and addressed... in
+    /// `p2p_transport.rs`'s `spawn_ws_peer`").
+    #[tokio::test]
+    async fn timed_write_frame_blocked_write_times_out() {
+        let mut stream = BlockedAsyncWrite;
+        let budget = Duration::from_millis(100);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            timed_write_frame(&mut stream, b"payload", budget),
+        )
+        .await
+        .expect("timed_write_frame must return well within the 5s test timeout");
+
+        assert!(
+            result.is_err(),
+            "a write that blocks past its budget must be reported as failed, not hang forever"
+        );
     }
 }
