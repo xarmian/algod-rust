@@ -37,7 +37,7 @@ use algo_avm::txn_fields;
 use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
 use algo_types::{
-    Address, HoldingRef, LocalsRef, ResourceRef, SignedTransaction, TealValue, Transaction,
+    Address, HoldingRef, LocalsRef, ResourceRef, Round, SignedTransaction, TealValue, Transaction,
 };
 use sha2::{Digest, Sha512_256};
 
@@ -6549,6 +6549,49 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         false
     }
 
+    // ---- Voter / stake queries (issue #1215) ----
+    //
+    // Both opcodes answer from the historical "balance round" -- go's
+    // `agreement.BalanceRound(current, cparams)`, i.e.
+    // `2*SeedRefreshInterval*SeedLookback` rounds back from the round being
+    // built (`ledger/eval/eval.go::roundCowBase.balanceRound`) -- not
+    // current ledger state. `self.round` here already equals go's `current`
+    // (`x.rnd+1`, the round being built -- see `apply.rs`'s
+    // `ApplyContext::round = block.round.0`, threaded straight through to
+    // `LedgerAvmContext::new`), so no extra `+1` is needed before computing
+    // the lookback round. `algo_agreement::balance_round` is the exact same
+    // function go's `balanceRound()` calls, already used for the identical
+    // lookback on the agreement/sortition path
+    // (`crate::agreement_bridge::membership_from_ledger`).
+
+    fn voter_params_get(
+        &self,
+        account: &[u8; 32],
+        field: u8,
+    ) -> Result<(TealValue, bool), AlgoError> {
+        self.note_account_access(account);
+        let addr = Address(*account);
+        let brnd = algo_agreement::balance_round(Round(self.round), &self.consensus);
+        let data = self.store.voter_agreement_data_at_round(brnd.0, &addr)?;
+        let value = match field {
+            // VoterBalance: online stake in microAlgos, with rewards.
+            0 => TealValue::Uint(data.micro_algos),
+            // VoterIncentiveEligible
+            1 => TealValue::Uint(data.incentive_eligible as u64),
+            _ => {
+                return Err(AlgoError::Avm {
+                    message: format!("unknown VoterParamsField index: {field}"),
+                })
+            }
+        };
+        Ok((value, data.micro_algos > 0))
+    }
+
+    fn online_stake(&self) -> Result<u64, AlgoError> {
+        let brnd = algo_agreement::balance_round(Round(self.round), &self.consensus);
+        self.store.online_stake_at_round(brnd.0, self.round)
+    }
+
     // ---- Box storage ----
     //
     // Every method below is implemented once, generalized over an explicit
@@ -6745,8 +6788,8 @@ mod tests {
     use super::*;
     use crate::state::LedgerState;
     use algo_types::{
-        AccountData, AppLocalState, AppParams, AssetHolding as AssetHoldingType, AssetParamsRecord,
-        StateSchema,
+        AccountData, AccountStatus, AppLocalState, AppParams, AssetHolding as AssetHoldingType,
+        AssetParamsRecord, StateSchema,
     };
     use std::collections::BTreeMap;
 
@@ -8445,6 +8488,258 @@ mod tests {
         let (val, exists) = ctx.acct_params_get(&[99u8; 32], 0).unwrap();
         assert!(!exists);
         assert_eq!(val, TealValue::Uint(0));
+    }
+
+    // ---- voter_params_get / online_stake tests (issue #1215) ----
+    //
+    // Regression coverage for `LedgerAvmContext` (the real production
+    // ledger-execution context) not overriding `AvmContext::voter_params_get`/
+    // `online_stake`, so every real TEAL v11+ program using either opcode
+    // unconditionally failed with "context unavailable: ...". The
+    // `ops/state.rs` opcode-level tests only ever exercised a local
+    // test-double `AvmContext` mock, never `LedgerAvmContext`, so this gap
+    // was invisible to existing coverage -- these tests go through
+    // `LedgerAvmContext` itself.
+
+    #[test]
+    fn voter_params_get_context_unavailable_bug_is_fixed() {
+        // Before the fix, both methods fell back to the `AvmContext` trait's
+        // default "context unavailable" stub on `LedgerAvmContext` -- this
+        // pins that the real context now answers instead of erroring.
+        let addr = [11u8; 32];
+        let txn = make_pay_txn(addr, [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.accounts.insert(
+            Address(addr),
+            AccountData {
+                micro_algos: 2_000_000,
+                status: AccountStatus::Online,
+                incentive_eligible: true,
+                ..Default::default()
+            },
+        );
+        let ctx = make_context(&mut store, vec![txn]);
+
+        let (val, exists) = ctx.voter_params_get(&addr, 0).unwrap();
+        assert!(exists);
+        assert_eq!(val, TealValue::Uint(2_000_000));
+
+        let (val, _) = ctx.voter_params_get(&addr, 1).unwrap();
+        assert_eq!(val, TealValue::Uint(1));
+
+        assert!(ctx.online_stake().is_ok());
+    }
+
+    #[test]
+    fn voter_params_get_offline_account_returns_zero_and_false() {
+        // Mirrors `AgreementLedgerBridge::lookup_agreement`'s offline-account
+        // handling (go's `TestLookupAgreement`): an offline account's stale
+        // balance/key material must not leak through `voter_params_get`.
+        let addr = [12u8; 32];
+        let txn = make_pay_txn(addr, [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.accounts.insert(
+            Address(addr),
+            AccountData {
+                micro_algos: 9_000_000,
+                status: AccountStatus::Offline,
+                incentive_eligible: true,
+                ..Default::default()
+            },
+        );
+        let ctx = make_context(&mut store, vec![txn]);
+
+        let (val, exists) = ctx.voter_params_get(&addr, 0).unwrap();
+        assert!(!exists);
+        assert_eq!(val, TealValue::Uint(0));
+
+        let (val, _) = ctx.voter_params_get(&addr, 1).unwrap();
+        assert_eq!(val, TealValue::Uint(0));
+    }
+
+    #[test]
+    fn voter_params_get_unknown_account_returns_zero_and_false() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        let (val, exists) = ctx.voter_params_get(&[99u8; 32], 0).unwrap();
+        assert!(!exists);
+        assert_eq!(val, TealValue::Uint(0));
+    }
+
+    #[test]
+    fn voter_params_get_unknown_field_errors() {
+        let addr = [13u8; 32];
+        let txn = make_pay_txn(addr, [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        let err = ctx.voter_params_get(&addr, 2).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("VoterParamsField"), "got: {msg}");
+    }
+
+    #[test]
+    fn online_stake_sums_online_accounts() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.accounts.insert(
+            Address([21u8; 32]),
+            AccountData {
+                micro_algos: 3_000_000,
+                status: AccountStatus::Online,
+                ..Default::default()
+            },
+        );
+        store.accounts.insert(
+            Address([22u8; 32]),
+            AccountData {
+                micro_algos: 7_000_000,
+                status: AccountStatus::Online,
+                ..Default::default()
+            },
+        );
+        // Offline stake must not be counted.
+        store.accounts.insert(
+            Address([23u8; 32]),
+            AccountData {
+                micro_algos: 1_000_000,
+                status: AccountStatus::Offline,
+                ..Default::default()
+            },
+        );
+        let ctx = make_context(&mut store, vec![txn]);
+
+        assert_eq!(ctx.online_stake().unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn voter_params_get_and_online_stake_use_real_balance_round_lookback() {
+        // The defining semantic this issue's design decision (acceptance
+        // criterion #1) commits to: both opcodes answer from the historical
+        // "balance round" (`agreement.BalanceRound`, `ledger/eval/eval.go::
+        // roundCowBase.balanceRound`), not current ledger state. This test
+        // proves it against the real `SqliteLedger` backend (which persists
+        // per-round online-account history via `onlineaccounts`, unlike the
+        // in-memory `LedgerState` used by the other tests here): an account
+        // online at an early round, then taken offline at a later round,
+        // must still read back as online through `LedgerAvmContext` when the
+        // queried round's balance-round lookback lands before the
+        // went-offline round -- and must read back as offline once the
+        // lookback round passes it. `ConsensusParams::default()`'s balance
+        // lookback (`2*SeedRefreshInterval*SeedLookback` = `2*80*2` = 320)
+        // happens to equal `MaxBalLookback`, matching go-algorand.
+        let mut store = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([31u8; 32]);
+
+        store.begin_block().unwrap();
+        store.set_current_round(Round(100));
+        store.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                incentive_eligible: true,
+                vote_id: Some([1u8; 32]),
+                selection_id: Some([2u8; 32]),
+                vote_first_valid: 1,
+                vote_last_valid: 100_000,
+                vote_key_dilution: 10_000,
+                ..Default::default()
+            },
+        );
+        store.commit_block().unwrap();
+
+        // `online_stake_at_round`'s total reads (a) a per-round online-supply
+        // snapshot (`onlineroundparamstail`) keyed by *exact* round match,
+        // written by every `commit_block` from (b) the `accounttotals`
+        // aggregate -- which the raw `set_account` trait method used above
+        // does not itself maintain (that bookkeeping lives in `apply.rs`'s
+        // higher-level account-update helpers, not exercised by this
+        // store-level test). Seed `accounttotals` explicitly, matching the
+        // pattern `online_circulation_at_round`'s own tests use, so the
+        // round-130 no-op commit below captures the intended 5,000,000
+        // online total rather than an un-seeded zero.
+        store
+            .put_account_totals_seed(5_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        store.begin_block().unwrap();
+        store.set_current_round(Round(130));
+        store.commit_block().unwrap();
+
+        store.begin_block().unwrap();
+        store.set_current_round(Round(400));
+        store.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 1_000_000,
+                status: AccountStatus::Offline,
+                ..Default::default()
+            },
+        );
+        store.commit_block().unwrap();
+        store
+            .put_account_totals_seed(0, 0, 1_000_000, 0, 0, 0)
+            .unwrap();
+
+        // Same no-op-commit reasoning as round 130 above, for the late
+        // context's exact balance round (430).
+        store.begin_block().unwrap();
+        store.set_current_round(Round(430));
+        store.commit_block().unwrap();
+
+        let txn = make_pay_txn([31u8; 32], [20u8; 32], 5000);
+
+        // Building round 450: balance round = 450 - 320 = 130, which lands
+        // after the round-100 Online snapshot and before the round-400
+        // Offline one -- must read back Online.
+        let ctx_early = LedgerAvmContext::new(
+            &mut store,
+            vec![txn.clone()],
+            0,
+            450,
+            12345,
+            42,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+        );
+        let (val, exists) = ctx_early.voter_params_get(&addr.0, 0).unwrap();
+        assert!(
+            exists,
+            "balance round 130 must still see the round-100 Online snapshot"
+        );
+        assert_eq!(val, TealValue::Uint(5_000_000));
+        let (val, _) = ctx_early.voter_params_get(&addr.0, 1).unwrap();
+        assert_eq!(val, TealValue::Uint(1));
+        assert_eq!(ctx_early.online_stake().unwrap(), 5_000_000);
+        drop(ctx_early);
+
+        // Building round 750: balance round = 750 - 320 = 430, past the
+        // round-400 Offline snapshot -- must now read back Offline/zero.
+        let ctx_late = LedgerAvmContext::new(
+            &mut store,
+            vec![txn],
+            0,
+            750,
+            12345,
+            42,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+        );
+        let (val, exists) = ctx_late.voter_params_get(&addr.0, 0).unwrap();
+        assert!(
+            !exists,
+            "balance round 430 must see the round-400 Offline snapshot"
+        );
+        assert_eq!(val, TealValue::Uint(0));
+        assert_eq!(ctx_late.online_stake().unwrap(), 0);
     }
 
     // ---- LogicSig args tests ----

@@ -1666,6 +1666,47 @@ impl crate::store_trait::LedgerStore for LedgerState {
         Ok(())
     }
 
+    // ---- Balance-round-lookback online-participation queries (issue #1215) ----
+    //
+    // `LedgerState` is the in-memory test/simulation backend -- it does not
+    // persist a per-round online-account history the way `SqliteLedger`'s
+    // `onlineaccounts` table does (populated by real block commits; see
+    // `SqliteLedger::get_online_account_at_round`/`online_circulation_at_round`
+    // for the historically-accurate implementation used by real ledger
+    // execution). Both methods below therefore fall back to *current*
+    // account state rather than the true historical balance round -- a
+    // documented approximation acceptable here because `LedgerState` is not
+    // used on the real block-apply path (that always runs against
+    // `SqliteLedger`); `round`/`vote_rnd` are accepted but unused for
+    // exactly that reason.
+
+    fn voter_agreement_data_at_round(
+        &self,
+        _round: u64,
+        addr: &Address,
+    ) -> Result<crate::store_trait::VoterAgreementData, algo_error::AlgoError> {
+        let acct = self.get_account(addr).cloned().unwrap_or_default();
+        if acct.status != AccountStatus::Online {
+            return Ok(crate::store_trait::VoterAgreementData::default());
+        }
+        Ok(crate::store_trait::VoterAgreementData {
+            micro_algos: acct.micro_algos,
+            incentive_eligible: acct.incentive_eligible,
+        })
+    }
+
+    fn online_stake_at_round(
+        &self,
+        _round: u64,
+        _vote_rnd: u64,
+    ) -> Result<u64, algo_error::AlgoError> {
+        Ok(self
+            .online_accounts()
+            .iter()
+            .map(|(_, acct)| acct.micro_algos)
+            .fold(0u64, |acc, v| acc.saturating_add(v)))
+    }
+
     // ---- Voters snapshot: full participant array (issue #912) ----
 
     fn put_voters_participants(
