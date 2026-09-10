@@ -1690,6 +1690,31 @@ mod tests {
 
     // ── Empty tree tests ─────────────────────────────────────────────
 
+    /// Mirrors go's `TestTreeNumOfLeavesField`
+    /// (`crypto/merklearray/merkle_test.go:1048`): `num_of_elements` on a
+    /// freshly built tree equals the input array length, swept across
+    /// sizes 1/2/3 for both the plain `build` tree and the
+    /// `build_vector_commitment_tree` tree.
+    #[test]
+    fn num_of_elements_matches_input_size_for_plain_and_vc_trees() {
+        for size in 1..=3usize {
+            let arr = TestArray((0..size).map(|i| [i as u8; 32]).collect());
+            let factory = HashFactory::new(HashType::Sha512_256);
+            let tree = build(&arr, factory).unwrap();
+            assert_eq!(
+                tree.num_of_elements, size as u64,
+                "plain tree num_of_elements for size {size}"
+            );
+
+            let factory = HashFactory::new(HashType::Sha512_256);
+            let vc_tree = build_vector_commitment_tree(&arr, factory).unwrap();
+            assert_eq!(
+                vc_tree.num_of_elements, size as u64,
+                "VC tree num_of_elements for size {size}"
+            );
+        }
+    }
+
     #[test]
     fn empty_tree_has_empty_root() {
         let arr = TestArray(vec![]);
@@ -1918,6 +1943,69 @@ mod tests {
         assert_eq!(merkle_tree_to_vector_commitment_index(7, 3).unwrap(), 7);
     }
 
+    /// Mirrors the pathLen=2 table from go's `TestIndexing`
+    /// (`crypto/merklearray/vectorCommitmentArray_test.go:35`).
+    #[test]
+    fn bit_reversal_depth_two() {
+        assert_eq!(merkle_tree_to_vector_commitment_index(0, 2).unwrap(), 0);
+        assert_eq!(merkle_tree_to_vector_commitment_index(1, 2).unwrap(), 2);
+        assert_eq!(merkle_tree_to_vector_commitment_index(2, 2).unwrap(), 1);
+        assert_eq!(merkle_tree_to_vector_commitment_index(3, 2).unwrap(), 3);
+    }
+
+    /// Mirrors the pathLen=4 table from go's `TestIndexing`.
+    #[test]
+    fn bit_reversal_depth_four() {
+        let expected: [(u64, u64); 16] = [
+            (0, 0),
+            (1, 8),
+            (2, 4),
+            (3, 12),
+            (4, 2),
+            (5, 10),
+            (6, 6),
+            (7, 14),
+            (8, 1),
+            (9, 9),
+            (10, 5),
+            (11, 13),
+            (12, 3),
+            (13, 11),
+            (14, 7),
+            (15, 15),
+        ];
+        for (from, to) in expected {
+            assert_eq!(
+                merkle_tree_to_vector_commitment_index(from, 4).unwrap(),
+                to,
+                "pathLen=4, from={from}"
+            );
+        }
+    }
+
+    /// Mirrors the pathLen=63 (near-u64-max) boundary cases from go's
+    /// `TestIndexing`.
+    #[test]
+    fn bit_reversal_depth_sixty_three_boundary_cases() {
+        let path_len = 63u8;
+        assert_eq!(
+            merkle_tree_to_vector_commitment_index(0, path_len).unwrap(),
+            0
+        );
+        assert_eq!(
+            merkle_tree_to_vector_commitment_index((1u64 << 63) / 2, path_len).unwrap(),
+            1
+        );
+        assert_eq!(
+            merkle_tree_to_vector_commitment_index(1, path_len).unwrap(),
+            (1u64 << 63) / 2
+        );
+        assert_eq!(
+            merkle_tree_to_vector_commitment_index((1u64 << 63) - 1, path_len).unwrap(),
+            (1u64 << 63) - 1
+        );
+    }
+
     #[test]
     fn bit_reversal_is_involution() {
         for depth in 1..6u8 {
@@ -1989,6 +2077,52 @@ mod tests {
         let root = vec![0u8; 32];
         let result = verify(&root, &[], &proof);
         assert_eq!(result, Err(MerkleError::NonEmptyProofForEmptyElements));
+    }
+
+    /// Mirrors part of go's `TestMerkleVerifyEdgeCases`
+    /// (`crypto/merklearray/merkle_test.go:299`): a proof for one valid
+    /// position, verified against a map that also contains an extra
+    /// out-of-bounds position, must fail with `PosOutOfBound` rather than
+    /// silently ignoring the extra entry.
+    #[test]
+    fn verify_extra_out_of_bounds_position_in_map_fails() {
+        let data: Vec<[u8; 32]> = (0..4u8).map(|i| [i; 32]).collect();
+        let arr = TestArray(data.clone());
+        let factory = HashFactory::new(HashType::Sha512_256);
+        let tree = build(&arr, factory).unwrap();
+        let root = tree.root();
+
+        let proof = tree.prove(&[3]).unwrap();
+        let elem3 = TestMessage(data[3].to_vec());
+
+        // Out-of-bounds alone.
+        let result = verify(&root, &[(4, &elem3)], &proof);
+        assert!(matches!(result, Err(MerkleError::PosOutOfBound { .. })));
+
+        // Valid position plus an extra out-of-bounds position.
+        let result = verify(&root, &[(3, &elem3), (4, &elem3)], &proof);
+        assert!(matches!(result, Err(MerkleError::PosOutOfBound { .. })));
+    }
+
+    /// VC-tree counterpart of `verify_extra_out_of_bounds_position_in_map_fails`,
+    /// mirroring go's `TestMerkleVCVerifyEdgeCases`
+    /// (`crypto/merklearray/merkle_test.go:379`).
+    #[test]
+    fn verify_vector_commitment_extra_out_of_bounds_position_in_map_fails() {
+        let data: Vec<[u8; 32]> = (0..4u8).map(|i| [i; 32]).collect();
+        let arr = TestArray(data.clone());
+        let factory = HashFactory::new(HashType::Sha512_256);
+        let tree = build_vector_commitment_tree(&arr, factory).unwrap();
+        let root = tree.root();
+
+        let proof = tree.prove(&[3]).unwrap();
+        let elem3 = TestMessage(data[3].to_vec());
+
+        let result = verify_vector_commitment(&root, &[(4, &elem3)], &proof);
+        assert!(matches!(result, Err(MerkleError::PosOutOfBound { .. })));
+
+        let result = verify_vector_commitment(&root, &[(3, &elem3), (4, &elem3)], &proof);
+        assert!(matches!(result, Err(MerkleError::PosOutOfBound { .. })));
     }
 
     // ── Sumhash tree tests ───────────────────────────────────────────
@@ -2136,6 +2270,51 @@ mod tests {
 
         let result = tree.prove_single_leaf(0);
         assert!(matches!(result, Err(MerkleError::ProvingZeroCommitment)));
+    }
+
+    /// Mirrors go's `TestMerkleVCProveEdgeCases`
+    /// (`crypto/merklearray/merkle_test.go:260`): a 5-element VC tree
+    /// (padded to 8 leaves, depth 3) rejects both an in-padded-array but
+    /// past-the-real-elements position and a past-the-padded-array
+    /// position, and `prove(&[])` on a non-empty vs. empty tree returns an
+    /// empty-path proof with the tree's real depth (3) vs. 0 respectively.
+    #[test]
+    fn vc_prove_edge_cases() {
+        let data: Vec<[u8; 32]> = (0..5u8).map(|i| [i; 32]).collect();
+        let arr = TestArray(data);
+        let factory = HashFactory::new(HashType::Sha512_256);
+        let tree = build_vector_commitment_tree(&arr, factory).unwrap();
+
+        // Position 5 is outside the 5 real elements (but inside the
+        // padded-to-8 array).
+        assert!(matches!(
+            tree.prove(&[5]),
+            Err(MerkleError::PosOutOfBound { .. })
+        ));
+
+        // Position 8 is outside even the padded array.
+        assert!(matches!(
+            tree.prove(&[8]),
+            Err(MerkleError::PosOutOfBound { .. })
+        ));
+
+        // Proving nothing on a non-empty tree yields an empty-path proof
+        // at the tree's real depth.
+        let proof = tree.prove(&[]).unwrap();
+        assert!(proof.path.is_empty());
+        assert_eq!(proof.tree_depth, 3);
+
+        // An empty tree also accepts an empty proof request, at depth 0.
+        let empty_arr = TestArray(vec![]);
+        let factory = HashFactory::new(HashType::Sha512_256);
+        let empty_tree = build_vector_commitment_tree(&empty_arr, factory).unwrap();
+        assert!(matches!(
+            empty_tree.prove(&[0]),
+            Err(MerkleError::ProvingZeroCommitment)
+        ));
+        let proof = empty_tree.prove(&[]).unwrap();
+        assert!(proof.path.is_empty());
+        assert_eq!(proof.tree_depth, 0);
     }
 
     // ── Empty proof ──────────────────────────────────────────────────

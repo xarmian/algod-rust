@@ -55,3 +55,33 @@ impl From<[u8; 32]> for Digest {
         Self(bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors go's `TestDigest_IsZero` (`crypto/util_test.go:40`): the
+    /// all-zero digest reports `IsZero() == true`, and any digest with at
+    /// least one non-zero byte (first, middle, or last) reports `false`.
+    #[test]
+    fn is_zero_true_for_all_zero_bytes() {
+        assert!(Digest([0u8; 32]).is_zero());
+    }
+
+    #[test]
+    fn is_zero_false_when_any_byte_nonzero() {
+        let mut first = [0u8; 32];
+        first[0] = 1;
+        assert!(!Digest(first).is_zero());
+
+        let mut middle = [0u8; 32];
+        middle[16] = 1;
+        assert!(!Digest(middle).is_zero());
+
+        let mut last = [0u8; 32];
+        last[31] = 1;
+        assert!(!Digest(last).is_zero());
+
+        assert!(!Digest([0xffu8; 32]).is_zero());
+    }
+}
