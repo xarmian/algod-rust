@@ -459,6 +459,27 @@ mod tests {
         assert!(matches!(err, FalconError::InvalidSignatureSize(1)));
     }
 
+    /// Port of the "signature" subtest of go's
+    /// `TestTxnValidationPQSigRejectsMalformedProof`
+    /// (`data/transactions/verify/txn_test.go`): a signature blob larger than
+    /// `crypto.MaxPQSignatureSize` must be rejected on a cheap length check
+    /// before any FFI verification call, not just an undersized one (already
+    /// covered by `test_invalid_signature_empty`/`test_invalid_signature_one_byte`).
+    #[test]
+    fn test_invalid_signature_oversized() {
+        let seed = [0u8; FALCON_SEED_SIZE];
+        let (pubkey, _) = falcon_keygen(&seed).expect("keygen should succeed");
+
+        let oversized_sig = vec![0u8; FALCON_DET1024_SIG_COMPRESSED_MAXSIZE + 1];
+        let msg = b"test";
+
+        let err = falcon_verify(&pubkey, &oversized_sig, msg).unwrap_err();
+        assert!(matches!(
+            err,
+            FalconError::InvalidSignatureSize(n) if n == FALCON_DET1024_SIG_COMPRESSED_MAXSIZE + 1
+        ));
+    }
+
     // ── Phase 17 missing-test sweep (batch 6, docs/phase17/parity_crypto.md) ──
 
     #[test]

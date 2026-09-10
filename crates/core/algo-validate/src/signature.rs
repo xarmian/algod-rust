@@ -1972,6 +1972,51 @@ mod tests {
     }
 
     #[test]
+    fn verify_logicsig_contract_account_with_blank_pqsig_unchanged() {
+        // Port of go's TestTxnGroupLogicOnlyAccountRemainsUnchanged
+        // (data/transactions/verify/txn_test.go): a logic-only (contract
+        // account) LogicSig that also carries an explicit but blank/zeroed
+        // `Lsig.PQsig` field must verify exactly as if PQsig were absent --
+        // `Lsig.pqsig.blank()` must not be counted toward the
+        // sig/msig/lmsig/pqsig mutual-exclusivity total (see `has_pqsig` in
+        // `verify_logicsig_with_tracer`), and program-only ("logic-only
+        // account") authorization must still succeed.
+        let logic = vec![0x06, 0x81, 0x01]; // TEAL v6, int 1
+
+        let mut program_msg = Vec::new();
+        program_msg.extend_from_slice(PROGRAM_PREFIX);
+        program_msg.extend_from_slice(&logic);
+        let hash = Sha512_256::digest(&program_msg);
+        let mut addr_bytes = [0u8; 32];
+        addr_bytes.copy_from_slice(&hash);
+        let contract_addr = Address(addr_bytes);
+
+        let txn = minimal_pay_txn(contract_addr);
+        let lsig = LogicSig {
+            logic: ByteBuf::from(logic),
+            sig: [0u8; 64],
+            msig: None,
+            args: None,
+            lmsig: None,
+            pqsig: Some(PQSig::default()), // present but blank
+        };
+
+        let stx = SignedTransaction {
+            txn,
+            sig: [0u8; 64],
+            msig: None,
+            lsig: Some(lsig),
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        assert!(verify_lsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
+        assert!(verify_sig(&stx).is_ok());
+    }
+
+    #[test]
     fn verify_logicsig_contract_account_wrong_sender() {
         let logic = vec![0x06, 0x81, 0x01];
         let wrong_sender = Address([0xDD; 32]);
@@ -3212,6 +3257,97 @@ mod tests {
         let group = [stx.clone()];
         let mut budget = GroupBudget::for_logicsig(1);
         assert!(verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus).is_ok());
+    }
+
+    /// Port of go's `TestPQSigVerifyRejectsChangedTransaction`
+    /// (`data/transactions/pqsig_test.go:332`), at the pqsig-over-Transaction
+    /// wiring level (`verify_transaction_signature`) rather than just the
+    /// Falcon crypto-primitive level (`test_verify_wrong_message` in
+    /// `algo-falcon`): a valid PQSig signed over one transaction must be
+    /// rejected once the transaction it accompanies is mutated afterward
+    /// (the signed message is derived from the transaction's own canonical
+    /// encoding, so it must change too).
+    #[test]
+    fn pqsig_rejects_when_transaction_changed_after_signing() {
+        let (pk, sk, salt, addr) = falcon_identity(21);
+        let txn = minimal_pay_txn(addr);
+
+        let canonical = canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+        msg.extend_from_slice(TX_PREFIX);
+        msg.extend_from_slice(&canonical);
+        let sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(sig),
+        };
+        let mut stx = SignedTransaction {
+            txn,
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+        // Mutate the transaction after signing -- the signature was computed
+        // over the original amount.
+        stx.txn.amount += 1;
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err("a PQSig must not verify against a transaction it wasn't signed over");
+        assert!(
+            err.to_string()
+                .contains("pq falcon signature verification failed"),
+            "expected a signature-verification failure, got: {err}"
+        );
+    }
+
+    /// Port of go's `TestPQSigVerifyRejectsChangedSignature`
+    /// (`data/transactions/pqsig_test.go:343`), at the pqsig-over-Transaction
+    /// wiring level rather than just the Falcon crypto-primitive level
+    /// (`test_verify_wrong_pubkey` in `algo-falcon`): flipping a byte of the
+    /// signature itself (transaction and public key unchanged) must be
+    /// rejected too.
+    #[test]
+    fn pqsig_rejects_when_signature_bytes_changed() {
+        let (pk, sk, salt, addr) = falcon_identity(22);
+        let txn = minimal_pay_txn(addr);
+
+        let canonical = canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+        msg.extend_from_slice(TX_PREFIX);
+        msg.extend_from_slice(&canonical);
+        let mut sig = algo_falcon::falcon_sign(&sk, &msg).expect("falcon sign");
+        // Flip a byte inside the signature payload (mirrors the existing
+        // `stxn.Lsig.PQsig.Signature[0] ^= 1` pattern go uses for its
+        // "wrong-signature" subtest).
+        sig[0] ^= 0x01;
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(sig),
+        };
+        let stx = SignedTransaction {
+            txn,
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err("a tampered PQSig signature must not verify");
+        assert!(
+            err.to_string()
+                .contains("pq falcon signature verification failed"),
+            "expected a signature-verification failure, got: {err}"
+        );
     }
 
     #[test]
