@@ -29,6 +29,21 @@ use algo_types::{
 /// `include_values` was requested.
 pub type BoxPage = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
+/// Minimal per-account online-participation data as of a historical
+/// "balance round" -- the subset of go-algorand's `basics.OnlineAccountData`
+/// that the `voter_params_get` AVM opcode (0x74) exposes. See
+/// [`LedgerStore::voter_agreement_data_at_round`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VoterAgreementData {
+    /// Online balance with rewards applied, as of the balance round. Zero
+    /// for an account that was not online at that round (matches go's
+    /// all-zero `basics.OnlineAccountData{}` for a non-online lookup).
+    pub micro_algos: u64,
+    /// Whether the account had opted into block payouts (`IncentiveEligible`)
+    /// as of the balance round.
+    pub incentive_eligible: bool,
+}
+
 /// Abstraction over ledger storage backends.
 ///
 /// Both the in-memory `LedgerState` and a future SQLite backend implement
@@ -555,6 +570,51 @@ pub trait LedgerStore {
     /// backend.
     fn online_accounts(&self) -> Vec<(Address, AccountData)>;
 
+    // ---- Balance-round-lookback online-participation queries (issue #1215) ----
+    //
+    // Both back the incentive-opcode pair `voter_params_get`/`online_stake`
+    // (AVM v11+, go commit `98fdd2a09`) via `LedgerAvmContext`
+    // (`avm_context.rs`). go-algorand answers both from the historical
+    // "balance round" (`agreement.BalanceRound`, i.e.
+    // `2*SeedRefreshInterval*SeedLookback` rounds back from the round being
+    // built -- see `ledger/eval/eval.go::roundCowBase.balanceRound`), not
+    // current ledger state, so the round is a caller-supplied parameter
+    // here rather than implicit "now".
+    //
+    // No default implementation, for the same reason as `online_accounts`
+    // above: silently falling back to zero/empty would make every real
+    // v11+ TEAL program using these opcodes observe wrong (not just
+    // unavailable) consensus data.
+
+    /// Per-account online-participation data as of `round`, for the subset
+    /// of go-algorand's `basics.OnlineAccountData` that `voter_params_get`
+    /// (opcode 0x74, `data/transactions/logic/eval.go::opVoterParamsGet`)
+    /// needs: online balance with rewards applied, and whether the account
+    /// had opted into block payouts (`IncentiveEligible`).
+    ///
+    /// An account that was not online (or unknown) at `round` returns
+    /// [`VoterAgreementData::default`] (all zero), matching go's
+    /// `basics.OnlineAccountData{}` sentinel returned by
+    /// `InternalLedger.LookupAgreement` for a non-online account -- see
+    /// `AgreementLedgerBridge::lookup_agreement` (`agreement_bridge.rs`),
+    /// which implements the same historical-then-current-state fallback for
+    /// the agreement/sortition path that this mirrors for the AVM path.
+    fn voter_agreement_data_at_round(
+        &self,
+        round: u64,
+        addr: &Address,
+    ) -> Result<VoterAgreementData, AlgoError>;
+
+    /// Total online stake ("circulation") to report as of `round`, adjusted
+    /// for the stake behind participation keys that will have expired by
+    /// `vote_rnd`. Backs the `online_stake` opcode (0x75,
+    /// `data/transactions/logic/eval.go::opOnlineStake` /
+    /// `ledger/eval/eval.go::roundCowBase.onlineStake`), which calls
+    /// `Ledger.OnlineCirculation(brnd, x.rnd+1)` -- the same accessor
+    /// `AgreementLedgerBridge::circulation` already uses for agreement's
+    /// sortition/committee-sizing lookback.
+    fn online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError>;
+
     /// Store a voters snapshot -- `(voters_commitment, online_total_weight)`
     /// -- keyed by the round it was taken at (go's `votersForRoundCache` map
     /// key).
@@ -624,7 +684,10 @@ pub trait LedgerStore {
     fn put_voters_participants(
         &mut self,
         round: u64,
-        participants: &[(algo_types::Address, algo_consensus_crypto::stateproof::Participant)],
+        participants: &[(
+            algo_types::Address,
+            algo_consensus_crypto::stateproof::Participant,
+        )],
     ) -> Result<(), AlgoError> {
         let _ = (round, participants);
         Ok(())
@@ -640,7 +703,12 @@ pub trait LedgerStore {
         &self,
         round: u64,
     ) -> Result<
-        Option<Vec<(algo_types::Address, algo_consensus_crypto::stateproof::Participant)>>,
+        Option<
+            Vec<(
+                algo_types::Address,
+                algo_consensus_crypto::stateproof::Participant,
+            )>,
+        >,
         AlgoError,
     > {
         let _ = round;

@@ -39,7 +39,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::catchpoint::verify::{encode_mixed_map, encode_msgpack_uint};
 use crate::lease::LeaseTable;
 use crate::rewards::{normalized_online_balance, REWARD_UNITS};
-use crate::store_trait::LedgerStore;
+use crate::store_trait::{LedgerStore, VoterAgreementData};
 
 /// Compute the normalized online balance for an account and convert to i64
 /// for SQLite storage. Panics if the result does not fit in i64.
@@ -7167,6 +7167,37 @@ impl LedgerStore for SqliteLedger {
                 message: format!("delete_voters_participants error: {e}"),
             })?;
         Ok(())
+    }
+
+    // ---- Balance-round-lookback online-participation queries (issue #1215) ----
+
+    /// Mirrors `AgreementLedgerBridge::lookup_agreement`'s historical
+    /// (`onlineaccounts` table) lookup with a current-account-state fallback
+    /// when no historical row exists, gated on `AccountStatus::Online` so an
+    /// offline account never leaks its raw balance/stale key material into
+    /// `voter_params_get` -- see that function's doc comment
+    /// (`agreement_bridge.rs`) for the full go-algorand rationale
+    /// (`LookupAgreement`/`basics.OnlineAccountData{}`).
+    fn voter_agreement_data_at_round(
+        &self,
+        round: u64,
+        addr: &Address,
+    ) -> Result<VoterAgreementData, AlgoError> {
+        let acct = match self.get_online_account_at_round(addr, round) {
+            Ok(Some(acct)) => acct,
+            Ok(None) | Err(_) => self.get_account(addr).unwrap_or_default(),
+        };
+        if acct.status != AccountStatus::Online {
+            return Ok(VoterAgreementData::default());
+        }
+        Ok(VoterAgreementData {
+            micro_algos: acct.micro_algos,
+            incentive_eligible: acct.incentive_eligible,
+        })
+    }
+
+    fn online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError> {
+        self.online_circulation_at_round(round, vote_rnd)
     }
 }
 

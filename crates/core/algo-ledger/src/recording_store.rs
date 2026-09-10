@@ -538,4 +538,18 @@ impl<L: LedgerStore> LedgerStore for RecordingStore<'_, L> {
     fn delete_voters_snapshot(&mut self, round: u64) -> Result<(), AlgoError> {
         self.inner.delete_voters_snapshot(round)
     }
+
+    // ---- Balance-round-lookback online-participation queries (issue #1215) ----
+
+    fn voter_agreement_data_at_round(
+        &self,
+        round: u64,
+        addr: &Address,
+    ) -> Result<crate::store_trait::VoterAgreementData, AlgoError> {
+        self.inner.voter_agreement_data_at_round(round, addr)
+    }
+
+    fn online_stake_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError> {
+        self.inner.online_stake_at_round(round, vote_rnd)
+    }
 }
