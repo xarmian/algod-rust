@@ -4810,6 +4810,17 @@ pub async fn run(
                     as i64,
                 incoming_connections_limit: resolved_net.incoming_connections_limit as i64,
                 is_listen_server,
+                // Issue #1221: mirrors go's `P2PNetwork`'s own
+                // `relayMessages := cfg.IsListenServer() || cfg.ForceRelayMessages`
+                // (`network/p2pNetwork.go:245`) — the same
+                // `is_listen_server`/`force_relay_messages` inputs already
+                // computed above for the WS transport's `net_config.relay_messages`
+                // (issue #748), just combined the way the P2P transport's
+                // own `wantTXGossip` seeding expects (unlike the WS field,
+                // never gated on `ws_active` — a P2P-only node's `relayMessages`
+                // doesn't depend on whether the WS stack is even running).
+                relay_messages: is_listen_server || node_config.force_relay_messages,
+                force_fetch_transactions: node_config.force_fetch_transactions,
             })
             .await
             .map_err(|e| anyhow::anyhow!("failed to start P2P transport: {e}"))?,

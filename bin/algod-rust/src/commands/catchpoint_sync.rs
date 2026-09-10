@@ -1387,6 +1387,8 @@ mod tests {
             gossip_fanout: 4,
             incoming_connections_limit: -1,
             is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
         })
         .await
         .expect("start listener");
@@ -1414,6 +1416,8 @@ mod tests {
             gossip_fanout: 4,
             incoming_connections_limit: -1,
             is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
         })
         .await
         .expect("start dialer");

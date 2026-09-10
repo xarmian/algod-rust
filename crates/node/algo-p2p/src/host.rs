@@ -738,6 +738,20 @@ impl P2pHost {
             })
     }
 
+    /// Whether this host currently holds a live gossipsub subscription to
+    /// `topic_name`. Exercised by tests (issue #1221's `P2pTransport`
+    /// TX-topic gating) to observe the actual gossipsub subscription state
+    /// this host's underlying `gossipsub::Behaviour` tracks, rather than
+    /// only a caller-side bookkeeping flag.
+    pub fn gossipsub_is_subscribed(&self, topic_name: &str) -> bool {
+        let target = crate::pubsub::ident_topic(topic_name).hash();
+        self.swarm
+            .behaviour()
+            .gossipsub
+            .topics()
+            .any(|t| *t == target)
+    }
+
     /// Publish `data` to a gossipsub topic. `data` is the raw tag payload,
     /// unwrapped — the topic name itself conveys the message tag, mirroring
     /// go-algorand's `serviceImpl.Publish` (`network/p2p/pubsub.go`), which
