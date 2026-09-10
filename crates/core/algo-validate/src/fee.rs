@@ -413,6 +413,80 @@ mod tests {
     use super::*;
     use algo_types::consensus::{consensus_params_for_version, CONSENSUS_V41, CONSENSUS_V42};
 
+    // ── mul2div_u64 (mirrors go's basics.Mul2div) ─────────────────
+
+    #[test]
+    fn mul2div_u64_matches_go_test_vectors() {
+        // Mirrors go-algorand's TestMul2div (data/basics/units_test.go):
+        // a battery of (a,b,c,d,expected_quotient) cases for `a*b*c/d`,
+        // including large/near-overflow values that exercise the
+        // carry-safe three-widening-multiply construction.
+        let cases: &[(u64, u64, u64, u128, u64)] = &[
+            (1, 1, 1, 1, 1),
+            (2, 1, 1, 1, 2),
+            (1, 2, 1, 1, 2),
+            (1, 1, 2, 1, 2),
+            (1, 1, 2, 2, 1),
+            (10, 20, 5, 2, 500),
+            (100, 200, 50, 2000, 500),
+            (1, u64::MAX, 1, u64::MAX as u128, 1),
+            (u64::MAX, u64::MAX, 1, u64::MAX as u128, u64::MAX),
+            (
+                (u64::MAX - 1) / 2,
+                (u64::MAX - 1) / 2,
+                4,
+                (u64::MAX - 1) as u128,
+                u64::MAX - 1,
+            ),
+            // Zero handling
+            (0, 1, 1, 1, 0),
+            (1, 0, 1, 1, 0),
+            (1, 1, 0, 1, 0),
+            (0, 0, 0, 1, 0),
+            (u64::MAX, 0, u64::MAX, 1, 0),
+            // Division by 1
+            (100, 200, 50, 1, 1_000_000),
+            (1000, 1000, 1000, 1, 1_000_000_000),
+            // Intermediate overflow but final result fits:
+            // (2^32 * 2^32 * 2) / 2^63 = 2^65 / 2^63 = 4
+            (1 << 32, 1 << 32, 2, 1u128 << 63, 4),
+            // Near-overflow: result is just under 2^64
+            (u64::MAX, 1, 1, 1, u64::MAX),
+            (1, u64::MAX, 1, 1, u64::MAX),
+            (1, 1, u64::MAX, 1, u64::MAX),
+        ];
+        for &(a, b, c, d, expected) in cases {
+            let (quo, _rem, overflow) = mul2div_u64(a, b, c, d);
+            assert!(!overflow, "unexpected overflow for {a}*{b}*{c}/{d}");
+            assert_eq!(
+                quo, expected,
+                "{a}*{b}*{c}/{d}: got {quo}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn mul2div_u64_matches_go_overflow_test_vectors() {
+        // Mirrors go-algorand's TestMul2divOverflow (data/basics/units_test.go):
+        // cases where a*b*c/d genuinely exceeds u64::MAX and must saturate,
+        // reporting overflow.
+        let cases: &[(u64, u64, u64, u128)] = &[
+            (u64::MAX, u64::MAX, u64::MAX, u64::MAX as u128),
+            (u64::MAX, u64::MAX, u64::MAX, 1),
+            (u64::MAX, u64::MAX, u64::MAX / 2 + 1, 1),
+            (u64::MAX, u64::MAX, 2, 1),
+            (u64::MAX, u64::MAX, 2, u64::MAX as u128),
+            (1 << 43, 1 << 43, 1 << 43, 1u128 << 63),
+            // Overflow in middle digit addition (M + J >= 2^64 with L = 0)
+            (2, u64::MAX, (1 << 63) + 2, 4),
+        ];
+        for &(a, b, c, d) in cases {
+            let (quo, _rem, overflow) = mul2div_u64(a, b, c, d);
+            assert!(overflow, "expected overflow for {a}*{b}*{c}/{d}");
+            assert_eq!(quo, u64::MAX, "overflow must saturate to u64::MAX");
+        }
+    }
+
     // ── micros_mul_int ──────────────────────────────────────────
 
     #[test]

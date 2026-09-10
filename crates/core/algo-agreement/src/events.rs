@@ -1741,6 +1741,85 @@ mod tests {
     }
 
     #[test]
+    fn message_event_msgpack_roundtrip() {
+        // Mirrors go-algorand's TestMarshalUnmarshalmessageEvent /
+        // TestRandomizedEncodingmessageEvent (agreement/msgp_gen_test.go):
+        // roundtrip a populated (non-default) messageEvent through msgpack.
+        let mut input = InternalMessage::default();
+        input.unauthenticated_vote.raw_vote.round = Round(42);
+        let me = MessageEvent {
+            t: EventType::VotePresent,
+            input,
+            err: Some(SerializableError::new("boom".to_string())),
+            task_index: 7,
+            tail: Some(Box::new(MessageEvent {
+                t: EventType::PayloadPresent,
+                ..MessageEvent::default()
+            })),
+            cancelled: true,
+            proto: ConsensusVersionView::default(),
+        };
+        let bytes = rmp_serde::to_vec_named(&me).expect("msgpack serialize");
+        let decoded: MessageEvent = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(decoded.t, EventType::VotePresent);
+        assert_eq!(decoded.input.unauthenticated_vote.raw_vote.round, Round(42));
+        assert_eq!(decoded.task_index, 7);
+        assert!(decoded.cancelled);
+        assert_eq!(decoded.tail.unwrap().t, EventType::PayloadPresent);
+        assert!(decoded.err.is_some());
+    }
+
+    #[test]
+    fn threshold_event_msgpack_roundtrip() {
+        // Mirrors go-algorand's TestMarshalUnmarshalthresholdEvent /
+        // TestRandomizedEncodingthresholdEvent (agreement/msgp_gen_test.go):
+        // roundtrip a populated (non-default) thresholdEvent through msgpack.
+        let te = ThresholdEvent {
+            t: EventType::NextThreshold,
+            round: Round(5),
+            period: Period(3),
+            step: crate::step::Step(4),
+            proposal: ProposalValue {
+                original_period: Period(1),
+                original_proposer: algo_types::Address([0x77; 32]),
+                block_digest: algo_types::Digest([0x88; 32]),
+                encoding_digest: algo_types::Digest([0x99; 32]),
+            },
+            ..ThresholdEvent::default()
+        };
+        let bytes = rmp_serde::to_vec_named(&te).expect("msgpack serialize");
+        let decoded: ThresholdEvent = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(decoded.t, EventType::NextThreshold);
+        assert_eq!(decoded.round, Round(5));
+        assert_eq!(decoded.period, Period(3));
+        assert_eq!(
+            decoded.proposal.original_proposer,
+            algo_types::Address([0x77; 32])
+        );
+    }
+
+    #[test]
+    fn next_threshold_status_event_msgpack_roundtrip() {
+        // Mirrors go-algorand's TestMarshalUnmarshalnextThresholdStatusEvent /
+        // TestRandomizedEncodingnextThresholdStatusEvent
+        // (agreement/msgp_gen_test.go): roundtrip a populated
+        // nextThresholdStatusEvent through msgpack.
+        let ev = NextThresholdStatusEvent {
+            proposal: ProposalValue {
+                original_period: Period(2),
+                original_proposer: algo_types::Address([0x11; 32]),
+                block_digest: algo_types::Digest([0x22; 32]),
+                encoding_digest: algo_types::Digest([0x33; 32]),
+            },
+            bottom: true,
+        };
+        let bytes = rmp_serde::to_vec_named(&ev).expect("msgpack serialize");
+        let decoded: NextThresholdStatusEvent =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(decoded, ev);
+    }
+
+    #[test]
     fn event_display() {
         let e = Event::Empty(EmptyEvent);
         assert_eq!(format!("{e}"), "none");

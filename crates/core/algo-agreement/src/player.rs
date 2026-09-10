@@ -1593,6 +1593,27 @@ mod tests {
     }
 
     #[test]
+    fn proposal_table_msgpack_roundtrip() {
+        // Mirrors go-algorand's TestMarshalUnmarshalproposalTable /
+        // TestRandomizedEncodingproposalTable (agreement/msgp_gen_test.go):
+        // roundtrip a populated (non-empty pending map, non-zero next_seq)
+        // proposalTable through msgpack.
+        let mut pt = ProposalTableImpl::default();
+        let mut me = MessageEvent::default();
+        me.t = crate::events::EventType::PayloadPresent;
+        let seq1 = pt.push(Some(Box::new(me)));
+        let _seq2 = pt.push(None);
+
+        let bytes = rmp_serde::to_vec_named(&pt).expect("msgpack serialize");
+        let mut decoded: ProposalTableImpl = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        let popped = decoded.pop(seq1).expect("pending entry should survive roundtrip");
+        assert_eq!(popped.t, crate::events::EventType::PayloadPresent);
+        // next_seq must survive so future pushes keep Go-matching sequence numbers.
+        let seq3 = decoded.push(None);
+        assert_eq!(seq3, 3);
+    }
+
+    #[test]
     fn proposal_table_push_pop() {
         let mut pt = ProposalTableImpl::default();
         let me = MessageEvent::default();
