@@ -2395,9 +2395,42 @@ where
                 }
             };
 
-            // Write to the WebSocket.
-            if let Err(e) = sink.send(WsMessage::Binary(data)).await {
-                return Err(format!("write error: {e}"));
+            // Write to the WebSocket, bounded by the remaining slice of the
+            // message's MAX_MESSAGE_QUEUE_DURATION budget (issue #1220).
+            //
+            // Go's watchdog (`wsPeer.checkSlowWritingPeer`,
+            // `network/wsPeer.go:1014`) runs on an independent periodic
+            // timer and force-disconnects a peer whose *currently in-flight*
+            // write has been blocked past `maxMessageQueueDuration` (25s).
+            // We have no second timer/task; instead we bound the awaited
+            // `sink.send()` itself so a peer that accepts the TCP connection
+            // but stops reading cannot pin this task open indefinitely.
+            // `remaining_budget` is recomputed here (rather than reusing
+            // `age` above) so that time already spent in filtering/encoding
+            // counts against the same 25s ceiling as Go's single
+            // enqueue-to-write window.
+            let remaining_budget =
+                MAX_MESSAGE_QUEUE_DURATION.saturating_sub(send_msg.enqueued.elapsed());
+            match tokio::time::timeout(remaining_budget, sink.send(WsMessage::Binary(data))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(format!("write error: {e}")),
+                Err(_) => {
+                    // The send timed out. Per tokio_tungstenite's
+                    // `Sink::send` contract, an incomplete/timed-out send
+                    // can leave the underlying `WebSocketStream` mid-frame
+                    // (a partial write buffered but not flushed) — the same
+                    // hazard the existing "stale message" branch above
+                    // avoids by never touching the sink at all. Do not
+                    // attempt to reuse `sink` after this; treat it exactly
+                    // like the stale-message and write-error paths and
+                    // close the connection.
+                    tracing::warn!(
+                        peer = %remote_addr,
+                        tag = %tag,
+                        "write_loop: write timed out (blocked past MAX_MESSAGE_QUEUE_DURATION budget)"
+                    );
+                    return Err("write timed out".to_string());
+                }
             }
 
             // Do NOT update last_packet_time here — only inbound traffic
@@ -2692,6 +2725,78 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Blocked-write test infrastructure (issue #1220)
+    // -----------------------------------------------------------------------
+
+    /// A `Stream + Sink<WsMessage>` that never completes a write.
+    ///
+    /// `poll_ready`/`start_send`/`poll_flush` all return [`Poll::Pending`]
+    /// forever (without registering a waker — nothing but an external
+    /// timer, e.g. `tokio::time::timeout`, will ever cause the task polling
+    /// this sink to be woken again). Simulates a peer whose TCP socket
+    /// accepted the connection but stopped reading: a real stalled
+    /// connection is hard to reproduce deterministically and fast in a
+    /// loopback-socket test, so this stands in for it.
+    ///
+    /// Implements `Stream` too (always `Poll::Pending`) purely so it can be
+    /// `.split()` into a `SplitSink` the same way a real
+    /// `WebSocketStream` is — [`process_write_command`]/[`write_loop`] are
+    /// generic over the sink half, not the combined stream, so the stream
+    /// side is never actually polled in these tests.
+    struct BlockedWsHalf;
+
+    impl futures_util::Stream for BlockedWsHalf {
+        type Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl futures_util::Sink<WsMessage> for BlockedWsHalf {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, _item: WsMessage) -> Result<(), Self::Error> {
+            unreachable!("poll_ready never resolves, so start_send is never called")
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Backdate an `enqueued` timestamp so only `remaining` of the real
+    /// [`MAX_MESSAGE_QUEUE_DURATION`] (25s) budget is left — the same
+    /// "manipulate the enqueue timestamp" technique
+    /// `write_command_stale_message_returns_error` already uses to
+    /// exercise the staleness check without a real 25s wait. Lets the new
+    /// blocked-write tests below observe a `tokio::time::timeout` firing in
+    /// well under a second, without touching the production constant.
+    fn enqueued_with_remaining_budget(remaining: Duration) -> Instant {
+        Instant::now() - MAX_MESSAGE_QUEUE_DURATION.saturating_sub(remaining)
+    }
+
+    // -----------------------------------------------------------------------
     // Tag framing tests
     // -----------------------------------------------------------------------
 
@@ -2980,6 +3085,110 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("stale"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocked outbound write is bounded (issue #1220)
+    // -----------------------------------------------------------------------
+
+    /// A write whose *send* blocks past the remaining message-queue budget
+    /// must fail (closing the peer), not hang forever.
+    ///
+    /// Before the fix, `process_write_command`'s `WriteCommand::Data` arm
+    /// awaited `sink.send(...)` with no timeout at all, so this test would
+    /// hang until the test harness's own timeout killed it — this pins the
+    /// correct behavior: bounded by the remaining slice of
+    /// `MAX_MESSAGE_QUEUE_DURATION`, wrapped here in an outer
+    /// `tokio::time::timeout` so a regression fails fast instead of hanging
+    /// the whole test suite.
+    #[tokio::test]
+    async fn write_command_blocked_send_times_out() {
+        let (mut sink, _stream) = BlockedWsHalf.split();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+
+        // Only 100ms of the 25s budget remains — the blocked send must be
+        // aborted well within that, not after the full 25s.
+        let msg = OutgoingMessage::new(Tag::Transaction, b"stuck".to_vec());
+        let cmd = WriteCommand::Data(SendMessage {
+            msg,
+            enqueued: enqueued_with_remaining_budget(Duration::from_millis(100)),
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            process_write_command(
+                cmd,
+                &mut sink,
+                &send_message_tags,
+                "test",
+                PeerFeatureFlags::empty(),
+                &None,
+                0,
+                &Arc::new(AtomicBool::new(false)),
+                &mut None,
+            ),
+        )
+        .await
+        .expect("process_write_command must return well within the 5s test timeout");
+
+        assert!(result.is_err(), "a blocked send must fail, not succeed");
+        assert!(
+            result.unwrap_err().contains("timed out"),
+            "must be reported as a timeout, not some other error"
+        );
+    }
+
+    /// `close()` (i.e. cancelling the shared `CancellationToken`) during a
+    /// blocked write must not hang `write_loop` until `Drop`'s hard
+    /// `JoinHandle::abort()` — the write-timeout fix incidentally makes the
+    /// loop responsive again once the in-flight write's budget elapses, and
+    /// this proves that end-to-end through the real `write_loop` (not just
+    /// `process_write_command` in isolation).
+    #[tokio::test]
+    async fn close_during_blocked_write_terminates_write_loop() {
+        let (sink, _stream) = BlockedWsHalf.split();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let closing = CancellationToken::new();
+
+        let (high_prio_tx, high_prio_rx) = mpsc::channel::<WriteCommand>(10);
+        let (_bulk_tx, bulk_rx) = mpsc::channel::<WriteCommand>(10);
+
+        // Enqueue a message with only a sliver of budget left so the test
+        // doesn't wait anywhere near the real 25s ceiling.
+        let msg = OutgoingMessage::new(Tag::Transaction, b"stuck".to_vec());
+        high_prio_tx
+            .send(WriteCommand::Data(SendMessage {
+                msg,
+                enqueued: enqueued_with_remaining_budget(Duration::from_millis(100)),
+            }))
+            .await
+            .unwrap();
+
+        let closing_clone = closing.clone();
+        let write_task = tokio::spawn(write_loop(
+            sink,
+            high_prio_rx,
+            bulk_rx,
+            send_message_tags,
+            closing_clone,
+            "test".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        // Simulate a `close()` request arriving while the write is stuck:
+        // write_loop cannot observe this until the in-flight write's own
+        // timeout resolves (it's only checked between writes), which is
+        // exactly the "incidental" responsiveness the fix provides.
+        closing.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), write_task).await;
+        assert!(
+            result.is_ok(),
+            "write_loop must terminate within the message's timeout budget, \
+             not hang until Drop's abort()"
+        );
     }
 
     // -----------------------------------------------------------------------
