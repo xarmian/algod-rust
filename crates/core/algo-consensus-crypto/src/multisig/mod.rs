@@ -60,8 +60,16 @@ use sha2::{Digest, Sha512_256};
 /// `multiSigString` constant at `crypto/multisig.go:90`.
 pub const MULTISIG_ADDR_PREFIX: &[u8] = b"MultisigAddr";
 
-/// Maximum number of multisig public keys. Matches Go's `maxMultisig`
-/// constant at `crypto/multisig.go:91`.
+/// Maximum number of multisig subsigs Go's `MultisigVerify` accepts
+/// (`crypto/multisig.go:260`, enforced by `MultisigBatchPrep`).
+/// Matches Go's `maxMultisig` constant at `crypto/multisig.go:91`.
+///
+/// This cap is **verify-time only** in Go: `MultisigAddrGen` and
+/// `MultisigAssemble` place no limit on pubkey/signature count, so
+/// this crate (producer-side only — address derivation, signing,
+/// assembly) does not enforce it either. The verifier
+/// (`algo_validate::signature::verify_multisig`) is where the cap
+/// belongs; see issue #1207.
 pub const MAX_MULTISIG: usize = 255;
 
 /// Multisig version we support. Go's `MultisigAddrGen` rejects
@@ -74,17 +82,17 @@ pub const MULTISIG_VERSION_V1: u8 = 1;
 /// `Address = SHA512/256("MultisigAddr" || version || threshold || pk1 || pk2 || ... || pkN)`
 ///
 /// Mirrors `MultisigAddrGen` (`crypto/multisig.go:96-112`). Rejects
-/// `version != 1`, empty `pks`, `threshold == 0`, `threshold > pks.len()`,
-/// and `pks.len() > 255`.
+/// `version != 1`, empty `pks`, `threshold == 0`, and `threshold >
+/// pks.len()`. Deliberately does **not** reject `pks.len() >
+/// [`MAX_MULTISIG`]` — Go's `MultisigAddrGen` has no such cap; only
+/// `MultisigVerify` does, at verify time (see [`MAX_MULTISIG`]'s
+/// docs and issue #1207).
 pub fn multisig_addr_gen(version: u8, threshold: u8, pks: &[[u8; 32]]) -> Result<Address, Error> {
     if version != MULTISIG_VERSION_V1 {
         return Err(Error::UnknownVersion);
     }
     if threshold == 0 || pks.is_empty() || threshold as usize > pks.len() {
         return Err(Error::InvalidThreshold);
-    }
-    if pks.len() > MAX_MULTISIG {
-        return Err(Error::TooManyKeys);
     }
     let mut hasher = Sha512_256::new();
     hasher.update(MULTISIG_ADDR_PREFIX);
@@ -276,17 +284,21 @@ mod tests {
     }
 
     #[test]
-    fn addr_gen_too_many_keys() {
+    fn addr_gen_allows_more_than_max_multisig_keys() {
+        // go-algorand's `MultisigAddrGen` (`crypto/multisig.go:96-112`)
+        // places no cap on pubkey count — only `MultisigVerify` (via
+        // `MultisigBatchPrep`, `crypto/multisig.go:260`) rejects an
+        // oversized set, at verify time. A 256+-pubkey address must
+        // still generate successfully here (issue #1207); the cap
+        // belongs solely to the verifier
+        // (`algo_validate::signature::verify_multisig`).
         let mut pks = Vec::new();
         for _ in 0..=MAX_MULTISIG {
             let (_, pk) = fresh_signer();
             pks.push(pk);
         }
-        // 256 keys → reject.
-        assert_eq!(
-            multisig_addr_gen(1, 1, &pks).unwrap_err(),
-            Error::TooManyKeys
-        );
+        assert_eq!(pks.len(), MAX_MULTISIG + 1);
+        assert!(multisig_addr_gen(1, 1, &pks).is_ok());
     }
 
     /// Address is deterministic — same inputs yield same address.

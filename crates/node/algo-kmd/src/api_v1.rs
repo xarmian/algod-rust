@@ -928,12 +928,13 @@ async fn post_multisig_import(
             error_message(&Error::MultisigInvalidThreshold),
         );
     }
-    // Known divergence (TASK-219): algo-consensus-crypto adds a
-    // `pks.len() > MAX_MULTISIG (255)` rejection that Go's
-    // `MultisigAddrGen` doesn't have, so a 256+-pk import with a
-    // valid threshold returns 400 here but succeeds in Go.  Tracked
-    // for follow-up; practical impact is low because SDKs don't
-    // construct 256+-pk multisigs.
+    // TASK-219 (issue #1207) resolved: `algo_consensus_crypto::multisig_addr_gen`
+    // no longer caps `pks.len()` at 255 — matching Go's `MultisigAddrGen`
+    // (`crypto/multisig.go:96-112`), which places no such cap either. The
+    // 255-subsig cap lives solely at verify time, in
+    // `algo_validate::signature::verify_multisig` (mirroring Go's
+    // `MultisigVerify`/`MultisigBatchPrep`, `crypto/multisig.go:260`). A
+    // 256+-pk import with a valid threshold now succeeds here, matching Go.
 
     let addr = match blocking(move || handle.wallet.import_multisig(version, threshold, &pks)).await
     {

@@ -152,9 +152,11 @@ pub enum Error {
     TooManyKeys,
 
     /// `(version, threshold, pks)` rejected by multisig address
-    /// derivation — version != 1, threshold == 0 or > len(pks),
-    /// pks empty, or > 255 keys. Mirrors errors from `MultisigAddrGen`
-    /// (`crypto/multisig.go:96–112`).
+    /// derivation — version != 1, threshold == 0 or > len(pks), or
+    /// pks empty. Mirrors errors from `MultisigAddrGen`
+    /// (`crypto/multisig.go:96–112`), which places no cap on pubkey
+    /// count (unlike `MultisigVerify`'s verify-time cap — see
+    /// issue #1207).
     #[error("invalid multisig preimage")]
     MultisigInvalid,
 

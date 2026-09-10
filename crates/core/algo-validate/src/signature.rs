@@ -1890,6 +1890,46 @@ mod tests {
         assert!(err.to_string().contains("address mismatch"));
     }
 
+    /// Go-parity placement (issue #1207): go-algorand's `MultisigVerify`
+    /// (via `MultisigBatchPrep`, `crypto/multisig.go:260`) is the ONLY
+    /// place a >255-pubkey multisig is rejected -- `MultisigAddrGen`
+    /// itself places no cap. A 256-key multisig address must therefore
+    /// generate successfully (see `algo_consensus_crypto::multisig`'s
+    /// `addr_gen_allows_more_than_max_multisig_keys`) and be rejected
+    /// only here, at verify time, with Go's exact "too many subsigs"
+    /// placement (checked after the address-match check, before the
+    /// threshold-met check).
+    #[test]
+    fn verify_multisig_rejects_more_than_255_subsigs_at_verify_time() {
+        // 256 distinct keys: `signing_key_from_seed` fills all 32 seed
+        // bytes with the same value, so seeds 0..=255 give 256 distinct
+        // signers -- exactly enough to exceed the 255-subsig cap.
+        let keys: Vec<SigningKey> = (0u8..=255).map(signing_key_from_seed).collect();
+        assert_eq!(keys.len(), 256);
+        let msig_addr = compute_msig_addr(&keys, 1, 1);
+        let txn = minimal_pay_txn(msig_addr);
+
+        // Sign with key 0 only (threshold is 1, so this would otherwise pass).
+        let msig = build_multisig(&keys, &[0], 1, &txn);
+
+        let stx = SignedTransaction {
+            txn,
+            sig: [0u8; 64],
+            msig: Some(msig),
+            lsig: None,
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("too many multisig subsigs"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ---- LogicSig tests ----
 
     #[test]
