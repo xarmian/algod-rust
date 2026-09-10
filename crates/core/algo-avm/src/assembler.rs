@@ -3525,6 +3525,20 @@ mod tests {
     }
 
     #[test]
+    fn test_arg_unparseable_immediate_reports_parse_error() {
+        // TestAssembleArg's second case: `arg x` (a non-numeric immediate)
+        // is rejected with a parse-failure message rather than being
+        // silently accepted or reported as a generic "unknown field" error
+        // -- go's message is "unable to parse argument...".
+        let errs = expect_errors("#pragma version 8\narg x\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.starts_with("arg") && e.message.contains("unable to parse")),
+            "arg x: expected an 'unable to parse' error, got: {errs:?}"
+        );
+    }
+
+    #[test]
     fn test_immediate_ranges_load_store_ok() {
         // TestAssembleImmediateRanges: values within range assemble fine.
         // `store`'s immediate is an unsigned byte, so 0 is in range;

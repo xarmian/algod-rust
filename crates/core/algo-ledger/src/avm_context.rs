@@ -13116,6 +13116,106 @@ mod tests {
     }
 
     #[test]
+    fn box_replace_on_unlisted_name_rejected() {
+        // TestBoxReadWrite: `box_replace` against a name absent from the
+        // group's box-ref set (not in `available_boxes`, and no unnamed/
+        // newly-created-app access applies) fails with go's exact "invalid
+        // Box reference" message rather than e.g. a generic not-found error.
+        let mut store = LedgerState::new();
+        store.set_box(888, b"self", vec![0u8; 5]);
+        let mut ctx = make_box_context(&mut store, 888, b"self");
+        let err = ctx.box_replace(b"unlisted", 0, b"hi").unwrap_err();
+        assert_eq!(format!("{err}"), "AVM: invalid Box reference 0x756e6c6973746564");
+    }
+
+    #[test]
+    fn box_splice_growing_the_box_is_illegal() {
+        // TestBoxSplice: a box's total size never changes -- splicing in a
+        // replacement longer than the spliced-out region is rejected
+        // ("splice inserted bytes too long"), matching go-algorand's fixed-
+        // size splice semantics (`box_splice_impl`,
+        // crates/core/algo-ledger/src/avm_context.rs).
+        let mut store = LedgerState::new();
+        store.set_box(888, b"self", vec![0u8; 5]);
+        let mut ctx = make_box_context(&mut store, 888, b"self");
+        // Splice out zero bytes at offset 0 but try to insert 6 -- the box
+        // would have to grow from 5 to 6 bytes, which is illegal.
+        let err = ctx.box_splice(b"self", 0, 0, b"abcdef").unwrap_err();
+        assert_eq!(format!("{err}"), "AVM: splice inserted bytes too long");
+    }
+
+    #[test]
+    fn box_splice_on_unlisted_name_rejected() {
+        // Same "invalid Box reference" enforcement for box_splice.
+        let mut store = LedgerState::new();
+        store.set_box(888, b"self", vec![0u8; 5]);
+        let mut ctx = make_box_context(&mut store, 888, b"self");
+        let err = ctx.box_splice(b"unlisted", 0, 1, b"h").unwrap_err();
+        assert_eq!(format!("{err}"), "AVM: invalid Box reference 0x756e6c6973746564");
+    }
+
+    #[test]
+    fn box_create_increments_acct_total_boxes_and_box_bytes() {
+        // TestBoxTotals: box_create_impl updates the app account's
+        // TotalBoxes/TotalBoxBytes counters live (AcctTotalBoxBytes =
+        // name.len() + size, matching go-algorand's ledgercore accounting),
+        // not just readable after a full apply -- verified directly here
+        // rather than only through the `app_params_get` readback row this
+        // used to be paired with.
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_context(&mut store, 888, b"self");
+        ctx.available_boxes.insert((888, b"other".to_vec()), false);
+        ctx.box_create(b"self", 10).unwrap();
+        let app_addr = Address(app_address(888));
+        let acct = ctx.store.get_account(&app_addr).unwrap();
+        assert_eq!(acct.total_boxes, 1);
+        assert_eq!(acct.total_box_bytes, b"self".len() as u64 + 10);
+
+        ctx.box_create(b"other", 5).unwrap();
+        let acct = ctx.store.get_account(&app_addr).unwrap();
+        assert_eq!(acct.total_boxes, 2);
+        assert_eq!(
+            acct.total_box_bytes,
+            (b"self".len() as u64 + 10) + (b"other".len() as u64 + 5)
+        );
+    }
+
+    #[test]
+    fn box_create_name_too_long_rejected() {
+        // TestBoxNewBad: box_length_checks (avm_context.rs) enforces
+        // MaxAppKeyLen (64 at V41) on the box name, matching go-algorand's
+        // "name too long" rejection -- runs before any budget/availability
+        // check.
+        let mut store = LedgerState::new();
+        let long_name = vec![b'x'; 65];
+        let mut ctx = make_box_context(&mut store, 888, &long_name);
+        let err = ctx.box_create(&long_name, 10).unwrap_err();
+        assert!(
+            err.to_string().contains("name too long"),
+            "unexpected error: {err}"
+        );
+        // Exactly at the limit is accepted (subject to budget/availability).
+        let ok_name = vec![b'x'; 64];
+        let mut ctx2 = make_box_budget_context(&mut store, 889, 100);
+        ctx2.available_boxes.insert((889, ok_name.clone()), false);
+        ctx2.box_create(&ok_name, 10).unwrap();
+    }
+
+    #[test]
+    fn box_create_size_too_large_rejected() {
+        // TestBoxNewBad: box_length_checks enforces MaxBoxSize (32768 at
+        // V41) on the requested box size, matching go-algorand's "box size
+        // too large" rejection.
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_context(&mut store, 888, b"self");
+        let err = ctx.box_create(b"self", 32_769).unwrap_err();
+        assert!(
+            err.to_string().contains("box size too large"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn dirty_tracking_create_delete_create_cancels_out() {
         // "though it cancels out a creation that happened here"
         let mut store = LedgerState::new();
