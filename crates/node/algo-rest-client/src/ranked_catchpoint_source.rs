@@ -441,7 +441,8 @@ mod tests {
                 let mut buf = [0u8; 1024];
                 let _ = socket.read(&mut buf).await;
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-algorand-ledger-v2.1\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = socket.write_all(header.as_bytes()).await;

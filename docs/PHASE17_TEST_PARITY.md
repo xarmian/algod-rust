@@ -52,8 +52,8 @@ per-area split of the former).
 | status | count | share |
 |---|---|---|
 | `matched-1:1` | 980 | 31% |
-| `matched-1:many` | 719 | 23% |
-| `partial` | 679 | 21% |
+| `matched-1:many` | 720 | 23% |
+| `partial` | 678 | 21% |
 | `out-of-scope` | 588 | 18% |
 | `matched-many:1` | 213 | 7% |
 | `not-implemented` | 0 | 0% |
@@ -85,6 +85,6 @@ were triaged into tracked issues.
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 23 | 11 | 0 | 18 | 0 | 0 | 66 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 36 | 28 | 7 | 15 | 0 | 0 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
-| Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 12 | 0 | 15 | 0 | 0 | 3 |
-| **Total** | | **3,179** | **980** | **719** | **213** | **679** | **0** | **0** | **588** |
+| Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 13 | 0 | 14 | 0 | 0 | 3 |
+| **Total** | | **3,179** | **980** | **720** | **213** | **678** | **0** | **0** | **588** |
 
