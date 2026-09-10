@@ -4757,3 +4757,29 @@ pub async fn raw_transaction_async<N: NodeInterface>(
 
     StatusCode::OK.into_response()
 }
+
+#[cfg(test)]
+mod handlers_pure_fn_tests {
+    use super::*;
+
+    /// Port of go's `TestApplicationBoxesMaxKeys`
+    /// (`daemon/algod/api/server/v2/handlers_test.go#L33`): direct unit
+    /// coverage of the pure `applicationBoxesMaxKeys` function, matching
+    /// go's exact table of inputs/outputs, rather than only exercising it
+    /// indirectly through the `/v2/applications/{id}/boxes` integration
+    /// tests.
+    #[test]
+    fn application_boxes_max_keys_matches_go_table() {
+        // Response size limited by request-supplied value.
+        assert_eq!(application_boxes_max_keys(5, 7), 5);
+        assert_eq!(application_boxes_max_keys(5, 0), 5);
+
+        // Response size limited by algod max (incremented by 1 to signal
+        // "more results exist than the algod max allows").
+        assert_eq!(application_boxes_max_keys(5, 1), 2);
+        assert_eq!(application_boxes_max_keys(0, 1), 2);
+
+        // Response size not limited at all when both are 0.
+        assert_eq!(application_boxes_max_keys(0, 0), u64::MAX);
+    }
+}

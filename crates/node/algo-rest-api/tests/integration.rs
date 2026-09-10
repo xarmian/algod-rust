@@ -5481,6 +5481,37 @@ async fn get_light_block_header_proof_no_state_proof() {
     );
 }
 
+/// Port of go's `TestHeaderProofRoundTooHigh`
+/// (`daemon/algod/api/server/v2/test/handlers_test.go#L2690`): a request
+/// for a round beyond the node's latest known round must fail with 500
+/// (`given round is greater than the latest round`,
+/// `handlers.rs::get_light_block_header_proof`), distinct from
+/// `get_light_block_header_proof_no_state_proof` above (a round that *is*
+/// within range but has no covering state proof, 404/500 for a different
+/// reason).
+#[tokio::test]
+async fn get_light_block_header_proof_round_too_high() {
+    let node = MockNode::synced();
+    // status.last_round is 1000 (see `get_light_block_header_proof_no_state_proof`);
+    // request a round beyond it.
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/100000/lightheader/proof"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("greater than the latest round"),
+        "expected the round-too-high message, got: {text}"
+    );
+}
+
 #[tokio::test]
 async fn get_light_block_header_proof_returns_408_on_timeout() {
     // Mirrors go-algorand's `TestStateproofTransactionForRoundTimeouts`
