@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 
 use algo_types::{Digest, Round};
 
-use crate::bundle::{BundleError, UnauthenticatedBundle, VoteAuthenticator};
+use crate::bundle::{
+    BundleError, EquivocationVoteAuthenticator, UnauthenticatedBundle, VoteAuthenticator,
+};
 use crate::ledger_reader::LedgerReader;
 use crate::step::{Period, CERT};
 use crate::vote::ProposalValue;
@@ -46,6 +48,17 @@ pub struct Certificate {
     pub proposal: ProposalValue,
     /// The vote authenticators proving quorum was reached.
     pub votes: Vec<VoteAuthenticator>,
+    /// Equivocation-vote authenticators whose weight also counts toward
+    /// quorum (a voter who equivocated but whose weight is still needed —
+    /// and cryptographically accounted for — to reach the step's threshold).
+    ///
+    /// Mirrors go's `unauthenticatedBundle.EquivocationVotes`, which
+    /// `Certificate` (a type alias for `unauthenticatedBundle` in go)
+    /// carries directly. A real network certificate can legitimately carry
+    /// these; dropping them here would silently under-count quorum weight
+    /// during [`Self::authenticate`] and misrepresent the certificate when
+    /// re-encoded (see `from_bundle`/`to_unauthenticated_bundle`).
+    pub equivocation_votes: Vec<EquivocationVoteAuthenticator>,
 }
 
 impl Default for Certificate {
@@ -55,6 +68,7 @@ impl Default for Certificate {
             period: Period(0),
             proposal: crate::vote::BOTTOM,
             votes: Vec::new(),
+            equivocation_votes: Vec::new(),
         }
     }
 }
@@ -120,6 +134,7 @@ impl Certificate {
             period: b.period,
             proposal: b.proposal,
             votes: b.votes.clone(),
+            equivocation_votes: b.equivocation_votes.clone(),
         }
     }
 
@@ -133,7 +148,7 @@ impl Certificate {
             step: CERT,
             proposal: self.proposal,
             votes: self.votes.clone(),
-            equivocation_votes: vec![],
+            equivocation_votes: self.equivocation_votes.clone(),
         }
     }
 
@@ -316,6 +331,7 @@ mod tests {
                 encoding_digest: Digest([0xbb; 32]),
             },
             votes: vec![],
+            equivocation_votes: vec![],
         };
 
         let ledger = MockLedgerReader::new();
@@ -338,6 +354,7 @@ mod tests {
                 encoding_digest: Digest([0xbb; 32]),
             },
             votes: vec![],
+            equivocation_votes: vec![],
         };
 
         let ledger = MockLedgerReader::new();
@@ -346,6 +363,83 @@ mod tests {
             result,
             Err(CertificateError::DigestMismatch { .. })
         ));
+    }
+
+    /// Port of go-algorand's
+    /// `agreement/certificate_test.go::TestCertificateBadCertificateWithFakeDoubleVote`.
+    ///
+    /// A "fake" equivocation vote (both `Proposals` entries identical —
+    /// i.e. not real equivocation) attached to a `Certificate` must make
+    /// `Certificate::authenticate` fail, exactly as it makes
+    /// `UnauthenticatedBundle::verify` fail (already covered generically by
+    /// `bundle::tests::bundle_verify_rejects_identical_equivocation_proposals`).
+    ///
+    /// This specific certificate-level test exists because
+    /// `Certificate::from_bundle`/`Certificate::to_unauthenticated_bundle`
+    /// used to silently DROP `equivocation_votes` entirely (the `Certificate`
+    /// struct had no such field) — go's `Certificate` is a direct type alias
+    /// for `unauthenticatedBundle` and always carries them. That data loss
+    /// was harmless in the fail-safe direction for quorum weight (dropping
+    /// weight only makes acceptance of a *valid* cert less likely, never
+    /// makes an *invalid* one wrongly accepted), but it meant real
+    /// certificates authenticated through this path (see
+    /// `algo_ledger::agreement_bridge` / `Player::from_bundle` in
+    /// `player.rs`) could never actually have their equivocation votes
+    /// cryptographically checked at all — this test pins that the field is
+    /// now threaded through and the check actually runs.
+    #[test]
+    fn certificate_authenticate_rejects_fake_double_vote_equivocation() {
+        use crate::bundle::EquivocationVoteAuthenticator;
+        use crate::credential::UnauthenticatedCredential;
+        use algo_consensus_crypto::OneTimeSignature;
+
+        fn zero_sig() -> OneTimeSignature {
+            OneTimeSignature {
+                sig: [0u8; 64],
+                pk: [0u8; 32],
+                pk_sig_old: [0u8; 64],
+                pk2: [0u8; 32],
+                pk1_sig: [0u8; 64],
+                pk2_sig: [0u8; 64],
+            }
+        }
+
+        let proposal = ProposalValue {
+            original_period: Period(0),
+            original_proposer: Address([0x01; 32]),
+            block_digest: Digest([0xaa; 32]),
+            encoding_digest: Digest([0xbb; 32]),
+        };
+
+        let cert = Certificate {
+            round: Round(100),
+            period: Period(0),
+            proposal,
+            votes: vec![],
+            // Both proposals in the pair are identical — a "fake" double
+            // vote, not real equivocation. Mirrors go's test constructing
+            // an `equivocationVote` from `v1`/`v2`, both signed over the
+            // same `lastHash`.
+            equivocation_votes: vec![EquivocationVoteAuthenticator {
+                sender: Address([0x02; 32]),
+                cred: UnauthenticatedCredential::new([0u8; 80]),
+                sigs: [zero_sig(), zero_sig()],
+                proposals: [proposal, proposal],
+            }],
+        };
+
+        let ledger = MockLedgerReader::new();
+        let result = cert.authenticate(Round(100), Digest([0xaa; 32]), &ledger);
+        assert!(
+            matches!(
+                result,
+                Err(CertificateError::BundleError(
+                    BundleError::IdenticalEquivocationProposals
+                ))
+            ),
+            "expected authenticate() to reject the fake double-vote equivocation \
+             via the underlying bundle check, got: {result:?}"
+        );
     }
 
     #[test]
@@ -360,6 +454,7 @@ mod tests {
                 encoding_digest: Digest([0xbb; 32]),
             },
             votes: vec![],
+            equivocation_votes: vec![],
         };
 
         let ledger = MockLedgerReader::new();
@@ -388,6 +483,7 @@ mod tests {
                 encoding_digest: Digest([0xbb; 32]),
             },
             votes: vec![],
+            equivocation_votes: vec![],
         };
 
         let result = cert.claims_to_authenticate(Round(100), Digest([0xaa; 32]));
@@ -406,6 +502,7 @@ mod tests {
                 encoding_digest: Digest([0xbb; 32]),
             },
             votes: vec![],
+            equivocation_votes: vec![],
         };
 
         let bundle = cert.to_unauthenticated_bundle();
@@ -475,6 +572,7 @@ mod tests {
                 encoding_digest: algo_types::Digest([0xef; 32]),
             },
             votes: vec![],
+            equivocation_votes: vec![],
         };
         let via_certificate = canonical_encode_certificate(&c);
         let via_bundle = crate::codec::encode_bundle(&c.to_unauthenticated_bundle());
@@ -505,6 +603,7 @@ mod tests {
                 period: Period(0),
                 proposal: crate::vote::BOTTOM,
                 votes: vec![],
+                equivocation_votes: vec![],
             },
             Certificate {
                 round: Round(256),
@@ -516,6 +615,7 @@ mod tests {
                     encoding_digest: algo_types::Digest([9u8; 32]),
                 },
                 votes: vec![],
+                equivocation_votes: vec![],
             },
         ];
         for (i, c) in cases.iter().enumerate() {

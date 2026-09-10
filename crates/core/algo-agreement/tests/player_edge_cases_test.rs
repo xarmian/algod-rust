@@ -391,6 +391,7 @@ fn player_regression_ensures_cert_thresh_from_old_period_8ba23942() {
         period: p,
         proposal: pv,
         votes: Vec::new(),
+        equivocation_votes: Vec::new(),
     };
     assert!(
         contains_ensure_for(
@@ -440,6 +441,7 @@ fn player_rejects_cert_threshold_from_previous_round() {
         period: algo_agreement::Period(p.0 + 1),
         proposal: pv,
         votes: Vec::new(),
+        equivocation_votes: Vec::new(),
     };
     assert!(
         !contains_stage_digest_for(&machine, &bad_cert),
@@ -477,6 +479,7 @@ fn player_cert_threshold_does_not_block() {
         period: p,
         proposal: pv,
         votes: Vec::new(),
+        equivocation_votes: Vec::new(),
     };
     assert!(
         contains_stage_digest_for(&machine, &cert),
@@ -527,6 +530,7 @@ fn player_cert_threshold_does_not_block_future_period() {
         period: algo_agreement::Period(p.0 + 1),
         proposal: pv,
         votes: Vec::new(),
+        equivocation_votes: Vec::new(),
     };
     assert!(
         contains_stage_digest_for(&machine, &cert),

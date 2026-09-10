@@ -298,6 +298,50 @@ fn two_node_cluster_commits_three_ordinary_rounds() {
     sanity_check(&cluster, start_round, 3);
 }
 
+/// Port of go-algorand's `TestAgreementSynchronous5`/`TestAgreementSynchronous1`/
+/// `TestAgreementSynchronous3`/`TestAgreementSynchronous4`/
+/// `TestAgreementSynchronous10`/`TestAgreementSynchronous5_50`
+/// (`agreement/service_test.go`'s `simulateAgreement(t, numNodes, numRounds,
+/// disabled)`) — go's plain "N real nodes, no fault injection, just commit
+/// several ordinary rounds in lockstep" scenario, at go's actual 5-node
+/// scale (this file's established convention — see the module doc comment).
+///
+/// These `TestAgreementSynchronous*` rows were previously mapped only to
+/// `simulate_smoke.rs`'s lighter/simplified harness as `partial`, even
+/// though by the time issue #825/#920/#1035's investigations landed, this
+/// file already had a real multi-node `Service` harness capable of exactly
+/// this scenario (`two_node_cluster_commits_three_ordinary_rounds` above
+/// proves the 2-node case) — a doc-mismap, not a genuine architecture gap.
+/// The module doc comment's caution about 5-node ordinary-round liveness
+/// predates the `SharedCommits`/`ensure_digest` fix (issue #911): that fix
+/// is general harness infrastructure, not specific to the fault-injection
+/// scenarios it was found through, and every 5-node scenario added to this
+/// file since (`large_periods_five_node`, `late_cert_bug_five_node`,
+/// `certificate_does_not_stall_single_relay_five_node`, etc.) has proven
+/// reliable — this test is verified the same way (repeated standalone runs
+/// plus full `-p algo-agreement` runs) before landing.
+///
+/// go itself never runs `TestAgreementSynchronous10` (`t.Skip("Skipping
+/// flaky agreement integration test")` — even go's own literal, fully
+/// synchronous single-goroutine model finds 10 real nodes unreliable), so
+/// this port does not attempt a 10-node variant either.
+#[test]
+fn five_node_cluster_commits_four_ordinary_rounds() {
+    let cluster = setup_agreement(5);
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    for _ in 0..4 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+
+    cluster.shutdown();
+    sanity_check(&cluster, start_round, 4);
+}
+
 /// Adapted port of go-algorand's `TestAgreementFastRecoveryDownEarly`
 /// (`agreement/service_test.go`) — see this file's module doc comment for
 /// why this runs at 2 nodes, tracking committed rounds rather than the

@@ -803,6 +803,7 @@ fn stub_block_validator_and_ledger_writer_flow() {
         period: Period(0),
         proposal: BOTTOM,
         votes: vec![],
+        equivocation_votes: vec![],
     };
 
     ledger.ensure_validated_block(vb.as_ref(), &cert);
@@ -874,6 +875,7 @@ fn stub_ledger_full_lifecycle() {
         period: Period(0),
         proposal: BOTTOM,
         votes: vec![],
+        equivocation_votes: vec![],
     };
     ledger.ensure_block(&Block::default(), &cert);
     assert_eq!(ledger.get_written_blocks().len(), 1);
