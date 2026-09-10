@@ -392,6 +392,68 @@ mod tests {
         assert_eq!(LATEST_ROUND_HEADER, "X-Latest-Round");
     }
 
+    // -- End-to-end fetch against a real HTTP server (go's TestUGetBlockHTTP) --
+
+    /// Direct port of go's `TestUGetBlockHTTP` (`catchup/universalFetcher_test.go`):
+    /// fetching the next round from a real (test) block service succeeds and
+    /// returns the exact body bytes, then fetching the round immediately after
+    /// (which the server does not have) fails with
+    /// [`HttpBlockFetchError::BlockNotAvailable`] carrying the peer's latest
+    /// round — mirroring go's `noBlockForRoundError{round: next+1, latest:
+    /// next}` assertion. Unlike the URL-construction/accessor unit tests
+    /// above, this drives `fetch_block` through a real `reqwest` request
+    /// against a live listener, matching go's use of an actual
+    /// `rpcs.MakeBlockService` HTTP handler.
+    #[tokio::test]
+    async fn fetch_block_succeeds_then_reports_no_block_for_next_round() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const NEXT_ROUND: u64 = 7;
+        const BODY: &[u8] = b"fake-msgpack-block-and-cert-bytes";
+
+        let server = MockServer::start().await;
+
+        // The round-7 path in base-36 is "7".
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/test-genesisID/block/{}", NEXT_ROUND)))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", BLOCK_RESPONSE_CONTENT_TYPE)
+                    .set_body_bytes(BODY),
+            )
+            .mount(&server)
+            .await;
+
+        // The server has no block for round 8: respond 404 with the latest
+        // round header, exactly as go's blockService does when asked for a
+        // round beyond its tip.
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/test-genesisID/block/{}", NEXT_ROUND + 1)))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .insert_header("X-Latest-Round", NEXT_ROUND.to_string().as_str()),
+            )
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpBlockFetcher::new(server.uri(), "test-genesisID").unwrap();
+
+        // First call: succeeds and returns exactly the served bytes.
+        let body = fetcher.fetch_block(NEXT_ROUND).await.unwrap();
+        assert_eq!(body, BODY);
+
+        // Second call: the server has nothing for `NEXT_ROUND + 1`, so the
+        // fetch must fail with `BlockNotAvailable` carrying the latest round.
+        let err = fetcher.fetch_block(NEXT_ROUND + 1).await.unwrap_err();
+        match err {
+            HttpBlockFetchError::BlockNotAvailable { latest_round } => {
+                assert_eq!(latest_round, Some(NEXT_ROUND));
+            }
+            other => panic!("expected BlockNotAvailable, got: {other:?}"),
+        }
+    }
+
     // -- Error Display --
 
     #[test]
