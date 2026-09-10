@@ -32,7 +32,9 @@
 use algo_consensus_crypto::merklesig;
 use algo_consensus_crypto::stateproof::Verifier;
 use algo_ledger::apply_stateproof::state_proof_message_hash;
-use algo_ledger::stateproof_worker::{state_proof_body_from_crypto, SigFromAddr, StateProofRuntime};
+use algo_ledger::stateproof_worker::{
+    state_proof_body_from_crypto, SigFromAddr, StateProofRuntime,
+};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::voters_tracker::record_voters_snapshot;
 use algo_ledger::LedgerState;
@@ -172,7 +174,9 @@ fn runtime_signs_gathers_builds_and_verifies_a_real_state_proof() {
         // payload.
         let wire = sfa.to_msgpack();
         let decoded = SigFromAddr::from_msgpack(&wire).unwrap();
-        let outcome = runtime.handle_sig(&store, &decoded).unwrap();
+        let outcome = runtime
+            .handle_sig(&store, &decoded, STATE_PROOF_ROUND, false)
+            .unwrap();
         assert_eq!(
             outcome,
             algo_ledger::stateproof_worker::SigOutcome::Broadcast,
@@ -194,9 +198,14 @@ fn runtime_signs_gathers_builds_and_verifies_a_real_state_proof() {
                 round: STATE_PROOF_ROUND,
                 sig: dup_sig,
             },
+            STATE_PROOF_ROUND,
+            false,
         )
         .unwrap();
-    assert_eq!(dup_outcome, algo_ledger::stateproof_worker::SigOutcome::Ignore);
+    assert_eq!(
+        dup_outcome,
+        algo_ledger::stateproof_worker::SigOutcome::Ignore
+    );
 
     // Every account's rewards-adjusted balance was added exactly once --
     // independently recomputed from the persisted participant array.
@@ -234,11 +243,14 @@ fn runtime_signs_gathers_builds_and_verifies_a_real_state_proof() {
     // snapshot 240's persisted value) -- the same value go's
     // `GetProvenWeight(votersHdr, ...)` would read to compute the
     // cryptographic proven-weight bound.
-    let proven_weight =
-        ((total_weight as u128) * (params.state_proof_weight_threshold as u128) / (1u128 << 32))
-            as u64;
-    let verifier = Verifier::new(root.clone(), proven_weight, params.state_proof_strength_target)
-        .expect("verifier construction");
+    let proven_weight = ((total_weight as u128) * (params.state_proof_weight_threshold as u128)
+        / (1u128 << 32)) as u64;
+    let verifier = Verifier::new(
+        root.clone(),
+        proven_weight,
+        params.state_proof_strength_target,
+    )
+    .expect("verifier construction");
     verifier
         .verify(STATE_PROOF_ROUND, msg_hash, proof)
         .expect("the runtime-built proof must verify against an independent Verifier");

@@ -206,7 +206,7 @@ pub fn find_and_sign_eligible_rounds<L: LedgerStore>(
             ) {
                 warn!(round, signer = %sfa.signer_address, error = %e, "stateproof: failed to persist own signature");
             }
-            if let Err(e) = runtime.handle_sig(store, &sfa) {
+            if let Err(e) = runtime.handle_sig(store, &sfa, current.0, true) {
                 warn!(round, signer = %sfa.signer_address, error = %e, "stateproof: failed to insert own signature into runtime");
             }
             info!(round, signer = %sfa.signer_address, "stateproof: signed state proof message");
@@ -272,7 +272,8 @@ impl MessageHandler for StateProofSigHandler {
                 Ok(r) => r,
                 Err(_) => return ignore_message(),
             };
-            runtime.handle_sig(&*ledger, &sfa)
+            let latest_round = ledger.current_round().0;
+            runtime.handle_sig(&*ledger, &sfa, latest_round, false)
         };
 
         match outcome {

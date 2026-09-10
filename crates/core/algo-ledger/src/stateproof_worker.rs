@@ -795,11 +795,69 @@ impl StateProofRuntime {
     /// prover entry first if needed. Mirrors the insertion half of go's
     /// `Worker.handleSig` (`builder.go:343`): an already-present signature
     /// is a harmless [`SigOutcome::Ignore`], not an error.
+    ///
+    /// Before creating a *new* prover entry for a round this runtime isn't
+    /// tracking yet, applies the same anti-spam/already-complete gating go's
+    /// `handleSig` does (`builder.go:355-390`), using `latest_round` (the
+    /// caller's already-fetched ledger tip -- mirroring go's
+    /// `spw.ledger.Latest()`/`BlockHdr(latest)` call) to look up the current
+    /// `StateProofNextRound` and consensus params:
+    /// - a round the ledger has already produced a state proof for
+    ///   (`sfa.round < state_proof_next_round`) is silently ignored -- go's
+    ///   "already have a complete state proof in ledger" case;
+    /// - a round that isn't a nonzero multiple of the state-proof interval
+    ///   is silently ignored (go disconnects the sender for this; this
+    ///   runtime leaves policing malicious peers to the gossip layer, same
+    ///   as the existing `InsertSigError` cases);
+    /// - a round beyond the ledger tip is silently ignored (go: "avoiding
+    ///   an inspection in DB in case we haven't reached the round");
+    /// - and, only for `from_this_node == false` (go: `sender != nil`),
+    ///   [`meets_broadcast_policy`] must pass -- this is the anti-spam gate
+    ///   that keeps an externally-gossiped signature for a round far ahead
+    ///   of the online-prover cache window (a stalled-chain spam scenario)
+    ///   from forcing this node to eagerly build a brand-new prover entry
+    ///   (fetch voters data, rebuild the vector-commitment tree) for every
+    ///   distinct round a malicious peer cares to send.
+    ///
+    /// A signature for a round already tracked in `self.provers` (including
+    /// one this node signed itself) always skips this gate and is inserted
+    /// directly, matching go's `if ok { ... }` fast path in `handleSig`.
     pub fn handle_sig<L: LedgerStore>(
         &mut self,
         store: &L,
         sfa: &SigFromAddr,
+        latest_round: u64,
+        from_this_node: bool,
     ) -> Result<SigOutcome, HandleSigError> {
+        if !self.provers.contains_key(&sfa.round) {
+            if let Some(latest_hdr) = store.get_block_header(latest_round)? {
+                let state_proof_next_round =
+                    crate::block_header::state_proof_next_round(&latest_hdr.state_proof_tracking);
+                if sfa.round < state_proof_next_round {
+                    // Already have a complete state proof in the ledger for
+                    // this round -- nothing to gather.
+                    return Ok(SigOutcome::Ignore);
+                }
+                if let Some(params) = consensus_params_for_version(&latest_hdr.current_protocol) {
+                    if params.state_proof_interval == 0
+                        || sfa.round % params.state_proof_interval != 0
+                        || sfa.round > latest_round
+                    {
+                        return Ok(SigOutcome::Ignore);
+                    }
+                    if !from_this_node
+                        && !meets_broadcast_policy(
+                            sfa.round,
+                            latest_round,
+                            params.state_proof_interval,
+                            state_proof_next_round,
+                        )
+                    {
+                        return Ok(SigOutcome::Ignore);
+                    }
+                }
+            }
+        }
         self.ensure_prover(store, sfa.round)?;
         let entry = self
             .provers
@@ -1181,6 +1239,101 @@ mod tests {
         assert!(!meets_broadcast_policy(2048, latest, interval, next));
         // Disabled: always rejected.
         assert!(!meets_broadcast_policy(256, latest, 0, next));
+    }
+
+    /// Build a minimal ledger with a single block header at `round`,
+    /// carrying `state_proof_next_round` (the `"n"` field) and using
+    /// `CONSENSUS_V41`'s state-proof interval -- just enough for
+    /// [`StateProofRuntime::handle_sig`]'s anti-spam gate to run without
+    /// needing a real voters snapshot (which is only fetched once the gate
+    /// is passed and `ensure_prover`/`create_prover_entry` actually runs).
+    fn store_with_header_at(round: u64, state_proof_next_round: u64) -> crate::state::LedgerState {
+        let mut store = crate::state::LedgerState::new();
+        let tracking = Some(rmpv::Value::Map(vec![(
+            rmpv::Value::from(0u64),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::from("n"),
+                rmpv::Value::from(state_proof_next_round),
+            )]),
+        )]));
+        let hdr = algo_types::BlockHeader {
+            round: algo_types::Round(round),
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            state_proof_tracking: tracking,
+            ..algo_types::BlockHeader::default()
+        };
+        let bytes = algo_codec::canonical_encode_block_header(&hdr);
+        store
+            .put_block(round, &hdr.current_protocol, &bytes, &[])
+            .unwrap();
+        store
+    }
+
+    fn dummy_sfa(round: u64) -> SigFromAddr {
+        SigFromAddr {
+            signer_address: Address([7u8; 32]),
+            round,
+            sig: merklesig::Signature::default(),
+        }
+    }
+
+    #[test]
+    fn handle_sig_ignores_a_round_the_ledger_already_has_a_complete_proof_for() {
+        // state_proof_next_round (2048) is already past sfa.round (1024):
+        // the ledger has moved on, so a lingering/replayed signature for
+        // 1024 is silently dropped without ever touching create_prover_entry
+        // (which would otherwise fail since no voters snapshot exists).
+        let store = store_with_header_at(5000, 2048);
+        let mut runtime = StateProofRuntime::new();
+        let outcome = runtime
+            .handle_sig(&store, &dummy_sfa(1024), 5000, false)
+            .unwrap();
+        assert_eq!(outcome, SigOutcome::Ignore);
+        assert!(!runtime.has_prover(1024));
+    }
+
+    #[test]
+    fn handle_sig_ignores_an_externally_sourced_signature_beyond_the_broadcast_policy() {
+        // interval=256 (CONSENSUS_V41), state_proof_next_round=1024, so the
+        // online-prover threshold is 1024 + 3*256 = 1792. `latest_round` is
+        // itself an exact multiple of 256 (5120), so the current latest
+        // state-proof round is 5120. A signature for round 2048 -- beyond
+        // the threshold, not the latest state-proof round, but still at or
+        // below `latest_round` (so it doesn't also trip the separate
+        // "round is beyond the ledger tip" check) -- from a peer must be
+        // ignored: the anti-spam gate this test closes, rather than eagerly
+        // building a brand-new prover entry for a stale, far-behind round a
+        // malicious peer cares to spam.
+        let latest_round = 5120u64;
+        let store = store_with_header_at(latest_round, 1024);
+        let mut runtime = StateProofRuntime::new();
+        let outcome = runtime
+            .handle_sig(&store, &dummy_sfa(2048), latest_round, false)
+            .unwrap();
+        assert_eq!(outcome, SigOutcome::Ignore);
+        assert!(
+            !runtime.has_prover(2048),
+            "a spam round from a peer must never create a prover entry"
+        );
+    }
+
+    #[test]
+    fn handle_sig_does_not_apply_the_broadcast_policy_to_this_nodes_own_signature() {
+        // Same out-of-window round as above, but from_this_node=true (go:
+        // sender == nil) -- the anti-spam gate is skipped and the runtime
+        // proceeds to actually try building the prover entry, which fails
+        // here only because round 2048 has no block header of its own in
+        // this minimal store (a ledger-data error, not the anti-spam
+        // Ignore).
+        let latest_round = 5120u64;
+        let store = store_with_header_at(latest_round, 1024);
+        let mut runtime = StateProofRuntime::new();
+        let result = runtime.handle_sig(&store, &dummy_sfa(2048), latest_round, true);
+        assert!(
+            result.is_err(),
+            "own signature bypasses the spam gate and reaches create_prover_entry, \
+             which fails here for lack of a round-2048 block header -- not Ok(Ignore)"
+        );
     }
 
     /// Mirrors go's `TestRoundDownToMultipleOf`
