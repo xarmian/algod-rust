@@ -1000,6 +1000,89 @@ mod tests {
     }
 
     #[test]
+    fn balance_record_v6_marshal_unmarshal_msgpack_roundtrip() {
+        // Port of go's `TestMarshalUnmarshalBalanceRecordV6`: a zero-value
+        // record must round-trip cleanly through marshal/unmarshal with no
+        // leftover bytes, and so must a populated one.
+        let record = BalanceRecordV6::default();
+        let bytes = rmp_serde::to_vec_named(&record).expect("msgpack serialize");
+        let round_tripped: BalanceRecordV6 =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, record);
+
+        let mut resources = HashMap::new();
+        resources.insert(7u64, ByteBuf::from(vec![9u8, 8, 7]));
+        let populated = BalanceRecordV6 {
+            address: ByteBuf::from(vec![1u8; 32]),
+            account_data: ByteBuf::from(vec![2u8, 3, 4]),
+            resources,
+            expecting_more_entries: true,
+        };
+        let bytes = rmp_serde::to_vec_named(&populated).expect("msgpack serialize");
+        let round_tripped: BalanceRecordV6 =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, populated);
+    }
+
+    #[test]
+    fn kv_record_v6_marshal_unmarshal_msgpack_roundtrip() {
+        // Port of go's `TestMarshalUnmarshalKVRecordV6`.
+        let record = KVRecordV6::default();
+        let bytes = rmp_serde::to_vec_named(&record).expect("msgpack serialize");
+        let round_tripped: KVRecordV6 = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, record);
+
+        let populated = KVRecordV6 {
+            key: ByteBuf::from(vec![b'k']),
+            value: ByteBuf::from(vec![1u8, 2, 3, 4]),
+        };
+        let bytes = rmp_serde::to_vec_named(&populated).expect("msgpack serialize");
+        let round_tripped: KVRecordV6 = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, populated);
+    }
+
+    #[test]
+    fn online_account_record_v6_marshal_unmarshal_msgpack_roundtrip() {
+        // Port of go's `TestMarshalUnmarshalOnlineAccountRecordV6`.
+        let record = OnlineAccountRecordV6::default();
+        let bytes = rmp_serde::to_vec_named(&record).expect("msgpack serialize");
+        let round_tripped: OnlineAccountRecordV6 =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, record);
+
+        let populated = OnlineAccountRecordV6 {
+            address: ByteBuf::from(vec![5u8; 32]),
+            updated_round: 100,
+            normalized_online_balance: 200,
+            vote_last_valid: 300,
+            ..Default::default()
+        };
+        let bytes = rmp_serde::to_vec_named(&populated).expect("msgpack serialize");
+        let round_tripped: OnlineAccountRecordV6 =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, populated);
+    }
+
+    #[test]
+    fn online_round_params_record_v6_marshal_unmarshal_msgpack_roundtrip() {
+        // Port of go's `TestMarshalUnmarshalOnlineRoundParamsRecordV6`.
+        let record = OnlineRoundParamsRecordV6::default();
+        let bytes = rmp_serde::to_vec_named(&record).expect("msgpack serialize");
+        let round_tripped: OnlineRoundParamsRecordV6 =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, record);
+
+        let populated = OnlineRoundParamsRecordV6 {
+            round: 555,
+            data: ByteBuf::from(vec![1u8, 2, 3]),
+        };
+        let bytes = rmp_serde::to_vec_named(&populated).expect("msgpack serialize");
+        let round_tripped: OnlineRoundParamsRecordV6 =
+            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(round_tripped, populated);
+    }
+
+    #[test]
     fn chunk_default() {
         let chunk = CatchpointSnapshotChunkV6::default();
         assert!(chunk.balances.is_empty());
