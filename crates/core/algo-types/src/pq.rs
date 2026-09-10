@@ -205,6 +205,25 @@ mod tests {
         assert!(!sig.blank());
     }
 
+    /// go: `TestPQSchemes` (`protocol/pq_scheme_test.go`) checks every
+    /// registered `PQScheme` wire literal is printable ASCII and that no two
+    /// schemes collide. go registers two schemes (`PQSchemeFalcon1024`,
+    /// `PQSchemeFalcon512`); algod-rust models only `PQ_SCHEME_FALCON1024`
+    /// (no Falcon-512 wire scheme exists here — see this module's doc
+    /// comment), so the uniqueness half of the invariant is trivial over a
+    /// single element, but the printable-ASCII invariant is real and worth
+    /// pinning against a future second scheme literal accidentally using a
+    /// non-printable byte.
+    #[test]
+    fn pq_scheme_falcon1024_literal_is_printable_ascii() {
+        for &b in &PQ_SCHEME_FALCON1024 {
+            assert!(
+                (0x20..0x7f).contains(&b),
+                "PQScheme byte {b:#x} must be printable ASCII"
+            );
+        }
+    }
+
     #[test]
     fn canonical_pq_address_salt_is_deterministic_and_pq_compliant() {
         let pk = vec![0x42u8; 1793];

@@ -258,6 +258,25 @@ mod tests {
         assert_eq!(Tag::VotePacked.max_message_size(), 1_228);
     }
 
+    /// go: `TestMaxSizesDefined` (`protocol/tags_test.go`) iterates the
+    /// full `TagList` and asserts every tag has a nonzero max message size.
+    /// `max_sizes_match_go` above happens to enumerate exactly the 12
+    /// `Tag::ACTIVE_TAGS` values, but as fixed per-tag literals rather than
+    /// a loop over `Tag::ACTIVE_TAGS` itself, so it would silently stop
+    /// being exhaustive if a 13th tag were ever added without updating that
+    /// list by hand. This iterates `Tag::ACTIVE_TAGS` directly, matching
+    /// go's actual exhaustiveness guarantee.
+    #[test]
+    fn every_active_tag_has_a_nonzero_max_message_size() {
+        for tag in Tag::ACTIVE_TAGS {
+            assert_ne!(
+                tag.max_message_size(),
+                0,
+                "{tag:?} has a zero max message size"
+            );
+        }
+    }
+
     #[test]
     fn deprecated_tags_have_zero_max_size() {
         assert_eq!(Tag::PingDeprecated.max_message_size(), 0);

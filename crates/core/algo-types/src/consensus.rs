@@ -2425,6 +2425,49 @@ mod tests {
         }
     }
 
+    /// go: `TestConsensusUpgradeWindow` (`config/consensus_test.go`) sweeps
+    /// every version's `ApprovedUpgrades` map, asserting each delay is
+    /// nonzero and within `[MinUpgradeWaitRounds, MaxUpgradeWaitRounds]`.
+    /// algod-rust models only the single outbound upgrade edge relevant per
+    /// version (`ConsensusParams::approved_upgrade`, an `Option<(target,
+    /// delay)>` rather than a full historical map -- see that field's doc
+    /// comment), so this sweeps every version in `KNOWN_PROTOCOL_VERSIONS`
+    /// the same way go iterates its map, checking the invariant for
+    /// whichever ones actually carry an approved upgrade -- not just the
+    /// pre-v22 zero-bound boundary case the other test below covers.
+    #[test]
+    fn upgrade_window_bounds_hold_for_every_known_version_with_an_approved_upgrade() {
+        let mut checked_at_least_one = false;
+        for &version in KNOWN_PROTOCOL_VERSIONS {
+            let Some(params) = consensus_params_for_version(version) else {
+                continue;
+            };
+            if let Some((_, delay)) = params.approved_upgrade {
+                checked_at_least_one = true;
+                assert!(
+                    delay > 0,
+                    "version {version} has a zero-delay approved upgrade"
+                );
+                if params.min_upgrade_wait_rounds > 0 || params.max_upgrade_wait_rounds > 0 {
+                    assert!(
+                        delay >= params.min_upgrade_wait_rounds,
+                        "version {version}: delay {delay} < min_upgrade_wait_rounds {}",
+                        params.min_upgrade_wait_rounds
+                    );
+                    assert!(
+                        delay <= params.max_upgrade_wait_rounds,
+                        "version {version}: delay {delay} > max_upgrade_wait_rounds {}",
+                        params.max_upgrade_wait_rounds
+                    );
+                }
+            }
+        }
+        assert!(
+            checked_at_least_one,
+            "expected at least one known version to carry an approved upgrade to sweep"
+        );
+    }
+
     #[test]
     fn test_upgrade_wait_rounds_bounds_before_v22_are_zero() {
         // Go zero-value: MinUpgradeWaitRounds/MaxUpgradeWaitRounds are unset

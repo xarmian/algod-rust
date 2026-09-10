@@ -454,6 +454,121 @@ mod tests {
         assert_eq!(binary_marshal_length(10, 0.01), expected);
     }
 
+    /// go: `Filter.estimateFalsePositiveRate` (`util/bloom/bloom_test.go`)
+    /// -- fills the filter with `num_added` sequential big-endian-u32
+    /// elements, then probes consecutive non-member u32s (starting right
+    /// after the inserted range) until `num_fp` false positives are found,
+    /// returning the observed false-positive rate.
+    fn estimate_false_positive_rate(f: &mut Filter, num_added: u32, num_fp: usize) -> f64 {
+        for i in 0..num_added {
+            f.set(&i.to_be_bytes());
+        }
+        let mut false_positives = 0usize;
+        let mut num_rounds = 0usize;
+        let mut i: u32 = 0;
+        while false_positives < num_fp {
+            let x = (num_added + i + 1).to_be_bytes();
+            if f.test(&x) {
+                false_positives += 1;
+            }
+            num_rounds += 1;
+            i += 1;
+        }
+        false_positives as f64 / num_rounds as f64
+    }
+
+    /// go: `TestOptimal` -- statistically validates that `Optimal`-sized
+    /// filters actually hit their target false-positive rate within a
+    /// generous margin, not just that the sizing *formula* matches (the
+    /// existing golden tests only pin `(size_bits, num_hashes)` output
+    /// values). Uses go's own `testing.Short()` case subset since this
+    /// crate's suite always runs "short"; same close-enough-to-target
+    /// methodology (`closeEnough`, 20% relative error, `actual < target`
+    /// short-circuits as trivially fine) ported from go 1:1.
+    #[test]
+    fn optimal_sized_filter_achieves_target_false_positive_rate() {
+        let cases: [(usize, f64, usize); 2] = [(2000, 0.001, 100), (200_000, 0.00001, 25)];
+        for (num_elements, fp_rate, num_fp) in cases {
+            let (num_bits, num_hashes) = Filter::optimal(num_elements, fp_rate);
+            let mut f = Filter::new(num_bits, num_hashes, 1234);
+            let actual_rate = estimate_false_positive_rate(&mut f, num_elements as u32, num_fp);
+            if actual_rate < fp_rate {
+                continue;
+            }
+            let relerr = if actual_rate.abs() > fp_rate.abs() {
+                ((fp_rate - actual_rate) / actual_rate).abs()
+            } else {
+                ((fp_rate - actual_rate) / fp_rate).abs()
+            };
+            assert!(
+                relerr <= 0.20,
+                "numElements={num_elements} want {fp_rate} got {actual_rate} ({:.2}% error)",
+                relerr * 100.0
+            );
+        }
+    }
+
+    /// go: `TestOptimalSize` -- the Alpenhorn-paper parameters
+    /// (150000 elements, 1e-10 false-positive rate) must yield exactly 48
+    /// bits per element in the marshaled encoding. Unlike the existing
+    /// `binary_marshal_length_matches_optimal_sizing` test (which checks a
+    /// different, small 10-element/0.01 case and only cross-checks against
+    /// `binary_marshal_length` rather than a fixed expected value), this
+    /// pins go's own exact parameters and expected constant.
+    #[test]
+    fn optimal_size_matches_go_bits_per_element_for_alpenhorn_params() {
+        let num_elements = 150_000usize;
+        let (num_bits, num_hashes) = Filter::optimal(num_elements, 1e-10);
+        let f = Filter::new(num_bits, num_hashes, 1234);
+        let bs = f.marshal_binary();
+        let bits_per_element = ((bs.len() * 8) as f64 / num_elements as f64).ceil();
+        assert_eq!(bits_per_element, 48.0);
+    }
+
+    /// go: `TestEmptyFilter` -- for every truncation prefix length
+    /// `0..len(marshaled)` of a real filter's marshaled bytes,
+    /// `unmarshal_binary` must either reject the truncated input outright
+    /// or return a `Filter` that's safe to call `test` on (no panic, no
+    /// divide-by-zero). The existing `unmarshal_rejects_short_data` test
+    /// only checks two fixed short inputs are rejected; this exhaustively
+    /// sweeps every prefix length the way go does.
+    #[test]
+    fn unmarshal_of_every_truncation_prefix_either_errors_or_tests_safely() {
+        let blm = Filter::new(200, 16, 1234);
+        let marshaled = blm.marshal_binary();
+        for i in 0..marshaled.len() {
+            if let Ok(f) = Filter::unmarshal_binary(&marshaled[0..i]) {
+                let _ = f.test(&[1, 2, 3, 4, 5]);
+            }
+        }
+    }
+
+    /// go: `TestBinaryMarshalLength` -- full cross product of go's own
+    /// element-count and false-positive-rate case lists (7 x 6 = 42 cases),
+    /// checking `BinaryMarshalLength`'s predicted length always matches the
+    /// real `MarshalBinary` output length. The existing
+    /// `binary_marshal_length_matches_optimal_sizing` test only checks one
+    /// case (10 elements, 0.01); this sweeps go's full matrix.
+    #[test]
+    fn binary_marshal_length_matches_go_full_sweep() {
+        let element_counts = [2usize, 16, 1024, 32768, 5101, 100237, 144539];
+        let fp_rates = [0.2, 0.1, 0.01, 0.001, 0.00001, 0.0000001];
+        for &num_elements in &element_counts {
+            for &fp_rate in &fp_rates {
+                let (size_bits, num_hashes) = Filter::optimal(num_elements, fp_rate);
+                let filter = Filter::new(size_bits, num_hashes, 1234);
+                let bytes = filter.marshal_binary();
+                assert_ne!(bytes.len(), 0);
+                let calculated = binary_marshal_length(num_elements, fp_rate);
+                assert_eq!(
+                    calculated,
+                    bytes.len(),
+                    "num_elements={num_elements} fp_rate={fp_rate}"
+                );
+            }
+        }
+    }
+
     /// go: `TestIncompressible` (`util/bloom/bloom_test.go`) fills a filter
     /// sized for 150,000 elements to its `Optimal` false-positive-rate
     /// target, then checks that DEFLATE (level 9) can't shrink the
