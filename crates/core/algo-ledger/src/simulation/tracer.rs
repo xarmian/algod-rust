@@ -25,6 +25,13 @@
 //! [`TransactionTrace`] structures for the simulation result.
 
 use algo_avm::machine::AvmValue;
+
+/// The AVM's scratch space is always exactly this many slots
+/// (`algo_avm::machine::SCRATCH_SPACE_SIZE`, private to that crate), all
+/// zero-initialized. Mirrored here so the tracer can seed a matching
+/// all-zero "before" snapshot instead of an empty one — see
+/// `SimulationTracer::before_program`'s doc comment on `scratch_before`.
+const SCRATCH_SPACE_SIZE: usize = 256;
 use algo_avm::tracer::{
     AppStateAccess, AppStateOp, AppStateType, EvalTracer, ProgramType, UnnamedResourceAccess,
 };
@@ -358,7 +365,16 @@ impl EvalTracer for SimulationTracer {
             program_hash,
             trace: ProgramTrace::default(),
             stack_before: Vec::new(),
-            scratch_before: Vec::new(),
+            // The AVM's scratch space is always 256 zero-initialized slots
+            // (`algo_avm::machine::SCRATCH_SPACE_SIZE`), never empty. Seeding
+            // `scratch_before` with a matching all-zero snapshot up front
+            // means the diff in `after_opcode` only ever flags slots whose
+            // value actually changed. Seeding it empty instead (as before)
+            // made the "new scratch is longer" extras branch fire on the
+            // very first traced opcode of every program, spuriously
+            // reporting all 256 still-zero slots as "changes" in the
+            // simulate response's exec trace.
+            scratch_before: vec![AvmValueTrace::Uint64(0); SCRATCH_SPACE_SIZE],
             pending_spawned_inners: Vec::new(),
         });
     }

@@ -279,6 +279,124 @@ fn simulation_trace_with_stack() {
     );
 }
 
+/// Parity with go-algorand's `TestSimulateScratchSlotChange`
+/// (`test/e2e-go/restAPI/simulate/simulateRestAPI_test.go:1700`): with
+/// scratch tracing enabled, a direct `store` and an indirect `stores` must
+/// each record a `(slot, new_value)` entry, scoped to the opcode that
+/// performed the write.
+///
+/// This is a regression test for a real bug found while auditing this row:
+/// `SimulationTracer::before_program` seeded `scratch_before` as an *empty*
+/// `Vec` instead of a 256-zero snapshot matching the AVM's actual
+/// fixed-size scratch space. Because `after_opcode`'s diff treats any slot
+/// beyond `scratch_before`'s current length as a fresh "extra" (see the
+/// "if new scratch is longer" branch), every simulate response with
+/// scratch tracing enabled spuriously reported all 256 still-zero slots as
+/// "changed" on the very first traced opcode of the program -- silent
+/// noise that also made asserting *real* scratch changes unreliable. Fixed
+/// by seeding `scratch_before` with 256 zero slots up front.
+///
+/// Known deliberately-out-of-scope remainder: go's own tracer
+/// (`ledger/simulation/tracer.go`'s `scratchSlots`) records a write
+/// unconditionally whenever `store`/`stores` executes, even if the
+/// newly-written value equals the slot's current value (go's own test
+/// exploits this: it writes the same value 1 to slot 1 twice, via `store`
+/// then `stores`, and expects two separate recorded changes). algod-rust's
+/// diff-based tracer only reports a slot as changed when the value
+/// actually differs, so a same-value overwrite via `stores` is invisible.
+/// Reproducing go's write-unconditional semantics needs the AVM's
+/// `store`/`stores` opcode handlers to report the slot they touched
+/// through a new tracer hook (`ops::dispatch` doesn't currently thread a
+/// tracer at all) -- real, but sized as new-infrastructure work, not a
+/// same-PR fix; filed separately.
+#[test]
+fn simulation_trace_captures_scratch_slot_changes() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+
+    // v8: pushint 5; store 1 (scratch[1]=5); pushint 2; pushint 9;
+    // stores (scratch[2]=9); pushint 1 (approve)
+    let approval = vec![
+        0x08, // version 8
+        0x81, 0x05, // pushint 5
+        0x35, 0x01, // store 1 -> scratch[1] = 5
+        0x81, 0x02, // pushint 2 (index for stores)
+        0x81, 0x09, // pushint 9 (value for stores)
+        0x3f, // stores -> scratch[2] = 9
+        0x81, 0x01, // pushint 1 (approve)
+    ];
+
+    let mut state = setup_state(sender, app_id, approval);
+    let txn = make_appl_txn(sender, app_id);
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: true,
+        trace_config: ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: true,
+            state: false,
+        },
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("simulation should succeed");
+
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "simulation should not fail: {:?}",
+        group.failure_message
+    );
+
+    let trace = group.txn_results[0]
+        .trace
+        .as_ref()
+        .expect("trace should be present");
+    let approval_trace = trace
+        .approval_program_trace
+        .as_ref()
+        .expect("approval trace should be present");
+
+    // Collect every scratch change recorded across the whole program.
+    let all_changes: Vec<(usize, u64)> = approval_trace
+        .opcodes
+        .iter()
+        .flat_map(|op| op.scratch_changes.iter())
+        .map(|(slot, value)| match value {
+            AvmValueTrace::Uint64(v) => (*slot, *v),
+            AvmValueTrace::Bytes(_) => panic!("expected a uint64 scratch value"),
+        })
+        .collect();
+
+    // Exactly two real writes: slot 1 = 5 (from `store`), slot 2 = 9 (from
+    // `stores`). Before the fix, this list would additionally contain 256
+    // bogus (slot, 0) entries from the first traced opcode.
+    assert_eq!(
+        all_changes,
+        vec![(1, 5), (2, 9)],
+        "expected exactly the two real scratch writes, no spurious extras"
+    );
+
+    // Each write is scoped to its own opcode (`store`, then `stores`), on
+    // two distinct program counters.
+    let scratch_pcs: Vec<usize> = approval_trace
+        .opcodes
+        .iter()
+        .filter(|op| !op.scratch_changes.is_empty())
+        .map(|op| op.pc)
+        .collect();
+    assert_eq!(scratch_pcs.len(), 2, "store and stores each record one pc");
+    assert_ne!(
+        scratch_pcs[0], scratch_pcs[1],
+        "store and stores fire at different program counters"
+    );
+}
+
 /// With state-change tracing on, an app that writes global state should record
 /// a per-opcode state change (operation `w`) in the exec trace.
 #[test]

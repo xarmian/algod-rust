@@ -3109,4 +3109,50 @@ mod tests {
         let expected = abs_path_in("data/program.teal", &fixture_cwd()).unwrap();
         assert_eq!(got, expected.to_string_lossy());
     }
+
+    /// Parity with go-algorand's `TestClerkSendNoteEncoding`
+    /// (`test/e2e-go/cli/goal/clerk_test.go:31`): a plain `--note` value is
+    /// stored verbatim as the transaction's note bytes -- go's test sends a
+    /// text note and asserts `noteText == string(tx1.Txn.Txn.Note)` on the
+    /// confirmed transaction; `parse_note` is the exact point where
+    /// `goal-rust`'s `clerk send` turns `--note` into those bytes.
+    #[test]
+    fn parse_note_plain_text_encodes_as_utf8_bytes() {
+        let note_text = "Sample Text-based Note";
+        let note = parse_note(None, Some(note_text)).unwrap();
+        assert_eq!(String::from_utf8(note).unwrap(), note_text);
+    }
+
+    /// Parity with go-algorand's `TestClerkSendNoteEncoding`: `--noteb64`
+    /// must be decoded with `base64.StdEncoding` (not URL-safe, not
+    /// raw/unpadded) -- go's test round-trips
+    /// `"Noteb64-encoded text With Binary x1x0x3"` (control-byte and
+    /// non-ASCII content included) through
+    /// `base64.StdEncoding.EncodeToString` and asserts the decoded note on
+    /// the confirmed transaction equals the original string byte-for-byte.
+    #[test]
+    fn parse_note_base64_decodes_with_standard_encoding() {
+        let original = "Noteb64-encoded text With Binary \u{1}x1x0x3";
+        let noteb64 = base64::engine::general_purpose::STANDARD.encode(original.as_bytes());
+        let note = parse_note(Some(&noteb64), None).unwrap();
+        assert_eq!(String::from_utf8(note).unwrap(), original);
+    }
+
+    /// `--noteb64` wins over `--note` when both are somehow set (clerk.go's
+    /// documented precedence, mirrored by `parse_note`'s doc comment).
+    #[test]
+    fn parse_note_base64_wins_over_plain_text() {
+        let noteb64 = base64::engine::general_purpose::STANDARD.encode(b"from base64");
+        let note = parse_note(Some(&noteb64), Some("from plain text")).unwrap();
+        assert_eq!(String::from_utf8(note).unwrap(), "from base64");
+    }
+
+    /// A malformed `--noteb64` value is rejected up front rather than sent
+    /// on to the network, matching `parse_lease`'s analogous validation for
+    /// `--lease`.
+    #[test]
+    fn parse_note_base64_invalid_errors() {
+        let err = parse_note(Some("not valid base64!!"), None).unwrap_err();
+        assert!(err.contains("Cannot base64-decode note"), "got: {err}");
+    }
 }
