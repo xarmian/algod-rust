@@ -75,11 +75,32 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   rather than repeating the notification back with a one-line
   acknowledgement — a real check either surfaces something actionable or
   confirms genuine progress, whereas a bare acknowledgement does neither.
-- Use `scripts/wait_for_issue_pr.sh` / `scripts/wait_for_pr_checks.sh`
-  (see the `algod-agent-wait` skill) for the coordinator's own CI waits;
-  a dispatched agent doing its own internal polling is a separate matter
-  — that agent's chatter is not something the coordinator needs to
-  re-echo turn by turn.
+- **Use `scripts/wait_for_issue_pr.sh` / `scripts/wait_for_pr_checks.sh`
+  (see the `algod-agent-wait` skill) for every coordinator-side CI wait —
+  and once one is launched with `run_in_background: true`, that single
+  launch is the ENTIRE waiting action for that turn and every turn after
+  it until its own notification arrives.** This has been violated
+  repeatedly in past sessions in a specific, tempting way: launch the
+  script correctly, then — while genuinely waiting for its notification —
+  start manually re-checking anyway (`gh pr checks`, `gh pr view`, `git
+  log` in the worktree, or any other "just a quick peek" / "something
+  productive to do while waiting" call), sometimes dozens of times in a
+  row, each wrapped in a one-line "waiting..." text turn. This is not
+  meaningfully different from not having launched the script at all — it
+  is the exact polling-noise anti-pattern the script exists to replace,
+  just laundered through calling the script once first. **The concrete
+  rule: after `run_in_background: true` on either wait script, make ZERO
+  further tool calls — none, not `gh pr checks`, not a "let me check
+  something useful while I wait" tangent, not another `echo`/`true`
+  filler command — until that script's own `task-notification` arrives.**
+  If you genuinely have other useful, unrelated work to do (filing a
+  separate issue, reviewing a different PR, reading a doc), do it and
+  stop there — do not loop back to peek at the thing you're waiting on.
+  If nothing else is useful right now, end the turn on a single sentence
+  and nothing else. A long-running check (the "Dual-Node REST
+  Conformance"/live-parity workflows routinely take 10–15 minutes) is not
+  a signal to check more often — it is exactly the case this script was
+  built to sit through unattended.
 
 ## Golden Fixtures
 
