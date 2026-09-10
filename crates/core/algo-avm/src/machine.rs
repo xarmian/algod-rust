@@ -28,11 +28,48 @@ use std::collections::HashMap;
 
 use algo_error::AlgoError;
 
-use crate::bytecode::Program;
+use crate::bytecode::{Immediates, Instruction, Program};
 use crate::context::AvmContext;
 use crate::opcode::{self, CostKind};
 use crate::ops;
 use crate::tracer::EvalTracer;
+
+/// The `store i` opcode byte (`ops::stack::op_store`).
+const OPCODE_STORE: u8 = 0x35;
+/// The `stores` opcode byte (`ops::stack::op_stores`).
+const OPCODE_STORES: u8 = 0x3f;
+
+/// Determine which scratch slot (if any) `instr` is about to write, reading
+/// only pre-dispatch state (the instruction's own immediate, and the stack
+/// as it stands before dispatch mutates it) -- see `step_with_tracer`'s call
+/// site (issue #1225).
+///
+/// Returns `None` for any other opcode, or when the slot cannot be
+/// determined from the pre-dispatch state (e.g. `stores` with fewer than two
+/// values on the stack, or a non-uint64 index) -- in those cases dispatch
+/// itself will error and no write happens, so there is nothing to report.
+fn scratch_write_slot(instr: &Instruction, stack: &[AvmValue]) -> Option<usize> {
+    match instr.opcode {
+        OPCODE_STORE => match instr.immediates {
+            Immediates::Uint8(slot) => Some(slot as usize),
+            _ => None,
+        },
+        OPCODE_STORES => {
+            // `stores` pops the value first, then the index (see
+            // `op_stores`), so before dispatch the index sits directly
+            // beneath the value: `stack[len-2]`.
+            let idx_val = stack.len().checked_sub(2).map(|i| &stack[i])?;
+            match idx_val {
+                AvmValue::Uint64(n) => Some(*n as usize),
+                // Mirrors `AvmMachine::pop_uint`'s coercion: empty bytes read
+                // as 0, non-empty bytes are invalid (dispatch will error).
+                AvmValue::Bytes(b) if b.is_empty() => Some(0),
+                AvmValue::Bytes(_) => None,
+            }
+        }
+        _ => None,
+    }
+}
 
 /// Maximum stack depth allowed by the AVM.
 const MAX_STACK_DEPTH: usize = 1000;
@@ -351,6 +388,17 @@ impl AvmMachine {
         // exhaustion opcodes are visible in the trace, matching go-algorand).
         tracer.before_opcode(self.pc, instr.opcode);
 
+        // Capture the scratch slot a `store`/`stores` instruction is about to
+        // write, *before* dispatch mutates the stack/immediates state (issue
+        // #1225). Reported to the tracer only if dispatch actually succeeds
+        // (see below) -- go-algorand's tracer only records the write once the
+        // opcode has actually run. `store`'s slot is a static immediate;
+        // `stores`' slot is popped dynamically from the stack (value on top,
+        // index directly beneath it -- see `ops::stack::op_stores`), so it
+        // must be read from the pre-dispatch stack here since `ops::dispatch`
+        // does not currently thread a tracer through to the opcode handlers.
+        let scratch_write_slot = scratch_write_slot(&instr, &self.stack);
+
         // Charge static cost. Must resolve through `resolve_spec` (not the
         // bare prefix-byte `lookup`) so a multi-byte "prefix opcode" family
         // (e.g. `app_box_*` at 0xd4) charges its actual sub-opcode's own
@@ -378,6 +426,12 @@ impl AvmMachine {
         // Tracer: after opcode (with error if any).
         match &result {
             Ok(()) => {
+                // Report the scratch write (if any) before `after_opcode` so
+                // a tracer building its opcode trace unit inside
+                // `after_opcode` can incorporate it into that same unit.
+                if let Some(slot) = scratch_write_slot {
+                    tracer.record_scratch_write(slot);
+                }
                 tracer.after_opcode(old_pc, instr.opcode, &self.stack, &self.scratch, None);
             }
             Err(e) => {
