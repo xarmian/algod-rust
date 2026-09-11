@@ -641,6 +641,24 @@ pub struct ConsensusParams {
     /// replay of a chain whose genesis predates v26 (this never changes
     /// after genesis is created).
     pub initial_rewards_rate_calculation: bool,
+    /// Suppress an empty per-account local-state delta from `EvalDelta.LocalDeltas`
+    /// (Go: `NoEmptyLocalDeltas`, v27+). Pre-v27, an `ApplicationOptIn` call
+    /// that touches no local state still recorded a real (empty) `"ld"` entry
+    /// for that (address, app) pair — go's `roundCowState.buildEvalDelta`
+    /// (`ledger/eval/appcow.go`) created a `storageDelta` purely from the
+    /// opt-in touch. From v27 this is suppressed: an address only appears in
+    /// `LocalDeltas` when its per-key delta map is non-empty. This only
+    /// affects `ApplyData.EvalDelta` content (REST/historical-replay), never
+    /// block-hash consensus (`EvalDelta` isn't part of the payset commitment).
+    ///
+    /// Go's real condition also carves out the historical
+    /// `ConsensusV24`-with-`NextProtocol != ConsensusV26` upgrade window
+    /// (a buggy period during the live V24→V26 mainnet upgrade transition
+    /// kept producing empty deltas); that carve-out needs the block header's
+    /// `NextProtocol` threaded through the apply/AVM-context boundary, which
+    /// nothing here currently models, so it is intentionally not
+    /// implemented — see issue #1280.
+    pub no_empty_local_deltas: bool,
     /// When the rewards rate refreshes at a recalculation round, use the
     /// freshly-refreshed rate immediately for that same round's level
     /// advance, rather than the previous round's rate (Go:
@@ -1008,6 +1026,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         max_version_string_len: 64,
         pending_residue_rewards: false,
         initial_rewards_rate_calculation: false,
+        no_empty_local_deltas: false,
         rewards_calculation_fix: false,
         rewards_in_apply_data: false,
         force_non_participating_fee_sink: false,
@@ -1237,8 +1256,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     }
 
     // ── v27 ─────────────────────────────────────────────────────
-    let v27 = v26.clone();
-    // v27 enables NoEmptyLocalDeltas (not modeled)
+    let mut v27 = v26.clone();
+    v27.no_empty_local_deltas = true;
     if version == CONSENSUS_V27 {
         return Some(v27);
     }
@@ -1827,6 +1846,7 @@ pub struct ConsensusParamsOverride {
     pub max_upgrade_wait_rounds: u64,
     pub pending_residue_rewards: bool,
     pub initial_rewards_rate_calculation: bool,
+    pub no_empty_local_deltas: bool,
     pub rewards_calculation_fix: bool,
     pub rewards_in_apply_data: bool,
     pub force_non_participating_fee_sink: bool,
@@ -2021,6 +2041,7 @@ impl ConsensusParamsOverride {
             max_version_string_len: self.max_version_string_len,
             pending_residue_rewards: self.pending_residue_rewards,
             initial_rewards_rate_calculation: self.initial_rewards_rate_calculation,
+            no_empty_local_deltas: self.no_empty_local_deltas,
             rewards_calculation_fix: self.rewards_calculation_fix,
             rewards_in_apply_data: self.rewards_in_apply_data,
             force_non_participating_fee_sink: self.force_non_participating_fee_sink,

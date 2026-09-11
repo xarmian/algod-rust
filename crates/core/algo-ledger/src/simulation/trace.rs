@@ -1145,7 +1145,7 @@ mod tests {
                 inner_transactions: inner,
                 ..algo_avm::eval::AvmResult::empty()
             };
-            stx.eval_delta = crate::eval_delta::encode_eval_delta(&avm_result, &stx.txn);
+            stx.eval_delta = crate::eval_delta::encode_eval_delta(&avm_result, &stx.txn, false);
         }
         stx
     }

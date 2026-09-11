@@ -862,6 +862,15 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// Tracks local state changes made during execution (dual-write with store).
     /// Key: (account address, state key bytes), Value: the new TealValue (or absent for deletes).
     local_delta_tracker: HashMap<(Address, Vec<u8>), Option<TealValue>>,
+    /// Addresses that opted in to this call's app during this execution but
+    /// may never write any local-state key (issue #1280). Mirrors go's
+    /// `roundCowState.buildEvalDelta` creating a `storageDelta` purely from
+    /// the opt-in touch (`ledger/eval/appcow.go`): without this, an
+    /// opt-in-only call has no entry at all in `local_delta_tracker`, so
+    /// `take_local_deltas` would never surface the (possibly-empty) local
+    /// delta that pre-`NoEmptyLocalDeltas` (pre-v27) `EvalDelta` encoding
+    /// needs to conditionally include.
+    local_delta_touched: std::collections::HashSet<Address>,
 
     /// Optional execution tracer for capturing opcode-level details.
     /// Used by the simulation engine for tracing inner transactions.
@@ -1736,6 +1745,15 @@ pub(crate) fn default_scratch_row() -> [TealValue; 256] {
 }
 
 impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
+    /// Record that `addr` opted in to this call's app during this execution
+    /// (issue #1280), so [`take_local_deltas`](AvmContext::take_local_deltas)
+    /// surfaces an entry for it even if no local-state key is ever written.
+    /// Call sites: the top-level and inner `appl` OptIn paths, right after
+    /// `apply_appl_opt_in_pre_program` runs and this context exists.
+    pub(crate) fn mark_local_delta_touch(&mut self, addr: Address) {
+        self.local_delta_touched.insert(addr);
+    }
+
     /// Core asset-reference resolution, matching go-algorand's
     /// `resolveAsset` (`data/transactions/logic/eval.go`) *before* its
     /// `AppForbidLowResources` low-id check (applied by the caller via
@@ -1973,6 +1991,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             family_chain: Vec::new(),
             global_delta_tracker: HashMap::new(),
             local_delta_tracker: HashMap::new(),
+            local_delta_touched: std::collections::HashSet::new(),
             tracer_ptr: None,
             max_log_calls: MAX_LOG_CALLS,
             max_log_size: MAX_LOG_SIZE,
@@ -3885,6 +3904,12 @@ fn execute_inner_appl<L: LedgerStore>(
             .map(|p| p.version)
             .unwrap_or(0),
     );
+    // Record the opt-in touch (issue #1280) now that `inner_ctx` exists, so
+    // an opt-in-only inner call (no local-state writes) still surfaces an
+    // entry in `take_local_deltas` for pre-v27 `EvalDelta` encoding.
+    if on_completion == ON_COMPLETION_OPT_IN {
+        inner_ctx.mark_local_delta_touch(sender);
+    }
     // Issue #1128: `global_sharing` is the caller's own value OR'd with this
     // program's own version-eligibility -- mirrors go's `evalTracer.
     // BeforeProgram` walking from the current frame up through every caller
@@ -4062,7 +4087,11 @@ fn execute_inner_appl<L: LedgerStore>(
     // (eval.go:5751 appends each inner txn with its own ApplyData). Reuses the
     // same encoder as the outer txn (TASK-280); nested `itx[*].dt` are already
     // populated on each child stxn, so the recursion composes. (TASK-281)
-    let dt = crate::eval_delta::encode_eval_delta(&avm_result, &stxn.txn);
+    let dt = crate::eval_delta::encode_eval_delta(
+        &avm_result,
+        &stxn.txn,
+        consensus.no_empty_local_deltas,
+    );
     stxn.eval_delta = dt;
 
     // ── Apply OnCompletion side effects (post-program) ──
@@ -6797,6 +6826,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         for ((addr, key), maybe_val) in tracker {
             // Preserve None entries — they represent key deletions (app_local_del).
             deltas.entry(addr).or_default().insert(key, maybe_val);
+        }
+        // Opt-in-only touches (issue #1280): an address that opted in during
+        // this call but wrote no local-state key still gets an entry here
+        // (empty if it has no kv writes) so pre-v27 `EvalDelta` encoding can
+        // conditionally surface it. `entry().or_default()` is a no-op when
+        // the address already has real kv writes above.
+        for addr in std::mem::take(&mut self.local_delta_touched) {
+            deltas.entry(addr).or_default();
         }
         deltas
     }

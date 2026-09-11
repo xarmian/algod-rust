@@ -165,9 +165,17 @@ pub fn parse_eval_delta(val: &rmpv::Value) -> Result<EvalDelta, AlgoError> {
 /// global/local state deltas, logs, and their own nested inner transactions —
 /// the recursion composes because each inner `SignedTransaction` already has its
 /// delta encoded before the parent serializes it under `itx`.
+///
+/// `no_empty_local_deltas` mirrors go-algorand's `ConsensusParams.
+/// NoEmptyLocalDeltas` (v27+, `config/consensus.go`): when true, an address
+/// whose local-state delta map is empty (e.g. an `ApplicationOptIn` call
+/// that writes no local-state key) is omitted from the `"ld"` map entirely,
+/// rather than being recorded as a real empty entry. Pass the calling
+/// transaction's active `ConsensusParams::no_empty_local_deltas`.
 pub fn encode_eval_delta(
     result: &algo_avm::eval::AvmResult,
     txn: &Transaction,
+    no_empty_local_deltas: bool,
 ) -> Option<rmpv::Value> {
     use rmpv::Value;
 
@@ -212,32 +220,43 @@ pub fn encode_eval_delta(
         // accounts. Iterate in a deterministic order since HashMap order is
         // unspecified.
         let accounts: &[Address] = txn.accounts.as_deref().unwrap_or(&[]);
-        let mut items: Vec<_> = result.local_deltas.iter().collect();
+        // NoEmptyLocalDeltas (v27+, issue #1280): drop an address whose
+        // per-key delta map is empty before it ever reaches the wire —
+        // mirrors go's `buildEvalDelta`'s `if !noEmptyDeltas || len(d) != 0`
+        // guard (`ledger/eval/appcow.go`). Pre-v27 (`no_empty_local_deltas`
+        // false), an opt-in-only touch's empty map is kept as a real entry.
+        let mut items: Vec<_> = result
+            .local_deltas
+            .iter()
+            .filter(|(_, kv)| !no_empty_local_deltas || !kv.is_empty())
+            .collect();
         items.sort_by_key(|(addr, _)| addr.0);
 
-        let mut shared: Vec<Address> = Vec::new();
-        let mut ld: Vec<(Value, Value)> = Vec::with_capacity(items.len());
-        for (addr, kv) in items {
-            let index = if *addr == txn.sender {
-                0u64
-            } else if let Some(i) = accounts.iter().position(|a| a == addr) {
-                (i + 1) as u64
-            } else {
-                let pos = shared.iter().position(|a| a == addr).unwrap_or_else(|| {
-                    shared.push(*addr);
-                    shared.len() - 1
-                });
-                (1 + accounts.len() + pos) as u64
-            };
-            ld.push((Value::from(index), state_delta(kv)));
-        }
-        entries.push((Value::from("ld"), Value::Map(ld)));
-        if !shared.is_empty() {
-            // `sa`: addresses for the local deltas that index beyond `accounts`.
-            entries.push((
-                Value::from("sa"),
-                Value::Array(shared.iter().map(|a| Value::Binary(a.0.to_vec())).collect()),
-            ));
+        if !items.is_empty() {
+            let mut shared: Vec<Address> = Vec::new();
+            let mut ld: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+            for (addr, kv) in items {
+                let index = if *addr == txn.sender {
+                    0u64
+                } else if let Some(i) = accounts.iter().position(|a| a == addr) {
+                    (i + 1) as u64
+                } else {
+                    let pos = shared.iter().position(|a| a == addr).unwrap_or_else(|| {
+                        shared.push(*addr);
+                        shared.len() - 1
+                    });
+                    (1 + accounts.len() + pos) as u64
+                };
+                ld.push((Value::from(index), state_delta(kv)));
+            }
+            entries.push((Value::from("ld"), Value::Map(ld)));
+            if !shared.is_empty() {
+                // `sa`: addresses for the local deltas that index beyond `accounts`.
+                entries.push((
+                    Value::from("sa"),
+                    Value::Array(shared.iter().map(|a| Value::Binary(a.0.to_vec())).collect()),
+                ));
+            }
         }
     }
 
@@ -865,7 +884,7 @@ mod tests {
             vec![b"log1".to_vec()],
         );
 
-        let encoded = encode_eval_delta(&result, &txn).expect("non-empty delta");
+        let encoded = encode_eval_delta(&result, &txn, false).expect("non-empty delta");
         let parsed = parse_eval_delta(&encoded).expect("encoded delta round-trips through parse");
 
         let gd = parsed.global_delta.expect("global delta");
@@ -894,7 +913,47 @@ mod tests {
     #[test]
     fn encode_eval_delta_empty_is_none() {
         let result = avm_result(HashMap::new(), HashMap::new(), vec![], vec![]);
-        assert!(encode_eval_delta(&result, &Transaction::default()).is_none());
+        assert!(encode_eval_delta(&result, &Transaction::default(), false).is_none());
+    }
+
+    /// Issue #1280: an opt-in-only touch (address present in `local_deltas`
+    /// with an empty per-key map, matching how `LedgerAvmContext::
+    /// take_local_deltas` now records `ApplicationOptIn`) must encode as a
+    /// real empty `"ld"` entry when `no_empty_local_deltas` is false
+    /// (pre-v27), and must be omitted from `"ld"` entirely — and the whole
+    /// `"ld"`/`"dt"` map must vanish along with it, since nothing else is
+    /// present — when `no_empty_local_deltas` is true (v27+, go's
+    /// `ConsensusParams.NoEmptyLocalDeltas`).
+    #[test]
+    fn encode_eval_delta_opt_in_only_touch_no_empty_local_deltas_gate() {
+        let sender = Address([1u8; 32]);
+        let txn = Transaction {
+            sender,
+            ..Default::default()
+        };
+        let mut local_deltas = HashMap::new();
+        local_deltas.insert(sender, HashMap::new()); // opt-in touch, no kv writes
+        let result = avm_result(HashMap::new(), local_deltas, vec![], vec![]);
+
+        // Pre-v27: the empty local delta is a real "ld" entry.
+        let encoded_pre_v27 =
+            encode_eval_delta(&result, &txn, false).expect("pre-v27 must keep the empty ld entry");
+        let parsed_pre_v27 = parse_eval_delta(&encoded_pre_v27).unwrap();
+        let ld_pre_v27 = parsed_pre_v27
+            .local_deltas
+            .expect("pre-v27 local_deltas must be Some");
+        let sender_delta = ld_pre_v27.get(&0).expect("sender (index 0) entry");
+        assert!(
+            sender_delta.is_empty(),
+            "opt-in-only touch must be an empty per-key map"
+        );
+
+        // v27+: NoEmptyLocalDeltas suppresses the entry -- with nothing else
+        // in the delta, the whole encoding is None.
+        assert!(
+            encode_eval_delta(&result, &txn, true).is_none(),
+            "v27+ must omit an opt-in-only touch's empty ld entry entirely"
+        );
     }
 
     /// Extract the `sa` (shared accounts) entries from an encoded eval delta.
@@ -941,6 +1000,7 @@ mod tests {
         let encoded = encode_eval_delta(
             &avm_result(HashMap::new(), local_deltas, vec![], vec![]),
             &txn,
+            false,
         )
         .expect("delta");
 
