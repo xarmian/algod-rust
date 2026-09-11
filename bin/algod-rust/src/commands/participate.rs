@@ -4329,9 +4329,12 @@ pub async fn run(
             let dns_template = dns_bootstrap_override.unwrap_or(&node_config.dns_bootstrap_id);
             match algo_network::Discovery::new(
                 phonebook.clone(),
-                Box::new(algo_network::HickorySrvResolver::new(
-                    resolve_fallback_dns_resolver(&node_config.fallback_dns_resolver_address),
-                )),
+                Box::new(
+                    algo_network::HickorySrvResolver::new_with_dnssec_validation(
+                        resolve_fallback_dns_resolver(&node_config.fallback_dns_resolver_address),
+                        node_config.dns_security_srv_enforced(),
+                    ),
+                ),
                 dns_template,
                 network_name,
                 dns_bootstrap_override.is_some(),
