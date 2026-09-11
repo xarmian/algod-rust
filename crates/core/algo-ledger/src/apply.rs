@@ -4197,7 +4197,6 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
                             new_version, prev_version
                         )));
                     }
-                    app.approval_program = approval.to_vec();
                 }
                 if let Some(ref clear) = txn.clear_state_program {
                     let prev_version = algo_avm::bytecode::parse(&app.clear_state_program)
@@ -4214,6 +4213,80 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
                             new_version, prev_version
                         )));
                     }
+                }
+
+                // go-algorand `ledger/apply/application.go`'s
+                // `updateApplication`: `sizeChange := ac.UpdatingSizes()`,
+                // computed before the program-size recheck below so the
+                // `!sizeChange` branch can use it.
+                let new_global_schema = txn.global_state_schema.clone().unwrap_or_default();
+                let size_change = txn.extra_program_pages != 0 || !new_global_schema.is_empty();
+
+                // Issue #1309 / go-algorand `updateApplication`
+                // (`ledger/apply/application.go:200-208`):
+                //
+                //   if !sizeChange {
+                //       // The wellFormed() check rejects big programs
+                //       // conservatively, but it doesn't know the actual
+                //       // params.ExtraProgramPages, so it allows any
+                //       // programs that fit under the absolute max. (if
+                //       // there is a size change, that check is precise
+                //       // because the programs are in the transaction)
+                //       if err = ac.WellSizedPrograms(params.ExtraProgramPages, proto); err != nil {
+                //           return err
+                //       }
+                //   }
+                //
+                // `algo_validate::rules`'s well-formedness pass deliberately
+                // uses the lenient `max_absolute_extra_program_pages` bound
+                // for a non-resizing update (it can't see the app's real
+                // stored `extra_program_pages` at mempool-admission time).
+                // That means a program between the app's real per-page limit
+                // and the absolute max can pass well-formedness -- go closes
+                // that gap here, at apply time, against the real stored
+                // value; this recheck mirrors that exactly. When
+                // `size_change` is true the transaction's own
+                // `extra_program_pages` already gave well-formedness a
+                // precise bound, so no recheck is needed (matching go's
+                // comment).
+                if !size_change {
+                    let new_approval_len = txn
+                        .approval_program
+                        .as_ref()
+                        .map(|p| p.len())
+                        .unwrap_or(app.approval_program.len());
+                    let new_clear_len = txn
+                        .clear_state_program
+                        .as_ref()
+                        .map(|p| p.len())
+                        .unwrap_or(app.clear_state_program.len());
+                    let pages = 1usize + app.extra_program_pages as usize;
+                    let max_program_len = pages * consensus.max_app_program_len;
+                    if new_approval_len > max_program_len {
+                        return Err(err_ctx.error(format!(
+                            "approval program too long. ({} > {})",
+                            new_approval_len, max_program_len
+                        )));
+                    }
+                    if new_clear_len > max_program_len {
+                        return Err(err_ctx.error(format!(
+                            "clear state program too long. ({} > {})",
+                            new_clear_len, max_program_len
+                        )));
+                    }
+                    let max_total_program_len = pages * consensus.max_app_total_program_len;
+                    if new_approval_len + new_clear_len > max_total_program_len {
+                        return Err(err_ctx.error(format!(
+                            "app programs too long. ({} + {} > {})",
+                            new_approval_len, new_clear_len, max_total_program_len
+                        )));
+                    }
+                }
+
+                if let Some(ref approval) = txn.approval_program {
+                    app.approval_program = approval.to_vec();
+                }
+                if let Some(ref clear) = txn.clear_state_program {
                     app.clear_state_program = clear.to_vec();
                 }
                 // go-algorand `ledger/apply/application.go`'s `updateApplication`:
@@ -4234,8 +4307,6 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
                 // currently on the hook to this update's sender -- back to
                 // "nobody" (encoded as the zero address) if the sender is
                 // the creator itself.
-                let new_global_schema = txn.global_state_schema.clone().unwrap_or_default();
-                let size_change = txn.extra_program_pages != 0 || !new_global_schema.is_empty();
                 if size_change {
                     let sponsor = if app.size_sponsor.is_zero() {
                         app.creator
@@ -11677,6 +11748,146 @@ mod tests {
 
         apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute)
             .expect("upgrading the approval program version must be allowed");
+    }
+
+    // ---- Issue #1309: a non-resizing app update must recheck program sizes
+    // against the app's REAL stored `extra_program_pages`, not the lenient
+    // absolute-max bound well-formedness uses when it can't see the app's
+    // actual on-chain sizing (go-algorand `ledger/apply/application.go`'s
+    // `updateApplication`, `if !sizeChange { ac.WellSizedPrograms(params.
+    // ExtraProgramPages, proto) }`) ----
+
+    #[test]
+    fn issue_1309_app_update_without_resize_rejects_program_over_real_epp_limit() {
+        let creator = Address([11u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        // Round 1: create an app with extra_program_pages == 0 (the default
+        // -- the create txn sets no ExtraProgramPages), so its real program
+        // size limit is 1 * MaxAppProgramLen (2048 bytes at v42).
+        let create_approval = trivial_clear_program();
+        let create_clear = trivial_clear_program();
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(create_approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(create_clear));
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V42.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let &app_id = delta1
+            .creatables
+            .keys()
+            .next()
+            .expect("app create must register a creatable");
+
+        // Round 2: update the app WITHOUT setting ExtraProgramPages/
+        // GlobalStateSchema (size_change == false), but with an approval
+        // program well past the real 1-page (2048-byte) limit -- still
+        // within the lenient absolute-max bound
+        // ((1 + MaxAbsoluteExtraProgramPages) * MaxAppProgramLen ==
+        // 8 * 2048 == 16384 bytes at v42) that well-formedness alone would
+        // have allowed. go-algorand's real ledger rejects this at apply
+        // time; algod-rust must too.
+        let oversized_approval = padded_approving_program(3_000);
+        assert!(
+            oversized_approval.len() > 2_048,
+            "test program must actually exceed the real 1-page limit, got {}",
+            oversized_approval.len()
+        );
+        let clear_again = trivial_clear_program();
+        let mut update = SignedTransaction::default();
+        update.txn.txn_type = "appl".into();
+        update.txn.sender = creator;
+        update.txn.fee = 10_000;
+        update.txn.application_id = app_id;
+        update.txn.on_completion = ON_COMPLETION_UPDATE;
+        update.txn.approval_program = Some(serde_bytes::ByteBuf::from(oversized_approval));
+        update.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear_again));
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V42.to_string(),
+            payset: vec![update],
+            ..Block::default()
+        };
+
+        let err = apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute).unwrap_err();
+        assert!(
+            err.to_string().contains("approval program too long"),
+            "expected a real-epp-limit rejection for the oversized non-resizing update, got: {err}"
+        );
+    }
+
+    #[test]
+    fn issue_1309_app_update_with_resize_allows_program_up_to_new_epp_limit() {
+        let creator = Address([12u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        // Round 1: create an app with extra_program_pages == 0.
+        let create_approval = trivial_clear_program();
+        let create_clear = trivial_clear_program();
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(create_approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(create_clear));
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V42.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let &app_id = delta1
+            .creatables
+            .keys()
+            .next()
+            .expect("app create must register a creatable");
+
+        // Round 2: this time the update DOES resize (ExtraProgramPages = 1),
+        // so the same oversized-relative-to-1-page program is legitimately
+        // within the new 2-page limit (2 * 2048 == 4096 bytes) and must be
+        // accepted -- confirming the fix's `!size_change` gate doesn't
+        // over-reject the legitimate resizing path.
+        let resized_approval = padded_approving_program(3_000);
+        assert!(resized_approval.len() <= 4_096);
+        let clear_again = trivial_clear_program();
+        let mut update = SignedTransaction::default();
+        update.txn.txn_type = "appl".into();
+        update.txn.sender = creator;
+        update.txn.fee = 10_000;
+        update.txn.application_id = app_id;
+        update.txn.on_completion = ON_COMPLETION_UPDATE;
+        update.txn.approval_program = Some(serde_bytes::ByteBuf::from(resized_approval));
+        update.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear_again));
+        update.txn.extra_program_pages = 1;
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V42.to_string(),
+            payset: vec![update],
+            ..Block::default()
+        };
+
+        apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute)
+            .expect("a legitimately resizing update must still be accepted");
     }
 
     // ---- Issue #725: box read-I/O-budget check must run eagerly for every
