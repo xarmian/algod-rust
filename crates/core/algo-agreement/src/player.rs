@@ -1599,8 +1599,10 @@ mod tests {
         // roundtrip a populated (non-empty pending map, non-zero next_seq)
         // proposalTable through msgpack.
         let mut pt = ProposalTableImpl::default();
-        let mut me = MessageEvent::default();
-        me.t = crate::events::EventType::PayloadPresent;
+        let me = MessageEvent {
+            t: crate::events::EventType::PayloadPresent,
+            ..MessageEvent::default()
+        };
         let seq1 = pt.push(Some(Box::new(me)));
         let _seq2 = pt.push(None);
 
