@@ -1552,10 +1552,17 @@ static ENABLE_METRIC_REPORTING: VersionedDefault<bool> = VersionedDefault::new(&
 //   `MessageFilter` bucket construction (`message_filter.rs`), which
 //   previously hardcoded a single bucket-size constant with no
 //   bucket-count knob and no incoming/outgoing split at all.
-// - `dns_security_flags`/`network_protocol_version`/
-//   `disable_outgoing_connection_throttling`: round-trip only, no underlying
-//   DNS-response-validation, protocol-version-override, or
+// - `network_protocol_version`/`disable_outgoing_connection_throttling`:
+//   round-trip only, no underlying protocol-version-override or
 //   outgoing-throttle-disable subsystem exists to gate.
+// - `dns_security_flags`: its SRV-enforcement bit is decoded by
+//   [`Local::dns_security_srv_enforced`] and wired into `participate`'s
+//   `HickorySrvResolver` construction (issue #1314) — the other three bits
+//   (`DNSSecurityRelayAddrEnforced`/`DNSSecurityTelemetryAddrEnforced`/
+//   `DNSSecurityTXTEnforced`) gate architecturally separate go subsystems
+//   (relay-hostname resolution, telemetry, p2p `dnsaddr` TXT resolution)
+//   that algod-rust has no equivalent production code path for yet, so
+//   they stay unconsumed.
 // - `block_service_custom_fallback_endpoints`/`enable_request_logger`: wired
 //   into `relay`'s block-service/HTTP-server construction (`relay.rs`'s
 //   `.with_custom_fallback_endpoints`/`enable_request_logger` fields) —
@@ -4354,6 +4361,24 @@ impl Local {
         serde_json::to_string_pretty(&serde_json::Value::Object(out)).map_err(ConfigError::Encode)
     }
 
+    /// Returns `true` if SRV-record DNS bootstrap resolution must validate
+    /// DNSSEC. Mirrors go's `config.Local.DNSSecuritySRVEnforced()`
+    /// (`config/localTemplate.go:729-731`): `DNSSecurityFlags & dnssecSRV
+    /// != 0`, where `dnssecSRV` is bit `0x01` of the flags bitmask
+    /// (`config/config.go`'s `dnssecSRV = 1 << iota` block).
+    ///
+    /// Consulted by `participate`'s DNS-bootstrap SRV resolver construction
+    /// (issue #1314) to decide whether
+    /// `algo_network::HickorySrvResolver` enforces DNSSEC validation or
+    /// falls back to plain (non-validating) resolution — go's own
+    /// `getDNSAddrs` (`network/wsNetwork.go`) passes this exact bit through
+    /// `resolveSRVRecords`'s `secure` argument into
+    /// `tools/network/resolveController.go`'s `ResolveController`, which
+    /// returns a non-validating `net.Resolver` when `secure` is `false`.
+    pub fn dns_security_srv_enforced(&self) -> bool {
+        self.dns_security_flags & 0x01 != 0
+    }
+
     /// Write [`Local::to_json_minimized`]'s output to `path`.
     pub fn save_non_default_to_path(&self, path: &Path) -> Result<(), ConfigError> {
         let json = self.to_json_minimized()?;
@@ -5028,6 +5053,48 @@ mod tests {
         cfg.dns_security_flags = 3; // explicit override, not the v6 default of 1
         cfg.migrate().expect("migrates");
         assert_eq!(cfg.dns_security_flags, 3);
+    }
+
+    // --- `dns_security_srv_enforced` (issue #1314) --------------------------
+
+    /// The stock default (`DNSSecurityFlags == 9`, SRV + TXT bits set)
+    /// enforces SRV DNSSEC validation.
+    #[test]
+    fn dns_security_srv_enforced_true_by_default() {
+        assert!(Local::default().dns_security_srv_enforced());
+    }
+
+    /// An explicit override clearing the SRV bit (`0x01`) disables
+    /// enforcement, even with other bits (e.g. TXT, `0x08`) still set.
+    #[test]
+    fn dns_security_srv_enforced_false_when_srv_bit_cleared() {
+        let cfg = Local {
+            dns_security_flags: 0x08, // TXT only, SRV bit cleared
+            ..Local::default()
+        };
+        assert!(!cfg.dns_security_srv_enforced());
+    }
+
+    /// `DNSSecurityFlags = 0` (DNSSEC entirely disabled) disables SRV
+    /// enforcement.
+    #[test]
+    fn dns_security_srv_enforced_false_when_flags_zero() {
+        let cfg = Local {
+            dns_security_flags: 0,
+            ..Local::default()
+        };
+        assert!(!cfg.dns_security_srv_enforced());
+    }
+
+    /// The SRV bit alone (without the TXT bit) still enforces SRV
+    /// validation — the bits are independent.
+    #[test]
+    fn dns_security_srv_enforced_true_when_only_srv_bit_set() {
+        let cfg = Local {
+            dns_security_flags: 0x01,
+            ..Local::default()
+        };
+        assert!(cfg.dns_security_srv_enforced());
     }
 
     #[test]

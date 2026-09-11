@@ -118,25 +118,53 @@ pub trait SrvResolver: Send + Sync {
 pub struct HickorySrvResolver {
     /// Optional fallback DNS server address (IP or hostname).
     fallback_dns: Option<String>,
+
+    /// Whether every resolver this instance builds validates DNSSEC.
+    ///
+    /// Mirrors go's `config.Local::DNSSecuritySRVEnforced()`
+    /// (`config/localTemplate.go:729-731`), which `getDNSAddrs`
+    /// (`network/wsNetwork.go`) passes as `resolveSRVRecords`'s `secure`
+    /// argument, flowing into `tools/network/resolveController.go`'s
+    /// `ResolveController` — a `false` there returns a plain non-validating
+    /// `net.Resolver`-backed resolver instead of a
+    /// `dnssec.MakeDnssecResolver(...)`-backed one. Issue #1314: this used
+    /// to be hardcoded `true` unconditionally with no way to disable it.
+    validate_dnssec: bool,
 }
 
 impl HickorySrvResolver {
-    /// Create a new resolver.
+    /// Create a new resolver with DNSSEC validation enabled (go's default:
+    /// `DNSSecurityFlags`'s SRV bit set).
     ///
     /// `fallback_dns` is an optional IP address (e.g. `"8.8.8.8"`) used as a
     /// fallback when the system resolver fails, mirroring go-algorand's
     /// `fallbackDNSResolverAddress` parameter.
     pub fn new(fallback_dns: Option<String>) -> Self {
-        Self { fallback_dns }
+        Self {
+            fallback_dns,
+            validate_dnssec: true,
+        }
     }
 
-    /// Build a hickory [`TokioResolver`] with the given config and DNSSEC
-    /// validation enabled.
-    fn build_resolver(config: ResolverConfig) -> TokioResolver {
+    /// Create a new resolver with an explicit DNSSEC-validation setting,
+    /// mirroring go's `config.Local::DNSSecuritySRVEnforced()` (issue
+    /// #1314). Callers with a loaded `Local` config (e.g. `participate`)
+    /// should use this instead of [`Self::new`] so an operator's explicit
+    /// `DNSSecurityFlags` override actually takes effect.
+    pub fn new_with_dnssec_validation(fallback_dns: Option<String>, validate_dnssec: bool) -> Self {
+        Self {
+            fallback_dns,
+            validate_dnssec,
+        }
+    }
+
+    /// Build a hickory [`TokioResolver`] with the given config, enabling
+    /// DNSSEC validation only when `validate` is set.
+    fn build_resolver(config: ResolverConfig, validate: bool) -> TokioResolver {
         let provider = TokioConnectionProvider::default();
         let mut builder = TokioResolver::builder_with_config(config, provider);
         let opts = builder.options_mut();
-        opts.validate = true; // Enable DNSSEC
+        opts.validate = validate;
         opts.try_tcp_on_error = true;
         builder.build()
     }
@@ -145,19 +173,19 @@ impl HickorySrvResolver {
     ///
     /// Uses `builder_tokio()` which reads `/etc/resolv.conf` on Unix or the
     /// registry on Windows to discover the system's DNS servers.
-    fn system_resolver() -> Result<TokioResolver, ResolveError> {
+    fn system_resolver(validate: bool) -> Result<TokioResolver, ResolveError> {
         let mut builder = TokioResolver::builder_tokio().map_err(|e| {
             warn!("failed to read system DNS config: {e}");
             e
         })?;
         let opts = builder.options_mut();
-        opts.validate = true; // Enable DNSSEC
+        opts.validate = validate;
         opts.try_tcp_on_error = true;
         Ok(builder.build())
     }
 
     /// Build a fallback resolver targeting a specific DNS server IP.
-    fn fallback_resolver(addr: &str) -> Option<TokioResolver> {
+    fn fallback_resolver(addr: &str, validate: bool) -> Option<TokioResolver> {
         let ip: IpAddr = match addr.parse() {
             Ok(ip) => ip,
             Err(e) => {
@@ -167,17 +195,17 @@ impl HickorySrvResolver {
         };
         let group = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
         let config = ResolverConfig::from_parts(None, vec![], group);
-        Some(Self::build_resolver(config))
+        Some(Self::build_resolver(config, validate))
     }
 
     /// Build a default resolver using well-known public DNS servers
     /// (Cloudflare + Google), mirroring go-algorand's `DefaultResolver`.
-    fn default_resolver() -> TokioResolver {
+    fn default_resolver(validate: bool) -> TokioResolver {
         // Combine Cloudflare and Google name servers for redundancy.
         let mut group = NameServerConfigGroup::cloudflare();
         group.merge(NameServerConfigGroup::google());
         let config = ResolverConfig::from_parts(None, vec![], group);
-        Self::build_resolver(config)
+        Self::build_resolver(config, validate)
     }
 
     /// Perform an SRV lookup using the given resolver, returning parsed
@@ -298,7 +326,7 @@ impl SrvResolver for HickorySrvResolver {
             let srv_name = format!("_{service}._{protocol}.{name}");
 
             // 3. Try system resolver first.
-            let sys_err: String = match Self::system_resolver() {
+            let sys_err: String = match Self::system_resolver(self.validate_dnssec) {
                 Ok(resolver) => match Self::do_lookup(&resolver, &srv_name).await {
                     Ok(records) => return Ok(records),
                     Err(e) => {
@@ -314,7 +342,7 @@ impl SrvResolver for HickorySrvResolver {
 
             // 4. If system fails and fallback is configured, try fallback.
             let fb_err: String = if let Some(ref fallback_addr) = self.fallback_dns {
-                match Self::fallback_resolver(fallback_addr) {
+                match Self::fallback_resolver(fallback_addr, self.validate_dnssec) {
                     Some(resolver) => match Self::do_lookup(&resolver, &srv_name).await {
                         Ok(records) => return Ok(records),
                         Err(e) => {
@@ -331,7 +359,7 @@ impl SrvResolver for HickorySrvResolver {
             };
 
             // 5. Try default resolver (well-known public DNS).
-            let default_resolver = Self::default_resolver();
+            let default_resolver = Self::default_resolver(self.validate_dnssec);
             match Self::do_lookup(&default_resolver, &srv_name).await {
                 Ok(records) => Ok(records),
                 Err(e) => {
@@ -642,6 +670,36 @@ mod tests {
     #[test]
     fn resolver_with_fallback() {
         let resolver = HickorySrvResolver::new(Some("8.8.8.8".to_string()));
+        assert_eq!(resolver.fallback_dns.as_deref(), Some("8.8.8.8"));
+    }
+
+    // --- DNSSEC-validation flag threading (issue #1314) ---------------------
+
+    /// `new` (the default constructor, used by `observe`/`sync`, which have
+    /// no loaded config to consult) enables DNSSEC validation — go's own
+    /// default (`DNSSecurityFlags`'s SRV bit set).
+    #[test]
+    fn new_enables_dnssec_validation_by_default() {
+        let resolver = HickorySrvResolver::new(None);
+        assert!(resolver.validate_dnssec);
+    }
+
+    /// `new_with_dnssec_validation` threads an explicit `true` through.
+    #[test]
+    fn new_with_dnssec_validation_true() {
+        let resolver = HickorySrvResolver::new_with_dnssec_validation(None, true);
+        assert!(resolver.validate_dnssec);
+    }
+
+    /// `new_with_dnssec_validation` threads an explicit `false` through —
+    /// the core parity fix: an operator clearing `DNSSecurityFlags`'s SRV
+    /// bit must actually disable validation, not just round-trip the
+    /// setting unused.
+    #[test]
+    fn new_with_dnssec_validation_false() {
+        let resolver =
+            HickorySrvResolver::new_with_dnssec_validation(Some("8.8.8.8".to_string()), false);
+        assert!(!resolver.validate_dnssec);
         assert_eq!(resolver.fallback_dns.as_deref(), Some("8.8.8.8"));
     }
 
