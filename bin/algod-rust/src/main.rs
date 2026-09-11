@@ -179,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
                     fail_fast,
                     end,
                     node_config.accounts_rebuild_synchronous_mode,
+                    node_config.catchup_block_download_retry_attempts,
                     &catchpoint_peer_url,
                     gossip,
                     genesis_id.as_deref(),

@@ -182,6 +182,14 @@ pub struct SyncConfig {
     /// `1` (NORMAL) matches go's default and this field's previously
     /// hardcoded, unconditional value.
     pub accounts_rebuild_synchronous_mode: i64,
+    /// Bounded-retry-then-abort budget for the lookback-block download
+    /// phase (`run_download_lookback` -> `download_lookback_blocks_with_lookback`)
+    /// — go's `Config.CatchupBlockDownloadRetryAttempts`
+    /// (`catchup/catchpointService.go`'s `processStageBlocksDownload`,
+    /// issue #1287). `1000` matches go's default
+    /// (`config/local_defaults.go`, `version[9]:"1000"`) and this field's
+    /// previously-nonexistent (unbounded) retry behavior.
+    pub catchup_block_download_retry_attempts: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,6 +1082,7 @@ impl SyncOrchestrator {
         let blocks_downloaded = crate::catchpoint::download_lookback_blocks_with_lookback(
             round,
             lookback,
+            self.config.catchup_block_download_retry_attempts,
             // fetch_block callback
             |rnd| {
                 let (proto, hdrdata, blkdata) = self.backend.fetch_block_raw(rnd).map_err(|e| {
@@ -2206,6 +2215,8 @@ mod tests {
             fail_fast: false,
             end_round: None,
             accounts_rebuild_synchronous_mode,
+            catchup_block_download_retry_attempts:
+                crate::catchpoint::DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS,
         }
     }
 
@@ -2355,6 +2366,102 @@ mod tests {
             assert!(pair[1].1 >= pair[0].1, "acquired regressed: {snaps:?}");
         }
         assert_eq!(after_total_set.last().unwrap().1, 6);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A [`SyncBackend`] fake whose `fetch_block_raw` always fails, so
+    /// `run_download_lookback` can be driven against a permanently
+    /// unreachable peer source without a network. `fetch_attempts` is an
+    /// `Arc` so the test can keep observing the counter after the backend
+    /// is moved into the (trait-object-erasing) `SyncOrchestrator`.
+    struct AlwaysFailingLookbackBackend {
+        fetch_attempts: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl SyncBackend for AlwaysFailingLookbackBackend {
+        fn download_catchpoint(
+            &self,
+            _genesis_id: &str,
+            _round: u64,
+            _dest_path: &std::path::Path,
+        ) -> Result<(), AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+            self.fetch_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(AlgoError::Network {
+                message: format!("simulated unreachable peer for round {round}"),
+            })
+        }
+
+        fn fetch_block(&self, _round: u64) -> Result<Block, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn get_current_round(&self) -> Result<u64, AlgoError> {
+            unimplemented!("not exercised by the lookback-only test")
+        }
+
+        fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+            Ok(None)
+        }
+    }
+
+    /// TDD regression for issue #1287 (acceptance criterion #1): a catchup
+    /// lookback-block download that exhausts its configured
+    /// `catchup_block_download_retry_attempts` must abort with an error
+    /// rather than retrying unboundedly — driven through the real
+    /// `SyncOrchestrator::run_download_lookback` entry point (not just the
+    /// underlying `download_lookback_blocks_with_lookback` helper, which
+    /// has its own dedicated unit tests in `catchpoint::verify`), against a
+    /// fake, permanently-failing peer source.
+    #[test]
+    fn run_download_lookback_aborts_after_exhausting_configured_retry_attempts() {
+        let dir = std::env::temp_dir().join(format!(
+            "algo-ledger-sync-test-lookback-retry-abort-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("ledger");
+
+        let mut config = test_config(db_path, 1);
+        const MAX_RETRIES: u64 = 3;
+        config.catchup_block_download_retry_attempts = MAX_RETRIES;
+
+        let fetch_attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let backend = AlwaysFailingLookbackBackend {
+            fetch_attempts: fetch_attempts.clone(),
+        };
+        let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
+        orchestrator.state = SyncState::VerifyingLedger;
+        orchestrator.catchpoint_round = Some(5u64);
+
+        let result = orchestrator.run_download_lookback();
+
+        assert!(
+            result.is_err(),
+            "an always-failing block source must abort, not hang or succeed"
+        );
+        // `run_download_lookback` makes one extra speculative
+        // `fetch_block_raw(round)` call up front (to probe whether a
+        // pending state proof needs a deeper lookback window than
+        // `MAX_TXN_LIFE`, see the `sp_lookback` computation above this
+        // function's retry loop) before the bounded-retry loop itself
+        // starts, so the total is `1 + (MAX_RETRIES + 1)`: that speculative
+        // probe, plus `MAX_RETRIES + 1` real attempts against the first
+        // (highest) round before aborting — the retry loop never advances
+        // past the first failing round, proving it is bounded rather than
+        // unbounded.
+        assert_eq!(
+            fetch_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_RETRIES + 2,
+            "expected exactly 1 speculative probe + (max_retries + 1) fetch attempts before \
+             aborting"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

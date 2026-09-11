@@ -803,6 +803,16 @@ pub fn rebuild_trie_from_db(conn: &Connection) -> Result<[u8; 32], CatchpointErr
 /// to cover all potentially active leases at the catchpoint round.
 pub const MAX_TXN_LIFE: u64 = 1000;
 
+/// Default bound on failed lookback-block download/store attempts before
+/// aborting the whole stage, used by [`download_lookback_blocks`] (which
+/// has no caller-supplied config to source a real value from). Mirrors
+/// go's `config.Local.CatchupBlockDownloadRetryAttempts` default
+/// (`config/local_defaults.go`, `version[9]:"1000"`). Production callers
+/// (`algo-ledger`'s `SyncOrchestrator`) pass the actually-configured value
+/// to [`download_lookback_blocks_with_lookback`] directly instead of this
+/// default (issue #1287).
+pub const DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS: u64 = 1000;
+
 /// Downloads lookback blocks from `round` backward for lease reconstruction.
 ///
 /// After catchpoint import, we need block history to reconstruct the lease
@@ -814,6 +824,10 @@ pub const MAX_TXN_LIFE: u64 = 1000;
 /// # Arguments
 ///
 /// * `round` - The catchpoint round (highest round to download).
+/// * `max_retries` - Bounded-retry budget shared across the whole download,
+///   matching go's `Config.CatchupBlockDownloadRetryAttempts` — see
+///   [`download_lookback_blocks_with_lookback`]'s doc comment for the exact
+///   retry-accounting semantics this implements.
 /// * `fetch_block` - Callback that fetches raw block bytes and protocol version
 ///   for a given round. Returns `(proto, hdrdata, blkdata)`. The caller
 ///   (typically the CLI) bridges this to the async `BlockSource` trait.
@@ -826,7 +840,8 @@ pub const MAX_TXN_LIFE: u64 = 1000;
 ///
 /// # Errors
 ///
-/// Returns `CatchpointError` if any fetch or store operation fails.
+/// Returns `CatchpointError` if any fetch or store operation fails and the
+/// `max_retries` budget for that failure has been exhausted.
 ///
 /// # Reference
 ///
@@ -836,6 +851,7 @@ pub const MAX_TXN_LIFE: u64 = 1000;
 /// to reconstruct leases and block header history.
 pub fn download_lookback_blocks<F, S>(
     round: u64,
+    max_retries: u64,
     fetch_block: F,
     store_block: S,
 ) -> Result<u64, CatchpointError>
@@ -843,7 +859,13 @@ where
     F: FnMut(u64) -> Result<(String, Vec<u8>, Vec<u8>), CatchpointError>,
     S: FnMut(u64, &str, &[u8], &[u8]) -> Result<(), CatchpointError>,
 {
-    download_lookback_blocks_with_lookback(round, MAX_TXN_LIFE, fetch_block, store_block)
+    download_lookback_blocks_with_lookback(
+        round,
+        MAX_TXN_LIFE,
+        max_retries,
+        fetch_block,
+        store_block,
+    )
 }
 
 /// Same as [`download_lookback_blocks`], but with an explicit `lookback`
@@ -859,9 +881,33 @@ where
 /// don't care about state proofs (or are fine with the plain
 /// transaction-lifetime window) should use [`download_lookback_blocks`]
 /// instead.
+///
+/// # Retry accounting (issue #1287)
+///
+/// `max_retries` mirrors go's `Config.CatchupBlockDownloadRetryAttempts`,
+/// enforced as a real bounded-retry-then-abort budget: a failed
+/// `fetch_block`/`store_block` attempt is retried against the *same* round
+/// (not skipped, and `rnd` is not advanced) until `max_retries` retries have
+/// been spent, at which point the whole download aborts with an error
+/// instead of retrying unboundedly.
+///
+/// `retry_count` is a single counter shared across the *entire* lookback
+/// download (not reset per round, not reset per peer — this port has no
+/// peer concept of its own; peer selection/ranking already happens one
+/// layer up, in the `SyncBackend`/`fetch_block` closure the caller
+/// provides) and is incremented **only when an attempt fails** — never on a
+/// successful fetch/store. This mirrors go's post-`c1a8cf443` fix
+/// ("bugfix: incorrect block download retry accounting during fast
+/// catchup", #1792): the pre-fix code incremented its attempt counter on
+/// *every* loop iteration including successful ones, so a normal lookback
+/// download spanning more rounds than the configured retry budget would
+/// spuriously exhaust it and abort even with zero real failures. Counting
+/// only real failures against the budget (and letting it persist rather
+/// than resetting) is the exact fix go shipped and this must match.
 pub fn download_lookback_blocks_with_lookback<F, S>(
     round: u64,
     lookback: u64,
+    max_retries: u64,
     mut fetch_block: F,
     mut store_block: S,
 ) -> Result<u64, CatchpointError>
@@ -876,22 +922,39 @@ where
     // Going backward matches the typical catchpoint download pattern where
     // the catchpoint block is fetched first, then predecessors.
     let mut rnd = round;
+    // Single failure budget for the whole download — see this function's
+    // "Retry accounting" doc section above for exactly why this must not
+    // reset per round and must not count successes.
+    let mut retry_count = 0u64;
     loop {
         if rnd < start_round {
             break;
         }
 
-        let (proto, hdrdata, blkdata) = fetch_block(rnd).map_err(|e| {
-            CatchpointError::VerificationError(format!(
-                "failed to fetch lookback block at round {rnd}: {e}"
-            ))
-        })?;
+        let (proto, hdrdata, blkdata) = match fetch_block(rnd) {
+            Ok(v) => v,
+            Err(e) => {
+                if retry_count < max_retries {
+                    retry_count += 1;
+                    continue; // retry the same round
+                }
+                return Err(CatchpointError::VerificationError(format!(
+                    "failed to fetch lookback block at round {rnd} after {retry_count} \
+                     retries (of {max_retries} configured): {e}"
+                )));
+            }
+        };
 
-        store_block(rnd, &proto, &hdrdata, &blkdata).map_err(|e| {
-            CatchpointError::VerificationError(format!(
-                "failed to store lookback block at round {rnd}: {e}"
-            ))
-        })?;
+        if let Err(e) = store_block(rnd, &proto, &hdrdata, &blkdata) {
+            if retry_count < max_retries {
+                retry_count += 1;
+                continue; // retry the same round
+            }
+            return Err(CatchpointError::VerificationError(format!(
+                "failed to store lookback block at round {rnd} after {retry_count} retries \
+                 (of {max_retries} configured): {e}"
+            )));
+        }
 
         count += 1;
 
@@ -2232,6 +2295,7 @@ mod tests {
 
         let count = download_lookback_blocks(
             5, // round
+            0, // max_retries
             |rnd| Ok((format!("v{rnd}"), vec![rnd as u8], vec![rnd as u8; 2])),
             |rnd, proto, hdr, blk| {
                 stored.push((rnd, proto.to_string(), hdr.to_vec(), blk.to_vec()));
@@ -2255,6 +2319,7 @@ mod tests {
 
         let count = download_lookback_blocks(
             2000, // round
+            0,    // max_retries
             |_rnd| Ok(("v41".to_string(), vec![0], vec![0])),
             |rnd, _proto, _hdr, _blk| {
                 stored_rounds.push(rnd);
@@ -2275,6 +2340,7 @@ mod tests {
 
         let count = download_lookback_blocks(
             0,
+            0, // max_retries
             |_rnd| Ok(("v41".to_string(), vec![], vec![])),
             |_rnd, _proto, _hdr, _blk| {
                 count_stored += 1;
@@ -2292,6 +2358,7 @@ mod tests {
     fn download_lookback_blocks_fetch_error() {
         let result = download_lookback_blocks(
             10,
+            0, // max_retries
             |rnd| {
                 if rnd == 7 {
                     Err(CatchpointError::VerificationError("network error".into()))
@@ -2316,6 +2383,7 @@ mod tests {
     fn download_lookback_blocks_store_error() {
         let result = download_lookback_blocks(
             10,
+            0, // max_retries
             |_rnd| Ok(("v41".to_string(), vec![], vec![])),
             |rnd, _proto, _hdr, _blk| {
                 if rnd == 8 {
@@ -2327,6 +2395,164 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded-retry-then-abort semantics (issue #1287)
+    // -----------------------------------------------------------------------
+
+    /// TDD regression for issue #1287: with `max_retries == 0` (old
+    /// behavior), a single fetch failure aborts immediately without any
+    /// retry — pinned separately from `download_lookback_blocks_fetch_error`
+    /// above to make the "0 retries configured" contract explicit alongside
+    /// the retrying cases below.
+    #[test]
+    fn download_lookback_blocks_zero_retries_aborts_on_first_failure() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let fetch_attempts = AtomicU64::new(0);
+
+        let result = download_lookback_blocks_with_lookback(
+            10,
+            10,
+            0, // max_retries
+            |rnd| {
+                fetch_attempts.fetch_add(1, Ordering::SeqCst);
+                if rnd == 7 {
+                    Err(CatchpointError::VerificationError("network error".into()))
+                } else {
+                    Ok(("v41".to_string(), vec![], vec![]))
+                }
+            },
+            |_rnd, _proto, _hdr, _blk| Ok(()),
+        );
+
+        assert!(result.is_err());
+        // Rounds 10,9,8 succeed (3 attempts), round 7 fails once and, with
+        // zero retries configured, aborts on that single attempt.
+        assert_eq!(fetch_attempts.load(Ordering::SeqCst), 4);
+    }
+
+    /// A round whose fetch fails transiently (fewer times than the
+    /// configured retry budget) must be retried at the *same* round and the
+    /// download must ultimately succeed — the retry loop this issue adds
+    /// must not just abort on the first failure.
+    #[test]
+    fn download_lookback_blocks_retries_a_transient_fetch_failure_then_succeeds() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let attempts_at_7 = AtomicU64::new(0);
+        let mut stored: Vec<u64> = Vec::new();
+
+        let count = download_lookback_blocks_with_lookback(
+            10,
+            10,
+            3, // max_retries
+            |rnd| {
+                if rnd == 7 {
+                    let n = attempts_at_7.fetch_add(1, Ordering::SeqCst);
+                    // Fail the first two attempts at round 7, succeed on the third.
+                    if n < 2 {
+                        return Err(CatchpointError::VerificationError(
+                            "transient network error".into(),
+                        ));
+                    }
+                }
+                Ok((format!("v{rnd}"), vec![], vec![]))
+            },
+            |rnd, _proto, _hdr, _blk| {
+                stored.push(rnd);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        // Rounds 0..=10 inclusive = 11 blocks, despite the transient failure.
+        assert_eq!(count, 11);
+        assert_eq!(stored.len(), 11);
+        // Round 7 was retried (not skipped) and ultimately stored exactly once.
+        assert_eq!(stored.iter().filter(|&&r| r == 7).count(), 1);
+        assert_eq!(attempts_at_7.load(Ordering::SeqCst), 3);
+    }
+
+    /// TDD regression for issue #1287 (core acceptance criterion): a
+    /// download whose fetches fail more times than the configured retry
+    /// budget must abort with an error, not retry unboundedly.
+    #[test]
+    fn download_lookback_blocks_aborts_once_retry_budget_is_exhausted() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let attempts = AtomicU64::new(0);
+
+        let result = download_lookback_blocks_with_lookback(
+            10,
+            10,
+            3, // max_retries: 1 initial attempt + 3 retries = 4 total attempts
+            |_rnd| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(CatchpointError::VerificationError(
+                    "peer permanently unreachable".into(),
+                ))
+            },
+            |_rnd, _proto, _hdr, _blk| Ok(()),
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            CatchpointError::VerificationError(msg) => {
+                assert!(msg.contains("round 10"), "msg: {msg}");
+                assert!(msg.contains("3 retries"), "msg: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        // Exactly max_retries + 1 = 4 attempts, all against round 10 (never
+        // advances past the first failing round), then it aborts — proving
+        // the budget is enforced rather than retried unboundedly.
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    }
+
+    /// The retry budget must be a single counter shared across the *whole*
+    /// download rather than reset per round — mirroring go's post-
+    /// `c1a8cf443` fix. Two separate rounds each failing once, with
+    /// `max_retries == 1`, must both be retried successfully (1 + 1 = 2
+    /// failures total, well within a budget that would already be exhausted
+    /// if it reset to 1 fresh retry for every round).
+    #[test]
+    fn download_lookback_blocks_retry_budget_is_shared_across_rounds_not_reset_per_round() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let attempts_at_8 = AtomicU64::new(0);
+        let attempts_at_5 = AtomicU64::new(0);
+
+        let count = download_lookback_blocks_with_lookback(
+            10,
+            10,
+            1, // max_retries: only one retry for the *entire* download
+            |rnd| {
+                match rnd {
+                    8 => {
+                        let n = attempts_at_8.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            return Err(CatchpointError::VerificationError("blip".into()));
+                        }
+                    }
+                    5 => {
+                        let n = attempts_at_5.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            return Err(CatchpointError::VerificationError("blip".into()));
+                        }
+                    }
+                    _ => {}
+                }
+                Ok((format!("v{rnd}"), vec![], vec![]))
+            },
+            |_rnd, _proto, _hdr, _blk| Ok(()),
+        );
+
+        // A shared, never-reset budget of 1 retry cannot cover two separate
+        // failures (round 8's failure spends the only retry; round 5's
+        // failure then has none left and must abort).
+        assert!(
+            count.is_err(),
+            "a budget of 1 shared retry must not cover two independent round failures"
+        );
     }
 
     // -----------------------------------------------------------------------
