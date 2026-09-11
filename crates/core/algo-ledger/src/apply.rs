@@ -4569,7 +4569,11 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         store.restore_snapshot(cs_snapshot);
                     } else {
                         // Report the clear-state program's state changes / logs.
-                        captured_eval_delta = crate::eval_delta::encode_eval_delta(&result, txn);
+                        captured_eval_delta = crate::eval_delta::encode_eval_delta(
+                            &result,
+                            txn,
+                            ctx.consensus.no_empty_local_deltas,
+                        );
                     }
                 }
             } else {
@@ -4625,6 +4629,13 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         .map(|p| p.version)
                         .unwrap_or(0),
                 );
+                // Record the opt-in touch (issue #1280) now that `avm_ctx`
+                // exists, so an opt-in-only top-level call (no local-state
+                // writes) still surfaces an entry in `take_local_deltas` for
+                // pre-v27 `EvalDelta` encoding.
+                if txn.on_completion == ON_COMPLETION_OPT_IN {
+                    avm_ctx.mark_local_delta_touch(txn.sender);
+                }
                 // Issue #1128: this is a top-level call (no caller), so
                 // unnamed-resource group sharing is purely this
                 // transaction's own program-version eligibility.
@@ -4723,7 +4734,11 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     // report the partial delta instead of `None`. Mirrors
                     // go-algorand's `evalTracer.saveEvalDelta`.
                     ctx.failed_eval_delta
-                        .set(crate::eval_delta::encode_eval_delta(&result, txn));
+                        .set(crate::eval_delta::encode_eval_delta(
+                            &result,
+                            txn,
+                            ctx.consensus.no_empty_local_deltas,
+                        ));
                     let message = format!(
                         "appl execute: app {} approval program rejected transaction{}",
                         app_id,
@@ -4761,7 +4776,11 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     });
                 }
                 // Report the approval program's state changes / logs / inner txns.
-                captured_eval_delta = crate::eval_delta::encode_eval_delta(&result, txn);
+                captured_eval_delta = crate::eval_delta::encode_eval_delta(
+                    &result,
+                    txn,
+                    ctx.consensus.no_empty_local_deltas,
+                );
             }
         }
     }
@@ -12019,6 +12038,94 @@ mod tests {
             state.get_account(&creator).unwrap().total_extra_app_pages,
             0,
             "v29+ delete must decrement total_extra_app_pages"
+        );
+    }
+
+    /// Issue #1280: an `ApplicationOptIn` call whose approval program writes
+    /// no local-state key must still produce a real (empty) `"ld"` entry in
+    /// the resulting `EvalDelta` pre-v27 -- go-algorand's `roundCowState.
+    /// buildEvalDelta` (`ledger/eval/appcow.go`) creates a `storageDelta`
+    /// purely from the opt-in touch, and only suppresses the empty entry
+    /// once `ConsensusParams.NoEmptyLocalDeltas` activates at v27.
+    #[test]
+    fn test_no_empty_local_deltas_pre_v27_opt_in_only_call_keeps_empty_ld_entry() {
+        let creator = Address([1u8; 32]);
+        let sender = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 10_000_000), (sender, 10_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.mode = ApplyMode::Execute;
+        // Explicit pre-v27: `no_empty_local_deltas` defaults false, but spell
+        // it out so this test doesn't silently rot if the default changes.
+        ctx.consensus.no_empty_local_deltas = false;
+
+        apply_transaction(&mut state, &appl_create_txn(creator, 1_000, 0), &ctx, 0)
+            .expect("app create must succeed");
+
+        let mut opt_in = SignedTransaction::default();
+        opt_in.txn.txn_type = "appl".into();
+        opt_in.txn.sender = sender;
+        opt_in.txn.fee = 1_000;
+        opt_in.txn.application_id = 1; // first txn_counter-derived app id
+        opt_in.txn.on_completion = ON_COMPLETION_OPT_IN;
+
+        let applied =
+            apply_transaction(&mut state, &opt_in, &ctx, 0).expect("opt-in-only call must succeed");
+        let dt = applied
+            .eval_delta
+            .expect("pre-v27 opt-in-only call must produce a non-empty EvalDelta");
+        let parsed = crate::eval_delta::parse_eval_delta(&dt).expect("dt must parse");
+        let ld = parsed
+            .local_deltas
+            .expect("pre-v27 must record a local_deltas map");
+        let sender_delta = ld
+            .get(&0)
+            .expect("sender (index 0, own opt-in) must have an entry");
+        assert!(
+            sender_delta.is_empty(),
+            "opt-in-only touch must be an empty per-key delta map"
+        );
+    }
+
+    /// Issue #1280: the v27+ counterpart of the test above -- once
+    /// `NoEmptyLocalDeltas` activates, the same opt-in-only scenario must
+    /// produce no `"ld"` entry at all (and, since nothing else changed,
+    /// no `EvalDelta` at all).
+    #[test]
+    fn test_no_empty_local_deltas_v27_opt_in_only_call_omits_ld_entry() {
+        let creator = Address([1u8; 32]);
+        let sender = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(creator, 10_000_000), (sender, 10_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.mode = ApplyMode::Execute;
+        ctx.consensus.no_empty_local_deltas = true;
+
+        apply_transaction(&mut state, &appl_create_txn(creator, 1_000, 0), &ctx, 0)
+            .expect("app create must succeed");
+
+        let mut opt_in = SignedTransaction::default();
+        opt_in.txn.txn_type = "appl".into();
+        opt_in.txn.sender = sender;
+        opt_in.txn.fee = 1_000;
+        opt_in.txn.application_id = 1;
+        opt_in.txn.on_completion = ON_COMPLETION_OPT_IN;
+
+        let applied =
+            apply_transaction(&mut state, &opt_in, &ctx, 0).expect("opt-in-only call must succeed");
+        assert!(
+            applied.eval_delta.is_none(),
+            "v27+ opt-in-only call must produce no EvalDelta at all \
+             (the empty ld entry is suppressed and nothing else is present), got {:?}",
+            applied.eval_delta
         );
     }
 
