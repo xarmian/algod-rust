@@ -441,6 +441,26 @@ fn compute_multisig_address(msig: &MultisigSig) -> Address {
 /// Rejects unsupported versions, threshold of 0, threshold exceeding subsig count,
 /// and more than 255 subsigs (which would overflow a u8 counter).
 fn validate_multisig_params(msig: &MultisigSig) -> Result<(), AlgoError> {
+    // Matches go's `crypto.MultisigBatchPrep` (`crypto/multisig.go`), which
+    // begins with:
+    //   if (len(sig.Subsigs) == 0 || sig.Subsigs[0] == MultisigSubsig{}) {
+    //       return errInvalidNumberOfSignature
+    //   }
+    // -- unconditionally rejecting a MultisigSig whose first subsig is the
+    // zero-valued {Key: zero pubkey, Sig: zero signature} placeholder,
+    // before ever computing/comparing the multisig address. Without this,
+    // a multisig address that happens to include an all-zero pubkey as one
+    // of its configured signers (a slot no private key can ever sign for)
+    // could be accepted here on the strength of its *other* signers
+    // reaching threshold, even though go-algorand always rejects it
+    // outright (issue #1307).
+    if msig.subsigs.is_empty()
+        || (msig.subsigs[0].public_key == [0u8; 32] && msig.subsigs[0].signature == [0u8; 64])
+    {
+        return Err(AlgoError::Validation {
+            message: "invalid number of signatures: first multisig subsig is empty".into(),
+        });
+    }
     if msig.version != 1 {
         return Err(AlgoError::Validation {
             message: format!("unsupported multisig version: {}", msig.version),
@@ -1916,6 +1936,81 @@ mod tests {
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
         assert!(err.to_string().contains("address mismatch"));
+    }
+
+    /// Go-parity (issue #1307): go-algorand's `MultisigBatchPrep`
+    /// (`crypto/multisig.go`) unconditionally rejects a `MultisigSig` whose
+    /// `Subsigs[0]` is the exact zero-valued `MultisigSubsig{}` (zero
+    /// pubkey, zero sig) -- checked *before* the address is even computed
+    /// -- regardless of whether the other subsigs are validly signed and
+    /// reach threshold. This constructs a real multisig address that
+    /// includes an all-zero pubkey as its first configured signer (a slot
+    /// nobody can ever produce a valid signature for), with that slot left
+    /// blank and the other two signers validly reaching threshold: go
+    /// rejects this outright, so algod-rust must too.
+    #[test]
+    fn verify_multisig_rejects_all_zero_first_subsig() {
+        let keys: Vec<SigningKey> = (10u8..12).map(signing_key_from_seed).collect();
+
+        // Address computed over [zero-pubkey, key0-pubkey, key1-pubkey].
+        let msig_addr = compute_multisig_address(&MultisigSig {
+            version: 1,
+            threshold: 2,
+            subsigs: vec![
+                MultisigSubsig {
+                    public_key: [0u8; 32],
+                    signature: [0u8; 64],
+                },
+                MultisigSubsig {
+                    public_key: keys[0].verifying_key().to_bytes(),
+                    signature: [0u8; 64],
+                },
+                MultisigSubsig {
+                    public_key: keys[1].verifying_key().to_bytes(),
+                    signature: [0u8; 64],
+                },
+            ],
+        });
+
+        let txn = minimal_pay_txn(msig_addr);
+        let msig = MultisigSig {
+            version: 1,
+            threshold: 2,
+            subsigs: vec![
+                MultisigSubsig {
+                    public_key: [0u8; 32],
+                    signature: [0u8; 64],
+                },
+                MultisigSubsig {
+                    public_key: keys[0].verifying_key().to_bytes(),
+                    signature: sign_txn(&keys[0], &txn),
+                },
+                MultisigSubsig {
+                    public_key: keys[1].verifying_key().to_bytes(),
+                    signature: sign_txn(&keys[1], &txn),
+                },
+            ],
+        };
+
+        let stx = SignedTransaction {
+            txn,
+            sig: [0u8; 64],
+            msig: Some(msig),
+            lsig: None,
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        // Sanity: both real signers reach the threshold (2), and the
+        // address matches -- so without the zero-subsig[0] guard this
+        // would otherwise verify successfully.
+        let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("subsig") || err.to_string().contains("zero"),
+            "expected a subsig/zero-related rejection, got: {err}"
+        );
     }
 
     /// Go-parity placement (issue #1207): go-algorand's `MultisigVerify`
