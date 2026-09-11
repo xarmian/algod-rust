@@ -375,6 +375,11 @@ pub struct ConsensusParams {
     // ── Asset parameters ────────────────────────────────────────
     /// Max assets per account (Go: `MaxAssetsPerAccount`). 0 = unlimited (v32+).
     pub max_assets_per_account: u32,
+    /// Record the closed-out amount in `ApplyData.AssetClosingAmount` for an
+    /// asset transfer with `AssetCloseTo` set (Go: `EnableAssetCloseAmount`,
+    /// v25+). A late addition to `ApplyData` -- before v25 the field is
+    /// never populated even though the underlying close still happens.
+    pub enable_asset_close_amount: bool,
 
     // ── Logging ─────────────────────────────────────────────────
     /// Max size of a single log message (AVM `log` opcode limit: 1024 bytes).
@@ -415,6 +420,11 @@ pub struct ConsensusParams {
     pub max_apps_created: usize,
     /// Max apps an account can opt into (Go: `MaxAppsOptedIn`). 0 = unlimited (v32+).
     pub max_apps_opted_in: usize,
+    /// Properly deallocate an app's extra program pages from its size
+    /// sponsor's `TotalExtraAppPages` on deletion (Go:
+    /// `EnableProperExtraPageAccounting`, v29+). A short-lived bug before v29
+    /// meant deleting an app with extra pages never freed that MBR space.
+    pub enable_proper_extra_page_accounting: bool,
 
     // ── Keyreg ──────────────────────────────────────────────────
     /// Max validity period for keyreg (Go: `MaxKeyregValidPeriod`, v31+).
@@ -617,6 +627,11 @@ pub struct ConsensusParams {
     /// advance, rather than the previous round's rate (Go:
     /// `RewardsCalculationFix`, v31+).
     pub rewards_calculation_fix: bool,
+    /// Record per-transaction rewards (`SenderRewards`/`ReceiverRewards`/
+    /// `CloseRewards`) in `ApplyData` (Go: `RewardsInApplyData`, v15+).
+    /// Before v15, `ApplyData` never carried these fields even though the
+    /// account-level reward accrual itself is unaffected.
+    pub rewards_in_apply_data: bool,
 
     // ── Inner transaction IDs (historical-replay correctness) ────
     /// Enables a consistent, unified way of computing inner transaction IDs
@@ -880,6 +895,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         box_byte_min_balance: 0,
         maximum_minimum_balance: 0,
         max_assets_per_account: 0,
+        enable_asset_close_amount: false,
         max_log_size: 1024,
         max_log_calls: 32,
         deeper_block_header_history: 0,
@@ -893,6 +909,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         support_genesis_hash: false,
         max_apps_created: 0,
         max_apps_opted_in: 0,
+        enable_proper_extra_page_accounting: false,
         max_keyreg_valid_period: 0,
         enable_keyreg_coherency_check: false,
         enable_state_proof_keyreg_check: false,
@@ -963,6 +980,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         pending_residue_rewards: false,
         initial_rewards_rate_calculation: false,
         rewards_calculation_fix: false,
+        rewards_in_apply_data: false,
         unify_inner_tx_ids: false,
         unfunded_senders: false,
         enable_precheck_ecdsa_curve: false,
@@ -1052,8 +1070,10 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     }
 
     // ── v15 ─────────────────────────────────────────────────────
-    let v15 = v14.clone();
-    // v15 adds RewardsInApplyData, ForceNonParticipatingFeeSink (not modeled)
+    let mut v15 = v14.clone();
+    v15.rewards_in_apply_data = true;
+    // v15 also adds ForceNonParticipatingFeeSink, a genesis-initialization-only
+    // flag (not a per-transaction apply/eval gate) -- not modeled here.
     if version == CONSENSUS_V15 {
         return Some(v15);
     }
@@ -1169,8 +1189,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     }
 
     // ── v25 ─────────────────────────────────────────────────────
-    let v25 = v24.clone();
-    // v25 enables EnableAssetCloseAmount (not modeled)
+    let mut v25 = v24.clone();
+    v25.enable_asset_close_amount = true;
     if version == CONSENSUS_V25 {
         return Some(v25);
     }
@@ -1209,8 +1229,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     }
 
     // ── v29 ─────────────────────────────────────────────────────
-    let v29 = v28.clone();
-    // v29 enables EnableProperExtraPageAccounting (not modeled)
+    let mut v29 = v28.clone();
+    v29.enable_proper_extra_page_accounting = true;
     if version == CONSENSUS_V29 {
         return Some(v29);
     }
@@ -1695,6 +1715,7 @@ pub struct ConsensusParamsOverride {
     pub box_byte_min_balance: u64,
     pub maximum_minimum_balance: u64,
     pub max_assets_per_account: u32,
+    pub enable_asset_close_amount: bool,
     pub deeper_block_header_history: u64,
     pub reward_unit: u64,
     pub rewards_rate_refresh_interval: u64,
@@ -1707,6 +1728,7 @@ pub struct ConsensusParamsOverride {
     pub support_genesis_hash: bool,
     pub max_apps_created: usize,
     pub max_apps_opted_in: usize,
+    pub enable_proper_extra_page_accounting: bool,
     pub max_keyreg_valid_period: u64,
     pub enable_keyreg_coherency_check: bool,
     pub enable_state_proof_keyreg_check: bool,
@@ -1772,6 +1794,7 @@ pub struct ConsensusParamsOverride {
     pub pending_residue_rewards: bool,
     pub initial_rewards_rate_calculation: bool,
     pub rewards_calculation_fix: bool,
+    pub rewards_in_apply_data: bool,
     #[serde(rename = "UnifyInnerTxIDs")]
     pub unify_inner_tx_ids: bool,
     pub unfunded_senders: bool,
@@ -1882,6 +1905,7 @@ impl ConsensusParamsOverride {
             box_byte_min_balance: self.box_byte_min_balance,
             maximum_minimum_balance: self.maximum_minimum_balance,
             max_assets_per_account: self.max_assets_per_account,
+            enable_asset_close_amount: self.enable_asset_close_amount,
             // Not part of go's `config.ConsensusParams` JSON shape — see the
             // struct doc comment.
             max_log_size: 1024,
@@ -1897,6 +1921,7 @@ impl ConsensusParamsOverride {
             support_genesis_hash: self.support_genesis_hash,
             max_apps_created: self.max_apps_created,
             max_apps_opted_in: self.max_apps_opted_in,
+            enable_proper_extra_page_accounting: self.enable_proper_extra_page_accounting,
             max_keyreg_valid_period: self.max_keyreg_valid_period,
             enable_keyreg_coherency_check: self.enable_keyreg_coherency_check,
             enable_state_proof_keyreg_check: self.enable_state_proof_keyreg_check,
@@ -1959,6 +1984,7 @@ impl ConsensusParamsOverride {
             pending_residue_rewards: self.pending_residue_rewards,
             initial_rewards_rate_calculation: self.initial_rewards_rate_calculation,
             rewards_calculation_fix: self.rewards_calculation_fix,
+            rewards_in_apply_data: self.rewards_in_apply_data,
             unify_inner_tx_ids: self.unify_inner_tx_ids,
             unfunded_senders: self.unfunded_senders,
             enable_precheck_ecdsa_curve: self.enable_precheck_ecdsa_curve,
