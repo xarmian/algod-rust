@@ -3934,6 +3934,7 @@ pub(crate) fn apply_appl_opt_in_pre_program<L: crate::store_trait::LedgerStore>(
     sender: &Address,
     app_id: u64,
     err_ctx: ApplErrorContext,
+    consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
     if store.has_app_local_state(sender, app_id) {
         return Err(err_ctx.error(format!(
@@ -3942,6 +3943,20 @@ pub(crate) fn apply_appl_opt_in_pre_program<L: crate::store_trait::LedgerStore>(
             sender,
             app_id,
         )));
+    }
+    // Go: `optInApplication` -- "Make sure the user isn't already at the app
+    // opt-in max" (`ledger/apply/application.go`). `MaxAppsOptedIn == 0` means
+    // unlimited (true for every protocol version from v32 on); the cap only
+    // ever bites on a historical pre-v32 block being replayed.
+    let max_apps_opted_in = consensus.max_apps_opted_in;
+    if max_apps_opted_in > 0 {
+        let total_apps_opted_in = store.get_or_default_account(sender).total_apps_opted_in;
+        if total_apps_opted_in >= max_apps_opted_in as u64 {
+            return Err(err_ctx.error(format!(
+                "cannot opt in app {} for {}: max opted-in apps per acct is {}",
+                app_id, sender, max_apps_opted_in,
+            )));
+        }
     }
     let app = store.get_app_params(app_id).ok_or_else(|| {
         err_ctx.error(format!(
@@ -4481,6 +4496,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         &txn.sender,
                         app_id,
                         ApplErrorContext::Outer,
+                        &ctx.consensus,
                     )?;
                 }
 
@@ -4668,6 +4684,25 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 ),
             });
         }
+        // Go: `optInApplication`'s `MaxAppsOptedIn` cap (v32+ unlimited, see
+        // `apply_appl_opt_in_pre_program`'s doc comment for the historical
+        // rationale). Replay mode has its own opt-in branch (this one)
+        // rather than going through `apply_appl_opt_in_pre_program`, so the
+        // cap must be checked here too.
+        let max_apps_opted_in = ctx.consensus.max_apps_opted_in;
+        if max_apps_opted_in > 0 {
+            let total_apps_opted_in = store
+                .get_or_default_account(&txn.sender)
+                .total_apps_opted_in;
+            if total_apps_opted_in >= max_apps_opted_in as u64 {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "cannot opt in app {} for {}: max opted-in apps per acct is {}",
+                        app_id, txn.sender, max_apps_opted_in,
+                    ),
+                });
+            }
+        }
         let local_schema = if is_create {
             txn.local_state_schema.clone().unwrap_or_default()
         } else {
@@ -4739,6 +4774,14 @@ pub fn apply_keyreg<L: crate::store_trait::LedgerStore>(
 
     if vote_pk_empty || selection_pk_empty {
         // ── Offline or non-participating ──
+        if txn.non_participation && !consensus.support_become_non_participating_transactions {
+            // Go: SupportBecomeNonParticipatingTransactions (v18+). Before v18,
+            // a keyreg requesting Nonparticipation is rejected outright rather
+            // than silently treated as an ordinary offline keyreg.
+            return Err(AlgoError::Ledger {
+                message: "transaction tries to mark an account as nonparticipating, but that transaction is not supported".to_string(),
+            });
+        }
         let mut account = store.get_or_default_account(&txn.sender);
         if txn.non_participation {
             account.status = AccountStatus::NotParticipating;
@@ -4806,30 +4849,43 @@ pub fn apply_keyreg<L: crate::store_trait::LedgerStore>(
             });
         }
 
-        // D14: Round-based keyreg coherency check (Go: EnableKeyregCoherencyCheck, enabled since v28).
+        // D14: Round-based keyreg coherency check (Go: EnableKeyregCoherencyCheck, v28+).
         // VoteLast must be beyond the current round, and VoteFirst must start by next round.
-        if txn.vote_last <= round {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "keyreg online: vote_last {} <= current round {} (expired participation key)",
-                    txn.vote_last, round,
-                ),
-            });
-        }
-        if txn.vote_first > round + 1 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "keyreg online: vote_first {} > round+1 {} (first voting round too far in future)",
-                    txn.vote_first, round + 1,
-                ),
-            });
+        // Before v28 go-algorand did not perform this check at all, so gate it
+        // on the consensus flag rather than enforcing it unconditionally --
+        // otherwise a pre-v28 historical block containing a keyreg that was
+        // valid under its own protocol version would be wrongly rejected.
+        if consensus.enable_keyreg_coherency_check {
+            if txn.vote_last <= round {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "keyreg online: vote_last {} <= current round {} (expired participation key)",
+                        txn.vote_last, round,
+                    ),
+                });
+            }
+            if txn.vote_first > round + 1 {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "keyreg online: vote_first {} > round+1 {} (first voting round too far in future)",
+                        txn.vote_first, round + 1,
+                    ),
+                });
+            }
         }
 
         let mut account = store.get_or_default_account(&txn.sender);
         account.status = AccountStatus::Online;
         account.vote_id = Some(vote_id);
         account.selection_id = Some(selection_id);
-        account.state_proof_id = state_proof_id;
+        // Go: `if params.EnableStateProofKeyregCheck { record.StateProofID = keyreg.StateProofPK }`
+        // (v31+). Before v31 the field is left untouched by Keyreg entirely,
+        // which is behaviorally equivalent to "stays empty" for any reachable
+        // pre-v31 account (the field could never have been populated by an
+        // earlier keyreg, since the feature didn't exist yet).
+        if consensus.enable_state_proof_keyreg_check {
+            account.state_proof_id = state_proof_id;
+        }
         account.vote_first_valid = txn.vote_first;
         account.vote_last_valid = txn.vote_last;
         account.vote_key_dilution = txn.vote_key_dilution;
@@ -6986,6 +7042,116 @@ mod tests {
         let acct = state.get_account(&sender).unwrap();
         assert_eq!(acct.status, AccountStatus::NotParticipating);
         assert_eq!(acct.micro_algos, 1_000_000); // fee rolled back
+    }
+
+    // -----------------------------------------------------------------
+    // issue #1259: `apply_keyreg` consulted three version-gated consensus
+    // flags (`EnableStateProofKeyregCheck`, `SupportBecomeNonParticipatingTransactions`,
+    // `EnableKeyregCoherencyCheck`) unconditionally instead of gating on
+    // them per go-algorand's `ledger/apply/keyreg.go`. Each field was ported
+    // onto `ConsensusParams` and set correctly per protocol version, but
+    // never actually read by `apply_keyreg` -- a historical (pre-v18/v28/v31)
+    // block-replay divergence, matching `TestStateProofPKKeyReg`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_keyreg_nonpart_rejected_pre_v18() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.consensus = consensus_params_for_version(algo_types::consensus::CONSENSUS_V17)
+            .expect("V17 must be a known protocol version");
+        assert!(!ctx.consensus.support_become_non_participating_transactions);
+
+        let stx = keyreg_nonpart_txn(sender, 1_000);
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(
+            result.is_err(),
+            "a Nonparticipation keyreg must be rejected before v18"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not supported"),
+            "expected go-algorand's 'not supported' message, got: {}",
+            msg
+        );
+
+        // Confirm the same transaction succeeds once the flag is enabled (v18+).
+        let ctx_v41 = ApplyContext::new_replay(0, fee_sink, 1);
+        assert!(
+            ctx_v41
+                .consensus
+                .support_become_non_participating_transactions
+        );
+        let stx2 = keyreg_nonpart_txn(sender, 1_000);
+        apply_transaction(&mut state, &stx2, &ctx_v41, 0)
+            .expect("Nonparticipation keyreg must succeed under the current protocol");
+        assert_eq!(
+            state.get_account(&sender).unwrap().status,
+            AccountStatus::NotParticipating
+        );
+    }
+
+    #[test]
+    fn test_keyreg_state_proof_id_not_set_pre_v31() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.consensus = consensus_params_for_version(algo_types::consensus::CONSENSUS_V30)
+            .expect("V30 must be a known protocol version");
+        assert!(!ctx.consensus.enable_state_proof_keyreg_check);
+
+        let stx = keyreg_online_txn(sender, 1_000);
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::Online);
+        assert_eq!(
+            acct.state_proof_id, None,
+            "StateProofID must stay unset before v31 even when the txn supplies state_proof_pk"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_coherency_check_not_enforced_pre_v28() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.consensus = consensus_params_for_version(algo_types::consensus::CONSENSUS_V27)
+            .expect("V27 must be a known protocol version");
+        assert!(!ctx.consensus.enable_keyreg_coherency_check);
+
+        // vote_last <= round(1): would be rejected as "expired participation
+        // key" under v28+'s coherency check, but go-algorand never performed
+        // that check before v28, so it must succeed here.
+        let mut stx = keyreg_online_txn(sender, 1_000);
+        stx.txn.vote_first = 0;
+        stx.txn.vote_last = 1;
+        apply_transaction(&mut state, &stx, &ctx, 0)
+            .expect("incoherent vote_last/vote_first must be accepted before v28");
+
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::Online);
+        assert_eq!(acct.vote_last_valid, 1);
+
+        // Confirm the same shape is rejected once the check is enabled (v28+).
+        let mut state2 = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx_v41 = ApplyContext::new_replay(0, fee_sink, 1);
+        assert!(ctx_v41.consensus.enable_keyreg_coherency_check);
+        let mut stx2 = keyreg_online_txn(sender, 1_000);
+        stx2.txn.vote_first = 0;
+        stx2.txn.vote_last = 1;
+        let result = apply_transaction(&mut state2, &stx2, &ctx_v41, 0);
+        assert!(
+            result.is_err(),
+            "the same incoherent vote_last/vote_first must be rejected under the current protocol"
+        );
     }
 
     #[test]

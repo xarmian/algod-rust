@@ -22,7 +22,7 @@
 
 use algo_ledger::{
     apply_block, apply_transaction, apply_transaction_with_budget, ApplyContext, ApplyMode,
-    BoxBudgetState, GroupInfo, LedgerState,
+    BoxBudgetState, GroupInfo, LedgerState, LedgerStore,
 };
 use algo_types::{AccountStatus, Address, AssetParams, Block, Round, SignedTransaction, TealValue};
 
@@ -767,6 +767,71 @@ fn test_appl_create_and_optin() {
     assert_eq!(local.schema.num_uint, 2);
     assert_eq!(local.schema.num_byte_slice, 1);
     assert_eq!(state.get_account(&user).unwrap().total_apps_opted_in, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 11a2. app opt-in rejects once the account is at go-algorand's per-version
+// `MaxAppsOptedIn` cap (issue #1260: consensus field was ported and set
+// correctly per protocol version but never consulted by the real opt-in
+// apply path in either the outer or inner-transaction code path).
+//
+// go-algorand: `ledger/apply/application.go`'s `optInApplication` --
+// "cannot opt in app %d for %s: max opted-in apps per acct is %d" when
+// `MaxAppsOptedIn > 0 && TotalAppLocalStates >= MaxAppsOptedIn`. The cap is
+// 0 (unlimited) for every protocol version from v32 on, so this only bites
+// on a historical pre-v32 block -- exactly the scenario `TestAppInsMinBalance`
+// / `TestAppCallOptIn` exercise via `ConsensusV30`.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_appl_optin_rejected_at_max_apps_opted_in_cap_pre_v32() {
+    let user = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let app_id = 200u64;
+
+    let mut state = make_state(&[(user, 50_000_000), (fee_sink, 0)], fee_sink);
+    // App must exist for opt-in to reach the cap check.
+    state.set_app_params(
+        app_id,
+        algo_types::AppParams {
+            creator: Address([1u8; 32]),
+            approval_program: vec![0x06, 0x81, 0x01],
+            clear_state_program: vec![0x06, 0x81, 0x01],
+            ..Default::default()
+        },
+    );
+
+    let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+    ctx.consensus =
+        algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V30)
+            .expect("V30 must be a known protocol version");
+    let max_apps_opted_in = ctx.consensus.max_apps_opted_in;
+    assert_eq!(max_apps_opted_in, 50, "V30's documented cap");
+
+    // Put the user already at the cap.
+    {
+        let acct = state.get_or_default_account_mut(&user);
+        acct.total_apps_opted_in = max_apps_opted_in as u64;
+    }
+
+    let optin = appl_optin_txn(user, 1_000, app_id);
+    let result = apply_transaction(&mut state, &optin, &ctx, 0);
+    assert!(
+        result.is_err(),
+        "opt-in at the MaxAppsOptedIn cap must be rejected under a pre-v32 protocol version"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("max opted-in apps per acct"),
+        "expected go-algorand's cap-rejection message, got: {}",
+        msg
+    );
+
+    // Confirm the cap is inert once v32+ params (unlimited) are in effect.
+    let ctx_v41 = ApplyContext::new_replay(0, fee_sink, 1);
+    assert_eq!(ctx_v41.consensus.max_apps_opted_in, 0);
+    let optin2 = appl_optin_txn(user, 1_000, app_id);
+    apply_transaction(&mut state, &optin2, &ctx_v41, 0)
+        .expect("unlimited opt-ins under the current (v32+) protocol");
 }
 
 // ---------------------------------------------------------------------------
