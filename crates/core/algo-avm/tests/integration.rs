@@ -575,3 +575,30 @@ fn test_scratch_default_zero() {
     let result = run_program(3, code).unwrap();
     assert!(result, "scratch default should be Uint64(0)");
 }
+
+// ---------------------------------------------------------------------------
+// Regression (issue #1255): a bytes-typed stack value -- even a non-nil,
+// zero-length one -- in a uint64 arg position must be rejected at runtime,
+// exactly like go-algorand's unconditional `opCompat`/`avmType()` gate
+// (`data/transactions/logic/eval.go`). algod-rust's assembler would refuse to
+// *assemble* this source (its static type tracker rejects `+` after
+// `pushbytes ""`), so this test hand-builds raw bytecode -- the same
+// technique go-algorand's own `TestWrongStackTypeRuntime`/
+// `TestWrongStackTypeRuntime2` (eval_test.go) use to reach the runtime-only
+// path, since on-chain programs are raw bytecode, not source.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_plus_rejects_empty_bytes_arg() {
+    let code: &[u8] = &[
+        0x80, 0x00, // pushbytes "" (empty, non-nil bytes)
+        0x81, 0x01, // pushint 1
+        0x08, // + (uint64, uint64) -> uint64
+    ];
+    let result = run_program(3, code);
+    let err = result.expect_err("+ with an empty-bytes operand must error, not coerce to 0");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bytes") || msg.contains("uint64") || msg.contains("type"),
+        "expected a type-mismatch error, got: {msg}"
+    );
+}
