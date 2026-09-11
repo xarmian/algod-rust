@@ -138,8 +138,26 @@ impl HttpBlockFetcher {
         base_url: impl Into<String>,
         genesis_id: impl Into<String>,
     ) -> Result<Self, HttpBlockFetchError> {
+        Self::with_timeout(base_url, genesis_id, DEFAULT_FETCH_TIMEOUT)
+    }
+
+    /// Create a new fetcher with an explicit request timeout — go's
+    /// `CatchupHTTPBlockFetchTimeoutSec` (`config.Local`, issue #1291).
+    /// Callers with a loaded `config.json` should pass
+    /// `node_config.catchup_http_block_fetch_timeout_sec` here rather than
+    /// relying on [`Self::new`]'s [`DEFAULT_FETCH_TIMEOUT`] fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpBlockFetchError::ClientBuildFailed`] if the HTTP client
+    /// cannot be constructed (e.g. TLS backend unavailable).
+    pub fn with_timeout(
+        base_url: impl Into<String>,
+        genesis_id: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self, HttpBlockFetchError> {
         let client = reqwest::Client::builder()
-            .timeout(DEFAULT_FETCH_TIMEOUT)
+            .timeout(timeout)
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
             .map_err(HttpBlockFetchError::ClientBuildFailed)?;
@@ -452,6 +470,55 @@ mod tests {
             }
             other => panic!("expected BlockNotAvailable, got: {other:?}"),
         }
+    }
+
+    // -- Configurable timeout (issue #1291) --
+
+    /// `HttpBlockFetcher::new` previously always built its `reqwest::Client`
+    /// with a hardcoded `DEFAULT_FETCH_TIMEOUT` (30s), regardless of go's
+    /// `CatchupHTTPBlockFetchTimeoutSec` config — there was no way for a
+    /// caller to get a *shorter* timeout without hand-building a
+    /// `reqwest::Client` via `with_client`. `with_timeout` closes that gap:
+    /// a fetch against a server that responds slower than the configured
+    /// timeout must fail promptly (well under the server's own delay)
+    /// rather than hang until `DEFAULT_FETCH_TIMEOUT` elapses.
+    #[tokio::test]
+    async fn with_timeout_aborts_a_slow_response_before_the_default_timeout_would() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test-genesisID/block/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", BLOCK_RESPONSE_CONTENT_TYPE)
+                    .set_body_bytes(b"unused" as &[u8])
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let fetcher = HttpBlockFetcher::with_timeout(
+            server.uri(),
+            "test-genesisID",
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let result = fetcher.fetch_block(1).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a request slower than the configured timeout must fail, not succeed"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected the 200ms configured timeout to abort well before the server's 5s delay, \
+             took {elapsed:?}"
+        );
     }
 
     // -- Error Display --

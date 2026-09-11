@@ -188,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
                     node_config.max_catchpoint_download_duration,
                     node_config.min_catchpoint_file_download_bytes_per_second,
                     node_config.catchup_ledger_download_retry_attempts,
+                    node_config.catchup_http_block_fetch_timeout_sec,
                 )
                 .await?;
             } else {
