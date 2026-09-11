@@ -274,6 +274,96 @@ fn automatic_catchpoint_generation_disabled_when_not_configured() {
 }
 
 #[test]
+fn automatic_catchpoint_export_suppressed_for_lookback_rounds_after_mid_chain_sp_contexts_upgrade()
+{
+    // Issue #1285: go's `catchpointTracker.newBlock` (ledger/catchpointtracker.go)
+    // latches `reenableCatchpointsRound = upgradeRound + CatchpointLookback`
+    // the first time a committed block's consensus params have
+    // `EnableCatchpointsWithSPContexts == true`, and
+    // `calculateFirstStageRounds`/`produceCommittingTask` then suppress
+    // catchpoint generation until the chain passes that round -- a window
+    // relative to *when the feature activated on this chain*, not to
+    // genesis. A chain that ran a long time on a pre-v38 protocol (already
+    // well past CatchpointLookback rounds) and then upgrades mid-history to
+    // a v38+ protocol must still suppress catchpoint export for
+    // CatchpointLookback rounds immediately following the upgrade round --
+    // the existing genesis-relative `round <= CatchpointLookback` guard
+    // (issue #1054) does NOT cover this, since `round` is already far past
+    // `CatchpointLookback` by the time the upgrade happens.
+    let ledger_path = temp_ledger_path("reenable-round-mid-chain-upgrade");
+    let catchpoint_dir = temp_catchpoint_dir("reenable-round-mid-chain-upgrade");
+    std::fs::create_dir_all(&catchpoint_dir).unwrap();
+
+    let interval: u64 = 50;
+    {
+        let mut ledger = SqliteLedger::open(&ledger_path).unwrap();
+        ledger.configure_automatic_catchpoints(Some(AutoCatchpointConfig {
+            interval,
+            file_history_length: -1,
+            dir: catchpoint_dir.clone(),
+        }));
+
+        // Run well past CatchpointLookback (320) on a pre-v38 protocol
+        // (V37: `enable_catchpoints_with_sp_contexts == false`), so the
+        // genesis-relative guard is long since satisfied and catchpoints
+        // export normally at every interval round.
+        ledger.set_protocol(algo_types::consensus::CONSENSUS_V37.to_string());
+        for round in 1..=500u64 {
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(algo_types::Round(round));
+            ledger
+                .put_account_totals_seed(1_000_000 + round, 0, 0, 0, 0, 0)
+                .unwrap();
+            ledger.commit_block().unwrap();
+            ledger.wait_for_pending_catchpoint_export();
+        }
+
+        // Upgrade to V38 (`enable_catchpoints_with_sp_contexts == true`) at
+        // round 501. This latches `reenable_catchpoints_round = 501 + 320
+        // = 821`. Continue to round 900: interval-aligned rounds in
+        // (501, 821) -- 550, 600, ..., 800 -- must be suppressed; 850 (the
+        // first interval round >= 821) must export.
+        ledger.set_protocol(algo_types::consensus::CONSENSUS_V38.to_string());
+        for round in 501..=900u64 {
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(algo_types::Round(round));
+            ledger
+                .put_account_totals_seed(1_000_000 + round, 0, 0, 0, 0, 0)
+                .unwrap();
+            ledger.commit_block().unwrap();
+            ledger.wait_for_pending_catchpoint_export();
+        }
+    }
+
+    let mut names: Vec<String> = std::fs::read_dir(&catchpoint_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+
+    // Pre-upgrade (V37, no reenable-round gate at all): 350, 400, 450, 500.
+    // Post-upgrade, suppressed until round 821: 550..800 must be absent.
+    // First round >= 821 that's interval-aligned: 850.
+    let expected = vec![
+        "350.catchpoint.tar.gz".to_string(),
+        "400.catchpoint.tar.gz".to_string(),
+        "450.catchpoint.tar.gz".to_string(),
+        "500.catchpoint.tar.gz".to_string(),
+        "850.catchpoint.tar.gz".to_string(),
+        "900.catchpoint.tar.gz".to_string(),
+    ];
+    assert_eq!(
+        names, expected,
+        "rounds 550..800 (inside the post-upgrade CatchpointLookback window ending at 821) \
+         must be suppressed, matching go's reenableCatchpointsRound latch; got {names:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&catchpoint_dir);
+    let _ = std::fs::remove_file(algo_ledger::sqlite::tracker_path_for_prefix(&ledger_path));
+    let _ = std::fs::remove_file(algo_ledger::sqlite::block_path_for_prefix(&ledger_path));
+}
+
+#[test]
 fn automatic_catchpoint_generation_zero_interval_is_a_noop() {
     let ledger_path = temp_ledger_path("zero-interval");
     let catchpoint_dir = temp_catchpoint_dir("zero-interval");
