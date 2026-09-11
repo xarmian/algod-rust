@@ -244,6 +244,20 @@ impl InnerTxnBuilder {
                     }
                 }
             }
+            // Note
+            5 => {
+                if let TealValue::Bytes(b) = value {
+                    // Uses the "effective" helper for the same reason as
+                    // ApplicationArgs above: `max_absolute_txn_note_bytes`
+                    // is left 0 ("unset") pre-v42 (issue #1299).
+                    let max = algo_validate::fee::effective_max_note_bytes(consensus);
+                    if b.len() > max {
+                        return Err(AlgoError::Avm {
+                            message: format!("Note may not exceed {max} bytes"),
+                        });
+                    }
+                }
+            }
             // OnCompletion: must not exceed DeleteApplicationOC (5).
             25 => {
                 if let TealValue::Uint(v) = value {
@@ -287,7 +301,14 @@ impl InnerTxnBuilder {
                 };
                 let existing = self.array_fields.get(&26).map(Vec::as_slice).unwrap_or(&[]);
                 let total = array_bytes_len(existing) + b.len();
-                if total > consensus.max_absolute_total_arg_len {
+                // `max_absolute_total_arg_len` is left 0 ("unset") for
+                // protocol versions at/before v41 -- use the "effective"
+                // helper (falls back to the soft cap `max_app_total_arg_len`
+                // in that case), matching go's `checkSetMax` clamp at
+                // config-load time (`config/consensus.go`). Using the raw
+                // field directly would reject every non-empty
+                // ApplicationArgs value pre-v42 (issue #1299).
+                if total > algo_validate::fee::effective_max_total_arg_len(consensus) {
                     return Err(AlgoError::Avm {
                         message: "total application args length too long".to_string(),
                     });
@@ -13152,6 +13173,25 @@ mod tests {
     }
 
     #[test]
+    fn itxn_field_note_over_max_rejected() {
+        // Issue #1299 follow-up to #1297: `Note` also has a bound check in
+        // go-algorand's `stackIntoTxnField` (`MaxAbsoluteTxnNoteBytes`),
+        // missed by #1297's initial pass.
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let max = algo_validate::fee::effective_max_note_bytes(&ctx.consensus);
+        let err = ctx
+            .itxn_field(5, TealValue::Bytes(vec![0u8; max + 1])) // Note
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("may not exceed"),
+            "unexpected error: {err}"
+        );
+        // Boundary value is accepted.
+        ctx.itxn_field(5, TealValue::Bytes(vec![0u8; max])).unwrap();
+    }
+
+    #[test]
     fn itxn_field_config_asset_decimals_over_max_rejected() {
         let mut store = LedgerState::new();
         let mut ctx = make_itxn_bounds_ctx(&mut store);
@@ -13281,7 +13321,7 @@ mod tests {
     fn itxn_field_application_args_total_length_over_max_rejected() {
         let mut store = LedgerState::new();
         let mut ctx = make_itxn_bounds_ctx(&mut store);
-        let max = ctx.consensus.max_absolute_total_arg_len;
+        let max = algo_validate::fee::effective_max_total_arg_len(&ctx.consensus);
         let err = ctx
             .itxn_field(26, TealValue::Bytes(vec![0u8; max + 1])) // ApplicationArgs
             .unwrap_err();
