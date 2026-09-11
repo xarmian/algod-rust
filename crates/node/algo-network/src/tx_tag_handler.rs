@@ -1090,6 +1090,49 @@ impl MessageHandler for TxTagHandler {
             }
         }
 
+        // `checkAlreadyCommitted`-equivalent pre-check (issue #1249),
+        // mirroring go's `backlogWorker` calling `checkAlreadyCommitted(wi)`
+        // -- which calls `txPool.Test(tx.unverifiedTxGroup)` -- immediately
+        // after pulling an item off the backlog queue, *before* handing the
+        // group to `streamVerifierChan` (`data/txHandler.go:341`, `:905`).
+        // `TransactionPool::test()` runs the same well-formedness /
+        // duplicate / eviction-fee checks `remember()`'s evaluator step
+        // does, against the pool's live pending-block-evaluator state, but
+        // without storing anything and without any cryptographic signature
+        // verification. The `seen`/canonical-form dedup caches above only
+        // catch a group this node has personally, successfully remembered
+        // before via this exact gossip path -- they miss a group that's
+        // already committed to the ledger, conflicts with a currently
+        // pending group, or would be rejected on fee/eviction-priority
+        // grounds under pool congestion. Without this check, such a group
+        // falls through to full batch signature verification below only to
+        // be rejected by `pool.remember()` afterward anyway -- exactly the
+        // wasted crypto work `pool.Test()` exists to short-circuit.
+        //
+        // A rejection here mirrors go's `continue` right after
+        // `checkAlreadyCommitted` returns `true`: the group never reaches
+        // batch verification or `pool.remember()`, and the canonical-cache
+        // entry it was tentatively admitted under above is rolled back
+        // (mirroring the other early-drop paths in this handler) since the
+        // group never earns a legitimate `seen`/canonical slot.
+        if let Err(e) = self.pool.test(&group) {
+            debug!(
+                sender = %msg.sender,
+                group_len = group.len(),
+                error = %e,
+                "TxTagHandler: dropped by pool pre-check (already committed/duplicate/rejected)",
+            );
+            if let (Some(digest), Some(cache)) = (canonical_digest, &self.canonical_cache) {
+                cache.remove(&digest);
+            }
+            return OutgoingMessage {
+                action: ForwardingPolicy::Ignore,
+                tag: Tag::Transaction,
+                payload: Vec::new(),
+                topics: None,
+            };
+        }
+
         // Batch signature verification (issue #1043), mirroring go's
         // `TxHandler` routing every incoming gossip group through
         // `StreamToBatch` before it reaches the pool. Only engages when a
@@ -1947,6 +1990,70 @@ mod batch_verifier_wiring_tests {
         pool
     }
 
+    /// Ledger/evaluator whose `test_transaction_group` always rejects --
+    /// used to prove the `pool.test()` pre-check (issue #1249) gates
+    /// admission *before* batch signature verification, the way go's
+    /// `checkAlreadyCommitted` gates admission before `streamVerifierChan`.
+    struct RejectingTestLedger {
+        round: Round,
+    }
+
+    impl PoolLedger for RejectingTestLedger {
+        fn latest(&self) -> Round {
+            self.round
+        }
+        fn block_hdr(&self, _round: Round) -> Result<BlockHeader, AlgoError> {
+            Ok(BlockHeader::default())
+        }
+        fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, AlgoError> {
+            Ok(ConsensusParams::default())
+        }
+        fn start_evaluator(
+            &self,
+            _hdr: BlockHeader,
+            _payset_hint: usize,
+            _max_txn_bytes_per_block: usize,
+        ) -> Result<Box<dyn BlockEvaluator>, AlgoError> {
+            Ok(Box::new(RejectingTestEvaluator {
+                round: self.round.next(),
+            }))
+        }
+    }
+
+    struct RejectingTestEvaluator {
+        round: Round,
+    }
+
+    impl BlockEvaluator for RejectingTestEvaluator {
+        fn round(&self) -> Round {
+            self.round
+        }
+        fn pay_set_size(&self) -> usize {
+            0
+        }
+        fn test_transaction_group(&self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            Err(AlgoError::Validation {
+                message: "injected: already committed / duplicate / rejected".into(),
+            })
+        }
+        fn transaction_group(&mut self, _txgroup: &[SignedTransaction]) -> Result<(), AlgoError> {
+            // Would succeed if reached -- proves the pre-check, not
+            // `remember()`'s own evaluator step, is what gates this group.
+            Ok(())
+        }
+        fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+            Ok(Block::default())
+        }
+        fn reset_txn_bytes(&mut self) {}
+    }
+
+    fn make_pool_rejecting_test() -> Arc<TransactionPool> {
+        let ledger: Arc<dyn PoolLedger> = Arc::new(RejectingTestLedger { round: Round(1) });
+        let pool = Arc::new(TransactionPool::new(PoolConfig::default(), ledger));
+        pool.on_new_block(&Block::default(), &std::collections::HashSet::new());
+        pool
+    }
+
     fn make_payment_txn(sender_byte: u8, note: u8) -> SignedTransaction {
         let mut stx = SignedTransaction::default();
         stx.txn.txn_type = TxnType::Pay;
@@ -2050,6 +2157,56 @@ mod batch_verifier_wiring_tests {
         assert!(
             !pool.pending_tx_ids().contains(&txid),
             "a failed-verification group must never reach the pool"
+        );
+
+        drop(handler);
+        Arc::try_unwrap(verifier)
+            .unwrap_or_else(|_| panic!("verifier still shared"))
+            .shutdown()
+            .await;
+    }
+
+    /// A group `TransactionPool::test()` rejects (already committed,
+    /// conflicting with a pending group, or otherwise doomed under
+    /// `remember()`) must be dropped *before* it ever reaches the attached
+    /// `BatchVerifier` -- proving the `checkAlreadyCommitted`-equivalent
+    /// pre-check (issue #1249) actually short-circuits batch signature
+    /// verification rather than running it unconditionally. Mirrors go's
+    /// `backlogWorker` calling `checkAlreadyCommitted(wi)` (which calls
+    /// `txPool.Test(...)`) before handing the group to
+    /// `streamVerifierChan` (`data/txHandler.go:341`).
+    #[tokio::test]
+    async fn pool_test_rejection_never_reaches_batch_verifier_or_pool() {
+        let pool = make_pool_rejecting_test();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let cache = Arc::new(VerifiedTransactionCache::new(100));
+        let verify_fn: Arc<TestVerifyFn> = Arc::new(move |_request, _cache| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let verifier = Arc::new(BatchVerifier::spawn_with_verifier(
+            BatchVerifierConfig::default(),
+            cache,
+            verify_fn,
+        ));
+        let handler = TxTagHandler::new(pool.clone(), seen).with_batch_verifier(verifier.clone());
+
+        let tx = make_payment_txn(3, 3);
+        let txid = compute_txn_id(&tx.txn);
+        let msg = incoming(std::slice::from_ref(&tx), "9.9.9.9:4160");
+        let out = handler.handle(msg).await;
+
+        assert_eq!(out.action, ForwardingPolicy::Ignore);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the pool pre-check must reject the group before batch verification ever runs"
+        );
+        assert!(
+            !pool.pending_tx_ids().contains(&txid),
+            "a group rejected by the pool pre-check must never reach the pool"
         );
 
         drop(handler);
