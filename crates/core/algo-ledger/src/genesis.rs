@@ -98,12 +98,18 @@ pub struct GenesisAccountState {
 
 /// Resolve the account status a genesis allocation entry should actually get.
 ///
-/// Only the **fee sink** is unconditionally forced to `NotParticipating`
-/// regardless of the genesis file's declared `onl` value; the rewards pool
-/// honors its declared status like any other account. Verified live
-/// against go-algorand v4.6.0-stable with a *nonzero* rewards-pool balance
-/// (issue #449) -- `GET /v2/accounts/{rewardsPool}` reports `"Offline"`
-/// (matching this localnet genesis's `"onl": 0`), not `"Not Participating"`.
+/// The **fee sink** is forced to `NotParticipating` regardless of the
+/// genesis file's declared `onl` value only when the genesis protocol
+/// version's `force_non_participating_fee_sink` consensus param is set (Go:
+/// `ForceNonParticipatingFeeSink`, v15+, `config/consensus.go:181`,
+/// consulted in `data/ledger.go`'s `LoadLedger`) -- issue #1279. Before v15,
+/// go instead honors the genesis file's own declared status for the fee
+/// sink, exactly like any other account. Verified live against
+/// go-algorand v4.6.0-stable (a v15+ genesis protocol) with a *nonzero*
+/// rewards-pool balance (issue #449) -- `GET /v2/accounts/{rewardsPool}`
+/// reports `"Offline"` (matching this localnet genesis's `"onl": 0`), not
+/// `"Not Participating"`; the rewards pool always honors its declared
+/// status like any other account, at every protocol version.
 ///
 /// A prior version of this function also forced the rewards pool to
 /// `NotParticipating`, based on an earlier live comparison that used a
@@ -119,8 +125,9 @@ fn effective_genesis_status(
     addr: &str,
     state: &GenesisAccountState,
     fee_sink: &str,
+    force_fee_sink_not_participating: bool,
 ) -> AccountStatus {
-    if addr == fee_sink {
+    if addr == fee_sink && force_fee_sink_not_participating {
         return AccountStatus::NotParticipating;
     }
     match state.onl {
@@ -158,13 +165,27 @@ pub fn populate_store<L: crate::store_trait::LedgerStore>(
     store.set_genesis_hash(genesis_hash(genesis));
     store.set_protocol(genesis.proto.clone());
 
+    // Go: `config.Consensus[genesisProto].ForceNonParticipatingFeeSink`
+    // (`data/ledger.go`'s `LoadLedger`) -- an unrecognized/unmodeled genesis
+    // protocol conservatively defaults to `false` (the pre-v15 behavior),
+    // matching go's zero-value `ConsensusParams` for a version it doesn't
+    // know either.
+    let force_fee_sink_not_participating = algo_types::consensus_params_for_version(&genesis.proto)
+        .map(|p| p.force_non_participating_fee_sink)
+        .unwrap_or(false);
+
     // Process allocations
     for alloc in &genesis.alloc {
         let addr = Address::from_algorand_string(&alloc.addr).map_err(|e| AlgoError::Ledger {
             message: format!("invalid allocation address '{}': {e}", alloc.addr),
         })?;
 
-        let status = effective_genesis_status(&alloc.addr, &alloc.state, &genesis.fees);
+        let status = effective_genesis_status(
+            &alloc.addr,
+            &alloc.state,
+            &genesis.fees,
+            force_fee_sink_not_participating,
+        );
 
         let vote_id = decode_key_32(&alloc.state.vote, "vote")?;
         let selection_id = decode_key_32(&alloc.state.sel, "sel")?;
@@ -543,9 +564,18 @@ pub fn seed_account_totals_from_genesis(
     // here and diverge accounttotals from what actually lives in
     // accountbase. Sample genesis files (e.g. fee sink + rewards pool
     // sharing the reserve address) hit this in practice.
+    let force_fee_sink_not_participating = algo_types::consensus_params_for_version(&genesis.proto)
+        .map(|p| p.force_non_participating_fee_sink)
+        .unwrap_or(false);
+
     let mut per_addr: HashMap<String, (AccountStatus, u64)> = HashMap::new();
     for alloc in &genesis.alloc {
-        let status = effective_genesis_status(&alloc.addr, &alloc.state, &genesis.fees);
+        let status = effective_genesis_status(
+            &alloc.addr,
+            &alloc.state,
+            &genesis.fees,
+            force_fee_sink_not_participating,
+        );
         per_addr.insert(alloc.addr.clone(), (status, alloc.state.algo));
     }
     // Reward units per account are floor(microAlgos / RewardUnit), summed by
@@ -776,25 +806,34 @@ mod tests {
     /// behavior (issue #449).
     #[test]
     fn fee_sink_forced_not_participating_rewards_pool_honors_declared_status() {
-        let json = r#"{
+        // `force_non_participating_fee_sink` (issue #1279) only forces the
+        // fee sink from v15 onward, so this test -- which pins the
+        // v4.6.0-stable live-verified behavior -- must use a real,
+        // known-to-algod-rust v15+ protocol string rather than an opaque
+        // placeholder.
+        let json = format!(
+            r#"{{
             "network": "devnet",
             "id": "v1.0",
-            "proto": "test-proto",
+            "proto": "{}",
             "alloc": [
-                {
+                {{
                     "addr": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
                     "comment": "FeeSink",
-                    "state": { "algo": 100000, "onl": 0 }
-                },
-                {
+                    "state": {{ "algo": 100000, "onl": 0 }}
+                }},
+                {{
                     "addr": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM",
                     "comment": "RewardsPool",
-                    "state": { "algo": 125000000000000, "onl": 0 }
-                }
+                    "state": {{ "algo": 125000000000000, "onl": 0 }}
+                }}
             ],
             "fees": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
             "rwd": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM"
-        }"#;
+        }}"#,
+            algo_types::CONSENSUS_V42
+        );
+        let json = json.as_str();
 
         let state = LedgerState::from_genesis_json(json).unwrap();
         let fee_sink_addr = Address::from_algorand_string(
@@ -817,6 +856,51 @@ mod tests {
         );
     }
 
+    /// Issue #1279: before v15 (`ForceNonParticipatingFeeSink` activates at
+    /// v15, `config/consensus.go:1031`), go-algorand honors the genesis
+    /// file's own declared status for the fee sink like any other account
+    /// -- it is NOT force-overridden to `NotParticipating`. Uses the same
+    /// scenario as `fee_sink_forced_not_participating_rewards_pool_honors_declared_status`
+    /// above but with a real pre-v15 protocol string, to prove the two
+    /// behaviors are correctly version-gated rather than one silently
+    /// masking the other.
+    #[test]
+    fn fee_sink_honors_declared_status_before_v15() {
+        let json = format!(
+            r#"{{
+            "network": "devnet",
+            "id": "v1.0",
+            "proto": "{}",
+            "alloc": [
+                {{
+                    "addr": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
+                    "comment": "FeeSink",
+                    "state": {{ "algo": 100000, "onl": 0 }}
+                }},
+                {{
+                    "addr": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM",
+                    "comment": "RewardsPool",
+                    "state": {{ "algo": 125000000000000, "onl": 0 }}
+                }}
+            ],
+            "fees": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
+            "rwd": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM"
+        }}"#,
+            algo_types::consensus::CONSENSUS_V14
+        );
+        let state = LedgerState::from_genesis_json(&json).unwrap();
+        let fee_sink_addr = Address::from_algorand_string(
+            "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
+        )
+        .unwrap();
+        assert_eq!(
+            state.get_account(&fee_sink_addr).unwrap().status,
+            AccountStatus::Offline,
+            "before v15, the fee sink must honor the genesis file's declared onl:0 (Offline), \
+             not be force-overridden to NotParticipating"
+        );
+    }
+
     /// The `/v2/ledger/supply` companion to the test above: a fee sink
     /// funded in genesis must not count toward `total-money`
     /// (`participating_money` / go's `AccountTotals.Participating()`,
@@ -827,31 +911,37 @@ mod tests {
     /// comment).
     #[test]
     fn seed_account_totals_excludes_fee_sink_only() {
-        let json = r#"{
+        // See the comment in `fee_sink_forced_not_participating_rewards_pool_honors_declared_status`
+        // above: a real v15+ protocol string is required for
+        // `force_non_participating_fee_sink` (issue #1279) to apply.
+        let json = format!(
+            r#"{{
             "network": "devnet",
             "id": "v1.0",
-            "proto": "test-proto",
+            "proto": "{}",
             "alloc": [
-                {
+                {{
                     "addr": "GBMUQUM7E3QW75GCVLQFMCS2Y7V5XTOJUBRVBXWOLS3EENBZP4AIGPHM6A",
                     "comment": "dev account",
-                    "state": { "algo": 1000, "onl": 0 }
-                },
-                {
+                    "state": {{ "algo": 1000, "onl": 0 }}
+                }},
+                {{
                     "addr": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
                     "comment": "FeeSink",
-                    "state": { "algo": 100000, "onl": 0 }
-                },
-                {
+                    "state": {{ "algo": 100000, "onl": 0 }}
+                }},
+                {{
                     "addr": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM",
                     "comment": "RewardsPool",
-                    "state": { "algo": 500, "onl": 0 }
-                }
+                    "state": {{ "algo": 500, "onl": 0 }}
+                }}
             ],
             "fees": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
             "rwd": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM"
-        }"#;
-        let genesis = parse_genesis_json(json).unwrap();
+        }}"#,
+            algo_types::CONSENSUS_V42
+        );
+        let genesis = parse_genesis_json(&json).unwrap();
         let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
         seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
         // The 1000-microAlgo dev account and the 500-microAlgo rewards pool
