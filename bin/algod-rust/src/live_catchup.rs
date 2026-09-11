@@ -496,6 +496,16 @@ impl CatchupRunner for OrchestratorCatchupRunner {
             &self.params.algod_token,
             &self.params.catchpoint_peer_urls,
             self.params.p2p_transport.as_ref(),
+            // Live catchup has no `config.json`-carrying params struct of
+            // its own to source real `MaxCatchpointDownloadDuration`/
+            // `MinCatchpointFileDownloadBytesPerSecond`/
+            // `CatchupLedgerDownloadRetryAttempts` values from yet (mirrors
+            // `accounts_rebuild_synchronous_mode: 0` and
+            // `DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS` below, issue
+            // #1289) — these defaults already match go's own defaults, so
+            // this is still real, bounded behavior rather than a no-op.
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
         );
 
         let config = SyncConfig {

@@ -105,9 +105,16 @@ pub struct RankedCatchpointSource {
     retriever: Arc<StaticUrlRetriever>,
     config: CatchpointDownloadConfig,
     selector: StdMutex<ClassBasedPeerSelector>,
+    ledger_download_retry_attempts: usize,
 }
 
 impl RankedCatchpointSource {
+    /// go's `config.Local.CatchupLedgerDownloadRetryAttempts` default (50,
+    /// `config/local_defaults.go`) — the fallback [`Self::new`] applies
+    /// until a caller overrides it via
+    /// [`Self::with_ledger_download_retry_attempts`] (issue #1289).
+    pub const DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS: usize = 50;
+
     /// Build a ranked source from candidate `(base_url, token)` pairs,
     /// each given its own [`CatchpointDownloader`] sharing `config`.
     ///
@@ -136,7 +143,20 @@ impl RankedCatchpointSource {
             )),
             retriever,
             config,
+            ledger_download_retry_attempts: Self::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
         }
+    }
+
+    /// Override the pre-flight probe retry budget [`Self::check_ledger_download`]
+    /// uses — go's `config.Local.CatchupLedgerDownloadRetryAttempts` (issue
+    /// #1289). Callers with a loaded `config.json` should pass
+    /// `node_config.catchup_ledger_download_retry_attempts` here rather than
+    /// relying on [`Self::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS`], the same
+    /// way [`CatchpointDownloadConfig`] itself is meant to be built from
+    /// config rather than left at its own defaults.
+    pub fn with_ledger_download_retry_attempts(mut self, attempts: usize) -> Self {
+        self.ledger_download_retry_attempts = attempts;
+        self
     }
 
     /// Add a P2P-backed candidate catchpoint peer (issue #1127): its
@@ -176,15 +196,6 @@ impl RankedCatchpointSource {
             .len()
     }
 
-    /// Upper bound on pre-flight probe attempts in [`Self::check_ledger_download`]
-    /// — go's `config.Local.CatchupLedgerDownloadRetryAttempts` default (50,
-    /// `config/local_defaults.go`). algod-rust has no equivalent config
-    /// knob yet, so this mirrors the go default directly rather than
-    /// reusing [`Self::RETRY_ATTEMPTS_PER_PEER`] (a download-stage-specific
-    /// budget, tuned much lower since a real transfer attempt is far more
-    /// expensive than a HEAD probe).
-    const CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS: usize = 50;
-
     /// Pre-flight availability probe stage: mirrors go's
     /// `CatchpointCatchupService.checkLedgerDownload` (`catchup/catchpointService.go`),
     /// run once ahead of the real transfer in [`Self::download`].
@@ -205,7 +216,7 @@ impl RankedCatchpointSource {
     /// distinction, already used by the download stage below, for
     /// consistency).
     async fn check_ledger_download(&self, genesis_id: &str, round: u64) -> Result<()> {
-        // Fixed budget, matching go's `for i := 0; i <
+        // Configurable budget (issue #1289), matching go's `for i := 0; i <
         // cs.config.CatchupLedgerDownloadRetryAttempts; i++` exactly — go
         // never scales this down for a small candidate-peer count, and
         // neither must this: `get_next_peer()` breaks ties between
@@ -219,7 +230,7 @@ impl RankedCatchpointSource {
         // can exhaust itself on the same already-known-bad peer while a
         // working peer sits untried in the very same tied pool (see issue
         // #928).
-        let attempts = Self::CATCHUP_LEDGER_DOWNLOAD_RETRY_ATTEMPTS;
+        let attempts = self.ledger_download_retry_attempts;
         let mut last_err = None;
 
         for _ in 0..attempts {
@@ -736,6 +747,52 @@ mod tests {
             download_result.is_err(),
             "download() must propagate a check_ledger_download failure rather than falling \
              through to a real transfer attempt"
+        );
+    }
+
+    /// Issue #1289: `check_ledger_download`'s probe-retry budget must
+    /// actually be configurable — go's real `Config.CatchupLedgerDownloadRetryAttempts`
+    /// bounds `checkLedgerDownload`'s loop, and algod-rust's default-config
+    /// callers should be able to override the equivalent budget here rather
+    /// than being stuck on the hardcoded go-default-matching fallback. With
+    /// a single, permanently-404 candidate peer, `PeerSelector::get_next_peer`
+    /// always returns that one peer (no tie/redraw ambiguity to worry
+    /// about), so the number of HTTP requests observed is an exact proxy
+    /// for the number of probe attempts actually made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_ledger_download_retry_budget_is_configurable() {
+        let (missing_url, missing_requests) = spawn_always_404_server().await;
+        let src = RankedCatchpointSource::new(&[(missing_url, String::new())], fast_retry_config())
+            .with_ledger_download_retry_attempts(3);
+
+        let probe_result = src.check_ledger_download("test-v1.0", 1).await;
+        assert!(
+            probe_result.is_err(),
+            "check_ledger_download should fail once the configured budget is exhausted"
+        );
+        assert_eq!(
+            missing_requests.load(Ordering::SeqCst),
+            3,
+            "check_ledger_download must make exactly the configured number of probe attempts, \
+             not the hardcoded 50-attempt go-default fallback"
+        );
+    }
+
+    /// `RankedCatchpointSource::new` without any
+    /// `with_ledger_download_retry_attempts` override still uses
+    /// [`RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS`]
+    /// (go's `CatchupLedgerDownloadRetryAttempts` default, 50) as the probe
+    /// budget passed into the loop — asserted directly on the constant
+    /// (rather than by driving a real 404 server to 50 requests, which a
+    /// single-candidate-peer `ClassBasedPeerSelector` can exhaust
+    /// `get_next_peer()` well before reaching, independent of this budget;
+    /// see `check_ledger_download_retry_budget_is_configurable` above for
+    /// the end-to-end proof that a *smaller* configured budget is honored).
+    #[test]
+    fn default_ledger_download_retry_attempts_matches_go_default() {
+        assert_eq!(
+            RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            50
         );
     }
 
