@@ -334,6 +334,78 @@ impl TxPoolRememberCounter {
 }
 
 // ---------------------------------------------------------------------------
+// TxPoolCheckCounter — per-tag inbound-gossip `pool.test()`
+// (`checkAlreadyCommitted`-equivalent) rejection counter (issue #1251)
+// ---------------------------------------------------------------------------
+
+/// Per-[`PoolErrorTag`] counter for inbound gossip transaction groups
+/// [`TransactionPool::test`] rejects, mirroring go-algorand's
+/// `data/txHandler.go`:
+/// `transactionMessageTxPoolCheckCounter = metrics.NewTagCounter(
+/// "algod_transaction_messages_txpool_check_err_{TAG}", "Number of
+/// transaction messages that didn't pass check by {TAG}",
+/// pools.TxPoolErrTags...)`, incremented in `TxHandler.checkAlreadyCommitted`
+/// at `transactionMessageTxPoolCheckCounter.Add(pools.ClassifyTxPoolError(err), 1)`
+/// — the exact go-side call site is the structural analogue of (decoded
+/// gossip group -> `pool.Test`/`pool.test` -> classify the failure),
+/// mirrored in [`TxTagHandler::handle`]'s `pool.test()` pre-check (issue
+/// #1249) right below.
+///
+/// Lock-free fixed-size array indexed by [`PoolErrorTag`], same pattern as
+/// [`TxPoolRememberCounter`] above and `algo_pool::TxPoolReevalCounter`.
+#[derive(Debug, Default)]
+pub struct TxPoolCheckCounter {
+    counts: [AtomicU64; PoolErrorTag::ALL.len()],
+}
+
+impl TxPoolCheckCounter {
+    /// A fresh, all-zero counter set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn index_of(tag: PoolErrorTag) -> usize {
+        PoolErrorTag::ALL
+            .iter()
+            .position(|t| *t == tag)
+            .expect("PoolErrorTag::ALL is exhaustive over PoolErrorTag")
+    }
+
+    /// Record one inbound gossip group rejected by `pool.test()`,
+    /// classified as `tag`. Go:
+    /// `transactionMessageTxPoolCheckCounter.Add(ClassifyTxPoolError(err), 1)`.
+    pub fn record(&self, tag: PoolErrorTag) {
+        self.counts[Self::index_of(tag)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current count for `tag`. Zero for a tag nothing has been recorded
+    /// for yet.
+    pub fn count(&self, tag: PoolErrorTag) -> u64 {
+        self.counts[Self::index_of(tag)].load(Ordering::Relaxed)
+    }
+
+    /// Render as Prometheus text exposition format, substituting the
+    /// literal tag into `algod_transaction_messages_txpool_check_err_{TAG}`
+    /// — not as a label — matching go's `metrics.TagCounter` naming
+    /// convention.
+    pub fn to_prometheus_text(&self) -> String {
+        let mut out = String::with_capacity(96 * PoolErrorTag::ALL.len());
+        for tag in PoolErrorTag::ALL {
+            let name = format!(
+                "algod_transaction_messages_txpool_check_err_{}",
+                tag.as_str()
+            );
+            out.push_str(&format!(
+                "# HELP {name} Number of transaction messages that didn't pass check by {}.\n# TYPE {name} counter\n{name} {}\n",
+                tag.as_str(),
+                self.count(*tag)
+            ));
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TxBacklogPeerLimiter — per-peer backlog-admission fairness gate
 // (issue #1195)
 // ---------------------------------------------------------------------------
@@ -637,6 +709,7 @@ pub struct TxTagHandler {
     backlog_tx: Option<mpsc::Sender<BacklogItem>>,
     backlog_dropped: Arc<AtomicU64>,
     remember_counter: Arc<TxPoolRememberCounter>,
+    check_counter: Arc<TxPoolCheckCounter>,
     backlog_peer_limiter: Option<Arc<TxBacklogPeerLimiter>>,
     net: Option<Arc<dyn GossipNode>>,
 }
@@ -723,6 +796,7 @@ impl TxTagHandler {
             backlog_tx: None,
             backlog_dropped: Arc::new(AtomicU64::new(0)),
             remember_counter: Arc::new(TxPoolRememberCounter::new()),
+            check_counter: Arc::new(TxPoolCheckCounter::new()),
             backlog_peer_limiter: None,
             net: None,
         }
@@ -901,6 +975,26 @@ impl TxTagHandler {
     #[must_use]
     pub fn remember_counter(&self) -> &Arc<TxPoolRememberCounter> {
         &self.remember_counter
+    }
+
+    /// Attach a shared [`TxPoolCheckCounter`] (issue #1251), so its counts
+    /// are shared (and thus node-wide, matching go's single `TxHandler`)
+    /// across multiple `TxTagHandler` instances registered on different
+    /// transports — same sharing rationale as
+    /// [`Self::with_remember_counter`]. Without this, [`Self::new`]'s
+    /// fresh, unshared counter is used.
+    #[must_use]
+    pub fn with_check_counter(mut self, counter: Arc<TxPoolCheckCounter>) -> Self {
+        self.check_counter = counter;
+        self
+    }
+
+    /// The per-tag `pool.test()` (`checkAlreadyCommitted`-equivalent)
+    /// rejection counters this handler updates. Exposed so `GET /metrics`
+    /// can render them (issue #1251).
+    #[must_use]
+    pub fn check_counter(&self) -> &Arc<TxPoolCheckCounter> {
+        &self.check_counter
     }
 
     /// Returns a reference to the shared seen-tx cache.
@@ -1116,6 +1210,9 @@ impl MessageHandler for TxTagHandler {
         // (mirroring the other early-drop paths in this handler) since the
         // group never earns a legitimate `seen`/canonical slot.
         if let Err(e) = self.pool.test(&group) {
+            // `transactionMessageTxPoolCheckCounter.Add(ClassifyTxPoolError(err), 1)`
+            // (issue #1251).
+            self.check_counter.record(classify_pool_error(&e));
             debug!(
                 sender = %msg.sender,
                 group_len = group.len(),
@@ -1585,6 +1682,43 @@ mod tests {
         assert!(text.contains("algod_transaction_messages_txpool_remember_err_teal_reject 1\n"));
         assert!(text
             .contains("# TYPE algod_transaction_messages_txpool_remember_err_teal_reject counter"));
+        assert!(!text.contains("tag=\""));
+    }
+
+    // -----------------------------------------------------------------
+    // TxPoolCheckCounter (issue #1251)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn check_counter_starts_at_zero_for_every_tag() {
+        let c = TxPoolCheckCounter::new();
+        for tag in algo_pool::PoolErrorTag::ALL {
+            assert_eq!(c.count(*tag), 0);
+        }
+    }
+
+    #[test]
+    fn check_counter_record_increments_only_matching_tag() {
+        let c = TxPoolCheckCounter::new();
+        c.record(algo_pool::PoolErrorTag::Overspend);
+        c.record(algo_pool::PoolErrorTag::Overspend);
+        c.record(algo_pool::PoolErrorTag::Cap);
+
+        assert_eq!(c.count(algo_pool::PoolErrorTag::Overspend), 2);
+        assert_eq!(c.count(algo_pool::PoolErrorTag::Cap), 1);
+        assert_eq!(c.count(algo_pool::PoolErrorTag::Fee), 0);
+    }
+
+    #[test]
+    fn check_counter_prometheus_text_uses_tag_in_series_name() {
+        let c = TxPoolCheckCounter::new();
+        c.record(algo_pool::PoolErrorTag::TealReject);
+        let text = c.to_prometheus_text();
+
+        assert!(text.contains("algod_transaction_messages_txpool_check_err_teal_reject 1\n"));
+        assert!(
+            text.contains("# TYPE algod_transaction_messages_txpool_check_err_teal_reject counter")
+        );
         assert!(!text.contains("tag=\""));
     }
 }
@@ -2214,6 +2348,33 @@ mod batch_verifier_wiring_tests {
             .unwrap_or_else(|_| panic!("verifier still shared"))
             .shutdown()
             .await;
+    }
+
+    /// A `pool.test()` rejection must increment the `TxPoolCheckCounter`
+    /// (issue #1251), mirroring go's `checkAlreadyCommitted` calling
+    /// `transactionMessageTxPoolCheckCounter.Add(ClassifyTxPoolError(err), 1)`
+    /// right before dropping the group.
+    #[tokio::test]
+    async fn pool_test_rejection_increments_check_counter() {
+        let pool = make_pool_rejecting_test();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let check_counter = Arc::new(TxPoolCheckCounter::new());
+        let handler =
+            TxTagHandler::new(pool.clone(), seen).with_check_counter(check_counter.clone());
+
+        let tx = make_payment_txn(4, 4);
+        let msg = incoming(std::slice::from_ref(&tx), "1.1.1.1:4160");
+        let out = handler.handle(msg).await;
+
+        assert_eq!(out.action, ForwardingPolicy::Ignore);
+        let total: u64 = algo_pool::PoolErrorTag::ALL
+            .iter()
+            .map(|t| check_counter.count(*t))
+            .sum();
+        assert_eq!(
+            total, 1,
+            "exactly one tag must be incremented by the pool.test() rejection"
+        );
     }
 
     /// Concurrently-submitted gossip transaction groups must both be

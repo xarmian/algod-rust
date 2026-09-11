@@ -372,6 +372,12 @@ pub struct AlgodNodeInterface {
     /// registers a `TxTagHandler` for inbound TX traffic (the `participate`
     /// and `node start` commands) — `None` for read-only/test contexts.
     tx_pool_remember_counter: Option<Arc<algo_network::TxPoolRememberCounter>>,
+    /// Per-tag inbound-gossip `pool.test()` (`checkAlreadyCommitted`-
+    /// equivalent) rejection counters (issue #1251). `Some` only when a
+    /// [`Self::with_pool`]-attached node also registers a `TxTagHandler`
+    /// for inbound TX traffic — `None` for read-only/test contexts, same
+    /// lifetime rules as `tx_pool_remember_counter`.
+    tx_pool_check_counter: Option<Arc<algo_network::TxPoolCheckCounter>>,
     /// The WebSocket gossip network, if this node has one active
     /// (`NetworkMode::WsOnly`/`Hybrid`). Backs `GET /v2/node/peers`'
     /// `"ws"`-typed entries via [`GossipNode::get_peers`]. `None` for
@@ -452,6 +458,7 @@ impl AlgodNodeInterface {
             participation_metrics: None,
             agreement_message_counters: None,
             tx_pool_remember_counter: None,
+            tx_pool_check_counter: None,
             ws_network: None,
             p2p_network: None,
             enable_developer_api_cfg: false,
@@ -496,6 +503,19 @@ impl AlgodNodeInterface {
         counter: Arc<algo_network::TxPoolRememberCounter>,
     ) -> Self {
         self.tx_pool_remember_counter = Some(counter);
+        self
+    }
+
+    /// Attach the inbound-gossip tx-handler's per-tag `pool.test()`
+    /// (`checkAlreadyCommitted`-equivalent) rejection counters (issue
+    /// #1251) so `GET /metrics` reports them. Builder-style, matching
+    /// [`Self::with_tx_pool_remember_counter`].
+    #[must_use]
+    pub fn with_tx_pool_check_counter(
+        mut self,
+        counter: Arc<algo_network::TxPoolCheckCounter>,
+    ) -> Self {
+        self.tx_pool_check_counter = Some(counter);
         self
     }
 
@@ -2326,6 +2346,11 @@ impl NodeInterface for AlgodNodeInterface {
         if let Some(counter) = self.tx_pool_remember_counter.as_ref() {
             text.push_str(&counter.to_prometheus_text());
         }
+        // Issue #1251: inbound-gossip `pool.test()`
+        // (`checkAlreadyCommitted`-equivalent) rejection counters.
+        if let Some(counter) = self.tx_pool_check_counter.as_ref() {
+            text.push_str(&counter.to_prometheus_text());
+        }
         if self.enable_runtime_metrics_cfg {
             text.push_str(
                 &algo_rest_api::process_metrics::RuntimeMetricsSnapshot::capture()
@@ -3769,13 +3794,27 @@ mod tests {
         assert!(text.contains("algod_transaction_messages_txpool_remember_err_teal_reject 1"));
     }
 
-    /// All three new families combine with the existing participation/
-    /// runtime/netdev sections in one exposition.
+    /// Attaching `TxPoolCheckCounter` alone adds its series to `/metrics`
+    /// (issue #1251).
+    #[test]
+    fn tx_pool_check_counter_alone_adds_series() {
+        let counter = Arc::new(algo_network::TxPoolCheckCounter::new());
+        counter.record(algo_pool::PoolErrorTag::TealReject);
+        let adapter = make_adapter().with_tx_pool_check_counter(counter);
+        let text = adapter
+            .metrics_exposition()
+            .expect("check counter alone must make /metrics available");
+        assert!(text.contains("algod_transaction_messages_txpool_check_err_teal_reject 1"));
+    }
+
+    /// All families combine with the existing participation/runtime/netdev
+    /// sections in one exposition.
     #[test]
     fn all_1134_metric_families_combine_with_existing_sections() {
         let participation = Arc::new(algo_agreement::ParticipationMetrics::new());
         let agreement_counters = Arc::new(algo_network::AgreementMessageCounters::new());
         let remember_counter = Arc::new(algo_network::TxPoolRememberCounter::new());
+        let check_counter = Arc::new(algo_network::TxPoolCheckCounter::new());
         let pool = Arc::new(algo_pool::TransactionPool::new(
             algo_pool::PoolConfig::default(),
             Arc::new(PoolLedgerStub),
@@ -3784,12 +3823,14 @@ mod tests {
             .with_participation_metrics(participation)
             .with_agreement_message_counters(agreement_counters)
             .with_tx_pool_remember_counter(remember_counter)
+            .with_tx_pool_check_counter(check_counter)
             .with_pool(pool);
         let text = adapter.metrics_exposition().expect("exposition available");
         assert!(text.contains("algod_rust_agreement_"));
         assert!(text.contains("algod_agreement_handled_vote"));
         assert!(text.contains("algod_tx_pool_reeval_"));
         assert!(text.contains("algod_transaction_messages_txpool_remember_err_"));
+        assert!(text.contains("algod_transaction_messages_txpool_check_err_"));
     }
 
     #[test]
