@@ -120,7 +120,7 @@ impl BlockSource for FallbackBlockSource {
 /// Connection establishment is entirely delegated to the `MeshThread` — no
 /// manual `try_connect` / `add_peer` calls are made here, avoiding the
 /// double-dial race where manually-added peers conflict with mesh-managed ones.
-async fn setup_gossip_network(
+pub(crate) async fn setup_gossip_network(
     network: &str,
     algod_url: &str,
     algod_token: &str,

@@ -307,13 +307,20 @@ pub(crate) fn build_algod_sync_backend(
 /// the existing peer mesh. HTTP block fetch is used as a fallback when
 /// gossip fails or for gap-fill / recovery scenarios.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Public API — used by integration code and tests.
 pub enum BlockSourcePolicy {
     /// Try gossip first, fall back to HTTP on failure (default for live sync).
     GossipFirst,
     /// Use HTTP only (for recovery / gap-fill when no peers are available).
     HttpOnly,
     /// Use gossip only (when HTTP endpoint is not available).
+    ///
+    /// `build_catchpoint_backend` never selects this today — the CLI
+    /// wiring only ever picks `GossipFirst` (peers connected) or `HttpOnly`
+    /// (no peers), since the REST endpoint is always available on the
+    /// `catchpoint-sync` path. Kept as a selectable policy (and exercised
+    /// directly by `GossipSyncBackend`'s unit tests below) for callers that
+    /// construct a `GossipSyncBackend` directly without an HTTP endpoint.
+    #[allow(dead_code)]
     GossipOnly,
 }
 
@@ -327,7 +334,6 @@ pub enum BlockSourcePolicy {
 /// This ensures batch fetches route through the same HTTP block fetcher that
 /// single-block fetches use, rather than constructing ad-hoc `AlgodClient`
 /// instances.
-#[allow(dead_code)] // wired up when catchup batch-fetch routes through BlockSource
 struct HttpBlockFetcherSource {
     fetcher: HttpBlockFetcher,
 }
@@ -379,7 +385,6 @@ impl BlockSource for HttpBlockFetcherSource {
 ///
 /// The HTTP fallback uses [`HttpBlockFetcherSource`] to ensure consistency
 /// with the single-block fetch path (which routes through `HttpBlockFetcher`).
-#[allow(dead_code)] // wired up when catchup batch-fetch routes through BlockSource
 struct FallbackBlockSource {
     gossip: Arc<GossipBlockSource>,
     http: HttpBlockFetcherSource,
@@ -444,7 +449,6 @@ impl BlockSource for FallbackBlockSource {
 ///
 /// The `download_catchpoint` and `discover_catchpoint` operations delegate
 /// to the REST client since those are inherently HTTP operations.
-#[allow(dead_code)] // Public API — used by integration code and tests.
 pub struct GossipSyncBackend {
     /// Gossip-based block source (WebSocket unicast to peers).
     gossip: Arc<GossipBlockSource>,
@@ -459,15 +463,10 @@ pub struct GossipSyncBackend {
     rt: tokio::runtime::Handle,
     /// Source selection policy.
     policy: BlockSourcePolicy,
-    /// Stored URL for constructing parallel fetchers.
-    algod_url: String,
-    /// Stored token for constructing parallel fetchers.
-    algod_token: String,
     /// Concurrency for batch fetches.
     concurrency: usize,
 }
 
-#[allow(dead_code)] // Public API — used by integration code and tests.
 impl GossipSyncBackend {
     /// Create a new `GossipSyncBackend`.
     ///
@@ -497,8 +496,6 @@ impl GossipSyncBackend {
             downloader,
             rt,
             policy,
-            algod_url: algod_url.to_string(),
-            algod_token: algod_token.to_string(),
             concurrency,
         }
     }
@@ -703,261 +700,145 @@ impl SyncBackend for GossipSyncBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Bootstrap handoff — REST catchpoint -> gossip live stream
+// CatchpointBackend — REST-only or gossip-first, selected once at startup
 // ---------------------------------------------------------------------------
 
-/// After the initial catchpoint/REST bootstrap completes, transition to using
-/// `GossipSyncBackend` for live block streaming.
+/// Dispatches every [`SyncBackend`] call to either the REST-only
+/// [`AlgodSyncBackend`] or the gossip-first [`GossipSyncBackend`], picked
+/// once by [`build_catchpoint_backend`] based on `--gossip`.
 ///
-/// This function creates a `GossipSyncBackend` and runs a block-by-block
-/// live sync loop starting from the ledger's current round, without re-running
-/// the catchpoint download/import/verify phases.
+/// [`SyncOrchestrator::with_backend`] takes `impl SyncBackend + 'static`, a
+/// single concrete (monomorphized) type — this enum is what lets `run()`
+/// choose between the two concrete backend types at runtime while still
+/// handing the orchestrator one static type. Using it for the *whole* sync
+/// run (bootstrap phases and `--follow` alike), not just the live-follow
+/// tail, mirrors go-algorand's own preference for the gossip/WS peer mesh
+/// over REST polling for block fetch (see this module's `GossipSyncBackend`
+/// doc comment) — `download_catchpoint`/`discover_catchpoint` still always
+/// go through REST either way, since catchpoint files have no gossip path.
 ///
-/// # Source selection policy
-///
-/// - **Gossip-first** for live blocks (low latency via peer mesh)
-/// - **HTTP fallback** for gap-fill / recovery when gossip peers fail
-///
-/// # Arguments
-///
-/// * `gossip_source` — Pre-connected gossip block source with active peers.
-/// * `http_fetcher` — HTTP block fetcher for fallback.
-/// * `config` — Sync configuration (db_path, follow_after_sync, etc.).
-/// * `cancel` — Cancellation token for graceful shutdown.
-#[allow(dead_code)] // Public API — used by integration code when gossip peers are connected.
-pub async fn handoff_to_gossip_sync(
-    gossip_source: Arc<GossipBlockSource>,
-    http_fetcher: HttpBlockFetcher,
-    config: SyncConfig,
-    cancel: CancellationToken,
-) -> anyhow::Result<algo_ledger::sync::SyncResult> {
-    use std::time::Instant;
+/// Before issue #1247, `GossipSyncBackend`/`BlockSourcePolicy` had no real
+/// caller at all: `run()` always built a bare `AlgodSyncBackend`, so
+/// `--gossip` was silently ignored on the `catchpoint-sync` CLI path and
+/// `--follow` polled REST forever regardless of the flag.
+enum CatchpointBackend {
+    Rest(AlgodSyncBackend),
+    Gossip(GossipSyncBackend),
+}
 
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+impl SyncBackend for CatchpointBackend {
+    fn is_noop(&self) -> bool {
+        match self {
+            Self::Rest(b) => b.is_noop(),
+            Self::Gossip(b) => b.is_noop(),
+        }
+    }
 
-    info!(
-        algod_url = %config.algod_url,
-        genesis_id = %config.genesis_id,
-        concurrency = config.concurrency,
-        follow = config.follow_after_sync,
-        "bootstrap handoff: transitioning to gossip-based live sync"
-    );
+    fn download_catchpoint(
+        &self,
+        genesis_id: &str,
+        round: u64,
+        dest_path: &std::path::Path,
+    ) -> Result<(), AlgoError> {
+        match self {
+            Self::Rest(b) => b.download_catchpoint(genesis_id, round, dest_path),
+            Self::Gossip(b) => b.download_catchpoint(genesis_id, round, dest_path),
+        }
+    }
 
-    let peer_count = gossip_source.peer_count();
+    fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
+        match self {
+            Self::Rest(b) => b.fetch_block_raw(round),
+            Self::Gossip(b) => b.fetch_block_raw(round),
+        }
+    }
+
+    fn fetch_block(&self, round: u64) -> Result<Block, AlgoError> {
+        match self {
+            Self::Rest(b) => b.fetch_block(round),
+            Self::Gossip(b) => b.fetch_block(round),
+        }
+    }
+
+    fn get_current_round(&self) -> Result<u64, AlgoError> {
+        match self {
+            Self::Rest(b) => b.get_current_round(),
+            Self::Gossip(b) => b.get_current_round(),
+        }
+    }
+
+    fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
+        match self {
+            Self::Rest(b) => b.discover_catchpoint(),
+            Self::Gossip(b) => b.discover_catchpoint(),
+        }
+    }
+
+    fn fetch_blocks_batch(
+        &self,
+        start: u64,
+        end: u64,
+        concurrency: usize,
+    ) -> Result<Vec<(u64, Block)>, AlgoError> {
+        match self {
+            Self::Rest(b) => b.fetch_blocks_batch(start, end, concurrency),
+            Self::Gossip(b) => b.fetch_blocks_batch(start, end, concurrency),
+        }
+    }
+}
+
+/// Build the [`CatchpointBackend`] `run()` hands to [`SyncOrchestrator`].
+///
+/// `gossip_peers` is the caller's already-connected gossip peer snapshot
+/// (from a live [`algo_network::WebsocketNetwork`] via `get_unicast_peers()`
+/// in production; an empty `Vec` in tests that don't need a real socket).
+/// Kept separate from the (unmockable, socket-opening) network setup in
+/// [`crate::commands::sync::setup_gossip_network`] so the policy-selection
+/// logic here — `gossip` on/off, and `GossipFirst` vs. `HttpOnly` depending
+/// on whether any peers are connected — is unit-testable without a live
+/// network (issue #1247's TDD requirement).
+fn build_catchpoint_backend(
+    gossip: bool,
+    algod_url: &str,
+    algod_token: &str,
+    genesis_id: &str,
+    gossip_peers: Vec<Arc<dyn algo_network::UnicastPeer>>,
+    catchpoint_peer_urls: &[String],
+    concurrency: usize,
+) -> anyhow::Result<CatchpointBackend> {
+    if !gossip {
+        return Ok(CatchpointBackend::Rest(
+            AlgodSyncBackend::with_catchpoint_peers(algod_url, algod_token, catchpoint_peer_urls),
+        ));
+    }
+
+    let peer_count = gossip_peers.len();
     let policy = if peer_count == 0 {
-        warn!("no gossip peers available — using HTTP-only mode for live sync");
+        warn!(
+            "--gossip requested but no gossip peers are connected — \
+             using HTTP-only mode for block fetch"
+        );
         BlockSourcePolicy::HttpOnly
     } else {
         info!(
             peer_count,
-            "gossip peers available — using gossip-first source selection"
+            "gossip peers connected — using gossip-first source selection for block fetch"
         );
         BlockSourcePolicy::GossipFirst
     };
 
-    let backend = GossipSyncBackend::new(
+    let gossip_source = Arc::new(GossipBlockSource::new(gossip_peers));
+    let http_fetcher = HttpBlockFetcher::new(algod_url, genesis_id)
+        .map_err(|e| anyhow::anyhow!("failed to build HTTP block fetcher for gossip sync: {e}"))?;
+
+    Ok(CatchpointBackend::Gossip(GossipSyncBackend::new(
         gossip_source,
         http_fetcher,
-        &config.algod_url,
-        &config.algod_token,
+        algod_url,
+        algod_token,
         policy,
-        config.concurrency,
-    );
-
-    // Open the ledger to determine the current round.
-    let ledger =
-        algo_ledger::SqliteLedger::open(&config.db_path).map_err(|e| AlgoError::Ledger {
-            message: format!("open ledger for gossip handoff: {e}"),
-        })?;
-    // Reconcile the cross-file state before trusting the tracker round.
-    // By this point the catchpoint orchestrator has already downloaded
-    // the catchpoint round + lookback, so blockdb should contain
-    // `[catchpoint - MaxTxnLife, catchpoint]`. CatchpointOnly here
-    // therefore signals an upstream failure (lookback skipped); refuse
-    // to start the gossip-forward pass against a sparse archive,
-    // because the missing tail would silently break lease validation
-    // and cert-cross-verify on those rounds.
-    match ledger
-        .reconcile_cross_file()
-        .map_err(|e| anyhow::anyhow!("reconcile cross-file consistency for gossip handoff: {e}"))?
-    {
-        algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {}
-        algo_ledger::CrossFileState::CatchpointOnly { tracker_round } => {
-            anyhow::bail!(
-                "internal: gossip handoff reached with tracker_round={tracker_round} and an \
-                 empty blockdb — the catchpoint lookback download did not run. Recover from a \
-                 catchpoint or delete the DB and restart sync from genesis."
-            );
-        }
-        algo_ledger::CrossFileState::BlockBehind {
-            tracker_round,
-            block_max_round,
-        } => {
-            anyhow::bail!(
-                "ledger inconsistency at gossip handoff: tracker at round {tracker_round} but \
-                 blockdb.blocks max is {block_max_round}. Recover from a catchpoint or delete \
-                 the DB."
-            );
-        }
-    }
-    let mut current_round = ledger
-        .last_committed_round()
-        .map_err(|e| AlgoError::Ledger {
-            message: format!("query last committed round: {e}"),
-        })?
-        .ok_or_else(|| AlgoError::Ledger {
-            message: "gossip handoff: no committed round in ledger".to_string(),
-        })?;
-    // Drop the read-only handle before entering the sync loop.
-    drop(ledger);
-
-    info!(
-        start_round = current_round,
-        "gossip handoff: starting live sync from ledger round"
-    );
-
-    let start = Instant::now();
-    let mut blocks_synced: u64 = 0;
-    let mut eval_delta_stats = algo_ledger::EvalDeltaStats::default();
-
-    loop {
-        // Check for cancellation.
-        if cancel.is_cancelled() {
-            info!(
-                blocks_synced,
-                last_round = current_round,
-                "gossip handoff: cancellation requested"
-            );
-            break;
-        }
-
-        // Get the current network round.
-        let network_round = match backend.get_current_round() {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "gossip handoff: failed to get current round, retrying");
-                tokio::time::sleep(POLL_INTERVAL).await;
-                continue;
-            }
-        };
-
-        // If we're caught up, either exit or keep following.
-        if current_round >= network_round {
-            if config.follow_after_sync {
-                tokio::time::sleep(POLL_INTERVAL).await;
-                continue;
-            } else {
-                info!(
-                    round = current_round,
-                    "gossip handoff: caught up to network tip"
-                );
-                break;
-            }
-        }
-
-        // Fetch and apply blocks one at a time from current+1 to network_round.
-        while current_round < network_round {
-            if cancel.is_cancelled() {
-                info!(
-                    blocks_synced,
-                    last_round = current_round,
-                    "gossip handoff: cancellation requested"
-                );
-                break;
-            }
-
-            let next_round = current_round + 1;
-
-            let block = match backend.fetch_block(next_round) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(
-                        round = next_round,
-                        error = %e,
-                        "gossip handoff: block fetch failed, retrying"
-                    );
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                    break;
-                }
-            };
-
-            // Open ledger, apply, commit.
-            let mut store = algo_ledger::SqliteLedger::open(&config.db_path).map_err(|e| {
-                AlgoError::Ledger {
-                    message: format!("open ledger for block {next_round}: {e}"),
-                }
-            })?;
-
-            // Enable Merkle trie tracking if configured, matching the
-            // SyncOrchestrator replay/follow paths.
-            if config.trie_path.is_some() {
-                use algo_ledger::LedgerStore;
-                store.enable_trie();
-            }
-
-            store.begin_block().map_err(|e| AlgoError::Ledger {
-                message: format!("begin_block at round {next_round}: {e}"),
-            })?;
-
-            let apply_result = if config.compare_mode || config.avm_execute {
-                let (result, block_stats) =
-                    algo_ledger::apply_block_with_comparison(&mut store, &block);
-                eval_delta_stats += block_stats;
-                result
-            } else {
-                algo_ledger::apply_block(&mut store, &block)
-            };
-
-            match apply_result {
-                Ok(()) => {
-                    // Finalize trie updates before commit, matching the
-                    // SyncOrchestrator replay/follow paths.
-                    if config.trie_path.is_some() {
-                        use algo_ledger::LedgerStore;
-                        store.finalize_trie_updates();
-                    }
-                    store.commit_block().map_err(|e| AlgoError::Ledger {
-                        message: format!("commit_block at round {next_round}: {e}"),
-                    })?;
-                    blocks_synced += 1;
-                    current_round = next_round;
-
-                    if blocks_synced % 1000 == 0 {
-                        info!(
-                            round = current_round,
-                            blocks_synced, "gossip handoff: sync progress"
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        round = next_round,
-                        error = %e,
-                        "gossip handoff: apply_block failed"
-                    );
-                    let _ = store.rollback_block();
-                    if config.compare_mode || config.avm_execute {
-                        eval_delta_stats.print_summary();
-                    }
-                    return Err(anyhow::anyhow!(
-                        "gossip handoff: block apply failed at round {next_round}: {e}"
-                    ));
-                }
-            }
-        }
-    }
-
-    // Print AVM/EvalDelta stats if compare or AVM execution was enabled.
-    if config.compare_mode || config.avm_execute {
-        eval_delta_stats.print_summary();
-    }
-
-    Ok(algo_ledger::sync::SyncResult {
-        final_round: current_round,
-        accounts_imported: 0, // No catchpoint import in handoff.
-        blocks_replayed: blocks_synced,
-        duration: start.elapsed(),
-    })
+        concurrency,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,6 +935,10 @@ pub async fn run(
     end: Option<u64>,
     accounts_rebuild_synchronous_mode: i64,
     catchpoint_peer_urls: &[String],
+    gossip: bool,
+    genesis_id_override: Option<&str>,
+    relay_addrs: &[String],
+    dns_bootstrap_override: Option<&str>,
 ) -> anyhow::Result<()> {
     // Determine the catchpoint label to use.
     let label = match (catchpoint_label, catchpoint_auto) {
@@ -1119,9 +1004,34 @@ pub async fn run(
     // Create the real backend and orchestrator. Extra catchpoint peer URLs
     // (issue #901) add ranked candidates for the catchpoint-file download
     // alongside the primary algod_url; block/status calls still use
-    // algod_url only.
-    let backend =
-        AlgodSyncBackend::with_catchpoint_peers(algod_url, algod_token, catchpoint_peer_urls);
+    // algod_url only — unless `--gossip` is set, in which case block fetch
+    // (bootstrap replay and `--follow` alike) prefers the gossip/WS peer
+    // mesh over REST polling, mirroring go-algorand's post-catchup live
+    // sync (issue #1247). With `--gossip` unset this is behaviorally
+    // identical to the pre-#1247 REST-only path.
+    let gossip_peers: Vec<Arc<dyn algo_network::UnicastPeer>> = if gossip {
+        let ws_network = crate::commands::sync::setup_gossip_network(
+            network,
+            algod_url,
+            algod_token,
+            genesis_id_override,
+            relay_addrs,
+            dns_bootstrap_override,
+        )
+        .await?;
+        ws_network.get_unicast_peers().await
+    } else {
+        Vec::new()
+    };
+    let backend = build_catchpoint_backend(
+        gossip,
+        algod_url,
+        algod_token,
+        &config.genesis_id,
+        gossip_peers,
+        catchpoint_peer_urls,
+        concurrency,
+    )?;
     let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
     orchestrator.set_cancel(cancel);
     orchestrator.set_progress_callback(Box::new(|progress| {
@@ -1166,6 +1076,55 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Fake UnicastPeer (for gossip-peer-snapshot tests) -----------------
+
+    /// A minimal fake [`algo_network::UnicastPeer`] with no real connection
+    /// behind it — only its presence in a peer snapshot matters for the
+    /// `build_catchpoint_backend` policy-selection tests below; nothing
+    /// calls `request`/`respond` on it.
+    struct FakeUnicastPeer {
+        addr: String,
+    }
+
+    impl algo_network::gossip_node::Peer for FakeUnicastPeer {
+        fn get_address(&self) -> &str {
+            &self.addr
+        }
+
+        fn get_connection_latency(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+
+        fn routing_addr(&self) -> &[u8] {
+            &[]
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl algo_network::UnicastPeer for FakeUnicastPeer {
+        async fn request(
+            &self,
+            _tag: algo_network::Tag,
+            _topics: algo_network::topics::Topics,
+        ) -> Result<algo_network::topics::Topics, algo_network::errors::PeerError> {
+            Err(algo_network::errors::PeerError::ConnectionClosed)
+        }
+
+        async fn respond(
+            &self,
+            _request_hash: u64,
+            _topics: algo_network::topics::Topics,
+        ) -> Result<(), algo_network::errors::PeerError> {
+            Ok(())
+        }
+    }
+
+    fn fake_unicast_peer(addr: &str) -> Arc<dyn algo_network::UnicastPeer> {
+        Arc::new(FakeUnicastPeer {
+            addr: addr.to_string(),
+        })
+    }
 
     // -- BlockSourcePolicy tests ------------------------------------------
 
@@ -1342,19 +1301,101 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // -- Bootstrap handoff logic tests -----------------------------------
+    // -- CatchpointBackend / CLI-gossip-wiring tests (issue #1247) --------
+    //
+    // Before this fix, `main.rs`'s catchpoint-sync CLI branch never forwarded
+    // `--gossip` to `catchpoint_sync::run` at all (its signature had no
+    // gossip/peer parameter), so `--catchpoint ... --follow --gossip` always
+    // built a bare `AlgodSyncBackend` and polled REST forever — silently
+    // ignoring the flag. `run()` now accepts the same gossip inputs
+    // `commands::sync::run`'s gossip path uses and threads them into
+    // `build_catchpoint_backend`, which is what these tests pin.
 
-    #[test]
-    fn handoff_selects_http_only_when_no_peers() {
-        // Verify the policy selection logic: no peers -> HttpOnly.
-        let gossip = Arc::new(GossipBlockSource::new(vec![]));
-        let peer_count = gossip.peer_count();
-        let policy = if peer_count == 0 {
-            BlockSourcePolicy::HttpOnly
-        } else {
-            BlockSourcePolicy::GossipFirst
+    #[tokio::test]
+    async fn gossip_flag_selects_gossip_backend_not_rest_only() {
+        // This is the core regression: with `gossip: true`, `run()`'s
+        // backend-selection helper must pick `CatchpointBackend::Gossip`
+        // (which prefers the gossip peer mesh for block fetch, falling back
+        // to HTTP) rather than `CatchpointBackend::Rest` (pure REST
+        // polling) — the bug this issue fixes was that the CLI path could
+        // never reach `Gossip` at all, regardless of `--gossip`.
+        let backend = build_catchpoint_backend(
+            true,
+            "http://localhost:19999",
+            "",
+            "test-genesis-v1.0",
+            vec![],
+            &[],
+            4,
+        )
+        .expect("gossip backend construction should succeed with zero peers");
+        assert!(
+            matches!(backend, CatchpointBackend::Gossip(_)),
+            "--gossip must route block fetch through CatchpointBackend::Gossip, not REST-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_gossip_flag_keeps_rest_only_backend() {
+        // Without `--gossip`, behavior must stay exactly what it was before
+        // this issue: a plain REST-only `AlgodSyncBackend`.
+        let backend = build_catchpoint_backend(
+            false,
+            "http://localhost:19999",
+            "",
+            "test-genesis-v1.0",
+            vec![],
+            &[],
+            4,
+        )
+        .expect("REST backend construction should succeed");
+        assert!(matches!(backend, CatchpointBackend::Rest(_)));
+    }
+
+    #[tokio::test]
+    async fn gossip_backend_uses_gossip_first_policy_when_peers_connected() {
+        // A non-empty gossip peer snapshot (as `run()` would pass after a
+        // real `setup_gossip_network` connects at least one peer) must
+        // select `GossipFirst`, not `HttpOnly` — i.e. live post-bootstrap
+        // block fetches actually prefer the gossip peer source, matching
+        // go-algorand's post-catchup behavior, instead of silently staying
+        // on REST/HTTP even when gossip peers are available.
+        let backend = build_catchpoint_backend(
+            true,
+            "http://localhost:19999",
+            "",
+            "test-genesis-v1.0",
+            vec![fake_unicast_peer("peer-a")],
+            &[],
+            4,
+        )
+        .expect("gossip backend construction should succeed with one peer");
+        let CatchpointBackend::Gossip(gossip_backend) = backend else {
+            panic!("expected CatchpointBackend::Gossip");
         };
-        assert_eq!(policy, BlockSourcePolicy::HttpOnly);
+        assert_eq!(gossip_backend.policy, BlockSourcePolicy::GossipFirst);
+    }
+
+    #[tokio::test]
+    async fn gossip_backend_falls_back_to_http_only_with_no_connected_peers() {
+        // Gossip requested but no peers connected (e.g. relay discovery
+        // found nothing yet): the CLI-reachable path must not error out or
+        // silently hang — it degrades to HttpOnly, same as the
+        // now-deleted `handoff_to_gossip_sync`'s policy-selection logic did.
+        let backend = build_catchpoint_backend(
+            true,
+            "http://localhost:19999",
+            "",
+            "test-genesis-v1.0",
+            vec![],
+            &[],
+            4,
+        )
+        .expect("gossip backend construction should succeed with zero peers");
+        let CatchpointBackend::Gossip(gossip_backend) = backend else {
+            panic!("expected CatchpointBackend::Gossip");
+        };
+        assert_eq!(gossip_backend.policy, BlockSourcePolicy::HttpOnly);
     }
 
     #[test]
