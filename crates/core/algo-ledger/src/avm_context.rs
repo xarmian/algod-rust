@@ -3764,7 +3764,13 @@ fn execute_inner_appl<L: LedgerStore>(
     let effective_app_id = if called_app_id == 0 {
         let new_app_id = txn_counter + 1;
         ad.application_id = new_app_id;
-        create_application(store, &stxn.txn, new_app_id, ApplErrorContext::Inner)?;
+        create_application(
+            store,
+            &stxn.txn,
+            new_app_id,
+            ApplErrorContext::Inner,
+            &consensus,
+        )?;
         // Record the created app ID on the SignedTransaction.
         stxn.apply_data_application_id = new_app_id;
         // Exclude this inner-created app's state from initial-state capture

@@ -3079,12 +3079,20 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
             }
 
             // Track per-address rewards.
-            if *addr == txn.sender {
-                apply_data.sender_rewards += reward;
-            } else if *addr == txn.receiver {
-                apply_data.receiver_rewards += reward;
-            } else if *addr == txn.close_remainder_to {
-                apply_data.close_rewards += reward;
+            // go-algorand's block evaluator (`ledger/eval/eval.go`): "If the
+            // protocol does not support rewards in ApplyData, clear them
+            // out" -- `if !params.RewardsInApplyData { ad.SenderRewards =
+            // ...; ad.ReceiverRewards = ...; ad.CloseRewards = ... }`.
+            // Before v15, ApplyData never carries these fields even though
+            // the account's actual reward accrual above is unaffected.
+            if ctx.consensus.rewards_in_apply_data {
+                if *addr == txn.sender {
+                    apply_data.sender_rewards += reward;
+                } else if *addr == txn.receiver {
+                    apply_data.receiver_rewards += reward;
+                } else if *addr == txn.close_remainder_to {
+                    apply_data.close_rewards += reward;
+                }
             }
         }
 
@@ -3230,6 +3238,22 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                             message: format!(
                                 "account {} balance {} below minimum balance {}",
                                 addr, account.micro_algos, min_bal,
+                            ),
+                        });
+                    }
+                    // go-algorand's `BlockEvaluator.checkMinBalance`
+                    // (`ledger/eval/eval.go`): "Check if we have exceeded the
+                    // maximum minimum balance" --
+                    // `if eval.proto.MaximumMinimumBalance != 0 { if
+                    // effectiveMinBalance.Raw > eval.proto.MaximumMinimumBalance
+                    // { ... } }`. 0 means unlimited (v32+ removes the cap).
+                    if ctx.consensus.maximum_minimum_balance != 0
+                        && min_bal > ctx.consensus.maximum_minimum_balance
+                    {
+                        return Err(AlgoError::Ledger {
+                            message: format!(
+                                "account {} would use too much space after this transaction. Minimum balance requirements would be {} (greater than max {})",
+                                addr, min_bal, ctx.consensus.maximum_minimum_balance,
                             ),
                         });
                     }
@@ -3763,7 +3787,15 @@ pub fn apply_axfer<L: crate::store_trait::LedgerStore>(
                     ),
                 })?;
             let remaining = from_holding.amount;
-            ad.asset_closing_amount = remaining;
+            // go-algorand's asset-transfer close-to handling
+            // (`ledger/apply/asset.go`): "AssetCloseAmount was a late
+            // addition, checking that the current protocol version supports
+            // it." -- `if balances.ConsensusParams().EnableAssetCloseAmount { ad.AssetClosingAmount = closeAmount }`.
+            // Before v25, ApplyData never records the closed amount even
+            // though the close itself still happens.
+            if consensus.enable_asset_close_amount {
+                ad.asset_closing_amount = remaining;
+            }
 
             // Check frozen on the sender's holding (unless bypassed).
             if from_holding.frozen && !bypass_freeze {
@@ -3914,12 +3946,29 @@ pub(crate) fn create_application<L: crate::store_trait::LedgerStore>(
     txn: &algo_types::Transaction,
     app_id: u64,
     err_ctx: ApplErrorContext,
+    consensus: &algo_types::ConsensusParams,
 ) -> Result<(), AlgoError> {
     if app_id == 0 {
         return Err(err_ctx.error(format!(
             "{} create: application id is zero",
             err_ctx.prefix()
         )));
+    }
+
+    // go-algorand's `createApplication` (`ledger/apply/application.go`):
+    // `maxAppsCreated := balances.ConsensusParams().MaxAppsCreated`
+    // `if maxAppsCreated > 0 && totalAppParams >= uint64(maxAppsCreated) { ... }`
+    // 0 means unlimited (v32+).
+    if consensus.max_apps_created > 0 {
+        let creator_account = store.get_or_default_account(&txn.sender);
+        if creator_account.total_created_apps >= consensus.max_apps_created as u64 {
+            return Err(err_ctx.error(format!(
+                "{} create: cannot create app for {}: max created apps per acct is {}",
+                err_ctx.prefix(),
+                txn.sender,
+                consensus.max_apps_created,
+            )));
+        }
     }
 
     let approval = txn
@@ -4101,9 +4150,17 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
                 let mut creator_account = store.get_or_default_account(&creator);
                 creator_account.total_created_apps =
                     creator_account.total_created_apps.saturating_sub(1);
-                creator_account.total_extra_app_pages = creator_account
-                    .total_extra_app_pages
-                    .saturating_sub(existing.extra_program_pages);
+                // go-algorand's `deleteApplication`
+                // (`ledger/apply/application.go`): "There was a short-lived
+                // bug so in one version, pages were not deallocated" --
+                // `if balances.ConsensusParams().EnableProperExtraPageAccounting { ... }`.
+                // Before v29, deleting an app never freed its extra pages'
+                // MBR space from the size sponsor.
+                if consensus.enable_proper_extra_page_accounting {
+                    creator_account.total_extra_app_pages = creator_account
+                        .total_extra_app_pages
+                        .saturating_sub(existing.extra_program_pages);
+                }
                 creator_account.total_app_schema =
                     creator_account.total_app_schema.sub_schema(&global_schema);
                 store.set_account(&creator, creator_account);
@@ -4300,7 +4357,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     }
 
     if is_create {
-        create_application(store, txn, app_id, ApplErrorContext::Outer)?;
+        create_application(store, txn, app_id, ApplErrorContext::Outer, &ctx.consensus)?;
         // During simulation with state-change tracing, apps created
         // mid-simulation are excluded from initial-state capture (they have no
         // pre-existing on-chain state). No-op when no tracer is attached, so the
@@ -11829,5 +11886,409 @@ mod tests {
         apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute).expect(
             "eager read-budget check + a later in-program box opcode must not double-count the same box",
         );
+    }
+
+    // ── Deep-pass 4 (docs/phase17/parity_ledger_core.md): consensus-gated
+    // behaviors that were applied unconditionally instead of reading the
+    // matching `ConsensusParams` field at the decision point. ──
+
+    fn trivial_appl_program() -> Vec<u8> {
+        // Same minimal "version 6, approve" bytes used elsewhere in this
+        // module's tests (e.g. `issue_586_app_create_populates_app_resources_and_creatables`).
+        vec![0x06, 0x81, 0x01]
+    }
+
+    fn appl_create_txn(sender: Address, fee: u64, extra_program_pages: u32) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "appl".into();
+        stx.txn.sender = sender;
+        stx.txn.fee = fee;
+        stx.txn.approval_program = Some(serde_bytes::ByteBuf::from(trivial_appl_program()));
+        stx.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(trivial_appl_program()));
+        stx.txn.extra_program_pages = extra_program_pages;
+        stx
+    }
+
+    /// Issue #1264: `create_application` must enforce `MaxAppsCreated`
+    /// (go-algorand's `ledger/apply/application.go`'s
+    /// `maxAppsCreated > 0 && totalAppParams >= uint64(maxAppsCreated)`).
+    #[test]
+    fn test_max_apps_created_enforced() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000), (fee_sink, 0)], fee_sink);
+
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.mode = ApplyMode::Execute;
+        ctx.consensus.max_apps_created = 1;
+
+        apply_transaction(&mut state, &appl_create_txn(creator, 1_000, 0), &ctx, 0)
+            .expect("first app create must succeed under the cap");
+
+        let err = apply_transaction(&mut state, &appl_create_txn(creator, 1_000, 0), &ctx, 0)
+            .expect_err("second app create must be rejected once at MaxAppsCreated");
+        assert!(
+            format!("{err}").contains("max created apps"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Issue #1264: `max_apps_created == 0` means unlimited (matches go's
+    /// `maxAppsCreated > 0 &&` short-circuit; current pin / v32+).
+    #[test]
+    fn test_max_apps_created_zero_is_unlimited() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000), (fee_sink, 0)], fee_sink);
+
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.mode = ApplyMode::Execute;
+        ctx.consensus.max_apps_created = 0; // unlimited
+
+        apply_transaction(&mut state, &appl_create_txn(creator, 1_000, 0), &ctx, 0).unwrap();
+        apply_transaction(&mut state, &appl_create_txn(creator, 1_000, 0), &ctx, 0)
+            .expect("app creation must be unlimited when max_apps_created == 0");
+    }
+
+    /// Issue #1265: pre-v29, deleting an app must NOT deallocate its extra
+    /// program pages from the creator's `total_extra_app_pages` (the
+    /// historical go-algorand bug `EnableProperExtraPageAccounting` fixed).
+    #[test]
+    fn test_enable_proper_extra_page_accounting_pre_v29_delete_leaves_pages() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000), (fee_sink, 0)], fee_sink);
+
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.mode = ApplyMode::Execute;
+        // `ApplyContext::new_replay`'s `ConsensusParams::default()` is the
+        // current (V42) params, which has this flag true (set at v29 and
+        // never reset) -- explicitly force it false to model pre-v29.
+        ctx.consensus.enable_proper_extra_page_accounting = false;
+
+        apply_transaction(&mut state, &appl_create_txn(creator, 1_000, 1), &ctx, 0).unwrap();
+        assert_eq!(
+            state.get_account(&creator).unwrap().total_extra_app_pages,
+            1
+        );
+
+        let mut delete = SignedTransaction::default();
+        delete.txn.txn_type = "appl".into();
+        delete.txn.sender = creator;
+        delete.txn.fee = 1_000;
+        delete.txn.application_id = 1; // first txn_counter-derived app id
+        delete.txn.on_completion = ON_COMPLETION_DELETE;
+
+        apply_transaction(&mut state, &delete, &ctx, 0).unwrap();
+
+        assert_eq!(
+            state.get_account(&creator).unwrap().total_extra_app_pages,
+            1,
+            "pre-v29 delete must not decrement total_extra_app_pages (matches the historical bug)"
+        );
+    }
+
+    /// Issue #1265: v29+, deleting an app must deallocate its extra program
+    /// pages from the creator.
+    #[test]
+    fn test_enable_proper_extra_page_accounting_v29_delete_frees_pages() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000), (fee_sink, 0)], fee_sink);
+
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.mode = ApplyMode::Execute;
+        ctx.consensus.enable_proper_extra_page_accounting = true;
+
+        apply_transaction(&mut state, &appl_create_txn(creator, 1_000, 1), &ctx, 0).unwrap();
+        assert_eq!(
+            state.get_account(&creator).unwrap().total_extra_app_pages,
+            1
+        );
+
+        let mut delete = SignedTransaction::default();
+        delete.txn.txn_type = "appl".into();
+        delete.txn.sender = creator;
+        delete.txn.fee = 1_000;
+        delete.txn.application_id = 1;
+        delete.txn.on_completion = ON_COMPLETION_DELETE;
+
+        apply_transaction(&mut state, &delete, &ctx, 0).unwrap();
+
+        assert_eq!(
+            state.get_account(&creator).unwrap().total_extra_app_pages,
+            0,
+            "v29+ delete must decrement total_extra_app_pages"
+        );
+    }
+
+    /// Issue #1266: pre-v25, an axfer close-to must still perform the close
+    /// but must NOT record `AssetClosingAmount` in `ApplyData`.
+    #[test]
+    fn test_enable_asset_close_amount_pre_v25_leaves_apply_data_unset() {
+        let creator = Address([1u8; 32]);
+        let user = Address([2u8; 32]);
+        let close_target = Address([4u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[
+                (creator, 10_000_000),
+                (user, 10_000_000),
+                (close_target, 10_000_000),
+                (fee_sink, 0),
+            ],
+            fee_sink,
+        );
+        // `ApplyContext::new_replay`'s `ConsensusParams::default()` is the
+        // current (V42) params, which has this flag true (set at v25 and
+        // never reset) -- explicitly force it false to model pre-v25.
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.consensus.enable_asset_close_amount = false;
+
+        let params = AssetParams {
+            total: 1_000,
+            manager: Some(creator),
+            ..Default::default()
+        };
+        create_asset_in_state(&mut state, &ctx, creator, 42, params);
+
+        state.asset_holdings.insert(
+            (user, 42),
+            AssetHolding {
+                amount: 300,
+                frozen: false,
+            },
+        );
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
+        state.asset_holdings.insert(
+            (close_target, 42),
+            AssetHolding {
+                amount: 0,
+                frozen: false,
+            },
+        );
+        state
+            .get_or_default_account_mut(&close_target)
+            .total_assets_opted_in += 1;
+
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "axfer".into();
+        stx.txn.sender = user;
+        stx.txn.fee = 1_000;
+        stx.txn.xaid = 42;
+        stx.txn.asset_amount = 100;
+        stx.txn.asset_receiver = Some(creator);
+        stx.txn.asset_close_to = Some(close_target);
+
+        let ad = apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        // The close itself still happens...
+        assert_eq!(
+            state.get_asset_holding(&close_target, 42).unwrap().amount,
+            200
+        );
+        // ...but pre-v25, ApplyData must not record the closed amount.
+        assert_eq!(
+            ad.asset_closing_amount, 0,
+            "pre-v25 ApplyData must not record AssetClosingAmount"
+        );
+    }
+
+    /// Issue #1266: v25+, an axfer close-to must record `AssetClosingAmount`.
+    #[test]
+    fn test_enable_asset_close_amount_v25_records_apply_data() {
+        let creator = Address([1u8; 32]);
+        let user = Address([2u8; 32]);
+        let close_target = Address([4u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[
+                (creator, 10_000_000),
+                (user, 10_000_000),
+                (close_target, 10_000_000),
+                (fee_sink, 0),
+            ],
+            fee_sink,
+        );
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.consensus.enable_asset_close_amount = true;
+
+        let params = AssetParams {
+            total: 1_000,
+            manager: Some(creator),
+            ..Default::default()
+        };
+        create_asset_in_state(&mut state, &ctx, creator, 42, params);
+
+        state.asset_holdings.insert(
+            (user, 42),
+            AssetHolding {
+                amount: 300,
+                frozen: false,
+            },
+        );
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in += 1;
+        state.asset_holdings.insert(
+            (close_target, 42),
+            AssetHolding {
+                amount: 0,
+                frozen: false,
+            },
+        );
+        state
+            .get_or_default_account_mut(&close_target)
+            .total_assets_opted_in += 1;
+
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "axfer".into();
+        stx.txn.sender = user;
+        stx.txn.fee = 1_000;
+        stx.txn.xaid = 42;
+        stx.txn.asset_amount = 100;
+        stx.txn.asset_receiver = Some(creator);
+        stx.txn.asset_close_to = Some(close_target);
+
+        let ad = apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        assert_eq!(
+            ad.asset_closing_amount, 200,
+            "v25+ ApplyData must record AssetClosingAmount"
+        );
+    }
+
+    /// Issue #1267: `MaximumMinimumBalance` (nonzero) must reject a
+    /// transaction that pushes a touched account's effective minimum
+    /// balance requirement above the cap, even though the account's actual
+    /// balance is well above that requirement.
+    #[test]
+    fn test_maximum_minimum_balance_enforced() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 10_000_000), (receiver, 10_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        // Base MinBalance (crate::params::MIN_BALANCE) is 100_000 for every
+        // touched account; cap below that so the check trips regardless of
+        // the account's real (well-funded) balance.
+        ctx.consensus.maximum_minimum_balance = 50_000;
+
+        let stx = pay_txn(sender, receiver, 1_000, 1_000);
+        let err = apply_transaction(&mut state, &stx, &ctx, 0)
+            .expect_err("effective min balance above MaximumMinimumBalance must be rejected");
+        assert!(
+            format!("{err}").contains("Minimum balance requirements"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Issue #1267: `MaximumMinimumBalance == 0` means unlimited (v32+ /
+    /// current pin).
+    #[test]
+    fn test_maximum_minimum_balance_zero_is_unlimited() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 10_000_000), (receiver, 10_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        let mut ctx = ApplyContext::new_replay(0, fee_sink, 1);
+        ctx.consensus.maximum_minimum_balance = 0; // unlimited
+
+        let stx = pay_txn(sender, receiver, 1_000, 1_000);
+        apply_transaction(&mut state, &stx, &ctx, 0)
+            .expect("maximum_minimum_balance == 0 must not reject");
+    }
+
+    /// Issue #1268: pre-v15, `ApplyData` must not record per-transaction
+    /// rewards even though the account's actual reward accrual is
+    /// unaffected.
+    #[test]
+    fn test_rewards_in_apply_data_pre_v15_leaves_apply_data_unset() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 10_000_000),
+                (receiver, 10_000_000),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        // rewards_level = 100 (nonzero) so `apply_rewards` earns a real,
+        // nonzero reward for both sender and receiver.
+        // `ApplyContext::new_replay`'s `ConsensusParams::default()` is the
+        // current (V42) params, which has this flag true (set at v15 and
+        // never reset) -- explicitly force it false to model pre-v15.
+        let mut ctx = ApplyContext::new_replay(100, fee_sink, 1);
+        ctx.consensus.rewards_in_apply_data = false;
+
+        let sender_before = state.get_account(&sender).unwrap().micro_algos;
+        let stx = pay_txn(sender, receiver, 1_000, 1_000);
+        let ad = apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        // The account-level reward accrual still happened...
+        let sender_after = state.get_account(&sender).unwrap().micro_algos;
+        assert!(
+            sender_after + 1_000 + 1_000 > sender_before,
+            "sender must still accrue the actual reward"
+        );
+        // ...but pre-v15, ApplyData must not record it.
+        assert_eq!(
+            ad.sender_rewards, 0,
+            "pre-v15 ApplyData must not record SenderRewards"
+        );
+        assert_eq!(
+            ad.receiver_rewards, 0,
+            "pre-v15 ApplyData must not record ReceiverRewards"
+        );
+    }
+
+    /// Issue #1268: v15+, `ApplyData` must record per-transaction rewards.
+    #[test]
+    fn test_rewards_in_apply_data_v15_records_apply_data() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 10_000_000),
+                (receiver, 10_000_000),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        let mut ctx = ApplyContext::new_replay(100, fee_sink, 1);
+        ctx.consensus.rewards_in_apply_data = true;
+
+        let stx = pay_txn(sender, receiver, 1_000, 1_000);
+        let ad = apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        assert!(ad.sender_rewards > 0, "v15+ must record SenderRewards");
+        assert!(ad.receiver_rewards > 0, "v15+ must record ReceiverRewards");
     }
 }
