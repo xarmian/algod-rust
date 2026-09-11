@@ -451,8 +451,20 @@ fn verify_transaction_group_cached_inner(
     // not the reverse, so it can't hold a concrete `LedgerStore` itself) --
     // out of scope for this issue's minimal-surface fix. Tracked as a
     // follow-up rather than silently left undocumented.
-    let mut lsig_budget = GroupBudget::for_logicsig(txgroup.len());
+    // LogicSig opcode budget is pooled across the whole atomic group only
+    // when `EnableLogicSigCostPooling` is set for the active protocol
+    // version (go: v39+, `config/consensus.go`). Before that, go-algorand
+    // gives each LogicSig its own independent `LogicSigMaxCost` budget
+    // (`data/transactions/logic/eval.go`'s `remainingBudget()`, taken when
+    // `PooledLogicSigBudget == nil`) -- see issue #1253. Mirrors the same
+    // gating in `block.rs`'s per-group LogicSig budget construction.
+    let pooled_lsig = consensus.enable_logicsig_cost_pooling;
+    let mut lsig_budget = GroupBudget::for_logicsig(if pooled_lsig { txgroup.len() } else { 1 });
     for (group_index, stx) in txgroup.iter().enumerate() {
+        if !pooled_lsig {
+            // Non-pooled: each transaction gets a fresh, independent budget.
+            lsig_budget = GroupBudget::for_logicsig(1);
+        }
         verify_transaction_signature(stx, txgroup, group_index, &mut lsig_budget, consensus)?;
     }
 
@@ -727,5 +739,102 @@ mod tests {
             err.to_string().contains("panic"),
             "expected a panic-recovery error, got: {err}"
         );
+    }
+
+    // ── Issue #1253: EnableLogicSigCostPooling must gate group-wide
+    // LogicSig budget pooling ──
+    //
+    // Port of go-algorand's `TestSigBudget`'s `EnableLogicSigCostPooling =
+    // false` case (`data/transactions/logic/eval_test.go`): before protocol
+    // v39, each LogicSig gets its own independent `LogicSigMaxCost` budget
+    // (go: `eval.go`'s `remainingBudget()`, taken when
+    // `PooledLogicSigBudget == nil`) -- an expensive LogicSig cannot borrow
+    // unused budget from a cheap sibling in the same group. At and after
+    // v39, budgets are pooled across the whole group
+    // (`len(txgroup) * LogicSigMaxCost`), so the same expensive LogicSig
+    // succeeds by drawing on the cheap sibling's unused share.
+
+    /// A trivial `int 1` contract-account LogicSig program (cost 1) and its
+    /// signed transaction, using the standard "authorizer == HashProgram"
+    /// escrow-account dispatch (no delegated signature needed).
+    fn contract_account_lsig_stxn(program: &[u8], note: u64) -> SignedTransaction {
+        use algo_types::LogicSig;
+        let addr = crate::signature::hash_program(program);
+        SignedTransaction {
+            txn: Transaction {
+                sender: addr,
+                ..test_txn(note)
+            },
+            lsig: Some(LogicSig {
+                logic: serde_bytes::ByteBuf::from(program.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A backward-branch loop whose total opcode cost lands just over
+    /// `LOGICSIG_BUDGET` (20,000) on its own: `iterations * 4` (`int 1`,
+    /// `-`, `dup`, `bnz` each cost 1) plus 3 for the initial `int`, final
+    /// `pop`, and final `int 1`. With `iterations = 5000` that's
+    /// `1 + 5000*4 + 1 + 1 = 20003` -- enough to blow a single, independent
+    /// 20,000-opcode budget, but trivially affordable pooled alongside a
+    /// near-free sibling in a 2-member group (pool = 40,000).
+    fn expensive_lsig_program() -> Vec<u8> {
+        let src = "#pragma version 4\nint 5000\nloop:\nint 1\n-\ndup\nbnz loop\npop\nint 1\n";
+        algo_avm::assemble_string(src)
+            .expect("expensive lsig program must assemble")
+            .program
+    }
+
+    /// The `int 1` (v4) program -- a near-free contract-account LogicSig.
+    fn cheap_lsig_program() -> Vec<u8> {
+        algo_avm::assemble_string("#pragma version 4\nint 1\n")
+            .expect("cheap lsig program must assemble")
+            .program
+    }
+
+    #[test]
+    fn logicsig_cost_pooling_disabled_rejects_expensive_sibling_cheap_group_would_pool() {
+        let cache = VerifiedTransactionCache::new(10);
+        let context = test_context();
+
+        let cheap = contract_account_lsig_stxn(&cheap_lsig_program(), 1);
+        let expensive = contract_account_lsig_stxn(&expensive_lsig_program(), 2);
+        let group = vec![cheap, expensive];
+
+        // Pooling disabled (pre-v39 behavior): the expensive sibling can't
+        // borrow the cheap sibling's unused budget, so its own program
+        // alone (cost ~20003) blows its independent 20,000-opcode budget.
+        let unpooled = ConsensusParams {
+            enable_logicsig_cost_pooling: false,
+            ..ConsensusParams::default()
+        };
+        let err = verify_transaction_group_cached(&group, &context, &unpooled, &cache)
+            .expect_err("expensive LogicSig must exceed its own unpooled budget");
+        assert!(
+            err.to_string().contains("budget"),
+            "expected a budget-exhaustion error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn logicsig_cost_pooling_enabled_lets_expensive_sibling_borrow_cheap_groups_budget() {
+        let cache = VerifiedTransactionCache::new(10);
+        let context = test_context();
+
+        let cheap = contract_account_lsig_stxn(&cheap_lsig_program(), 3);
+        let expensive = contract_account_lsig_stxn(&expensive_lsig_program(), 4);
+        let group = vec![cheap, expensive];
+
+        // Pooling enabled (v39+, today's default consensus): the group's
+        // combined 40,000-opcode pool easily covers the expensive
+        // sibling's ~20,003 cost after the cheap sibling's near-zero spend.
+        let pooled = ConsensusParams {
+            enable_logicsig_cost_pooling: true,
+            ..ConsensusParams::default()
+        };
+        verify_transaction_group_cached(&group, &context, &pooled, &cache)
+            .expect("pooled group budget must cover the expensive LogicSig");
     }
 }
