@@ -1389,6 +1389,7 @@ mod tests {
             is_listen_server: false,
             relay_messages: false,
             force_fetch_transactions: false,
+            enable_vote_compression: true,
         })
         .await
         .expect("start listener");
@@ -1418,6 +1419,7 @@ mod tests {
             is_listen_server: false,
             relay_messages: false,
             force_fetch_transactions: false,
+            enable_vote_compression: true,
         })
         .await
         .expect("start dialer");

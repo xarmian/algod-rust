@@ -4425,6 +4425,9 @@ pub async fn run(
         // participates, e.g. for an operator who wants full mempool
         // visibility for local tooling.
         force_fetch_transactions: node_config.force_fetch_transactions,
+        // Issue #1239: wires go's `EnableVoteCompression` through to
+        // `advertise_vote_compression`'s call sites in `ws_network.rs`.
+        enable_vote_compression: node_config.enable_vote_compression,
         ..Default::default()
     };
 
@@ -4830,6 +4833,11 @@ pub async fn run(
                 // doesn't depend on whether the WS stack is even running).
                 relay_messages: is_listen_server || node_config.force_relay_messages,
                 force_fetch_transactions: node_config.force_fetch_transactions,
+                // Issue #1239: wires go's `EnableVoteCompression` through to
+                // this transport's vote-compression feature negotiation —
+                // same `node_config` field `net_config.enable_vote_compression`
+                // below wires for the WS transport.
+                enable_vote_compression: node_config.enable_vote_compression,
             })
             .await
             .map_err(|e| anyhow::anyhow!("failed to start P2P transport: {e}"))?,

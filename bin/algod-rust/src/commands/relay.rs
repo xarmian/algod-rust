@@ -672,6 +672,10 @@ pub async fn run(
         // same way as `p2pNetwork.go`'s identical `relayMessages ||
         // ForceFetchTransactions` gate for consistency across commands.
         force_fetch_transactions: node_config.force_fetch_transactions,
+        // Issue #1239: wires go's `EnableVoteCompression` through to
+        // `advertise_vote_compression`'s call sites in `ws_network.rs`,
+        // same as `participate`'s `net_config` above.
+        enable_vote_compression: node_config.enable_vote_compression,
         ..Default::default()
     };
 

@@ -104,13 +104,12 @@ const DEFAULT_MESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Default stateful vpack vote-compression table size, advertised on every
 /// outbound connection alongside stateless vote compression.
 ///
-/// Matches go-algorand's `config.Local` defaults
-/// (`EnableVoteCompression: true`, `StatefulVoteCompressionTableSize: 2048`
-/// in `config/local_defaults.go`). Not yet exposed as a configurable knob
-/// on this crate's side (see `algo-config`'s deliberate omission of
-/// `EnableVoteCompression`/`StatefulVoteCompressionTableSize` pending this
-/// exact wiring, `crates/node/algo-config/src/lib.rs`); hardcoded to match
-/// Go's own default, the same treatment already given to
+/// Matches go-algorand's `config.Local` `StatefulVoteCompressionTableSize:
+/// 2048` default (`config/local_defaults.go`). Issue #1239 gave the
+/// *enabled/disabled* half of this (`EnableVoteCompression`) a real config
+/// knob (see [`WebsocketNetworkConfig::enable_vote_compression`]), but the
+/// table *size* itself remains hardcoded to Go's own default — same
+/// treatment given to
 /// [`crate::peer_features::PeerFeatureFlags::COMPRESSED_PROPOSAL`] (also
 /// unconditionally advertised, not config-gated).
 const DEFAULT_VOTE_COMPRESSION_TABLE_SIZE: u32 = 2048;
@@ -363,6 +362,19 @@ pub struct WebsocketNetworkConfig {
     /// instead of the raw socket address, mirroring go's
     /// `RequestTracker.remoteHostProxyFix` (`network/requestTracker.go`).
     pub use_x_forwarded_for_address_field: String,
+
+    /// Whether this node advertises/negotiates stateless+stateful vpack
+    /// vote compression at all (default: `true`, matching go's
+    /// `EnableVoteCompression`). When `false`, [`advertise_vote_compression`]
+    /// is called with `enabled = false` on every handshake this node
+    /// participates in, so it negotiates down to the uncompressed
+    /// `AgreementVote` wire format — mirroring go's
+    /// `network/wsNetwork.go` `setHeaders` gating on
+    /// `cfg.EnableVoteCompression`. Issue #1239: previously always `true`
+    /// with no config knob (`algo_config::Local::enable_vote_compression`
+    /// did not exist). Does not affect
+    /// [`DEFAULT_VOTE_COMPRESSION_TABLE_SIZE`], which stays hardcoded.
+    pub enable_vote_compression: bool,
 }
 
 /// Default block-service memory cap: 500,000,000 bytes.
@@ -407,6 +419,7 @@ impl Default for WebsocketNetworkConfig {
             enable_request_logger: false,
             force_fetch_transactions: false,
             use_x_forwarded_for_address_field: String::new(),
+            enable_vote_compression: true,
         }
     }
 }
@@ -1225,7 +1238,7 @@ impl WebsocketNetwork {
             let connect_config = ConnectConfig {
                 genesis_id: self.config.genesis_id.clone(),
                 our_features: crate::peer_features::advertise_vote_compression(
-                    true,
+                    self.config.enable_vote_compression,
                     DEFAULT_VOTE_COMPRESSION_TABLE_SIZE,
                 ),
                 peer_config: Some(crate::ws_peer::WsPeerConfig {
@@ -2090,6 +2103,10 @@ struct NetworkConnectFn {
     outgoing_message_filter_enabled: bool,
     outgoing_message_filter_bucket_count: usize,
     outgoing_message_filter_bucket_size: usize,
+    /// Issue #1239: whether this node advertises/negotiates vote
+    /// compression at all — see
+    /// [`WebsocketNetworkConfig::enable_vote_compression`]'s doc comment.
+    enable_vote_compression: bool,
     /// Issue #1101: shared phonebook, threaded into the real dial so it can
     /// go through [`try_connect_with_phonebook`]'s `rate_limited_call`
     /// wrapping — mirroring go's `wn.dialer` (a `limitcaller.Dialer`
@@ -2119,6 +2136,7 @@ impl ConnectFn for NetworkConnectFn {
         let phonebook = Arc::clone(&self.phonebook);
         let conn_perf_monitor = Arc::clone(&self.conn_perf_monitor);
         let throttled_outgoing_connections = Arc::clone(&self.throttled_outgoing_connections);
+        let enable_vote_compression = self.enable_vote_compression;
         // Issue #803: build a fresh outgoing filter for *this* connection —
         // never reuse an instance across dials, or one peer's
         // `MsgDigestSkip` would suppress sends to a different peer.
@@ -2135,7 +2153,7 @@ impl ConnectFn for NetworkConnectFn {
             let connect_config = ConnectConfig {
                 genesis_id,
                 our_features: crate::peer_features::advertise_vote_compression(
-                    true,
+                    enable_vote_compression,
                     DEFAULT_VOTE_COMPRESSION_TABLE_SIZE,
                 ),
                 peer_config: Some(WsPeerConfig {
@@ -2398,6 +2416,7 @@ impl WebsocketNetwork {
             outgoing_message_filter_enabled: self.config.enable_outgoing_network_message_filtering,
             outgoing_message_filter_bucket_count: self.config.outgoing_message_filter_bucket_count,
             outgoing_message_filter_bucket_size: self.config.outgoing_message_filter_bucket_size,
+            enable_vote_compression: self.config.enable_vote_compression,
             phonebook: Arc::clone(&self.phonebook),
             conn_perf_monitor: Arc::clone(&self.conn_perf_monitor),
             throttled_outgoing_connections: Arc::clone(&self.throttled_outgoing_connections),
@@ -2735,8 +2754,10 @@ async fn gossip_upgrade_handler(
     // inbound and outbound paths in this crate consistent with each other,
     // and is behaviourally identical to go's approach whenever both sides
     // use the same (default 2048) table size.
-    let our_features =
-        crate::peer_features::advertise_vote_compression(true, DEFAULT_VOTE_COMPRESSION_TABLE_SIZE);
+    let our_features = crate::peer_features::advertise_vote_compression(
+        network.config.enable_vote_compression,
+        DEFAULT_VOTE_COMPRESSION_TABLE_SIZE,
+    );
     let client_features_header = headers
         .get(HeaderName::from_static("x-algorand-peer-features"))
         .and_then(|v| v.to_str().ok())
