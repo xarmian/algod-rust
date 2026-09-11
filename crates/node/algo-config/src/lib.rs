@@ -1553,12 +1553,24 @@ static ENABLE_METRIC_REPORTING: VersionedDefault<bool> = VersionedDefault::new(&
 //   previously hardcoded a single bucket-size constant with no
 //   bucket-count knob and no incoming/outgoing split at all.
 // - `dns_security_flags`/`network_protocol_version`/
-//   `disable_outgoing_connection_throttling`/
-//   `block_service_custom_fallback_endpoints`/`enable_request_logger`/
-//   `fallback_dns_resolver_address`: round-trip only, no underlying
-//   DNS-response-validation, protocol-version-override,
-//   outgoing-throttle-disable, custom-fallback-endpoint, request-logging,
-//   or fallback-DNS-resolver subsystem exists to gate.
+//   `disable_outgoing_connection_throttling`: round-trip only, no underlying
+//   DNS-response-validation, protocol-version-override, or
+//   outgoing-throttle-disable subsystem exists to gate.
+// - `block_service_custom_fallback_endpoints`/`enable_request_logger`: wired
+//   into `relay`'s block-service/HTTP-server construction (`relay.rs`'s
+//   `.with_custom_fallback_endpoints`/`enable_request_logger` fields) —
+//   not actually round-trip-only despite this comment previously grouping
+//   them with the fields above; corrected alongside the
+//   `fallback_dns_resolver_address` fix below (issue #1312).
+// - `fallback_dns_resolver_address`: wired into `participate`'s DNS-bootstrap
+//   SRV resolver construction (issue #1312) via
+//   `network_common::resolve_fallback_dns_resolver` —
+//   `algo_network::HickorySrvResolver` already implements go's system ->
+//   configured-fallback -> default resolver chain
+//   (`tools/network/bootstrap.go`'s `readFromSRV`); this field just needed
+//   threading from the loaded config into the one production call site that
+//   has it in scope (`observe`/`sync` have no loaded `Local` config at all,
+//   so their own `HickorySrvResolver::new(None)` call sites are unaffected).
 // - `use_x_forwarded_for_address_field`: wired into `algo_network`'s
 //   inbound connection tracker (issue #1157) — see
 //   `algo_network::request_tracker::get_forwarded_connection_address` and
