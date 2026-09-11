@@ -95,10 +95,25 @@ pub fn compute_pending_rewards(account: &AccountData, rewards_level: u64) -> u64
 /// - `micro_algos` is increased by the pending reward
 /// - `rewarded_micro_algos` is increased by the pending reward
 /// - `rewards_base` is set to the current `rewards_level`
+///
+/// Matches go's `basics.WithUpdatedRewards` (`data/basics/userBalance.go`):
+/// `micro_algos` overflowing u64 is a fatal consensus invariant violation
+/// there (go panics via its `OverflowTracker`, message "overflowed account
+/// balance when applying rewards ..."), not a value to silently wrap.
+/// `rewarded_micro_algos`, the lifetime reward counter, is deliberately
+/// allowed to roll over via plain wrapping addition in go too (its own
+/// comment: "The total reward over the lifetime of the account could exceed
+/// a 64-bit value... this rewardAlgos counter could potentially roll
+/// over") — that half keeps `wrapping_add`.
 pub fn apply_rewards(account: &mut AccountData, rewards_level: u64) -> u64 {
     let pending = compute_pending_rewards(account, rewards_level);
     if pending > 0 {
-        account.micro_algos = account.micro_algos.wrapping_add(pending);
+        account.micro_algos = account.micro_algos.checked_add(pending).unwrap_or_else(|| {
+            panic!(
+                "apply_rewards: overflowed account balance when applying rewards {} + {}",
+                account.micro_algos, pending
+            )
+        });
         account.rewarded_micro_algos = account.rewarded_micro_algos.wrapping_add(pending);
     }
     account.rewards_base = rewards_level;
@@ -280,6 +295,49 @@ mod tests {
         assert_eq!(earned, 0);
         assert_eq!(account.micro_algos, 1_000_000);
         assert_eq!(account.rewards_base, 50);
+    }
+
+    #[test]
+    #[should_panic(expected = "overflowed account balance when applying rewards")]
+    fn test_apply_rewards_panics_on_micro_algos_overflow() {
+        // Mirrors go's TestWithUpdatedRewardsPanics "AlgoPanic" subtest
+        // (data/basics/userBalance_test.go): a balance at u64::MAX plus any
+        // positive pending reward overflows `microAlgosOut` in go's
+        // `OverflowTracker.AddA`, which is a fatal invariant violation there
+        // (`AccountData.WithUpdatedRewards(): overflowed account balance
+        // when applying rewards ...`), not a value to silently wrap.
+        let mut account = AccountData {
+            micro_algos: u64::MAX,
+            rewarded_micro_algos: 0,
+            rewards_base: 0,
+            status: AccountStatus::Online,
+            ..Default::default()
+        };
+        apply_rewards(&mut account, 100);
+    }
+
+    #[test]
+    fn test_apply_rewards_rewarded_micro_algos_wraps_without_panicking() {
+        // Mirrors go's TestWithUpdatedRewardsPanics "RewardsOverflow"
+        // subtest: go deliberately lets the *lifetime* reward counter
+        // (RewardedMicroAlgos) roll over via plain unsigned addition ("The
+        // total reward over the lifetime of the account could exceed a
+        // 64-bit value... this rewardAlgos counter could potentially roll
+        // over"), while the live balance (MicroAlgos) must not silently
+        // wrap. This must NOT panic, unlike the case above.
+        let mut account = AccountData {
+            micro_algos: 80_000_000,
+            rewarded_micro_algos: u64::MAX,
+            rewards_base: 0,
+            status: AccountStatus::Online,
+            ..Default::default()
+        };
+        let earned = apply_rewards(&mut account, 100);
+        // (100 - 0) * (80_000_000 / 1_000_000) = 100 * 80 = 8000
+        assert_eq!(earned, 8000);
+        assert_eq!(account.micro_algos, 80_000_000 + 8000);
+        // u64::MAX + 8000 wraps around.
+        assert_eq!(account.rewarded_micro_algos, u64::MAX.wrapping_add(8000));
     }
 
     #[test]
