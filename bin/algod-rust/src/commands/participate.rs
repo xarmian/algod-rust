@@ -5205,7 +5205,11 @@ pub async fn run(
             // (issue #776): process-wide `/metrics` counters, wired
             // independently of the participation-metrics collector above.
             .with_enable_runtime_metrics(node_config.enable_runtime_metrics)
-            .with_enable_netdev_metrics(node_config.enable_netdev_metrics);
+            .with_enable_netdev_metrics(node_config.enable_netdev_metrics)
+            // `config.json`'s `Archival` (issue #1318): rejects
+            // `start_catchup` outright on an archival node, matching go's
+            // `node.config.Archival` guard in `node/node.go`.
+            .with_archival(node_config.archival);
         if let Some(p2p) = &p2p_transport {
             adapter = adapter.with_p2p_network(p2p.clone() as Arc<dyn algo_network::GossipNode>);
         }

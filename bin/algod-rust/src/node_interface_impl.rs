@@ -410,6 +410,12 @@ pub struct AlgodNodeInterface {
     /// `GET /metrics` includes the network-interface byte counters from
     /// `algo_rest_api::process_metrics::NetDevMetricsSnapshot`.
     enable_netdev_metrics_cfg: bool,
+    /// `config.json`'s `Archival` (issue #1318). Mirrors go's
+    /// `node.config.Archival` guard in `node/node.go`'s `StartCatchup`:
+    /// an archival node already retains full history, so starting a
+    /// catchpoint (fast) catchup is rejected outright rather than delegated
+    /// to `catchup_manager`.
+    archival_cfg: bool,
     /// Live catchpoint-catchup mode toggle (issue #937). `Some` only for
     /// commands that construct a
     /// [`live_catchup::LiveCatchupManager`](crate::live_catchup::LiveCatchupManager)
@@ -467,6 +473,7 @@ impl AlgodNodeInterface {
             max_api_box_per_application_cfg: 100_000,
             enable_runtime_metrics_cfg: false,
             enable_netdev_metrics_cfg: false,
+            archival_cfg: false,
             catchup_manager: None,
             follower_sync_round: None,
             round_timestamp_tracker: Mutex::new(RoundTimestampTracker::new()),
@@ -650,6 +657,15 @@ impl AlgodNodeInterface {
     #[must_use]
     pub fn with_enable_netdev_metrics(mut self, enabled: bool) -> Self {
         self.enable_netdev_metrics_cfg = enabled;
+        self
+    }
+
+    /// Set `config.json`'s `Archival` value (issue #1318). Gates
+    /// `start_catchup` — see [`Self::start_catchup`]'s doc comment.
+    /// Builder-style, matching the other collaborators.
+    #[must_use]
+    pub fn with_archival(mut self, archival: bool) -> Self {
+        self.archival_cfg = archival;
         self
     }
 
@@ -2521,11 +2537,23 @@ impl NodeInterface for AlgodNodeInterface {
     /// except `node start --follow <peer>` (see `commands/node.rs`).
     /// `min_rounds`'s admission check has already run in the REST handler
     /// (`handlers.rs::start_catchup`) before this is called.
+    ///
+    /// Issue #1318: mirrors go's `node.config.Archival` guard, which runs
+    /// *first* in `node.go`'s `StartCatchup` — an archival node already
+    /// retains full history, so go rejects catching up via a catchpoint
+    /// outright rather than checking whether a catchup service exists at
+    /// all. The archival check below therefore takes priority over the
+    /// `catchup_manager`-absent `NotImplemented` fallback.
     async fn start_catchup(
         &self,
         catchpoint: &str,
         _min_rounds: u64,
     ) -> Result<CatchupStartResult, NodeError> {
+        if self.archival_cfg {
+            return Err(NodeError::Internal(
+                "catching up using a catchpoint is not supported on archive nodes".to_string(),
+            ));
+        }
         match &self.catchup_manager {
             Some(mgr) => Ok(mgr.start_catchup(catchpoint).await),
             None => Err(NodeError::NotImplemented("start_catchup")),
@@ -6908,6 +6936,50 @@ mod tests {
             adapter.abort_catchup("1000#deadbeef").await,
             Err(NodeError::NotImplemented("abort_catchup"))
         ));
+    }
+
+    /// Issue #1318: go-algorand's `node.AlgorandFullNode.StartCatchup`
+    /// (`node/node.go`) rejects a catchpoint catchup outright on an archival
+    /// node (`if node.config.Archival { return fmt.Errorf("catching up
+    /// using a catchpoint is not supported on archive nodes") }`), before
+    /// even checking whether a catchup is already in progress. `with_archival`
+    /// must gate `start_catchup` the same way, and it must win even when a
+    /// `catchup_manager` is attached (matching go's check ordering).
+    #[tokio::test]
+    async fn start_catchup_rejected_on_archival_node() {
+        let cancel_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Arc::new(BlockingRunner { cancel_observed });
+        let manager = crate::live_catchup::LiveCatchupManager::new(
+            runner,
+            Arc::new(crate::live_catchup::NoopSyncControl),
+        );
+        let adapter = make_adapter()
+            .with_catchup_manager(manager)
+            .with_archival(true);
+
+        let err = adapter
+            .start_catchup("1000#deadbeef", 0)
+            .await
+            .expect_err("archival node must reject start_catchup");
+        assert!(matches!(err, NodeError::Internal(ref msg)
+            if msg == "catching up using a catchpoint is not supported on archive nodes"));
+    }
+
+    /// A non-archival node (the default) must be unaffected by the new gate.
+    #[tokio::test]
+    async fn start_catchup_allowed_on_non_archival_node() {
+        let cancel_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Arc::new(BlockingRunner { cancel_observed });
+        let manager = crate::live_catchup::LiveCatchupManager::new(
+            runner,
+            Arc::new(crate::live_catchup::NoopSyncControl),
+        );
+        let adapter = make_adapter()
+            .with_catchup_manager(manager)
+            .with_archival(false);
+
+        let started = adapter.start_catchup("1000#deadbeef", 0).await.unwrap();
+        assert_eq!(started, CatchupStartResult::Created);
     }
 
     /// End-to-end through the `NodeInterface` trait methods: `start_catchup`
