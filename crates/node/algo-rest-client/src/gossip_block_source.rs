@@ -95,13 +95,20 @@ impl PeersRetriever for GossipPeersRetriever {
 /// Configuration for [`GossipBlockSource`].
 #[derive(Debug, Clone)]
 pub struct GossipBlockSourceConfig {
-    /// Timeout for a single WS block request (default: 4s).
+    /// Timeout for a single WS block request (default: 4s, matching go's
+    /// `CatchupGossipBlockFetchTimeoutSec` default).
     ///
-    /// This value should be passed to [`WsPeerConfig::request_timeout`] when
-    /// constructing peers that will be used with this source.  The peer's own
-    /// `request()` method applies the timeout internally and properly cleans
-    /// up `RequestTracker` state on expiry — avoiding the tracker leak that
-    /// occurs when an outer `tokio::time::timeout` drops the request future.
+    /// Applied per-call via [`UnicastPeer::request_with_timeout`]
+    /// (issue #1292) rather than the peer's own connection-level
+    /// `request_timeout` (set via [`WsPeerConfig::request_timeout`] at
+    /// peer-construction time and shared by every request that peer ever
+    /// sends) — mirroring go's `context.WithTimeout(ctx,
+    /// CatchupGossipBlockFetchTimeoutSec)` scoping in
+    /// `catchup/universalFetcher.go`'s `getBlockBytes`.
+    /// `request_with_timeout` applies the timeout internally and properly
+    /// cleans up `RequestTracker` state on expiry — avoiding the tracker
+    /// leak that occurs when an outer `tokio::time::timeout` drops the
+    /// request future.
     pub request_timeout: Duration,
 
     /// Maximum number of peers to try per round before giving up (default: 5).
@@ -202,15 +209,20 @@ impl GossipBlockSource {
     /// decoded [`BlockResponse`] and the raw block msgpack bytes (for payset
     /// blob extraction).
     ///
-    /// Mirrors Go's `wsFetcherClient.requestBlock()`.
+    /// Mirrors Go's `wsFetcherClient.getBlockBytes()`, which wraps each
+    /// fetch in its own `context.WithTimeout(ctx,
+    /// CatchupGossipBlockFetchTimeoutSec)` (`catchup/universalFetcher.go`) —
+    /// a bound scoped to this one request, independent of whatever timeout
+    /// policy governs the connection generally.
     ///
-    /// Timeout handling is delegated to the peer's own `request()` method,
-    /// which uses the peer's configured `request_timeout` (set via
-    /// [`WsPeerConfig::request_timeout`]) and properly cleans up its
-    /// `RequestTracker` entry on expiry. Callers should configure peers
-    /// with the desired timeout (e.g. [`GossipBlockSourceConfig::request_timeout`])
-    /// rather than wrapping with an outer `tokio::time::timeout`, which
-    /// would leak tracker entries.
+    /// This calls [`UnicastPeer::request_with_timeout`] with
+    /// [`GossipBlockSourceConfig::request_timeout`] rather than
+    /// [`UnicastPeer::request`] (which would instead apply the peer's own
+    /// connection-level default, set once at peer-construction time and
+    /// shared by every request that peer ever sends — issue #1292).
+    /// `request_with_timeout` cleans up its `RequestTracker` entry on
+    /// expiry itself; do not wrap this call in an outer
+    /// `tokio::time::timeout`, which would leak tracker entries instead.
     async fn fetch_from_peer(
         &self,
         peer: &dyn UnicastPeer,
@@ -218,11 +230,12 @@ impl GossipBlockSource {
     ) -> Result<(BlockResponse, Vec<u8>)> {
         let topics = make_block_request_topics(round.0);
 
-        // Send the request and await the response. The peer's own timeout
-        // (configurable via WsPeerConfig::request_timeout) handles cleanup
-        // of pending tracker state.
+        // Send the request and await the response, bounded by this call's
+        // own configured timeout (not the peer's connection-level
+        // default). `request_with_timeout` handles cleanup of pending
+        // tracker state on expiry.
         let response_topics = peer
-            .request(Tag::UniEnsBlockReq, topics)
+            .request_with_timeout(Tag::UniEnsBlockReq, topics, self.config.request_timeout)
             .await
             .map_err(|e| AlgoError::Network {
                 message: format!(
@@ -928,5 +941,100 @@ mod tests {
         assert_eq!(cfg.max_peer_attempts, 5);
         assert_eq!(cfg.poll_backoff, Duration::from_millis(500));
         assert_eq!(cfg.max_wait, Duration::from_secs(300));
+    }
+
+    // -- request_with_timeout wiring (issue #1292) ---------------------------
+
+    /// A peer that records the `timeout` argument it was called with via
+    /// [`UnicastPeer::request_with_timeout`], and panics if the
+    /// connection-default [`UnicastPeer::request`] is called instead —
+    /// pinning that `GossipBlockSource::fetch_from_peer` routes through the
+    /// call-scoped method rather than the peer's connection-level default.
+    struct TimeoutCapturingPeer {
+        addr: String,
+        captured_timeout: Mutex<Option<Duration>>,
+    }
+
+    impl algo_network::gossip_node::Peer for TimeoutCapturingPeer {
+        fn get_address(&self) -> &str {
+            &self.addr
+        }
+
+        fn get_connection_latency(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn routing_addr(&self) -> &[u8] {
+            &[]
+        }
+    }
+
+    #[async_trait]
+    impl UnicastPeer for TimeoutCapturingPeer {
+        async fn request(
+            &self,
+            _tag: Tag,
+            _topics: Topics,
+        ) -> std::result::Result<Topics, PeerError> {
+            panic!(
+                "fetch_from_peer must call request_with_timeout (the call-scoped \
+                 method), not request() (the connection-default method)"
+            );
+        }
+
+        async fn request_with_timeout(
+            &self,
+            _tag: Tag,
+            _topics: Topics,
+            timeout: Duration,
+        ) -> std::result::Result<Topics, PeerError> {
+            *self.captured_timeout.lock().unwrap() = Some(timeout);
+            // The wiring under test is which method/timeout gets called,
+            // not the fetch outcome — a request error is sufficient here
+            // and keeps this test independent of block/cert decoding.
+            Err(PeerError::RequestTimeout)
+        }
+
+        async fn respond(
+            &self,
+            _request_hash: u64,
+            _topics: Topics,
+        ) -> std::result::Result<(), PeerError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_from_peer_uses_configured_timeout_via_request_with_timeout() {
+        // go: `catchup/universalFetcher.go`'s `wsFetcherClient.getBlockBytes`
+        // wraps each fetch in `context.WithTimeout(ctx,
+        // CatchupGossipBlockFetchTimeoutSec)` — a bound scoped to this one
+        // request. This pins that `GossipBlockSourceConfig::request_timeout`
+        // (sourced from `node_config.catchup_gossip_block_fetch_timeout_sec`
+        // at production call sites) actually reaches the peer via
+        // `request_with_timeout`, distinct from whatever the peer's own
+        // connection-level default might be.
+        let peer = Arc::new(TimeoutCapturingPeer {
+            addr: "peer:4160".to_string(),
+            captured_timeout: Mutex::new(None),
+        });
+
+        let configured_timeout = Duration::from_millis(777);
+        let cfg = GossipBlockSourceConfig {
+            request_timeout: configured_timeout,
+            ..GossipBlockSourceConfig::default()
+        };
+        let src = GossipBlockSource::with_config(vec![peer.clone() as Arc<dyn UnicastPeer>], cfg);
+
+        // The peer always errors, so the fetch fails — only the wiring
+        // (which method, which timeout) is under test here.
+        let _ = src.get_block(Round(1)).await;
+
+        assert_eq!(
+            *peer.captured_timeout.lock().unwrap(),
+            Some(configured_timeout),
+            "fetch_from_peer must pass GossipBlockSourceConfig::request_timeout \
+             through to request_with_timeout's timeout argument"
+        );
     }
 }

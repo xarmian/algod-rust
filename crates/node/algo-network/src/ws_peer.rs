@@ -1248,6 +1248,74 @@ impl Peer for PeerHandle {
 }
 
 // ---------------------------------------------------------------------------
+// Shared request/response-with-timeout helper
+// ---------------------------------------------------------------------------
+
+/// Send a topic-based request over `send_bulk` and await the correlated
+/// response, bounding the wait with an explicitly supplied `timeout`
+/// (rather than a field baked into the caller's struct).
+///
+/// Shared by [`PeerHandle`] and [`UnicastPeerRef`]'s `request`/
+/// `request_with_timeout` implementations — both hold the same shape of
+/// send channel, request tracker, and closing token, so this is the one
+/// place the leak-safety pattern (cancel the pending [`RequestTracker`]
+/// entry on every non-success exit: send failure, peer closing, or
+/// timeout) needs to be gotten right. `request(tag, topics)` calls this
+/// with the peer's own configured `request_timeout`; `request_with_timeout`
+/// calls it with the caller-supplied override — the same function either
+/// way, so a future change to the leak-safety handling can't accidentally
+/// apply to only one of the two call paths.
+async fn request_with_timeout_via_tracker(
+    tracker: &RequestTracker,
+    send_bulk: &mpsc::Sender<WriteCommand>,
+    closing: &CancellationToken,
+    tag: Tag,
+    topics: Topics,
+    timeout: Duration,
+) -> Result<Topics, PeerError> {
+    // 1. Prepare the request: append nonce, serialize, hash, register receiver.
+    let (serialized, hash, rx) = tracker.prepare_request(topics).await;
+
+    // 2. Send the serialized topics as the payload with the given tag.
+    let msg = OutgoingMessage::new(tag, serialized);
+    let cmd = WriteCommand::Data(SendMessage {
+        msg,
+        enqueued: Instant::now(),
+    });
+    if send_bulk.try_send(cmd).is_err() {
+        // Clean up the pending request entry to prevent a leak.
+        tracker.cancel_request(hash).await;
+        return Err(PeerError::SendBufferFull);
+    }
+
+    // 3. Await the response with a timeout, cancelling on peer close.
+    let result = tokio::select! {
+        biased;
+        _ = closing.cancelled() => {
+            // Peer is closing; cancel the pending request.
+            tracker.cancel_request(hash).await;
+            return Err(PeerError::ConnectionClosed);
+        }
+        resp = tokio::time::timeout(timeout, rx) => {
+            resp
+        }
+    };
+
+    match result {
+        Ok(Ok(response_topics)) => Ok(response_topics),
+        Ok(Err(_recv_error)) => {
+            // The sender was dropped (peer closed or request cancelled).
+            Err(PeerError::ResponseChannelClosed)
+        }
+        Err(_timeout) => {
+            // Clean up the pending request on timeout.
+            tracker.cancel_request(hash).await;
+            Err(PeerError::RequestTimeout)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UnicastPeer trait implementation for PeerHandle
 // ---------------------------------------------------------------------------
 
@@ -1258,47 +1326,36 @@ impl UnicastPeer for PeerHandle {
             .request_tracker
             .as_ref()
             .ok_or(PeerError::NoRequestTracker)?;
+        request_with_timeout_via_tracker(
+            tracker,
+            &self.send_bulk,
+            &self.closing,
+            tag,
+            topics,
+            self.request_timeout,
+        )
+        .await
+    }
 
-        // 1. Prepare the request: append nonce, serialize, hash, register receiver.
-        let (serialized, hash, rx) = tracker.prepare_request(topics).await;
-
-        // 2. Send the serialized topics as the payload with the given tag.
-        let msg = OutgoingMessage::new(tag, serialized);
-        let cmd = WriteCommand::Data(SendMessage {
-            msg,
-            enqueued: Instant::now(),
-        });
-        if self.send_bulk.try_send(cmd).is_err() {
-            // Clean up the pending request entry to prevent a leak.
-            tracker.cancel_request(hash).await;
-            return Err(PeerError::SendBufferFull);
-        }
-
-        // 3. Await the response with a timeout, cancelling on peer close.
-        let result = tokio::select! {
-            biased;
-            _ = self.closing.cancelled() => {
-                // Peer is closing; cancel the pending request.
-                tracker.cancel_request(hash).await;
-                return Err(PeerError::ConnectionClosed);
-            }
-            resp = tokio::time::timeout(self.request_timeout, rx) => {
-                resp
-            }
-        };
-
-        match result {
-            Ok(Ok(response_topics)) => Ok(response_topics),
-            Ok(Err(_recv_error)) => {
-                // The sender was dropped (peer closed or request cancelled).
-                Err(PeerError::ResponseChannelClosed)
-            }
-            Err(_timeout) => {
-                // Clean up the pending request on timeout.
-                tracker.cancel_request(hash).await;
-                Err(PeerError::RequestTimeout)
-            }
-        }
+    async fn request_with_timeout(
+        &self,
+        tag: Tag,
+        topics: Topics,
+        timeout: Duration,
+    ) -> Result<Topics, PeerError> {
+        let tracker = self
+            .request_tracker
+            .as_ref()
+            .ok_or(PeerError::NoRequestTracker)?;
+        request_with_timeout_via_tracker(
+            tracker,
+            &self.send_bulk,
+            &self.closing,
+            tag,
+            topics,
+            timeout,
+        )
+        .await
     }
 
     async fn respond(&self, request_hash: u64, topics: Topics) -> Result<(), PeerError> {
@@ -1371,38 +1428,36 @@ impl UnicastPeer for UnicastPeerRef {
             .request_tracker
             .as_ref()
             .ok_or(PeerError::NoRequestTracker)?;
+        request_with_timeout_via_tracker(
+            tracker,
+            &self.send_bulk,
+            &self.closing,
+            tag,
+            topics,
+            self.request_timeout,
+        )
+        .await
+    }
 
-        let (serialized, hash, rx) = tracker.prepare_request(topics).await;
-
-        let msg = OutgoingMessage::new(tag, serialized);
-        let cmd = WriteCommand::Data(SendMessage {
-            msg,
-            enqueued: Instant::now(),
-        });
-        if self.send_bulk.try_send(cmd).is_err() {
-            tracker.cancel_request(hash).await;
-            return Err(PeerError::SendBufferFull);
-        }
-
-        let result = tokio::select! {
-            biased;
-            _ = self.closing.cancelled() => {
-                tracker.cancel_request(hash).await;
-                return Err(PeerError::ConnectionClosed);
-            }
-            resp = tokio::time::timeout(self.request_timeout, rx) => {
-                resp
-            }
-        };
-
-        match result {
-            Ok(Ok(response_topics)) => Ok(response_topics),
-            Ok(Err(_recv_error)) => Err(PeerError::ResponseChannelClosed),
-            Err(_timeout) => {
-                tracker.cancel_request(hash).await;
-                Err(PeerError::RequestTimeout)
-            }
-        }
+    async fn request_with_timeout(
+        &self,
+        tag: Tag,
+        topics: Topics,
+        timeout: Duration,
+    ) -> Result<Topics, PeerError> {
+        let tracker = self
+            .request_tracker
+            .as_ref()
+            .ok_or(PeerError::NoRequestTracker)?;
+        request_with_timeout_via_tracker(
+            tracker,
+            &self.send_bulk,
+            &self.closing,
+            tag,
+            topics,
+            timeout,
+        )
+        .await
     }
 
     async fn respond(&self, request_hash: u64, topics: Topics) -> Result<(), PeerError> {
@@ -4661,6 +4716,82 @@ mod tests {
 
         // The pending request should have been cleaned up.
         assert_eq!(tracker.pending_count().await, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // UnicastPeer: request_with_timeout() honors a per-call override,
+    // independent of the connection's own (much longer) default, and does
+    // not leak RequestTracker state on expiry (issue #1292).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn unicast_request_with_timeout_overrides_connection_default_without_leaking() {
+        let (_client_ws, _server_ws) = ws_raw_pair().await;
+        let closing = CancellationToken::new();
+
+        // Nobody ever reads `_bulk_rx`, but it stays alive so `try_send`
+        // below succeeds (a dropped receiver would fail the send for an
+        // unrelated reason before the timeout logic is even exercised).
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let (bulk_tx, _bulk_rx) = mpsc::channel(10);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(10);
+
+        let tracker = Arc::new(RequestTracker::new());
+
+        let handle = PeerHandle {
+            send_high_prio: high_prio_tx,
+            send_bulk: bulk_tx,
+            incoming: incoming_rx,
+            closing: closing.clone(),
+            remote_addr: "127.0.0.1:9999".to_string(),
+            identity_key: None,
+            identity_verified: false,
+            features: PeerFeatureFlags::empty(),
+            version: "2.2".to_string(),
+            request_tracker: Some(tracker.clone()),
+            // Connection-level default is the generous 60s fallback.
+            // Nothing ever replies on this connection, so a plain
+            // request() call would hang for the full 60s. The catchup
+            // gossip block-fetch path (go: `context.WithTimeout(ctx,
+            // CatchupGossipBlockFetchTimeoutSec)` in
+            // catchup/universalFetcher.go's getBlockBytes) needs a much
+            // tighter, per-call-scoped bound instead.
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            _read_handle: tokio::spawn(async {}),
+            _write_handle: tokio::spawn(async {}),
+            _keepalive_handle: tokio::spawn(async {}),
+        };
+
+        let topics = Topics::from_vec(vec![Topic::new("q", b"test".to_vec())]);
+
+        // Bound the whole test itself well under the connection's 60s
+        // default: if request_with_timeout regressed to using
+        // `self.request_timeout` instead of the supplied override, this
+        // outer timeout fires first and fails the test with a clear
+        // message rather than hanging.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.request_with_timeout(Tag::UniEnsBlockReq, topics, Duration::from_millis(50)),
+        )
+        .await
+        .expect(
+            "request_with_timeout must honor its own short timeout, \
+             not fall back to the connection's 60s default",
+        );
+
+        assert!(
+            matches!(result, Err(PeerError::RequestTimeout)),
+            "expected RequestTimeout, got: {result:?}"
+        );
+
+        // Leak-safety: the pending RequestTracker entry registered by
+        // prepare_request() must be cancelled on timeout, exactly like
+        // request()'s own timeout branch does — otherwise every timed-out
+        // catchup gossip block-fetch would permanently grow the tracker's
+        // pending map.
+        assert_eq!(tracker.pending_count().await, 0);
+
+        closing.cancel();
     }
 
     // -----------------------------------------------------------------------

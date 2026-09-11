@@ -832,6 +832,7 @@ fn build_catchpoint_backend(
     download_config: algo_rest_client::CatchpointDownloadConfig,
     ledger_download_retry_attempts: usize,
     http_block_fetch_timeout: std::time::Duration,
+    catchup_gossip_block_fetch_timeout: std::time::Duration,
 ) -> anyhow::Result<CatchpointBackend> {
     if !gossip {
         return Ok(CatchpointBackend::Rest(
@@ -860,7 +861,18 @@ fn build_catchpoint_backend(
         BlockSourcePolicy::GossipFirst
     };
 
-    let gossip_source = Arc::new(GossipBlockSource::new(gossip_peers));
+    // go: `CatchupGossipBlockFetchTimeoutSec` (`config.Local`, issue #1292)
+    // bounds each gossip block-fetch request specifically, mirroring the
+    // HTTP-fallback fetcher's `http_block_fetch_timeout` wiring just above
+    // (issue #1291) rather than the 4s hardcoded default
+    // `GossipBlockSource::new`/`GossipBlockSourceConfig::default()` would use.
+    let gossip_source = Arc::new(GossipBlockSource::with_config(
+        gossip_peers,
+        algo_rest_client::GossipBlockSourceConfig {
+            request_timeout: catchup_gossip_block_fetch_timeout,
+            ..Default::default()
+        },
+    ));
     // go: `CatchupHTTPBlockFetchTimeoutSec` (`config.Local`, issue #1291) —
     // previously this HTTP fallback fetcher always used a hardcoded 30s
     // client timeout regardless of `config.json`.
@@ -1000,6 +1012,21 @@ fn http_block_fetch_timeout_from_node_config(
     std::time::Duration::from_secs(catchup_http_block_fetch_timeout_sec.max(0) as u64)
 }
 
+/// Clamp a loaded `config.json`'s `CatchupGossipBlockFetchTimeoutSec`
+/// (`config.Local`, issue #1292) into the [`std::time::Duration`]
+/// [`GossipBlockSourceConfig::request_timeout`] takes, on the `--gossip`
+/// gossip-unicast block-fetch path — the sibling of
+/// [`http_block_fetch_timeout_from_node_config`] for the HTTP-fallback
+/// fetcher (issue #1291). `Config.CatchupGossipBlockFetchTimeoutSec` is
+/// `int` (seconds) in go and always non-negative in practice; a
+/// pathological negative override clamps to a zero timeout rather than
+/// panicking on the `as u64` cast.
+fn catchup_gossip_block_fetch_timeout_from_node_config(
+    catchup_gossip_block_fetch_timeout_sec: i64,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(catchup_gossip_block_fetch_timeout_sec.max(0) as u64)
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -1035,6 +1062,7 @@ pub async fn run(
     min_catchpoint_file_download_bytes_per_second: u64,
     catchup_ledger_download_retry_attempts: i64,
     catchup_http_block_fetch_timeout_sec: i64,
+    catchup_gossip_block_fetch_timeout_sec: i64,
 ) -> anyhow::Result<()> {
     // Determine the catchpoint label to use.
     let label = match (catchpoint_label, catchpoint_auto) {
@@ -1140,6 +1168,8 @@ pub async fn run(
         ledger_download_retry_attempts_from_node_config(catchup_ledger_download_retry_attempts);
     let http_block_fetch_timeout =
         http_block_fetch_timeout_from_node_config(catchup_http_block_fetch_timeout_sec);
+    let catchup_gossip_block_fetch_timeout =
+        catchup_gossip_block_fetch_timeout_from_node_config(catchup_gossip_block_fetch_timeout_sec);
     let backend = build_catchpoint_backend(
         gossip,
         algod_url,
@@ -1151,6 +1181,7 @@ pub async fn run(
         download_config,
         ledger_download_retry_attempts,
         http_block_fetch_timeout,
+        catchup_gossip_block_fetch_timeout,
     )?;
     let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
     orchestrator.set_cancel(cancel);
@@ -1521,6 +1552,7 @@ mod tests {
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             std::time::Duration::from_secs(4),
+            std::time::Duration::from_secs(4),
         )
         .expect("gossip backend construction should succeed with zero peers");
         assert!(
@@ -1543,6 +1575,7 @@ mod tests {
             4,
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
         )
         .expect("REST backend construction should succeed");
@@ -1568,6 +1601,7 @@ mod tests {
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
             std::time::Duration::from_secs(4),
+            std::time::Duration::from_secs(4),
         )
         .expect("gossip backend construction should succeed with one peer");
         let CatchpointBackend::Gossip(gossip_backend) = backend else {
@@ -1592,6 +1626,7 @@ mod tests {
             4,
             algo_rest_client::CatchpointDownloadConfig::default(),
             algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+            std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(4),
         )
         .expect("gossip backend construction should succeed with zero peers");

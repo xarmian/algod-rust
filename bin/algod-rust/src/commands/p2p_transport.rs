@@ -802,6 +802,40 @@ impl Peer for P2pUnicastPeer {
     }
 }
 
+/// Send a `UniEnsBlockReq`-style request over `tx` and await the correlated
+/// `TopicMsgResp`, bounding the wait with an explicitly supplied `timeout`.
+///
+/// Shared by [`P2pUnicastPeer`]'s `request`/`request_with_timeout`
+/// implementations (mirroring `ws_peer.rs`'s
+/// `request_with_timeout_via_tracker`, which plays the same role for
+/// `PeerHandle`/`UnicastPeerRef`) so the `RequestTracker`-leak-safety
+/// pattern — cancel the pending entry on every non-success exit — lives in
+/// exactly one place rather than being duplicated (and potentially drifting)
+/// across both call paths.
+async fn p2p_request_with_timeout_via_tracker(
+    tracker: &RequestTracker,
+    tx: &mpsc::UnboundedSender<P2pOutboundMsg>,
+    tag: Tag,
+    topics: Topics,
+    timeout: Duration,
+) -> Result<Topics, PeerError> {
+    let (serialized, hash, rx) = tracker.prepare_request(topics).await;
+
+    if tx.send((tag, serialized, Instant::now())).is_err() {
+        tracker.cancel_request(hash).await;
+        return Err(PeerError::ConnectionClosed);
+    }
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(response_topics)) => Ok(response_topics),
+        Ok(Err(_recv_error)) => Err(PeerError::ResponseChannelClosed),
+        Err(_timeout) => {
+            tracker.cancel_request(hash).await;
+            Err(PeerError::RequestTimeout)
+        }
+    }
+}
+
 #[async_trait]
 impl UnicastPeer for P2pUnicastPeer {
     /// Send a `UniEnsBlockReq`-style request over this peer's
@@ -810,21 +844,27 @@ impl UnicastPeer for P2pUnicastPeer {
     /// `RequestTracker` protocol), just framed onto this stream's own
     /// outgoing sender instead of a WS write-command channel.
     async fn request(&self, tag: Tag, topics: Topics) -> Result<Topics, PeerError> {
-        let (serialized, hash, rx) = self.request_tracker.prepare_request(topics).await;
+        p2p_request_with_timeout_via_tracker(
+            &self.request_tracker,
+            &self.tx,
+            tag,
+            topics,
+            self.request_timeout,
+        )
+        .await
+    }
 
-        if self.tx.send((tag, serialized, Instant::now())).is_err() {
-            self.request_tracker.cancel_request(hash).await;
-            return Err(PeerError::ConnectionClosed);
-        }
-
-        match tokio::time::timeout(self.request_timeout, rx).await {
-            Ok(Ok(response_topics)) => Ok(response_topics),
-            Ok(Err(_recv_error)) => Err(PeerError::ResponseChannelClosed),
-            Err(_timeout) => {
-                self.request_tracker.cancel_request(hash).await;
-                Err(PeerError::RequestTimeout)
-            }
-        }
+    /// Same as `request`, but bounds the wait with a caller-supplied
+    /// timeout rather than this peer's connection-level default — see
+    /// [`UnicastPeer::request_with_timeout`]'s doc comment (issue #1292).
+    async fn request_with_timeout(
+        &self,
+        tag: Tag,
+        topics: Topics,
+        timeout: Duration,
+    ) -> Result<Topics, PeerError> {
+        p2p_request_with_timeout_via_tracker(&self.request_tracker, &self.tx, tag, topics, timeout)
+            .await
     }
 
     /// Send a response to a previously received request over this peer's
