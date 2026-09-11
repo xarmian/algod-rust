@@ -2102,11 +2102,55 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     }
 
     /// Report an unnamed-resource access to the attached tracer. A no-op when
-    /// unnamed-resource tracking is disabled or no tracer is attached.
+    /// unnamed-resource tracking is disabled, no tracer is attached, or the
+    /// access isn't reportable at the group level (see
+    /// [`Self::reportable_at_group_level`]).
     fn record_unnamed(&self, access: UnnamedResourceAccess) {
+        if !self.reportable_at_group_level(&access) {
+            return;
+        }
         if let Some(p) = self.tracer_ptr {
             // SAFETY: identical aliasing invariants to `record_app_state_access`.
             unsafe { &mut *p }.record_unnamed_resource(&access);
+        }
+    }
+
+    /// Whether `access` should be surfaced in the group-level
+    /// `unnamed_resources_accessed` report (the only unnamed-resource-access
+    /// field this engine's `TxnGroupResult` exposes -- see its doc comment).
+    ///
+    /// Mirrors go-algorand's `groupResourceTracker.addAccount`/`addAsset`/
+    /// `addApp` (`ledger/simulation/resources.go`): those three categories
+    /// are recorded into the group-shared `globalResources` map only when
+    /// `global_sharing` is true (`cx.version >= SHARED_RESOURCES_VERSION`
+    /// for every frame in the call chain); otherwise the access is recorded
+    /// purely into the accessing top-level transaction's own
+    /// `localTxnResources[gi]`, which go's own group-level
+    /// `TxnGroupResult.UnnamedResourcesAccessed` never includes (go instead
+    /// surfaces it only via the per-transaction
+    /// `SimulateTransactionResult.UnnamedResourcesAccessed`, a field this
+    /// engine doesn't yet expose -- see `TxnResult`'s doc comment). Boxes,
+    /// asset holdings, and app-local pairs have no such split: go's
+    /// `hasBox`/`addBox`/`hasHolding`/`addHolding`/`hasLocal`/`addLocal`
+    /// always consult `globalResources` regardless of version, so those
+    /// categories (and the box-budget bookkeeping variants) are always
+    /// reportable (issue #1240).
+    fn reportable_at_group_level(&self, access: &UnnamedResourceAccess) -> bool {
+        match access {
+            UnnamedResourceAccess::Account(_)
+            | UnnamedResourceAccess::Asset(_)
+            | UnnamedResourceAccess::App(_) => {
+                self.global_sharing
+                    || self
+                        .unnamed_capacity
+                        .as_ref()
+                        .map_or(true, |cap| cap.borrow().local_txn.is_empty())
+            }
+            UnnamedResourceAccess::AssetHolding(..)
+            | UnnamedResourceAccess::AppLocal(..)
+            | UnnamedResourceAccess::Box(..)
+            | UnnamedResourceAccess::EmptyBoxRef
+            | UnnamedResourceAccess::DeficitEmptyBoxRefs(_) => true,
         }
     }
 

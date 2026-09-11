@@ -685,10 +685,19 @@ fn fix_signers_requires_allow_empty_signatures() {
 // allow_unnamed_resources
 // ---------------------------------------------------------------------------
 
-/// v6 program: pushint asset_id; asset_params_get AssetTotal; pop; pop;
-/// pushint 1; return.
-fn asset_params_program(asset_id: u64) -> Vec<u8> {
-    let mut p = vec![0x06, 0x81];
+/// Program at the given AVM `version`: pushint asset_id; asset_params_get
+/// AssetTotal; pop; pop; pushint 1; return.
+///
+/// The version matters for unnamed-resource reporting: group-level sharing
+/// of unnamed accesses only kicks in at `SHARED_RESOURCES_VERSION` (9, see
+/// `avm_context::LedgerAvmContext::global_sharing`'s doc comment) -- below
+/// that, an access is recorded purely into the accessing top-level
+/// transaction's own local pool, which this engine's only exposed
+/// `unnamed_resources_accessed` field (group-level) never surfaces, exactly
+/// like go-algorand's `groupResourceTracker.addAsset` never touches
+/// `globalResources.Assets` pre-v9 (`ledger/simulation/resources.go`).
+fn asset_params_program_v(asset_id: u64, version: u8) -> Vec<u8> {
+    let mut p = vec![version, 0x81];
     // varint asset_id
     let mut n = asset_id;
     loop {
@@ -708,13 +717,43 @@ fn asset_params_program(asset_id: u64) -> Vec<u8> {
     p
 }
 
-/// v6 program: pushbytes <32-byte addr>; balance; pop; pushint 1; return.
-fn balance_program(addr: &Address) -> Vec<u8> {
-    let mut p = vec![0x06, 0x80, 32];
+/// v9 program (at `SHARED_RESOURCES_VERSION`, so a genuinely unnamed access
+/// is promoted to the group-level report -- see [`asset_params_program_v`]'s
+/// doc comment): pushint asset_id; asset_params_get AssetTotal; pop; pop;
+/// pushint 1; return.
+fn asset_params_program(asset_id: u64) -> Vec<u8> {
+    asset_params_program_v(asset_id, 9)
+}
+
+/// Program at the given AVM `version`: pushbytes <32-byte addr>; balance;
+/// pop; pushint 1; return. See [`asset_params_program_v`]'s doc comment for
+/// why the version matters to unnamed-resource reporting.
+fn balance_program_v(addr: &Address, version: u8) -> Vec<u8> {
+    let mut p = vec![version, 0x80, 32];
     p.extend_from_slice(&addr.0);
     p.push(0x60); // balance
     p.push(0x48); // pop
     p.extend_from_slice(&[0x81, 0x01, 0x43]);
+    p
+}
+
+/// v9 program (at `SHARED_RESOURCES_VERSION`): pushbytes <32-byte addr>;
+/// balance; pop; pushint 1; return.
+fn balance_program(addr: &Address) -> Vec<u8> {
+    balance_program_v(addr, 9)
+}
+
+/// v9 program: pushbytes <32-byte addr>; acct_params_get AcctAuthAddr; pop;
+/// pop; pushint 1; return. Used to prove an unnamed account is tracked
+/// correctly even when accessed only via `acct_params_get` (go's
+/// `TestUnnamedResources` rekey scenario checks exactly this field), not
+/// just `balance`.
+fn acct_auth_addr_program(addr: &Address) -> Vec<u8> {
+    let mut p = vec![0x09, 0x80, 32]; // version 9; pushbytes <addr>
+    p.extend_from_slice(&addr.0);
+    p.extend_from_slice(&[0x73, 0x02]); // acct_params_get AcctAuthAddr
+    p.extend_from_slice(&[0x48, 0x48]); // pop; pop (value, exists)
+    p.extend_from_slice(&[0x81, 0x01, 0x43]); // pushint 1; return
     p
 }
 
@@ -909,6 +948,142 @@ fn unnamed_box_access_fails_without_flag_and_tracked_with_flag() {
     assert!(
         unnamed.boxes.contains(&(100, b"bk".to_vec())),
         "unnamed box must be tracked: {unnamed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rekeyed-account access + pre-v9/v9+ version sweep (issue #1240)
+//
+// Ports the two remaining uncovered facets of go-algorand's
+// `TestUnnamedResources` (`ledger/simulation/simulation_eval_test.go`,
+// commit `1088a2aad`, `v3.18.0-stable`): a rekeyed account accessed via
+// `acct_params_get AcctAuthAddr`, and the `ResourceTracker` shape
+// transition at `SHARED_RESOURCES_VERSION` (9) -- below that version an
+// unnamed access is recorded only into the accessing top-level
+// transaction's own local pool (never surfaced by this engine's group-level
+// `unnamed_resources_accessed`, per go's `groupResourceTracker.addAccount`
+// never touching `globalResources.Accounts` pre-v9); at/above it, the
+// access is shared group-wide and does appear in the group-level report.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unnamed_rekeyed_account_access_tracked_when_allowed() {
+    let sender = Address([0xAA; 32]);
+    let stranger = Address([0x77; 32]);
+    let auth = Address([0x55; 32]);
+    let mut state = setup_state(sender);
+    register_app(&mut state, sender, 100, acct_auth_addr_program(&stranger));
+    // The unnamed account is rekeyed to `auth` -- mirrors go's
+    // `env.Rekey(otherAccount.Addr, otherAccountAuthAddr)`.
+    state.set_account(
+        &stranger,
+        AccountData {
+            micro_algos: 424_242,
+            auth_addr: Some(auth),
+            ..Default::default()
+        },
+    );
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![make_appl_txn(sender, 100)]],
+        allow_empty_signatures: true,
+        allow_unnamed_resources: true,
+        ..Default::default()
+    };
+
+    let result = simulate(&mut state, request).expect("simulation should succeed");
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "acct_params_get AcctAuthAddr on a rekeyed, wholly unnamed account must succeed: {:?}",
+        group.failure_message
+    );
+    let unnamed = group
+        .unnamed_resources_accessed
+        .as_ref()
+        .expect("unnamed resources must be reported");
+    assert!(
+        unnamed.accounts.contains(&stranger),
+        "a rekeyed account accessed only via acct_params_get must still be tracked as unnamed: {unnamed:?}"
+    );
+}
+
+#[test]
+fn unnamed_account_access_below_shared_resources_version_not_promoted_to_group_level() {
+    let sender = Address([0xAA; 32]);
+    let stranger = Address([0x77; 32]);
+    let mut state = setup_state(sender);
+    // v8: below SHARED_RESOURCES_VERSION (9).
+    register_app(&mut state, sender, 100, balance_program_v(&stranger, 8));
+    state.set_account(
+        &stranger,
+        AccountData {
+            micro_algos: 424_242,
+            ..Default::default()
+        },
+    );
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![make_appl_txn(sender, 100)]],
+        allow_empty_signatures: true,
+        allow_unnamed_resources: true,
+        ..Default::default()
+    };
+
+    let result = simulate(&mut state, request).expect("simulation should succeed");
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "group must succeed: {:?}",
+        group.failure_message
+    );
+    assert!(
+        group.unnamed_resources_accessed.is_none(),
+        "a below-SHARED_RESOURCES_VERSION unnamed access is local to its own \
+         transaction and must not be promoted to the group-level report \
+         (mirrors go's groupResourceTracker.addAccount never touching \
+         globalResources.Accounts pre-v9): {:?}",
+        group.unnamed_resources_accessed
+    );
+}
+
+#[test]
+fn unnamed_account_access_at_shared_resources_version_promoted_to_group_level() {
+    let sender = Address([0xAA; 32]);
+    let stranger = Address([0x77; 32]);
+    let mut state = setup_state(sender);
+    // v9: at SHARED_RESOURCES_VERSION.
+    register_app(&mut state, sender, 100, balance_program_v(&stranger, 9));
+    state.set_account(
+        &stranger,
+        AccountData {
+            micro_algos: 424_242,
+            ..Default::default()
+        },
+    );
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![make_appl_txn(sender, 100)]],
+        allow_empty_signatures: true,
+        allow_unnamed_resources: true,
+        ..Default::default()
+    };
+
+    let result = simulate(&mut state, request).expect("simulation should succeed");
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "group must succeed: {:?}",
+        group.failure_message
+    );
+    let unnamed = group
+        .unnamed_resources_accessed
+        .as_ref()
+        .expect("unnamed resources must be reported at SHARED_RESOURCES_VERSION");
+    assert!(
+        unnamed.accounts.contains(&stranger),
+        "an at-SHARED_RESOURCES_VERSION unnamed access is group-shared and \
+         must appear in the group-level report: {unnamed:?}"
     );
 }
 
