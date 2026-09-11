@@ -3109,12 +3109,12 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
             }
             "acfg" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
-                let ad = apply_acfg(store, &stx.txn, ctx.txn_counter.get())?;
+                let ad = apply_acfg(store, &stx.txn, ctx.txn_counter.get(), &ctx.consensus)?;
                 apply_data.config_asset = ad.config_asset;
             }
             "axfer" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink, &ctx.consensus)?;
-                let ad = apply_axfer(store, &stx.txn)?;
+                let ad = apply_axfer(store, &stx.txn, &ctx.consensus)?;
                 apply_data.asset_closing_amount = ad.asset_closing_amount;
             }
             "afrz" => {
@@ -3435,12 +3435,29 @@ pub fn apply_acfg<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     txn: &algo_types::Transaction,
     txn_counter: u64,
+    consensus: &ConsensusParams,
 ) -> Result<InnerApplyData, AlgoError> {
     let mut ad = InnerApplyData::default();
 
     if txn.config_asset == 0 {
         // ── Create ──
         let new_asset_id = txn_counter + 1;
+
+        // go-algorand (ledger/apply/asset.go `AssetConfig`): reject asset
+        // creation once the sender's total held/created-asset count already
+        // reaches `MaxAssetsPerAccount` (0 = unlimited, the case from v32 on).
+        let sender_account = store.get_or_default_account(&txn.sender);
+        let total_assets = sender_account.total_assets_opted_in;
+        if consensus.max_assets_per_account > 0
+            && total_assets >= consensus.max_assets_per_account as u64
+        {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "acfg: too many assets in account: {} >= {}",
+                    total_assets, consensus.max_assets_per_account
+                ),
+            });
+        }
 
         let txn_params = txn.asset_params.as_ref().cloned().unwrap_or_default();
         let total = txn_params.total;
@@ -3575,6 +3592,7 @@ pub fn apply_acfg<L: crate::store_trait::LedgerStore>(
 pub fn apply_axfer<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     txn: &algo_types::Transaction,
+    consensus: &ConsensusParams,
 ) -> Result<InnerApplyData, AlgoError> {
     let mut ad = InnerApplyData::default();
 
@@ -3627,6 +3645,26 @@ pub fn apply_axfer<L: crate::store_trait::LedgerStore>(
                 message: format!("axfer opt-in: asset {} does not exist", asset_id),
             })?;
         let default_frozen = params.params.default_frozen;
+
+        // go-algorand (ledger/apply/asset.go `AssetTransfer`): reject a new
+        // opt-in holding allocation once the account's total held/created-asset
+        // count already reaches `MaxAssetsPerAccount` (0 = unlimited, the case
+        // from v32 on). This mirrors the identical cap enforced at `acfg`
+        // asset-creation time.
+        let total_assets = store
+            .get_or_default_account(&from_addr)
+            .total_assets_opted_in;
+        if consensus.max_assets_per_account > 0
+            && total_assets >= consensus.max_assets_per_account as u64
+        {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "axfer opt-in: too many assets in account: {} >= {}",
+                    total_assets, consensus.max_assets_per_account
+                ),
+            });
+        }
+
         store.set_asset_holding(
             &from_addr,
             asset_id,
@@ -5944,6 +5982,110 @@ mod tests {
         assert!(!holding.frozen);
     }
 
+    /// go-algorand `ledger/apply/asset.go` `AssetConfig`'s create branch:
+    /// `if maxAssetsPerAccount > 0 && totalAssets >= uint64(maxAssetsPerAccount)`
+    /// rejects creating a new asset once the sender already holds/created
+    /// `MaxAssetsPerAccount` assets. Pre-v32 (e.g. V31) the cap is 1000;
+    /// from v32 on it's 0 (unlimited). Issue #1262: `max_assets_per_account`
+    /// was ported onto `ConsensusParams` but never consulted by `apply_acfg`.
+    #[test]
+    fn test_acfg_create_rejects_at_max_assets_per_account_cap_pre_v32() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V31,
+        )
+        .expect("V31 params");
+        assert_eq!(consensus.max_assets_per_account, 1000);
+
+        // Seed the sender as already holding exactly the cap.
+        state
+            .get_or_default_account_mut(&sender)
+            .total_assets_opted_in = 1000;
+
+        let params = AssetParams {
+            total: 1,
+            manager: Some(sender),
+            ..Default::default()
+        };
+        let txn = algo_types::Transaction {
+            txn_type: "acfg".into(),
+            sender,
+            config_asset: 0,
+            asset_params: Some(params),
+            ..Default::default()
+        };
+        let err = apply_acfg(&mut state, &txn, 1000, &consensus).unwrap_err();
+        assert!(
+            format!("{err}").contains("too many assets"),
+            "expected a too-many-assets rejection, got: {err}"
+        );
+    }
+
+    /// Same cap, one below the boundary: creation must succeed.
+    #[test]
+    fn test_acfg_create_succeeds_below_max_assets_per_account_cap_pre_v32() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V31,
+        )
+        .expect("V31 params");
+
+        state
+            .get_or_default_account_mut(&sender)
+            .total_assets_opted_in = 999;
+
+        let params = AssetParams {
+            total: 1,
+            manager: Some(sender),
+            ..Default::default()
+        };
+        let txn = algo_types::Transaction {
+            txn_type: "acfg".into(),
+            sender,
+            config_asset: 0,
+            asset_params: Some(params),
+            ..Default::default()
+        };
+        let ad = apply_acfg(&mut state, &txn, 1000, &consensus).unwrap();
+        assert_eq!(ad.config_asset, 1001);
+    }
+
+    /// Current-protocol (v32+) sanity check: the cap is 0/unlimited, so the
+    /// same seeded-at-1000 scenario must NOT be rejected.
+    #[test]
+    fn test_acfg_create_unlimited_at_current_protocol() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
+        let consensus = ConsensusParams::default();
+        assert_eq!(consensus.max_assets_per_account, 0);
+
+        state
+            .get_or_default_account_mut(&sender)
+            .total_assets_opted_in = 1000;
+
+        let params = AssetParams {
+            total: 1,
+            manager: Some(sender),
+            ..Default::default()
+        };
+        let txn = algo_types::Transaction {
+            txn_type: "acfg".into(),
+            sender,
+            config_asset: 0,
+            asset_params: Some(params),
+            ..Default::default()
+        };
+        apply_acfg(&mut state, &txn, 1000, &consensus).unwrap();
+    }
+
     #[test]
     fn test_acfg_destroy() {
         let sender = Address([1u8; 32]);
@@ -6200,7 +6342,7 @@ mod tests {
             ..Default::default()
         };
 
-        let _ad = apply_acfg(&mut state, &inner_txn, 100).unwrap();
+        let _ad = apply_acfg(&mut state, &inner_txn, 100, &ctx.consensus).unwrap();
 
         let record = state.get_asset_params(42).unwrap();
         // Manager should be updated.
@@ -6258,7 +6400,7 @@ mod tests {
             ..Default::default()
         };
 
-        let _ad = apply_acfg(&mut state, &inner_txn, 100).unwrap();
+        let _ad = apply_acfg(&mut state, &inner_txn, 100, &ctx.consensus).unwrap();
 
         let record = state.get_asset_params(42).unwrap();
         assert_eq!(record.params.manager, Some(creator));
@@ -6361,6 +6503,96 @@ mod tests {
         // Holding unchanged, count unchanged.
         assert_eq!(state.get_asset_holding(&user, 42).unwrap().amount, 0);
         assert_eq!(state.get_account(&user).unwrap().total_assets_opted_in, 1);
+    }
+
+    /// go-algorand `ledger/apply/asset.go` `AssetTransfer`'s opt-in-allocation
+    /// branch enforces the identical `MaxAssetsPerAccount` cap as `AssetConfig`
+    /// create. Pre-v32 (e.g. V31) the cap is 1000; from v32 on it's 0
+    /// (unlimited). Issue #1262: the cap was ported onto `ConsensusParams`
+    /// but never consulted by `apply_axfer`.
+    #[test]
+    fn test_axfer_optin_rejects_at_max_assets_per_account_cap_pre_v32() {
+        let creator = Address([1u8; 32]);
+        let user = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(creator, 10_000_000), (user, 10_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+
+        let params = AssetParams {
+            total: 1_000,
+            manager: Some(creator),
+            ..Default::default()
+        };
+        create_asset_in_state(&mut state, &ctx, creator, 42, params);
+
+        // Seed user as already holding exactly the pre-v32 cap.
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in = 1000;
+
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V31,
+        )
+        .expect("V31 params");
+        let txn = algo_types::Transaction {
+            txn_type: "axfer".into(),
+            sender: user,
+            xaid: 42,
+            asset_amount: 0,
+            asset_receiver: Some(user),
+            ..Default::default()
+        };
+        let err = apply_axfer(&mut state, &txn, &consensus).unwrap_err();
+        assert!(
+            format!("{err}").contains("too many assets"),
+            "expected a too-many-assets rejection, got: {err}"
+        );
+        // No holding was allocated.
+        use crate::store_trait::LedgerStore;
+        assert!(!state.has_asset_holding(&user, 42));
+    }
+
+    /// Current-protocol (v32+) sanity check: the cap is 0/unlimited, so the
+    /// same seeded-at-1000 scenario must NOT be rejected.
+    #[test]
+    fn test_axfer_optin_unlimited_at_current_protocol() {
+        let creator = Address([1u8; 32]);
+        let user = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(creator, 10_000_000), (user, 10_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+
+        let params = AssetParams {
+            total: 1_000,
+            manager: Some(creator),
+            ..Default::default()
+        };
+        create_asset_in_state(&mut state, &ctx, creator, 42, params);
+
+        state
+            .get_or_default_account_mut(&user)
+            .total_assets_opted_in = 1000;
+
+        let consensus = ConsensusParams::default();
+        let txn = algo_types::Transaction {
+            txn_type: "axfer".into(),
+            sender: user,
+            xaid: 42,
+            asset_amount: 0,
+            asset_receiver: Some(user),
+            ..Default::default()
+        };
+        apply_axfer(&mut state, &txn, &consensus).unwrap();
+        use crate::store_trait::LedgerStore;
+        assert!(state.has_asset_holding(&user, 42));
     }
 
     #[test]
