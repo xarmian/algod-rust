@@ -1509,6 +1509,33 @@ pub fn has_txn512(version: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns `true` if the given protocol version tracks on-chain congestion
+/// load in the block header's `Load` field (`LoadTracking`, v42+). Returns
+/// `false` for unknown versions.
+pub fn load_tracking(version: &str) -> bool {
+    consensus_params_for_version(version)
+        .map(|p| p.load_tracking)
+        .unwrap_or(false)
+}
+
+/// Compute the expected block-header `Load` value for a block with
+/// `block_size` total encoded transaction bytes out of `max_size` allowed.
+///
+/// `Load` is a fixed-point fraction with 6 digits of precision
+/// (1,000,000 == a completely full block). This mirrors
+/// `algo_ledger::compute_load` (go: `ledger/eval/eval.go`'s `ComputeLoad`,
+/// introduced v4.7.0-beta PR #6548) exactly, but is duplicated here rather
+/// than calling into `algo-ledger`: `algo-ledger` depends on
+/// `algo-validate`, so the reverse dependency would be circular.
+pub fn compute_expected_load(block_size: usize, max_size: usize) -> u64 {
+    const MICROS_UNIT: u128 = 1_000_000;
+    if max_size == 0 {
+        return MICROS_UNIT as u64;
+    }
+    let load = (MICROS_UNIT * block_size as u128) / max_size as u128;
+    load.min(MICROS_UNIT) as u64
+}
+
 /// Returns `true` if the given protocol version supports heartbeat
 /// transactions (`hb` type, v40+). Returns `false` for unknown versions.
 pub fn has_heartbeat(version: &str) -> bool {

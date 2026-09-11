@@ -117,6 +117,11 @@ pub enum BlockValidationError {
         total_bytes: usize,
         max_bytes: usize,
     },
+    /// The block header's `Load` congestion-measurement field does not match
+    /// the value recomputed from the block's actual payset size (go: "bad
+    /// load", `ledger/eval/eval.go`). Only checked when the block's protocol
+    /// has `LoadTracking` enabled (v42+).
+    BadLoad { expected: u64, actual: u64 },
 }
 
 impl fmt::Display for BlockValidationError {
@@ -191,6 +196,9 @@ impl fmt::Display for BlockValidationError {
                     f,
                     "aggregate block size {total_bytes} exceeds limit {max_bytes}"
                 )
+            }
+            Self::BadLoad { expected, actual } => {
+                write!(f, "bad load: {actual} != {expected}")
             }
         }
     }
@@ -638,6 +646,20 @@ pub fn validate_block_with_cache(
                     max_bytes,
                 });
             }
+
+            // 9. Load field for on-chain congestion measurement (go: "bad
+            // load", `ledger/eval/eval.go`, v4.7.0-beta+). Only checked when
+            // the block's protocol has `LoadTracking` enabled (v42+) —
+            // pre-v42, go never validates the field either.
+            if crate::rules::load_tracking(&block.current_protocol) {
+                let expected_load = crate::rules::compute_expected_load(total_txn_bytes, max_bytes);
+                if block.load != expected_load {
+                    errors.push(BlockValidationError::BadLoad {
+                        expected: expected_load,
+                        actual: block.load,
+                    });
+                }
+            }
         }
     }
 
@@ -886,6 +908,21 @@ mod tests {
         }
     }
 
+    /// Set `block.load` to the value `validate_block` will actually expect,
+    /// for tests whose protocol has `LoadTracking` enabled (issue #1305).
+    /// Mirrors the same `canonical_encode_signed_txn_in_block` summation
+    /// `validate_block` itself uses to build `total_txn_bytes`.
+    fn set_expected_load(block: &mut Block) {
+        let total_bytes: usize = block
+            .payset
+            .iter()
+            .map(|stx| canonical_encode_signed_txn_in_block(stx).len())
+            .sum();
+        if let Ok(max_bytes) = crate::rules::max_txn_bytes_per_block(&block.current_protocol) {
+            block.load = crate::rules::compute_expected_load(total_bytes, max_bytes);
+        }
+    }
+
     /// Create a properly signed transaction for testing.
     fn make_signed_txn(key: &SigningKey, amount: u64) -> SignedTransaction {
         let pk = key.verifying_key();
@@ -947,6 +984,63 @@ mod tests {
         );
         assert_eq!(result.txn_count, 0);
         assert_eq!(result.total_txn_bytes, 0);
+    }
+
+    /// Issue #1305: `LoadTracking` (v42+) protocols must reject a block
+    /// whose header `Load` field doesn't match the value recomputed from
+    /// the block's actual payset size — go's "bad load" check
+    /// (`ledger/eval/eval.go`).
+    #[test]
+    fn bad_load_rejected_when_load_tracking_enabled() {
+        let mut block = empty_block();
+        // "future" carries LoadTracking=true (v42+). An empty payset means
+        // total_txn_bytes == 0, so the correct Load is 0 — set it wrong.
+        block.load = 12345;
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
+        assert!(!result.is_valid, "block with wrong Load should be rejected");
+        assert!(
+            result.errors.iter().any(|e| matches!(
+                e,
+                BlockValidationError::BadLoad {
+                    expected: 0,
+                    actual: 12345
+                }
+            )),
+            "expected BadLoad error, got: {:?}",
+            result.errors
+        );
+    }
+
+    /// The positive control for the same gate: a correctly computed Load
+    /// value must be accepted.
+    #[test]
+    fn correct_load_accepted_when_load_tracking_enabled() {
+        let mut block = empty_block();
+        block.load = 0; // matches compute_expected_load(0, max) for an empty payset
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
+        assert!(
+            result.is_valid,
+            "block with correct Load should be valid, errors: {:?}",
+            result.errors
+        );
+    }
+
+    /// Pre-v42 protocols don't have `LoadTracking`, so go never validates
+    /// the field — algod-rust must not reject a nonzero `Load` either.
+    #[test]
+    fn load_not_checked_pre_load_tracking() {
+        let mut block = empty_block();
+        block.current_protocol = "v41".into();
+        block.load = 999_999; // would be "bad load" under LoadTracking, but v41 predates it
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| matches!(e, BlockValidationError::BadLoad { .. })),
+            "pre-v42 block must not be rejected for its Load field, errors: {:?}",
+            result.errors
+        );
     }
 
     #[test]
@@ -1082,6 +1176,7 @@ mod tests {
         // Compute the correct commitment (needs full block for genesis restoration).
         let root = compute_payset_merkle_root(&block);
         block.txn_commitment = root;
+        set_expected_load(&mut block);
 
         let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
         assert!(
@@ -1173,6 +1268,7 @@ mod tests {
         block.payset = vec![stx];
         let root = compute_payset_merkle_root(&block);
         block.txn_commitment = root;
+        set_expected_load(&mut block);
         block
     }
 
@@ -1266,6 +1362,7 @@ mod tests {
         block.payset = vec![stx.clone()];
         let root = compute_payset_merkle_root(&block);
         block.txn_commitment = root;
+        set_expected_load(&mut block);
 
         let cache = VerifiedTransactionCache::new(100);
 
@@ -1363,6 +1460,7 @@ mod tests {
         block.payset = vec![stx];
         let root = compute_payset_merkle_root(&block);
         block.txn_commitment = root;
+        set_expected_load(&mut block);
 
         let cache = VerifiedTransactionCache::new(100);
 
@@ -1383,6 +1481,7 @@ mod tests {
         block.payset[0] = make_signed_txn(&key2, 5000);
         let root2 = compute_payset_merkle_root(&block);
         block.txn_commitment = root2;
+        set_expected_load(&mut block);
 
         let second = validate_block_with_cache(
             &block,
@@ -1410,6 +1509,7 @@ mod tests {
         // Commitment verification is warn-only until Epic 12a implements raw-passthrough
         // encoding for STIB hashing.
         block.txn_commitment = [0xFF; 32];
+        set_expected_load(&mut block);
 
         let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
         assert!(
