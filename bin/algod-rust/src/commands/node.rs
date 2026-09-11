@@ -549,7 +549,11 @@ async fn run_start(
         // consensus participation, so `node start` wires them the same way
         // `participate` does.
         .with_enable_runtime_metrics(file_config.enable_runtime_metrics)
-        .with_enable_netdev_metrics(file_config.enable_netdev_metrics);
+        .with_enable_netdev_metrics(file_config.enable_netdev_metrics)
+        // `config.json`'s `Archival` (issue #1318): rejects `start_catchup`
+        // outright on an archival node, matching go's `node.config.Archival`
+        // guard in `node/node.go`.
+        .with_archival(file_config.archival);
     if dev_mode {
         let pool = Arc::new(TransactionPool::new(
             crate::commands::participate::pool_config_from_local(&file_config),
