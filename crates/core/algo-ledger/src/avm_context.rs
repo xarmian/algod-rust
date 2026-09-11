@@ -3780,7 +3780,13 @@ fn execute_inner_appl<L: LedgerStore>(
 
     // ── OptIn: create local state before running program ──
     if on_completion == ON_COMPLETION_OPT_IN {
-        apply_appl_opt_in_pre_program(store, &sender, effective_app_id, ApplErrorContext::Inner)?;
+        apply_appl_opt_in_pre_program(
+            store,
+            &sender,
+            effective_app_id,
+            ApplErrorContext::Inner,
+            &consensus,
+        )?;
     }
 
     // ── ClearState: verify sender is opted in before running program ──
