@@ -1016,45 +1016,6 @@ fn time_since_last_round(last_round_timestamp: Option<std::time::Instant>) -> Du
     }
 }
 
-/// Port of go's `getOfflineClosedStatus` (`node/node.go`): classifies an
-/// account's online/offline/closed status from its voting-key validity
-/// window and reward-inclusive balance, returning the same bitmask go uses
-/// for its participation-key-mismatch diagnostic logging
-/// (`AlgorandFullNode.VotingKeys`). An account is offline when it has no
-/// valid voting-key round range (`vote_first_valid == vote_last_valid == 0`);
-/// an offline account is additionally closed when its balance
-/// (`micro_algos_with_rewards`) is zero. Bit values match go's
-/// `bitAccountOffline` / `bitAccountIsClosed` (`1 << 2`, `1 << 3` — the low
-/// two bits, `bitMismatchingVotingKey`/`bitMismatchingSelectionKey`, belong
-/// to the surrounding diagnostic caller this repo has not yet ported).
-///
-/// `#[allow(dead_code)]`: this is the classifier formula only — the
-/// surrounding `VotingKeys` participation-key-mismatch diagnostic logging
-/// it feeds in go has no algod-rust equivalent yet (no production call
-/// site), so it is currently exercised only by the unit tests pinning its
-/// behavior against go's `TestOfflineOnlineClosedBitStatus`. Matches the
-/// existing scaffolding pattern in `live_catchup.rs`.
-#[allow(dead_code)]
-fn offline_closed_status(
-    vote_first_valid: u64,
-    vote_last_valid: u64,
-    micro_algos_with_rewards: u64,
-) -> u32 {
-    const BIT_ACCOUNT_OFFLINE: u32 = 1 << 2;
-    const BIT_ACCOUNT_IS_CLOSED: u32 = 1 << 3;
-
-    let mut rval = 0u32;
-    let is_offline = vote_first_valid == 0 && vote_last_valid == 0;
-    if is_offline {
-        rval |= BIT_ACCOUNT_OFFLINE;
-    }
-    let is_closed = is_offline && micro_algos_with_rewards == 0;
-    if is_closed {
-        rval |= BIT_ACCOUNT_IS_CLOSED;
-    }
-    rval
-}
-
 #[async_trait]
 impl NodeInterface for AlgodNodeInterface {
     // ---- Genesis / build metadata (cached, branch-free) ----
@@ -3294,35 +3255,6 @@ mod tests {
         assert!(
             second > first,
             "advancing the round must bump the timestamp"
-        );
-    }
-
-    // ---- offline/online closed-bit status (issue #958 theme 6; go's
-    // TestOfflineOnlineClosedBitStatus, node/node_test.go) ----
-
-    #[test]
-    fn offline_closed_status_online_account_reports_zero() {
-        // go "online 1": valid voting-key window, zero balance.
-        assert_eq!(offline_closed_status(1, 100, 0), 0);
-        // go "online 2": valid voting-key window, nonzero balance.
-        assert_eq!(offline_closed_status(1, 100, 1), 0);
-    }
-
-    #[test]
-    fn offline_closed_status_offline_not_closed_sets_offline_bit_only() {
-        // go "offline & not closed": no voting-key window, nonzero balance.
-        const BIT_ACCOUNT_OFFLINE: u32 = 1 << 2;
-        assert_eq!(offline_closed_status(0, 0, 1), BIT_ACCOUNT_OFFLINE);
-    }
-
-    #[test]
-    fn offline_closed_status_offline_and_closed_sets_both_bits() {
-        // go "offline & closed": no voting-key window, zero balance.
-        const BIT_ACCOUNT_OFFLINE: u32 = 1 << 2;
-        const BIT_ACCOUNT_IS_CLOSED: u32 = 1 << 3;
-        assert_eq!(
-            offline_closed_status(0, 0, 0),
-            BIT_ACCOUNT_OFFLINE | BIT_ACCOUNT_IS_CLOSED
         );
     }
 

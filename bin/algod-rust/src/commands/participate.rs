@@ -26,7 +26,8 @@ use std::time::Duration;
 
 use algo_agreement::{
     AccountSigningKeys, AsyncCryptoVerifier, BlockFactoryBridge, BlockValidatorBridge,
-    EventsProcessingMonitor, NetworkAdvancer, Parameters, RandomSource, Service, SystemClock,
+    EventsProcessingMonitor, LedgerReader, NetworkAdvancer, Parameters, RandomSource, Service,
+    SystemClock,
 };
 use algo_avm::group::GroupBudget;
 use algo_codec::{
@@ -483,7 +484,15 @@ impl ParticipateAgreementControl {
                 "loaded participation signing secrets for consensus"
             );
         }
-        let key_manager = AgreementKeyManagerBridge::new(part_store);
+        // Issue #1238: give the key manager an on-chain lookup (go's
+        // `node.ledger.LookupAgreement`) so `voting_keys` can detect and log
+        // participation-key/on-chain-account mismatches, matching go's
+        // `AlgorandFullNode.VotingKeys`. A fresh, lightweight bridge is
+        // enough here -- this is a read-only lookup, no catchup/condvar
+        // wiring needed.
+        let key_manager_ledger: Arc<dyn LedgerReader + Send + Sync> =
+            Arc::new(AgreementLedgerBridge::new(self.ledger.clone()));
+        let key_manager = AgreementKeyManagerBridge::with_ledger(part_store, key_manager_ledger);
         let block_factory = BlockFactoryBridge::new(self.pool.clone());
 
         let prev_timestamp: Option<i64> = {

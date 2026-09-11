@@ -25,16 +25,73 @@
 //! `ParticipationRecord`, and delegates to `ParticipationStore` for key
 //! storage and action recording.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use algo_agreement::traits::{
     AgreementKeyManager, ParticipationAction as AgreementAction,
     ParticipationRecord as AgreementParticipationRecord,
 };
+use algo_agreement::{LedgerReader, OnlineAccountData};
 use algo_types::{Address, Round};
 
 use crate::participation::{
     ParticipationAction as LedgerAction, ParticipationRecord as LedgerParticipationRecord,
     ParticipationStore,
 };
+
+// ---------------------------------------------------------------------------
+// Participation-key-mismatch diagnostic bit flags
+//
+// Mirrors go-algorand's `node/node.go` constants:
+//
+//     bitMismatchingVotingKey = 1 << iota
+//     bitMismatchingSelectionKey
+//     bitAccountOffline
+//     bitAccountIsClosed
+// ---------------------------------------------------------------------------
+
+/// The local participation key's `OneTimeSignatureVerifier` doesn't match
+/// the on-chain account's `VoteID`. Go: `bitMismatchingVotingKey`.
+const BIT_MISMATCHING_VOTING_KEY: u32 = 1 << 0;
+/// The local participation key's VRF public key doesn't match the on-chain
+/// account's `SelectionID`. Go: `bitMismatchingSelectionKey`.
+const BIT_MISMATCHING_SELECTION_KEY: u32 = 1 << 1;
+/// The account has no valid on-chain voting-key round range. Go:
+/// `bitAccountOffline`.
+const BIT_ACCOUNT_OFFLINE: u32 = 1 << 2;
+/// The account is offline and has a zero reward-inclusive balance. Go:
+/// `bitAccountIsClosed`.
+const BIT_ACCOUNT_IS_CLOSED: u32 = 1 << 3;
+
+/// Port of go's `getOfflineClosedStatus` (`node/node.go`): classifies an
+/// account's online/offline/closed status from its on-chain voting-key
+/// validity window and reward-inclusive balance, returning the same bitmask
+/// go uses for its participation-key-mismatch diagnostic logging
+/// (`AlgorandFullNode.VotingKeys`). An account is offline when it has no
+/// valid voting-key round range (`vote_first_valid == vote_last_valid == 0`);
+/// an offline account is additionally closed when its balance
+/// (`micro_algos_with_rewards`) is zero.
+///
+/// Ported and unit-tested standalone in issue #958 (then dead code — no
+/// production call site); wired into [`AgreementKeyManagerBridge::voting_keys`]
+/// by issue #1238.
+fn offline_closed_status(
+    vote_first_valid: u64,
+    vote_last_valid: u64,
+    micro_algos_with_rewards: u64,
+) -> u32 {
+    let mut rval = 0u32;
+    let is_offline = vote_first_valid == 0 && vote_last_valid == 0;
+    if is_offline {
+        rval |= BIT_ACCOUNT_OFFLINE;
+    }
+    let is_closed = is_offline && micro_algos_with_rewards == 0;
+    if is_closed {
+        rval |= BIT_ACCOUNT_IS_CLOSED;
+    }
+    rval
+}
 
 // ---------------------------------------------------------------------------
 // From conversion: ledger ParticipationRecord -> agreement ParticipationRecord
@@ -77,12 +134,38 @@ fn to_ledger_action(action: AgreementAction) -> LedgerAction {
 /// passed to the agreement service.
 pub struct AgreementKeyManagerBridge {
     store: ParticipationStore,
+    /// On-chain account-data lookup used to detect participation keys that
+    /// no longer match the account's registered `VoteID`/`SelectionID` (go's
+    /// `node.ledger.LookupAgreement`). `None` disables the mismatch
+    /// diagnostics entirely (used by tests / callers with no ledger handle
+    /// available) -- `voting_keys` still returns the same key selection
+    /// either way, since this is log-output-only and never changes which
+    /// keys are used for voting.
+    ledger: Option<Arc<dyn LedgerReader + Send + Sync>>,
 }
 
 impl AgreementKeyManagerBridge {
-    /// Create a new bridge wrapping the given participation store.
+    /// Create a new bridge wrapping the given participation store, with no
+    /// on-chain lookup (mismatch diagnostics disabled).
     pub fn new(store: ParticipationStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            ledger: None,
+        }
+    }
+
+    /// Create a new bridge wrapping the given participation store, with an
+    /// on-chain account-data lookup wired in so `voting_keys` can detect and
+    /// log participation-key/on-chain-account mismatches (go's
+    /// `AlgorandFullNode.VotingKeys`).
+    pub fn with_ledger(
+        store: ParticipationStore,
+        ledger: Arc<dyn LedgerReader + Send + Sync>,
+    ) -> Self {
+        Self {
+            store,
+            ledger: Some(ledger),
+        }
     }
 }
 
@@ -92,32 +175,152 @@ impl AgreementKeyManager for AgreementKeyManagerBridge {
         voting_round: Round,
         keys_round: Round,
     ) -> Vec<AgreementParticipationRecord> {
-        match self.store.get_for_voting_round(voting_round, keys_round) {
-            Ok(records) => records
-                .iter()
-                .filter(|rec| {
-                    if rec.vote_id.is_none() || rec.vrf_public_key.is_none() {
-                        tracing::warn!(
-                            account = %rec.account,
-                            participation_id = %rec.participation_id,
-                            vote_id_present = rec.vote_id.is_some(),
-                            vrf_key_present = rec.vrf_public_key.is_some(),
-                            round = %voting_round,
-                            "filtering out participation record with missing vote_id or VRF key — \
-                             it would produce invalid votes"
-                        );
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .map(AgreementParticipationRecord::from)
-                .collect(),
+        let records = match self.store.get_for_voting_round(voting_round, keys_round) {
+            Ok(records) => records,
             Err(e) => {
                 tracing::warn!("failed to get voting keys for round {voting_round}: {e}");
-                Vec::new()
+                return Vec::new();
+            }
+        };
+
+        // Drop records with no usable key material up front -- these would
+        // produce invalid votes and have nothing to compare against on-chain
+        // data anyway. Not part of go's `VotingKeys` (whose `Participation`
+        // records always carry both keys locally); this is algod-rust's own
+        // defensive filter.
+        let candidates: Vec<&LedgerParticipationRecord> = records
+            .iter()
+            .filter(|rec| {
+                if rec.vote_id.is_none() || rec.vrf_public_key.is_none() {
+                    tracing::warn!(
+                        account = %rec.account,
+                        participation_id = %rec.participation_id,
+                        vote_id_present = rec.vote_id.is_some(),
+                        vrf_key_present = rec.vrf_public_key.is_some(),
+                        round = %voting_round,
+                        "filtering out participation record with missing vote_id or VRF key — \
+                         it would produce invalid votes"
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        let Some(ledger) = &self.ledger else {
+            // No on-chain lookup wired in -- return the candidate keys as-is
+            // (the pre-#1238 behavior), skipping go's mismatch diagnostics.
+            return candidates
+                .into_iter()
+                .map(AgreementParticipationRecord::from)
+                .collect();
+        };
+
+        // Port of go's `AlgorandFullNode.VotingKeys` (`node/node.go`):
+        // for each candidate key, look up the account's real on-chain
+        // `OnlineAccountData` (go's `LookupAgreement`, cached per account
+        // since multiple keys may share an account), and compare its
+        // `VoteID`/`SelectionID` against the local key. A key is used for
+        // voting only when it matches; when no key for an account matches,
+        // emit one diagnostic (closed -> info, offline -> warn,
+        // mismatched-but-online -> warn with a regeneration hint). This is
+        // log output only -- it never changes which keys are selected.
+        let mut accounts_data: HashMap<Address, OnlineAccountData> = HashMap::new();
+        let mut matching_accounts: std::collections::HashSet<Address> =
+            std::collections::HashSet::new();
+        let mut mismatching_accounts: HashMap<Address, u32> = HashMap::new();
+        let mut participations = Vec::new();
+
+        for rec in candidates {
+            let acct_data = if let Some(d) = accounts_data.get(&rec.account) {
+                d.clone()
+            } else {
+                match ledger.lookup_agreement(keys_round, &rec.account) {
+                    Ok(d) => {
+                        accounts_data.insert(rec.account, d.clone());
+                        d
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "node.VotingKeys: Account {} not participating: cannot locate \
+                             account for round {}: {}",
+                            rec.account,
+                            keys_round,
+                            e
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            let mut flags = mismatching_accounts.get(&rec.account).copied().unwrap_or(0);
+            flags |= offline_closed_status(
+                acct_data.vote_first_valid.0,
+                acct_data.vote_last_valid.0,
+                acct_data.micro_algos,
+            );
+
+            // Presence already verified by the candidate filter above.
+            let vote_id = rec.vote_id.expect("candidate filter guarantees vote_id");
+            let selection_id = rec
+                .vrf_public_key
+                .expect("candidate filter guarantees vrf_public_key")
+                .0;
+
+            if acct_data.vote_id != vote_id {
+                mismatching_accounts.insert(rec.account, flags | BIT_MISMATCHING_VOTING_KEY);
+                continue;
+            }
+            if acct_data.selection_id != selection_id {
+                mismatching_accounts.insert(rec.account, flags | BIT_MISMATCHING_SELECTION_KEY);
+                continue;
+            }
+
+            mismatching_accounts.insert(rec.account, flags);
+            matching_accounts.insert(rec.account);
+            participations.push(rec);
+        }
+
+        // Emit the diagnostic only for accounts where NO key matched.
+        for (addr, flags) in &mismatching_accounts {
+            if matching_accounts.contains(addr) {
+                continue;
+            }
+            if flags & (BIT_MISMATCHING_VOTING_KEY | BIT_MISMATCHING_SELECTION_KEY) == 0 {
+                continue;
+            }
+            if flags & BIT_ACCOUNT_IS_CLOSED != 0 {
+                // Closed accounts are downgraded to info so this doesn't
+                // spam telemetry reporting (matches go's comment verbatim).
+                tracing::info!(
+                    "node.VotingKeys: Address: {} - Account was closed but still has a \
+                     participation key active.",
+                    addr
+                );
+            } else if flags & BIT_ACCOUNT_OFFLINE != 0 {
+                tracing::warn!(
+                    "node.VotingKeys: Address: {} - Account is offline.  No registration \
+                     transaction has been issued or a previous registration transaction has \
+                     expired",
+                    addr
+                );
+            } else {
+                tracing::warn!(
+                    "node.VotingKeys: Account {} not participating on round {}: on chain \
+                     voting key differ from participation voting key for round {}. Consider \
+                     regenerating the participation key for this node.",
+                    addr,
+                    voting_round,
+                    keys_round
+                );
             }
         }
+
+        participations
+            .into_iter()
+            .map(AgreementParticipationRecord::from)
+            .collect()
     }
 
     fn record(&self, account: &Address, round: Round, action: AgreementAction) {
@@ -209,6 +412,266 @@ mod tests {
         assert!(bridge
             .signing_keys_for(&Address([0u8; 32]), Round(1), Round(1))
             .is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // offline_closed_status (port of go's TestOfflineOnlineClosedBitStatus,
+    // node/node_test.go) — moved here from `node_interface_impl.rs`
+    // (issue #958) now that it has a real production call site (issue
+    // #1238, `voting_keys` below).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn offline_closed_status_online_account_reports_zero() {
+        // A key with a valid voting round range is online regardless of
+        // balance -- neither bit should be set.
+        assert_eq!(offline_closed_status(1, 100, 0), 0);
+        assert_eq!(offline_closed_status(1, 100, 1), 0);
+    }
+
+    #[test]
+    fn offline_closed_status_offline_not_closed_sets_offline_bit_only() {
+        // No voting round range (offline) but nonzero balance: offline, not closed.
+        assert_eq!(offline_closed_status(0, 0, 1), BIT_ACCOUNT_OFFLINE);
+    }
+
+    #[test]
+    fn offline_closed_status_offline_and_closed_sets_both_bits() {
+        // No voting round range and zero balance: offline AND closed.
+        assert_eq!(
+            offline_closed_status(0, 0, 0),
+            BIT_ACCOUNT_OFFLINE | BIT_ACCOUNT_IS_CLOSED
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // voting_keys on-chain mismatch diagnostics (issue #1238)
+    //
+    // Port of go's `AlgorandFullNode.VotingKeys` participation-key-mismatch
+    // logging (`node/node.go`). Uses `algo_agreement::StubLedger` as the
+    // fake `LookupAgreement`-equivalent lookup, and a minimal
+    // `tracing_subscriber::Layer` (mirroring the pattern in
+    // `sqlite.rs::tests::CapturingLayer`) to assert on the emitted log
+    // line's level and message.
+    // ------------------------------------------------------------------
+
+    use algo_agreement::StubLedger;
+    use algo_types::consensus::{consensus_params_for_version, CONSENSUS_V41};
+
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        message: String,
+    }
+
+    struct CapturingLayer {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CapturingLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                message: visitor.0,
+            });
+        }
+    }
+
+    /// Runs `run` under a subscriber that captures every `tracing` event
+    /// emitted from this module, returning them for assertion.
+    fn capture_events(run: impl FnOnce()) -> Vec<CapturedEvent> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = CapturingLayer {
+            events: events.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, run);
+        let captured = events.lock().unwrap().clone();
+        captured
+    }
+
+    /// Builds a store with one registered, effective participation key for
+    /// `account`, and a `StubLedger` seeded with `on_chain` as that
+    /// account's `OnlineAccountData` at `keys_round`. Returns
+    /// `(bridge, voting_round, keys_round)`.
+    fn setup_mismatch_case(
+        account: Address,
+        on_chain: OnlineAccountData,
+    ) -> (AgreementKeyManagerBridge, Round, Round) {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let key = Participation::generate(account, Round(0), Round(2000), 10_000, 0).unwrap();
+        let id = store.insert(&key).unwrap();
+        store.register(&id, Round(1)).unwrap();
+
+        let voting_round = Round(50);
+        let keys_round = Round(50);
+
+        let params = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        let mut ledger = StubLedger::new(params, Round(51));
+        ledger.set_account(keys_round, account, on_chain);
+
+        let bridge = AgreementKeyManagerBridge::with_ledger(store, std::sync::Arc::new(ledger));
+        (bridge, voting_round, keys_round)
+    }
+
+    #[test]
+    fn voting_keys_mismatched_but_online_warns_with_regeneration_hint() {
+        let account = Address([9u8; 32]);
+        // Online (nonzero voting-round range) but VoteID doesn't match any
+        // local key -- looks like the key was generated on a different node.
+        let on_chain = OnlineAccountData {
+            micro_algos: 1_000_000,
+            vote_id: [7u8; 32],
+            selection_id: [7u8; 32],
+            vote_first_valid: Round(1),
+            vote_last_valid: Round(2000),
+            ..OnlineAccountData::default()
+        };
+        let (bridge, voting_round, keys_round) = setup_mismatch_case(account, on_chain);
+
+        let events = capture_events(|| {
+            let keys = bridge.voting_keys(voting_round, keys_round);
+            assert!(
+                keys.is_empty(),
+                "mismatched key must not be selected for voting"
+            );
+        });
+
+        let hit = events.iter().find(|e| {
+            e.level == tracing::Level::WARN && e.message.contains("Consider regenerating")
+        });
+        assert!(
+            hit.is_some(),
+            "expected a WARN with the regeneration hint, got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn voting_keys_offline_account_warns_without_hint() {
+        let account = Address([10u8; 32]);
+        // Offline: no voting-key round range, but a nonzero balance (not closed).
+        let on_chain = OnlineAccountData {
+            micro_algos: 1_000_000,
+            vote_id: [0u8; 32],
+            selection_id: [0u8; 32],
+            vote_first_valid: Round(0),
+            vote_last_valid: Round(0),
+            ..OnlineAccountData::default()
+        };
+        let (bridge, voting_round, keys_round) = setup_mismatch_case(account, on_chain);
+
+        let events = capture_events(|| {
+            let keys = bridge.voting_keys(voting_round, keys_round);
+            assert!(keys.is_empty());
+        });
+
+        let hit = events
+            .iter()
+            .find(|e| e.level == tracing::Level::WARN && e.message.contains("Account is offline"));
+        assert!(
+            hit.is_some(),
+            "expected a WARN about the account being offline, got: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.message.contains("Consider regenerating")),
+            "offline diagnostic must not carry the regeneration hint: {events:?}"
+        );
+    }
+
+    #[test]
+    fn voting_keys_closed_account_logs_info_not_warn() {
+        let account = Address([11u8; 32]);
+        // Closed: offline AND zero balance -- downgraded to info so it
+        // doesn't spam telemetry (go's comment, verbatim).
+        let on_chain = OnlineAccountData {
+            micro_algos: 0,
+            vote_id: [0u8; 32],
+            selection_id: [0u8; 32],
+            vote_first_valid: Round(0),
+            vote_last_valid: Round(0),
+            ..OnlineAccountData::default()
+        };
+        let (bridge, voting_round, keys_round) = setup_mismatch_case(account, on_chain);
+
+        let events = capture_events(|| {
+            let keys = bridge.voting_keys(voting_round, keys_round);
+            assert!(keys.is_empty());
+        });
+
+        let hit = events
+            .iter()
+            .find(|e| e.level == tracing::Level::INFO && e.message.contains("was closed"));
+        assert!(
+            hit.is_some(),
+            "expected an INFO about the account being closed, got: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.level == tracing::Level::WARN),
+            "closed account must not also warn: {events:?}"
+        );
+    }
+
+    #[test]
+    fn voting_keys_matching_key_emits_no_diagnostic() {
+        let account = Address([12u8; 32]);
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let key = Participation::generate(account, Round(0), Round(2000), 10_000, 0).unwrap();
+        let id = store.insert(&key).unwrap();
+        store.register(&id, Round(1)).unwrap();
+
+        let voting_round = Round(50);
+        let keys_round = Round(50);
+
+        let on_chain = OnlineAccountData {
+            micro_algos: 1_000_000,
+            vote_id: key.voting.verifier(),
+            selection_id: key.vrf_pubkey().0,
+            vote_first_valid: Round(1),
+            vote_last_valid: Round(2000),
+            ..OnlineAccountData::default()
+        };
+        let params = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        let mut ledger = StubLedger::new(params, Round(51));
+        ledger.set_account(keys_round, account, on_chain);
+        let bridge = AgreementKeyManagerBridge::with_ledger(store, std::sync::Arc::new(ledger));
+
+        let events = capture_events(|| {
+            let keys = bridge.voting_keys(voting_round, keys_round);
+            assert_eq!(keys.len(), 1, "matching key must be selected for voting");
+            assert_eq!(keys[0].address, account);
+        });
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.level == tracing::Level::WARN || e.level == tracing::Level::INFO),
+            "a fully matching key must not log any mismatch diagnostic: {events:?}"
+        );
     }
 
     #[test]
