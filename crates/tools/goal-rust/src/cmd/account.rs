@@ -1334,19 +1334,30 @@ fn round_or_na(value: Option<u64>) -> String {
 
 // ---- keyreg status-change pipeline (TASK-244 / B12) -----------------------
 
-/// Typical protocol `MaxTxnLife` (rounds). The consensus-param table isn't
-/// loaded client-side, so the default validity window + confirmation wait use
-/// this — matching the assumption already made by `renew_one`.
+/// The stock `MaxTxnLife` value for every real go-algorand consensus
+/// version to date (test fixture only -- production code never references
+/// this constant). The real bound comes from
+/// [`crate::cmd::clerk::resolve_max_txn_life`] (reads `<data_dir>/consensus.json`
+/// overrides merged onto the built-in per-version table, keyed by the
+/// node-reported consensus version), mirroring go-algorand's
+/// `libgoal.Client.ComputeValidityRounds` (libgoal.go:509-521) — see issue
+/// #1295.
+#[cfg(test)]
 const MAX_TXN_LIFE: u64 = 1000;
 
 /// Compute a transaction's `[first_valid, last_valid]` window, mirroring
 /// go-algorand's `libgoal.computeValidityRounds` (libgoal.go:525) with
 /// `validRounds = 0`: an unset `first` defaults to the current round (or 1),
-/// an unset `last` defaults to `first + MaxTxnLife`, and the span is validated.
+/// an unset `last` defaults to `first + max_txn_life`, and the span is
+/// validated. `max_txn_life` should come from
+/// [`crate::cmd::clerk::resolve_max_txn_life`] rather than a hardcoded
+/// constant, so a `consensus.json` override on the active consensus version
+/// is respected the same way go's `cparams.MaxTxnLife` lookup is.
 fn compute_validity(
     first_valid: Option<u64>,
     last_valid: Option<u64>,
     last_round: u64,
+    max_txn_life: u64,
 ) -> Result<(u64, u64), String> {
     let first = match first_valid {
         Some(f) if f != 0 => f,
@@ -1360,16 +1371,16 @@ fn compute_validity(
     };
     let last = match last_valid {
         Some(l) if l != 0 => l,
-        _ => first.saturating_add(MAX_TXN_LIFE),
+        _ => first.saturating_add(max_txn_life),
     };
     if first > last {
         return Err(format!(
             "txn would first be valid on round {first} which is after last valid round {last}"
         ));
     }
-    if last - first > MAX_TXN_LIFE {
+    if last - first > max_txn_life {
         return Err(format!(
-            "txn validity period ({first} to {last}) is greater than max txn lifetime {MAX_TXN_LIFE}"
+            "txn validity period ({first} to {last}) is greater than max txn lifetime {max_txn_life}"
         ));
     }
     Ok((first, last))
@@ -1488,6 +1499,7 @@ pub fn run_changeonlinestatus(
         // chooseParticipation) and register it.
         rt.block_on(register_online_keyreg(
             &pipeline,
+            &data_dir_path,
             sender,
             &args.address,
             args.fee,
@@ -1501,6 +1513,7 @@ pub fn run_changeonlinestatus(
         // Offline: a bare keyreg clears the account's voting keys.
         rt.block_on(submit_offline_keyreg(
             &pipeline,
+            &data_dir_path,
             sender,
             args.fee,
             args.first_valid,
@@ -1524,6 +1537,7 @@ pub fn run_changeonlinestatus(
 #[allow(clippy::too_many_arguments)]
 async fn submit_offline_keyreg(
     pipeline: &algo_txn_pipeline::TxnPipeline,
+    data_dir: &Path,
     sender: algo_types::Address,
     fee: Option<u64>,
     first_valid: Option<u64>,
@@ -1536,7 +1550,9 @@ async fn submit_offline_keyreg(
         .suggested_params()
         .await
         .map_err(|e| e.to_string())?;
-    let (first, last) = compute_validity(first_valid, last_valid, params.last_round)?;
+    let max_txn_life =
+        crate::cmd::clerk::resolve_max_txn_life(data_dir, &params.consensus_version)?;
+    let (first, last) = compute_validity(first_valid, last_valid, params.last_round, max_txn_life)?;
     let mut txn = algo_txn_pipeline::KeyregBuilder::offline(sender)
         .fee(fee.unwrap_or(0))
         .validity(first, last)
@@ -1591,8 +1607,20 @@ pub fn run_marknonparticipating(
             return ExitCode::from(1);
         }
     };
-    let (first, last) = match compute_validity(args.first_valid, args.last_valid, params.last_round)
-    {
+    let max_txn_life =
+        match crate::cmd::clerk::resolve_max_txn_life(&data_dir_path, &params.consensus_version) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(1);
+            }
+        };
+    let (first, last) = match compute_validity(
+        args.first_valid,
+        args.last_valid,
+        params.last_round,
+        max_txn_life,
+    ) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Could not construct transaction: {e}");
@@ -1748,6 +1776,7 @@ pub fn run_renewpartkey(
     };
     match rt.block_on(register_online_keyreg(
         &pipeline,
+        &data_dir_path,
         sender,
         &args.address,
         None,
@@ -1775,6 +1804,7 @@ pub fn run_renewpartkey(
 #[allow(clippy::too_many_arguments)]
 async fn register_online_keyreg(
     pipeline: &algo_txn_pipeline::TxnPipeline,
+    data_dir: &Path,
     sender: algo_types::Address,
     address: &str,
     fee: Option<u64>,
@@ -1788,7 +1818,9 @@ async fn register_online_keyreg(
         .suggested_params()
         .await
         .map_err(|e| e.to_string())?;
-    let (first, last) = compute_validity(first_valid, last_valid, params.last_round)?;
+    let max_txn_life =
+        crate::cmd::clerk::resolve_max_txn_life(data_dir, &params.consensus_version)?;
+    let (first, last) = compute_validity(first_valid, last_valid, params.last_round, max_txn_life)?;
     let parts = pipeline
         .algod()
         .list_participation_keys()
@@ -3015,18 +3047,38 @@ mod tests {
     #[test]
     fn compute_validity_defaults_to_current_round_window() {
         // Unset first ⇒ current round; unset last ⇒ first + MaxTxnLife.
-        assert_eq!(compute_validity(None, None, 500).unwrap(), (500, 1500));
+        assert_eq!(
+            compute_validity(None, None, 500, MAX_TXN_LIFE).unwrap(),
+            (500, 1500)
+        );
         // first==0 with no last_round ⇒ first defaults to 1.
-        assert_eq!(compute_validity(Some(0), None, 0).unwrap(), (1, 1001));
+        assert_eq!(
+            compute_validity(Some(0), None, 0, MAX_TXN_LIFE).unwrap(),
+            (1, 1001)
+        );
         // Explicit window honored.
-        assert_eq!(compute_validity(Some(10), Some(20), 999).unwrap(), (10, 20));
+        assert_eq!(
+            compute_validity(Some(10), Some(20), 999, MAX_TXN_LIFE).unwrap(),
+            (10, 20)
+        );
     }
 
     #[test]
     fn compute_validity_rejects_bad_windows() {
-        assert!(compute_validity(Some(100), Some(50), 0).is_err());
+        assert!(compute_validity(Some(100), Some(50), 0, MAX_TXN_LIFE).is_err());
         // Span wider than MaxTxnLife.
-        assert!(compute_validity(Some(1), Some(1 + MAX_TXN_LIFE + 1), 0).is_err());
+        assert!(compute_validity(Some(1), Some(1 + MAX_TXN_LIFE + 1), 0, MAX_TXN_LIFE).is_err());
+    }
+
+    #[test]
+    fn compute_validity_respects_a_smaller_max_txn_life() {
+        // Issue #1295: compute_validity must respect the resolved
+        // MaxTxnLife it's given rather than a hardcoded default -- a
+        // consensus.json override with a smaller MaxTxnLife for the active
+        // consensus version must shrink both the default window and the
+        // explicit-window upper bound.
+        assert_eq!(compute_validity(None, None, 500, 5).unwrap(), (500, 505));
+        assert!(compute_validity(Some(1), Some(7), 0, 5).is_err());
     }
 
     #[test]
