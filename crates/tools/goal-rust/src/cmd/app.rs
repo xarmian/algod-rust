@@ -356,6 +356,7 @@ struct TxnHeader {
 
 fn resolve_txn_header(
     txn_args: &AppTxnArgs,
+    data_dir: &Path,
     params: &algo_rest_client::SuggestedParams,
 ) -> Result<TxnHeader, String> {
     let note = parse_note(txn_args.note_b64.as_deref(), txn_args.note.as_deref())?;
@@ -365,11 +366,14 @@ fn resolve_txn_header(
         .as_deref()
         .map(|r| Address::from_algorand_string(r).map_err(|e| format!("rekey-to invalid: {e}")))
         .transpose()?;
+    let max_txn_life =
+        crate::cmd::clerk::resolve_max_txn_life(data_dir, &params.consensus_version)?;
     let (first, last) = compute_validity(
         txn_args.first_valid,
         txn_args.last_valid,
         txn_args.valid_rounds,
         params.last_round,
+        max_txn_life,
     )?;
     Ok(TxnHeader {
         fee: txn_args.fee.unwrap_or(0),
@@ -540,7 +544,7 @@ fn submit_app_lifecycle_txn(
     let params = rt
         .block_on(algod.suggested_transaction_params())
         .map_err(|e| e.to_string())?;
-    let header = resolve_txn_header(txn_args, &params)?;
+    let header = resolve_txn_header(txn_args, &data_dir_path, &params)?;
 
     let signer_addr = txn_args
         .signer
@@ -663,7 +667,7 @@ fn run_create_inner(args: CreateArgs, wallet: Option<String>) -> Result<ExitCode
     let params = rt
         .block_on(algod.suggested_transaction_params())
         .map_err(|e| e.to_string())?;
-    let header = resolve_txn_header(&args.txn, &params)?;
+    let header = resolve_txn_header(&args.txn, &data_dir_path, &params)?;
 
     let signer_addr = args
         .txn
@@ -761,7 +765,7 @@ fn run_update_inner(args: UpdateArgs, wallet: Option<String>) -> Result<ExitCode
     let params = rt
         .block_on(algod.suggested_transaction_params())
         .map_err(|e| e.to_string())?;
-    let header = resolve_txn_header(&args.txn, &params)?;
+    let header = resolve_txn_header(&args.txn, &data_dir_path, &params)?;
 
     let signer_addr = args
         .txn
@@ -1463,7 +1467,7 @@ fn run_method_inner(args: MethodArgs, wallet: Option<String>) -> Result<ExitCode
     let params = rt
         .block_on(algod.suggested_transaction_params())
         .map_err(|e| e.to_string())?;
-    let header = resolve_txn_header(&args.txn, &params)?;
+    let header = resolve_txn_header(&args.txn, &data_dir_path, &params)?;
 
     let mut builder =
         algo_txn_pipeline::ApplicationCallBuilder::new(from_addr, app_id, on_completion)

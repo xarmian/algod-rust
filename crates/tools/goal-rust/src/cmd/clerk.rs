@@ -60,11 +60,40 @@ use crate::groups::clerk::{
     RawsendArgs, SendArgs, SignArgs, SimulateArgs, SplitArgs, TealsignArgs,
 };
 
-/// Typical protocol `MaxTxnLife` (rounds). The consensus-param table isn't
-/// loaded client-side, so the validity-window default uses this — matching the
-/// assumption already made by `crate::cmd::account::compute_validity`
-/// (go-algorand's `computeValidityRounds` uses the protocol's `MaxTxnLife`).
+/// The stock `MaxTxnLife` value for every real go-algorand consensus
+/// version to date (test fixture only -- production code never references
+/// this constant). The real bound always comes from
+/// [`resolve_max_txn_life`], mirroring go-algorand's
+/// `libgoal.Client.ComputeValidityRounds` (libgoal.go:509-521), which looks
+/// up `cparams.MaxTxnLife` from the client-side consensus table
+/// (`c.consensus[params.ConsensusVersion]`, populated from
+/// `config.PreloadConfigurableConsensusProtocols(dataDir)`) on every call
+/// rather than using a compile-time constant.
+#[cfg(test)]
 const MAX_TXN_LIFE: u64 = 1000;
+
+/// Resolve the effective `MaxTxnLife` for `consensus_version`, mirroring
+/// go-algorand's `libgoal.Client.ComputeValidityRounds`
+/// (libgoal.go:509-521): load `<data_dir>/consensus.json` overrides merged
+/// onto the built-in per-version table
+/// ([`algo_types::consensus::preload_configurable_consensus_protocols`], the
+/// Rust port of `config.PreloadConfigurableConsensusProtocols`), then look
+/// up `consensus_version` in it. An unrecognized version is a hard error,
+/// matching go's `"cannot construct transaction: unknown consensus protocol
+/// %s"` (libgoal.go:516).
+pub(crate) fn resolve_max_txn_life(
+    data_dir: &Path,
+    consensus_version: &str,
+) -> Result<u64, String> {
+    let table = algo_types::consensus::preload_configurable_consensus_protocols(data_dir)
+        .map_err(|e| format!("cannot construct transaction: {e}"))?;
+    table
+        .get(consensus_version)
+        .map(|params| params.max_txn_life)
+        .ok_or_else(|| {
+            format!("cannot construct transaction: unknown consensus protocol {consensus_version}")
+        })
+}
 
 /// Mirrors Go's `Could not contact kmd; is it running?` error path.
 const ERROR_KMD_UNREACHABLE: &str = "Could not contact kmd; is it running?";
@@ -215,11 +244,13 @@ fn run_send_inner(
     let params = rt
         .block_on(pipeline.suggested_params())
         .map_err(|e| e.to_string())?;
+    let max_txn_life = resolve_max_txn_life(&data_dir_path, &params.consensus_version)?;
     let (first, last) = compute_validity(
         args.first_valid,
         args.last_valid,
         args.valid_rounds,
         params.last_round,
+        max_txn_life,
     )?;
     let mut builder = algo_txn_pipeline::PaymentBuilder::new(from_addr, to_addr, args.amount)
         .fee(args.fee.unwrap_or(0))
@@ -548,6 +579,7 @@ pub(crate) fn compute_validity(
     last_valid: Option<u64>,
     valid_rounds: Option<u64>,
     last_round: u64,
+    max_txn_life: u64,
 ) -> Result<(u64, u64), String> {
     let valid_rounds = valid_rounds.unwrap_or(0);
     let last_valid_in = last_valid.unwrap_or(0);
@@ -571,16 +603,16 @@ pub(crate) fn compute_validity(
 
     let last = if valid_rounds != 0 {
         // validRounds = maxTxnLife+1 ⇒ lastValid = firstValid + maxTxnLife.
-        if valid_rounds > MAX_TXN_LIFE.saturating_add(1) {
+        if valid_rounds > max_txn_life.saturating_add(1) {
             return Err(format!(
                 "cannot construct transaction: txn validity period {} is greater than protocol \
-                 max txn lifetime {MAX_TXN_LIFE}",
+                 max txn lifetime {max_txn_life}",
                 valid_rounds - 1
             ));
         }
         first.saturating_add(valid_rounds).saturating_sub(1)
     } else if last_valid_in == 0 {
-        first.saturating_add(MAX_TXN_LIFE)
+        first.saturating_add(max_txn_life)
     } else {
         last_valid_in
     };
@@ -591,10 +623,10 @@ pub(crate) fn compute_validity(
              after last valid round {last}"
         ));
     }
-    if last - first > MAX_TXN_LIFE {
+    if last - first > max_txn_life {
         return Err(format!(
             "cannot construct transaction: txn validity period ( {first} to {last} ) is greater \
-             than protocol max txn lifetime {MAX_TXN_LIFE}"
+             than protocol max txn lifetime {max_txn_life}"
         ));
     }
     Ok((first, last))
@@ -2937,23 +2969,35 @@ mod tests {
 
     #[test]
     fn compute_validity_all_unset_defaults_from_last_round() {
-        let (fv, lv) = compute_validity(None, None, None, TEST_LAST_ROUND).unwrap();
+        let (fv, lv) = compute_validity(None, None, None, TEST_LAST_ROUND, MAX_TXN_LIFE).unwrap();
         assert_eq!(fv, TEST_LAST_ROUND);
         assert_eq!(lv, fv + MAX_TXN_LIFE);
     }
 
     #[test]
     fn compute_validity_rounds_at_max_plus_one_ok() {
-        let (fv, lv) =
-            compute_validity(None, None, Some(MAX_TXN_LIFE + 1), TEST_LAST_ROUND).unwrap();
+        let (fv, lv) = compute_validity(
+            None,
+            None,
+            Some(MAX_TXN_LIFE + 1),
+            TEST_LAST_ROUND,
+            MAX_TXN_LIFE,
+        )
+        .unwrap();
         assert_eq!(fv, TEST_LAST_ROUND);
         assert_eq!(lv, fv + MAX_TXN_LIFE);
     }
 
     #[test]
     fn compute_validity_rounds_over_max_plus_one_errors() {
-        let err =
-            compute_validity(None, None, Some(MAX_TXN_LIFE + 2), TEST_LAST_ROUND).unwrap_err();
+        let err = compute_validity(
+            None,
+            None,
+            Some(MAX_TXN_LIFE + 2),
+            TEST_LAST_ROUND,
+            MAX_TXN_LIFE,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             "cannot construct transaction: txn validity period 1001 is greater than protocol \
@@ -2963,7 +3007,8 @@ mod tests {
 
     #[test]
     fn compute_validity_ambiguous_last_valid_and_valid_rounds_errors() {
-        let err = compute_validity(None, Some(1), Some(2), TEST_LAST_ROUND).unwrap_err();
+        let err =
+            compute_validity(None, Some(1), Some(2), TEST_LAST_ROUND, MAX_TXN_LIFE).unwrap_err();
         assert_eq!(
             err,
             "cannot construct transaction: ambiguous input: lastValid = 1, validRounds = 2"
@@ -2972,7 +3017,8 @@ mod tests {
 
     #[test]
     fn compute_validity_first_after_last_errors() {
-        let err = compute_validity(Some(2), Some(1), None, TEST_LAST_ROUND).unwrap_err();
+        let err =
+            compute_validity(Some(2), Some(1), None, TEST_LAST_ROUND, MAX_TXN_LIFE).unwrap_err();
         assert_eq!(
             err,
             "cannot construct transaction: txn would first be valid on round 2 which is after \
@@ -2982,8 +3028,14 @@ mod tests {
 
     #[test]
     fn compute_validity_explicit_window_over_max_life_errors() {
-        let err =
-            compute_validity(Some(1), Some(MAX_TXN_LIFE + 2), None, TEST_LAST_ROUND).unwrap_err();
+        let err = compute_validity(
+            Some(1),
+            Some(MAX_TXN_LIFE + 2),
+            None,
+            TEST_LAST_ROUND,
+            MAX_TXN_LIFE,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             "cannot construct transaction: txn validity period ( 1 to 1002 ) is greater than \
@@ -2993,39 +3045,120 @@ mod tests {
 
     #[test]
     fn compute_validity_explicit_window_at_max_life_ok() {
-        let (fv, lv) =
-            compute_validity(Some(1), Some(MAX_TXN_LIFE + 1), None, TEST_LAST_ROUND).unwrap();
+        let (fv, lv) = compute_validity(
+            Some(1),
+            Some(MAX_TXN_LIFE + 1),
+            None,
+            TEST_LAST_ROUND,
+            MAX_TXN_LIFE,
+        )
+        .unwrap();
         assert_eq!(fv, 1);
         assert_eq!(lv, MAX_TXN_LIFE + 1);
     }
 
     #[test]
     fn compute_validity_last_valid_only_defaults_first_from_last_round() {
-        let (fv, lv) =
-            compute_validity(None, Some(TEST_LAST_ROUND + 1), None, TEST_LAST_ROUND).unwrap();
+        let (fv, lv) = compute_validity(
+            None,
+            Some(TEST_LAST_ROUND + 1),
+            None,
+            TEST_LAST_ROUND,
+            MAX_TXN_LIFE,
+        )
+        .unwrap();
         assert_eq!(fv, TEST_LAST_ROUND);
         assert_eq!(lv, TEST_LAST_ROUND + 1);
     }
 
     #[test]
     fn compute_validity_valid_rounds_one_gives_single_round_window() {
-        let (fv, lv) = compute_validity(None, None, Some(1), TEST_LAST_ROUND).unwrap();
+        let (fv, lv) =
+            compute_validity(None, None, Some(1), TEST_LAST_ROUND, MAX_TXN_LIFE).unwrap();
         assert_eq!(fv, TEST_LAST_ROUND);
         assert_eq!(lv, TEST_LAST_ROUND);
     }
 
     #[test]
     fn compute_validity_valid_rounds_at_max_life() {
-        let (fv, lv) = compute_validity(None, None, Some(MAX_TXN_LIFE), TEST_LAST_ROUND).unwrap();
+        let (fv, lv) = compute_validity(
+            None,
+            None,
+            Some(MAX_TXN_LIFE),
+            TEST_LAST_ROUND,
+            MAX_TXN_LIFE,
+        )
+        .unwrap();
         assert_eq!(fv, TEST_LAST_ROUND);
         assert_eq!(lv, TEST_LAST_ROUND + MAX_TXN_LIFE - 1);
     }
 
     #[test]
     fn compute_validity_explicit_first_valid_rounds_one() {
-        let (fv, lv) = compute_validity(Some(1), None, Some(1), TEST_LAST_ROUND).unwrap();
+        let (fv, lv) =
+            compute_validity(Some(1), None, Some(1), TEST_LAST_ROUND, MAX_TXN_LIFE).unwrap();
         assert_eq!(fv, 1);
         assert_eq!(lv, 1);
+    }
+
+    // ---- resolve_max_txn_life ------------------------------------------
+    // Issue #1295: `resolve_max_txn_life` must reflect a `consensus.json`
+    // override for the active consensus version, mirroring go-algorand's
+    // `libgoal.Client.ComputeValidityRounds` (libgoal.go:509-521), which
+    // always looks `cparams.MaxTxnLife` up from the client-side consensus
+    // table (`config.PreloadConfigurableConsensusProtocols(dataDir)`)
+    // instead of a compile-time constant.
+
+    #[test]
+    fn resolve_max_txn_life_defaults_to_1000_with_no_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let max_txn_life =
+            resolve_max_txn_life(dir.path(), algo_types::consensus::CONSENSUS_V41).unwrap();
+        assert_eq!(max_txn_life, 1000);
+    }
+
+    #[test]
+    fn resolve_max_txn_life_reflects_consensus_json_override() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Before the override, the built-in table's MaxTxnLife for a brand
+        // new custom version doesn't exist at all (unregistered protocol);
+        // after installing a consensus.json override for it, the resolved
+        // bound must come from the override, not the MAX_TXN_LIFE=1000
+        // fallback constant.
+        let custom_version = "goal-rust-test-shortened-life";
+        let mut overrides: algo_types::consensus::ConsensusOverrides = HashMap::new();
+        overrides.insert(
+            custom_version.to_string(),
+            algo_types::consensus::ConsensusParamsOverride {
+                max_txn_life: 7,
+                approved_upgrades: Some(HashMap::new()),
+                ..Default::default()
+            },
+        );
+        algo_types::consensus::save_configurable_consensus(dir.path(), &overrides).unwrap();
+
+        let max_txn_life = resolve_max_txn_life(dir.path(), custom_version).unwrap();
+        assert_eq!(
+            max_txn_life, 7,
+            "resolve_max_txn_life must reflect the consensus.json override, not a hardcoded 1000"
+        );
+
+        // The override must also change what compute_validity actually
+        // computes -- not just what the resolver returns in isolation.
+        let (fv, lv) = compute_validity(None, None, None, TEST_LAST_ROUND, max_txn_life).unwrap();
+        assert_eq!(fv, TEST_LAST_ROUND);
+        assert_eq!(lv, TEST_LAST_ROUND + 7);
+    }
+
+    #[test]
+    fn resolve_max_txn_life_errors_on_unknown_consensus_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_max_txn_life(dir.path(), "no-such-protocol-version").unwrap_err();
+        assert_eq!(
+            err,
+            "cannot construct transaction: unknown consensus protocol no-such-protocol-version"
+        );
     }
 
     // ---- determine_path_to_source_from_source_map ---------------------
