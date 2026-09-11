@@ -177,6 +177,189 @@ impl InnerTxnBuilder {
         }
     }
 
+    /// Validate a field write against go-algorand's `stackIntoTxnField`
+    /// consensus bounds (`data/transactions/logic/eval.go`) before it is
+    /// stored. go-algorand performs these checks at `itxn_field` time so a
+    /// violation fails the opcode immediately, rather than silently
+    /// building an out-of-bounds inner transaction that only top-level
+    /// (wire-decoded) transactions would otherwise have rejected (issue
+    /// #1297).
+    fn validate_field_bounds(
+        &self,
+        consensus: &ConsensusParams,
+        field: u8,
+        value: &TealValue,
+    ) -> Result<(), AlgoError> {
+        fn too_long() -> AlgoError {
+            AlgoError::Avm {
+                message: "value is too long".to_string(),
+            }
+        }
+        fn larger_than_max(v: u64, max: u64) -> AlgoError {
+            AlgoError::Avm {
+                message: format!("{v} is larger than max={max}"),
+            }
+        }
+        // Sum of byte lengths already accumulated for an array field.
+        let array_bytes_len = |arr: &[TealValue]| -> usize {
+            arr.iter()
+                .map(|v| match v {
+                    TealValue::Bytes(b) => b.len(),
+                    TealValue::Uint(_) => 0,
+                })
+                .sum()
+        };
+
+        match field {
+            // ConfigAssetDecimals
+            35 => {
+                if let TealValue::Uint(v) = value {
+                    let max = consensus.max_asset_decimals as u64;
+                    if *v > max {
+                        return Err(larger_than_max(*v, max));
+                    }
+                }
+            }
+            // ConfigAssetUnitName
+            37 => {
+                if let TealValue::Bytes(b) = value {
+                    if b.len() > consensus.max_asset_unit_name_bytes {
+                        return Err(too_long());
+                    }
+                }
+            }
+            // ConfigAssetName
+            38 => {
+                if let TealValue::Bytes(b) = value {
+                    if b.len() > consensus.max_asset_name_bytes {
+                        return Err(too_long());
+                    }
+                }
+            }
+            // ConfigAssetURL
+            39 => {
+                if let TealValue::Bytes(b) = value {
+                    if b.len() > consensus.max_asset_url_bytes {
+                        return Err(too_long());
+                    }
+                }
+            }
+            // OnCompletion: must not exceed DeleteApplicationOC (5).
+            25 => {
+                if let TealValue::Uint(v) = value {
+                    let max = crate::apply::ON_COMPLETION_DELETE;
+                    if *v > max {
+                        return Err(larger_than_max(*v, max));
+                    }
+                }
+            }
+            // GlobalNumUint / GlobalNumByteSlice
+            52 | 53 => {
+                if let TealValue::Uint(v) = value {
+                    if *v > consensus.max_global_schema_entries {
+                        return Err(larger_than_max(*v, consensus.max_global_schema_entries));
+                    }
+                }
+            }
+            // LocalNumUint / LocalNumByteSlice
+            54 | 55 => {
+                if let TealValue::Uint(v) = value {
+                    if *v > consensus.max_local_schema_entries {
+                        return Err(larger_than_max(*v, consensus.max_local_schema_entries));
+                    }
+                }
+            }
+            // ExtraProgramPages
+            56 => {
+                if let TealValue::Uint(v) = value {
+                    let max = consensus.max_absolute_extra_program_pages as u64;
+                    if *v > max {
+                        return Err(larger_than_max(*v, max));
+                    }
+                }
+            }
+            // ApplicationArgs: byte-array only, running total length, then count.
+            26 => {
+                let TealValue::Bytes(b) = value else {
+                    return Err(AlgoError::Avm {
+                        message: "ApplicationArg is not a byte array".to_string(),
+                    });
+                };
+                let existing = self.array_fields.get(&26).map(Vec::as_slice).unwrap_or(&[]);
+                let total = array_bytes_len(existing) + b.len();
+                if total > consensus.max_absolute_total_arg_len {
+                    return Err(AlgoError::Avm {
+                        message: "total application args length too long".to_string(),
+                    });
+                }
+                if existing.len() >= consensus.max_app_args {
+                    return Err(AlgoError::Avm {
+                        message: "too many application args".to_string(),
+                    });
+                }
+            }
+            // Accounts
+            28 => {
+                let existing = self.array_fields.get(&28).map(Vec::len).unwrap_or(0);
+                if existing >= consensus.max_app_txn_accounts {
+                    return Err(AlgoError::Avm {
+                        message: "too many foreign accounts".to_string(),
+                    });
+                }
+            }
+            // Assets (foreign assets)
+            48 => {
+                let existing = self.array_fields.get(&48).map(Vec::len).unwrap_or(0);
+                if existing >= consensus.max_app_txn_foreign_assets {
+                    return Err(AlgoError::Avm {
+                        message: "too many foreign assets".to_string(),
+                    });
+                }
+            }
+            // Applications (foreign apps)
+            50 => {
+                let existing = self.array_fields.get(&50).map(Vec::len).unwrap_or(0);
+                if existing >= consensus.max_app_txn_foreign_apps {
+                    return Err(AlgoError::Avm {
+                        message: "too many foreign apps".to_string(),
+                    });
+                }
+            }
+            // ApprovalProgram / ClearStateProgram (scalar overwrite)
+            30 | 31 => {
+                if let TealValue::Bytes(b) = value {
+                    let max = consensus.max_app_program_len
+                        * (1 + consensus.max_absolute_extra_program_pages as usize);
+                    if b.len() > max {
+                        return Err(AlgoError::Avm {
+                            message: format!("may not exceed {max} bytes"),
+                        });
+                    }
+                }
+            }
+            // ApprovalProgramPages / ClearStateProgramPages (accumulate)
+            64 | 66 => {
+                if let TealValue::Bytes(b) = value {
+                    let max = consensus.max_app_program_len
+                        * (1 + consensus.max_absolute_extra_program_pages as usize);
+                    let existing = self
+                        .array_fields
+                        .get(&field)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let total = array_bytes_len(existing) + b.len();
+                    if total > max {
+                        return Err(AlgoError::Avm {
+                            message: format!("may not exceed {max} bytes"),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Pre-populate the Fee field with a computed default (go-algorand's
     /// `addInnerTxn`-style fee-credit-aware default). Unlike `set_field`,
     /// this does **not** mark `fee_set` — a later explicit
@@ -5481,12 +5664,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn itxn_field(&mut self, field: u8, value: TealValue) -> Result<(), AlgoError> {
+        let consensus = &self.consensus;
         let builder = self
             .inner_building
             .last_mut()
             .ok_or_else(|| AlgoError::Avm {
                 message: "itxn_field: no inner txn being built".to_string(),
             })?;
+        builder.validate_field_bounds(consensus, field, &value)?;
         builder.set_field(field, value);
         Ok(())
     }
@@ -12940,6 +13125,228 @@ mod tests {
             TealValue::Uint(0),
             "explicitly set fee=0 should be preserved, not defaulted to MinTxnFee"
         );
+    }
+
+    // ---- Issue #1297: itxn_field must enforce go-algorand's consensus
+    // bounds (stackIntoTxnField, data/transactions/logic/eval.go) instead of
+    // silently accepting out-of-range field values on inner transactions. ----
+
+    fn make_itxn_bounds_ctx(store: &mut LedgerState) -> LedgerAvmContext<'_, LedgerState> {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        ctx.itxn_begin().unwrap();
+        ctx
+    }
+
+    #[test]
+    fn itxn_field_config_asset_decimals_over_max_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let max = ctx.consensus.max_asset_decimals as u64;
+        let err = ctx
+            .itxn_field(35, TealValue::Uint(max + 1)) // ConfigAssetDecimals
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is larger than max"),
+            "unexpected error: {err}"
+        );
+        // Boundary value is accepted.
+        ctx.itxn_field(35, TealValue::Uint(max)).unwrap();
+    }
+
+    #[test]
+    fn itxn_field_config_asset_unit_name_too_long_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let max = ctx.consensus.max_asset_unit_name_bytes;
+        let too_long = vec![b'u'; max + 1];
+        let err = ctx
+            .itxn_field(37, TealValue::Bytes(too_long)) // ConfigAssetUnitName
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+        // Boundary value is accepted.
+        ctx.itxn_field(37, TealValue::Bytes(vec![b'u'; max]))
+            .unwrap();
+    }
+
+    #[test]
+    fn itxn_field_config_asset_name_too_long_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let max = ctx.consensus.max_asset_name_bytes;
+        let too_long = vec![b'n'; max + 1];
+        let err = ctx
+            .itxn_field(38, TealValue::Bytes(too_long)) // ConfigAssetName
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_config_asset_url_too_long_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let max = ctx.consensus.max_asset_url_bytes;
+        let too_long = vec![b'h'; max + 1];
+        let err = ctx
+            .itxn_field(39, TealValue::Bytes(too_long)) // ConfigAssetURL
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_on_completion_above_delete_application_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        // DeleteApplicationOC = 5; 6 is out of range.
+        let err = ctx.itxn_field(25, TealValue::Uint(6)).unwrap_err(); // OnCompletion
+        assert!(
+            err.to_string().contains("is larger than max"),
+            "unexpected error: {err}"
+        );
+        // Boundary value (DeleteApplicationOC = 5) is accepted.
+        ctx.itxn_field(25, TealValue::Uint(5)).unwrap();
+    }
+
+    #[test]
+    fn itxn_field_global_and_local_schema_entries_over_max_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let gmax = ctx.consensus.max_global_schema_entries;
+        let lmax = ctx.consensus.max_local_schema_entries;
+        let err = ctx
+            .itxn_field(52, TealValue::Uint(gmax + 1)) // GlobalNumUint
+            .unwrap_err();
+        assert!(err.to_string().contains("is larger than max"));
+        let err = ctx
+            .itxn_field(54, TealValue::Uint(lmax + 1)) // LocalNumUint
+            .unwrap_err();
+        assert!(err.to_string().contains("is larger than max"));
+        // Boundary values accepted.
+        ctx.itxn_field(52, TealValue::Uint(gmax)).unwrap();
+        ctx.itxn_field(54, TealValue::Uint(lmax)).unwrap();
+    }
+
+    #[test]
+    fn itxn_field_extra_program_pages_over_max_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let max = ctx.consensus.max_absolute_extra_program_pages as u64;
+        let err = ctx
+            .itxn_field(56, TealValue::Uint(max + 1)) // ExtraProgramPages
+            .unwrap_err();
+        assert!(err.to_string().contains("is larger than max"));
+        ctx.itxn_field(56, TealValue::Uint(max)).unwrap();
+    }
+
+    #[test]
+    fn itxn_field_application_args_count_over_max_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let max = ctx.consensus.max_app_args;
+        for _ in 0..max {
+            ctx.itxn_field(26, TealValue::Bytes(Vec::new())).unwrap(); // ApplicationArgs (empty, to avoid tripping the total-length bound)
+        }
+        let err = ctx
+            .itxn_field(26, TealValue::Bytes(Vec::new()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too many application args"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_application_args_total_length_over_max_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let max = ctx.consensus.max_absolute_total_arg_len;
+        let err = ctx
+            .itxn_field(26, TealValue::Bytes(vec![0u8; max + 1])) // ApplicationArgs
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("total application args length too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_accounts_assets_applications_count_over_max_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+
+        let accts_max = ctx.consensus.max_app_txn_accounts;
+        for i in 0..accts_max {
+            ctx.itxn_field(28, TealValue::Bytes(vec![i as u8; 32]))
+                .unwrap(); // Accounts
+        }
+        let err = ctx
+            .itxn_field(28, TealValue::Bytes(vec![0xAAu8; 32]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too many foreign accounts"),
+            "unexpected error: {err}"
+        );
+
+        let assets_max = ctx.consensus.max_app_txn_foreign_assets;
+        for i in 0..assets_max {
+            ctx.itxn_field(48, TealValue::Uint(i as u64 + 1)).unwrap(); // Assets
+        }
+        let err = ctx.itxn_field(48, TealValue::Uint(999)).unwrap_err();
+        assert!(
+            err.to_string().contains("too many foreign assets"),
+            "unexpected error: {err}"
+        );
+
+        let apps_max = ctx.consensus.max_app_txn_foreign_apps;
+        for i in 0..apps_max {
+            ctx.itxn_field(50, TealValue::Uint(i as u64 + 1)).unwrap(); // Applications
+        }
+        let err = ctx.itxn_field(50, TealValue::Uint(999)).unwrap_err();
+        assert!(
+            err.to_string().contains("too many foreign apps"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_approval_program_over_max_len_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let max = ctx.consensus.max_app_program_len
+            * (1 + ctx.consensus.max_absolute_extra_program_pages as usize);
+        let err = ctx
+            .itxn_field(30, TealValue::Bytes(vec![0x01u8; max + 1])) // ApprovalProgram
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("may not exceed"),
+            "unexpected error: {err}"
+        );
+        // Boundary value is accepted.
+        ctx.itxn_field(30, TealValue::Bytes(vec![0x01u8; max]))
+            .unwrap();
     }
 
     #[test]
