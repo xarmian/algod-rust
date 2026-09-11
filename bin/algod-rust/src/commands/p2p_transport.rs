@@ -110,12 +110,13 @@ const ALGORAND_WS_SUPPORTED_VERSIONS: &[&str] = &["2.2"];
 /// advertises during the `/algorand-ws/2.2.0` handshake, alongside stateless
 /// compression.
 ///
-/// Matches go-algorand's `config.Local` defaults (`EnableVoteCompression:
-/// true`, `StatefulVoteCompressionTableSize: 2048`) — the *same*
-/// hardcoded-not-yet-configurable value `algo_network::ws_network`'s
+/// Matches go-algorand's `config.Local` `StatefulVoteCompressionTableSize:
+/// 2048` default — the *same* hardcoded value `algo_network::ws_network`'s
 /// `DEFAULT_VOTE_COMPRESSION_TABLE_SIZE` already uses for the classic
-/// WS-gossip transport (issue #817), for the identical reason: not yet
-/// exposed as a configurable knob on this crate's side.
+/// WS-gossip transport (issue #817); the table *size* stays hardcoded on
+/// both transports. `EnableVoteCompression` (the enable/disable bit) is a
+/// real per-node knob as of issue #1239 — see
+/// [`P2pTransportConfig::enable_vote_compression`].
 ///
 /// Go: `network/p2pNetwork.go` threads `cfg.EnableVoteCompression` into the
 /// P2P transport's per-peer `wsPeer` construction exactly as it does for
@@ -1025,6 +1026,16 @@ pub struct P2pTransportConfig {
     /// `ws_network.rs`'s `WebsocketNetworkConfig::force_fetch_transactions`
     /// (issue #1191's precedent for the WS transport).
     pub force_fetch_transactions: bool,
+    /// Matches go's `cfg.EnableVoteCompression` — whether this transport
+    /// advertises/negotiates stateless+stateful vpack vote compression at
+    /// all (issue #1239). Mirrors `ws_network.rs`'s
+    /// `WebsocketNetworkConfig::enable_vote_compression` (its doc comment
+    /// has the full explanation); `Default::default()` gives `false`
+    /// (bool default), unlike go's real `true` default — a caller building
+    /// a real node config should always set this explicitly from
+    /// `algo_config::Local::enable_vote_compression`, same caveat as
+    /// `gossip_fanout` above.
+    pub enable_vote_compression: bool,
 }
 
 /// Split a multiaddr into its dialable transport address and an optional
@@ -1297,15 +1308,20 @@ impl P2pTransport {
                 anyhow::anyhow!("failed to register algorand-http stream acceptor: {e}")
             })?;
         let http_stream_control = stream_control.clone();
-        // Vote-compression advertisement (issue #925): always offer
-        // stateless + stateful (table size 2048) vpack compression, exactly
-        // as `algo_network::ws_network`'s classic WS-gossip transport does
-        // (see `DEFAULT_VOTE_COMPRESSION_TABLE_SIZE`'s doc comment for the
-        // go-source citation on why this is hardcoded-on rather than a
-        // config knob). `our_features` is threaded into both the accept
-        // and dial loops below so each side's handshake can compute the
-        // intersection with whatever the peer actually advertised back.
-        let our_features = advertise_vote_compression(true, DEFAULT_VOTE_COMPRESSION_TABLE_SIZE);
+        // Vote-compression advertisement (issue #925, config-gated by issue
+        // #1239 via `cfg.enable_vote_compression`): offer stateless +
+        // stateful (table size 2048) vpack compression, exactly as
+        // `algo_network::ws_network`'s classic WS-gossip transport does
+        // (see `DEFAULT_VOTE_COMPRESSION_TABLE_SIZE`'s doc comment — the
+        // table *size* stays hardcoded, only the enable/disable bit is a
+        // real per-node knob). `our_features` is threaded into both the
+        // accept and dial loops below so each side's handshake can compute
+        // the intersection with whatever the peer actually advertised
+        // back.
+        let our_features = advertise_vote_compression(
+            cfg.enable_vote_compression,
+            DEFAULT_VOTE_COMPRESSION_TABLE_SIZE,
+        );
         let our_ws_headers = build_headers(
             &cfg.network_id,
             "",
@@ -2393,6 +2409,7 @@ mod tests {
             is_listen_server: false,
             relay_messages: false,
             force_fetch_transactions: false,
+            enable_vote_compression: true,
         })
         .await
         .expect("start p2p transport");
@@ -2426,6 +2443,7 @@ mod tests {
             is_listen_server: false,
             relay_messages: false,
             force_fetch_transactions: false,
+            enable_vote_compression: true,
         })
         .await
         .expect("start p2p transport");
@@ -2460,6 +2478,7 @@ mod tests {
             is_listen_server: false,
             relay_messages: true,
             force_fetch_transactions: false,
+            enable_vote_compression: true,
         })
         .await
         .expect("start listener");
@@ -2489,6 +2508,7 @@ mod tests {
             is_listen_server: false,
             relay_messages: true,
             force_fetch_transactions: false,
+            enable_vote_compression: true,
         })
         .await
         .expect("start dialer");
@@ -2537,6 +2557,7 @@ mod tests {
             is_listen_server: false,
             relay_messages: false,
             force_fetch_transactions: false,
+            enable_vote_compression: true,
         }
     }
 
@@ -2893,6 +2914,7 @@ mod tests {
             is_listen_server: false,
             relay_messages: false,
             force_fetch_transactions: false,
+            enable_vote_compression: true,
         })
         .await
         .expect("start listener");
@@ -2919,6 +2941,7 @@ mod tests {
             is_listen_server: false,
             relay_messages: false,
             force_fetch_transactions: false,
+            enable_vote_compression: true,
         })
         .await
         .expect("start dialer");
@@ -3408,6 +3431,7 @@ mod tests {
             is_listen_server: false,
             relay_messages: false,
             force_fetch_transactions: false,
+            enable_vote_compression: true,
         })
         .await
         .expect("start transport");

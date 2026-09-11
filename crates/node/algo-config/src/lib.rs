@@ -1571,14 +1571,20 @@ static ENABLE_METRIC_REPORTING: VersionedDefault<bool> = VersionedDefault::new(&
 //   the existing `--p2p-persist-peer-id` boolean flag.
 // - `enable_dht_providers`/`dht_mode`: wired into `algo_p2p::dht`'s
 //   existing (previously config-less) DHT construction.
-// - `EnableVoteCompression`/`StatefulVoteCompressionTableSize`/
-//   `EnableBatchVerification` are **deliberately NOT added** here, per
-//   issue #768's explicit instruction: confirmed no vote-compression code
-//   exists anywhere in algod-rust's gossip wire protocol, and
-//   `algo_validate::signature` itself documents "no ed25519 batch
-//   verifier" today — a no-op knob for a nonexistent feature is worse
-//   than no knob (same precedent #748 set). Add them only once a future
-//   issue actually builds the underlying feature.
+// - `EnableVoteCompression`: added by issue #1239, reversing issue #768's
+//   original "deliberately NOT added" disposition for this one field —
+//   `algo_network::peer_features::advertise_vote_compression` and
+//   `ws_network.rs`'s stateful/stateless vpack negotiation are now fully
+//   implemented, so a no-op-knob objection no longer applies. See
+//   [`ENABLE_VOTE_COMPRESSION`]'s doc comment.
+// - `StatefulVoteCompressionTableSize`/`EnableBatchVerification` remain
+//   **deliberately NOT added** here, per issue #768's original reasoning
+//   (re-confirmed by issue #1239): `StatefulVoteCompressionTableSize`
+//   stays hardcoded (`DEFAULT_VOTE_COMPRESSION_TABLE_SIZE`) rather than a
+//   real per-node knob, and `algo_validate::signature` still documents "no
+//   ed25519 batch verifier" — a no-op knob for a nonexistent feature is
+//   worse than no knob (same precedent #748 set). Add them only once a
+//   future issue actually builds the underlying feature.
 
 /// Go: `PublicAddress string` `version[0]:""` (`localTemplate.go:65`).
 /// Round-trip only — see the module note above.
@@ -1701,6 +1707,21 @@ static ENABLE_DHT_PROVIDERS: VersionedDefault<bool> = VersionedDefault::new(&[(3
 /// Go: `DHTMode string` `version[38]:""` (`localTemplate.go:638`).
 /// Wired into `algo_p2p::dht`'s DHT construction.
 static DHT_MODE: VersionedDefault<String> = VersionedDefault::new(&[(38, String::new)]);
+
+/// Go: `EnableVoteCompression bool` `version[36]:"true"`
+/// (`localTemplate.go:657`, "controls whether vote compression is enabled
+/// for websocket networks"). Wired into `algo_network`'s
+/// stateless/stateful vpack vote-compression feature negotiation (issue
+/// #1239) — see `advertise_vote_compression`'s call sites in
+/// `algo_network::ws_network` and `bin/algod-rust`'s
+/// `commands::p2p_transport`. Previously deliberately omitted (issue
+/// #768) because no vote-compression code existed anywhere in this crate
+/// at the time; that has since changed and this flag now has a real
+/// effect (`StatefulVoteCompressionTableSize` remains hardcoded — see
+/// `DEFAULT_VOTE_COMPRESSION_TABLE_SIZE`'s doc comment — and
+/// `EnableBatchVerification` remains genuinely unimplemented, so neither
+/// is added here).
+static ENABLE_VOTE_COMPRESSION: VersionedDefault<bool> = VersionedDefault::new(&[(36, || true)]);
 
 /// Go: `EnableAccountUpdatesStats bool` `version[16]:"false"`
 /// (`localTemplate.go:503-504`, "specifies whether or not to emit the
@@ -2146,6 +2167,9 @@ fn default_enable_dht_providers() -> bool {
 }
 fn default_dht_mode() -> String {
     DHT_MODE.at(LATEST_VERSION)
+}
+fn default_enable_vote_compression() -> bool {
+    ENABLE_VOTE_COMPRESSION.at(LATEST_VERSION)
 }
 fn default_enable_runtime_metrics() -> bool {
     ENABLE_RUNTIME_METRICS.at(LATEST_VERSION)
@@ -3305,6 +3329,15 @@ pub struct Local {
     #[serde(rename = "DHTMode", default = "default_dht_mode")]
     pub dht_mode: String,
 
+    /// Go: `EnableVoteCompression`. Wired into `algo_network`'s
+    /// stateless/stateful vpack vote-compression feature negotiation — see
+    /// [`ENABLE_VOTE_COMPRESSION`]'s doc comment.
+    #[serde(
+        rename = "EnableVoteCompression",
+        default = "default_enable_vote_compression"
+    )]
+    pub enable_vote_compression: bool,
+
     /// Go: `EnableRuntimeMetrics`. Wired into
     /// `AlgodNodeInterface::metrics_exposition` (issue #776) — see
     /// [`ENABLE_RUNTIME_METRICS`]'s doc comment.
@@ -3519,6 +3552,7 @@ impl Local {
             p2p_private_key_location: P2P_PRIVATE_KEY_LOCATION.at(version),
             enable_dht_providers: ENABLE_DHT_PROVIDERS.at(version),
             dht_mode: DHT_MODE.at(version),
+            enable_vote_compression: ENABLE_VOTE_COMPRESSION.at(version),
             enable_runtime_metrics: ENABLE_RUNTIME_METRICS.at(version),
             enable_netdev_metrics: ENABLE_NET_DEV_METRICS.at(version),
             enable_account_updates_stats: ENABLE_ACCOUNT_UPDATES_STATS.at(version),
@@ -4188,6 +4222,12 @@ impl Local {
                 next,
             );
             migrate_field(&mut self.dht_mode, &DHT_MODE, cur, next);
+            migrate_field(
+                &mut self.enable_vote_compression,
+                &ENABLE_VOTE_COMPRESSION,
+                cur,
+                next,
+            );
             migrate_field(
                 &mut self.enable_runtime_metrics,
                 &ENABLE_RUNTIME_METRICS,
@@ -5118,19 +5158,49 @@ mod tests {
     }
 
     #[test]
-    fn vote_compression_and_batch_verification_fields_are_not_present() {
-        // Explicitly asserts issue #768's disposition: these upstream
-        // fields must NOT exist on `Local` at all (no-op knobs for
-        // nonexistent features are worse than no knob). Encoded as a
-        // negative JSON-shape check so a future accidental re-add is
-        // caught: `serde` would otherwise silently accept and drop an
-        // unknown field, so this only guards the "someone adds it as a
-        // real field" case together with the source-level absence, which
-        // is the actual contract here.
+    fn stateful_vote_compression_table_size_and_batch_verification_fields_are_not_present() {
+        // Issue #1239 flipped `EnableVoteCompression`'s half of issue
+        // #768's original "not present" disposition (see
+        // `enable_vote_compression_present_and_defaults_true` below) but
+        // deliberately left these two alone: `StatefulVoteCompressionTableSize`
+        // stays hardcoded rather than a real per-node knob, and
+        // `EnableBatchVerification` still has no backing ed25519
+        // batch-verifier implementation (a no-op knob for a nonexistent
+        // feature is worse than no knob — same precedent #748 set).
+        // Encoded as a negative JSON-shape check so a future accidental
+        // re-add is caught: `serde` would otherwise silently accept and
+        // drop an unknown field, so this only guards the "someone adds it
+        // as a real field" case together with the source-level absence,
+        // which is the actual contract here.
         let default_json = Local::default().to_json_full().expect("serializes");
-        assert!(!default_json.contains("EnableVoteCompression"));
         assert!(!default_json.contains("StatefulVoteCompressionTableSize"));
         assert!(!default_json.contains("EnableBatchVerification"));
+    }
+
+    /// Issue #1239: `EnableVoteCompression` is now a real field on `Local`,
+    /// reversing issue #768's original "deliberately NOT added" disposition
+    /// for this one field now that `algo_network`'s vote-compression
+    /// feature negotiation (`advertise_vote_compression`) is fully
+    /// implemented. Defaults to `true` (matching go's
+    /// `EnableVoteCompression: true` `localTemplate.go` default) and
+    /// round-trips through JSON.
+    #[test]
+    fn enable_vote_compression_present_and_defaults_true() {
+        let default_json = Local::default().to_json_full().expect("serializes");
+        assert!(default_json.contains("EnableVoteCompression"));
+        assert!(Local::default().enable_vote_compression);
+
+        // An explicit override must be given at (or past) the field's own
+        // `version[36]` tag to survive migration — an override supplied at
+        // an earlier version is indistinguishable from "unset" (equal to
+        // that earlier version's default) and gets carried forward to
+        // [`LATEST_VERSION`]'s default instead, exactly like every other
+        // versioned field in this module (see `migrate_field`'s doc
+        // comment and `enable_netdev_metrics_override_survives_migration_past_version_34`
+        // above for the same pattern).
+        let cfg = Local::load_from_str(r#"{"Version": 36, "EnableVoteCompression": false}"#)
+            .expect("parses");
+        assert!(!cfg.enable_vote_compression);
     }
 
     // --- Catchup/sync fields (issue #753) --------------------------------

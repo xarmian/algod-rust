@@ -67,10 +67,15 @@
 //!   genesis-consistency check) and filed as issue #1066. Now that that fix
 //!   (`resolve_effective_genesis_expectations`) has landed,
 //!   `p2p_two_independently_staked_voters_reach_quorum` below proves this
-//!   shape does work over the P2P transport too (issue #1070) -- still not
-//!   covered is go's specific differing-`EnableVoteCompression`-version
-//!   negotiation, since `P2pTransport` has no CLI/config knob to disable
-//!   vote-compression negotiation per node today.
+//!   shape does work over the P2P transport too (issue #1070). Go's
+//!   specific differing-`EnableVoteCompression`-version negotiation --
+//!   `P2pTransport` had no config knob to disable vote-compression
+//!   negotiation per node at the time this note was written -- is now
+//!   covered too: `algo_config::Local::enable_vote_compression` (issue
+//!   #1239) wires into `P2pTransportConfig::enable_vote_compression`, and
+//!   `p2p_two_voters_with_differing_vote_compression_settings_reach_quorum`
+//!   below proves two nodes with differing settings still certify a round
+//!   together.
 //! - **`TestNodeP2PRelays`** -- a 3-node `R1 (DHT) -> R2 (phonebook) <- N`
 //!   topology where a non-relay participant must *discover* a second relay
 //!   purely via the Kademlia DHT (no direct multiaddr for it at all).
@@ -397,10 +402,41 @@ fn spawn_p2p_participate_node(
     online_participation: Option<&Participation>,
     bootstrap_peer: Option<&Multiaddr>,
 ) -> NodeProcess {
+    spawn_p2p_participate_node_with_config(
+        data_dir,
+        p2p_port,
+        rest_port,
+        genesis_json,
+        online_participation,
+        bootstrap_peer,
+        None,
+    )
+}
+
+/// Full-generality variant of [`spawn_p2p_participate_node`] that additionally
+/// writes `config_json` (when given) to `<data_dir>/config.json` before
+/// spawning -- e.g. to override `algo_config::Local` fields like
+/// `EnableVoteCompression` per node (issue #1239), the same
+/// `config.json`-in-data-dir mechanism `multi_node_consensus_sync.rs` uses
+/// for the classic WS-gossip transport's equivalent tests.
+#[allow(clippy::too_many_arguments)]
+fn spawn_p2p_participate_node_with_config(
+    data_dir: TempDir,
+    p2p_port: u16,
+    rest_port: u16,
+    genesis_json: &str,
+    online_participation: Option<&Participation>,
+    bootstrap_peer: Option<&Multiaddr>,
+    config_json: Option<&str>,
+) -> NodeProcess {
     let data_dir_path = data_dir.path().to_path_buf();
 
     let genesis_path = data_dir_path.join("genesis.json");
     std::fs::write(&genesis_path, genesis_json).expect("write genesis.json");
+
+    if let Some(config) = config_json {
+        std::fs::write(data_dir_path.join("config.json"), config).expect("write config.json");
+    }
 
     let ledger_path = data_dir_path.join("ledger.sqlite");
     let partkey_path = data_dir_path.join("partkey.sqlite");
@@ -824,5 +860,129 @@ async fn p2p_two_independently_staked_voters_reach_quorum() {
         hash_a, hash_b,
         "node A and node B (each 50% of genesis online stake, independently signing, over the \
          P2P transport) disagree on round {compare_round}'s block hash"
+    );
+}
+
+/// The literal shape of go-algorand's `TestNodeP2P_NetProtoVersions`
+/// (`node/node_test.go`): two nodes with *differing* `EnableVoteCompression`
+/// settings (node A: `false`, node B: go's real default `true`) still reach
+/// consensus together, closing the one gap
+/// `p2p_two_independently_staked_voters_reach_quorum`'s module doc comment
+/// above left open -- issue #1239 gave `algo_config::Local` a real
+/// `EnableVoteCompression` field and wired it into
+/// `P2pTransportConfig::enable_vote_compression`, so this scenario can
+/// finally be reproduced: node A negotiates every handshake with vote
+/// compression advertised off (`advertise_vote_compression(false, ..)`
+/// only sets `COMPRESSED_PROPOSAL`, no `COMPRESSED_VOTE_VPACK*` bits), node
+/// B still advertises the full default set, and the intersection each side
+/// computes (`remote_features.intersection(config.our_features)`) collapses
+/// to "no vote compression" on both -- proving the transport falls back to
+/// the uncompressed `AgreementVote` wire format cleanly rather than
+/// stalling or misdecoding votes, exactly as go's differing-version-
+/// negotiation test asserts.
+///
+/// Same two-independently-staked-voters shape as
+/// `p2p_two_independently_staked_voters_reach_quorum` (each holds 50% of
+/// genesis online stake, both propose/vote) -- the only difference is node
+/// A's `<data_dir>/config.json` override, written via
+/// [`spawn_p2p_participate_node_with_config`]. `"Version": 38` (
+/// `algo_config::LATEST_VERSION`) is required in that override: an
+/// explicit field value given at an earlier version is indistinguishable
+/// from "unset" and gets silently carried forward to the latest version's
+/// own default during `Local::migrate()` (see `algo-config`'s
+/// `migrate_field` and this exact pattern in its own
+/// `enable_vote_compression_present_and_defaults_true` unit test).
+#[tokio::test]
+#[ignore = "spawns two real algod-rust processes over the libp2p P2P transport and runs \
+            real BFT agreement; run with --ignored"]
+async fn p2p_two_voters_with_differing_vote_compression_settings_reach_quorum() {
+    let genesis = build_two_voter_genesis();
+
+    let p2p_port_a = alloc_loopback_port();
+    let rest_a = alloc_loopback_port();
+    let p2p_port_b = alloc_loopback_port();
+    let rest_b = alloc_loopback_port();
+
+    let data_dir_a = tempfile::Builder::new()
+        .prefix("algod-rust-p2p-votecompress-a-")
+        .tempdir()
+        .expect("tempdir for node A");
+    let data_dir_b = tempfile::Builder::new()
+        .prefix("algod-rust-p2p-votecompress-b-")
+        .tempdir()
+        .expect("tempdir for node B");
+
+    // Node A's identity must be known before either process starts, since
+    // node B dials it directly by multiaddr. Only node B dials -- node A
+    // never dials out -- to avoid the mutual-simultaneous-dial race fixed
+    // by, but not needed to be re-exercised by, issue #1067.
+    let peer_id_a = pregenerate_p2p_identity(data_dir_a.path());
+    let multiaddr_a = p2p_multiaddr(p2p_port_a, peer_id_a);
+
+    // Node A: vote compression explicitly disabled.
+    let mut node_a = spawn_p2p_participate_node_with_config(
+        data_dir_a,
+        p2p_port_a,
+        rest_a,
+        &genesis.genesis_json,
+        Some(&genesis.participation_a),
+        None,
+        Some(r#"{"Version": 38, "EnableVoteCompression": false}"#),
+    );
+    // Node B: default config -- vote compression enabled (go's real
+    // default), the differing side of the negotiation.
+    let mut node_b = spawn_p2p_participate_node_with_config(
+        data_dir_b,
+        p2p_port_b,
+        rest_b,
+        &genesis.genesis_json,
+        Some(&genesis.participation_b),
+        Some(&multiaddr_a),
+        None,
+    );
+
+    let client = http_client();
+    let overall_deadline = Instant::now() + Duration::from_secs(120);
+
+    wait_for_rest_ready(&client, &node_a.rest_addr, overall_deadline).await;
+    wait_for_rest_ready(&client, &node_b.rest_addr, overall_deadline).await;
+    let token_a = read_api_token(&node_a.data_dir_path, overall_deadline).await;
+    let token_b = read_api_token(&node_b.data_dir_path, overall_deadline).await;
+
+    let round_a = wait_for_round(
+        &client,
+        &node_a.rest_addr,
+        &token_a,
+        1,
+        overall_deadline,
+        "node A",
+    )
+    .await;
+    let round_b = wait_for_round(
+        &client,
+        &node_b.rest_addr,
+        &token_b,
+        1,
+        overall_deadline,
+        "node B",
+    )
+    .await;
+
+    let compare_round = round_a.min(round_b);
+    let hash_a = get_block_hash(&client, &node_a.rest_addr, &token_a, compare_round).await;
+    let hash_b = get_block_hash(&client, &node_b.rest_addr, &token_b, compare_round).await;
+
+    if hash_a != hash_b {
+        dump_node_logs(&node_a, "A");
+        dump_node_logs(&node_b, "B");
+    }
+    node_b.shutdown();
+    node_a.shutdown();
+
+    assert_eq!(
+        hash_a, hash_b,
+        "node A (EnableVoteCompression=false) and node B (EnableVoteCompression=true, default) \
+         disagree on round {compare_round}'s block hash -- differing vote-compression settings \
+         should not prevent reaching consensus together"
     );
 }
