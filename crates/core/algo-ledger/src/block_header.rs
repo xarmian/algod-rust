@@ -98,6 +98,15 @@ fn apply_upgrade_vote(
             });
         }
 
+        if vote.upgrade_propose.len() as u64 > params.max_version_string_len {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "apply_upgrade_vote: proposed protocol version {} too long",
+                    vote.upgrade_propose
+                ),
+            });
+        }
+
         let upgrade_delay = if vote.upgrade_delay > params.max_upgrade_wait_rounds
             || vote.upgrade_delay < params.min_upgrade_wait_rounds
         {
@@ -948,6 +957,44 @@ mod tests {
         assert!(
             apply_upgrade_vote(&prev_state, 10, &vote_with_delay(0), &params).is_err(),
             "zero delay below a nonzero minimum must be rejected"
+        );
+    }
+
+    /// Port of go's `MaxVersionStringLen` check in `applyUpgradeVote`
+    /// (`data/bookkeeping/block.go`): a proposed `UpgradePropose` string
+    /// longer than the active version's `max_version_string_len` must be
+    /// rejected, while a proposal exactly at the limit is accepted. Issue
+    /// #1278.
+    #[test]
+    fn apply_upgrade_vote_rejects_oversized_upgrade_propose() {
+        let params = ConsensusParams {
+            max_version_string_len: 8,
+            ..v41_params()
+        };
+        let prev_state = NextUpgradeState {
+            current_protocol: CONSENSUS_V41.to_string(),
+            next_protocol: String::new(),
+            next_protocol_approvals: 0,
+            next_protocol_vote_before: Round(0),
+            next_protocol_switch_on: Round(0),
+        };
+        // v41 requires a nonzero delay within [MinUpgradeWaitRounds,
+        // MaxUpgradeWaitRounds]; 10_000 is v41's own MinUpgradeWaitRounds, so
+        // the delay bounds check passes and only the length check under test
+        // can reject or accept.
+        let vote_with_propose = |propose: &str| NextUpgradeVote {
+            upgrade_propose: propose.to_string(),
+            upgrade_delay: 10_000,
+            upgrade_approve: false,
+        };
+
+        assert!(
+            apply_upgrade_vote(&prev_state, 10, &vote_with_propose("123456789"), &params).is_err(),
+            "a proposal longer than max_version_string_len must be rejected"
+        );
+        assert!(
+            apply_upgrade_vote(&prev_state, 10, &vote_with_propose("12345678"), &params).is_ok(),
+            "a proposal exactly at max_version_string_len must be accepted"
         );
     }
 

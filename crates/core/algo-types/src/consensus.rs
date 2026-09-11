@@ -617,6 +617,14 @@ pub struct ConsensusParams {
     /// Maximum permissible `UpgradeDelay` for a new proposal, inclusive
     /// (Go: `MaxUpgradeWaitRounds`, v22+; zero before that).
     pub max_upgrade_wait_rounds: u64,
+    /// Maximum permissible length, in bytes, of a proposed `UpgradePropose`
+    /// version string (Go: `MaxVersionStringLen`, 64 at v7, bumped to 128 at
+    /// v12). Consulted by [`crate::consensus`]-adjacent block-header
+    /// validation (`apply_upgrade_vote` in `algo-ledger`'s
+    /// `block_header.rs`) to reject a malformed/oversized upgrade proposal
+    /// from an externally-produced block, exactly like go's
+    /// `UpgradeState.applyUpgradeVote` (`data/bookkeeping/block.go`).
+    pub max_version_string_len: u64,
 
     // ── Rewards fixes (historical-replay correctness) ───────────
     /// Fix the rewards calculation by avoiding subtracting too much from the
@@ -643,6 +651,14 @@ pub struct ConsensusParams {
     /// Before v15, `ApplyData` never carried these fields even though the
     /// account-level reward accrual itself is unaffected.
     pub rewards_in_apply_data: bool,
+    /// Force the genesis fee-sink account's status to `NotParticipating`
+    /// regardless of the genesis allocation file's own declared `onl` value
+    /// (Go: `ForceNonParticipatingFeeSink`, v15+, `config/consensus.go:181`,
+    /// consulted in `data/ledger.go`'s `LoadLedger`). Before v15, the fee
+    /// sink instead keeps whatever status the genesis file declares, like
+    /// any other account. Consulted by `algo-ledger`'s
+    /// `genesis::effective_genesis_status`.
+    pub force_non_participating_fee_sink: bool,
 
     // ── Inner transaction IDs (historical-replay correctness) ────
     /// Enables a consistent, unified way of computing inner transaction IDs
@@ -989,10 +1005,12 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         default_upgrade_wait_rounds: 10_000,
         min_upgrade_wait_rounds: 0,
         max_upgrade_wait_rounds: 0,
+        max_version_string_len: 64,
         pending_residue_rewards: false,
         initial_rewards_rate_calculation: false,
         rewards_calculation_fix: false,
         rewards_in_apply_data: false,
+        force_non_participating_fee_sink: false,
         unify_inner_tx_ids: false,
         unfunded_senders: false,
         enable_precheck_ecdsa_curve: false,
@@ -1062,8 +1080,9 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     }
 
     // ── v12 ─────────────────────────────────────────────────────
-    let v12 = v11.clone();
-    // v12 only increases MaxVersionStringLen (not modeled)
+    let mut v12 = v11.clone();
+    // Go: v12.MaxVersionStringLen = 128 (config/consensus.go:1002).
+    v12.max_version_string_len = 128;
     if version == CONSENSUS_V12 {
         return Some(v12);
     }
@@ -1084,8 +1103,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     // ── v15 ─────────────────────────────────────────────────────
     let mut v15 = v14.clone();
     v15.rewards_in_apply_data = true;
-    // v15 also adds ForceNonParticipatingFeeSink, a genesis-initialization-only
-    // flag (not a per-transaction apply/eval gate) -- not modeled here.
+    // Go: v15.ForceNonParticipatingFeeSink = true (config/consensus.go:1031).
+    v15.force_non_participating_fee_sink = true;
     if version == CONSENSUS_V15 {
         return Some(v15);
     }
@@ -1802,6 +1821,7 @@ pub struct ConsensusParamsOverride {
     pub approved_upgrades: Option<HashMap<String, u64>>,
     pub upgrade_vote_rounds: u64,
     pub upgrade_threshold: u64,
+    pub max_version_string_len: u64,
     pub default_upgrade_wait_rounds: u64,
     pub min_upgrade_wait_rounds: u64,
     pub max_upgrade_wait_rounds: u64,
@@ -1809,6 +1829,7 @@ pub struct ConsensusParamsOverride {
     pub initial_rewards_rate_calculation: bool,
     pub rewards_calculation_fix: bool,
     pub rewards_in_apply_data: bool,
+    pub force_non_participating_fee_sink: bool,
     #[serde(rename = "UnifyInnerTxIDs")]
     pub unify_inner_tx_ids: bool,
     pub unfunded_senders: bool,
@@ -1997,10 +2018,12 @@ impl ConsensusParamsOverride {
             default_upgrade_wait_rounds: self.default_upgrade_wait_rounds,
             min_upgrade_wait_rounds: self.min_upgrade_wait_rounds,
             max_upgrade_wait_rounds: self.max_upgrade_wait_rounds,
+            max_version_string_len: self.max_version_string_len,
             pending_residue_rewards: self.pending_residue_rewards,
             initial_rewards_rate_calculation: self.initial_rewards_rate_calculation,
             rewards_calculation_fix: self.rewards_calculation_fix,
             rewards_in_apply_data: self.rewards_in_apply_data,
+            force_non_participating_fee_sink: self.force_non_participating_fee_sink,
             unify_inner_tx_ids: self.unify_inner_tx_ids,
             unfunded_senders: self.unfunded_senders,
             enable_precheck_ecdsa_curve: self.enable_precheck_ecdsa_curve,
@@ -2520,6 +2543,31 @@ mod tests {
         let v22 = consensus_params_for_version(CONSENSUS_V22).unwrap();
         assert_eq!(v22.min_upgrade_wait_rounds, 10_000);
         assert_eq!(v22.max_upgrade_wait_rounds, 150_000);
+    }
+
+    /// Issue #1278: `MaxVersionStringLen` is 64 at v7 (the base struct) and
+    /// bumps to 128 at v12 (`config/consensus.go:1002`), staying 128 through
+    /// every later known version.
+    #[test]
+    fn test_max_version_string_len_activates_at_v12() {
+        let v11 = consensus_params_for_version(CONSENSUS_V11).unwrap();
+        assert_eq!(v11.max_version_string_len, 64);
+        let v12 = consensus_params_for_version(CONSENSUS_V12).unwrap();
+        assert_eq!(v12.max_version_string_len, 128);
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert_eq!(v42.max_version_string_len, 128);
+    }
+
+    /// Issue #1279: `ForceNonParticipatingFeeSink` activates at v15
+    /// (`config/consensus.go:1031`), false before it.
+    #[test]
+    fn test_force_non_participating_fee_sink_activates_at_v15() {
+        let v14 = consensus_params_for_version(CONSENSUS_V14).unwrap();
+        assert!(!v14.force_non_participating_fee_sink);
+        let v15 = consensus_params_for_version(CONSENSUS_V15).unwrap();
+        assert!(v15.force_non_participating_fee_sink);
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert!(v42.force_non_participating_fee_sink);
     }
 
     #[test]
