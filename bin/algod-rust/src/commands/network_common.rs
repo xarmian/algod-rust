@@ -133,6 +133,27 @@ pub fn networking_active(mode_active: bool, disable_networking: bool) -> bool {
     mode_active && !disable_networking
 }
 
+/// Resolve `config.json`'s `FallbackDNSResolverAddress` into the `Option<String>`
+/// [`algo_network::HickorySrvResolver::new`] expects (issue #1312).
+///
+/// Go's `FallbackDNSResolverAddress string` (`config/localTemplate.go`) is
+/// threaded straight into `resolveSRVRecords`/`readFromSRV`
+/// (`network/wsNetwork.go`, `tools/network/bootstrap.go`), where an empty
+/// string means "no fallback configured" — the DNSSEC resolver chain then
+/// goes straight from the system resolver to the default public resolvers on
+/// failure, skipping the fallback step entirely
+/// (`tools/network/bootstrap.go`'s `readFromSRV`: `if fallbackDNSResolverAddress != ""`).
+/// `HickorySrvResolver` mirrors that chain already (`fallback_resolver`); this
+/// just maps the empty-string sentinel onto `None` so a stock/unset config
+/// doesn't try to stand up a resolver against `""`.
+pub fn resolve_fallback_dns_resolver(fallback_dns_resolver_address: &str) -> Option<String> {
+    if fallback_dns_resolver_address.is_empty() {
+        None
+    } else {
+        Some(fallback_dns_resolver_address.to_string())
+    }
+}
+
 /// Map a network name to its genesis ID.
 ///
 /// Returns `None` for unknown networks.
@@ -244,6 +265,25 @@ mod tests {
         let cfg = algo_config::Local::default();
         assert_eq!(resolve_gossip_fanout(&cfg, true, 12), 12);
         assert_eq!(resolve_gossip_fanout(&cfg, false, 12), 12);
+    }
+
+    // --- `resolve_fallback_dns_resolver` (issue #1312) ----------------------
+
+    /// A stock/unset config (`FallbackDNSResolverAddress == ""`) resolves to
+    /// `None` — matching go's "no fallback configured" semantics rather than
+    /// trying to build a resolver targeting an empty address.
+    #[test]
+    fn resolve_fallback_dns_resolver_empty_is_none() {
+        assert_eq!(resolve_fallback_dns_resolver(""), None);
+    }
+
+    /// A configured fallback address is passed through unchanged.
+    #[test]
+    fn resolve_fallback_dns_resolver_configured_is_some() {
+        assert_eq!(
+            resolve_fallback_dns_resolver("8.8.8.8"),
+            Some("8.8.8.8".to_string())
+        );
     }
 
     // --- `networking_active` (issue #1189) ----------------------------------

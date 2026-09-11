@@ -65,7 +65,7 @@ use tracing::{debug, info, warn};
 use crate::commands::dual_gossip_node;
 use crate::commands::network_common::{
     genesis_id_for, networking_active, resolve_account_updates_stats_config,
-    resolve_automatic_catchpoint_config, resolve_gossip_fanout,
+    resolve_automatic_catchpoint_config, resolve_fallback_dns_resolver, resolve_gossip_fanout,
 };
 use crate::commands::p2p_transport::{NetworkMode, P2pOptions, P2pTransport, P2pTransportConfig};
 use crate::config::RestConfig;
@@ -4329,7 +4329,9 @@ pub async fn run(
             let dns_template = dns_bootstrap_override.unwrap_or(&node_config.dns_bootstrap_id);
             match algo_network::Discovery::new(
                 phonebook.clone(),
-                Box::new(algo_network::HickorySrvResolver::new(None)),
+                Box::new(algo_network::HickorySrvResolver::new(
+                    resolve_fallback_dns_resolver(&node_config.fallback_dns_resolver_address),
+                )),
                 dns_template,
                 network_name,
                 dns_bootstrap_override.is_some(),
