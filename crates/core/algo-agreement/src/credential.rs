@@ -99,7 +99,16 @@ impl UnauthenticatedCredential {
         // Compute sortition weight
         let committee_size = membership.selector.committee_size(params);
 
-        if membership.total_money == 0 || committee_size == 0 {
+        // Mirrors go-algorand's `UnauthenticatedCredential.Verify` panic guard:
+        //   m.TotalMoney.IsZero() || committeeSize == 0 || committeeSize > m.TotalMoney.Raw
+        // (data/committee/credential.go). A committee larger than the total
+        // online stake is a broken invariant — proceeding would feed
+        // sortition::select/select_f128 an out-of-domain ratio (selection
+        // probability > 1) and silently produce nonsensical weight.
+        if membership.total_money == 0
+            || committee_size == 0
+            || committee_size > membership.total_money
+        {
             return Err(CredentialError::InvalidParameters);
         }
 
@@ -608,6 +617,31 @@ mod tests {
             Err(CredentialError::ZeroWeight) => {}
             Err(e) => panic!("unexpected error: {e}"),
         }
+    }
+
+    #[test]
+    fn verify_fails_when_committee_size_exceeds_total_money() {
+        // Mirrors go-algorand's `UnauthenticatedCredential.Verify` panic guard
+        // `committeeSize > m.TotalMoney.Raw` (data/committee/credential.go) —
+        // a broken invariant (total online stake smaller than the configured
+        // committee size for this step) must be rejected before ever calling
+        // into sortition::select/select_f128, not silently proceed with an
+        // out-of-domain committee_size/total_money ratio.
+        let params = v41_params();
+        let committee_size = SOFT.committee_size(&params);
+        assert!(committee_size > 0);
+
+        let kp = VrfKeypair::from_seed([7u8; 32]);
+        // total_money is far smaller than the soft committee size, but still
+        // >= balance so the earlier `total_money < balance` guard doesn't
+        // fire first — we want to isolate the committee_size > total_money
+        // check specifically.
+        let total_money = committee_size - 1;
+        let membership = make_test_membership(&kp, SOFT, 1, total_money);
+        let ucred = make_unauthenticated_credential(&kp, &membership.selector);
+
+        let result = ucred.verify(&params, &membership);
+        assert_eq!(result, Err(CredentialError::InvalidParameters));
     }
 
     #[test]
