@@ -106,6 +106,44 @@ pub trait UnicastPeer: Peer {
     /// (timeout, send buffer full, peer closed, etc.).
     async fn request(&self, tag: Tag, topics: Topics) -> Result<Topics, PeerError>;
 
+    /// Same as [`request`](UnicastPeer::request), but bounds the wait with
+    /// a caller-supplied `timeout` instead of the connection's own default
+    /// (set once at peer-construction time and shared by every request this
+    /// peer sends).
+    ///
+    /// Mirrors Go's real per-call scoping: `wsPeer.Request` takes a
+    /// `context.Context` argument, and callers such as
+    /// `catchup/universalFetcher.go`'s `wsFetcherClient.getBlockBytes` wrap
+    /// each call in its own `context.WithTimeout(ctx,
+    /// CatchupGossipBlockFetchTimeoutSec)` — independent of whatever
+    /// timeout policy governs the connection generally. algod-rust's
+    /// `request()` collapsed this to a single fixed `request_timeout` field
+    /// per peer; this method restores the per-call override without
+    /// changing `request()`'s existing behavior or signature.
+    ///
+    /// Implementations must apply the same leak-safety pattern `request()`
+    /// uses: the pending [`RequestTracker`](crate::request_response::RequestTracker)
+    /// entry registered for this call must be cancelled on every non-success
+    /// exit (send failure, connection closing, timeout) — never left to
+    /// leak because an outer future was dropped or raced against another
+    /// branch. See `ws_peer.rs`'s `PeerHandle`/`UnicastPeerRef` and
+    /// `p2p_transport.rs`'s `P2pUnicastPeer` for the reference
+    /// implementation.
+    ///
+    /// The default implementation delegates to [`request`](UnicastPeer::request),
+    /// ignoring `timeout` entirely — this preserves existing behavior for
+    /// any implementor (e.g. test mocks) that has no genuinely call-scoped
+    /// timeout mechanism to offer. Production implementors override this.
+    async fn request_with_timeout(
+        &self,
+        tag: Tag,
+        topics: Topics,
+        timeout: std::time::Duration,
+    ) -> Result<Topics, PeerError> {
+        let _ = timeout;
+        self.request(tag, topics).await
+    }
+
     /// Send a response to a previously received request.
     ///
     /// `request_hash` is the SHA-512/256-truncated-to-u64 hash of the

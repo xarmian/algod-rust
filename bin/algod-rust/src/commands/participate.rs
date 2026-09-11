@@ -143,11 +143,22 @@ impl NetworkAdvancer for GossipNetworkAdvancer {
 async fn fetch_block_via_unicast_peers(
     peers: Vec<Arc<dyn algo_network::gossip_node::UnicastPeer>>,
     round: Round,
+    catchup_gossip_block_fetch_timeout: Duration,
 ) -> Result<FetchedBlockCert, FetchError> {
     if peers.is_empty() {
         return Err(FetchError::NoPeersAvailable);
     }
-    let source = GossipBlockSource::new(peers);
+    // go: `CatchupGossipBlockFetchTimeoutSec` (`config.Local`, issue #1292)
+    // bounds each gossip block-fetch request specifically, sourced here
+    // from `node_config` via `ParticipateAgreementControl` rather than the
+    // 4s hardcoded default `GossipBlockSourceConfig::default()` would use.
+    let source = GossipBlockSource::with_config(
+        peers,
+        algo_rest_client::GossipBlockSourceConfig {
+            request_timeout: catchup_gossip_block_fetch_timeout,
+            ..Default::default()
+        },
+    );
     let (response, raw_block_data) = source.get_block_with_raw_data(round).await.map_err(|e| {
         FetchError::NetworkError(format!("block fetch failed for round {}: {}", round, e))
     })?;
@@ -211,6 +222,7 @@ async fn fetch_block_via_unicast_peers(
 struct GossipBlockFetcher {
     ws_network: Arc<WebsocketNetwork>,
     rt_handle: tokio::runtime::Handle,
+    catchup_gossip_block_fetch_timeout: Duration,
 }
 
 impl BlockFetcher for GossipBlockFetcher {
@@ -220,7 +232,8 @@ impl BlockFetcher for GossipBlockFetcher {
         // runtime would panic.
         self.rt_handle.block_on(async {
             let peers = self.ws_network.get_unicast_peers().await;
-            fetch_block_via_unicast_peers(peers, round).await
+            fetch_block_via_unicast_peers(peers, round, self.catchup_gossip_block_fetch_timeout)
+                .await
         })
     }
 }
@@ -238,6 +251,7 @@ impl BlockFetcher for GossipBlockFetcher {
 struct P2pBlockFetcher {
     p2p_transport: Arc<P2pTransport>,
     rt_handle: tokio::runtime::Handle,
+    catchup_gossip_block_fetch_timeout: Duration,
 }
 
 impl BlockFetcher for P2pBlockFetcher {
@@ -246,7 +260,8 @@ impl BlockFetcher for P2pBlockFetcher {
         // background-thread / `block_on` constraint applies here.
         self.rt_handle.block_on(async {
             let peers = self.p2p_transport.unicast_peers();
-            fetch_block_via_unicast_peers(peers, round).await
+            fetch_block_via_unicast_peers(peers, round, self.catchup_gossip_block_fetch_timeout)
+                .await
         })
     }
 }
@@ -396,6 +411,11 @@ struct ParticipateAgreementControl {
     network_mode: NetworkMode,
     p2p_transport: Option<Arc<P2pTransport>>,
     catchup_parallel_blocks: u64,
+    /// go: `CatchupGossipBlockFetchTimeoutSec` (`config.Local`, issue
+    /// #1292) — bounds each catchup gossip/P2P block-fetch request
+    /// specifically (via [`UnicastPeer::request_with_timeout`]), mirroring
+    /// `catchup/universalFetcher.go`'s per-fetch `context.WithTimeout`.
+    catchup_gossip_block_fetch_timeout: Duration,
     running: tokio::sync::Mutex<Option<RunningAgreementCycle>>,
 }
 
@@ -530,16 +550,19 @@ impl ParticipateAgreementControl {
         let ws_block_fetcher: Arc<dyn BlockFetcher> = Arc::new(GossipBlockFetcher {
             ws_network: self.gossip_node.clone(),
             rt_handle: self.rt_handle.clone(),
+            catchup_gossip_block_fetch_timeout: self.catchup_gossip_block_fetch_timeout,
         });
         let block_fetcher: Arc<dyn BlockFetcher> = match (&self.network_mode, &self.p2p_transport) {
             (NetworkMode::P2pOnly, Some(p2p)) => Arc::new(P2pBlockFetcher {
                 p2p_transport: Arc::clone(p2p),
                 rt_handle: self.rt_handle.clone(),
+                catchup_gossip_block_fetch_timeout: self.catchup_gossip_block_fetch_timeout,
             }),
             (NetworkMode::Hybrid, Some(p2p)) => Arc::new(FallbackBlockFetcher {
                 primary: Arc::new(P2pBlockFetcher {
                     p2p_transport: Arc::clone(p2p),
                     rt_handle: self.rt_handle.clone(),
+                    catchup_gossip_block_fetch_timeout: self.catchup_gossip_block_fetch_timeout,
                 }),
                 secondary: ws_block_fetcher,
             }),
@@ -666,6 +689,7 @@ impl ParticipateAgreementControl {
             network_mode: self.network_mode,
             p2p_transport: self.p2p_transport.clone(),
             catchup_parallel_blocks: self.catchup_parallel_blocks,
+            catchup_gossip_block_fetch_timeout: self.catchup_gossip_block_fetch_timeout,
             running: tokio::sync::Mutex::new(None),
         }
     }
@@ -5077,6 +5101,15 @@ pub async fn run(
         network_mode,
         p2p_transport: p2p_transport.clone(),
         catchup_parallel_blocks: node_config.catchup_parallel_blocks,
+        // go: `CatchupGossipBlockFetchTimeoutSec` (`config.Local`, issue
+        // #1292) is `int` (seconds) and always non-negative in practice;
+        // clamp a pathological negative `config.json` override to a zero
+        // timeout rather than panicking on the `as u64` cast (mirrors
+        // `catchpoint_sync.rs`'s `http_block_fetch_timeout_from_node_config`
+        // for the sibling `CatchupHTTPBlockFetchTimeoutSec`, issue #1291).
+        catchup_gossip_block_fetch_timeout: Duration::from_secs(
+            node_config.catchup_gossip_block_fetch_timeout_sec.max(0) as u64,
+        ),
         running: tokio::sync::Mutex::new(None),
     });
 
@@ -10873,6 +10906,7 @@ mod tests {
             network_mode: NetworkMode::WsOnly,
             p2p_transport: None,
             catchup_parallel_blocks: 4,
+            catchup_gossip_block_fetch_timeout: Duration::from_secs(4),
             running: tokio::sync::Mutex::new(None),
         };
         (control, tmp_dir)
