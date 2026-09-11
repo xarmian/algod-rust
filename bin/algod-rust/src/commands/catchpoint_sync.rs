@@ -75,10 +75,19 @@ impl AlgodSyncBackend {
     /// candidate peers today. An empty `extra_catchpoint_peer_urls` is
     /// behaviorally identical to the old single-source downloader: ranking
     /// with exactly one candidate always selects that candidate.
+    ///
+    /// `download_config`/`ledger_download_retry_attempts` are go's
+    /// `MaxCatchpointDownloadDuration`/`MinCatchpointFileDownloadBytesPerSecond`/
+    /// `CatchupLedgerDownloadRetryAttempts` (`config.Local`, issue #1289) —
+    /// callers with a loaded `config.json` should pass real values sourced
+    /// from it (see `run()` below) rather than defaults, mirroring the
+    /// existing `catchpoint.rs` one-shot CLI download command's wiring.
     fn with_catchpoint_peers(
         algod_url: &str,
         algod_token: &str,
         extra_catchpoint_peer_urls: &[String],
+        download_config: algo_rest_client::CatchpointDownloadConfig,
+        ledger_download_retry_attempts: usize,
     ) -> Self {
         let client = AlgodClient::new(algod_url, algod_token);
         let mut peers = vec![(algod_url.to_string(), algod_token.to_string())];
@@ -87,10 +96,8 @@ impl AlgodSyncBackend {
                 .iter()
                 .map(|u| (u.clone(), algod_token.to_string())),
         );
-        let catchpoint_source = RankedCatchpointSource::new(
-            &peers,
-            algo_rest_client::CatchpointDownloadConfig::default(),
-        );
+        let catchpoint_source = RankedCatchpointSource::new(&peers, download_config)
+            .with_ledger_download_retry_attempts(ledger_download_retry_attempts);
         let rt = tokio::runtime::Handle::current();
         Self {
             client,
@@ -147,9 +154,16 @@ impl AlgodSyncBackend {
         algod_token: &str,
         extra_catchpoint_peer_urls: &[String],
         p2p_transport: Option<&Arc<P2pTransport>>,
+        download_config: algo_rest_client::CatchpointDownloadConfig,
+        ledger_download_retry_attempts: usize,
     ) -> Self {
-        let backend =
-            Self::with_catchpoint_peers(algod_url, algod_token, extra_catchpoint_peer_urls);
+        let backend = Self::with_catchpoint_peers(
+            algod_url,
+            algod_token,
+            extra_catchpoint_peer_urls,
+            download_config,
+            ledger_download_retry_attempts,
+        );
         if let Some(transport) = p2p_transport {
             let http_transport: Arc<dyn HttpPeerTransport> =
                 Arc::new(P2pHttpPeerTransport::new(Arc::clone(transport)));
@@ -287,12 +301,16 @@ pub(crate) fn build_algod_sync_backend(
     algod_token: &str,
     extra_catchpoint_peer_urls: &[String],
     p2p_transport: Option<&Arc<P2pTransport>>,
+    download_config: algo_rest_client::CatchpointDownloadConfig,
+    ledger_download_retry_attempts: usize,
 ) -> impl SyncBackend {
     AlgodSyncBackend::with_catchpoint_peers_and_p2p(
         algod_url,
         algod_token,
         extra_catchpoint_peer_urls,
         p2p_transport,
+        download_config,
+        ledger_download_retry_attempts,
     )
 }
 
@@ -478,6 +496,10 @@ impl GossipSyncBackend {
     /// * `algod_token` — REST API token.
     /// * `policy` — Source selection policy (default: `GossipFirst`).
     /// * `concurrency` — Number of concurrent fetches for batch operations.
+    /// * `download_config` — go's `MaxCatchpointDownloadDuration`/
+    ///   `MinCatchpointFileDownloadBytesPerSecond` (`config.Local`, issue
+    ///   #1289), sourced from a loaded `config.json` by the caller rather
+    ///   than left at [`algo_rest_client::CatchpointDownloadConfig::default`].
     pub fn new(
         gossip: Arc<GossipBlockSource>,
         http_fetcher: HttpBlockFetcher,
@@ -485,9 +507,10 @@ impl GossipSyncBackend {
         algod_token: &str,
         policy: BlockSourcePolicy,
         concurrency: usize,
+        download_config: algo_rest_client::CatchpointDownloadConfig,
     ) -> Self {
         let rest_client = AlgodClient::new(algod_url, algod_token);
-        let downloader = CatchpointDownloader::new(algod_url, algod_token);
+        let downloader = CatchpointDownloader::with_config(algod_url, algod_token, download_config);
         let rt = tokio::runtime::Handle::current();
         Self {
             gossip,
@@ -797,6 +820,7 @@ impl SyncBackend for CatchpointBackend {
 /// logic here — `gossip` on/off, and `GossipFirst` vs. `HttpOnly` depending
 /// on whether any peers are connected — is unit-testable without a live
 /// network (issue #1247's TDD requirement).
+#[allow(clippy::too_many_arguments)]
 fn build_catchpoint_backend(
     gossip: bool,
     algod_url: &str,
@@ -805,10 +829,18 @@ fn build_catchpoint_backend(
     gossip_peers: Vec<Arc<dyn algo_network::UnicastPeer>>,
     catchpoint_peer_urls: &[String],
     concurrency: usize,
+    download_config: algo_rest_client::CatchpointDownloadConfig,
+    ledger_download_retry_attempts: usize,
 ) -> anyhow::Result<CatchpointBackend> {
     if !gossip {
         return Ok(CatchpointBackend::Rest(
-            AlgodSyncBackend::with_catchpoint_peers(algod_url, algod_token, catchpoint_peer_urls),
+            AlgodSyncBackend::with_catchpoint_peers(
+                algod_url,
+                algod_token,
+                catchpoint_peer_urls,
+                download_config,
+                ledger_download_retry_attempts,
+            ),
         ));
     }
 
@@ -838,6 +870,7 @@ fn build_catchpoint_backend(
         algod_token,
         policy,
         concurrency,
+        download_config,
     )))
 }
 
@@ -910,6 +943,45 @@ mod hex {
 }
 
 // ---------------------------------------------------------------------------
+// Production catchpoint-download config wiring (issue #1289)
+// ---------------------------------------------------------------------------
+
+/// Build the [`algo_rest_client::CatchpointDownloadConfig`] the production
+/// ranked-catchup path (`build_catchpoint_backend`/`AlgodSyncBackend`) uses,
+/// from loaded `config.json` fields — go's `MaxCatchpointDownloadDuration`/
+/// `MinCatchpointFileDownloadBytesPerSecond` (`config.Local`, issue #1289).
+///
+/// Extracted as a small pure function (rather than inlined in [`run`]) so
+/// the field mapping is unit-testable without a live node or `config.json`
+/// — mirroring the identical construction already used by the one-shot CLI
+/// `algod-rust catchpoint download` command (`commands/catchpoint.rs`,
+/// issue #749).
+fn catchpoint_download_config_from_node_config(
+    max_catchpoint_download_duration: i64,
+    min_catchpoint_file_download_bytes_per_second: u64,
+) -> algo_rest_client::CatchpointDownloadConfig {
+    algo_rest_client::CatchpointDownloadConfig {
+        timeout: std::time::Duration::from_nanos(max_catchpoint_download_duration.max(0) as u64),
+        min_bytes_per_second: min_catchpoint_file_download_bytes_per_second,
+        ..Default::default()
+    }
+}
+
+/// Clamp a loaded `config.json`'s `CatchupLedgerDownloadRetryAttempts`
+/// (`config.Local`, issue #1289) into the `usize` budget
+/// [`algo_rest_client::RankedCatchpointSource::with_ledger_download_retry_attempts`]
+/// takes. `Config.CatchupLedgerDownloadRetryAttempts` is `int` in go and
+/// always non-negative in practice; a pathological negative override
+/// clamps to `0` (no retries) rather than panicking on the `as usize` cast
+/// — mirroring `catchup_block_download_retry_attempts`'s existing clamp
+/// (issue #1287).
+fn ledger_download_retry_attempts_from_node_config(
+    catchup_ledger_download_retry_attempts: i64,
+) -> usize {
+    catchup_ledger_download_retry_attempts.max(0) as usize
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -940,6 +1012,9 @@ pub async fn run(
     genesis_id_override: Option<&str>,
     relay_addrs: &[String],
     dns_bootstrap_override: Option<&str>,
+    max_catchpoint_download_duration: i64,
+    min_catchpoint_file_download_bytes_per_second: u64,
+    catchup_ledger_download_retry_attempts: i64,
 ) -> anyhow::Result<()> {
     // Determine the catchpoint label to use.
     let label = match (catchpoint_label, catchpoint_auto) {
@@ -1030,6 +1105,19 @@ pub async fn run(
     } else {
         Vec::new()
     };
+    // go: `MaxCatchpointDownloadDuration`/`MinCatchpointFileDownloadBytesPerSecond`/
+    // `CatchupLedgerDownloadRetryAttempts` (issue #1289) — previously these
+    // three `config.json` fields never reached the production ranked-catchup
+    // path at all (`CatchpointDownloadConfig::default()`/a hardcoded
+    // retry-budget const were used unconditionally), unlike the one-shot CLI
+    // `algod-rust catchpoint download` command, which already wired the
+    // first two (issue #749).
+    let download_config = catchpoint_download_config_from_node_config(
+        max_catchpoint_download_duration,
+        min_catchpoint_file_download_bytes_per_second,
+    );
+    let ledger_download_retry_attempts =
+        ledger_download_retry_attempts_from_node_config(catchup_ledger_download_retry_attempts);
     let backend = build_catchpoint_backend(
         gossip,
         algod_url,
@@ -1038,6 +1126,8 @@ pub async fn run(
         gossip_peers,
         catchpoint_peer_urls,
         concurrency,
+        download_config,
+        ledger_download_retry_attempts,
     )?;
     let mut orchestrator = SyncOrchestrator::with_backend(config, backend);
     orchestrator.set_cancel(cancel);
@@ -1177,6 +1267,7 @@ mod tests {
             "",
             BlockSourcePolicy::GossipFirst,
             4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
         );
 
         assert!(!backend.is_noop());
@@ -1195,6 +1286,7 @@ mod tests {
             "",
             BlockSourcePolicy::GossipFirst,
             4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
         );
 
         let result = backend.fetch_blocks_batch(10, 5, 4);
@@ -1217,6 +1309,7 @@ mod tests {
             "",
             BlockSourcePolicy::GossipFirst,
             4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
         );
 
         let result = backend.fetch_block(1);
@@ -1236,6 +1329,7 @@ mod tests {
             "",
             BlockSourcePolicy::HttpOnly,
             4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
         );
 
         let result = backend.fetch_block(1);
@@ -1255,6 +1349,7 @@ mod tests {
             "",
             BlockSourcePolicy::GossipOnly,
             4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
         );
 
         let result = backend.fetch_block(1);
@@ -1277,6 +1372,7 @@ mod tests {
             "",
             BlockSourcePolicy::GossipFirst,
             4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
         );
 
         let err = backend.fetch_block(42).unwrap_err();
@@ -1302,10 +1398,57 @@ mod tests {
             "",
             BlockSourcePolicy::HttpOnly,
             4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
         );
 
         let result = backend.fetch_block_raw(1);
         assert!(result.is_err());
+    }
+
+    // -- Production catchpoint-download config wiring (issue #1289) -------
+    //
+    // Before this fix, `build_catchpoint_backend`/`AlgodSyncBackend`
+    // always used `CatchpointDownloadConfig::default()` and a hardcoded
+    // retry-budget const, regardless of `config.json`: the production
+    // ranked-catchup path (`algod-rust sync --catchpoint`/live catchup)
+    // silently ignored `MaxCatchpointDownloadDuration`/
+    // `MinCatchpointFileDownloadBytesPerSecond`/
+    // `CatchupLedgerDownloadRetryAttempts` overrides, unlike the one-shot
+    // CLI `algod-rust catchpoint download` command, which already
+    // consulted the first two (issue #749).
+
+    #[test]
+    fn catchpoint_download_config_reflects_configured_duration_and_speed() {
+        // 3 hours in nanoseconds, and a 1 MiB/s floor — distinct from both
+        // `CatchpointDownloadConfig::default()`'s values (12h / 20 KiB/s)
+        // and go's own defaults, so this pins that the *configured* value
+        // reaches the struct, not just a plausible-looking default.
+        let three_hours_ns = 3 * 60 * 60 * 1_000_000_000i64;
+        let one_mib_per_sec = 1024 * 1024u64;
+
+        let cfg = catchpoint_download_config_from_node_config(three_hours_ns, one_mib_per_sec);
+
+        assert_eq!(cfg.timeout, std::time::Duration::from_secs(3 * 60 * 60));
+        assert_eq!(cfg.min_bytes_per_second, one_mib_per_sec);
+    }
+
+    #[test]
+    fn catchpoint_download_config_clamps_negative_duration_to_zero() {
+        // `MaxCatchpointDownloadDuration` is a `time.Duration` (`int64`) in
+        // go; a pathological negative `config.json` override must clamp to
+        // a zero timeout rather than panicking on the `as u64` cast.
+        let cfg = catchpoint_download_config_from_node_config(-1, 0);
+        assert_eq!(cfg.timeout, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn ledger_download_retry_attempts_reflects_configured_value() {
+        assert_eq!(ledger_download_retry_attempts_from_node_config(7), 7);
+    }
+
+    #[test]
+    fn ledger_download_retry_attempts_clamps_negative_to_zero() {
+        assert_eq!(ledger_download_retry_attempts_from_node_config(-5), 0);
     }
 
     // -- CatchpointBackend / CLI-gossip-wiring tests (issue #1247) --------
@@ -1334,6 +1477,8 @@ mod tests {
             vec![],
             &[],
             4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
         )
         .expect("gossip backend construction should succeed with zero peers");
         assert!(
@@ -1354,6 +1499,8 @@ mod tests {
             vec![],
             &[],
             4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
         )
         .expect("REST backend construction should succeed");
         assert!(matches!(backend, CatchpointBackend::Rest(_)));
@@ -1375,6 +1522,8 @@ mod tests {
             vec![fake_unicast_peer("peer-a")],
             &[],
             4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
         )
         .expect("gossip backend construction should succeed with one peer");
         let CatchpointBackend::Gossip(gossip_backend) = backend else {
@@ -1397,6 +1546,8 @@ mod tests {
             vec![],
             &[],
             4,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
         )
         .expect("gossip backend construction should succeed with zero peers");
         let CatchpointBackend::Gossip(gossip_backend) = backend else {
@@ -1499,8 +1650,14 @@ mod tests {
 
         // Baseline: no P2P transport -> exactly the one HTTP peer
         // (`algod_url` itself) `with_catchpoint_peers` always includes.
-        let backend_no_p2p =
-            AlgodSyncBackend::with_catchpoint_peers_and_p2p("http://localhost:4001", "", &[], None);
+        let backend_no_p2p = AlgodSyncBackend::with_catchpoint_peers_and_p2p(
+            "http://localhost:4001",
+            "",
+            &[],
+            None,
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
+        );
         assert_eq!(backend_no_p2p.catchpoint_source.peer_count(), 1);
 
         // With a connected P2P transport: the HTTP peer plus every
@@ -1510,6 +1667,8 @@ mod tests {
             "",
             &[],
             Some(&dialer),
+            algo_rest_client::CatchpointDownloadConfig::default(),
+            algo_rest_client::RankedCatchpointSource::DEFAULT_LEDGER_DOWNLOAD_RETRY_ATTEMPTS,
         );
         assert_eq!(
             backend_with_p2p.catchpoint_source.peer_count(),
