@@ -233,9 +233,19 @@ fn to_candidate(addr: algo_types::Address, acct: &AccountData) -> OnlineAccountC
 
 /// go's `onlineAccounts.TopOnlineAccounts`'s `totalOnlineStake` return value:
 /// the rewards-extrapolated balance of *every* online account (not just the
-/// selected top-N), minus -- when `exclude_expired` (go's
-/// `ExcludeExpiredCirculation`, v38+) -- the stake behind participation keys
-/// that will have expired by `vote_rnd` (go's `expiredOnlineCirculation`).
+/// selected top-N), minus an exclusion for accounts whose participation key
+/// will not cover `vote_rnd`. Which exclusion algorithm applies depends on
+/// `exclude_expired` (go's `ExcludeExpiredCirculation`, v38+):
+///
+/// - `exclude_expired == true` (v38+): subtract the full rewards-extrapolated
+///   balance of every such account (go's `expiredOnlineCirculation`).
+/// - `exclude_expired == false` (pre-v38 legacy branch,
+///   `ledger/acctonline.go:972-985`): **always** subtract each such
+///   account's raw (non-extrapolated) `MicroAlgos` stake, and additionally
+///   subtract its extrapolated pending rewards too when
+///   `exclude_rewards_for_invalid` is set (go's
+///   `StateProofExcludeTotalWeightWithRewards`, v35+). Before v35 this legacy
+///   branch subtracts raw stake only, never rewards.
 ///
 /// Unlike go, which draws the total and the expired-subset from two
 /// independently-maintained figures that can disagree by a small amount
@@ -254,23 +264,37 @@ fn total_online_stake(
     rewards_level: u64,
     vote_rnd: u64,
     exclude_expired: bool,
+    exclude_rewards_for_invalid: bool,
 ) -> u64 {
     let mut total: u128 = 0;
     let mut expired: u128 = 0;
+    let mut invalid_raw_stake: u128 = 0;
+    let mut invalid_rewards: u128 = 0;
     for (_, acct) in accounts {
         let pending = compute_pending_rewards(acct, rewards_level);
         let money = acct.micro_algos as u128 + pending as u128;
         total += money;
-        if exclude_expired && acct.vote_last_valid != 0 && vote_rnd > acct.vote_last_valid {
-            expired += money;
+        let is_invalid = acct.vote_last_valid != 0 && vote_rnd > acct.vote_last_valid;
+        if is_invalid {
+            if exclude_expired {
+                expired += money;
+            } else {
+                invalid_raw_stake += acct.micro_algos as u128;
+                invalid_rewards += pending as u128;
+            }
         }
     }
     let total = total.min(u64::MAX as u128) as u64;
-    let expired = expired.min(u64::MAX as u128) as u64;
     if exclude_expired {
+        let expired = expired.min(u64::MAX as u128) as u64;
         total.saturating_sub(expired)
     } else {
-        total
+        let mut subtract = invalid_raw_stake;
+        if exclude_rewards_for_invalid {
+            subtract += invalid_rewards;
+        }
+        let subtract = subtract.min(u64::MAX as u128) as u64;
+        total.saturating_sub(subtract)
     }
 }
 
@@ -323,6 +347,7 @@ pub fn record_voters_snapshot<L: LedgerStore>(
         rewards_level,
         vote_rnd,
         params.exclude_expired_circulation,
+        params.state_proof_exclude_total_weight_with_rewards,
     );
 
     store.put_voters_snapshot(round, root, total_weight)?;
@@ -585,7 +610,10 @@ mod tests {
             (Address([2u8; 32]), online_account(3_000_000)),
             (Address([3u8; 32]), online_account(1_000_000)),
         ];
-        assert_eq!(total_online_stake(&accounts, 0, 100, false), 9_000_000);
+        assert_eq!(
+            total_online_stake(&accounts, 0, 100, false, false),
+            9_000_000
+        );
     }
 
     #[test]
@@ -596,10 +624,71 @@ mod tests {
             (Address([1u8; 32]), online_account(5_000_000)),
             (Address([2u8; 32]), expiring),
         ];
-        // Not excluded: full total.
-        assert_eq!(total_online_stake(&accounts, 0, 100, false), 9_000_000);
-        // Excluded: the expiring account's stake is subtracted.
-        assert_eq!(total_online_stake(&accounts, 0, 100, true), 5_000_000);
+        // exclude_expired=true (v38+, ExcludeExpiredCirculation): the
+        // expiring account's full stake is subtracted.
+        assert_eq!(
+            total_online_stake(&accounts, 0, 100, true, false),
+            5_000_000
+        );
+        // exclude_expired=false (pre-v38 legacy branch): still always
+        // subtracts the invalid account's raw stake unconditionally
+        // (`ledger/acctonline.go:972-977`), independent of the rewards
+        // sub-flag, matching the v38+ result here since rewards_level is 0.
+        assert_eq!(
+            total_online_stake(&accounts, 0, 100, false, false),
+            5_000_000
+        );
+        assert_eq!(
+            total_online_stake(&accounts, 0, 100, false, true),
+            5_000_000
+        );
+    }
+
+    /// Pre-v38 legacy branch (`exclude_expired == false`): go's
+    /// `ledger/acctonline.go:972-985` always subtracts an invalidated
+    /// account's raw `MicroAlgos`, and *additionally* subtracts its
+    /// extrapolated pending rewards only when
+    /// `StateProofExcludeTotalWeightWithRewards` is set (issue #1276) --
+    /// before this fix, algod-rust performed no subtraction at all on this
+    /// branch.
+    #[test]
+    fn total_online_stake_pre_v38_legacy_branch_subtracts_raw_stake_always_rewards_when_flagged() {
+        // rewards_base=0, rewards_level=100 -> compute_pending_rewards
+        // extrapolates a positive, nonzero rewards amount on top of the raw
+        // stake for every account (see `compute_pending_rewards`/
+        // `REWARD_UNIT` below).
+        let mut expiring = online_account(4_000_000);
+        expiring.vote_last_valid = 50; // expires before vote_rnd=100
+        expiring.rewards_base = 0;
+        let mut valid = online_account(5_000_000);
+        valid.rewards_base = 0;
+        let accounts = vec![(Address([1u8; 32]), valid), (Address([2u8; 32]), expiring)];
+        let rewards_level = 100;
+        let vote_rnd = 100;
+
+        let pending_on_expiring = compute_pending_rewards(&accounts[1].1, rewards_level);
+        assert!(
+            pending_on_expiring > 0,
+            "test fixture must exercise a nonzero rewards delta"
+        );
+
+        let raw_total = 9_000_000
+            + compute_pending_rewards(&accounts[0].1, rewards_level)
+            + pending_on_expiring;
+
+        // Without the rewards flag: only the expiring account's raw
+        // 4_000_000 microAlgos is subtracted, its extrapolated rewards stay
+        // in the total.
+        assert_eq!(
+            total_online_stake(&accounts, rewards_level, vote_rnd, false, false),
+            raw_total - 4_000_000
+        );
+        // With the rewards flag: the expiring account's rewards are
+        // subtracted too.
+        assert_eq!(
+            total_online_stake(&accounts, rewards_level, vote_rnd, false, true),
+            raw_total - 4_000_000 - pending_on_expiring
+        );
     }
 
     // ── record_voters_snapshot / expected_voters_tracking round trip ────

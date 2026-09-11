@@ -578,6 +578,17 @@ pub struct ConsensusParams {
     /// `GET /v2/ledger/supply`'s `online-stake` (Go: `ExcludeExpiredCirculation`,
     /// v38+).
     pub exclude_expired_circulation: bool,
+    /// Whether the state-proof "online total weight" snapshot's legacy
+    /// (pre-`ExcludeExpiredCirculation`) path additionally subtracts
+    /// excluded/expired-by-`voteRnd` online accounts' *pending rewards*
+    /// (not just their raw stake) from the total (Go:
+    /// `StateProofExcludeTotalWeightWithRewards`, v35+;
+    /// `ledger/acctonline.go`'s `TopOnlineAccounts`). Only consulted when
+    /// `exclude_expired_circulation` is false (pre-v38), since v38+'s
+    /// `ExcludeExpiredCirculation` path uses an entirely different
+    /// (`expiredOnlineCirculation`-based) computation that ignores this
+    /// flag.
+    pub state_proof_exclude_total_weight_with_rewards: bool,
 
     // ── Protocol upgrade vote (Go: `data/bookkeeping/block.go`
     // `applyUpgradeVote`/`ProcessUpgradeParams`) ─────────────────
@@ -968,6 +979,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         // Dynamic filter
         dynamic_filter_timeout: false,
         exclude_expired_circulation: false,
+        state_proof_exclude_total_weight_with_rewards: false,
         // Protocol upgrade vote (Go base struct: config/consensus.go's
         // `initConsensusProtocols`, the values set on the v7-equivalent
         // struct literal before any version-specific overrides).
@@ -1308,8 +1320,9 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     }
 
     // ── v35 ─────────────────────────────────────────────────────
-    let v35 = v34.clone();
-    // v35 enables StateProofExcludeTotalWeightWithRewards (not modeled)
+    let mut v35 = v34.clone();
+    // Go: v35.StateProofExcludeTotalWeightWithRewards = true (config/consensus.go:1399).
+    v35.state_proof_exclude_total_weight_with_rewards = true;
     if version == CONSENSUS_V35 {
         return Some(v35);
     }
@@ -1778,6 +1791,7 @@ pub struct ConsensusParamsOverride {
     pub credential_domain_separation_enabled: bool,
     pub dynamic_filter_timeout: bool,
     pub exclude_expired_circulation: bool,
+    pub state_proof_exclude_total_weight_with_rewards: bool,
     /// `nil`/absent means "delete this version" per
     /// [`merge_consensus_protocols`]; `{}` means "replace this version, no
     /// outbound upgrade proposal of its own" — the distinction is exactly
@@ -1975,6 +1989,8 @@ impl ConsensusParamsOverride {
             credential_domain_separation_enabled: self.credential_domain_separation_enabled,
             dynamic_filter_timeout: self.dynamic_filter_timeout,
             exclude_expired_circulation: self.exclude_expired_circulation,
+            state_proof_exclude_total_weight_with_rewards: self
+                .state_proof_exclude_total_weight_with_rewards,
             approved_upgrade,
             upgrade_vote_rounds: self.upgrade_vote_rounds,
             upgrade_threshold: self.upgrade_threshold,
@@ -3259,6 +3275,18 @@ mod tests {
     }
 
     #[test]
+    fn state_proof_exclude_total_weight_with_rewards_activates_at_v35() {
+        // Go: config/consensus.go:1399 -- `v35.StateProofExcludeTotalWeightWithRewards = true`
+        // (issue #1276).
+        let v34 = consensus_params_for_version(CONSENSUS_V34).unwrap();
+        assert!(!v34.state_proof_exclude_total_weight_with_rewards);
+        let v35 = consensus_params_for_version(CONSENSUS_V35).unwrap();
+        assert!(v35.state_proof_exclude_total_weight_with_rewards);
+        let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
+        assert!(v42.state_proof_exclude_total_weight_with_rewards);
+    }
+
+    #[test]
     fn catchpoint_lookback_activates_at_v33_distinct_from_max_bal_lookback() {
         let v32 = consensus_params_for_version(CONSENSUS_V32).unwrap();
         assert_eq!(v32.catchpoint_lookback, 0);
@@ -3313,6 +3341,21 @@ mod tests {
 
         let v42 = consensus_params_for_version(CONSENSUS_V42).unwrap();
         assert!(v42.enable_catchpoints_with_online_accounts);
+    }
+
+    #[test]
+    fn consensus_json_override_round_trips_state_proof_exclude_total_weight_with_rewards() {
+        // Issue #1276.
+        let json = r#"{
+            "vTest1276": {
+                "StateProofExcludeTotalWeightWithRewards": true
+            }
+        }"#;
+        let overrides: ConsensusOverrides = serde_json::from_str(json).unwrap();
+        let entry = overrides.get("vTest1276").expect("entry must parse");
+        assert!(entry.state_proof_exclude_total_weight_with_rewards);
+        let params = entry.to_consensus_params();
+        assert!(params.state_proof_exclude_total_weight_with_rewards);
     }
 
     #[test]
