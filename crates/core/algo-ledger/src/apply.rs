@@ -1408,6 +1408,20 @@ fn apply_group_transactions<S: crate::store_trait::LedgerStore>(
             scratch: &scratch,
         };
         if stx.txn.txn_type == "appl" {
+            // App-call opcode budget is pooled across the whole atomic
+            // group's top-level app calls only when `EnableAppCostPooling`
+            // is set for this block's protocol version (go: v30+,
+            // `config/consensus.go`). Before that, go-algorand gives each
+            // top-level app call its own independent `MaxAppProgramCost`
+            // budget (`data/transactions/logic/eval.go`'s
+            // `remainingBudget()`, taken when `PooledApplicationBudget ==
+            // nil`) -- see issue #1254. Reset the shared budget to a fresh
+            // single-call allotment right before each top-level app call so
+            // no cost carries over between group members when pooling is
+            // disabled.
+            if !ctx.consensus.enable_app_cost_pooling {
+                *group_budget = GroupBudget::new(1);
+            }
             // Fresh per-call re-borrow via explicit `match`-bound reborrow.
             // The inner `&mut dyn EvalTracer` lives only for the duration
             // of this synchronous call; matching binds a fresh borrow with
@@ -10705,6 +10719,179 @@ mod tests {
             "a pure reconfigure is not a create/destroy transition -- no Creatables entry: {:?}",
             delta3.creatables
         );
+    }
+
+    // ── Issue #1254: EnableAppCostPooling must gate the shared app-call
+    // budget `apply_group_transactions` threads across an atomic group's
+    // top-level app calls ──
+    //
+    // Sibling of issue #1253's LogicSig-budget-pooling gap (`block.rs`).
+    // `GroupBudget::new(num_app_calls)` unconditionally pooled
+    // `APP_BUDGET_PER_CALL` (700) opcodes per top-level app call across the
+    // whole group with no consensus gate, but go-algorand only allocates
+    // `PooledApplicationBudget` when `EnableAppCostPooling` (v30+,
+    // `config/consensus.go`) is set -- before that, each top-level app call
+    // gets its own independent 700-opcode budget
+    // (`data/transactions/logic/eval.go`'s `remainingBudget()`).
+
+    /// On create (`ApplicationID == 0`), just approves cheaply -- exactly
+    /// like a real deployed app's create call, and needed so the round-1
+    /// setup below (which creates this app as its own single-member group)
+    /// doesn't itself trip the very budget limit this program exists to
+    /// probe. On every later call, runs a backward-branch loop whose total
+    /// opcode cost (`1 + 1 + 1 + 200*4 + 1 + 1 = 805`) exceeds a single app
+    /// call's own 700-opcode budget on its own, but comfortably fits within
+    /// a 2-call pooled group's 1,400-opcode budget alongside a cheap
+    /// sibling. `#pragma version 4` matches `CONSENSUS_V29`'s
+    /// `LogicSigVersion` ceiling so the same program runs unmodified at
+    /// both the pre-v30 and v30+ protocol under test.
+    fn app_cost_pooling_expensive_program() -> Vec<u8> {
+        let src = "#pragma version 4\n\
+            txn ApplicationID\n\
+            bz approve\n\
+            int 200\n\
+            loop:\n\
+            int 1\n\
+            -\n\
+            dup\n\
+            bnz loop\n\
+            pop\n\
+            approve:\n\
+            int 1\n";
+        algo_avm::assembler::assemble_string(src)
+            .expect("expensive app program must assemble")
+            .program
+    }
+
+    fn app_cost_pooling_cheap_program() -> Vec<u8> {
+        algo_avm::assembler::assemble_string("#pragma version 4\nint 1\n")
+            .expect("cheap app program must assemble")
+            .program
+    }
+
+    /// Create two standalone (ungrouped) apps -- one whose approval program
+    /// is cheap, one expensive per the helpers above -- in round 1, and
+    /// return `(state, cheap_app_id, expensive_app_id)` ready for a round-2
+    /// grouped call.
+    fn app_cost_pooling_setup(creator: Address, fee_sink: Address) -> (LedgerState, u64, u64) {
+        let mut state = make_state_with_accounts(&[(creator, 20_000_000), (fee_sink, 0)], fee_sink);
+
+        let clear = algo_avm::assembler::assemble_string("#pragma version 4\nint 1\n")
+            .expect("clear program must assemble")
+            .program;
+
+        let mut create_cheap = SignedTransaction::default();
+        create_cheap.txn.txn_type = "appl".into();
+        create_cheap.txn.sender = creator;
+        create_cheap.txn.fee = 1_000;
+        create_cheap.txn.approval_program =
+            Some(serde_bytes::ByteBuf::from(app_cost_pooling_cheap_program()));
+        create_cheap.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear.clone()));
+
+        let mut create_expensive = SignedTransaction::default();
+        create_expensive.txn.txn_type = "appl".into();
+        create_expensive.txn.sender = creator;
+        create_expensive.txn.fee = 1_000;
+        create_expensive.txn.approval_program = Some(serde_bytes::ByteBuf::from(
+            app_cost_pooling_expensive_program(),
+        ));
+        create_expensive.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create_cheap, create_expensive],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let mut ids: Vec<u64> = delta1.creatables.keys().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(ids.len(), 2, "expected exactly two created apps");
+        (state, ids[0], ids[1])
+    }
+
+    /// Build a round-2 atomic group calling the cheap app then the
+    /// expensive app (same order the pool is consumed in), sharing a
+    /// nonzero group hash so `detect_transaction_groups` treats them as one
+    /// atomic group.
+    fn app_cost_pooling_call_block(
+        creator: Address,
+        fee_sink: Address,
+        cheap_app_id: u64,
+        expensive_app_id: u64,
+        current_protocol: &str,
+    ) -> Block {
+        let group_hash = [0x55u8; 32];
+        let mut call_cheap = SignedTransaction::default();
+        call_cheap.txn.txn_type = "appl".into();
+        call_cheap.txn.sender = creator;
+        call_cheap.txn.fee = 1_000;
+        call_cheap.txn.application_id = cheap_app_id;
+        call_cheap.txn.group = group_hash;
+
+        let mut call_expensive = SignedTransaction::default();
+        call_expensive.txn.txn_type = "appl".into();
+        call_expensive.txn.sender = creator;
+        call_expensive.txn.fee = 1_000;
+        call_expensive.txn.application_id = expensive_app_id;
+        call_expensive.txn.group = group_hash;
+
+        Block {
+            round: Round(2),
+            fee_sink,
+            current_protocol: current_protocol.to_string(),
+            payset: vec![call_cheap, call_expensive],
+            ..Block::default()
+        }
+    }
+
+    #[test]
+    fn issue_1254_app_cost_pooling_disabled_rejects_expensive_sibling() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let (mut state, cheap_id, expensive_id) = app_cost_pooling_setup(creator, fee_sink);
+
+        // Pre-v30 protocol: pooling disabled, so the expensive app call
+        // can't borrow the cheap sibling's unused budget and fails its own
+        // independent 700-opcode budget (needs 803).
+        let block2 = app_cost_pooling_call_block(
+            creator,
+            fee_sink,
+            cheap_id,
+            expensive_id,
+            algo_types::consensus::CONSENSUS_V29,
+        );
+        let result = apply_block_with_mode(&mut state, &block2, ApplyMode::Execute);
+        let err = result.expect_err(
+            "expensive app call must fail its own independent 700-opcode budget pre-v30",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("budget"),
+            "expected a budget-exhaustion error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn issue_1254_app_cost_pooling_enabled_lets_expensive_sibling_borrow() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let (mut state, cheap_id, expensive_id) = app_cost_pooling_setup(creator, fee_sink);
+
+        // v30+ protocol: pooling enabled, so the group's combined
+        // 1,400-opcode pool easily covers the expensive sibling (803) after
+        // the cheap sibling's negligible consumption.
+        let block2 = app_cost_pooling_call_block(
+            creator,
+            fee_sink,
+            cheap_id,
+            expensive_id,
+            algo_types::consensus::CONSENSUS_V41,
+        );
+        apply_block_with_mode(&mut state, &block2, ApplyMode::Execute).unwrap_or_else(|e| {
+            panic!("pooled group budget should cover the expensive app call, got: {e}")
+        });
     }
 
     // ---- Issue #723: considerBudgetProgramWrites (oversized app-program

@@ -652,9 +652,26 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             .iter()
             .filter(|stx| stx.txn.txn_type == "appl")
             .count();
-        let mut group_budget = GroupBudget::new(num_app_calls);
-        // Apply extra opcode budget from the simulation request.
-        if request.extra_opcode_budget != 0 {
+        // App-call opcode budget is pooled across the whole atomic group's
+        // top-level app calls only when `EnableAppCostPooling` is set for
+        // the active consensus version (go: v30+, `config/consensus.go`).
+        // Before that, `NewAppEvalParams` never allocates
+        // `PooledApplicationBudget` at all (it stays nil), so each
+        // top-level app call gets its own independent `MaxAppProgramCost`
+        // budget (`remainingBudget()`) and the simulate-only
+        // `ExtraOpcodeBudget` override is never applied either --
+        // go-algorand's `evalTracer.BeforeTxnGroup` (`ledger/simulation/
+        // tracer.go`) only adds it under `if ep.PooledApplicationBudget !=
+        // nil`. See issue #1254. When pooling is enabled, seed the group
+        // budget from every top-level app call up front as before, and add
+        // any requested extra budget once for the whole group. When
+        // disabled, the per-call reset below (mirroring the real apply
+        // path's `apply_group_transactions`) gives each app call a fresh
+        // single-call budget; `extra_opcode_budget` is simply not applied,
+        // matching go's nil-pool behavior.
+        let pooled = apply_ctx.consensus.enable_app_cost_pooling;
+        let mut group_budget = GroupBudget::new(if pooled { num_app_calls } else { 1 });
+        if pooled && request.extra_opcode_budget != 0 {
             group_budget.add(request.extra_opcode_budget);
         }
         // Group-scoped box I/O budget state (issue #727): mirrors
@@ -682,6 +699,15 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 break;
             }
             apply_ctx.txn_index.set(i);
+
+            // Non-pooled protocol versions (pre-v30): each top-level app
+            // call gets a fresh, independent budget -- nothing carries over
+            // from a prior group member (see the budget construction
+            // above). Reset right before dispatch so a non-appl txn between
+            // two app calls doesn't matter either way.
+            if !pooled && eval_group[i].txn.txn_type == "appl" {
+                group_budget = GroupBudget::new(1);
+            }
 
             // Create a per-transaction tracer to capture execution details.
             // Seed it with apps created by earlier transactions in the group so
@@ -859,10 +885,20 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // submitted anywhere in the group, matching go-algorand's
         // `BeforeTxnGroup` (`tracer.go:156`, `AppBudgetAdded += MaxAppProgramCost`
         // whenever `ep.GetCaller() != nil`) — issue #215.
+        // go-algorand only ever populates `AppBudgetAdded` from
+        // `ep.PooledApplicationBudget` (`tracer.go`'s `BeforeTxnGroup`),
+        // which `NewAppEvalParams` never allocates when
+        // `EnableAppCostPooling` is off -- so the field (and any inner-txn-
+        // group/extra-budget contribution to it) stays 0 pre-v30, not a
+        // per-call figure. See issue #1254.
         let max_app_program_cost = apply_ctx.consensus.max_app_program_cost as i64;
-        let total_budget = (num_app_calls as i64) * max_app_program_cost
-            + (inner_txn_groups as i64) * max_app_program_cost
-            + request.extra_opcode_budget;
+        let total_budget = if pooled {
+            (num_app_calls as i64) * max_app_program_cost
+                + (inner_txn_groups as i64) * max_app_program_cost
+                + request.extra_opcode_budget
+        } else {
+            0
+        };
         group_result.app_budget_added = total_budget.max(0) as u64;
         group_result.app_budget_consumed = group_result
             .txn_results
