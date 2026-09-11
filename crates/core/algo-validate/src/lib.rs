@@ -51,8 +51,8 @@ pub use rules::{
 pub use signature::{
     hash_program, logic_sig_group_size_check, logicsig_sanity_check, validate_pqsig_envelope,
     validate_pqsig_scheme, verify_auth_addr_sender_diff, verify_group_logicsig_size,
-    verify_heartbeat_proof, verify_single_sig, verify_transaction_signature,
-    verify_transaction_signature_with_tracer,
+    verify_heartbeat_proof, verify_rekeying_supported, verify_single_sig,
+    verify_transaction_signature, verify_transaction_signature_with_tracer,
 };
 pub use verified_txn_cache::{
     verify_transaction_group_cached, GroupContext, VerificationContext, VerifiedTransactionCache,
