@@ -210,6 +210,38 @@ func mkVector(name, desc, source string, version uint64, args [][]byte) Vector {
 	}
 }
 
+// mkVectorRawAppend assembles `source`, then appends `rawOpcode` directly to
+// the compiled program bytes (bypassing the assembler's own static type
+// tracker for the appended opcode), evaluates the result, and returns a
+// fully populated Vector. This mirrors go-algorand's own technique for
+// reaching the *runtime* type gate in `data/transactions/logic/eval_test.go`
+// (e.g. `TestWrongStackTypeRuntime`/`TestWrongStackTypeRuntime2`, which do
+// `ops.Program = append(ops.Program, 0x08)` after assembling a prefix) --
+// used where the mismatch the vector exercises is one the assembler's static
+// type tracker would itself refuse to assemble as source, so it can only be
+// reached by a raw/malicious on-chain program.
+func mkVectorRawAppend(name, desc, source string, version uint64, rawOpcode byte, args [][]byte) Vector {
+	program := append(assemble(source, version), rawOpcode)
+	pass, errStr, stack := evalSig(program, args)
+	argsHex := make([]string, len(args))
+	for i, a := range args {
+		argsHex[i] = hex.EncodeToString(a)
+	}
+	return Vector{
+		Name:         name,
+		Description:  desc,
+		Proto:        string(protoVersion),
+		ProgramHex:   hex.EncodeToString(program),
+		ArgsHex:      argsHex,
+		Pass:         pass,
+		Error:        errStr,
+		FinalStack:   stack,
+		// The appended raw opcode always errors here (a runtime type-gate
+		// rejection), so there is no successful final stack to compare.
+		CompareStack: false,
+	}
+}
+
 // sourceEndsWithReturn reports whether the final opcode token of a TEAL source
 // is `return` (0x43). Tokens are separated by `;` and newlines.
 func sourceEndsWithReturn(source string) bool {
@@ -514,6 +546,23 @@ func generate() []Vector {
 		"flow/return_zero_rejects",
 		"int 0; return -> pass=false (no error)",
 		"int 0; return", 7,
+		nil,
+	))
+
+	// =======================================================================
+	// Regression (issue #1255): a bytes-typed stack value -- even a non-nil,
+	// zero-length one -- in a uint64 arg position must be rejected by the
+	// runtime type gate (`avmType()`/`opCompat()` in
+	// data/transactions/logic/eval.go), exactly like a non-empty bytes value.
+	// The assembler's own static type tracker would refuse to assemble `byte
+	// ""; int 1; +` as source, so the mismatching `+` opcode is appended raw
+	// post-assembly -- the same technique go-algorand's own
+	// TestWrongStackTypeRuntime2 uses to reach this runtime-only path.
+	// =======================================================================
+	out = append(out, mkVectorRawAppend(
+		"arith/plus_rejects_empty_bytes_arg",
+		"byte \"\"; int 1; <raw 0x08 (+)> -> runtime type-gate error, not coercion to 0",
+		"byte \"\"; int 1", 7, 0x08,
 		nil,
 	))
 

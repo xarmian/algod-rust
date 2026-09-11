@@ -61,9 +61,12 @@ fn scratch_write_slot(instr: &Instruction, stack: &[AvmValue]) -> Option<usize> 
             let idx_val = stack.len().checked_sub(2).map(|i| &stack[i])?;
             match idx_val {
                 AvmValue::Uint64(n) => Some(*n as usize),
-                // Mirrors `AvmMachine::pop_uint`'s coercion: empty bytes read
-                // as 0, non-empty bytes are invalid (dispatch will error).
-                AvmValue::Bytes(b) if b.is_empty() => Some(0),
+                // Mirrors `AvmMachine::pop_uint`: any bytes value (empty or
+                // not) is not a valid slot index, so `op_stores`'s own
+                // `pop_uint()` call will reject it and dispatch will error --
+                // this speculative guess is only ever consulted on the `Ok`
+                // path (see the `step_with_tracer` call site below), so
+                // `None` here is simply discarded on that error path.
                 AvmValue::Bytes(_) => None,
             }
         }
@@ -496,9 +499,18 @@ impl AvmMachine {
     pub fn pop_uint(&mut self) -> Result<u64, AlgoError> {
         match self.pop()? {
             AvmValue::Uint64(v) => Ok(v),
-            AvmValue::Bytes(b) if b.is_empty() => Ok(0),
+            // go-algorand's runtime type gate (`avmType()`/`opCompat()` in
+            // `data/transactions/logic/eval.go`) rejects ANY bytes-typed
+            // stack value in a uint64 arg position -- `avmType()` returns
+            // `avmBytes` whenever `sv.Bytes != nil`, with no special case
+            // for a zero-length slice. A prior version of this code
+            // coerced empty bytes to `0`, which diverges from go and is a
+            // consensus-validation risk (see issue #1255): on-chain
+            // programs are raw bytecode, so a crafted program can push a
+            // non-nil, zero-length bytes value where the assembler's own
+            // static type tracker would never allow it.
             AvmValue::Bytes(_) => Err(AlgoError::Avm {
-                message: "expected uint64 on stack, got non-empty bytes".to_string(),
+                message: "expected uint64 on stack, got bytes".to_string(),
             }),
         }
     }
@@ -705,14 +717,18 @@ mod tests {
     }
 
     #[test]
-    fn test_pop_empty_bytes_as_uint() {
+    fn test_pop_empty_bytes_as_uint_rejected() {
+        // go-algorand's `avmType()`/`opCompat()` reject ANY bytes-typed
+        // stack value -- including a non-nil, zero-length slice -- in a
+        // uint64 arg position (issue #1255). algod-rust must match that
+        // unconditional rejection, not coerce empty bytes to 0.
         let program = Program {
             version: 1,
             instructions: vec![],
         };
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
         m.push(AvmValue::Bytes(vec![])).unwrap();
-        assert_eq!(m.pop_uint().unwrap(), 0);
+        assert!(m.pop_uint().is_err());
     }
 
     #[test]
