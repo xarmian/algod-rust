@@ -347,7 +347,19 @@ pub fn validate_block_with_cache(
     };
 
     for group in &groups {
-        let mut lsig_budget = GroupBudget::for_logicsig(group.len());
+        // LogicSig opcode budget is pooled across the whole atomic group
+        // only when `EnableLogicSigCostPooling` is set for this block's
+        // protocol version (go: v39+, `config/consensus.go`). Before that,
+        // go-algorand gives each LogicSig its own independent
+        // `LogicSigMaxCost` budget (`data/transactions/logic/eval.go`'s
+        // `remainingBudget()`, taken when `PooledLogicSigBudget == nil`) --
+        // see issue #1253. The budget is reset per transaction below when
+        // pooling is disabled so no cost carries over between members.
+        let mut lsig_budget = GroupBudget::for_logicsig(if params.enable_logicsig_cost_pooling {
+            group.len()
+        } else {
+            1
+        });
 
         // Build the group slice of SignedTransactions for LogicSig context.
         // LogicSig programs use `gtxn`, `global GroupSize`, and `txn GroupIndex`
@@ -380,6 +392,12 @@ pub fn validate_block_with_cache(
         let mut group_sig_ok = true;
 
         for (intra_group_idx, &(idx, stx)) in group.iter().enumerate() {
+            // Non-pooled protocol versions (pre-v39): each transaction gets
+            // a fresh, independent LogicSig budget -- nothing carries over
+            // from a prior group member (see the budget construction above).
+            if !params.enable_logicsig_cost_pooling {
+                lsig_budget = GroupBudget::for_logicsig(1);
+            }
             // State proof transactions (`stpf`) are special protocol-level
             // transactions injected by consensus. They legitimately have fee=0
             // and carry no standard ed25519/multisig/logicsig signature. Skip
@@ -1744,5 +1762,101 @@ mod tests {
         let result = contents_match_header(&block, None);
         assert!(result.is_err(), "unknown protocol should return Err");
         assert!(result.unwrap_err().contains("unsupported"));
+    }
+
+    // ── Issue #1253: EnableLogicSigCostPooling must gate the per-group
+    // LogicSig budget block validation constructs ──
+    //
+    // Same underlying gap as `verified_txn_cache.rs`'s
+    // `logicsig_cost_pooling_*` tests, exercised here through the actual
+    // `validate_block` entry point rather than the pool-admission one, since
+    // `block.rs` builds its own, separate `GroupBudget` (both were
+    // unconditionally pooling before the fix).
+
+    /// A backward-branch loop whose total opcode cost (`1 + 5000*4 + 1 + 1
+    /// = 20003`) lands just over `LOGICSIG_BUDGET` (20,000) on its own --
+    /// see the identical helper/derivation in `verified_txn_cache.rs`'s
+    /// tests.
+    fn block_expensive_lsig_program() -> Vec<u8> {
+        let src = "#pragma version 4\nint 5000\nloop:\nint 1\n-\ndup\nbnz loop\npop\nint 1\n";
+        algo_avm::assemble_string(src)
+            .expect("expensive lsig program must assemble")
+            .program
+    }
+
+    fn block_cheap_lsig_program() -> Vec<u8> {
+        algo_avm::assemble_string("#pragma version 4\nint 1\n")
+            .expect("cheap lsig program must assemble")
+            .program
+    }
+
+    /// Build a 2-member atomic group of contract-account LogicSig
+    /// transactions (escrow dispatch: authorizer == HashProgram(program),
+    /// no delegated signature needed), one cheap and one expensive.
+    fn lsig_group_block(current_protocol: &str) -> Block {
+        let group_hash = [0x77u8; 32];
+        let mk = |program: &[u8], receiver_tag: u8| SignedTransaction {
+            txn: Transaction {
+                txn_type: "pay".into(),
+                sender: crate::signature::hash_program(program),
+                fee: 1000,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                receiver: Address([receiver_tag; 32]),
+                amount: 0,
+                group: group_hash,
+                genesis_id: "test-v1".into(),
+                genesis_hash: test_genesis_hash(),
+                ..Default::default()
+            },
+            lsig: Some(algo_types::LogicSig {
+                logic: serde_bytes::ByteBuf::from(program.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut block = empty_block();
+        block.current_protocol = current_protocol.to_string();
+        block.payset = vec![
+            mk(&block_cheap_lsig_program(), 0x42),
+            mk(&block_expensive_lsig_program(), 0x43),
+        ];
+        block.txn_commitment = compute_payset_merkle_root(&block);
+        block
+    }
+
+    fn block_has_budget_sig_error(result: &BlockValidationResult) -> bool {
+        result.errors.iter().any(|e| {
+            matches!(e, BlockValidationError::SignatureVerificationFailed { error, .. }
+                if error.contains("budget"))
+        })
+    }
+
+    #[test]
+    fn block_logicsig_cost_pooling_disabled_rejects_expensive_sibling() {
+        // Pre-v39 protocol: pooling disabled, so the expensive LogicSig
+        // can't borrow the cheap sibling's unused budget and fails its own
+        // independent 20,000-opcode budget.
+        let block = lsig_group_block(algo_types::consensus::CONSENSUS_V38);
+        let result = validate_block(&block, None, "test-v1", &test_genesis_hash(), None);
+        assert!(
+            block_has_budget_sig_error(&result),
+            "expected a budget-exhaustion SignatureVerificationFailed, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn block_logicsig_cost_pooling_enabled_lets_expensive_sibling_borrow() {
+        // v39+ protocol: pooling enabled, so the group's combined
+        // 40,000-opcode pool easily covers the expensive sibling.
+        let block = lsig_group_block(algo_types::consensus::CONSENSUS_V39);
+        let result = validate_block(&block, None, "test-v1", &test_genesis_hash(), None);
+        assert!(
+            !block_has_budget_sig_error(&result),
+            "pooled group budget should cover the expensive LogicSig, got: {:?}",
+            result.errors
+        );
     }
 }
