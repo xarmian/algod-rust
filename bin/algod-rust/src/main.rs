@@ -180,6 +180,10 @@ async fn main() -> anyhow::Result<()> {
                     end,
                     node_config.accounts_rebuild_synchronous_mode,
                     &catchpoint_peer_url,
+                    gossip,
+                    genesis_id.as_deref(),
+                    &relay_addr,
+                    dns_bootstrap.as_deref(),
                 )
                 .await?;
             } else {
