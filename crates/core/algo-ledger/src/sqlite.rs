@@ -2222,6 +2222,20 @@ pub struct SqliteLedger {
     /// holds a read-only snapshot connection and cannot write it directly.
     catchpoint_worker: Option<std::thread::JoinHandle<Option<String>>>,
 
+    /// Issue #1285: mirrors go's `catchpointTracker.reenableCatchpointsRound`
+    /// one-time latch (`ledger/catchpointtracker.go`'s `newBlock`). `0`
+    /// means unset. Set exactly once, on the first committed block whose
+    /// consensus params have `enable_catchpoints_with_sp_contexts == true`,
+    /// to `that block's round + catchpoint_lookback` (falling back to
+    /// `max_bal_lookback` when `catchpoint_lookback == 0`, matching
+    /// `StoreBalancesRound`) — never updated again afterwards. Consulted by
+    /// [`Self::maybe_spawn_automatic_catchpoint`] to suppress catchpoint
+    /// export for `catchpoint_lookback` rounds after the SP-contexts
+    /// feature first activates on this chain's history (distinct from, and
+    /// in addition to, the fixed genesis-relative `round <=
+    /// catchpoint_lookback` underflow guard already there).
+    reenable_catchpoints_round: u64,
+
     /// Periodic "AccountUpdates telemetry event" config (issue #1187), set
     /// via [`Self::configure_account_updates_stats`]. `None` (the default)
     /// disables the feature entirely — matching go's
@@ -2662,6 +2676,7 @@ impl SqliteLedger {
             pending_online_touched: std::collections::HashSet::new(),
             catchpoint_auto: None,
             catchpoint_worker: None,
+            reenable_catchpoints_round: 0,
             acctupdates_stats: None,
             acctupdates_stats_gate: crate::acctupdates_stats::AccountUpdatesStatsGate::default(),
         })
@@ -3698,6 +3713,12 @@ impl SqliteLedger {
             crate::acctupdates_stats::log_event(&acctupdates_sample);
         }
 
+        // Issue #1285: mirror go's `catchpointTracker.newBlock`, which
+        // latches `reenableCatchpointsRound` on *every* committed block
+        // regardless of whether interval-based catchpoint generation is
+        // even configured — not just when about to attempt an export.
+        self.update_reenable_catchpoints_round();
+
         // Issue #770: automatic interval-driven catchpoint generation.
         // Fire-and-forget on a background OS thread — deliberately placed
         // after COMMIT (and after `in_block` is cleared) so this never
@@ -3896,6 +3917,41 @@ impl SqliteLedger {
         Ok(algo_codec::compute_block_header_digest(&header).0)
     }
 
+    /// Issue #1285: mirror go's `catchpointTracker.newBlock`
+    /// (`ledger/catchpointtracker.go`) — latch
+    /// [`Self::reenable_catchpoints_round`] exactly once, on the first
+    /// committed block whose consensus params have
+    /// `enable_catchpoints_with_sp_contexts == true`. go also latches on
+    /// its `forceCatchpointFileWriting` test-only override, which
+    /// algod-rust has no equivalent of and so does not model here.
+    ///
+    /// Deliberately called unconditionally from `commit_block` (not only
+    /// when [`Self::catchpoint_auto`] is configured), matching go: the
+    /// tracker always observes every block, independent of whether
+    /// `CatchpointInterval` is even nonzero — only *consulting* the latch
+    /// is gated on catchpoint generation being configured
+    /// ([`Self::maybe_spawn_automatic_catchpoint`]).
+    fn update_reenable_catchpoints_round(&mut self) {
+        if self.reenable_catchpoints_round != 0 {
+            return;
+        }
+        let Some(p) = algo_types::consensus_params_for_version(&self.protocol) else {
+            return;
+        };
+        if !p.enable_catchpoints_with_sp_contexts {
+            return;
+        }
+        // go: `StoreBalancesRound` falls back to `MaxBalLookback` when
+        // `CatchpointLookback` is unset — same fallback used by
+        // `maybe_spawn_automatic_catchpoint` just below.
+        let lookback = if p.catchpoint_lookback != 0 {
+            p.catchpoint_lookback
+        } else {
+            p.max_bal_lookback
+        };
+        self.reenable_catchpoints_round = self.current_round.0 + lookback;
+    }
+
     /// Check whether this just-committed round is a catchpoint round
     /// (`round % interval == 0`) under the configured
     /// [`crate::catchpoint::AutoCatchpointConfig`], and if so spawn a
@@ -3999,6 +4055,22 @@ impl SqliteLedger {
                 catchpoint_lookback,
                 "automatic catchpoint: round is within CatchpointLookback of genesis \
                  (balances_round would underflow); skipping export"
+            );
+            return;
+        }
+        // Issue #1285: go's `reenableCatchpointsRound` latch suppresses
+        // catchpoint generation for `catchpoint_lookback` rounds starting
+        // from the round where `enable_catchpoints_with_sp_contexts` first
+        // activated on *this* chain's history — distinct from (and, for a
+        // chain that upgraded mid-history, far later than) the fixed
+        // genesis-relative guard just above. See
+        // `Self::update_reenable_catchpoints_round`.
+        if self.reenable_catchpoints_round != 0 && round < self.reenable_catchpoints_round {
+            tracing::debug!(
+                round,
+                reenable_catchpoints_round = self.reenable_catchpoints_round,
+                "automatic catchpoint: still within the post-upgrade reenableCatchpointsRound \
+                 window; skipping export"
             );
             return;
         }
