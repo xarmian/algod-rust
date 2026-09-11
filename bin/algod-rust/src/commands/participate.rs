@@ -4466,6 +4466,10 @@ pub async fn run(
     // their own handler instance -- see the `TxTagHandler::new(...)` call
     // sites below), mirroring go's single node-wide `TxHandler` counter.
     let tx_pool_remember_counter = Arc::new(algo_network::TxPoolRememberCounter::new());
+    // Issue #1251: inbound-gossip tx-handler per-tag `pool.test()`
+    // (`checkAlreadyCommitted`-equivalent) rejection counters, shared the
+    // same way as `tx_pool_remember_counter` above.
+    let tx_pool_check_counter = Arc::new(algo_network::TxPoolCheckCounter::new());
     // StreamToBatch-equivalent async worker pool (issue #1017) wired into
     // the live gossip tx-admission path (issue #1043): every inbound TX-tag
     // group is routed through this shared pool for signature verification
@@ -4646,6 +4650,7 @@ pub async fn run(
         algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
             .with_batch_verifier(batch_verifier.clone())
             .with_remember_counter(tx_pool_remember_counter.clone())
+            .with_check_counter(tx_pool_check_counter.clone())
             // Phase 17 network-parity deep pass (`TestLineNetwork` row,
             // `docs/phase17/parity_network.md`): relay an inbound gossip
             // group to this node's *other* WS-gossip peers (excluding the
@@ -4871,6 +4876,7 @@ pub async fn run(
             algo_network::TxTagHandler::new(pool.clone(), tx_seen_cache.clone())
                 .with_batch_verifier(batch_verifier.clone())
                 .with_remember_counter(tx_pool_remember_counter.clone())
+                .with_check_counter(tx_pool_check_counter.clone())
                 // Same relay wiring as the WS-gossip handler above, over
                 // the P2P transport's own `GossipNode` impl (which fans a
                 // relayed `TX` message out over gossipsub, go's real P2P
@@ -5139,6 +5145,8 @@ pub async fn run(
             // participation metrics above.
             .with_agreement_message_counters(agreement_message_counters.clone())
             .with_tx_pool_remember_counter(tx_pool_remember_counter.clone())
+            // Issue #1251: inbound-gossip pool.test() rejection counters.
+            .with_tx_pool_check_counter(tx_pool_check_counter.clone())
             // `GET /v2/node/peers` (issue #673): the WS gossip network is
             // always constructed (even in P2P-only mode it just reports no
             // connections — the "no leak" guarantee above), so it's always
