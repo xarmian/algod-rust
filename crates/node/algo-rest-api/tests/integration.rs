@@ -7374,6 +7374,95 @@ async fn simulate_returns_response() {
     assert_eq!(json["txn-groups"].as_array().unwrap().len(), 1);
 }
 
+/// Port of `node/follower_node_test.go`'s `TestSimulate`: unlike
+/// `raw_transaction`/`raw_transaction_async`/the participation-key
+/// handlers (see `raw_transaction_rejected_in_follower_mode` and its
+/// siblings below), `/v2/transactions/simulate` is deliberately NOT
+/// follower-mode-gated -- go's own `TestErrors`/`TestSimulate` in
+/// `follower_node_test.go` show a follower's `Simulate` call succeeding
+/// same as a full node's. This was previously only exercised by generic,
+/// non-follower simulate coverage (`simulate_returns_response` above); this
+/// pins the follower-mode-specific case directly, proving the REST handler
+/// never even looks at `NodeInterface::is_follower_mode()` for this route.
+#[tokio::test]
+async fn simulate_succeeds_in_follower_mode() {
+    use algo_rest_api::models::{
+        PreEncodedTxInfo, SimulateResponse, SimulateTransactionGroupResult,
+        SimulateTransactionResult,
+    };
+
+    let mut node = MockNode::synced();
+    node.is_follower_mode = true;
+    node.simulate_result = Some(SimulateResponse {
+        version: 2,
+        last_round: 1000,
+        txn_groups: vec![SimulateTransactionGroupResult {
+            txn_results: vec![SimulateTransactionResult {
+                txn_result: PreEncodedTxInfo {
+                    txn: SignedTransaction::default(),
+                    pool_error: String::new(),
+                    confirmed_round: None,
+                    closing_amount: None,
+                    asset_closing_amount: None,
+                    sender_rewards: None,
+                    receiver_rewards: None,
+                    close_rewards: None,
+                    asset_index: None,
+                    application_index: None,
+                    global_state_delta: None,
+                    local_state_delta: None,
+                    logs: None,
+                    inner_txns: None,
+                },
+                app_budget_consumed: None,
+                exec_trace: None,
+                fees_paid: None,
+                fixed_signer: None,
+                logic_sig_budget_consumed: None,
+                unnamed_resources_accessed: None,
+            }],
+            app_budget_added: None,
+            app_budget_consumed: None,
+            failed_at: None,
+            failure_message: None,
+            group_usage: None,
+            group_fees_paid: None,
+            unnamed_resources_accessed: None,
+        }],
+        eval_overrides: None,
+        exec_trace_config: None,
+        initial_states: None,
+    });
+    let server = TestServer::start(node).await;
+
+    let stx_val = serde_json::to_value(SignedTransaction::default()).unwrap();
+    let request_json = serde_json::json!({
+        "txn-groups": [{
+            "txns": [stx_val]
+        }]
+    });
+    let body = serde_json::to_vec(&request_json).unwrap();
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "simulate must succeed on a follower node, unlike broadcast/participation-key routes"
+    );
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["version"], 2);
+    assert!(json["txn-groups"].is_array());
+}
+
 #[tokio::test]
 async fn simulate_format_msgpack() {
     use algo_rest_api::models::{
