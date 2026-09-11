@@ -1552,9 +1552,14 @@ static ENABLE_METRIC_REPORTING: VersionedDefault<bool> = VersionedDefault::new(&
 //   `MessageFilter` bucket construction (`message_filter.rs`), which
 //   previously hardcoded a single bucket-size constant with no
 //   bucket-count knob and no incoming/outgoing split at all.
-// - `network_protocol_version`/`disable_outgoing_connection_throttling`:
-//   round-trip only, no underlying protocol-version-override or
-//   outgoing-throttle-disable subsystem exists to gate.
+// - `network_protocol_version`: round-trip only, no underlying
+//   protocol-version-override subsystem exists to gate.
+// - `disable_outgoing_connection_throttling`: wired into
+//   `WebsocketNetwork::new`'s `throttled_outgoing_connections` seeding
+//   (issue #1316) — forces the seed to `0` (opting out of the
+//   performance-based "disconnect the worst throttled outgoing peer"
+//   mesh-maintenance behavior, issue #1105) exactly like go's `Start()`
+//   post-seed override.
 // - `dns_security_flags`: its SRV-enforcement bit is decoded by
 //   [`Local::dns_security_srv_enforced`] and wired into `participate`'s
 //   `HickorySrvResolver` construction (issue #1314) — the other three bits

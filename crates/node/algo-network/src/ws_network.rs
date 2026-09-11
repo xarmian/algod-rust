@@ -276,6 +276,21 @@ pub struct WebsocketNetworkConfig {
     /// unbounded-by-default behavior.
     pub broadcast_connections_limit: u32,
 
+    /// Disables the `gossip_fanout`/relay-mode-derived
+    /// `throttled_outgoing_connections` seed, forcing it to `0` (default:
+    /// `false`).
+    ///
+    /// Matches Go's `DisableOutgoingConnectionThrottling`: `Start()`
+    /// (`network/wsNetwork.go:711-713`) seeds the counter from
+    /// `GossipFanout`/relay-mode exactly like [`Self::gossip_fanout`]/
+    /// [`Self::relay_messages`] already drive here (issue #1105), then
+    /// unconditionally zeroes it when this flag is set — opting a node out
+    /// of the performance-based "disconnect the worst throttled outgoing
+    /// peer" mesh-maintenance behavior entirely. Issue #1316 fixed this
+    /// field being round-tripped from config.json with no consuming code
+    /// path at all.
+    pub disable_outgoing_connection_throttling: bool,
+
     /// Path to TLS certificate file.  `None` means plain HTTP/WS.
     ///
     /// Matches Go's `TLSCertFile`.
@@ -406,6 +421,7 @@ impl Default for WebsocketNetworkConfig {
             max_connections_per_ip: 8,
             connections_rate_limiting_count: 60,
             broadcast_connections_limit: UNBOUNDED_BROADCAST_CONNECTIONS_LIMIT,
+            disable_outgoing_connection_throttling: false,
             tls_cert_file: None,
             tls_key_file: None,
             block_service_mem_cap: DEFAULT_BLOCK_SERVICE_MEM_CAP,
@@ -640,11 +656,18 @@ impl WebsocketNetwork {
         // `wn.relayMessages`, computed the same way as
         // `effective_relay_messages()` below), all of it for a non-relay.
         let effective_relay_messages = config.net_address.is_some() || config.relay_messages;
-        let throttled_outgoing_connections_seed = if effective_relay_messages {
+        let mut throttled_outgoing_connections_seed = if effective_relay_messages {
             (config.gossip_fanout / 2) as i32
         } else {
             config.gossip_fanout as i32
         };
+        // Mirrors go's `Start()`: `if wn.config.DisableOutgoingConnectionThrottling
+        // { wn.throttledOutgoingConnections.Store(0) }` (`network/wsNetwork.go:711-713`),
+        // applied as a post-seed override exactly like go's own two-step
+        // structure (issue #1316).
+        if config.disable_outgoing_connection_throttling {
+            throttled_outgoing_connections_seed = 0;
+        }
         // Mirrors go's `setup()`: `if wn.relayMessages || wn.config.ForceFetchTransactions
         // { wn.wantTXGossip.Store(wantTXGossipYes) }` (`network/wsNetwork.go:601-604`).
         // A plain non-relay, non-force node starts "undecided" — its first
@@ -4683,6 +4706,54 @@ mod tests {
         // Releasing a slot that was *not* held is a no-op.
         release_throttled_slot_if_held(&counter, false);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Issue #1316: `DisableOutgoingConnectionThrottling` overrides the
+    /// `gossip_fanout`/relay-mode seed to `0` regardless of its value,
+    /// exactly like go's `Start()` (`network/wsNetwork.go:711-713`):
+    /// `if wn.config.DisableOutgoingConnectionThrottling {
+    /// wn.throttledOutgoingConnections.Store(0) }`, applied *after* the
+    /// seeding this same test area's
+    /// `throttled_outgoing_connections_seeded_from_gossip_fanout_and_relay_mode`
+    /// pins.
+    #[test]
+    fn disable_outgoing_connection_throttling_forces_seed_to_zero() {
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+
+        let non_relay = WebsocketNetwork::new(
+            WebsocketNetworkConfig {
+                gossip_fanout: 5,
+                relay_messages: false,
+                net_address: None,
+                disable_outgoing_connection_throttling: true,
+                ..Default::default()
+            },
+            Arc::clone(&phonebook),
+        );
+        assert_eq!(
+            non_relay
+                .throttled_outgoing_connections
+                .load(Ordering::SeqCst),
+            0,
+            "DisableOutgoingConnectionThrottling must force the seed to 0 even though \
+             gossip_fanout alone would seed 5"
+        );
+
+        let relay = WebsocketNetwork::new(
+            WebsocketNetworkConfig {
+                gossip_fanout: 5,
+                relay_messages: true,
+                net_address: Some("127.0.0.1:0".to_string()),
+                disable_outgoing_connection_throttling: true,
+                ..Default::default()
+            },
+            Arc::clone(&phonebook),
+        );
+        assert_eq!(
+            relay.throttled_outgoing_connections.load(Ordering::SeqCst),
+            0,
+            "DisableOutgoingConnectionThrottling must force the seed to 0 for relays too"
+        );
     }
 
     /// Issue #1105: `throttled_outgoing_connections` must be seeded from
