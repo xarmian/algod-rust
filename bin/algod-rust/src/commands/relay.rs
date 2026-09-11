@@ -676,6 +676,9 @@ pub async fn run(
         // `advertise_vote_compression`'s call sites in `ws_network.rs`,
         // same as `participate`'s `net_config` above.
         enable_vote_compression: node_config.enable_vote_compression,
+        // Issue #1316: wires go's `DisableOutgoingConnectionThrottling`
+        // through to `throttled_outgoing_connections`'s post-seed override.
+        disable_outgoing_connection_throttling: node_config.disable_outgoing_connection_throttling,
         ..Default::default()
     };
 
