@@ -53,7 +53,7 @@ use crate::rules::{
 };
 use crate::signature::{
     logic_sig_group_size_check, verify_auth_addr_sender_diff, verify_heartbeat_proof,
-    verify_transaction_signature,
+    verify_rekeying_supported, verify_transaction_signature,
 };
 use crate::verified_txn_cache::{GroupContext, VerificationContext, VerifiedTransactionCache};
 
@@ -512,6 +512,15 @@ pub fn validate_block_with_cache(
             // AuthAddr != Sender check (Go: EnforceAuthAddrSenderDiff, future only).
             if let Err(e) = verify_auth_addr_sender_diff(stx, params.enforce_auth_addr_sender_diff)
             {
+                errors.push(BlockValidationError::TransactionValidationFailed {
+                    txn_index: idx,
+                    error: e.to_string(),
+                });
+            }
+
+            // Nonempty AuthAddr rejected when rekeying is not supported
+            // (Go: verify.txnBatchPrep, `errRekeyingNotSupported`).
+            if let Err(e) = verify_rekeying_supported(stx, params.support_rekeying) {
                 errors.push(BlockValidationError::TransactionValidationFailed {
                     txn_index: idx,
                     error: e.to_string(),

@@ -372,6 +372,14 @@ pub fn validate_transaction_wellformed(
     // ── Application-call schema/size well-formedness ────────────────
     // Go: `ApplicationCallTxnFields.wellFormed` (data/transactions/application.go).
     if txn.txn_type == "appl" {
+        // Go: `transaction.go`'s `WellFormed`, `case protocol.ApplicationCallTx:
+        // if !proto.Application { return fmt.Errorf("application transaction
+        // not supported") }` (issue #1272).
+        if !params.application {
+            return Err(AlgoError::Validation {
+                message: "application transaction not supported".to_string(),
+            });
+        }
         validate_application_call_wellformed(txn, params)?;
     }
 
@@ -414,6 +422,14 @@ pub fn validate_transaction_wellformed(
 
     // ── Asset config well-formedness (Go: AssetConfigTxnFields.wellFormed, asset.go) ──
     if txn.txn_type == "acfg" {
+        // Go: `transaction.go`'s `WellFormed`, `case protocol.AssetConfigTx:
+        // if !proto.Asset { return fmt.Errorf("asset transaction not
+        // supported") }` (issue #1272).
+        if !params.asset {
+            return Err(AlgoError::Validation {
+                message: "asset transaction not supported".to_string(),
+            });
+        }
         if let Some(ap) = &txn.asset_params {
             if ap.asset_name.len() > params.max_asset_name_bytes {
                 return Err(AlgoError::Validation {
@@ -455,6 +471,13 @@ pub fn validate_transaction_wellformed(
 
     // ── Asset transfer well-formedness (Go: AssetTransferTxnFields.wellFormed, asset.go) ──
     if txn.txn_type == "axfer" {
+        // Go: `transaction.go`'s `WellFormed`, `case protocol.AssetTransferTx:
+        // if !proto.Asset { ... }` (issue #1272).
+        if !params.asset {
+            return Err(AlgoError::Validation {
+                message: "asset transaction not supported".to_string(),
+            });
+        }
         if txn.xaid == 0 && txn.asset_amount != 0 {
             return Err(AlgoError::Validation {
                 message: "asset ID cannot be zero".to_string(),
@@ -471,6 +494,13 @@ pub fn validate_transaction_wellformed(
 
     // ── Asset freeze well-formedness (Go: AssetFreezeTxnFields.wellFormed, asset.go) ──
     if txn.txn_type == "afrz" {
+        // Go: `transaction.go`'s `WellFormed`, `case protocol.AssetFreezeTx:
+        // if !proto.Asset { ... }` (issue #1272).
+        if !params.asset {
+            return Err(AlgoError::Validation {
+                message: "asset transaction not supported".to_string(),
+            });
+        }
         if txn.freeze_asset == 0 {
             return Err(AlgoError::Validation {
                 message: "asset ID cannot be zero".to_string(),
@@ -588,19 +618,61 @@ pub fn validate_transaction_wellformed(
                 });
             }
         } else {
-            let going_online = txn.vote_key_dilution != 0;
-            if !going_online && !state_proof_pk_empty {
+            // Go: `if proto.MaxKeyregValidPeriod != 0 && uint64(keyreg.VoteLast.SubSaturate(keyreg.VoteFirst)) > proto.MaxKeyregValidPeriod`
+            // (keyreg.go, `stateProofPKWellFormed`). Runs before the
+            // offline/nonparticipation StateProofPK checks below.
+            if params.max_keyreg_valid_period != 0
+                && txn.vote_last.saturating_sub(txn.vote_first) > params.max_keyreg_valid_period
+            {
                 return Err(AlgoError::Validation {
-                    message: "offline keyreg transactions should contain empty stateProofPK"
-                        .to_string(),
+                    message: "validity period for keyreg transaction is too long".to_string(),
                 });
             }
-            if txn.non_participation && !state_proof_pk_empty {
-                return Err(AlgoError::Validation {
-                    message:
-                        "non participation keyreg transactions should contain empty stateProofPK"
-                            .to_string(),
-                });
+
+            // Go: `stateProofPKWellFormed`'s remaining three branches, checked
+            // in order and mutually exclusive (each returns immediately):
+            // nonparticipation -> offline (empty VotePK/SelectionPK) ->
+            // online. Issue #1274 added the previously-missing third branch
+            // (online transactions must NOT have an empty StateProofPK).
+            if txn.non_participation {
+                if !state_proof_pk_empty {
+                    return Err(AlgoError::Validation {
+                        message:
+                            "non participation keyreg transactions should contain empty stateProofPK"
+                                .to_string(),
+                    });
+                }
+            } else {
+                let vote_pk_empty = txn
+                    .vote_pk
+                    .as_ref()
+                    .map(|k| *k == [0u8; 32])
+                    .unwrap_or(true);
+                let selection_pk_empty = txn
+                    .selection_pk
+                    .as_ref()
+                    .map(|k| *k == [0u8; 32])
+                    .unwrap_or(true);
+                if vote_pk_empty || selection_pk_empty {
+                    // Offline.
+                    if !state_proof_pk_empty {
+                        return Err(AlgoError::Validation {
+                            message:
+                                "offline keyreg transactions should contain empty stateProofPK"
+                                    .to_string(),
+                        });
+                    }
+                } else {
+                    // Online: setting online cannot set an empty stateProofPK
+                    // (Go: errKeyRegEmptyStateProofPK, issue #1274).
+                    if state_proof_pk_empty {
+                        return Err(AlgoError::Validation {
+                            message:
+                                "online keyreg transaction cannot have empty field StateProofPK"
+                                    .to_string(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -648,6 +720,96 @@ pub fn validate_transaction_wellformed(
         }
     }
 
+    // ── Cross-field type isolation (Go: transaction.go's `WellFormed`,
+    // `nonZeroFields` map) ──────────────────────────────────────────
+    // A transaction whose canonical wire encoding is a flat struct (mirroring
+    // go-algorand's for byte-level parity) could in principle carry populated
+    // fields belonging to a *different* declared type than `txn.txn_type`.
+    // Go rejects this outright; issue #1273.
+    check_txn_type_field_isolation(txn)?;
+
+    Ok(())
+}
+
+/// Reject a transaction that carries non-zero/non-empty fields belonging to
+/// a transaction type other than its own declared `txn_type`. Mirrors Go's
+/// `Transaction.WellFormed`'s `nonZeroFields` map/loop (`transaction.go`),
+/// matching its error message "transaction of type %v has non-zero fields
+/// for type %v".
+fn check_txn_type_field_isolation(txn: &Transaction) -> Result<(), AlgoError> {
+    // An unrecognized `txn_type` is not this check's concern: Go's `WellFormed`
+    // rejects it earlier via its type `switch`'s `default` case ("unknown tx
+    // type %v"), before ever reaching `nonZeroFields`. algod-rust's structural
+    // "unknown type" rejection instead lives in `checks.rs::check_txn_group`
+    // (`transaction has an unknown type`, matching go's `CheckTxnGroup`) as a
+    // group-level admission gate with different failure-propagation semantics
+    // (aborts the whole request rather than failing a single transaction) —
+    // deferring to it here avoids duplicating that rejection under this
+    // function's different (per-transaction) error path.
+    const KNOWN_TYPES: [&str; 8] = [
+        "pay", "keyreg", "acfg", "axfer", "afrz", "appl", "stpf", "hb",
+    ];
+    if !KNOWN_TYPES.contains(&txn.txn_type.as_str()) {
+        return Ok(());
+    }
+
+    let is_pay_nonzero =
+        txn.amount != 0 || !txn.receiver.is_zero() || !txn.close_remainder_to.is_zero();
+    let is_keyreg_nonzero = txn.vote_pk.is_some()
+        || txn.selection_pk.is_some()
+        || txn.state_proof_pk.is_some()
+        || txn.vote_first != 0
+        || txn.vote_last != 0
+        || txn.vote_key_dilution != 0
+        || txn.non_participation;
+    let is_acfg_nonzero = txn.config_asset != 0 || txn.asset_params.is_some();
+    let is_axfer_nonzero = txn.xaid != 0
+        || txn.asset_amount != 0
+        || txn.asset_sender.is_some()
+        || txn.asset_receiver.is_some()
+        || txn.asset_close_to.is_some();
+    let is_afrz_nonzero = txn.freeze_asset != 0 || txn.freeze_account.is_some() || txn.asset_frozen;
+    // `ApplicationCallTxnFields.Empty()` (application.go): every field at its
+    // zero value, including `access`/`reject_version` (issue #1273's scope
+    // also covers the V41+ Access-list and RejectVersion fields).
+    let is_appl_nonzero = txn.application_id != 0
+        || txn.on_completion != 0
+        || txn.approval_program.is_some()
+        || txn.clear_state_program.is_some()
+        || txn.app_arguments.is_some()
+        || txn.accounts.is_some()
+        || txn.foreign_apps.is_some()
+        || txn.foreign_assets.is_some()
+        || txn.boxes.is_some()
+        || txn.global_state_schema.is_some()
+        || txn.local_state_schema.is_some()
+        || txn.extra_program_pages != 0
+        || txn.access.is_some()
+        || txn.reject_version != 0;
+    let is_stpf_nonzero =
+        txn.state_proof_type != 0 || txn.state_proof.is_some() || txn.state_proof_message.is_some();
+    let is_hb_nonzero = txn.heartbeat.is_some();
+
+    let mismatches: [(&str, bool); 8] = [
+        ("pay", is_pay_nonzero),
+        ("keyreg", is_keyreg_nonzero),
+        ("acfg", is_acfg_nonzero),
+        ("axfer", is_axfer_nonzero),
+        ("afrz", is_afrz_nonzero),
+        ("appl", is_appl_nonzero),
+        ("stpf", is_stpf_nonzero),
+        ("hb", is_hb_nonzero),
+    ];
+    for (type_name, nonzero) in mismatches {
+        if nonzero && txn.txn_type != type_name {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "transaction of type {} has non-zero fields for type {}",
+                    txn.txn_type, type_name
+                ),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -2683,6 +2845,77 @@ mod tests {
         );
     }
 
+    // ── Cross-field type isolation (Go: `WellFormed`'s `nonZeroFields`,
+    // issue #1273) ──────────────────────────────────────────────────
+
+    /// A transaction declared `axfer` but carrying populated `acfg` fields
+    /// (`asset_params`) must be rejected.
+    #[test]
+    fn test_axfer_with_acfg_fields_rejected() {
+        let mut txn = make_valid_txn();
+        txn.txn_type = "axfer".into();
+        txn.xaid = 1;
+        txn.asset_params = Some(algo_types::AssetParams {
+            asset_name: "smuggled".to_string(),
+            ..Default::default()
+        });
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("transaction of type axfer has non-zero fields for type acfg"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A transaction declared `pay` but carrying populated `keyreg` fields
+    /// (`vote_pk`) must be rejected.
+    #[test]
+    fn test_pay_with_keyreg_fields_rejected() {
+        let mut txn = make_valid_txn();
+        txn.txn_type = "pay".into();
+        txn.vote_pk = Some([7u8; 32]);
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("transaction of type pay has non-zero fields for type keyreg"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A transaction declared `appl` but carrying a populated `heartbeat`
+    /// field must be rejected.
+    #[test]
+    fn test_appl_with_heartbeat_fields_rejected() {
+        let mut txn = make_appl_txn();
+        txn.heartbeat = Some(algo_types::HeartbeatTxnFields {
+            address: Address([1u8; 32]),
+            proof: None,
+            seed: [0u8; 32],
+            vote_id: [0u8; 32],
+            key_dilution: 1,
+            hb_challenge_discount: false,
+        });
+        let params = v42_params();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("transaction of type appl has non-zero fields for type hb"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Baseline: a well-formed transaction with no cross-type field leakage
+    /// must still be accepted (regression guard for the isolation check
+    /// itself being too strict).
+    #[test]
+    fn test_well_formed_baseline_unaffected_by_type_isolation_check() {
+        let txn = make_valid_txn();
+        let params = v42_params();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
     #[test]
     fn test_empty_version_fails() {
         let err = validate_protocol_version("").unwrap_err();
@@ -2858,6 +3091,26 @@ mod tests {
     fn set_min_programs(txn: &mut Transaction) {
         txn.approval_program = Some(ByteBuf::from(vec![6]));
         txn.clear_state_program = Some(ByteBuf::from(vec![6]));
+    }
+
+    /// Go: `transaction.go`'s `WellFormed`, `case protocol.ApplicationCallTx:
+    /// if !proto.Application { return fmt.Errorf("application transaction not
+    /// supported") }` (issue #1272). `Application` became true at consensus
+    /// v24; the v18 URL predates it (has groups/leases/assets but not apps).
+    #[test]
+    fn test_appl_rejected_pre_application_support() {
+        let params = consensus_params_for_version(
+            "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f",
+        )
+        .unwrap();
+        assert!(!params.application);
+        let txn = make_appl_txn();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("application transaction not supported"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -4040,6 +4293,21 @@ mod tests {
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
     }
 
+    /// Go: `transaction.go`'s `WellFormed`, `case protocol.AssetConfigTx: if
+    /// !proto.Asset { return fmt.Errorf("asset transaction not supported") }`
+    /// (issue #1272). `Asset` became true at consensus v18; `v7` predates it.
+    #[test]
+    fn test_acfg_rejected_pre_asset_support() {
+        let params = consensus_params_for_version("v7").unwrap();
+        assert!(!params.asset);
+        let txn = make_acfg_txn();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("asset transaction not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ── Asset transfer well-formedness (issue #812) ──────────────
 
     fn make_axfer_txn() -> Transaction {
@@ -4083,6 +4351,20 @@ mod tests {
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
     }
 
+    /// Go: `transaction.go`'s `WellFormed`, `case protocol.AssetTransferTx: if
+    /// !proto.Asset { ... }` (issue #1272).
+    #[test]
+    fn test_axfer_rejected_pre_asset_support() {
+        let params = consensus_params_for_version("v7").unwrap();
+        assert!(!params.asset);
+        let txn = make_axfer_txn();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("asset transaction not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ── Asset freeze well-formedness (issue #812) ────────────────
 
     fn make_afrz_txn() -> Transaction {
@@ -4123,6 +4405,20 @@ mod tests {
         let txn = make_afrz_txn();
         let params = v42_params();
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    /// Go: `transaction.go`'s `WellFormed`, `case protocol.AssetFreezeTx: if
+    /// !proto.Asset { ... }` (issue #1272).
+    #[test]
+    fn test_afrz_rejected_pre_asset_support() {
+        let params = consensus_params_for_version("v7").unwrap();
+        assert!(!params.asset);
+        let txn = make_afrz_txn();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("asset transaction not supported"),
+            "unexpected error: {err}"
+        );
     }
 
     // ── Keyreg well-formedness (issue #812) ───────────────────────
@@ -4231,7 +4527,11 @@ mod tests {
 
     #[test]
     fn test_keyreg_going_online_valid_ok() {
-        let txn = make_keyreg_txn();
+        let mut txn = make_keyreg_txn();
+        // A going-online keyreg must carry a non-empty StateProofPK once
+        // `enable_state_proof_keyreg_check` is active (v42_params below;
+        // issue #1274) -- Go: `errKeyRegEmptyStateProofPK`.
+        txn.state_proof_pk = Some([1u8; 64]);
         let params = v42_params();
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
     }
@@ -4334,6 +4634,25 @@ mod tests {
         assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
     }
 
+    /// Go: `keyreg.go`'s `stateProofPKWellFormed` — "online transactions:
+    /// setting online cannot set an empty stateProofPK" (`errKeyRegEmptyStateProofPK`,
+    /// issue #1274). A going-online keyreg (non-empty VotePK/SelectionPK,
+    /// non-participation false) must be rejected if it carries no
+    /// StateProofPK, once `enable_state_proof_keyreg_check` is active.
+    #[test]
+    fn test_keyreg_state_proof_pk_empty_going_online_rejected() {
+        let mut txn = make_keyreg_txn();
+        txn.state_proof_pk = None;
+        let params = v42_params();
+        assert!(params.enable_state_proof_keyreg_check);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("online keyreg transaction cannot have empty field StateProofPK"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// Parity with go-algorand's `TestKeysWithoutStateProofKeyCanRegister`
     /// (`test/e2e-go/upgrades/stateproof_participation_test.go:84`): at a
     /// pre-state-proof-mandate consensus version (`EnableStateProofKeyregCheck
@@ -4355,6 +4674,53 @@ mod tests {
             "a going-online keyreg with no state-proof key must be accepted \
              pre-mandate, matching go-algorand's TestKeysWithoutStateProofKeyCanRegister"
         );
+    }
+
+    /// Go: `keyreg.go`'s `stateProofPKWellFormed` —
+    /// `proto.MaxKeyregValidPeriod != 0 && uint64(VoteLast.SubSaturate(VoteFirst)) > proto.MaxKeyregValidPeriod`
+    /// rejects an excessively long validity window once
+    /// `EnableStateProofKeyregCheck` is active (issue #1270).
+    #[test]
+    fn test_keyreg_validity_period_too_long_rejected() {
+        let mut txn = make_keyreg_txn();
+        txn.state_proof_pk = Some([1u8; 64]);
+        txn.vote_first = 0;
+        txn.vote_last = 100;
+        let mut params = v42_params();
+        assert!(params.enable_state_proof_keyreg_check);
+        params.max_keyreg_valid_period = 99;
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("validity period for keyreg transaction is too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Companion to the rejection test above: a window within
+    /// `max_keyreg_valid_period` must still be accepted.
+    #[test]
+    fn test_keyreg_validity_period_within_bound_accepted() {
+        let mut txn = make_keyreg_txn();
+        txn.state_proof_pk = Some([1u8; 64]);
+        txn.vote_first = 0;
+        txn.vote_last = 100;
+        let mut params = v42_params();
+        params.max_keyreg_valid_period = 100;
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    /// `max_keyreg_valid_period == 0` means the bound is disabled entirely
+    /// (Go: the `!= 0` guard), matching pre-v31 consensus versions.
+    #[test]
+    fn test_keyreg_validity_period_check_disabled_when_zero() {
+        let mut txn = make_keyreg_txn();
+        txn.state_proof_pk = Some([1u8; 64]);
+        txn.vote_first = 0;
+        txn.vote_last = 1_000_000;
+        let mut params = v42_params();
+        params.max_keyreg_valid_period = 0;
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
     }
 
     // ── State proof well-formedness (issue #812) ──────────────────

@@ -1033,6 +1033,34 @@ pub fn verify_auth_addr_sender_diff(
     Ok(())
 }
 
+/// Reject a signed transaction carrying a non-zero `AuthAddr` when the
+/// consensus version does not support rekeying at all.
+///
+/// Matches Go's `verify.txnBatchPrep` (`data/transactions/verify/txn.go`):
+/// `if !groupCtx.consensusParams.SupportRekeying && !s.AuthAddr.IsZero() { ... }`
+/// (`errRekeyingNotSupported`, "nonempty AuthAddr but rekeying is not
+/// supported"). This is distinct from `Transaction.WellFormed`'s
+/// `SupportRekeying`/`RekeyTo` check (`rules.rs`): that one rejects a
+/// transaction whose *own* `RekeyTo` field is set pre-rekeying, while this
+/// one rejects a *signed* transaction whose `AuthAddr` — asserting it was
+/// authorized by a previously-rekeyed-to address — is set at all, regardless
+/// of this transaction's own `RekeyTo`. `SupportRekeying` became true at
+/// consensus v24 (go-algorand commit `90152c46a`, first released v2.0.7-stable).
+pub fn verify_rekeying_supported(
+    stx: &SignedTransaction,
+    support_rekeying: bool,
+) -> Result<(), AlgoError> {
+    if support_rekeying {
+        return Ok(());
+    }
+    if stx.auth_addr.is_some() {
+        return Err(AlgoError::Validation {
+            message: "nonempty AuthAddr but rekeying is not supported".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Verify the signature on a signed transaction, dispatching by signature type.
 ///
 /// - Single-sig (`sig` present): verifies ed25519 signature.
@@ -2805,6 +2833,80 @@ mod tests {
         };
 
         assert!(verify_auth_addr_sender_diff(&stx, true).is_ok());
+    }
+
+    // ---- Rekeying-not-supported (AuthAddr) tests (issue #1271) ----
+
+    #[test]
+    fn verify_rekeying_supported_rejects_nonempty_auth_addr_when_unsupported() {
+        let key = test_signing_key();
+        let pk = key.verifying_key();
+        let sender = Address(pk.to_bytes());
+        let txn = minimal_pay_txn(sender);
+        let sig = sign_txn(&key, &txn);
+
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            msig: None,
+            lsig: None,
+            auth_addr: Some(Address([0xFF; 32])),
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        let err = verify_rekeying_supported(&stx, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("nonempty AuthAddr but rekeying is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_rekeying_supported_accepts_nonempty_auth_addr_when_supported() {
+        let key = test_signing_key();
+        let pk = key.verifying_key();
+        let sender = Address(pk.to_bytes());
+        let txn = minimal_pay_txn(sender);
+        let sig = sign_txn(&key, &txn);
+
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            msig: None,
+            lsig: None,
+            auth_addr: Some(Address([0xFF; 32])),
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        assert!(verify_rekeying_supported(&stx, true).is_ok());
+    }
+
+    #[test]
+    fn verify_rekeying_supported_accepts_none_auth_addr_regardless() {
+        let key = test_signing_key();
+        let pk = key.verifying_key();
+        let sender = Address(pk.to_bytes());
+        let txn = minimal_pay_txn(sender);
+        let sig = sign_txn(&key, &txn);
+
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            msig: None,
+            lsig: None,
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        assert!(verify_rekeying_supported(&stx, false).is_ok());
+        assert!(verify_rekeying_supported(&stx, true).is_ok());
     }
 
     // ---- Heartbeat proof tests ----
