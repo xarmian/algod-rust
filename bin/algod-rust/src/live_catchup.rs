@@ -516,6 +516,14 @@ impl CatchupRunner for OrchestratorCatchupRunner {
             fail_fast: true,
             end_round: None,
             accounts_rebuild_synchronous_mode: 0,
+            // Live catchup has no `config.json`-carrying params struct of
+            // its own to source a real value from yet (mirrors
+            // `accounts_rebuild_synchronous_mode: 0` above) — the go
+            // default (`Config.CatchupBlockDownloadRetryAttempts`, issue
+            // #1287) is still a real bounded-retry-then-abort budget rather
+            // than the previous unbounded-retry behavior.
+            catchup_block_download_retry_attempts:
+                algo_ledger::catchpoint::DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS,
         };
 
         let mut orchestrator = SyncOrchestrator::with_backend(config, backend);

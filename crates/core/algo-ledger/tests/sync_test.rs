@@ -50,6 +50,8 @@ fn test_config() -> SyncConfig {
         fail_fast: true,
         end_round: None,
         accounts_rebuild_synchronous_mode: 1,
+        catchup_block_download_retry_attempts:
+            algo_ledger::catchpoint::DEFAULT_CATCHUP_BLOCK_DOWNLOAD_RETRY_ATTEMPTS,
     }
 }
 
@@ -597,6 +599,7 @@ fn test_sync_config_various_constructions() {
         fail_fast: false,
         end_round: None,
         accounts_rebuild_synchronous_mode: 1,
+        catchup_block_download_retry_attempts: 500,
     };
 
     assert!(config.catchpoint_label.is_none());

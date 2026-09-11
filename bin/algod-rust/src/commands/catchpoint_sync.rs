@@ -934,6 +934,7 @@ pub async fn run(
     fail_fast: bool,
     end: Option<u64>,
     accounts_rebuild_synchronous_mode: i64,
+    catchup_block_download_retry_attempts: i64,
     catchpoint_peer_urls: &[String],
     gossip: bool,
     genesis_id_override: Option<&str>,
@@ -977,6 +978,12 @@ pub async fn run(
         fail_fast,
         end_round: end,
         accounts_rebuild_synchronous_mode,
+        // `Config.CatchupBlockDownloadRetryAttempts` (issue #1287) is
+        // `int` in go and always non-negative in practice (its default and
+        // every documented value are positive); clamp a pathological
+        // negative `config.json` override to 0 (no retries) rather than
+        // panicking on the `as u64` cast.
+        catchup_block_download_retry_attempts: catchup_block_download_retry_attempts.max(0) as u64,
     };
 
     info!(
