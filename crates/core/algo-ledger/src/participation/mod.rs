@@ -468,8 +468,15 @@ pub trait KeyManager {
 
     /// Delete old key material for forward security.
     ///
-    /// Removes all records whose `lastValid < current_round`.
-    fn delete_old_keys(&self, current_round: Round) -> Result<(), rusqlite::Error>;
+    /// Removes all records whose `lastValid < current_round`. `default_key_dilution`
+    /// is used for any record whose stored `key_dilution` is `0` (matches go's
+    /// `config.ConsensusParams.DefaultKeyDilution` fallback in
+    /// `account.PersistedParticipation.DeleteOldKeys`).
+    fn delete_old_keys(
+        &self,
+        current_round: Round,
+        default_key_dilution: u64,
+    ) -> Result<(), rusqlite::Error>;
 
     /// Record that a participation action was taken for an account.
     ///
@@ -494,8 +501,12 @@ impl KeyManager for ParticipationStore {
         self.get_for_voting_round(voting_round, key_round)
     }
 
-    fn delete_old_keys(&self, current_round: Round) -> Result<(), rusqlite::Error> {
-        delete_old_key_material(self, current_round)?;
+    fn delete_old_keys(
+        &self,
+        current_round: Round,
+        default_key_dilution: u64,
+    ) -> Result<(), rusqlite::Error> {
+        delete_old_key_material(self, current_round, default_key_dilution)?;
         Ok(())
     }
 
@@ -584,6 +595,14 @@ pub fn discover_participating_accounts(
 /// Returns the total count: fully expired records removed + records that
 /// had key material trimmed.
 ///
+/// `default_key_dilution` is used for any record whose stored `key_dilution`
+/// is `0` (matches go's `account.PersistedParticipation.DeleteOldKeys`:
+/// `keyDilution := part.KeyDilution; if keyDilution == 0 { keyDilution =
+/// proto.DefaultKeyDilution }`, `data/account/participation.go`) — a stored
+/// dilution of `0` is a legitimate reachable state (e.g. an imported or
+/// never-explicitly-dilution-set record), not a programming-error condition,
+/// so it must not panic here.
+///
 /// # Crash-safety note
 ///
 /// The in-memory `delete_before` and the subsequent `update_voting_secrets`
@@ -593,6 +612,7 @@ pub fn discover_participating_accounts(
 pub fn delete_old_key_material(
     store: &ParticipationStore,
     current_round: Round,
+    default_key_dilution: u64,
 ) -> Result<usize, rusqlite::Error> {
     // Step 1: Remove fully expired records.
     let fully_expired = store.delete_expired(current_round)?;
@@ -614,6 +634,9 @@ pub fn delete_old_key_material(
                 None => continue,
             };
 
+        let key_dilution =
+            algo_agreement::effective_key_dilution(record.key_dilution, default_key_dilution);
+
         // Snapshot state before trimming.
         let old_first_batch = participation.voting.first_batch();
         let old_first_offset = participation.voting.first_offset();
@@ -621,7 +644,7 @@ pub fn delete_old_key_material(
         // Trim old key material from the voting secrets.
         participation
             .voting
-            .delete_before(current_round.0, record.key_dilution);
+            .delete_before(current_round.0, key_dilution);
 
         // Only persist if something actually changed.
         if participation.voting.first_batch() != old_first_batch
@@ -1125,7 +1148,7 @@ mod tests {
         insert_test_key(&store, 1, 10, 50);
         insert_test_key(&store, 2, 100, 200);
 
-        let deleted = delete_old_key_material(&store, Round(100)).unwrap();
+        let deleted = delete_old_key_material(&store, Round(100), 10_000).unwrap();
         // 1 fully expired (key 1, last_valid=50 < 100) + 1 trimmed (key 2,
         // forward-secure deletion within its validity window).
         assert!(
@@ -1143,9 +1166,47 @@ mod tests {
         let store = ParticipationStore::open_in_memory().unwrap();
         insert_test_key(&store, 1, 100, 200);
 
-        let deleted = delete_old_key_material(&store, Round(50)).unwrap();
+        let deleted = delete_old_key_material(&store, Round(50), 10_000).unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(store.get_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_old_key_material_zero_dilution_falls_back_to_default() {
+        // A stored `key_dilution` of 0 is a legitimate reachable state
+        // (e.g. an imported/migrated record that never had an explicit
+        // dilution set -- algod-rust's own DB-install default is 0 too,
+        // see `install.rs`'s schema-install tests), not a
+        // programming-error condition. go's
+        // `account.PersistedParticipation.DeleteOldKeys` substitutes
+        // `config.ConsensusParams.DefaultKeyDilution` in this case
+        // (`data/account/participation.go`) rather than treating 0 as a
+        // literal dilution.
+        //
+        // Before this fix, `delete_old_key_material` passed the stored 0
+        // straight through to `OneTimeSignatureSecrets::delete_before`,
+        // which asserts `key_dilution > 0` and panics. This must not panic.
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let default_key_dilution = 10_000u64;
+        let vrf = VrfKeypair::from_seed([9u8; 32]);
+        let voting = OneTimeSignatureSecrets::generate(0, 2);
+        let part = Participation {
+            parent: Address([9u8; 32]),
+            vrf,
+            voting,
+            first_valid: Round(0),
+            last_valid: Round(100),
+            key_dilution: 0,
+            state_proof_secrets: None,
+        };
+        let id = store.insert(&part).unwrap();
+
+        // Must not panic; falls back to `default_key_dilution`.
+        delete_old_key_material(&store, Round(50), default_key_dilution).unwrap();
+
+        // The record itself survives (round 50 is within its 0-100
+        // validity window), just with key material trimmed.
+        assert!(store.get_for_round(&id, Round(50)).unwrap().is_some());
     }
 
     #[test]
@@ -1195,7 +1256,7 @@ mod tests {
         assert!(verify_one_time_signature(&sig5, &verifier, 0, 5, b"round5"));
 
         // Delete key material before round 20.
-        let count = delete_old_key_material(&store, Round(20)).unwrap();
+        let count = delete_old_key_material(&store, Round(20), 10_000).unwrap();
         assert!(count > 0, "should have trimmed at least one key");
 
         // Retrieve again — signing round 25 should work.
@@ -1225,7 +1286,7 @@ mod tests {
         let initial_first_batch = part_before.voting.first_batch();
 
         // Trim at round 30 (should advance past batch 2).
-        delete_old_key_material(&store, Round(30)).unwrap();
+        delete_old_key_material(&store, Round(30), 10_000).unwrap();
 
         // Retrieve again — the persisted state should reflect the trim.
         let part_after = store.get_for_round(&id, Round(50)).unwrap().unwrap();
@@ -1251,7 +1312,7 @@ mod tests {
         assert_eq!(store.get_all().unwrap().len(), 3);
 
         // Delete at round 60: key A fully expired, key B trimmed, key C not yet in range
-        let count = delete_old_key_material(&store, Round(60)).unwrap();
+        let count = delete_old_key_material(&store, Round(60), 10_000).unwrap();
         // 1 fully expired (A) + 1 trimmed (B) = 2; C has first_valid=80 > 60 so not trimmed
         assert_eq!(
             count, 2,
@@ -1277,14 +1338,14 @@ mod tests {
         let id = insert_test_key_with_dilution(&store, 1, 0, 100, key_dilution);
 
         // First deletion at round 30.
-        let count1 = delete_old_key_material(&store, Round(30)).unwrap();
+        let count1 = delete_old_key_material(&store, Round(30), 10_000).unwrap();
         assert!(count1 > 0);
 
         let part1 = store.get_for_round(&id, Round(50)).unwrap().unwrap();
         let fb1 = part1.voting.first_batch();
 
         // Second deletion at the same round — should be idempotent (no change).
-        let count2 = delete_old_key_material(&store, Round(30)).unwrap();
+        let count2 = delete_old_key_material(&store, Round(30), 10_000).unwrap();
         assert_eq!(
             count2, 0,
             "second call at same round should not change anything"
