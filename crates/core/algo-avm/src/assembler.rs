@@ -6406,6 +6406,43 @@ dup
     }
 
     #[test]
+    fn test_proto_asm_ported_from_go() {
+        // TestProtoAsm (assembler_test.go#L3331), full port. Fixed in issue
+        // #1383: `type_track.rs`'s `track_instruction` now has a `"proto"`
+        // special case mirroring go's `typeProto` -- a `proto` reached with
+        // a non-empty tracked stack, or without a permissive bottom (i.e.
+        // not reached only via dead code / an unconditional branch), is
+        // statically rejected.
+        let errs = expect_errors("#pragma version 8\nproto 0 0\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("proto must be unreachable")),
+            "{errs:?}"
+        );
+
+        // `#pragma typetrack false` suppresses the check, like every other
+        // static type-tracking diagnostic.
+        assemble_string("#pragma version 8\n#pragma typetrack false\nproto 0 0\n").unwrap();
+
+        // Reached only through an unconditional branch (`b a`) -- the `int
+        // 1` in between is dead code, and the label reopens analysis with a
+        // permissive bottom, so `proto` is fine here.
+        assemble_string("#pragma version 8\nb a\nint 1\na:\nproto 0 0\n").unwrap();
+
+        // `main:` is reached only via `callsub`/after an unconditional
+        // `return` -- both cases give a permissive bottom, so `proto 2 1`
+        // is accepted, and the whole program assembles cleanly (go's own
+        // comment on this case -- "This consumes the top arg. We complain."
+        // -- is stale: `testProg` is called with no `exp(...)`, i.e. zero
+        // errors expected, and `dup; dup` right after restores the height
+        // before `retsub` either way).
+        assemble_string(
+            "#pragma version 8\nint 10\nint 20\ncallsub main\nint 1\nreturn\nmain:\nproto 2 1\n+\ndup\ndup\nretsub\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn test_cover_asm_ported_from_go() {
         // TestCoverAsm (assembler_test.go#L3353).
         assemble_string("#pragma version 8\nint 4\nbyte \"john\"\nint 5\ncover 2\npop\n+\n")

@@ -1159,6 +1159,49 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
         return;
     }
 
+    // typeProto (assembler.go:1586-1599): a `proto a r` is only reachable
+    // legitimately when nothing is live on the tracked stack -- an empty
+    // tracked stack *and* a permissive bottom (mirrors go's `len(pgm.stack)
+    // != 0 || pgm.bottom.AVMType != avmAny`; [`OpStream::type_track_bottom_permissive`]
+    // is this slice's stand-in for `pgm.bottom == StackAny`, see its doc
+    // comment). A permissive bottom only exists after a label/`callsub`
+    // reopens analysis following dead code (or an unconditional branch), so
+    // a bare `proto` as literally the first instruction is rejected too --
+    // `type_track_bottom_permissive` starts `false`, mirroring go's
+    // zero-value `StackNone` bottom at program start. On success the
+    // tracked stack is force-set to `a` `Any` values (go's `pgm.stack =
+    // anyTypes(a)`) rather than appended to, but since the check just
+    // proved the tracked stack is already empty, pushing `a` `Any` values
+    // via the ordinary pop/push path achieves the identical result.
+    if mnemonic == "proto" {
+        if let (Some(a), Some(_r)) = (
+            args.first().and_then(|s| s.parse::<i64>().ok()),
+            args.get(1).and_then(|s| s.parse::<i64>().ok()),
+        ) {
+            if !ops.type_stack.is_empty() || !ops.type_track_bottom_permissive {
+                if ops.type_track_reporting {
+                    ops.record_error(
+                        ops.source_line,
+                        0,
+                        "proto must be unreachable from previous PC".to_string(),
+                    );
+                }
+                // Mirrors go: on error, `nargs`/`nreturns` stay `nil`, so
+                // `trackStack` still runs with `proto`'s fixed base proto
+                // (no pops/pushes) -- the tracked stack is left untouched.
+                apply_stack_effect(ops, mnemonic, args, &[], &[]);
+            } else {
+                let count = a.max(0) as usize;
+                apply_stack_effect(ops, mnemonic, args, &[], &vec![Any; count]);
+            }
+        }
+        // A non-parseable `a`/`r` immediate mirrors go's `getImm` failure:
+        // `typeProto` returns `(nil, nil, nil)`, a pure no-op -- nothing
+        // further to track (a separate assembly-time error, if any, is
+        // reported elsewhere for the bad immediate itself).
+        return;
+    }
+
     let spec = match opcode::lookup_by_name(mnemonic) {
         // Not a real opcode (or a pseudo-op this slice doesn't model, e.g.
         // `extract`'s own arity dispatch) -- the rest of assembly will
