@@ -123,6 +123,34 @@ pub const PROTOCOL_VERSION: &str = "2.2";
 /// Go: `SupportedProtocolVersions = []string{"2.2"}`.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2.2"];
 
+/// The versions this node actually advertises/accepts, honoring
+/// `config.Local`'s `NetworkProtocolVersion` override (issue #1320).
+///
+/// Go: `network/wsNetwork.go:665-669` (`WebsocketNetwork.setup`) and the
+/// identical override in `network/p2pNetwork.go:289-290`:
+///
+/// ```go
+/// // set our supported versions
+/// if wn.config.NetworkProtocolVersion != "" {
+///     wn.supportedProtocolVersions = []string{wn.config.NetworkProtocolVersion}
+/// } else {
+///     wn.supportedProtocolVersions = SupportedProtocolVersions
+/// }
+/// ```
+///
+/// When an operator sets `NetworkProtocolVersion` in `config.json`, go pins
+/// the node to exactly that one version for both outgoing dial headers and
+/// incoming/outgoing version matching, instead of the full built-in list.
+/// An empty override (the default) falls back to [`SUPPORTED_PROTOCOL_VERSIONS`]
+/// unchanged.
+pub fn effective_protocol_versions(network_protocol_version: &str) -> Vec<&str> {
+    if network_protocol_version.is_empty() {
+        SUPPORTED_PROTOCOL_VERSIONS.to_vec()
+    } else {
+        vec![network_protocol_version]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Gossip network path
 // ---------------------------------------------------------------------------
@@ -165,6 +193,10 @@ pub struct OutgoingHeaderParams<'a> {
     pub identity_challenge: Option<&'a str>,
     /// Optional comma-separated peer features string.
     pub peer_features: Option<&'a str>,
+    /// `config.Local.NetworkProtocolVersion` override (empty string means
+    /// "no override" — falls back to [`SUPPORTED_PROTOCOL_VERSIONS`]). See
+    /// [`effective_protocol_versions`].
+    pub network_protocol_version: &'a str,
 }
 
 /// Builds the HTTP headers for an outgoing WebSocket upgrade request.
@@ -225,8 +257,9 @@ pub fn set_headers(params: &OutgoingHeaderParams<'_>) -> HeaderMap {
         PROTOCOL_VERSION.parse().expect("valid header value"),
     );
 
-    // Accept-version list — one entry per supported version
-    for v in SUPPORTED_PROTOCOL_VERSIONS {
+    // Accept-version list — one entry per supported version, honoring
+    // `NetworkProtocolVersion`'s override (issue #1320).
+    for v in effective_protocol_versions(params.network_protocol_version) {
         headers.append(
             HeaderName::from_static("x-algorand-accept-version"),
             v.parse().expect("valid header value"),
@@ -476,6 +509,7 @@ mod tests {
             telemetry_id: Some("tel-xyz"),
             identity_challenge: Some("base64challenge"),
             peer_features: Some("ppzstd,avvpack"),
+            network_protocol_version: "",
         };
 
         let headers = set_headers(&params);
@@ -557,6 +591,46 @@ mod tests {
         );
     }
 
+    // --- Issue #1320: `NetworkProtocolVersion` config override -------------
+
+    #[test]
+    fn effective_protocol_versions_falls_back_when_unset() {
+        assert_eq!(effective_protocol_versions(""), SUPPORTED_PROTOCOL_VERSIONS);
+    }
+
+    #[test]
+    fn effective_protocol_versions_pins_to_override_when_set() {
+        // Mirrors go's `wsNetwork.go:665-669`: a non-empty
+        // `NetworkProtocolVersion` replaces the *entire* supported-versions
+        // list with just that one value, not an addition to it.
+        assert_eq!(effective_protocol_versions("9.9"), vec!["9.9"]);
+    }
+
+    #[test]
+    fn set_headers_honors_network_protocol_version_override() {
+        let params = OutgoingHeaderParams {
+            genesis_id: "testnet-v1.0",
+            node_random: "abc123",
+            location: None,
+            instance_name: "my-node",
+            telemetry_id: None,
+            identity_challenge: None,
+            peer_features: None,
+            network_protocol_version: "9.9",
+        };
+
+        let headers = set_headers(&params);
+
+        let accept_values: Vec<&str> = headers
+            .get_all("x-algorand-accept-version")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        // Only the overridden version is advertised -- not the default
+        // "2.2" alongside it.
+        assert_eq!(accept_values, vec!["9.9"]);
+    }
+
     #[test]
     fn set_headers_optional_fields_omitted() {
         let params = OutgoingHeaderParams {
@@ -567,6 +641,7 @@ mod tests {
             telemetry_id: None,
             identity_challenge: None,
             peer_features: None,
+            network_protocol_version: "",
         };
 
         let headers = set_headers(&params);
@@ -605,6 +680,7 @@ mod tests {
             telemetry_id: Some(""),
             identity_challenge: Some(""),
             peer_features: Some(""),
+            network_protocol_version: "",
         };
 
         let headers = set_headers(&params);
@@ -637,6 +713,7 @@ mod tests {
             telemetry_id: None,
             identity_challenge: None,
             peer_features: None,
+            network_protocol_version: "",
         };
 
         let headers = set_headers(&params);

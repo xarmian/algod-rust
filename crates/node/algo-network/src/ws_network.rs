@@ -71,7 +71,7 @@ use crate::connect::{try_connect_with_phonebook, ConnectConfig};
 use crate::forwarding_policy::ForwardingPolicy;
 use crate::gossip_node::{GossipNode, Peer, PeerOption};
 use crate::handler::{Multiplexer, TaggedMessageHandler, TaggedMessageValidatorHandler};
-use crate::handshake::{check_protocol_version_match, VersionMatch, SUPPORTED_PROTOCOL_VERSIONS};
+use crate::handshake::{check_protocol_version_match, effective_protocol_versions, VersionMatch};
 use crate::health_service::health_router;
 use crate::mesh::{ConnectFn, MeshRequest, MeshThread, PeerCounter};
 use crate::message::OutgoingMessage;
@@ -390,6 +390,17 @@ pub struct WebsocketNetworkConfig {
     /// did not exist). Does not affect
     /// [`DEFAULT_VOTE_COMPRESSION_TABLE_SIZE`], which stays hardcoded.
     pub enable_vote_compression: bool,
+
+    /// `config.Local.NetworkProtocolVersion` override (default: `""`, no
+    /// override). When non-empty, pins both outgoing dial headers and
+    /// incoming/outgoing version matching to exactly this one protocol
+    /// version instead of the full built-in
+    /// [`crate::handshake::SUPPORTED_PROTOCOL_VERSIONS`] list — matching
+    /// go's `network/wsNetwork.go:665-669`/`network/p2pNetwork.go:289-290`
+    /// override. Issue #1320: previously round-tripped from `config.json`
+    /// with no consuming code path at all. See
+    /// [`crate::handshake::effective_protocol_versions`].
+    pub network_protocol_version: String,
 }
 
 /// Default block-service memory cap: 500,000,000 bytes.
@@ -436,6 +447,7 @@ impl Default for WebsocketNetworkConfig {
             force_fetch_transactions: false,
             use_x_forwarded_for_address_field: String::new(),
             enable_vote_compression: true,
+            network_protocol_version: String::new(),
         }
     }
 }
@@ -1269,6 +1281,7 @@ impl WebsocketNetwork {
                     outgoing_filter: outgoing_filter.clone(),
                     ..crate::ws_peer::WsPeerConfig::default()
                 }),
+                network_protocol_version: self.config.network_protocol_version.clone(),
                 ..ConnectConfig::default()
             };
 
@@ -2130,6 +2143,10 @@ struct NetworkConnectFn {
     /// compression at all — see
     /// [`WebsocketNetworkConfig::enable_vote_compression`]'s doc comment.
     enable_vote_compression: bool,
+    /// Issue #1320: `config.Local.NetworkProtocolVersion` override, threaded
+    /// into this dial path's `ConnectConfig` the same way
+    /// `enable_vote_compression` is above.
+    network_protocol_version: String,
     /// Issue #1101: shared phonebook, threaded into the real dial so it can
     /// go through [`try_connect_with_phonebook`]'s `rate_limited_call`
     /// wrapping — mirroring go's `wn.dialer` (a `limitcaller.Dialer`
@@ -2160,6 +2177,7 @@ impl ConnectFn for NetworkConnectFn {
         let conn_perf_monitor = Arc::clone(&self.conn_perf_monitor);
         let throttled_outgoing_connections = Arc::clone(&self.throttled_outgoing_connections);
         let enable_vote_compression = self.enable_vote_compression;
+        let network_protocol_version = self.network_protocol_version.clone();
         // Issue #803: build a fresh outgoing filter for *this* connection —
         // never reuse an instance across dials, or one peer's
         // `MsgDigestSkip` would suppress sends to a different peer.
@@ -2185,6 +2203,7 @@ impl ConnectFn for NetworkConnectFn {
                     outgoing_filter: outgoing_message_filter.clone(),
                     ..WsPeerConfig::default()
                 }),
+                network_protocol_version: network_protocol_version.clone(),
                 ..ConnectConfig::default()
             };
 
@@ -2440,6 +2459,7 @@ impl WebsocketNetwork {
             outgoing_message_filter_bucket_count: self.config.outgoing_message_filter_bucket_count,
             outgoing_message_filter_bucket_size: self.config.outgoing_message_filter_bucket_size,
             enable_vote_compression: self.config.enable_vote_compression,
+            network_protocol_version: self.config.network_protocol_version.clone(),
             phonebook: Arc::clone(&self.phonebook),
             conn_perf_monitor: Arc::clone(&self.conn_perf_monitor),
             throttled_outgoing_connections: Arc::clone(&self.throttled_outgoing_connections),
@@ -2599,8 +2619,11 @@ fn validate_incoming_connection(
         );
     }
 
-    // 2. Protocol version check
-    let matched_version = match check_protocol_version_match(headers, SUPPORTED_PROTOCOL_VERSIONS) {
+    // 2. Protocol version check — honors `NetworkProtocolVersion`'s override
+    // (issue #1320): a non-empty override pins matching to exactly that one
+    // version instead of the full built-in list.
+    let our_versions = effective_protocol_versions(&network.config.network_protocol_version);
+    let matched_version = match check_protocol_version_match(headers, &our_versions) {
         VersionMatch::Matched(v) => v,
         VersionMatch::NoMatch { other_version } => {
             tracing::warn!(
@@ -2737,7 +2760,7 @@ async fn gossip_upgrade_handler(
         HeaderName::from_static("x-algorand-version"),
         matched_version.parse().expect("valid header value"),
     );
-    for v in SUPPORTED_PROTOCOL_VERSIONS {
+    for v in effective_protocol_versions(&network.config.network_protocol_version) {
         response_headers.append(
             HeaderName::from_static("x-algorand-accept-version"),
             v.parse().expect("valid header value"),
