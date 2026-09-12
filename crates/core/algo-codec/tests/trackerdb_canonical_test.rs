@@ -111,6 +111,37 @@ fn base_account_data_byte_exact_against_go_fixtures() {
     println!("baseaccountdata: {checked} fixtures byte-exact ✓");
 }
 
+/// go's `TestBaseAccountDataDecodeEmpty`
+/// (`ledger/store/trackerdb/data_test.go`): decoding zero-length input must
+/// error (there's no valid empty msgpack encoding of a missing value), while
+/// decoding an explicit empty msgpack map (`0x80`) must succeed and yield an
+/// all-default `BaseAccountData`/`AccountData`. Uses the same
+/// `decode_base_account_data_value` helper the byte-exact/round-trip tests
+/// above exercise against real fixtures.
+#[test]
+fn base_account_data_decode_empty() {
+    let err = decode_base_account_data_value(&[])
+        .expect_err("decoding zero-length input must error, not silently default");
+    assert!(
+        !err.is_empty(),
+        "expected a non-empty error message for zero-length input"
+    );
+
+    let empty_map = decode_base_account_data_value(&[0x80])
+        .expect("decoding an explicit empty msgpack map must succeed");
+    assert_eq!(
+        empty_map,
+        AccountData {
+            asset_params: BTreeMap::new(),
+            assets: BTreeMap::new(),
+            app_local_states: BTreeMap::new(),
+            app_params: BTreeMap::new(),
+            ..AccountData::default()
+        },
+        "an empty map must decode to an all-default account"
+    );
+}
+
 /// PLAN-36 G8 (TASK-120): round-trip property — decode any fixture,
 /// re-encode through the canonical encoder, decode again, and confirm
 /// the second decode yields the same `AccountData`. Guards against an
