@@ -8533,6 +8533,37 @@ mod tests {
         assert_eq!(loaded.vote_key_dilution, 10);
     }
 
+    /// go's `TestAccountStorageWithStateProofID` (`ledger/acctdeltas_test.go`):
+    /// an online account's state-proof (MSS/Falcon) public key must round-trip
+    /// through storage byte-exact, distinct from the generic field round-trip
+    /// `test_account_round_trip` above (which never sets `state_proof_id`).
+    #[test]
+    fn account_round_trip_preserves_state_proof_id() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([0x77; 32]);
+        let state_proof_id = [0x5A; 64];
+
+        let acct = AccountData {
+            micro_algos: 5_000_000,
+            status: AccountStatus::Online,
+            vote_id: Some([1u8; 32]),
+            selection_id: Some([2u8; 32]),
+            state_proof_id: Some(state_proof_id),
+            vote_first_valid: 1000,
+            vote_last_valid: 2000,
+            vote_key_dilution: 10,
+            ..Default::default()
+        };
+        ledger.set_account(&addr, acct);
+
+        let loaded = ledger.get_account(&addr).unwrap();
+        assert_eq!(
+            loaded.state_proof_id,
+            Some(state_proof_id),
+            "an online account's state-proof key must round-trip through storage byte-exact"
+        );
+    }
+
     #[test]
     fn test_account_remove() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
@@ -11643,6 +11674,54 @@ mod tests {
             .optional()
             .unwrap();
         assert_eq!(certdata.unwrap(), b"cert-data");
+    }
+
+    /// go's `TestBlockDBAppend`/`TestBlockDBInit` (`ledger/store/blockdb/blockdb_test.go`):
+    /// their shared `checkBlockDB` helper re-verifies *every* previously-appended
+    /// round's block/header/cert data is still byte-identical after each new
+    /// append, not just the just-inserted round. `test_put_block_cert` above only
+    /// ever checks a single isolated round; this test appends 10 rounds one at a
+    /// time (like go's `for i := 0; i < 10; i++ { BlockPut(...); checkBlockDB(...) }`
+    /// loop) and re-checks the full history after each append.
+    #[test]
+    fn put_block_sequential_append_keeps_full_history_readable() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let mut expected: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new(); // (hdr, blk, cert)
+
+        for round in 0u64..10 {
+            let hdr = format!("hdr-{round}").into_bytes();
+            let blk = format!("blk-{round}").into_bytes();
+            let cert = format!("cert-{round}").into_bytes();
+            ledger.put_block(round, "v41", &hdr, &blk).unwrap();
+            ledger.put_block_cert(round, &cert).unwrap();
+            expected.push((hdr, blk, cert));
+
+            for (r, (exp_hdr, exp_blk, exp_cert)) in expected.iter().enumerate() {
+                let r = r as u64;
+                assert_eq!(
+                    ledger.get_block_header_data(r).unwrap().as_ref(),
+                    Some(exp_hdr),
+                    "round {r}'s header must survive appending through round {round}"
+                );
+                assert_eq!(
+                    ledger.get_block_data(r).unwrap().as_ref(),
+                    Some(exp_blk),
+                    "round {r}'s block must survive appending through round {round}"
+                );
+                assert_eq!(
+                    ledger.get_block_cert(r).unwrap().as_ref(),
+                    Some(exp_cert),
+                    "round {r}'s cert must survive appending through round {round}"
+                );
+            }
+
+            // Mirrors go's `BlockGet(tx, basics.Round(len(blocks)))` must-error
+            // check: a round beyond the ones written so far is still absent.
+            assert!(
+                ledger.get_block_data(round + 1).unwrap().is_none(),
+                "a round beyond the appended history must not be readable"
+            );
+        }
     }
 
     #[test]
