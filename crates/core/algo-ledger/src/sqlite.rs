@@ -11817,6 +11817,73 @@ mod tests {
         }
     }
 
+    /// go's `TestBlockDBInit` (`ledger/store/blockdb/blockdb_test.go`): a
+    /// bulk-loaded chain of 10 blocks (rather than one-at-a-time append, see
+    /// `put_block_sequential_append_keeps_full_history_readable` above) must
+    /// be fully and correctly readable, AND re-running the same load again
+    /// (go's second `BlockInit(tx, blockChainBlocks(blocks))` call) must be
+    /// idempotent -- the data must come back byte-identical, not duplicated
+    /// or corrupted. algod-rust's `put_block` is an unconditional upsert
+    /// (`ON CONFLICT DO UPDATE`) rather than go's "only load if empty"
+    /// `BlockInit`, so the idempotency property here is proven by re-running
+    /// the same upserts rather than by a skipped no-op branch — the
+    /// externally observable guarantee (re-init doesn't corrupt the chain)
+    /// is the same.
+    #[test]
+    fn put_block_bulk_init_then_reinit_is_idempotent() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let blocks: Vec<(u64, Vec<u8>, Vec<u8>)> = (0u64..10)
+            .map(|round| {
+                (
+                    round,
+                    format!("hdr-{round}").into_bytes(),
+                    format!("blk-{round}").into_bytes(),
+                )
+            })
+            .collect();
+
+        // Bulk load, like go's `BlockInit(tx, blockChainBlocks(blocks))`.
+        for (round, hdr, blk) in &blocks {
+            ledger.put_block(*round, "v41", hdr, blk).unwrap();
+        }
+        for (round, hdr, blk) in &blocks {
+            assert_eq!(
+                ledger.get_block_header_data(*round).unwrap().as_ref(),
+                Some(hdr)
+            );
+            assert_eq!(ledger.get_block_data(*round).unwrap().as_ref(), Some(blk));
+        }
+        assert!(
+            ledger.get_block_data(10).unwrap().is_none(),
+            "a round beyond the loaded chain must not be readable"
+        );
+
+        // Re-run the exact same load again -- must be idempotent.
+        for (round, hdr, blk) in &blocks {
+            ledger.put_block(*round, "v41", hdr, blk).unwrap();
+        }
+        for (round, hdr, blk) in &blocks {
+            assert_eq!(
+                ledger.get_block_header_data(*round).unwrap().as_ref(),
+                Some(hdr),
+                "round {round} header must survive a re-init unchanged"
+            );
+            assert_eq!(
+                ledger.get_block_data(*round).unwrap().as_ref(),
+                Some(blk),
+                "round {round} block must survive a re-init unchanged"
+            );
+        }
+        let total: i64 = ledger
+            .conn
+            .query_row("SELECT COUNT(*) FROM blockdb.blocks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            total, 10,
+            "re-init must not duplicate rows for already-loaded rounds"
+        );
+    }
+
     #[test]
     fn test_put_block_overwrites_preserves_cert() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
