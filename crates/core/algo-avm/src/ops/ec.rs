@@ -1969,4 +1969,96 @@ mod tests {
         // 1 (pushbytes) + 3100 (subgroup_check) = 3101
         assert_eq!(m2.budget, 700_000 - 3101);
     }
+
+    /// Right-align a hex-decoded scalar into a 32-byte big-endian buffer,
+    /// mirroring go's `tealInt`/scalar literal handling in `TestAgreement`.
+    fn scalar32(hex: &str) -> Vec<u8> {
+        let bytes = hex_decode(hex);
+        let mut out = vec![0u8; 32 - bytes.len()];
+        out.extend_from_slice(&bytes);
+        out
+    }
+
+    #[test]
+    fn test_agreement_ported_from_go() {
+        // TestAgreement (pairing_test.go#L371): for each of the 4 curve
+        // groups, `k1*P1 + k2*P2` computed via `ec_scalar_mul`/`ec_add`
+        // must equal the same computed via `ec_multi_scalar_mul`, for both
+        // an ordinary scalar and a maximal (all-0xFE, 32-byte) one.
+        let k1 = scalar32("2F53");
+        let k2_values = [scalar32("372D82"), vec![0xFEu8; 32]];
+
+        // (group byte, P1 bytes, P2 bytes = 3*G, ec_add opcode is always
+        // 0xe0, ec_scalar_mul 0xe1, ec_multi_scalar_mul 0xe3).
+        let bn254_g1_p2 = {
+            let g = BN254G1Affine::generator();
+            let p2: BN254G1Affine = (g + g + g).into_affine();
+            bn254_g1_to_bytes(&p2)
+        };
+        let bn254_g2_p2 = {
+            let g = BN254G2Affine::generator();
+            let p2: BN254G2Affine = (g + g + g).into_affine();
+            bn254_g2_to_bytes(&p2)
+        };
+        let bls12_g1_p2 = {
+            let g = BLS12G1Affine::generator();
+            let p2: BLS12G1Affine = (g + g + g).into_affine();
+            bls12_g1_to_bytes(&p2)
+        };
+        let bls12_g2_p2 = {
+            let g = BLS12G2Affine::generator();
+            let p2: BLS12G2Affine = (g + g + g).into_affine();
+            bls12_g2_to_bytes(&p2)
+        };
+
+        let groups: [(u8, &str, Vec<u8>, Vec<u8>); 4] = [
+            (0, "BN254g1", bn254_g1_generator(), bn254_g1_p2),
+            (1, "BN254g2", bn254_g2_generator(), bn254_g2_p2),
+            (2, "BLS12_381g1", bls12_g1_generator(), bls12_g1_p2),
+            (3, "BLS12_381g2", bls12_g2_generator(), bls12_g2_p2),
+        ];
+
+        for (group_byte, name, p1, p2) in groups {
+            for k2 in &k2_values {
+                let mut code = Vec::new();
+                // k1 * P1
+                push_bytes(&mut code, &p1);
+                push_bytes(&mut code, &k1);
+                code.extend_from_slice(&[0xe1, group_byte]); // ec_scalar_mul
+                                                             // k2 * P2
+                push_bytes(&mut code, &p2);
+                push_bytes(&mut code, k2);
+                code.extend_from_slice(&[0xe1, group_byte]); // ec_scalar_mul
+                                                             // (k1*P1) + (k2*P2)
+                code.extend_from_slice(&[0xe0, group_byte]); // ec_add
+
+                // The same via ec_multi_scalar_mul.
+                let mut points_concat = p1.clone();
+                points_concat.extend_from_slice(&p2);
+                push_bytes(&mut code, &points_concat);
+                let mut scalars_concat = k1.clone();
+                scalars_concat.extend_from_slice(k2);
+                push_bytes(&mut code, &scalars_concat);
+                code.extend_from_slice(&[0xe3, group_byte]); // ec_multi_scalar_mul
+
+                let raw = prog(10, &code);
+                let program = bytecode::parse(&raw).unwrap();
+                let mut m = AvmMachine::new(program, ExecMode::Application, 7_000_000);
+                // 2 pushes + scalar_mul, twice (6 steps), + add (1 step),
+                // + 2 pushes + multi_scalar_mul (3 steps) = 10 steps.
+                step_n(&mut m, &mut NullContext, 10).unwrap();
+
+                assert_eq!(m.stack.len(), 2, "{name}");
+                let (AvmValue::Bytes(add_path), AvmValue::Bytes(multiexp_path)) =
+                    (&m.stack[0], &m.stack[1])
+                else {
+                    panic!("{name}: expected bytes on stack");
+                };
+                assert_eq!(
+                    add_path, multiexp_path,
+                    "{name}: (mul,mul,add) path should equal ec_multi_scalar_mul"
+                );
+            }
+        }
+    }
 }
