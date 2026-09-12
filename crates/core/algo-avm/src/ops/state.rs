@@ -1194,6 +1194,19 @@ mod tests {
             app_id: u64,
             key: &[u8],
         ) -> Result<Option<TealValue>, AlgoError> {
+            // Matches go-algorand's `roundCowState.getKey` (`ledger/eval/appcow.go`)
+            // via `LedgerAvmContext::app_local_get`: a local-state read hard-errors
+            // when the account has never opted in to this app's local storage at
+            // all -- distinct from "opted in, but this key is absent" (returns
+            // `None` below, no error). Tests mark opt-in via `self.opted_in`.
+            if !*self.opted_in.get(&(*account, app_id)).unwrap_or(&false) {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "cannot fetch key, {} has not opted in to app {app_id}",
+                        algo_types::Address(*account)
+                    ),
+                });
+            }
             Ok(self
                 .local_state
                 .get(&(*account, app_id, key.to_vec()))
@@ -1800,6 +1813,7 @@ mod tests {
         let program = bytecode::parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
         let mut ctx = TestStateContext::new(100);
+        ctx.opted_in.insert((addr, 100), true);
         ctx.local_state
             .insert((addr, 100, b"mykey".to_vec()), TealValue::Uint(999));
         step_n(&mut m, &mut ctx, 3).unwrap();
@@ -1807,6 +1821,13 @@ mod tests {
         assert_eq!(m.stack[0], AvmValue::Uint64(999));
     }
 
+    /// go-algorand's `opAppLocalGetImpl` -> `roundCowState.getKey`
+    /// (`ledger/eval/appcow.go`) hard-errors ("<addr> has not opted in to
+    /// app <id>") when the target account has NEVER opted into the app's
+    /// local storage at all -- this is a real ledger error, not a silent
+    /// zero. This used to be pinned to the WRONG (silent-zero) behavior;
+    /// see `test_app_local_get_key_absent_but_opted_in` below for the
+    /// still-correct "opted in, key absent -> zero" case (issue #1356).
     #[test]
     fn test_app_local_get_not_found() {
         let addr = test_addr(0x07);
@@ -1819,6 +1840,32 @@ mod tests {
         let program = bytecode::parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
         let mut ctx = TestStateContext::new(100);
+        // Never opted in: no `ctx.opted_in` entry for (addr, 100).
+        let err = step_n(&mut m, &mut ctx, 3).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "cannot fetch key, {} has not opted in to app 100",
+                algo_types::Address(addr)
+            )),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The still-correct counterpart: opted in, but the specific key is
+    /// absent -> zero, no error (issue #1356 acceptance criteria).
+    #[test]
+    fn test_app_local_get_key_absent_but_opted_in() {
+        let addr = test_addr(0x37);
+        let mut code = vec![0x80, 0x20];
+        code.extend_from_slice(&addr);
+        code.extend_from_slice(&[0x80, 0x05]);
+        code.extend_from_slice(b"mykey");
+        code.push(0x62);
+        let raw = prog(5, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.opted_in.insert((addr, 100), true); // opted in, but no keys set
         step_n(&mut m, &mut ctx, 3).unwrap();
         assert_eq!(m.stack.len(), 1);
         assert_eq!(m.stack[0], AvmValue::Uint64(0));
@@ -1838,6 +1885,7 @@ mod tests {
         let program = bytecode::parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
         let mut ctx = TestStateContext::new(100);
+        ctx.opted_in.insert((addr, 100), true);
         ctx.local_state
             .insert((addr, 100, b"k".to_vec()), TealValue::Uint(42));
         step_n(&mut m, &mut ctx, 4).unwrap();
@@ -1846,6 +1894,10 @@ mod tests {
         assert_eq!(m.stack[1], AvmValue::Uint64(1)); // did_exist
     }
 
+    /// Same divergence as `test_app_local_get_not_found` but for the `_ex`
+    /// variant: go's `opAppLocalGetImpl` is shared by both opcodes, so
+    /// "never opted in" is a hard error for `app_local_get_ex` too, not a
+    /// `(0, false)` result (issue #1356).
     #[test]
     fn test_app_local_get_ex_not_found() {
         let addr = test_addr(0x09);
@@ -1859,6 +1911,33 @@ mod tests {
         let program = bytecode::parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
         let mut ctx = TestStateContext::new(100);
+        // Never opted in: no `ctx.opted_in` entry for (addr, 100).
+        let err = step_n(&mut m, &mut ctx, 4).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "cannot fetch key, {} has not opted in to app 100",
+                algo_types::Address(addr)
+            )),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The still-correct counterpart for `_ex`: opted in, key absent ->
+    /// `(0, false)`, no error (issue #1356 acceptance criteria).
+    #[test]
+    fn test_app_local_get_ex_key_absent_but_opted_in() {
+        let addr = test_addr(0x38);
+        let mut code = vec![0x80, 0x20];
+        code.extend_from_slice(&addr);
+        code.extend_from_slice(&[0x81, 100]);
+        code.extend_from_slice(&[0x80, 0x01]);
+        code.push(b'k');
+        code.push(0x63);
+        let raw = prog(5, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.opted_in.insert((addr, 100), true); // opted in, but no keys set
         step_n(&mut m, &mut ctx, 4).unwrap();
         assert_eq!(m.stack.len(), 2);
         assert_eq!(m.stack[0], AvmValue::Uint64(0)); // default value
@@ -2470,6 +2549,7 @@ mod tests {
     fn self_mutate_v8_rejects_own_address_local_put_and_del_but_allows_get() {
         let self_addr = test_addr(0x0D);
         let mut ctx = TestStateContext::new(888);
+        ctx.opted_in.insert((self_addr, 888), true);
         ctx.local_state
             .insert((self_addr, 888, b"hey".to_vec()), TealValue::Uint(77));
 
@@ -2523,6 +2603,7 @@ mod tests {
     fn self_mutate_v9_allows_own_address_local_put_and_del() {
         let self_addr = test_addr(0x0E);
         let mut ctx = TestStateContext::new(888);
+        ctx.opted_in.insert((self_addr, 888), true);
         ctx.local_state
             .insert((self_addr, 888, b"hey".to_vec()), TealValue::Uint(77));
 
@@ -2589,6 +2670,7 @@ mod tests {
         let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
         let mut ctx = TestStateContext::new(100);
         ctx.accounts.push(addr);
+        ctx.opted_in.insert((addr, 100), true);
         step_n(&mut m, &mut ctx, 7).unwrap();
         assert_eq!(m.stack.len(), 1);
         assert_eq!(m.stack[0], AvmValue::Uint64(77));
@@ -2599,6 +2681,7 @@ mod tests {
         let addr = test_addr(0x0B);
         let mut ctx = TestStateContext::new(100);
         ctx.accounts.push(addr);
+        ctx.opted_in.insert((addr, 100), true);
         ctx.local_state
             .insert((addr, 100, b"x".to_vec()), TealValue::Uint(50));
         // A mutating op (app_local_del) requires an accounts-array index,
