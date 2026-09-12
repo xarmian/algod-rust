@@ -1466,3 +1466,513 @@ itxn_submit
         Some(&algo_types::TealValue::Bytes(b"X".to_vec()))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 17 (issue #1322): TestGlobalChangesAcrossApps / TestLocalChangesAcrossApps
+// (ledger/apptxn_test.go:2864 / 2972)
+//
+// go's tests show that global/local app state changes made by an inner
+// call to app B are immediately visible to a LATER, sibling inner call to
+// a *different* app C -- as long as A's inner call to C also passes on
+// access to B (`itxn_field Applications`) -- and to a subsequent inner
+// call back to B itself, and finally to A's own top-level `app_global_get_ex`/
+// `app_local_get_ex` read of B's state. algod-rust's existing coverage
+// (`app_global_state_read_write`/`app_local_state_read_write` in
+// avm_context.rs) only exercises the raw `LedgerAvmContext` get/put/del
+// primitives directly -- never through a real chain of inner app calls
+// where one app's write must be observed by a different app's later read
+// in the same top-level transaction. These two tests close that gap via a
+// full three-app inner-call chain, run through `apply_block_capturing_apply_data`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_global_changes_across_apps() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let app_a_id = 930u64;
+    let app_b_id = 931u64;
+    let app_c_id = 932u64;
+
+    let app_a_addr = Address(algo_ledger::avm_context::app_address(app_a_id));
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+    // App A's own account funds the three inner-txn fees it will submit.
+    state.get_or_default_account_mut(&app_a_addr).micro_algos = 1_000_000;
+
+    let app_a_src = "\
+itxn_begin
+int appl
+itxn_field TypeEnum
+txn Applications 1
+itxn_field ApplicationID
+itxn_submit
+
+itxn_begin
+int appl
+itxn_field TypeEnum
+txn Applications 2
+itxn_field ApplicationID
+txn Applications 1
+itxn_field Applications
+itxn_submit
+
+itxn_begin
+int appl
+itxn_field TypeEnum
+txn Applications 1
+itxn_field ApplicationID
+byte \"check, please\"
+itxn_field ApplicationArgs
+itxn_submit
+
+txn Applications 1
+byte \"X\"
+app_global_get_ex
+assert
+byte \"ABC\"
+==
+assert
+int 1
+";
+    state.app_params.insert(
+        app_a_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(&format!("#pragma version 8\n{app_a_src}")),
+            clear_state_program: assemble(APPROVE_SRC),
+            ..Default::default()
+        },
+    );
+
+    let app_b_src = "#pragma version 8
+txn NumAppArgs
+bnz check
+byte \"X\"
+byte \"ABC\"
+app_global_put
+b end
+check:
+byte \"X\"
+app_global_get
+byte \"ABC\"
+==
+assert
+end:
+int 1
+";
+    state.app_params.insert(
+        app_b_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(app_b_src),
+            clear_state_program: assemble(APPROVE_SRC),
+            global_state_schema: StateSchema {
+                num_uint: 0,
+                num_byte_slice: 1,
+            },
+            ..Default::default()
+        },
+    );
+
+    let app_c_src = "#pragma version 8
+txn Applications 1
+byte \"X\"
+app_global_get_ex
+assert
+byte \"ABC\"
+==
+assert
+int 1
+";
+    state.app_params.insert(
+        app_c_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(app_c_src),
+            clear_state_program: assemble(APPROVE_SRC),
+            ..Default::default()
+        },
+    );
+
+    let mut call = appl_call(creator, 1_000, app_a_id, 0, None);
+    call.txn.foreign_apps = Some(vec![app_b_id, app_c_id]);
+    let block = minimal_block(fee_sink, 1, vec![call]);
+    let results = apply_block_capturing_apply_data(&mut state, &block, ApplyMode::Execute).expect(
+        "app A's chained inner calls to B/C must see B's global state \
+             change across the chain, and A's own trailing read must see it too",
+    );
+    assert!(results[0].eval_delta.is_some());
+}
+
+#[test]
+fn test_local_changes_across_apps() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let app_a_id = 940u64;
+    let app_b_id = 941u64;
+    let app_c_id = 942u64;
+
+    let app_a_addr = Address(algo_ledger::avm_context::app_address(app_a_id));
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+    state.get_or_default_account_mut(&app_a_addr).micro_algos = 1_000_000;
+
+    let app_a_src = "\
+itxn_begin
+int appl
+itxn_field TypeEnum
+txn Applications 1
+itxn_field ApplicationID
+int OptIn
+itxn_field OnCompletion
+itxn_submit
+
+itxn_begin
+int appl
+itxn_field TypeEnum
+txn Applications 2
+itxn_field ApplicationID
+txn Applications 1
+itxn_field Applications
+itxn_submit
+
+itxn_begin
+int appl
+itxn_field TypeEnum
+txn Applications 1
+itxn_field ApplicationID
+byte \"check, please\"
+itxn_field ApplicationArgs
+itxn_submit
+
+global CurrentApplicationAddress
+txn Applications 1
+byte \"X\"
+app_local_get_ex
+assert
+byte \"ABC\"
+==
+assert
+int 1
+";
+    state.app_params.insert(
+        app_a_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(&format!("#pragma version 8\n{app_a_src}")),
+            clear_state_program: assemble(APPROVE_SRC),
+            ..Default::default()
+        },
+    );
+
+    let app_b_src = "#pragma version 8
+txn NumAppArgs
+bnz check
+txn Sender
+byte \"X\"
+byte \"ABC\"
+app_local_put
+b end
+check:
+txn Sender
+byte \"X\"
+app_local_get
+byte \"ABC\"
+==
+assert
+end:
+int 1
+";
+    state.app_params.insert(
+        app_b_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(app_b_src),
+            clear_state_program: assemble(APPROVE_SRC),
+            local_state_schema: StateSchema {
+                num_uint: 0,
+                num_byte_slice: 1,
+            },
+            ..Default::default()
+        },
+    );
+
+    let app_c_src = "#pragma version 8
+txn Sender
+txn Applications 1
+byte \"X\"
+app_local_get_ex
+assert
+byte \"ABC\"
+==
+assert
+int 1
+";
+    state.app_params.insert(
+        app_c_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(app_c_src),
+            clear_state_program: assemble(APPROVE_SRC),
+            ..Default::default()
+        },
+    );
+
+    let mut call = appl_call(creator, 1_000, app_a_id, 0, None);
+    call.txn.foreign_apps = Some(vec![app_b_id, app_c_id]);
+    let block = minimal_block(fee_sink, 1, vec![call]);
+    let results = apply_block_capturing_apply_data(&mut state, &block, ApplyMode::Execute).expect(
+        "app A's chained inner calls to B/C must see B's local state \
+             change (for A's own opted-in account) across the chain, and \
+             A's own trailing read must see it too",
+    );
+    assert!(results[0].eval_delta.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17 (issue #1322): TestCreateAndUse (ledger/apptxn_test.go:1375)
+//
+// A group of [acfg create-asset, appl call] lets the appl reference the
+// asset created by its EARLIER group sibling via `gaid 0` and submit an
+// inner axfer against it, with NO `ForeignAssets` entry on the appl call --
+// go's point is that this "implicit group-level resource sharing" for a
+// just-created asset works without any psychic foreign-asset setting.
+// algod-rust's existing `test_gaid` (algo-avm/src/ops/state.rs) only proves
+// the opcode returns the right ID from a synthetic `created_ids` map; it
+// never runs the resulting ID through a REAL inner-txn resource-availability
+// check end to end. This closes that gap via `apply_block_capturing_apply_data`
+// over a real [acfg, appl] group.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_create_and_use_group_asset_via_gaid() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let app_id = 950u64;
+
+    let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+    state.get_or_default_account_mut(&app_addr).micro_algos = 1_000_000;
+
+    // itxn_begin; axfer 0-amount self-transfer of the asset named by `gaid 0`
+    // (the earlier acfg sibling), Sender/AssetReceiver both the app's own
+    // account (mirrors go's `global CurrentApplicationAddress`).
+    let app_src = "#pragma version 8
+itxn_begin
+int axfer
+itxn_field TypeEnum
+int 0
+itxn_field Amount
+gaid 0
+itxn_field XferAsset
+global CurrentApplicationAddress
+itxn_field Sender
+global CurrentApplicationAddress
+itxn_field AssetReceiver
+itxn_submit
+int 1
+";
+    state.app_params.insert(
+        app_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(app_src),
+            clear_state_program: assemble(APPROVE_SRC),
+            ..Default::default()
+        },
+    );
+
+    const EXPECTED_ASSET_ID: u64 = 42;
+
+    let group_id = [0xABu8; 32];
+    let mut createasa = SignedTransaction::default();
+    createasa.txn.txn_type = "acfg".into();
+    createasa.txn.sender = creator;
+    createasa.txn.fee = 1_000;
+    createasa.txn.asset_params = Some(algo_types::AssetParams {
+        total: 1_000_000,
+        ..Default::default()
+    });
+    createasa.txn.group = group_id;
+    // `gaid` reads a sibling's creatable ID directly off the (pre-apply)
+    // group array, so the expected ID must be pre-populated here; the real
+    // apply path derives the actual created ID from the block's running
+    // `txn_counter`, set below to line up with the same value (mirrors
+    // `test_gtxn_effects_via_apply_block_capturing_apply_data`'s pattern).
+    createasa.apply_data_config_asset = EXPECTED_ASSET_ID;
+
+    // No `foreign_assets` set on this call: the whole point of the test is
+    // that it's unnecessary given the just-created asset is a real group
+    // sibling.
+    let mut use_call = appl_call(creator, 1_000, app_id, 0, None);
+    use_call.txn.group = group_id;
+
+    state.txn_counter = EXPECTED_ASSET_ID - 1;
+    let mut block = minimal_block(fee_sink, 1, vec![createasa, use_call]);
+    block.txn_counter = EXPECTED_ASSET_ID;
+    let results = apply_block_capturing_apply_data(&mut state, &block, ApplyMode::Execute).expect(
+        "appl call must be able to reference and axfer the asset its earlier \
+         group sibling created via `gaid 0`, with no ForeignAssets entry",
+    );
+
+    let created_asset_id = results[0].config_asset;
+    assert_eq!(created_asset_id, EXPECTED_ASSET_ID);
+
+    let dt = results[1]
+        .eval_delta
+        .as_ref()
+        .expect("appl call must produce an eval delta with an inner axfer");
+    let ed = parse_eval_delta(dt).expect("eval delta must parse");
+    let inner = ed
+        .inner_txns
+        .expect("appl call must submit one inner axfer");
+    assert_eq!(inner.len(), 1);
+    assert_eq!(inner[0].txn.xaid, created_asset_id);
+
+    // The app account must now show up as opted into (holding) the asset,
+    // proving the inner axfer actually applied against the real asset.
+    let holding = state
+        .get_asset_holding(&app_addr, created_asset_id)
+        .expect("app account must hold the asset after the self-axfer");
+    assert_eq!(holding.amount, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17 (issue #1322): TestInnerAppManipulate (ledger/apptxn_test.go:1278)
+//
+// A caller app invokes a callee app via inner txn with `ApplicationArgs`
+// ["set", "X", "A"], which sets the callee's global "X" to "A". go's test
+// asserts the exact EvalDelta SHAPE this produces: the TOP-LEVEL call's own
+// EvalDelta has NO GlobalDelta/LocalDeltas (the write happened in the
+// callee, not the caller), while the delta lives on `InnerTxns[0]`'s own
+// EvalDelta. algod-rust's existing `inner_app_logs_accessible` only proves
+// logs are readable and doesn't assert on GlobalDelta placement at all; this
+// test closes that gap directly against a real inner-appl-call EvalDelta.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_inner_app_manipulate_global_delta_on_inner_not_outer() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let callee_id = 960u64;
+    let caller_id = 961u64;
+
+    let caller_addr = Address(algo_ledger::avm_context::app_address(caller_id));
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+    state.get_or_default_account_mut(&caller_addr).micro_algos = 1_000_000;
+
+    // callee: arg0=="set" -> global_put(arg1, arg2); arg0=="get" -> log(global_get(arg1)).
+    let callee_src = "#pragma version 8
+txn ApplicationArgs 0
+byte \"set\"
+==
+bz next1
+txn ApplicationArgs 1
+txn ApplicationArgs 2
+app_global_put
+b end
+next1:
+txn ApplicationArgs 0
+byte \"get\"
+==
+bz next2
+txn ApplicationArgs 1
+app_global_get
+log
+b end
+next2:
+err
+end:
+int 1
+";
+    state.app_params.insert(
+        callee_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(callee_src),
+            clear_state_program: assemble(APPROVE_SRC),
+            global_state_schema: StateSchema {
+                num_uint: 0,
+                num_byte_slice: 1,
+            },
+            ..Default::default()
+        },
+    );
+
+    let caller_src = format!(
+        "#pragma version 8
+itxn_begin
+int appl
+itxn_field TypeEnum
+int {callee_id}
+itxn_field ApplicationID
+byte \"set\"
+itxn_field ApplicationArgs
+byte \"X\"
+itxn_field ApplicationArgs
+byte \"A\"
+itxn_field ApplicationArgs
+itxn_submit
+itxn NumLogs
+int 0
+==
+assert
+int 1
+"
+    );
+    state.app_params.insert(
+        caller_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(&caller_src),
+            clear_state_program: assemble(APPROVE_SRC),
+            ..Default::default()
+        },
+    );
+
+    let mut call = appl_call(creator, 1_000, caller_id, 0, None);
+    call.txn.foreign_apps = Some(vec![callee_id]);
+    let block = minimal_block(fee_sink, 1, vec![call]);
+    let results = apply_block_capturing_apply_data(&mut state, &block, ApplyMode::Execute)
+        .expect("caller's inner appl-call manipulation of callee's global state must apply");
+
+    let dt = results[0]
+        .eval_delta
+        .as_ref()
+        .expect("call must produce an eval delta");
+    let ed = parse_eval_delta(dt).expect("eval delta must parse");
+
+    // No changes in the TOP-LEVEL EvalDelta.
+    assert!(
+        ed.global_delta.unwrap_or_default().is_empty(),
+        "the write happened in the callee, not the caller -- outer GlobalDelta must be empty"
+    );
+    assert!(ed.local_deltas.unwrap_or_default().is_empty());
+
+    let inner = ed
+        .inner_txns
+        .as_ref()
+        .expect("caller must submit exactly one inner appl call");
+    assert_eq!(inner.len(), 1);
+    let inner_dt = inner[0]
+        .eval_delta
+        .as_ref()
+        .expect("the inner appl call must produce its own eval delta");
+    let inner_ed = parse_eval_delta(inner_dt).expect("inner eval delta must parse");
+    assert!(inner_ed.local_deltas.unwrap_or_default().is_empty());
+    let inner_global_delta = inner_ed
+        .global_delta
+        .expect("inner call must set global state");
+    assert_eq!(inner_global_delta.len(), 1);
+    let delta = inner_global_delta
+        .get(b"X".as_slice())
+        .expect("callee's GlobalDelta must record the set of key \"X\"");
+    assert_eq!(delta.action, algo_ledger::DeltaAction::SetBytes);
+    assert_eq!(
+        delta.bytes.as_slice(),
+        b"A".as_slice(),
+        "the inner call's own EvalDelta must carry the actual state change"
+    );
+}
