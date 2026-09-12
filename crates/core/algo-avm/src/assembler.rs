@@ -6586,4 +6586,161 @@ dup
             );
         }
     }
+
+    // ─── issue #1363 batch: parity_txn_logic.md `partial`-row sweep ───────
+
+    #[test]
+    fn test_byte_odd_length_hex_rejected_ported_from_go() {
+        // Ports the second (source-level) assertion of go's `TestOpBytes`
+        // (assembler_test.go#L1219): `byte 0x7` -- an odd-length hex
+        // literal -- is rejected at every AVM version. The first assertion
+        // of `TestOpBytes` exercises go's internal `OpStream.byteLiteral`
+        // two-phase API directly (bypassing the v4+ single-use constant
+        // optimizer that the real `AssembleString` entry point always
+        // applies); rust's single-pass assembler has no equivalent
+        // pre-optimization unit boundary to reproduce that half.
+        for v in 1..=MAX_AVM_VERSION {
+            let src = format!("#pragma version {v}\nbyte 0x7\nlen\n");
+            let errs = expect_errors(&src);
+            assert!(
+                errs.iter().any(|e| e.message.to_lowercase().contains("odd")
+                    && e.message.to_lowercase().contains("hex")),
+                "v{v}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_assemble_reject_neg_jump_ported_from_go() {
+        // Ports go's `TestAssembleRejectNegJump` (assembler_test.go#L1813):
+        // a `bnz` to a label defined earlier in the source (a back
+        // reference) is rejected pre-`BACK_BRANCH_ENABLED_VERSION` (v4)
+        // with the "back reference" message, and accepted from v4 on.
+        let source = "wat:\nint 1\nbnz wat\nint 2\n";
+        for v in 1u8..BACK_BRANCH_ENABLED_VERSION {
+            let src = format!("#pragma version {v}\n{source}");
+            let errs = expect_errors(&src);
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("is a back reference")),
+                "v{v}: {errs:?}"
+            );
+        }
+        for v in BACK_BRANCH_ENABLED_VERSION..=MAX_AVM_VERSION {
+            let src = format!("#pragma version {v}\n{source}");
+            assemble_string(&src).unwrap_or_else(|e| panic!("v{v} should assemble: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn test_disassemble_int_multi_constant_annotations_ported_from_go() {
+        // Ports go's `TestDisassembleInt` (assembler_test.go#L2469): of six
+        // `int` literals, the one repeated value (17) goes into the
+        // constant block and disassembles with a `// 17` comment; the four
+        // singly-used values (27, 37, 47, 5) are inlined as `pushint N`.
+        let source = format!(
+            "#pragma version {v}\nint 17\nint 27\nint 37\nint 47\nint 5\nint 17\n",
+            v = MAX_AVM_VERSION
+        );
+        let ops = assemble_string(&source).unwrap();
+        let text = crate::disassembler::disassemble(&ops.program).unwrap();
+        assert!(text.contains("// 17"), "{text}");
+        assert!(text.contains("pushint 27"), "{text}");
+        assert!(text.contains("pushint 37"), "{text}");
+        assert!(text.contains("pushint 47"), "{text}");
+        assert!(text.contains("pushint 5"), "{text}");
+    }
+
+    #[test]
+    fn test_pragma_unsupported_directive_rejected_ported_from_go() {
+        // Ports the final assertion of go's `TestAssemblePragmaVersion`
+        // (assembler_test.go#L3014): `#pragma unk` is rejected as an
+        // unsupported pragma directive. (The earlier `assemblerNoVersion`
+        // caller-supplied-expected-version-vs-`#pragma version` mismatch
+        // assertions in that same go test exercise `AssembleStringWithVersion`,
+        // a production API taking an explicit expected version, that rust's
+        // single `assemble_string(text)` entry point -- which always derives
+        // the version from the source's own `#pragma version`/default -- has
+        // no equivalent surface for; the "defaults to v1 with no pragma"
+        // sub-case is already covered by `test_assemble_default_version_is_one`.)
+        let errs = expect_errors("#pragma unk\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("unsupported pragma directive")
+                    && e.message.contains("unk")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_manual_cblocks_ported_from_go() {
+        // Ports the previously-untested error/optimization sub-cases of
+        // go's `TestManualCBlocks` (assembler_test.go#L1363); the
+        // dead-code-manual-cblock-doesn't-block-auto-insertion sub-cases
+        // are already covered by `test_manual_cblock_eval_dead_intcblock_does_not_block_auto_insertion`
+        // / `..._bytecblock_...` above (ported from the sibling
+        // `TestManualCBlockEval`), and the cross-program byte-equality
+        // (`checkSame`) assertions mixing `int`/`intc` against a manual
+        // block are left for a follow-up (they re-exercise the same
+        // manual-cblock-lookup path this test already covers, just via
+        // several textually-different-but-equivalent programs).
+
+        // "Despite appearing twice, 500s are pushints because of manual
+        // intcblock": once there's a manual `intcblock` at
+        // BACK_BRANCH_ENABLED_VERSION+, a repeated `int` literal still
+        // compiles to `pushint`, not `intc`, per go's `asmInt`.
+        let source = format!(
+            "#pragma version {v}\nintcblock 1\nint 500\nint 500\n==\n",
+            v = MAX_AVM_VERSION
+        );
+        let ops = assemble_string(&source).unwrap();
+        let pushint_opcode = opcode::lookup_by_name("pushint")
+            .expect("pushint exists")
+            .opcode;
+        assert_eq!(
+            ops.program[4], pushint_opcode,
+            "expected pushint at byte 4: {:x?}",
+            ops.program
+        );
+
+        // "But complain if they [ints] do not [appear in the manual block]"
+        // -- only pre-BACK_BRANCH_ENABLED_VERSION: at v4+, go's `asmInt`
+        // takes the manual-cblock-present branch *before* the
+        // does-it-appear check and unconditionally falls back to
+        // `pushint` instead (see the `pushint`-conversion assertion
+        // above), so this specific rejection is a pre-v4-only path.
+        let errs = expect_errors("#pragma version 3\nintcblock 4\nint 3\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("value 3 does not appear")),
+            "{errs:?}"
+        );
+
+        // "Or if the ref comes before the constant block" -- `intcblock`
+        // may not follow a plain `int` literal at all, matched or not.
+        for v in [3u8, 4u8] {
+            let errs = expect_errors(&format!("#pragma version {v}\nint 5\nintcblock 4\n"));
+            assert!(
+                errs.iter().any(|e| e.message == "intcblock following int"),
+                "v{v}: {errs:?}"
+            );
+            let errs = expect_errors(&format!("#pragma version {v}\nint 4\nintcblock 4\n"));
+            assert!(
+                errs.iter().any(|e| e.message == "intcblock following int"),
+                "v{v}: {errs:?}"
+            );
+        }
+
+        // Same for `bytecblock` following `byte`/`addr`/`method`.
+        for v in [3u8, 4u8] {
+            let errs = expect_errors(&format!(
+                "#pragma version {v}\naddr RWXCBB73XJITATVQFOI7MVUUQOL2PFDDSDUMW4H4T2SNSX4SEUOQ2MM7F4\nbytecblock 0x44\n"
+            ));
+            assert!(
+                errs.iter()
+                    .any(|e| e.message == "bytecblock following byte/addr/method"),
+                "v{v}: {errs:?}"
+            );
+        }
+    }
 }
