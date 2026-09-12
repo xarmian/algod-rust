@@ -2257,3 +2257,70 @@ int 1
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// TestAppEmptyBox (`ledger/applications_test.go`): creating a box with
+// content length 0 (`box_create` with size 0), and later deleting it via
+// `box_del`, must both apply cleanly. Zero-length boxes are a real edge
+// case for MBR accounting (`AcctTotalBoxBytes` must still count the box
+// itself, just with zero content bytes) and for the box-store round trip
+// (an empty byte string is a legitimate, distinct value from "absent").
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_app_empty_box_create_and_delete() {
+    let creator = Address([31u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let app_id = 1002u64;
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+
+    // On the creation call (`txn ApplicationID == 0`), create a zero-length
+    // box named "boxname". On any later call, delete it instead.
+    let src = "#pragma version 8
+txn ApplicationID
+int 0
+==
+bnz create_box
+byte \"boxname\"
+box_del
+return
+
+create_box:
+byte \"boxname\"
+int 0
+box_create
+return
+";
+    let mut create = appl_create(creator, 2_000, app_id, src, APPROVE_SRC, None, None, None);
+    create.txn.boxes = Some(vec![algo_types::BoxRef {
+        index: 0,
+        name: Some(serde_bytes::ByteBuf::from(b"boxname".to_vec())),
+    }]);
+
+    let create_block = minimal_block(fee_sink, 1, vec![create]);
+    apply_block_capturing_apply_data(&mut state, &create_block, ApplyMode::Execute)
+        .expect("creating a zero-length box must apply cleanly");
+
+    // The box must actually exist, with zero-length content.
+    use algo_ledger::store_trait::LedgerStore;
+    let stored = state
+        .get_box(app_id, b"boxname")
+        .expect("the zero-length box must exist after creation");
+    assert_eq!(stored, Vec::<u8>::new());
+
+    // A later call deletes it.
+    let mut delete = appl_call(creator, 1_000, app_id, 0, None);
+    delete.txn.boxes = Some(vec![algo_types::BoxRef {
+        index: 0,
+        name: Some(serde_bytes::ByteBuf::from(b"boxname".to_vec())),
+    }]);
+    let delete_block = minimal_block(fee_sink, 2, vec![delete]);
+    apply_block_capturing_apply_data(&mut state, &delete_block, ApplyMode::Execute)
+        .expect("deleting the zero-length box must apply cleanly");
+
+    assert!(
+        state.get_box(app_id, b"boxname").is_none(),
+        "the box must be gone after deletion"
+    );
+}

@@ -12758,6 +12758,67 @@ mod tests {
         );
     }
 
+    /// TestArchivalCreatables (`ledger/archival_test.go`): go's version
+    /// restarts a live tracker DB in-process and re-verifies the
+    /// asset/app creatable index survives. algod-rust has no equivalent of
+    /// go's in-memory tracker-restart harness, but `SqliteLedger` genuinely
+    /// persists to disk, so closing and reopening a real file-backed
+    /// `SqliteLedger` (not a catchpoint export/import round trip, which
+    /// `export_then_import_round_trips_state_and_label`/
+    /// `test_creator_table_population` already cover) is the closer
+    /// equivalent of "restart" available here: it exercises the on-disk
+    /// `assetcreators`/`resources` tables directly, without going through
+    /// the catchpoint fixture machinery at all.
+    #[test]
+    fn creatable_index_survives_file_backed_close_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let creator = Address([21u8; 32]);
+
+        {
+            let mut ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
+            ledger.set_account(&creator, AccountData::default());
+            ledger.set_asset_params(
+                150,
+                AssetParamsRecord {
+                    params: AssetParams {
+                        total: 42,
+                        unit_name: "ARC".into(),
+                        ..Default::default()
+                    },
+                    creator,
+                },
+            );
+            ledger.set_app_params(
+                250,
+                AppParams {
+                    creator,
+                    approval_program: vec![0x06],
+                    clear_state_program: vec![0x06],
+                    ..Default::default()
+                },
+            );
+            // Falls out of scope here -- an in-process "restart".
+        }
+
+        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen");
+
+        let asset = ledger
+            .get_asset_params(150)
+            .expect("asset creatable index must survive close/reopen");
+        assert_eq!(asset.creator, creator);
+        assert_eq!(asset.params.total, 42);
+        assert_eq!(asset.params.unit_name, "ARC");
+
+        let apps_by_creator = ledger.app_params_created_by(&creator);
+        assert_eq!(
+            apps_by_creator.len(),
+            1,
+            "app creatable index must survive close/reopen"
+        );
+        assert_eq!(apps_by_creator[0].approval_program, vec![0x06]);
+    }
+
     #[test]
     fn reconcile_cross_file_distinguishes_empty_consistent_catchpoint_and_block_behind() {
         // Empty DB: both tracker and blockdb are bare. Should report Empty.
