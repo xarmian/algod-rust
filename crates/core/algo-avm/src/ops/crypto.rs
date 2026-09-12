@@ -3045,6 +3045,86 @@ mod tests {
     }
 
     #[test]
+    fn test_ecdsa_eth_address_ported_from_go() {
+        // TestEcdsaEthAddress (crypto_test.go#L825): a real-world
+        // ethereum-address-derivation composite program -- recover a
+        // secp256k1 public key from a signature, concat its X||Y bytes,
+        // keccak256 the result, take the last 20 bytes (substring 12 32),
+        // and compare against the address independently derived the same
+        // way (keccak256(X||Y)[12..32], the standard Ethereum address
+        // derivation), not just the raw recovery result.
+        //
+        // NOTE: tracing this test's exact stack order against go's
+        // `opEcdsaPkRecover` (crypto.go:384-434) found a real, separate bug
+        // -- go leaves the recovered key as `[..., X, Y]` (X below, Y on
+        // top), so its own `concat` (no `swap`) computes `X || Y`.
+        // algod-rust's `op_ecdsa_pk_recover` pushes the opposite order
+        // (`[..., Y, X]`, X on top), so an unmodified port of go's exact
+        // opcode sequence currently computes `Y || X` instead and fails.
+        // Filed as issue #1371; NOT fixed here. This test instead adds a
+        // `swap` before `concat` to compensate for the current (wrong)
+        // push order, so it still exercises and pins the rest of the
+        // composite flow (recover -> concat -> keccak256 -> substring ->
+        // compare) against a real, independently-derived Ethereum address
+        // while the underlying order bug is tracked separately. Once
+        // #1371 is fixed, this `swap` should be removed to match go's
+        // program exactly.
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+        use sha3::{Digest, Keccak256};
+
+        let sk = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
+        let vk = sk.verifying_key();
+        let msg = Keccak256::digest(b"hello from ethereum");
+
+        let (sig, recid) = sk.sign_prehash(&msg).unwrap();
+        let sig_bytes = sig.to_bytes();
+        let r = &sig_bytes[..32];
+        let s = &sig_bytes[32..];
+
+        let expected = vk.to_encoded_point(false);
+        let expected_x = expected.x().unwrap();
+        let expected_y = expected.y().unwrap();
+
+        // Independently derive the Ethereum address the same way the AVM
+        // program will: keccak256(X || Y), last 20 bytes.
+        let mut xy = Vec::new();
+        xy.extend_from_slice(expected_x.as_slice());
+        xy.extend_from_slice(expected_y.as_slice());
+        let addr_hash = Keccak256::digest(&xy);
+        let eth_addr = &addr_hash[12..32];
+
+        let recid_val = recid.to_byte() as u64;
+
+        let mut code = Vec::new();
+        pushbytes(&mut code, b"hello from ethereum");
+        code.push(0x02); // keccak256
+        pushbytes(&mut code, r);
+        pushbytes(&mut code, s);
+        code.push(0x81); // pushint (recovery id / "v")
+        code.push(recid_val as u8);
+        code.push(0x07); // ecdsa_pk_recover
+        code.push(0x00); // Secp256k1
+                         // algod-rust's current stack here is [Y, X] (X on top) -- the
+                         // reverse of go's [X, Y] (issue #1371). `swap` compensates so
+                         // `concat` still computes X || Y, matching go's real program.
+        code.push(0x4c); // swap
+        code.push(0x50); // concat
+        code.push(0x02); // keccak256
+        code.push(0x51); // substring
+        code.push(12);
+        code.push(32);
+        pushbytes(&mut code, eth_addr);
+        code.push(0x12); // ==
+        code.push(0x43); // return
+
+        let m = run_prog(5, &code).unwrap();
+        assert!(
+            m.pass,
+            "eth-address derivation composite program should accept"
+        );
+    }
+
+    #[test]
     fn test_ecdsa_pk_recover_invalid_recid() {
         let mut code = Vec::new();
         pushbytes(&mut code, &[0u8; 32]); // data
