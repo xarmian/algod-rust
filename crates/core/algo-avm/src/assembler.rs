@@ -2218,34 +2218,49 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
                 );
                 return;
             }
+            // Explicit `intc`/`bytec` mnemonics: mirror go-algorand's
+            // `asmIntC`/`asmByteC` (assembler.go:583-609), which route
+            // through `writeIntc`/`writeBytec` (assembler.go:429-452,
+            // 482-505) instead of the generic 2-byte opcode+immediate
+            // form used by every other `Uint8`-immediate opcode. Those
+            // special-case constant index 0-3 to the single-byte
+            // `intc_0..3`/`bytec_0..3` opcodes (and reject an index past
+            // the end of the constant pool built so far, or -- once the
+            // pool is large enough -- more than 256 constants), so route
+            // here before ever pushing the generic `spec.opcode` byte.
+            if mnemonic == "intc" || mnemonic == "bytec" {
+                match parse_uint8_or_int8(args[0], mnemonic) {
+                    Ok(val) => {
+                        let pool_len = if mnemonic == "intc" {
+                            ops.intc.len()
+                        } else {
+                            ops.bytec.len()
+                        };
+                        if val as usize >= pool_len {
+                            ops.record_error(
+                                ops.source_line,
+                                0,
+                                format!("{} {} is not defined", mnemonic, val),
+                            );
+                            return;
+                        }
+                        if mnemonic == "intc" {
+                            ops.write_intc(val as usize);
+                        } else {
+                            ops.write_bytec(val as usize);
+                        }
+                    }
+                    Err(e) => {
+                        ops.record_error(ops.source_line, 0, format!("{mnemonic} {e}"));
+                    }
+                }
+                return;
+            }
             ops.pending.push(spec.opcode);
             // Check if this opcode uses a field group
             if let Some(val) = resolve_field_immediate(ops, mnemonic, args[0]) {
                 ops.pending.push(val);
             } else if let Ok(val) = parse_uint8_or_int8(args[0], mnemonic) {
-                // TestAssembleConstants: a direct `intc N`/`bytec N`
-                // reference to an index past the end of the constant pool
-                // built so far (by any preceding `intcblock`/`bytecblock`)
-                // is rejected at assembly time, matching go-algorand's
-                // `writeIntc`/`writeBytec` (`assembler.go:447-448,
-                // 500-501`): `"intc %d is not defined"` /
-                // `"bytec %d is not defined"`.
-                let pool_len = match mnemonic {
-                    "intc" => Some(ops.intc.len()),
-                    "bytec" => Some(ops.bytec.len()),
-                    _ => None,
-                };
-                if let Some(len) = pool_len {
-                    if val as usize >= len {
-                        ops.record_error(
-                            ops.source_line,
-                            0,
-                            format!("{} {} is not defined", mnemonic, val),
-                        );
-                        ops.pending.pop();
-                        return;
-                    }
-                }
                 ops.pending.push(val);
             } else if is_field_group_immediate(mnemonic, 0) {
                 ops.record_error(
@@ -4077,6 +4092,102 @@ mod tests {
 
         let ops = assemble_string("#pragma version 8\nbytecblock 0x01 0x02\nbytec 1\n").unwrap();
         assert!(!ops.program.is_empty());
+    }
+
+    #[test]
+    fn test_explicit_intc_bytec_mnemonics_use_short_form_opcodes() {
+        // Issue #1381: go-algorand's `writeIntc`/`writeBytec`
+        // (assembler.go:429-452, 482-505), called from the explicit
+        // `intc`/`bytec` mnemonic handlers `asmIntC`/`asmByteC`
+        // (assembler.go:583-609), special-case constant index 0-3 to the
+        // single-byte `intc_0..3`/`bytec_0..3` opcodes rather than the
+        // generic 2-byte `intc <idx>`/`bytec <idx>` form used for index 4+.
+        // This must hold for the *explicit* mnemonic (unlike the `int`/
+        // `byte` literal auto-optimization path, which already picked the
+        // short form correctly).
+        let source = "#pragma version 8\n\
+             intcblock 10 20 30 40 50\n\
+             intc 0\n\
+             intc 1\n\
+             intc 2\n\
+             intc 3\n\
+             intc 4\n\
+             pop\npop\npop\npop\npop\n\
+             int 1\nreturn\n";
+        let ops = assemble_string(source).unwrap();
+        // program: [version, intcblock(0x20, count=5, 10,20,30,40,50), ...]
+        let mut i = 1;
+        assert_eq!(ops.program[i], 0x20); // intcblock
+        i += 1;
+        assert_eq!(ops.program[i], 5); // count
+        i += 1;
+        for v in [10u8, 20, 30, 40, 50] {
+            assert_eq!(ops.program[i], v);
+            i += 1;
+        }
+        assert_eq!(ops.program[i], 0x22, "intc 0 -> intc_0"); // intc_0
+        i += 1;
+        assert_eq!(ops.program[i], 0x23, "intc 1 -> intc_1"); // intc_1
+        i += 1;
+        assert_eq!(ops.program[i], 0x24, "intc 2 -> intc_2"); // intc_2
+        i += 1;
+        assert_eq!(ops.program[i], 0x25, "intc 3 -> intc_3"); // intc_3
+        i += 1;
+        assert_eq!(ops.program[i], 0x21, "intc 4 -> intc <idx> (long form)"); // intc
+        i += 1;
+        assert_eq!(ops.program[i], 4); // index immediate
+
+        let source = "#pragma version 8\n\
+             bytecblock 0x01 0x02 0x03 0x04 0x05\n\
+             bytec 0\n\
+             bytec 1\n\
+             bytec 2\n\
+             bytec 3\n\
+             bytec 4\n\
+             pop\npop\npop\npop\npop\n\
+             int 1\nreturn\n";
+        let ops = assemble_string(source).unwrap();
+        let mut i = 1;
+        assert_eq!(ops.program[i], 0x26); // bytecblock
+        i += 1;
+        assert_eq!(ops.program[i], 5); // count
+        i += 1;
+        for v in [1u8, 2, 3, 4, 5] {
+            assert_eq!(ops.program[i], 1); // length prefix (1 byte each)
+            i += 1;
+            assert_eq!(ops.program[i], v);
+            i += 1;
+        }
+        assert_eq!(ops.program[i], 0x28, "bytec 0 -> bytec_0"); // bytec_0
+        i += 1;
+        assert_eq!(ops.program[i], 0x29, "bytec 1 -> bytec_1"); // bytec_1
+        i += 1;
+        assert_eq!(ops.program[i], 0x2a, "bytec 2 -> bytec_2"); // bytec_2
+        i += 1;
+        assert_eq!(ops.program[i], 0x2b, "bytec 3 -> bytec_3"); // bytec_3
+        i += 1;
+        assert_eq!(ops.program[i], 0x27, "bytec 4 -> bytec <idx> (long form)"); // bytec
+        i += 1;
+        assert_eq!(ops.program[i], 4); // index immediate
+    }
+
+    #[test]
+    fn test_assemble_jump_to_the_end_byte_exact() {
+        // TestAssembleJumpToTheEnd (assembler_test.go:1929-1946), at
+        // AssemblerMaxVersion (13, >= varintBranchVersion so `bnz` uses the
+        // 1-byte varint offset form): go asserts the exact assembled
+        // program bytes `0120010122224000` -- version, intcblock(count=1,
+        // val=1), `intc_0`, `intc_0`, `bnz`, offset-varint(0). This is a
+        // byte-exact regression pin for issue #1381: before the fix, each
+        // explicit `intc 0` mnemonic assembled as the 2-byte generic form
+        // (`0x21 0x00`) instead of the single-byte `intc_0` (`0x22`),
+        // producing an 11-byte program instead of go's 8 bytes.
+        let source = "#pragma version 13\nintcblock 1\nintc 0\nintc 0\nbnz done\ndone:\n";
+        let ops = assemble_string(source).unwrap();
+        assert_eq!(
+            ops.program,
+            vec![opcode::MAX_AVM_VERSION, 0x20, 0x01, 0x01, 0x22, 0x22, 0x40, 0x00]
+        );
     }
 
     #[test]
