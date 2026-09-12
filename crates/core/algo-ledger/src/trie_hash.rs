@@ -377,6 +377,94 @@ mod tests {
         );
     }
 
+    /// Phase 17 (issue #1322): TestHashContract
+    /// (ledger/catchpointtracker_test.go:1757) -- ports go's literal,
+    /// hand-computed expected hex strings directly (not via the captured
+    /// fixture-file mechanism the tests above use), for one case of each
+    /// `HashKind` go's own test exercises: Account (x2: UpdateRound-driven
+    /// and RewardsBase-driven affinity), Asset, App, and Kv. The existing
+    /// `test_finish_v6_matches_go_captured_elements` fixture test proves
+    /// byte-exactness for a DIFFERENT, tool-captured set of scenarios; this
+    /// closes the documented gap of not having go's own `TestHashContract`
+    /// literal vectors pinned directly.
+    #[test]
+    fn test_hash_contract_matches_go_literal_vectors() {
+        use algo_codec::{canonical_encode_resources_data, ResourcesData};
+
+        let addr = Address([
+            0x7, 0xda, 0xcb, 0x4b, 0x6d, 0x9e, 0xd1, 0x41, 0xb1, 0x75, 0x76, 0xbd, 0x45, 0x9a,
+            0xe6, 0x42, 0x1d, 0x48, 0x6d, 0xa3, 0xd4, 0xef, 0x22, 0x47, 0xc4, 0x9, 0xa3, 0x96,
+            0xb8, 0x2e, 0xa2, 0x21,
+        ]);
+
+        // Account case 1: UpdateRound: 1024 (affinity comes from UpdateRound).
+        let acct1 = AccountData {
+            update_round: 1024,
+            ..Default::default()
+        };
+        let h1 = account_hash_v6(&addr, &acct1);
+        assert_eq!(h1[4], HashKind::Account as u8);
+        assert_eq!(
+            hex::encode(h1),
+            "0000040000c3c39a72c146dc6bcb87b499b63ef730145a8fe4a187c96e9a52f74ef17f54"
+        );
+
+        // Account case 2: RewardsBase: 10000 (UpdateRound is zero, so
+        // affinity falls back to RewardsBase).
+        let acct2 = AccountData {
+            rewards_base: 10000,
+            ..Default::default()
+        };
+        let h2 = account_hash_v6(&addr, &acct2);
+        assert_eq!(h2[4], HashKind::Account as u8);
+        assert_eq!(
+            hex::encode(h2),
+            "0000271000804b58bcc81190c3c7343c1db9c737621ff0438104bdd20a25d12aa4e9b6e5"
+        );
+
+        // Resource (asset) case: creatable index 7, updateRound 1024
+        // (passed explicitly to ResourcesHashBuilderV6 -- NOT derived from
+        // the resource's own UpdateRound field, which is left at 0 here).
+        let asset_rd = ResourcesData {
+            amount: 1000,
+            decimals: 3,
+            asset_name: "test".to_string(),
+            manager: addr.0,
+            ..Default::default()
+        };
+        let asset_encoded = canonical_encode_resources_data(&asset_rd);
+        let h3 = resource_hash_v6_with_kind(&addr, 7, &asset_encoded, 1024, HashKind::Asset);
+        assert_eq!(h3[4], HashKind::Asset as u8);
+        assert_eq!(
+            hex::encode(h3),
+            "0000040001ca4157130516bd7f120cef4b3a28715e464d9a29f7575db9b2173b4eccd18e"
+        );
+
+        // Resource (app) case: same creatable index/updateRound convention.
+        let app_rd = ResourcesData {
+            approval_program: vec![1, 3, 10, 15],
+            clear_state_program: vec![15, 10, 3, 1],
+            local_state_schema_num_uint: 2,
+            global_state_schema_num_uint: 2,
+            ..Default::default()
+        };
+        let app_encoded = canonical_encode_resources_data(&app_rd);
+        let h4 = resource_hash_v6_with_kind(&addr, 7, &app_encoded, 1024, HashKind::App);
+        assert_eq!(h4[4], HashKind::App as u8);
+        assert_eq!(
+            hex::encode(h4),
+            "00000400023547567f3234873b48fd4152f296a92ae260b024b93c2408f35caccff57c32"
+        );
+
+        // Kv case.
+        let h5 = kv_hash_v6(b"sample key", b"sample value");
+        assert_eq!(h5[4], HashKind::Kv as u8);
+        assert_eq!(
+            hex::encode(h5),
+            "0000000003cca3d1a8d7d724daa445c795ad277a7a64b351b4b9407f738841282f9c348b"
+        );
+    }
+
     #[test]
     fn test_affinity_uses_update_round_when_nonzero() {
         let acct = AccountData {

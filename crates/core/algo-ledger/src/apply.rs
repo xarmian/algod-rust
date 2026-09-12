@@ -7377,6 +7377,97 @@ mod tests {
         assert_eq!(acct.vote_key_dilution, 0);
     }
 
+    /// Phase 17 (issue #1322): TestLedgerKeyregFlip
+    /// (ledger/ledger_test.go:2821) -- ports the core "rapid flip across
+    /// rounds" property go's (much larger, 1000-round) stress test proves:
+    /// an account's participation status and its VoteID/SelectionID key
+    /// material must correctly flip online<->offline round after round,
+    /// with each round's real (distinct) key bytes actually landing in the
+    /// account -- not stale bytes surviving from an earlier online period.
+    /// `test_keyreg_online`/`test_keyreg_offline` each only prove a SINGLE
+    /// isolated transition; this drives several accounts through many
+    /// rounds of alternating on/off with round- and account-distinct key
+    /// bytes (mirroring go's `isOnline`/per-round-distinct-byte pattern)
+    /// and checks every round's resulting status and key bytes.
+    #[test]
+    fn test_keyreg_rapid_flip_across_rounds_tracks_distinct_vote_keys() {
+        let accounts: Vec<Address> = (0u8..4).map(|i| Address([i + 10; 32])).collect();
+        let fee_sink = Address([3u8; 32]);
+
+        let mut balances: Vec<(Address, u64)> = accounts.iter().map(|a| (*a, 10_000_000)).collect();
+        balances.push((fee_sink, 0));
+        let mut state = make_state_with_accounts(&balances, fee_sink);
+
+        // Same shape as go's `isOnline`: (round + acct_idx) % 4 == 1.
+        let is_online = |round: u64, acct_idx: u64| (round + acct_idx) % 4 == 1;
+
+        for round in 1..=12u64 {
+            let ctx = ApplyContext::new_replay(0, fee_sink, round);
+            for (acct_idx, addr) in accounts.iter().enumerate() {
+                let acct_idx = acct_idx as u64;
+                let mut stx = SignedTransaction::default();
+                stx.txn.txn_type = "keyreg".into();
+                stx.txn.sender = *addr;
+                stx.txn.fee = 1_000;
+                stx.txn.vote_first = round;
+                stx.txn.vote_last = round + 100_000;
+
+                let online = is_online(round, acct_idx);
+                if online {
+                    // Distinct, round- and account-derived key bytes, so a
+                    // stale carry-over from a PRIOR online period would be
+                    // caught by the byte assertions below.
+                    let mut vote_pk = [0u8; 32];
+                    vote_pk[0] = acct_idx as u8;
+                    vote_pk[1] = round as u8;
+                    vote_pk[2] = 254;
+                    let mut selection_pk = [0u8; 32];
+                    selection_pk[0] = acct_idx as u8;
+                    selection_pk[1] = round as u8;
+                    selection_pk[2] = 255;
+                    stx.txn.vote_pk = Some(vote_pk);
+                    stx.txn.selection_pk = Some(selection_pk);
+                    stx.txn.vote_key_dilution = 10;
+                }
+
+                apply_transaction(&mut state, &stx, &ctx, 0).unwrap_or_else(|e| {
+                    panic!("round {round} acct {acct_idx} keyreg must apply: {e}")
+                });
+
+                let acct = state.get_account(addr).unwrap();
+                if online {
+                    assert_eq!(
+                        acct.status,
+                        AccountStatus::Online,
+                        "round {round} acct {acct_idx} must be online"
+                    );
+                    let vote_id = acct.vote_id.unwrap_or_else(|| {
+                        panic!("round {round} acct {acct_idx}: online account must have a VoteID")
+                    });
+                    assert_eq!(vote_id[0], acct_idx as u8);
+                    assert_eq!(vote_id[1], round as u8);
+                    assert_eq!(vote_id[2], 254);
+                    let selection_id = acct.selection_id.unwrap();
+                    assert_eq!(selection_id[0], acct_idx as u8);
+                    assert_eq!(selection_id[1], round as u8);
+                    assert_eq!(selection_id[2], 255);
+                } else {
+                    assert_eq!(
+                        acct.status,
+                        AccountStatus::Offline,
+                        "round {round} acct {acct_idx} must be offline"
+                    );
+                    assert_eq!(
+                        acct.vote_id, None,
+                        "round {round} acct {acct_idx}: going offline must clear any prior VoteID, \
+                         not leave a stale one behind"
+                    );
+                    assert_eq!(acct.selection_id, None);
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_keyreg_nonpart() {
         let sender = Address([1u8; 32]);
