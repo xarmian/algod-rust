@@ -2575,6 +2575,21 @@ mod tests {
         );
     }
 
+    /// go's `TestTestTransactionGroup`/`TestPrivateTransactionGroup`
+    /// (`ledger/eval/eval_test.go`): both are thin wrappers around the same
+    /// group-size check (`BlockEvaluator.TestTransactionGroup`/
+    /// `TransactionGroup`) and both assert an empty group is a trivial no-op
+    /// ("nothing to do, no problem"), not an error. `test_group_too_large_fails`
+    /// above only ever covers the oversized-group error path.
+    #[test]
+    fn test_empty_group_is_ok() {
+        let empty: Vec<SignedTransaction> = Vec::new();
+        assert!(
+            validate_transaction_group(&empty).is_ok(),
+            "an empty transaction group must be a trivial no-op, not an error"
+        );
+    }
+
     #[test]
     fn test_single_txn_group_skipped() {
         let mut txn = make_valid_txn();

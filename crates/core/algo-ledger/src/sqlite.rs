@@ -9227,6 +9227,7 @@ mod tests {
             .put_account_totals_seed(1_000_000, 0, 0, 0, 0, 0)
             .unwrap();
         ledger.commit_block().unwrap();
+
         assert_eq!(ledger.online_supply_at_round(1).unwrap(), Some(1_000_000));
 
         // Jump far enough ahead that round 1 falls outside the 320-round
@@ -9248,6 +9249,54 @@ mod tests {
             Some(5_000_000),
             "the just-committed round's snapshot must remain"
         );
+    }
+
+    /// go's `TestAccountOnlineRoundParams` (`ledger/acctdeltas_test.go`):
+    /// write a batch of per-round online-supply snapshots directly (go's
+    /// `AccountsPutOnlineRoundParams`), verify every one reads back
+    /// correctly (go's `AccountsOnlineRoundParams`/`MakeOnlineRoundParamsIter`),
+    /// then prune everything before a cutoff round (go's
+    /// `AccountsPruneOnlineRoundParams`) and verify exactly the rounds
+    /// before the cutoff are gone while the rest survive untouched. Uses
+    /// the low-level `put_online_supply_at_round`/`prune_online_supply_before`
+    /// primitives directly (mirroring go's direct writer-API calls) rather
+    /// than `commit_block_appends_online_supply_snapshot_for_each_round`'s
+    /// live-apply-driven 3-round scenario above.
+    #[test]
+    fn online_supply_bulk_write_read_prune_matches_go() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+
+        const MAX_ROUND: u64 = 40;
+        for round in 1..=MAX_ROUND {
+            ledger.put_online_supply_at_round(round, round).unwrap();
+        }
+
+        // Every written round must read back exactly what was written.
+        for round in 1..=MAX_ROUND {
+            assert_eq!(
+                ledger.online_supply_at_round(round).unwrap(),
+                Some(round),
+                "round {round} must read back its own written online supply"
+            );
+        }
+
+        // Prune everything strictly before round 10.
+        ledger.prune_online_supply_before(10).unwrap();
+
+        for round in 1..10 {
+            assert_eq!(
+                ledger.online_supply_at_round(round).unwrap(),
+                None,
+                "round {round} must be pruned (< cutoff 10)"
+            );
+        }
+        for round in 10..=MAX_ROUND {
+            assert_eq!(
+                ledger.online_supply_at_round(round).unwrap(),
+                Some(round),
+                "round {round} must survive the prune (>= cutoff 10)"
+            );
+        }
     }
 
     /// Issue #529: the snapshot for the *exact* lookback round
