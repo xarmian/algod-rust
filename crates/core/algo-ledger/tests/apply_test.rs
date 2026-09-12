@@ -1093,6 +1093,253 @@ fn test_eval_delta_inner_txns() {
 }
 
 // ---------------------------------------------------------------------------
+// 13b. App global/local state survives round gaps
+// (go's `TestLedgerAppCrossRoundWrites`, `ledger/ledger_test.go`)
+//
+// go's version creates an app with a global-state write in one block, adds
+// TWO empty blocks in between (advancing the round with no app txns at
+// all), then has a second account opt in with both a global-state update
+// and a local-state write in the same call, and checks the final global
+// value reflects both writes. The prior `test_eval_delta_global_state`
+// only ever applied deltas within a single shared `ApplyContext`/round —
+// it never proved a value written in one *block* is still correctly read
+// and built upon after the ledger has advanced through intervening rounds
+// that never touch the app at all. This test closes that specific gap by
+// driving `apply_block` across four real rounds with two empty blocks in
+// the middle. (go's separate `LookupApplication(rnd, ...)` calls at an
+// *older*, already-passed round have no equivalent here: algod-rust's
+// `LedgerState` holds only the current-round-committed state, not a
+// lookback window of recent-round snapshots — see the row comment in
+// `docs/phase17/parity_ledger_core.md`.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_app_global_and_local_state_persist_across_round_gaps() {
+    let creator = Address([1u8; 32]);
+    let user = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[(creator, 50_000_000), (user, 50_000_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let app_id = 500u64;
+
+    // Round 1: creator creates the app, writing global "counter" = 1.
+    let mut create = appl_create_txn(creator, 1_000, app_id, 0);
+    create.eval_delta = Some(rmpv::Value::Map(vec![(
+        rmpv::Value::String("gd".into()),
+        rmpv::Value::Map(vec![(
+            rmpv::Value::String("counter".into()),
+            rmpv::Value::Map(vec![
+                (
+                    rmpv::Value::String("at".into()),
+                    rmpv::Value::Integer(1.into()),
+                ),
+                (
+                    rmpv::Value::String("ui".into()),
+                    rmpv::Value::Integer(1.into()),
+                ),
+            ]),
+        )]),
+    )]));
+    let block1 = minimal_block(fee_sink, 1, vec![create]);
+    apply_block(&mut state, &block1).expect("app create must apply");
+    assert_eq!(
+        *state
+            .get_app_params(app_id)
+            .unwrap()
+            .global_state
+            .get(b"counter".as_slice())
+            .unwrap(),
+        TealValue::Uint(1)
+    );
+
+    // Rounds 2 and 3: empty blocks — no app txns at all. The written global
+    // state must survive untouched across these round boundaries.
+    let block2 = minimal_block(fee_sink, 2, vec![]);
+    apply_block(&mut state, &block2).expect("empty round 2 must apply");
+    let block3 = minimal_block(fee_sink, 3, vec![]);
+    apply_block(&mut state, &block3).expect("empty round 3 must apply");
+    assert_eq!(
+        *state
+            .get_app_params(app_id)
+            .unwrap()
+            .global_state
+            .get(b"counter".as_slice())
+            .unwrap(),
+        TealValue::Uint(1),
+        "global state must be unchanged after two rounds with no app txns"
+    );
+
+    // Round 4: a different account (`user`) opts in, writing both a new
+    // global value and its own local-state entry in the same call.
+    let mut optin = appl_optin_txn(user, 1_000, app_id);
+    optin.eval_delta = Some(rmpv::Value::Map(vec![
+        (
+            rmpv::Value::String("gd".into()),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::String("counter".into()),
+                rmpv::Value::Map(vec![
+                    (
+                        rmpv::Value::String("at".into()),
+                        rmpv::Value::Integer(1.into()),
+                    ),
+                    (
+                        rmpv::Value::String("ui".into()),
+                        rmpv::Value::Integer(2.into()),
+                    ),
+                ]),
+            )]),
+        ),
+        (
+            rmpv::Value::String("ld".into()),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::Integer(0.into()),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::String("counter".into()),
+                    rmpv::Value::Map(vec![
+                        (
+                            rmpv::Value::String("at".into()),
+                            rmpv::Value::Integer(1.into()),
+                        ),
+                        (
+                            rmpv::Value::String("ui".into()),
+                            rmpv::Value::Integer(1.into()),
+                        ),
+                    ]),
+                )]),
+            )]),
+        ),
+    ]));
+    let block4 = minimal_block(fee_sink, 4, vec![optin]);
+    apply_block(&mut state, &block4).expect("opt-in with global+local delta must apply");
+
+    // Global state now reflects the round-4 write, having correctly carried
+    // forward the round-1 value across the two intervening empty rounds.
+    assert_eq!(
+        *state
+            .get_app_params(app_id)
+            .unwrap()
+            .global_state
+            .get(b"counter".as_slice())
+            .unwrap(),
+        TealValue::Uint(2)
+    );
+    // The opted-in user's own local state was written in the same call.
+    let local = state.get_app_local_state(&user, app_id).unwrap();
+    assert_eq!(
+        *local.key_value.get(b"counter".as_slice()).unwrap(),
+        TealValue::Uint(1)
+    );
+    // The creator never opted in and has no local state for this app.
+    assert!(state.get_app_local_state(&creator, app_id).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 13c. Two app calls from different senders in the same block apply their
+// global-state deltas sequentially in payset order (go's
+// `TestLedgerAppMultiTxnWrites`, `ledger/ledger_test.go`). go's version runs
+// this both grouped and ungrouped to show grouping is irrelevant to delta
+// application order; algod-rust's `apply_block` has no group-aware special
+// case in the eval-delta-application path (grouping only affects upstream
+// AVM evaluation/validation, not this replay-mode apply step), so a single
+// ungrouped run exercises the same in-scope property: each transaction's
+// pre-computed `eval_delta` is applied strictly in payset order, so the
+// second transaction's delta (computed by go's AVM run against the
+// first transaction's already-applied value) matches what algod-rust
+// actually produces once applied in sequence.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_app_global_state_two_senders_same_block_sequential_deltas() {
+    let creator = Address([1u8; 32]);
+    let user = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[(creator, 50_000_000), (user, 50_000_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let app_id = 600u64;
+    let base: u64 = 10;
+
+    fn global_delta_txn(sender: Address, fee: u64, app_id: u64, value: u64) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "appl".into();
+        stx.txn.sender = sender;
+        stx.txn.fee = fee;
+        stx.txn.application_id = app_id;
+        stx.txn.on_completion = 0; // NoOp
+        stx.eval_delta = Some(rmpv::Value::Map(vec![(
+            rmpv::Value::String("gd".into()),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::String("key".into()),
+                rmpv::Value::Map(vec![
+                    (
+                        rmpv::Value::String("at".into()),
+                        rmpv::Value::Integer(1.into()),
+                    ),
+                    (
+                        rmpv::Value::String("ui".into()),
+                        rmpv::Value::Integer(value.into()),
+                    ),
+                ]),
+            )]),
+        )]));
+        stx
+    }
+
+    // Create the app with the initial value (mirrors go's ApplicationArgs
+    // create call, but with the eval_delta injected directly since this
+    // integration layer sits below AVM evaluation).
+    let mut create = appl_create_txn(creator, 1_000, app_id, 0);
+    create.eval_delta = Some(rmpv::Value::Map(vec![(
+        rmpv::Value::String("gd".into()),
+        rmpv::Value::Map(vec![(
+            rmpv::Value::String("key".into()),
+            rmpv::Value::Map(vec![
+                (
+                    rmpv::Value::String("at".into()),
+                    rmpv::Value::Integer(1.into()),
+                ),
+                (
+                    rmpv::Value::String("ui".into()),
+                    rmpv::Value::Integer(base.into()),
+                ),
+            ]),
+        )]),
+    )]));
+    let create_block = minimal_block(fee_sink, 1, vec![create]);
+    apply_block(&mut state, &create_block).expect("app create must apply");
+
+    // Two app calls from different senders in the SAME block. Each
+    // transaction's eval_delta encodes the value go's AVM would have
+    // produced by reading the *previous* transaction's already-applied
+    // global state (base=10, +11 from creator, then +17 from user).
+    let val1 = 11u64;
+    let val2 = 17u64;
+    let call1 = global_delta_txn(creator, 1_000, app_id, base + val1);
+    let call2 = global_delta_txn(user, 1_000, app_id, base + val1 + val2);
+
+    let call_block = minimal_block(fee_sink, 2, vec![call1, call2]);
+    apply_block(&mut state, &call_block).expect("both same-block app calls must apply");
+
+    assert_eq!(
+        *state
+            .get_app_params(app_id)
+            .unwrap()
+            .global_state
+            .get(b"key".as_slice())
+            .unwrap(),
+        TealValue::Uint(base + val1 + val2),
+        "both same-block deltas from different senders must apply in payset order"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 14. Keyreg in block — integration
 // ---------------------------------------------------------------------------
 
