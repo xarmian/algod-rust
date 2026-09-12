@@ -11495,6 +11495,224 @@ mod tests {
         );
     }
 
+    /// Phase 17 (issue #1322): `TestAcfgAction` (`ledger/apptxn_test.go`).
+    ///
+    /// go's version has an app CREATE its own asset via inner acfg (itself
+    /// as manager/reserve/freeze/clawback), then reconfigure each of those
+    /// four special addresses in turn via further inner acfg calls, and
+    /// finally shows that once the app reassigns its OWN manager role away
+    /// to someone else, a further reconfigure attempt by the same app fails
+    /// with "this transaction should be issued by the manager" -- a
+    /// self-inflicted authorization loss. `issue_604_inner_acfg_reconfigure_
+    /// of_preexisting_asset_populates_asset_resources` above only exercises
+    /// an app reconfiguring an asset it was made manager of by someone
+    /// else, and never loses that authority -- it never proves (a) an app
+    /// creating its OWN asset via inner acfg with itself as every special
+    /// address, nor (b) the authorization-loss-after-self-reassignment
+    /// property that is the actual point of go's test name ("Not the
+    /// manager anymore so this won't work").
+    #[test]
+    fn test_acfg_action_app_creates_asset_then_loses_manager_authority_via_inner_reconfigure() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+        let new_manager = Address([7u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(creator, 20_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        // Approval program: on create, just approve. On any later call:
+        //   ApplicationArgs[0] == "create": create an asset with the app's
+        //     own address as manager/reserve/freeze/clawback.
+        //   otherwise: reconfigure the existing asset (ApplicationArgs[1],
+        //     an 8-byte big-endian asset id) to the four 32-byte addresses
+        //     given in ApplicationArgs[2..=5] (manager/reserve/freeze/
+        //     clawback, in that order) -- this only succeeds while the
+        //     calling app is still the asset's manager, mirroring go's
+        //     `asset_params_get`-then-`itxn_field`-unchanged-fields pattern
+        //     but with the caller supplying the (possibly unchanged)
+        //     values directly, since the authorization property under test
+        //     doesn't depend on how the unchanged fields are sourced.
+        let approval_src = "#pragma version 6\n\
+            txn ApplicationID\n\
+            bz approve\n\
+            itxn_begin\n\
+            int acfg\n\
+            itxn_field TypeEnum\n\
+            txna ApplicationArgs 0\n\
+            byte \"create\"\n\
+            ==\n\
+            bz reconfig\n\
+            int 1000000\n\
+            itxn_field ConfigAssetTotal\n\
+            byte \"oz\"\n\
+            itxn_field ConfigAssetUnitName\n\
+            global CurrentApplicationAddress\n\
+            itxn_field ConfigAssetManager\n\
+            global CurrentApplicationAddress\n\
+            itxn_field ConfigAssetReserve\n\
+            global CurrentApplicationAddress\n\
+            itxn_field ConfigAssetFreeze\n\
+            global CurrentApplicationAddress\n\
+            itxn_field ConfigAssetClawback\n\
+            b submit\n\
+            reconfig:\n\
+            txna ApplicationArgs 1\n\
+            btoi\n\
+            itxn_field ConfigAsset\n\
+            txna ApplicationArgs 2\n\
+            itxn_field ConfigAssetManager\n\
+            txna ApplicationArgs 3\n\
+            itxn_field ConfigAssetReserve\n\
+            txna ApplicationArgs 4\n\
+            itxn_field ConfigAssetFreeze\n\
+            txna ApplicationArgs 5\n\
+            itxn_field ConfigAssetClawback\n\
+            submit:\n\
+            itxn_submit\n\
+            approve:\n\
+            int 1\n\
+            return\n";
+        let approval = algo_avm::assembler::assemble_string(approval_src)
+            .expect("approval program must assemble")
+            .program;
+        let clear = algo_avm::assembler::assemble_string("#pragma version 6\nint 1\nreturn\n")
+            .expect("clear program must assemble")
+            .program;
+
+        // Round 1: create the app.
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 1_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute).unwrap();
+        let (&app_id, _) = delta1.creatables.iter().next().unwrap();
+        let app_addr = Address(crate::avm_context::app_address(app_id));
+
+        // Round 2: fund the app account (asset MBR + inner-txn fee via fee
+        // pooling), then call it with args=["create"] so it creates its OWN
+        // asset via inner acfg, with itself as every special address.
+        let fund = pay_txn(creator, app_addr, 3_000_000, 1_000);
+        let mut create_call = SignedTransaction::default();
+        create_call.txn.txn_type = "appl".into();
+        create_call.txn.sender = creator;
+        create_call.txn.fee = 3_000;
+        create_call.txn.application_id = app_id;
+        create_call.txn.app_arguments =
+            Some(vec![Some(serde_bytes::ByteBuf::from(b"create".to_vec()))]);
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![fund, create_call],
+            ..Block::default()
+        };
+        let delta2 = apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute).unwrap();
+        let (&asset_id, _) = delta2.creatables.iter().next().unwrap();
+
+        let params = state.get_asset_params(asset_id).expect("asset must exist");
+        assert_eq!(
+            params.params.manager,
+            Some(app_addr),
+            "the app-created asset's manager must be the app's own address"
+        );
+        assert_eq!(params.params.reserve, Some(app_addr));
+        assert_eq!(params.params.freeze, Some(app_addr));
+        assert_eq!(params.params.clawback, Some(app_addr));
+
+        // Round 3: the app, still manager, reassigns ONLY its manager role
+        // away to `new_manager` (reserve/freeze/clawback stay the app's own
+        // address) -- a legitimate reconfigure while still authorized.
+        let mut reassign = SignedTransaction::default();
+        reassign.txn.txn_type = "appl".into();
+        reassign.txn.sender = creator;
+        reassign.txn.fee = 3_000;
+        reassign.txn.application_id = app_id;
+        reassign.txn.app_arguments = Some(vec![
+            Some(serde_bytes::ByteBuf::from(b"manager".to_vec())),
+            Some(serde_bytes::ByteBuf::from(asset_id.to_be_bytes().to_vec())),
+            Some(serde_bytes::ByteBuf::from(new_manager.0.to_vec())),
+            Some(serde_bytes::ByteBuf::from(app_addr.0.to_vec())),
+            Some(serde_bytes::ByteBuf::from(app_addr.0.to_vec())),
+            Some(serde_bytes::ByteBuf::from(app_addr.0.to_vec())),
+        ]);
+        let block3 = Block {
+            round: Round(3),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![reassign],
+            ..Block::default()
+        };
+        apply_block_with_delta_mode(&mut state, &block3, ApplyMode::Execute)
+            .expect("the app, still manager at this point, must be able to reassign its own manager role away");
+        let params_after = state
+            .get_asset_params(asset_id)
+            .expect("asset must still exist");
+        assert_eq!(
+            params_after.params.manager,
+            Some(new_manager),
+            "the manager reassignment must have applied"
+        );
+
+        // Round 4: "Not the manager anymore so this won't work" -- the app
+        // attempts ANOTHER reconfigure (trying to move reserve to itself
+        // again, redundantly, but that's irrelevant -- any reconfigure
+        // requires manager authority), and must now fail, since round 3
+        // gave that authority away.
+        let mut nodice = SignedTransaction::default();
+        nodice.txn.txn_type = "appl".into();
+        nodice.txn.sender = creator;
+        nodice.txn.fee = 3_000;
+        nodice.txn.application_id = app_id;
+        nodice.txn.app_arguments = Some(vec![
+            Some(serde_bytes::ByteBuf::from(b"reserve".to_vec())),
+            Some(serde_bytes::ByteBuf::from(asset_id.to_be_bytes().to_vec())),
+            Some(serde_bytes::ByteBuf::from(new_manager.0.to_vec())),
+            Some(serde_bytes::ByteBuf::from(app_addr.0.to_vec())),
+            Some(serde_bytes::ByteBuf::from(app_addr.0.to_vec())),
+            Some(serde_bytes::ByteBuf::from(app_addr.0.to_vec())),
+        ]);
+        let block4 = Block {
+            round: Round(4),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![nodice],
+            ..Block::default()
+        };
+        let err = apply_block_with_delta_mode(&mut state, &block4, ApplyMode::Execute).expect_err(
+            "the app is no longer the asset's manager -- this reconfigure must be rejected",
+        );
+        assert!(
+            err.to_string().contains("not the manager"),
+            "expected a manager-authorization error, got: {err}"
+        );
+
+        // And the asset's params must be completely unchanged by the
+        // rejected attempt -- the whole transaction (and its inner txn)
+        // must have been rolled back, not partially applied.
+        let params_unchanged = state
+            .get_asset_params(asset_id)
+            .expect("asset must still exist");
+        assert_eq!(params_unchanged.params.manager, Some(new_manager));
+        assert_eq!(params_unchanged.params.reserve, Some(app_addr));
+    }
+
     // ── Issue #1254: EnableAppCostPooling must gate the shared app-call
     // budget `apply_group_transactions` threads across an atomic group's
     // top-level app calls ──

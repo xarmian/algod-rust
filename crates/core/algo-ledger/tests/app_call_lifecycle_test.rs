@@ -79,7 +79,7 @@ use std::cell::RefCell;
 use algo_avm::group::GroupBudget;
 use algo_ledger::{
     apply_block_capturing_apply_data, apply_transaction_with_budget, parse_eval_delta,
-    ApplyContext, ApplyMode, GroupInfo, LedgerState,
+    ApplyContext, ApplyMode, GroupInfo, LedgerState, LedgerStore,
 };
 use algo_types::{Address, Block, Round, SignedTransaction, StateSchema};
 
@@ -2900,5 +2900,172 @@ itxn_submit
     assert!(
         after.size_sponsor.is_zero(),
         "sponsor bookkeeping must be untouched by a rejected inner shrink"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 17 (issue #1322): TestBoxInners (ledger/boxtxn_test.go:627)
+//
+// A top-level call to a "pass-through" app (no boxes of its own) that
+// forwards the call as an inner `appl` transaction to a SEPARATE
+// "box-owning" app (named via `ForeignApps`), which performs the actual
+// `box_create`/`box_get` on its own box namespace during that inner call.
+// The point go's test makes with its very first assertion ("The current
+// Boxes gives top-level access to 'x', not the inner app") is that a
+// top-level `BoxRef` is scoped to a specific app (selected by `Index`, a
+// position into the top-level txn's OWN `ForeignApps`) -- referencing "x"
+// with the WRONG index (0, meaning "the currently-executing top-level app",
+// i.e. the pass-through app, which owns no boxes) fails with "invalid Box
+// reference", even though a box named "x" is about to be created on the
+// FOREIGN app two calls deep. Only `Index: 1` (pointing at `ForeignApps[0]`,
+// the box-owning app) correctly authorizes that inner app's own box_create.
+//
+// The existing `foreign_read_allowed_via_foreign_box_reads` (avm_context.rs)
+// exercises a DIFFERENT, newer mechanism entirely (the `ForeignBoxReads`/
+// `FamilyBoxAccess` consensus-gated direct-box_get-without-a-BoxRef path);
+// go's plain `BoxRef`+`ForeignApps`-based cross-app access (this test) needs
+// no such flag and predates it, and this is the first place algod-rust
+// proves it end-to-end through a REAL inner-txn call (not a direct
+// `ctx.app_box_get`/`app_box_put` unit call), matching how a top-level
+// `Boxes` declaration threads down into an inner call's own resource
+// resolution.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_box_inners_top_level_box_ref_scoped_to_correct_foreign_app() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let box_app_id = 700u64;
+    let pass_id = 701u64;
+
+    let box_app_addr = Address(algo_ledger::avm_context::app_address(box_app_id));
+    let pass_addr = Address(algo_ledger::avm_context::app_address(pass_id));
+
+    let mut state = make_state(
+        &[
+            (creator, 50_000_000),
+            (fee_sink, 0),
+            (box_app_addr, 1_000_000),
+            (pass_addr, 1_000_000),
+        ],
+        fee_sink,
+    );
+
+    // Box-owning app: on a real call (not creation), `box_create`s the box
+    // named by ApplicationArgs[0] with a fixed size, mirroring go's
+    // `boxAppSource`'s "create" branch (simplified to the one operation
+    // this test needs).
+    let box_app_src = "#pragma version 8\n\
+        txn ApplicationID\n\
+        bz end\n\
+        txn ApplicationArgs 0\n\
+        int 4\n\
+        box_create\n\
+        assert\n\
+        end:\n\
+        int 1\n";
+
+    // Pass-through app: forwards the call as an inner `appl` to
+    // `Applications 1` (its own `ForeignApps[0]`), copying its own
+    // ApplicationArgs[0] through -- mirrors go's `passThruSource`
+    // ("Call the app in txn.Applications[1] the same way I was called").
+    let pass_src = "#pragma version 8\n\
+        txn ApplicationID\n\
+        bz end\n\
+        itxn_begin\n\
+        txn Applications 1\n\
+        itxn_field ApplicationID\n\
+        int appl\n\
+        itxn_field TypeEnum\n\
+        txn ApplicationArgs 0\n\
+        itxn_field ApplicationArgs\n\
+        itxn_submit\n\
+        end:\n\
+        int 1\n";
+
+    let create_box_app = appl_create(
+        creator,
+        1_000,
+        box_app_id,
+        box_app_src,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    let create_pass = appl_create(
+        creator,
+        1_000,
+        pass_id,
+        pass_src,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    let setup_block = minimal_block(fee_sink, 1, vec![create_box_app, create_pass]);
+    apply_block_capturing_apply_data(&mut state, &setup_block, ApplyMode::Execute)
+        .expect("both app creations must apply cleanly");
+
+    // Round 2: call `pass_id` with `Boxes: [{Index: 0, Name: "x"}]` -- Index
+    // 0 means "the currently executing top-level app" (pass_id itself, per
+    // go's `Applications`/box-ref indexing convention), NOT the foreign
+    // `box_app_id` that actually ends up creating the box two calls deep.
+    // Must fail with "invalid Box reference", exactly like go's first
+    // assertion.
+    let mut wrong_index_call = appl_call(creator, 3_000, pass_id, 0, None);
+    wrong_index_call.txn.foreign_apps = Some(vec![box_app_id]);
+    wrong_index_call.txn.app_arguments =
+        Some(vec![Some(serde_bytes::ByteBuf::from(b"x".to_vec()))]);
+    wrong_index_call.txn.boxes = Some(vec![algo_types::BoxRef {
+        index: 0,
+        name: Some(serde_bytes::ByteBuf::from(b"x".to_vec())),
+    }]);
+    let wrong_index_block = minimal_block(fee_sink, 2, vec![wrong_index_call]);
+    let err = apply_block_capturing_apply_data(&mut state, &wrong_index_block, ApplyMode::Execute)
+        .expect_err(
+            "a BoxRef indexed at 0 (the pass-through app itself) must not authorize \
+             a box_create on the foreign box-owning app two calls deep",
+        );
+    assert!(
+        err.to_string().contains("invalid Box reference"),
+        "expected an invalid-Box-reference error, got: {err}"
+    );
+    assert!(
+        state.get_box(box_app_id, b"x").is_none(),
+        "the rejected call's inner box_create must not have taken effect"
+    );
+
+    // Round 3: same call, but `Boxes: [{Index: 1, Name: "x"}]` -- Index 1
+    // correctly names `ForeignApps[0]` (`box_app_id`). The top-level BoxRef
+    // now authorizes the box-owning app's own `box_create`, even though
+    // that create happens two calls deep (pass_id's inner call into
+    // box_app_id), with no `ForeignBoxReads`/`FamilyBoxAccess` consensus
+    // flag involved at all -- this is go's plain, original BoxRef-scoping
+    // mechanism.
+    let mut right_index_call = appl_call(creator, 3_000, pass_id, 0, None);
+    right_index_call.txn.foreign_apps = Some(vec![box_app_id]);
+    right_index_call.txn.app_arguments =
+        Some(vec![Some(serde_bytes::ByteBuf::from(b"x".to_vec()))]);
+    right_index_call.txn.boxes = Some(vec![algo_types::BoxRef {
+        index: 1,
+        name: Some(serde_bytes::ByteBuf::from(b"x".to_vec())),
+    }]);
+    // The rejected round-2 block above never committed (apply_block fails
+    // the whole block, leaving `current_round` at 1), so this is round 2.
+    let right_index_block = minimal_block(fee_sink, 2, vec![right_index_call]);
+    apply_block_capturing_apply_data(&mut state, &right_index_block, ApplyMode::Execute).expect(
+        "a BoxRef correctly indexed at the foreign box-owning app must authorize \
+         its own inner box_create",
+    );
+    assert!(
+        state.get_box(box_app_id, b"x").is_some(),
+        "the box-owning app's own box_create (run via the pass-through app's \
+         inner call) must have taken effect once correctly authorized"
+    );
+    assert!(
+        state.get_box(pass_id, b"x").is_none(),
+        "the box must belong to the box-owning app's namespace, not the \
+         pass-through app's"
     );
 }
