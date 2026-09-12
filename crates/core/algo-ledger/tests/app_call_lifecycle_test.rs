@@ -2324,3 +2324,90 @@ return
         "the box must be gone after deletion"
     );
 }
+
+// ---------------------------------------------------------------------------
+// TestParentGlobals (`ledger/apptxn_test.go` L1011): the pending-created-app
+// edge case. `nested_caller_app_id` (inner_txn_integration.rs) already
+// proves `global CallerApplicationID` resolves correctly when the caller is
+// an already-existing app. go's test additionally creates an app at the TOP
+// LEVEL whose approval program -- while it is still being created, i.e.
+// before its own `ApplicationID` has been committed and is only known via
+// `txn_counter + 1` bookkeeping -- issues an inner `appl` call to a second
+// app that reads `global CallerApplicationID`. The callee must see the
+// creating app's real (about-to-be-assigned) ID, not 0 or a stale value.
+// This exercises the `effective_app_id`/txn-counter-derived-ID path for a
+// TOP-LEVEL create specifically (the inner-create path already goes through
+// the same `effective_app_id` computation in `execute_inner_appl`, but the
+// top-level path is a separate code path in `apply_appl` and was untested
+// for this scenario).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_parent_globals_pending_created_app_caller_id() {
+    let creator = Address([41u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let checker_app_id = 950u64;
+    const NEW_APP_ID: u64 = 951;
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+
+    // The checker app: approve only if the inner call's CallerApplicationID
+    // is exactly the about-to-be-created app's ID (951) -- not 0, not any
+    // other value.
+    let checker_src = "#pragma version 8
+txn ApplicationID
+bz create
+global CallerApplicationID
+int 951
+==
+assert
+create:
+int 1
+";
+    let create_checker = appl_create(
+        creator,
+        1_000,
+        checker_app_id,
+        checker_src,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    let checker_block = minimal_block(fee_sink, 1, vec![create_checker]);
+    apply_block_capturing_apply_data(&mut state, &checker_block, ApplyMode::Execute)
+        .expect("checker app creation must succeed");
+
+    // The app being created: during its OWN creation call (ApplicationID
+    // still 0 on the outer txn), it issues an inner appl call to the
+    // checker app. `2 * MinTxnFee` covers both the outer creation and the
+    // inner call.
+    let create_src = "#pragma version 8
+itxn_begin
+int appl
+itxn_field TypeEnum
+int 950
+itxn_field ApplicationID
+itxn_submit
+int 1
+";
+    let mut create_new = appl_create(
+        creator,
+        2_000,
+        NEW_APP_ID,
+        create_src,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    create_new.txn.foreign_apps = Some(vec![checker_app_id]);
+
+    let create_block = minimal_block(fee_sink, 2, vec![create_new]);
+    apply_block_capturing_apply_data(&mut state, &create_block, ApplyMode::Execute).expect(
+        "creating an app whose own creation inner-calls a checker of \
+         CallerApplicationID must succeed -- the checked-in-progress \
+         creation's about-to-be-assigned app ID must be visible to the \
+         inner callee",
+    );
+}
