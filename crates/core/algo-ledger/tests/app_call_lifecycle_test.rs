@@ -667,7 +667,7 @@ fn test_appl_create_with_clear_state_on_completion_rejected_not_opted_in() {
 }
 
 // ---------------------------------------------------------------------------
-// TestDeleteNonExistentKeys (ledger/apptxn_test.go)
+// TestDeleteNonExistentKeys (ledger/apptxn_test.go:3455)
 //
 // The opcode-level tests (`test_app_global_del`/`test_app_local_del` in
 // algo-avm) already prove app_global_del/app_local_del are no-ops on a
@@ -675,6 +675,19 @@ fn test_appl_create_with_clear_state_on_completion_rejected_not_opted_in() {
 // ApplyData.EvalDelta produced by such a no-op call carries zero entries
 // (not e.g. a spurious empty-value delta entry) -- this closes that
 // narrower gap.
+//
+// Mirrors go's exact two-transaction structure: go wraps the del body in
+// its `main()` test helper (`txn ApplicationID; bz end; <body>; end: int 1`)
+// so the body is skipped entirely at creation time, then runs it for real
+// via a *separate* `OnCompletion: OptIn` call from a different account
+// (`addrs[1]`) -- opt-in allocates that account's local storage as part of
+// the same call, before the approval program's `app_local_del` runs, so
+// the delete lands on a genuinely allocated-but-key-absent slot (not an
+// unallocated one). Issue #1356 correctly added an opted-in check to
+// `app_local_del`/`app_global_del`-equivalent local access; a version of
+// this test that ran the del body directly at creation time (unguarded, on
+// the creator, who is never opted in) was a bad port that only ever passed
+// because that check didn't exist yet -- see issue #1360.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -689,12 +702,17 @@ fn test_delete_nonexistent_keys_produces_empty_eval_delta() {
         fee_sink,
     );
 
+    // `main()`-style guard: skip the del body entirely on the creation call
+    // (ApplicationID == 0), matching go's helper exactly.
     let approval_src = "#pragma version 8
+txn ApplicationID
+bz end
 byte \"missing_global\"
 app_global_del
-int 0
+txn Sender
 byte \"missing_local\"
 app_local_del
+end:
 int 1
 ";
     let create = appl_create(
@@ -709,8 +727,11 @@ int 1
     );
     let create_block = minimal_block(fee_sink, 1, vec![create]);
     apply_block_capturing_apply_data(&mut state, &create_block, ApplyMode::Execute)
-        .expect("app creation must apply cleanly");
+        .expect("app creation (ApplicationID==0 branch, del body skipped) must apply cleanly");
 
+    // Separate transaction, different account, OptIn: allocates `other`'s
+    // local storage as part of this same call before the approval
+    // program's guarded del body runs against it.
     const ON_COMPLETION_OPT_IN: u64 = 1;
     let optin = appl_call(other, 1_000, app_id, ON_COMPLETION_OPT_IN, None);
     let optin_block = minimal_block(fee_sink, 2, vec![optin]);
