@@ -3267,6 +3267,64 @@ mod tests {
         );
     }
 
+    /// TestBigAppCreate (`ledger/bigtxn_test.go`): a v42+ (size-pricing)
+    /// create of an oversized program is rejected purely for insufficient
+    /// FEE -- a distinct, additional gate from the well-sized-programs/
+    /// ExtraProgramPages bound `test_appl_extra_program_pages_over_max_rejected`
+    /// pins. `MaxAbsoluteExtraProgramPages` widens to 7 at v42 (letting a
+    /// program this large through `well_sized_programs` at all, given a
+    /// correctly declared `ExtraProgramPages`), but the FREE tier used by
+    /// `large_program_extra_bytes`/`app_call_fee_contribution` (`MaxAppTotal
+    /// ProgramLen*(1+MaxExtraAppProgramPages)`, still 8192) is unchanged --
+    /// so bytes beyond it must be paid for via `PerByteTxnSurcharge`, exactly
+    /// mirroring go's "txgroup with 1mA fees is less than" rejection.
+    #[test]
+    fn test_appl_create_oversized_program_insufficient_fee_rejected() {
+        let mut txn = make_appl_txn();
+        txn.application_id = 0; // creation
+        txn.approval_program = Some(ByteBuf::from(vec![6u8; 8_200]));
+        txn.clear_state_program = Some(ByteBuf::from(vec![6u8]));
+        // 8_201 total bytes needs ceil(8201/2048) = 5 pages, i.e. EPP = 4.
+        txn.extra_program_pages = 4;
+        let params = v42_params();
+        txn.fee = params.min_txn_fee; // the plain minimum -- no size-pricing surcharge paid
+
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(
+            err.to_string().contains("below minimum"),
+            "expected a fee-insufficiency rejection (well_sized_programs itself must pass -- EPP=4 covers the size), got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_appl_create_oversized_program_sufficient_fee_accepted() {
+        // Companion to the rejection test above: identical oversized create,
+        // but paying the exact size-pricing-inclusive fee
+        // `fee::required_fee_for_txn` computes must let it through.
+        let mut txn = make_appl_txn();
+        txn.application_id = 0;
+        txn.approval_program = Some(ByteBuf::from(vec![6u8; 8_200]));
+        txn.clear_state_program = Some(ByteBuf::from(vec![6u8]));
+        txn.extra_program_pages = 4;
+        let params = v42_params();
+
+        let (required_fee, overflow) = crate::fee::required_fee_for_txn(&txn, &params);
+        assert!(
+            !overflow,
+            "required-fee computation must not overflow for this test's inputs"
+        );
+        assert!(
+            required_fee > params.min_txn_fee,
+            "an oversized program must actually require more than the flat minimum fee, got {required_fee}"
+        );
+        txn.fee = required_fee;
+
+        assert!(
+            validate_transaction_wellformed(&txn, false, &params, None).is_ok(),
+            "paying the exact size-pricing-inclusive required fee must let the oversized create through"
+        );
+    }
+
     #[test]
     fn test_appl_extra_program_pages_over_max_rejected() {
         let mut txn = make_appl_txn();
