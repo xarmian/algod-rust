@@ -868,7 +868,9 @@ pub fn op_ecdsa_verify(
 
 /// `ecdsa_pk_decompress` (0x06): decompress a public key.
 /// Immediate: curve index. Stack: pop compressed pubkey (33 bytes).
-/// Push Y then X (X on top).
+/// Push X then Y (Y on top), matching go's `opEcdsaPkDecompress`
+/// (`data/transactions/logic/crypto.go`), which writes X into the lower
+/// (existing) stack slot and appends Y as a new top-of-stack entry.
 pub fn op_ecdsa_pk_decompress(
     machine: &mut AvmMachine,
     instruction: &Instruction,
@@ -895,9 +897,12 @@ pub fn op_ecdsa_pk_decompress(
         EcdsaCurve::Secp256r1 => ecdsa_decompress_secp256r1(&compressed)?,
     };
 
-    // Push Y first, then X (X ends up on top)
-    machine.push(AvmValue::Bytes(y))?;
-    machine.push(AvmValue::Bytes(x))
+    // Push X first, then Y (Y ends up on top), matching go's stack-slot
+    // write order in opEcdsaPkDecompress (crypto.go:340-382): X goes into
+    // the lower (existing) slot, Y is appended as a new top-of-stack
+    // entry, so the final stack (bottom to top) is [..., X, Y].
+    machine.push(AvmValue::Bytes(x))?;
+    machine.push(AvmValue::Bytes(y))
 }
 
 /// `ecdsa_pk_recover` (0x07): recover public key from ECDSA signature.
@@ -2939,14 +2944,13 @@ mod tests {
         pushbytes(&mut code, compressed.as_bytes()); // compressed pubkey (33 bytes)
         code.push(0x06); // ecdsa_pk_decompress
         code.push(0x00); // Secp256k1
-                         // Stack now has: [Y, X] with X on top
-                         // Store X, then compare Y to expected_y, then compare X to expected_x
-                         // Just verify X matches by pushing expected and comparing
-        pushbytes(&mut code, expected_x.as_slice());
-        code.push(0x12); // ==
-        code.push(0x4c); // swap (bring Y to top)
+                         // Stack now has: [X, Y] with Y on top (matching go's
+                         // opEcdsaPkDecompress order -- see issue #1373).
         pushbytes(&mut code, expected_y.as_slice());
-        code.push(0x12); // ==
+        code.push(0x12); // == (compare top-of-stack Y to expected_y)
+        code.push(0x4c); // swap (bring X to top)
+        pushbytes(&mut code, expected_x.as_slice());
+        code.push(0x12); // == (compare X to expected_x)
         code.push(0x10); // && (both must match)
         code.push(0x43); // return
 
@@ -2972,11 +2976,13 @@ mod tests {
         pushbytes(&mut code, compressed.as_bytes());
         code.push(0x06); // ecdsa_pk_decompress
         code.push(0x01); // Secp256r1
-        pushbytes(&mut code, expected_x.as_slice());
-        code.push(0x12); // ==
-        code.push(0x4c); // swap
+                         // Stack now has: [X, Y] with Y on top (matching go's
+                         // opEcdsaPkDecompress order -- see issue #1373).
         pushbytes(&mut code, expected_y.as_slice());
-        code.push(0x12); // ==
+        code.push(0x12); // == (compare top-of-stack Y to expected_y)
+        code.push(0x4c); // swap (bring X to top)
+        pushbytes(&mut code, expected_x.as_slice());
+        code.push(0x12); // == (compare X to expected_x)
         code.push(0x10); // &&
         code.push(0x43); // return
 
