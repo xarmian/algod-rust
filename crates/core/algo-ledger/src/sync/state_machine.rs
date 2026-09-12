@@ -257,3 +257,109 @@ impl SyncProgress {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Analogous to go's `TestCatchupAccessorFoo`'s `SetState` sequence
+    /// (`ledger/catchupaccessor_test.go`): that test drives
+    /// `catchpointCatchupAccessor.SetState` through the full valid
+    /// forward sequence (Inactive -> LedgerDownload ->
+    /// LatestBlockDownload -> BlocksDownload -> Switch), asserting each
+    /// transition succeeds, then asserts one further, out-of-sequence
+    /// transition (`catchpointCatchupStateLast+1`, an unrecognized state)
+    /// is rejected. `SyncState::can_transition_to` is algod-rust's direct
+    /// analog of that state-transition gate (`sync/mod.rs`'s `transition`
+    /// calls it before committing any phase change) -- this test drives
+    /// the same shape of property: every step of the real happy-path
+    /// pipeline succeeds in order, and an invalid (skipped-ahead or
+    /// backward) transition is rejected.
+    #[test]
+    fn can_transition_to_walks_the_full_happy_path_in_order() {
+        let sequence = [
+            SyncState::Idle,
+            SyncState::DownloadingLedger,
+            SyncState::ImportingLedger,
+            SyncState::VerifyingLedger,
+            SyncState::DownloadingLookback,
+            SyncState::ReplayingBlocks,
+            SyncState::Complete,
+        ];
+        for pair in sequence.windows(2) {
+            let (from, to) = (&pair[0], &pair[1]);
+            assert!(
+                from.can_transition_to(to),
+                "{from:?} must be able to transition to {to:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn can_transition_to_rejects_skipping_ahead() {
+        // Idle skipping straight to ImportingLedger (over DownloadingLedger)
+        // must be rejected -- mirrors go's rejection of an out-of-sequence
+        // SetState call.
+        assert!(!SyncState::Idle.can_transition_to(&SyncState::ImportingLedger));
+        assert!(!SyncState::Idle.can_transition_to(&SyncState::Complete));
+        assert!(!SyncState::DownloadingLedger.can_transition_to(&SyncState::ReplayingBlocks));
+    }
+
+    #[test]
+    fn can_transition_to_rejects_moving_out_of_a_terminal_state() {
+        // Once Complete, no further forward transition is allowed (mirrors
+        // go's `catchpointCatchupStateLast+1` rejection -- there is no
+        // valid "next" state once the pipeline has finished).
+        assert!(!SyncState::Complete.can_transition_to(&SyncState::Idle));
+        assert!(!SyncState::Complete.can_transition_to(&SyncState::DownloadingLedger));
+        let failed = SyncState::Failed("boom".to_string());
+        assert!(!failed.can_transition_to(&SyncState::Idle));
+    }
+
+    #[test]
+    fn can_transition_to_allows_failing_from_any_state() {
+        // Any state, including a terminal one, can still record a failure
+        // -- go's error path can be hit from anywhere in the pipeline too.
+        for state in [
+            SyncState::Idle,
+            SyncState::DownloadingLedger,
+            SyncState::ImportingLedger,
+            SyncState::VerifyingLedger,
+            SyncState::DownloadingLookback,
+            SyncState::ReplayingBlocks,
+            SyncState::Complete,
+            SyncState::Failed("prior error".to_string()),
+        ] {
+            assert!(state.can_transition_to(&SyncState::Failed("new error".to_string())));
+        }
+    }
+
+    #[test]
+    fn db_string_round_trips_every_state() {
+        let states = [
+            SyncState::Idle,
+            SyncState::DownloadingLedger,
+            SyncState::ImportingLedger,
+            SyncState::VerifyingLedger,
+            SyncState::DownloadingLookback,
+            SyncState::ReplayingBlocks,
+            SyncState::Complete,
+            SyncState::Failed("disk full".to_string()),
+        ];
+        for state in states {
+            let encoded = state.to_db_string();
+            let decoded = SyncState::from_db_string(&encoded);
+            assert_eq!(
+                decoded,
+                Some(state.clone()),
+                "round trip failed for {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_db_string_rejects_unrecognized_strings() {
+        assert_eq!(SyncState::from_db_string("not_a_real_state"), None);
+        assert_eq!(SyncState::from_db_string(""), None);
+    }
+}

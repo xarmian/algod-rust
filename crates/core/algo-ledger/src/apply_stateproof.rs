@@ -906,6 +906,61 @@ mod tests {
             .is_some());
     }
 
+    /// Analogous to go's `TestStateProofVerificationTracker_CommitFullDbPruning`
+    /// (`ledger/spverificationtracker_test.go`): that test feeds 6 stacked
+    /// state-proof intervals' worth of contexts into the tracker, commits
+    /// far enough that every one of them *except the single
+    /// still-needed one* (the context whose attested round's own
+    /// state-proof transaction hasn't been committed yet) is pruned from
+    /// the DB. `tracker_prunes_entries_before_new_state_proof_next` above
+    /// already pins the 2-entry case; this closes the gap to go's actual
+    /// scale (several stacked contexts pruned down to exactly one) and
+    /// its specific "prune everything strictly before the still-needed
+    /// entry, not the still-needed entry itself" property.
+    #[test]
+    fn tracker_full_pruning_leaves_exactly_the_still_needed_entry() {
+        let mut store = LedgerState::new();
+        let ctx = VerificationContext {
+            voters_commitment: vec![7, 7, 7],
+            online_total_weight: 99,
+            version: CONSENSUS_V41.to_string(),
+        };
+        // 6 stacked contexts, one per state-proof interval (256), as go's
+        // `contextToAdd := uint64(6)` sets up.
+        let rounds: Vec<u64> = (1..=6).map(|n| n * 256).collect();
+        for &round in &rounds {
+            store
+                .put_state_proof_verification_context(
+                    round,
+                    &encode_verification_context(round, &ctx),
+                )
+                .unwrap();
+        }
+
+        // Commit far enough that only the last (6th) context's own
+        // state-proof transaction hasn't landed yet -- prune everything
+        // strictly before it, mirroring go's `finalLastAttestedRound`.
+        let still_needed = *rounds.last().unwrap();
+        prune_state_proof_verification_contexts(&mut store, still_needed).unwrap();
+
+        for &round in &rounds[..rounds.len() - 1] {
+            assert!(
+                store
+                    .get_state_proof_verification_context(round)
+                    .unwrap()
+                    .is_none(),
+                "context at round {round} must be pruned once it's no longer needed"
+            );
+        }
+        assert!(
+            store
+                .get_state_proof_verification_context(still_needed)
+                .unwrap()
+                .is_some(),
+            "the still-needed final context at round {still_needed} must survive pruning"
+        );
+    }
+
     #[test]
     fn record_state_proof_verification_context_ignores_non_voters_rounds() {
         let mut store = LedgerState::new();
