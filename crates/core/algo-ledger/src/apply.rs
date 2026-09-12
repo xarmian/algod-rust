@@ -11715,6 +11715,143 @@ mod tests {
         );
     }
 
+    // ---- Issue #1335: a real (non-simulation) top-level app CALL must
+    // charge the called app's oversized approval+clear-state program bytes
+    // against the read I/O budget, exactly like go-algorand's
+    // `EvalContract` (data/transactions/logic/eval.go ~1274-1344), which
+    // loops over `cx.available.sharedApps` and adds
+    // `transactions.LargeProgramExtraBytes(...)` to `bytesRead`
+    // unconditionally -- regardless of whether any box opcode ever runs.
+    // This is distinct from issue #723's create/update WRITE-budget check
+    // (`consider_budget_program_writes`, only active while creating/
+    // updating/deleting) and issue #1020's `capacity_allows_app`
+    // (only active under simulation/unnamed-resource tracking) -- neither
+    // of those paths fires for a plain NoOp call to an already-created app.
+
+    #[test]
+    fn issue_1335_call_to_existing_oversized_app_with_no_box_refs_is_rejected() {
+        let creator = Address([7u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        // Round 1: create an oversized app, with enough box-ref bumps to
+        // satisfy issue #723's CREATE-time WRITE-budget check.
+        let approval = padded_approving_program(8_200);
+        let clear = trivial_clear_program();
+        let total_len = approval.len() + clear.len();
+        let extra = total_len.saturating_sub(8_192);
+        let bumps_needed = extra.div_ceil(2_048); // V41 BytesPerBoxReference
+
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        create.txn.boxes = Some(vec![algo_types::BoxRef::default(); bumps_needed]);
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute)
+            .expect("oversized create with enough box bumps must succeed");
+        let &app_id = delta1
+            .creatables
+            .keys()
+            .next()
+            .expect("app create must register a creatable");
+
+        // Round 2: call the already-created app with a plain NoOp and zero
+        // box refs. No box opcode ever runs, but go-algorand still rejects
+        // this because the called app's own program size already exceeds
+        // the free tier -- the entire point of this issue.
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 10_000;
+        call.txn.application_id = app_id;
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![call],
+            ..Block::default()
+        };
+
+        let err = apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read budget exceeded"),
+            "expected a read-budget-exceeded rejection for calling an oversized app with no box refs, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn issue_1335_call_to_existing_oversized_app_with_enough_box_bumps_is_accepted() {
+        // Companion to the rejection test above: supplying enough empty
+        // ("io bump") box refs to cover the app's oversized-program charge
+        // lets the identical call succeed.
+        let creator = Address([7u8; 32]);
+        let fee_sink = Address([0xFEu8; 32]);
+        let rewards_pool = Address([0xFDu8; 32]);
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000)], fee_sink);
+
+        let approval = padded_approving_program(8_200);
+        let clear = trivial_clear_program();
+        let total_len = approval.len() + clear.len();
+        let extra = total_len.saturating_sub(8_192);
+        let bumps_needed = extra.div_ceil(2_048); // V41 BytesPerBoxReference
+
+        let mut create = SignedTransaction::default();
+        create.txn.txn_type = "appl".into();
+        create.txn.sender = creator;
+        create.txn.fee = 10_000;
+        create.txn.approval_program = Some(serde_bytes::ByteBuf::from(approval));
+        create.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(clear));
+        create.txn.boxes = Some(vec![algo_types::BoxRef::default(); bumps_needed]);
+        let block1 = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![create],
+            ..Block::default()
+        };
+        let delta1 = apply_block_with_delta_mode(&mut state, &block1, ApplyMode::Execute)
+            .expect("oversized create with enough box bumps must succeed");
+        let &app_id = delta1
+            .creatables
+            .keys()
+            .next()
+            .expect("app create must register a creatable");
+
+        // Round 2: call the app again, this time with enough empty box
+        // refs to cover the read-budget charge.
+        let mut call = SignedTransaction::default();
+        call.txn.txn_type = "appl".into();
+        call.txn.sender = creator;
+        call.txn.fee = 10_000;
+        call.txn.application_id = app_id;
+        call.txn.boxes = Some(vec![algo_types::BoxRef::default(); bumps_needed]);
+        let block2 = Block {
+            round: Round(2),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![call],
+            ..Block::default()
+        };
+
+        apply_block_with_delta_mode(&mut state, &block2, ApplyMode::Execute)
+            .expect("enough io-bump box refs must satisfy the real-call read budget");
+    }
+
     // ---- Issue #809: app-version downgrade must be rejected once the
     // program has reached MinInnerApplVersion (matches go-algorand's
     // CheckContractVersions, data/transactions/transaction.go) ----
