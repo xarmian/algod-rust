@@ -673,6 +673,99 @@ mod tests {
         );
     }
 
+    /// Analogous to go's `TestCowStateProof` (`ledger/eval/cow_test.go`):
+    /// that test drives go's cow-mutating `SetStateProofNextRound`/
+    /// `GetStateProofNextRound` through three `apply.StateProof` calls in a
+    /// row -- reject a proof for the wrong (too-far-ahead) round, accept one
+    /// for the *correct* next round (which advances the tracked "next"
+    /// forward by one interval), then accept a *second* proof for that
+    /// newly-advanced round too.
+    ///
+    /// algod-rust has no equivalent in-memory mutable "next round" field --
+    /// `apply_state_proof` re-derives the expected round fresh from the
+    /// *previous block's own header* every call (see
+    /// `crate::block_header::state_proof_next_round`), which is populated by
+    /// whichever block was actually applied at that round (see
+    /// `apply::apply_block_with_delta_mode`'s `state_proof_next` field and
+    /// `block_header::next_state_proof_tracking`'s doc comment). This test
+    /// pins the same externally observable property go's does -- rejecting
+    /// a too-far round, then successfully walking the expected round
+    /// forward interval-by-interval across two consecutive applications --
+    /// using rust's header-driven mechanism instead of a mutated cow field.
+    #[test]
+    fn walks_expected_state_proof_round_forward_across_two_consecutive_applications() {
+        const INTERVAL: u64 = 256;
+        const FIRST_STATE_PROOF: u64 = INTERVAL * 2; // 512
+
+        let mut store = LedgerState::new();
+        // Previous header (round FIRST_STATE_PROOF - 1) tracks the expected
+        // next round as FIRST_STATE_PROOF, mirroring `c0.SetStateProofNextRound`.
+        put_header(
+            &mut store,
+            &header_at(
+                FIRST_STATE_PROOF - 1,
+                CONSENSUS_V41,
+                tracking_value(FIRST_STATE_PROOF, &[], 0),
+            ),
+        );
+        let ctx = ApplyContext::new_replay(0, Address::ZERO, FIRST_STATE_PROOF);
+
+        // 1. Cannot apply a state proof for 3*interval when 2*interval (512)
+        //    is expected.
+        let too_far_txn = Transaction {
+            txn_type: "stpf".into(),
+            state_proof_message: Some(StateProofMessage {
+                last_attested_round: FIRST_STATE_PROOF + INTERVAL,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = apply_state_proof(&store, &ctx, &too_far_txn).unwrap_err();
+        assert!(
+            format!("{err}").contains("expected different state proof round"),
+            "unexpected error: {err}"
+        );
+
+        // 2. Applying for the correct round (512) succeeds.
+        let first_txn = Transaction {
+            txn_type: "stpf".into(),
+            state_proof_message: Some(StateProofMessage {
+                last_attested_round: FIRST_STATE_PROOF,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_state_proof(&store, &ctx, &first_txn)
+            .expect("state proof for the expected round must be accepted");
+
+        // The next round now advances to 3*interval (768) -- modeled here by
+        // a new previous-header (as `next_state_proof_tracking` would have
+        // produced for the block that just carried `first_txn`).
+        let second_round = FIRST_STATE_PROOF + INTERVAL; // 768
+        put_header(
+            &mut store,
+            &header_at(
+                second_round - 1,
+                CONSENSUS_V41,
+                tracking_value(second_round, &[], 0),
+            ),
+        );
+        let ctx2 = ApplyContext::new_replay(0, Address::ZERO, second_round);
+
+        // 3. Applying the next state proof (768) against the now-advanced
+        //    expectation also succeeds.
+        let second_txn = Transaction {
+            txn_type: "stpf".into(),
+            state_proof_message: Some(StateProofMessage {
+                last_attested_round: second_round,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_state_proof(&store, &ctx2, &second_txn)
+            .expect("state proof for the newly-advanced round must also be accepted");
+    }
+
     #[test]
     fn rejects_insufficient_signed_weight_when_validating() {
         let mut store = LedgerState::new();

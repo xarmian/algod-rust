@@ -8703,6 +8703,164 @@ mod tests {
         assert!(!ledger.has_app_local_state(&addr, 30));
     }
 
+    /// Analogous to go's `TestAccountDBInit` (`ledger/acctdeltas_test.go`):
+    /// that test writes a batch of `RandomAccounts(20, true)` -- each
+    /// carrying a mix of algo balance, asset holdings/params, and app
+    /// params/local state -- via `AccountsInitTest`, verifies every field
+    /// round-trips (`checkAccounts`), then re-runs init a *second* time
+    /// (`AccountsInitLightTest`) and asserts it reports "not a fresh DB"
+    /// (`newDB == false`) while every account's data is still intact and
+    /// unduplicated.
+    ///
+    /// algod-rust has no single `AccountsInit*`-style bulk-schema-creation
+    /// entrypoint (there is no separate "genesis import" step distinct from
+    /// ordinary `set_*` calls -- `SqliteLedger`'s tables are created once at
+    /// `open`/`open_in_memory` and every account/resource write goes through
+    /// the same `set_account`/`set_asset_*`/`set_app_*` path whether it's
+    /// the first write ever or the hundredth). The two externally
+    /// observable properties go's test actually cares about --  (1) a batch
+    /// of several accounts, each carrying every resource kind at once,
+    /// round-trips every field correctly, and (2) re-applying the exact
+    /// same data a second time ("re-init") does not duplicate or corrupt
+    /// anything -- are both real, testable properties here too. This
+    /// closes the gap the previous single-account single-field tests
+    /// (`test_account_round_trip`/`test_asset_holding_round_trip`/
+    /// `test_app_params_round_trip`) left open: several accounts at once,
+    /// each with every resource kind simultaneously, plus the
+    /// re-application-is-idempotent property.
+    #[test]
+    fn bulk_multi_account_multi_resource_round_trip_survives_reapplication() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+
+        struct Fixture {
+            addr: Address,
+            micro_algos: u64,
+            asset_id: u64,
+            holding: AssetHolding,
+            asset_params: AssetParamsRecord,
+            app_id: u64,
+            app_params: AppParams,
+            local: AppLocalState,
+        }
+
+        let fixtures: Vec<Fixture> = (0u8..5)
+            .map(|i| {
+                let addr = Address([i + 1; 32]);
+                Fixture {
+                    addr,
+                    micro_algos: 1_000_000 * (i as u64 + 1),
+                    asset_id: 100 + i as u64,
+                    holding: AssetHolding {
+                        amount: 10 * (i as u64 + 1),
+                        frozen: i % 2 == 0,
+                    },
+                    asset_params: AssetParamsRecord {
+                        params: AssetParams {
+                            total: 1_000 * (i as u64 + 1),
+                            decimals: i as u32,
+                            unit_name: format!("U{i}"),
+                            asset_name: format!("Asset{i}"),
+                            ..Default::default()
+                        },
+                        creator: addr,
+                    },
+                    app_id: 200 + i as u64,
+                    app_params: AppParams {
+                        creator: addr,
+                        approval_program: vec![0x06, 0x81, i],
+                        clear_state_program: vec![0x06, 0x81, 0x01],
+                        global_state_schema: StateSchema {
+                            num_uint: i as u64,
+                            num_byte_slice: 1,
+                        },
+                        ..Default::default()
+                    },
+                    local: AppLocalState {
+                        schema: StateSchema {
+                            num_uint: 1,
+                            num_byte_slice: i as u64,
+                        },
+                        key_value: BTreeMap::new(),
+                    },
+                }
+            })
+            .collect();
+
+        // Write every account and every resource kind for it, in one batch
+        // -- mirroring go's single `AccountsInitTest(t, accts, ...)` call
+        // over the whole `RandomAccounts(20, true)` set.
+        let write_all = |ledger: &mut SqliteLedger, fixtures: &[Fixture]| {
+            for f in fixtures {
+                ledger.set_account(
+                    &f.addr,
+                    AccountData {
+                        micro_algos: f.micro_algos,
+                        ..Default::default()
+                    },
+                );
+                ledger.set_asset_holding(&f.addr, f.asset_id, f.holding.clone());
+                ledger.set_asset_params(f.asset_id, f.asset_params.clone());
+                ledger.set_app_params(f.app_id, f.app_params.clone());
+                ledger.set_app_local_state(&f.addr, f.app_id, f.local.clone());
+            }
+        };
+
+        let check_all = |ledger: &SqliteLedger, fixtures: &[Fixture]| {
+            for f in fixtures {
+                let acct = ledger.get_account(&f.addr).expect("account must exist");
+                assert_eq!(acct.micro_algos, f.micro_algos, "addr {:?}", f.addr);
+
+                let holding = ledger
+                    .get_asset_holding(&f.addr, f.asset_id)
+                    .expect("holding must exist");
+                assert_eq!(holding.amount, f.holding.amount);
+                assert_eq!(holding.frozen, f.holding.frozen);
+
+                let params = ledger
+                    .get_asset_params(f.asset_id)
+                    .expect("asset params must exist");
+                assert_eq!(params.params.total, f.asset_params.params.total);
+                assert_eq!(params.params.decimals, f.asset_params.params.decimals);
+                assert_eq!(params.creator, f.asset_params.creator);
+
+                let app = ledger
+                    .get_app_params(f.app_id)
+                    .expect("app params must exist");
+                assert_eq!(app.creator, f.app_params.creator);
+                assert_eq!(app.approval_program, f.app_params.approval_program);
+                assert_eq!(
+                    app.global_state_schema.num_uint,
+                    f.app_params.global_state_schema.num_uint
+                );
+
+                let local = ledger
+                    .get_app_local_state(&f.addr, f.app_id)
+                    .expect("app local state must exist");
+                assert_eq!(local.schema.num_byte_slice, f.local.schema.num_byte_slice);
+            }
+        };
+
+        write_all(&mut ledger, &fixtures);
+        check_all(&ledger, &fixtures);
+
+        // "Re-init": apply the exact same batch a second time (go's
+        // `AccountsInitLightTest` returning `newDB == false`) -- every
+        // account/resource must still round-trip identically, with no
+        // duplication (e.g. `app_local_states_for_addr` must not grow).
+        write_all(&mut ledger, &fixtures);
+        check_all(&ledger, &fixtures);
+
+        for f in &fixtures {
+            let locals = ledger.app_local_states_for_addr(&f.addr);
+            assert_eq!(
+                locals.len(),
+                1,
+                "re-applying the same local state must not duplicate rows for {:?}",
+                f.addr
+            );
+        }
+    }
+
     #[test]
     fn test_chain_state_round_trip() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();
