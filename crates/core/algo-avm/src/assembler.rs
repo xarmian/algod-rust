@@ -1683,13 +1683,13 @@ fn assemble_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
         "method" => asm_method(ops, args),
         "intcblock" => asm_intc_block(ops, args),
         "bytecblock" => asm_bytec_block(ops, args),
-        "txn" | "gtxn" | "gtxns" | "replace" => asm_pseudo_arity(ops, mnemonic, args),
+        "txn" | "gtxn" | "gtxns" | "replace" | "extract" => asm_pseudo_arity(ops, mnemonic, args),
         _ => asm_regular(ops, mnemonic, args),
     }
 }
 
 // ---------------------------------------------------------------------------
-// `txn`/`gtxn`/`gtxns`/`replace` pseudo-op arity dispatch
+// `txn`/`gtxn`/`gtxns`/`replace`/`extract` pseudo-op arity dispatch
 // ---------------------------------------------------------------------------
 //
 // go-algorand's assembler treats these mnemonics as "pseudo-ops": the
@@ -1701,6 +1701,7 @@ fn assemble_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
 //   "txn":     {1: OpSpec{Name: "txn"},     2: OpSpec{Name: "txna"}},
 //   "gtxn":    {2: OpSpec{Name: "gtxn"},    3: OpSpec{Name: "gtxna"}},
 //   "gtxns":   {1: OpSpec{Name: "gtxns"},   2: OpSpec{Name: "gtxnsa"}},
+//   "extract": {0: OpSpec{Name: "extract3"}, 2: OpSpec{Name: "extract"}},
 //   "replace": {0: OpSpec{Name: "replace3"}, 1: OpSpec{Name: "replace2"}},
 //
 // `replace` (issue #945) follows the exact same immediate-count dispatch
@@ -1708,6 +1709,11 @@ fn assemble_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
 // immediate (1 immediate) assembles as the fixed-offset `replace2`;
 // `replace` with no immediate (the offset instead comes off the stack, 0
 // immediates) assembles as `replace3`.
+//
+// `extract` (issue #1388) follows the same shape: bare `extract` (0
+// immediates, start/length come off the stack) assembles as `extract3`;
+// `extract N M` (2 immediates, literal start/length) assembles as the real
+// `extract` opcode.
 //
 // go-algorand's `getSpec` (assembler.go:1735-1773) resolves the target spec
 // by arity, but keeps reporting diagnostics under the *pseudo* mnemonic
@@ -1727,6 +1733,7 @@ fn pseudo_arity_table(mnemonic: &str) -> &'static [(usize, &'static str)] {
         "gtxn" => &[(2, "gtxn"), (3, "gtxna")],
         "gtxns" => &[(1, "gtxns"), (2, "gtxnsa")],
         "replace" => &[(0, "replace3"), (1, "replace2")],
+        "extract" => &[(0, "extract3"), (2, "extract")],
         _ => &[],
     }
 }
@@ -1756,11 +1763,11 @@ fn join_immediate_counts(counts: &[usize]) -> String {
     msg
 }
 
-/// Assemble a `txn`/`gtxn`/`gtxns`/`replace` pseudo-op, dispatching by
-/// immediate count to the real opcode -- the scalar opcode or its
-/// array-indexed (`txna`/`gtxna`/`gtxnsa`) sibling, or `replace3`/
-/// `replace2` -- per go-algorand's `pseudoOps` table (assembler.go:1804-
-/// 1816).
+/// Assemble a `txn`/`gtxn`/`gtxns`/`replace`/`extract` pseudo-op, dispatching
+/// by immediate count to the real opcode -- the scalar opcode or its
+/// array-indexed (`txna`/`gtxna`/`gtxnsa`) sibling, `replace3`/`replace2`, or
+/// `extract3`/`extract` -- per go-algorand's `pseudoOps` table
+/// (assembler.go:1804-1816).
 fn asm_pseudo_arity(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
     let table = pseudo_arity_table(mnemonic);
     match table.iter().find(|(n, _)| *n == args.len()) {
@@ -3922,6 +3929,60 @@ mod tests {
         assert!(
             errs.iter()
                 .any(|e| e.message == "replace opcode with 1 immediate was introduced in v7"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    // ── `extract` pseudo-op arity dispatch (issue #1388) ──────────────────
+    // go's pseudoOps table (assembler.go:1814) dispatches bare `extract` (0
+    // immediates, start/length come off the stack) to the real `extract3`
+    // opcode, and `extract N M` (2 immediates) to the real `extract` opcode.
+
+    #[test]
+    fn test_extract_pseudo_no_immediates_dispatches_to_extract3() {
+        let extract =
+            assemble_string("#pragma version 8\nbyte 0x0000\nint 0\nint 1\nextract\n").unwrap();
+        let extract3 =
+            assemble_string("#pragma version 8\nbyte 0x0000\nint 0\nint 1\nextract3\n").unwrap();
+        assert_eq!(extract.program, extract3.program);
+    }
+
+    #[test]
+    fn test_extract_pseudo_two_immediates_dispatches_to_extract() {
+        // `extract N M` (2 immediates) assembles as the real 2-immediate
+        // `extract` opcode (byte 0x57), not `extract3` (byte 0x58).
+        let extract = assemble_string("#pragma version 8\nbyte 0x0000\nextract 0 1\n").unwrap();
+        assert!(
+            extract.program.contains(&0x57),
+            "program: {:?}",
+            extract.program
+        );
+        assert!(
+            !extract.program.contains(&0x58),
+            "program: {:?}",
+            extract.program
+        );
+    }
+
+    #[test]
+    fn test_extract_pseudo_wrong_arity_errors() {
+        // An immediate count matching neither arity (1 immediate) in the
+        // pseudoOps table is rejected with a combined "N or M" message.
+        let errs = expect_errors("#pragma version 8\nbyte 0x0000\nextract 0\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "extract expects 0 or 2 immediate arguments"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_pseudo_version_gating() {
+        // `extract`/`extract3` were introduced in v5.
+        let errs = expect_errors("#pragma version 4\nbyte 0x0000\nextract 0 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "extract opcode with 2 immediates was introduced in v5"),
             "unexpected errors: {errs:?}"
         );
     }
