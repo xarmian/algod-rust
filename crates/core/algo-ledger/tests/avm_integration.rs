@@ -30,7 +30,7 @@ use serde_bytes::ByteBuf;
 
 use algo_avm::eval::run_approval_program;
 use algo_avm::group::GroupBudget;
-use algo_avm::{parse, AvmMachine, ExecMode};
+use algo_avm::{assemble_string, parse, AvmMachine, ExecMode};
 use algo_ledger::{LedgerAvmContext, LedgerState};
 use algo_types::{
     AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, AssetParamsRecord,
@@ -183,6 +183,21 @@ fn run_with_context(
     machine.run(ctx)
 }
 
+/// Assemble a TEAL source snippet (prefixed with the given version's pragma)
+/// and run it through the AVM using the given context.
+fn run_source_with_context(
+    version: u8,
+    source: &str,
+    ctx: &mut dyn algo_avm::AvmContext,
+) -> Result<bool, algo_error::AlgoError> {
+    let full_source = format!("#pragma version {version}\n{source}\n");
+    let ops = assemble_string(&full_source)
+        .unwrap_or_else(|e| panic!("assembly failed for {full_source:?}: {e:?}"));
+    let program = parse(&ops.program)?;
+    let mut machine = AvmMachine::new(program, ExecMode::Application, 20_000);
+    machine.run(ctx)
+}
+
 /// Seed a LedgerState with a default app_params for app_id=42.
 fn seed_app(store: &mut LedgerState) {
     store.app_params.insert(
@@ -300,6 +315,101 @@ fn txna_application_args() {
     ];
     let result = run_with_context(6, code, &mut ctx).unwrap();
     assert!(result, "txna ApplicationArgs 0 should return 'hello'");
+}
+
+/// TestTxnaEmptyValues (eval_test.go), ApplicationArgs half: `btoi(txna
+/// ApplicationArgs 0) == 0` must hold for both an explicit empty-bytes arg
+/// and a nil arg -- go distinguishes `[]byte("")` from `nil`, but rust's
+/// `Vec<u8>` has no such distinction, so both cases collapse to the same
+/// representation and this test exercises that directly.
+#[test]
+fn txna_application_args_empty_bytes_is_zero() {
+    let sender = [0xAA; 32];
+    let txn = make_appl_txn_with_args(sender, 42, vec![Vec::new()]);
+    let mut store = LedgerState::new();
+    let mut ctx = make_context(&mut store, vec![txn]);
+
+    let code: &[u8] = &[
+        0x36, 26, 0x00, // txna ApplicationArgs 0
+        0x17, // btoi
+        0x81, 0x00, // pushint 0
+        0x12, // ==
+        0x43, // return
+    ];
+    let result = run_with_context(6, code, &mut ctx).unwrap();
+    assert!(result, "btoi of an empty ApplicationArgs[0] should equal 0");
+}
+
+/// TestTxnaEmptyValues (eval_test.go), Accounts half: `txna Accounts 1 ==
+/// global ZeroAddress` must hold both when Accounts[0] is an explicit
+/// zero-valued Address and when it's the Rust default (also all zero
+/// bytes, since `Address` has no separate absent/nil state).
+#[test]
+fn txna_accounts_zero_value_equals_zero_address() {
+    let sender = [0xAA; 32];
+    let txn = make_appl_txn_with_refs(sender, 42, vec![Address([0u8; 32])], vec![]);
+    let mut store = LedgerState::new();
+    let mut ctx = make_context(&mut store, vec![txn]);
+
+    let code: &[u8] = &[
+        0x36, 28,
+        0x01, // txna Accounts 1 (index 1: Accounts[0] is at txna-index 1, Sender is 0)
+        0x32, 0x03, // global ZeroAddress
+        0x12, // ==
+        0x43, // return
+    ];
+    let result = run_with_context(6, code, &mut ctx).unwrap();
+    assert!(
+        result,
+        "a zero-valued Accounts[0] should equal global ZeroAddress"
+    );
+}
+
+/// TestAppGlobalReadWriteDeleteErrors (evalStateful_test.go), "read" case:
+/// `app_global_get_ex` on a key absent from an app's global state must push
+/// exists=false (not error at the context layer), driving the AVM program's
+/// own `bnz ok / err` branch to execute `err` and reject -- go's assertion
+/// is "err opcode". Then, once the key is present, the same program must
+/// pass.
+#[test]
+fn app_global_get_ex_missing_key_then_present_key() {
+    let sender = [0xAA; 32];
+    let txn = make_appl_txn(sender, 42);
+    let mut store = LedgerState::new();
+    seed_app(&mut store);
+
+    let source = r#"
+int 0
+byte "ALGO"
+app_global_get_ex
+bnz ok
+err
+ok:
+int 0x77
+==
+"#;
+
+    {
+        let mut ctx = make_context(&mut store, vec![txn.clone()]);
+        ctx.consensus = pre_app_forbid_low_resources_consensus();
+        let err = run_source_with_context(6, source, &mut ctx).unwrap_err();
+        let _ = err; // "err opcode" rejection -- absent key takes the err branch
+    }
+
+    store
+        .app_params
+        .get_mut(&42)
+        .unwrap()
+        .global_state
+        .insert(b"ALGO".to_vec(), TealValue::Uint(0x77));
+
+    let mut ctx = make_context(&mut store, vec![txn]);
+    ctx.consensus = pre_app_forbid_low_resources_consensus();
+    let result = run_source_with_context(6, source, &mut ctx).unwrap();
+    assert!(
+        result,
+        "app_global_get_ex should find the key and pass once it's set"
+    );
 }
 
 /// Verify txn FirstValid and LastValid.

@@ -22,7 +22,7 @@
 //!
 //! Each test assembles raw bytecode, parses, and runs through the full machine pipeline.
 
-use algo_avm::{parse, AvmMachine, ExecMode, NullContext};
+use algo_avm::{assemble_string, parse, AvmMachine, ExecMode, NullContext};
 
 /// Helper: prepend version byte, parse, and run. Returns Ok(true) for pass, Ok(false) for reject.
 fn run_program(version: u8, code: &[u8]) -> Result<bool, algo_error::AlgoError> {
@@ -31,6 +31,46 @@ fn run_program(version: u8, code: &[u8]) -> Result<bool, algo_error::AlgoError> 
     let program = parse(&raw)?;
     let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 20_000);
     machine.run(&mut NullContext)
+}
+
+/// Helper: assemble a TEAL source snippet (prefixed with the given version's
+/// pragma) and run it end to end. Mirrors go-algorand's `testPanics`/
+/// `testLogic` helpers -- returns the same `Result` shape as `run_program`.
+fn run_source(version: u8, source: &str) -> Result<bool, algo_error::AlgoError> {
+    let full_source = format!("#pragma version {version}\n{source}\n");
+    let ops = assemble_string(&full_source)
+        .unwrap_or_else(|e| panic!("assembly failed for {full_source:?}: {e:?}"));
+    let program = parse(&ops.program)?;
+    let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 20_000);
+    machine.run(&mut NullContext)
+}
+
+#[test]
+fn test_intc_too_far() {
+    // TestIntcTooFar (eval_test.go): intc_1 must fail at runtime whether an
+    // intcblock exists (but is too small) or not at all.
+    assert!(
+        run_source(1, "intc_1").is_err(),
+        "intc_1 with no intcblock should fail at runtime"
+    );
+    assert!(
+        run_source(1, "intcblock 7\nintc_1\npop").is_err(),
+        "intc_1 indexing past a 1-entry intcblock should fail at runtime"
+    );
+}
+
+#[test]
+fn test_bytec_too_far() {
+    // TestBytecTooFar (eval_test.go): bytec_1/bytec_2 must fail at runtime
+    // whether a bytecblock exists (but is too small) or not at all.
+    assert!(
+        run_source(1, "bytec_1\nbtoi").is_err(),
+        "bytec_1 with no bytecblock should fail at runtime"
+    );
+    assert!(
+        run_source(1, "bytecblock 0x23 0x45\nbytec_2\nbtoi").is_err(),
+        "bytec_2 indexing past a 2-entry bytecblock should fail at runtime"
+    );
 }
 
 // ---------------------------------------------------------------------------
