@@ -1879,8 +1879,36 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     // (issue #1350) -- `forget_before` existed but was never invoked from the
     // real per-block commit path. Same failure policy as the writes above:
     // auxiliary tracker maintenance, logged rather than fatal.
+    //
+    // go's `Ledger.notifyCommit` (`ledger/ledger.go`) doesn't stop at this
+    // consensus-derived floor: it further combines it with two more
+    // node-level inputs (issue #1354) --
+    //   1. `MaxBlockHistoryLookback` -- an explicit operator override that
+    //      can *extend* retention further back than the consensus window,
+    //   2. a catchpoint-interval-derived floor (`2 * CatchpointInterval`
+    //      rounds back) when the node stores catchpoints, so enough history
+    //      survives around each catchpoint boundary,
+    // and `archival` mode forces "retain everything", overriding both. The
+    // combined floor is the OLDEST (smallest) round implied by whichever of
+    // these apply -- matching `notifyCommit`'s `if x < minToSave { minToSave
+    // = x }` chain -- unless archival, which always wins outright.
     let retain_size = consensus.max_txn_life + consensus.deeper_block_header_history;
-    let forget_before_round = (block.round.0 + 1).saturating_sub(retain_size);
+    let mut forget_before_round = (block.round.0 + 1).saturating_sub(retain_size);
+    let retention = store.retention_config();
+    if retention.archival {
+        forget_before_round = 0;
+    } else {
+        if retention.max_block_history_lookback > 0 {
+            let lookback_floor =
+                (block.round.0 + 1).saturating_sub(retention.max_block_history_lookback);
+            forget_before_round = forget_before_round.min(lookback_floor);
+        }
+        if retention.catchpoint_min_rounds_lookback > 0 {
+            let catchpoint_floor =
+                (block.round.0 + 1).saturating_sub(retention.catchpoint_min_rounds_lookback);
+            forget_before_round = forget_before_round.min(catchpoint_floor);
+        }
+    }
     if forget_before_round > 0 {
         if let Err(e) = store.forget_before(forget_before_round) {
             tracing::warn!(
@@ -8326,6 +8354,207 @@ mod tests {
         assert!(
             state.get_txtail(far_round).unwrap().is_some(),
             "the just-applied round's txtail entry must remain"
+        );
+    }
+
+    /// Issue #1354: go-algorand's `Ledger.notifyCommit` (`ledger/ledger.go`)
+    /// combines the consensus-derived `committedUpTo` floor with
+    /// `config.Local.MaxBlockHistoryLookback` — an explicit operator
+    /// override that can *extend* retention further back than the
+    /// consensus-derived window alone would allow (`if configuredMinToSave
+    /// := r.SubSaturate(basics.Round(l.cfg.MaxBlockHistoryLookback));
+    /// configuredMinToSave < minToSave { minToSave = configuredMinToSave }`).
+    ///
+    /// Before this fix, `algo_ledger`'s commit-time pruning (issue #1350)
+    /// consulted only `consensus.max_txn_life +
+    /// consensus.deeper_block_header_history`, never
+    /// `RetentionConfig::max_block_history_lookback` — so a round that a
+    /// larger configured lookback should still keep got pruned anyway.
+    #[test]
+    fn test_apply_block_max_block_history_lookback_extends_retention() {
+        use crate::store_trait::{LedgerStore, RetentionConfig};
+
+        let fee_sink = Address([3u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 10_000_000), (receiver, 1_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        let retain_size = consensus.max_txn_life + consensus.deeper_block_header_history;
+
+        // Configure a lookback comfortably larger than the consensus-derived
+        // window, so it becomes the binding (smallest) floor.
+        let lookback = retain_size + 100;
+        state.configure_retention(RetentionConfig {
+            max_block_history_lookback: lookback,
+            ..RetentionConfig::default()
+        });
+
+        let mut block1 = make_test_block(fee_sink);
+        block1.round = Round(1);
+        apply_block(&mut state, &block1).unwrap();
+        assert!(state.get_block_data(1).unwrap().is_some());
+        assert!(state.get_txtail(1).unwrap().is_some());
+
+        // Commit far enough ahead that the consensus-only window would have
+        // pruned round 1 (far_round + 1 - retain_size > 1), but not far
+        // enough to exceed the configured lookback (far_round + 1 -
+        // lookback <= 1).
+        let far_round = retain_size + 50;
+        assert!(
+            far_round + 1 > retain_size + 1,
+            "sanity: consensus-only window would already prune round 1"
+        );
+        assert!(
+            (far_round + 1).saturating_sub(lookback) <= 1,
+            "sanity: the configured lookback must not yet prune round 1"
+        );
+
+        for r in 2..=far_round {
+            let mut block = make_test_block(fee_sink);
+            block.round = Round(r);
+            block.payset = Vec::new();
+            apply_block(&mut state, &block).unwrap();
+        }
+
+        assert!(
+            state.get_block_data(1).unwrap().is_some(),
+            "round 1 must still be retrievable: MaxBlockHistoryLookback ({lookback}) \
+             extends retention past the consensus-only window ({retain_size})"
+        );
+        assert!(
+            state.get_txtail(1).unwrap().is_some(),
+            "round 1's txtail entry must still be retrievable under the extended lookback"
+        );
+    }
+
+    /// Issue #1354: go-algorand's `Ledger.notifyCommit` also combines in a
+    /// catchpoint-interval-derived floor via `calcMinCatchpointRoundsLookback`
+    /// (`ledger/ledger.go`): `2 * CatchpointInterval` rounds back, whenever
+    /// the node stores catchpoints (and `CatchpointFileHistoryLength != 0`).
+    /// Verified directly against source (not just the issue's paraphrase):
+    /// this floor only *extends* retention past the consensus-derived window
+    /// when `2 * CatchpointInterval` exceeds `MaxTxnLife +
+    /// DeeperBlockHeaderHistory` — otherwise the (already wider)
+    /// consensus-derived floor stays binding, exactly as go's `if
+    /// catchpointsMinToSave < minToSave` comparison implies.
+    #[test]
+    fn test_apply_block_catchpoint_interval_floor_extends_retention() {
+        use crate::store_trait::{LedgerStore, RetentionConfig};
+
+        let fee_sink = Address([3u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 10_000_000), (receiver, 1_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        let retain_size = consensus.max_txn_life + consensus.deeper_block_header_history;
+
+        // Pick a catchpoint interval whose `2 * interval` floor comfortably
+        // exceeds the consensus-derived window, so it becomes binding.
+        let catchpoint_interval = retain_size / 2 + 100;
+        let catchpoint_min_rounds_lookback = 2 * catchpoint_interval;
+        state.configure_retention(RetentionConfig {
+            catchpoint_min_rounds_lookback,
+            ..RetentionConfig::default()
+        });
+
+        let mut block1 = make_test_block(fee_sink);
+        block1.round = Round(1);
+        apply_block(&mut state, &block1).unwrap();
+
+        let far_round = retain_size + 50;
+        assert!(
+            far_round + 1 > retain_size + 1,
+            "sanity: consensus-only window would already prune round 1"
+        );
+        assert!(
+            (far_round + 1).saturating_sub(catchpoint_min_rounds_lookback) <= 1,
+            "sanity: the catchpoint floor must not yet prune round 1"
+        );
+
+        for r in 2..=far_round {
+            let mut block = make_test_block(fee_sink);
+            block.round = Round(r);
+            block.payset = Vec::new();
+            apply_block(&mut state, &block).unwrap();
+        }
+
+        assert!(
+            state.get_block_data(1).unwrap().is_some(),
+            "round 1 must still be retrievable: the catchpoint-interval floor \
+             (2 * {catchpoint_interval} = {catchpoint_min_rounds_lookback}) extends \
+             retention past the consensus-only window ({retain_size})"
+        );
+        assert!(
+            state.get_txtail(1).unwrap().is_some(),
+            "round 1's txtail entry must still be retrievable under the catchpoint floor"
+        );
+    }
+
+    /// Issue #1354: go-algorand's `Ledger.notifyCommit` forces `minToSave =
+    /// 0` unconditionally when the node is archival, overriding both
+    /// `MaxBlockHistoryLookback` and the catchpoint-interval floor -- an
+    /// archival node never forgets a block/txtail row.
+    #[test]
+    fn test_apply_block_archival_retains_everything() {
+        use crate::store_trait::{LedgerStore, RetentionConfig};
+
+        let fee_sink = Address([3u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 10_000_000), (receiver, 1_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        let retain_size = consensus.max_txn_life + consensus.deeper_block_header_history;
+
+        // Archival, with a small (irrelevant) MaxBlockHistoryLookback and no
+        // catchpoint floor configured -- archival must win outright.
+        state.configure_retention(RetentionConfig {
+            archival: true,
+            max_block_history_lookback: 10,
+            catchpoint_min_rounds_lookback: 0,
+        });
+
+        let mut block1 = make_test_block(fee_sink);
+        block1.round = Round(1);
+        apply_block(&mut state, &block1).unwrap();
+
+        // Commit well past where the consensus-only window (and the tiny
+        // configured lookback) would have pruned round 1.
+        let far_round = retain_size + 50;
+        for r in 2..=far_round {
+            let mut block = make_test_block(fee_sink);
+            block.round = Round(r);
+            block.payset = Vec::new();
+            apply_block(&mut state, &block).unwrap();
+        }
+
+        assert!(
+            state.get_block_data(1).unwrap().is_some(),
+            "archival mode must retain round 1's block data regardless of any other input"
+        );
+        assert!(
+            state.get_txtail(1).unwrap().is_some(),
+            "archival mode must retain round 1's txtail entry regardless of any other input"
         );
     }
 

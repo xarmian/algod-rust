@@ -143,6 +143,12 @@ pub struct LedgerState {
     /// snapshot: full participant array" section.
     voters_participants_store:
         HashMap<u64, Vec<(Address, algo_consensus_crypto::stateproof::Participant)>>,
+    /// Node-level retention overrides (issue #1354), consulted by
+    /// `apply.rs`'s per-block commit pruning. See
+    /// [`crate::store_trait::RetentionConfig`] and
+    /// [`Self::configure_retention`]. Defaults to the all-default value,
+    /// which reproduces the pre-existing consensus-only pruning window.
+    retention: crate::store_trait::RetentionConfig,
 }
 
 impl LedgerState {
@@ -176,7 +182,14 @@ impl LedgerState {
             state_proof_verification_store: HashMap::new(),
             voters_snapshot_store: HashMap::new(),
             voters_participants_store: HashMap::new(),
+            retention: crate::store_trait::RetentionConfig::default(),
         }
+    }
+
+    /// Configure node-level retention overrides (issue #1354). See
+    /// [`crate::store_trait::RetentionConfig`]'s doc comment.
+    pub fn configure_retention(&mut self, cfg: crate::store_trait::RetentionConfig) {
+        self.retention = cfg;
     }
 
     pub fn get_account(&self, addr: &Address) -> Option<&AccountData> {
@@ -1596,6 +1609,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
         self.block_store.retain(|&r, _| r >= round);
         self.txtail_store.retain(|&r, _| r >= round);
         Ok(())
+    }
+
+    fn retention_config(&self) -> crate::store_trait::RetentionConfig {
+        self.retention
     }
 
     // ---- State-proof verification-context tracker ----
