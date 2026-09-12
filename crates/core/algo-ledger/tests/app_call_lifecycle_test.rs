@@ -2100,3 +2100,160 @@ int 1
          match its real MinBalance/TotalBoxes/TotalBoxBytes",
     );
 }
+
+// ---------------------------------------------------------------------------
+// TestAppAccountDelta (ledger/applications_test.go:372) -- issue #1325
+//
+// go-algorand's `opAppGlobalPut`/`opAppLocalPut`
+// (`data/transactions/logic/eval.go`) only record a GlobalDelta/LocalDelta
+// entry when a write actually changes the value currently observed via
+// `cx.Ledger.GetGlobal`/`GetLocal` -- re-asserting a key's existing value in
+// a LATER, separate top-level call produces NO EvalDelta entry for that key
+// at all. This end-to-end test drives the real scenario go's test exercises
+// (minus the `local1`/close-out branches, which are separate concerns):
+// opt-in + local write, then a separate later call re-writing the SAME
+// local value; a global write, then a separate later call re-writing the
+// SAME global value.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_app_account_delta_rewrite_same_value_produces_empty_eval_delta() {
+    let creator = Address([1u8; 32]);
+    let user = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let app_id = 960u64;
+
+    let mut state = make_state(
+        &[(creator, 50_000_000), (user, 50_000_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    // Mirrors go's test program: on creation just approve; on a real call,
+    // write local state "lk"="local" when there are no args, or write
+    // global state "gk"="global" when ApplicationArgs[0] == "global".
+    let approval_src = "#pragma version 8
+txn ApplicationID
+int 0
+==
+bnz success
+txn NumAppArgs
+int 0
+==
+bnz writelocal
+txna ApplicationArgs 0
+byte \"global\"
+==
+bnz writeglobal
+int 0
+return
+writelocal:
+int 0
+byte \"lk\"
+byte \"local\"
+app_local_put
+b success
+writeglobal:
+byte \"gk\"
+byte \"global\"
+app_global_put
+success:
+int 1
+";
+    let create = appl_create(
+        creator,
+        1_000,
+        app_id,
+        approval_src,
+        APPROVE_SRC,
+        Some(StateSchema {
+            num_uint: 0,
+            num_byte_slice: 4,
+        }),
+        Some(StateSchema {
+            num_uint: 0,
+            num_byte_slice: 2,
+        }),
+        None,
+    );
+    let create_block = minimal_block(fee_sink, 1, vec![create]);
+    apply_block_capturing_apply_data(&mut state, &create_block, ApplyMode::Execute)
+        .expect("app creation must apply cleanly");
+
+    const ON_COMPLETION_OPT_IN: u64 = 1;
+
+    // Opt in + write local "lk" = "local" -- first write, must record a delta.
+    let optin = appl_call(user, 1_000, app_id, ON_COMPLETION_OPT_IN, None);
+    let optin_block = minimal_block(fee_sink, 2, vec![optin]);
+    let results = apply_block_capturing_apply_data(&mut state, &optin_block, ApplyMode::Execute)
+        .expect("opt-in + local write must apply cleanly");
+    let ed = parse_eval_delta(
+        results[0]
+            .eval_delta
+            .as_ref()
+            .expect("first local write must produce an eval delta"),
+    )
+    .expect("eval delta must parse");
+    let local_deltas = ed
+        .local_deltas
+        .expect("first local write must record a LocalDeltas entry");
+    assert_eq!(local_deltas.len(), 1);
+
+    // Re-write the SAME local value in a separate, LATER call -- go asserts
+    // this produces a completely empty ApplyData.EvalDelta.
+    let rewrite_local = appl_call(user, 1_000, app_id, 0, None);
+    let rewrite_local_block = minimal_block(fee_sink, 3, vec![rewrite_local]);
+    let results =
+        apply_block_capturing_apply_data(&mut state, &rewrite_local_block, ApplyMode::Execute)
+            .expect("local re-write must apply cleanly");
+    match results[0].eval_delta.as_ref() {
+        None => {} // no eval delta at all is also a valid "empty" encoding
+        Some(dt) => {
+            let ed = parse_eval_delta(dt).expect("eval delta must parse");
+            assert_eq!(
+                ed.local_deltas.as_ref().map(|m| m.len()).unwrap_or(0),
+                0,
+                "re-writing the same local value in a later call must not produce a LocalDeltas entry"
+            );
+        }
+    }
+
+    // Write global "gk" = "global" -- first write, must record a delta.
+    let mut write_global = appl_call(creator, 1_000, app_id, 0, None);
+    write_global.txn.app_arguments =
+        Some(vec![Some(serde_bytes::ByteBuf::from(b"global".to_vec()))]);
+    let write_global_block = minimal_block(fee_sink, 4, vec![write_global]);
+    let results =
+        apply_block_capturing_apply_data(&mut state, &write_global_block, ApplyMode::Execute)
+            .expect("first global write must apply cleanly");
+    let ed = parse_eval_delta(
+        results[0]
+            .eval_delta
+            .as_ref()
+            .expect("first global write must produce an eval delta"),
+    )
+    .expect("eval delta must parse");
+    let global_delta = ed
+        .global_delta
+        .expect("first global write must record a GlobalDelta entry");
+    assert_eq!(global_delta.len(), 1);
+
+    // Re-write the SAME global value in a separate, LATER call.
+    let mut rewrite_global = appl_call(creator, 1_000, app_id, 0, None);
+    rewrite_global.txn.app_arguments =
+        Some(vec![Some(serde_bytes::ByteBuf::from(b"global".to_vec()))]);
+    let rewrite_global_block = minimal_block(fee_sink, 5, vec![rewrite_global]);
+    let results =
+        apply_block_capturing_apply_data(&mut state, &rewrite_global_block, ApplyMode::Execute)
+            .expect("global re-write must apply cleanly");
+    match results[0].eval_delta.as_ref() {
+        None => {}
+        Some(dt) => {
+            let ed = parse_eval_delta(dt).expect("eval delta must parse");
+            assert_eq!(
+                ed.global_delta.as_ref().map(|m| m.len()).unwrap_or(0),
+                0,
+                "re-writing the same global value in a later call must not produce a GlobalDelta entry"
+            );
+        }
+    }
+}

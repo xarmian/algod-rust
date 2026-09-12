@@ -5077,7 +5077,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             AppStateOp::Write,
             Some(*account),
             key,
-            pre,
+            pre.clone(),
             Some(value.clone()),
         );
         // Enforce maximum value length and combined key+value length,
@@ -5107,8 +5107,18 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         local.key_value.insert(key.to_vec(), value.clone());
         check_state_schema_counts(&local.key_value, &local.schema)?;
         self.store.set_app_local_state(&addr, app_id, local);
-        // Track delta for EvalDelta comparison.
-        if app_id == self.app_id {
+        // Track delta for EvalDelta comparison. Matches go-algorand's
+        // `opAppLocalPut` (`data/transactions/logic/eval.go`): "if writing
+        // the same value, don't record in EvalDelta" -- `pre` was read from
+        // `self.store` above, i.e. the value as currently observed
+        // (reflecting any earlier write to this key within the same
+        // top-level transaction's execution, including by an already-
+        // completed nested inner call sharing this same mutable store, or
+        // the truly-committed value on first touch). Only a write that
+        // actually changes what's currently visible gets an entry; a write
+        // that merely re-asserts it is a no-op for EvalDelta purposes
+        // (issue #1325).
+        if app_id == self.app_id && pre.as_ref() != Some(&value) {
             self.local_delta_tracker
                 .insert((addr, key.to_vec()), Some(value));
         }
@@ -5182,7 +5192,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             AppStateOp::Write,
             None,
             key,
-            pre,
+            pre.clone(),
             Some(value.clone()),
         );
         // Enforce maximum value length and combined key+value length,
@@ -5212,8 +5222,18 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         p.global_state.insert(key.to_vec(), value.clone());
         check_state_schema_counts(&p.global_state, &p.global_state_schema)?;
         self.store.set_app_params(app_id, p);
-        // Track delta for EvalDelta comparison.
-        if app_id == self.app_id {
+        // Track delta for EvalDelta comparison. Matches go-algorand's
+        // `opAppGlobalPut` (`data/transactions/logic/eval.go`): "if writing
+        // the same value, don't record in EvalDelta" -- `pre` was read from
+        // `self.store` above, i.e. the value as currently observed
+        // (reflecting any earlier write to this key within the same
+        // top-level transaction's execution, including by an already-
+        // completed nested inner call sharing this same mutable store, or
+        // the truly-committed value on first touch). Only a write that
+        // actually changes what's currently visible gets an entry; a write
+        // that merely re-asserts it is a no-op for EvalDelta purposes
+        // (issue #1325).
+        if app_id == self.app_id && pre.as_ref() != Some(&value) {
             self.global_delta_tracker.insert(key.to_vec(), Some(value));
         }
         Ok(())
@@ -8496,6 +8516,222 @@ mod tests {
 
         let delta = algo_avm::context::AvmContext::take_global_delta(&mut ctx);
         assert_eq!(delta.get(b"counter".as_slice()), Some(&None));
+    }
+
+    // ---- no-op write EvalDelta omission (issue #1325) ----
+    //
+    // go-algorand's `opAppGlobalPut`/`opAppLocalPut`
+    // (`data/transactions/logic/eval.go`) only record a GlobalDelta/
+    // LocalDelta entry when the write actually changes the value currently
+    // observed via `cx.Ledger.GetGlobal`/`GetLocal` ("if writing the same
+    // value, don't record in EvalDelta, matching ledger behavior with
+    // previous BuildEvalDelta mechanism"). That "currently observed" value
+    // already reflects any earlier write to the same key within the same
+    // top-level transaction's execution -- including one made by an
+    // already-completed nested inner call, since `cx.Ledger` walks up
+    // through every ancestor cow to find the freshest delta
+    // (`roundCowState.getKey`, `ledger/eval/appcow.go`) -- or, on first
+    // touch, the truly-committed pre-transaction value.
+
+    /// Port of go-algorand's `TestAppAccountDelta`'s core global-state
+    /// assertion: re-writing a global key to the exact value it already
+    /// holds must not appear in the EvalDelta at all.
+    #[test]
+    fn app_global_put_rewrite_same_value_records_no_delta() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let mut global = BTreeMap::new();
+        global.insert(b"gk".to_vec(), TealValue::Bytes(b"global".to_vec()));
+        store.app_params.insert(
+            42,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: vec![],
+                clear_state_program: vec![],
+                global_state: global,
+                local_state_schema: StateSchema::default(),
+                global_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                extra_program_pages: 0,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        // Re-write "gk" to the SAME value ("global") it already holds.
+        ctx.app_global_put(42, b"gk", TealValue::Bytes(b"global".to_vec()))
+            .unwrap();
+
+        let delta = algo_avm::context::AvmContext::take_global_delta(&mut ctx);
+        assert!(
+            delta.is_empty(),
+            "re-writing a global key to its existing value must not record an EvalDelta entry, got {delta:?}"
+        );
+    }
+
+    /// Same as `app_global_put_rewrite_same_value_records_no_delta` but for
+    /// `app_local_put` -- port of go-algorand's `TestAppAccountDelta`'s local
+    /// half.
+    #[test]
+    fn app_local_put_rewrite_same_value_records_no_delta() {
+        let sender = [10u8; 32];
+        let txn = make_pay_txn(sender, [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let mut kv = BTreeMap::new();
+        kv.insert(b"lk".to_vec(), TealValue::Bytes(b"local".to_vec()));
+        store.set_app_local_state(
+            &Address(sender),
+            42,
+            algo_types::AppLocalState {
+                schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                key_value: kv,
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        // Re-write "lk" to the SAME value ("local") it already holds.
+        ctx.app_local_put(&sender, 42, b"lk", TealValue::Bytes(b"local".to_vec()))
+            .unwrap();
+
+        let deltas = algo_avm::context::AvmContext::take_local_deltas(&mut ctx);
+        assert!(
+            deltas.is_empty(),
+            "re-writing a local key to its existing value must not record an EvalDelta entry, got {deltas:?}"
+        );
+    }
+
+    /// Sanity check that a genuinely new global key still records a delta --
+    /// guards against a fix that over-corrects and suppresses all writes.
+    #[test]
+    fn app_global_put_new_key_still_records_delta() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.app_params.insert(
+            42,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: vec![],
+                clear_state_program: vec![],
+                global_state: BTreeMap::new(),
+                local_state_schema: StateSchema::default(),
+                global_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                extra_program_pages: 0,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_global_put(42, b"gk", TealValue::Bytes(b"global".to_vec()))
+            .unwrap();
+
+        let delta = algo_avm::context::AvmContext::take_global_delta(&mut ctx);
+        assert_eq!(
+            delta.get(b"gk".as_slice()),
+            Some(&Some(TealValue::Bytes(b"global".to_vec())))
+        );
+    }
+
+    /// Sanity check that changing an EXISTING global key to a genuinely
+    /// different value still records a delta.
+    #[test]
+    fn app_global_put_changed_value_still_records_delta() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let mut global = BTreeMap::new();
+        global.insert(b"gk".to_vec(), TealValue::Bytes(b"global".to_vec()));
+        store.app_params.insert(
+            42,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: vec![],
+                clear_state_program: vec![],
+                global_state: global,
+                local_state_schema: StateSchema::default(),
+                global_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                extra_program_pages: 0,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_global_put(42, b"gk", TealValue::Bytes(b"other".to_vec()))
+            .unwrap();
+
+        let delta = algo_avm::context::AvmContext::take_global_delta(&mut ctx);
+        assert_eq!(
+            delta.get(b"gk".as_slice()),
+            Some(&Some(TealValue::Bytes(b"other".to_vec())))
+        );
+    }
+
+    /// Documents go-algorand's ACTUAL (not the naively-assumed) semantics for
+    /// a key written to a different value and then back to its original
+    /// value within the SAME transaction ("A -> B -> A"). `opAppGlobalPut`
+    /// compares each write only against the value *currently observed* via
+    /// `cx.Ledger.GetGlobal` at the moment of that write -- which, after the
+    /// first write (A -> B), is B, not the pristine original A. So the
+    /// second write (B -> A) DOES change what's currently observed (B != A)
+    /// and DOES get recorded, overwriting the tracked entry to describe the
+    /// final value (A). go-algorand does not retroactively compare against
+    /// the transaction's start-of-evaluation snapshot when taking the
+    /// eval delta -- there is no second suppression pass beyond the
+    /// per-write check (the `stateDelta.serialize()`/`valueDelta` all-in-one
+    /// oldExists-vs-new comparison in `ledger/eval/appcow.go` is dead code
+    /// for any `LogicSigVersion >= 6`, which is every currently-relevant
+    /// consensus version including the v5.0.0-stable pin -- see
+    /// `StatefulEval`'s `if cb.proto.LogicSigVersion < 6` branch). A fix that
+    /// suppressed this A->B->A case entirely would therefore be a NEW
+    /// divergence from go, not a parity fix.
+    #[test]
+    fn app_global_put_a_then_b_then_a_within_one_txn_records_final_write() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let mut global = BTreeMap::new();
+        global.insert(b"gk".to_vec(), TealValue::Bytes(b"a".to_vec()));
+        store.app_params.insert(
+            42,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: vec![],
+                clear_state_program: vec![],
+                global_state: global,
+                local_state_schema: StateSchema::default(),
+                global_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                extra_program_pages: 0,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        // A -> B (a real change, must record).
+        ctx.app_global_put(42, b"gk", TealValue::Bytes(b"b".to_vec()))
+            .unwrap();
+        // B -> A (also a real change relative to what's CURRENTLY observed
+        // -- "b" -- even though "a" matches the pre-transaction original).
+        ctx.app_global_put(42, b"gk", TealValue::Bytes(b"a".to_vec()))
+            .unwrap();
+
+        let delta = algo_avm::context::AvmContext::take_global_delta(&mut ctx);
+        assert_eq!(
+            delta.get(b"gk".as_slice()),
+            Some(&Some(TealValue::Bytes(b"a".to_vec()))),
+            "the final write must be recorded even though it restores the pre-transaction value, \
+             matching go-algorand's per-write (not per-transaction) comparison"
+        );
     }
 
     // ---- balance/min_balance tests ----
