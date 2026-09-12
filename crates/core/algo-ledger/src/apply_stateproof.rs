@@ -831,6 +831,43 @@ mod tests {
             .is_none());
     }
 
+    /// TestStateProofVerificationTracker_StateProofsDisabled
+    /// (`ledger/spverificationtracker_test.go`): on a protocol version that
+    /// predates state proofs (`StateProofInterval == 0`), feeding 1000
+    /// rounds through the tracker must accumulate zero verification
+    /// contexts -- not just for non-multiple rounds (already pinned by
+    /// `record_state_proof_verification_context_ignores_non_voters_rounds`
+    /// with a real nonzero interval), but for every round, including ones
+    /// that *would* be multiples of a real interval were one active (round
+    /// 0 is a multiple of every interval, and round % 0 would otherwise
+    /// panic without the `state_proof_interval == 0` short-circuit).
+    #[test]
+    fn record_state_proof_verification_context_disabled_records_nothing_across_many_rounds() {
+        let mut store = LedgerState::new();
+        for round in 0..1000u64 {
+            record_state_proof_verification_context(
+                &mut store,
+                round,
+                CONSENSUS_V41, // protocol label is inert here -- `state_proof_interval` (last arg) is what gates recording
+                &None,
+                0, // StateProofInterval == 0: state proofs not yet enabled
+            )
+            .unwrap();
+        }
+        // No context could have been recorded at any `round + interval` key
+        // since interval is always 0 here; spot-check a spread of plausible
+        // keys a real interval (e.g. 256) would have produced.
+        for candidate in [0u64, 1, 256, 512, 768, 1000, 1256] {
+            assert!(
+                store
+                    .get_state_proof_verification_context(candidate)
+                    .unwrap()
+                    .is_none(),
+                "no verification context may exist at round {candidate} when state proofs are disabled"
+            );
+        }
+    }
+
     /// Analogous to go's `TestStateProofVerificationTracker_StateProofIntervalChange`:
     /// a protocol upgrade can change `StateProofInterval` mid-chain. Contexts
     /// recorded under the old interval must still resolve at their
