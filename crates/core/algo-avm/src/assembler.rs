@@ -1931,7 +1931,15 @@ fn asm_byte(ops: &mut OpStream, args: &[&str]) {
     }
 
     match parse_binary_args(args) {
-        Ok((val, _consumed)) => {
+        Ok((val, consumed)) => {
+            if args.len() != consumed {
+                ops.record_error(
+                    ops.source_line,
+                    0,
+                    "byte with extraneous argument".to_string(),
+                );
+                return;
+            }
             if val.len() > opcode::MAX_STRING_SIZE {
                 ops.record_error(
                     ops.source_line,
@@ -1960,7 +1968,15 @@ fn asm_push_bytes(ops: &mut OpStream, args: &[&str]) {
         return;
     }
     match parse_binary_args(args) {
-        Ok((val, _consumed)) => {
+        Ok((val, consumed)) => {
+            if args.len() != consumed {
+                ops.record_error(
+                    ops.source_line,
+                    0,
+                    "pushbytes with extraneous argument".to_string(),
+                );
+                return;
+            }
             if val.len() > opcode::MAX_STRING_SIZE {
                 ops.record_error(
                     ops.source_line,
@@ -6406,10 +6422,18 @@ dup
             // go rejects `byte 0xaa 0xbb` / `byte b32 X X` with "byte with
             // extraneous argument" (asmByte checks `parseBinaryArgs`'s
             // `consumed` token count against `len(args)`, assembler.go:853).
-            // algod-rust's `asm_byte`/`asm_push_bytes` both discard
-            // `parse_binary_args`'s consumed-count and never make this
-            // check, so a trailing extra token is silently ignored instead
-            // of rejected. Filed as issue #1369; not asserted here.
+            let errs = expect_errors(&format!("{pfx}byte 0xaa 0xbb"));
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("byte with extraneous argument")),
+                "v{v} byte 0xaa 0xbb: {errs:?}"
+            );
+            let errs = expect_errors(&format!("{pfx}byte b32 MFRGGZDFMY MFRGGZDFMY"));
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("byte with extraneous argument")),
+                "v{v} byte b32 MFRGGZDFMY MFRGGZDFMY: {errs:?}"
+            );
             assemble_string(&format!(
                 "{pfx}byte 0x{}",
                 "aa".repeat(opcode::MAX_STRING_SIZE)
