@@ -6068,16 +6068,11 @@ dup
 
     #[test]
     fn test_bury_asm_ported_from_go() {
-        // TestBuryAsm (assembler_test.go#L3199): the immediate arity/parse
-        // half is ported here and matched. `bury`'s static type-tracking
-        // (height error when the immediate exceeds the stack, replacing
-        // the buried slot's tracked type, and the `bury 0`-always-fails
-        // special case from assembler.go:1358) is a real gap -- unlike
-        // `dig`/`cover`/`uncover`, `type_track.rs`'s `refined_types` has no
-        // `"bury"` arm at all, so `bury` falls back to the generic fixed
-        // `Any`-in/nothing-out proto and none of go's `typeBury` behavior is
-        // reproduced. Tracked in issue #1364; do not add the failing
-        // assertions here until that's fixed.
+        // TestBuryAsm (assembler_test.go#L3199), full port. Fixed in
+        // issue #1364: `type_track.rs`'s `refined_types` now has a `"bury"`
+        // arm mirroring go's `typeBury` (height check via the `n+1` pop
+        // count, buried-slot type update, and the `bury 0`-always-fails
+        // special case).
         let errs = expect_errors("#pragma version 8\nint 1\nbury\n+\n");
         assert!(
             errs.iter().any(|e| e.message.contains("bury expects 1")),
@@ -6087,6 +6082,70 @@ dup
         let errs = expect_errors("#pragma version 8\nint 1\nbury junk\n+\n");
         assert!(
             errs.iter().any(|e| e.message.contains("unable to parse")),
+            "{errs:?}"
+        );
+
+        // "the 2 replaces the byte string" -- `bury 1` overwrites the
+        // byte-string slot with the int on top, so `+` sees two uint64s.
+        assemble_string("#pragma version 8\nint 1\nbyte 0x1234\nint 2\nbury 1\n+\n").unwrap();
+
+        let errs = expect_errors("#pragma version 8\nint 2\nint 2\nbyte 0x1234\nbury 1\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 1")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nbyte 0x32\nbyte 0x1234\nint 2\nbury 3\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("bury 3 expects 4")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nint 1\nbyte 0x1234\nint 2\nbury 12\n+\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("bury 12 expects 13")),
+            "{errs:?}"
+        );
+
+        // We do not lose track of the ints between ToS and the bury index.
+        let errs = expect_errors("#pragma version 8\nint 0\nint 1\nint 2\nint 4\nbury 3\nconcat\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("concat arg 1 wanted type []byte")),
+            "{errs:?}"
+        );
+
+        // Even when we are burying into unknown (seems repetitive, but is
+        // an easy bug): a permissive bottom (reached via a label after
+        // dead code) must not silently swallow this check either.
+        let errs = expect_errors(
+            "#pragma version 8\nint 0\nint 0\nb LABEL\nLABEL:\nint 1\nint 2\nint 4\nbury 4\nconcat\n",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("concat arg 1 wanted type []byte")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nintcblock 55\nbury 1\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("bury 1 expects 2 stack arguments")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nintcblock 55\nint 2\nbury 1\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("bury 1 expects 2 stack arguments")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nint 3\nint 2\nbury 0\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("bury 0 always fails")),
             "{errs:?}"
         );
     }

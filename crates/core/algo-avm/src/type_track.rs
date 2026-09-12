@@ -469,13 +469,18 @@ enum ScratchEffect {
 /// needed only by `asset_holding_get` to pick between its two versioned
 /// protos (see that match arm) -- go instead selects between two whole
 /// `OpSpec` entries by version (`getSpec`), which this module doesn't model
-/// for any other opcode.
+/// for any other opcode. `bottom_permissive` is
+/// [`OpStream::type_track_bottom_permissive`], needed only by `bury`'s
+/// insufficient-height case (see that match arm) to decide between forcing
+/// a height error and silently falling back to the default fixed proto,
+/// mirroring go's `pgm.bottom.AVMType == avmNone` check in `typeBury`.
 #[allow(clippy::type_complexity)]
 fn refined_types(
     stack: &[StackType],
     consts: &[Option<u64>],
     scratch: &[StackType; 256],
     version: u8,
+    bottom_permissive: bool,
     mnemonic: &str,
     args: &[&str],
 ) -> Option<(
@@ -552,6 +557,38 @@ fn refined_types(
                 returns[depth] = stack[idx];
             }
             Some((Some(vec![Any; depth]), Some(returns), None))
+        }
+        // typeBury (assembler.go:1352-1378): `bury n` pops the top `n+1`
+        // tracked values and pushes back `n`, with the bottom-most of those
+        // `n` (the slot actually being buried into) replaced by the
+        // original top's type -- the value being buried down overwrites it.
+        // `bury 0` is rejected before this arm is ever reached (see
+        // `track_instruction`'s dedicated special case, mirroring go's
+        // `errors.New("bury 0 always fails")`).
+        "bury" => {
+            let n: usize = args.first()?.parse().ok()?;
+            let depth = n + 1;
+            if len < depth {
+                // Mirrors go's `idx := top - n; if idx < 0`: with a
+                // permissive bottom (analysis reopened after dead code,
+                // `pgm.bottom.AVMType != avmNone`) there's nothing to
+                // refine -- fall back entirely to the default fixed proto
+                // (pop 1 `Any`, push nothing), exactly like go's `nil, nil,
+                // nil`. Without a permissive bottom, force the pop count to
+                // `depth` so `apply_stack_effect` reports the standard
+                // "expects N stack arguments" height error, mirroring go's
+                // `anyTypes(n + 1)`.
+                return if bottom_permissive {
+                    Some((None, None, None))
+                } else {
+                    Some((Some(vec![Any; depth]), None, None))
+                };
+            }
+            let idx = len - depth;
+            let mut returns = vec![Any; n];
+            returns.copy_from_slice(&stack[idx..idx + n]);
+            returns[0] = stack[len - 1];
+            Some((Some(stack[idx..].to_vec()), Some(returns), None))
         }
         // typeStore (assembler.go:1543-1553): a known slot index (`store`
         // always has a literal immediate, never a stack arg) gets set to
@@ -1088,6 +1125,23 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
         return;
     }
 
+    // typeBury's `bury 0` special case (assembler.go:1357-1359): there is no
+    // valid stack shape where burying the top value into itself makes
+    // sense, so go raises a dedicated hard error here -- unlike every other
+    // height mismatch, which is reported via the standard "arg N wanted
+    // type"/"expects N stack arguments" phrasing derived from a pop/push
+    // override. This is handled before `refined_types` is ever consulted
+    // (mirroring go's `trackStack` still running with the *unrefined*
+    // `spec.Arg.Types`/`spec.Return.Types` -- pop 1 `Any`, push nothing --
+    // since `typeBury`'s `nargs`/`nreturns` stay `nil` on its error branch).
+    if mnemonic == "bury" && args.first().and_then(|s| s.parse::<usize>().ok()) == Some(0) {
+        if ops.type_track_reporting {
+            ops.record_error(ops.source_line, 0, "bury 0 always fails".to_string());
+        }
+        apply_stack_effect(ops, mnemonic, args, &[Any], &[]);
+        return;
+    }
+
     let spec = match opcode::lookup_by_name(mnemonic) {
         // Not a real opcode (or a pseudo-op this slice doesn't model, e.g.
         // `extract`'s own arity dispatch) -- the rest of assembly will
@@ -1102,6 +1156,7 @@ pub(crate) fn track_instruction(ops: &mut OpStream, mnemonic: &str, args: &[&str
         &ops.type_stack_const,
         &ops.scratch_space,
         ops.version,
+        ops.type_track_bottom_permissive,
         mnemonic,
         args,
     );
