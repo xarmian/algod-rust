@@ -9737,6 +9737,99 @@ mod tests {
         );
     }
 
+    /// go's `TestOnlineAccountsSuspended` (`ledger/acctdeltas_test.go`): once
+    /// an account has transitioned online -> offline (recorded as a
+    /// zero-voting-data marker row), a *further* offline-to-offline update
+    /// must not write a new `onlineaccounts` row -- even when the incoming
+    /// `AccountData` carries stale non-zero `vote_first_valid`/
+    /// `vote_last_valid` fields left over from before it went offline (go's
+    /// test constructs exactly this "suspended" shape: `Status: Offline` but
+    /// `VotingData` still populated) and the balance changed. Only the
+    /// account's *previous stored row* voting-emptiness should gate the
+    /// skip, matching go's `IsVotingEmpty()`-on-the-cached-entry check, not
+    /// whatever the new delta's own voting fields happen to say.
+    #[test]
+    fn record_online_account_history_skips_redundant_offline_to_offline_update() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([0x55; 32]);
+
+        // Round 1: goes online with real voting data.
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 100_000_000,
+                status: AccountStatus::Online,
+                vote_id: Some([1u8; 32]),
+                selection_id: Some([2u8; 32]),
+                vote_first_valid: 1,
+                vote_last_valid: 5,
+                vote_key_dilution: 10_000,
+                ..Default::default()
+            },
+        );
+        ledger.commit_block().unwrap();
+
+        // Round 2: goes offline -- must record the transition (zero marker).
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(2));
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 100_000_000,
+                status: AccountStatus::Offline,
+                ..Default::default()
+            },
+        );
+        ledger.commit_block().unwrap();
+
+        let rows_after_round2: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
+                params![addr.0.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows_after_round2, 2,
+            "the online row (round 1) plus the offline transition marker (round 2)"
+        );
+
+        // Round 3: "transfer to suspended account" -- still offline, balance
+        // changed, but (mirroring go's exact fixture) the incoming AccountData
+        // still carries the old non-zero VoteFirstValid/VoteLastValid. Since
+        // the account was ALREADY recorded offline, this must be a no-op.
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(3));
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 100_000_000 - 1,
+                status: AccountStatus::Offline,
+                vote_first_valid: 1,
+                vote_last_valid: 5,
+                ..Default::default()
+            },
+        );
+        ledger.commit_block().unwrap();
+
+        let rows_after_round3: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
+                params![addr.0.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows_after_round3, 2,
+            "a repeated offline update must not write a new onlineaccounts row, \
+             even with stale non-zero voting fields on the incoming delta"
+        );
+    }
+
     /// go's `TestOnlineAccountsDeletion` ("delete" subtest,
     /// `ledger/acctdeltas_test.go`): drives `prune_online_account_history_before`
     /// directly (go's `OnlineAccountsDelete`) round-by-round over the exact
