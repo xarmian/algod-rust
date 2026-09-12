@@ -6013,4 +6013,120 @@ dup
             "{errs:?}"
         );
     }
+
+    #[test]
+    fn test_dig_asm_ported_from_go() {
+        // TestDigAsm (assembler_test.go#L3178): assembly-time immediate
+        // arity/parse errors, plus static type-tracking through `dig`.
+        let errs = expect_errors("#pragma version 8\nint 1\ndig\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("dig expects 1")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nint 1\ndig junk\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("unable to parse")),
+            "{errs:?}"
+        );
+
+        assemble_string("#pragma version 8\nint 1\nbyte 0x1234\nint 2\ndig 2\n+\n").unwrap();
+
+        let errs = expect_errors("#pragma version 8\nbyte 0x32\nbyte 0x1234\nint 2\ndig 2\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 1")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nbyte 0x32\nbyte 0x1234\nint 2\ndig 3\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("dig 3 expects 4")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nint 1\nbyte 0x1234\nint 2\ndig 12\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("dig 12 expects 13")),
+            "{errs:?}"
+        );
+
+        // Digging something out does not ruin our knowledge about the
+        // types in the middle.
+        let errs = expect_errors(
+            "#pragma version 8\nint 1\nbyte 0x1234\nbyte 0x1234\ndig 2\ndig 3\n+\npop\n+\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 1")),
+            "{errs:?}"
+        );
+
+        assemble_string(
+            "#pragma version 8\nint 3\npushbytes \"123456\"\nint 1\ndig 2\nsubstring3\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_bury_asm_ported_from_go() {
+        // TestBuryAsm (assembler_test.go#L3199): the immediate arity/parse
+        // half is ported here and matched. `bury`'s static type-tracking
+        // (height error when the immediate exceeds the stack, replacing
+        // the buried slot's tracked type, and the `bury 0`-always-fails
+        // special case from assembler.go:1358) is a real gap -- unlike
+        // `dig`/`cover`/`uncover`, `type_track.rs`'s `refined_types` has no
+        // `"bury"` arm at all, so `bury` falls back to the generic fixed
+        // `Any`-in/nothing-out proto and none of go's `typeBury` behavior is
+        // reproduced. Tracked in issue #1364; do not add the failing
+        // assertions here until that's fixed.
+        let errs = expect_errors("#pragma version 8\nint 1\nbury\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("bury expects 1")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nint 1\nbury junk\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("unable to parse")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_cover_asm_ported_from_go() {
+        // TestCoverAsm (assembler_test.go#L3353).
+        assemble_string("#pragma version 8\nint 4\nbyte \"john\"\nint 5\ncover 2\npop\n+\n")
+            .unwrap();
+        assemble_string("#pragma version 8\nint 4\nbyte \"ayush\"\nint 5\ncover 1\npop\n+\n")
+            .unwrap();
+
+        let errs = expect_errors("#pragma version 8\nint 4\nbyte \"john\"\nint 5\ncover 2\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 1")),
+            "{errs:?}"
+        );
+
+        let errs = expect_errors("#pragma version 8\nint 4\ncover junk\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("unable to parse")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_uncover_asm_ported_from_go() {
+        // TestUncoverAsm (assembler_test.go#L3364).
+        assemble_string("#pragma version 8\nint 4\nbyte \"john\"\nint 5\nuncover 2\n+\n").unwrap();
+        assemble_string("#pragma version 8\nint 4\nbyte \"ayush\"\nint 5\nuncover 1\npop\n+\n")
+            .unwrap();
+        assemble_string(
+            "#pragma version 8\nint 1\nbyte \"jj\"\nbyte \"ayush\"\nbyte \"john\"\nint 5\nuncover 4\n+\n",
+        )
+        .unwrap();
+
+        let errs = expect_errors("#pragma version 8\nint 4\nbyte \"ayush\"\nint 5\nuncover 1\n+\n");
+        assert!(
+            errs.iter().any(|e| e.message.contains("+ arg 1")),
+            "{errs:?}"
+        );
+    }
 }
