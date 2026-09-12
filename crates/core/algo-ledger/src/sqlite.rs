@@ -8331,6 +8331,150 @@ mod tests {
         assert!(meta.has_holding);
     }
 
+    /// TestIsEmptyAppFields (`ledger/store/trackerdb/data_test.go`): go
+    /// sweeps `NearZeros(AppParams{})` -- one variant per field, each with
+    /// exactly that field minimally non-default -- and asserts
+    /// `IsEmptyAppFields()` is false for every single one, i.e. every field
+    /// genuinely participates in (non-)emptiness detection, so a newly
+    /// added struct field can never be silently invisible to it. algod-rust
+    /// has no single `IsEmptyAppFields`-equivalent boolean (per-field
+    /// `skip_serializing_if` in the canonical encoder plays that role
+    /// instead), so the equivalent regression this guards against is: a
+    /// near-zero mutation of any one field must actually round-trip through
+    /// `encode_app_params_with_round`/`decode_app_params` rather than being
+    /// silently dropped by the encoder (which `IsEmptyAppFields` returning
+    /// true for a non-empty struct would also symptomize in go).
+    #[test]
+    fn near_zero_app_params_fields_all_round_trip() {
+        let base = AppParams::default();
+        let creator = Address([9u8; 32]);
+
+        let variants: Vec<AppParams> = vec![
+            AppParams {
+                approval_program: vec![1],
+                ..base.clone()
+            },
+            AppParams {
+                clear_state_program: vec![1],
+                ..base.clone()
+            },
+            AppParams {
+                global_state: BTreeMap::from([(b"k".to_vec(), TealValue::Uint(1))]),
+                ..base.clone()
+            },
+            AppParams {
+                local_state_schema: StateSchema {
+                    num_uint: 1,
+                    num_byte_slice: 0,
+                },
+                ..base.clone()
+            },
+            AppParams {
+                local_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                ..base.clone()
+            },
+            AppParams {
+                global_state_schema: StateSchema {
+                    num_uint: 1,
+                    num_byte_slice: 0,
+                },
+                ..base.clone()
+            },
+            AppParams {
+                global_state_schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                ..base.clone()
+            },
+            AppParams {
+                extra_program_pages: 1,
+                ..base.clone()
+            },
+            AppParams {
+                version: 1,
+                ..base.clone()
+            },
+            AppParams {
+                size_sponsor: Address([2u8; 32]),
+                ..base.clone()
+            },
+            AppParams {
+                foreign_box_reads: true,
+                ..base.clone()
+            },
+            AppParams {
+                family_box_access: true,
+                ..base.clone()
+            },
+        ];
+
+        for (i, variant) in variants.iter().enumerate() {
+            let bytes = encode_app_params_with_round(variant, 0);
+            assert_ne!(
+                bytes,
+                encode_app_params_with_round(&base, 0),
+                "variant {i} must encode differently from the all-default baseline"
+            );
+            let decoded = decode_app_params(&bytes, creator).expect("decode near-zero variant");
+            let mut expected = variant.clone();
+            expected.creator = creator; // creator isn't part of the params blob itself
+            assert_eq!(
+                decoded, expected,
+                "variant {i} must round-trip through encode/decode intact"
+            );
+        }
+    }
+
+    /// Companion to the AppParams sweep above, for `AppLocalState`
+    /// (go's sibling `NearZeros(AppLocalState{})` coverage in the same
+    /// area of `data_test.go`).
+    #[test]
+    fn near_zero_app_local_state_fields_all_round_trip() {
+        let base = AppLocalState {
+            schema: StateSchema::default(),
+            key_value: BTreeMap::new(),
+        };
+
+        let variants: Vec<AppLocalState> = vec![
+            AppLocalState {
+                schema: StateSchema {
+                    num_uint: 1,
+                    num_byte_slice: 0,
+                },
+                key_value: BTreeMap::new(),
+            },
+            AppLocalState {
+                schema: StateSchema {
+                    num_uint: 0,
+                    num_byte_slice: 1,
+                },
+                key_value: BTreeMap::new(),
+            },
+            AppLocalState {
+                schema: StateSchema::default(),
+                key_value: BTreeMap::from([(b"k".to_vec(), TealValue::Bytes(vec![9]))]),
+            },
+        ];
+
+        for (i, variant) in variants.iter().enumerate() {
+            let bytes = encode_app_local_state_with_round(variant, 0);
+            assert_ne!(
+                bytes,
+                encode_app_local_state_with_round(&base, 0),
+                "variant {i} must encode differently from the all-default baseline"
+            );
+            let decoded = decode_app_local_state(&bytes).expect("decode near-zero variant");
+            assert_eq!(
+                &decoded, variant,
+                "variant {i} must round-trip through encode/decode intact"
+            );
+        }
+    }
+
     #[test]
     fn encode_app_local_state_round_trip_via_decoder() {
         let mut kv = BTreeMap::new();
@@ -10157,6 +10301,116 @@ mod tests {
         let loaded_holding2 = ledger.get_asset_holding(&addr, 80).unwrap();
         assert_eq!(loaded_holding2.amount, 999);
         assert!(loaded_holding2.frozen);
+    }
+
+    /// TestResourcesDataSetData (`ledger/store/trackerdb/data_test.go`): go's
+    /// `ResourcesData.SetData`/`SetAssetData` matrix covers a `del`/`emp`/
+    /// `act` deltaCode independently for both the params side and the
+    /// holding/local-state side. `test_asset_params_and_holding_*` /
+    /// `test_app_params_and_local_state_*` above already pin `act` (real
+    /// values) merged both orders, and `del` (removed, the other side
+    /// survives) both directions -- the one combination those tests don't
+    /// separately isolate is `emp`: an explicitly-set, all-default-valued
+    /// params/holding (still *present*, distinct from never having been set
+    /// at all or having been removed). Matches go's `IsOwning()`/
+    /// `IsHolding()` staying true for a present-but-zero-valued side.
+    #[test]
+    fn test_asset_params_empty_but_present_distinct_from_absent() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([16u8; 32]);
+        ledger.set_account(&addr, AccountData::default());
+
+        assert!(
+            !ledger.has_asset_params(90),
+            "never-set params must report absent"
+        );
+
+        // "emp": an explicitly-set, all-default AssetParams -- present, not absent.
+        ledger.set_asset_params(
+            90,
+            AssetParamsRecord {
+                params: AssetParams::default(),
+                creator: addr,
+            },
+        );
+        assert!(
+            ledger.has_asset_params(90),
+            "an explicitly-set zero-valued AssetParams must still report present"
+        );
+        assert_eq!(
+            ledger.get_asset_params(90).unwrap().params,
+            AssetParams::default()
+        );
+
+        // "del": removing it afterward must report absent again.
+        ledger.remove_asset_params(90);
+        assert!(
+            !ledger.has_asset_params(90),
+            "removed params must report absent, distinct from present-but-empty"
+        );
+    }
+
+    #[test]
+    fn test_asset_holding_empty_but_present_distinct_from_absent() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([17u8; 32]);
+        ledger.set_account(&addr, AccountData::default());
+
+        assert!(!ledger.has_asset_holding(&addr, 91));
+
+        // "emp": an explicitly-set, all-default AssetHolding.
+        ledger.set_asset_holding(&addr, 91, AssetHolding::default());
+        assert!(
+            ledger.has_asset_holding(&addr, 91),
+            "an explicitly-set zero-valued AssetHolding must still report present"
+        );
+        assert_eq!(
+            ledger.get_asset_holding(&addr, 91).unwrap(),
+            AssetHolding::default()
+        );
+
+        ledger.remove_asset_holding(&addr, 91);
+        assert!(!ledger.has_asset_holding(&addr, 91));
+    }
+
+    #[test]
+    fn test_app_params_empty_but_present_distinct_from_absent() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([18u8; 32]);
+        ledger.set_account(&addr, AccountData::default());
+
+        assert!(!ledger.has_app_params(92));
+
+        ledger.set_app_params(92, AppParams::default());
+        assert!(
+            ledger.has_app_params(92),
+            "an explicitly-set zero-valued AppParams must still report present"
+        );
+
+        ledger.remove_app_params(92);
+        assert!(!ledger.has_app_params(92));
+    }
+
+    #[test]
+    fn test_app_local_state_empty_but_present_distinct_from_absent() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([19u8; 32]);
+        ledger.set_account(&addr, AccountData::default());
+
+        assert!(!ledger.has_app_local_state(&addr, 93));
+
+        let empty_local = AppLocalState {
+            schema: StateSchema::default(),
+            key_value: BTreeMap::new(),
+        };
+        ledger.set_app_local_state(&addr, 93, empty_local);
+        assert!(
+            ledger.has_app_local_state(&addr, 93),
+            "an explicitly-set zero-valued AppLocalState must still report present"
+        );
+
+        ledger.remove_app_local_state(&addr, 93);
+        assert!(!ledger.has_app_local_state(&addr, 93));
     }
 
     #[test]

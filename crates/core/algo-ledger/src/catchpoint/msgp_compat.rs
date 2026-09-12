@@ -1597,6 +1597,36 @@ mod tests {
         assert_eq!(result, CatchpointOnlineRoundParamsData::default());
     }
 
+    /// TestMarshalUnmarshalOnlineRoundParamsData
+    /// (`ledger/ledgercore/msgp_gen_test.go`): go's generated
+    /// `MarshalMsg`/`UnmarshalMsg` round-trip a zero-value
+    /// `OnlineRoundParamsData` cleanly, with zero bytes left over. Go's
+    /// `_struct struct{} codec:",omitempty,omitemptyarray"` tag means every
+    /// field (`OnlineSupply`/`RewardsLevel`/`CurrentProtocol`, all
+    /// zero-valued) is omitted, so `MarshalMsg` of the zero value produces
+    /// exactly the canonical fixed-map-of-zero-entries byte (`0x80`) --
+    /// there is no other value it could encode to. algod-rust has no
+    /// `CatchpointOnlineRoundParamsData` encoder (only the hand-written
+    /// positional `decode_online_round_params_data` decoder, since this
+    /// blob is only ever read from go-produced catchpoints, never written),
+    /// so this pins the Rust-reachable half of the same round-trip
+    /// property directly against that literal byte -- decoding go's own
+    /// canonical zero-value encoding must yield the default struct, with
+    /// nothing left over (the same assertion `TestMarshalUnmarshalOnlineRoundParamsData`
+    /// makes about `UnmarshalMsg`'s leftover-byte count).
+    #[test]
+    fn online_round_params_data_zero_value_matches_gos_canonical_empty_map_byte() {
+        const GO_ZERO_VALUE_CANONICAL_BYTES: &[u8] = &[0x80]; // fixmap(0): every field omitempty-dropped
+        assert_eq!(
+            encode_map(&[]),
+            GO_ZERO_VALUE_CANONICAL_BYTES,
+            "the empty-map helper used by the sibling test must itself match go's canonical \
+             zero-value byte, not merely an arbitrary empty map"
+        );
+        let result = decode_online_round_params_data(GO_ZERO_VALUE_CANONICAL_BYTES).unwrap();
+        assert_eq!(result, CatchpointOnlineRoundParamsData::default());
+    }
+
     #[test]
     fn decode_online_round_params_data_empty_input() {
         let result = decode_online_round_params_data(&[]).unwrap();

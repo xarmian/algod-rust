@@ -1866,6 +1866,63 @@ mod tests {
     }
 
     #[test]
+    fn make_label_v7_combinatorial_sweep_never_collides() {
+        // TestUniqueCatchpointLabel (`ledger/ledgercore/catchpointlabel_test.go`):
+        // a combinatorial sweep over 10 distinct block hashes, 10 balances
+        // merkle roots, 10 state-proof-verification-context hashes, 10
+        // distinct `AccountTotals` (varying `RewardsLevel`), and 15 rounds
+        // (0..=100 step 7) -- 150,000 label combinations, none of which may
+        // collide. Pins actual hash-mixing behavior (every input byte
+        // genuinely participates in the digest) far more strongly than the
+        // existing pairwise `make_label_different_rounds_different_labels`/
+        // `make_label_v7_extends_v6` tests, which only ever vary one field
+        // at a time.
+        use std::collections::HashSet;
+
+        let block_hashes: Vec<[u8; 32]> = (0u8..10)
+            .map(|i| *Sha512_256::digest([i]).as_ref())
+            .collect();
+        let sp_hashes: Vec<[u8; 32]> = (0u8..10)
+            .map(|i| *Sha512_256::digest([i, 1]).as_ref())
+            .collect();
+        let balances_roots: Vec<[u8; 32]> = (0u8..10)
+            .map(|i| *Sha512_256::digest([i, i, 1]).as_ref())
+            .collect();
+        let totals: Vec<AccountTotals> = (0u64..10)
+            .map(|i| AccountTotals {
+                rewards_level: i * 500_000,
+                ..Default::default()
+            })
+            .collect();
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut round = 0u64;
+        while round <= 100 {
+            for block_hash in &block_hashes {
+                for balances_root in &balances_roots {
+                    for sp_hash in &sp_hashes {
+                        for total in &totals {
+                            let label = make_catchpoint_label_v7(
+                                round,
+                                block_hash,
+                                balances_root,
+                                total,
+                                sp_hash,
+                            );
+                            assert!(
+                                seen.insert(label.clone()),
+                                "label collision at round {round}: {label}"
+                            );
+                        }
+                    }
+                }
+            }
+            round += 7;
+        }
+        assert_eq!(seen.len(), 15 * 10 * 10 * 10 * 10);
+    }
+
+    #[test]
     fn make_label_parseable() {
         // Every label we produce must be parseable by parse_catchpoint_label
         let block_hash = [0xFF; 32];
