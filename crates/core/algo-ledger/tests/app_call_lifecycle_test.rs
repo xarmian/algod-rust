@@ -1467,6 +1467,216 @@ itxn_submit
     );
 }
 
+// Issue #1346 / go-algorand `ledger/apply/application.go`'s
+// `deleteApplication`: the MBR for an app's `GlobalStateSchema`/
+// `ExtraProgramPages` must be released from the app's actual current
+// *size sponsor* -- `params.SizeSponsor`, falling back to the creator only
+// if no resize ever happened -- not unconditionally from the creator.
+//
+// This mirrors `test_inner_update_resizing_moves_sponsor_and_grows_schema`'s
+// setup (a non-creator inner `UpdateApplication` resize moves
+// `size_sponsor`/`total_app_schema`/`total_extra_app_pages` to the
+// updater), then deletes the app as the creator (delete still requires the
+// sender to equal `creator`, unlike update) and asserts the SPONSOR's
+// totals -- not the creator's -- return to zero.
+#[test]
+fn diagnostic_delete_releases_sponsor_not_creator() {
+    let creator = Address([11u8; 32]);
+    let updater_creator = Address([12u8; 32]);
+    let caller = Address([13u8; 32]);
+    let fee_sink = Address([14u8; 32]);
+    let small_id = 950u64;
+    let updater_id = 951u64;
+
+    let updater_addr = Address(algo_ledger::avm_context::app_address(updater_id));
+
+    let mut state = make_state(
+        &[
+            (creator, 50_000_000),
+            (updater_creator, 50_000_000),
+            (caller, 50_000_000),
+            (fee_sink, 0),
+            (updater_addr, 3_000_000),
+        ],
+        fee_sink,
+    );
+
+    // smallID: created by `creator` with no explicit global schema.
+    let small_create = appl_create(
+        creator,
+        1_000,
+        small_id,
+        APPROVE_SRC,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    let mut create_block = minimal_block(fee_sink, 1, vec![small_create]);
+    create_block.current_protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    apply_block_capturing_apply_data(&mut state, &create_block, ApplyMode::Execute)
+        .expect("smallID creation must apply cleanly");
+
+    // updaterID: performs a non-creator inner resize of smallID (mirrors
+    // `test_inner_update_resizing_moves_sponsor_and_grows_schema`'s resize
+    // program, minus the follow-up calls -- this test only needs the
+    // resize's sponsor-accounting side effects).
+    let updater_src = "\
+itxn_begin
+int appl
+itxn_field TypeEnum
+txn Applications 1
+itxn_field ApplicationID
+int UpdateApplication
+itxn_field OnCompletion
+txn Applications 1
+app_params_get AppApprovalProgram
+assert
+itxn_field ApprovalProgram
+txn Applications 1
+app_params_get AppClearStateProgram
+assert
+itxn_field ClearStateProgram
+int 1
+itxn_field ExtraProgramPages
+itxn_submit
+";
+    let updater_wrapped =
+        format!("#pragma version 8\ntxn ApplicationID\nbz end\n{updater_src}\nend:\nint 1\n");
+    let updater_create = appl_create(
+        updater_creator,
+        1_000,
+        updater_id,
+        &updater_wrapped,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    let mut updater_block = minimal_block(fee_sink, 2, vec![updater_create]);
+    updater_block.current_protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    apply_block_capturing_apply_data(&mut state, &updater_block, ApplyMode::Execute)
+        .expect("updater app creation must apply cleanly");
+
+    let mut resize_call = appl_call(caller, 1_000, updater_id, 0, None);
+    resize_call.txn.foreign_apps = Some(vec![small_id]);
+    let mut resize_block = minimal_block(fee_sink, 3, vec![resize_call]);
+    resize_block.current_protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    apply_block_capturing_apply_data(&mut state, &resize_block, ApplyMode::Execute)
+        .expect("non-creator inner update resizing smallID must apply cleanly");
+
+    // Confirm the resize actually moved sponsorship, as a precondition.
+    let small_params = state.get_app_params(small_id).unwrap();
+    assert_eq!(small_params.extra_program_pages, 1);
+    assert_eq!(
+        small_params.size_sponsor, updater_addr,
+        "precondition: MBR responsibility must have moved to the non-creator updater"
+    );
+    let updater_account = state.get_account(&updater_addr).unwrap();
+    assert_eq!(
+        updater_account.total_extra_app_pages, 1,
+        "precondition: sponsor must be charged for the resize"
+    );
+    let creator_account = state.get_account(&creator).unwrap();
+    assert_eq!(
+        creator_account.total_extra_app_pages, 0,
+        "precondition: creator must not be charged for a resize it didn't perform"
+    );
+
+    // creator deletes smallID (delete still requires sender == creator).
+    let delete_call = appl_call(creator, 1_000, small_id, 5, None);
+    let mut delete_block = minimal_block(fee_sink, 4, vec![delete_call]);
+    delete_block.current_protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    apply_block_capturing_apply_data(&mut state, &delete_block, ApplyMode::Execute)
+        .expect("creator delete of smallID must apply cleanly");
+
+    assert!(
+        state.get_app_params(small_id).is_none(),
+        "smallID must no longer exist after delete"
+    );
+
+    let updater_account_after = state.get_account(&updater_addr).unwrap();
+    assert_eq!(
+        updater_account_after.total_extra_app_pages, 0,
+        "the SPONSOR's total_extra_app_pages must be released on delete, not left dangling"
+    );
+    assert!(
+        updater_account_after.total_app_schema.is_empty(),
+        "the SPONSOR's total_app_schema must be released on delete"
+    );
+
+    let creator_account_after = state.get_account(&creator).unwrap();
+    assert_eq!(
+        creator_account_after.total_extra_app_pages, 0,
+        "the creator (never charged) must remain unaffected by the sponsor's release"
+    );
+    assert!(creator_account_after.total_app_schema.is_empty());
+    assert_eq!(
+        creator_account_after.total_created_apps, 0,
+        "total_created_apps is always decremented on the creator regardless of sponsor"
+    );
+}
+
+// Companion to `diagnostic_delete_releases_sponsor_not_creator`: the common
+// case where the app was never resized by anyone else, so `size_sponsor`
+// stays zero and the creator IS the sponsor. Deleting must still release
+// the schema/extra-pages MBR from the creator in this default case.
+#[test]
+fn diagnostic_delete_releases_from_creator_when_creator_is_sponsor() {
+    let creator = Address([21u8; 32]);
+    let fee_sink = Address([24u8; 32]);
+    let app_id = 960u64;
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+
+    let global_schema = StateSchema {
+        num_uint: 2,
+        num_byte_slice: 1,
+    };
+    let mut create = appl_create(
+        creator,
+        1_000,
+        app_id,
+        APPROVE_SRC,
+        APPROVE_SRC,
+        Some(global_schema.clone()),
+        None,
+        None,
+    );
+    create.txn.extra_program_pages = 1;
+    let mut create_block = minimal_block(fee_sink, 1, vec![create]);
+    create_block.current_protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    apply_block_capturing_apply_data(&mut state, &create_block, ApplyMode::Execute)
+        .expect("app creation must apply cleanly");
+
+    let app_params = state.get_app_params(app_id).unwrap();
+    assert!(
+        app_params.size_sponsor.is_zero(),
+        "no resize ever happened, so size_sponsor stays the zero address"
+    );
+
+    let creator_account = state.get_account(&creator).unwrap();
+    assert_eq!(creator_account.total_extra_app_pages, 1);
+    assert_eq!(creator_account.total_app_schema.num_uint, 2);
+    assert_eq!(creator_account.total_app_schema.num_byte_slice, 1);
+
+    let delete_call = appl_call(creator, 1_000, app_id, 5, None);
+    let mut delete_block = minimal_block(fee_sink, 2, vec![delete_call]);
+    delete_block.current_protocol = algo_types::consensus::CONSENSUS_V42.to_string();
+    apply_block_capturing_apply_data(&mut state, &delete_block, ApplyMode::Execute)
+        .expect("creator delete must apply cleanly");
+
+    assert!(state.get_app_params(app_id).is_none());
+
+    let creator_account_after = state.get_account(&creator).unwrap();
+    assert_eq!(
+        creator_account_after.total_extra_app_pages, 0,
+        "the creator (as its own sponsor) must have its MBR released on delete"
+    );
+    assert!(creator_account_after.total_app_schema.is_empty());
+    assert_eq!(creator_account_after.total_created_apps, 0);
+}
+
 // ---------------------------------------------------------------------------
 // Phase 17 (issue #1322): TestGlobalChangesAcrossApps / TestLocalChangesAcrossApps
 // (ledger/apptxn_test.go:2864 / 2972)
