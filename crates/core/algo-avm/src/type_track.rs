@@ -756,6 +756,23 @@ fn refined_types(
                 .map(|ty| vec![ty, Uint64]);
             Some((Some(args_override), ret, None))
         }
+        // `balance`/`min_balance` (opcodes.go:668-669,693-694,
+        // TestAssembleBalance/TestAssembleMinBalance): same
+        // `directRefEnabledVersion` split as `asset_holding_get` above --
+        // below v4 the account argument is a foreign-accounts-array index
+        // (`Uint64` only, proto `i:i`); from v4 on a direct address
+        // reference is also accepted (proto widens to `a:i` / `Any`).
+        // Neither opcode's pushed `Uint64` return depends on the version,
+        // so only the popped arg is overridden here.
+        "balance" | "min_balance" => {
+            const DIRECT_REF_ENABLED_VERSION: u8 = 4;
+            let args_override = if version < DIRECT_REF_ENABLED_VERSION {
+                vec![Uint64]
+            } else {
+                vec![Any]
+            };
+            Some((Some(args_override), None, None))
+        }
         // `asset_params_get`/`app_params_get`/`acct_params_get`
         // (opcodes.go:686-688, TestAssembleAsset): fixed (non-versioned) pop
         // shape already covered by `TYPE_TABLE`; only the pushed `value`
