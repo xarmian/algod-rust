@@ -6129,4 +6129,37 @@ dup
             "{errs:?}"
         );
     }
+
+    #[test]
+    fn test_assemble_balance_type_check_ported_from_go() {
+        // TestAssembleBalance (assembler_test.go#L2388): `balance`'s
+        // argument type should be `uint64` (foreign-accounts-array index)
+        // below `directRefEnabledVersion` (=4), and `Any` (a direct address
+        // reference, e.g. an address literal, is also accepted) from v4 on
+        // -- opcodes.go:668-669. The v4+ half (a real address-shaped
+        // argument is accepted) already passes: `TYPE_TABLE`'s default
+        // `Any` pop already accepts it. The pre-v4 half -- rejecting a
+        // `[1]byte` in the `uint64`-only proto with "balance arg 0 wanted
+        // type uint64 got [1]byte" -- is a real gap: `type_track.rs` has no
+        // version-gated `"balance"`/`"min_balance"` arm (unlike
+        // `asset_holding_get`, which does have one), so pre-v4 programs get
+        // no static type check on this argument at all. Filed as issue
+        // #1366; not fixed here.
+        let source = "byte 0x00\nbalance\nint 1\n==\n";
+        for v in 4..=opcode::MAX_AVM_VERSION {
+            assemble_string(&format!("#pragma version {v}\n{source}")).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_assemble_min_balance_type_check_ported_from_go() {
+        // TestAssembleMinBalance (assembler_test.go#L2404): same gap as
+        // TestAssembleBalance above (issue #1366), for `min_balance`
+        // (introduced at v3, opcodes.go:693-694). Only the v4+ half is
+        // ported here.
+        let source = "byte 0x00\nmin_balance\nint 1\n==\n";
+        for v in 4..=opcode::MAX_AVM_VERSION {
+            assemble_string(&format!("#pragma version {v}\n{source}")).unwrap();
+        }
+    }
 }
