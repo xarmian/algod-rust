@@ -2902,6 +2902,30 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         self.read_budget_checked = true;
         let mut used: u64 = 0;
 
+        // First count the extra reading required for any large programs
+        // that are available -- matches go-algorand's `EvalContract`, which
+        // loops over `cx.available.sharedApps` (the top-level called app
+        // itself, plus every named foreign app reachable via
+        // `txn.ForeignApps`/`txn.Access` in the group) and unconditionally
+        // adds `transactions.LargeProgramExtraBytes(...)` to `bytesRead`
+        // for each one, regardless of whether any box opcode ever executes
+        // (`data/transactions/logic/eval.go:1289-1297`). This is distinct
+        // from `capacity_allows_app` (issue #1020, simulation/unnamed-
+        // resource tracking only) and `consider_budget_program_writes`
+        // (issue #723, the CREATE/UPDATE-time WRITE-budget path) -- neither
+        // of those charges this real-call READ-budget path.
+        for &app_id in &self.group_resources.shared_apps {
+            if let Some(params) = self.store.get_app_params(app_id) {
+                let extra = algo_validate::large_program_extra_bytes(
+                    &self.consensus,
+                    params.approval_program.len() + params.clear_state_program.len(),
+                ) as u64;
+                used = used.saturating_add(extra);
+            }
+            // Matches go's `err != nil { continue }`: an app reference that
+            // doesn't exist on-chain contributes nothing.
+        }
+
         // Iterate over a snapshot of box keys, summing the full named-box
         // read total before checking it against the budget -- matches
         // go-algorand's `EvalContract`, which sums `bytesRead` across every
