@@ -9706,6 +9706,129 @@ mod tests {
         );
     }
 
+    /// go's `TestOnlineAccountsDeletion` ("delete" subtest,
+    /// `ledger/acctdeltas_test.go`): drives `prune_online_account_history_before`
+    /// directly (go's `OnlineAccountsDelete`) round-by-round over the exact
+    /// same fixture -- addrA with rows at updround 1 (online), 3 (offline,
+    /// empty voting data), 6 (online); addrB with rows at updround 3, 7
+    /// (both online) -- and pins go's exact per-stage total-row-count and
+    /// per-address history-length assertions at every `forget_before` value
+    /// from 1 through 9. This is materially stronger than the existing
+    /// `commit_block_prunes_online_account_history_beyond_lookback_window`
+    /// test above: that one only checks two snapshots (before/after a single
+    /// big jump past the lookback window), while go's test -- and this one --
+    /// verifies the deletion is correct at *every* intermediate round,
+    /// including the exact history lengths go asserts (3/2 rows, then 1/2,
+    /// then 1/1) rather than just "some pruning happened".
+    #[test]
+    fn online_accounts_delete_matches_go_per_round_history_length_progression() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr_a = Address([0xAA; 32]);
+        let addr_b = Address([0xBB; 32]);
+
+        let online = |vote_byte: u8| AccountData {
+            micro_algos: 100_000_000,
+            status: AccountStatus::Online,
+            vote_id: Some([vote_byte; 32]),
+            selection_id: Some([vote_byte; 32]),
+            vote_first_valid: 1,
+            vote_last_valid: 100_000,
+            vote_key_dilution: 10_000,
+            ..Default::default()
+        };
+        let offline = AccountData {
+            micro_algos: 100_000_000,
+            status: AccountStatus::Offline,
+            ..Default::default()
+        };
+
+        // addrA: online @1, offline (empty voting) @3, online @6.
+        ledger
+            .insert_online_account_row(&addr_a, 1, &online(1))
+            .unwrap();
+        ledger
+            .insert_online_account_row(&addr_a, 3, &offline)
+            .unwrap();
+        ledger
+            .insert_online_account_row(&addr_a, 6, &online(2))
+            .unwrap();
+        // addrB: online @3, online @7.
+        ledger
+            .insert_online_account_row(&addr_b, 3, &online(3))
+            .unwrap();
+        ledger
+            .insert_online_account_row(&addr_b, 7, &online(4))
+            .unwrap();
+
+        let total_count = |ledger: &SqliteLedger| -> i64 {
+            ledger
+                .conn
+                .query_row("SELECT COUNT(*) FROM onlineaccounts", [], |row| row.get(0))
+                .unwrap()
+        };
+        let history_len = |ledger: &SqliteLedger, addr: &Address| -> i64 {
+            ledger
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM onlineaccounts WHERE address = ?1",
+                    params![addr.0.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        for forget_before in [1u64, 2, 3] {
+            ledger
+                .prune_online_account_history_before(forget_before)
+                .unwrap();
+            assert_eq!(total_count(&ledger), 5, "forget_before={forget_before}");
+            assert_eq!(
+                history_len(&ledger, &addr_a),
+                3,
+                "forget_before={forget_before}"
+            );
+            assert_eq!(
+                history_len(&ledger, &addr_b),
+                2,
+                "forget_before={forget_before}"
+            );
+        }
+
+        for forget_before in [4u64, 5, 6, 7] {
+            ledger
+                .prune_online_account_history_before(forget_before)
+                .unwrap();
+            assert_eq!(total_count(&ledger), 3, "forget_before={forget_before}");
+            assert_eq!(
+                history_len(&ledger, &addr_a),
+                1,
+                "forget_before={forget_before}"
+            );
+            assert_eq!(
+                history_len(&ledger, &addr_b),
+                2,
+                "forget_before={forget_before}"
+            );
+        }
+
+        for forget_before in [8u64, 9] {
+            ledger
+                .prune_online_account_history_before(forget_before)
+                .unwrap();
+            assert_eq!(total_count(&ledger), 2, "forget_before={forget_before}");
+            assert_eq!(
+                history_len(&ledger, &addr_a),
+                1,
+                "forget_before={forget_before}"
+            );
+            assert_eq!(
+                history_len(&ledger, &addr_b),
+                1,
+                "forget_before={forget_before}"
+            );
+        }
+    }
+
     #[test]
     fn test_begin_commit_block() {
         let mut ledger = SqliteLedger::open_in_memory().unwrap();

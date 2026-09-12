@@ -511,6 +511,37 @@ mod tests {
         assert_eq!(total_weight, 5_000_000);
     }
 
+    /// go's `TestTopNAccountsThatHaveNoMssKeys`
+    /// (`ledger/voters_test.go`): every selected top-online-account
+    /// participant that never registered a state-proof (MSS/Falcon) key must
+    /// carry `merklesignature.NoKeysCommitment` as its `PK.Commitment` --
+    /// not just "some" commitment, and not just a single-account smoke test.
+    /// Mirrors go's assertion loop over `top.Participants` for a whole batch
+    /// of keyless online accounts selected together.
+    #[test]
+    fn top_n_accounts_that_have_no_mss_keys_all_get_no_keys_commitment() {
+        let candidates: Vec<_> = (1u8..=20)
+            .map(|i| candidate(addr(i), i as u64 * 1_000_000))
+            // Explicit for clarity: `candidate()` already defaults state_proof_id to zero.
+            .map(|mut c| {
+                c.state_proof_id = [0u8; 64];
+                c
+            })
+            .collect();
+        let selected = select_top_online_accounts(&candidates, 20, 100, REWARD_UNIT);
+        assert_eq!(selected.len(), 20);
+
+        let (participants, _total_weight) = build_participants(&selected, 0, REWARD_UNIT).unwrap();
+        assert_eq!(participants.len(), 20);
+        for p in &participants {
+            assert_eq!(
+                p.pk.commitment, NO_KEYS_COMMITMENT,
+                "every participant lacking a registered state-proof key must carry \
+                 the NoKeysCommitment placeholder"
+            );
+        }
+    }
+
     #[test]
     fn registered_state_proof_key_is_committed_verbatim() {
         let mut c = candidate(addr(1), 5_000_000);
