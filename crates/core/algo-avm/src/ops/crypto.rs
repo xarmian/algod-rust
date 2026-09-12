@@ -903,7 +903,10 @@ pub fn op_ecdsa_pk_decompress(
 /// `ecdsa_pk_recover` (0x07): recover public key from ECDSA signature.
 /// Immediate: curve index (Secp256k1 only).
 /// Stack: pop recovery_id (uint64, 0-3), S (bytes), R (bytes), data (32 bytes).
-/// Push Y then X (X on top). Cost: 2000 (static).
+/// Push X then Y (Y on top), matching go's `opEcdsaPkRecover`
+/// (`data/transactions/logic/crypto.go`), which writes X into the lower
+/// stack slot and Y into the higher one before truncating. Cost: 2000
+/// (static).
 pub fn op_ecdsa_pk_recover(
     machine: &mut AvmMachine,
     instruction: &Instruction,
@@ -934,9 +937,12 @@ pub fn op_ecdsa_pk_recover(
 
     let (x, y) = ecdsa_recover_secp256k1(&data, &sig_r, &sig_s, recid as u8)?;
 
-    // Push Y first, then X (X ends up on top)
-    machine.push(AvmValue::Bytes(y))?;
-    machine.push(AvmValue::Bytes(x))
+    // Push X first, then Y (Y ends up on top), matching go's stack-slot
+    // write order in opEcdsaPkRecover (crypto.go:384-434): X goes into the
+    // lower ("fourth") slot, Y into the higher ("pprev") slot, so the
+    // final stack (bottom to top) is [..., X, Y].
+    machine.push(AvmValue::Bytes(x))?;
+    machine.push(AvmValue::Bytes(y))
 }
 
 // ---------------------------------------------------------------------------
@@ -3028,11 +3034,11 @@ mod tests {
         code.push(recid_val as u8);
         code.push(0x07); // ecdsa_pk_recover
         code.push(0x00); // Secp256k1
-                         // Stack: [Y, X] with X on top
-        pushbytes(&mut code, expected_x.as_slice());
+                         // Stack: [X, Y] with Y on top
+        pushbytes(&mut code, expected_y.as_slice());
         code.push(0x12); // ==
         code.push(0x4c); // swap
-        pushbytes(&mut code, expected_y.as_slice());
+        pushbytes(&mut code, expected_x.as_slice());
         code.push(0x12); // ==
         code.push(0x10); // &&
         code.push(0x43); // return
@@ -3054,21 +3060,10 @@ mod tests {
         // way (keccak256(X||Y)[12..32], the standard Ethereum address
         // derivation), not just the raw recovery result.
         //
-        // NOTE: tracing this test's exact stack order against go's
-        // `opEcdsaPkRecover` (crypto.go:384-434) found a real, separate bug
-        // -- go leaves the recovered key as `[..., X, Y]` (X below, Y on
-        // top), so its own `concat` (no `swap`) computes `X || Y`.
-        // algod-rust's `op_ecdsa_pk_recover` pushes the opposite order
-        // (`[..., Y, X]`, X on top), so an unmodified port of go's exact
-        // opcode sequence currently computes `Y || X` instead and fails.
-        // Filed as issue #1371; NOT fixed here. This test instead adds a
-        // `swap` before `concat` to compensate for the current (wrong)
-        // push order, so it still exercises and pins the rest of the
-        // composite flow (recover -> concat -> keccak256 -> substring ->
-        // compare) against a real, independently-derived Ethereum address
-        // while the underlying order bug is tracked separately. Once
-        // #1371 is fixed, this `swap` should be removed to match go's
-        // program exactly.
+        // go's `opEcdsaPkRecover` (crypto.go:384-434) leaves the recovered
+        // key as `[..., X, Y]` (X below, Y on top), so its own `concat`
+        // (no `swap`) computes `X || Y` directly -- this is a ported,
+        // unmodified copy of go's exact opcode sequence (issue #1371).
         use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
         use sha3::{Digest, Keccak256};
 
@@ -3104,10 +3099,8 @@ mod tests {
         code.push(recid_val as u8);
         code.push(0x07); // ecdsa_pk_recover
         code.push(0x00); // Secp256k1
-                         // algod-rust's current stack here is [Y, X] (X on top) -- the
-                         // reverse of go's [X, Y] (issue #1371). `swap` compensates so
-                         // `concat` still computes X || Y, matching go's real program.
-        code.push(0x4c); // swap
+                         // Stack here is [X, Y] (Y on top), matching go's real order --
+                         // concat directly, no swap needed.
         code.push(0x50); // concat
         code.push(0x02); // keccak256
         code.push(0x51); // substring
