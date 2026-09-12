@@ -4146,24 +4146,50 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
                 }
                 let creator = existing.creator;
                 let global_schema = existing.global_state_schema.clone();
+                let extra_program_pages = existing.extra_program_pages;
+                // go-algorand's `deleteApplication` (`ledger/apply/application.go`):
+                // `sponsor := params.SizeSponsor; if sponsor.IsZero() { sponsor =
+                // creator }` -- release the schema/extra-pages MBR from
+                // whoever is actually on the hook for it (the account that
+                // last resized the app via `AppSizeUpdates`), not
+                // unconditionally from the creator. Falls back to the
+                // creator when no resize ever happened (`size_sponsor` is
+                // still the zero address).
+                let sponsor = if existing.size_sponsor.is_zero() {
+                    creator
+                } else {
+                    existing.size_sponsor
+                };
                 store.remove_app_params(app_id);
+                // `total_created_apps` is always the creator's own count of
+                // apps it created, independent of who sponsors the MBR --
+                // this decrement stays on `creator` unconditionally.
                 let mut creator_account = store.get_or_default_account(&creator);
                 creator_account.total_created_apps =
                     creator_account.total_created_apps.saturating_sub(1);
-                // go-algorand's `deleteApplication`
-                // (`ledger/apply/application.go`): "There was a short-lived
+                store.set_account(&creator, creator_account);
+
+                // Sponsor and creator may be the same account (the common,
+                // never-resized case) -- fetching the sponsor's record only
+                // now, after the creator's `total_created_apps` update
+                // above, mirrors `ON_COMPLETION_UPDATE`'s resize branch's
+                // explicit sponsor-then-updater ordering for the same
+                // reason: a single record must see both updates when
+                // `sponsor == creator`.
+                let mut sponsor_account = store.get_or_default_account(&sponsor);
+                // go-algorand's `deleteApplication`: "There was a short-lived
                 // bug so in one version, pages were not deallocated" --
                 // `if balances.ConsensusParams().EnableProperExtraPageAccounting { ... }`.
                 // Before v29, deleting an app never freed its extra pages'
                 // MBR space from the size sponsor.
                 if consensus.enable_proper_extra_page_accounting {
-                    creator_account.total_extra_app_pages = creator_account
+                    sponsor_account.total_extra_app_pages = sponsor_account
                         .total_extra_app_pages
-                        .saturating_sub(existing.extra_program_pages);
+                        .saturating_sub(extra_program_pages);
                 }
-                creator_account.total_app_schema =
-                    creator_account.total_app_schema.sub_schema(&global_schema);
-                store.set_account(&creator, creator_account);
+                sponsor_account.total_app_schema =
+                    sponsor_account.total_app_schema.sub_schema(&global_schema);
+                store.set_account(&sponsor, sponsor_account);
             }
         }
         ON_COMPLETION_UPDATE => {
