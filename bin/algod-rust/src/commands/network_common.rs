@@ -93,6 +93,38 @@ pub fn resolve_account_updates_stats_config(
     })
 }
 
+/// Resolve `config.json`'s `MaxBlockHistoryLookback`/`Archival`/catchpoint
+/// fields into the [`algo_ledger::store_trait::RetentionConfig`] the live
+/// block-apply loop's per-block pruning needs (issue #1354), mirroring
+/// go-algorand's `Ledger.notifyCommit`/`calcMinCatchpointRoundsLookback`
+/// (`ledger/ledger.go`). Shared by `relay` and `participate`, following the
+/// same pattern as [`resolve_automatic_catchpoint_config`]/
+/// [`resolve_account_updates_stats_config`] above.
+///
+/// The catchpoint floor is pre-resolved here (rather than passed through as
+/// raw fields) so `algo_ledger` doesn't need to depend on `algo_config` just
+/// to reproduce this one gate: `2 * CatchpointInterval` when the node
+/// stores catchpoints (`Local::stores_catchpoints()`) AND
+/// `CatchpointFileHistoryLength != 0` (go's own `calcMinCatchpointRoundsLookback`
+/// bails to `0` when the file-history length is exactly zero — a `-1`
+/// "keep all catchpoint files forever" setting does NOT disable this floor,
+/// only an exact `0` does), else `0` (no catchpoint-derived floor).
+pub fn resolve_retention_config(
+    node_config: &algo_config::Local,
+) -> algo_ledger::store_trait::RetentionConfig {
+    let catchpoint_min_rounds_lookback =
+        if node_config.stores_catchpoints() && node_config.catchpoint_file_history_length != 0 {
+            2 * node_config.catchpoint_interval
+        } else {
+            0
+        };
+    algo_ledger::store_trait::RetentionConfig {
+        max_block_history_lookback: node_config.max_block_history_lookback,
+        catchpoint_min_rounds_lookback,
+        archival: node_config.archival,
+    }
+}
+
 /// Resolve the effective `WebsocketNetworkConfig::gossip_fanout` for a
 /// command that may or may not be acting as a listen server, applying go's
 /// `enrichNetworkingConfig` `GossipFanout` bump (`config/config.go:170-179`,
@@ -222,6 +254,93 @@ mod tests {
         assert_eq!(resolved.interval, 5_000);
         assert_eq!(resolved.file_history_length, 10);
         assert_eq!(resolved.dir, std::path::PathBuf::from("/data/catchpoints"));
+    }
+
+    // --- `resolve_retention_config` (issue #1354) ---------------------------
+
+    /// A stock default config resolves to the all-default
+    /// `RetentionConfig` (no lookback override, no catchpoint floor, not
+    /// archival) -- identical to the pre-#1354 consensus-only behavior.
+    #[test]
+    fn resolve_retention_config_stock_default_is_all_default() {
+        let resolved = resolve_retention_config(&algo_config::Local::default());
+        assert_eq!(
+            resolved,
+            algo_ledger::store_trait::RetentionConfig::default()
+        );
+    }
+
+    /// `MaxBlockHistoryLookback`/`Archival` pass through unchanged. With
+    /// `CatchpointInterval` explicitly disabled, `stores_catchpoints() ==
+    /// false` leaves the catchpoint floor at `0` (note: leaving
+    /// `CatchpointInterval` at its stock nonzero default here would make
+    /// `stores_catchpoints()` resolve to `true` too, since
+    /// `CatchpointTracking`'s default Automatic mode follows `archival` —
+    /// that's correct go-mirroring behavior, just not what this test is
+    /// isolating).
+    #[test]
+    fn resolve_retention_config_lookback_and_archival_pass_through() {
+        let cfg = algo_config::Local {
+            max_block_history_lookback: 22_000,
+            archival: true,
+            catchpoint_interval: 0,
+            ..algo_config::Local::default()
+        };
+        assert!(!cfg.stores_catchpoints());
+        let resolved = resolve_retention_config(&cfg);
+        assert_eq!(resolved.max_block_history_lookback, 22_000);
+        assert!(resolved.archival);
+        assert_eq!(resolved.catchpoint_min_rounds_lookback, 0);
+    }
+
+    /// A node that stores catchpoints resolves the catchpoint floor to
+    /// `2 * CatchpointInterval`, mirroring go's
+    /// `calcMinCatchpointRoundsLookback`.
+    #[test]
+    fn resolve_retention_config_catchpoint_floor_when_storing_catchpoints() {
+        let cfg = algo_config::Local {
+            catchpoint_interval: 10_000,
+            catchpoint_tracking: 2, // Stored
+            ..algo_config::Local::default()
+        };
+        assert!(cfg.stores_catchpoints());
+        let resolved = resolve_retention_config(&cfg);
+        assert_eq!(resolved.catchpoint_min_rounds_lookback, 20_000);
+    }
+
+    /// `CatchpointFileHistoryLength == 0` disables the catchpoint floor
+    /// even when the node otherwise stores catchpoints -- matches go's
+    /// `calcMinCatchpointRoundsLookback`'s explicit
+    /// `CatchpointFileHistoryLength == 0` bail-out.
+    #[test]
+    fn resolve_retention_config_catchpoint_floor_disabled_when_history_length_zero() {
+        let cfg = algo_config::Local {
+            catchpoint_interval: 10_000,
+            catchpoint_tracking: 2, // Stored
+            catchpoint_file_history_length: 0,
+            ..algo_config::Local::default()
+        };
+        assert!(cfg.stores_catchpoints());
+        let resolved = resolve_retention_config(&cfg);
+        assert_eq!(resolved.catchpoint_min_rounds_lookback, 0);
+    }
+
+    /// `CatchpointFileHistoryLength == -1` ("keep all catchpoint files
+    /// forever") does NOT disable the floor -- only an exact `0` does, per
+    /// go's `l.cfg.CatchpointFileHistoryLength == 0` check (verified
+    /// directly against `ledger/ledger.go`, not just the field's doc
+    /// comment).
+    #[test]
+    fn resolve_retention_config_catchpoint_floor_kept_when_history_length_negative_one() {
+        let cfg = algo_config::Local {
+            catchpoint_interval: 10_000,
+            catchpoint_tracking: 2, // Stored
+            catchpoint_file_history_length: -1,
+            ..algo_config::Local::default()
+        };
+        assert!(cfg.stores_catchpoints());
+        let resolved = resolve_retention_config(&cfg);
+        assert_eq!(resolved.catchpoint_min_rounds_lookback, 20_000);
     }
 
     // --- `resolve_gossip_fanout` (issue #788) -------------------------------

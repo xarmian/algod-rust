@@ -66,6 +66,7 @@ use crate::commands::dual_gossip_node;
 use crate::commands::network_common::{
     genesis_id_for, networking_active, resolve_account_updates_stats_config,
     resolve_automatic_catchpoint_config, resolve_fallback_dns_resolver, resolve_gossip_fanout,
+    resolve_retention_config,
 };
 use crate::commands::p2p_transport::{NetworkMode, P2pOptions, P2pTransport, P2pTransportConfig};
 use crate::config::RestConfig;
@@ -4087,6 +4088,13 @@ pub async fn run(
         );
         sqlite_ledger.configure_account_updates_stats(Some(stats_cfg));
     }
+
+    // Issue #1354: node-level block/txtail retention overrides
+    // (`MaxBlockHistoryLookback`/`Archival`/catchpoint-interval floor),
+    // consulted by the live block-apply loop's per-block pruning
+    // (`algo_ledger::apply`). A no-op (identical to pre-#1354 behavior)
+    // when `config.json` leaves all three at their stock defaults.
+    sqlite_ledger.configure_retention(resolve_retention_config(&node_config));
 
     // Reject anything but a fully populated block archive before
     // booting agreement. Participating with a missing tail block — or

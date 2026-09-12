@@ -29,6 +29,46 @@ use algo_types::{
 /// `include_values` was requested.
 pub type BoxPage = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
+/// Node-level block/txtail retention overrides (issue #1354), consulted by
+/// the per-block commit pruning path (`apply.rs`) alongside the
+/// consensus-derived retention window (`MaxTxnLife + DeeperBlockHeaderHistory`).
+///
+/// Mirrors the three inputs go-algorand's `Ledger.notifyCommit`
+/// (`ledger/ledger.go`) combines with the tracker-derived floor:
+///
+/// 1. `max_block_history_lookback` — go's `config.Local.MaxBlockHistoryLookback`,
+///    an explicit operator override that can *extend* retention further back
+///    than the consensus-derived window. `0` means unconfigured (no override).
+/// 2. `catchpoint_min_rounds_lookback` — go's `Ledger.calcMinCatchpointRoundsLookback`,
+///    pre-resolved by the caller to `2 * CatchpointInterval` when the node
+///    stores catchpoints (`Local::stores_catchpoints()`) and
+///    `CatchpointFileHistoryLength != 0`, else `0`. Kept as a single
+///    pre-computed round count (rather than raw `catchpoint_interval` +
+///    `stores_catchpoints` fields) so this crate does not need to depend on
+///    `algo_config` just to reproduce that resolution.
+/// 3. `archival` — go's `Ledger.archival`: when `true`, retain everything
+///    (`forget_before` is never called with a nonzero round), overriding both
+///    of the above.
+///
+/// The default (`max_block_history_lookback: 0`, `catchpoint_min_rounds_lookback: 0`,
+/// `archival: false`) reproduces exactly the consensus-only pruning behavior
+/// from issue #1350 -- i.e. a store that never calls
+/// [`LedgerStore::configure_retention`] (not all stores expose that method;
+/// see [`crate::sqlite::SqliteLedger::configure_retention`] and
+/// [`crate::state::LedgerState::configure_retention`]) behaves exactly
+/// as it did before this type existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// Go: `config.Local.MaxBlockHistoryLookback`. `0` = unconfigured.
+    pub max_block_history_lookback: u64,
+    /// Pre-resolved `2 * CatchpointInterval` catchpoint floor, or `0` when
+    /// the node doesn't store catchpoints (or `CatchpointFileHistoryLength
+    /// == 0`). See this type's doc comment.
+    pub catchpoint_min_rounds_lookback: u64,
+    /// Go: `Ledger.archival`. When `true`, retain everything.
+    pub archival: bool,
+}
+
 /// Minimal per-account online-participation data as of a historical
 /// "balance round" -- the subset of go-algorand's `basics.OnlineAccountData`
 /// that the `voter_params_get` AVM opcode (0x74) exposes. See
@@ -502,6 +542,18 @@ pub trait LedgerStore {
     fn forget_before(&mut self, round: u64) -> Result<(), AlgoError> {
         let _ = round;
         Ok(())
+    }
+
+    /// The node-level retention overrides configured for this store (issue
+    /// #1354). See [`RetentionConfig`]'s doc comment for the semantics.
+    ///
+    /// Default: the all-default [`RetentionConfig`], which reproduces the
+    /// consensus-only pruning window exactly as it behaved before this
+    /// method existed (issue #1350) -- a store need only override this (and
+    /// expose its own `configure_retention` setter) if it wants to honor
+    /// `MaxBlockHistoryLookback`/catchpoint-floor/archival overrides.
+    fn retention_config(&self) -> RetentionConfig {
+        RetentionConfig::default()
     }
 
     // ---- State-proof verification-context tracker ----

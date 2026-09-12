@@ -2245,6 +2245,12 @@ pub struct SqliteLedger {
     /// Tracks whether `acctupdates_stats`'s interval has elapsed since the
     /// last emitted event — go's `accountUpdates.lastMetricsLogTime`.
     acctupdates_stats_gate: crate::acctupdates_stats::AccountUpdatesStatsGate,
+
+    /// Node-level retention overrides (issue #1354), set via
+    /// [`Self::configure_retention`]. Defaults to the all-default
+    /// [`crate::store_trait::RetentionConfig`], which reproduces the
+    /// pre-existing consensus-only pruning window (issue #1350) exactly.
+    retention: crate::store_trait::RetentionConfig,
 }
 
 /// In-memory accumulator for the per-round change to the `accounttotals`
@@ -2679,6 +2685,7 @@ impl SqliteLedger {
             reenable_catchpoints_round: 0,
             acctupdates_stats: None,
             acctupdates_stats_gate: crate::acctupdates_stats::AccountUpdatesStatsGate::default(),
+            retention: crate::store_trait::RetentionConfig::default(),
         })
     }
 
@@ -3803,6 +3810,20 @@ impl SqliteLedger {
         // A fresh gate so a reconfiguration (e.g. a config reload) doesn't
         // inherit a stale "last logged" timestamp from a prior interval.
         self.acctupdates_stats_gate = crate::acctupdates_stats::AccountUpdatesStatsGate::default();
+    }
+
+    /// Configure node-level retention overrides (issue #1354): callers
+    /// resolve `max_block_history_lookback`/`archival` from
+    /// `algo_config::Local` directly, and the catchpoint floor via
+    /// `Local::stores_catchpoints()` + `catchpoint_file_history_length !=
+    /// 0` gating `2 * catchpoint_interval` (mirroring go's
+    /// `Ledger.calcMinCatchpointRoundsLookback`), once at node startup —
+    /// same pattern as [`Self::configure_automatic_catchpoints`]/
+    /// [`Self::configure_account_updates_stats`] just above. See
+    /// [`crate::store_trait::RetentionConfig`]'s doc comment for the full
+    /// semantics this feeds into `apply.rs`'s per-block pruning.
+    pub fn configure_retention(&mut self, cfg: crate::store_trait::RetentionConfig) {
+        self.retention = cfg;
     }
 
     /// Block until any in-flight automatic catchpoint export finishes.
@@ -7001,6 +7022,10 @@ impl LedgerStore for SqliteLedger {
                 message: format!("forget_before txtail error: {e}"),
             })?;
         Ok(())
+    }
+
+    fn retention_config(&self) -> crate::store_trait::RetentionConfig {
+        self.retention
     }
 
     // ---- State-proof verification-context tracker ----
