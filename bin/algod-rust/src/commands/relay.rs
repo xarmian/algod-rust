@@ -679,6 +679,9 @@ pub async fn run(
         // Issue #1316: wires go's `DisableOutgoingConnectionThrottling`
         // through to `throttled_outgoing_connections`'s post-seed override.
         disable_outgoing_connection_throttling: node_config.disable_outgoing_connection_throttling,
+        // Issue #1320: wires go's `NetworkProtocolVersion` override through
+        // to the handshake's supported-version list (both directions).
+        network_protocol_version: node_config.network_protocol_version.clone(),
         ..Default::default()
     };
 

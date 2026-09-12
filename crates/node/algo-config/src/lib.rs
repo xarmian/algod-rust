@@ -1552,8 +1552,17 @@ static ENABLE_METRIC_REPORTING: VersionedDefault<bool> = VersionedDefault::new(&
 //   `MessageFilter` bucket construction (`message_filter.rs`), which
 //   previously hardcoded a single bucket-size constant with no
 //   bucket-count knob and no incoming/outgoing split at all.
-// - `network_protocol_version`: round-trip only, no underlying
-//   protocol-version-override subsystem exists to gate.
+// - `network_protocol_version`: wired into `algo_network`'s handshake layer
+//   (issue #1320) — `handshake::effective_protocol_versions` overrides
+//   `SUPPORTED_PROTOCOL_VERSIONS` at all four handshake call sites (outgoing
+//   `set_headers`/`ConnectConfig`, `try_connect_inner`'s server-response
+//   check, and `ws_network.rs`'s `validate_incoming_connection`/
+//   `gossip_upgrade_handler` accept-version echo) when set, matching go's
+//   `wsNetwork.go:665-669`/`p2pNetwork.go:289-290` override. Not previously
+//   accurate to call this round-trip-only despite this comment's earlier
+//   claim otherwise — corrected alongside the fix, following the same
+//   pattern as the `block_service_custom_fallback_endpoints`/
+//   `enable_request_logger` correction in issue #1312.
 // - `disable_outgoing_connection_throttling`: wired into
 //   `WebsocketNetwork::new`'s `throttled_outgoing_connections` seeding
 //   (issue #1316) — forces the seed to `0` (opting out of the
@@ -1678,7 +1687,13 @@ static ENABLE_INCOMING_MESSAGE_FILTER: VersionedDefault<bool> =
 static DNS_SECURITY_FLAGS: VersionedDefault<u32> = VersionedDefault::new(&[(6, || 1), (34, || 9)]);
 
 /// Go: `NetworkProtocolVersion string` `version[6]:""` (`localTemplate.go:395`).
-/// Round-trip only — see the module note above.
+/// Wired into `algo_network`'s handshake layer (issue #1320): when non-empty,
+/// `handshake::effective_protocol_versions` pins outgoing/incoming protocol
+/// version negotiation to exactly this one value instead of the full
+/// built-in `SUPPORTED_PROTOCOL_VERSIONS` list — matching go's
+/// `wsNetwork.go:665-669`/`p2pNetwork.go:289-290` override. An empty value
+/// (the default) round-trips through `config.json` and falls back to the
+/// built-in list unchanged.
 static NETWORK_PROTOCOL_VERSION: VersionedDefault<String> =
     VersionedDefault::new(&[(6, String::new)]);
 
@@ -3273,8 +3288,8 @@ pub struct Local {
     #[serde(rename = "DNSSecurityFlags", default = "default_dns_security_flags")]
     pub dns_security_flags: u32,
 
-    /// Go: `NetworkProtocolVersion`. Round-trip only — see
-    /// [`NETWORK_PROTOCOL_VERSION`]'s doc comment.
+    /// Go: `NetworkProtocolVersion`. Wired into `algo_network`'s handshake
+    /// layer (issue #1320) — see [`NETWORK_PROTOCOL_VERSION`]'s doc comment.
     #[serde(
         rename = "NetworkProtocolVersion",
         default = "default_network_protocol_version"

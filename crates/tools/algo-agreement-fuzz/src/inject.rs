@@ -109,6 +109,7 @@ fn throwaway_config(cfg: &InjectorConfig) -> ConnectConfig {
         handshake_timeout: cfg.handshake_timeout,
         peer_config: None,
         max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
+        network_protocol_version: String::new(),
     }
 }
 

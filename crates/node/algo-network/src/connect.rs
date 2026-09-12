@@ -44,8 +44,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::errors::WsConnectError;
 use crate::handshake::{
-    check_server_response_variables, gossip_path, set_headers, OutgoingHeaderParams,
-    SUPPORTED_PROTOCOL_VERSIONS, TOO_MANY_REQUESTS_RETRY_AFTER_HEADER,
+    check_server_response_variables, effective_protocol_versions, gossip_path, set_headers,
+    OutgoingHeaderParams, TOO_MANY_REQUESTS_RETRY_AFTER_HEADER,
 };
 use crate::identity::{
     attach_challenge_header, build_identity_verification, generate_challenge,
@@ -137,6 +137,13 @@ pub struct ConnectConfig {
     /// the previous (uncapped beyond `tungstenite`'s own internal 64 KiB
     /// `AttackCheck`) behavior.
     pub max_header_bytes: usize,
+
+    /// `config.Local.NetworkProtocolVersion` override (issue #1320). Empty
+    /// (the default) means "no override" — the full built-in
+    /// [`crate::handshake::SUPPORTED_PROTOCOL_VERSIONS`] list is advertised
+    /// and accepted, matching go's `wsNetwork.go:665-669` fallback. See
+    /// [`crate::handshake::effective_protocol_versions`].
+    pub network_protocol_version: String,
 }
 
 impl Default for ConnectConfig {
@@ -153,6 +160,7 @@ impl Default for ConnectConfig {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             peer_config: None,
             max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
+            network_protocol_version: String::new(),
         }
     }
 }
@@ -260,6 +268,7 @@ async fn try_connect_inner(
         telemetry_id: Some(config.telemetry_id.as_str()),
         identity_challenge: challenge_header_str,
         peer_features: Some(&features_str),
+        network_protocol_version: &config.network_protocol_version,
     };
     let headers = set_headers(&params);
 
@@ -348,9 +357,10 @@ async fn try_connect_inner(
 
     // Step 7: Validate server response headers
     let response_headers = response.headers();
+    let our_versions = effective_protocol_versions(&config.network_protocol_version);
     let server_info = check_server_response_variables(
         response_headers,
-        SUPPORTED_PROTOCOL_VERSIONS,
+        &our_versions,
         &node_random_str,
         &config.genesis_id,
     )

@@ -191,6 +191,7 @@ async fn default_connect_config() -> ConnectConfig {
         handshake_timeout: Duration::from_secs(15),
         peer_config: None,
         max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
+        network_protocol_version: String::new(),
     }
 }
 
@@ -525,6 +526,7 @@ async fn test_reconnect_supervisor_connects() {
                     handshake_timeout: Duration::from_secs(10),
                     peer_config: None,
                     max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
+                    network_protocol_version: String::new(),
                 };
 
                 let handle = try_connect(&addr, &config)
@@ -614,6 +616,7 @@ async fn test_reconnect_after_failure() {
                     handshake_timeout: Duration::from_secs(10),
                     peer_config: None,
                     max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
+                    network_protocol_version: String::new(),
                 };
 
                 let handle = try_connect(&real_addr, &config)
