@@ -2009,6 +2009,19 @@ fn asm_method(ops: &mut OpStream, args: &[&str]) {
     if arg.len() > 1 && arg.starts_with('"') && arg.ends_with('"') {
         match parse_string_literal(arg) {
             Ok(sig_bytes) => {
+                // go's asmMethod calls abi.VerifyMethodSignature and warns
+                // (non-fatally, since the ABI isn't governed by the core
+                // protocol) if the string isn't a well-formed ARC-4 method
+                // signature. Assembly still succeeds either way.
+                if let Ok(sig_str) = std::str::from_utf8(&sig_bytes) {
+                    if let Err(e) = algo_abi::parse_method_signature(sig_str) {
+                        ops.record_warning(
+                            ops.source_line,
+                            0,
+                            format!("invalid ARC-4 ABI method signature for method op: {e}"),
+                        );
+                    }
+                }
                 use sha2::{Digest, Sha512_256};
                 let hash = Sha512_256::digest(&sig_bytes);
                 ops.byte_literal(hash[..4].to_vec());
@@ -6248,19 +6261,39 @@ dup
         // `AssemblyWarning` ("invalid ARC-4 ABI method signature for
         // method op") when the string literal isn't a well-formed ARC-4
         // method signature -- assembly still succeeds either way.
-        // `asm_method` (this file) has no such check at all -- it only
-        // requires the literal to *parse as a string*, so every
-        // malformed-signature case below currently produces zero warnings
-        // instead of go's one. Filed as issue #1368; only the
-        // well-formed-signature (no-warning) case is asserted here.
-        let source = "method \"abc(uint64)void\"\nint 1\n";
-        for v in 1..=opcode::MAX_AVM_VERSION {
-            let ops = assemble_string(&format!("#pragma version {v}\n{source}")).unwrap();
-            assert!(
-                ops.warnings.is_empty(),
-                "v{v}: expected no warnings for a well-formed signature, got {:?}",
-                ops.warnings
-            );
+        let tests: &[(&str, bool)] = &[
+            ("abc(uint64)void", true),
+            ("abc(uint64)", false),
+            ("abc(uint65)void", false),
+            ("(uint64)void", false),
+            ("abc(uint65,void", false),
+        ];
+        for (method, pass) in tests {
+            let source = format!("method \"{method}\"\nint 1\n");
+            for v in 1..=opcode::MAX_AVM_VERSION {
+                let ops = assemble_string(&format!("#pragma version {v}\n{source}")).unwrap();
+                if *pass {
+                    assert!(
+                        ops.warnings.is_empty(),
+                        "v{v} {method:?}: expected no warnings for a well-formed signature, got {:?}",
+                        ops.warnings
+                    );
+                } else {
+                    assert_eq!(
+                        ops.warnings.len(),
+                        1,
+                        "v{v} {method:?}: expected exactly one warning, got {:?}",
+                        ops.warnings
+                    );
+                    assert!(
+                        ops.warnings[0]
+                            .message
+                            .contains("invalid ARC-4 ABI method signature for method op"),
+                        "v{v} {method:?}: unexpected warning message {:?}",
+                        ops.warnings[0]
+                    );
+                }
+            }
         }
     }
 
