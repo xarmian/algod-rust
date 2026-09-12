@@ -1526,6 +1526,156 @@ fn sender_auth_unauthorized_fails() {
     assert!(is_failure(&result), "unauthorized sender should fail");
 }
 
+/// Phase 17 (issue #1322): TestRekeyActionCloseAccount
+/// (ledger/apptxn_test.go:522) -- closing a rekeyed account erases its
+/// rekeying (`AccountData` is reset to its zero value, `auth_addr`
+/// included), so a LATER inner txn in the same top-level call that still
+/// tries to spend from that account as though it were rekeyed must fail
+/// sender-authorization, even though an EARLIER inner txn in the very same
+/// call successfully spent from (and closed) it. `test_rekey_to`
+/// (apply.rs) only proves a single rekey/un-rekey round trip in isolation;
+/// it never exercises the close-erases-rekey interaction with a
+/// still-later inner-txn authorization check.
+#[test]
+fn rekeyed_account_close_erases_rekey_for_later_inner_txn() {
+    let app_id = 42u64;
+    let rekeyed = [0xAA; 32]; // rekeyed to the app, then closed
+    let close_to = [0xBB; 32];
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 1_000_000);
+
+    let rekeyed_acct = store.get_or_default_account_mut(&Address(rekeyed));
+    rekeyed_acct.micro_algos = 2_000_000;
+    rekeyed_acct.auth_addr = Some(app_addr);
+
+    let txn = make_appl_txn([0xCC; 32], app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 10_000;
+
+    // itxn 1: pay from the rekeyed account, closing its whole balance to
+    // `close_to`. This succeeds (still rekeyed) and, per go's CloseAccount
+    // semantics, resets the account (including auth_addr) to zero.
+    let mut code = Vec::new();
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(1));
+    code.extend([0xb2, 16]); // TypeEnum = pay
+    code.extend(pushbytes(&rekeyed));
+    code.extend([0xb2, 0]); // Sender
+    code.extend(pushbytes(&close_to));
+    code.extend([0xb2, 9]); // CloseRemainderTo
+    code.push(0xb3); // itxn_submit
+
+    // itxn 2: reopen the account with a fresh deposit from the app's own
+    // account (default sender).
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(1));
+    code.extend([0xb2, 16]); // TypeEnum = pay
+    code.extend(pushint(5_000));
+    code.extend([0xb2, 8]); // Amount
+    code.extend(pushbytes(&rekeyed));
+    code.extend([0xb2, 7]); // Receiver
+    code.push(0xb3); // itxn_submit
+
+    // itxn 3: try to spend from the reopened account again as though it
+    // were still rekeyed -- must fail, since closing erased the rekey.
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(1));
+    code.extend([0xb2, 16]); // TypeEnum = pay
+    code.extend(pushint(1));
+    code.extend([0xb2, 8]); // Amount
+    code.extend(pushbytes(&rekeyed));
+    code.extend([0xb2, 0]); // Sender
+    code.extend(pushbytes(&close_to));
+    code.extend([0xb2, 7]); // Receiver
+    code.push(0xb3); // itxn_submit
+
+    code.extend(pushint(1));
+    code.push(0x43); // return
+
+    let result = run_with_context(6, &code, &mut ctx);
+    assert!(
+        is_failure(&result),
+        "the third inner txn must fail sender-authorization: closing the \
+         account in the first inner txn erased its rekey to the app"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("unauthorized"),
+        "expected an unauthorized-sender error, got: {err}"
+    );
+
+    // The close and reopen (itxns 1 and 2) DID apply before the third
+    // failed: the account was reset to zero and never got any funds added
+    // back beyond the 5000 reopen deposit (itxn 3's payment never took
+    // effect).
+    let final_acct = ctx.store.get_account(&Address(rekeyed)).unwrap();
+    assert_eq!(final_acct.micro_algos, 5_000);
+    assert_eq!(
+        final_acct.auth_addr, None,
+        "the reopened account must not be rekeyed to the app anymore"
+    );
+}
+
+/// Phase 17 (issue #1322): TestDuplicatePayAction (ledger/apptxn_test.go:582)
+/// -- two inner pays with IDENTICAL parameters (same receiver, same
+/// amount) submitted as separate `itxn_begin`/`itxn_submit` groups within
+/// one top-level call must both apply (no accidental transaction-id
+/// dedup/lease collision across inner txns), and their effects on the
+/// shared receiver must simply sum. `inner_group_two_pays_via_itxn_next`
+/// only exercises two DIFFERENT-receiver/different-amount pays chained via
+/// `itxn_next` inside a SINGLE group; it never proves two pays with
+/// identical fields, submitted as separate inner-txn groups, don't
+/// collide.
+#[test]
+fn duplicate_pay_action_two_identical_inner_pays_both_apply() {
+    let sender = [0xAA; 32];
+    let receiver = [0xBB; 32];
+    let app_id = 42u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 10_000_000);
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 10_000;
+
+    // Two SEPARATE itxn_begin/itxn_submit groups (not itxn_next-chained),
+    // each paying the exact same receiver the exact same amount.
+    let mut code = Vec::new();
+    code.extend(build_inner_pay(&receiver, 5_000));
+    code.extend(build_inner_pay(&receiver, 5_000));
+    code.extend(pushint(1));
+    code.push(0x43); // return
+
+    let result = run_with_context(6, &code, &mut ctx).unwrap();
+    assert!(result, "two identical inner pays must both apply cleanly");
+
+    let inner = ctx.inner_txns();
+    assert_eq!(inner.len(), 2, "each itxn_submit produces its own group");
+    assert_eq!(inner[0][0].txn.amount, 5_000);
+    assert_eq!(inner[1][0].txn.amount, 5_000);
+
+    let r_bal = ctx
+        .store
+        .get_account(&Address(receiver))
+        .map(|a| a.micro_algos)
+        .unwrap_or(0);
+    assert_eq!(
+        r_bal, 10_000,
+        "the two identical pays' effects on the shared receiver must sum, \
+         not collide/dedup"
+    );
+}
+
 // ===========================================================================
 // 8. Edge Cases
 // ===========================================================================
@@ -2367,6 +2517,64 @@ fn inner_app_creation() {
     assert!(created_app_id > 0, "should have a created app ID");
     let new_app = ctx.store.app_params.get(&created_app_id);
     assert!(new_app.is_some(), "new app should exist in store");
+}
+
+/// Phase 17 (issue #1322): TestAppCallAppDuringInit (ledger/apptxn_test.go:
+/// 3764) -- an app can call ANOTHER (already-existing) app via inner txn
+/// during its OWN creation call, even though its own account has ZERO
+/// balance at that point (it hasn't been funded yet). Under go's
+/// `UnfundedSenders` (v34+, the current v41 pin), a zero-fee sub-transaction
+/// from a zero-balance sender is not an error -- the outer creation txn's
+/// fee overpayment (2x MinTxnFee) supplies fee credit that covers the
+/// inner call's own fee entirely via pooling, so the app's own account is
+/// never actually charged (and, per `UnfundedSenders`, never even written).
+/// `inner_app_creation` above always funds the calling app's account with
+/// 10_000_000 first; this specifically exercises the zero-balance-at-call
+/// path go's test is about.
+#[test]
+fn app_call_app_during_init_with_zero_balance_sender_succeeds() {
+    let sender = [0xAA; 32];
+    let approve_id = 99u64;
+    let creating_app_id = 100u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, approve_id, Address([1u8; 32]));
+
+    let mut a_code = Vec::new();
+    a_code.push(0xb1); // itxn_begin
+    a_code.extend(pushint(6)); // TypeEnum = appl
+    a_code.extend([0xb2, 16]);
+    a_code.extend(pushint(approve_id));
+    a_code.extend([0xb2, 24]); // ApplicationID = the pre-existing approve app
+    a_code.push(0xb3); // itxn_submit
+    a_code.extend(pushint(1));
+    a_code.push(0x43); // return
+
+    // Deliberately NOT funding the creating app's own account: it's zero
+    // balance, mirroring go's "not funded yet" creation-time scenario.
+    let txn = make_appl_txn(sender, creating_app_id);
+    let mut ctx = make_context(&mut store, vec![txn], creating_app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    // The outer creation txn's own fee overpayment (2x MinTxnFee) supplies
+    // this credit, covering the inner call's fee entirely via pooling.
+    ctx.fee_credit = 2_000;
+
+    let result = run_with_context(6, &a_code, &mut ctx).unwrap();
+    assert!(
+        result,
+        "calling an existing app via inner txn during creation must \
+         succeed even with a zero-balance sender, given sufficient fee credit"
+    );
+
+    let creating_app_addr = Address(app_address(creating_app_id));
+    let acct = ctx.store.get_account(&creating_app_addr);
+    assert!(
+        acct.is_none() || acct.unwrap().micro_algos == 0,
+        "the zero-fee, zero-balance sender must not gain a nonzero balance \
+         from this call, and UnfundedSenders means it need not even be \
+         written to the store"
+    );
 }
 
 /// Mirrors go-algorand's `TestInnerCreatedAppsAreCallable`: an app created
