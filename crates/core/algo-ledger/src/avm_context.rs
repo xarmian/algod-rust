@@ -4639,7 +4639,7 @@ fn check_reentrancy(
 /// declared `NumUint`/`NumByteSlice` bounds, matching go-algorand's
 /// `storageDelta.checkCounts` (`ledger/eval/appcow.go`), which runs after
 /// every state write.
-fn check_state_schema_counts(
+pub(crate) fn check_state_schema_counts(
     state: &std::collections::BTreeMap<Vec<u8>, TealValue>,
     schema: &algo_types::StateSchema,
 ) -> Result<(), AlgoError> {

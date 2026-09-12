@@ -2411,3 +2411,284 @@ int 1
          inner callee",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1345: `UpdateApplication` resizing (`ON_COMPLETION_UPDATE`'s
+// `size_change` branch, `apply.rs`) must reject a shrink of
+// `GlobalStateSchema` below the app's CURRENT live global key/value usage,
+// matching go-algorand's `updateApplication` (`ledger/apply/application.go`)
+// calling `balances.SetAppGlobalSchema` -> `storageDelta.checkCounts`
+// (`ledger/eval/appcow.go`) BEFORE installing the new schema. Previously
+// algod-rust installed the new (possibly smaller) schema unconditionally,
+// silently leaving the app's declared schema undercounting what was
+// actually stored.
+//
+// Covers both the `NumByteSlice` and `NumUint` shrink cases, and both the
+// top-level and inner-update paths -- `apply_appl_on_completion` is the one
+// shared function both `apply_appl` (top-level) and `execute_inner_appl`
+// (inner) call into, so a fix there covers both, but the inner path gets
+// its own dedicated test per the issue's acceptance criteria.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_schema_updates_shrink_below_current_usage_rejected() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    // --- Scenario A: NumByteSlice shrink (2 -> 1) below 2 live byte-slice keys.
+    {
+        let app_id = 900u64;
+        let writer_src = "#pragma version 8
+txn ApplicationID
+bz create
+b approve
+create:
+byte \"A\"
+byte \"X\"
+app_global_put
+byte \"B\"
+byte \"Y\"
+app_global_put
+approve:
+int 1
+";
+        let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = execute_ctx(fee_sink, 1);
+
+        let create = appl_create(
+            creator,
+            1_000,
+            app_id,
+            writer_src,
+            APPROVE_SRC,
+            Some(StateSchema {
+                num_uint: 0,
+                num_byte_slice: 2,
+            }),
+            None,
+            None,
+        );
+        apply_transaction_with_budget(&mut state, &create, &ctx, 0, None, None, None, None)
+            .expect("create writing 2 distinct byte-slice keys must fit schema=2");
+
+        let before = state.get_app_params(app_id).unwrap();
+        assert_eq!(before.global_state.len(), 2);
+        assert_eq!(before.global_state_schema.num_byte_slice, 2);
+        let before = before.clone();
+        let creator_before = state
+            .get_account(&creator)
+            .unwrap()
+            .total_app_schema
+            .clone();
+
+        // Top-level UpdateApplication shrinking NumByteSlice 2 -> 1, below
+        // the app's live 2-key usage, must be rejected outright -- with no
+        // approval/clear program change (`None` means "keep existing"), so
+        // only the resize itself is under test.
+        let mut update = appl_call(
+            creator, 1_000, app_id, 4, /* ON_COMPLETION_UPDATE */
+            None,
+        );
+        update.txn.global_state_schema = Some(StateSchema {
+            num_uint: 0,
+            num_byte_slice: 1,
+        });
+        let err =
+            apply_transaction_with_budget(&mut state, &update, &ctx, 0, None, None, None, None)
+                .expect_err("shrinking NumByteSlice below live 2-key usage must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "unable to change global schema: store bytes count 2 exceeds schema bytes count 1"
+            ),
+            "unexpected error: {msg}"
+        );
+
+        let after = state.get_app_params(app_id).unwrap();
+        assert_eq!(
+            after.global_state_schema, before.global_state_schema,
+            "schema must be completely unchanged after a rejected shrink"
+        );
+        assert_eq!(
+            after.global_state, before.global_state,
+            "global state must be completely unchanged after a rejected shrink"
+        );
+        assert_eq!(
+            after.size_sponsor, before.size_sponsor,
+            "sponsor bookkeeping must be untouched by a rejected shrink"
+        );
+        assert_eq!(after.extra_program_pages, before.extra_program_pages);
+        assert_eq!(
+            state.get_account(&creator).unwrap().total_app_schema,
+            creator_before,
+            "creator's MBR accounting must be untouched by a rejected shrink"
+        );
+    }
+
+    // --- Scenario B: NumUint shrink (2 -> 1) below 2 live uint keys.
+    {
+        let app_id = 901u64;
+        let writer_src = "#pragma version 8
+txn ApplicationID
+bz create
+b approve
+create:
+byte \"A\"
+int 1
+app_global_put
+byte \"B\"
+int 2
+app_global_put
+approve:
+int 1
+";
+        let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = execute_ctx(fee_sink, 1);
+
+        let create = appl_create(
+            creator,
+            1_000,
+            app_id,
+            writer_src,
+            APPROVE_SRC,
+            Some(StateSchema {
+                num_uint: 2,
+                num_byte_slice: 0,
+            }),
+            None,
+            None,
+        );
+        apply_transaction_with_budget(&mut state, &create, &ctx, 0, None, None, None, None)
+            .expect("create writing 2 distinct uint keys must fit schema=2");
+
+        let before = state.get_app_params(app_id).unwrap();
+        assert_eq!(before.global_state.len(), 2);
+        assert_eq!(before.global_state_schema.num_uint, 2);
+        let before = before.clone();
+
+        let mut update = appl_call(
+            creator, 1_000, app_id, 4, /* ON_COMPLETION_UPDATE */
+            None,
+        );
+        update.txn.global_state_schema = Some(StateSchema {
+            num_uint: 1,
+            num_byte_slice: 0,
+        });
+        let err =
+            apply_transaction_with_budget(&mut state, &update, &ctx, 0, None, None, None, None)
+                .expect_err("shrinking NumUint below live 2-key usage must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "unable to change global schema: store integer count 2 exceeds schema integer count 1"
+            ),
+            "unexpected error: {msg}"
+        );
+
+        let after = state.get_app_params(app_id).unwrap();
+        assert_eq!(after.global_state_schema, before.global_state_schema);
+        assert_eq!(after.global_state, before.global_state);
+        assert_eq!(after.size_sponsor, before.size_sponsor);
+    }
+}
+
+// Same shrink-below-usage rejection, but through the inner-update path
+// (`execute_inner_appl`'s `ON_COMPLETION_UPDATE` handling) rather than a
+// top-level `UpdateApplication` -- proving the fix lives in the shared
+// `apply_appl_on_completion` helper both paths call into, not just the
+// top-level call site.
+#[test]
+fn test_inner_update_shrink_below_current_usage_rejected() {
+    let creator = Address([1u8; 32]);
+    let updater_creator = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let small_id = 910u64;
+    let updater_id = 911u64;
+
+    let updater_addr = Address(algo_ledger::avm_context::app_address(updater_id));
+
+    let mut state = make_state(
+        &[
+            (creator, 50_000_000),
+            (updater_creator, 50_000_000),
+            (fee_sink, 0),
+            (updater_addr, 3_000_000),
+        ],
+        fee_sink,
+    );
+
+    // smallID is inserted directly with 2 live byte-slice global keys under
+    // a schema of exactly 2 -- go's real `checkCounts` reads whatever is
+    // actually stored, regardless of how it got there.
+    let mut small_global_state = std::collections::BTreeMap::new();
+    small_global_state.insert(b"A".to_vec(), algo_types::TealValue::Bytes(b"X".to_vec()));
+    small_global_state.insert(b"B".to_vec(), algo_types::TealValue::Bytes(b"Y".to_vec()));
+    state.app_params.insert(
+        small_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(APPROVE_SRC),
+            clear_state_program: assemble(APPROVE_SRC),
+            global_state_schema: StateSchema {
+                num_uint: 0,
+                num_byte_slice: 2,
+            },
+            global_state: small_global_state.clone(),
+            ..Default::default()
+        },
+    );
+
+    // updaterID performs an inner UpdateApplication on smallID, shrinking
+    // NumByteSlice from 2 to 1 -- below smallID's live 2-key usage.
+    let updater_src = "\
+itxn_begin
+int appl
+itxn_field TypeEnum
+txn Applications 1
+itxn_field ApplicationID
+int UpdateApplication
+itxn_field OnCompletion
+int 1
+itxn_field GlobalNumByteSlice
+itxn_submit
+";
+    let updater_wrapped =
+        format!("#pragma version 8\ntxn ApplicationID\nbz end\n{updater_src}\nend:\nint 1\n");
+    let updater_create = appl_create(
+        updater_creator,
+        1_000,
+        updater_id,
+        &updater_wrapped,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    let create_block = minimal_block(fee_sink, 1, vec![updater_create]);
+    apply_block_capturing_apply_data(&mut state, &create_block, ApplyMode::Execute)
+        .expect("updater app creation must apply cleanly");
+
+    let mut call = appl_call(creator, 1_000, updater_id, 0, None);
+    call.txn.foreign_apps = Some(vec![small_id]);
+    let call_block = minimal_block(fee_sink, 2, vec![call]);
+    let err = apply_block_capturing_apply_data(&mut state, &call_block, ApplyMode::Execute)
+        .expect_err(
+            "inner UpdateApplication shrinking NumByteSlice below smallID's \
+             live 2-key usage must be rejected, failing the whole outer call",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains(
+            "unable to change global schema: store bytes count 2 exceeds schema bytes count 1"
+        ),
+        "unexpected error: {msg}"
+    );
+
+    let after = state.get_app_params(small_id).unwrap();
+    assert_eq!(after.global_state_schema.num_byte_slice, 2);
+    assert_eq!(after.global_state, small_global_state);
+    assert!(
+        after.size_sponsor.is_zero(),
+        "sponsor bookkeeping must be untouched by a rejected inner shrink"
+    );
+}

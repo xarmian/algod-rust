@@ -4308,6 +4308,29 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
                 // "nobody" (encoded as the zero address) if the sender is
                 // the creator itself.
                 if size_change {
+                    // go-algorand `ledger/apply/application.go`'s
+                    // `updateApplication` calls `balances.SetAppGlobalSchema`
+                    // (`ledger/eval/appcow.go`) BEFORE installing the new
+                    // schema, which runs `storageDelta.checkCounts()`
+                    // against the app's *live* stored global key/value
+                    // counts and rejects the whole update -- wrapped as
+                    // `"unable to change global schema: %w"` -- if the new,
+                    // possibly-shrunk schema no longer covers what's
+                    // actually stored. Must run before any mutation below
+                    // (sponsor accounting, `app.global_state_schema`) so a
+                    // rejected shrink leaves everything completely
+                    // untouched -- issue #1345.
+                    if let Err(AlgoError::Avm { message }) =
+                        crate::avm_context::check_state_schema_counts(
+                            &app.global_state,
+                            &new_global_schema,
+                        )
+                    {
+                        return Err(
+                            err_ctx.error(format!("unable to change global schema: {}", message))
+                        );
+                    }
+
                     let sponsor = if app.size_sponsor.is_zero() {
                         app.creator
                     } else {
