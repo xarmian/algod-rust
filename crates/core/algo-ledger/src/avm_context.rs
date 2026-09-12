@@ -3963,6 +3963,7 @@ fn execute_inner_appl<L: LedgerStore>(
     box_state: crate::apply::BoxBudgetState,
     family_chain: Vec<FamilyFrame>,
     created_apps_snapshot: Vec<u64>,
+    group_resources_snapshot: GroupResources,
     consensus: ConsensusParams,
     mut tracer: Option<&mut dyn algo_avm::tracer::EvalTracer>,
     log_limits: (u64, u64),
@@ -4172,6 +4173,26 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.unnamed_access = box_state.unnamed_access;
     // Inherit created_apps so newAppAccess fallback works for apps created earlier.
     inner_ctx.created_apps = created_apps_snapshot;
+    // Issue #1322: inherit the TOP-LEVEL group's resource-sharing catalog
+    // (accounts/assets/apps named via Accounts/ForeignApps/ForeignAssets/
+    // Access on ANY sibling of the outermost atomic group, plus the
+    // Holding/Locals cross-products they establish), not a fresh
+    // recomputation over this inner call's tiny 1-or-few-item sibling list.
+    // Mirrors go-algorand's `NewInnerEvalParams`, which sets `available:
+    // caller.available` -- a single `*resources` object shared BY POINTER
+    // across the entire call tree regardless of depth, computed once from
+    // `ep.TxnGroup` (the outer atomic group) and never recomputed for an
+    // inner group. Without this, an account/app/asset made available only
+    // via a DIFFERENT top-level sibling's `Access`/foreign-array entry (not
+    // named anywhere on the itxn's own constructed fields) would incorrectly
+    // read as unavailable as soon as execution is two or more inner-call
+    // levels deep, even though it is available at the immediate first level
+    // (whose `group` still happens to include the top-level siblings that
+    // matter for the check). `fill_group_resources` was already run once
+    // more via `LedgerAvmContext::new` just above using only this call's
+    // own inner-group siblings; that result is intentionally discarded here
+    // in favor of the inherited top-level catalog.
+    inner_ctx.group_resources = group_resources_snapshot;
     // Family-shared box reentrancy guard: inherit the caller-chain snapshot
     // (see `FamilyFrame`). `family_chain` already includes the immediate
     // caller's own frame (pushed by the call site before invoking us).
@@ -6354,6 +6375,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     caller_box_state,
                     child_family_chain,
                     self.created_apps.clone(),
+                    self.group_resources.clone(),
                     self.consensus.clone(),
                     tracer_ref,
                     (self.max_log_calls, self.max_log_size),

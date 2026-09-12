@@ -3069,3 +3069,199 @@ fn test_box_inners_top_level_box_ref_scoped_to_correct_foreign_app() {
          pass-through app's"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 17 (issue #1322): TestLocalAccessInNewApps (ledger/apptxn_test.go:3900)
+//
+// A group creates a new app (`app_read`) at index 0 and, in the SAME group,
+// a second app (`call_first`) that -- right at its own creation time --
+// makes a two-deep inner-call chain: it calls a pre-existing app
+// (`app_arg`) passing the just-created app's resolved ID (read via `gtxn 0
+// CreatedApplicationID`, not a hardcoded literal) as an argument; `app_arg`
+// re-invokes THAT app by the resolved ID, passing along an address to
+// read locals for. `app_read`'s own body (skipped at its own creation via
+// an `ApplicationID == 0` guard, exactly like go's `main()` helper) only
+// runs on this re-invocation, and does a plain `app_local_get` for the
+// passed-in address.
+//
+// go's point: `app_read` was created only THIS group, so it can never have
+// had that address opt in "for real" -- but the address's LOCAL STATE for
+// `app_read` must still be resource-*available* (no explicit `LocalsRef`
+// needed) purely because `app_read` is a group-created app and the address
+// is available some other way. Two sub-cases:
+//   1. The address is named NOWHERE in the group -> "unavailable Account".
+//   2. `call_first`'s `Access` list separately makes the address available
+//      (with no `LocalsRef` naming `app_read`'s locals at all) -> the
+//      resource check now succeeds, and execution reaches the real
+//      "has not opted in" runtime error from issue #1356's fix, proving
+//      that success came from the implicit created-app/available-account
+//      rule and not some other path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_local_access_in_new_apps() {
+    let creator = Address([1u8; 32]);
+    let addr_target = Address([2u8; 32]); // never opts in to app_read
+    let fee_sink = Address([3u8; 32]);
+
+    let app_arg_id = 700u64; // pre-existing "callArg0WithArg1" analog
+    let app_read_id = 800u64; // created at group index 0
+    let app_call_first_id = 801u64; // created at group index 1
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+
+    // Pre-existing app: re-invokes ApplicationArgs[0] (as an app ID) with
+    // ApplicationArgs[1] as its own single argument. Mirrors go's
+    // `callArg0WithArg1`, which is created BEFORE the tested group runs and
+    // is always called (never itself created) in the group below, so it
+    // needs no `main()`-style creation guard.
+    let app_arg_src = "#pragma version 10\n\
+        itxn_begin\n\
+        int appl\n\
+        itxn_field TypeEnum\n\
+        txn ApplicationArgs 0\n\
+        btoi\n\
+        itxn_field ApplicationID\n\
+        txn ApplicationArgs 1\n\
+        itxn_field ApplicationArgs\n\
+        itxn_submit\n\
+        int 1\n";
+    state.app_params.insert(
+        app_arg_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(app_arg_src),
+            clear_state_program: assemble(APPROVE_SRC),
+            ..Default::default()
+        },
+    );
+    let app_arg_addr = Address(algo_ledger::avm_context::app_address(app_arg_id));
+    state.get_or_default_account_mut(&app_arg_addr).micro_algos = 1_000_000;
+
+    // The group-created app: does nothing at its own creation (guard skips
+    // the body when ApplicationID == 0), but on a real re-invocation reads
+    // local state "XXX" for the address named in ApplicationArgs[0].
+    // Mirrors go's `readFromArg0`.
+    let app_read_src = "#pragma version 10\n\
+        txn ApplicationID\n\
+        bz end\n\
+        txn ApplicationArgs 0\n\
+        byte \"XXX\"\n\
+        app_local_get\n\
+        end:\n\
+        int 1\n";
+
+    // The other group-created app: runs its inner-call chain immediately at
+    // its OWN creation (no guard, mirrors go's explicit "Don't use main()"
+    // comment on `callFirst`). Resolves the sibling-created app's ID via
+    // `gtxn 0 CreatedApplicationID` (NOT a hardcoded literal), forwards its
+    // own ApplicationArgs[0] (the target address) through `app_arg`, and
+    // calls `app_arg` by its own (fixed, pre-existing) ID.
+    let call_first_src = format!(
+        "#pragma version 10\n\
+        itxn_begin\n\
+        int appl\n\
+        itxn_field TypeEnum\n\
+        gtxn 0 CreatedApplicationID\n\
+        itob\n\
+        itxn_field ApplicationArgs\n\
+        txn ApplicationArgs 0\n\
+        itxn_field ApplicationArgs\n\
+        int {app_arg_id}\n\
+        itxn_field ApplicationID\n\
+        itxn_submit\n\
+        int 1\n"
+    );
+
+    let group_id = [0xEEu8; 32];
+
+    let mut app_read_create = appl_create(
+        creator,
+        1_000,
+        app_read_id,
+        app_read_src,
+        APPROVE_SRC,
+        None,
+        None,
+        None,
+    );
+    app_read_create.txn.group = group_id;
+
+    let make_call_first = |access: Vec<algo_types::ResourceRef>| {
+        let mut txn = appl_create(
+            creator,
+            3_000,
+            app_call_first_id,
+            &call_first_src,
+            APPROVE_SRC,
+            None,
+            None,
+            None,
+        );
+        txn.txn.group = group_id;
+        txn.txn.app_arguments = Some(vec![Some(serde_bytes::ByteBuf::from(
+            addr_target.0.to_vec(),
+        ))]);
+        txn.txn.access = Some(access);
+        txn
+    };
+
+    // Sub-case 1: `call_first`'s Access names only the pre-existing
+    // `app_arg` app (needed so the itxn's ApplicationID resolves) -- the
+    // target address is not named ANYWHERE in the group.
+    let call_first_unavailable = make_call_first(vec![algo_types::ResourceRef {
+        app: app_arg_id,
+        ..Default::default()
+    }]);
+    let block1 = minimal_block(
+        fee_sink,
+        1,
+        vec![app_read_create.clone(), call_first_unavailable],
+    );
+    let err1 = apply_block_capturing_apply_data(&mut state, &block1, ApplyMode::Execute)
+        .expect_err(
+            "reading locals for an address named nowhere in the group must \
+             fail with an unavailable-account resource error, even though \
+             app_read was created earlier in this same group",
+        );
+    assert!(
+        err1.to_string().contains("unavailable")
+            && err1.to_string().contains(&addr_target.to_string()),
+        "expected an 'unavailable Account {addr_target}' error, got: {err1}"
+    );
+
+    // The failed block above must not have committed (round 1 is still
+    // un-applied), so round 1 is reused for sub-case 2 below.
+    assert_eq!(state.current_round, Round(0));
+
+    // Sub-case 2: `call_first`'s Access ALSO names the target address
+    // directly (no `LocalsRef` naming `app_read`'s locals for it at all).
+    // The resource-availability check must now succeed -- proving the
+    // group-created-app/any-available-account rule fired -- and execution
+    // must reach the real "has not opted in" runtime error, since
+    // `addr_target` genuinely never opted in to the brand-new `app_read`.
+    let call_first_available = make_call_first(vec![
+        algo_types::ResourceRef {
+            app: app_arg_id,
+            ..Default::default()
+        },
+        algo_types::ResourceRef {
+            address: addr_target,
+            ..Default::default()
+        },
+    ]);
+    let block2 = minimal_block(fee_sink, 1, vec![app_read_create, call_first_available]);
+    let err2 = apply_block_capturing_apply_data(&mut state, &block2, ApplyMode::Execute)
+        .expect_err(
+            "once the target address is made available via Access, the \
+             implicit created-app local-access rule must let the read \
+             proceed to the real opt-in check, which must then fail because \
+             addr_target never opted in to the brand-new app_read",
+        );
+    assert!(
+        err2.to_string().contains("has not opted in")
+            && err2.to_string().contains(&addr_target.to_string()),
+        "expected a 'has not opted in' error (proving the resource became \
+         available), got: {err2}"
+    );
+}
