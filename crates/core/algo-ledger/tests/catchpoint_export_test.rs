@@ -706,6 +706,96 @@ fn export_splits_oversized_account_resources() {
     );
 }
 
+/// go-algorand's `TestCatchpointReadDatabaseOverflowAccounts`
+/// (`catchpointfilewriter_test.go`) strengthens the single-oversized-account
+/// case above (go's `TestCatchpointReadDatabaseOverflowSingleAccount`) to
+/// *multiple* accounts that each individually overflow the per-chunk
+/// resource budget, interleaved with normal (non-overflowing) accounts —
+/// pinning that the writer's pending-chunk flush/reset around an oversized
+/// account (`writer.rs`'s `pending`/`pending_resources` bookkeeping) doesn't
+/// leak resources or record boundaries across account boundaries when it
+/// happens more than once in the same export.
+#[test]
+fn export_splits_multiple_oversized_accounts_resources() {
+    let src = build_source_db();
+    // Account #1 (otherwise resource-free) overflows with 5 resources;
+    // account #5 (otherwise resource-free) overflows with 4 resources.
+    // Accounts #2/#3/#4 keep their original (non-overflowing) resource
+    // counts from build_source_db(), so both oversized accounts have
+    // ordinary accounts on either side of them in address order.
+    for aidx in 400..405u64 {
+        src.execute(
+            "INSERT INTO resources(addrid, aidx, data, ctype) VALUES(1, ?1, ?2, ?3)",
+            params![aidx as i64, asset_blob(1), CTYPE_ASSET],
+        )
+        .unwrap();
+    }
+    src.execute(
+        "UPDATE accountbase SET data = ?1 WHERE addrid = 1",
+        params![account_blob_with_resource_totals(1_000, 5, 5, 0, 0)],
+    )
+    .unwrap();
+
+    for aidx in 500..504u64 {
+        src.execute(
+            "INSERT INTO resources(addrid, aidx, data, ctype) VALUES(5, ?1, ?2, ?3)",
+            params![aidx as i64, asset_blob(2), CTYPE_ASSET],
+        )
+        .unwrap();
+    }
+    src.execute(
+        "UPDATE accountbase SET data = ?1 WHERE addrid = 5",
+        params![account_blob_with_resource_totals(5_000, 4, 4, 0, 0)],
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multi_oversized.tar.gz");
+    let opts = ExportOptions {
+        max_resources_per_chunk: 2,
+        ..export_options()
+    };
+    export_catchpoint_file(&src, &path, &opts).unwrap();
+
+    let dst = Connection::open_in_memory().unwrap();
+    import_catchpoint_file(&dst, &path, REWARD_UNITS).unwrap();
+
+    let resource_count_for = |conn: &Connection, address: u8| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM resources r JOIN accountbase a ON a.rowid = r.addrid \
+             WHERE a.address = ?1",
+            params![addr(address).to_vec()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    // Every account's resources land back on its own address -- none
+    // leaked into a neighboring account's row -- and the original
+    // non-overflowing accounts (#2 has 2, #4 has 1) are untouched.
+    assert_eq!(resource_count_for(&dst, 1), 5, "account #1's 5 resources");
+    assert_eq!(
+        resource_count_for(&dst, 2),
+        2,
+        "account #2's original 2 resources"
+    );
+    assert_eq!(
+        resource_count_for(&dst, 4),
+        1,
+        "account #4's original 1 resource"
+    );
+    assert_eq!(resource_count_for(&dst, 5), 4, "account #5's 4 resources");
+
+    // Full-state equivalence: the imported DB's merkle trie matches the
+    // source's, proving no resource was dropped, duplicated, or
+    // misattributed while flushing/resetting the pending-chunk state
+    // around two separate oversized accounts in one export.
+    assert_eq!(
+        rebuild_trie_from_db(&src).unwrap(),
+        rebuild_trie_from_db(&dst).unwrap()
+    );
+}
+
 #[test]
 fn export_zeroes_pre_horizon_online_update_round() {
     let src = build_source_db();
