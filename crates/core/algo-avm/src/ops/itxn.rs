@@ -659,4 +659,58 @@ mod tests {
         // RejectVersion (68) has itxVersion = 12, should succeed at version 12
         assert!(try_itxn_field(12, 68).is_ok());
     }
+
+    #[test]
+    fn test_bad_inner_fields_ported_from_go() {
+        // TestBadInnerFields (assembler_test.go#L3386): go rejects these at
+        // *assembly* time (its assembler statically resolves the itxn_field
+        // immediate's field name and checks itxVersion before the program
+        // ever runs). algod-rust enforces the identical itxVersion==0
+        // ("is not allowed", i.e. never settable) / itxVersion>version
+        // ("was introduced in vN") rules at *execution* time instead (see
+        // op_itxn_field's itx_version check) -- a different architectural
+        // layer (algod-rust's assembler has no itxn-field-name-aware static
+        // check), but the accept/reject verdict at each field/version pair
+        // is identical, which is what this test pins.
+        for (field_byte, name) in [
+            (2u8, "FirstValid"),
+            (3, "FirstValidTime"),
+            (4, "LastValid"),
+            (6, "Lease"),
+            (23, "TxID"),
+        ] {
+            // Always "not allowed" (itxVersion == 0), at both v5 and v6.
+            for version in [5, 6] {
+                let err = try_itxn_field(version, field_byte).unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains(&format!("invalid itxn_field {name}")),
+                    "{name} v{version}: expected itxVersion==0 rejection, got: {err}"
+                );
+            }
+        }
+
+        // Note (5) and VotePK (10) both have itxVersion = 6: rejected at
+        // v5, accepted at v6.
+        for (field_byte, name) in [(5u8, "Note"), (10, "VotePK")] {
+            let err = try_itxn_field(5, field_byte).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("invalid itxn_field {name}")),
+                "{name} v5: expected version-gated rejection, got: {err}"
+            );
+            assert!(
+                try_itxn_field(6, field_byte).is_ok(),
+                "{name} v6: expected acceptance"
+            );
+        }
+
+        // RejectVersion (68) has itxVersion = 12: rejected at v11, accepted
+        // at v12 (already covered by test_itxn_field_rejects_version_gated_fields
+        // / test_itxn_field_accepts_valid_fields above; repeated here to keep
+        // this test a self-contained port of go's TestBadInnerFields).
+        let err = try_itxn_field(11, 68).unwrap_err();
+        assert!(err.to_string().contains("invalid itxn_field RejectVersion"));
+        assert!(try_itxn_field(12, 68).is_ok());
+    }
 }
