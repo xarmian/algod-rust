@@ -2184,6 +2184,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_json_keys() {
+        // TestParseKeys (jsonspec_test.go): a broad sweep of key-spelling
+        // edge cases -- empty string key/value, a \u-escaped ASCII key
+        // (must resolve to the same value under both the escaped and
+        // literal spellings), duplicate top-level keys (rejected) vs.
+        // duplicate *nested* keys (fine, since only top-level keys are
+        // deduplicated), a dotted key, a double-colon (invalid JSON),
+        // a single-quoted string value (invalid JSON -- only double
+        // quotes are valid), and a bare numeric key (invalid JSON --
+        // object keys must be strings).
+        assert!(
+            parse_json_object(br#"{"": 1}"#).is_ok(),
+            "empty string key with int value should be accepted"
+        );
+        assert!(
+            parse_json_object(br#"{"": "algo"}"#).is_ok(),
+            "empty string key with string value should be accepted"
+        );
+
+        let escaped_input: &[u8] = b"{\"\\u0061\": 1}";
+        let escaped =
+            parse_json_object(escaped_input).expect("\\u0061-escaped key should be accepted");
+        assert_eq!(
+            escaped.get("\u{0061}").map(|v| v.as_slice()),
+            Some(b"1".as_slice()),
+            "escaped key should resolve under its literal-character spelling"
+        );
+        assert_eq!(
+            escaped.get("a").map(|v| v.as_slice()),
+            Some(b"1".as_slice()),
+            "\\u0061 should decode to the same key as literal 'a'"
+        );
+
+        assert!(
+            parse_json_object(br#"{"key0": 1,"key0": 2}"#).is_err(),
+            "duplicate top-level keys should be rejected"
+        );
+        assert!(
+            parse_json_object(br#"{"key0": 1,"key1": {"key2":2,"key2":"10"}}"#).is_ok(),
+            "duplicate keys nested inside a value are not top-level duplicates"
+        );
+        assert!(
+            parse_json_object(br#"{"keys.1": 1}"#).is_ok(),
+            "a dotted key should be accepted as an ordinary string key"
+        );
+        assert!(
+            parse_json_object(br#"{"key0":: 1}"#).is_err(),
+            "a double colon after the key should be rejected"
+        );
+        assert!(
+            parse_json_object(br#"{"key0":: "1"}"#).is_err(),
+            "a double colon before a string value should be rejected"
+        );
+        assert!(
+            parse_json_object(br#"{"key0": 'algo'}"#).is_err(),
+            "a single-quoted value is not valid JSON and should be rejected"
+        );
+        assert!(
+            parse_json_object(br#"{1: 1}"#).is_err(),
+            "a bare numeric key is not valid JSON and should be rejected"
+        );
+    }
+
     // ── JSON parser edge-case parity (issue #823 theme 2), ported from
     // go-algorand's jsonspec_test.go ────────────────────────────────
 
@@ -2288,6 +2352,40 @@ mod tests {
         let utf16le: Vec<u8> =
             r#"{"key0": "algo"}"#.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         assert!(parse_json_object(&utf16le).is_err());
+    }
+
+    #[test]
+    fn test_parse_json_utf16be_utf32_encoded_text_rejected() {
+        // TestParseFileEncoding (jsonspec_test.go): go verifies that none of
+        // UTF-16LE, UTF-16BE, UTF-32LE, or UTF-32BE encoded text (only
+        // plain UTF-8 is valid JSON) parse successfully. The UTF-16LE case
+        // is covered by test_parse_json_utf16_encoded_text_rejected above;
+        // this covers the remaining three encodings.
+        let text = r#"{"key0": "algo"}"#;
+
+        let utf16be: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+        assert!(
+            parse_json_object(&utf16be).is_err(),
+            "UTF-16BE encoded text should be rejected"
+        );
+
+        let utf32le: Vec<u8> = text
+            .chars()
+            .flat_map(|c| (c as u32).to_le_bytes())
+            .collect();
+        assert!(
+            parse_json_object(&utf32le).is_err(),
+            "UTF-32LE encoded text should be rejected"
+        );
+
+        let utf32be: Vec<u8> = text
+            .chars()
+            .flat_map(|c| (c as u32).to_be_bytes())
+            .collect();
+        assert!(
+            parse_json_object(&utf32be).is_err(),
+            "UTF-32BE encoded text should be rejected"
+        );
     }
 
     #[test]

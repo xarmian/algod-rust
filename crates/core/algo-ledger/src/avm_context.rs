@@ -7355,6 +7355,31 @@ mod tests {
     }
 
     #[test]
+    fn txn_field_gtxn_bad_index_rejected() {
+        // TestGtxnBadIndex (data/transactions/logic/eval_test.go): a `gtxn`
+        // referencing a group index >= the group's size must be rejected --
+        // go's program `{0x01, 0x33, 0x1, 0x01}` is `gtxn 1 Fee` in a
+        // single-txn group (index 1 is out of range for a size-1 group),
+        // and go asserts the error mentions "txn index 1". Rust's ledger
+        // AvmContext::txn_field already performs this bounds check (see
+        // the `group_index >= self.group.len()` guard above) with
+        // different wording ("group_index N out of range"); this closes
+        // the missing-test-coverage gap for that runtime rejection.
+        let sender = [10u8; 32];
+        let receiver = [20u8; 32];
+        let txn = make_pay_txn(sender, receiver, 5000);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]); // group size == 1
+
+        let err = ctx.txn_field(1, 1, None).unwrap_err(); // gtxn 1 Fee
+        let msg = err.to_string();
+        assert!(
+            msg.contains('1') && msg.to_lowercase().contains("out of range"),
+            "expected an out-of-range group-index error, got: {msg}"
+        );
+    }
+
+    #[test]
     fn txn_field_fee() {
         let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
         let mut store = LedgerState::new();
@@ -8442,6 +8467,61 @@ mod tests {
         assert_eq!(val, None);
     }
 
+    /// TestAppGlobalDelete (evalStateful_test.go): after writing two global
+    /// keys and then deleting both, both keys must read back as absent
+    /// (`app_global_get_ex`'s exists=false path) -- distinct from the
+    /// happy-path read/write covered by `app_global_state_read_write` above,
+    /// which only deletes and re-reads a single key.
+    #[test]
+    fn app_global_delete_multiple_keys() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.app_params.insert(
+            100,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: vec![],
+                clear_state_program: vec![],
+                global_state: BTreeMap::new(),
+                local_state_schema: StateSchema::default(),
+                global_state_schema: StateSchema {
+                    num_uint: 1,
+                    num_byte_slice: 1,
+                },
+                extra_program_pages: 0,
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        ctx.app_global_put(100, b"ALGO", TealValue::Uint(0x77))
+            .unwrap();
+        ctx.app_global_put(100, b"ALGOA", TealValue::Bytes(b"ALGO".to_vec()))
+            .unwrap();
+        assert_eq!(
+            ctx.app_global_get(100, b"ALGO").unwrap(),
+            Some(TealValue::Uint(0x77))
+        );
+        assert_eq!(
+            ctx.app_global_get(100, b"ALGOA").unwrap(),
+            Some(TealValue::Bytes(b"ALGO".to_vec()))
+        );
+
+        ctx.app_global_del(100, b"ALGO").unwrap();
+        ctx.app_global_del(100, b"ALGOA").unwrap();
+
+        assert_eq!(
+            ctx.app_global_get(100, b"ALGO").unwrap(),
+            None,
+            "ALGO should read back absent after delete"
+        );
+        assert_eq!(
+            ctx.app_global_get(100, b"ALGOA").unwrap(),
+            None,
+            "ALGOA should read back absent after delete"
+        );
+    }
+
     #[test]
     fn app_local_state_read_write() {
         let sender = [10u8; 32];
@@ -8482,6 +8562,52 @@ mod tests {
         // Write to non-opted-in app should fail
         let result = ctx.app_local_put(&sender, 99, b"x", TealValue::Uint(1));
         assert!(result.is_err());
+    }
+
+    /// TestAppLocalDelete (evalStateful_test.go): writing then deleting a
+    /// local-state key for *two different* opted-in accounts (sender and an
+    /// "other" account) must leave both accounts reading back absent for
+    /// their respective keys -- go's version specifically exercises two
+    /// distinct accounts' local storage, unlike the single-account
+    /// read/write/delete already covered by `app_local_state_read_write`.
+    #[test]
+    fn app_local_delete_two_accounts() {
+        let sender = [10u8; 32];
+        let other = [20u8; 32];
+        let txn = make_pay_txn(sender, other, 5000);
+        let mut store = LedgerState::new();
+        for addr in [sender, other] {
+            store.app_local_states.insert(
+                (Address(addr), 100),
+                AppLocalState {
+                    schema: StateSchema {
+                        num_uint: 1,
+                        num_byte_slice: 1,
+                    },
+                    key_value: BTreeMap::new(),
+                },
+            );
+        }
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        ctx.app_local_put(&sender, 100, b"ALGO", TealValue::Uint(0x77))
+            .unwrap();
+        ctx.app_local_put(&other, 100, b"ALGOA", TealValue::Bytes(b"ALGO".to_vec()))
+            .unwrap();
+
+        ctx.app_local_del(&sender, 100, b"ALGO").unwrap();
+        ctx.app_local_del(&other, 100, b"ALGOA").unwrap();
+
+        assert_eq!(
+            ctx.app_local_get(&sender, 100, b"ALGO").unwrap(),
+            None,
+            "sender's ALGO key should read back absent after delete"
+        );
+        assert_eq!(
+            ctx.app_local_get(&other, 100, b"ALGOA").unwrap(),
+            None,
+            "other account's ALGOA key should read back absent after delete"
+        );
     }
 
     /// Port of go-algorand's `roundCowState.getKey`/`setKey`/`delKey`
