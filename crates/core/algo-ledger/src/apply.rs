@@ -1857,7 +1857,6 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     // Store block header data, full block data, and txtail for history.
     // These are auxiliary tracker writes — failures are logged but do not
     // fail block application (matches go-algorand's tracker persistence pattern).
-    // TODO(Epic 25b): Wire up `forget_before` to prune old blocks/txtail entries.
     let hdrdata = algo_codec::canonical_encode_block_header_from_block(block);
     let blkdata = algo_codec::canonical_encode_block(block);
     let proto = &block.current_protocol;
@@ -1869,6 +1868,26 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     let txtail_data = algo_codec::canonical_encode_txtail_round(&txtail);
     if let Err(e) = store.put_txtail(block.round.0, &txtail_data) {
         tracing::warn!("put_txtail failed for round {}: {e}", block.round.0);
+    }
+
+    // Prune blockdb/txtail rows that have fallen outside the retention
+    // window, mirroring go-algorand's `txTail` tracker (`ledger/txtail.go`):
+    // `prepareCommit` sets `retainSize := MaxTxnLife + DeeperBlockHeaderHistory`
+    // and `commitRound` computes `forgetBeforeRound := (newBase + 1).SubSaturate(retainSize)`
+    // before calling `TxtailNewRound(..., forgetBeforeRound)`. Without this,
+    // `SqliteLedger`'s blockdb/txtail tables grow unbounded on a live node
+    // (issue #1350) -- `forget_before` existed but was never invoked from the
+    // real per-block commit path. Same failure policy as the writes above:
+    // auxiliary tracker maintenance, logged rather than fatal.
+    let retain_size = consensus.max_txn_life + consensus.deeper_block_header_history;
+    let forget_before_round = (block.round.0 + 1).saturating_sub(retain_size);
+    if forget_before_round > 0 {
+        if let Err(e) = store.forget_before(forget_before_round) {
+            tracing::warn!(
+                "forget_before({forget_before_round}) failed for round {}: {e}",
+                block.round.0
+            );
+        }
     }
 
     // State-proof verification-context tracker (issue #632): mirrors go's
@@ -8238,6 +8257,76 @@ mod tests {
             assert!(state.get_block_data(r).unwrap().is_some());
             assert!(state.get_txtail(r).unwrap().is_some());
         }
+    }
+
+    /// Issue #1350: `apply_block`'s real per-block commit path must prune
+    /// blockdb/txtail rows once they fall outside go-algorand's txTail
+    /// retention window (`MaxTxnLife + DeeperBlockHeaderHistory`), not just
+    /// leave `forget_before` wired up but uncalled. Before the fix, this
+    /// failed: round 1's block/txtail rows were still present after a much
+    /// later block was applied.
+    #[test]
+    fn test_apply_block_prunes_old_blocks_and_txtail_beyond_retention_window() {
+        use crate::store_trait::LedgerStore;
+
+        let fee_sink = Address([3u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 10_000_000), (receiver, 1_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        // Apply a block at round 1 -- its block/header/txtail rows must
+        // exist right after commit.
+        let mut block1 = make_test_block(fee_sink);
+        block1.round = Round(1);
+        apply_block(&mut state, &block1).unwrap();
+
+        assert!(state.get_block_data(1).unwrap().is_some());
+        assert!(state.get_txtail(1).unwrap().is_some());
+
+        // go-algorand's txTail tracker retains `MaxTxnLife +
+        // DeeperBlockHeaderHistory` rounds (`ledger/txtail.go`'s
+        // `prepareCommit`/`commitRound`); for CONSENSUS_V41 that's
+        // 1000 + 1 = 1001. Apply blocks (round monotonicity is enforced,
+        // so every intermediate round must be applied too, with empty
+        // paysets to keep this cheap) far enough ahead that round 1 falls
+        // outside that window: forget_before = (far_round + 1) - retain_size.
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        let retain_size = consensus.max_txn_life + consensus.deeper_block_header_history;
+        let far_round = retain_size + 50;
+
+        for r in 2..far_round {
+            let mut block = make_test_block(fee_sink);
+            block.round = Round(r);
+            block.payset = Vec::new();
+            apply_block(&mut state, &block).unwrap();
+        }
+
+        let mut block2 = make_test_block(fee_sink);
+        block2.round = Round(far_round);
+        apply_block(&mut state, &block2).unwrap();
+
+        assert!(
+            state.get_block_data(1).unwrap().is_none(),
+            "round 1's block data must be pruned once it falls outside the retention window"
+        );
+        assert!(
+            state.get_txtail(1).unwrap().is_none(),
+            "round 1's txtail entry must be pruned once it falls outside the retention window"
+        );
+        assert!(
+            state.get_block_data(far_round).unwrap().is_some(),
+            "the just-applied round's block data must remain"
+        );
+        assert!(
+            state.get_txtail(far_round).unwrap().is_some(),
+            "the just-applied round's txtail entry must remain"
+        );
     }
 
     // ── Heartbeat tests ──────────────────────────────────────────────
