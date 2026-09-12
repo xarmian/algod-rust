@@ -11104,6 +11104,62 @@ mod tests {
         assert!(!resources.shared_locals.contains(&(sender, 999)));
     }
 
+    /// Port of go-algorand's `TestZeroAppLocalsAccess`'s "short way" case
+    /// (`ledger/apptxn_test.go`): a `LocalsRef{Address: <index>, App: 0}`
+    /// entry means "App 0 = the app being called", not "no app". The
+    /// version/create gating for whether `App: 0` is even *accepted* lives
+    /// entirely in `algo_validate`'s wellformed check
+    /// (`test_appl_access_locals_zero_app_accepted_on_noncreation_call` et
+    /// al., `AllowZeroLocalAppRef`/v42) -- by the time a transaction reaches
+    /// `fill_group_resources`, a disallowed `App: 0` has already been
+    /// rejected, so this test only needs to confirm the *resolution*
+    /// itself: once accepted, `App: 0` must resolve to the called app's ID
+    /// and correctly share the referenced account's local state for it,
+    /// not silently resolve to app 0 (no app) or fail to share anything.
+    #[test]
+    fn fill_group_resources_locals_ref_app_zero_means_called_app() {
+        let sender = [62u8; 32];
+        let other_acct = Address([63u8; 32]);
+        let called_app = 902u64;
+        let txn = SignedTransaction {
+            txn: Transaction {
+                txn_type: "appl".into(),
+                sender: Address(sender),
+                fee: 1000,
+                application_id: called_app,
+                access: Some(vec![
+                    ResourceRef {
+                        address: other_acct,
+                        ..Default::default()
+                    },
+                    ResourceRef {
+                        // Locals for (Access[0]=other_acct, App: 0 = the
+                        // called app itself) -- the "short way" from
+                        // TestZeroAppLocalsAccess.
+                        locals: Some(LocalsRef { address: 1, app: 0 }),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resources = fill_group_resources(&[txn]);
+
+        assert!(resources.shared_accounts.contains(&other_acct.0));
+        // The key assertion: App: 0 resolved to `called_app` (902), not to
+        // app ID 0 and not left unshared.
+        assert!(
+            resources
+                .shared_locals
+                .contains(&(other_acct.0, called_app)),
+            "LocalsRef{{App: 0}} must share the referenced account's local \
+             state for the CALLED app, not app 0: {:?}",
+            resources.shared_locals
+        );
+        assert!(!resources.shared_locals.contains(&(other_acct.0, 0)));
+    }
+
     #[test]
     fn fill_group_resources_covers_access_list() {
         // Matches go's `fillApplicationCallAccess`: the sender, the called
