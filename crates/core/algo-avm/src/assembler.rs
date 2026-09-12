@@ -6195,29 +6195,48 @@ dup
         // argument type should be `uint64` (foreign-accounts-array index)
         // below `directRefEnabledVersion` (=4), and `Any` (a direct address
         // reference, e.g. an address literal, is also accepted) from v4 on
-        // -- opcodes.go:668-669. The v4+ half (a real address-shaped
-        // argument is accepted) already passes: `TYPE_TABLE`'s default
-        // `Any` pop already accepts it. The pre-v4 half -- rejecting a
-        // `[1]byte` in the `uint64`-only proto with "balance arg 0 wanted
-        // type uint64 got [1]byte" -- is a real gap: `type_track.rs` has no
-        // version-gated `"balance"`/`"min_balance"` arm (unlike
-        // `asset_holding_get`, which does have one), so pre-v4 programs get
-        // no static type check on this argument at all. Filed as issue
-        // #1366; not fixed here.
+        // -- opcodes.go:668-669. Below v4, a `[1]byte` value in the
+        // `uint64`-only proto must be rejected with "balance arg 0 wanted
+        // type uint64 got [1]byte" (issue #1366, fixed via the same
+        // version-gated `refined_types` arm `asset_holding_get` already
+        // has).
         let source = "byte 0x00\nbalance\nint 1\n==\n";
-        for v in 4..=opcode::MAX_AVM_VERSION {
+        const DIRECT_REF_ENABLED_VERSION: u8 = 4;
+        for v in 2..DIRECT_REF_ENABLED_VERSION {
+            let errs = expect_errors(&format!("#pragma version {v}\n{source}"));
+            // go's error also reports the exact bound length ("got
+            // [1]byte") -- this module's `StackType` doesn't model bound
+            // lengths (see `asset_holding_get`'s equivalent test), so only
+            // the "wanted type uint64" half is asserted here.
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("balance arg 0 wanted type uint64")),
+                "v{v}: {errs:?}"
+            );
+        }
+        for v in DIRECT_REF_ENABLED_VERSION..=opcode::MAX_AVM_VERSION {
             assemble_string(&format!("#pragma version {v}\n{source}")).unwrap();
         }
     }
 
     #[test]
     fn test_assemble_min_balance_type_check_ported_from_go() {
-        // TestAssembleMinBalance (assembler_test.go#L2404): same gap as
+        // TestAssembleMinBalance (assembler_test.go#L2404): same pattern as
         // TestAssembleBalance above (issue #1366), for `min_balance`
-        // (introduced at v3, opcodes.go:693-694). Only the v4+ half is
-        // ported here.
+        // (introduced at v3, opcodes.go:693-694).
         let source = "byte 0x00\nmin_balance\nint 1\n==\n";
-        for v in 4..=opcode::MAX_AVM_VERSION {
+        const DIRECT_REF_ENABLED_VERSION: u8 = 4;
+        for v in 3..DIRECT_REF_ENABLED_VERSION {
+            let errs = expect_errors(&format!("#pragma version {v}\n{source}"));
+            // Same bound-length caveat as `test_assemble_balance_type_check_ported_from_go`
+            // above.
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("min_balance arg 0 wanted type uint64")),
+                "v{v}: {errs:?}"
+            );
+        }
+        for v in DIRECT_REF_ENABLED_VERSION..=opcode::MAX_AVM_VERSION {
             assemble_string(&format!("#pragma version {v}\n{source}")).unwrap();
         }
     }
