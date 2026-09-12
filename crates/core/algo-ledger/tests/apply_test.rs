@@ -158,6 +158,63 @@ fn test_apply_block_multiple_txns() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. Round continuity: applying an out-of-order or duplicate block is
+// rejected (TestPutBlockTooOld, `ledger/blockqueue_test.go`). go's
+// `blockQ.putBlock` rejects both (a) a block far behind the ledger's
+// current round, and (b) a duplicate re-put of an already-applied round,
+// both with a `ledgercore.BlockInLedgerError`. algod-rust applies blocks
+// synchronously rather than through an async queue, so the equivalent
+// enforcement point is `apply_block`'s round-monotonicity check
+// (`apply.rs`'s `"expected round {}, got {}"`), which rejects a block
+// whose round isn't exactly `current_round + 1` -- covering both cases
+// under the same guard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_apply_block_rejects_round_far_behind_current() {
+    // Mirrors go's first `putBlock` case: attempting to add a block whose
+    // round is well before the ledger's current round.
+    let fee_sink = Address([3u8; 32]);
+    let mut state = make_state(&[(fee_sink, 0)], fee_sink);
+    state.current_round = Round(10);
+
+    let stale_block = minimal_block(fee_sink, 0, vec![]);
+    let err = apply_block(&mut state, &stale_block).unwrap_err();
+    assert!(
+        err.to_string().contains("expected round"),
+        "expected a round-continuity rejection, got: {err}"
+    );
+    // The ledger's round must not have moved as a result of the rejection.
+    assert_eq!(state.current_round, Round(10));
+}
+
+#[test]
+fn test_apply_block_rejects_duplicate_round() {
+    // Mirrors go's second `putBlock` case: adding a block for round 1
+    // succeeds, but re-adding a block for that same round afterward fails.
+    let fee_sink = Address([3u8; 32]);
+    let mut state = make_state(&[(fee_sink, 0)], fee_sink);
+
+    let block1 = minimal_block(fee_sink, 1, vec![]);
+    apply_block(&mut state, &block1).unwrap();
+    assert_eq!(state.current_round, Round(1));
+
+    // Re-applying the same round again (the ledger has already moved past
+    // it) must be rejected, not silently re-accepted or double-applied.
+    let duplicate = minimal_block(fee_sink, 1, vec![]);
+    let err = apply_block(&mut state, &duplicate).unwrap_err();
+    assert!(
+        err.to_string().contains("expected round"),
+        "expected a round-continuity rejection for the duplicate, got: {err}"
+    );
+    assert_eq!(
+        state.current_round,
+        Round(1),
+        "the rejected duplicate must not move the round forward again"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 3. apply_block updates rewards state and current_round
 // ---------------------------------------------------------------------------
 
