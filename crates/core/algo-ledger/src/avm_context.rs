@@ -5022,10 +5022,22 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     ) -> Result<Option<TealValue>, AlgoError> {
         self.note_local_access(account, app_id);
         let addr = Address(*account);
-        let value = match self.store.get_app_local_state(&addr, app_id) {
-            Some(local) => local.key_value.get(key).cloned(),
-            None => None,
-        };
+        // Matches go-algorand's `roundCowState.getKey` (`ledger/eval/appcow.go`):
+        // a local-state read first checks whether the account has ANY
+        // AppLocalState allocated for this app at all ("allocated"). If not,
+        // this is a hard error ("cannot fetch key, <addr> has not opted in
+        // to app <id>") -- distinct from "opted in, but this key is absent",
+        // which returns None (no error) below. Never opting in at all is a
+        // stronger, always-checked condition layered after resource
+        // availability (checked by the opcode dispatch before this call),
+        // not a replacement for it.
+        let local = self
+            .store
+            .get_app_local_state(&addr, app_id)
+            .ok_or_else(|| AlgoError::Avm {
+                message: format!("cannot fetch key, {addr} has not opted in to app {app_id}"),
+            })?;
+        let value = local.key_value.get(key).cloned();
         self.record_app_state_access(
             app_id,
             AppStateType::Local,
@@ -5089,10 +5101,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             .store
             .get_app_local_state(&addr, app_id)
             .ok_or_else(|| AlgoError::Avm {
-                message: format!(
-                    "app_local_put: account {} not opted in to app {app_id}",
-                    Address(*account)
-                ),
+                // Matches go-algorand's `roundCowState.setKey`
+                // (`ledger/eval/appcow.go`): "cannot set key, <addr> has not
+                // opted in to app <id>".
+                message: format!("cannot set key, {addr} has not opted in to app {app_id}"),
             })?;
         let pre = local.key_value.get(key).cloned();
         self.record_app_state_access(
@@ -5157,10 +5169,18 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     ) -> Result<(), AlgoError> {
         self.note_local_access(account, app_id);
         let addr = Address(*account);
-        let pre = self
+        // Matches go-algorand's `roundCowState.delKey` (`ledger/eval/appcow.go`):
+        // deleting from local state requires the account to have opted in
+        // (an allocated `AppLocalState`) at all -- "cannot del key, <addr>
+        // has not opted in to app <id>" -- even though deleting an absent
+        // *key* within already-opted-in storage is a normal no-op.
+        let mut local = self
             .store
             .get_app_local_state(&addr, app_id)
-            .and_then(|l| l.key_value.get(key).cloned());
+            .ok_or_else(|| AlgoError::Avm {
+                message: format!("cannot del key, {addr} has not opted in to app {app_id}"),
+            })?;
+        let pre = local.key_value.get(key).cloned();
         let key_existed = pre.is_some();
         self.record_app_state_access(
             app_id,
@@ -5171,10 +5191,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             pre,
             None,
         );
-        if let Some(mut local) = self.store.get_app_local_state(&addr, app_id) {
-            local.key_value.remove(key);
-            self.store.set_app_local_state(&addr, app_id, local);
-        }
+        local.key_value.remove(key);
+        self.store.set_app_local_state(&addr, app_id, local);
         // Track delta for EvalDelta comparison. Matching go-algorand's
         // opAppLocalDel ("if deleting a non-existent value, don't record in
         // EvalDelta, matching ledger behavior with previous BuildEvalDelta
@@ -8442,6 +8460,66 @@ mod tests {
         // Write to non-opted-in app should fail
         let result = ctx.app_local_put(&sender, 99, b"x", TealValue::Uint(1));
         assert!(result.is_err());
+    }
+
+    /// Port of go-algorand's `roundCowState.getKey`/`setKey`/`delKey`
+    /// (`ledger/eval/appcow.go`): `app_local_get`/`app_local_put`/
+    /// `app_local_del` must hard-error with go's exact message
+    /// ("cannot <verb> key, <addr> has not opted in to app <id>") when the
+    /// target account has NEVER opted into the app's local storage at all
+    /// -- distinct from "opted in, key absent", which stays a silent
+    /// `None`/no-op (issue #1356).
+    #[test]
+    fn app_local_get_and_del_error_when_never_opted_in() {
+        let sender = [11u8; 32];
+        let txn = make_pay_txn(sender, [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        // `sender` has never opted in to app 42 at all: no
+        // `app_local_states` entry for (sender, 42).
+        let mut ctx = make_context(&mut store, vec![txn]);
+        assert!(!ctx.app_opted_in(&sender, 42).unwrap());
+
+        let addr_str = Address(sender).to_string();
+
+        let get_err = ctx.app_local_get(&sender, 42, b"x").unwrap_err();
+        assert_eq!(
+            get_err.to_string(),
+            format!("AVM: cannot fetch key, {addr_str} has not opted in to app 42")
+        );
+
+        let put_err = ctx
+            .app_local_put(&sender, 42, b"x", TealValue::Uint(1))
+            .unwrap_err();
+        assert_eq!(
+            put_err.to_string(),
+            format!("AVM: cannot set key, {addr_str} has not opted in to app 42")
+        );
+
+        let del_err = ctx.app_local_del(&sender, 42, b"x").unwrap_err();
+        assert_eq!(
+            del_err.to_string(),
+            format!("AVM: cannot del key, {addr_str} has not opted in to app 42")
+        );
+    }
+
+    /// The still-correct counterpart: opted in, but the specific key is
+    /// absent -- must stay a silent `None`, never an error (issue #1356
+    /// acceptance criteria).
+    #[test]
+    fn app_local_get_key_absent_but_opted_in_returns_none() {
+        let sender = [12u8; 32];
+        let txn = make_pay_txn(sender, [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        store.app_local_states.insert(
+            (Address(sender), 42),
+            AppLocalState {
+                schema: StateSchema::default(),
+                key_value: BTreeMap::new(),
+            },
+        );
+        let ctx = make_context(&mut store, vec![txn]);
+        assert!(ctx.app_opted_in(&sender, 42).unwrap());
+        assert_eq!(ctx.app_local_get(&sender, 42, b"missing").unwrap(), None);
     }
 
     /// go-algorand's `opAppGlobalDel` only records a `DeleteAction` EvalDelta
