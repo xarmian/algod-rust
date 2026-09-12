@@ -1976,3 +1976,127 @@ int 1
         "the inner call's own EvalDelta must carry the actual state change"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 17 (issue #1322): TestBoxAccountData (ledger/boxtxn_test.go:441)
+//
+// `acct_params_get AcctMinBalance`/`AcctTotalBoxes`/`AcctTotalBoxBytes`,
+// read against a FOREIGN account (a box-owning app's own address, passed
+// via `Accounts`) from a SEPARATE verifier app, must reflect that
+// account's real box-derived MBR/box-count/box-bytes state after a
+// `box_create`. The existing `test_min_balance_with_apps_and_boxes`
+// (params.rs) only checks the internal `min_balance` helper function in
+// isolation against a hand-built `AccountData`; it never proves the
+// `acct_params_get` opcode itself surfaces the same numbers for a REAL
+// account, from a DIFFERENT app, after a real `box_create`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_box_account_data_visible_via_acct_params_get_from_another_app() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let box_app_id = 970u64;
+    let verify_app_id = 971u64;
+
+    let box_app_addr = Address(algo_ledger::avm_context::app_address(box_app_id));
+
+    let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
+    state.get_or_default_account_mut(&box_app_addr).micro_algos = 10_000_000;
+
+    // box_app: on a real (non-creation) call, create a box named "x" of
+    // size 16.
+    let box_app_src = "#pragma version 8
+txn ApplicationID
+bz end
+byte \"x\"
+int 16
+box_create
+pop
+end:
+int 1
+";
+    state.app_params.insert(
+        box_app_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(box_app_src),
+            clear_state_program: assemble(APPROVE_SRC),
+            ..Default::default()
+        },
+    );
+
+    // verify_app: read AcctMinBalance/AcctTotalBoxes/AcctTotalBoxBytes for
+    // `txn Accounts 1` (the box_app's own account) and assert against the
+    // values passed in as ApplicationArgs.
+    let verify_app_src = "#pragma version 8
+txn ApplicationArgs 0
+btoi
+txn Accounts 1
+acct_params_get AcctMinBalance
+assert
+==
+assert
+
+txn ApplicationArgs 1
+btoi
+txn Accounts 1
+acct_params_get AcctTotalBoxes
+assert
+==
+assert
+
+txn ApplicationArgs 2
+btoi
+txn Accounts 1
+acct_params_get AcctTotalBoxBytes
+assert
+==
+assert
+
+int 1
+";
+    state.app_params.insert(
+        verify_app_id,
+        algo_types::AppParams {
+            creator,
+            approval_program: assemble(verify_app_src),
+            clear_state_program: assemble(APPROVE_SRC),
+            ..Default::default()
+        },
+    );
+
+    // Create the box.
+    let mut create_call = appl_call(creator, 1_000, box_app_id, 0, None);
+    create_call.txn.boxes = Some(vec![algo_types::BoxRef {
+        index: 0,
+        name: Some(serde_bytes::ByteBuf::from(b"x".to_vec())),
+    }]);
+    let create_block = minimal_block(fee_sink, 1, vec![create_call]);
+    apply_block_capturing_apply_data(&mut state, &create_block, ApplyMode::Execute)
+        .expect("box creation call must apply cleanly");
+
+    // Compute the expected MinBalance the same way the real ledger does
+    // (self-consistency: this isn't hardcoding go's formula, it's the same
+    // helper `params::min_balance` already used elsewhere in this crate).
+    let box_account = state.get_account(&box_app_addr).unwrap();
+    assert_eq!(box_account.total_boxes, 1);
+    assert_eq!(box_account.total_box_bytes, 1 + 16); // name "x" (1 byte) + size 16
+    let expected_min_balance = algo_ledger::min_balance(box_account);
+
+    fn u64_arg(v: u64) -> Vec<u8> {
+        v.to_be_bytes().to_vec()
+    }
+
+    let mut verify_call = appl_call(creator, 1_000, verify_app_id, 0, None);
+    verify_call.txn.accounts = Some(vec![box_app_addr]);
+    verify_call.txn.app_arguments = Some(vec![
+        Some(serde_bytes::ByteBuf::from(u64_arg(expected_min_balance))),
+        Some(serde_bytes::ByteBuf::from(u64_arg(1))),
+        Some(serde_bytes::ByteBuf::from(u64_arg(17))),
+    ]);
+    let verify_block = minimal_block(fee_sink, 2, vec![verify_call]);
+    apply_block_capturing_apply_data(&mut state, &verify_block, ApplyMode::Execute).expect(
+        "verify app's acct_params_get reads of the box app's account must \
+         match its real MinBalance/TotalBoxes/TotalBoxBytes",
+    );
+}
