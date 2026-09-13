@@ -200,7 +200,7 @@ impl FallbackEndpoints {
 /// matching go's `addr.IsMultiaddr`'s prefix test (a leading `/` that isn't
 /// the start of a scheme-relative URL's `//`) without pulling in a
 /// multiaddr-parsing dependency this crate doesn't otherwise need.
-fn is_multiaddr_like(s: &str) -> bool {
+pub(crate) fn is_multiaddr_like(s: &str) -> bool {
     s.starts_with('/') && !s.starts_with("//")
 }
 
