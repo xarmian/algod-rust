@@ -5114,6 +5114,61 @@ dup
         }
     }
 
+    // Closes the remaining `TestAssembleDisassembleErrors` parity gap noted
+    // in Phase 17: go's exact "program end while reading immediate %s for
+    // %s" wording (assembler.go:3071) for a program truncated mid-immediate,
+    // ported verbatim for each of go's sub-cases (asset_params_get's field
+    // byte, gtxna's three immediates one at a time, txna's index byte, and
+    // substring's end-offset byte).
+    #[test]
+    fn test_disassemble_truncated_immediate_reports_go_wording() {
+        let truncate_and_expect = |source: &str, drop: usize, expected: &str| {
+            let ops = assemble_string(source).unwrap();
+            let program = &ops.program[..ops.program.len() - drop];
+            let err = crate::disassembler::disassemble(program).unwrap_err();
+            assert!(
+                err.contains(expected),
+                "source {source:?} truncated by {drop}: expected {expected:?}, got {err:?}"
+            );
+        };
+
+        truncate_and_expect(
+            "#pragma version 8\nint 0\nasset_params_get AssetTotal\n",
+            1,
+            "program end while reading immediate f for asset_params_get",
+        );
+
+        // gtxna has three immediates (t, f, i in that declaration order);
+        // dropping 1/2/3 trailing bytes must name i/f/t respectively.
+        truncate_and_expect(
+            "#pragma version 8\ngtxna 0 Accounts 0\n",
+            1,
+            "program end while reading immediate i for gtxna",
+        );
+        truncate_and_expect(
+            "#pragma version 8\ngtxna 0 Accounts 0\n",
+            2,
+            "program end while reading immediate f for gtxna",
+        );
+        truncate_and_expect(
+            "#pragma version 8\ngtxna 0 Accounts 0\n",
+            3,
+            "program end while reading immediate t for gtxna",
+        );
+
+        truncate_and_expect(
+            "#pragma version 8\ntxna Accounts 0\n",
+            1,
+            "program end while reading immediate i for txna",
+        );
+
+        truncate_and_expect(
+            "#pragma version 8\nbyte 0x4141\nsubstring 0 1\n",
+            1,
+            "program end while reading immediate e for substring",
+        );
+    }
+
     #[test]
     fn test_disassemble_illegal_opcode_and_unsupported_version() {
         // 0xff is not (currently) assigned to any opcode.
@@ -5229,6 +5284,156 @@ dup
             tokenize_line("xbase64 ABC//== rest"),
             vec!["xbase64", "ABC"]
         );
+    }
+
+    // Full port of go-algorand's `TestTokensFromLine`
+    // (`data/transactions/logic/assembler_test.go:1727`), closing out the
+    // remaining "partial" gap noted in Phase 17: the two prior tests here
+    // covered the `;`-token and base64/b64-literal-suppresses-comment
+    // behaviors individually, but not go's full `check(...)` case table.
+    // Every `check(line, tokens...)` call from go's test is reproduced
+    // here verbatim against `tokenize_line`; rust's tokenizer has a
+    // different internal architecture (no macro-expansion pass) but must
+    // still agree with go on every one of these token splits.
+    #[test]
+    fn test_tokenize_line_go_parity_full_sweep() {
+        assert_eq!(tokenize_line("op arg"), vec!["op", "arg"]);
+        assert_eq!(tokenize_line("op arg // test"), vec!["op", "arg"]);
+        assert_eq!(
+            tokenize_line("op base64 ABC//=="),
+            vec!["op", "base64", "ABC//=="]
+        );
+        assert_eq!(
+            tokenize_line("op base64 base64"),
+            vec!["op", "base64", "base64"]
+        );
+        assert_eq!(
+            tokenize_line("op base64 base64 //comment"),
+            vec!["op", "base64", "base64"]
+        );
+        assert_eq!(
+            tokenize_line("op base64 base64; op2 //done"),
+            vec!["op", "base64", "base64", ";", "op2"]
+        );
+        assert_eq!(
+            tokenize_line("op base64 ABC/=="),
+            vec!["op", "base64", "ABC/=="]
+        );
+        assert_eq!(
+            tokenize_line("op base64 ABC/== /"),
+            vec!["op", "base64", "ABC/==", "/"]
+        );
+        assert_eq!(
+            tokenize_line("op base64 ABC/== //"),
+            vec!["op", "base64", "ABC/=="]
+        );
+        assert_eq!(
+            tokenize_line("op base64 ABC//== //"),
+            vec!["op", "base64", "ABC//=="]
+        );
+        assert_eq!(
+            tokenize_line("op b64 ABC//== //"),
+            vec!["op", "b64", "ABC//=="]
+        );
+        assert_eq!(
+            tokenize_line("op b64(ABC//==) // comment"),
+            vec!["op", "b64(ABC//==)"]
+        );
+        assert_eq!(
+            tokenize_line("op base64(ABC//==) // comment"),
+            vec!["op", "base64(ABC//==)"]
+        );
+        assert_eq!(
+            tokenize_line("op b64(ABC/==) // comment"),
+            vec!["op", "b64(ABC/==)"]
+        );
+        assert_eq!(
+            tokenize_line("op base64(ABC/==) // comment"),
+            vec!["op", "base64(ABC/==)"]
+        );
+        assert_eq!(tokenize_line("base64(ABC//==)"), vec!["base64(ABC//==)"]);
+        assert_eq!(tokenize_line("b(ABC//==)"), vec!["b(ABC"]);
+        assert_eq!(tokenize_line("b(ABC//==) //"), vec!["b(ABC"]);
+        assert_eq!(tokenize_line("b(ABC ==) //"), vec!["b(ABC", "==)"]);
+        assert_eq!(
+            tokenize_line("op base64 ABC)"),
+            vec!["op", "base64", "ABC)"]
+        );
+        assert_eq!(
+            tokenize_line("op base64 ABC) // comment"),
+            vec!["op", "base64", "ABC)"]
+        );
+        assert_eq!(
+            tokenize_line("op base64 ABC//) // comment"),
+            vec!["op", "base64", "ABC//)"]
+        );
+        assert_eq!(tokenize_line(r#"op "test""#), vec!["op", r#""test""#]);
+        assert_eq!(
+            tokenize_line(r#"op "test1 test2""#),
+            vec!["op", r#""test1 test2""#]
+        );
+        assert_eq!(
+            tokenize_line(r#"op "test1 test2" // comment"#),
+            vec!["op", r#""test1 test2""#]
+        );
+        assert_eq!(
+            tokenize_line(r#"op "test1 test2 // not a comment""#),
+            vec!["op", r#""test1 test2 // not a comment""#]
+        );
+        assert_eq!(
+            tokenize_line(r#"op "test1 test2 // not a comment" // comment"#),
+            vec!["op", r#""test1 test2 // not a comment""#]
+        );
+        assert_eq!(
+            tokenize_line(r#"op "test1 test2" //"#),
+            vec!["op", r#""test1 test2""#]
+        );
+        assert_eq!(
+            tokenize_line(r#"op "test1 test2"//"#),
+            vec!["op", r#""test1 test2""#]
+        );
+        // Non-terminated string literal: no closing quote at all.
+        assert_eq!(
+            tokenize_line(r#"op "test1 test2"#),
+            vec!["op", r#""test1 test2"#]
+        );
+        // Non-terminated string literal: trailing backslash-escaped quote
+        // does not close it.
+        assert_eq!(
+            tokenize_line(r#"op "test1 test2\""#),
+            vec!["op", "\"test1 test2\\\""]
+        );
+        // A leading backslash means this is NOT a string literal -- go's
+        // tokenizer only treats an *unescaped* `"` as a string opener.
+        assert_eq!(
+            tokenize_line(r#"op \"test1 test2\""#),
+            vec!["op", "\\\"test1", "test2\\\""]
+        );
+        assert_eq!(tokenize_line(r#""test1 test2""#), vec![r#""test1 test2""#]);
+        assert_eq!(
+            tokenize_line(r#"\"test1 test2""#),
+            vec!["\\\"test1", "test2\""]
+        );
+        assert_eq!(tokenize_line(r#""" // test"#), vec![r#""""#]);
+        assert_eq!(
+            tokenize_line("int 1; int 2"),
+            vec!["int", "1", ";", "int", "2"]
+        );
+        assert_eq!(
+            tokenize_line("int 1;;;int 2"),
+            vec!["int", "1", ";", ";", ";", "int", "2"]
+        );
+        assert_eq!(
+            tokenize_line("int 1; ;int 2;; ; ;; "),
+            vec!["int", "1", ";", ";", "int", "2", ";", ";", ";", ";", ";"]
+        );
+        assert_eq!(tokenize_line(";"), vec![";"]);
+        assert_eq!(
+            tokenize_line("; ; ;;;;"),
+            vec![";", ";", ";", ";", ";", ";"]
+        );
+        assert_eq!(tokenize_line(" ;"), vec![";"]);
+        assert_eq!(tokenize_line(" ; "), vec![";"]);
     }
 
     #[test]
