@@ -33,6 +33,21 @@ use rand::seq::SliceRandom;
 
 use crate::peer_role::{Role, RoleSet};
 
+// Structural check for a libp2p multiaddr (`/ip4/.../tcp/.../p2p/...`),
+// mirroring go's `addr.IsMultiaddr` prefix test. go's `NewWebsocketNetwork`
+// (`network/wsNetwork.go`) filters a mixed bootstrap/phonebook address list
+// through `addr.ParseHostOrURL` before ever calling `AddPersistentPeers`, so
+// multiaddr-formatted entries never reach the classic ws-transport phonebook
+// -- only plain `"host:port"` entries do (`TestWsNetworkPhonebookMix`,
+// `network/wsNetwork_test.go`). [`replace_peer_list`] and
+// [`add_persistent_peers`] below reuse the same structural check already
+// used by [`crate::block_service`]'s fallback-endpoint parsing, rather than
+// duplicating it.
+//
+// [`replace_peer_list`]: Phonebook::replace_peer_list
+// [`add_persistent_peers`]: Phonebook::add_persistent_peers
+use crate::block_service::is_multiaddr_like as is_multiaddr;
+
 /// Sentinel value: when passed to [`Phonebook::get_addresses`], retrieves all
 /// eligible addresses regardless of count.
 const GET_ALL_ADDRESSES: usize = usize::MAX;
@@ -244,6 +259,18 @@ impl Phonebook {
     ///   name and role updated.
     /// * Persistent peers for this role are never removed.
     pub fn replace_peer_list(&self, dns_addresses: &[String], network_name: &str, role: Role) {
+        let filtered: Vec<String>;
+        let dns_addresses: &[String] = if dns_addresses.iter().any(|a| is_multiaddr(a)) {
+            filtered = dns_addresses
+                .iter()
+                .filter(|a| !is_multiaddr(a))
+                .cloned()
+                .collect();
+            &filtered
+        } else {
+            dns_addresses
+        };
+
         let mut inner = self.inner.write().unwrap();
 
         // Build a map of items to remove: entries belonging to network_name
@@ -298,7 +325,7 @@ impl Phonebook {
     pub fn add_persistent_peers(&self, dns_addresses: &[String], network_name: &str, role: Role) {
         let mut inner = self.inner.write().unwrap();
 
-        for addr in dns_addresses {
+        for addr in dns_addresses.iter().filter(|a| !is_multiaddr(a)) {
             if let Some(pb_data) = inner.data.get_mut(addr.as_str()) {
                 pb_data.roles.add_persistent(role);
             } else {
@@ -736,6 +763,62 @@ mod tests {
         let mut result = pb.get_addresses(10, RELAY_ROLE);
         result.sort();
         assert_eq!(result, vec!["a", "d", "e"]);
+    }
+
+    #[test]
+    fn replace_peer_list_filters_multiaddr_entries() {
+        // Mirrors go's TestWsNetworkPhonebookMix (network/wsNetwork_test.go):
+        // a mixed list of a plain "host:port" address and libp2p
+        // multiaddr-formatted addresses should only add the plain address to
+        // the classic ws-transport phonebook.
+        let pb = Phonebook::new(1, Duration::from_nanos(1));
+
+        let mixed = vec![
+            "127.0.0.1:1234".to_string(),
+            "/ip4/127.0.0.1/tcp/1234".to_string(),
+            "/ip4/127.0.0.1/p2p/QmcgpsyWgH8Y8ajJz1Cu72KnS5uo2Aa2LpzU7kinSupNKC".to_string(),
+        ];
+        pb.replace_peer_list(&mixed, "default", RELAY_ROLE);
+
+        let result = pb.get_addresses(10, RELAY_ROLE);
+        assert_eq!(result, vec!["127.0.0.1:1234".to_string()]);
+    }
+
+    #[test]
+    fn replace_peer_list_plain_addresses_only_unaffected() {
+        // A phonebook list containing only plain addresses (no multiaddr
+        // entries) must be entirely unaffected by the new filtering.
+        let pb = Phonebook::new(1, Duration::from_nanos(1));
+
+        let plain = vec![
+            "127.0.0.1:1234".to_string(),
+            "relay.example.com:4160".to_string(),
+        ];
+        pb.replace_peer_list(&plain, "default", RELAY_ROLE);
+
+        let mut result = pb.get_addresses(10, RELAY_ROLE);
+        result.sort();
+        assert_eq!(
+            result,
+            vec![
+                "127.0.0.1:1234".to_string(),
+                "relay.example.com:4160".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn add_persistent_peers_filters_multiaddr_entries() {
+        let pb = Phonebook::new(1, Duration::from_nanos(1));
+
+        let mixed = vec![
+            "persistent-relay:4160".to_string(),
+            "/ip4/127.0.0.1/tcp/1234".to_string(),
+        ];
+        pb.add_persistent_peers(&mixed, "phonebook.json", RELAY_ROLE);
+
+        let result = pb.get_addresses(10, RELAY_ROLE);
+        assert_eq!(result, vec!["persistent-relay:4160".to_string()]);
     }
 
     // -----------------------------------------------------------------------
