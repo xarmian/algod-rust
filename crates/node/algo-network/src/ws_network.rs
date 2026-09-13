@@ -5583,6 +5583,71 @@ mod tests {
             net_b.stop().await;
         }
 
+        /// go: `TestWebsocketNetworkTXMessageOfInterestRelay`
+        /// (`network/wsNetwork_test.go:3202`). netB is a non-listening
+        /// node with `ForceRelayMessages: true` (go's `bConfig.NetAddress =
+        /// ""`, `bConfig.ForceRelayMessages = true`) — `relay_messages`
+        /// alone (independent of `IsListenServer()`/`net_address`) must
+        /// seed `wantTXGossip` to "yes" at startup and `OnNetworkAdvance`
+        /// must not narrow it, so netB receives every broadcast tag,
+        /// TX included. Closes the Phase 17 parity gap: previously only
+        /// `want_tx_gossip_seeded_yes_for_relay` (a unit-level, no-sockets
+        /// check of the seed value alone) existed for the relay case —
+        /// this proves it end-to-end against live delivery counts exactly
+        /// as go's test does.
+        #[tokio::test]
+        async fn force_relay_messages_always_receives_tx() {
+            let net_a = start_net_a("testnet-v1.0").await;
+            let (addr_a, listening) = net_a.address();
+            assert!(listening);
+
+            let config_b = WebsocketNetworkConfig {
+                genesis_id: "testnet-v1.0".to_string(),
+                network_id: "testnet".to_string(),
+                net_address: None,
+                relay_messages: true,
+                ..Default::default()
+            };
+            let phonebook_b = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+            let net_b = Arc::new(WebsocketNetwork::new(config_b, phonebook_b));
+            net_b.start_arc().await.expect("netB starts");
+            assert!(net_b.effective_relay_messages());
+            assert_eq!(net_b.want_tx_gossip(), WANT_TX_GOSSIP_YES);
+
+            connect_b_to_a(&net_b, &addr_a).await;
+            wait_for_peer_count(&net_a, 1).await;
+
+            let (counts, done) = register_counting_handlers(&net_b, 5 * 4);
+
+            // OnNetworkAdvance must not narrow a force-relay node's TX
+            // interest away — mirrors go's assertion that A->B still
+            // follows MOI with all 4 tags after this call.
+            net_b.on_network_advance();
+            assert_eq!(net_b.want_tx_gossip(), WANT_TX_GOSSIP_YES);
+
+            for _ in 0..5 {
+                broadcast_paced(&net_a, Tag::AgreementVote).await;
+                broadcast_paced(&net_a, Tag::Transaction).await;
+                broadcast_paced(&net_a, Tag::ProposalPayload).await;
+                broadcast_paced(&net_a, Tag::VoteBundle).await;
+            }
+
+            tokio::time::timeout(Duration::from_secs(5), done.notified())
+                .await
+                .expect("all 20 messages arrived at netB");
+
+            {
+                let counts = counts.lock().expect("counts lock poisoned");
+                assert_eq!(counts.len(), 4, "{counts:?}");
+                for count in counts.values() {
+                    assert_eq!(*count, 5);
+                }
+            }
+
+            net_a.stop().await;
+            net_b.stop().await;
+        }
+
         /// go: `TestWebsocketNetworkTXMessageOfInterestNPN`
         /// (`network/wsNetwork_test.go:3369`). A plain non-relay,
         /// non-force-fetch, non-participating node must deregister TX
