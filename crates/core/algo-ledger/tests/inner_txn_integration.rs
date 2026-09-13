@@ -1597,6 +1597,72 @@ fn sender_auth_unauthorized_fails() {
     assert!(is_failure(&result), "unauthorized sender should fail");
 }
 
+/// Phase 17 (issue #1363) / issue #1400: TestRekeyInnerGroup
+/// (data/transactions/logic/evalAppTxn_test.go:388) -- within a SINGLE
+/// inner-txn group (chained via itxn_next), if the app's own account is
+/// rekeyed away by an earlier itxn in that same still-uncommitted group, a
+/// LATER itxn in the group that (implicitly, via the default sender) still
+/// tries to use the app's own address as sender must be rejected as
+/// unauthorized. go's `authorizedSender` has no "sender == app address"
+/// special case: it always resolves the real current authorizer and
+/// compares. algod-rust's authorization check previously short-circuited
+/// `sender.0 == app_addr` to "always authorized" without ever consulting
+/// `auth_addr`, and additionally ran that check for the WHOLE group up
+/// front (before any group member had actually executed), so even
+/// consulting `auth_addr` there could never observe the first itxn's own
+/// rekey effect. Both bugs must be fixed for this test to pass.
+#[test]
+fn rekey_in_inner_group_blocks_reuse_by_same_group() {
+    let sender = [0xAA; 32];
+    let junk_rekey_target = [0x01; 32];
+    let app_id = 42u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 1_000_000);
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 10_000;
+
+    // itxn 0: a 0-pay (default Sender = app address, default Receiver =
+    // zero address, default Amount = 0) that also rekeys the app's own
+    // account away to a junk address.
+    // itxn 1 (chained via itxn_next): another 0-pay, relying on the
+    // SAME default Sender = app address -- but by the time this one
+    // executes, itxn 0 has already rekeyed the app account away, so this
+    // must fail "unauthorized".
+    let mut code = Vec::new();
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(1));
+    code.extend([0xb2, 16]); // itxn_field TypeEnum = pay
+    code.extend(pushbytes(&junk_rekey_target));
+    code.extend([0xb2, 32]); // itxn_field RekeyTo
+    code.push(0xb6); // itxn_next
+    code.extend(pushint(1));
+    code.extend([0xb2, 16]); // itxn_field TypeEnum = pay
+    code.push(0xb3); // itxn_submit
+    code.extend(pushint(1));
+    code.push(0x43); // return
+
+    let result = run_with_context(6, &code, &mut ctx);
+    assert!(
+        is_failure(&result),
+        "second itxn in the group must be rejected as unauthorized once \
+         the first itxn rekeyed the app's own account away, got: {result:?}"
+    );
+    if let Err(err) = &result {
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unauthorized"),
+            "expected an unauthorized-sender error, got: {msg}"
+        );
+    }
+}
+
 /// Phase 17 (issue #1322): TestRekeyActionCloseAccount
 /// (ledger/apptxn_test.go:522) -- closing a rekeyed account erases its
 /// rekeying (`AccountData` is reset to its zero value, `auth_addr`

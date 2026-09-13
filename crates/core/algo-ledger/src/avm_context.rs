@@ -6206,28 +6206,26 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
         // ── Sender authorization ──
         //
-        // Per go-algorand authorizedSender: the sender must be the current
-        // app address, or an account whose auth_addr (rekey) is the app address.
+        // Per go-algorand `authorizedSender` (data/transactions/logic/
+        // eval.go:5478-5486), called once per inner txn, immediately before
+        // that txn is performed (eval.go:6085) -- NOT as a single check over
+        // the whole group up front. There is no "sender equals the app's own
+        // address" special case: go always resolves `cx.Ledger.Authorizer
+        // (addr)` (the account's current `auth_addr` if rekeyed, else the
+        // address itself) and compares it to the app address. An unrekeyed
+        // account's `auth_addr` is `None`, so this falls back to `sender.0`,
+        // which already equals `app_addr` for the app's own address -- the
+        // "not rekeyed" case is handled naturally without any special case.
+        //
+        // Critically, this check must run txn-by-txn INTERLEAVED with
+        // execution (see the per-`i` loop below), not for the whole group
+        // before any member has executed: an earlier inner txn in this same
+        // still-uncommitted group may itself rekey the app's own account
+        // away (via its RekeyTo, applied per-txn below), and a later txn in
+        // the group that still relies on the app address as sender must see
+        // that rekey and be rejected as unauthorized (go's TestRekeyInnerGroup,
+        // issue #1400).
         let app_addr = app_address(self.app_id);
-        for stxn in &txns {
-            let sender = &stxn.txn.sender;
-            if sender.0 == app_addr {
-                continue; // app address itself — always authorized
-            }
-            // Check if the sender is rekeyed to the app address.
-            let acct = self.store.get_or_default_account(sender);
-            let authorizer = acct.auth_addr.as_ref().map(|a| a.0).unwrap_or(sender.0);
-            if authorizer != app_addr {
-                return Err(AlgoError::Avm {
-                    message: format!(
-                        "app {} (addr {}) unauthorized {}",
-                        self.app_id,
-                        Address(app_addr),
-                        Address(authorizer),
-                    ),
-                });
-            }
-        }
 
         // ── Take state snapshot for rollback ──
         //
@@ -6406,6 +6404,38 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             RefCell::new(vec![None; num_subtxns]);
 
         for i in 0..num_subtxns {
+            // Sender authorization (matches go-algorand `authorizedSender`,
+            // called immediately before each inner txn is performed -- see
+            // the comment above the `app_addr` computation for why this
+            // must run here, per-txn, rather than once for the whole group
+            // before any member executes).
+            {
+                let sender = txns[i].txn.sender;
+                let acct = self.store.get_or_default_account(&sender);
+                let authorizer = acct.auth_addr.as_ref().map(|a| a.0).unwrap_or(sender.0);
+                if authorizer != app_addr {
+                    self.store.restore_snapshot(snapshot);
+                    for &id in &extra_created_asset_ids {
+                        self.store.remove_asset_params(id);
+                        self.store.remove_all_asset_holdings_for_asset(id);
+                    }
+                    for &id in &extra_created_app_ids {
+                        self.store.remove_app_params(id);
+                        self.store.remove_all_app_local_states_for_app(id);
+                    }
+                    let err_msg = format!(
+                        "app {} (addr {}) unauthorized {}",
+                        self.app_id,
+                        Address(app_addr),
+                        Address(authorizer),
+                    );
+                    if let Some(p) = self.tracer_ptr {
+                        unsafe { &mut *p }.after_txn_group(Some(&err_msg));
+                    }
+                    return Err(AlgoError::Avm { message: err_msg });
+                }
+            }
+
             // Deduct fee from sender to fee_sink (matches go-algorand takeFee).
             let fee = txns[i].txn.fee;
             if fee > 0 {
