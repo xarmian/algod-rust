@@ -82,7 +82,7 @@ fn make_context<'a>(
     app_id: u64,
 ) -> LedgerAvmContext<'a, LedgerState> {
     let creator = [1u8; 32];
-    LedgerAvmContext::new(
+    let mut ctx = LedgerAvmContext::new(
         store,
         group,
         0,         // group_index
@@ -94,7 +94,18 @@ fn make_context<'a>(
         [0u8; 32], // program_hash
         [0u8; 32], // genesis_hash
         algo_types::ConsensusParams::default(),
-    )
+    );
+    // See the identical comment on algo-ledger's own `avm_context.rs` test
+    // `make_context`: `LedgerAvmContext::new` leaves `program_version` at
+    // its placeholder `0`; real callers always set it to the
+    // actually-parsed program version immediately after construction. No
+    // real program executes `itxn`/`itxn_field` at version 0 (they're v5+
+    // opcodes), so default this shared integration-test helper to 6 -- high
+    // enough for every itxn-issuable type including keyreg/appl (issue
+    // #1391 / TestInnerTypesV5's per-type `innerTxnTypes` version gate) --
+    // so these tests aren't spuriously rejected by that gate.
+    ctx.set_program_version(6);
+    ctx
 }
 
 /// Run a program through the AVM with given context. Returns pass/reject.

@@ -126,7 +126,7 @@ fn make_context<'a>(
     store: &'a mut LedgerState,
     group: Vec<SignedTransaction>,
 ) -> LedgerAvmContext<'a, LedgerState> {
-    LedgerAvmContext::new(
+    let mut ctx = LedgerAvmContext::new(
         store,
         group,
         0,         // group_index
@@ -138,7 +138,15 @@ fn make_context<'a>(
         [0u8; 32], // program_hash
         [0u8; 32], // genesis_hash
         algo_types::ConsensusParams::default(),
-    )
+    );
+    // See the identical comment in `inner_txn_integration.rs`'s
+    // `make_context` / algo-ledger's own `avm_context.rs` test helper:
+    // default to program version 6 so itxn-issuable-type tests (issue
+    // #1391 / TestInnerTypesV5) aren't spuriously rejected by the
+    // `program_version == 0` placeholder no real caller ever leaves in
+    // place while executing `itxn`/`itxn_field`.
+    ctx.set_program_version(6);
+    ctx
 }
 
 /// Build a LedgerAvmContext in LogicSig mode.
