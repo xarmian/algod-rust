@@ -1989,3 +1989,99 @@ fn null_context_take_methods_return_empty() {
     assert!(ctx.take_global_delta().is_empty());
     assert!(ctx.take_local_deltas().is_empty());
 }
+
+// ===========================================================================
+// TestAppBudget (evalStateful_test.go#L3863): the `global OpcodeBudget`
+// field must reflect the exact pooled-budget remaining, self-verified by
+// TEAL `assert`s the same way go's test does.
+// ===========================================================================
+
+/// Ported from go's `TestAppBudget`'s `source(budget)` helper: reads
+/// `OpcodeBudget` twice (asserting `budget-1` right after the first read,
+/// then `budget-5` after four more single-cost opcodes), then returns.
+/// `app_global_get` after `return` is unreachable dead code kept only (as
+/// in go) to mark the program stateful.
+fn app_budget_source(budget: i64) -> String {
+    format!(
+        "#pragma version 8\n\
+         global OpcodeBudget\n\
+         int {a}\n\
+         ==\n\
+         assert\n\
+         global OpcodeBudget\n\
+         int {b}\n\
+         ==\n\
+         return\n\
+         app_global_get\n",
+        a = budget - 1,
+        b = budget - 5,
+    )
+}
+
+/// go: `testApp(t, source(700), nil)` -- a single (unpooled) app call sees
+/// the base 700-opcode budget.
+#[test]
+fn app_budget_single_call_matches_go() {
+    let ops = algo_avm::assemble_string(&app_budget_source(700)).expect("assemble");
+    let mut ctx = NullContext;
+    let mut budget = GroupBudget::new(1);
+    let result =
+        run_approval_program(&ops.program, &mut ctx, &mut budget).expect("program must not error");
+    assert!(
+        result.approved,
+        "single app call must see OpcodeBudget starting at 700, matching go's TestAppBudget"
+    );
+}
+
+/// go: `testApps(t, []string{source(1400), source(1392)}, nil, nil, nil)` --
+/// with pooling, a two-app-call group starts with 1400 and the second call
+/// sees the pool already drained by the first call's 8 opcodes (down to
+/// 1392).
+#[test]
+fn app_budget_pooled_two_calls_matches_go() {
+    let mut budget = GroupBudget::new(2); // 1400 total, pooled
+    assert_eq!(budget.remaining(), 1400);
+
+    let ops1 = algo_avm::assemble_string(&app_budget_source(1400)).expect("assemble");
+    let mut ctx1 = NullContext;
+    let r1 = run_approval_program(&ops1.program, &mut ctx1, &mut budget)
+        .expect("first call must not error");
+    assert!(
+        r1.approved,
+        "first pooled call must see OpcodeBudget starting at 1400"
+    );
+
+    let ops2 = algo_avm::assemble_string(&app_budget_source(1392)).expect("assemble");
+    let mut ctx2 = NullContext;
+    let r2 = run_approval_program(&ops2.program, &mut ctx2, &mut budget)
+        .expect("second call must not error");
+    assert!(
+        r2.approved,
+        "second pooled call must see the pool already drained to 1392 by the \
+         first call's 8 opcodes, matching go's TestAppBudget pooling numbers exactly"
+    );
+}
+
+/// go: `testApps(t, []string{source(700), source(700)}, nil, func(p)
+/// {p.EnableAppCostPooling = false}, nil)` -- without pooling, each app call
+/// gets its own independent base-700 budget rather than sharing a pool.
+/// `EnableAppCostPooling`'s own group-wide wiring (whether a real applied
+/// txn group grants one shared `GroupBudget` vs. one per app call) is
+/// covered separately by `apply.rs`'s pooling gate (see the
+/// `enable_app_cost_pooling` call sites); this closes the narrower "does
+/// `OpcodeBudget` read back the right independent value" gap this go test
+/// exercises via `assert`.
+#[test]
+fn app_budget_unpooled_two_independent_calls_matches_go() {
+    for _ in 0..2 {
+        let mut budget = GroupBudget::new(1); // each call: independent 700
+        let ops = algo_avm::assemble_string(&app_budget_source(700)).expect("assemble");
+        let mut ctx = NullContext;
+        let result = run_approval_program(&ops.program, &mut ctx, &mut budget)
+            .expect("program must not error");
+        assert!(
+            result.approved,
+            "each independently-budgeted call must see OpcodeBudget starting at 700"
+        );
+    }
+}
