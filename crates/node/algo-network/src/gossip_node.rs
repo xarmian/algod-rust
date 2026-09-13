@@ -151,6 +151,42 @@ pub trait UnicastPeer: Peer {
     /// augmented with a `RequestHash` field containing this value and
     /// sent as a `TopicMsgResp` message.
     async fn respond(&self, request_hash: u64, topics: Topics) -> Result<(), PeerError>;
+
+    /// Same as [`respond`](UnicastPeer::respond), but additionally attaches a
+    /// caller-supplied `on_release` callback that fires exactly once the
+    /// resulting outgoing message is released — either by actually being
+    /// sent over the wire, or by being dropped/discarded (send queue full,
+    /// or still-queued when the peer connection shuts down).
+    ///
+    /// Mirrors Go's `OutgoingMessage.OnRelease` (`network/wsPeer.go:234-236`),
+    /// a per-response completion callback used by callers that need to know
+    /// when a queued response has actually left the send queue (e.g. to
+    /// release in-flight resource accounting kept for the lifetime of the
+    /// pending write, such as a block-service memory cap).
+    ///
+    /// The default implementation ignores `on_release` and delegates to
+    /// [`respond`](UnicastPeer::respond) — this preserves existing behavior
+    /// for any implementor (e.g. test mocks) with no release-notification
+    /// mechanism to offer, following the same non-breaking-default pattern
+    /// as [`request_with_timeout`](UnicastPeer::request_with_timeout).
+    /// Production implementors ([`crate::ws_peer::PeerHandle`],
+    /// [`crate::ws_peer::UnicastPeerRef`]) override this to actually wire the
+    /// callback through to the outgoing message's release point.
+    async fn respond_with_release(
+        &self,
+        request_hash: u64,
+        topics: Topics,
+        on_release: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<(), PeerError> {
+        let result = self.respond(request_hash, topics).await;
+        // No real queue-release point to hook into here, but the contract
+        // is that the callback fires exactly once regardless — so fire it
+        // immediately rather than silently dropping it.
+        if let Some(cb) = on_release {
+            cb();
+        }
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------

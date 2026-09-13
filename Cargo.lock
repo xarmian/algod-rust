@@ -484,6 +484,7 @@ dependencies = [
  "hickory-resolver 0.25.2",
  "libp2p",
  "libp2p-stream",
+ "rand 0.8.5",
  "rmp-serde",
  "serde",
  "serde_json",

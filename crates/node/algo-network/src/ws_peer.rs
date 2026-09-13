@@ -79,7 +79,8 @@ use crate::metrics::NetworkTagMetrics;
 use crate::msg_of_interest::unmarshal_msg_of_interest;
 use crate::peer_features::{self, PeerFeatureFlags};
 use crate::request_response::{
-    encode_uvarint, hash_topics, RequestTracker, DEFAULT_REQUEST_TIMEOUT, RESPONSE_HASH_FIELD,
+    encode_uvarint, hash_topics, RequestResponseError, RequestTracker, DEFAULT_REQUEST_TIMEOUT,
+    RESPONSE_HASH_FIELD,
 };
 use crate::tag::Tag;
 use crate::topics::{Topic, Topics};
@@ -161,12 +162,73 @@ pub(crate) fn default_send_message_tags() -> HashSet<Tag> {
 /// Internal send message with enqueue timestamp for stale-message detection.
 ///
 /// Mirrors Go's `sendMessage` struct.
-#[derive(Debug)]
 struct SendMessage {
     /// The outgoing message (tag + payload).
     msg: OutgoingMessage,
     /// When this message was first enqueued (for staleness detection).
     enqueued: Instant,
+    /// Callback invoked exactly once this message is released — either by
+    /// being sent, or by being dropped/discarded (queue drained on close).
+    ///
+    /// Mirrors Go's `sendMessage.onRelease` (`network/wsPeer.go:123-124`),
+    /// which is copied from the caller-supplied `OutgoingMessage.OnRelease`
+    /// when `wsPeer.Respond()` builds the outgoing `sendMessage`. Used by
+    /// callers that need outgoing-message lifecycle notification (e.g.
+    /// releasing in-flight resource accounting once a queued response has
+    /// actually left the send queue).
+    on_release: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for SendMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendMessage")
+            .field("msg", &self.msg)
+            .field("enqueued", &self.enqueued)
+            .field("on_release", &self.on_release.is_some())
+            .finish()
+    }
+}
+
+impl SendMessage {
+    /// Build a `SendMessage` with no release callback (the common case).
+    fn new(msg: OutgoingMessage) -> Self {
+        Self {
+            msg,
+            enqueued: Instant::now(),
+            on_release: None,
+        }
+    }
+
+    /// Build a `SendMessage` carrying a release callback, invoked once the
+    /// message is sent or dropped. Mirrors Go's `wsPeer.Respond()` copying
+    /// `outMsg.OnRelease` onto the `sendMessage` it enqueues.
+    fn with_release(msg: OutgoingMessage, on_release: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            msg,
+            enqueued: Instant::now(),
+            on_release: Some(on_release),
+        }
+    }
+}
+
+impl Drop for SendMessage {
+    /// Mirrors Go's `wsPeer.Close()` draining loop (`network/wsPeer.go:982-995`,
+    /// `msgs.onRelease()`), which walks any messages still sitting in
+    /// `sendBufferBulk` when the peer closes and fires their callback so
+    /// callers relying on release notification (e.g. in-flight resource
+    /// accounting) aren't left hanging. Because every code path that
+    /// consumes a `SendMessage` — a successful write, a filtered/suppressed/
+    /// encode-failed drop, an `mpsc::Sender::try_send` failure (channel
+    /// full), or the receiver being dropped when the peer shuts down and
+    /// still-buffered messages are discarded — ultimately drops the value,
+    /// running this once per message covers every "sent or discarded" exit
+    /// Go's `defer msg.onRelease()` covers, without needing to thread an
+    /// explicit call through each call site.
+    fn drop(&mut self) {
+        if let Some(cb) = self.on_release.take() {
+            cb();
+        }
+    }
 }
 
 /// A special control message to update the send-message-tag filter.
@@ -500,6 +562,7 @@ impl PeerSender {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
         self.send_bulk
             .try_send(cmd)
@@ -512,6 +575,7 @@ impl PeerSender {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
         self.send_high_prio
             .try_send(cmd)
@@ -587,6 +651,7 @@ impl PeerHandle {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
         self.send_bulk
             .try_send(cmd)
@@ -601,6 +666,7 @@ impl PeerHandle {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
         self.send_high_prio
             .try_send(cmd)
@@ -1128,6 +1194,11 @@ async fn write_inbound_data_message(
 ) -> Result<(), ()> {
     use futures_util::SinkExt;
 
+    // `sm`'s `on_release` callback (issue #1429) fires via `SendMessage`'s
+    // `Drop` impl once `sm` goes out of scope at the end of this function,
+    // regardless of which path below handled it (filtered, suppressed,
+    // encode failure, write failure, or a successful write) — mirroring
+    // Go's `writeLoopSend`'s `defer msg.onRelease()`.
     let tag = sm.msg.tag;
 
     // Issue #1156: message-of-interest filter — the peer is not interested
@@ -1328,15 +1399,18 @@ async fn request_with_timeout_via_tracker(
 
     // 2. Send the serialized topics as the payload with the given tag.
     let msg = OutgoingMessage::new(tag, serialized);
-    let cmd = WriteCommand::Data(SendMessage {
-        msg,
-        enqueued: Instant::now(),
-    });
+    let cmd = WriteCommand::Data(SendMessage::new(msg));
     if send_bulk.try_send(cmd).is_err() {
         // Clean up the pending request entry to prevent a leak.
         tracker.cancel_request(hash).await;
         return Err(PeerError::SendBufferFull);
     }
+    // Only now that the request has actually been handed off to the send
+    // queue do we count it as outstanding — mirroring go's
+    // `wp.outstandingTopicRequests.Add(1)` (`network/wsPeer.go:1064`),
+    // which likewise only fires on the successful-enqueue branch of the
+    // `select` in `Request()`.
+    tracker.mark_request_sent();
 
     // 3. Await the response with a timeout, cancelling on peer close.
     let result = tokio::select! {
@@ -1409,31 +1483,59 @@ impl UnicastPeer for PeerHandle {
     }
 
     async fn respond(&self, request_hash: u64, topics: Topics) -> Result<(), PeerError> {
-        // Build the response: append the RequestHash topic and serialize.
-        let request_hash_data = encode_uvarint(request_hash);
-        let mut response_topics = topics;
-        response_topics
-            .0
-            .push(Topic::new(RESPONSE_HASH_FIELD, request_hash_data));
-
-        let serialized = response_topics.marshal();
-        let msg = OutgoingMessage {
-            action: ForwardingPolicy::Respond,
-            tag: Tag::TopicMsgResp,
-            payload: serialized,
-            topics: None,
-        };
-
-        let cmd = WriteCommand::Data(SendMessage {
-            msg,
-            enqueued: Instant::now(),
-        });
+        let cmd = build_response_write_command(request_hash, topics, None);
 
         // Use the bulk channel (matching Go's sendBufferBulk for Respond).
+        // If this fails, `cmd` (and the `SendMessage` inside it) is dropped
+        // right here, firing any `on_release` callback via `SendMessage`'s
+        // `Drop` impl — mirroring Go's `Respond()` explicitly invoking
+        // `outMsg.OnRelease()` when it can't enqueue the message.
         self.send_bulk
             .try_send(cmd)
             .map_err(|_| PeerError::SendBufferFull)
     }
+
+    async fn respond_with_release(
+        &self,
+        request_hash: u64,
+        topics: Topics,
+        on_release: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<(), PeerError> {
+        let cmd = build_response_write_command(request_hash, topics, on_release);
+        self.send_bulk
+            .try_send(cmd)
+            .map_err(|_| PeerError::SendBufferFull)
+    }
+}
+
+/// Build the `TopicMsgResp` [`WriteCommand`] for [`UnicastPeer::respond`]/
+/// [`UnicastPeer::respond_with_release`]: append the `RequestHash` topic,
+/// serialize, and wrap in a [`SendMessage`] carrying the optional release
+/// callback. Shared by [`PeerHandle`] and [`UnicastPeerRef`].
+fn build_response_write_command(
+    request_hash: u64,
+    topics: Topics,
+    on_release: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> WriteCommand {
+    let request_hash_data = encode_uvarint(request_hash);
+    let mut response_topics = topics;
+    response_topics
+        .0
+        .push(Topic::new(RESPONSE_HASH_FIELD, request_hash_data));
+
+    let serialized = response_topics.marshal();
+    let msg = OutgoingMessage {
+        action: ForwardingPolicy::Respond,
+        tag: Tag::TopicMsgResp,
+        payload: serialized,
+        topics: None,
+    };
+
+    let sm = match on_release {
+        Some(cb) => SendMessage::with_release(msg, cb),
+        None => SendMessage::new(msg),
+    };
+    WriteCommand::Data(sm)
 }
 
 // ---------------------------------------------------------------------------
@@ -1511,25 +1613,19 @@ impl UnicastPeer for UnicastPeerRef {
     }
 
     async fn respond(&self, request_hash: u64, topics: Topics) -> Result<(), PeerError> {
-        let request_hash_data = encode_uvarint(request_hash);
-        let mut response_topics = topics;
-        response_topics
-            .0
-            .push(Topic::new(RESPONSE_HASH_FIELD, request_hash_data));
+        let cmd = build_response_write_command(request_hash, topics, None);
+        self.send_bulk
+            .try_send(cmd)
+            .map_err(|_| PeerError::SendBufferFull)
+    }
 
-        let serialized = response_topics.marshal();
-        let msg = OutgoingMessage {
-            action: ForwardingPolicy::Respond,
-            tag: Tag::TopicMsgResp,
-            payload: serialized,
-            topics: None,
-        };
-
-        let cmd = WriteCommand::Data(SendMessage {
-            msg,
-            enqueued: Instant::now(),
-        });
-
+    async fn respond_with_release(
+        &self,
+        request_hash: u64,
+        topics: Topics,
+        on_release: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<(), PeerError> {
+        let cmd = build_response_write_command(request_hash, topics, on_release);
         self.send_bulk
             .try_send(cmd)
             .map_err(|_| PeerError::SendBufferFull)
@@ -1990,12 +2086,30 @@ async fn read_loop<St>(
                 // TopicMsgResp messages are routed to the RequestTracker.
                 if tag == Tag::TopicMsgResp {
                     if let Some(ref rt) = request_tracker {
-                        if let Err(e) = rt.handle_response(&payload).await {
-                            tracing::warn!(
-                                peer = %remote_addr,
-                                error = %e,
-                                "read_loop: failed to handle TopicMsgResp"
-                            );
+                        match rt.handle_response(&payload).await {
+                            Ok(()) => {}
+                            Err(RequestResponseError::UnrequestedResponse) => {
+                                // Mirrors go's `disconnectUnexpectedTopicResp`
+                                // (`network/wsPeer.go:547-556`): the peer has
+                                // sent more TS/TopicMsgResp responses than we
+                                // have ever requested from it — a protocol
+                                // violation. Tear down the connection instead
+                                // of continuing to read from it (issue #1429).
+                                tracing::warn!(
+                                    peer = %remote_addr,
+                                    "read_loop: peer sent TopicMsgResp with no \
+                                     matching outstanding request, disconnecting"
+                                );
+                                closing.cancel();
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    peer = %remote_addr,
+                                    error = %e,
+                                    "read_loop: failed to handle TopicMsgResp"
+                                );
+                            }
                         }
                         continue;
                     }
@@ -2126,6 +2240,7 @@ async fn read_loop<St>(
                             let cmd = WriteCommand::Data(SendMessage {
                                 msg: resp_msg,
                                 enqueued: Instant::now(),
+                                on_release: None,
                             });
                             if let Err(e) = send_high_prio_tx.try_send(cmd) {
                                 tracing::warn!(
@@ -3127,6 +3242,168 @@ mod tests {
         assert_eq!(tags.len(), 3);
     }
 
+    /// Ports go-algorand's `TestSendMessageCallbacks`
+    /// (`network/wsNetwork_test.go:4646`): a caller-supplied release
+    /// callback (issue #1429's `OnRelease`-equivalent) must fire once the
+    /// message is actually written to the connection.
+    #[tokio::test]
+    async fn on_release_fires_when_message_is_sent() {
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut sink, _client_stream) = client_ws.split();
+        let (_server_sink, mut server_stream) = server_ws.split();
+
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_callback = released.clone();
+        let msg = OutgoingMessage::new(Tag::Transaction, b"hello".to_vec());
+        let sm = SendMessage::with_release(
+            msg,
+            Arc::new(move || {
+                released_for_callback.store(true, Ordering::SeqCst);
+            }),
+        );
+        let cmd = WriteCommand::Data(sm);
+
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "must not fire before the message is processed"
+        );
+
+        let result = process_write_command(
+            cmd,
+            &mut sink,
+            &send_message_tags,
+            "test",
+            PeerFeatureFlags::empty(),
+            &None,
+            0,
+            &Arc::new(AtomicBool::new(false)),
+            &mut None,
+            &None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(
+            released.load(Ordering::SeqCst),
+            "on_release must fire once the message has actually been sent"
+        );
+
+        // Sanity: the message really did go out over the wire.
+        let received = server_stream.next().await.unwrap().unwrap();
+        match received {
+            WsMessage::Binary(data) => {
+                let (tag, payload) = decode_frame(&data).unwrap();
+                assert_eq!(tag, Tag::Transaction);
+                assert_eq!(payload, b"hello");
+            }
+            other => panic!("expected binary message, got: {other:?}"),
+        }
+    }
+
+    /// Ports go-algorand's `TestSendMessageCallbackDrain`
+    /// (`network/wsNetwork_test.go:4690`): a release callback must still
+    /// fire for a message that was queued but never actually got a chance
+    /// to be sent, because the peer's send loop shut down first — mirroring
+    /// Go's `wsPeer.Close()` draining loop over `sendBufferBulk`
+    /// (`network/wsPeer.go:982-995`).
+    #[tokio::test]
+    async fn on_release_fires_when_queue_drained_on_close() {
+        let (client_ws, _server_ws) = ws_raw_pair().await;
+        let (sink, _client_stream) = client_ws.split();
+
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let (_high_prio_tx, high_prio_rx) = mpsc::channel::<WriteCommand>(SEND_BUFFER_LENGTH);
+        let (bulk_tx, bulk_rx) = mpsc::channel::<WriteCommand>(SEND_BUFFER_LENGTH);
+        let closing = CancellationToken::new();
+
+        // Queue up several messages, each with its own release callback,
+        // and never let the write loop actually process them: the
+        // `closing` token is already cancelled before `write_loop` is even
+        // spawned, so on its very first iteration it takes the
+        // `closing.cancelled()` branch and returns immediately, dropping
+        // `bulk_rx` (and every `SendMessage` still buffered inside it).
+        const N: usize = 10;
+        let released_flags: Vec<Arc<AtomicBool>> =
+            (0..N).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        for flag in &released_flags {
+            let flag = flag.clone();
+            let msg = OutgoingMessage::new(Tag::Transaction, b"queued".to_vec());
+            let sm = SendMessage::with_release(
+                msg,
+                Arc::new(move || {
+                    flag.store(true, Ordering::SeqCst);
+                }),
+            );
+            bulk_tx.try_send(WriteCommand::Data(sm)).unwrap();
+        }
+
+        closing.cancel();
+
+        let write_task = tokio::spawn(write_loop(
+            sink,
+            high_prio_rx,
+            bulk_rx,
+            send_message_tags,
+            closing,
+            "test".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), write_task)
+            .await
+            .expect("write_loop should return promptly once closing")
+            .expect("write_loop task panicked");
+
+        for (i, flag) in released_flags.iter().enumerate() {
+            assert!(
+                flag.load(Ordering::SeqCst),
+                "message {i} should have had its on_release callback fired \
+                 when the queue was drained on close"
+            );
+        }
+    }
+
+    /// A release callback must also fire immediately when a message is
+    /// dropped because the send queue is full (`try_send` failing) —
+    /// mirroring go's `Respond()` invoking `outMsg.OnRelease()` directly
+    /// on the `case <-wp.closing` / `case <-ctx.Done()` branches when it
+    /// can't hand the message to `sendBufferBulk`.
+    #[tokio::test]
+    async fn on_release_fires_when_dropped_due_to_full_queue() {
+        let (tx, _rx) = mpsc::channel::<WriteCommand>(1);
+
+        // Fill the channel's one slot so the next try_send fails.
+        let filler = OutgoingMessage::new(Tag::Transaction, b"filler".to_vec());
+        tx.try_send(WriteCommand::Data(SendMessage::new(filler)))
+            .unwrap();
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_callback = released.clone();
+        let msg = OutgoingMessage::new(Tag::Transaction, b"overflow".to_vec());
+        let sm = SendMessage::with_release(
+            msg,
+            Arc::new(move || {
+                released_for_callback.store(true, Ordering::SeqCst);
+            }),
+        );
+
+        let send_result = tx.try_send(WriteCommand::Data(sm));
+        assert!(send_result.is_err(), "channel should be full");
+        // Dropping the failed send's returned command releases it — this is
+        // exactly what `.map_err(|_| PeerError::SendBufferFull)` does at the
+        // real call sites (`PeerHandle::respond`/`respond_with_release`).
+        drop(send_result);
+
+        assert!(
+            released.load(Ordering::SeqCst),
+            "on_release must fire when the message is dropped due to a full queue"
+        );
+    }
+
     #[tokio::test]
     async fn write_command_sends_data() {
         let (client_ws, server_ws) = ws_raw_pair().await;
@@ -3139,6 +3416,7 @@ mod tests {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
 
         let result = process_write_command(
@@ -3198,6 +3476,7 @@ mod tests {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
 
         let result = process_write_command(
@@ -3241,6 +3520,7 @@ mod tests {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
 
         let result = process_write_command(
@@ -3287,6 +3567,7 @@ mod tests {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
 
         let result = process_write_command(
@@ -3319,6 +3600,7 @@ mod tests {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now() - MAX_MESSAGE_QUEUE_DURATION - Duration::from_secs(1),
+            on_release: None,
         });
 
         let result = process_write_command(
@@ -3364,6 +3646,7 @@ mod tests {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: enqueued_with_remaining_budget(Duration::from_millis(100)),
+            on_release: None,
         });
 
         let result = tokio::time::timeout(
@@ -3413,6 +3696,7 @@ mod tests {
             .send(WriteCommand::Data(SendMessage {
                 msg,
                 enqueued: enqueued_with_remaining_budget(Duration::from_millis(100)),
+                on_release: None,
             }))
             .await
             .unwrap();
@@ -3467,6 +3751,7 @@ mod tests {
             .send(WriteCommand::Data(SendMessage {
                 msg: bulk_msg,
                 enqueued: Instant::now(),
+                on_release: None,
             }))
             .await
             .unwrap();
@@ -3476,6 +3761,7 @@ mod tests {
             .send(WriteCommand::Data(SendMessage {
                 msg: prio_msg,
                 enqueued: Instant::now(),
+                on_release: None,
             }))
             .await
             .unwrap();
@@ -3801,6 +4087,7 @@ mod tests {
             .send(WriteCommand::Data(SendMessage {
                 msg,
                 enqueued: Instant::now(),
+                on_release: None,
             }))
             .await
             .unwrap();
@@ -3909,6 +4196,7 @@ mod tests {
         let sm = SendMessage {
             msg: OutgoingMessage::new(Tag::Transaction, vec![1, 2, 3]),
             enqueued: Instant::now(),
+            on_release: None,
         };
         let s = format!("{sm:?}");
         assert!(!s.is_empty());
@@ -4179,6 +4467,10 @@ mod tests {
         // Prepare a request so we have a pending entry.
         let request_topics = Topics::from_vec(vec![Topic::new("q", b"data".to_vec())]);
         let (_serialized, hash, rx) = request_tracker.prepare_request(request_topics).await;
+        // Simulate the request having actually been sent (issue #1429's
+        // outstanding-topic-request counter is only incremented once a
+        // request is handed off to the send queue).
+        request_tracker.mark_request_sent();
         assert_eq!(request_tracker.pending_count().await, 1);
 
         let closing_clone = closing.clone();
@@ -4245,6 +4537,82 @@ mod tests {
         assert_eq!(request_tracker.pending_count().await, 0);
 
         closing.cancel();
+    }
+
+    /// Ports go-algorand's `TestDiscardUnrequestedBlockResponse`
+    /// (`network/wsNetwork_test.go:4182`) at the `read_loop` level: a peer
+    /// that sends a `TopicMsgResp` with no matching outstanding request is a
+    /// protocol violation and must be disconnected, mirroring go's
+    /// `disconnectUnexpectedTopicResp` (issue #1429).
+    #[tokio::test]
+    async fn unrequested_topic_msg_resp_disconnects_peer() {
+        use crate::topics::{Topic, Topics};
+
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut client_sink, _client_stream) = client_ws.split();
+        let (_server_sink, server_stream) = server_ws.split();
+
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(10);
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let closing = CancellationToken::new();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+
+        // A request tracker with NO outstanding requests at all.
+        let request_tracker = Arc::new(RequestTracker::new());
+        assert_eq!(request_tracker.outstanding_topic_requests(), 0);
+
+        let closing_clone = closing.clone();
+        let read_task = tokio::spawn(read_loop(
+            server_stream,
+            incoming_tx,
+            high_prio_tx,
+            send_message_tags,
+            last_packet_time,
+            closing_clone,
+            "test-peer".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            None,
+            None,
+            Some(request_tracker.clone()),
+            make_test_peer_sender(closing.clone()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        ));
+
+        // Send an unrequested TopicMsgResp — we never sent this peer a
+        // request, so there's nothing for this to correlate to.
+        let response_topics = Topics::from_vec(vec![Topic::new("foo", b"bar".to_vec())]);
+        let response_data = response_topics.marshal();
+        let frame = encode_frame(&Tag::TopicMsgResp, &response_data).unwrap();
+        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+
+        // The read loop must disconnect: it cancels the shared `closing`
+        // token and returns, rather than continuing to read from the peer.
+        tokio::time::timeout(Duration::from_secs(2), read_task)
+            .await
+            .expect("read_loop should have returned promptly after the unrequested response")
+            .expect("read_loop task panicked");
+        assert!(
+            closing.is_cancelled(),
+            "read_loop must cancel the shared closing token on an unrequested TopicMsgResp"
+        );
+
+        // Nothing should have reached the incoming channel. `read_loop` has
+        // already returned (dropping `incoming_tx`), so `recv()` resolves
+        // immediately with `None` (channel closed) rather than timing out —
+        // that itself is proof no message was ever forwarded.
+        let result = tokio::time::timeout(Duration::from_millis(100), incoming_rx.recv())
+            .await
+            .expect("recv should resolve promptly once incoming_tx is dropped");
+        assert!(
+            result.is_none(),
+            "unrequested TopicMsgResp should not appear on incoming channel"
+        );
+
+        // The counter reflects the violation.
+        assert_eq!(request_tracker.outstanding_topic_requests(), -1);
     }
 
     #[tokio::test]
@@ -4504,6 +4872,7 @@ mod tests {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
 
         let result = process_write_command(
@@ -4527,6 +4896,7 @@ mod tests {
         let cmd2 = WriteCommand::Data(SendMessage {
             msg: msg2,
             enqueued: Instant::now(),
+            on_release: None,
         });
 
         let result2 = process_write_command(
@@ -4583,6 +4953,7 @@ mod tests {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
 
         let result = process_write_command(
@@ -5219,6 +5590,7 @@ mod tests {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
 
         // Stateless-only: COMPRESSED_VOTE_VPACK negotiated, no stateful tier.
@@ -5268,6 +5640,7 @@ mod tests {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
 
         let features = PeerFeatureFlags::COMPRESSED_VOTE_VPACK
@@ -5322,6 +5695,7 @@ mod tests {
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
+            on_release: None,
         });
 
         // No COMPRESSED_VOTE_VPACK bit negotiated — must send plain AV.
