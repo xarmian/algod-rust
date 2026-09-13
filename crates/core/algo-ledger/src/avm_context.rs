@@ -10749,6 +10749,70 @@ mod tests {
         assert_eq!(ctx.opcode_budget, 797);
     }
 
+    /// Direct port of go-algorand's `TestIncrementCheck`
+    /// (`data/transactions/logic/evalAppTxn_test.go#L1762`): the
+    /// opcode-budget credit granted by an inner appl call is a fixed,
+    /// per-call amount (go's `MaxAppProgramCost`, minus the cost the called
+    /// program itself consumes) -- applied identically on a *second*,
+    /// independent inner call within the same evaluation, not cumulative or
+    /// decaying. `inner_appl_budget_pooling` above only exercises a single
+    /// inner call; this closes the "repeat the increment and it's still the
+    /// same fixed amount" invariant go's test specifically checks (three
+    /// budget readings: baseline, +1 call, +2 calls, with equal deltas).
+    #[test]
+    fn inner_appl_budget_increment_is_identical_on_repeated_calls() {
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 100;
+
+        // First inner call: credit + cost delta as established above.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100
+        ctx.itxn_submit().unwrap();
+        let after_first = ctx.opcode_budget;
+        assert_eq!(
+            after_first, 797,
+            "sanity: matches inner_appl_budget_pooling"
+        );
+        let first_delta = after_first - 100;
+
+        // Second, independent inner call: must grant the identical delta,
+        // not a cumulative/decayed/doubled amount.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100
+        ctx.itxn_submit().unwrap();
+        let after_second = ctx.opcode_budget;
+        let second_delta = after_second - after_first;
+
+        assert_eq!(
+            first_delta, second_delta,
+            "each inner appl call must grant the same fixed budget credit \
+             (first={first_delta}, second={second_delta})"
+        );
+        assert_eq!(after_second, 100 + 2 * first_delta);
+    }
+
     #[test]
     fn inner_appl_clearstate_prohibition() {
         // ClearState programs cannot issue inner transactions.
@@ -11285,6 +11349,47 @@ mod tests {
         assert_eq!(ctx.inner_txn_ids().len(), 1);
         assert_eq!(ctx.inner_txn_ids()[0].len(), 1);
         assert_eq!(ctx.inner_txn_ids()[0][0], expected_id);
+    }
+
+    /// Direct port of go-algorand's `TestCachedTxIDs`
+    /// (`data/transactions/logic/eval_test.go#L2035`): reading `gtxn 0
+    /// TxID`, `gtxn 1 TxID`, and `txn TxID` (top-level, non-inner reads,
+    /// each read twice) in a 2-txn top-level group must return the correct,
+    /// stable value both times -- matching go's exact assertion (repeated
+    /// reads agree with the pre-computed `TxnGroup[i].ID()`). Unlike
+    /// go-algorand, which caches these reads (`EvalParams.txidCache`,
+    /// `eval.go`'s `getTxIDNotUnified`/`getTxID`), algod-rust's
+    /// `txn_field`/`read_txn_field` recompute the TxID from scratch on
+    /// every read rather than caching it -- since ID computation is a pure,
+    /// deterministic function of the transaction bytes, this is
+    /// observationally equivalent for this *top-level, no-inner-txns* case
+    /// (no cache-key collision opportunity exists without a `gitxn`/`itxn`
+    /// read in the mix -- see `TestInnerTxIDCaching`'s row for the inner
+    /// case, which is NOT equivalent and is flagged separately).
+    #[test]
+    fn cached_txids_go_test_cached_tx_ids_port() {
+        let txn0 = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let txn1 = make_pay_txn([11u8; 32], [21u8; 32], 7000);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn0.clone(), txn1.clone()]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        // `make_context` defaults group_index to 0 (the top-level program's
+        // own txn); `txn TxID` should therefore match `gtxn 0 TxID`.
+        ctx.group_index = 0;
+
+        let txid0 = algo_codec::compute_txn_id(&txn0.txn);
+        let txid1 = algo_codec::compute_txn_id(&txn1.txn);
+
+        for _ in 0..2 {
+            let gtxn0 = ctx.txn_field(0, 23, None).unwrap(); // gtxn 0 TxID
+            assert_eq!(gtxn0, TealValue::Bytes(txid0.0.to_vec()));
+
+            let txn_self = ctx.txn_field(0, 23, None).unwrap(); // txn TxID (group_index=0)
+            assert_eq!(txn_self, TealValue::Bytes(txid0.0.to_vec()));
+
+            let gtxn1 = ctx.txn_field(1, 23, None).unwrap(); // gtxn 1 TxID
+            assert_eq!(gtxn1, TealValue::Bytes(txid1.0.to_vec()));
+        }
     }
 
     #[test]
@@ -14319,6 +14424,68 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Direct port of go-algorand's `TestFieldSetting`
+    /// (`data/transactions/logic/evalAppTxn_test.go#L1000`): the boundary
+    /// values for every fixed-length or bounded-length `itxn_field` byte
+    /// target, both the accepted boundary and the just-over-boundary
+    /// rejection, for fields whose *pass* case wasn't otherwise exercised
+    /// (`itxn_field_note_over_max_rejected`, `itxn_field_vote_pk_wrong_length_rejected`,
+    /// `itxn_field_nonparticipation_invalid_bool_rejected`,
+    /// `itxn_field_config_asset_unit_name_too_long_rejected`, and
+    /// `itxn_field_config_asset_name_too_long_rejected` above already cover
+    /// Note, VotePK's failure side, Nonparticipation, and the two
+    /// ConfigAsset*Name boundaries). This closes the gap: SelectionPK,
+    /// StateProofPK, RekeyTo, and VotePK's own *accepted* boundary were
+    /// previously untested.
+    #[test]
+    fn itxn_field_setting_go_test_field_setting_port() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+
+        // VotePK: exactly 32 bytes is accepted; go additionally asserts 31
+        // is rejected (covered by itxn_field_vote_pk_wrong_length_rejected).
+        ctx.itxn_field(10, TealValue::Bytes(vec![0u8; 32])).unwrap();
+
+        // SelectionPK: exactly 32 bytes accepted, 33 rejected.
+        ctx.itxn_field(11, TealValue::Bytes(vec![0u8; 32])).unwrap();
+        let err = ctx
+            .itxn_field(11, TealValue::Bytes(vec![0u8; 33])) // SelectionPK
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must be 32 bytes"),
+            "unexpected error: {err}"
+        );
+
+        // StateProofPK: exactly 64 bytes accepted, 63 and 65 both rejected.
+        ctx.itxn_field(63, TealValue::Bytes(vec![0u8; 64])).unwrap();
+        let err = ctx
+            .itxn_field(63, TealValue::Bytes(vec![0u8; 63])) // StateProofPK
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must be 64 bytes"),
+            "unexpected error: {err}"
+        );
+        let err = ctx
+            .itxn_field(63, TealValue::Bytes(vec![0u8; 65])) // StateProofPK
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must be 64 bytes"),
+            "unexpected error: {err}"
+        );
+
+        // RekeyTo: exactly 32 bytes accepted; go additionally asserts a
+        // 31-byte value is rejected as "not an address" (covered generically
+        // by itxn_field_rekey_to_uint_value_rejected for the Uint case).
+        ctx.itxn_field(32, TealValue::Bytes(vec![0u8; 32])).unwrap();
+        let err = ctx
+            .itxn_field(32, TealValue::Bytes(vec![0u8; 31])) // RekeyTo
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not an address"),
             "unexpected error: {err}"
         );
     }

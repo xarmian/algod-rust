@@ -1407,6 +1407,87 @@ fn created_asset_id_from_inner_acfg() {
     assert!(result, "CreatedAssetID should equal txn_counter");
 }
 
+/// Direct port of go-algorand's `TestCreateAndUse`
+/// (`data/transactions/logic/evalAppTxn_test.go#L3076`, the `axfer` case):
+/// an asset created via one inner `acfg` transaction must be immediately
+/// usable -- referenced via `itxn CreatedAssetID` -- as the `XferAsset` of a
+/// *second*, later inner `axfer` transaction within the same evaluation.
+/// `created_asset_id_from_inner_acfg` above only reads `CreatedAssetID` back
+/// as a value; this closes the "and then actually use it in a following
+/// inner txn" flow the go test specifically exercises (go additionally
+/// asserts this fails with "unavailable Asset" pre-`CreatedResourcesVersion`
+/// (v6/AVM_V6) -- algod-rust doesn't model pre-v6 execution here since
+/// `itxn`/inner apps require v6+ regardless, so only the post-activation
+/// success path is meaningfully portable).
+#[test]
+fn created_asset_used_as_xfer_asset_in_second_inner_txn() {
+    let sender = [0xAA; 32];
+    let app_id = 42u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 10_000_000);
+    fund_account(&mut store, Address(sender), 10_000_000);
+    // Pre-opt `sender` into the asset the inner acfg will create (predicted
+    // id: txn_counter (500) + 1 (pre-execution bump) + 1 (acfg's own
+    // allocation) = 502, matching `created_asset_id_from_inner_acfg`'s same
+    // arithmetic above). go's mock `Ledger` test double doesn't enforce
+    // asset opt-in for its lightweight AVM-opcode-level tests, but
+    // algod-rust's `LedgerState`/`run_with_context` apply real transaction
+    // semantics for inner txns, so the receiver must actually be opted in
+    // for the axfer to settle -- this is a test-harness realism gap, not a
+    // go-algorand behavioral requirement this test is asserting against.
+    store.asset_holdings.insert(
+        (Address(sender), 502),
+        AssetHolding {
+            amount: 0,
+            frozen: false,
+        },
+    );
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 50_000;
+    ctx.txn_counter = 500;
+
+    let mut code = Vec::new();
+    // itxn_begin; create an asset via acfg, held entirely by the app (the
+    // creator), so the second inner axfer moving units out is well-formed.
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(3)); // TypeEnum = acfg
+    code.extend([0xb2, 16]); // itxn_field TypeEnum
+    code.extend(pushint(1_000_000)); // ConfigAssetTotal
+    code.extend([0xb2, 34]); // itxn_field ConfigAssetTotal
+    code.extend(pushint(0)); // ConfigAssetDecimals
+    code.extend([0xb2, 35]); // itxn_field ConfigAssetDecimals
+    code.push(0xb3); // itxn_submit
+
+    // Second inner txn: axfer of the just-created asset to `sender`, using
+    // `itxn CreatedAssetID` (field 60) directly as XferAsset (field 17).
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(4)); // TypeEnum = axfer
+    code.extend([0xb2, 16]); // itxn_field TypeEnum
+    code.extend([0xb4, 60]); // itxn CreatedAssetID
+    code.extend([0xb2, 17]); // itxn_field XferAsset
+    code.extend(pushbytes(&sender)); // AssetReceiver = sender
+    code.extend([0xb2, 20]); // itxn_field AssetReceiver
+    code.extend(pushint(10)); // AssetAmount
+    code.extend([0xb2, 18]); // itxn_field AssetAmount
+    code.push(0xb3); // itxn_submit
+
+    code.extend(pushint(1));
+    code.push(0x43); // return
+
+    let result = run_with_context(6, &code, &mut ctx).unwrap();
+    assert!(
+        result,
+        "asset created by one inner acfg must be usable as XferAsset in a following inner axfer"
+    );
+}
+
 /// Logs from inner appl are accessible via itxn field.
 #[test]
 fn inner_app_logs_accessible() {
@@ -1468,6 +1549,105 @@ fn inner_app_logs_accessible() {
 
     let result = run_with_context(6, &a_code, &mut ctx).unwrap();
     assert!(result, "should see 1 log from inner app call");
+}
+
+/// Direct port of go-algorand's `TestInnerValidity`
+/// (`data/transactions/logic/evalAppTxn_test.go#L633`): an inner appl's
+/// `FirstValid`/`LastValid` must be copied down from the outer (top-level)
+/// transaction -- both as read directly via `itxn FirstValid`/`itxn
+/// LastValid` from the caller, and as read via `txn FirstValid`/`txn
+/// LastValid` from *inside* the called inner app's own program (round-
+/// tripped back to the caller via `log`).
+#[test]
+fn inner_appl_inherits_first_and_last_valid_from_outer() {
+    let sender = [0xAA; 32];
+    let app_a = 100u64;
+    let app_b = 200u64;
+
+    let mut store = LedgerState::new();
+
+    // App B: logs itob(FirstValid), itob(LastValid), then approves.
+    let mut b_code = Vec::new();
+    b_code.extend([0x31, 2]); // txn FirstValid
+    b_code.push(0x16); // itob
+    b_code.push(0xb0); // log
+    b_code.extend([0x31, 4]); // txn LastValid
+    b_code.push(0x16); // itob
+    b_code.push(0xb0); // log
+    b_code.extend(pushint(1));
+    b_code.push(0x43);
+    let b_prog = prog(6, &b_code);
+
+    seed_app_with_programs(
+        &mut store,
+        app_b,
+        Address([2u8; 32]),
+        b_prog,
+        prog(6, &[0x81, 0x01]),
+    );
+
+    // App A: calls B, then checks both B's logged values and the itxn
+    // FirstValid/LastValid fields directly, all against its own txn
+    // FirstValid/LastValid.
+    let mut a_code = Vec::new();
+    a_code.push(0xb1); // itxn_begin
+    a_code.extend(pushint(6)); // TypeEnum = appl
+    a_code.extend([0xb2, 16]);
+    a_code.extend(pushint(app_b));
+    a_code.extend([0xb2, 24]);
+    a_code.push(0xb3); // itxn_submit
+
+    a_code.extend([0xb5, 58, 0]); // itxna Logs 0
+    a_code.push(0x17); // btoi
+    a_code.extend([0x31, 2]); // txn FirstValid
+    a_code.push(0x12); // ==
+    a_code.push(0x44); // assert
+
+    a_code.extend([0xb5, 58, 1]); // itxna Logs 1
+    a_code.push(0x17); // btoi
+    a_code.extend([0x31, 4]); // txn LastValid
+    a_code.push(0x12); // ==
+    a_code.push(0x44); // assert
+
+    a_code.extend([0xb4, 2]); // itxn FirstValid
+    a_code.extend([0x31, 2]); // txn FirstValid
+    a_code.push(0x12); // ==
+    a_code.push(0x44); // assert
+
+    a_code.extend([0xb4, 4]); // itxn LastValid
+    a_code.extend([0x31, 4]); // txn LastValid
+    a_code.push(0x12); // ==
+    a_code.push(0x44); // assert
+
+    a_code.extend(pushint(1));
+    a_code.push(0x43); // return
+
+    let a_prog = prog(6, &a_code);
+    seed_app_with_programs(
+        &mut store,
+        app_a,
+        Address([1u8; 32]),
+        a_prog,
+        prog(6, &[0x81, 0x01]),
+    );
+
+    let app_a_addr = Address(app_address(app_a));
+    fund_account(&mut store, app_a_addr, 10_000_000);
+
+    // make_appl_txn defaults first_valid=100, last_valid=200.
+    let txn = make_appl_txn(sender, app_a);
+    let mut ctx = make_context(&mut store, vec![txn], app_a);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 50_000;
+    ctx.txn_counter = 300;
+
+    let result = run_with_context(6, &a_code, &mut ctx).unwrap();
+    assert!(
+        result,
+        "inner appl's FirstValid/LastValid must match the outer txn's, \
+         both via itxn fields and as read from inside the called program"
+    );
 }
 
 // ===========================================================================
@@ -2892,6 +3072,108 @@ fn inner_app_creation() {
     assert!(created_app_id > 0, "should have a created app ID");
     let new_app = ctx.store.app_params.get(&created_app_id);
     assert!(new_app.is_some(), "new app should exist in store");
+}
+
+/// Direct port of go-algorand's `TestCreateAndPay`
+/// (`data/transactions/logic/evalAppTxn_test.go#L3238`): an app created via
+/// one inner `appl` transaction must be immediately payable -- its address,
+/// looked up via `itxn CreatedApplicationID; app_params_get AppAddress`, used
+/// as the `Receiver` of a *second*, later inner `pay` transaction within the
+/// same evaluation. `inner_app_creation` above only reads back
+/// `CreatedApplicationID`; this closes the "and then actually pay it" flow
+/// go's test specifically exercises (go's comment notes this wasn't allowed
+/// before v6 "because of the strict adherence to the foreign-accounts
+/// rules" -- moot here since itxn/inner apps already require v6+).
+#[test]
+fn created_app_paid_via_second_inner_txn() {
+    let sender = [0xAA; 32];
+    let app_a = 100u64;
+
+    let mut store = LedgerState::new();
+
+    let new_app_approval = prog(6, &[0x81, 0x01]); // pushint 1
+    let new_app_clear = prog(6, &[0x81, 0x01]);
+
+    let mut a_code = Vec::new();
+    a_code.push(0xb1); // itxn_begin
+    a_code.extend(pushint(6)); // TypeEnum = appl
+    a_code.extend([0xb2, 16]);
+    a_code.extend(pushint(0)); // ApplicationID = 0 (create)
+    a_code.extend([0xb2, 24]);
+    a_code.extend(pushbytes(&new_app_approval)); // ApprovalProgram (field 30)
+    a_code.extend([0xb2, 30]);
+    a_code.extend(pushbytes(&new_app_clear)); // ClearStateProgram (field 31)
+    a_code.extend([0xb2, 31]);
+    a_code.push(0xb3); // itxn_submit
+
+    // Look up the new app's address: itxn CreatedApplicationID (field 61),
+    // then app_params_get AppAddress (immediate field 8).
+    a_code.extend([0xb4, 61]); // itxn CreatedApplicationID
+    a_code.extend([0x72, 8]); // app_params_get AppAddress
+    a_code.push(0x44); // assert (must exist)
+
+    // Second inner txn: pay 10 microAlgos to the newly created app's address.
+    a_code.push(0xb1); // itxn_begin
+    a_code.extend(pushint(1)); // TypeEnum = pay
+    a_code.extend([0xb2, 16]);
+    a_code.push(0xb2); // itxn_field Receiver -- consumes the address left on
+    a_code.push(7); //   the stack by app_params_get above
+    a_code.extend(pushint(10)); // Amount
+    a_code.extend([0xb2, 8]);
+    a_code.push(0xb3); // itxn_submit
+
+    a_code.extend(pushint(1));
+    a_code.push(0x43); // return
+
+    let a_prog = prog(6, &a_code);
+    seed_app_with_programs(
+        &mut store,
+        app_a,
+        Address([1u8; 32]),
+        a_prog,
+        prog(6, &[0x81, 0x01]),
+    );
+
+    let app_a_addr = Address(app_address(app_a));
+    fund_account(&mut store, app_a_addr, 10_000_000);
+
+    let txn = make_appl_txn(sender, app_a);
+    let mut ctx = make_context(&mut store, vec![txn], app_a);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 50_000;
+    ctx.txn_counter = 500;
+
+    let result = run_with_context(6, &a_code, &mut ctx).unwrap();
+    assert!(
+        result,
+        "created app's address must be immediately payable via a second inner txn"
+    );
+
+    let inner = ctx.inner_txns();
+    assert_eq!(
+        inner.len(),
+        2,
+        "expected an appl-create group and a pay group"
+    );
+    let created_app_id = inner[0][0].apply_data_application_id;
+    assert!(created_app_id > 0);
+    let created_app_addr = app_address(created_app_id);
+    assert_eq!(
+        inner[1][0].txn.receiver,
+        Address(created_app_addr),
+        "the pay's receiver must be the created app's address"
+    );
+    let paid_balance = ctx
+        .store
+        .accounts
+        .get(&Address(created_app_addr))
+        .map(|a| a.micro_algos)
+        .unwrap_or(0);
+    assert_eq!(
+        paid_balance, 10,
+        "created app account should have received the pay"
+    );
 }
 
 /// Phase 17 (issue #1363): TestInfiniteRecursion
