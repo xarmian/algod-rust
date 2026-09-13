@@ -1406,11 +1406,15 @@ fn handle_pragma(ops: &mut OpStream, tokens: &[&str], version_set: &mut bool) {
             // #pragma version (no number)
             ops.record_error(ops.source_line, 0, "no version value".into());
         } else if parts.len() > 3 {
-            // #pragma version N extra
+            // #pragma version N extra -- mirrors go's exact wording
+            // (`assembler.go:2471`: `tokens[3].errorf("unexpected extra
+            // tokens:%s", reJoin("", tokens[3:]))`; `reJoin` prefixes
+            // each remaining token with a space, so the rendered message
+            // reads "unexpected extra tokens: <rest>").
             ops.record_error(
                 ops.source_line,
                 0,
-                "unexpected tokens after version value".into(),
+                format!("unexpected extra tokens: {}", parts[3..].join(" ")),
             );
         } else {
             // #pragma version N
@@ -1438,7 +1442,15 @@ fn handle_pragma(ops: &mut OpStream, tokens: &[&str], version_set: &mut bool) {
                     }
                 }
             } else {
-                ops.record_error(ops.source_line, 0, format!("invalid version: {}", parts[2]));
+                // Mirrors go's exact wording (`assembler.go:2478`:
+                // `tokens[2].errorf("bad #pragma version: %#v", value)`),
+                // same `{:?}`-as-`%#v` convention already used by the
+                // autosalt/typetrack bad-value branches above/below.
+                ops.record_error(
+                    ops.source_line,
+                    0,
+                    format!("bad #pragma version: {:?}", parts[2]),
+                );
             }
         }
     } else if parts[1] == "autosalt" {
@@ -3411,6 +3423,41 @@ mod tests {
         let ops = assemble_string("int 3\n").unwrap();
         assert_eq!(ops.version, 1);
         assert_eq!(ops.program[0], 1);
+    }
+
+    // ── TestPragmas (issue #1363 batch 9, part 2): match go's exact
+    // `#pragma version` bad-value / extra-tokens wording ─────────────────
+    //
+    // go's `pragma()` (`assembler.go:2469-2478`) reports:
+    //   - `unexpected extra tokens:%s` with `reJoin("", tokens[3:])`
+    //     (which prefixes each remaining token with a space) for
+    //     `#pragma version 5 blah` -> "unexpected extra tokens: blah"
+    //   - `bad #pragma version: %#v` for a non-numeric value, e.g.
+    //     `#pragma version a` -> `bad #pragma version: "a"`
+    // algod-rust previously used its own wording here ("unexpected tokens
+    // after version value" / "invalid version: a") while the sibling
+    // autosalt/typetrack bad-value branches already matched go's `%#v`-style
+    // quoting (see `test_autosalt_pragma_bad_value_rejected`,
+    // `bad #pragma typetrack: "blah"` at line ~6828) -- this closes that gap.
+
+    #[test]
+    fn test_pragma_version_bad_value_matches_go_wording() {
+        let errs = expect_errors("#pragma version a\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "bad #pragma version: \"a\""),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_pragma_version_extra_tokens_matches_go_wording() {
+        let errs = expect_errors("#pragma version 5 blah\nint 1\n");
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "unexpected extra tokens: blah"),
+            "{errs:?}"
+        );
     }
 
     /// `app_params_set` is App-mode only, but the assembler doesn't enforce

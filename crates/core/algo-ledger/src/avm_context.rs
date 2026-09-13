@@ -202,7 +202,7 @@ impl InnerTxnBuilder {
     /// silently treated as an empty byte string there too -- preserving
     /// that quirk (rather than "fixing" it by analogy with the other byte
     /// fields) keeps behavior bit-for-bit with go.
-    fn validate_field_type(field: u8, value: &TealValue) -> Result<(), AlgoError> {
+    fn validate_field_type(field: u8, value: &TealValue, version: u8) -> Result<(), AlgoError> {
         fn not_a_uint64(b: &[u8]) -> AlgoError {
             AlgoError::Avm {
                 message: format!("{b:?} is not a uint64"),
@@ -258,13 +258,27 @@ impl InnerTxnBuilder {
                 }),
             }
         }
-        // go's `innerTxnTypes` map (`data/transactions/logic/fields.go`):
-        // only these six transaction types can be built via itxn -- keyreg
-        // and appl were added later, but this codebase's minimum itxn
-        // AVM-version gate already implies both are available, so (unlike
-        // go) no separate per-type version check is needed here.
-        fn is_itxn_issuable_type_name(name: &str) -> bool {
-            matches!(name, "pay" | "keyreg" | "acfg" | "axfer" | "afrz" | "appl")
+        // go's `innerTxnTypes` map (`data/transactions/logic/fields.go:483-490`):
+        // the minimum AVM version at which each transaction type becomes
+        // itxn-issuable -- confirmed by reading fields.go directly (not
+        // from memory): pay/acfg/axfer/afrz = 5 (itxn's own minimum
+        // version, so those four are issuable at every version itxn exists
+        // at all), keyreg/appl = 6. `stackIntoTxnField` (`eval.go:5656-5686`)
+        // looks up `ver, ok := innerTxnTypes[txType]` and requires
+        // `ok && ver <= cx.version`; any other type (including deliberately
+        // non-issuable ones like `stpf`/`hb`) or a too-low program version
+        // both fall through to the same `"%s is not a valid Type for
+        // itxn_field"` error, which is why a single `Option<u8>` (issuable
+        // type -> its gating version) is enough to reproduce both cases.
+        fn itxn_type_min_version(name: &str) -> Option<u8> {
+            match name {
+                "pay" | "acfg" | "axfer" | "afrz" => Some(5),
+                "keyreg" | "appl" => Some(6),
+                _ => None,
+            }
+        }
+        fn is_itxn_issuable_type_name(name: &str, version: u8) -> bool {
+            itxn_type_min_version(name).is_some_and(|min_version| min_version <= version)
         }
         // go's `TxnTypeNames` (`data/transactions/logic/fields.go`), enum
         // order. Index 0 (Unknown) is deliberately absent: go's TypeEnum
@@ -321,7 +335,7 @@ impl InnerTxnBuilder {
                     });
                 };
                 let name = String::from_utf8_lossy(b);
-                if is_itxn_issuable_type_name(&name) {
+                if is_itxn_issuable_type_name(&name, version) {
                     Ok(())
                 } else {
                     Err(AlgoError::Avm {
@@ -337,7 +351,7 @@ impl InnerTxnBuilder {
                     TealValue::Uint(v) => *v,
                 };
                 match txn_type_name_for_enum(i) {
-                    Some(name) if is_itxn_issuable_type_name(name) => Ok(()),
+                    Some(name) if is_itxn_issuable_type_name(name, version) => Ok(()),
                     Some(name) => Err(AlgoError::Avm {
                         message: format!("{name} is not a valid Type for itxn_field"),
                     }),
@@ -6020,7 +6034,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // Type check first, then bounds -- matches go's `stackIntoTxnField`
         // per-field order (e.g. `sv.Bytes == nil` checked before length/count
         // bounds for `ApplicationArgs`).
-        InnerTxnBuilder::validate_field_type(field, &value)?;
+        InnerTxnBuilder::validate_field_type(field, &value, self.program_version)?;
         builder.validate_field_bounds(consensus, field, &value)?;
         builder.set_field(field, value);
         Ok(())
@@ -7040,6 +7054,18 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         {
             return true;
         }
+        // Unnamed-resource relaxation (simulation `allow_unnamed_resources`),
+        // capacity-gated: matches go's `availableAsset`'s final fallback to
+        // `cx.UnnamedResources.AvailableAsset` (`ledger/simulation/
+        // resources.go`; `data/transactions/logic/eval.go:5578-5603`).
+        // Checked only after every named path above has already failed, so
+        // a named asset never spends capacity or gets reported as unnamed.
+        // Mirrors `is_app_available`'s identical fallback just below
+        // (issue #1413, the same gap as fixed for `is_app_available` in
+        // issue #1410 / PR #1412).
+        if self.unnamed_tracking.is_some() {
+            return self.unnamed_asset_available(asset_id);
+        }
         false
     }
 
@@ -7617,7 +7643,7 @@ mod tests {
         store: &mut LedgerState,
         group: Vec<SignedTransaction>,
     ) -> LedgerAvmContext<'_, LedgerState> {
-        LedgerAvmContext::new(
+        let mut ctx = LedgerAvmContext::new(
             store,
             group,
             0,     // group_index
@@ -7629,7 +7655,21 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             ConsensusParams::default(),
-        )
+        );
+        // `LedgerAvmContext::new` leaves `program_version` at its
+        // placeholder `0` (real callers always call `set_program_version`
+        // with the actually-parsed program version immediately after
+        // construction, per `apply.rs`; no real program executes `itxn`
+        // opcodes at version 0, since `itxn`/`itxn_field` are v5+
+        // opcodes). Default this shared test helper to 6 -- high enough
+        // for every itxn-issuable type including keyreg/appl (issue #1391 /
+        // TestInnerTypesV5's per-type `innerTxnTypes` version gate,
+        // `data/transactions/logic/fields.go`) -- so tests that build inner
+        // txns via this helper without caring about program-version gating
+        // aren't spuriously rejected. Tests that DO care call
+        // `set_program_version` explicitly afterward, overriding this.
+        ctx.set_program_version(6);
+        ctx
     }
 
     /// Helper: build an acfg (asset config) transaction.
@@ -11705,6 +11745,7 @@ mod tests {
         let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
         let mut ctx = make_context(&mut store, vec![txn]);
         ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.set_program_version(6);
         ctx.opcode_budget = 2000;
 
         ctx.itxn_begin().unwrap();
@@ -12804,6 +12845,7 @@ mod tests {
 
         let mut ctx = make_context(&mut store, vec![txn]);
         ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.set_program_version(6);
         ctx.txn_counter = 500;
 
         // Group: pay + acfg create.
@@ -14890,6 +14932,7 @@ mod tests {
 
         let mut ctx = make_context(&mut store, vec![txn]);
         ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.set_program_version(6);
         // Provide enough fee credit so the zero-fee inner txn is covered.
         ctx.fee_credit = 10_000;
 
@@ -14930,6 +14973,12 @@ mod tests {
             algo_types::consensus::CONSENSUS_V41,
         )
         .unwrap();
+        // itxn's own minimum AVM version is 5, but appl/keyreg (issue
+        // #1391 / TestInnerTypesV5) additionally require v6+
+        // (`innerTxnTypes`, `data/transactions/logic/fields.go`) -- set 6
+        // here so this shared helper's callers can exercise the full
+        // itxn-issuable type set, not just the v5 subset.
+        ctx.set_program_version(6);
         ctx.itxn_begin().unwrap();
         ctx
     }
@@ -15257,6 +15306,80 @@ mod tests {
         );
     }
 
+    // ── TestInnerTypesV5 (issue #1363 / #1391 follow-up): per-AVM-version
+    // itxn-issuable-type gate ────────────────────────────────────────────
+    //
+    // go's `innerTxnTypes` (`data/transactions/logic/fields.go:483-490`,
+    // confirmed by reading the file directly) maps each itxn-issuable type
+    // name to the *minimum* AVM version at which it becomes issuable, not
+    // just a yes/no allow-list: pay/acfg/axfer/afrz = 5 (itxn's own min
+    // version, so effectively "always" for any program that can reach
+    // `itxn_field` at all), keyreg/appl = 6. `stackIntoTxnField`
+    // (`eval.go:5656-5686`) requires `ok && ver <= cx.version`, rejecting
+    // keyreg/appl with the same "%s is not a valid Type for itxn_field"
+    // message used for a wholly-non-issuable type when the calling
+    // program's version is too low.
+    #[test]
+    fn itxn_field_type_keyreg_and_appl_rejected_below_v6_accepted_at_v6() {
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.set_program_version(5); // itxn's own minimum version
+        ctx.itxn_begin().unwrap();
+
+        // TypeEnum: keyreg (2) and appl (6) both require v6+; at v5 both
+        // are rejected with go's exact "not a valid Type" wording.
+        let err = ctx.itxn_field(16, TealValue::Uint(2)).unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid Type for itxn_field"),
+            "keyreg TypeEnum at v5: unexpected error: {err}"
+        );
+        let err = ctx.itxn_field(16, TealValue::Uint(6)).unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid Type for itxn_field"),
+            "appl TypeEnum at v5: unexpected error: {err}"
+        );
+        // Type (string form): same gate.
+        let err = ctx
+            .itxn_field(15, TealValue::Bytes(b"keyreg".to_vec()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid Type for itxn_field"),
+            "keyreg Type at v5: unexpected error: {err}"
+        );
+        let err = ctx
+            .itxn_field(15, TealValue::Bytes(b"appl".to_vec()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid Type for itxn_field"),
+            "appl Type at v5: unexpected error: {err}"
+        );
+
+        // pay/acfg/axfer/afrz (min version 5) are all still accepted at v5.
+        for (enum_val, name) in [(1u64, "pay"), (3, "acfg"), (4, "axfer"), (5, "afrz")] {
+            ctx.itxn_field(16, TealValue::Uint(enum_val))
+                .unwrap_or_else(|e| panic!("{name} TypeEnum should be accepted at v5, got: {e}"));
+        }
+
+        // At v6, keyreg/appl are now accepted too.
+        ctx.set_program_version(6);
+        ctx.itxn_field(16, TealValue::Uint(2)).unwrap(); // keyreg
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(15, TealValue::Bytes(b"keyreg".to_vec()))
+            .unwrap();
+        ctx.itxn_field(15, TealValue::Bytes(b"appl".to_vec()))
+            .unwrap();
+    }
+
     #[test]
     fn itxn_field_sender_non_32_byte_value_rejected() {
         let mut store = LedgerState::new();
@@ -15523,6 +15646,7 @@ mod tests {
 
         let mut ctx = make_context(&mut store, vec![txn]);
         ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.set_program_version(6);
 
         ctx.itxn_begin().unwrap();
         ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
@@ -15558,6 +15682,7 @@ mod tests {
 
         let mut ctx = make_context(&mut store, vec![txn]);
         ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.set_program_version(6);
         ctx.fee_credit = 5_000;
 
         ctx.itxn_begin().unwrap();
@@ -15594,6 +15719,7 @@ mod tests {
 
         let mut ctx = make_context(&mut store, vec![txn]);
         ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.set_program_version(6);
         ctx.fee_credit = 0; // No credit available
 
         ctx.itxn_begin().unwrap();
@@ -18420,6 +18546,62 @@ mod tests {
         assert!(
             !ctx.is_app_available(701),
             "a second distinct unnamed app must exceed max_apps=1"
+        );
+    }
+
+    // Issue #1413: `is_asset_available` was missing the identical
+    // unnamed-resource-tracking fallback just fixed for `is_app_available`
+    // in issue #1410 / PR #1412. Same TDD shape as
+    // `is_app_available_unnamed_fallback_matches_is_account_available`.
+    #[test]
+    fn is_asset_available_unnamed_fallback_matches_is_app_available() {
+        let sender = [89u8; 32];
+        let txn = make_appl_txn(sender, 909, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        // Asset 54321 is named nowhere: not in Access/ForeignAssets/
+        // xaid/config_asset/freeze_asset/created-in-group/shared-resources.
+        assert!(
+            !ctx.is_asset_available(54321),
+            "an asset named nowhere must stay unavailable when unnamed-resource \
+             tracking isn't active"
+        );
+
+        ctx.enable_unnamed_resource_tracking(Arc::new(NamedGroupResources::default()));
+        assert!(
+            ctx.is_asset_available(54321),
+            "the same never-named asset must become available once \
+             allow_unnamed_resources/unnamed_tracking is active, mirroring \
+             go's availableAsset final fallback to \
+             cx.UnnamedResources.AvailableAsset"
+        );
+    }
+
+    // Confirms the fallback also feeds the same capacity-gated
+    // opcode-failure enforcement (issue #1005) and reporting mechanism as
+    // every other unnamed-resource category, exactly like
+    // `is_app_available_unnamed_fallback_rejects_once_max_apps_exhausted`.
+    #[test]
+    fn is_asset_available_unnamed_fallback_rejects_once_max_assets_exhausted() {
+        let sender = [90u8; 32];
+        let txn = make_appl_txn(sender, 910, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        let mut cap = tiny_capacity();
+        cap.max_assets = 1;
+        cap.max_total_refs = 100;
+        attach_capacity(&mut ctx, cap);
+
+        // Exactly at the asset limit.
+        assert!(ctx.is_asset_available(800));
+        // A repeat access of the same already-tracked asset never costs
+        // capacity.
+        assert!(ctx.is_asset_available(800));
+        // One more distinct, never-named asset exceeds max_assets=1.
+        assert!(
+            !ctx.is_asset_available(801),
+            "a second distinct unnamed asset must exceed max_assets=1"
         );
     }
 
