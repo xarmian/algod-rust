@@ -516,6 +516,77 @@ fn nested_caller_app_id() {
     assert!(result, "App B should see CallerApplicationID == 100");
 }
 
+/// TestCallerGlobals (evalAppTxn_test.go): the called app checks BOTH
+/// `CallerApplicationID` and `CallerApplicationAddress`, matching go's
+/// exact scenario. `nested_caller_app_id` above only checks the ID field;
+/// this closes the "CallerApplicationAddress ... narrower" gap the parity
+/// row flagged.
+#[test]
+fn caller_globals_checks_both_app_id_and_address() {
+    let sender = [0xAA; 32];
+    let app_a = 888u64;
+    let app_b = 222u64;
+    let app_a_addr = app_address(app_a);
+
+    let mut store = LedgerState::new();
+
+    // App B: global CallerApplicationID == 888 && global
+    // CallerApplicationAddress == app A's address.
+    let mut b_code = Vec::new();
+    b_code.extend([0x32, 13]); // global CallerApplicationID (field 13)
+    b_code.extend(pushint(app_a));
+    b_code.push(0x12); // ==
+    b_code.extend([0x32, 14]); // global CallerApplicationAddress (field 14)
+    b_code.extend(pushbytes(&app_a_addr));
+    b_code.push(0x12); // ==
+    b_code.push(0x10); // &&
+    b_code.push(0x43); // return
+    let b_prog = prog(6, &b_code);
+
+    seed_app_with_programs(
+        &mut store,
+        app_b,
+        Address([2u8; 32]),
+        b_prog,
+        prog(6, &[0x81, 0x01]),
+    );
+
+    // App A: inner appl call to App B.
+    let mut a_code = Vec::new();
+    a_code.push(0xb1); // itxn_begin
+    a_code.extend(pushint(6)); // TypeEnum = appl
+    a_code.extend([0xb2, 16]);
+    a_code.extend(pushint(app_b));
+    a_code.extend([0xb2, 24]); // ApplicationID
+    a_code.push(0xb3); // itxn_submit
+    a_code.extend(pushint(1));
+    a_code.push(0x43);
+    let a_prog = prog(6, &a_code);
+
+    seed_app_with_programs(
+        &mut store,
+        app_a,
+        Address([1u8; 32]),
+        a_prog,
+        prog(6, &[0x81, 0x01]),
+    );
+
+    fund_account(&mut store, Address(app_a_addr), 10_000_000);
+
+    let txn = make_appl_txn(sender, app_a);
+    let mut ctx = make_context(&mut store, vec![txn], app_a);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 50_000;
+    ctx.txn_counter = 300;
+
+    let result = run_with_context(6, &a_code, &mut ctx).unwrap();
+    assert!(
+        result,
+        "App B should see both CallerApplicationID == 888 and CallerApplicationAddress == app A's address"
+    );
+}
+
 // ===========================================================================
 // 3. Budget and Depth
 // ===========================================================================
