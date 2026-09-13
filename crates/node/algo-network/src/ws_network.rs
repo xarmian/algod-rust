@@ -649,6 +649,13 @@ pub struct WebsocketNetwork {
     /// [`Self::on_network_advance`]. Lazily initialized when
     /// [`Self::start_arc`] spawns the refresh loop.
     messages_of_interest_refresh_tx: Mutex<Option<mpsc::Sender<()>>>,
+
+    /// Shared per-wire-tag byte/message traffic counters (issue #1425),
+    /// mirroring go's process-global `network.TagCounter` vars
+    /// (`networkSentBytesByTag` etc., `network/metrics.go`). One instance is
+    /// shared across every peer this network accepts or dials, so counts
+    /// aggregate node-wide traffic exactly like go's package-level vars.
+    network_metrics: Arc<crate::metrics::NetworkTagMetrics>,
 }
 
 impl WebsocketNetwork {
@@ -718,7 +725,18 @@ impl WebsocketNetwork {
             want_tx_gossip: Arc::new(AtomicU8::new(want_tx_gossip_seed)),
             messages_of_interest: Arc::new(RwLock::new(None)),
             messages_of_interest_refresh_tx: Mutex::new(None),
+            network_metrics: Arc::new(crate::metrics::NetworkTagMetrics::new()),
         }
+    }
+
+    /// Shared per-wire-tag byte/message traffic counters (issue #1425).
+    ///
+    /// Aggregates traffic across every peer this network accepts or dials —
+    /// mirrors go's process-global `network.TagCounter` vars. Use this to
+    /// expose `to_prometheus_text()` via a `/metrics` endpoint, or to read
+    /// individual counts for diagnostics/tests.
+    pub fn network_metrics(&self) -> &Arc<crate::metrics::NetworkTagMetrics> {
+        &self.network_metrics
     }
 
     /// Create a `WebsocketNetwork` with default configuration.
@@ -1279,6 +1297,9 @@ impl WebsocketNetwork {
                 peer_config: Some(crate::ws_peer::WsPeerConfig {
                     incoming_filter: self.incoming_message_filter.clone(),
                     outgoing_filter: outgoing_filter.clone(),
+                    // Issue #1425: share this network's single counter
+                    // instance, matching the inbound path.
+                    network_metrics: Some(self.network_metrics.clone()),
                     ..crate::ws_peer::WsPeerConfig::default()
                 }),
                 network_protocol_version: self.config.network_protocol_version.clone(),
@@ -2162,6 +2183,11 @@ struct NetworkConnectFn {
     /// dial is an outgoing connection, so `try_dial` reserves a slot for it
     /// on connect and releases it on every removal path below.
     throttled_outgoing_connections: Arc<AtomicI32>,
+    /// Issue #1425: the network's shared per-wire-tag traffic-counter
+    /// instance, threaded into every mesh-dialed peer's `WsPeerConfig` so
+    /// mesh-dial traffic is counted alongside directly-dialed and inbound
+    /// peers' — matching go's process-global counters.
+    network_metrics: Arc<crate::metrics::NetworkTagMetrics>,
 }
 
 impl ConnectFn for NetworkConnectFn {
@@ -2178,6 +2204,7 @@ impl ConnectFn for NetworkConnectFn {
         let throttled_outgoing_connections = Arc::clone(&self.throttled_outgoing_connections);
         let enable_vote_compression = self.enable_vote_compression;
         let network_protocol_version = self.network_protocol_version.clone();
+        let network_metrics = Arc::clone(&self.network_metrics);
         // Issue #803: build a fresh outgoing filter for *this* connection —
         // never reuse an instance across dials, or one peer's
         // `MsgDigestSkip` would suppress sends to a different peer.
@@ -2201,6 +2228,7 @@ impl ConnectFn for NetworkConnectFn {
                     request_timeout: Some(Duration::from_secs(5)),
                     incoming_filter: incoming_message_filter,
                     outgoing_filter: outgoing_message_filter.clone(),
+                    network_metrics: Some(network_metrics.clone()),
                     ..WsPeerConfig::default()
                 }),
                 network_protocol_version: network_protocol_version.clone(),
@@ -2463,6 +2491,7 @@ impl WebsocketNetwork {
             phonebook: Arc::clone(&self.phonebook),
             conn_perf_monitor: Arc::clone(&self.conn_perf_monitor),
             throttled_outgoing_connections: Arc::clone(&self.throttled_outgoing_connections),
+            network_metrics: Arc::clone(&self.network_metrics),
         };
 
         let peer_counter = NetworkPeerCounter {
@@ -2952,6 +2981,10 @@ async fn handle_gossip_websocket(
         network.incoming_message_filter().cloned(),
         outgoing_filter.clone(),
         features,
+        // Issue #1425: share this network's single traffic-counter
+        // instance so inbound peers' traffic is counted alongside
+        // outbound peers', matching go's process-global counters.
+        Some(network.network_metrics().clone()),
     );
 
     // Register the inbound peer in the peer map via add_peer, which

@@ -75,6 +75,7 @@ use crate::message::{IncomingMessage, OutgoingMessage};
 use crate::message_filter::{
     dedup_safe_tag, generate_message_digest, MessageFilter, MESSAGE_FILTER_SIZE,
 };
+use crate::metrics::NetworkTagMetrics;
 use crate::msg_of_interest::unmarshal_msg_of_interest;
 use crate::peer_features::{self, PeerFeatureFlags};
 use crate::request_response::{
@@ -233,6 +234,16 @@ pub struct WsPeerConfig {
     /// Set this to a shorter duration (e.g. 4s) for block-fetch peers
     /// where fast failover is more important than tolerating slow peers.
     pub request_timeout: Option<Duration>,
+    /// Shared per-wire-tag byte/message traffic counters (issue #1425).
+    ///
+    /// Mirrors go's process-global `network.TagCounter` vars
+    /// (`networkSentBytesByTag` etc., `network/metrics.go`) — when set, this
+    /// should be the *same* instance shared across every peer of one
+    /// [`crate::ws_network::WebsocketNetwork`], not a fresh one per peer, so
+    /// counts aggregate node-wide traffic rather than one connection's.
+    /// `None` disables counting (e.g. for tests/callers that don't need
+    /// metrics).
+    pub network_metrics: Option<Arc<NetworkTagMetrics>>,
 }
 
 /// A live WebSocket peer connection.
@@ -360,6 +371,7 @@ impl WsPeer {
         let incoming_filter = self.config.incoming_filter;
         let outgoing_filter = self.config.outgoing_filter;
         let request_tracker = self.config.request_tracker;
+        let network_metrics = self.config.network_metrics;
         let request_timeout = self
             .config
             .request_timeout
@@ -418,6 +430,7 @@ impl WsPeer {
             request_tracker,
             peer_sender,
             stateful_vote_enabled.clone(),
+            network_metrics.clone(),
         ));
 
         let write_handle = tokio::spawn(write_loop(
@@ -430,6 +443,7 @@ impl WsPeer {
             features,
             outgoing_filter,
             stateful_vote_enabled,
+            network_metrics,
         ));
 
         let keepalive_handle = tokio::spawn(keepalive_loop(
@@ -709,6 +723,7 @@ impl PeerHandle {
     /// tokio-tungstenite path's `read_loop`/`write_loop`, sharing the
     /// sink-agnostic `decompress_incoming_vote`/`compress_outgoing_vote`
     /// helpers so the wire behaviour is identical in both directions.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_inbound(
         socket: axum::extract::ws::WebSocket,
         remote_addr: String,
@@ -717,6 +732,11 @@ impl PeerHandle {
         incoming_filter: Option<Arc<MessageFilter>>,
         outgoing_filter: Option<Arc<MessageFilter>>,
         features: PeerFeatureFlags,
+        // Issue #1425: shared per-tag traffic counters (`None` disables
+        // counting) — see [`WsPeerConfig::network_metrics`] for the sharing
+        // contract (one instance per [`crate::ws_network::WebsocketNetwork`],
+        // not per peer).
+        network_metrics: Option<Arc<NetworkTagMetrics>>,
     ) -> Self {
         use futures_util::{SinkExt, StreamExt};
 
@@ -756,6 +776,7 @@ impl PeerHandle {
         let read_outgoing_filter = outgoing_filter.clone();
         let read_send_high_prio_tx = send_high_prio_tx.clone();
         let read_stateful_vote_enabled = stateful_vote_enabled.clone();
+        let read_network_metrics = network_metrics.clone();
 
         // Read loop: reads from axum WebSocket and dispatches to incoming channel.
         let read_handle = tokio::spawn(async move {
@@ -771,6 +792,15 @@ impl PeerHandle {
                         match msg {
                             Some(Ok(axum::extract::ws::Message::Binary(data))) => {
                                 if let Ok((mut tag, payload)) = crate::framing::decode_frame(&data) {
+                                    // Issue #1425: count received bytes/
+                                    // messages by tag, mirroring the
+                                    // outbound read loop's identical
+                                    // placement right after a successful
+                                    // `decode_frame`.
+                                    if let Some(ref m) = read_network_metrics {
+                                        m.record_received(tag, payload.len() as u64 + 2);
+                                    }
+
                                     // go-algorand compresses every proposal
                                     // broadcast unconditionally at wsnet 2.2
                                     // (`msgBroadcaster.preparePeerData`,
@@ -820,6 +850,15 @@ impl PeerHandle {
                                         Some(p) => p,
                                         None => continue,
                                     };
+
+                                    // Issue #1425: post-decompression byte
+                                    // count, keyed by the (possibly VP->AV
+                                    // retagged) final tag — mirrors the
+                                    // outbound read loop's identical
+                                    // placement.
+                                    if let Some(ref m) = read_network_metrics {
+                                        m.record_received_uncompressed(tag, payload.len() as u64 + 2);
+                                    }
 
                                     // --- MI (MsgOfInterest) handling ---
                                     // The peer is telling us which tags it
@@ -959,6 +998,7 @@ impl PeerHandle {
                                     &stateful_vote_enabled,
                                     &mut stateful_encoder,
                                     &write_addr,
+                                    &network_metrics,
                                 ).await.is_err() {
                                     break;
                                 }
@@ -990,6 +1030,7 @@ impl PeerHandle {
                                     &stateful_vote_enabled,
                                     &mut stateful_encoder,
                                     &write_addr,
+                                    &network_metrics,
                                 ).await.is_err() {
                                     break;
                                 }
@@ -1081,6 +1122,9 @@ async fn write_inbound_data_message(
     stateful_vote_enabled: &Arc<AtomicBool>,
     stateful_encoder: &mut Option<StatefulEncoder>,
     remote_addr: &str,
+    // Issue #1425: shared per-tag traffic counters (`None` disables
+    // counting).
+    network_metrics: &Option<Arc<NetworkTagMetrics>>,
 ) -> Result<(), ()> {
     use futures_util::SinkExt;
 
@@ -1127,12 +1171,18 @@ async fn write_inbound_data_message(
         },
     };
 
+    let sent_len = frame.len() as u64;
     if ws_writer
         .send(axum::extract::ws::Message::Binary(frame))
         .await
         .is_err()
     {
         return Err(());
+    }
+    // Issue #1425: count sent bytes/messages by tag only on a successful
+    // write, mirroring the outbound write loop's identical placement.
+    if let Some(m) = network_metrics {
+        m.record_sent(tag, sent_len);
     }
     Ok(())
 }
@@ -1720,6 +1770,10 @@ async fn read_loop<St>(
     // disables stateful vote compression for both directions of this
     // connection. See go-algorand's `wsPeerMsgCodec.statefulVoteEnabled`.
     stateful_vote_enabled: Arc<AtomicBool>,
+    // Issue #1425: shared per-tag traffic counters (`None` disables
+    // counting). Go: `networkReceivedBytesByTag`/`networkMessageReceivedByTag`/
+    // `networkReceivedUncompressedBytesByTag`.
+    network_metrics: Option<Arc<NetworkTagMetrics>>,
 ) where
     St: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
@@ -1788,6 +1842,15 @@ async fn read_loop<St>(
                     }
                 };
 
+                // Issue #1425: count received bytes/messages by tag as soon
+                // as the frame is decoded, before any decompression — go
+                // does the equivalent right after reading the raw frame
+                // (`networkReceivedBytesByTag.Add(string(tag[:]),
+                // uint64(len(msg.Data)+2))`, `+2` for the tag prefix).
+                if let Some(ref m) = network_metrics {
+                    m.record_received(tag, payload.len() as u64 + 2);
+                }
+
                 // Decompress PP payloads that carry the zstd frame magic.
                 //
                 // This deliberately does NOT consult the negotiated
@@ -1845,6 +1908,14 @@ async fn read_loop<St>(
                     Some(p) => p,
                     None => continue,
                 };
+
+                // Issue #1425: post-decompression byte count, keyed by the
+                // (possibly VP->AV retagged) final tag. Go:
+                // `networkReceivedUncompressedBytesByTag.Add(string(msg.Tag),
+                // uint64(len(msg.Data)+2))`.
+                if let Some(ref m) = network_metrics {
+                    m.record_received_uncompressed(tag, payload.len() as u64 + 2);
+                }
 
                 // Handle MI (MsgOfInterest) messages: update the send filter.
                 if tag == Tag::MsgOfInterest {
@@ -2163,6 +2234,9 @@ async fn write_loop<Sk>(
     outgoing_filter: Option<Arc<MessageFilter>>,
     // Shared with `read_loop` — see that function's parameter doc.
     stateful_vote_enabled: Arc<AtomicBool>,
+    // Issue #1425: shared per-tag traffic counters (`None` disables
+    // counting). Go: `networkSentBytesByTag`/`networkMessageSentByTag`.
+    network_metrics: Option<Arc<NetworkTagMetrics>>,
 ) where
     Sk: futures_util::Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
@@ -2185,6 +2259,7 @@ async fn write_loop<Sk>(
                     vote_table_size,
                     &stateful_vote_enabled,
                     &mut stateful_encoder,
+                    &network_metrics,
                 )
                 .await
                 {
@@ -2250,6 +2325,7 @@ async fn write_loop<Sk>(
             vote_table_size,
             &stateful_vote_enabled,
             &mut stateful_encoder,
+            &network_metrics,
         )
         .await
         {
@@ -2283,6 +2359,9 @@ async fn process_write_command<Sk>(
     vote_table_size: u32,
     stateful_vote_enabled: &Arc<AtomicBool>,
     stateful_encoder: &mut Option<StatefulEncoder>,
+    // Issue #1425: shared per-tag traffic counters (`None` disables
+    // counting).
+    network_metrics: &Option<Arc<NetworkTagMetrics>>,
 ) -> Result<(), String>
 where
     Sk: futures_util::Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
@@ -2466,8 +2545,17 @@ where
             // enqueue-to-write window.
             let remaining_budget =
                 MAX_MESSAGE_QUEUE_DURATION.saturating_sub(send_msg.enqueued.elapsed());
+            let sent_len = data.len() as u64;
             match tokio::time::timeout(remaining_budget, sink.send(WsMessage::Binary(data))).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    // Issue #1425: count sent bytes/messages by tag only on
+                    // a successful write, mirroring go's placement of
+                    // `networkSentBytesByTag.Add`/`networkMessageSentByTag
+                    // .Add` right after `wp.conn.WriteMessage` succeeds.
+                    if let Some(m) = network_metrics {
+                        m.record_sent(tag, sent_len);
+                    }
+                }
                 Ok(Err(e)) => return Err(format!("write error: {e}")),
                 Err(_) => {
                     // The send timed out. Per tokio_tungstenite's
@@ -2986,6 +3074,7 @@ mod tests {
             0,
             &Arc::new(AtomicBool::new(false)),
             &mut None,
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -3017,6 +3106,7 @@ mod tests {
             0,
             &Arc::new(AtomicBool::new(false)),
             &mut None,
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -3061,6 +3151,7 @@ mod tests {
             0,
             &Arc::new(AtomicBool::new(false)),
             &mut None,
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -3119,6 +3210,7 @@ mod tests {
             2048,
             &Arc::new(AtomicBool::new(true)),
             &mut None,
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -3161,6 +3253,7 @@ mod tests {
             0,
             &Arc::new(AtomicBool::new(false)),
             &mut None,
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -3206,6 +3299,7 @@ mod tests {
             0,
             &Arc::new(AtomicBool::new(false)),
             &mut None,
+            &None,
         )
         .await;
 
@@ -3237,6 +3331,7 @@ mod tests {
             0,
             &Arc::new(AtomicBool::new(false)),
             &mut None,
+            &None,
         )
         .await;
 
@@ -3283,6 +3378,7 @@ mod tests {
                 0,
                 &Arc::new(AtomicBool::new(false)),
                 &mut None,
+                &None,
             ),
         )
         .await
@@ -3332,6 +3428,7 @@ mod tests {
             PeerFeatureFlags::empty(),
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Simulate a `close()` request arriving while the write is stuck:
@@ -3395,6 +3492,7 @@ mod tests {
             PeerFeatureFlags::empty(),
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Read the first two messages from the server.
@@ -3466,6 +3564,7 @@ mod tests {
             None,
             make_test_peer_sender(closing.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Send a TX message from the client.
@@ -3517,6 +3616,7 @@ mod tests {
             None,
             make_test_peer_sender(closing.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Build and send an MI message saying we only want AV and TX.
@@ -3584,6 +3684,7 @@ mod tests {
             None,
             make_test_peer_sender(closing.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         let closing_clone = closing.clone();
@@ -3597,6 +3698,7 @@ mod tests {
             PeerFeatureFlags::empty(),
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         let (keepalive_prio_tx, _keepalive_prio_rx) = mpsc::channel::<WriteCommand>(10);
@@ -3622,6 +3724,122 @@ mod tests {
             keepalive_result.is_ok(),
             "keepalive_loop should stop after cancel"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-tag traffic metrics wired into real read/write loops (issue #1425)
+    // -----------------------------------------------------------------------
+
+    /// Drives an actual client write_loop -> (real TCP WebSocket) ->
+    /// server read_loop round trip and asserts that the shared
+    /// [`NetworkTagMetrics`] instances attached to each side are updated
+    /// from the real traffic — not just the [`NetworkTagMetrics`]/
+    /// [`crate::metrics::TagCounter`] unit-level behavior already covered
+    /// in `metrics.rs`'s own tests. This is the "counts verified against
+    /// actual traffic" half of issue #1425's acceptance criteria.
+    #[tokio::test]
+    async fn network_metrics_record_real_sent_and_received_traffic() {
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (client_sink, _client_stream) = client_ws.split();
+        let (_server_sink, server_stream) = server_ws.split();
+
+        // Client side: a write_loop whose outbound traffic is counted by
+        // `sent_metrics`.
+        let (client_high_prio_tx, client_high_prio_rx) = mpsc::channel::<WriteCommand>(10);
+        let (_client_bulk_tx, client_bulk_rx) = mpsc::channel::<WriteCommand>(10);
+        let client_send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let client_closing = CancellationToken::new();
+        let sent_metrics = Arc::new(NetworkTagMetrics::new());
+
+        let write_task = tokio::spawn(write_loop(
+            client_sink,
+            client_high_prio_rx,
+            client_bulk_rx,
+            client_send_message_tags,
+            client_closing.clone(),
+            "client".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Some(sent_metrics.clone()),
+        ));
+
+        // Server side: a read_loop whose inbound traffic is counted by
+        // `received_metrics`.
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(10);
+        // read_loop's own outbound channel (for MI/VP-abort replies) — not
+        // exercised by this test, so a plain unattached sender is enough.
+        let (server_send_high_prio_tx, _server_send_high_prio_rx) =
+            mpsc::channel::<WriteCommand>(10);
+        let server_send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let server_last_packet_time = Arc::new(RwLock::new(Instant::now()));
+        let server_closing = CancellationToken::new();
+        let received_metrics = Arc::new(NetworkTagMetrics::new());
+
+        let read_task = tokio::spawn(read_loop(
+            server_stream,
+            incoming_tx,
+            server_send_high_prio_tx,
+            server_send_message_tags,
+            server_last_packet_time,
+            server_closing.clone(),
+            "server".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            None,
+            None,
+            None,
+            make_test_peer_sender(server_closing.clone()),
+            Arc::new(AtomicBool::new(false)),
+            Some(received_metrics.clone()),
+        ));
+
+        // Send one real Transaction-tagged message over the wire.
+        let payload = b"issue-1425 real traffic".to_vec();
+        let msg = OutgoingMessage::new(Tag::Transaction, payload.clone());
+        client_high_prio_tx
+            .send(WriteCommand::Data(SendMessage {
+                msg,
+                enqueued: Instant::now(),
+            }))
+            .await
+            .unwrap();
+
+        // Wait for the server side to actually receive it (proves the
+        // message really crossed the wire, not just that a counter was
+        // incremented in isolation).
+        let received = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
+            .await
+            .expect("timed out waiting for server to receive the message")
+            .expect("incoming channel closed unexpectedly");
+        assert_eq!(received.tag, Tag::Transaction);
+        assert_eq!(received.data, payload);
+
+        // The on-wire frame is 2 tag bytes + payload (Transaction is not
+        // compressed).
+        let expected_len = payload.len() as u64 + 2;
+
+        assert_eq!(sent_metrics.messages_sent(Tag::Transaction), 1);
+        assert_eq!(sent_metrics.sent_bytes(Tag::Transaction), expected_len);
+        assert_eq!(received_metrics.messages_received(Tag::Transaction), 1);
+        assert_eq!(
+            received_metrics.received_bytes(Tag::Transaction),
+            expected_len
+        );
+        assert_eq!(
+            received_metrics.received_uncompressed_bytes(Tag::Transaction),
+            expected_len
+        );
+        // No unrelated tag's bucket should have moved.
+        assert_eq!(sent_metrics.messages_sent(Tag::AgreementVote), 0);
+        assert_eq!(received_metrics.messages_received(Tag::AgreementVote), 0);
+        assert_eq!(sent_metrics.unknown_sent_bytes(), 0);
+        assert_eq!(received_metrics.unknown_received_bytes(), 0);
+
+        client_closing.cancel();
+        server_closing.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), write_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), read_task).await;
     }
 
     // -----------------------------------------------------------------------
@@ -3656,6 +3874,7 @@ mod tests {
             None,
             make_test_peer_sender(closing.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Send a close frame from the client.
@@ -3761,6 +3980,7 @@ mod tests {
             None,
             make_test_peer_sender(closing.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Send several messages to fill the incoming channel and overflow it.
@@ -3846,6 +4066,7 @@ mod tests {
             None,
             make_test_peer_sender(closing.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Send a MsgDigestSkip with a 32-byte digest.
@@ -3904,6 +4125,7 @@ mod tests {
             None,
             make_test_peer_sender(closing.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Send the same TX message twice.
@@ -3975,6 +4197,7 @@ mod tests {
             Some(request_tracker.clone()),
             make_test_peer_sender(closing.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Build a TopicMsgResp response containing the request hash
@@ -4097,6 +4320,7 @@ mod tests {
                 None,
                 make_test_peer_sender(closing.clone()),
                 Arc::new(AtomicBool::new(false)),
+                None,
             ));
 
             let frame = encode_frame(&Tag::Transaction, b"tx-data").unwrap();
@@ -4153,6 +4377,7 @@ mod tests {
                 None,
                 make_test_peer_sender(closing.clone()),
                 Arc::new(AtomicBool::new(false)),
+                None,
             ));
 
             let frame = encode_frame(&Tag::AgreementVote, b"bad-vote").unwrap();
@@ -4219,6 +4444,7 @@ mod tests {
             None,
             make_test_peer_sender(closing.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         let frame = encode_frame(&Tag::UniEnsBlockReq, b"request-data").unwrap();
@@ -4290,6 +4516,7 @@ mod tests {
             0,
             &Arc::new(AtomicBool::new(false)),
             &mut None,
+            &None,
         )
         .await;
         assert!(result.is_ok(), "should succeed (silently dropped)");
@@ -4312,6 +4539,7 @@ mod tests {
             0,
             &Arc::new(AtomicBool::new(false)),
             &mut None,
+            &None,
         )
         .await;
         assert!(result2.is_ok());
@@ -4367,6 +4595,7 @@ mod tests {
             0,
             &Arc::new(AtomicBool::new(false)),
             &mut None,
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -4417,6 +4646,7 @@ mod tests {
             None, // no request tracker
             make_test_peer_sender(closing.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Send a TX message.
@@ -4472,6 +4702,7 @@ mod tests {
             PeerFeatureFlags::empty(),
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Build a PeerHandle with a request tracker.
@@ -4553,6 +4784,7 @@ mod tests {
             PeerFeatureFlags::empty(),
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Set up the request tracker (shared between PeerHandle and read loop).
@@ -4581,6 +4813,7 @@ mod tests {
             Some(read_tracker),
             peer_sender,
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Build the PeerHandle.
@@ -5000,6 +5233,7 @@ mod tests {
             0, // vote_table_size = 0 → stateful disabled
             &Arc::new(AtomicBool::new(false)),
             &mut None,
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -5050,6 +5284,7 @@ mod tests {
             16, // negotiated stateful table size
             &stateful_enabled,
             &mut encoder,
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -5100,6 +5335,7 @@ mod tests {
             0,
             &Arc::new(AtomicBool::new(false)),
             &mut None,
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -5146,6 +5382,7 @@ mod tests {
             None,
             make_test_peer_sender(closing.clone()),
             Arc::new(AtomicBool::new(false)),
+            None,
         ));
 
         // Send a stateless-vpack-compressed AV frame from the server side.
@@ -5199,6 +5436,7 @@ mod tests {
             None,
             make_test_peer_sender(closing.clone()),
             stateful_enabled,
+            None,
         ));
 
         let frame = encode_frame(&Tag::VotePacked, &stateful).unwrap();
@@ -5248,6 +5486,7 @@ mod tests {
             None,
             make_test_peer_sender(closing.clone()),
             stateful_enabled,
+            None,
         ));
 
         // Send the VP abort control byte.
