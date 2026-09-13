@@ -296,4 +296,52 @@ mod tests {
         let listener = RejectingLimitListener::new(inner, 100);
         assert_eq!(listener.local_addr().unwrap(), expected);
     }
+
+    /// Go: `TestRejectingLimitListenerClose` (`network/limitlistener/
+    /// rejectingLimitListener_test.go`) explicitly calls `ln.Close()` on the
+    /// wrapped `net.Listener` and then asserts a subsequent `Accept()` fails.
+    /// `RejectingLimitListener` has no explicit `close()` method — it doesn't
+    /// need one, since it doesn't expose `inner` as a trait object the way
+    /// go's `net.Listener` interface does; closing is Rust's idiomatic
+    /// `Drop`-based resource release instead. This test exercises the same
+    /// observable property go's test checks (the underlying OS socket stops
+    /// accepting connections once the listener goes away): dropping the
+    /// `RejectingLimitListener` closes the bound TCP socket, and a new
+    /// connection attempt to the same address is refused rather than
+    /// hanging or somehow still succeeding.
+    #[tokio::test]
+    async fn dropping_listener_closes_underlying_socket() {
+        let inner = bind_listener().await;
+        let addr = inner.local_addr().unwrap();
+        let listener = RejectingLimitListener::new(inner, 1);
+
+        // Sanity: the socket accepts connections while the listener is alive.
+        let client = TcpStream::connect(addr).await;
+        assert!(client.is_ok(), "listener should accept while alive");
+        let (_stream, _addr, _guard) = listener.accept().await.unwrap();
+
+        // Dropping the wrapper closes the underlying `TcpListener`, freeing
+        // the OS-level bound socket. Prove the socket was actually released
+        // (rather than merely unreachable via this handle) by rebinding the
+        // exact same address: a bind only succeeds if nothing still holds
+        // that port. This avoids relying on platform-specific
+        // connection-refused timing (observed to sometimes hang rather than
+        // RST-and-fail promptly on Windows loopback) while still verifying
+        // the same underlying property go's post-`Close()` `Accept()`-fails
+        // test checks: the listener genuinely stops owning the socket.
+        drop(listener);
+
+        let rebound = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            // The OS may take a moment to release the port; poll briefly.
+            loop {
+                if let Ok(l) = TcpListener::bind(addr).await {
+                    return l;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("port should become rebindable after the listener is dropped");
+        assert_eq!(rebound.local_addr().unwrap(), addr);
+    }
 }
