@@ -34,22 +34,43 @@ use super::helpers::{get_uint8, get_uint8_pair, get_uint8_triple, teal_to_avm};
 // Transaction field opcodes
 // ---------------------------------------------------------------------------
 
-/// Enforce per-field version gating shared by every `txn`/`gtxn`/`txna`/etc.
-/// opcode. Matches go-algorand's shared `(*EvalContext).fetchField`
-/// (`data/transactions/logic/eval.go`): `fs.version > cx.version`.
-fn check_txn_field_version(field_byte: u8, machine_version: u8) -> Result<(), AlgoError> {
-    match TxnField::from_u8(field_byte) {
-        Ok(field) if field.version() <= machine_version => Ok(()),
-        Ok(field) => Err(AlgoError::Avm {
-            message: format!("invalid txn field {field}"),
-        }),
-        Err(_) => Err(AlgoError::Avm {
-            message: format!(
-                "invalid txn field {}",
-                TxnField::unknown_display(field_byte)
-            ),
-        }),
+/// Enforce per-field version gating and array-ness validation shared by
+/// every `txn`/`gtxn`/`txna`/etc. opcode. Matches go-algorand's shared
+/// `(*EvalContext).fetchField` (`data/transactions/logic/eval.go`):
+/// `fs.version > cx.version`, then `expectArray != fs.array` (erroring
+/// `"unsupported array field %s"` when an array form is used on a
+/// non-array field, or `"invalid txn field %s"` when a scalar form is used
+/// on an array-only field).
+fn check_txn_field_access(
+    field_byte: u8,
+    machine_version: u8,
+    expect_array: bool,
+) -> Result<(), AlgoError> {
+    let field = match TxnField::from_u8(field_byte) {
+        Ok(field) if field.version() <= machine_version => field,
+        Ok(field) => {
+            return Err(AlgoError::Avm {
+                message: format!("invalid txn field {field}"),
+            });
+        }
+        Err(_) => {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "invalid txn field {}",
+                    TxnField::unknown_display(field_byte)
+                ),
+            });
+        }
+    };
+    if field.is_array() != expect_array {
+        let message = if expect_array {
+            format!("unsupported array field {field}")
+        } else {
+            format!("invalid txn field {field}")
+        };
+        return Err(AlgoError::Avm { message });
     }
+    Ok(())
 }
 
 /// `txn f` (0x31): push Txn.Fields[f] for the current transaction.
@@ -60,7 +81,7 @@ pub fn op_txn(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field = get_uint8(instruction)?;
-    check_txn_field_version(field, machine.version)?;
+    check_txn_field_access(field, machine.version, false)?;
     let group_index = ctx.group_index();
     let val = ctx.txn_field(group_index, field, None)?;
     machine.push(teal_to_avm(val))
@@ -74,7 +95,7 @@ pub fn op_gtxn(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let (group_index, field) = get_uint8_pair(instruction)?;
-    check_txn_field_version(field, machine.version)?;
+    check_txn_field_access(field, machine.version, false)?;
     let val = ctx.txn_field(group_index as usize, field, None)?;
     machine.push(teal_to_avm(val))
 }
@@ -87,7 +108,7 @@ pub fn op_txna(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let (field, array_index) = get_uint8_pair(instruction)?;
-    check_txn_field_version(field, machine.version)?;
+    check_txn_field_access(field, machine.version, true)?;
     let group_index = ctx.group_index();
     let val = ctx.txn_field(group_index, field, Some(array_index as usize))?;
     machine.push(teal_to_avm(val))
@@ -101,7 +122,7 @@ pub fn op_gtxna(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let (group_index, field, array_index) = get_uint8_triple(instruction)?;
-    check_txn_field_version(field, machine.version)?;
+    check_txn_field_access(field, machine.version, true)?;
     let val = ctx.txn_field(group_index as usize, field, Some(array_index as usize))?;
     machine.push(teal_to_avm(val))
 }
@@ -114,7 +135,7 @@ pub fn op_gtxns(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field = get_uint8(instruction)?;
-    check_txn_field_version(field, machine.version)?;
+    check_txn_field_access(field, machine.version, false)?;
     let group_index = machine.pop_uint()? as usize;
     let val = ctx.txn_field(group_index, field, None)?;
     machine.push(teal_to_avm(val))
@@ -128,7 +149,7 @@ pub fn op_gtxnsa(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let (field, array_index) = get_uint8_pair(instruction)?;
-    check_txn_field_version(field, machine.version)?;
+    check_txn_field_access(field, machine.version, true)?;
     let group_index = machine.pop_uint()? as usize;
     let val = ctx.txn_field(group_index, field, Some(array_index as usize))?;
     machine.push(teal_to_avm(val))
@@ -142,7 +163,7 @@ pub fn op_txnas(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field = get_uint8(instruction)?;
-    check_txn_field_version(field, machine.version)?;
+    check_txn_field_access(field, machine.version, true)?;
     let array_index = machine.pop_uint()? as usize;
     let group_index = ctx.group_index();
     let val = ctx.txn_field(group_index, field, Some(array_index))?;
@@ -157,7 +178,7 @@ pub fn op_gtxnas(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let (group_index, field) = get_uint8_pair(instruction)?;
-    check_txn_field_version(field, machine.version)?;
+    check_txn_field_access(field, machine.version, true)?;
     let array_index = machine.pop_uint()? as usize;
     let val = ctx.txn_field(group_index as usize, field, Some(array_index))?;
     machine.push(teal_to_avm(val))
@@ -172,7 +193,7 @@ pub fn op_gtxnsas(
     ctx: &dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field = get_uint8(instruction)?;
-    check_txn_field_version(field, machine.version)?;
+    check_txn_field_access(field, machine.version, true)?;
     let array_index = machine.pop_uint()? as usize;
     let group_index = machine.pop_uint()? as usize;
     let val = ctx.txn_field(group_index, field, Some(array_index))?;
@@ -373,38 +394,38 @@ mod tests {
 
     #[test]
     fn test_txna_application_args() {
-        // txna ApplicationArgs 2 (field=25, array_index=2), group_index=0
-        // Expected: ctx.txn_field(0, 25, Some(2)) => Bytes("0:25:2")
+        // txna ApplicationArgs 2 (field=26, array_index=2), group_index=0
+        // Expected: ctx.txn_field(0, 26, Some(2)) => Bytes("0:26:2")
         let mut ctx = TestTxnContext::new(0, 1, vec![]);
         let m = run_with_ctx(
             2,
             &[
-                0x36, 25, 2, // txna ApplicationArgs 2
+                0x36, 26, 2, // txna ApplicationArgs 2
             ],
             &mut ctx,
         )
         .unwrap();
         assert_eq!(m.stack.len(), 1);
-        assert_eq!(m.stack[0], AvmValue::Bytes(b"0:25:2".to_vec()));
+        assert_eq!(m.stack[0], AvmValue::Bytes(b"0:26:2".to_vec()));
     }
 
     // --- gtxna tests ---
 
     #[test]
     fn test_gtxna() {
-        // gtxna 1 25 3 (group=1, field=25, array_index=3)
-        // Expected: ctx.txn_field(1, 25, Some(3)) => Bytes("1:25:3")
+        // gtxna 1 26 3 (group=1, field=26, array_index=3)
+        // Expected: ctx.txn_field(1, 26, Some(3)) => Bytes("1:26:3")
         let mut ctx = TestTxnContext::new(0, 2, vec![]);
         let m = run_with_ctx(
             2,
             &[
-                0x37, 1, 25, 3, // gtxna 1 ApplicationArgs 3
+                0x37, 1, 26, 3, // gtxna 1 ApplicationArgs 3
             ],
             &mut ctx,
         )
         .unwrap();
         assert_eq!(m.stack.len(), 1);
-        assert_eq!(m.stack[0], AvmValue::Bytes(b"1:25:3".to_vec()));
+        assert_eq!(m.stack[0], AvmValue::Bytes(b"1:26:3".to_vec()));
     }
 
     // --- gtxns tests ---
@@ -431,82 +452,82 @@ mod tests {
 
     #[test]
     fn test_gtxnsa() {
-        // pushint 1, gtxnsa 25 0 (pop group_index=1, field=25, array_index=0)
-        // Expected: ctx.txn_field(1, 25, Some(0)) => Bytes("1:25:0")
+        // pushint 1, gtxnsa 26 0 (pop group_index=1, field=26, array_index=0)
+        // Expected: ctx.txn_field(1, 26, Some(0)) => Bytes("1:26:0")
         let mut ctx = TestTxnContext::new(0, 2, vec![]);
         let m = run_with_ctx(
             3,
             &[
                 0x81, 0x01, // pushint 1
-                0x39, 25, 0, // gtxnsa ApplicationArgs 0
+                0x39, 26, 0, // gtxnsa ApplicationArgs 0
             ],
             &mut ctx,
         )
         .unwrap();
         assert_eq!(m.stack.len(), 1);
-        assert_eq!(m.stack[0], AvmValue::Bytes(b"1:25:0".to_vec()));
+        assert_eq!(m.stack[0], AvmValue::Bytes(b"1:26:0".to_vec()));
     }
 
     // --- txnas tests ---
 
     #[test]
     fn test_txnas() {
-        // pushint 3, txnas 25 (pop array_index=3, field=25, group_index=0)
-        // Expected: ctx.txn_field(0, 25, Some(3)) => Bytes("0:25:3")
+        // pushint 3, txnas 26 (pop array_index=3, field=26, group_index=0)
+        // Expected: ctx.txn_field(0, 26, Some(3)) => Bytes("0:26:3")
         let mut ctx = TestTxnContext::new(0, 1, vec![]);
         let m = run_with_ctx(
             5,
             &[
                 0x81, 0x03, // pushint 3
-                0xc0, 25, // txnas ApplicationArgs
+                0xc0, 26, // txnas ApplicationArgs
             ],
             &mut ctx,
         )
         .unwrap();
         assert_eq!(m.stack.len(), 1);
-        assert_eq!(m.stack[0], AvmValue::Bytes(b"0:25:3".to_vec()));
+        assert_eq!(m.stack[0], AvmValue::Bytes(b"0:26:3".to_vec()));
     }
 
     // --- gtxnas tests ---
 
     #[test]
     fn test_gtxnas() {
-        // pushint 2, gtxnas 1 25 (pop array_index=2, group=1, field=25)
-        // Expected: ctx.txn_field(1, 25, Some(2)) => Bytes("1:25:2")
+        // pushint 2, gtxnas 1 26 (pop array_index=2, group=1, field=26)
+        // Expected: ctx.txn_field(1, 26, Some(2)) => Bytes("1:26:2")
         let mut ctx = TestTxnContext::new(0, 2, vec![]);
         let m = run_with_ctx(
             5,
             &[
                 0x81, 0x02, // pushint 2
-                0xc1, 1, 25, // gtxnas 1 ApplicationArgs
+                0xc1, 1, 26, // gtxnas 1 ApplicationArgs
             ],
             &mut ctx,
         )
         .unwrap();
         assert_eq!(m.stack.len(), 1);
-        assert_eq!(m.stack[0], AvmValue::Bytes(b"1:25:2".to_vec()));
+        assert_eq!(m.stack[0], AvmValue::Bytes(b"1:26:2".to_vec()));
     }
 
     // --- gtxnsas tests ---
 
     #[test]
     fn test_gtxnsas() {
-        // pushint 1, pushint 2, gtxnsas 25
-        // pop array_index=2, pop group_index=1, field=25
-        // Expected: ctx.txn_field(1, 25, Some(2)) => Bytes("1:25:2")
+        // pushint 1, pushint 2, gtxnsas 26
+        // pop array_index=2, pop group_index=1, field=26
+        // Expected: ctx.txn_field(1, 26, Some(2)) => Bytes("1:26:2")
         let mut ctx = TestTxnContext::new(0, 2, vec![]);
         let m = run_with_ctx(
             5,
             &[
                 0x81, 0x01, // pushint 1 (group_index)
                 0x81, 0x02, // pushint 2 (array_index)
-                0xc2, 25, // gtxnsas ApplicationArgs
+                0xc2, 26, // gtxnsas ApplicationArgs
             ],
             &mut ctx,
         )
         .unwrap();
         assert_eq!(m.stack.len(), 1);
-        assert_eq!(m.stack[0], AvmValue::Bytes(b"1:25:2".to_vec()));
+        assert_eq!(m.stack[0], AvmValue::Bytes(b"1:26:2".to_vec()));
     }
 
     // --- arg tests ---
@@ -653,9 +674,11 @@ mod tests {
 
     #[test]
     fn test_txn_field_version_assets_gated_at_v3() {
-        // Assets (field 48) requires v3.
-        assert!(txn_field_at_version(2, 48).is_err());
-        assert!(txn_field_at_version(3, 48).is_ok());
+        // NumAssets (field 49) requires v3. (Not `Assets`/48 itself -- that's
+        // an array field and can't be accessed via the scalar `txn` form
+        // this helper uses; see issue #1397's array-ness validation.)
+        assert!(txn_field_at_version(2, 49).is_err());
+        assert!(txn_field_at_version(3, 49).is_ok());
     }
 
     #[test]
@@ -706,5 +729,131 @@ mod tests {
         // ApplicationID (field 24) requires v2; gtxn target=0.
         assert!(run_with_ctx(1, &[0x33, 0x00, 24], &mut ctx).is_err());
         assert!(run_with_ctx(2, &[0x33, 0x00, 24], &mut ctx).is_ok());
+    }
+
+    // --- Array-ness validation (issue #1397) ---
+    //
+    // Matches go-algorand's shared `fetchField(field, expectArray)`
+    // (`data/transactions/logic/eval.go`): the accessing opcode's
+    // array-expectation must match the target field's own `array` metadata
+    // (`txnFieldSpecs[].array`), or the access is rejected outright.
+
+    /// Extract the error message from a failing `run_with_ctx` result.
+    /// (`AvmMachine` doesn't implement `Debug`, so `Result::unwrap_err`
+    /// can't be used directly here.)
+    fn expect_err_msg(result: Result<AvmMachine, AlgoError>) -> String {
+        match result {
+            Ok(_) => panic!("expected an error, but the program succeeded"),
+            Err(e) => format!("{e}"),
+        }
+    }
+
+    #[test]
+    fn test_txna_fee_rejected_not_an_array_field() {
+        // txna Fee 0 -- Fee (field 1) is not an array field, so the `txna`
+        // (array-indexed) form must reject it rather than silently ignoring
+        // the index and returning plain Fee.
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let result = run_with_ctx(2, &[0x36, 1, 0], &mut ctx); // txna Fee 0
+        let msg = expect_err_msg(result);
+        assert!(
+            msg.contains("unsupported array field"),
+            "expected an 'unsupported array field' error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_txn_application_args_rejected_array_only_field() {
+        // txn ApplicationArgs -- ApplicationArgs (field 26) is array-only
+        // and must be accessed via `txna`/`txnas`; the scalar `txn` form
+        // must reject it rather than silently returning the array length.
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let result = run_with_ctx(2, &[0x31, 26], &mut ctx); // txn ApplicationArgs
+        let msg = expect_err_msg(result);
+        assert!(
+            msg.contains("invalid txn field"),
+            "expected an 'invalid txn field' error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_gtxn_application_args_rejected_array_only_field() {
+        // gtxn 0 ApplicationArgs -- same as above, via the gtxn scalar form.
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let result = run_with_ctx(2, &[0x33, 0, 26], &mut ctx);
+        let msg = expect_err_msg(result);
+        assert!(msg.contains("invalid txn field"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_gtxns_application_args_rejected_array_only_field() {
+        // pushint 0, gtxns ApplicationArgs -- same, via gtxns.
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let result = run_with_ctx(3, &[0x81, 0x00, 0x38, 26], &mut ctx);
+        let msg = expect_err_msg(result);
+        assert!(msg.contains("invalid txn field"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_gtxna_fee_rejected_not_an_array_field() {
+        // gtxna 0 Fee 0 -- Fee is not an array field.
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let result = run_with_ctx(2, &[0x37, 0, 1, 0], &mut ctx);
+        let msg = expect_err_msg(result);
+        assert!(msg.contains("unsupported array field"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_gtxnsa_fee_rejected_not_an_array_field() {
+        // pushint 0, gtxnsa Fee 0 -- Fee is not an array field.
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let result = run_with_ctx(3, &[0x81, 0x00, 0x39, 1, 0], &mut ctx);
+        let msg = expect_err_msg(result);
+        assert!(msg.contains("unsupported array field"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_txnas_fee_rejected_not_an_array_field() {
+        // pushint 0, txnas Fee -- Fee is not an array field.
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let result = run_with_ctx(5, &[0x81, 0x00, 0xc0, 1], &mut ctx);
+        let msg = expect_err_msg(result);
+        assert!(msg.contains("unsupported array field"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_gtxnas_fee_rejected_not_an_array_field() {
+        // pushint 0, gtxnas 0 Fee -- Fee is not an array field.
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let result = run_with_ctx(5, &[0x81, 0x00, 0xc1, 0, 1], &mut ctx);
+        let msg = expect_err_msg(result);
+        assert!(msg.contains("unsupported array field"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_gtxnsas_fee_rejected_not_an_array_field() {
+        // pushint 0, pushint 0, gtxnsas Fee -- Fee is not an array field.
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let result = run_with_ctx(5, &[0x81, 0x00, 0x81, 0x00, 0xc2, 1], &mut ctx);
+        let msg = expect_err_msg(result);
+        assert!(msg.contains("unsupported array field"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_txn_sender_scalar_field_still_works() {
+        // Existing valid scalar access (txn Sender) must keep working.
+        let mut ctx = TestTxnContext::new(1, 2, vec![]);
+        let m = run_with_ctx(2, &[0x31, 0], &mut ctx).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Uint64(256));
+    }
+
+    #[test]
+    fn test_txna_accounts_array_field_still_works() {
+        // Existing valid array access (txna Accounts 0) must keep working.
+        let mut ctx = TestTxnContext::new(0, 1, vec![]);
+        let m = run_with_ctx(2, &[0x36, 28, 0], &mut ctx).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Bytes(b"0:28:0".to_vec()));
     }
 }
