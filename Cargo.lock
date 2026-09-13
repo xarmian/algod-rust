@@ -156,6 +156,7 @@ dependencies = [
  "k256",
  "num-bigint",
  "p256",
+ "proptest",
  "serde",
  "serde_bytes",
  "serde_json",

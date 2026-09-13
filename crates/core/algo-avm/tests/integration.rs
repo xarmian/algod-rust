@@ -644,6 +644,55 @@ fn test_plus_rejects_empty_bytes_arg() {
 }
 
 // ---------------------------------------------------------------------------
+// Port of go-algorand's `TestWrongStackTypeRuntime` (eval_test.go ~line
+// 3229): `int 1` leaves a uint64 on the stack, then raw `sha256` (opcode
+// 0x01) is appended directly (bypassing the assembler, which would reject
+// this statically) -- sha256 requires a bytes argument, so this must error
+// at runtime, exactly like the `+`/empty-bytes case above (issue #1255) but
+// for the opposite direction (uint64 supplied where bytes is wanted) and a
+// crypto opcode rather than an arithmetic one.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_sha256_rejects_uint64_arg() {
+    let code: &[u8] = &[
+        0x81, 0x01, // pushint 1
+        0x01, // sha256 (wants bytes, got uint64)
+    ];
+    let result = run_program(3, code);
+    let err = result.expect_err("sha256 with a uint64 operand must error, not coerce");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bytes") || msg.contains("uint64") || msg.contains("type"),
+        "expected a type-mismatch error, got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Port of go-algorand's `TestShortProgramTrue` (eval_test.go ~line 3353):
+// `intcblock 1; intc 0; intc 0; bnz done; done:` -- the `done:` label sits
+// at the very *end* of the program with no instructions after it, so taking
+// the branch must land exactly on the end-of-program offset (not
+// off-by-one/out-of-range) and execution must then finish via the implicit
+// end-of-program acceptance rule (truthy leftover top-of-stack), not error.
+// `test_valid_branch_forward` in `validator.rs` covers a related but
+// different shape (branch lands just before one trailing instruction, and
+// only checks static validation, not execution); this is the specific
+// branch-to-true-end-of-program runtime case.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_short_program_true_branch_to_end_of_program() {
+    let code: &[u8] = &[
+        0x20, 0x01, 0x01, // intcblock [1]
+        0x21, 0x00, // intc 0  (push 1)
+        0x21, 0x00, // intc 0  (push 1, this is the bnz condition)
+        0x40, 0x00, 0x00, // bnz done (offset 0 -> lands exactly at end of program)
+    ];
+    let result = run_program(2, code);
+    let pass = result.expect("branch to end-of-program label must not error");
+    assert!(pass, "leftover truthy int on stack must accept");
+}
+
+// ---------------------------------------------------------------------------
 // Frame-pointer / subroutine coverage (frames_test.go, fpVersion = 8)
 // ---------------------------------------------------------------------------
 

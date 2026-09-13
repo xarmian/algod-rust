@@ -4995,6 +4995,38 @@ dup
         assert_eq!(parse_named_int("random"), None);
     }
 
+    // Ported from go-algorand's `TestOnCompletionConstants`
+    // (data/transactions/logic/eval_test.go ~line 1400): for every
+    // OnCompletion symbol, `int <Symbol>; int <numeric-value>; ==` must
+    // assemble and evaluate to accept(1) -- i.e. the `int` pseudo-op's named
+    // constant resolves to exactly the same numeric value as go's
+    // `OnCompletion` enum for every one of the 6 symbols (0..=5).
+    #[test]
+    fn test_on_completion_constants_int_pseudo_op_matches_numeric_value() {
+        let cases: &[(&str, u64)] = &[
+            ("NoOp", 0),
+            ("OptIn", 1),
+            ("CloseOut", 2),
+            ("ClearState", 3),
+            ("UpdateApplication", 4),
+            ("DeleteApplication", 5),
+        ];
+        for (symbol, value) in cases {
+            let source =
+                format!("#pragma version {MAX_AVM_VERSION}\nint {symbol}\nint {value}\n==\n");
+            let ops = assemble_string(&source).unwrap_or_else(|errs| {
+                panic!("expected {source:?} to assemble cleanly, got: {errs:?}")
+            });
+            let program = crate::bytecode::parse(&ops.program).expect("parse assembled program");
+            let mut m =
+                crate::machine::AvmMachine::new(program, crate::machine::ExecMode::LogicSig, 1000);
+            let pass = m
+                .run(&mut crate::context::NullContext)
+                .unwrap_or_else(|e| panic!("expected {symbol} program to evaluate, got: {e:?}"));
+            assert!(pass, "expected `int {symbol}` to equal {value}");
+        }
+    }
+
     #[test]
     fn test_method_pseudo_op() {
         let source = "#pragma version 3\nmethod \"add(uint64,uint64)uint64\"\npop\nint 1\n";
@@ -6234,6 +6266,142 @@ dup
                 && e.message.contains("arg 1 wanted type []byte")),
             "{errs:?}"
         );
+    }
+
+    // Ported from go-algorand's `TestEvalVersions`
+    // (data/transactions/logic/eval_test.go ~line 4384): a single combined
+    // scenario chaining both version-related rejection paths against the
+    // *same* assembled program, rather than the two paths' unit tests
+    // (`test_program_v12_under_v40_consensus_rejected` in `validator.rs` and
+    // `test_resolve_illegal_opcode` in `opcode.rs`) being exercised
+    // independently as they are today:
+    //   1. Assembled normally, the program is fine.
+    //   2. Under a protocol/consensus LogicSigVersion ceiling below the
+    //      program's own declared version, it's rejected *before* any
+    //      opcode is even inspected (go: "greater than protocol supported
+    //      version 1"; here: `check_program_version_allowed`'s "exceeds
+    //      consensus LogicSigVersion ceiling").
+    //   3. With the version *byte in the program itself* hacked down to 1
+    //      (bypassing the assembler, since real on-chain bytecode is raw
+    //      bytes) while the `txna` opcode bytes (v2+) stay in place, parsing
+    //      now fails on the opcode itself, not the protocol ceiling (go:
+    //      "illegal opcode 0x36"; here: `bytecode::parse`'s "requires AVM
+    //      v2, but program is v1" -- this crate's flat single-table design
+    //      reports the same underlying fact with different wording, as
+    //      established by every other version-gate test in this crate).
+    #[test]
+    fn test_eval_versions_protocol_ceiling_then_hacked_version_byte() {
+        let source =
+            "#pragma version 13\nintcblock 1\nintc_0\ntxna ApplicationArgs 0\npop\nint 1\n";
+        let ops = assemble_string(source)
+            .unwrap_or_else(|errs| panic!("expected {source:?} to assemble, got: {errs:?}"));
+
+        // Step 1: parses fine as assembled.
+        let program = crate::bytecode::parse(&ops.program).expect("assembled program must parse");
+        assert_eq!(program.version, 13);
+
+        // Step 2: a protocol/consensus ceiling below the program's declared
+        // version rejects it outright.
+        let ceiling_err =
+            crate::validator::check_program_version_allowed(ops.program[0], 1).unwrap_err();
+        assert!(
+            format!("{ceiling_err}").contains("exceeds consensus LogicSigVersion ceiling"),
+            "{ceiling_err}"
+        );
+
+        // Step 3: hack the version byte down to 1, keeping the v2+ `txna`
+        // opcode bytes intact -- now the failure comes from the opcode
+        // itself, not the protocol ceiling.
+        let mut hacked = ops.program.clone();
+        hacked[0] = 1;
+        let err = crate::bytecode::parse(&hacked).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("txna") && msg.contains("v1"),
+            "expected an opcode-version-gate error naming txna and v1, got: {msg}"
+        );
+    }
+
+    // Ported from go-algorand's `TestPush` (data/transactions/logic/eval_test.go
+    // ~line 4983): the assembler's automatic `intcblock`/`intc_N` constant
+    // consolidation is a genuine program-size optimization, not just a
+    // stylistic choice -- these assert the actual byte-length trade-offs go
+    // documents: (1) a lone `int 1` costs more than an explicit `pushint 1`
+    // because the intcblock overhead isn't amortized over any other
+    // constant; (2) `pushint` buys nothing when it merely replaces a
+    // reference that would already fit in a single `intc_0..3` byte; (3)
+    // `pushint` wins again once the intcblock has grown past 4 entries, so
+    // referencing further entries needs the 2-byte `intc N` form.
+    #[test]
+    fn test_push_program_size_savings_vs_intcblock() {
+        fn program_len(source: &str) -> usize {
+            assemble_string(&format!("#pragma version 3\n{source}\n"))
+                .unwrap_or_else(|errs| panic!("expected {source:?} to assemble, got: {errs:?}"))
+                .program
+                .len()
+        }
+
+        // A lone constant: pushint has no intcblock overhead to pay.
+        assert!(
+            program_len("pushint 1") < program_len("int 1"),
+            "pushint should be smaller than an intcblock-backed `int` for a single constant"
+        );
+
+        // Second distinct constant still fits in the 1-byte intc_0..3 range,
+        // so pushint buys nothing -- same total size either way.
+        assert_eq!(
+            program_len("int 2\nint 1"),
+            program_len("int 2\npushint 1"),
+            "pushint should be a no-op-sized replacement when the intc reference is 1 byte"
+        );
+
+        // With more than 4 distinct constants, referencing the 5th needs the
+        // 2-byte `intc N` form, so pushint saves a byte again.
+        assert!(
+            program_len("int 2\nint 3\nint 5\nint 6\npushint 1")
+                < program_len("int 2\nint 3\nint 5\nint 6\nint 1"),
+            "pushint should be smaller once the intc reference needs 2 bytes"
+        );
+    }
+
+    // Ported from go-algorand's `TestBnz` (data/transactions/logic/eval_test.go
+    // ~line 708): a program with a `bnz`-guarded "straightline" path that
+    // static type-tracking cannot prove unreachable (it merges stack shapes
+    // across both branch targets) gets flagged with a real assembler-time
+    // type error at the merge point, even though the *runtime* branch taken
+    // for these specific literal values never actually executes the
+    // offending `*` (only one operand on the stack). `#pragma typetrack
+    // false` suppresses the static check entirely, so the identical bytecode
+    // assembles and evaluates to accept(1) at runtime.
+    const BNZ_PLANB_PROGRAM: &str = "\nint 1\nint 2\nint 1\nint 2\n>\nbnz planb\n*\nint 1\nbnz after\nplanb:\n+\nafter:\ndup\npop\n";
+
+    #[test]
+    fn test_bnz_static_typetrack_flags_unreachable_straightline_mismatch() {
+        let source = format!("#pragma version {MAX_AVM_VERSION}\n{BNZ_PLANB_PROGRAM}");
+        let errs = expect_errors(&source);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.starts_with("+")
+                    && e.message.contains("expects 2 stack arguments")),
+            "expected a `+ expects 2 stack arguments` error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_bnz_typetrack_false_allows_and_accepts_at_runtime() {
+        let source = format!(
+            "#pragma version {MAX_AVM_VERSION}\n#pragma typetrack false\n{BNZ_PLANB_PROGRAM}"
+        );
+        let ops = assemble_string(&source).unwrap_or_else(|errs| {
+            panic!("expected {source:?} to assemble cleanly, got: {errs:?}")
+        });
+        let program = crate::bytecode::parse(&ops.program).expect("parse assembled program");
+        let mut m =
+            crate::machine::AvmMachine::new(program, crate::machine::ExecMode::LogicSig, 100_000);
+        let pass = m
+            .run(&mut crate::context::NullContext)
+            .expect("expected runtime evaluation to succeed, not error");
+        assert!(pass, "expected the program to accept (result 1)");
     }
 
     // ── Dispatch-/variable-arity opcodes (issue #829, slice 6): `txn`/

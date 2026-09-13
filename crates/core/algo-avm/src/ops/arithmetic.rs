@@ -435,6 +435,52 @@ mod tests {
         assert!(op_sub(&mut m, &instr).is_err());
     }
 
+    // Property-based analog of go-algorand's `TestRapidMath`
+    // (data/transactions/logic/eval_test.go): rapid.Check draws random
+    // uint64 pairs and asserts `+`/`-` accept when the mathematical result
+    // fits in a uint64 and panic (error, here) exactly when it doesn't --
+    // i.e. wrapping never silently occurs. algod-rust has no `rapid`
+    // dependency, but `proptest` (already a workspace dependency used by
+    // algo-agreement) draws the same random-uint64-pair space and asserts
+    // the identical overflow/underflow invariant directly against the
+    // opcode implementations rather than fixed example values.
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_add_matches_checked_add(a: u64, b: u64) {
+            let mut m = make_machine();
+            let instr = dummy_instruction();
+            m.push(AvmValue::Uint64(a)).unwrap();
+            m.push(AvmValue::Uint64(b)).unwrap();
+            let result = op_add(&mut m, &instr);
+            match a.checked_add(b) {
+                Some(sum) => {
+                    result.unwrap();
+                    prop_assert_eq!(m.pop_uint().unwrap(), sum);
+                }
+                None => {
+                    prop_assert!(result.is_err());
+                }
+            }
+        }
+
+        #[test]
+        fn prop_sub_matches_checked_sub(a: u64, b: u64) {
+            let mut m = make_machine();
+            let instr = dummy_instruction();
+            m.push(AvmValue::Uint64(a)).unwrap();
+            m.push(AvmValue::Uint64(b)).unwrap();
+            let result = op_sub(&mut m, &instr);
+            if a < b {
+                prop_assert!(result.is_err());
+            } else {
+                result.unwrap();
+                prop_assert_eq!(m.pop_uint().unwrap(), a - b);
+            }
+        }
+    }
+
     // ---- Multiplication ----
     #[test]
     fn test_mul_basic() {
