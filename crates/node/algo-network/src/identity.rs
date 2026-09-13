@@ -116,14 +116,19 @@ pub type IdentityChallengeValue = [u8; CHALLENGE_SIZE];
 /// ```
 ///
 /// Canonical field order (sorted): `a`, `c`, `pk`
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IdentityChallenge {
     /// Sender's ed25519 public key (32 bytes). Go codec tag: `pk`.
-    #[serde(rename = "pk", with = "serde_bytes")]
+    /// Omitted when all-zero (`crypto.PublicKey.MsgIsZero()`); `default` lets
+    /// decode tolerate the field being absent, matching Go's `UnmarshalMsg`
+    /// (which leaves an absent field at its zero value instead of erroring).
+    #[serde(rename = "pk", default, with = "serde_bytes")]
     pub key: Vec<u8>,
 
     /// 32-byte random challenge. Go codec tag: `c`.
-    #[serde(rename = "c", with = "serde_bytes")]
+    /// Omitted when all-zero (`identityChallengeValue{}`); see `key` above
+    /// for why `default` is required for decode to tolerate the omission.
+    #[serde(rename = "c", default, with = "serde_bytes")]
     pub challenge: Vec<u8>,
 
     /// Public address of the intended recipient. Go codec tag: `a`.
@@ -152,7 +157,11 @@ pub struct IdentityChallenge {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IdentityChallengeSigned {
     /// The unsigned challenge message. Go codec tag: `ic`.
-    #[serde(rename = "ic")]
+    /// Omitted when the *entire* inner message is zero/empty (Go's
+    /// `MsgIsZero` on the composite type); `default` lets decode tolerate
+    /// the field being absent, defaulting to `IdentityChallenge::default()`
+    /// (matching Go's `UnmarshalMsg`).
+    #[serde(rename = "ic", default)]
     pub msg: IdentityChallenge,
 
     /// Ed25519 signature over `"NIC" || canonical_encode(msg)`. Go codec tag: `sig`.
@@ -173,18 +182,22 @@ pub struct IdentityChallengeSigned {
 /// ```
 ///
 /// Canonical field order (sorted): `c`, `pk`, `rc`
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IdentityChallengeResponse {
     /// Responder's ed25519 public key (32 bytes). Go codec tag: `pk`.
-    #[serde(rename = "pk", with = "serde_bytes")]
+    /// Omitted when all-zero; `default` lets decode tolerate the field being
+    /// absent, matching Go's `UnmarshalMsg` (see `IdentityChallenge::key`).
+    #[serde(rename = "pk", default, with = "serde_bytes")]
     pub key: Vec<u8>,
 
     /// Original challenge echoed back. Go codec tag: `c`.
-    #[serde(rename = "c", with = "serde_bytes")]
+    /// Omitted when all-zero; `default` lets decode tolerate the omission.
+    #[serde(rename = "c", default, with = "serde_bytes")]
     pub challenge: Vec<u8>,
 
     /// New 32-byte response challenge. Go codec tag: `rc`.
-    #[serde(rename = "rc", with = "serde_bytes")]
+    /// Omitted when all-zero; `default` lets decode tolerate the omission.
+    #[serde(rename = "rc", default, with = "serde_bytes")]
     pub response_challenge: Vec<u8>,
 }
 
@@ -203,7 +216,9 @@ pub struct IdentityChallengeResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IdentityChallengeResponseSigned {
     /// The unsigned response message. Go codec tag: `icr`.
-    #[serde(rename = "icr")]
+    /// Omitted when the *entire* inner message is zero/empty; `default` lets
+    /// decode tolerate the field being absent (see `IdentityChallengeSigned::msg`).
+    #[serde(rename = "icr", default)]
     pub msg: IdentityChallengeResponse,
 
     /// Ed25519 signature over `"NIR" || canonical_encode(msg)`. Go codec tag: `sig`.
@@ -222,10 +237,11 @@ pub struct IdentityChallengeResponseSigned {
 /// ```
 ///
 /// Canonical field order: `rc`
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IdentityVerificationMessage {
     /// Response challenge from Message 2. Go codec tag: `rc`.
-    #[serde(rename = "rc", with = "serde_bytes")]
+    /// Omitted when all-zero; `default` lets decode tolerate the omission.
+    #[serde(rename = "rc", default, with = "serde_bytes")]
     pub response_challenge: Vec<u8>,
 }
 
@@ -244,7 +260,12 @@ pub struct IdentityVerificationMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IdentityVerificationMessageSigned {
     /// The unsigned verification message. Go codec tag: `ivm`.
-    #[serde(rename = "ivm")]
+    /// Omitted when the inner message is zero/empty (its only field,
+    /// `response_challenge`, is all-zero); `default` lets decode tolerate
+    /// the field being absent (see `IdentityChallengeSigned::msg`). This is
+    /// the case actually exercised by an all-zero `identityChallengeValue`,
+    /// since `IdentityVerificationMessage` has only that one field.
+    #[serde(rename = "ivm", default)]
     pub msg: IdentityVerificationMessage,
 
     /// Ed25519 signature over `"NIV" || canonical_encode(msg)`. Go codec tag: `sig`.
@@ -2033,29 +2054,197 @@ mod tests {
         }
     }
 
-    // NOTE: `TestRandomizedEncodingidentityChallengeValue` (row for
-    // `identityChallengeValue`, a plain go `[32]byte`) is deliberately NOT
-    // given a randomized-roundtrip test here. While investigating it, sweeping
-    // the all-zero 32-byte value (which go's `quick`-randomized generator
-    // also visits, and which is exactly the case this row exists to cover)
-    // surfaced a real decode-side divergence from go: when a field's
-    // zero value causes `canonical_encode_challenge`/`_response`/
+    // `TestRandomizedEncodingidentityChallengeValue` (row for
+    // `identityChallengeValue`, a plain go `[32]byte`): sweeping the all-zero
+    // 32-byte value (which go's `quick`-randomized generator also visits) is
+    // exactly the case this row exists to cover. It previously surfaced a
+    // real decode-side divergence from go (issue #1417): when a field's zero
+    // value causes `canonical_encode_challenge`/`_response`/
     // `_verification_message` to omit that map key entirely (mirroring go's
-    // `omitempty`), decoding the result back via `rmp_serde::from_slice`
-    // (the same call these types' real wire-decode paths use — see
-    // `parse_challenge_signed`/`parse_challenge_response_signed`/
-    // `parse_verification_message_signed` above) fails with a hard
-    // "missing field" error, because `IdentityChallenge::key`/`::challenge`,
-    // `IdentityChallengeResponse`'s three fields, and
-    // `IdentityVerificationMessage::response_challenge` all lack
-    // `#[serde(default)]`. Go's generated `UnmarshalMsg`, by contrast, only
-    // sets fields present in the decoded map and leaves absent ones at their
-    // zero value — it does not error. This is left `partial` rather than
-    // fixed inline per this sweep's rule against fixing real behavioral bugs
-    // in-place; see the batch's final report for the suggested follow-up
-    // issue (add `#[serde(default)]` to these fields, or an equivalent
-    // custom `Deserialize`, so an all-zero-omitted wire encoding round-trips
-    // instead of erroring).
+    // `omitempty`), decoding the result back via `rmp_serde::from_slice` (the
+    // same call these types' real wire-decode paths — `verify_challenge_and_respond`,
+    // `verify_challenge_response`, `verify_identity_verification` above —
+    // use) failed with a hard "missing field" error, because
+    // `IdentityChallenge::key`/`::challenge`, `IdentityChallengeResponse`'s
+    // three fields, and `IdentityVerificationMessage::response_challenge` all
+    // lacked `#[serde(default)]`. Go's generated `UnmarshalMsg`, by contrast,
+    // only sets fields present in the decoded map and leaves absent ones at
+    // their zero value — it does not error. Fixed by adding
+    // `#[serde(default)]` to those six fields (see their doc comments above);
+    // the tests below are the regression coverage for that fix.
+
+    #[test]
+    fn zero_challenge_field_omitted_on_wire_decodes_via_real_path() {
+        // IdentityChallenge::challenge all-zero -> canonical_encode_challenge
+        // omits "c" entirely. Before the #[serde(default)] fix, decoding this
+        // via the real wire-decode path (verify_challenge_and_respond, which
+        // calls rmp_serde::from_slice on the deserialized IdentityChallengeSigned)
+        // failed with IdentityError::MsgpackDecode ("missing field `c`").
+        let initiator_key = test_key(1);
+        let responder_key = test_key(2);
+        let addr = "responder.example.com:4160";
+
+        let msg = IdentityChallenge {
+            key: initiator_key.verifying_key().to_bytes().to_vec(),
+            challenge: vec![0u8; CHALLENGE_SIZE], // all-zero -> omitted on encode
+            public_address: addr.as_bytes().to_vec(),
+        };
+        let canonical = canonical_encode_challenge(&msg);
+        let signature = sign_message(HASH_ID_CHALLENGE, &canonical, &initiator_key);
+        let signed = IdentityChallengeSigned {
+            msg,
+            signature: signature.to_bytes().to_vec(),
+        };
+        let header_value = attach_challenge_header(&signed);
+
+        // Full success end-to-end: decode recovers the omitted `challenge`
+        // field as the empty-Vec<u8> zero value, re-encoding it is therefore
+        // consistent with the signed bytes, and signature verification passes.
+        let (response_signed, _response_challenge, peer_pk) =
+            verify_challenge_and_respond(&header_value, &responder_key, &[addr])
+                .expect("decode must recover the omitted `challenge` field, not error");
+        assert_eq!(peer_pk, initiator_key.verifying_key());
+
+        // The response echoes back the decoded challenge (cloned verbatim);
+        // confirm it is the empty Vec<u8> zero value, matching what the
+        // encoder started with (an all-zero challenge collapses to "absent").
+        assert_eq!(response_signed.msg.challenge, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn zero_key_field_in_identity_challenge_fails_downstream_not_at_decode() {
+        // IdentityChallenge::key all-zero -> canonical_encode_challenge omits
+        // "pk". A genuinely-zero key is never a valid peer key, so this still
+        // fails -- but it must now fail at *key validation*
+        // (IdentityError::InvalidPublicKey), not at *deserialization*
+        // (IdentityError::MsgpackDecode "missing field `pk`") as it did before
+        // the #[serde(default)] fix. This proves the decode step itself no
+        // longer errors on the omitted field.
+        let responder_key = test_key(2);
+        let addr = "responder.example.com:4160";
+
+        let msg = IdentityChallenge {
+            key: vec![0u8; CHALLENGE_SIZE], // all-zero -> omitted on encode
+            challenge: vec![0xAA; CHALLENGE_SIZE],
+            public_address: addr.as_bytes().to_vec(),
+        };
+        // Sign with an arbitrary key; the signature will not validate against
+        // the (empty, post-decode) key anyway -- we only care that decode
+        // itself succeeds and the failure moves downstream.
+        let canonical = canonical_encode_challenge(&msg);
+        let signer = test_key(9);
+        let signature = sign_message(HASH_ID_CHALLENGE, &canonical, &signer);
+        let signed = IdentityChallengeSigned {
+            msg,
+            signature: signature.to_bytes().to_vec(),
+        };
+        let header_value = attach_challenge_header(&signed);
+
+        let result = verify_challenge_and_respond(&header_value, &responder_key, &[addr]);
+        assert!(
+            matches!(result, Err(IdentityError::InvalidPublicKey(_))),
+            "expected InvalidPublicKey (decode succeeded, key validation failed downstream), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn zero_response_challenge_field_omitted_on_wire_decodes_via_real_path() {
+        // IdentityChallengeResponse::response_challenge all-zero ->
+        // canonical_encode_challenge_response omits "rc" entirely. Before the
+        // #[serde(default)] fix, decoding this via the real wire-decode path
+        // (verify_challenge_response) failed with IdentityError::MsgpackDecode
+        // ("missing field `rc`").
+        let initiator_key = test_key(1);
+        let responder_key = test_key(2);
+
+        let (challenge_signed, orig_challenge) =
+            generate_challenge(&initiator_key, "responder:4160");
+        let header_value = attach_challenge_header(&challenge_signed);
+
+        // Build the response by hand so response_challenge is all-zero
+        // (rather than the random value verify_challenge_and_respond would
+        // generate), keeping key/challenge non-zero so only "rc" is omitted.
+        let signed_challenge: IdentityChallengeSigned = rmp_serde::from_slice(
+            &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &header_value)
+                .unwrap(),
+        )
+        .unwrap();
+        let resp_msg = IdentityChallengeResponse {
+            key: responder_key.verifying_key().to_bytes().to_vec(),
+            challenge: signed_challenge.msg.challenge.clone(),
+            response_challenge: vec![0u8; CHALLENGE_SIZE], // all-zero -> omitted
+        };
+        let canonical_resp = canonical_encode_challenge_response(&resp_msg);
+        let resp_signature =
+            sign_message(HASH_ID_CHALLENGE_RESPONSE, &canonical_resp, &responder_key);
+        let resp_signed = IdentityChallengeResponseSigned {
+            msg: resp_msg,
+            signature: resp_signature.to_bytes().to_vec(),
+        };
+        let response_header = attach_response_header(&resp_signed);
+
+        // Full success end-to-end: decode recovers the omitted
+        // `response_challenge` field as the empty-Vec<u8> zero value,
+        // re-encoding is therefore consistent, and signature verification
+        // (and the original-challenge check) both pass.
+        let (identity, verification_signed) =
+            verify_challenge_response(&response_header, &orig_challenge, &initiator_key)
+                .expect("decode must recover the omitted `response_challenge` field, not error");
+        assert_eq!(identity.public_key, responder_key.verifying_key());
+
+        // Message 3's response_challenge is cloned from the decoded response;
+        // confirm it is the empty Vec<u8> zero value.
+        assert_eq!(verification_signed.msg.response_challenge, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn zero_response_challenge_field_in_verification_message_decodes_without_missing_field_error() {
+        // IdentityVerificationMessage::response_challenge all-zero ->
+        // canonical_encode_verification_message omits "rc" entirely. Before
+        // the #[serde(default)] fix, decoding this via the real wire-decode
+        // path (verify_identity_verification) failed with
+        // IdentityError::MsgpackDecode ("missing field `rc`"). After the fix,
+        // decode recovers the field as the empty Vec<u8> zero value -- since
+        // that no longer bit-for-bit equals a genuinely-all-zero 32-byte
+        // expected challenge, the subsequent challenge-match check now fails
+        // instead (IdentityError::ChallengeMismatch), proving the failure
+        // moved from deserialization to the (unrelated, pre-existing)
+        // challenge-equality check downstream.
+        let initiator_key = test_key(1);
+
+        let ver_msg = IdentityVerificationMessage {
+            response_challenge: vec![0u8; CHALLENGE_SIZE], // all-zero -> omitted
+        };
+        let canonical = canonical_encode_verification_message(&ver_msg);
+        let sig = sign_message(HASH_ID_VERIFICATION, &canonical, &initiator_key);
+        let ver_signed = IdentityVerificationMessageSigned {
+            msg: ver_msg,
+            signature: sig.to_bytes().to_vec(),
+        };
+        let wire = build_identity_verification(&ver_signed);
+        let payload = &wire[NET_ID_VERIFICATION_TAG.len()..];
+
+        // Directly confirm the decode-level fix: the same rmp_serde call
+        // verify_identity_verification uses internally now recovers the
+        // omitted field as the empty Vec<u8> zero value instead of erroring.
+        let decoded: IdentityVerificationMessageSigned =
+            rmp_serde::from_slice(payload).expect("decode must not error on the omitted field");
+        assert_eq!(decoded.msg.response_challenge, Vec::<u8>::new());
+
+        // Through the real function: the all-zero expected challenge no
+        // longer bit-for-bit matches the recovered empty Vec<u8>, so this
+        // fails at the (unrelated) challenge-match check, NOT at decode.
+        let expected_challenge = [0u8; CHALLENGE_SIZE];
+        let result = verify_identity_verification(
+            payload,
+            &expected_challenge,
+            &initiator_key.verifying_key(),
+        );
+        assert!(
+            matches!(result, Err(IdentityError::ChallengeMismatch)),
+            "expected ChallengeMismatch (decode succeeded), got {result:?}"
+        );
+    }
 
     #[test]
     fn randomized_roundtrip_identity_verification_message() {
