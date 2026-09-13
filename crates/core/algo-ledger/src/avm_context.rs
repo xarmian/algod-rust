@@ -1174,6 +1174,18 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// Precomputed inner transaction IDs, mirroring `inner_txns` structure.
     /// Each inner txn gets an ID computed via `compute_inner_txn_id(parent, offset, txn)`.
     inner_txn_ids: Vec<Vec<algo_types::Digest>>,
+    /// Issue #1406: reproduces go-algorand's `EvalParams.txidCache`
+    /// (`data/transactions/logic/eval.go`'s `getTxIDNotUnified`), the
+    /// pre-`UnifyInnerTxIDs` (pre-v34) backward-compatible TxID read cache.
+    /// Keyed **only by numeric group index**, with no distinction between an
+    /// outer-peer read (`gtxn N`/`txn`) and an inner read (`gitxn N`/`itxn`,
+    /// which always reads index 0) at the same index -- go's own bug, being
+    /// reproduced bug-for-bug here. Only consulted for a top-level (`depth
+    /// == 0`) reading context when `!consensus.unify_inner_tx_ids`; see
+    /// [`Self::get_txid_not_unified`]. Never cleared for the lifetime of
+    /// this context (matches go: the cache persists across multiple
+    /// `itxn_submit` calls within the same top-level program execution).
+    txid_cache: RefCell<HashMap<usize, algo_types::Digest>>,
     /// Asset IDs created by inner transactions (available to subsequent opcodes).
     /// Mirrors go-algorand's `resources.createdAsas`.
     pub created_assets: Vec<u64>,
@@ -2363,6 +2375,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             fee_sink: Address::ZERO,
             opcode_budget: 0,
             inner_txn_ids: Vec::new(),
+            txid_cache: RefCell::new(HashMap::new()),
             created_assets: Vec::new(),
             created_apps: Vec::new(),
             parent_txn_id: algo_types::Digest([0u8; 32]),
@@ -2417,6 +2430,42 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// call site.
     pub fn set_program_version(&mut self, version: u8) {
         self.program_version = version;
+    }
+
+    /// Issue #1406: reproduces go-algorand's `getTxIDNotUnified`
+    /// (`data/transactions/logic/eval.go:3313-3332`) for a **top-level**
+    /// (`depth == 0`) reading context -- go's `cx.caller == nil` branch,
+    /// which returns the plain, unsalted `txn.ID()` (the same hash function
+    /// used for a standalone top-level transaction) with no parent/offset
+    /// salting at all, unlike the `InnerID`-salted value `UnifyInnerTxIDs`
+    /// (v34+) uses.
+    ///
+    /// Deliberately keyed **only by `group_index`**: an outer-peer read
+    /// (`gtxn N`/`txn`, `group_index` = the outer group index) and an inner
+    /// read (`gitxn N`/`itxn`, `group_index` = the inner group's local
+    /// index -- always 0 for `itxn`, matching go's `opItxn` always passing
+    /// `gi = 0`) share the very same cache slot whenever their indices
+    /// coincide, so whichever one is read first "poisons" the other with
+    /// its own (wrong) value. This is go's actual bug, reproduced exactly
+    /// -- see go's own `TestInnerTxIDCaching`
+    /// (`data/transactions/logic/evalAppTxn_test.go`), ported at
+    /// `inner_txid_caching_go_test_inner_txid_caching_port` below.
+    ///
+    /// Only called for `depth == 0` call sites (see `txn_field`,
+    /// `last_itxn_field`, `last_itxn_group_field`); a nested (`depth > 0`)
+    /// pre-v34 reader is a rare, untested-by-go corner case not covered by
+    /// this port and keeps the existing `inner_txn_ids`-derived value.
+    fn get_txid_not_unified(
+        &self,
+        txn: &algo_types::Transaction,
+        group_index: usize,
+    ) -> algo_types::Digest {
+        if let Some(cached) = self.txid_cache.borrow().get(&group_index) {
+            return *cached;
+        }
+        let txid = algo_codec::compute_txn_id(txn);
+        self.txid_cache.borrow_mut().insert(group_index, txid);
+        txid
     }
 
     /// Activate group-wide *unnamed*-resource sharing for a **top-level**
@@ -5052,6 +5101,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 }),
             };
         }
+        // Issue #1406: pre-v34 (not UnifyInnerTxIDs), a top-level reading
+        // context's TxID reads (both `gtxn`/`txn` and `gitxn`/`itxn`) go
+        // through go's groupIndex-only-keyed `txidCache`, which can return a
+        // stale/colliding value shared with an inner-txn TxID read at the
+        // same numeric index. See `get_txid_not_unified`'s doc.
+        if field == 23 && !self.consensus.unify_inner_tx_ids && self.depth == 0 {
+            let txid = self.get_txid_not_unified(&stxn.txn, group_index);
+            return Ok(TealValue::Bytes(txid.0.to_vec()));
+        }
         read_txn_field(stxn, field, array_index, group_index)
     }
 
@@ -6821,7 +6879,18 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             message: "last_itxn_field: empty inner txn group".to_string(),
         })?;
         // TxID (field 23) for inner txns uses the precomputed inner txn ID.
+        //
+        // Issue #1406: pre-v34, go's `opItxn` always reads via the
+        // groupIndex-only-keyed `txidCache` at index 0 (`gi = 0`, matching
+        // `getLastInner()`'s single-element slice) rather than the
+        // `InnerID`-salted value -- and that cache slot collides with a
+        // `gtxn 0`/`txn` (group_index 0) read at a top-level reading
+        // context. See `get_txid_not_unified`'s doc.
         if field == 23 {
+            if !self.consensus.unify_inner_tx_ids && self.depth == 0 {
+                let txid = self.get_txid_not_unified(&last_txn.txn, 0);
+                return Ok(TealValue::Bytes(txid.0.to_vec()));
+            }
             if let Some(last_ids) = self.inner_txn_ids.last() {
                 if let Some(id) = last_ids.last() {
                     return Ok(TealValue::Bytes(id.0.to_vec()));
@@ -6850,7 +6919,16 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             });
         }
         // TxID (field 23) for inner txns uses the precomputed inner txn ID.
+        //
+        // Issue #1406: pre-v34, `gitxn N TxID` reads via the same
+        // groupIndex-only-keyed `txidCache` as `gtxn N`/`txn` (a top-level
+        // reading context), colliding whenever both are read at the same
+        // numeric index. See `get_txid_not_unified`'s doc.
         if field == 23 {
+            if !self.consensus.unify_inner_tx_ids && self.depth == 0 {
+                let txid = self.get_txid_not_unified(&last_group[group_index].txn, group_index);
+                return Ok(TealValue::Bytes(txid.0.to_vec()));
+            }
             if let Some(last_ids) = self.inner_txn_ids.last() {
                 if let Some(id) = last_ids.get(group_index) {
                     return Ok(TealValue::Bytes(id.0.to_vec()));
@@ -11389,6 +11467,167 @@ mod tests {
 
             let gtxn1 = ctx.txn_field(1, 23, None).unwrap(); // gtxn 1 TxID
             assert_eq!(gtxn1, TealValue::Bytes(txid1.0.to_vec()));
+        }
+    }
+
+    /// Issue #1406 / direct port of go-algorand's `TestInnerTxIDCaching`
+    /// (`data/transactions/logic/evalAppTxn_test.go:2694`): reproduces go's
+    /// exact `EvalParams.txidCache` collision between an outer-peer TxID
+    /// read (`gtxn 0`/`txn`) and an inner TxID read (`gitxn 0`/`itxn`) --
+    /// both keyed by the same numeric index in go's pre-`UnifyInnerTxIDs`
+    /// (pre-v34) `txidCache`, so whichever is read first "poisons" the
+    /// other with its own value -- while confirming no such collision
+    /// exists at v34+ (current, correct, non-colliding behavior preserved).
+    ///
+    /// Ported at the context-method level (this file's existing
+    /// `cached_txids_go_test_cached_tx_ids_port` style) rather than
+    /// compiling/running the original TEAL source, since `LedgerAvmContext`'s
+    /// methods (`txn_field`, `last_itxn_group_field`) are the same surface
+    /// go's `opTxn`/`opGitxn` opcodes dispatch through. The original test's
+    /// three TEAL scenarios (does gitxn hit the cache for gtxn? does gtxn
+    /// hit the cache for gitxn? does the cache survive a second
+    /// itxn_submit?) map onto the three scenarios below, each on a fresh
+    /// context/store so the cache starts empty.
+    #[test]
+    fn inner_txid_caching_go_test_inner_txid_caching_port() {
+        fn new_ctx(
+            store: &mut LedgerState,
+            consensus: ConsensusParams,
+        ) -> LedgerAvmContext<'_, LedgerState> {
+            let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+            let app_addr = Address(app_address(42));
+            store.set_account(
+                &app_addr,
+                AccountData {
+                    micro_algos: 10_000_000,
+                    ..Default::default()
+                },
+            );
+            let mut ctx = make_context(store, vec![txn]);
+            ctx.fee_sink = Address([0xFEu8; 32]);
+            ctx.consensus = consensus;
+            ctx
+        }
+
+        // Submits a single-inner-txn group (group_index 0) so the inner
+        // read's numeric index (0) coincides with the outer read's index
+        // (also 0, `make_context`'s single top-level txn) -- exactly the
+        // collision-prone configuration go's own test exercises.
+        fn submit_inner_pay(ctx: &mut LedgerAvmContext<'_, LedgerState>, amount: u64) {
+            let rcv = Address([30u8; 32]);
+            ctx.itxn_begin().unwrap();
+            ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum: pay
+            ctx.itxn_field(7, TealValue::Bytes(rcv.0.to_vec())).unwrap(); // Receiver
+            ctx.itxn_field(8, TealValue::Uint(amount)).unwrap(); // Amount
+            ctx.itxn_submit().unwrap();
+        }
+
+        for unified in [false, true] {
+            let consensus = algo_types::consensus::consensus_params_for_version(if unified {
+                algo_types::consensus::CONSENSUS_V34
+            } else {
+                algo_types::consensus::CONSENSUS_V33
+            })
+            .expect("consensus params");
+            assert_eq!(consensus.unify_inner_tx_ids, unified);
+
+            // ── Scenario 1: does `gitxn 0 TxID` hit the cache populated by
+            // an earlier `gtxn 0 TxID` read? ──
+            {
+                let mut store = LedgerState::new();
+                let mut ctx = new_ctx(&mut store, consensus.clone());
+                let real_outer_id = algo_codec::compute_txn_id(&ctx.group[0].txn);
+
+                let outer_read = ctx.txn_field(0, 23, None).unwrap();
+                assert_eq!(outer_read, TealValue::Bytes(real_outer_id.0.to_vec()));
+
+                submit_inner_pay(&mut ctx, 1);
+                let real_inner_id =
+                    algo_codec::compute_txn_id(&ctx.inner_txns().last().unwrap()[0].txn);
+                let inner_read = ctx.last_itxn_group_field(0, 23, None).unwrap();
+
+                if unified {
+                    assert_ne!(
+                        inner_read, outer_read,
+                        "v34+: gitxn 0 must not collide with the earlier gtxn 0 read"
+                    );
+                } else {
+                    assert_eq!(
+                        inner_read, outer_read,
+                        "pre-v34: gitxn 0 TxID must return the stale gtxn 0 TxID value"
+                    );
+                    assert_ne!(
+                        inner_read,
+                        TealValue::Bytes(real_inner_id.0.to_vec()),
+                        "pre-v34: the colliding value must not be the inner txn's real ID"
+                    );
+                }
+            }
+
+            // ── Scenario 2: does `gtxn 0 TxID` hit the cache populated by
+            // an earlier `gitxn 0 TxID` read (no prior outer read)? ──
+            {
+                let mut store = LedgerState::new();
+                let mut ctx = new_ctx(&mut store, consensus.clone());
+                let real_outer_id = algo_codec::compute_txn_id(&ctx.group[0].txn);
+
+                submit_inner_pay(&mut ctx, 1);
+                let real_inner_id =
+                    algo_codec::compute_txn_id(&ctx.inner_txns().last().unwrap()[0].txn);
+                let inner_read = ctx.last_itxn_group_field(0, 23, None).unwrap();
+                let outer_read = ctx.txn_field(0, 23, None).unwrap();
+
+                if unified {
+                    assert_ne!(
+                        outer_read, inner_read,
+                        "v34+: gtxn 0 must not collide with the earlier gitxn 0 read"
+                    );
+                    assert_eq!(outer_read, TealValue::Bytes(real_outer_id.0.to_vec()));
+                } else {
+                    assert_eq!(
+                        outer_read, inner_read,
+                        "pre-v34: gtxn 0 TxID must return the stale gitxn 0 TxID value"
+                    );
+                    assert_eq!(
+                        outer_read,
+                        TealValue::Bytes(real_inner_id.0.to_vec()),
+                        "pre-v34: the colliding value is the inner txn's plain (unsalted) hash"
+                    );
+                }
+            }
+
+            // ── Scenario 3: does the `gitxn 0 TxID` cache survive a second
+            // `itxn_submit` (a fresh, different inner group)? ──
+            {
+                let mut store = LedgerState::new();
+                let mut ctx = new_ctx(&mut store, consensus.clone());
+
+                submit_inner_pay(&mut ctx, 1);
+                let first_read = ctx.last_itxn_group_field(0, 23, None).unwrap();
+
+                submit_inner_pay(&mut ctx, 2); // a genuinely different inner txn
+                let real_second_id =
+                    algo_codec::compute_txn_id(&ctx.inner_txns().last().unwrap()[0].txn);
+                let second_read = ctx.last_itxn_group_field(0, 23, None).unwrap();
+
+                if unified {
+                    assert_ne!(
+                        first_read, second_read,
+                        "v34+: the inner TxID cache must reset on every itxn_submit"
+                    );
+                } else {
+                    assert_eq!(
+                        first_read, second_read,
+                        "pre-v34: the stale cache from the first itxn_submit must survive \
+                         a second itxn_submit"
+                    );
+                    assert_ne!(
+                        second_read,
+                        TealValue::Bytes(real_second_id.0.to_vec()),
+                        "pre-v34: the returned value must not be the second group's real ID"
+                    );
+                }
+            }
         }
     }
 

@@ -51,10 +51,10 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 1,069 | 34% |
+| `matched-1:1` | 1,070 | 34% |
 | `matched-1:many` | 852 | 27% |
 | `out-of-scope` | 643 | 20% |
-| `partial` | 378 | 12% |
+| `partial` | 377 | 12% |
 | `matched-many:1` | 239 | 8% |
 | `not-implemented` | 0 | 0% |
 | `missing-test` | 0 | 0% |
@@ -71,7 +71,7 @@ were triaged into tracked issues.
 
 | area | file | total | 1:1 | 1:many | many:1 | partial | not-impl | missing-test | out-of-scope |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 146 | 239 | 6 | 20 | 0 | 0 | 38 |
+| AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 147 | 239 | 6 | 19 | 0 | 0 | 38 |
 | Transactions core (`data/transactions`) | [parity_txn_core.md](phase17/parity_txn_core.md) | 175 | 63 | 45 | 0 | 54 | 0 | 0 | 13 |
 | Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 78 | 151 | 62 | 1 | 0 | 0 | 211 |
 | Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 36 | 30 | 0 | 1 | 0 | 0 | 1 |
