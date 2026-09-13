@@ -933,3 +933,130 @@ fn test_string_literal_runtime_equality() {
         "empty string literal must equal empty byte constant even with trailing comments"
     );
 }
+
+/// TestLoop (eval_test.go#L5011): a backward-branch loop that doubles a
+/// value until it exceeds 10 (terminating at 16) must accept, while the
+/// same loop shape multiplying by 1 instead of 2 (never terminating) must
+/// panic (error) rather than pass or plain-reject, since it runs until the
+/// AVM's cost/step budget is exhausted.
+#[test]
+fn test_loop() {
+    let doubling = "int 1; loop: int 2; *; dup; int 10; <; bnz loop; int 16; ==";
+    let result = run_source(4, doubling).unwrap();
+    assert!(
+        result,
+        "doubling loop must terminate with 16 and accept, mirroring go's TestLoop"
+    );
+
+    let infinite = "int 1; loop:; int 1; *; dup; int 10; <; bnz loop; int 16; ==";
+    let err = run_source(4, infinite)
+        .expect_err("multiplying by 1 forever must never terminate the loop and must error out");
+    // go's testPanics asserts pass==false && err != nil (a genuine panic, not
+    // a plain reject) -- here that's the budget/cost-exhaustion error since
+    // there's no other termination condition.
+    let _ = err;
+}
+
+/// TestWideMath (eval_test.go#L924): a composed `mulw`/`addw`/`divmodw`/
+/// `load`/`store` algorithm -- multiply two u64s widened, add back a
+/// correction term, then divide back out by the first operand and verify
+/// the quotient/remainder recover the second operand exactly. Ported
+/// verbatim (same TEAL pattern, same four representative operand pairs
+/// go's test uses) rather than testing each opcode in isolation.
+#[test]
+fn test_wide_math() {
+    let pattern = |a: u64, b: u64| -> String {
+        format!(
+            "
+int {a}
+dup
+store 0
+int {b}
+dup
+store 1
+mulw
+// add one less than the first number
+load 0
+int 1
+-
+addw
+// stack is now [high word, carry bit, low word]
+store 2
++				// combine carry and high
+load 2
+// now divmodw by the 1st given number (widened)
+int 0
+load 0
+divmodw
+// remainder should be one less that first number
+load 0; int 1; -;  ==; assert
+int 0; ==; assert		// (upper word)
+// then the 2nd given number is left (widened)
+load 1; ==; assert
+int 0; ==; assert
+// succeed
+int 1
+"
+        )
+    };
+
+    for (a, b) in [
+        (1000u64, 8192378u64),
+        (1082734200, 8192378),
+        (1000, 8129387292378),
+        (10278362800, 8192378),
+    ] {
+        let result = run_source(4, &pattern(a, b))
+            .unwrap_or_else(|e| panic!("TestWideMath({a}, {b}) errored: {e:?}"));
+        assert!(
+            result,
+            "TestWideMath({a}, {b}): composed mulw/addw/divmodw algorithm must recover the \
+             original operands exactly, matching go"
+        );
+    }
+}
+
+/// TestMulDiv (eval_test.go#L971): a `callsub`/`retsub` subroutine
+/// computing `B*C/A` via `mulw`/`dig`/`divmodw`, exercised with both a
+/// passing and a deliberately-wrong expected result, plus a
+/// large-operand case.
+#[test]
+fn test_muldiv() {
+    let muldiv = "
+muldiv:
+mulw				// multiply B*C. puts TWO u64s on stack
+int 0				// high word of C as a double-word
+dig 3				// pull C to TOS
+divmodw
+pop				// pop unneeded remainder low word
+pop                             // pop unneeded remainder high word
+swap
+int 0
+==
+assert				// ensure high word of quotient was 0
+swap				// bring C to surface
+pop				// in order to get rid of it
+retsub
+";
+
+    let accept1 = format!("int 5; int 8; int 10; callsub muldiv; int 16; ==; return;{muldiv}");
+    assert!(
+        run_source(4, &accept1).unwrap(),
+        "5,8,10 -> muldiv -> 16 must accept, matching go's TestMulDiv"
+    );
+
+    let reject = format!("int 5; int 8; int 10; callsub muldiv; int 15; ==; return;{muldiv}");
+    assert!(
+        !run_source(4, &reject).unwrap(),
+        "5,8,10 -> muldiv -> 15 (wrong) must reject, matching go's TestMulDiv"
+    );
+
+    let accept2 = format!(
+        "int 500000000000; int 80000000000; int 100000000000; callsub muldiv; \
+         int 16000000000; ==; return;{muldiv}"
+    );
+    assert!(
+        run_source(4, &accept2).unwrap(),
+        "large-operand muldiv case must accept, matching go's TestMulDiv"
+    );
+}

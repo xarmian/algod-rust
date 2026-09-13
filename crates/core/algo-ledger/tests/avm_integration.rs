@@ -1675,3 +1675,145 @@ fn logicsig_mode_context_has_no_apps_enabled_version_floor() {
         "LogicSig-mode LedgerAvmContext must not enforce the appsEnabledVersion floor"
     );
 }
+
+// ===========================================================================
+// TestTLHC (eval_test.go#L590): hash-time-locked-contract LogicSig
+// ===========================================================================
+//
+// Ported from go-algorand's `tlhcProgramText`/`TestTLHC`. The contract logic
+// (encoded verbatim from go's TEAL source) is:
+//
+//   A = (CloseRemainderTo == a1 && Receiver == a1
+//        && len(arg0) == 32 && sha256(arg0) == secretHash)
+//   B = (CloseRemainderTo == a2 && Receiver == a2 && FirstValid > 3000)
+//   accept iff (A || B) && Fee < 1_000_000
+//
+// This exercises `addr`, `arg`, `len`, `sha256`, `byte base64(...)`, `txn
+// CloseRemainderTo/Receiver/FirstValid/Fee`, and boolean combinators
+// together in the composite multi-branch scenario go's test specifically
+// checks, closing the "no dedicated HTLC-style integration test" gap noted
+// in docs/phase17/parity_txn_logic.md.
+const TLHC_PROGRAM: &str = r#"
+txn CloseRemainderTo
+addr DFPKC2SJP3OTFVJFMCD356YB7BOT4SJZTGWLIPPFEWL3ZABUFLTOY6ILYE
+==
+txn Receiver
+addr DFPKC2SJP3OTFVJFMCD356YB7BOT4SJZTGWLIPPFEWL3ZABUFLTOY6ILYE
+==
+&&
+arg 0
+len
+int 32
+==
+&&
+arg 0
+sha256
+byte base64 r8St7smOQ0LV55o8AUmGGrpgnYwVmg4wCxeLA/H8Z+s=
+==
+&&
+txn CloseRemainderTo
+addr YYKRMERAFXMXCDWMBNR6BUUWQXDCUR53FPUGXLUYS7VNASRTJW2ENQ7BMQ
+==
+txn Receiver
+addr YYKRMERAFXMXCDWMBNR6BUUWQXDCUR53FPUGXLUYS7VNASRTJW2ENQ7BMQ
+==
+&&
+txn FirstValid
+int 3000
+>
+&&
+||
+txn Fee
+int 1000000
+<
+&&
+"#;
+
+/// Assemble the TLHC program at the given version and evaluate it as a
+/// LogicSig against `txn` (with the given `arg0`), returning pass/fail.
+fn eval_tlhc(version: u8, txn: Transaction, arg0: &[u8]) -> bool {
+    let full_source = format!("#pragma version {version}\n{TLHC_PROGRAM}\n");
+    let ops = assemble_string(&full_source)
+        .unwrap_or_else(|e| panic!("TLHC assembly failed at v{version}: {e:?}"));
+    let program = parse(&ops.program).expect("parse TLHC program");
+
+    let signed = SignedTransaction {
+        txn,
+        ..Default::default()
+    };
+    let mut store = LedgerState::new();
+    let mut ctx = make_lsig_context(&mut store, vec![signed]);
+    ctx.set_lsig_args(vec![arg0.to_vec()]);
+
+    let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 20_000);
+    machine
+        .run(&mut ctx)
+        .unwrap_or_else(|e| panic!("TLHC eval errored at v{version}: {e:?}"))
+}
+
+#[test]
+fn tlhc_hash_time_locked_contract() {
+    use base64::Engine;
+
+    let a1 =
+        Address::from_algorand_string("DFPKC2SJP3OTFVJFMCD356YB7BOT4SJZTGWLIPPFEWL3ZABUFLTOY6ILYE")
+            .unwrap();
+    let a2 =
+        Address::from_algorand_string("YYKRMERAFXMXCDWMBNR6BUUWQXDCUR53FPUGXLUYS7VNASRTJW2ENQ7BMQ")
+            .unwrap();
+    let secret = base64::engine::general_purpose::STANDARD
+        .decode("xPUB+DJir1wsH7g2iEY1QwYqHqYH1vUJtzZKW4RxXsY=")
+        .unwrap();
+    let wrong_secret =
+        b"=0\x97S\x85H\xe9\x91B\xfd\xdb;1\xf5Z\xaec?\xae\xf2I\x93\x08\x12\x94\xaa~\x06\x08\x849a"
+            .to_vec();
+    assert_eq!(secret.len(), 32);
+    assert_eq!(wrong_secret.len(), 32);
+
+    for v in 1u8..=algo_avm::opcode::MAX_AVM_VERSION {
+        // 1. Right secret, but Receiver/CloseRemainderTo default to the zero
+        //    address (neither a1 nor a2) -> neither branch A nor B is live.
+        let base = Transaction {
+            first_valid: 999_999.into(),
+            ..Default::default()
+        };
+        assert!(
+            !eval_tlhc(v, base.clone(), &secret),
+            "v{v}: zero-address receiver/close-to must reject"
+        );
+
+        // 2. Receiver=CloseTo=a2, FirstValid=999999 (>3000) -> branch B live.
+        let mut b_live = base.clone();
+        b_live.receiver = a2;
+        b_live.close_remainder_to = a2;
+        assert!(
+            eval_tlhc(v, b_live.clone(), &secret),
+            "v{v}: a2 branch with FirstValid > 3000 must pass"
+        );
+
+        // 3. Same a2 addresses but FirstValid=1 (not > 3000) -> B no longer
+        //    live, and A never was (CloseTo/Receiver != a1) -> reject.
+        let mut b_dead = b_live.clone();
+        b_dead.first_valid = 1.into();
+        assert!(
+            !eval_tlhc(v, b_dead, &secret),
+            "v{v}: a2 branch with FirstValid <= 3000 must reject"
+        );
+
+        // 4. Receiver=CloseTo=a1, right secret -> branch A live -> pass.
+        let mut a_live = base.clone();
+        a_live.receiver = a1;
+        a_live.close_remainder_to = a1;
+        assert!(
+            eval_tlhc(v, a_live.clone(), &secret),
+            "v{v}: a1 branch with the right secret must pass"
+        );
+
+        // 5. Same a1 addresses but the wrong secret -> sha256 mismatch -> A
+        //    no longer live -> reject.
+        assert!(
+            !eval_tlhc(v, a_live, &wrong_secret),
+            "v{v}: a1 branch with the wrong secret must reject"
+        );
+    }
+}
