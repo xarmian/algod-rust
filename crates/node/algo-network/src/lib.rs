@@ -39,6 +39,7 @@ pub mod identity;
 pub mod limitcaller;
 pub mod listener;
 pub mod message;
+pub mod metrics;
 pub mod msg_of_interest;
 pub mod net_prio;
 pub mod peer_features;
@@ -287,6 +288,12 @@ pub use agreement_network::{
     AgreementNetworkBridge, AgreementNetworkConfig, DEFAULT_BUNDLE_QUEUE_LEN,
     DEFAULT_PROPOSAL_QUEUE_LEN, DEFAULT_VOTE_QUEUE_LEN,
 };
+
+// ---------------------------------------------------------------------------
+// Re-exports: per-wire-tag byte/message metrics counters (issue #1425)
+// ---------------------------------------------------------------------------
+
+pub use metrics::{NetworkTagMetrics, TagCounter};
 
 // ---------------------------------------------------------------------------
 // Re-exports: Transaction synchronizer (Plan 33, gap G1 — skeleton)
