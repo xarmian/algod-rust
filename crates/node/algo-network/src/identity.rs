@@ -1168,6 +1168,41 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Mirrors go's `TestIdentityChallengeSchemeBadResponsePayload`
+    // (network/netidentity_test.go): unlike `bad_base64_header_rejected` /
+    // `bad_msgpack_payload_rejected` above (which exercise the *challenge*
+    // path, `verify_challenge_and_respond`), go's test specifically targets
+    // `VerifyResponse` — the *response* path, `verify_challenge_response` here
+    // — with a header that isn't valid base64 at all, asserting the error is
+    // (or wraps) a base64 corrupt-input error.
+    #[test]
+    fn response_bad_base64_header_rejected() {
+        let key = test_key(1);
+        let expected_challenge = [0x11; 32];
+
+        let result = verify_challenge_response("BAD B64 ENCODING :)", &expected_challenge, &key);
+        assert!(matches!(result, Err(IdentityError::Base64Decode(_))));
+    }
+
+    // Same go test as above, but the payload after base64-decoding is not
+    // valid msgpack -- go's `VerifyResponse` only ever surfaces the base64
+    // decode error class in that specific test, but the sibling
+    // `verify_challenge_and_respond` path (`bad_msgpack_payload_rejected`
+    // above) demonstrates the msgpack-decode-failure branch exists too, so
+    // this closes the same gap for the response path.
+    #[test]
+    fn response_bad_msgpack_payload_rejected() {
+        let key = test_key(1);
+        let expected_challenge = [0x22; 32];
+
+        let bad_payload = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"not-msgpack-data!!",
+        );
+        let result = verify_challenge_response(&bad_payload, &expected_challenge, &key);
+        assert!(matches!(result, Err(IdentityError::MsgpackDecode(_))));
+    }
+
     // -----------------------------------------------------------------------
     // Msgpack structure verification -- field names must match Go codec tags
     // -----------------------------------------------------------------------

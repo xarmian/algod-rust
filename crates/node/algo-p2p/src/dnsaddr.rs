@@ -303,6 +303,39 @@ mod tests {
         }
     }
 
+    // Go: `TestIsDnsaddr` (`network/p2p/dnsaddr/resolve_test.go`) — direct
+    // port of the same table (`is_dnsaddr` is a private fn in this module,
+    // so the test module can call it directly rather than only exercising it
+    // indirectly through `resolve_multiaddrs`).
+    #[test]
+    fn is_dnsaddr_table() {
+        let cases: &[(&str, bool)] = &[
+            ("/dnsaddr/foobar.com", true),
+            (
+                "/dnsaddr/foobar.com/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+                true,
+            ),
+            (
+                "/dnsaddr/foobar.com/ip4/127.0.0.1/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+                true,
+            ),
+            ("/dns4/foobar.com", false),
+            ("/dns6/foobar.com", false),
+            (
+                "/dns4/foobar.com/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+                false,
+            ),
+        ];
+        for (addr, expected) in cases {
+            let maddr: Multiaddr = addr.parse().expect("valid multiaddr");
+            assert_eq!(
+                is_dnsaddr(&maddr),
+                *expected,
+                "is_dnsaddr({addr}) expected {expected}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn resolves_concrete_multiaddrs() {
         let peer_id = libp2p::PeerId::random();
