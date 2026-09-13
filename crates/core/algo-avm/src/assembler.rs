@@ -2291,6 +2291,22 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
             ops.pending.push(spec.opcode);
             // Check if this opcode uses a field group
             if let Some(val) = resolve_field_immediate(ops, mnemonic, args[0]) {
+                if let Some(field_version) = field_group_version_at(mnemonic, 0, val) {
+                    if field_version > ops.version {
+                        ops.record_error(
+                            ops.source_line,
+                            0,
+                            format!(
+                                "{} {} field was introduced in v{}. Missed #pragma version?",
+                                mnemonic, args[0], field_version,
+                            ),
+                        );
+                        // Remove the opcode we just pushed since the field
+                        // isn't usable at this program version.
+                        ops.pending.pop();
+                        return;
+                    }
+                }
                 ops.pending.push(val);
             } else if let Ok(val) = parse_uint8_or_int8(args[0], mnemonic) {
                 ops.pending.push(val);
@@ -2325,6 +2341,19 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
             ops.pending.push(spec.opcode);
             for (i, arg) in args.iter().enumerate() {
                 if let Some(val) = resolve_field_immediate_at(ops, mnemonic, arg, i) {
+                    if let Some(field_version) = field_group_version_at(mnemonic, i, val) {
+                        if field_version > ops.version {
+                            ops.record_error(
+                                ops.source_line,
+                                0,
+                                format!(
+                                    "{} {} field was introduced in v{}. Missed #pragma version?",
+                                    mnemonic, arg, field_version,
+                                ),
+                            );
+                            continue;
+                        }
+                    }
                     ops.pending.push(val);
                 } else if let Ok(val) = parse_uint8_or_int8(arg, mnemonic) {
                     ops.pending.push(val);
@@ -2349,6 +2378,19 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
             ops.pending.push(spec.opcode);
             for (i, arg) in args.iter().enumerate() {
                 if let Some(val) = resolve_field_immediate_at(ops, mnemonic, arg, i) {
+                    if let Some(field_version) = field_group_version_at(mnemonic, i, val) {
+                        if field_version > ops.version {
+                            ops.record_error(
+                                ops.source_line,
+                                0,
+                                format!(
+                                    "{} {} field was introduced in v{}. Missed #pragma version?",
+                                    mnemonic, arg, field_version,
+                                ),
+                            );
+                            continue;
+                        }
+                    }
                     ops.pending.push(val);
                 } else if let Ok(val) = parse_uint8_or_int8(arg, mnemonic) {
                     ops.pending.push(val);
@@ -2642,6 +2684,94 @@ fn resolve_field_immediate_at(
         ("block", 0) => fields::block_field_by_name(arg),
         ("mimc", 0) => fields::mimc_config_by_name(arg),
         ("poseidon2", 0) => fields::poseidon2_config_by_name(arg),
+
+        _ => None,
+    }
+}
+
+/// Returns the AVM version at which the given field-group immediate byte
+/// (already resolved by [`resolve_field_immediate_at`] for this exact
+/// `(mnemonic, imm_index)`) was introduced -- mirrors go-algorand's
+/// `asmDefault` check (`assembler.go:1240-1245`): `if fs.Version() >
+/// ops.Version { error("... field was introduced in vN. Missed #pragma
+/// version?") }`. Every arm here must match [`resolve_field_immediate_at`]'s
+/// dispatch table exactly, since it is only ever called with a byte that
+/// function just produced.
+fn field_group_version_at(mnemonic: &str, imm_index: usize, byte: u8) -> Option<u8> {
+    match (mnemonic, imm_index) {
+        // `itxn_field` is go-algorand's odd one out here: it has its own
+        // `asmItxnField` (assembler.go:1128-1145), gating on the field's
+        // *settable-in-an-inner-txn* version (`fs.itxVersion`), not its
+        // ordinary *readable* version (`fs.version`) used by every other
+        // txn-field-group mnemonic below. A field with `itx_version() == 0`
+        // can never be set via `itxn_field` at any version (go reports
+        // `"... is not allowed."` for that, a distinct, pre-existing gap
+        // this issue doesn't address) -- returning `None` here just skips
+        // the version gate for it, same as before this fix.
+        ("itxn_field", 0) => {
+            let v = fields::TxnField::from_u8(byte).ok()?.itx_version();
+            if v == 0 {
+                None
+            } else {
+                Some(v)
+            }
+        }
+
+        ("txn", 0)
+        | ("txna", 0)
+        | ("txnas", 0)
+        | ("itxn", 0)
+        | ("itxna", 0)
+        | ("itxnas", 0)
+        | ("gtxn", 1)
+        | ("gtxna", 1)
+        | ("gtxns", 0)
+        | ("gtxnsa", 0)
+        | ("gtxnas", 1)
+        | ("gtxnsas", 0)
+        | ("gitxn", 1)
+        | ("gitxna", 1)
+        | ("gitxnas", 1) => fields::TxnField::from_u8(byte).ok().map(|f| f.version()),
+
+        ("global", 0) => fields::GlobalField::from_u8(byte).ok().map(|f| f.version()),
+
+        ("asset_holding_get", 0) => fields::AssetHoldingField::from_u8(byte)
+            .ok()
+            .map(|f| f.version()),
+        ("asset_params_get", 0) => fields::AssetParamsField::from_u8(byte)
+            .ok()
+            .map(|f| f.version()),
+        ("app_params_get", 0) | ("app_params_set", 0) => fields::AppParamsField::from_u8(byte)
+            .ok()
+            .map(|f| f.version()),
+        ("acct_params_get", 0) => fields::AcctParamsField::from_u8(byte)
+            .ok()
+            .map(|f| f.version()),
+        ("voter_params_get", 0) => fields::VoterParamsField::from_u8(byte)
+            .ok()
+            .map(|f| f.version()),
+
+        ("ecdsa_verify", 0) | ("ecdsa_pk_decompress", 0) | ("ecdsa_pk_recover", 0) => {
+            fields::EcdsaCurve::from_u8(byte).ok().map(|f| f.version())
+        }
+
+        ("ec_add", 0)
+        | ("ec_scalar_mul", 0)
+        | ("ec_pairing_check", 0)
+        | ("ec_multi_scalar_mul", 0)
+        | ("ec_subgroup_check", 0)
+        | ("ec_map_to", 0) => fields::EcGroup::from_u8(byte).ok().map(|f| f.version()),
+
+        ("base64_decode", 0) => fields::Base64Encoding::from_u8(byte)
+            .ok()
+            .map(|f| f.version()),
+        ("json_ref", 0) => fields::JSONRefType::from_u8(byte).ok().map(|f| f.version()),
+        ("vrf_verify", 0) => fields::VrfStandard::from_u8(byte).ok().map(|f| f.version()),
+        ("block", 0) => fields::BlockField::from_u8(byte).ok().map(|f| f.version()),
+        ("mimc", 0) => fields::MimcConfig::from_u8(byte).ok().map(|f| f.version()),
+        ("poseidon2", 0) => fields::Poseidon2Config::from_u8(byte)
+            .ok()
+            .map(|f| f.version()),
 
         _ => None,
     }
@@ -3623,6 +3753,208 @@ mod tests {
         let ops = assemble_string(source).unwrap();
         let pos = ops.program.iter().position(|&b| b == 0x31).unwrap();
         assert_eq!(ops.program[pos + 1], 0); // Sender = 0
+    }
+
+    // ── Field-group version gating (issue #1403) ────────────────────────
+    // go-algorand's assembler statically rejects a field-group immediate
+    // (a `global`/`txn`/`itxn_field`/... field name) whose spec version is
+    // newer than the program's declared `#pragma version`
+    // (`assembler.go:1240-1245`, "%s %s field was introduced in v%d. Missed
+    // #pragma version?"). algod-rust previously resolved the field byte
+    // without ever checking this.
+
+    #[test]
+    fn test_global_field_too_new_for_pragma_version_rejected() {
+        // OpcodeBudget is a GlobalField introduced at v6.
+        let errs = expect_errors("#pragma version 1\nglobal OpcodeBudget\n");
+        assert!(
+            errs.iter().any(|e| e.message
+                == "global OpcodeBudget field was introduced in v6. Missed #pragma version?"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_txn_field_too_new_for_pragma_version_rejected() {
+        // StateProofPK is a TxnField introduced at v6.
+        let errs = expect_errors("#pragma version 2\ntxn StateProofPK\n");
+        assert!(
+            errs.iter().any(|e| e.message
+                == "txn StateProofPK field was introduced in v6. Missed #pragma version?"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_itxn_field_too_new_for_pragma_version_rejected() {
+        // VotePK became settable via itxn_field at itxVersion 6 (TxnField's
+        // `itx_version`, not `version` -- but itxn_field's dispatch reuses
+        // TxnField::version() for the assemble-time gate here, same as
+        // `txn`, so a field whose *read* version is already >= the pragma
+        // is what this test needs; RejectVersion (v12) covers that cleanly
+        // for itxn_field too.
+        let errs = expect_errors("#pragma version 6\nitxn_field RejectVersion\n");
+        assert!(
+            errs.iter().any(|e| e.message
+                == "itxn_field RejectVersion field was introduced in v12. Missed #pragma version?"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_acct_params_get_field_too_new_for_pragma_version_rejected() {
+        // AcctIncentiveEligible is an AcctParamsField introduced at v11
+        // (incentiveVersion); acct_params_get itself exists from v6.
+        let errs =
+            expect_errors("#pragma version 6\nint 0\nacct_params_get AcctIncentiveEligible\n");
+        assert!(
+            errs.iter().any(|e| e.message
+                == "acct_params_get AcctIncentiveEligible field was introduced in v11. Missed #pragma version?"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_asset_params_get_field_too_new_for_pragma_version_rejected() {
+        // AssetCreator is an AssetParamsField introduced at v5;
+        // asset_params_get itself exists from v2.
+        let errs = expect_errors("#pragma version 2\nint 0\nasset_params_get AssetCreator\n");
+        assert!(
+            errs.iter().any(|e| e.message
+                == "asset_params_get AssetCreator field was introduced in v5. Missed #pragma version?"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_ecdsa_curve_too_new_for_pragma_version_rejected() {
+        // Secp256r1 was added at fidoVersion (7); ecdsa_pk_decompress itself
+        // exists from v5.
+        let source =
+            "#pragma version 5\nbyte 0x0102030405060708090a0b0c0d0e0f10111213141516171819202122232425\necdsa_pk_decompress Secp256r1\n";
+        let errs = expect_errors(source);
+        assert!(
+            errs.iter().any(|e| e.message
+                == "ecdsa_pk_decompress Secp256r1 field was introduced in v7. Missed #pragma version?"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_field_at_or_below_pragma_version_still_assembles() {
+        // Sanity: fields introduced at-or-before the declared version, and
+        // opcodes/fields shared across versions, must keep assembling.
+        for source in [
+            "#pragma version 6\nglobal OpcodeBudget\n",
+            "#pragma version 12\ntxn StateProofPK\n",
+            "#pragma version 12\nint 1\nitxn_field RejectVersion\n",
+            "#pragma version 11\nint 0\nacct_params_get AcctIncentiveEligible\n",
+            "#pragma version 5\nint 0\nasset_params_get AssetCreator\n",
+        ] {
+            assert!(
+                assemble_string(source).is_ok(),
+                "expected {source:?} to assemble cleanly"
+            );
+        }
+    }
+
+    /// Ported from go-algorand's `TestBackwardCompatGlobalFields`
+    /// (`data/transactions/logic/backwardCompat_test.go`): every
+    /// `GlobalField` introduced after v1 must be rejected by the assembler
+    /// at every version below its introduction, with go's exact
+    /// "was introduced in vN. Missed #pragma version?" message. This covers
+    /// the assemble-time half of the go test (the runtime `EvalSignature`
+    /// half -- "invalid global field" -- is already covered by `op_global`'s
+    /// existing runtime version check and its own tests).
+    #[test]
+    fn test_backward_compat_global_fields_exhaustive_sweep_ported_from_go() {
+        let mut swept = 0;
+        for index in 0u8..=u8::MAX {
+            let Ok(field) = fields::GlobalField::from_u8(index) else {
+                continue;
+            };
+            let version = field.version();
+            if version <= 1 {
+                continue;
+            }
+            let name = fields::global_field_name(index).expect("named field must have a name");
+            swept += 1;
+            for v in 1..version {
+                let source = format!("#pragma version {v}\nglobal {name}\n");
+                let errs = expect_errors(&source);
+                let expected = format!(
+                    "global {name} field was introduced in v{version}. Missed #pragma version?"
+                );
+                assert!(
+                    errs.iter().any(|e| e.message == expected),
+                    "v{v} global {name}: expected {expected:?}, got {errs:?}"
+                );
+            }
+            // At exactly the introduction version, it must assemble.
+            let source = format!("#pragma version {version}\nglobal {name}\n");
+            assert!(
+                assemble_string(&source).is_ok(),
+                "expected {source:?} to assemble cleanly"
+            );
+        }
+        assert!(
+            swept > 1,
+            "expected more than one post-v1 GlobalField to be swept"
+        );
+    }
+
+    /// Ported from go-algorand's `TestBackwardCompatTxnFields`
+    /// (`data/transactions/logic/backwardCompat_test.go`): every
+    /// (non-array) `TxnField` introduced after v1 must be rejected by the
+    /// assembler, via both `txn` and `gtxn 0`, at every version below its
+    /// introduction. Array fields (`Accounts`, `Applications`, etc.) are
+    /// excluded: go itself asserts a different, array-specific arity error
+    /// for those when used in scalar form ("field of %s can only be used
+    /// with N immediates"), which algod-rust doesn't yet implement -- a
+    /// separate, pre-existing gap outside this issue's scope.
+    #[test]
+    fn test_backward_compat_txn_fields_exhaustive_sweep_ported_from_go() {
+        let mut swept = 0;
+        for index in 0u8..=u8::MAX {
+            let Ok(field) = fields::TxnField::from_u8(index) else {
+                continue;
+            };
+            if field.is_array() {
+                continue;
+            }
+            let version = field.version();
+            if version <= 1 {
+                continue;
+            }
+            let name = field.to_string();
+            swept += 1;
+            for (op_text, mnemonic) in [
+                (format!("txn {name}"), "txn"),
+                (format!("gtxn 0 {name}"), "gtxn"),
+            ] {
+                for v in 1..version {
+                    let source = format!("#pragma version {v}\n{op_text}\n");
+                    let errs = expect_errors(&source);
+                    let expected = format!(
+                        "{mnemonic} {name} field was introduced in v{version}. Missed #pragma version?"
+                    );
+                    assert!(
+                        errs.iter().any(|e| e.message == expected),
+                        "v{v} {op_text:?}: expected {expected:?}, got {errs:?}"
+                    );
+                }
+                // At exactly the introduction version, it must assemble.
+                let source = format!("#pragma version {version}\n{op_text}\n");
+                assert!(
+                    assemble_string(&source).is_ok(),
+                    "expected {source:?} to assemble cleanly"
+                );
+            }
+        }
+        assert!(
+            swept > 1,
+            "expected more than one post-v1 non-array TxnField to be swept"
+        );
     }
 
     #[test]

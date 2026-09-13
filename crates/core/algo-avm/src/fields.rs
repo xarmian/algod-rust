@@ -218,6 +218,16 @@ field_enum! {
     }
 }
 
+impl AssetHoldingField {
+    /// Returns the AVM version in which this field became readable via
+    /// `asset_holding_get`. Values match go-algorand's
+    /// `assetHoldingFieldSpecs[].version` (`data/transactions/logic/fields.go`),
+    /// both fields introduced alongside the opcode itself at v2.
+    pub fn version(&self) -> u8 {
+        2
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AssetParamsField — `asset_params_get` opcode (0x71)
 // ---------------------------------------------------------------------------
@@ -681,6 +691,19 @@ field_enum! {
     }
 }
 
+impl EcdsaCurve {
+    /// Returns the AVM version in which this curve became usable via the
+    /// `ecdsa_*` opcodes. Values match go-algorand's `ecdsaCurveSpecs[].version`
+    /// (`data/transactions/logic/fields.go`): `Secp256k1` shipped with the
+    /// opcodes themselves at v5, `Secp256r1` was added at `fidoVersion` (7).
+    pub fn version(&self) -> u8 {
+        match self {
+            Self::Secp256k1 => 5,
+            Self::Secp256r1 => 7,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EcGroup — `ec_add`, `ec_scalar_mul`, `ec_pairing_check`, etc.
 // ---------------------------------------------------------------------------
@@ -699,6 +722,16 @@ field_enum! {
     }
 }
 
+impl EcGroup {
+    /// Returns the AVM version in which this group became usable via the
+    /// `ec_*` opcodes. Matches go-algorand's `ecGroupSpec.Version()`, which
+    /// returns the constant `pairingVersion` (10) for every variant --
+    /// same as the `ec_*` opcodes' own minimum version.
+    pub fn version(&self) -> u8 {
+        10
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MimcConfig — `mimc` opcode (0xe6)
 // ---------------------------------------------------------------------------
@@ -710,6 +743,16 @@ field_enum! {
         BN254Mp110 = 0,
         /// MiMC configuration for BLS12-381, Miyaguchi-Preneel mode, 111 rounds.
         BLS12_381Mp111 = 1,
+    }
+}
+
+impl MimcConfig {
+    /// Returns the AVM version in which this config became usable via the
+    /// `mimc` opcode. Matches go-algorand's `mimcConfigSpec.Version()`,
+    /// which returns the constant `mimcVersion` (11) for every variant --
+    /// same as the `mimc` opcode's own minimum version.
+    pub fn version(&self) -> u8 {
+        11
     }
 }
 
@@ -729,6 +772,16 @@ field_enum! {
     }
 }
 
+impl Poseidon2Config {
+    /// Returns the AVM version in which this config became usable via the
+    /// `poseidon2` opcode. Matches go-algorand's `poseidon2ConfigSpec.Version()`,
+    /// which returns the constant `poseidon2Version` (13) for every variant --
+    /// same as the `poseidon2` opcode's own minimum version.
+    pub fn version(&self) -> u8 {
+        13
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Base64Encoding — `base64_decode` opcode (0x5e)
 // ---------------------------------------------------------------------------
@@ -740,6 +793,16 @@ field_enum! {
         URLEncoding = 0,
         /// Standard base64 encoding (RFC 4648).
         StdEncoding = 1,
+    }
+}
+
+impl Base64Encoding {
+    /// Returns the AVM version in which this encoding became usable via
+    /// `base64_decode`. Values match go-algorand's
+    /// `base64EncodingSpecs[].version` (`data/transactions/logic/fields.go`),
+    /// both variants introduced alongside the opcode itself at v6.
+    pub fn version(&self) -> u8 {
+        6
     }
 }
 
@@ -788,6 +851,16 @@ field_enum! {
     }
 }
 
+impl JSONRefType {
+    /// Returns the AVM version in which this type became usable via
+    /// `json_ref`. Values match go-algorand's `jsonRefSpecs[].version`
+    /// (`data/transactions/logic/fields.go`), all three variants introduced
+    /// alongside the opcode itself at `fidoVersion` (7).
+    pub fn version(&self) -> u8 {
+        7
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VrfStandard — `vrf_verify` opcode (0xd0)
 // ---------------------------------------------------------------------------
@@ -797,6 +870,16 @@ field_enum! {
     pub enum VrfStandard {
         /// Algorand's built-in VRF standard.
         VrfAlgorand = 0,
+    }
+}
+
+impl VrfStandard {
+    /// Returns the AVM version in which this standard became usable via
+    /// `vrf_verify`. Matches go-algorand's `vrfStandardSpecs[].version`,
+    /// which is `randomnessVersion` (7) -- same as the opcode's own
+    /// minimum version.
+    pub fn version(&self) -> u8 {
+        7
     }
 }
 
@@ -849,6 +932,17 @@ field_enum! {
         VoterBalance = 0,
         /// Whether the account opted into block payouts via keyreg.
         VoterIncentiveEligible = 1,
+    }
+}
+
+impl VoterParamsField {
+    /// Returns the AVM version in which this field became readable via
+    /// `voter_params_get`. Values match go-algorand's
+    /// `voterParamsFieldSpecs[].version` (`data/transactions/logic/fields.go`),
+    /// both fields introduced alongside the opcode itself at `incentiveVersion`
+    /// (11).
+    pub fn version(&self) -> u8 {
+        11
     }
 }
 
