@@ -496,9 +496,13 @@ mod tests {
                 .await
                 .unwrap();
             AsyncWriteExt::flush(&mut a).await.unwrap();
-            AsyncWriteExt::write_all(&mut a, &data[..mid]).await.unwrap();
+            AsyncWriteExt::write_all(&mut a, &data[..mid])
+                .await
+                .unwrap();
             AsyncWriteExt::flush(&mut a).await.unwrap();
-            AsyncWriteExt::write_all(&mut a, &data[mid..]).await.unwrap();
+            AsyncWriteExt::write_all(&mut a, &data[mid..])
+                .await
+                .unwrap();
             AsyncWriteExt::flush(&mut a).await.unwrap();
         };
         let reader = read_peer_meta_headers(&mut b);
