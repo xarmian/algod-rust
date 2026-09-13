@@ -7514,6 +7514,119 @@ mod tests {
         )
     }
 
+    /// Helper: build an acfg (asset config) transaction.
+    fn make_acfg_txn(sender: [u8; 32]) -> SignedTransaction {
+        SignedTransaction {
+            txn: Transaction {
+                txn_type: "acfg".into(),
+                sender: Address(sender),
+                fee: 1000,
+                first_valid: 100.into(),
+                last_valid: 200.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    // ---- gaid / created_id edge-case tests (Phase 17 issue #1363, TestGaid
+    // (data/transactions/logic/evalStateful_test.go:3687)) ----
+    //
+    // The direct same-group (non-inner) `gaid`/`gaids` opcode mechanics are
+    // already covered in `algo-avm`'s `ops::state` tests via a mock context;
+    // these exercise the REAL `LedgerAvmContext::created_id` implementation's
+    // three edge-case error paths that go's `TestGaid` specifically asserts:
+    // accessing a txn ahead of the current one, accessing the current txn
+    // itself ("self"), and accessing a non-appl/non-acfg txn.
+
+    #[test]
+    fn created_id_ahead_of_current_txn_rejected() {
+        let mut store = LedgerState::new();
+        // group of 3: [acfg (created asset 100), appl (current, index 1), appl]
+        let mut acfg = make_acfg_txn([0xAA; 32]);
+        acfg.apply_data_config_asset = 100;
+        let group = vec![
+            acfg,
+            make_appl_txn([0xBB; 32], 888, vec![], vec![], vec![]),
+            make_appl_txn([0xCC; 32], 888, vec![], vec![], vec![]),
+        ];
+        let ctx = LedgerAvmContext::new(
+            &mut store,
+            group,
+            1, // group_index: currently executing txn 1
+            1000,
+            12345,
+            888,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+        );
+        let err = ctx.created_id(2).unwrap_err();
+        assert!(
+            err.to_string().contains("ahead of the current"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn created_id_self_access_rejected() {
+        let mut store = LedgerState::new();
+        let group = vec![
+            make_appl_txn([0xAA; 32], 888, vec![], vec![], vec![]),
+            make_appl_txn([0xBB; 32], 888, vec![], vec![], vec![]),
+        ];
+        let ctx = LedgerAvmContext::new(
+            &mut store,
+            group,
+            1, // group_index: currently executing txn 1
+            1000,
+            12345,
+            888,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+        );
+        let err = ctx.created_id(1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only for accessing creatable IDs of previous txns"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn created_id_non_creatable_txn_type_rejected() {
+        let mut store = LedgerState::new();
+        // group of 2: [pay (not app-call/acfg), appl (current, index 1)]
+        let group = vec![
+            make_pay_txn([0xAA; 32], [0xDD; 32], 100),
+            make_appl_txn([0xBB; 32], 888, vec![], vec![], vec![]),
+        ];
+        let ctx = LedgerAvmContext::new(
+            &mut store,
+            group,
+            1,
+            1000,
+            12345,
+            888,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+        );
+        let err = ctx.created_id(0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("is not an app call or asset config"),
+            "got: {err}"
+        );
+    }
+
     // ---- type_enum tests ----
 
     #[test]
