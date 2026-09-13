@@ -536,7 +536,13 @@ fn clearstate_reject_drops_logs_emitted_before_rejection() {
     let log_then_reject = prog(AVM_V6, &[0x80, 1, b'x', 0xb0, 0x81, 0x00]);
 
     let app_id = 202u64;
-    create_app(&mut state, app_id, creator, approval_program(), log_then_reject);
+    create_app(
+        &mut state,
+        app_id,
+        creator,
+        approval_program(),
+        log_then_reject,
+    );
 
     opt_in_account(&mut state, &sender, app_id);
     assert!(state.get_app_local_state(&sender, app_id).is_some());
@@ -1838,6 +1844,138 @@ fn avm_result_empty_is_well_formed() {
     assert!(result.inner_transactions.is_empty());
     assert!(result.global_delta.is_empty());
     assert!(result.local_deltas.is_empty());
+}
+
+// ===========================================================================
+// Phase 17 (issue #1363): TestAccessMyLocals
+// (data/transactions/logic/resources_test.go:1050)
+// ===========================================================================
+
+/// An app's own locals (sender's local state under the CURRENT app, at
+/// account offset 0) must be readable/writable/deletable with NO
+/// `txn.Accounts` entry at all -- own locals are always available under
+/// the group resource-sharing rules, unlike a locals lookup for another
+/// account which requires an explicit `Accounts`/`Access` slot. This is
+/// run at v9 (>= `SHARED_RESOURCES_VERSION`) through the REAL
+/// `apply_transaction` path (not a hand-built `AvmContext`), so it
+/// exercises the actual `fill_group_resources` population that must mark
+/// (sender, own app) as an always-available local, not just
+/// `resolve_account`'s address-resolution shortcut for index 0.
+#[test]
+fn access_my_locals_without_foreign_accounts_entry() {
+    let creator = Address([1u8; 32]);
+    let sender = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[(creator, 50_000_000), (sender, 50_000_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let app_id = 1_200u64;
+    let source = "#pragma version 9\n\
+         int 0\n\
+         byte \"X\"\n\
+         app_local_get\n\
+         !\n\
+         assert\n\
+         int 0\n\
+         byte \"X\"\n\
+         int 7\n\
+         app_local_put\n\
+         int 0\n\
+         byte \"X\"\n\
+         app_local_get\n\
+         int 7\n\
+         ==\n\
+         assert\n\
+         int 0\n\
+         byte \"X\"\n\
+         app_local_del\n\
+         int 1\n\
+         return\n";
+    let approval = algo_avm::assembler::assemble_string(source)
+        .expect("program must assemble")
+        .program;
+    create_app(&mut state, app_id, creator, approval, approval_program());
+    opt_in_account(&mut state, &sender, app_id);
+
+    let ctx = execute_ctx(fee_sink, 1);
+    // No `Accounts` array at all -- own locals must still work.
+    let stx = appl_noop_txn(sender, app_id, 1_000);
+    assert!(stx.txn.accounts.is_none());
+
+    let result = apply_transaction(&mut state, &stx, &ctx, 0);
+    assert!(
+        result.is_ok(),
+        "reading/writing/deleting the sender's own locals under the current \
+         app must succeed with no Accounts entry: {:?}",
+        result.err()
+    );
+}
+
+// ===========================================================================
+// Phase 17 (issue #1363): TestAppInfo
+// (data/transactions/logic/evalStateful_test.go:3842)
+// ===========================================================================
+
+/// go's `TestAppInfo` checks THREE distinct info surfaces about the
+/// CURRENTLY RUNNING app together in one program: `global
+/// CurrentApplicationID`, `global CurrentApplicationAddress`, and
+/// `app_params_get 0 AppAddress` (offset 0 = self) -- all three must agree
+/// with the app's real ID/address. Existing coverage exercised
+/// `app_params_get`'s `AppAddress` field and `CurrentApplicationAddress`'s
+/// raw value independently via direct `AvmContext` method calls; this adds
+/// one combined, real end-to-end run (through `apply_transaction`, not a
+/// hand-built context) asserting all three agree with each other, matching
+/// go's actual test shape.
+#[test]
+fn app_info_current_id_address_and_params_get_agree() {
+    let creator = Address([1u8; 32]);
+    let sender = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[(creator, 50_000_000), (sender, 50_000_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let app_id = 1_300u64;
+    let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+    let addr_str = app_addr.to_string();
+    let source = format!(
+        "#pragma version 8\n\
+         global CurrentApplicationID\n\
+         int {app_id}\n\
+         ==\n\
+         global CurrentApplicationAddress\n\
+         addr {addr_str}\n\
+         ==\n\
+         &&\n\
+         int 0\n\
+         app_params_get AppAddress\n\
+         assert\n\
+         addr {addr_str}\n\
+         ==\n\
+         &&\n\
+         return\n"
+    );
+    let approval = algo_avm::assembler::assemble_string(&source)
+        .expect("program must assemble")
+        .program;
+    create_app(&mut state, app_id, creator, approval, approval_program());
+
+    let ctx = execute_ctx(fee_sink, 1);
+    let stx = appl_noop_txn(sender, app_id, 1_000);
+
+    let result = apply_transaction(&mut state, &stx, &ctx, 0);
+    assert!(
+        result.is_ok(),
+        "CurrentApplicationID, CurrentApplicationAddress, and \
+         app_params_get(0, AppAddress) must all agree on the running app's \
+         identity: {:?}",
+        result.err()
+    );
 }
 
 /// NullContext's take_* methods return empty collections (verifying the

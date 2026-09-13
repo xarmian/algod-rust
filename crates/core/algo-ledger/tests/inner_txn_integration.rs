@@ -1692,6 +1692,97 @@ fn rekeyed_account_close_erases_rekey_for_later_inner_txn() {
     );
 }
 
+/// Phase 17 (issue #1363): TestRekeyBack
+/// (data/transactions/logic/evalAppTxn_test.go:356) -- an inner pay that
+/// sets `RekeyTo` back to the sender's OWN address (the original owner,
+/// not the app) must restore normal authorization: a later top-level call
+/// that tries to spend from that account as though it were still rekeyed
+/// to the app must fail "unauthorized", exactly as it would have before
+/// the account was ever rekeyed. `sender_auth_rekeyed_account_succeeds`
+/// only proves the rekeyed-account-as-sender path succeeds; it never
+/// proves an inner-txn-driven rekey-back-to-self round trip.
+#[test]
+fn rekey_back_to_self_restores_unauthorized() {
+    let original_owner = [0xDD; 32]; // rekeyed to the app, then rekeyed back
+    let receiver = [0xBB; 32];
+    let app_id = 42u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 10_000_000);
+
+    let acct = store.get_or_default_account_mut(&Address(original_owner));
+    acct.micro_algos = 5_000_000;
+    acct.auth_addr = Some(app_addr);
+
+    let txn = make_appl_txn([0xCC; 32], app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 10_000;
+
+    // Inner pay from the rekeyed account, that ALSO rekeys it back to
+    // itself (RekeyTo = original_owner) in the same itxn.
+    let mut code = Vec::new();
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(1));
+    code.extend([0xb2, 16]); // TypeEnum = pay
+    code.extend(pushbytes(&original_owner));
+    code.extend([0xb2, 0]); // Sender
+    code.extend(pushbytes(&receiver));
+    code.extend([0xb2, 7]); // Receiver
+    code.extend(pushint(100));
+    code.extend([0xb2, 8]); // Amount
+    code.extend(pushbytes(&original_owner));
+    code.extend([0xb2, 32]); // RekeyTo = original_owner (rekey back to self)
+    code.push(0xb3); // itxn_submit
+    code.extend(pushint(1));
+    code.push(0x43); // return
+
+    let result = run_with_context(6, &code, &mut ctx).unwrap();
+    assert!(result, "rekey-back-to-self inner pay should succeed");
+
+    let acct_after = ctx.store.get_account(&Address(original_owner)).unwrap();
+    assert_eq!(
+        acct_after.auth_addr, None,
+        "rekeying back to the account's own address clears auth_addr"
+    );
+
+    // A SECOND, later top-level call tries to spend from the same account
+    // as though it were still rekeyed to the app -- must now fail, since
+    // the previous inner txn rekeyed it back to itself.
+    let txn2 = make_appl_txn([0xCC; 32], app_id);
+    let mut ctx2 = make_context(ctx.store, vec![txn2], app_id);
+    ctx2.fee_sink = Address([0xFE; 32]);
+    ctx2.fee_credit = 10_000;
+
+    let mut code2 = Vec::new();
+    code2.push(0xb1); // itxn_begin
+    code2.extend(pushint(1));
+    code2.extend([0xb2, 16]); // TypeEnum = pay
+    code2.extend(pushbytes(&original_owner));
+    code2.extend([0xb2, 0]); // Sender
+    code2.extend(pushbytes(&receiver));
+    code2.extend([0xb2, 7]); // Receiver
+    code2.extend(pushint(1));
+    code2.extend([0xb2, 8]); // Amount
+    code2.push(0xb3); // itxn_submit
+    code2.extend(pushint(1));
+    code2.push(0x43); // return
+
+    let result2 = run_with_context(6, &code2, &mut ctx2);
+    assert!(
+        is_failure(&result2),
+        "spending from the account after it rekeyed back to itself must fail unauthorized"
+    );
+    let err = result2.unwrap_err().to_string();
+    assert!(
+        err.contains("unauthorized"),
+        "expected an unauthorized-sender error, got: {err}"
+    );
+}
+
 /// Phase 17 (issue #1322): TestDuplicatePayAction (ledger/apptxn_test.go:582)
 /// -- two inner pays with IDENTICAL parameters (same receiver, same
 /// amount) submitted as separate `itxn_begin`/`itxn_submit` groups within
@@ -2001,6 +2092,153 @@ fn inner_keyreg_nonparticipation() {
     let inner = ctx.inner_txns();
     assert_eq!(inner.len(), 1);
     assert_eq!(inner[0][0].txn.txn_type, "keyreg");
+}
+
+/// Phase 17 (issue #1363): TestKeyReg's "online with StateProofPK" subtest
+/// (data/transactions/logic/evalAppTxn_test.go:934) -- an inner keyreg that
+/// goes ONLINE (VoteFirst/VoteLast/VoteKeyDilution/VotePK/SelectionPK/
+/// StateProofPK all set, Nonparticipation left false) must round-trip every
+/// one of those fields back out through `itxn <Field>` reads exactly as
+/// set. `inner_keyreg_nonparticipation` only exercises the
+/// Nonparticipation=1 path; it never proves the online-registration field
+/// set (the actually common case) round-trips correctly.
+#[test]
+fn inner_keyreg_online_with_state_proof_pk_round_trips() {
+    let sender = [0xAA; 32];
+    let app_id = 42u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 10_000_000);
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 10_000;
+
+    let vote_pk = [0x01u8; 32];
+    let selection_pk = [0x02u8; 32];
+    let state_proof_pk = [0x03u8; 64];
+
+    let mut code = Vec::new();
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(2)); // TypeEnum = keyreg
+    code.extend([0xb2, 16]);
+    code.extend(pushint(100)); // VoteFirst
+    code.extend([0xb2, 12]);
+    code.extend(pushint(16_777_315)); // VoteLast
+    code.extend([0xb2, 13]);
+    code.extend(pushint(10)); // VoteKeyDilution
+    code.extend([0xb2, 14]);
+    code.extend(pushbytes(&vote_pk));
+    code.extend([0xb2, 10]); // VotePK
+    code.extend(pushbytes(&selection_pk));
+    code.extend([0xb2, 11]); // SelectionPK
+    code.extend(pushbytes(&state_proof_pk));
+    code.extend([0xb2, 63]); // StateProofPK
+    code.push(0xb3); // itxn_submit
+
+    // Read every field back and AND the equality checks together.
+    code.extend([0xb4, 12]); // itxn VoteFirst
+    code.extend(pushint(100));
+    code.push(0x12); // ==
+    code.extend([0xb4, 13]); // itxn VoteLast
+    code.extend(pushint(16_777_315));
+    code.push(0x12); // ==
+    code.push(0x10); // &&
+    code.extend([0xb4, 14]); // itxn VoteKeyDilution
+    code.extend(pushint(10));
+    code.push(0x12); // ==
+    code.push(0x10); // &&
+    code.extend([0xb4, 10]); // itxn VotePK
+    code.extend(pushbytes(&vote_pk));
+    code.push(0x12); // ==
+    code.push(0x10); // &&
+    code.extend([0xb4, 11]); // itxn SelectionPK
+    code.extend(pushbytes(&selection_pk));
+    code.push(0x12); // ==
+    code.push(0x10); // &&
+    code.extend([0xb4, 63]); // itxn StateProofPK
+    code.extend(pushbytes(&state_proof_pk));
+    code.push(0x12); // ==
+    code.push(0x10); // &&
+
+    let result = run_with_context(6, &code, &mut ctx).unwrap();
+    assert!(result, "online keyreg fields should all round-trip");
+
+    let inner = ctx.inner_txns();
+    assert_eq!(inner.len(), 1);
+    let itxn = &inner[0][0].txn;
+    assert_eq!(itxn.txn_type, "keyreg");
+    assert_eq!(itxn.vote_first, 100);
+    assert_eq!(itxn.vote_last, 16_777_315);
+    assert_eq!(itxn.vote_key_dilution, 10);
+    assert_eq!(itxn.vote_pk, Some(vote_pk));
+    assert_eq!(itxn.selection_pk, Some(selection_pk));
+    assert_eq!(itxn.state_proof_pk, Some(state_proof_pk));
+}
+
+/// Phase 17 (issue #1363): TestKeyReg's "offline" subtest
+/// (data/transactions/logic/evalAppTxn_test.go:869) -- an inner keyreg with
+/// all key fields left zero/empty and Nonparticipation=0 takes the account
+/// OFFLINE (as opposed to nonparticipating or online). This is a distinct
+/// third branch from `inner_keyreg_nonparticipation` (Nonparticipation=1)
+/// and `inner_keyreg_online_with_state_proof_pk_round_trips` (full key
+/// set): empty keys + Nonparticipation=0 must still submit successfully
+/// and read back as an all-zero/false keyreg, not be rejected as
+/// malformed.
+#[test]
+fn inner_keyreg_offline_round_trips() {
+    let sender = [0xAA; 32];
+    let app_id = 42u64;
+
+    let mut store = LedgerState::new();
+    seed_app_approve(&mut store, app_id, Address([1u8; 32]));
+    let app_addr = Address(app_address(app_id));
+    fund_account(&mut store, app_addr, 10_000_000);
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 10_000;
+
+    let mut code = Vec::new();
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(2)); // TypeEnum = keyreg
+    code.extend([0xb2, 16]);
+    // Nonparticipation explicitly false (0), all vote fields left unset
+    // (default zero/empty) -- this is the "offline" branch.
+    code.extend(pushint(0));
+    code.extend([0xb2, 57]); // Nonparticipation = 0
+    code.push(0xb3); // itxn_submit
+
+    code.extend([0xb4, 57]); // itxn Nonparticipation
+    code.push(0x14); // !
+    code.extend([0xb4, 12]); // itxn VoteFirst
+    code.push(0x14); // !
+    code.push(0x10); // &&
+    code.extend([0xb4, 13]); // itxn VoteLast
+    code.push(0x14); // !
+    code.push(0x10); // &&
+
+    let result = run_with_context(6, &code, &mut ctx).unwrap();
+    assert!(
+        result,
+        "offline keyreg (empty keys, Nonparticipation=0) should succeed"
+    );
+
+    let inner = ctx.inner_txns();
+    assert_eq!(inner.len(), 1);
+    let itxn = &inner[0][0].txn;
+    assert_eq!(itxn.txn_type, "keyreg");
+    assert!(!itxn.non_participation);
+    assert_eq!(itxn.vote_first, 0);
+    assert_eq!(itxn.vote_last, 0);
+    assert!(itxn.vote_pk.is_none() || itxn.vote_pk == Some([0u8; 32]));
+    assert!(itxn.selection_pk.is_none() || itxn.selection_pk == Some([0u8; 32]));
 }
 
 /// Self-call (reentrancy) is disallowed.
@@ -2588,6 +2826,75 @@ fn inner_app_creation() {
     assert!(created_app_id > 0, "should have a created app ID");
     let new_app = ctx.store.app_params.get(&created_app_id);
     assert!(new_app.is_some(), "new app should exist in store");
+}
+
+/// Phase 17 (issue #1363): TestInfiniteRecursion
+/// (data/transactions/logic/evalStateful_test.go:4067) -- an app whose
+/// approval program creates a NEW app via an inner txn, copying its OWN
+/// approval/clear-state program bytes (via `app_params_get 0
+/// AppApprovalProgram`/`AppClearStateProgram`) into the freshly created
+/// app, is genuinely self-recursive: creating an application transaction
+/// immediately runs the (new) app's approval program too, which creates
+/// yet another copy of itself, and so on, until the inner-app-call depth
+/// limit stops it. This is a materially different scenario from
+/// `depth_limit_9_fails` (which chains 9 pre-existing, DISTINCT apps
+/// calling each other by fixed ID) -- it proves the depth limit also
+/// bounds unbounded SELF-similar app creation, not just an explicit call
+/// chain.
+#[test]
+fn self_recursive_app_creation_hits_depth_limit() {
+    let sender = [0xAA; 32];
+    let app_id = 888u64;
+
+    let mut store = LedgerState::new();
+
+    // The app's own approval program: look up its OWN ApprovalProgram and
+    // ClearStateProgram via `app_params_get 0 <field>` (app offset 0 means
+    // "self"), and use them as the ApprovalProgram/ClearStateProgram of a
+    // brand new app created via an inner txn (ApplicationID left at its
+    // default 0, meaning "create").
+    let mut code = Vec::new();
+    code.push(0xb1); // itxn_begin
+    code.extend(pushint(6)); // TypeEnum = appl
+    code.extend([0xb2, 16]);
+    code.extend(pushint(0));
+    code.extend([0x72, 0]); // app_params_get 0 AppApprovalProgram
+    code.push(0x44); // assert (must exist)
+    code.extend([0xb2, 30]); // itxn_field ApprovalProgram
+    code.extend(pushint(0));
+    code.extend([0x72, 1]); // app_params_get 0 AppClearStateProgram
+    code.push(0x44); // assert (must exist)
+    code.extend([0xb2, 31]); // itxn_field ClearStateProgram
+    code.push(0xb3); // itxn_submit
+    code.extend(pushint(1));
+    code.push(0x43); // return
+
+    let prog7 = prog(7, &code);
+    let clear7 = prog(7, &[0x81, 0x01]); // trivial "int 1" clear program
+
+    seed_app_with_programs(&mut store, app_id, Address([1u8; 32]), prog7, clear7);
+    // A huge balance on the app account, mirroring go's giant top-level fee
+    // becoming FeeCredit -- it's impractical to fund every recursively
+    // created app individually.
+    fund_account(&mut store, Address(app_address(app_id)), 1_000_000_000_000);
+
+    let txn = make_appl_txn(sender, app_id);
+    let mut ctx = make_context(&mut store, vec![txn], app_id);
+    ctx.fee_sink = Address([0xFE; 32]);
+    fund_account(ctx.store, Address([0xFE; 32]), 0);
+    ctx.fee_credit = 1_000_000_000_000;
+    ctx.txn_counter = 10_000;
+
+    let result = run_with_context(7, &code, &mut ctx);
+    assert!(
+        is_failure(&result),
+        "self-recursive app creation must be stopped by the depth limit, not loop forever"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("appl depth (8) exceeded"),
+        "expected the exact depth-exceeded message go asserts, got: {err}"
+    );
 }
 
 /// Phase 17 (issue #1322): TestAppCallAppDuringInit (ledger/apptxn_test.go:
