@@ -36,7 +36,7 @@
 //!            go-algorand/crypto/util.go     (Hash = SHA-512/256, TrimUint64)
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha512_256};
@@ -146,6 +146,18 @@ pub enum RequestResponseError {
     /// The response hash field could not be decoded as a uvarint.
     #[error("response hash is not a valid uvarint")]
     InvalidHashEncoding,
+
+    /// A `TopicMsgResp` arrived with no matching outstanding request: the
+    /// per-peer outstanding-topic-request counter went negative.
+    ///
+    /// Mirrors go-algorand's `disconnectUnexpectedTopicResp` protocol
+    /// violation (`network/wsPeer.go:547-556`) — a peer sending more
+    /// `TS`/`TopicMsgResp` responses than we've ever sent it requests. The
+    /// caller (the read loop) must disconnect the peer on this error, the
+    /// same way go tears down the connection with
+    /// `networkConnectionsDroppedTotal{reason="unrequestedTS"}`.
+    #[error("peer sent a TopicMsgResp with no matching outstanding request")]
+    UnrequestedResponse,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +175,23 @@ pub struct RequestTracker {
 
     /// Pending requests: truncated u64 hash → oneshot sender.
     pending: Mutex<HashMap<u64, oneshot::Sender<Topics>>>,
+
+    /// Outstanding topic-request counter, mirroring go-algorand's
+    /// `wsPeer.outstandingTopicRequests` (`network/wsPeer.go:175-177`): one
+    /// per peer, incremented when a request is handed off to the send queue
+    /// ([`mark_request_sent`](Self::mark_request_sent)) and decremented once
+    /// per arriving `TopicMsgResp` response ([`handle_response`](Self::handle_response)),
+    /// regardless of whether that particular response's hash is found.
+    /// A negative value after decrementing means the peer has sent more
+    /// responses than we've ever requested — a protocol violation.
+    ///
+    /// Unlike the `pending` map (whose entries are removed as soon as an
+    /// individual `Request()` call's own wait ends, including on a
+    /// client-side timeout), this counter is never decremented by a local
+    /// timeout — only by an actual response arriving — so it also catches a
+    /// *late* response (for a request whose local wait already gave up) that
+    /// nonetheless corresponds to a real, previously-sent request.
+    outstanding: AtomicI64,
 }
 
 impl RequestTracker {
@@ -171,7 +200,22 @@ impl RequestTracker {
         Self {
             nonce: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
+            outstanding: AtomicI64::new(0),
         }
+    }
+
+    /// Record that a request was successfully handed off to the peer's send
+    /// queue. Mirrors go's `wp.outstandingTopicRequests.Add(1)`
+    /// (`network/wsPeer.go:1064`), called only once the request message has
+    /// actually been enqueued for sending (not if enqueueing failed).
+    pub fn mark_request_sent(&self) {
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The current value of the outstanding-topic-request counter. Exposed
+    /// for tests and diagnostics.
+    pub fn outstanding_topic_requests(&self) -> i64 {
+        self.outstanding.load(Ordering::SeqCst)
     }
 
     /// Prepare a request for sending.
@@ -226,6 +270,17 @@ impl RequestTracker {
     /// and `Ok(())` is returned. If the hash field is missing, an error is
     /// returned.
     pub async fn handle_response(&self, data: &[u8]) -> Result<(), RequestResponseError> {
+        // Decrement the outstanding-topic-request counter first, mirroring
+        // go's unconditional decrement on every `TopicMsgResp` arrival
+        // (`network/wsPeer.go:548,644`) — before any attempt to parse the
+        // payload. If this drives the counter negative, the peer has sent
+        // more responses than we've ever requested: a protocol violation
+        // the caller must disconnect for, exactly like go's
+        // `disconnectUnexpectedTopicResp`.
+        if self.outstanding.fetch_sub(1, Ordering::SeqCst) - 1 < 0 {
+            return Err(RequestResponseError::UnrequestedResponse);
+        }
+
         // Deserialize response Topics
         let topics =
             Topics::unmarshal(data).map_err(RequestResponseError::DeserializationFailed)?;
@@ -309,6 +364,10 @@ mod tests {
         // Prepare a request
         let request_topics = Topics::from_vec(vec![Topic::new("key", b"value".to_vec())]);
         let (_serialized, hash, rx) = tracker.prepare_request(request_topics).await;
+        // Simulate the request having actually been enqueued for sending
+        // (mirrors ws_peer.rs's `request_with_timeout_via_tracker` calling
+        // this only once `try_send` succeeds).
+        tracker.mark_request_sent();
 
         assert_eq!(tracker.pending_count().await, 1);
 
@@ -330,6 +389,18 @@ mod tests {
     async fn stale_response_does_not_error() {
         let tracker = RequestTracker::new();
 
+        // A request was genuinely sent (and thus is counted as outstanding),
+        // but the response we receive carries an unknown/mismatched hash —
+        // e.g. a late reply for a request whose local wait already timed out
+        // and removed its `pending` map entry, or a reply for some other
+        // request race. Since the peer HAS been sent at least one real
+        // request, this must not be treated as the "unrequested" protocol
+        // violation — only a genuinely unmatched-and-uncounted-for response
+        // (see `unrequested_response_is_detected` below) should disconnect.
+        let request_topics = Topics::from_vec(vec![Topic::new("q", b"data".to_vec())]);
+        let (_serialized, _hash, _rx) = tracker.prepare_request(request_topics).await;
+        tracker.mark_request_sent();
+
         // Build a response with an unknown hash
         let response_data = make_response(0xDEAD_BEEF, "data", b"stale");
 
@@ -338,9 +409,78 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Ports go-algorand's `TestDiscardUnrequestedBlockResponse`
+    /// (`network/wsNetwork_test.go:4182`): a peer sending a `TopicMsgResp`
+    /// with no matching outstanding request at all (the outstanding-topic-
+    /// request counter is already at zero — we never sent this peer any
+    /// request) is a protocol violation the caller must disconnect for,
+    /// mirroring go's `disconnectUnexpectedTopicResp`
+    /// (`network/wsPeer.go:547-556`,
+    /// `networkConnectionsDroppedTotal{reason="unrequestedTS"}`).
+    #[tokio::test]
+    async fn unrequested_response_is_detected() {
+        let tracker = RequestTracker::new();
+
+        // No request was ever prepared/sent — the counter starts at zero.
+        assert_eq!(tracker.outstanding_topic_requests(), 0);
+
+        let response_data = make_response(0xDEAD_BEEF, "data", b"unrequested");
+        let result = tracker.handle_response(&response_data).await;
+
+        assert!(matches!(
+            result,
+            Err(RequestResponseError::UnrequestedResponse)
+        ));
+        assert_eq!(tracker.outstanding_topic_requests(), -1);
+    }
+
+    /// A second unrequested response after the first drives the counter
+    /// further negative and is detected the same way — mirroring the
+    /// unconditional per-arrival decrement in go's readLoop.
+    #[tokio::test]
+    async fn repeated_unrequested_responses_keep_being_detected() {
+        let tracker = RequestTracker::new();
+
+        for _ in 0..3 {
+            let response_data = make_response(0xDEAD_BEEF, "data", b"unrequested");
+            let result = tracker.handle_response(&response_data).await;
+            assert!(matches!(
+                result,
+                Err(RequestResponseError::UnrequestedResponse)
+            ));
+        }
+        assert_eq!(tracker.outstanding_topic_requests(), -3);
+    }
+
+    /// Sending exactly N requests and receiving N+1 responses is detected on
+    /// the (N+1)th response, even though the first N all matched fine.
+    #[tokio::test]
+    async fn excess_response_beyond_sent_count_is_detected() {
+        let tracker = RequestTracker::new();
+
+        let t1 = Topics::from_vec(vec![Topic::new("req", b"1".to_vec())]);
+        let (_s1, h1, _rx1) = tracker.prepare_request(t1).await;
+        tracker.mark_request_sent();
+
+        // First response: matches the one request we sent. Not unrequested.
+        let resp1 = make_response(h1, "ans", b"one");
+        assert!(tracker.handle_response(&resp1).await.is_ok());
+
+        // Second response: no more outstanding requests at all now.
+        let resp2 = make_response(0xBEEF, "ans", b"two");
+        let result = tracker.handle_response(&resp2).await;
+        assert!(matches!(
+            result,
+            Err(RequestResponseError::UnrequestedResponse)
+        ));
+    }
+
     #[tokio::test]
     async fn missing_hash_field_returns_error() {
         let tracker = RequestTracker::new();
+        // A request was outstanding, so the counter check passes through to
+        // the actual payload validation being exercised here.
+        tracker.mark_request_sent();
 
         // Build a response without the RESPONSE_HASH_FIELD
         let topics = Topics::from_vec(vec![Topic::new("other", b"data".to_vec())]);
@@ -383,6 +523,9 @@ mod tests {
         let (_s1, h1, rx1) = tracker.prepare_request(t1).await;
         let (_s2, h2, rx2) = tracker.prepare_request(t2).await;
         let (_s3, h3, rx3) = tracker.prepare_request(t3).await;
+        tracker.mark_request_sent();
+        tracker.mark_request_sent();
+        tracker.mark_request_sent();
 
         assert_eq!(tracker.pending_count().await, 3);
 
@@ -457,6 +600,7 @@ mod tests {
     #[tokio::test]
     async fn deserialization_failure_returns_error() {
         let tracker = RequestTracker::new();
+        tracker.mark_request_sent();
 
         // Pass garbage data that can't be deserialized as Topics
         let result = tracker.handle_response(&[]).await;
