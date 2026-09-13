@@ -76,6 +76,17 @@ pub const DEFAULT_MAX_HEADER_BYTES: usize = 4096;
 /// User-Agent header value identifying this client.
 const USER_AGENT: &str = "algod-rust/0.1.0";
 
+/// Sets the `User-Agent` header on `headers`. Mirrors go's
+/// `SetUserAgentHeader` (`network/wsNetwork.go`), a small standalone helper
+/// go's own test (`TestSetUserAgentHeader`) calls directly against a bare
+/// `http.Header{}` and asserts adds exactly one header entry.
+fn set_user_agent_header(headers: &mut http::HeaderMap) {
+    headers.insert(
+        HeaderName::from_static("user-agent"),
+        USER_AGENT.parse().expect("valid header value"),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // ConnectConfig
 // ---------------------------------------------------------------------------
@@ -282,11 +293,8 @@ async fn try_connect_inner(
         request.headers_mut().insert(name.clone(), value.clone());
     }
 
-    // Set User-Agent header (matches Go's SetUserAgentHeader)
-    request.headers_mut().insert(
-        HeaderName::from_static("user-agent"),
-        USER_AGENT.parse().expect("valid header value"),
-    );
+    // Set User-Agent header.
+    set_user_agent_header(request.headers_mut());
 
     // Steps 5 & 6: Dial WebSocket with handshake timeout.
     //
@@ -1003,6 +1011,21 @@ mod tests {
     #[test]
     fn filter_ascii_empty() {
         assert_eq!(filter_ascii("", 128), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // set_user_agent_header tests (go: TestSetUserAgentHeader)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_user_agent_header_adds_exactly_one_header() {
+        let mut headers = http::HeaderMap::new();
+        set_user_agent_header(&mut headers);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(
+            headers.get(HeaderName::from_static("user-agent")).unwrap(),
+            USER_AGENT
+        );
     }
 
     // -----------------------------------------------------------------------
