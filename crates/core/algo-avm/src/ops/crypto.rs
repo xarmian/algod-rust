@@ -2126,6 +2126,32 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Port of go-algorand's `TestIsPrimitive`: go directly unit-tests its
+    /// internal `isPrimitiveJSON` helper against `null`, a top-level array
+    /// (`[1, 2, 3]`), and a bare number (`2`) -- all three are classified as
+    /// "primitive" (i.e. not a JSON object) by go's helper. algod-rust has
+    /// no standalone `isPrimitiveJSON`-equivalent function to unit-test
+    /// directly (`parse_json_object` folds the "is this a JSON object at
+    /// all" check into a single leading-`{`/serde_json::Value::Object
+    /// check instead), so this exercises the same input end to end through
+    /// `json_ref`. Of go's three cases, `test_json_ref_reject_array` and
+    /// `test_json_ref_reject_number` above already cover the array and
+    /// number cases; this adds the one still missing: `null`.
+    #[test]
+    fn test_json_ref_reject_null_as_primitive() {
+        let json = b"null";
+        let key = b"key";
+        let mut code = vec![0x80, json.len() as u8];
+        code.extend_from_slice(json);
+        code.extend_from_slice(&[0x80, key.len() as u8]);
+        code.extend_from_slice(key);
+        code.push(0x5f);
+        code.push(0x00);
+        code.extend_from_slice(&[0x80, 0x00, 0x12, 0x43]);
+        let result = run_prog(7, &code);
+        assert!(result.is_err(), "json_ref over `null` must be rejected");
+    }
+
     // -----------------------------------------------------------------------
     // Duplicate key detection unit tests
     // -----------------------------------------------------------------------

@@ -584,6 +584,58 @@ mod tests {
         assert_eq!(ops.program, ops2.program);
     }
 
+    /// Port of go-algorand's `TestDisassembleBytecblock`: disassembling a
+    /// program that references an `intcblock`/`bytecblock` both directly
+    /// (`intc_0`.."intc 4", `bytec_0`.."bytec 4") and again through a
+    /// `pushints`/`pushbytess` instruction (which pushes its own literal
+    /// values, unrelated to the const blocks, but is followed by more
+    /// const-block references) must decode every `intc_N`/`bytec_N`/`intc
+    /// n`/`bytec n` reference to its exact value-comment, in both places --
+    /// not just the single decode go's `test_bytecblock`-equivalent
+    /// (`bytecode::tests::test_bytecblock`) checks. This asserts the emitted
+    /// source line-by-line, matching go's `requireDisassembledSource`.
+    #[test]
+    fn test_disassemble_bytecblock_value_comments_intc_and_bytec() {
+        let intc_source = "#pragma version 8\n\
+intcblock 0 1 2 3 4 5\n\
+intc_0 // 0\n\
+intc_1 // 1\n\
+intc_2 // 2\n\
+intc_3 // 3\n\
+intc 4 // 4\n\
+pushints 6\n\
+intc_0 // 0\n\
+intc_1 // 1\n\
+intc_2 // 2\n\
+intc_3 // 3\n\
+intc 4 // 4\n";
+        let ops = assemble_string(intc_source).unwrap();
+        let text = disassemble(&ops.program).unwrap();
+        assert_eq!(text, intc_source);
+        // And the disassembled text must reassemble to the identical bytes.
+        let ops2 = assemble_string(&text).unwrap();
+        assert_eq!(ops.program, ops2.program);
+
+        let bytec_source = "#pragma version 8\n\
+bytecblock 0x6869 0x414243 0x74657374 0x666f7572 0x6c617374\n\
+bytec_0 // \"hi\"\n\
+bytec_1 // \"ABC\"\n\
+bytec_2 // \"test\"\n\
+bytec_3 // \"four\"\n\
+bytec 4 // \"last\"\n\
+pushbytess 0x6576696c\n\
+bytec_0 // \"hi\"\n\
+bytec_1 // \"ABC\"\n\
+bytec_2 // \"test\"\n\
+bytec_3 // \"four\"\n\
+bytec 4 // \"last\"\n";
+        let ops = assemble_string(bytec_source).unwrap();
+        let text = disassemble(&ops.program).unwrap();
+        assert_eq!(text, bytec_source);
+        let ops2 = assemble_string(&text).unwrap();
+        assert_eq!(ops.program, ops2.program);
+    }
+
     #[test]
     fn test_disassemble_pushbytes() {
         let program = vec![

@@ -153,7 +153,7 @@ impl std::error::Error for AssemblyWarning {}
 // ---------------------------------------------------------------------------
 
 /// A position in source code (0-based line and column).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SourceLocation {
     pub line: usize,
     pub col: usize,
@@ -4315,7 +4315,16 @@ mod tests {
         let ops = assemble_string(source).unwrap();
         assert_eq!(
             ops.program,
-            vec![opcode::MAX_AVM_VERSION, 0x20, 0x01, 0x01, 0x22, 0x22, 0x40, 0x00]
+            vec![
+                opcode::MAX_AVM_VERSION,
+                0x20,
+                0x01,
+                0x01,
+                0x22,
+                0x22,
+                0x40,
+                0x00
+            ]
         );
     }
 

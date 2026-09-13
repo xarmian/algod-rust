@@ -642,3 +642,245 @@ fn test_plus_rejects_empty_bytes_arg() {
         "expected a type-mismatch error, got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Frame-pointer / subroutine coverage (frames_test.go, fpVersion = 8)
+// ---------------------------------------------------------------------------
+
+/// Port of go-algorand's `TestFrameAccess` `ijsum` case: a subroutine that
+/// uses `frame_bury` to write both its return slot and a loop-local variable
+/// across iterations of a backward-branch loop, summing `frame_dig -2..-1`
+/// (2..8) into the return slot via repeated `frame_bury 0`/`frame_bury 1`.
+/// This is the load-bearing runtime exercise of `frame_bury` actually storing
+/// into the frame -- the existing `test_frame_dig` coverage in
+/// `bytecode.rs` only checks decode of the immediate, never execution.
+#[test]
+fn test_frame_bury_loop_accumulator() {
+    let source = r#"
+        b main
+  ijsum:
+        proto 2 1
+        int 0; int 0            // room for sum and one "local", a loop variable
+
+        frame_dig -2            // first arg
+        frame_bury 1            // initialize loop var
+   loop:
+        frame_dig 1              // loop var
+        frame_dig -1            // second arg
+        >
+        bnz break
+
+        frame_dig 1
+        frame_dig 0              // the sum, to be returned
+        +
+        frame_bury 0
+
+        frame_dig 1
+        int 1
+        +
+        frame_bury 1
+        b loop
+  break:
+        retsub                   // sum is sitting in frame_dig 0, which will end up ToS
+
+  main: int 2
+        int 8
+        callsub ijsum
+        int 35                   // 2+3+4+5+6+7+8
+        ==
+    "#;
+    let result = run_source(8, source).unwrap();
+    assert!(result, "frame_bury-accumulated loop sum should equal 35");
+}
+
+/// Port of go-algorand's `TestFrameAccesAtStart`: `frame_dig`/`frame_bury`
+/// with an empty callstack (no enclosing subroutine at all) must be a
+/// runtime error, not a silent garbage read/write -- there's no frame to
+/// index into.
+#[test]
+fn test_frame_dig_empty_callstack_errors() {
+    let result = run_source(8, "frame_dig 1");
+    assert!(
+        result.is_err(),
+        "frame_dig with empty callstack must error, got {result:?}"
+    );
+}
+
+#[test]
+fn test_frame_bury_empty_callstack_errors() {
+    let result = run_source(8, "int 7\nframe_bury 1");
+    assert!(
+        result.is_err(),
+        "frame_bury with empty callstack must error, got {result:?}"
+    );
+}
+
+/// Port of go-algorand's `TestDirectDig`: a subroutine can use the ordinary
+/// `dig` opcode (not `frame_dig`) to reach its own arguments, as long as the
+/// offset accounts for whatever else the subroutine itself has already
+/// pushed since entry. This is a distinct code path from `frame_dig` (which
+/// is frame-pointer-relative); `dig` inside a subroutine is stack-relative
+/// like anywhere else, so this exercises frame arguments being ordinary,
+/// reachable stack slots.
+#[test]
+fn test_direct_dig_reaches_subroutine_args() {
+    let source = r#"
+        int 3
+        int 5
+        callsub double_both
+        +
+        int 16; ==; return
+double_both:
+        proto 2 2
+        dig 1; int 2; *          // dig for first arg
+        dig 1; int 2; *          // dig for second
+        retsub
+    "#;
+    let result = run_source(8, source).unwrap();
+    assert!(
+        result,
+        "dig-based subroutine arg access should compute 3*2 + 5*2 == 16"
+    );
+}
+
+/// Port of go-algorand's `TestVoidSub`: a void (`proto 0 0`) subroutine's
+/// locals are always cleared off the stack on `retsub`, regardless of
+/// whether the caller cares about a return value -- so a junk local left on
+/// the stack inside the sub must not leak into the caller's stack.
+#[test]
+fn test_void_sub_clears_junk_local() {
+    let source = r#"
+        b main
+     a: proto 0 0
+        int 4                    // junk local should get cleared
+        retsub
+  main: callsub a
+        int 1                    // would fail because of two stack items unless 4 cleared
+    "#;
+    let result = run_source(8, source).unwrap();
+    assert!(
+        result,
+        "void subroutine must clear its junk local before retsub"
+    );
+}
+
+/// The `TestVoidSub` counterpart: without a `proto` declaration at all, the
+/// subroutine has no frame discipline, so a junk local pushed inside it is
+/// *not* cleared on `retsub` -- the caller is left with 2 stack items where
+/// it expects 1, which must fail (go's variant panics with a stack-height
+/// mismatch at the end of the program).
+#[test]
+fn test_no_proto_sub_does_not_clear_junk_local() {
+    let code: &[u8] = &[
+        0x42, 0x00, 0x03, // b main (delta +3 -> offset 6)
+        // a @ offset 3:
+        0x81, 0x04, // int 4 (junk local, no proto to clear it)
+        0x89, // retsub
+        // main @ offset 6:
+        0x88, 0xff, 0xfa, // callsub a (delta -6 -> offset 3)
+        0x81, 0x01, // int 1
+    ];
+    let result = run_program(8, code);
+    assert!(
+        result.is_err(),
+        "without proto, the junk local must NOT be cleared, leaving 2 stack items and failing, got {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Byte-wise bitwise ops and bytes<->uint conversions (eval_test.go, v4)
+// ---------------------------------------------------------------------------
+
+/// Port of go-algorand's `TestBytesBits`: `b|`/`b&`/`b^`/`b~` are byte-wise
+/// (not word-wise) bitwise operators over the wider of the two operands
+/// (`b|`/`b&`/`b^`), and `b~` complements every byte of its single operand
+/// in place, including the zero-length case. Only `bzero` had a dedicated
+/// Rust test before this; the byte-wise logical ops themselves were untested.
+#[test]
+fn test_bytes_bits_or_and_xor_not() {
+    let cases: &[&str] = &[
+        "byte 0x11; byte 0x10; b|; byte 0x11; ==",
+        "byte 0x01; byte 0x10; b|; byte 0x11; ==",
+        "byte 0x0201; byte 0x10f1; b|; byte 0x12f1; ==",
+        "byte 0x0001; byte 0x00f1; b|; byte 0x00f1; ==",
+        "byte 0x11; byte 0x10; b&; byte 0x10; ==",
+        "byte 0x01; byte 0x10; b&; byte 0x00; ==",
+        "byte 0x0201; byte 0x10f1; b&; byte 0x0001; ==",
+        "byte 0x01; byte 0x00f1; b&; byte 0x0001; ==",
+        "byte 0x11; byte 0x10; b^; byte 0x01; ==",
+        "byte 0x01; byte 0x10; b^; byte 0x11; ==",
+        "byte 0x0201; byte 0x10f1; b^; byte 0x12f0; ==",
+        "byte 0x0001; byte 0xf1; b^; byte 0x00f0; ==",
+        "byte 0x0001; b~; byte 0xfffe; ==",
+        "byte 0x; b~; byte 0x; ==",
+        "byte 0xf001; b~; byte 0x0ffe; ==",
+    ];
+    for src in cases {
+        let result = run_source(4, src).unwrap();
+        assert!(result, "expected accept for {src:?}");
+    }
+}
+
+/// Port of go-algorand's `TestBytesConversions`: `b+` (byte-wise big-endian
+/// addition) followed by `btoi` round-trips back through the uint64 domain,
+/// including when the operands have mismatched/leading-zero-padded lengths.
+/// The existing `bigint_b_add` coverage checked `b+` in isolation; this
+/// closes the `b+` -> `btoi` chain go's test actually exercises.
+#[test]
+fn test_bytes_conversions_b_add_then_btoi() {
+    let result = run_source(4, "byte 0x11; byte 0x10; b+; btoi; int 0x21; ==").unwrap();
+    assert!(result, "0x11 + 0x10 via b+/btoi should equal 0x21");
+
+    let result = run_source(4, "byte 0x0011; byte 0x10; b+; btoi; int 0x21; ==").unwrap();
+    assert!(
+        result,
+        "leading-zero-padded 0x0011 + 0x10 via b+/btoi should still equal 0x21"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// String literal parsing at runtime (eval_test.go, v1)
+// ---------------------------------------------------------------------------
+
+/// Port of go-algorand's `TestStringLiteral`: a quoted string literal must
+/// decode to exactly the same bytes as its base64 equivalent -- including a
+/// string containing what looks like a `//` comment marker (must not be
+/// truncated by the assembler's comment stripping), and the empty string
+/// (`byte ""`) must be byte-for-byte equal to the empty byte constant
+/// (`byte 0x`), not e.g. a nil/empty-type mismatch. The existing assembler
+/// unit tests check literal *parsing* in isolation; this exercises the
+/// runtime equality go's test actually asserts.
+#[test]
+fn test_string_literal_runtime_equality() {
+    let result = run_source(1, "byte \"foo bar\"\nbyte b64(Zm9vIGJhcg==)\n==\n").unwrap();
+    assert!(
+        result,
+        "quoted string literal must equal its base64 encoding"
+    );
+
+    let result = run_source(
+        1,
+        "byte \"foo bar // not a comment\"\nbyte b64(Zm9vIGJhciAvLyBub3QgYSBjb21tZW50)\n==\n",
+    )
+    .unwrap();
+    assert!(
+        result,
+        "a `//` inside a quoted string literal must not be treated as a comment"
+    );
+
+    let result = run_source(1, "byte \"\"\nbyte 0x\n==\n").unwrap();
+    assert!(
+        result,
+        "empty string literal must equal the empty byte constant"
+    );
+
+    let result = run_source(
+        1,
+        "byte \"\" // empty string literal\nbyte 0x // empty byte constant\n==\n",
+    )
+    .unwrap();
+    assert!(
+        result,
+        "empty string literal must equal empty byte constant even with trailing comments"
+    );
+}
