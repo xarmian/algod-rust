@@ -43,6 +43,17 @@ const OPTIMIZE_CONSTANTS_ENABLED_VERSION: u8 = 4;
 /// Default assembler version when no `#pragma version` is specified.
 const ASSEMBLER_DEFAULT_VERSION: u8 = 1;
 
+/// Sentinel marking "no `#pragma version` seen yet" for [`OpStream::version`],
+/// mirroring go's `assemblerNoVersion = ^uint64(0)` (`assembler.go:2722`).
+/// Distinct from any real version value -- including `0`, which is itself a
+/// valid, explicit `#pragma version` alias for v1 (`assembler.go:2478-2500`
+/// comment: "version 0 is valid version for v1"). Before this sentinel
+/// existed, `OpStream::version` used the real value `0` to double as the
+/// "unset" marker, which made an explicit `#pragma version 0` structurally
+/// indistinguishable from "not yet declared" and therefore impossible to
+/// accept (issue #1409).
+const ASSEMBLER_NO_VERSION: u8 = u8::MAX;
+
 /// AVM version where back-branches were introduced.
 const BACK_BRANCH_ENABLED_VERSION: u8 = 4;
 
@@ -348,7 +359,7 @@ impl OpStream {
     fn new() -> Self {
         Self {
             program: Vec::new(),
-            version: 0, // will be set by pragma or default
+            version: ASSEMBLER_NO_VERSION, // will be set by pragma or default
             errors: Vec::new(),
             warnings: Vec::new(),
             offset_to_source: HashMap::new(),
@@ -375,6 +386,29 @@ impl OpStream {
             type_track_deadcode: false,
             type_track_bottom_permissive: false,
             type_track_reporting: true,
+        }
+    }
+
+    /// The version used for every opcode/field-name *availability* gate
+    /// during assembly. `#pragma version 0` is a declared, explicit alias
+    /// for v1 (`assembler.go:2478-2500`'s "version 0 is valid version for
+    /// v1"): go implements this by seeding its per-version `OpsByName[0]`
+    /// table as a copy of `OpsByName[1]` with each spec's own `Version`
+    /// field also rewritten to `0` (`opcodes.go:955-970`, "Zero (empty)
+    /// version is an alias for v1 opcodes"), so every `spec.Version >
+    /// ops.Version` gate check compares `0 > 0` (false) exactly as `1 > 1`
+    /// would. algod-rust's opcode/field tables aren't re-derived per
+    /// version, so the equivalent is applied at the comparison call sites
+    /// instead: treat a literal `version == 0` as `1` for gating decisions
+    /// only. This must NEVER be used for the version byte written into the
+    /// assembled program, nor for reporting `self.version` -- both must
+    /// keep the literal declared value (including 0), matching go's
+    /// `ops.Program[0]`/`ops.Version` staying literally 0.
+    pub(crate) fn effective_version(&self) -> u8 {
+        if self.version == 0 {
+            1
+        } else {
+            self.version
         }
     }
 
@@ -1150,10 +1184,10 @@ fn is_any_field_name(name: &str) -> bool {
 }
 
 /// Validates a candidate macro name, matching go's `checkMacroName`
-/// (`assembler.go:2380-2430`). `ops.version == 0` stands in for go's
-/// `assemblerNoVersion` sentinel (version not yet settled by a `#pragma
-/// version` or the first real instruction) -- the opcode/field-name checks
-/// only activate once a version is known, mirroring go exactly (see
+/// (`assembler.go:2380-2430`). `ops.version == ASSEMBLER_NO_VERSION` stands
+/// in for go's `assemblerNoVersion` sentinel (version not yet settled by a
+/// `#pragma version` or the first real instruction) -- the opcode/field-name
+/// checks only activate once a version is known, mirroring go exactly (see
 /// [`recheck_macro_names`], invoked the moment the version does become
 /// known, to re-validate every macro defined while it wasn't).
 fn check_macro_name(name: &str, ops: &OpStream) -> Result<(), String> {
@@ -1191,9 +1225,9 @@ fn check_macro_name(name: &str, ops: &OpStream) -> Result<(), String> {
     if PSEUDO_OP_NAMES.contains(&name) {
         return Err(format!("Macro names cannot be pseudo-ops: {name}"));
     }
-    if ops.version != 0 {
+    if ops.version != ASSEMBLER_NO_VERSION {
         if let Some(spec) = opcode::lookup_by_name(name) {
-            if spec.version <= ops.version {
+            if spec.version <= ops.effective_version() {
                 return Err(format!("Macro names cannot be opcodes: {name}"));
             }
         }
@@ -1388,10 +1422,15 @@ fn handle_pragma(ops: &mut OpStream, tokens: &[&str], version_set: &mut bool) {
                 );
             }
             if let Ok(v) = parts[2].parse::<u8>() {
-                if v == 0 || v > MAX_AVM_VERSION {
+                if v > MAX_AVM_VERSION {
                     ops.record_error(ops.source_line, 0, format!("unsupported version: {v}"));
                 } else {
-                    let was_unknown = ops.version == 0;
+                    // `v == 0` is a valid, explicit alias for v1 (go:
+                    // "version 0 is valid version for v1", allowed for
+                    // reassembling old logicsigs) -- distinct from
+                    // `ASSEMBLER_NO_VERSION`, so it must never be rejected
+                    // here nor confused with "unset" below.
+                    let was_unknown = ops.version == ASSEMBLER_NO_VERSION;
                     ops.version = v;
                     *version_set = true;
                     if was_unknown {
@@ -1621,7 +1660,7 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
         // If no version set yet, default -- and, like go's parseText
         // (assembler.go:2183-2187), recheck every macro defined so far now
         // that a version is implicitly known.
-        if !version_set && ops.version == 0 {
+        if !version_set && ops.version == ASSEMBLER_NO_VERSION {
             ops.version = ASSEMBLER_DEFAULT_VERSION;
             version_set = true;
             recheck_macro_names(&mut ops);
@@ -1648,7 +1687,7 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
         }
     }
 
-    if !version_set && ops.version == 0 {
+    if !version_set && ops.version == ASSEMBLER_NO_VERSION {
         ops.version = ASSEMBLER_DEFAULT_VERSION;
     }
 
@@ -1807,7 +1846,7 @@ fn asm_pseudo_arity(ops: &mut OpStream, mnemonic: &str, args: &[&str]) {
             // go's getSpec (assembler.go:1756-1759): version-gate under the
             // pseudo mnemonic, citing the immediate count that was used --
             // e.g. "txn opcode with 2 immediates was introduced in v2".
-            if spec.version > ops.version {
+            if spec.version > ops.effective_version() {
                 let phrase = if args.len() == 1 {
                     "1 immediate".to_string()
                 } else {
@@ -2206,7 +2245,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
         }
     };
 
-    if spec.version > ops.version {
+    if spec.version > ops.effective_version() {
         ops.record_error(
             ops.source_line,
             0,
@@ -2292,7 +2331,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
             // Check if this opcode uses a field group
             if let Some(val) = resolve_field_immediate(ops, mnemonic, args[0]) {
                 if let Some(field_version) = field_group_version_at(mnemonic, 0, val) {
-                    if field_version > ops.version {
+                    if field_version > ops.effective_version() {
                         ops.record_error(
                             ops.source_line,
                             0,
@@ -2342,7 +2381,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
             for (i, arg) in args.iter().enumerate() {
                 if let Some(val) = resolve_field_immediate_at(ops, mnemonic, arg, i) {
                     if let Some(field_version) = field_group_version_at(mnemonic, i, val) {
-                        if field_version > ops.version {
+                        if field_version > ops.effective_version() {
                             ops.record_error(
                                 ops.source_line,
                                 0,
@@ -2379,7 +2418,7 @@ fn asm_regular_named(ops: &mut OpStream, lookup_name: &str, mnemonic: &str, args
             for (i, arg) in args.iter().enumerate() {
                 if let Some(val) = resolve_field_immediate_at(ops, mnemonic, arg, i) {
                     if let Some(field_version) = field_group_version_at(mnemonic, i, val) {
-                        if field_version > ops.version {
+                        if field_version > ops.effective_version() {
                             ops.record_error(
                                 ops.source_line,
                                 0,
@@ -3304,6 +3343,74 @@ mod tests {
         assert_eq!(ops.program[2], 1); // count=1
         assert_eq!(ops.program[3], 1); // value=1
         assert_eq!(ops.program[4], 0x22); // intc_0
+    }
+
+    // ── issue #1409: `#pragma version 0` is a valid v1 alias ────────────
+    //
+    // go-algorand's `pragma()` (`assembler.go:2478-2500`) explicitly allows
+    // `#pragma version 0`, treating it identically to v1 ("version 0 is
+    // valid version for v1" -- kept for reassembling old logicsigs). This
+    // relies on `assemblerNoVersion` being a dedicated sentinel distinct
+    // from any real version value, including 0. algod-rust's `OpStream::
+    // version` used to double `0` as both a real version and the "not yet
+    // set" marker, so it structurally could never accept an explicit 0.
+
+    #[test]
+    fn test_pragma_version_zero_assembles_like_v1() {
+        let source = "#pragma version 0\nint 1\n";
+        let ops = assemble_string(source).unwrap();
+        // The declared version is preserved verbatim (matching go's
+        // `ops.Version == 0` after this program), not silently promoted to 1.
+        assert_eq!(ops.version, 0);
+        assert_eq!(ops.program[0], 0); // version byte, written verbatim
+        assert_eq!(ops.program[1], 0x20); // intcblock
+        assert_eq!(ops.program[2], 1); // count=1
+        assert_eq!(ops.program[3], 1); // value=1
+        assert_eq!(ops.program[4], 0x22); // intc_0
+    }
+
+    #[test]
+    fn test_pragma_version_zero_behaves_like_v1_for_opcode_gating() {
+        // A v2+-only opcode (e.g. `txna`) must still be rejected as "not
+        // available" at declared version 0, exactly as it is at v1 -- 0
+        // must gate opcodes the same way v1 does, not be treated as
+        // "anything goes" or as version-unknown.
+        let errs_v0 = expect_errors("#pragma version 0\ntxna Accounts 0\n");
+        let errs_v1 = expect_errors("#pragma version 1\ntxna Accounts 0\n");
+        assert!(
+            errs_v0
+                .iter()
+                .any(|e| e.message.contains("txna") && e.message.contains("v2")),
+            "{errs_v0:?}"
+        );
+        assert_eq!(
+            errs_v0.iter().map(|e| &e.message).collect::<Vec<_>>(),
+            errs_v1.iter().map(|e| &e.message).collect::<Vec<_>>(),
+            "declared version 0 must gate opcodes identically to v1"
+        );
+
+        // And a plain v1 program still assembles fine at version 0.
+        let ops = assemble_string("#pragma version 0\nint 1\nint 1\n+\n").unwrap();
+        assert_eq!(ops.version, 0);
+    }
+
+    #[test]
+    fn test_pragma_version_explicit_one_still_works_after_zero_fix() {
+        // Regression guard: an explicit `#pragma version 1` must still work
+        // once `#pragma version 0` is accepted (i.e. 0 and 1 both assemble,
+        // and are not confused with each other or with "unset").
+        let ops = assemble_string("#pragma version 1\nint 1\n").unwrap();
+        assert_eq!(ops.version, 1);
+    }
+
+    #[test]
+    fn test_no_pragma_version_still_defaults_to_one_after_zero_fix() {
+        // Regression guard: a program with no `#pragma version` line at all
+        // must still default to v1 -- distinct from an explicit `#pragma
+        // version 0`, which must now also be accepted but preserved as 0.
+        let ops = assemble_string("int 3\n").unwrap();
+        assert_eq!(ops.version, 1);
+        assert_eq!(ops.program[0], 1);
     }
 
     /// `app_params_set` is App-mode only, but the assembler doesn't enforce
