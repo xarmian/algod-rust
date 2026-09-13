@@ -177,6 +177,186 @@ impl InnerTxnBuilder {
         }
     }
 
+    /// Validate that a popped `TealValue`'s AVM type (uint64 vs byte array,
+    /// and — for byte arrays — an expected fixed shape such as a 32-byte
+    /// address) matches what the target field expects, mirroring
+    /// go-algorand's `stackIntoTxnField` (`data/transactions/logic/eval.go`)
+    /// which validates via `sv.uint()` (errors on a byte-typed value),
+    /// `sv.address()` (errors unless exactly 32 bytes), `sv.bool()` (errors
+    /// unless literally 0 or 1), and dedicated logic for `Type`/`TypeEnum`.
+    ///
+    /// algod-rust previously stored any `TealValue` variant unconditionally;
+    /// `build()`'s per-field `if let TealValue::Bytes(b) = value { .. }` /
+    /// `if let TealValue::Uint(v) = value { .. }` guards silently no-op'd
+    /// (or, for `TypeEnum`, silently defaulted to `Pay`) on a type mismatch
+    /// instead of erroring -- a real consensus-relevant divergence (issue
+    /// #1391). This runs before `validate_field_bounds` (which assumes the
+    /// value is already the right variant), matching go's per-field
+    /// type-then-bounds check order (e.g. `ApplicationArgs`: `sv.Bytes ==
+    /// nil` checked before the length/count bounds).
+    ///
+    /// A handful of byte-array fields (`Note`, `ApprovalProgram`,
+    /// `ClearStateProgram`, and their `*Pages` variants) deliberately have
+    /// **no** entry here: go's `stackIntoTxnField` reads only `sv.Bytes` for
+    /// these without checking `sv.Bytes == nil`, so a `Uint`-typed value is
+    /// silently treated as an empty byte string there too -- preserving
+    /// that quirk (rather than "fixing" it by analogy with the other byte
+    /// fields) keeps behavior bit-for-bit with go.
+    fn validate_field_type(field: u8, value: &TealValue) -> Result<(), AlgoError> {
+        fn not_a_uint64(b: &[u8]) -> AlgoError {
+            AlgoError::Avm {
+                message: format!("{b:?} is not a uint64"),
+            }
+        }
+        fn not_an_address() -> AlgoError {
+            AlgoError::Avm {
+                message: "not an address".to_string(),
+            }
+        }
+        fn require_uint(value: &TealValue) -> Result<(), AlgoError> {
+            match value {
+                TealValue::Bytes(b) => Err(not_a_uint64(b)),
+                TealValue::Uint(_) => Ok(()),
+            }
+        }
+        fn require_address(value: &TealValue) -> Result<(), AlgoError> {
+            match value {
+                TealValue::Bytes(b) if b.len() == 32 => Ok(()),
+                _ => Err(not_an_address()),
+            }
+        }
+        fn require_bool(value: &TealValue) -> Result<(), AlgoError> {
+            match value {
+                TealValue::Bytes(b) => Err(not_a_uint64(b)),
+                TealValue::Uint(v) if *v == 0 || *v == 1 => Ok(()),
+                TealValue::Uint(v) => Err(AlgoError::Avm {
+                    message: format!("boolean is neither 1 nor 0: {v}"),
+                }),
+            }
+        }
+        fn require_fixed_bytes(
+            field_name: &str,
+            n: usize,
+            value: &TealValue,
+        ) -> Result<(), AlgoError> {
+            let len = match value {
+                TealValue::Bytes(b) => b.len(),
+                TealValue::Uint(_) => 0,
+            };
+            if len != n {
+                return Err(AlgoError::Avm {
+                    message: format!("{field_name} must be {n} bytes"),
+                });
+            }
+            Ok(())
+        }
+        fn require_byte_array(value: &TealValue) -> Result<(), AlgoError> {
+            match value {
+                TealValue::Bytes(_) => Ok(()),
+                TealValue::Uint(_) => Err(AlgoError::Avm {
+                    message: "not a byte array".to_string(),
+                }),
+            }
+        }
+        // go's `innerTxnTypes` map (`data/transactions/logic/fields.go`):
+        // only these six transaction types can be built via itxn -- keyreg
+        // and appl were added later, but this codebase's minimum itxn
+        // AVM-version gate already implies both are available, so (unlike
+        // go) no separate per-type version check is needed here.
+        fn is_itxn_issuable_type_name(name: &str) -> bool {
+            matches!(name, "pay" | "keyreg" | "acfg" | "axfer" | "afrz" | "appl")
+        }
+        // go's `TxnTypeNames` (`data/transactions/logic/fields.go`), enum
+        // order. Index 0 (Unknown) is deliberately absent: go's TypeEnum
+        // check special-cases `i == 0` to report "0 is not a valid
+        // TypeEnum" rather than resolving it to a name.
+        fn txn_type_name_for_enum(i: u64) -> Option<&'static str> {
+            match i {
+                1 => Some("pay"),
+                2 => Some("keyreg"),
+                3 => Some("acfg"),
+                4 => Some("axfer"),
+                5 => Some("afrz"),
+                6 => Some("appl"),
+                7 => Some("stpf"),
+                8 => Some("hb"),
+                _ => None,
+            }
+        }
+
+        match field {
+            // Address-typed fields: Sender, Receiver, CloseRemainderTo,
+            // AssetSender, AssetReceiver, AssetCloseTo, Accounts (array
+            // element), RekeyTo, ConfigAssetManager/Reserve/Freeze/Clawback,
+            // FreezeAssetAccount.
+            0 | 7 | 9 | 19 | 20 | 21 | 28 | 32 | 41 | 42 | 43 | 44 | 46 => require_address(value),
+            // Uint-typed fields: Fee, Amount, VoteFirst, VoteLast,
+            // VoteKeyDilution, XferAsset, AssetAmount, ApplicationID,
+            // OnCompletion, ConfigAsset, ConfigAssetTotal,
+            // ConfigAssetDecimals, FreezeAsset, Assets/Applications (array
+            // element), GlobalNumUint/ByteSlice, LocalNumUint/ByteSlice,
+            // ExtraProgramPages, RejectVersion. (Range/max bounds for the
+            // `uintMaxed`-checked subset are enforced separately by
+            // `validate_field_bounds`.)
+            1 | 8 | 12 | 13 | 14 | 17 | 18 | 24 | 25 | 33 | 34 | 35 | 45 | 48 | 50 | 52 | 53
+            | 54 | 55 | 56 | 68 => require_uint(value),
+            // Boolean-valued uint fields.
+            36 | 47 | 57 => require_bool(value),
+            // Fixed-length byte fields (checked by explicit length
+            // comparison in go, which also rejects a Uint-typed value since
+            // its absent Bytes has length 0).
+            10 => require_fixed_bytes("VotePK", 32, value),
+            11 => require_fixed_bytes("SelectionPK", 32, value),
+            63 => require_fixed_bytes("StateProofPK", 64, value),
+            40 => require_fixed_bytes("ConfigAssetMetadataHash", 32, value),
+            // General byte-array (string) fields: go's `sv.string()` errors
+            // "not a byte array" when the value isn't byte-typed.
+            37..=39 => require_byte_array(value),
+            // Type: byte-array type-name string; must name an itxn-issuable
+            // type.
+            15 => {
+                let TealValue::Bytes(b) = value else {
+                    return Err(AlgoError::Avm {
+                        message: "Type arg not a byte array".to_string(),
+                    });
+                };
+                let name = String::from_utf8_lossy(b);
+                if is_itxn_issuable_type_name(&name) {
+                    Ok(())
+                } else {
+                    Err(AlgoError::Avm {
+                        message: format!("{name} is not a valid Type for itxn_field"),
+                    })
+                }
+            }
+            // TypeEnum: numeric type selector; must resolve to an
+            // itxn-issuable type.
+            16 => {
+                let i = match value {
+                    TealValue::Bytes(b) => return Err(not_a_uint64(b)),
+                    TealValue::Uint(v) => *v,
+                };
+                match txn_type_name_for_enum(i) {
+                    Some(name) if is_itxn_issuable_type_name(name) => Ok(()),
+                    Some(name) => Err(AlgoError::Avm {
+                        message: format!("{name} is not a valid Type for itxn_field"),
+                    }),
+                    None => Err(AlgoError::Avm {
+                        message: format!("{i} is not a valid TypeEnum"),
+                    }),
+                }
+            }
+            // ApplicationArgs (26): its byte-array check ("ApplicationArg is
+            // not a byte array") already lives in `validate_field_bounds`,
+            // sharing the gate with its length/count bounds.
+            //
+            // Note (5), ApprovalProgram (30), ClearStateProgram (31), and
+            // their *Pages accumulator variants (64, 66): no type check in
+            // go itself -- see the doc comment above.
+            _ => Ok(()),
+        }
+    }
+
     /// Validate a field write against go-algorand's `stackIntoTxnField`
     /// consensus bounds (`data/transactions/logic/eval.go`) before it is
     /// stored. go-algorand performs these checks at `itxn_field` time so a
@@ -450,7 +630,11 @@ impl InnerTxnBuilder {
                             algo_types::TxnType::from(String::from_utf8_lossy(b).into_owned());
                     }
                 }
-                // TypeEnum
+                // TypeEnum. `InnerTxnBuilder::validate_field_type` (issue
+                // #1391) already rejected any value other than 1..=6 (the
+                // itxn-issuable types) at `itxn_field` time, so only those
+                // ever reach `build()`; the `_` arm below is unreachable but
+                // kept as a defensive fallback.
                 16 => {
                     if let TealValue::Uint(v) = value {
                         txn.txn_type = match v {
@@ -460,7 +644,6 @@ impl InnerTxnBuilder {
                             4 => algo_types::TxnType::Axfer,
                             5 => algo_types::TxnType::Afrz,
                             6 => algo_types::TxnType::Appl,
-                            7 => algo_types::TxnType::Stpf,
                             _ => algo_types::TxnType::default(),
                         };
                     }
@@ -787,15 +970,16 @@ impl InnerTxnBuilder {
         // Process array fields.
         for (&field, values) in &self.array_fields {
             match field {
-                // ApplicationArgs
+                // ApplicationArgs. `validate_field_bounds` already rejects a
+                // non-`Bytes` element ("ApplicationArg is not a byte array")
+                // before it can reach `array_fields`, so every element here
+                // is `TealValue::Bytes`.
                 26 => {
                     let args: Vec<Option<serde_bytes::ByteBuf>> = values
                         .iter()
                         .map(|v| match v {
                             TealValue::Bytes(b) => Some(serde_bytes::ByteBuf::from(b.clone())),
-                            TealValue::Uint(n) => {
-                                Some(serde_bytes::ByteBuf::from(n.to_be_bytes().to_vec()))
-                            }
+                            TealValue::Uint(_) => None,
                         })
                         .collect();
                     if !args.is_empty() {
@@ -5775,6 +5959,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             .ok_or_else(|| AlgoError::Avm {
                 message: "itxn_field: no inner txn being built".to_string(),
             })?;
+        // Type check first, then bounds -- matches go's `stackIntoTxnField`
+        // per-field order (e.g. `sv.Bytes == nil` checked before length/count
+        // bounds for `ApplicationArgs`).
+        InnerTxnBuilder::validate_field_type(field, &value)?;
         builder.validate_field_bounds(consensus, field, &value)?;
         builder.set_field(field, value);
         Ok(())
@@ -14124,6 +14312,299 @@ mod tests {
         // Boundary value is accepted.
         ctx.itxn_field(30, TealValue::Bytes(vec![0x01u8; max]))
             .unwrap();
+    }
+
+    // ---- Issue #1391: itxn_field must validate the popped value's type ----
+    // against the target field's expected AVM type (uint64 vs address vs
+    // general bytes vs boolean-valued-uint), mirroring go-algorand's
+    // `stackIntoTxnField` (`sv.uint()`/`sv.address()`/`sv.bool()` plus the
+    // `Type`/`TypeEnum` special cases), instead of silently no-op'ing or
+    // defaulting on a type mismatch. ----
+
+    #[test]
+    fn itxn_field_type_enum_out_of_range_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx.itxn_field(16, TealValue::Uint(99)).unwrap_err(); // TypeEnum
+        assert!(
+            err.to_string().contains("not a valid TypeEnum"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_type_enum_zero_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx.itxn_field(16, TealValue::Uint(0)).unwrap_err(); // TypeEnum
+        assert!(
+            err.to_string().contains("not a valid TypeEnum"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_type_enum_stpf_not_itxn_issuable_rejected() {
+        // TypeEnum=7 (stpf) is in TxnTypeNames range but is not one of
+        // go-algorand's `innerTxnTypes` (only pay/keyreg/acfg/axfer/afrz/appl
+        // can be created via itxn) -- must be rejected, not silently mapped
+        // to a valid-looking Stpf inner transaction.
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx.itxn_field(16, TealValue::Uint(7)).unwrap_err(); // TypeEnum
+        assert!(
+            err.to_string().contains("not a valid Type for itxn_field"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_sender_non_32_byte_value_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx
+            .itxn_field(0, TealValue::Bytes(vec![0u8; 16])) // Sender
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not an address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_sender_uint_value_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx.itxn_field(0, TealValue::Uint(42)).unwrap_err(); // Sender
+        assert!(
+            err.to_string().contains("not an address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_fee_bytes_value_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx
+            .itxn_field(1, TealValue::Bytes(vec![1, 2, 3])) // Fee
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not a uint64"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_nonparticipation_invalid_bool_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx.itxn_field(57, TealValue::Uint(2)).unwrap_err(); // Nonparticipation
+        assert!(
+            err.to_string().contains("boolean is neither 1 nor 0"),
+            "unexpected error: {err}"
+        );
+        // 0 and 1 remain valid.
+        ctx.itxn_field(57, TealValue::Uint(0)).unwrap();
+        ctx.itxn_field(57, TealValue::Uint(1)).unwrap();
+    }
+
+    #[test]
+    fn itxn_field_rekey_to_uint_value_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx.itxn_field(32, TealValue::Uint(1)).unwrap_err(); // RekeyTo
+        assert!(
+            err.to_string().contains("not an address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_vote_pk_wrong_length_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx
+            .itxn_field(10, TealValue::Bytes(vec![0u8; 31])) // VotePK
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must be 32 bytes"),
+            "unexpected error: {err}"
+        );
+        // A Uint value has no bytes (len 0), also rejected.
+        let err = ctx.itxn_field(10, TealValue::Uint(5)).unwrap_err();
+        assert!(
+            err.to_string().contains("must be 32 bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_config_asset_unit_name_uint_value_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx.itxn_field(37, TealValue::Uint(1)).unwrap_err(); // ConfigAssetUnitName
+        assert!(
+            err.to_string().contains("not a byte array"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_xfer_asset_bytes_value_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx
+            .itxn_field(17, TealValue::Bytes(vec![1, 2])) // XferAsset
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not a uint64"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_accounts_array_element_uint_value_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx.itxn_field(28, TealValue::Uint(1)).unwrap_err(); // Accounts
+        assert!(
+            err.to_string().contains("not an address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_assets_array_element_bytes_value_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        let err = ctx
+            .itxn_field(48, TealValue::Bytes(vec![1])) // Assets
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not a uint64"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn itxn_field_type_string_valid_names_accepted_and_invalid_rejected() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+        // Recognized itxn-issuable type name is accepted.
+        ctx.itxn_field(15, TealValue::Bytes(b"pay".to_vec()))
+            .unwrap(); // Type
+                       // Unrecognized name is rejected.
+        let err = ctx
+            .itxn_field(15, TealValue::Bytes(b"bogus".to_vec()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid Type for itxn_field"),
+            "unexpected error: {err}"
+        );
+        // A non-itxn-issuable but otherwise real type name (stpf) is
+        // rejected too.
+        let err = ctx
+            .itxn_field(15, TealValue::Bytes(b"stpf".to_vec()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid Type for itxn_field"),
+            "unexpected error: {err}"
+        );
+        // A Uint value is rejected outright (Type is byte-array only).
+        let err = ctx.itxn_field(15, TealValue::Uint(1)).unwrap_err();
+        assert!(
+            err.to_string().contains("not a byte array"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Direct port of go-algorand's `TestFieldTypes`
+    /// (`data/transactions/logic/evalAppTxn_test.go`), which pins the exact
+    /// `sv.address()`/`sv.uint()` type-mismatch error ("not an address" /
+    /// "not a uint64") go asserts for each named field. This nails down
+    /// issue #1391's fix against the literal go test rather than just its
+    /// acceptance-criteria examples.
+    #[test]
+    fn itxn_field_types_go_test_field_types_port() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_itxn_bounds_ctx(&mut store);
+
+        // Sender: byte "pay" -> not an address.
+        let err = ctx
+            .itxn_field(0, TealValue::Bytes(b"pay".to_vec()))
+            .unwrap_err();
+        assert!(err.to_string().contains("not an address"), "{err}");
+
+        // Receiver: int 7 -> not an address.
+        let err = ctx.itxn_field(7, TealValue::Uint(7)).unwrap_err();
+        assert!(err.to_string().contains("not an address"), "{err}");
+
+        // CloseRemainderTo: byte "" -> not an address.
+        let err = ctx.itxn_field(9, TealValue::Bytes(Vec::new())).unwrap_err();
+        assert!(err.to_string().contains("not an address"), "{err}");
+
+        // AssetSender: byte "" -> not an address.
+        let err = ctx
+            .itxn_field(19, TealValue::Bytes(Vec::new()))
+            .unwrap_err();
+        assert!(err.to_string().contains("not an address"), "{err}");
+
+        // AssetReceiver: a real 32-byte value passes the type/shape check
+        // (go: "can't really tell if it's an address, so 32 bytes gets
+        // further" -- to "unavailable Account", a resource-availability
+        // concern this crate's itxn_field builder doesn't model at this
+        // layer, so we only assert the type check itself doesn't reject it).
+        ctx.itxn_field(20, TealValue::Bytes(vec![b'0'; 32]))
+            .unwrap();
+
+        // AssetCloseTo: a base32 string *representation* of an address is
+        // itself not 32 raw bytes -> not an address.
+        let err = ctx
+            .itxn_field(
+                21,
+                TealValue::Bytes(
+                    b"GAYTEMZUGU3DOOBZGAYTEMZUGU3DOOBZGAYTEMZUGU3DOOBZGAYZIZD42E".to_vec(),
+                ),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("not an address"), "{err}");
+
+        // Fee: byte "pay" -> not a uint64.
+        let err = ctx
+            .itxn_field(1, TealValue::Bytes(b"pay".to_vec()))
+            .unwrap_err();
+        assert!(err.to_string().contains("is not a uint64"), "{err}");
+
+        // Amount: byte 0x01 -> not a uint64.
+        let err = ctx.itxn_field(8, TealValue::Bytes(vec![0x01])).unwrap_err();
+        assert!(err.to_string().contains("is not a uint64"), "{err}");
+
+        // XferAsset: byte 0x01 -> not a uint64.
+        let err = ctx
+            .itxn_field(17, TealValue::Bytes(vec![0x01]))
+            .unwrap_err();
+        assert!(err.to_string().contains("is not a uint64"), "{err}");
+
+        // AssetAmount: byte 0x01 -> not a uint64.
+        let err = ctx
+            .itxn_field(18, TealValue::Bytes(vec![0x01]))
+            .unwrap_err();
+        assert!(err.to_string().contains("is not a uint64"), "{err}");
+
+        // ExtraProgramPages: byte "pay" -> not a uint64 (coverage on
+        // uintMaxed()).
+        let err = ctx
+            .itxn_field(56, TealValue::Bytes(b"pay".to_vec()))
+            .unwrap_err();
+        assert!(err.to_string().contains("is not a uint64"), "{err}");
+
+        // Nonparticipation: byte "pay" -> not a uint64 (coverage on
+        // bool()).
+        let err = ctx
+            .itxn_field(57, TealValue::Bytes(b"pay".to_vec()))
+            .unwrap_err();
+        assert!(err.to_string().contains("is not a uint64"), "{err}");
     }
 
     #[test]
