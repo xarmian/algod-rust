@@ -5093,6 +5093,52 @@ mod tests {
         server_net.stop().await;
     }
 
+    /// Go: `TestPeeringSenderIdentityChallengeOnly` (`network/wsNetwork_test.go:1598`)
+    /// — "if only the Sender uses Identity, no identity exchange happens in
+    /// the connection." go's test gives the dialing side (`netA`) a
+    /// `PublicAddress` (enabling identity) while the accepting side (`netB`)
+    /// has none, connects them, and asserts neither side's identity map was
+    /// ever populated (`getSetCount() == 0` for both).
+    ///
+    /// This crate's relay/accept path (`WebsocketNetwork::start_relay_server`,
+    /// exercised here via `start_capturing_relay`) has no server-side
+    /// identity wiring at all (see `client_without_identity_key_connects_without_error`'s
+    /// doc comment above and issue #1133's `DualGossipNode` follow-up note in
+    /// `docs/phase17/parity_network.md`), so it structurally never responds
+    /// to an identity challenge header — the direct counterpart of go's
+    /// "receiver does not participate" half. Driving a real dial with
+    /// `our_identity_key: Some(..)` (the "sender-only" half) against that
+    /// real relay and asserting `identity_verified() == false` reproduces
+    /// go's actual observable outcome: a client that is willing to do
+    /// identity but whose peer never answers ends up with no identity
+    /// exchange, exactly as go's `getSetCount() == 0` proves no identity was
+    /// ever recorded.
+    #[tokio::test]
+    async fn sender_only_identity_key_yields_no_identity_exchange() {
+        let (server_net, _captured) = start_capturing_relay("testnet-v1.0").await;
+        let (addr, _) = server_net.address();
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let connect_config = ConnectConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            our_identity_key: Some(signing_key),
+            ..ConnectConfig::default()
+        };
+
+        let handle = try_connect(&addr, &connect_config)
+            .await
+            .expect("a relay that ignores the identity challenge must not fail the handshake");
+        assert!(
+            !handle.identity_verified(),
+            "sender-only identity (relay never answers the challenge) must not yield a \
+             verified identity, mirroring go's getSetCount() == 0 on both sides"
+        );
+        assert!(handle.identity().is_none());
+
+        handle.close();
+        server_net.stop().await;
+    }
+
     /// Go: `TestMaxHeaderSize` (`network/wsNetwork_test.go:4077`) —
     /// `ConnectConfig::max_header_bytes` caps the HTTP upgrade response
     /// header size on the outbound dial (issue #1158). Ported as three

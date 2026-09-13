@@ -1813,6 +1813,109 @@ mod tests {
         assert_eq!(decompress_vote(&compressed).unwrap(), msgp);
     }
 
+    // ── randomized property round-trip (mirrors go's `TestCheckStatelessEncoder`,
+    // network/vpack/rapid_test.go:35, which draws random votes via `rapid`
+    // and asserts CompressVote/DecompressVote round-trip losslessly) ──────
+    //
+    // This crate has no `rapid`-style property-test/shrinking harness, but
+    // the actual property go's test checks — random combinations of varuint
+    // width (u8/u16/u32/u64, biased toward small values the same way go's
+    // `stepGen` favors steps 0-3), optional-field presence, and byte-field
+    // content compress and decompress back to the exact original msgpack —
+    // is fully reproducible with a seeded RNG sweeping many random
+    // `VoteSpec`s, deterministically across test runs.
+    #[test]
+    fn randomized_roundtrip_property() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xF00D_BEEF);
+
+        // Draws a value from one of the four varuint width classes, mirroring
+        // go's `integerRangeGen := rapid.OneOf(uint8, uint16, uint32, uint64
+        // ranges)`.
+        fn random_varuint(rng: &mut impl rand::RngCore) -> u64 {
+            use rand::Rng;
+            match rng.gen_range(0..4) {
+                0 => rng.gen_range(0u64..=255),
+                1 => rng.gen_range(256u64..=65_535),
+                2 => rng.gen_range(65_536u64..=4_294_967_295),
+                _ => rng.gen_range(4_294_967_296u64..=u64::MAX),
+            }
+        }
+
+        fn random_bytes(rng: &mut impl rand::RngCore, n: usize) -> Vec<u8> {
+            (0..n).map(|_| rng.gen()).collect()
+        }
+
+        for i in 0..300 {
+            let mut v = VoteSpec {
+                pf: random_bytes(&mut rng, 80),
+                rnd: random_varuint(&mut rng).max(1), // round is never zero
+                snd: random_bytes(&mut rng, 32),
+                p: random_bytes(&mut rng, 32),
+                p1s: random_bytes(&mut rng, 64),
+                p2: random_bytes(&mut rng, 32),
+                p2s: random_bytes(&mut rng, 64),
+                s: random_bytes(&mut rng, 64),
+                ..Default::default()
+            };
+
+            // period: present (nonzero) about half the time
+            if rng.gen_bool(0.5) {
+                v.per = Some(random_varuint(&mut rng).max(1));
+            }
+
+            // step: biased toward small values 0-3, like go's stepGen —
+            // step 0 is itself omitted (BIT_STEP unset), so only assign
+            // when nonzero.
+            let step_val = match rng.gen_range(0..5) {
+                0 => 0,
+                1 => 1,
+                2 => 2,
+                3 => 3,
+                _ => random_varuint(&mut rng),
+            };
+            if step_val != 0 {
+                v.step = Some(step_val);
+            }
+
+            // proposal fields: included as a group about half the time,
+            // each individually sometimes empty (mirrors go's
+            // includeProposal + per-field OneOf(empty, full) generators).
+            if rng.gen_bool(0.5) {
+                v.oper = Some(random_varuint(&mut rng));
+                // "empty" here mirrors go's generator leaving the fixed
+                // 32-byte array at its zero value (a no-op `copy` from an
+                // empty slice) -- the field is still a full 32-byte value
+                // on the wire, just all-zero, not omitted or short.
+                v.dig = Some(if rng.gen_bool(0.2) {
+                    vec![0u8; 32]
+                } else {
+                    random_bytes(&mut rng, 32)
+                });
+                v.encdig = Some(if rng.gen_bool(0.2) {
+                    vec![0u8; 32]
+                } else {
+                    random_bytes(&mut rng, 32)
+                });
+                v.oprop = Some(if rng.gen_bool(0.2) {
+                    vec![0u8; 32]
+                } else {
+                    random_bytes(&mut rng, 32)
+                });
+            }
+
+            let msgp = build_msgp_vote(&v);
+            let compressed = compress_vote(&msgp)
+                .unwrap_or_else(|e| panic!("iteration {i}: compress_vote failed: {e:?}"));
+            let decompressed = decompress_vote(&compressed)
+                .unwrap_or_else(|e| panic!("iteration {i}: decompress_vote failed: {e:?}"));
+            assert_eq!(
+                decompressed, msgp,
+                "iteration {i}: round-trip must reproduce the exact original msgpack bytes"
+            );
+        }
+    }
+
     #[test]
     fn roundtrip_dig_only() {
         let mut v = base_spec();

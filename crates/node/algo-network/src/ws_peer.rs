@@ -3937,6 +3937,75 @@ mod tests {
         closing.cancel();
     }
 
+    /// Mirrors go's `TestWebsocketNetworkBasicInvalidTags`
+    /// (network/wsNetwork_test.go): a peer that sends an MI (message-of-
+    /// interest) payload naming an unknown/out-of-protocol tag causes
+    /// `handleMessageOfInterest`/`unmarshallMessageOfInterest` to fail and
+    /// the connection to be dropped with `disconnectBadData` -- go's test
+    /// observes this indirectly via a log line and a message that never
+    /// arrives; this drives the same failure directly through `read_loop`
+    /// and asserts the `closing` token is cancelled (our disconnect
+    /// signal), i.e. the read loop tears the connection down rather than
+    /// silently ignoring the bad MI message or forwarding it.
+    #[tokio::test]
+    async fn read_loop_bad_mi_message_disconnects() {
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut client_sink, _client_stream) = client_ws.split();
+        let (_server_sink, server_stream) = server_ws.split();
+
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(10);
+        let (high_prio_tx, mut high_prio_rx) = mpsc::channel::<WriteCommand>(10);
+        let closing = CancellationToken::new();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+
+        let closing_clone = closing.clone();
+        let read_task = tokio::spawn(read_loop(
+            server_stream,
+            incoming_tx,
+            high_prio_tx,
+            send_message_tags,
+            last_packet_time,
+            closing_clone,
+            "test-peer".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            None,
+            None,
+            None,
+            make_test_peer_sender(closing.clone()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        ));
+
+        // Build a malformed MI message: a Topics payload whose "tags" value
+        // names an unknown two-byte tag ("ZZ"), same shape as go's test
+        // driving an unrecognised tag through the MI handshake.
+        let bad_payload = {
+            let topics = crate::topics::Topics::from_vec(vec![crate::topics::Topic::new(
+                "tags",
+                b"ZZ".to_vec(),
+            )]);
+            topics.marshal()
+        };
+        let mi_frame = encode_frame(&Tag::MsgOfInterest, &bad_payload).unwrap();
+        client_sink.send(WsMessage::Binary(mi_frame)).await.unwrap();
+
+        // The read loop must tear the connection down (closing cancelled)
+        // rather than forward the bad MI payload or a filter update.
+        tokio::time::timeout(Duration::from_secs(2), closing.cancelled())
+            .await
+            .expect("read_loop should cancel `closing` on a bad MI message");
+
+        let read_result = tokio::time::timeout(Duration::from_secs(2), read_task).await;
+        assert!(read_result.is_ok(), "read_loop should exit after bad MI");
+
+        // Neither a filter update nor a forwarded message should have been
+        // produced from the bad MI payload.
+        assert!(high_prio_rx.try_recv().is_err());
+        assert!(incoming_rx.try_recv().is_err());
+    }
+
     // -----------------------------------------------------------------------
     // Close propagation
     // -----------------------------------------------------------------------
