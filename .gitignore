@@ -1,6 +1,7 @@
 /target/
 **/target/
 .claude/worktrees/
+/logs/
 .claude/scheduled_tasks.lock
 .codex
 # Compiled vector-capture binaries (built via `go build` in their dirs)
