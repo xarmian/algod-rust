@@ -51,7 +51,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -508,6 +508,14 @@ struct PeerEntry {
     /// [`WebsocketNetwork::check_existing_connections_need_disconnecting`]
     /// (issue #1105).
     throttled_outgoing_connection: bool,
+    /// Priority weight for this peer, mirroring go's `wsPeer.prioWeight`
+    /// (`network/wsPeer.go`), set via
+    /// [`WebsocketNetwork::set_peer_priority`] (issue #1428). Defaults to
+    /// `0` — the same priority every peer implicitly had before priority
+    /// tracking existed, so broadcast fan-out ordering is unaffected until
+    /// something actually assigns a weight. An [`AtomicU64`] so it can be
+    /// updated without taking the peers map's write lock.
+    prio_weight: AtomicU64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,6 +1013,7 @@ impl WebsocketNetwork {
                     direction,
                     outgoing_filter,
                     throttled_outgoing_connection,
+                    prio_weight: AtomicU64::new(0),
                 },
             );
         }
@@ -1184,6 +1193,35 @@ impl WebsocketNetwork {
             true
         } else {
             false
+        }
+    }
+
+    /// Set a connected peer's broadcast priority weight (issue #1428).
+    ///
+    /// Mirrors go's `prioTracker.setPriority` (`network/netprio.go`), which
+    /// `prioResponseHandler` calls after verifying a `NetPrioResponse` and
+    /// looking up the responder's stake weight via
+    /// `NetPrioScheme.GetPrioWeight`. algod-rust doesn't yet drive that
+    /// challenge/response handshake itself (see `net_prio.rs`'s docs), so
+    /// this is a standalone setter any caller with a weight to report can
+    /// use — the priority-ordering behavior in [`BroadcastThread`] (via
+    /// [`crate::broadcast::BroadcastPeer::prio_weight`]) is wired
+    /// unconditionally and doesn't depend on how the weight was computed.
+    ///
+    /// A no-op (returns `false`) if `addr` isn't currently a connected peer.
+    /// Higher weight is preferred: the broadcast thread's `inner_broadcast`
+    /// sorts peers by descending `prio_weight` before applying
+    /// `BroadcastConnectionsLimit`'s cap, so this peer will be favored over
+    /// lower-weight (including default-`0`) peers the next time a broadcast
+    /// is capped.
+    pub async fn set_peer_priority(&self, addr: &str, weight: u64) -> bool {
+        let peers = self.peers.read().await;
+        match peers.get(addr) {
+            Some(entry) => {
+                entry.prio_weight.store(weight, Ordering::Relaxed);
+                true
+            }
+            None => false,
         }
     }
 
@@ -2257,6 +2295,7 @@ impl ConnectFn for NetworkConnectFn {
                                 direction: PeerDirection::Outbound,
                                 outgoing_filter: outgoing_message_filter,
                                 throttled_outgoing_connection,
+                                prio_weight: AtomicU64::new(0),
                             },
                         );
                     }
@@ -2533,6 +2572,7 @@ impl WebsocketNetwork {
                         .map(|(addr, entry)| BroadcastPeer {
                             addr: addr.clone(),
                             handle: Arc::new(entry.handle.sender()),
+                            prio_weight: entry.prio_weight.load(Ordering::Relaxed),
                         })
                         .collect(),
                     Err(_) => Vec::new(),

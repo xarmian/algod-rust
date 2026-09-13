@@ -120,6 +120,19 @@ pub struct BroadcastPeer {
     pub addr: String,
     /// Send handle for delivering messages.
     pub handle: Arc<dyn PeerSendRef>,
+    /// Priority weight assigned via the `NetPrio` challenge/response
+    /// protocol.
+    ///
+    /// Mirrors go's `wsPeer.prioWeight` (`network/wsPeer.go`), set by
+    /// `prioTracker.setPriority` (`network/netprio.go`) from
+    /// `NetPrioScheme.GetPrioWeight`'s participation-key stake lookup.
+    /// algod-rust doesn't yet drive that challenge/response handshake
+    /// (`net_prio.rs`'s docs), so this is populated by whatever external
+    /// caller has a weight to report (e.g.
+    /// [`crate::ws_network::WebsocketNetwork::set_peer_priority`]) and
+    /// defaults to `0` — but the ordering behavior below is wired
+    /// unconditionally, independent of how the weight is computed.
+    pub prio_weight: u64,
 }
 
 /// Trait-object-safe interface for sending a message to a peer.
@@ -368,6 +381,16 @@ async fn broadcast_loop<F>(
 /// - Drops the message if it has been queued longer than
 ///   [`MAX_MESSAGE_QUEUE_DURATION`].
 /// - Skips the excluded peer (the originator).
+/// - Orders peers by descending [`BroadcastPeer::prio_weight`] before
+///   applying the cap (mirrors go's `peersHeap`-ordered `wn.peers` —
+///   `network/peersheap.go`'s `Less`, present since the original open-source
+///   release — so `innerBroadcast`'s linear scan there already visits
+///   higher-priority peers first; here the ordering is applied explicitly
+///   since `peers` isn't necessarily kept pre-sorted between broadcasts). A
+///   stable sort preserves the incoming relative order among peers with
+///   equal weight (notably, the common case where every weight is `0`),
+///   matching the current no-priority-tracking behavior exactly when no
+///   priority has been set on any peer.
 /// - Sends to at most `broadcast_connections_limit` peers.
 fn inner_broadcast(
     request: BroadcastRequest,
@@ -384,8 +407,11 @@ fn inner_broadcast(
         return;
     }
 
+    let mut ordered: Vec<&BroadcastPeer> = peers.iter().collect();
+    ordered.sort_by_key(|p| std::cmp::Reverse(p.prio_weight));
+
     let mut sent_count: u32 = 0;
-    for peer in peers {
+    for peer in ordered {
         if sent_count >= broadcast_connections_limit {
             break;
         }
@@ -434,10 +460,18 @@ mod tests {
     }
 
     fn make_mock_peer(addr: &str) -> (BroadcastPeer, MockPeerSender) {
+        make_mock_peer_with_priority(addr, 0)
+    }
+
+    fn make_mock_peer_with_priority(
+        addr: &str,
+        prio_weight: u64,
+    ) -> (BroadcastPeer, MockPeerSender) {
         let sender = MockPeerSender::default();
         let peer = BroadcastPeer {
             addr: addr.to_string(),
             handle: Arc::new(sender.clone()),
+            prio_weight,
         };
         (peer, sender)
     }
@@ -579,6 +613,7 @@ mod tests {
         let peer = BroadcastPeer {
             addr: "10.0.0.1:4160".to_string(),
             handle: Arc::new(sender),
+            prio_weight: 0,
         };
         let peers = vec![peer];
         let peers_arc = Arc::new(Mutex::new(peers));
@@ -739,6 +774,94 @@ mod tests {
 
         let msgs = sender.messages.lock().unwrap();
         assert!(msgs.is_empty(), "limit=0 should send to no peers");
+    }
+
+    // -----------------------------------------------------------------------
+    // Priority-weighted peer ordering under BroadcastConnectionsLimit
+    // (ports go's TestWebsocketNetworkPrioLimit, network/wsNetwork_test.go)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn broadcast_connections_limit_favors_higher_priority_peer() {
+        // Mirrors go's TestWebsocketNetworkPrioLimit: netB has prio=100,
+        // netC has prio=10, BroadcastConnectionsLimit=1 — only the
+        // higher-priority peer (B) should receive the broadcast.
+        let (peer_b, sender_b) = make_mock_peer_with_priority("B", 100);
+        let (peer_c, sender_c) = make_mock_peer_with_priority("C", 10);
+        // Insert the lower-priority peer first, so an implementation that
+        // ignores priority and just takes the first `limit` peers in
+        // insertion order would (wrongly) favor C.
+        let peers = vec![peer_c, peer_b];
+
+        let request = BroadcastRequest {
+            msg: OutgoingMessage::new(Tag::Transaction, vec![1]),
+            enqueued: Instant::now(),
+            exclude_peer: None,
+        };
+
+        inner_broadcast(request, &peers, 1);
+
+        assert_eq!(
+            sender_b.messages.lock().unwrap().len(),
+            1,
+            "higher-priority peer B (prio=100) should receive the broadcast"
+        );
+        assert!(
+            sender_c.messages.lock().unwrap().is_empty(),
+            "lower-priority peer C (prio=10) should NOT receive the broadcast"
+        );
+    }
+
+    #[test]
+    fn uncapped_broadcast_still_reaches_every_peer_regardless_of_priority() {
+        // With no effective cap, priority ordering must not change *who*
+        // receives the message — only the order peers are visited in.
+        let (peer_low, sender_low) = make_mock_peer_with_priority("low", 1);
+        let (peer_high, sender_high) = make_mock_peer_with_priority("high", 100);
+        let (peer_zero, sender_zero) = make_mock_peer_with_priority("zero", 0);
+        let peers = vec![peer_low, peer_high, peer_zero];
+
+        let request = BroadcastRequest {
+            msg: OutgoingMessage::new(Tag::Transaction, vec![1]),
+            enqueued: Instant::now(),
+            exclude_peer: None,
+        };
+
+        inner_broadcast(request, &peers, u32::MAX);
+
+        assert_eq!(sender_low.messages.lock().unwrap().len(), 1);
+        assert_eq!(sender_high.messages.lock().unwrap().len(), 1);
+        assert_eq!(sender_zero.messages.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn equal_priority_peers_preserve_relative_order() {
+        // All-zero (or otherwise equal) priority weights is the common case
+        // today (no priority ever set) — the sort must be stable so this
+        // matches the pre-existing insertion-order behavior exactly.
+        let mut peers = Vec::new();
+        let mut senders = Vec::new();
+        for i in 0..5 {
+            let (peer, sender) = make_mock_peer(&format!("10.0.0.{}:4160", i + 1));
+            peers.push(peer);
+            senders.push(sender);
+        }
+
+        let request = BroadcastRequest {
+            msg: OutgoingMessage::new(Tag::Transaction, vec![1]),
+            enqueued: Instant::now(),
+            exclude_peer: None,
+        };
+
+        inner_broadcast(request, &peers, 3);
+
+        // The first 3 peers in insertion order receive it, same as before
+        // priority ordering existed.
+        assert_eq!(senders[0].messages.lock().unwrap().len(), 1);
+        assert_eq!(senders[1].messages.lock().unwrap().len(), 1);
+        assert_eq!(senders[2].messages.lock().unwrap().len(), 1);
+        assert_eq!(senders[3].messages.lock().unwrap().len(), 0);
+        assert_eq!(senders[4].messages.lock().unwrap().len(), 0);
     }
 
     // -----------------------------------------------------------------------
