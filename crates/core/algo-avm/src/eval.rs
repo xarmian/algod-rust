@@ -1448,4 +1448,93 @@ mod tests {
             );
         }
     }
+
+    // Ported from go-algorand's `TestSlowLogic`
+    // (`data/transactions/logic/eval_test.go:3142`): the same static-cost
+    // "grandfathering" mechanism pinned above via the `TestBackwardCompatTEALv1`
+    // fixture, exercised instead with `TestSlowLogic`'s own `keccak256`
+    // repeat-fragment source (assembled here rather than via a pinned hex
+    // fixture, since the repeat counts are large and version-dependent).
+    // `testLogicBudget` in go is 25_000 (a test-only headroom constant, not
+    // the real `LogicSigMaxCost`), reused verbatim here as `MAX_COST`.
+    #[test]
+    fn test_slow_logic_keccak256_static_cost_grandfathering() {
+        use crate::assembler::assemble_string;
+
+        const MAX_COST: i64 = 25_000;
+        let fragment = "byte 0x666E6F7264\nkeccak256\n\
+             byte 0xc195eca25a6f4c82bfba0287082ddb0d602ae9230f9cf1f1a40b68f8e2c41567\n==\n";
+
+        // in v1, each repeat costs 30; in v2+, each repeat costs 134
+        // (byte+keccak256+byte+==+&&; keccak256 itself is 26/130 -- see
+        // `opcode::tests::test_effective_cost_hash_opcodes_are_cheaper_pre_v2`).
+        let v1_reps = MAX_COST / 30;
+        let v2_reps = MAX_COST / 134;
+
+        let build = |reps: i64, version: u8| -> Vec<u8> {
+            let mut source = format!("#pragma version {version}\n{fragment}");
+            for _ in 0..reps {
+                source.push_str(fragment);
+                source.push_str("&&\n");
+            }
+            assemble_string(&source)
+                .unwrap_or_else(|e| panic!("assembly failed: {e:?}"))
+                .program
+        };
+
+        let v1overspend = build(v1_reps, 1);
+        let v2overspend = build(v2_reps, 1); // assembled at v1 -- grandfathered cost
+
+        // v1overspend fails static check at v1 (its own, undiscounted-enough
+        // repeat count already exceeds the budget at the v1 discount rate).
+        let parsed = bytecode::parse(&v1overspend).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert!(
+            static_cost_check(&parsed, MAX_COST).is_err(),
+            "v1overspend must fail static cost check at v1"
+        );
+
+        // v2overspend, assembled (and thus cost-tagged) as v1, passes the
+        // static check at v1 even though its repeat count was sized for the
+        // *v2* per-repeat cost -- the old, lower v1 cost is "grandfathered".
+        let parsed = bytecode::parse(&v2overspend).unwrap();
+        assert_eq!(parsed.version, 1);
+        static_cost_check(&parsed, MAX_COST)
+            .expect("v2overspend compiled as v1 must be grandfathered to the cheaper v1 cost");
+
+        // The same v2overspend source, compiled explicitly as v2 (so
+        // keccak256 is tagged at its real, undiscounted cost), now fails --
+        // no more grandfathering once the opcode's own version says v2.
+        let v2overspend_as_v2 = build(v2_reps, 2);
+        let parsed = bytecode::parse(&v2overspend_as_v2).unwrap();
+        assert_eq!(parsed.version, 2);
+        assert!(
+            static_cost_check(&parsed, MAX_COST).is_err(),
+            "v2overspend compiled as v2 must fail static cost check"
+        );
+
+        // At v4+, `backBranchEnabledVersion` makes the static preflight a
+        // no-op (see `test_static_cost_check_v4_is_noop_relies_on_dynamic_tracking`
+        // above) -- cost is enforced only dynamically, during real
+        // execution, and always at the real (v2+) per-opcode cost
+        // regardless of which era's repeat count produced the program. Both
+        // v1overspend and v2overspend, recompiled at v4, must fail
+        // dynamically rather than being silently accepted by a skipped
+        // static check.
+        for reps in [v1_reps, v2_reps] {
+            let program_v4 = build(reps, 4);
+            let parsed = bytecode::parse(&program_v4).unwrap();
+            static_cost_check(&parsed, 0)
+                .expect("static preflight is a no-op at v4, even with max_cost 0");
+
+            let mut ctx = NullContext;
+            let mut budget = GroupBudget::with_remaining(MAX_COST);
+            let err = run_logicsig_program(&program_v4, &mut ctx, &mut budget)
+                .expect_err("v4 execution must fail once the real dynamic cost is exhausted");
+            assert!(
+                !err.to_string().contains("static cost"),
+                "v4 must fail dynamically, not via the (skipped) static preflight: {err}"
+            );
+        }
+    }
 }

@@ -8570,6 +8570,346 @@ mod tests {
         assert!(!ctx.is_account_available(&stranger));
     }
 
+    // Ported from go-algorand's `TestForeignAppAccountAccess`
+    // (`data/transactions/logic/evalAppTxn_test.go:3444`): a foreign app's
+    // own address (as returned by `app_params_get AppAddress`, or derived
+    // any other way) only becomes an available account starting at
+    // `appAddressAvailableVersion` (v7) -- before that, referencing it
+    // requires the address to be named directly (e.g. via `Accounts`).
+    #[test]
+    fn is_account_available_foreign_app_address_gated_at_v7() {
+        let sender = [10u8; 32];
+        let foreign_app_id = 111u64;
+        let foreign_app_addr = app_address(foreign_app_id);
+        let txn = make_appl_txn(sender, 42, vec![], vec![foreign_app_id], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        ctx.program_version = 6;
+        assert!(
+            !ctx.is_account_available(&foreign_app_addr),
+            "a foreign app's address must not be available before v7 \
+             (go: appAddressAvailableVersion)"
+        );
+
+        ctx.program_version = 7;
+        assert!(
+            ctx.is_account_available(&foreign_app_addr),
+            "a foreign app's address must become available starting at v7"
+        );
+    }
+
+    // Ported from go-algorand's `TestAppSharing`
+    // (`data/transactions/logic/resources_test.go:37`) core scenario: "In
+    // v8, the first tx can read app params of 500, because it's in its
+    // foreign array, but the second can't. In v9, the second can, because
+    // the first can." -- the group-wide app-sharing gate
+    // (`SHARED_RESOURCES_VERSION`/v9) exercised directly at the
+    // `is_app_available` unit boundary from the *second* group member's
+    // perspective, which never names app 500 itself.
+    #[test]
+    fn is_app_available_group_sharing_gated_at_v9_ported_from_go_test_app_sharing() {
+        let mut sender0 = [0u8; 32];
+        sender0[..4].copy_from_slice(&[1, 2, 3, 4]);
+        let mut sender1 = [0u8; 32];
+        sender1[..4].copy_from_slice(&[4, 3, 2, 1]);
+
+        let appl0 = make_appl_txn(sender0, 900, vec![], vec![500], vec![]);
+        let appl1 = make_appl_txn(sender1, 901, vec![], vec![], vec![]);
+        let group = vec![appl0, appl1];
+        let resources = fill_group_resources(&group);
+
+        let mut store = LedgerState::new();
+        let mut ctx = LedgerAvmContext::new(
+            &mut store,
+            group,
+            1, // group_index: the *second* txn, which names nothing itself
+            1000,
+            12345,
+            901,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+        );
+        ctx.group_resources = resources;
+
+        ctx.program_version = 8;
+        assert!(
+            !ctx.is_app_available(500),
+            "at v8 (pre-sharing), the second txn must not see app 500 via the first \
+             txn's foreign-apps array"
+        );
+
+        ctx.program_version = 9;
+        assert!(
+            ctx.is_app_available(500),
+            "at v9, group-wide sharing makes app 500 (named by the first txn) \
+             available to the second"
+        );
+    }
+
+    // Ported from go-algorand's `TestAppAccess`
+    // (`data/transactions/logic/resources_test.go:196`): "In v9, both [txns]
+    // can use 500, even though only the first has it in tx.Access" -- the
+    // same group-wide app-sharing gate as `TestAppSharing`, but sourced from
+    // `tx.Access` (v10+ `ResourceRef`) rather than the legacy `ForeignApps`
+    // array. The pre-v9 "cannot be invoked with tx.Access" rejection this
+    // test also covers is separately pinned already (see
+    // `avm_context::tests` around line 12114); this closes the group-sharing
+    // half.
+    #[test]
+    fn is_app_available_group_sharing_via_access_list_ported_from_go_test_app_access() {
+        let mut sender0 = [0u8; 32];
+        sender0[..4].copy_from_slice(&[1, 2, 3, 4]);
+        let mut sender1 = [0u8; 32];
+        sender1[..4].copy_from_slice(&[4, 3, 2, 1]);
+
+        let mut appl0 = make_appl_txn(sender0, 900, vec![], vec![], vec![]);
+        appl0.txn.access = Some(vec![ResourceRef {
+            app: 500,
+            ..Default::default()
+        }]);
+        let appl1 = make_appl_txn(sender1, 901, vec![], vec![], vec![]);
+        let group = vec![appl0, appl1];
+        let resources = fill_group_resources(&group);
+
+        let mut store = LedgerState::new();
+        let mut ctx = LedgerAvmContext::new(
+            &mut store,
+            group,
+            1, // the second txn, whose own tx.Access never names app 500
+            1000,
+            12345,
+            901,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+        );
+        ctx.group_resources = resources;
+        ctx.program_version = 9;
+
+        assert!(
+            ctx.is_app_available(500),
+            "at v9, app 500 (named only via the first txn's tx.Access) must be \
+             available to the second txn through group-wide sharing"
+        );
+    }
+
+    // Ported from go-algorand's `TestAssetSharing`
+    // (`data/transactions/logic/resources_test.go:431`): "In v8, the first
+    // tx can read asset 400, because it's in its foreign array, but the
+    // second can't. In v9, the second can, because the first can." -- the
+    // same group-wide sharing gate as `TestAppSharing`/`TestAppAccess`, for
+    // `is_asset_available` and the legacy `ForeignAssets` array.
+    #[test]
+    fn is_asset_available_group_sharing_gated_at_v9_ported_from_go_test_asset_sharing() {
+        let mut sender0 = [0u8; 32];
+        sender0[..4].copy_from_slice(&[1, 2, 3, 4]);
+        let mut sender1 = [0u8; 32];
+        sender1[..4].copy_from_slice(&[4, 3, 2, 1]);
+
+        let appl0 = make_appl_txn(sender0, 900, vec![], vec![], vec![400]);
+        let appl1 = make_appl_txn(sender1, 901, vec![], vec![], vec![]);
+        let group = vec![appl0, appl1];
+        let resources = fill_group_resources(&group);
+
+        let mut store = LedgerState::new();
+        let mut ctx = LedgerAvmContext::new(
+            &mut store,
+            group,
+            1, // the second txn, which never names asset 400 itself
+            1000,
+            12345,
+            901,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+        );
+        ctx.group_resources = resources;
+
+        ctx.program_version = 8;
+        assert!(
+            !ctx.is_asset_available(400),
+            "at v8 (pre-sharing), the second txn must not see asset 400 via the \
+             first txn's foreign-assets array"
+        );
+
+        ctx.program_version = 9;
+        assert!(
+            ctx.is_asset_available(400),
+            "at v9, group-wide sharing makes asset 400 (named by the first txn) \
+             available to the second"
+        );
+    }
+
+    // Ported from go-algorand's `TestAccountPassing`
+    // (`data/transactions/logic/resources_test.go:523`): an inner
+    // transaction's `Accounts` field only accepts an address the outer
+    // program could already name -- "First show that we're not just
+    // letting anything get passed in" (an arbitrary/random address is
+    // unavailable), then "we can pass our own address" (the current app's
+    // address is always available) or "the address of one of our
+    // ForeignApps" (already covered at the v7 gate by
+    // `is_account_available_foreign_app_address_gated_at_v7` above).
+    #[test]
+    fn is_account_available_own_address_always_available_ported_from_go_test_account_passing() {
+        let sender = [10u8; 32];
+        let app_id = 42u64;
+        let txn = make_appl_txn(sender, app_id, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.app_id = app_id;
+        ctx.program_version = 6;
+
+        // "First show that we're not just letting anything get passed in":
+        // an arbitrary, unnamed address must not be available.
+        let arbitrary = [0x07u8; 32];
+        assert!(
+            !ctx.is_account_available(&arbitrary),
+            "an arbitrary address not named anywhere must be unavailable"
+        );
+
+        // "Now show we can pass our own address": the current app's own
+        // address is always available, at any version.
+        let own_address = app_address(app_id);
+        assert!(
+            ctx.is_account_available(&own_address),
+            "the current app's own address must always be available"
+        );
+    }
+
+    // Ported from go-algorand's `TestOtherTxSharing`
+    // (`data/transactions/logic/resources_test.go:555`) core assertion:
+    // a plain `pay` txn's `Sender` becomes available to a sibling app-call
+    // txn at v9 (group-wide sharing), but not at v8 -- `fill_group_resources`
+    // already proves a pay's Sender/Receiver/CloseRemainderTo land in
+    // `shared_accounts` (see `fill_group_resources_covers_pay_acfg_axfer_afrz_appl`
+    // above); this closes the remaining `is_account_available` version-gate
+    // half of the same scenario.
+    #[test]
+    fn is_account_available_group_sharing_from_pay_txn_ported_from_go_test_other_tx_sharing() {
+        let pay_sender = [
+            1, 2, 3, 4, 5, 6, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ];
+        let pay_receiver = [
+            1, 2, 3, 4, 5, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ];
+        let pay = make_pay_txn(pay_sender, pay_receiver, 1);
+        let appl_sender = [
+            5u8, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        let appl = make_appl_txn(appl_sender, 900, vec![], vec![], vec![]);
+        let group = vec![pay, appl];
+        let resources = fill_group_resources(&group);
+
+        let mut store = LedgerState::new();
+        let mut ctx = LedgerAvmContext::new(
+            &mut store,
+            group,
+            1, // the appl txn, which never names pay_sender itself
+            1000,
+            12345,
+            900,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+        );
+        ctx.group_resources = resources;
+
+        ctx.program_version = 8;
+        assert!(
+            !ctx.is_account_available(&pay_sender),
+            "at v8 (pre-sharing), the appl txn must not see the pay txn's Sender"
+        );
+
+        ctx.program_version = 9;
+        assert!(
+            ctx.is_account_available(&pay_sender),
+            "at v9, group-wide sharing makes the pay txn's Sender available to \
+             the sibling appl txn"
+        );
+    }
+
+    // Ported from go-algorand's `TestSharedInnerTxns`
+    // (`data/transactions/logic/resources_test.go:715`) "keyreg" sub-case:
+    // "appl has no foreign ref to senderAcct, but can still inner pay it" at
+    // v9 via group-wide sharing (a `keyreg` txn's `Sender`, not yet
+    // exercised by the `pay`/`appl`-flavored sharing tests above) -- and,
+    // just as important, "confirm you can't just pay _anybody_": an address
+    // that no txn in the group references at all stays unavailable even at
+    // v9, so sharing doesn't degenerate into "anything goes".
+    #[test]
+    fn is_account_available_group_sharing_from_keyreg_and_unreferenced_stays_unavailable() {
+        let sender = [
+            1, 2, 3, 4, 5, 6, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ];
+        let keyreg = SignedTransaction {
+            txn: Transaction {
+                txn_type: "keyreg".into(),
+                sender: Address(sender),
+                fee: 1000,
+                first_valid: 100.into(),
+                last_valid: 200.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let appl_sender = [
+            5u8, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        let appl = make_appl_txn(appl_sender, 1234, vec![], vec![], vec![]);
+        let group = vec![keyreg, appl];
+        let resources = fill_group_resources(&group);
+
+        let mut store = LedgerState::new();
+        let mut ctx = LedgerAvmContext::new(
+            &mut store,
+            group,
+            1,
+            1000,
+            12345,
+            1234,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
+        );
+        ctx.group_resources = resources;
+        ctx.program_version = 9;
+
+        assert!(
+            ctx.is_account_available(&sender),
+            "at v9, the keyreg txn's Sender must be available to the sibling appl \
+             via group-wide sharing, even though appl has no foreign ref to it"
+        );
+
+        // An address referenced by *no* txn in the group must stay
+        // unavailable -- sharing only extends what some txn actually named.
+        let unreferenced = [
+            1, 2, 3, 4, 5, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ];
+        assert!(
+            !ctx.is_account_available(&unreferenced),
+            "an address named by no txn in the group must remain unavailable even \
+             under v9 group-wide sharing"
+        );
+    }
+
     #[test]
     fn is_asset_available_and_resolve_asset_consult_access_list() {
         let sender = [10u8; 32];

@@ -826,6 +826,40 @@ fn group_budget_exhaustion_fails() {
     assert_eq!(budget.remaining(), 10);
 }
 
+/// Ported from go-algorand's `TestPooledAppCallsVerifyOp`
+/// (`data/transactions/logic/evalStateful_test.go:3814`): a program that
+/// runs 5 cheap opcodes (cost 1 each) then `ed25519verify` (`Static(1900)`)
+/// exhausts a 2-app-call pooled budget (1400) but fits comfortably in a
+/// 3-app-call one (2100) -- go's exact numbers (`local program cost was 5`,
+/// pool sizes 1400/2100) reproduced directly against `GroupBudget` rather
+/// than a full applied transaction group, since the pooled-cost arithmetic
+/// this test exists to pin is entirely captured at that unit boundary (see
+/// `group_budget_consumed_across_calls` above for the same style).
+#[test]
+fn group_budget_ed25519verify_pooling_matches_go_test_pooled_app_calls_verify_op() {
+    const ED25519VERIFY_COST: i64 = 1900;
+    const PRIOR_OPCODES_COST: i64 = 5; // global/pop/byte/byte/addr, 1 each
+
+    // 2 grouped app calls: pool is 1400, so 5 + 1900 = 1905 > 1400 fails,
+    // matching go's "dynamic cost budget exceeded ... local program cost
+    // was 5".
+    let mut budget_two = GroupBudget::new(2);
+    assert_eq!(budget_two.remaining(), 1400);
+    budget_two.consume(PRIOR_OPCODES_COST).unwrap();
+    let err = budget_two
+        .consume(ED25519VERIFY_COST)
+        .expect_err("2-call pool must not cover a 1905-cost program");
+    assert!(err.to_string().contains("pooled budget exhausted"), "{err}");
+
+    // 3 grouped app calls: pool is 2100, so 5 + 1900 = 1905 <= 2100 succeeds.
+    let mut budget_three = GroupBudget::new(3);
+    assert_eq!(budget_three.remaining(), 2100);
+    budget_three.consume(PRIOR_OPCODES_COST).unwrap();
+    budget_three
+        .consume(ED25519VERIFY_COST)
+        .expect("3-call pool must cover a 1905-cost program");
+}
+
 /// GroupContext tracks app call index advancement.
 #[test]
 fn group_context_advance_tracks_index() {

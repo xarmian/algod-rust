@@ -44,7 +44,7 @@ use algo_avm::fields::{
     AcctParamsField, AppParamsField, AssetHoldingField, AssetParamsField, BlockField, GlobalField,
     TxnField,
 };
-use algo_avm::opcode::{lookup_by_name, MAX_AVM_VERSION};
+use algo_avm::opcode::{lookup_by_name, FOREIGN_BOX_VERSION, MAX_AVM_VERSION};
 
 /// Decode every byte 0..=255 through `from_u8`, returning `(index, version)`
 /// for every index the enum actually defines. Field enums are declared with
@@ -232,6 +232,51 @@ fn app_params_field_set_version_never_precedes_get_version() {
         any_settable,
         "expected at least one AppParamsField to be settable via app_params_set"
     );
+}
+
+/// Closes the remaining `TestAppParamsSetFieldsVersions` parity gap noted
+/// in Phase 17 ("still missing the full assembler/eval-level per-version-
+/// gate rejection sweep itself"): unlike `TxnField` (whose `itx_version`s
+/// span 5/6/7/12, several strictly after `itxn_field`'s own v5 debut, so a
+/// real per-field eval-level sweep is meaningful -- see
+/// `ops::itxn::tests::test_itxn_field_versions_exhaustive_sweep_ported_from_go`),
+/// every `AppParamsField` with a nonzero `set_version` is pinned to exactly
+/// `FOREIGN_BOX_VERSION` (13), which already equals `app_params_set`'s own
+/// opcode-level version gate (`opcode::tests` pins `app_params_set` to v13
+/// itself). There is no field settable *later* than the opcode's own debut
+/// to probe, so a field-level assembler/eval rejection sweep here would be
+/// vacuous by construction -- rejection below v13 is already fully pinned
+/// at the opcode/bytecode-parse layer by
+/// `ops::state::tests::test_app_params_set_opcode_rejected_below_v13`, and
+/// acceptance at exactly v13 by
+/// `ops::state::tests::test_app_params_set_foreign_box_reads`/
+/// `test_app_params_set_family_box_access`. This test pins the structural
+/// fact that makes that equivalence hold, so a future field added with a
+/// `set_version` diverging from the opcode's own gate would fail here
+/// first, flagging the need for a real per-field sweep like `TxnField`'s.
+#[test]
+fn app_params_field_settable_fields_all_gate_at_the_opcodes_own_version() {
+    let settable: Vec<(u8, u8)> = (0u16..=255)
+        .filter_map(|b| {
+            AppParamsField::from_u8(b as u8)
+                .ok()
+                .map(|f| (b as u8, f.set_version()))
+                .filter(|&(_, set_version)| set_version > 0)
+        })
+        .collect();
+    assert!(
+        !settable.is_empty(),
+        "expected at least one settable AppParamsField"
+    );
+    for (byte, set_version) in settable {
+        assert_eq!(
+            set_version, FOREIGN_BOX_VERSION,
+            "AppParamsField {byte} has set_version {set_version}, expected exactly \
+             FOREIGN_BOX_VERSION ({FOREIGN_BOX_VERSION}) -- if this now legitimately \
+             differs, add a per-field itxn_field-style exhaustive eval-level sweep \
+             instead of relying on the opcode-level version gate alone"
+        );
+    }
 }
 
 /// Mirrors go-algorand's `TestFieldVersions`

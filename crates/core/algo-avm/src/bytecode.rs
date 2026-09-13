@@ -469,20 +469,20 @@ fn parse_immediates(
         ImmKind::None => Ok((Immediates::None, 0)),
 
         ImmKind::Uint8 => {
-            let b = read_byte(code, pos)?;
+            let b = read_immediate_byte(code, pos, op_name, 0)?;
             Ok((Immediates::Uint8(b), 1))
         }
 
         ImmKind::Uint8Uint8 => {
-            let a = read_byte(code, pos)?;
-            let b = read_byte(code, pos + 1)?;
+            let a = read_immediate_byte(code, pos, op_name, 0)?;
+            let b = read_immediate_byte(code, pos + 1, op_name, 1)?;
             Ok((Immediates::Uint8Pair(a, b), 2))
         }
 
         ImmKind::Uint8Uint8Uint8 => {
-            let a = read_byte(code, pos)?;
-            let b = read_byte(code, pos + 1)?;
-            let c = read_byte(code, pos + 2)?;
+            let a = read_immediate_byte(code, pos, op_name, 0)?;
+            let b = read_immediate_byte(code, pos + 1, op_name, 1)?;
+            let c = read_immediate_byte(code, pos + 2, op_name, 2)?;
             Ok((Immediates::Uint8Triple(a, b, c), 3))
         }
 
@@ -642,6 +642,71 @@ fn read_byte(data: &[u8], pos: usize) -> Result<u8, AlgoError> {
         });
     }
     Ok(data[pos])
+}
+
+/// go-algorand's per-opcode immediate mnemonic letters (`immediates(...)`/
+/// `field(...)` calls in `data/transactions/logic/opcodes.go`), keyed by
+/// opcode name, in declaration order. Used only to reproduce go's exact
+/// `Disassemble` truncation wording ("program end while reading immediate
+/// %s for %s", `assembler.go:3071`) for opcodes whose immediates are single
+/// bytes (`ImmKind::Uint8`/`Uint8Uint8`/`Uint8Uint8Uint8`) -- see
+/// `TestAssembleDisassembleErrors`. Opcodes not listed here (or a position
+/// beyond the listed slice) fall back to the older generic "unexpected end
+/// of program at offset N" wording rather than guessing a wrong letter.
+fn uint8_immediate_names(op_name: &str) -> Option<&'static [&'static str]> {
+    Some(match op_name {
+        "ecdsa_verify" | "ecdsa_pk_decompress" | "ecdsa_pk_recover" => &["v"],
+        "intc" | "bytec" => &["i"],
+        "arg" => &["n"],
+        "txn" | "global" | "gtxns" | "itxn" | "itxn_field" | "txnas" | "gtxnsas" | "itxnas"
+        | "block" | "asset_holding_get" | "asset_params_get" | "app_params_get"
+        | "acct_params_get" | "voter_params_get" => &["f"],
+        "load" | "store" | "gloads" => &["i"],
+        "gaid" => &["t"],
+        "bury" | "popn" | "dupn" | "dig" | "cover" | "uncover" => &["n"],
+        "replace2" => &["s"],
+        "base64_decode" => &["e"],
+        "json_ref" => &["r"],
+        "frame_dig" | "frame_bury" => &["i"],
+        "vrf_verify" => &["s"],
+        "ec_add"
+        | "ec_scalar_mul"
+        | "ec_pairing_check"
+        | "ec_multi_scalar_mul"
+        | "ec_subgroup_check"
+        | "ec_map_to" => &["g"],
+        "mimc" | "poseidon2" => &["c"],
+        "gtxn" => &["t", "f"],
+        "txna" | "gtxnsa" | "itxna" => &["f", "i"],
+        "gload" => &["t", "i"],
+        "proto" => &["a", "r"],
+        "gitxn" | "gtxnas" | "gitxnas" => &["t", "f"],
+        "extract" => &["s", "l"],
+        "substring" => &["s", "e"],
+        "gtxna" | "gitxna" => &["t", "f", "i"],
+        _ => return None,
+    })
+}
+
+/// Read a single immediate byte at `pos`, reporting go's exact
+/// `"program end while reading immediate %s for %s"` wording on truncation
+/// when `op_name`/`imm_index` resolve to a known immediate letter (see
+/// [`uint8_immediate_names`]), falling back to [`read_byte`]'s generic
+/// wording otherwise.
+fn read_immediate_byte(
+    data: &[u8],
+    pos: usize,
+    op_name: &str,
+    imm_index: usize,
+) -> Result<u8, AlgoError> {
+    if pos >= data.len() {
+        if let Some(name) = uint8_immediate_names(op_name).and_then(|names| names.get(imm_index)) {
+            return Err(AlgoError::Avm {
+                message: format!("program end while reading immediate {name} for {op_name}"),
+            });
+        }
+    }
+    read_byte(data, pos)
 }
 
 #[cfg(test)]

@@ -548,15 +548,21 @@ mod tests {
 
     // -- itxn_field validation tests --
 
-    /// Helper: build a program that does `pushint 0; itxn_field <field_byte>`
-    /// and run it at the given AVM version. Returns the error (if any).
+    /// Helper: build a program that does `intcblock 0; intc_0;
+    /// itxn_field <field_byte>` and run it at the given AVM version.
+    /// Returns the error (if any). Uses `intcblock`/`intc_0` (v1) rather
+    /// than `pushint` (v3+) so this helper also works at versions 0..3,
+    /// which `test_itxn_field_versions_exhaustive_sweep_ported_from_go`
+    /// needs to probe fields with a low `itx_version`.
     fn try_itxn_field(version: u8, field_byte: u8) -> Result<(), AlgoError> {
         let mut ctx = TestItxnContext::new();
-        // pushint 0 (0x81 0x00), itxn_field <field_byte> (0xb2 <field_byte>)
-        let raw = prog(version, &[0x81, 0x00, 0xb2, field_byte]);
+        // intcblock [0] (0x20 0x01 0x00), intc_0 (0x22),
+        // itxn_field <field_byte> (0xb2 <field_byte>)
+        let raw = prog(version, &[0x20, 0x01, 0x00, 0x22, 0xb2, field_byte]);
         let program = bytecode::parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
-        m.step(&mut ctx).unwrap(); // pushint 0
+        m.step(&mut ctx).unwrap(); // intcblock
+        m.step(&mut ctx).unwrap(); // intc_0
         m.step(&mut ctx) // itxn_field
     }
 
@@ -658,6 +664,77 @@ mod tests {
 
         // RejectVersion (68) has itxVersion = 12, should succeed at version 12
         assert!(try_itxn_field(12, 68).is_ok());
+    }
+
+    // Ported from go-algorand's `TestITxnFieldVersions`
+    // (`data/transactions/logic/fields_test.go:211`): the spot checks above
+    // (Note/ApprovalProgramPages/RejectVersion) pin a handful of
+    // representative fields; this closes the "full assembler/eval-level
+    // per-version-gate rejection sweep" gap noted in Phase 17 by driving
+    // `op_itxn_field`'s real version check for *every* `TxnField` with a
+    // nonzero `itx_version` -- go's per-field-type value synthesis
+    // (`specialArgs`) is unnecessary here because `op_itxn_field` resolves
+    // the version gate before it ever inspects the popped value's type (see
+    // `op_itxn_field`'s doc comment / match above), so `try_itxn_field`'s
+    // generic `pushint 0` exercises every field uniformly.
+    #[test]
+    fn test_itxn_field_versions_exhaustive_sweep_ported_from_go() {
+        let settable_fields: Vec<(u8, crate::fields::TxnField)> = (0u16..=255)
+            .filter_map(|b| {
+                crate::fields::TxnField::from_u8(b as u8)
+                    .ok()
+                    .filter(|f| f.itx_version() > 0)
+                    .map(|f| (b as u8, f))
+            })
+            .collect();
+        // go: `require.Greater(t, len(fields), 1)`.
+        assert!(
+            settable_fields.len() > 1,
+            "expected more than one itxn-settable TxnField"
+        );
+
+        // `itxn_field` itself is a v5 opcode -- a version below that is
+        // rejected at `bytecode::parse` (unsupported opcode), which go's
+        // test also observes (its "was introduced in" assembler error for
+        // versions before the opcode's own debut), just at a different
+        // architectural layer than the field-specific `itx_version` check
+        // this sweep is pinning. Every listed field's `itx_version` is
+        // already >= the opcode's own version, so the field-level gate is
+        // only reachable (and only meaningful to probe) from there up.
+        let itxn_field_min_version = crate::opcode::lookup_by_name("itxn_field")
+            .expect("itxn_field must be a registered opcode")
+            .version;
+
+        for (byte, field) in settable_fields {
+            let itx_version = field.itx_version();
+            assert!(
+                itx_version >= itxn_field_min_version,
+                "{field}'s itx_version ({itx_version}) must not precede itxn_field's own \
+                 opcode version ({itxn_field_min_version})"
+            );
+
+            // "check assembler fails if version before introduction": every
+            // version below itx_version (from the opcode's own debut
+            // upward) must be rejected.
+            for v in itxn_field_min_version..itx_version {
+                match try_itxn_field(v, byte) {
+                    Err(err) => assert!(
+                        err.to_string()
+                            .contains(&format!("invalid itxn_field {field}")),
+                        "{field} at v{v}: unexpected error: {err}"
+                    ),
+                    Ok(()) => panic!(
+                        "{field} (itx_version {itx_version}) must be rejected at v{v}, got Ok"
+                    ),
+                }
+            }
+
+            // "First, make sure it works when it should": exactly at
+            // itx_version, itxn_field must succeed.
+            try_itxn_field(itx_version, byte).unwrap_or_else(|e| {
+                panic!("{field} must be settable at its own v{itx_version}: {e}")
+            });
+        }
     }
 
     #[test]
