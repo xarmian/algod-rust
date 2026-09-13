@@ -2580,8 +2580,14 @@ type NetworkState = Arc<WebsocketNetwork>;
 
 /// Validation result for an incoming gossip connection.
 enum ValidationResult {
-    /// Validation passed, with the negotiated protocol version.
-    Ok { matched_version: String },
+    /// Validation passed, with the negotiated protocol version and the
+    /// proxy-resolved tracking IP (go's `remoteHost`, before any further
+    /// `X-Algorand-Location` precedence is applied — see
+    /// [`crate::request_tracker::remote_address`]).
+    Ok {
+        matched_version: String,
+        tracking_ip: std::net::IpAddr,
+    },
     /// Validation failed — return this response to the client.
     Rejected(axum::response::Response),
 }
@@ -2724,7 +2730,33 @@ fn validate_incoming_connection(
         );
     }
 
-    ValidationResult::Ok { matched_version }
+    ValidationResult::Ok {
+        matched_version,
+        tracking_ip,
+    }
+}
+
+/// Resolves the effective peer address used as an accepted inbound peer's
+/// `rootURL` (the key it is stored/re-dialed under), mirroring go's
+/// `TrackerRequest.remoteAddress()` (`network/requestTracker.go:94-115`):
+/// prefer the peer-reported public address from the `X-Algorand-Location`
+/// header only if its hostname matches the (possibly proxy-derived)
+/// `tracking_ip`; otherwise fall back to the raw socket address (or the
+/// tracking host itself, when it disagrees with the socket address —
+/// signalling it came from a trusted proxy). Issue #1421.
+fn resolve_incoming_peer_address(
+    remote_addr: SocketAddr,
+    tracking_ip: std::net::IpAddr,
+    headers: &HeaderMap,
+) -> String {
+    let other_public_addr = headers
+        .get(HeaderName::from_static("x-algorand-location"))
+        .and_then(|v| v.to_str().ok());
+    crate::request_tracker::remote_address(
+        &remote_addr.to_string(),
+        &tracking_ip.to_string(),
+        other_public_addr,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2748,11 +2780,18 @@ async fn gossip_upgrade_handler(
     let remote_ip = remote_addr.ip();
 
     // Validate the incoming connection.
-    let matched_version =
+    let (matched_version, tracking_ip) =
         match validate_incoming_connection(&network, &genesis_id, &headers, remote_ip) {
-            ValidationResult::Ok { matched_version } => matched_version,
+            ValidationResult::Ok {
+                matched_version,
+                tracking_ip,
+            } => (matched_version, tracking_ip),
             ValidationResult::Rejected(response) => return response,
         };
+
+    // Resolve the effective peer address used as this peer's rootURL — see
+    // `resolve_incoming_peer_address`'s doc comment (issue #1421).
+    let resolved_addr = resolve_incoming_peer_address(remote_addr, tracking_ip, &headers);
 
     // Build response headers (matching Go's setHeaders for server responses).
     let mut response_headers = HeaderMap::new();
@@ -2829,7 +2868,7 @@ async fn gossip_upgrade_handler(
     // to the 101 Switching Protocols response.
     let network_clone = Arc::clone(&network);
     let version_clone = matched_version;
-    let addr_str = remote_addr.to_string();
+    let addr_str = resolved_addr;
 
     // Bound the accepted WebSocket connection's message/frame size to the
     // largest legitimate per-tag limit (`Tag::max_message_size()`'s max,
@@ -3715,6 +3754,75 @@ mod tests {
         assert_eq!(net.connection_tracker.active_count(socket_ip), 0);
     }
 
+    // -- resolve_incoming_peer_address (issue #1421: X-Algorand-Location
+    // header consumed on the incoming-accept path, matching go's
+    // TrackerRequest.remoteAddress() precedence) -----------------------
+
+    #[test]
+    fn resolve_incoming_peer_address_no_header_uses_socket_addr() {
+        let remote_addr: SocketAddr = "127.0.0.1:4444".parse().unwrap();
+        let tracking_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            resolve_incoming_peer_address(remote_addr, tracking_ip, &headers),
+            "127.0.0.1:4444"
+        );
+    }
+
+    #[test]
+    fn resolve_incoming_peer_address_header_used_when_hostname_matches() {
+        // The peer's self-reported public address (with its real listening
+        // port) is used because its hostname matches the observed remote.
+        let remote_addr: SocketAddr = "10.0.0.1:55555".parse().unwrap();
+        let tracking_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-algorand-location"),
+            "10.0.0.1:4160".parse().unwrap(),
+        );
+
+        assert_eq!(
+            resolve_incoming_peer_address(remote_addr, tracking_ip, &headers),
+            "10.0.0.1:4160"
+        );
+    }
+
+    #[test]
+    fn resolve_incoming_peer_address_header_ignored_when_hostname_mismatches() {
+        // A peer can claim any X-Algorand-Location it likes; it's only
+        // trusted when its hostname matches the address it actually
+        // connected from.
+        let remote_addr: SocketAddr = "10.0.0.1:55555".parse().unwrap();
+        let tracking_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-algorand-location"),
+            "203.0.113.5:4160".parse().unwrap(),
+        );
+
+        assert_eq!(
+            resolve_incoming_peer_address(remote_addr, tracking_ip, &headers),
+            "10.0.0.1:55555"
+        );
+    }
+
+    #[test]
+    fn resolve_incoming_peer_address_proxy_tracking_ip_used_when_it_disagrees() {
+        // No X-Algorand-Location header, but the tracking IP (resolved via
+        // X-Forwarded-For upstream) disagrees with the raw socket address —
+        // it came from a trusted proxy, so it's preferred over the socket
+        // address (without a port, matching go's `remoteHost` fallback).
+        let remote_addr: SocketAddr = "127.0.0.1:4444".parse().unwrap();
+        let tracking_ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            resolve_incoming_peer_address(remote_addr, tracking_ip, &headers),
+            "203.0.113.9"
+        );
+    }
+
     #[test]
     fn validate_incoming_valid_connection_passes() {
         let net = make_relay_network("testnet-v1.0");
@@ -3723,7 +3831,9 @@ mod tests {
 
         let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
         match result {
-            ValidationResult::Ok { matched_version } => {
+            ValidationResult::Ok {
+                matched_version, ..
+            } => {
                 assert_eq!(matched_version, "2.2");
             }
             ValidationResult::Rejected(_) => {

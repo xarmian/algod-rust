@@ -46,6 +46,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use http::{HeaderMap, HeaderName};
+use url::Url;
 
 // ---------------------------------------------------------------------------
 // ConnectionTracker
@@ -302,6 +303,116 @@ pub fn get_forwarded_connection_address(
             None
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Effective remote-address resolution (X-Algorand-Location precedence)
+// ---------------------------------------------------------------------------
+
+/// Computes the best-guess effective remote address for an incoming
+/// connection, mirroring go-algorand's `TrackerRequest.remoteAddress()`
+/// (`network/requestTracker.go:94-115`).
+///
+/// `remoteAddress()` is used either for logging or as the `rootURL` when
+/// registering a new peer (i.e. the address stored for future re-dialing).
+/// Per go's doc comment, the rationale is:
+///
+/// - `other_public_addr` (go's `otherPublicAddr`) is provided by the remote
+///   peer via the `X-Algorand-Location` header and cannot be trusted, but
+///   can be used if `remote_host` matches its hostname. In this case it is
+///   a better guess for a rootURL because it might include the peer's
+///   actual listening port (as opposed to its ephemeral outbound TCP source
+///   port).
+/// - `remote_host` (go's `remoteHost`) is either the real address of the
+///   remote peer, or a value derived from an `X-Forwarded-For`-style
+///   header. It is used when it disagrees with the host portion of
+///   `remote_addr`, signalling it came from a trusted proxy.
+/// - `remote_addr` (go's `remoteAddr`) --- the raw "host:port" of the
+///   accepted connection --- is used otherwise.
+///
+/// # Arguments
+///
+/// - `remote_addr` --- the raw `"host:port"` of the incoming connection.
+/// - `remote_host` --- the resolved host only (no port): either the host
+///   part of `remote_addr`, or a proxy-header-derived override.
+/// - `other_public_addr` --- the raw `X-Algorand-Location` header value, if
+///   present.
+pub fn remote_address(
+    remote_addr: &str,
+    remote_host: &str,
+    other_public_addr: Option<&str>,
+) -> String {
+    if let Some(other) = other_public_addr {
+        if !other.is_empty() {
+            if let Some(hostname) = parse_hostname(other) {
+                if !remote_host.is_empty() && hostname == remote_host {
+                    return other.to_string();
+                }
+            }
+        }
+    }
+
+    match parse_hostname(remote_addr) {
+        None => {
+            // remote_addr can't be parsed, so try remote_host (there is a
+            // chance it came from a proxy and has a meaningful value).
+            if !remote_host.is_empty() {
+                remote_host.to_string()
+            } else {
+                remote_addr.to_string()
+            }
+        }
+        Some(hostname) => {
+            if hostname != remote_host {
+                // remote_addr's host isn't equal to remote_host, so
+                // remote_host definitely came from a proxy -- use it.
+                remote_host.to_string()
+            } else {
+                remote_addr.to_string()
+            }
+        }
+    }
+}
+
+/// Extracts just the hostname portion of a `"host:port"` or bare-host
+/// string, mirroring go's `addr.ParseHostOrURL(s).Hostname()`.
+fn parse_hostname(s: &str) -> Option<String> {
+    parse_host_or_url(s).and_then(|u| u.host_str().map(|h| h.to_string()))
+}
+
+/// Parses a `"host:port"` string or bare host into a [`Url`], mirroring
+/// go's `addr.ParseHostOrURL`'s handling of a plain `"host:port"` (which
+/// `net/url`-style parsing otherwise chokes on, reading `"host:"` as a
+/// scheme) by assuming an `http://` scheme when no scheme is present.
+fn parse_host_or_url(s: &str) -> Option<Url> {
+    if is_host_colon_port(s) {
+        return Url::parse(&format!("http://{s}")).ok();
+    }
+    if let Ok(url) = Url::parse(s) {
+        if url.host().is_some() {
+            return Some(url);
+        }
+        return None;
+    }
+    let with_scheme = Url::parse(&format!("http://{s}")).ok()?;
+    if with_scheme.host().is_some() {
+        Some(with_scheme)
+    } else {
+        None
+    }
+}
+
+/// Matches go's `HostColonPortPattern` (`^[-a-zA-Z0-9.]+:\d+$`).
+fn is_host_colon_port(s: &str) -> bool {
+    let Some((host, port)) = s.rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && !port.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
 }
 
 // ---------------------------------------------------------------------------
@@ -732,5 +843,67 @@ mod tests {
 
         let ip = get_forwarded_connection_address(&header, "x-forwarded-for", &logged);
         assert_eq!(ip, Some("5.6.7.8".parse::<IpAddr>().unwrap()));
+    }
+
+    // -- remote_address (X-Algorand-Location precedence, ported from go's
+    // TestRemoteAddress, network/requestTracker_test.go:180) ---------------
+
+    #[test]
+    fn remote_address_no_header_uses_remote_addr() {
+        // tr := makeTrackerRequest("127.0.0.1:444", "", "", time.Now())
+        // remoteHost derived from remoteAddr: "127.0.0.1"
+        // require.Equal(t, "127.0.0.1:444", tr.remoteAddress())
+        assert_eq!(
+            remote_address("127.0.0.1:444", "127.0.0.1", None),
+            "127.0.0.1:444"
+        );
+    }
+
+    #[test]
+    fn remote_address_proxy_remote_host_used_when_it_disagrees() {
+        // remoteHost set to something else via X-Forwarded-For HTTP headers.
+        // require.Equal(t, "10.0.0.1", tr.remoteAddress())
+        assert_eq!(
+            remote_address("127.0.0.1:444", "10.0.0.1", None),
+            "10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn remote_address_header_used_when_hostname_matches_remote_host() {
+        // otherPublicAddr is set via X-Algorand-Location HTTP header and
+        // matches to the remoteHost.
+        // require.Equal(t, "10.0.0.1:555", tr.remoteAddress())
+        assert_eq!(
+            remote_address("127.0.0.1:444", "10.0.0.1", Some("10.0.0.1:555")),
+            "10.0.0.1:555"
+        );
+    }
+
+    #[test]
+    fn remote_address_header_ignored_when_hostname_does_not_match() {
+        // otherPublicAddr does not match remoteHost -- ignored, falls back
+        // to remoteAddr (whose hostname matches remoteHost here).
+        // require.Equal(t, "127.0.0.1:444", tr.remoteAddress())
+        assert_eq!(
+            remote_address("127.0.0.1:444", "127.0.0.1", Some("127.0.0.99:555")),
+            "127.0.0.1:444"
+        );
+    }
+
+    #[test]
+    fn remote_address_unparseable_remote_addr_falls_back_to_remote_host() {
+        assert_eq!(
+            remote_address("not a valid addr :: at all", "10.0.0.1", None),
+            "10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn remote_address_empty_header_ignored() {
+        assert_eq!(
+            remote_address("127.0.0.1:444", "127.0.0.1", Some("")),
+            "127.0.0.1:444"
+        );
     }
 }
