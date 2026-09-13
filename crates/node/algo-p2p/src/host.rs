@@ -1818,6 +1818,123 @@ mod tests {
         );
     }
 
+    /// Go: `TestCapabilities_Varying` (`network/p2p/capabilities_test.go`) —
+    /// scaled down from go's 10-node cluster (which additionally sweeps a
+    /// "bootstrap through only 2 of them" topology variant) to a star of 4
+    /// directly-connected hosts, but exercising the same property go's test
+    /// name describes: distinct peers advertising *different, overlapping*
+    /// capability sets are each found only under the capability they
+    /// actually advertised, not lumped into a single always-both scenario.
+    /// `archival_only` and `catchpoints_only` each advertise one capability;
+    /// `both` advertises both; a `seeker` (advertising neither) looks up
+    /// each capability and expects exactly the two peers that advertised it.
+    #[tokio::test]
+    async fn capability_advertised_by_varying_peers_is_found_by_matching_capability_only() {
+        use crate::capabilities::Capability;
+
+        let mut seeker = new_test_host();
+        let mut archival_only = new_test_host();
+        let mut catchpoints_only = new_test_host();
+        let mut both = new_test_host();
+        for h in [
+            &mut seeker,
+            &mut archival_only,
+            &mut catchpoints_only,
+            &mut both,
+        ] {
+            h.set_dht_mode(Some(kad::Mode::Server));
+        }
+
+        let seeker_listen_addr = start_listening(&mut seeker).await;
+        let seeker_peer_id = seeker.peer_id();
+        let dial_addr = seeker_listen_addr.with(libp2p::multiaddr::Protocol::P2p(seeker_peer_id));
+
+        archival_only
+            .dial(dial_addr.clone())
+            .expect("dial should be accepted");
+        catchpoints_only
+            .dial(dial_addr.clone())
+            .expect("dial should be accepted");
+        both.dial(dial_addr).expect("dial should be accepted");
+
+        // Drive all four swarms until the seeker has observed a
+        // ConnectionEstablished from each of the three providers.
+        let mut connected = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while connected < 3 {
+            tokio::select! {
+                ev = seeker.next_event() => {
+                    if let SwarmEvent::ConnectionEstablished { .. } = ev { connected += 1; }
+                }
+                _ = archival_only.next_event() => {}
+                _ = catchpoints_only.next_event() => {}
+                _ = both.next_event() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out before seeker observed all 3 connections");
+                }
+            }
+        }
+
+        let archival_peer_id = archival_only.peer_id();
+        let catchpoints_peer_id = catchpoints_only.peer_id();
+        let both_peer_id = both.peer_id();
+
+        archival_only
+            .advertise_capability(Capability::Archival)
+            .await
+            .expect("advertise should succeed");
+        catchpoints_only
+            .advertise_capability(Capability::Catchpoints)
+            .await
+            .expect("advertise should succeed");
+        both.advertise_capability(Capability::Archival)
+            .await
+            .expect("advertise should succeed");
+        both.advertise_capability(Capability::Catchpoints)
+            .await
+            .expect("advertise should succeed");
+
+        // Keep the three providers' swarms driven in the background while
+        // the seeker performs its lookups (their DHT records need to be
+        // reachable to answer the seeker's queries).
+        let providers_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = archival_only.next_event() => {}
+                    _ = catchpoints_only.next_event() => {}
+                    _ = both.next_event() => {}
+                }
+            }
+        });
+
+        let archival_found = seeker
+            .find_peers_for_capability(Capability::Archival, 5, Duration::from_secs(10))
+            .await;
+        let catchpoints_found = seeker
+            .find_peers_for_capability(Capability::Catchpoints, 5, Duration::from_secs(10))
+            .await;
+
+        providers_task.abort();
+
+        assert!(
+            archival_found.contains(&archival_peer_id) && archival_found.contains(&both_peer_id),
+            "expected exactly the archival-advertising peers, got: {archival_found:?}"
+        );
+        assert!(
+            !archival_found.contains(&catchpoints_peer_id),
+            "catchpoints-only peer must not appear under Archival: {archival_found:?}"
+        );
+        assert!(
+            catchpoints_found.contains(&catchpoints_peer_id)
+                && catchpoints_found.contains(&both_peer_id),
+            "expected exactly the catchpoints-advertising peers, got: {catchpoints_found:?}"
+        );
+        assert!(
+            !catchpoints_found.contains(&archival_peer_id),
+            "archival-only peer must not appear under Catchpoints: {catchpoints_found:?}"
+        );
+    }
+
     /// TDD anchor for this issue (#541): a node with no matching
     /// capability among its known peers returns "not found" (an empty
     /// list), not an error — the infallible `Vec` return type of
