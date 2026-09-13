@@ -1249,9 +1249,17 @@ impl P2pTransport {
         // `P2pTransport::identity_signing_key`'s doc comment (issue #1133).
         let identity_signing_key = host.identity_signing_key().clone();
 
-        if let Some(addr) = &cfg.listen_multiaddr {
-            host.listen(addr.clone())
-                .map_err(|e| anyhow::anyhow!("failed to listen on {addr}: {e}"))?;
+        // Mirrors go's `MakeHost` (`network/p2p/p2p.go:143-145`, issue
+        // #1420): `if cfg.IncomingConnectionsLimit == 0 { listenAddr = "" }`
+        // unconditionally suppresses listening regardless of whether a
+        // listen address is otherwise configured — a node configured for
+        // zero incoming connections (relay-disabled / outbound-only mode)
+        // must never open a listening socket at all.
+        if cfg.incoming_connections_limit != 0 {
+            if let Some(addr) = &cfg.listen_multiaddr {
+                host.listen(addr.clone())
+                    .map_err(|e| anyhow::anyhow!("failed to listen on {addr}: {e}"))?;
+            }
         }
 
         // `EnableDHTProviders`/`DHTMode` (issue #768): the DHT is only
@@ -2490,6 +2498,42 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!transport.is_listening());
+    }
+
+    #[tokio::test]
+    async fn zero_incoming_connections_limit_means_transport_never_binds() {
+        // Mirrors go's `TestP2PServiceStartZeroIncomingDoesNotListen`
+        // (`network/p2p/p2p_test.go:253`) and `MakeHost`'s
+        // `if cfg.IncomingConnectionsLimit == 0 { listenAddr = "" }`
+        // (`network/p2p/p2p.go:143-145`, issue #1420): a node configured
+        // with `IncomingConnectionsLimit == 0` (relay-disabled /
+        // outbound-only mode) must never open a listening socket at all,
+        // even when a listen multiaddr is otherwise configured.
+        let transport = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1420".to_string(),
+            listen_multiaddr: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+            bootstrap_peers: vec![],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: true,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: 0,
+            is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
+            enable_vote_compression: true,
+        })
+        .await
+        .expect("start p2p transport");
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !transport.is_listening(),
+            "incoming_connections_limit == 0 must suppress listening even with a configured listen_multiaddr"
+        );
+        assert!(transport.listen_addrs().is_empty());
     }
 
     /// Start two transports, dial `listener` from `dialer`, and wait until
