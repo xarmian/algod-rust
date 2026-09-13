@@ -440,6 +440,150 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // go: `TestReadPeerMetaHeaders` (`network/p2pMetainfo_test.go:50`) —
+    // per-`Read`-call error-injection / short-read cases. Go drives these
+    // through a hand-rolled `MockStream` that returns exactly one chunk
+    // (or an error) per `Read` call; this crate's `read_peer_meta_headers`
+    // uses `AsyncReadExt::read_exact`, whose whole contract is looping over
+    // however many partial reads (or a propagated error) the underlying
+    // stream produces until the buffer is full — so these tests drive that
+    // same contract through a real chunked/failing stream rather than
+    // asserting it never mattered.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_peer_meta_headers_handles_length_split_across_multiple_reads() {
+        // Mirrors go's "Verify short reads are handled: length arrives in
+        // two reads" case.
+        let (mut a, mut b) = duplex_pair();
+        let headers = build_headers("mynet-v1", "tel", "inst", "feat", &["2.2"]);
+        let data = encode_headers(&headers);
+        let len = u16::try_from(data.len()).unwrap();
+        let len_bytes = len.to_be_bytes();
+
+        let writer = async move {
+            // Write the 2-byte length prefix as two separate single-byte
+            // writes, then the body in one write.
+            AsyncWriteExt::write_all(&mut a, &len_bytes[..1])
+                .await
+                .unwrap();
+            AsyncWriteExt::flush(&mut a).await.unwrap();
+            AsyncWriteExt::write_all(&mut a, &len_bytes[1..])
+                .await
+                .unwrap();
+            AsyncWriteExt::write_all(&mut a, &data).await.unwrap();
+            AsyncWriteExt::flush(&mut a).await.unwrap();
+        };
+        let reader = read_peer_meta_headers(&mut b);
+        let (_, read_res) = tokio::join!(writer, reader);
+        let decoded = read_res.expect("split length reads must still be assembled correctly");
+        assert_eq!(decoded, headers);
+    }
+
+    #[tokio::test]
+    async fn read_peer_meta_headers_handles_body_split_across_multiple_reads() {
+        // Mirrors go's "Verify short reads are handled: body arrives in
+        // two reads" case.
+        let (mut a, mut b) = duplex_pair();
+        let headers = build_headers("mynet-v1", "tel", "inst", "feat", &["2.2"]);
+        let data = encode_headers(&headers);
+        let len = u16::try_from(data.len()).unwrap();
+        let mid = data.len() / 2;
+
+        let writer = async move {
+            AsyncWriteExt::write_all(&mut a, &len.to_be_bytes())
+                .await
+                .unwrap();
+            AsyncWriteExt::flush(&mut a).await.unwrap();
+            AsyncWriteExt::write_all(&mut a, &data[..mid]).await.unwrap();
+            AsyncWriteExt::flush(&mut a).await.unwrap();
+            AsyncWriteExt::write_all(&mut a, &data[mid..]).await.unwrap();
+            AsyncWriteExt::flush(&mut a).await.unwrap();
+        };
+        let reader = read_peer_meta_headers(&mut b);
+        let (_, read_res) = tokio::join!(writer, reader);
+        let decoded = read_res.expect("split body reads must still be assembled correctly");
+        assert_eq!(decoded, headers);
+    }
+
+    #[tokio::test]
+    async fn read_peer_meta_headers_surfaces_io_error_on_incomplete_length() {
+        // Mirrors go's "Error case: incomplete length read then EOF" /
+        // "Error case: error reading length" — the peer hangs up (or the
+        // underlying transport errors) after less than 2 bytes arrive.
+        let (a, mut b) = duplex_pair();
+        let writer = async move {
+            let mut a = a;
+            AsyncWriteExt::write_all(&mut a, &[0x01]).await.unwrap();
+            AsyncWriteExt::flush(&mut a).await.unwrap();
+            drop(a); // closes the pipe, so the pending read_exact sees EOF
+        };
+        let reader = read_peer_meta_headers(&mut b);
+        let (_, read_res) = tokio::join!(writer, reader);
+        assert!(
+            matches!(read_res, Err(WsProtoError::Io(_))),
+            "a stream that closes mid-length-prefix must surface an I/O error, got: {read_res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_peer_meta_headers_surfaces_io_error_on_incomplete_body() {
+        // Mirrors go's "Error case: incomplete message read then EOF" /
+        // "Error case: error reading message" — the length prefix arrives
+        // intact but the peer hangs up partway through the body.
+        let (a, mut b) = duplex_pair();
+        let writer = async move {
+            let mut a = a;
+            AsyncWriteExt::write_all(&mut a, &100u16.to_be_bytes())
+                .await
+                .unwrap();
+            AsyncWriteExt::write_all(&mut a, &[0u8; 10]).await.unwrap();
+            AsyncWriteExt::flush(&mut a).await.unwrap();
+            drop(a);
+        };
+        let reader = read_peer_meta_headers(&mut b);
+        let (_, read_res) = tokio::join!(writer, reader);
+        assert!(
+            matches!(read_res, Err(WsProtoError::Io(_))),
+            "a stream that closes mid-body must surface an I/O error, got: {read_res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_peer_meta_headers_rejects_corrupt_msgpack() {
+        // Mirrors go's "Error case: invalid messagepack (unmarshaling
+        // error)" — a valid length prefix followed by bytes that aren't a
+        // valid msgpack map.
+        let (mut a, mut b) = duplex_pair();
+        let corrupt = [0x99u8, 0x01, 0x02];
+        let writer = async move {
+            AsyncWriteExt::write_all(&mut a, &(corrupt.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            AsyncWriteExt::write_all(&mut a, &corrupt).await.unwrap();
+            AsyncWriteExt::flush(&mut a).await.unwrap();
+        };
+        let reader = read_peer_meta_headers(&mut b);
+        let (_, read_res) = tokio::join!(writer, reader);
+        assert!(matches!(read_res, Err(WsProtoError::HeaderDecode(_))));
+    }
+
+    #[tokio::test]
+    async fn write_peer_meta_headers_surfaces_io_error_when_peer_hung_up() {
+        // Mirrors go's `TestWritePeerMetaHeaders` "Error case: write error"
+        // — the peer end is gone before the write happens, so the write
+        // must fail rather than silently succeed.
+        let (mut a, b) = duplex_pair();
+        drop(b);
+        let headers = build_headers("mynet-v1", "tel", "inst", "feat", &["2.2"]);
+        let result = write_peer_meta_headers(&mut a, &headers).await;
+        assert!(
+            matches!(result, Err(WsProtoError::Io(_))),
+            "writing to a peer that already hung up must surface an I/O error, got: {result:?}"
+        );
+    }
+
     #[test]
     fn encode_headers_produces_canonical_msgpack_map_of_string_to_string_array() {
         // Mirrors go's msgp-generated encoding for `map[string][]string`:
