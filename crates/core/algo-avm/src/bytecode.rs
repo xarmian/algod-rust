@@ -1148,6 +1148,34 @@ mod tests {
         assert!(parse(&raw).is_err());
     }
 
+    /// Port of go-algorand's `TestShortBytecblock`: assemble a real
+    /// `bytecblock` program, fake its count byte up to 50 (far more entries
+    /// than are actually present), then parse every possible truncated
+    /// prefix of the program -- each one must fail cleanly with a bounds
+    /// error, never panic or silently succeed. `test_bytecblock` above only
+    /// checks a single well-formed decode; this exercises the exhaustive
+    /// truncation sweep go's version runs across every prefix length.
+    #[test]
+    fn test_truncated_bytecblock_exhaustive_prefixes() {
+        let ops = crate::assembler::assemble_string(
+            "#pragma version 4\nbytecblock 0x123456 0xababcdcd \"test\"\n",
+        )
+        .expect("bytecblock program should assemble");
+        let mut program = ops.program;
+        // program[0] = version, program[1] = bytecblock opcode (0x26),
+        // program[2] = count varuint (originally 3) -- fake it to 50.
+        assert_eq!(program[1], 0x26, "expected bytecblock opcode at index 1");
+        program[2] = 50;
+
+        for i in 2..program.len() {
+            let prefix = &program[..i];
+            assert!(
+                parse(prefix).is_err(),
+                "truncated bytecblock prefix of length {i} must fail to parse, got Ok"
+            );
+        }
+    }
+
     #[test]
     fn test_truncated_branch() {
         // bnz with only 1 byte of offset
