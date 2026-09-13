@@ -1586,6 +1586,120 @@ fn stack_pushbytess_v8() {
     assert!(m.run(&mut NullContext).unwrap());
 }
 
+// Port of go-algorand's `TestPushConsts` (eval_test.go ~6289) 256-value bulk
+// case: pushints/pushbytess with 256 entries, followed by `popn 255; pop;
+// int 1`, must accept -- exercising the bulk decode/push path (and `popn`'s
+// bulk-pop path) at a size well beyond the handful of entries the smaller
+// `stack_pushints_v8`/`stack_pushbytess_v8` tests above exercise.
+#[test]
+fn pushints_256_bulk_then_popn_accepts() {
+    let mut code = vec![0x83]; // pushints
+    code.extend(varuint(256));
+    for i in 0u64..256 {
+        code.extend(varuint(i));
+    }
+    code.push(0x46); // popn
+    code.push(255);
+    code.push(0x48); // pop
+    code.extend_from_slice(&[0x81, 0x01]); // pushint 1
+    code.push(0x43); // return
+    let raw = prog(8, &code);
+    let program = parse(&raw).unwrap();
+    let mut m = AvmMachine::new(program, ExecMode::Application, 100_000);
+    assert!(m.run(&mut NullContext).unwrap());
+}
+
+#[test]
+fn pushbytess_256_bulk_then_popn_accepts() {
+    let mut code = vec![0x82]; // pushbytess
+    code.extend(varuint(256));
+    for i in 0u8..=255 {
+        code.push(0x01); // 1-byte length
+        code.push(i);
+    }
+    code.push(0x46); // popn
+    code.push(255);
+    code.push(0x48); // pop
+    code.extend_from_slice(&[0x81, 0x01]); // pushint 1
+    code.push(0x43); // return
+    let raw = prog(8, &code);
+    let program = parse(&raw).unwrap();
+    let mut m = AvmMachine::new(program, ExecMode::Application, 100_000);
+    assert!(m.run(&mut NullContext).unwrap());
+}
+
+// Port of go-algorand's `TestBulkPushStackDepth` (eval_test.go ~6466): bulk
+// `pushints`/`pushbytess` at exactly `maxStackDepth` (1000) items leaves
+// that many stack items with no explicit `return`/single-value cleanup, so
+// the implicit end-of-program check (which requires the final stack to hold
+// exactly one value) fails -- but it's a *shape* failure, not a stack
+// overflow, proving the bulk push itself succeeded at exactly the limit.
+// `maxStackDepth+1` (1001) and 8000 must both fail as genuine stack
+// overflows instead, proving the per-item overflow guard
+// (`AvmMachine::push`, `machine.rs`) is actually reached mid-bulk-push, not
+// bypassed by pushints/pushbytess's bulk immediate-decode loop.
+fn bulk_push_program(opcode: u8, n: u64, bytes_mode: bool) -> Vec<u8> {
+    let mut code = vec![opcode];
+    code.extend(varuint(n));
+    for _ in 0..n {
+        if bytes_mode {
+            code.push(0x01); // 1-byte length
+            code.push(0xaa);
+        } else {
+            code.extend(varuint(1));
+        }
+    }
+    code
+}
+
+#[test]
+fn bulk_pushints_at_max_stack_depth_leaves_shape_error() {
+    let raw = prog(8, &bulk_push_program(0x83, 1000, false));
+    let program = parse(&raw).unwrap();
+    let mut m = AvmMachine::new(program, ExecMode::Application, 1_000_000);
+    let err = m.run(&mut NullContext).unwrap_err();
+    assert!(
+        !err.to_string().contains("overflow"),
+        "1000 items should not overflow, got: {err}"
+    );
+}
+
+#[test]
+fn bulk_pushints_over_max_stack_depth_overflows() {
+    let raw = prog(8, &bulk_push_program(0x83, 1001, false));
+    let program = parse(&raw).unwrap();
+    let mut m = AvmMachine::new(program, ExecMode::Application, 1_000_000);
+    let err = m.run(&mut NullContext).unwrap_err();
+    assert!(
+        err.to_string().contains("overflow"),
+        "1001 items should overflow, got: {err}"
+    );
+}
+
+#[test]
+fn bulk_pushints_way_over_max_stack_depth_overflows() {
+    let raw = prog(8, &bulk_push_program(0x83, 8000, false));
+    let program = parse(&raw).unwrap();
+    let mut m = AvmMachine::new(program, ExecMode::Application, 1_000_000);
+    let err = m.run(&mut NullContext).unwrap_err();
+    assert!(
+        err.to_string().contains("overflow"),
+        "8000 items should overflow, got: {err}"
+    );
+}
+
+#[test]
+fn bulk_pushbytess_over_max_stack_depth_overflows() {
+    let raw = prog(8, &bulk_push_program(0x82, 1001, true));
+    let program = parse(&raw).unwrap();
+    let mut m = AvmMachine::new(program, ExecMode::Application, 1_000_000);
+    let err = m.run(&mut NullContext).unwrap_err();
+    assert!(
+        err.to_string().contains("overflow"),
+        "1001 items should overflow, got: {err}"
+    );
+}
+
 // ===========================================================================
 // Store / Load (scratch space)
 // ===========================================================================
@@ -1926,6 +2040,74 @@ fn version_gate_assert_requires_v3() {
 fn version_gate_pushint_requires_v3() {
     // pushint (0x81) requires v3
     expect_parse_fail(2, &[0x81, 0x01]);
+}
+
+// Exhaustive port of go-algorand's `TestAllowedOpcodesV2`/`TestAllowedOpcodesV3`
+// (data/transactions/logic/eval_test.go ~4574/4646): those tests walk the
+// *entire* `OpSpecs` table and, for every opcode introduced at the version
+// under test, assert it is rejected ("illegal opcode") below that version.
+// The two hand-picked examples above (`addw`/`bz` for v2, `assert`/`pushint`
+// for v3) only sampled 2 of ~20 and 2 of 13 opcodes respectively. This walks
+// `algo_avm::opcode::lookup` over every byte 0..=255 the same way
+// `opcode_table_sweep_test.rs` does, so it automatically covers every
+// current and future opcode tagged with that version -- not just the ones
+// picked when this test was written.
+//
+// Unlike go (whose per-version opcode tables simply don't contain the
+// not-yet-introduced opcode, so any byte for it decodes as "illegal
+// opcode"), algod-rust's `bytecode::parse` resolves every opcode from one
+// flat table and then explicitly compares `spec.version` against the
+// program's declared version (`bytecode.rs`), producing a different (but
+// equally version-gated) error message -- so this only asserts parsing
+// fails, not the exact go wording, matching this crate's established
+// convention for version-gate tests (see `expect_parse_fail` above).
+fn assert_opcode_rejected_below_its_version(byte: u8, spec_version: u8) {
+    // The version check in `bytecode::parse` fires as soon as the opcode is
+    // resolved, before any immediates are decoded, so a bare
+    // `[version_byte, opcode_byte]` program is enough regardless of how
+    // many immediate bytes the opcode actually needs.
+    let below = spec_version - 1;
+    let raw = vec![below, byte];
+    assert!(
+        parse(&raw).is_err(),
+        "opcode 0x{byte:02x} (v{spec_version}) should be rejected at v{below}"
+    );
+}
+
+#[test]
+fn version_gate_all_v2_opcodes_rejected_below_v2() {
+    use algo_avm::opcode::lookup;
+    let mut checked = 0;
+    for byte in 0u16..=255 {
+        if let Some(spec) = lookup(byte as u8) {
+            if spec.version == 2 {
+                assert_opcode_rejected_below_its_version(byte as u8, 2);
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 20,
+        "expected at least 20 v2 opcodes to be swept, found {checked}"
+    );
+}
+
+#[test]
+fn version_gate_all_v3_opcodes_rejected_below_v3() {
+    use algo_avm::opcode::lookup;
+    let mut checked = 0;
+    for byte in 0u16..=255 {
+        if let Some(spec) = lookup(byte as u8) {
+            if spec.version == 3 {
+                assert_opcode_rejected_below_its_version(byte as u8, 3);
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 10,
+        "expected at least 10 v3 opcodes to be swept, found {checked}"
+    );
 }
 
 #[test]
