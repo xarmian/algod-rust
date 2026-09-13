@@ -642,6 +642,25 @@ impl TxnField {
     pub fn unknown_display(index: u8) -> String {
         format!("TxnField({})", index)
     }
+
+    /// Returns whether this field is an "array" field -- one that must be
+    /// accessed via the array-indexed opcode forms (`txna`/`gtxna`/`gtxnsa`/
+    /// `txnas`/`gtxnas`/`gtxnsas`) rather than the scalar forms (`txn`/
+    /// `gtxn`/`gtxns`). Matches go-algorand's `txnFieldSpecs[].array`
+    /// (`data/transactions/logic/fields.go`), enforced by go's shared
+    /// `fetchField` (`expectArray != fs.array`).
+    pub fn is_array(&self) -> bool {
+        matches!(
+            self,
+            Self::ApplicationArgs
+                | Self::Accounts
+                | Self::Assets
+                | Self::Applications
+                | Self::Logs
+                | Self::ApprovalProgramPages
+                | Self::ClearStateProgramPages
+        )
+    }
 }
 
 /// Inner transaction fields use the same field indices as regular transaction
