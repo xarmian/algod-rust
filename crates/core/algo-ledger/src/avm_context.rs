@@ -7077,6 +7077,16 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         {
             return true;
         }
+        // Unnamed-resource relaxation (simulation `allow_unnamed_resources`),
+        // capacity-gated: matches go's `availableApp`'s final fallback to
+        // `cx.UnnamedResources.AvailableApp` (`ResourceTracker.addApp`,
+        // `ledger/simulation/resources.go`). Checked only after every named
+        // path above has already failed, so a named app never spends
+        // capacity or gets reported as unnamed. Mirrors
+        // `is_account_available`'s equivalent fallback just below.
+        if self.unnamed_tracking.is_some() {
+            return self.unnamed_app_available(app_id);
+        }
         false
     }
 
@@ -18314,6 +18324,103 @@ mod tests {
         assert_eq!(ctx.resolve_app(600).unwrap(), 600);
         let err = ctx.resolve_app(601).unwrap_err();
         assert_eq!(format!("{err}"), "AVM: unavailable App 601");
+    }
+
+    // Regression test for issue #1410: `is_app_available` had no
+    // unnamed-resource-tracking fallback at all, unlike its sibling
+    // `is_account_available` (see that method's own fallback a few hundred
+    // lines above `is_app_available`'s definition). Mirrors go-algorand's
+    // `availableApp` (`data/transactions/logic/eval.go`), whose final
+    // fallback is `if aid > lastForbiddenResource && cx.UnnamedResources !=
+    // nil && cx.UnnamedResources.AvailableApp(aid) { return true }` -- an app
+    // named nowhere else must still be available once simulation's
+    // `allow_unnamed_resources` (`unnamed_tracking`) is active, and stay
+    // unavailable when it isn't.
+    #[test]
+    fn is_app_available_unnamed_fallback_matches_is_account_available() {
+        let sender = [86u8; 32];
+        let txn = make_appl_txn(sender, 906, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        // App 12345 is named nowhere: not in Access/ForeignApps/created-in-
+        // group/shared-resources, and isn't the current app (906).
+        assert!(
+            !ctx.is_app_available(12345),
+            "an app named nowhere must stay unavailable when unnamed-resource \
+             tracking isn't active"
+        );
+
+        ctx.enable_unnamed_resource_tracking(Arc::new(NamedGroupResources::default()));
+        assert!(
+            ctx.is_app_available(12345),
+            "the same never-named app must become available once \
+             allow_unnamed_resources/unnamed_tracking is active, mirroring \
+             go's availableApp final fallback to cx.UnnamedResources.AvailableApp"
+        );
+    }
+
+    // Companion to the direct test above: pins that the fallback also fixes
+    // the real opcode-reachable path through `is_local_available`'s
+    // "address of an app created earlier in the group" branch
+    // (`data/transactions/logic/resources.go`'s `allowsLocals`), which calls
+    // straight into `is_app_available` rather than `resolve_app`. Before the
+    // fix, an app resolvable ONLY via the unnamed-resource fallback (e.g.
+    // already accepted by `resolve_app`) would still be wrongly rejected
+    // here, because this second, independent check never consulted
+    // `unnamed_tracking` either.
+    #[test]
+    fn is_local_available_created_app_address_falls_back_to_unnamed_app() {
+        let sender = [87u8; 32];
+        let txn = make_appl_txn(sender, 907, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.set_program_version(9);
+        ctx.created_apps.push(1234);
+        let created_app_addr = app_address(1234);
+
+        // App 999 is never named anywhere -- without unnamed tracking, the
+        // created app's address doesn't unlock it either.
+        assert!(!ctx.is_local_available(&created_app_addr, 999));
+
+        ctx.enable_unnamed_resource_tracking(Arc::new(NamedGroupResources::default()));
+        assert!(
+            ctx.is_local_available(&created_app_addr, 999),
+            "a never-named app must become available (and reported) via the \
+             is_app_available unnamed fallback, exactly like the analogous \
+             is_holding_available/is_asset_available path already does"
+        );
+    }
+
+    // Confirms the fallback also feeds the same capacity-gated
+    // opcode-failure enforcement (issue #1005) and reporting mechanism as
+    // every other unnamed-resource category: `unnamed_app_available`
+    // consumes group capacity and records the access via `record_unnamed`
+    // (surfaced as `SimulateTransactionResult.UnnamedResourcesAccessed`) --
+    // it was simply never reached from `is_app_available` before this fix.
+    #[test]
+    fn is_app_available_unnamed_fallback_rejects_once_max_apps_exhausted() {
+        let sender = [88u8; 32];
+        let txn = make_appl_txn(sender, 908, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let mut ctx = make_context(&mut store, vec![txn]);
+        let mut cap = tiny_capacity();
+        cap.max_apps = 1;
+        cap.max_total_refs = 100;
+        attach_capacity(&mut ctx, cap);
+
+        // Exactly at the app limit.
+        assert!(ctx.is_app_available(700));
+        // A repeat access of the same already-tracked app never costs
+        // capacity.
+        assert!(ctx.is_app_available(700));
+        // One more distinct, never-named app exceeds max_apps=1: the same
+        // "opcode fails, not just reporting" shape as
+        // `is_account_available_rejects_once_max_accounts_exhausted`.
+        assert!(
+            !ctx.is_app_available(701),
+            "a second distinct unnamed app must exceed max_apps=1"
+        );
     }
 
     #[test]
