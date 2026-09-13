@@ -3077,6 +3077,108 @@ mod tests {
         }
     }
 
+    /// Mirrors go's `TestPreparePeerData`: for a plain, uncompressible tag
+    /// (e.g. `TX`), the outgoing wire frame is exactly `tag || data`
+    /// unchanged, regardless of whether the peer negotiated any
+    /// compression feature at all. Go additionally asserts this via a
+    /// separate `preparePeerData(req, prio)` call returning
+    /// `(data, compressedData, digest)`; this crate has no equivalent
+    /// broadcast-time preparation stage (see `process_write_command`'s own
+    /// `msgBroadcaster.preparePeerData` doc comment above — compression
+    /// happens per-peer, per-message, inside this same function instead),
+    /// so the property is proven here against the one place that
+    /// computation happens.
+    #[tokio::test]
+    async fn write_command_plain_tag_is_uncompressed_tag_plus_data() {
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut sink, _client_stream) = client_ws.split();
+        let (_server_sink, mut server_stream) = server_ws.split();
+
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+
+        // Even with every compression feature negotiated, a non-AV/PP tag
+        // (here Transaction, one of go's exact test tags) must pass through
+        // unmodified.
+        let features = PeerFeatureFlags::COMPRESSED_VOTE_VPACK
+            | PeerFeatureFlags::COMPRESSED_VOTE_VPACK_STATEFUL_16
+            | PeerFeatureFlags::COMPRESSED_PROPOSAL;
+
+        let msg = OutgoingMessage::new(Tag::Transaction, b"stateproof".to_vec());
+        let cmd = WriteCommand::Data(SendMessage {
+            msg,
+            enqueued: Instant::now(),
+        });
+
+        let result = process_write_command(
+            cmd,
+            &mut sink,
+            &send_message_tags,
+            "test",
+            features,
+            &None,
+            2048,
+            &Arc::new(AtomicBool::new(true)),
+            &mut None,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let received = server_stream.next().await.unwrap().unwrap();
+        match received {
+            WsMessage::Binary(data) => {
+                let (tag, payload) = decode_frame(&data).unwrap();
+                assert_eq!(tag, Tag::Transaction);
+                assert_eq!(payload, b"stateproof");
+            }
+            other => panic!("expected binary message, got: {other:?}"),
+        }
+    }
+
+    /// Mirrors go's `TestPreparePeerData`'s proposal-payload case: with
+    /// `COMPRESSED_PROPOSAL` negotiated, an outgoing `PP` frame is
+    /// zstd-compressed and the wire bytes begin with `tag || zstd magic`.
+    #[tokio::test]
+    async fn write_command_proposal_payload_is_zstd_compressed_with_magic_prefix() {
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut sink, _client_stream) = client_ws.split();
+        let (_server_sink, mut server_stream) = server_ws.split();
+
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+
+        let msg = OutgoingMessage::new(Tag::ProposalPayload, b"data".to_vec());
+        let cmd = WriteCommand::Data(SendMessage {
+            msg,
+            enqueued: Instant::now(),
+        });
+
+        let result = process_write_command(
+            cmd,
+            &mut sink,
+            &send_message_tags,
+            "test",
+            PeerFeatureFlags::COMPRESSED_PROPOSAL,
+            &None,
+            0,
+            &Arc::new(AtomicBool::new(false)),
+            &mut None,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let received = server_stream.next().await.unwrap().unwrap();
+        match received {
+            WsMessage::Binary(data) => {
+                assert_eq!(&data[..2], Tag::ProposalPayload.as_bytes());
+                assert_eq!(&data[2..6], &crate::compression::ZSTD_MAGIC);
+                let (tag, payload) = decode_frame(&data).unwrap();
+                assert_eq!(tag, Tag::ProposalPayload);
+                let decompressed = zstd_decompress(payload, MAX_DECOMPRESSED_MESSAGE_SIZE).unwrap();
+                assert_eq!(decompressed, b"data");
+            }
+            other => panic!("expected binary message, got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn write_command_drops_filtered_message() {
         let (client_ws, _server_ws) = ws_raw_pair().await;
