@@ -1306,6 +1306,10 @@ fn handle_define(ops: &mut OpStream, tokens: &[&str]) {
     }
 }
 
+/// A statement token paired with its 0-based source column (see
+/// [`tokenize_line_with_cols`]).
+type ColToken = (usize, String);
+
 /// Expands macro-name tokens in place and splits at the next literal `;`
 /// token, matching go's `nextStatement` (`assembler.go:2098-2114`): a
 /// macro's own body can contain a literal `;` (`#define -> ; store`), so
@@ -1315,17 +1319,24 @@ fn handle_define(ops: &mut OpStream, tokens: &[&str]) {
 /// (different, non-cyclical) macro name. Returns `(current, rest)`: the
 /// tokens making up this statement, and whatever tokens remain
 /// unprocessed on the line.
-fn next_statement(ops: &OpStream, mut tokens: Vec<String>) -> (Vec<String>, Vec<String>) {
+fn next_statement(ops: &OpStream, mut tokens: Vec<ColToken>) -> (Vec<ColToken>, Vec<ColToken>) {
     let mut i = 0usize;
     while i < tokens.len() {
-        if let Some(def) = ops.macros.get(&tokens[i]) {
+        if let Some(def) = ops.macros.get(&tokens[i].1) {
+            // A macro-expanded token has no column of its own (the macro
+            // body's tokens aren't re-tokenized from a specific source
+            // line here); attribute the whole expansion to the macro
+            // invocation's own column, which is strictly better than the
+            // previous always-0 and still correct for the common
+            // non-macro case this issue targets.
+            let col = tokens[i].0;
             let mut expanded = tokens[..i].to_vec();
-            expanded.extend(def.body.iter().cloned());
+            expanded.extend(def.body.iter().cloned().map(|s| (col, s)));
             expanded.extend_from_slice(&tokens[i + 1..]);
             tokens = expanded;
             continue;
         }
-        if tokens[i] == ";" {
+        if tokens[i].1 == ";" {
             let rest = tokens[i + 1..].to_vec();
             tokens.truncate(i);
             return (tokens, rest);
@@ -1496,12 +1507,12 @@ fn handle_pragma(ops: &mut OpStream, tokens: &[&str], version_set: &mut bool) {
 /// handling followed by mnemonic + immediate-argument dispatch. `current`
 /// is never empty (callers skip empty statements from adjacent `;`
 /// tokens).
-fn process_statement(ops: &mut OpStream, current: &[String]) {
+fn process_statement(ops: &mut OpStream, current: &[ColToken]) {
     let mut tok_idx = 0;
 
     // Handle labels
-    if current[0].ends_with(':') {
-        let label = &current[0][..current[0].len() - 1];
+    if current[0].1.ends_with(':') {
+        let label = &current[0].1[..current[0].1.len() - 1];
         // Mirrors go's label-vs-macro-name conflict check at the
         // `createLabel` call site (`assembler.go:2192-2199`): checked
         // *before* the ordinary duplicate-label check, and skips creating
@@ -1550,10 +1561,18 @@ fn process_statement(ops: &mut OpStream, current: &[String]) {
         }
     }
 
-    let mnemonic = current[tok_idx].as_str();
-    let args: Vec<&str> = current[tok_idx + 1..].iter().map(|s| s.as_str()).collect();
+    let mnemonic = current[tok_idx].1.as_str();
+    let args: Vec<&str> = current[tok_idx + 1..]
+        .iter()
+        .map(|s| s.1.as_str())
+        .collect();
 
-    ops.record_source_location(ops.source_line, 0);
+    // Mirrors go's `line, column := current[0].line, current[0].col`
+    // (assembler.go:2208): the column of this statement's instruction
+    // token (after any leading label has been consumed), not a hardcoded
+    // 0 -- see issue #1394.
+    let col = current[tok_idx].0;
+    ops.record_source_location(ops.source_line, col);
     type_track::track_instruction(ops, mnemonic, &args);
     assemble_instruction(ops, mnemonic, &args);
 }
@@ -1581,7 +1600,7 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
     for (line_idx, &line_text) in lines.iter().enumerate() {
         ops.source_line = line_idx + 1; // 1-based
 
-        let full_tokens = tokenize_line(line_text);
+        let full_tokens = tokenize_line_with_cols(line_text);
         if full_tokens.is_empty() {
             continue;
         }
@@ -1591,8 +1610,11 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
         // through to statement processing -- mirrors go's `parseText`
         // (assembler.go:2165-2177): a directive is recognized by its first
         // token alone, with no per-statement splitting for that line.
-        if full_tokens[0].starts_with('#') {
-            handle_directive(&mut ops, &full_tokens, &mut version_set);
+        // Directives don't need per-token columns (they don't feed
+        // `record_source_location`), so strip them down to plain text.
+        if full_tokens[0].1.starts_with('#') {
+            let directive_tokens: Vec<&str> = full_tokens.iter().map(|(_, t)| *t).collect();
+            handle_directive(&mut ops, &directive_tokens, &mut version_set);
             continue;
         }
 
@@ -1611,7 +1633,10 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
         // line's token stream rather than on statements pre-split at the
         // character level, since a macro's body may itself contain a
         // literal `;` (see `next_statement`'s doc comment).
-        let tokens: Vec<String> = full_tokens.iter().map(|s| s.to_string()).collect();
+        let tokens: Vec<ColToken> = full_tokens
+            .iter()
+            .map(|(col, s)| (*col, s.to_string()))
+            .collect();
         let (mut current, mut rest) = next_statement(&ops, tokens);
         while !current.is_empty() || !rest.is_empty() {
             if !current.is_empty() {
@@ -2936,7 +2961,20 @@ fn decode_algorand_address(addr: &str) -> Result<Vec<u8>, String> {
 /// a separate statement-splitting pass. [`next_statement`] does that
 /// splitting afterward, at the token level, once macros have been
 /// expanded.
+#[cfg(test)]
 fn tokenize_line(line: &str) -> Vec<&str> {
+    tokenize_line_with_cols(line)
+        .into_iter()
+        .map(|(_, tok)| tok)
+        .collect()
+}
+
+/// Same tokenization as [`tokenize_line`], but also returns each token's
+/// starting column (0-based, matching go's `token.col` from
+/// `tokensFromLine`, `assembler.go:1945-2020`) so callers that need to
+/// report a precise source location (`OpStream::record_source_location`)
+/// can thread it through instead of assuming column 0 -- see issue #1394.
+fn tokenize_line_with_cols(line: &str) -> Vec<(usize, &str)> {
     let mut tokens = Vec::new();
     let bytes = line.as_bytes();
     let mut i = 0usize;
@@ -2960,7 +2998,7 @@ fn tokenize_line(line: &str) -> Vec<&str> {
             break;
         }
         if bytes[i] == b';' {
-            tokens.push(&line[i..i + 1]);
+            tokens.push((i, &line[i..i + 1]));
             i += 1;
             continue;
         }
@@ -3004,7 +3042,7 @@ fn tokenize_line(line: &str) -> Vec<&str> {
             }
         }
         let tok = &line[start..i];
-        tokens.push(tok);
+        tokens.push((start, tok));
         // Bare `base64`/`b64` prefix form: the token just completed is
         // either the base64 literal itself (clear the flag) or, if it's
         // exactly "base64"/"b64", the prefix that opens one (the *next*
@@ -4858,6 +4896,66 @@ dup
         assert_eq!(
             tokenize_line("xbase64 ABC//== rest"),
             vec!["xbase64", "ABC"]
+        );
+    }
+
+    #[test]
+    fn test_tokenize_line_with_cols() {
+        // Plain tokens report their 0-based starting column.
+        assert_eq!(tokenize_line_with_cols("int 1"), vec![(0, "int"), (4, "1")]);
+        // Leading whitespace shifts the first token's column.
+        assert_eq!(tokenize_line_with_cols("  err"), vec![(2, "err")]);
+        // A `;`-joined line: the second statement's mnemonic starts at
+        // the column right after the `;`+space (matches go's
+        // `tokensFromLine`, `assembler.go:1945-2020`).
+        assert_eq!(
+            tokenize_line_with_cols("err; err"),
+            vec![(0, "err"), (3, ";"), (5, "err")]
+        );
+    }
+
+    /// Issue #1394: `OpStream::record_source_location` must report each
+    /// instruction's real source column (go's `current[0].col`,
+    /// `assembler.go:2208`), not a hardcoded 0 -- matches go's
+    /// `TestAssembleOffsets` (`assembler_test.go:2687`).
+    #[test]
+    fn test_assemble_offsets_columns() {
+        // `err; err` on one line: the first `err` is at column 0, the
+        // second (after `; `) is at column 5.
+        let source = "err\n// comment\nerr; err\n";
+        let ops = assemble_string(source).unwrap();
+        let locations: Vec<SourceLocation> = {
+            let mut entries: Vec<(usize, SourceLocation)> =
+                ops.offset_to_source.iter().map(|(&k, &v)| (k, v)).collect();
+            entries.sort_by_key(|(k, _)| *k);
+            entries.into_iter().map(|(_, v)| v).collect()
+        };
+        assert_eq!(
+            locations,
+            vec![
+                SourceLocation { line: 0, col: 0 },
+                SourceLocation { line: 2, col: 0 },
+                SourceLocation { line: 2, col: 5 },
+            ]
+        );
+
+        // An instruction preceded by leading whitespace/indentation
+        // (e.g. a label body indented by convention) reports the real
+        // indented column, not 0. `b` requires v2+.
+        let indented_source = "#pragma version 2\nerr\nb label1\nerr\nlabel1:\n  err\n";
+        let ops = assemble_string(indented_source).unwrap();
+        let mut entries: Vec<(usize, SourceLocation)> =
+            ops.offset_to_source.iter().map(|(&k, &v)| (k, v)).collect();
+        entries.sort_by_key(|(k, _)| *k);
+        let locations: Vec<SourceLocation> = entries.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(
+            locations,
+            vec![
+                SourceLocation { line: 1, col: 0 },
+                SourceLocation { line: 2, col: 0 },
+                SourceLocation { line: 3, col: 0 },
+                SourceLocation { line: 5, col: 2 },
+            ]
         );
     }
 
