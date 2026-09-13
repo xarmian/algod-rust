@@ -453,4 +453,83 @@ mod tests {
         let decoded = decode_headers(&encoded).unwrap();
         assert_eq!(decoded, headers);
     }
+
+    // -----------------------------------------------------------------------
+    // Randomized roundtrip: go's `TestRandomizedEncodingpeerMetaHeaders` /
+    // `TestRandomizedEncodingpeerMetaValues` (network/msgp_gen_test.go) run
+    // `protocol.RunEncodingTest` 1000 times over `quick`-randomized instances
+    // of `peerMetaHeaders` (`map[string]peerMetaValues`) and `peerMetaValues`
+    // (`[]string`) respectively, asserting encode -> decode reproduces the
+    // original value and re-encoding the decoded value reproduces the
+    // original bytes. Since this crate uses plain `rmp_serde` msgpack
+    // (`encode_headers`/`decode_headers`) rather than a hand-rolled
+    // MarshalMsg/UnmarshalMsg pair, the analogous property is: for many
+    // randomly generated `BTreeMap<String, Vec<String>>` / `Vec<String>`
+    // instances (including empty maps/vecs, empty strings, and duplicate
+    // values), encode -> decode -> re-encode is lossless and idempotent.
+    fn random_string(rng: &mut impl rand::RngCore, max_len: usize) -> String {
+        use rand::Rng;
+        let len = rng.gen_range(0..=max_len);
+        (0..len)
+            .map(|_| {
+                // Printable ASCII range, including a few header-hostile
+                // characters (spaces, dashes) to catch escaping bugs.
+                let c = rng.gen_range(0x20u8..=0x7Eu8);
+                c as char
+            })
+            .collect()
+    }
+
+    #[test]
+    fn randomized_roundtrip_peer_meta_headers() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
+        for _ in 0..200 {
+            let num_keys = rng.gen_range(0..=6);
+            let mut headers = PeerMetaHeaders::new();
+            for _ in 0..num_keys {
+                let key = random_string(&mut rng, 24);
+                let num_values = rng.gen_range(0..=4);
+                let values: Vec<String> = (0..num_values)
+                    .map(|_| random_string(&mut rng, 32))
+                    .collect();
+                headers.insert(key, values);
+            }
+            let encoded = encode_headers(&headers);
+            let decoded = decode_headers(&encoded).expect("random headers must decode");
+            assert_eq!(
+                decoded, headers,
+                "roundtrip must reproduce the original map"
+            );
+            // Re-encoding the decoded value must reproduce the same bytes
+            // (mirrors go's re-encoding-consistency check).
+            assert_eq!(
+                encode_headers(&decoded),
+                encoded,
+                "re-encoding the decoded value must be byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_roundtrip_peer_meta_values() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xFACADE);
+        for _ in 0..200 {
+            let num_values = rng.gen_range(0..=8);
+            let values: Vec<String> = (0..num_values)
+                .map(|_| random_string(&mut rng, 40))
+                .collect();
+            let encoded = rmp_serde::to_vec(&values).expect("Vec<String> is always serializable");
+            let decoded: Vec<String> =
+                rmp_serde::from_slice(&encoded).expect("random values must decode");
+            assert_eq!(decoded, values, "roundtrip must reproduce the original vec");
+            let re_encoded =
+                rmp_serde::to_vec(&decoded).expect("Vec<String> is always serializable");
+            assert_eq!(
+                re_encoded, encoded,
+                "re-encoding the decoded value must be byte-identical"
+            );
+        }
+    }
 }

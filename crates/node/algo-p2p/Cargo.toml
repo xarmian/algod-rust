@@ -47,3 +47,4 @@ url.workspace = true
 tempfile = "3"
 hex.workspace = true
 tokio-util = { workspace = true, features = ["compat"] }
+rand.workspace = true
