@@ -955,6 +955,124 @@ fn asset_holding_get_frozen() {
     assert!(result, "asset_holding_get AssetFrozen should be 1 (true)");
 }
 
+/// TestAssets (evalStateful_test.go): go's version sweeps EVERY
+/// `asset_holding_get`/`asset_params_get` field name against a real
+/// program. `asset_holding_get_balance`/`asset_holding_get_frozen` above
+/// already cover both `asset_holding_get` fields; this closes the
+/// remaining gap for `asset_params_get`, which previously only had
+/// mock-context (`TestStateContext`) coverage for 2 of its 12 fields
+/// (`AssetTotal`, `AssetCreator`). Sweeps all 12 real fields against a
+/// fully-populated `AssetParams` record through the real
+/// `LedgerAvmContext`.
+#[test]
+fn asset_params_get_full_field_sweep() {
+    let sender = [0xAA; 32];
+    let mut txn = make_appl_txn_with_refs(sender, 42, vec![], vec![7]);
+    txn.txn.xaid = 7;
+    let mut store = LedgerState::new();
+    seed_app(&mut store);
+    store.asset_params.insert(
+        7,
+        AssetParamsRecord {
+            params: AssetParams {
+                total: 1_000_000,
+                decimals: 6,
+                default_frozen: true,
+                unit_name: "UNIT".to_string(),
+                asset_name: "MyAsset".to_string(),
+                url: "http://example.com".to_string(),
+                metadata_hash: Some([0x11; 32]),
+                manager: Some(Address([0xAA; 32])),
+                reserve: Some(Address([0xBB; 32])),
+                freeze: Some(Address([0xCC; 32])),
+                clawback: Some(Address([0xDD; 32])),
+            },
+            creator: Address([0xEE; 32]),
+        },
+    );
+    let mut ctx = make_context(&mut store, vec![txn]);
+    ctx.consensus = pre_app_forbid_low_resources_consensus();
+
+    let source = r#"
+int 0
+asset_params_get AssetTotal
+assert
+int 1000000
+==
+int 0
+asset_params_get AssetDecimals
+assert
+int 6
+==
+&&
+int 0
+asset_params_get AssetDefaultFrozen
+assert
+int 1
+==
+&&
+int 0
+asset_params_get AssetUnitName
+assert
+byte "UNIT"
+==
+&&
+int 0
+asset_params_get AssetName
+assert
+byte "MyAsset"
+==
+&&
+int 0
+asset_params_get AssetURL
+assert
+byte "http://example.com"
+==
+&&
+int 0
+asset_params_get AssetMetadataHash
+assert
+byte 0x1111111111111111111111111111111111111111111111111111111111111111
+==
+&&
+int 0
+asset_params_get AssetManager
+assert
+byte 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+==
+&&
+int 0
+asset_params_get AssetReserve
+assert
+byte 0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+==
+&&
+int 0
+asset_params_get AssetFreeze
+assert
+byte 0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+==
+&&
+int 0
+asset_params_get AssetClawback
+assert
+byte 0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+==
+&&
+int 0
+asset_params_get AssetCreator
+assert
+byte 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+==
+&&
+"#;
+    let result = run_source_with_context(6, source, &mut ctx).unwrap();
+    assert!(
+        result,
+        "all 12 asset_params_get fields should match the real AssetParams record"
+    );
+}
+
 // ===========================================================================
 // Test Group 5: Log Opcode
 // ===========================================================================

@@ -11093,6 +11093,201 @@ mod tests {
         assert!(ctx.created_apps.contains(&created_id));
     }
 
+    /// TestGtxnApps (evalAppTxn_test.go): an inner group of three siblings
+    /// (two app-creates, then a call to a third app) submitted in one
+    /// `itxn_submit`. The THIRD sibling's own approval program reads
+    /// `gtxn 0 CreatedApplicationID`/`gtxn 1 CreatedApplicationID` --
+    /// go-algorand's real production behavior, since a program executing as
+    /// part of an inner group sees that inner group as its OWN `gtxn`
+    /// group, with earlier siblings' real (post-execution) `ApplyData`
+    /// already populated (`execute_inner_appl`'s `siblings_snapshot`,
+    /// issue #714). Logs the two ids, then the OUTER program reads them
+    /// back via `itxn Logs 0` (this group's own last member) and
+    /// `gitxn 1 Logs 0` (an earlier sibling read from outside), confirming
+    /// both the within-group `gtxn` cross-sibling read AND the outer
+    /// `itxn`/`gitxn` log-reading paths agree on the same real ids. Closes
+    /// the "single resource-availability case" gap this row flagged.
+    #[test]
+    fn gtxn_reads_created_app_id_from_earlier_inner_sibling() {
+        let sender = [0xAAu8; 32];
+        let app_a = 888u64;
+        let app_222 = 222u64;
+
+        let mut store = LedgerState::new();
+
+        // App 222: gtxn 0 CreatedApplicationID; itob; log;
+        //          gtxn 1 CreatedApplicationID; itob; log; int 1
+        let mut checker_code = Vec::new();
+        checker_code.extend([0x33, 0, 61]); // gtxn 0 CreatedApplicationID
+        checker_code.push(0x16); // itob
+        checker_code.push(0xb0); // log
+        checker_code.extend([0x33, 1, 61]); // gtxn 1 CreatedApplicationID
+        checker_code.push(0x16); // itob
+        checker_code.push(0xb0); // log
+        checker_code.extend([0x81, 0x01]); // pushint 1 (approve)
+        let mut checker_program = vec![6u8]; // version 6
+        checker_program.extend(checker_code);
+        setup_app(&mut store, app_222, checker_program, make_program(6, true));
+
+        let app_a_addr = Address(app_address(app_a));
+        store.set_account(
+            &app_a_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let txn = make_appl_txn(sender, app_a, vec![], vec![], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.fee_credit = 50_000;
+        ctx.txn_counter = 400;
+
+        let created_program = make_program(6, true);
+
+        // Build the inner group: create app, create app, call app 222.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(30, TealValue::Bytes(created_program.clone()))
+            .unwrap();
+        ctx.itxn_field(31, TealValue::Bytes(created_program.clone()))
+            .unwrap();
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap();
+        ctx.itxn_field(30, TealValue::Bytes(created_program.clone()))
+            .unwrap();
+        ctx.itxn_field(31, TealValue::Bytes(created_program))
+            .unwrap();
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(app_222)).unwrap(); // ApplicationID
+        ctx.itxn_submit().unwrap();
+
+        // Read back the two created app IDs directly (siblings 0 and 1).
+        let created0 = match ctx.last_itxn_group_field(0, 61, None).unwrap() {
+            TealValue::Uint(v) => v,
+            other => panic!("expected uint, got {other:?}"),
+        };
+        let created1 = match ctx.last_itxn_group_field(1, 61, None).unwrap() {
+            TealValue::Uint(v) => v,
+            other => panic!("expected uint, got {other:?}"),
+        };
+        assert_ne!(created0, 0);
+        assert_ne!(created1, 0);
+        assert_ne!(created0, created1);
+
+        // `itxn Logs 0` reads THIS group's own last member (app 222 itself)
+        // -- its first logged value must equal sibling 0's created id.
+        let log0 = match ctx.last_itxn_field(58, Some(0)).unwrap() {
+            TealValue::Bytes(b) => b,
+            other => panic!("expected bytes, got {other:?}"),
+        };
+        assert_eq!(
+            u64::from_be_bytes(log0.clone().try_into().unwrap()),
+            created0,
+            "app 222's first logged value should be sibling 0's real created app id"
+        );
+
+        // `gitxn 1 Logs 1` reads sibling 1 (a plain create with no logs) --
+        // instead directly confirm app 222's SECOND logged value (from
+        // outside, via the group-indexed accessor for its own slot 2).
+        let log1 = match ctx.last_itxn_group_field(2, 58, Some(1)).unwrap() {
+            TealValue::Bytes(b) => b,
+            other => panic!("expected bytes, got {other:?}"),
+        };
+        assert_eq!(
+            u64::from_be_bytes(log1.try_into().unwrap()),
+            created1,
+            "app 222's second logged value should be sibling 1's real created app id"
+        );
+    }
+
+    /// TestGtxnAsa (evalAppTxn_test.go): same cross-sibling `gtxn` pattern
+    /// as `gtxn_reads_created_app_id_from_earlier_inner_sibling` above, but
+    /// for ASA creation (`acfg`, `CreatedAssetID` field 60) instead of app
+    /// creation -- confirming the same `siblings_snapshot` mechanism
+    /// generalizes to a different effect field/creatable type.
+    #[test]
+    fn gtxn_reads_created_asset_id_from_earlier_inner_sibling() {
+        let sender = [0xAAu8; 32];
+        let app_a = 888u64;
+        let app_222 = 222u64;
+
+        let mut store = LedgerState::new();
+
+        // App 222: gtxn 0 CreatedAssetID; itob; log;
+        //          gtxn 1 CreatedAssetID; itob; log; int 1
+        let mut checker_code = Vec::new();
+        checker_code.extend([0x33, 0, 60]); // gtxn 0 CreatedAssetID
+        checker_code.push(0x16); // itob
+        checker_code.push(0xb0); // log
+        checker_code.extend([0x33, 1, 60]); // gtxn 1 CreatedAssetID
+        checker_code.push(0x16); // itob
+        checker_code.push(0xb0); // log
+        checker_code.extend([0x81, 0x01]); // pushint 1 (approve)
+        let mut checker_program = vec![6u8];
+        checker_program.extend(checker_code);
+        setup_app(&mut store, app_222, checker_program, make_program(6, true));
+
+        let app_a_addr = Address(app_address(app_a));
+        store.set_account(
+            &app_a_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let txn = make_appl_txn(sender, app_a, vec![], vec![], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.fee_credit = 50_000;
+        ctx.txn_counter = 400;
+
+        // Build the inner group: create asset, create asset, call app 222.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(3)).unwrap(); // acfg
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(3)).unwrap(); // acfg
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(app_222)).unwrap(); // ApplicationID
+        ctx.itxn_submit().unwrap();
+
+        let created0 = match ctx.last_itxn_group_field(0, 60, None).unwrap() {
+            TealValue::Uint(v) => v,
+            other => panic!("expected uint, got {other:?}"),
+        };
+        let created1 = match ctx.last_itxn_group_field(1, 60, None).unwrap() {
+            TealValue::Uint(v) => v,
+            other => panic!("expected uint, got {other:?}"),
+        };
+        assert_ne!(created0, 0);
+        assert_ne!(created1, 0);
+        assert_ne!(created0, created1);
+
+        let log0 = match ctx.last_itxn_field(58, Some(0)).unwrap() {
+            TealValue::Bytes(b) => b,
+            other => panic!("expected bytes, got {other:?}"),
+        };
+        assert_eq!(
+            u64::from_be_bytes(log0.try_into().unwrap()),
+            created0,
+            "app 222's first logged value should be sibling 0's real created asset id"
+        );
+
+        let log1 = match ctx.last_itxn_group_field(2, 58, Some(1)).unwrap() {
+            TealValue::Bytes(b) => b,
+            other => panic!("expected bytes, got {other:?}"),
+        };
+        assert_eq!(
+            u64::from_be_bytes(log1.try_into().unwrap()),
+            created1,
+            "app 222's second logged value should be sibling 1's real created asset id"
+        );
+    }
+
     #[test]
     fn resource_availability_foreign_arrays() {
         // Assets and apps in foreign arrays should be available.
@@ -14691,6 +14886,182 @@ mod tests {
         );
     }
 
+    /// TestEarlyPanics (box_test.go): go's `box_length_checks`-equivalent
+    /// (`boxNamePresent`/`checkBoxName` in go's `box.go`) runs before ANY
+    /// other opcode-specific logic for every one of the 9 box opcodes, so a
+    /// zero-length or over-`MaxAppKeyLen` name is rejected identically
+    /// regardless of which opcode set it up -- go's test sweeps all 9 with
+    /// both a zero-length and a 65-byte name. `box_create_name_too_long_rejected`
+    /// / `box_create_size_too_large_rejected` above (and the individual
+    /// `test_box_create_empty_name_rejected` in `algo-avm`) only exercised
+    /// `box_create`; this closes the "untested for most of the other 8
+    /// opcodes" gap the parity row flagged by driving the same two bad names
+    /// through every one of `LedgerAvmContext`'s real `box_*` trait methods.
+    #[test]
+    fn box_length_checks_shared_across_every_box_opcode() {
+        let zero_len_name: &[u8] = b"";
+        let long_name: Vec<u8> = vec![b'x'; 65]; // one over MaxAppKeyLen (64)
+
+        for name in [zero_len_name, long_name.as_slice()] {
+            let expected = if name.is_empty() {
+                "zero length"
+            } else {
+                "name too long"
+            };
+
+            let mut store = LedgerState::new();
+            let mut ctx = make_box_context(&mut store, 888, name);
+
+            let err = ctx.box_create(name, 10).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "box_create: unexpected error for {name:?}: {err}"
+            );
+            let err = ctx.box_del(name).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "box_del: unexpected error for {name:?}: {err}"
+            );
+            let err = ctx.box_extract(name, 1, 2).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "box_extract: unexpected error for {name:?}: {err}"
+            );
+            let err = ctx.box_get(name).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "box_get: unexpected error for {name:?}: {err}"
+            );
+            let err = ctx.box_len(name).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "box_len: unexpected error for {name:?}: {err}"
+            );
+            let err = ctx.box_put(name, b"hello").unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "box_put: unexpected error for {name:?}: {err}"
+            );
+            let err = ctx.box_replace(name, 0, b"new").unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "box_replace: unexpected error for {name:?}: {err}"
+            );
+            let err = ctx.box_splice(name, 0, 2, b"new").unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "box_splice: unexpected error for {name:?}: {err}"
+            );
+            let err = ctx.box_resize(name, 2).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "box_resize: unexpected error for {name:?}: {err}"
+            );
+        }
+    }
+
+    /// TestBoxAvailability (box_test.go): distinguishes go's two runtime
+    /// availability outcomes through a REAL executed program (`box_extract`
+    /// via `run_approval_program`), rather than manually pre-seeding
+    /// `available_boxes` the way most other box tests in this file do --
+    /// proving `ensure_boxes_initialized`'s box-ref resolution (index 0 =
+    /// "this app", index N = 1-based into `ForeignApps`) drives the exact
+    /// same two go outcomes: no box ref declared anywhere in the group ->
+    /// "invalid Box reference"; a box ref present (via either resolution
+    /// form) for a box that doesn't exist on-chain -> "no such box".
+    /// Closes the "not covered by any full-execution test" gap this row
+    /// flagged.
+    #[test]
+    fn box_availability_distinguishes_absent_ref_from_absent_box() {
+        // `byte "B"; int 1; int 2; box_extract`
+        let program: Vec<u8> = vec![
+            8u8, // version
+            0x80, 1, b'B', // pushbytes "B"
+            0x81, 1, // pushint 1
+            0x81, 2,    // pushint 2
+            0xba, // box_extract
+        ];
+
+        let app_id = 10_000u64;
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .expect("V41 consensus params must exist");
+
+        fn run(
+            store: &mut LedgerState,
+            txn: SignedTransaction,
+            app_id: u64,
+            consensus: ConsensusParams,
+            program: &[u8],
+        ) -> String {
+            use algo_avm::eval::run_approval_program;
+            use algo_avm::group::GroupBudget;
+            store.set_app_params(
+                app_id,
+                algo_types::AppParams {
+                    creator: Address([1u8; 32]),
+                    ..Default::default()
+                },
+            );
+            let mut ctx = LedgerAvmContext::new(
+                store,
+                vec![txn],
+                0,
+                1000,
+                12345,
+                app_id,
+                [1u8; 32],
+                true,
+                [2u8; 32],
+                [3u8; 32],
+                consensus,
+            );
+            let mut budget = GroupBudget::new(1);
+            let result = run_approval_program(program, &mut ctx, &mut budget)
+                .expect("run_approval_program itself should not error");
+            assert!(!result.approved, "program should have been rejected");
+            result.error.expect("must carry an error message")
+        }
+
+        // Case 1: "B" not referenced anywhere in the group -> not available
+        // at all, regardless of whether it exists on-chain.
+        {
+            let mut store = LedgerState::new();
+            let txn = make_appl_txn([9u8; 32], app_id, vec![], vec![], vec![]);
+            let err = run(&mut store, txn, app_id, consensus.clone(), &program);
+            assert!(err.contains("invalid Box reference"), "got: {err}");
+        }
+
+        // Case 2: "B" referenced via index 0 (this app) but never created
+        // on-chain -> available, but "no such box".
+        {
+            let mut store = LedgerState::new();
+            let mut txn = make_appl_txn([9u8; 32], app_id, vec![], vec![], vec![]);
+            txn.txn.boxes = Some(vec![algo_types::BoxRef {
+                index: 0,
+                name: Some(serde_bytes::ByteBuf::from(b"B".to_vec())),
+            }]);
+            let err = run(&mut store, txn, app_id, consensus.clone(), &program);
+            assert!(err.contains("no such box"), "got: {err}");
+        }
+
+        // Case 3: "B" referenced via a 1-based `ForeignApps` index that
+        // happens to resolve back to this same app -- a different
+        // resolution *path* through `ensure_boxes_initialized`, same
+        // real-world effect ("no such box", not "invalid Box reference").
+        {
+            let mut store = LedgerState::new();
+            let mut txn = make_appl_txn([9u8; 32], app_id, vec![], vec![app_id], vec![]);
+            txn.txn.boxes = Some(vec![algo_types::BoxRef {
+                index: 1,
+                name: Some(serde_bytes::ByteBuf::from(b"B".to_vec())),
+            }]);
+            let err = run(&mut store, txn, app_id, consensus, &program);
+            assert!(err.contains("no such box"), "got: {err}");
+        }
+    }
+
     #[test]
     fn dirty_tracking_create_delete_create_cancels_out() {
         // "though it cancels out a creation that happened here"
@@ -15078,6 +15449,69 @@ mod tests {
         ctx.box_extract(b"self", 1, 7).unwrap();
         ctx.box_extract(b"other", 1, 7).unwrap();
         ctx.box_create(b"another", 350).unwrap();
+    }
+
+    /// TestBoxReadBudget (box_test.go): drives the read-budget check through
+    /// a REAL assembled TEAL program (`box_len` on two box refs, `assert`ing
+    /// each exists, then comparing the two lengths) executed via
+    /// `run_approval_program`, rather than calling `check_read_budget`/the
+    /// `box_*` trait methods directly the way the pre-existing
+    /// `read_budget_check_*` and `io_budget_grow_*` tests above do -- closing
+    /// the "not through a full TEAL program" gap the parity row flagged.
+    /// Mirrors go's exact scenario: two 100-byte boxes exactly consume a
+    /// 200-byte (2-box-ref) budget and the program passes; growing one box
+    /// to 101 bytes exceeds the budget and the program is rejected with
+    /// go's exact "read budget exceeded (201 > 200)" message.
+    #[test]
+    fn box_read_budget_via_full_program_at_and_over_budget() {
+        use algo_avm::eval::run_approval_program;
+        use algo_avm::group::GroupBudget;
+
+        // `byte "self"; box_len; assert; byte "other"; box_len; assert; ==`
+        fn read_two_boxes_program() -> Vec<u8> {
+            let mut code = vec![8u8]; // version 8 (box opcodes)
+            for name in [b"self".as_slice(), b"other".as_slice()] {
+                code.push(0x80); // pushbytes
+                code.push(name.len() as u8);
+                code.extend_from_slice(name);
+                code.push(0xbd); // box_len -> pushes (len, exists)
+                code.push(0x44); // assert (pops `exists`, must be nonzero)
+            }
+            code.push(0x12); // == (compares the two lengths)
+            code
+        }
+
+        let app_id = 888u64;
+
+        // At budget: two 100-byte boxes, 2 box refs * 100 bytes/ref = 200.
+        let mut store = LedgerState::new();
+        store.set_box(app_id, b"self", vec![0u8; 100]);
+        store.set_box(app_id, b"other", vec![0u8; 100]);
+        let mut ctx =
+            make_io_budget_context(&mut store, app_id, vec![Some(b"self"), Some(b"other")]);
+        let mut budget = GroupBudget::new(1);
+        let result = run_approval_program(&read_two_boxes_program(), &mut ctx, &mut budget)
+            .expect("right at budget must not error");
+        assert!(
+            result.approved,
+            "equal-length 100-byte boxes should approve"
+        );
+
+        // Over budget: grow "other" to 101 bytes -- 100 + 101 = 201 > 200.
+        let mut store2 = LedgerState::new();
+        store2.set_box(app_id, b"self", vec![0u8; 100]);
+        store2.set_box(app_id, b"other", vec![0u8; 101]);
+        let mut ctx2 =
+            make_io_budget_context(&mut store2, app_id, vec![Some(b"self"), Some(b"other")]);
+        let mut budget2 = GroupBudget::new(1);
+        let result2 = run_approval_program(&read_two_boxes_program(), &mut ctx2, &mut budget2)
+            .expect("run_approval_program itself should not error");
+        assert!(!result2.approved, "over-budget program must be rejected");
+        let err = result2.error.expect("must carry an error message");
+        assert!(
+            err.contains("read budget exceeded (201 > 200)"),
+            "unexpected error: {err}"
+        );
     }
 
     // -------------------------------------------------------------------

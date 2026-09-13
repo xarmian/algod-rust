@@ -2251,6 +2251,28 @@ mod tests {
     // ── JSON parser edge-case parity (issue #823 theme 2), ported from
     // go-algorand's jsonspec_test.go ────────────────────────────────
 
+    /// TestParseScalar (jsonspec_test.go): `parseJSON` itself (not just the
+    /// `json_ref` opcode) accepts an object with a bare int-valued key and
+    /// an object with a bare string-valued key. Ported at the same unit
+    /// boundary go's test uses (direct `parse_json_object` call), closing
+    /// the gap noted in the parity row: `test_json_ref_string`/
+    /// `test_json_ref_uint64` above exercise the same scalar values but only
+    /// end-to-end through the `json_ref` opcode, not `parse_json_object`
+    /// directly.
+    #[test]
+    fn test_parse_json_scalar_values_accepted() {
+        let int_scalar = br#"{"key0": 4160}"#;
+        assert!(
+            parse_json_object(int_scalar).is_ok(),
+            "an int-valued scalar object should parse"
+        );
+        let str_scalar = br#"{"key0": "algo"}"#;
+        assert!(
+            parse_json_object(str_scalar).is_ok(),
+            "a string-valued scalar object should parse"
+        );
+    }
+
     #[test]
     fn test_parse_json_trailing_commas_rejected() {
         // TestParseTrailingCommas: any number of trailing commas before
