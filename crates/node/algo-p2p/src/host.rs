@@ -78,6 +78,7 @@ use libp2p::{identify, kad, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBu
 use crate::conn_limits::{derive_conn_limits, ConnLimitConfig};
 use crate::dht;
 use crate::errors::P2pError;
+use crate::filtered_identify::AddressFilteringBehaviour;
 use crate::identity::{to_identity_signing_key, IdentityConfig};
 use crate::metrics::GossipsubMetrics;
 use crate::pubsub::{derive_algorand_gossipsub_params, GossipsubMeshParams, IWANT_FOLLOWUP_TIME};
@@ -116,7 +117,13 @@ const IDENTIFY_PROTOCOL_VERSION: &str = "/algorand/id/1.0.0";
 #[derive(NetworkBehaviour)]
 pub struct P2pBehaviour {
     kad: kad::Behaviour<kad::store::MemoryStore>,
-    identify: identify::Behaviour,
+    /// Wrapped in [`AddressFilteringBehaviour`] so a host listening on an
+    /// "all interfaces" address (`0.0.0.0`/`::`) never advertises a
+    /// private/non-routable address to peers via `identify` — see
+    /// `crate::filtered_identify`'s doc comment (issue #1444) for why this
+    /// wrapper exists at all (`rust-libp2p` has no `AddrsFactory`
+    /// equivalent to hook into directly).
+    identify: AddressFilteringBehaviour<identify::Behaviour>,
     gossipsub: gossipsub::Behaviour,
     stream: libp2p_stream::Behaviour,
     /// Enforces [`derive_conn_limits`]'s output as hard admission control on
@@ -150,6 +157,19 @@ pub struct P2pHostConfig {
     pub is_listen_server: bool,
     /// Go: `cfg.EnableDHTProviders`.
     pub enable_dht_providers: bool,
+    /// Whether to apply [`crate::conn_limits::address_filter`] to this
+    /// host's `identify`-advertised addresses — go's `needAddressFilter`
+    /// local in `MakeHost` (`network/p2p/p2p.go`), computed by the caller
+    /// from [`crate::conn_limits::needs_address_filter`] against the
+    /// configured `NetAddress`/listen multiaddr *before* calling
+    /// [`P2pHost::new`] (this struct carries only the resulting bool, not
+    /// the address itself, since [`P2pHost::listen`] is a separate call
+    /// made after construction — see `crate::filtered_identify`'s doc
+    /// comment for why the filter must be wired in at construction time
+    /// regardless). `false` (matching a caller-configured specific bind
+    /// address, or no listen address at all) never filters anything,
+    /// preserving prior behavior.
+    pub filter_advertised_addresses: bool,
 }
 
 impl Default for P2pHostConfig {
@@ -159,6 +179,7 @@ impl Default for P2pHostConfig {
             incoming_connections_limit: -1,
             is_listen_server: false,
             enable_dht_providers: false,
+            filter_advertised_addresses: false,
         }
     }
 }
@@ -316,10 +337,13 @@ impl P2pHost {
             .with_behaviour(|key| {
                 let store = kad::store::MemoryStore::new(local_peer_id);
                 let kad = kad::Behaviour::with_config(local_peer_id, store, kad_config);
-                let identify = identify::Behaviour::new(identify::Config::new(
-                    IDENTIFY_PROTOCOL_VERSION.to_string(),
-                    key.public(),
-                ));
+                let identify = AddressFilteringBehaviour::new(
+                    identify::Behaviour::new(identify::Config::new(
+                        IDENTIFY_PROTOCOL_VERSION.to_string(),
+                        key.public(),
+                    )),
+                    host_cfg.filter_advertised_addresses,
+                );
                 // Go: `makePubSub`'s `pubsub.WithMessageSignaturePolicy(pubsub.StrictNoSign)`
                 // — no per-message signature/seqno/from, and
                 // `pubsub.WithValidateQueueSize`+async `ValidatorEx` per topic —
@@ -1155,6 +1179,103 @@ mod tests {
         }
 
         assert!(dialer.connected_peers().contains(&listener_peer_id));
+    }
+
+    /// Drives `listener`/`dialer` until `dialer` observes an `identify`
+    /// `Received` event from `listener`, returning the received `Info`.
+    /// Shared by the two address-filter tests below.
+    async fn identify_info_dialer_receives_from(
+        listener: &mut P2pHost,
+        dialer: &mut P2pHost,
+    ) -> identify::Info {
+        let listener_peer_id = listener.peer_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            tokio::select! {
+                ev = dialer.next_event() => {
+                    if let SwarmEvent::Behaviour(P2pBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) = ev {
+                        if peer_id == listener_peer_id {
+                            return info;
+                        }
+                    }
+                }
+                _ = listener.next_event() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out waiting for dialer to receive listener's identify info");
+                }
+            }
+        }
+    }
+
+    /// TDD anchor for issue #1444: `address_filter`/`needs_address_filter`
+    /// (`crate::conn_limits`) were computed but never wired into
+    /// `P2pHost::new`'s libp2p host construction, so a host listening on
+    /// an "all interfaces" address advertised every one of its listen
+    /// addresses to peers via `identify` — including private/non-routable
+    /// ones a real deployment should never hand out (go:
+    /// `network/p2p/p2p.go`'s `addressFilter`, applied via
+    /// `libp2p.AddrsFactory`).
+    ///
+    /// Control case for
+    /// `p2p_host_filter_enabled_does_not_advertise_private_listen_addr_to_peer`
+    /// below: with `filter_advertised_addresses` left at its default
+    /// (`false`, matching a caller-configured specific bind address per
+    /// go's own `needAddressFilter` semantics), `127.0.0.1` — private per
+    /// `manet`'s classification, see `conn_limits::PRIVATE4` — *is*
+    /// advertised, proving the suppression the next test asserts is
+    /// actually caused by the filter being enabled, not by some unrelated
+    /// transport behavior (e.g. address translation) dropping it anyway.
+    #[tokio::test]
+    async fn p2p_host_filter_disabled_advertises_private_listen_addr_to_peer() {
+        let mut listener = new_test_host();
+        let mut dialer = new_test_host();
+
+        let listen_addr = start_listening(&mut listener).await;
+        let listener_peer_id = listener.peer_id();
+        let dial_addr = listen_addr
+            .clone()
+            .with(libp2p::multiaddr::Protocol::P2p(listener_peer_id));
+        dialer.dial(dial_addr).expect("dial should be accepted");
+
+        let info = identify_info_dialer_receives_from(&mut listener, &mut dialer).await;
+        assert!(
+            info.listen_addrs.contains(&listen_addr),
+            "filter disabled must still advertise every listen address unmodified, got: {:?}",
+            info.listen_addrs
+        );
+    }
+
+    /// See `p2p_host_filter_disabled_advertises_private_listen_addr_to_peer`
+    /// above for the control case this proves against. With
+    /// `filter_advertised_addresses: true` (go: `needAddressFilter` — this
+    /// host is listening on an "all interfaces" address), the same private
+    /// `127.0.0.1` listen address must never reach a peer's `identify`
+    /// view of this host, matching go's `TestP2PMakeHostAddressFilter`
+    /// scenario (`network/p2p/p2p_test.go`).
+    #[tokio::test]
+    async fn p2p_host_filter_enabled_does_not_advertise_private_listen_addr_to_peer() {
+        let filtering_cfg = P2pHostConfig {
+            filter_advertised_addresses: true,
+            ..P2pHostConfig::default()
+        };
+        let mut listener = P2pHost::new(&loopback_identity(), TEST_NETWORK_ID, &filtering_cfg)
+            .expect("host with address filter enabled");
+        let mut dialer = new_test_host();
+
+        let listen_addr = start_listening(&mut listener).await;
+        let listener_peer_id = listener.peer_id();
+        let dial_addr = listen_addr
+            .clone()
+            .with(libp2p::multiaddr::Protocol::P2p(listener_peer_id));
+        dialer.dial(dial_addr).expect("dial should be accepted");
+
+        let info = identify_info_dialer_receives_from(&mut listener, &mut dialer).await;
+        assert!(
+            !info.listen_addrs.contains(&listen_addr),
+            "a private listen address (127.0.0.1) must never be advertised to a peer via \
+             identify once the host's address filter is enabled, got: {:?}",
+            info.listen_addrs
+        );
     }
 
     /// Go: `TestP2PGetPeersTransportConnections` (`network/p2pNetwork_test.go`)
@@ -2308,6 +2429,7 @@ mod tests {
             incoming_connections_limit: 2400,
             is_listen_server: true,
             enable_dht_providers: false,
+            filter_advertised_addresses: false,
         };
         let host = P2pHost::new(&loopback_identity(), TEST_NETWORK_ID, &host_cfg)
             .expect("host with listen-server config");
@@ -2331,6 +2453,7 @@ mod tests {
             incoming_connections_limit: 1,
             is_listen_server: true,
             enable_dht_providers: false,
+            filter_advertised_addresses: false,
         };
         assert_eq!(
             derive_conn_limits(0, 1, true, false).rcmgr_conns_inbound,
