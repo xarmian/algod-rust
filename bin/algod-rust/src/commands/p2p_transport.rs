@@ -1236,11 +1236,25 @@ impl P2pTransport {
             data_dir: cfg.data_dir.clone(),
             persist_peer_id: cfg.persist_peer_id,
         };
+        // Go: the `needAddressFilter` local in `MakeHost` (`network/p2p/
+        // p2p.go`) — enabled only when the configured listen address is
+        // "all interfaces" (`0.0.0.0`/`::`), never for a caller-configured
+        // specific bind address. Computed here (rather than inside
+        // `P2pHost::new`) because `listen_multiaddr` is this crate's
+        // already-parsed equivalent of go's `parsedListenAddr`, and
+        // `P2pHost::listen` — the call that actually starts listening on it
+        // — only happens after `P2pHost::new` returns; see
+        // `algo_p2p::filtered_identify`'s doc comment (issue #1444).
+        let filter_advertised_addresses = cfg
+            .listen_multiaddr
+            .as_ref()
+            .is_some_and(algo_p2p::conn_limits::is_ip_unspecified);
         let host_cfg = P2pHostConfig {
             gossip_fanout: cfg.gossip_fanout,
             incoming_connections_limit: cfg.incoming_connections_limit,
             is_listen_server: cfg.is_listen_server,
             enable_dht_providers: cfg.enable_dht_providers,
+            filter_advertised_addresses,
         };
         let mut host = P2pHost::new(&identity_cfg, &cfg.network_id, &host_cfg)
             .map_err(|e| anyhow::anyhow!("failed to build P2P host: {e}"))?;

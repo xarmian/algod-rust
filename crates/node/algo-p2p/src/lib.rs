@@ -48,6 +48,7 @@ pub mod conn_limits;
 pub mod dht;
 pub mod dnsaddr;
 pub mod errors;
+pub mod filtered_identify;
 pub mod host;
 pub mod httpproto;
 pub mod identity;
