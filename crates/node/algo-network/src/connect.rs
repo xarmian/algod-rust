@@ -49,7 +49,7 @@ use crate::handshake::{
 };
 use crate::identity::{
     attach_challenge_header, build_identity_verification, generate_challenge,
-    verify_challenge_response, IdentityChallengeValue,
+    verify_challenge_response, IdentityChallengeValue, IdentityDedupHook,
 };
 use crate::limitcaller::{rate_limited_call, RateLimitError, DEFAULT_QUEUEING_TIMEOUT};
 use crate::message::OutgoingMessage;
@@ -155,6 +155,14 @@ pub struct ConnectConfig {
     /// and accepted, matching go's `wsNetwork.go:665-669` fallback. See
     /// [`crate::handshake::effective_protocol_versions`].
     pub network_protocol_version: String,
+
+    /// Cross-connection/cross-transport duplicate-identity hook (issue
+    /// #1445), consulted once this outbound connection's identity has been
+    /// verified (`our_identity_key` was set and the peer completed the
+    /// challenge/response exchange). `None` (the default) skips the check
+    /// entirely — matches go's non-participating default. See
+    /// [`IdentityDedupHook`]'s doc comment.
+    pub identity_dedup_hook: Option<Arc<dyn IdentityDedupHook>>,
 }
 
 impl Default for ConnectConfig {
@@ -172,6 +180,7 @@ impl Default for ConnectConfig {
             peer_config: None,
             max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
             network_protocol_version: String::new(),
+            identity_dedup_hook: None,
         }
     }
 }
@@ -455,6 +464,28 @@ async fn try_connect_inner(
     };
 
     let identity_verified = id_verification_bytes.is_some();
+
+    // Step 10.5 (issue #1445): cross-connection/cross-transport duplicate
+    // detection. If this connection's identity was verified and a dedup
+    // hook is configured, claim it before spending any effort constructing
+    // the `WsPeer` — a `false` result means a different, already-live
+    // connection (possibly on the other transport leg, in `Hybrid` mode)
+    // already holds this identity, so this connection is the redundant one
+    // and must not be established at all. Mirrors go's
+    // `identityVerificationHandler` closing the loser.
+    if identity_verified {
+        if let (Some(hook), Some(peer_key)) = (&config.identity_dedup_hook, identity_key) {
+            if !hook.claim(addr, peer_key) {
+                tracing::info!(
+                    addr = %addr,
+                    peer_key = ?peer_key,
+                    "duplicate identity detected on outbound connection; abandoning \
+                     (already connected to this peer via another connection)"
+                );
+                return Err(WsConnectError::DuplicateIdentity);
+            }
+        }
+    }
 
     // Step 11: Create and start WsPeer
     let closing = CancellationToken::new();

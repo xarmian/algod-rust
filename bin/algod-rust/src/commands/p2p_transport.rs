@@ -76,7 +76,7 @@ use algo_network::ws_network::{
 };
 use algo_network::ws_peer::{compress_outgoing_vote, decompress_incoming_vote_core};
 use algo_network::{
-    encode_uvarint, hash_topics, ForwardingPolicy, GossipNode, IncomingMessage,
+    encode_uvarint, hash_topics, ForwardingPolicy, GossipNode, IdentityDedupHook, IncomingMessage,
     NetworkAdvanceMonitor, Peer, PeerError, PeerOption, RequestTracker, Router, Tag,
     DEFAULT_REQUEST_TIMEOUT, MAX_MESSAGE_QUEUE_DURATION, RESPONSE_HASH_FIELD,
 };
@@ -1277,6 +1277,35 @@ fn split_peer_id(addr: &Multiaddr) -> (Multiaddr, Option<PeerId>) {
     (base, peer)
 }
 
+/// Recover the Ed25519 public key a `PeerId` was derived from (issue
+/// #1445's cross-transport dedup: the WS leg's netidentity exchange deals
+/// in [`ed25519_dalek::VerifyingKey`]s, so a P2P connection's identity must
+/// be expressed the same way to compare against the WS leg's claim table).
+///
+/// This is possible without any extra protocol round-trip because of how
+/// libp2p derives `PeerId`s: `PeerId::from_public_key` wraps the
+/// protobuf-encoded public key in an *identity* multihash (code `0x00`,
+/// i.e. the multihash's digest bytes ARE the encoded key verbatim) whenever
+/// that encoding is small enough — `MAX_INLINE_KEY_LENGTH` (42 bytes), a
+/// threshold every Ed25519 key's ~37-byte protobuf encoding is always under
+/// (`libp2p_identity::peer_id`). Since [`algo_p2p::to_identity_signing_key`]
+/// only ever produces Ed25519 P2P identities, every `PeerId` this crate
+/// deals with satisfies that, so the public key is always recoverable
+/// straight from the `PeerId` itself — no separate identify-protocol
+/// exchange needed. `None` only for a `PeerId` that is somehow not an
+/// inlined Ed25519 key (defensive — shouldn't happen given the above).
+fn peer_id_to_verifying_key(peer_id: &PeerId) -> Option<ed25519_dalek::VerifyingKey> {
+    use libp2p::identity::PublicKey;
+
+    let multihash: &libp2p::multihash::Multihash<64> = peer_id.as_ref();
+    if multihash.code() != 0x00 {
+        return None;
+    }
+    let public_key = PublicKey::try_decode_protobuf(multihash.digest()).ok()?;
+    let ed25519_public_key = public_key.try_into_ed25519().ok()?;
+    ed25519_dalek::VerifyingKey::from_bytes(&ed25519_public_key.to_bytes()).ok()
+}
+
 /// A running libp2p P2P transport: owns a background task driving an
 /// `algo_p2p::P2pHost`'s swarm event loop, subscribed to every
 /// go-compatible-convention propagation topic this crate defines
@@ -1329,6 +1358,15 @@ pub struct P2pTransport {
     /// `baseWsStreamHandler` does: keep the first, close the second.
     #[cfg_attr(not(test), allow(dead_code))]
     identity_tracker: Arc<Mutex<IdentityTracker<PeerId, ConnectionId>>>,
+    /// Cross-transport duplicate-identity hook (issue #1445), consulted in
+    /// addition to `identity_tracker` above whenever a *new* `PeerId`
+    /// connection is established (i.e. `identity_tracker.set_identity`
+    /// already returned `true` for it) — mirrors go's hybrid-mode
+    /// `identityTracker` being shared between `wsNetwork` and
+    /// `p2pNetwork`. `None` (the default) skips the check entirely, e.g.
+    /// in `P2pOnly` mode where there is no other transport to dedup
+    /// against. Set via [`Self::set_identity_dedup_hook`].
+    identity_dedup_hook: Arc<Mutex<Option<Arc<dyn IdentityDedupHook>>>>,
     /// HTTP handlers registered via [`GossipNode::register_http_handler`],
     /// served over inbound `/algorand-http/1.0.0` streams (issue #1024) —
     /// the P2P-transport counterpart of [`algo_p2p::ALGORAND_HTTP_PROTOCOL`]
@@ -1611,6 +1649,11 @@ impl P2pTransport {
         let stream_generation: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let identity_tracker: Arc<Mutex<IdentityTracker<PeerId, ConnectionId>>> =
             Arc::new(Mutex::new(IdentityTracker::new()));
+        // Issue #1445: cross-transport dedup hook, `None` until
+        // `set_identity_dedup_hook` is called (e.g. by `participate.rs`'s
+        // `Hybrid`-mode construction).
+        let identity_dedup_hook: Arc<Mutex<Option<Arc<dyn IdentityDedupHook>>>> =
+            Arc::new(Mutex::new(None));
         // `EnableGossipService` (issue #1442): peers whose libp2p connection
         // to us was inbound (they dialed us) while our own gossip service
         // is disabled — mirrors go's `streamManager.allowIncomingGossip`
@@ -1743,6 +1786,7 @@ impl P2pTransport {
         let sp_for_task = Arc::clone(&stream_peers);
         let gen_counter_for_task = Arc::clone(&stream_generation);
         let identity_tracker_for_task = Arc::clone(&identity_tracker);
+        let identity_dedup_hook_for_task = Arc::clone(&identity_dedup_hook);
         let blocked_inbound_gossip_peers_for_task = Arc::clone(&blocked_inbound_gossip_peers);
         // Periodic DHT-driven mesh discovery (issue #1073): captured before
         // `cfg` is otherwise consumed below (`cfg.network_id` moves into
@@ -1900,6 +1944,45 @@ impl P2pTransport {
                                     continue;
                                 }
 
+                                // Cross-transport duplicate-identity dedup
+                                // (issue #1445): only reached once this is a
+                                // genuinely *new* `PeerId` for this P2P leg
+                                // (the intra-P2P check above passed). If a
+                                // dedup hook is configured (`Hybrid` mode)
+                                // and this peer's public key — recoverable
+                                // directly from `PeerId` since libp2p's
+                                // Noise handshake authenticates it and small
+                                // (Ed25519) keys are inlined into the peer
+                                // ID itself, see `peer_id_to_verifying_key` —
+                                // is already claimed by a connection on the
+                                // *other* transport leg (the WS leg, tagged
+                                // `IdentityLeg::Ws`), this P2P connection is
+                                // the redundant one: close it and don't open
+                                // an `/algorand-ws` stream for it either.
+                                if let Some(hook) = identity_dedup_hook_for_task
+                                    .lock()
+                                    .expect("identity_dedup_hook mutex poisoned")
+                                    .clone()
+                                {
+                                    if let Some(verifying_key) = peer_id_to_verifying_key(&peer_id)
+                                    {
+                                        if !hook.claim(&peer_id.to_string(), verifying_key) {
+                                            tracing::info!(
+                                                %peer_id, ?connection_id,
+                                                "P2P: closing connection — identity already \
+                                                 claimed by another connection on a different \
+                                                 transport leg"
+                                            );
+                                            identity_tracker_for_task
+                                                .lock()
+                                                .expect("identity_tracker mutex poisoned")
+                                                .remove_identity(&peer_id, &connection_id);
+                                            let _ = host.close_connection(connection_id);
+                                            continue;
+                                        }
+                                    }
+                                }
+
                                 cp.lock().expect("connected_peers mutex poisoned").push(peer_id);
 
                                 // `EnableGossipService` (issue #1442): mirrors
@@ -1985,6 +2068,20 @@ impl P2pTransport {
                                     .lock()
                                     .expect("identity_tracker mutex poisoned")
                                     .remove_identity(&peer_id, &connection_id);
+                                // Issue #1445: release this connection's
+                                // cross-transport identity claim (if any),
+                                // so a future connection (e.g. this peer
+                                // reconnecting) can claim it again.
+                                if let Some(hook) = identity_dedup_hook_for_task
+                                    .lock()
+                                    .expect("identity_dedup_hook mutex poisoned")
+                                    .clone()
+                                {
+                                    if let Some(verifying_key) = peer_id_to_verifying_key(&peer_id)
+                                    {
+                                        hook.release(&peer_id.to_string(), &verifying_key);
+                                    }
+                                }
                                 cp.lock()
                                     .expect("connected_peers mutex poisoned")
                                     .retain(|p| *p != peer_id);
@@ -2085,6 +2182,7 @@ impl P2pTransport {
             cmd_tx,
             stream_peers,
             identity_tracker,
+            identity_dedup_hook,
             http_router,
             http_stream_control,
             network_advance_monitor: Arc::new(std::sync::Mutex::new(NetworkAdvanceMonitor::new())),
@@ -2113,6 +2211,23 @@ impl P2pTransport {
     /// issue #1133).
     pub fn identity_signing_key(&self) -> ed25519_dalek::SigningKey {
         self.identity_signing_key.clone()
+    }
+
+    /// Configure the cross-transport duplicate-identity hook (issue
+    /// #1445), consulted on every new `PeerId` connection this transport
+    /// establishes (after this leg's own intra-P2P `identity_tracker`
+    /// dedup already accepted it). `participate.rs`'s `Hybrid`-mode
+    /// construction wires this to the same
+    /// `dual_gossip_node::HybridIdentityCoordinator` (via a
+    /// `dual_gossip_node::LegIdentityDedupHook` tagged `IdentityLeg::P2p`)
+    /// that `algo_network::WebsocketNetwork::set_identity` is wired to for
+    /// the WS leg — both consulting the same shared claim table is what
+    /// makes cross-transport dedup work at all.
+    pub fn set_identity_dedup_hook(&self, hook: Arc<dyn IdentityDedupHook>) {
+        *self
+            .identity_dedup_hook
+            .lock()
+            .expect("identity_dedup_hook mutex poisoned") = Some(hook);
     }
 
     /// Addresses this host has confirmed it is listening on (populated as

@@ -192,6 +192,7 @@ async fn test_rust_relay_forwards_messages() {
         peer_config: None,
         max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
         network_protocol_version: String::new(),
+        identity_dedup_hook: None,
     };
 
     let mut handle = try_connect(rust_relay_host_port, &config)

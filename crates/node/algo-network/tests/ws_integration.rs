@@ -192,6 +192,7 @@ async fn default_connect_config() -> ConnectConfig {
         peer_config: None,
         max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
         network_protocol_version: String::new(),
+        identity_dedup_hook: None,
     }
 }
 
@@ -527,6 +528,7 @@ async fn test_reconnect_supervisor_connects() {
                     peer_config: None,
                     max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
                     network_protocol_version: String::new(),
+                    identity_dedup_hook: None,
                 };
 
                 let handle = try_connect(&addr, &config)
@@ -617,6 +619,7 @@ async fn test_reconnect_after_failure() {
                     peer_config: None,
                     max_header_bytes: algo_network::connect::DEFAULT_MAX_HEADER_BYTES,
                     network_protocol_version: String::new(),
+                    identity_dedup_hook: None,
                 };
 
                 let handle = try_connect(&real_addr, &config)

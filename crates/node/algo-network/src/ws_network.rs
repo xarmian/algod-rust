@@ -60,6 +60,7 @@ use axum::extract::ws::WebSocket;
 use axum::extract::{ConnectInfo, Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::Router;
+use ed25519_dalek::SigningKey;
 use http::{HeaderMap, HeaderName, StatusCode};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -73,6 +74,7 @@ use crate::gossip_node::{GossipNode, Peer, PeerOption};
 use crate::handler::{Multiplexer, TaggedMessageHandler, TaggedMessageValidatorHandler};
 use crate::handshake::{check_protocol_version_match, effective_protocol_versions, VersionMatch};
 use crate::health_service::health_router;
+use crate::identity::{attach_response_header, verify_challenge_and_respond, IdentityDedupHook};
 use crate::mesh::{ConnectFn, MeshRequest, MeshThread, PeerCounter};
 use crate::message::OutgoingMessage;
 use crate::message_filter::{
@@ -85,7 +87,7 @@ use crate::request_response::{encode_uvarint, hash_topics, RESPONSE_HASH_FIELD};
 use crate::request_tracker::ConnectionTracker;
 use crate::tag::Tag;
 use crate::topics::{Topic, Topics};
-use crate::ws_peer::{default_send_message_tags, PeerHandle};
+use crate::ws_peer::{default_send_message_tags, InboundIdentityPending, PeerHandle};
 
 // ---------------------------------------------------------------------------
 // Constants (matching go-algorand defaults)
@@ -664,6 +666,27 @@ pub struct WebsocketNetwork {
     /// shared across every peer this network accepts or dials, so counts
     /// aggregate node-wide traffic exactly like go's package-level vars.
     network_metrics: Arc<crate::metrics::NetworkTagMetrics>,
+
+    // -------------------------------------------------------------------
+    // Cross-connection/cross-transport identity (issue #1445)
+    // -------------------------------------------------------------------
+    /// This node's netidentity signing key, set via [`Self::set_identity`].
+    /// `None` (the default) means identity exchange never runs on this
+    /// leg's live connections — matches go's non-participating default.
+    /// Set post-construction (rather than threaded through
+    /// [`WebsocketNetworkConfig`]) because in `Hybrid` mode the key is the
+    /// P2P transport's own identity key, only known once that transport is
+    /// constructed — see `dual_gossip_node.rs`'s module doc comment.
+    /// `Arc`-wrapped so [`NetworkConnectFn`] (built once, at
+    /// [`Self::start_arc`] time) can share the same live cell rather than
+    /// snapshotting a stale value if `set_identity` is called afterward.
+    identity_signing_key: Arc<std::sync::Mutex<Option<SigningKey>>>,
+    /// Cross-connection/cross-transport duplicate-identity hook, set
+    /// alongside `identity_signing_key` via [`Self::set_identity`]. `None`
+    /// skips the dedup check entirely (identity exchange, if configured,
+    /// still runs and is reflected on the resulting peer, it's just never
+    /// claimed against a shared tracker).
+    identity_dedup_hook: Arc<std::sync::Mutex<Option<Arc<dyn IdentityDedupHook>>>>,
 }
 
 impl WebsocketNetwork {
@@ -734,7 +757,52 @@ impl WebsocketNetwork {
             messages_of_interest: Arc::new(RwLock::new(None)),
             messages_of_interest_refresh_tx: Mutex::new(None),
             network_metrics: Arc::new(crate::metrics::NetworkTagMetrics::new()),
+            identity_signing_key: Arc::new(std::sync::Mutex::new(None)),
+            identity_dedup_hook: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Configure this node's netidentity signing key and
+    /// cross-connection/cross-transport duplicate-identity hook (issue
+    /// #1445), enabling identity exchange on every subsequent live
+    /// connection this network accepts or dials — both the inbound accept
+    /// path ([`gossip_upgrade_handler`]) and the outbound dial paths
+    /// ([`Self::mesh_connect_with_target`]/[`NetworkConnectFn::try_dial`]).
+    ///
+    /// Callable post-construction (rather than via [`WebsocketNetworkConfig`])
+    /// because in `Hybrid` mode `signing_key` is the P2P transport's own
+    /// identity key and `hook` is the shared cross-transport coordinator,
+    /// both of which only exist once that transport is constructed — see
+    /// `dual_gossip_node.rs`'s module doc comment and
+    /// `bin/algod-rust/src/commands/participate.rs`'s `Hybrid`-mode wiring.
+    pub fn set_identity(&self, signing_key: SigningKey, hook: Arc<dyn IdentityDedupHook>) {
+        *self
+            .identity_signing_key
+            .lock()
+            .expect("identity_signing_key mutex poisoned") = Some(signing_key);
+        *self
+            .identity_dedup_hook
+            .lock()
+            .expect("identity_dedup_hook mutex poisoned") = Some(hook);
+    }
+
+    /// This node's own configured public address(es), for the identity
+    /// challenge-response's address-match check (go's
+    /// `identityChallengePublicKeyScheme.VerifyRequestAndAttachResponse`
+    /// checking the initiator's claimed target address against ours). Both
+    /// the statically configured [`WebsocketNetworkConfig::net_address`]
+    /// and the actual bound [`Self::listen_addr`] are included since a
+    /// `net_address` of `"host:0"` (ephemeral port, common in tests) never
+    /// matches what a real dialer used to reach us.
+    fn own_addresses(&self) -> Vec<String> {
+        let mut addrs = Vec::new();
+        if let Some(a) = &self.config.net_address {
+            addrs.push(a.clone());
+        }
+        if let Some(a) = *self.listen_addr.lock().expect("listen_addr mutex poisoned") {
+            addrs.push(a.to_string());
+        }
+        addrs
     }
 
     /// Shared per-wire-tag byte/message traffic counters (issue #1425).
@@ -1188,6 +1256,22 @@ impl WebsocketNetwork {
 
         if let Some(entry) = entry {
             release_throttled_slot(&self.throttled_outgoing_connections, &entry);
+            // Issue #1445: release this connection's identity claim (if
+            // any) so a future connection — e.g. this same peer
+            // reconnecting, or on the other transport leg in `Hybrid`
+            // mode — can claim it again.
+            if entry.handle.identity_verified() {
+                if let Some(identity) = entry.handle.identity() {
+                    if let Some(hook) = self
+                        .identity_dedup_hook
+                        .lock()
+                        .expect("identity_dedup_hook mutex poisoned")
+                        .clone()
+                    {
+                        hook.release(addr, &identity);
+                    }
+                }
+            }
             entry.handle.close();
             tracing::info!(addr = %addr, "peer removed from network");
             true
@@ -1341,6 +1425,20 @@ impl WebsocketNetwork {
             // `MsgDigestSkip` from one peer must never suppress sends to a
             // different one.
             let outgoing_filter = self.new_outgoing_message_filter();
+            // Issue #1445: thread this network's identity signing key (if
+            // configured via `set_identity`) and dedup hook into this dial
+            // path too — mirrors the filters above, and matches
+            // `NetworkConnectFn::try_dial`'s identical wiring.
+            let our_identity_key = self
+                .identity_signing_key
+                .lock()
+                .expect("identity_signing_key mutex poisoned")
+                .clone();
+            let identity_dedup_hook = self
+                .identity_dedup_hook
+                .lock()
+                .expect("identity_dedup_hook mutex poisoned")
+                .clone();
             let connect_config = ConnectConfig {
                 genesis_id: self.config.genesis_id.clone(),
                 our_features: crate::peer_features::advertise_vote_compression(
@@ -1356,6 +1454,8 @@ impl WebsocketNetwork {
                     ..crate::ws_peer::WsPeerConfig::default()
                 }),
                 network_protocol_version: self.config.network_protocol_version.clone(),
+                our_identity_key,
+                identity_dedup_hook,
                 ..ConnectConfig::default()
             };
 
@@ -2251,6 +2351,11 @@ struct NetworkConnectFn {
     /// mesh-dial traffic is counted alongside directly-dialed and inbound
     /// peers' — matching go's process-global counters.
     network_metrics: Arc<crate::metrics::NetworkTagMetrics>,
+    /// Issue #1445: shared with [`WebsocketNetwork::identity_signing_key`] —
+    /// see that field's doc comment.
+    identity_signing_key: Arc<std::sync::Mutex<Option<SigningKey>>>,
+    /// Issue #1445: shared with [`WebsocketNetwork::identity_dedup_hook`].
+    identity_dedup_hook: Arc<std::sync::Mutex<Option<Arc<dyn IdentityDedupHook>>>>,
 }
 
 impl ConnectFn for NetworkConnectFn {
@@ -2268,6 +2373,16 @@ impl ConnectFn for NetworkConnectFn {
         let enable_vote_compression = self.enable_vote_compression;
         let network_protocol_version = self.network_protocol_version.clone();
         let network_metrics = Arc::clone(&self.network_metrics);
+        let our_identity_key = self
+            .identity_signing_key
+            .lock()
+            .expect("identity_signing_key mutex poisoned")
+            .clone();
+        let identity_dedup_hook = self
+            .identity_dedup_hook
+            .lock()
+            .expect("identity_dedup_hook mutex poisoned")
+            .clone();
         // Issue #803: build a fresh outgoing filter for *this* connection —
         // never reuse an instance across dials, or one peer's
         // `MsgDigestSkip` would suppress sends to a different peer.
@@ -2295,6 +2410,8 @@ impl ConnectFn for NetworkConnectFn {
                     ..WsPeerConfig::default()
                 }),
                 network_protocol_version: network_protocol_version.clone(),
+                our_identity_key,
+                identity_dedup_hook,
                 ..ConnectConfig::default()
             };
 
@@ -2556,6 +2673,11 @@ impl WebsocketNetwork {
             conn_perf_monitor: Arc::clone(&self.conn_perf_monitor),
             throttled_outgoing_connections: Arc::clone(&self.throttled_outgoing_connections),
             network_metrics: Arc::clone(&self.network_metrics),
+            // Issue #1445: share the live cells (not a snapshot) so a
+            // `set_identity` call after `start_arc()` still takes effect on
+            // this dial path.
+            identity_signing_key: Arc::clone(&self.identity_signing_key),
+            identity_dedup_hook: Arc::clone(&self.identity_dedup_hook),
         };
 
         let peer_counter = NetworkPeerCounter {
@@ -2958,6 +3080,66 @@ async fn gossip_upgrade_handler(
             .expect("valid header value"),
     );
 
+    // Identity challenge/response (issue #1445, message 1/2 of go's
+    // netidentity exchange — `network/netidentity.go`). Only runs when this
+    // node has a signing key configured (via `set_identity`, e.g. the
+    // `Hybrid`-mode wiring in `dual_gossip_node.rs`) *and* the client sent a
+    // signed `X-Algorand-IdentityChallenge` header — otherwise identity
+    // exchange is skipped entirely, exactly like a client with no identity
+    // key (`client_without_identity_key_connects_without_error`). Message 3
+    // (verifying the client actually holds the claimed key) is handled
+    // asynchronously by the inbound read loop once the connection is
+    // upgraded — see `PeerHandle::new_inbound`'s doc comment.
+    let identity_pending = network
+        .identity_signing_key
+        .lock()
+        .expect("identity_signing_key mutex poisoned")
+        .clone()
+        .and_then(|signing_key| {
+            let challenge_header = headers
+                .get(HeaderName::from_static("x-algorand-identitychallenge"))
+                .and_then(|v| v.to_str().ok())?;
+            let our_addresses = network.own_addresses();
+            let our_addresses_refs: Vec<&str> =
+                our_addresses.iter().map(String::as_str).collect();
+            match verify_challenge_and_respond(challenge_header, &signing_key, &our_addresses_refs)
+            {
+                Ok((response_signed, response_challenge, peer_public_key)) => {
+                    // Same header name as the request side
+                    // (`x-algorand-identitychallenge`) — request and
+                    // response headers are different namespaces, so go
+                    // reuses one constant for both directions (see
+                    // `connect.rs::extract_and_verify_identity`, the
+                    // existing, already-tested outbound counterpart of
+                    // this lookup).
+                    response_headers.insert(
+                        HeaderName::from_static("x-algorand-identitychallenge"),
+                        attach_response_header(&response_signed)
+                            .parse()
+                            .expect("valid header value"),
+                    );
+                    let dedup_hook = network
+                        .identity_dedup_hook
+                        .lock()
+                        .expect("identity_dedup_hook mutex poisoned")
+                        .clone();
+                    Some(InboundIdentityPending {
+                        expected_challenge: response_challenge,
+                        peer_public_key,
+                        dedup_hook,
+                    })
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        addr = %remote_addr,
+                        error = %e,
+                        "inbound: identity challenge present but not verified; skipping identity exchange"
+                    );
+                    None
+                }
+            }
+        });
+
     // Perform the WebSocket upgrade and attach the response headers
     // to the 101 Switching Protocols response.
     let network_clone = Arc::clone(&network);
@@ -2994,6 +3176,7 @@ async fn gossip_upgrade_handler(
                 // folds in the (untrusted) `X-Algorand-Location` header value
                 // per `resolve_incoming_peer_address`'s doc comment above.
                 Some(tracking_ip.to_string()),
+                identity_pending,
             )
         })
         .into_response();
@@ -3015,6 +3198,7 @@ async fn gossip_upgrade_handler(
 ///
 /// On disconnect, the peer is removed from the peer map and the
 /// connection tracking slot is released.
+#[allow(clippy::too_many_arguments)]
 async fn handle_gossip_websocket(
     network: Arc<WebsocketNetwork>,
     socket: WebSocket,
@@ -3026,6 +3210,9 @@ async fn handle_gossip_websocket(
     // `PeerHandle::new_inbound`'s `RoutingAddr()` normalization — see
     // `resolve_incoming_peer_address`'s caller for what this is.
     origin_address: Option<String>,
+    // Issue #1445: message 1/2 result, if identity exchange started — see
+    // `gossip_upgrade_handler`'s doc comment on this variable.
+    identity_pending: Option<InboundIdentityPending>,
 ) {
     // Connection is already tracked by validate_incoming_connection().
 
@@ -3064,6 +3251,7 @@ async fn handle_gossip_websocket(
         // Issue #1453: this connection's claimed origin address, for
         // `RoutingAddr()` normalization.
         origin_address,
+        identity_pending,
     );
 
     // Register the inbound peer in the peer map via add_peer, which

@@ -69,6 +69,45 @@ use serde::{Deserialize, Serialize};
 use super::errors::IdentityError;
 
 // ---------------------------------------------------------------------------
+// Cross-connection/cross-transport duplicate-identity hook (issue #1445)
+// ---------------------------------------------------------------------------
+
+/// Consulted once a live connection's identity has been verified (either
+/// direction, either transport leg), to detect that the *same* logical peer
+/// is already connected over a different connection — including, in
+/// `Hybrid` mode, a different transport entirely (WS vs. P2P).
+///
+/// Mirrors go-algorand's `identityTracker` interface
+/// (`network/identityTracker.go`), consulted from
+/// `identityVerificationHandler`/`p2pNetwork.go`'s `ConnectionEstablished`
+/// handling: `setIdentity` returning `false` means a different connection
+/// already holds this identity, and the caller closes the newer one.
+///
+/// `bin/algod-rust/src/commands/dual_gossip_node.rs`'s
+/// `HybridIdentityCoordinator` is the production implementation, wrapping a
+/// shared `algo_p2p::IdentityTracker` so the WS leg (via
+/// `crate::ws_network::WebsocketNetwork::set_identity`, both the inbound
+/// accept path and the outbound dial path) and the P2P leg
+/// (`bin/algod-rust/src/commands/p2p_transport.rs`) can both consult the
+/// same underlying claim table.
+pub trait IdentityDedupHook: Send + Sync {
+    /// Claim `identity` for `conn` (an opaque, connection-unique key — e.g.
+    /// a WS peer's remote address). Returns `false` if a *different*
+    /// connection already holds this identity: the caller must then treat
+    /// this connection as the redundant one and close it, mirroring go's
+    /// `identityTracker.setIdentity` contract.
+    fn claim(&self, conn: &str, identity: VerifyingKey) -> bool;
+
+    /// Release `conn`'s claim on `identity` (called when the connection is
+    /// torn down), so a future connection can claim it again. A no-op if
+    /// `conn` does not currently hold the claim (e.g. it already lost the
+    /// race to a different connection) — mirrors
+    /// `identityTracker.removeIdentity`'s "only the owner can evict itself"
+    /// contract.
+    fn release(&self, conn: &str, identity: &VerifyingKey);
+}
+
+// ---------------------------------------------------------------------------
 // Constants — sourced directly from go-algorand
 // ---------------------------------------------------------------------------
 
