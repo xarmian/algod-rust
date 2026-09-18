@@ -2685,6 +2685,71 @@ mod tests {
         assert!(validate_transaction_group(&signed).is_ok());
     }
 
+    /// Parity with go-algorand's `TestGroupTransactionsDifferentSizes`
+    /// (`test/e2e-go/features/transactions/group_test.go#L106`): go's test
+    /// sweeps `goodGroupSizes := []int{1, 2, 3, maxTxGroupSize}` (1, 2, 3, 16)
+    /// and asserts each one submits successfully, then constructs a group of
+    /// `maxTxGroupSize+1` (17) and asserts it is rejected. This exercises
+    /// **pool-admission** (fresh-submission) semantics specifically —
+    /// including the `gs=1` case, where go's client still computes and
+    /// stamps a real (non-zero) `Group` field on a lone transaction — so this
+    /// uses `validate_transaction_group_strict`, the pool-admission variant
+    /// that (unlike the lenient block-replay `validate_transaction_group`)
+    /// does not skip single-member groups. `test_group_too_large_fails`
+    /// above already pins the 17-member rejection under the lenient variant;
+    /// this test additionally sweeps every size go's test names and uses the
+    /// strict/submission-path function.
+    #[test]
+    fn test_group_various_sizes_accepted_max_plus_one_rejected_strict() {
+        for gs in [1usize, 2, 3, MAX_GROUP_SIZE] {
+            let base = make_valid_txn();
+            let txns: Vec<Transaction> = (0..gs)
+                .map(|i| {
+                    let mut t = base.clone();
+                    t.amount = i as u64;
+                    t
+                })
+                .collect();
+            let gid = compute_group_id(&txns);
+            let signed: Vec<SignedTransaction> = txns
+                .into_iter()
+                .map(|mut t| {
+                    t.group = *gid.as_bytes();
+                    wrap_signed(t)
+                })
+                .collect();
+            assert!(
+                validate_transaction_group_strict(&signed).is_ok(),
+                "group of size {gs} should be accepted"
+            );
+        }
+
+        // maxTxGroupSize + 1 (17) must be rejected the same way under the
+        // strict/submission path.
+        let bad_size = MAX_GROUP_SIZE + 1;
+        let base = make_valid_txn();
+        let txns: Vec<Transaction> = (0..bad_size)
+            .map(|i| {
+                let mut t = base.clone();
+                t.amount = i as u64;
+                t
+            })
+            .collect();
+        let gid = compute_group_id(&txns);
+        let signed: Vec<SignedTransaction> = txns
+            .into_iter()
+            .map(|mut t| {
+                t.group = *gid.as_bytes();
+                wrap_signed(t)
+            })
+            .collect();
+        let err = validate_transaction_group_strict(&signed).unwrap_err();
+        assert!(
+            err.to_string().contains("maximum"),
+            "expected max group size error, got: {err}"
+        );
+    }
+
     #[test]
     fn test_valid_group_passes() {
         let txn1 = make_valid_txn();
