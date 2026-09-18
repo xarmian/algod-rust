@@ -3183,6 +3183,205 @@ mod tests {
         assert_eq!(received.tag, Tag::Transaction);
     }
 
+    /// Issue #1446 (Phase 17 network parity, batch 7 / #1415): mirrors go's
+    /// `TestP2PSubmitTXNoGossip` (`network/p2pNetwork_test.go:159`) exactly
+    /// — a 3-node topology where a relay node (`netA`, force-fetch enabled)
+    /// broadcasts transactions to a second relay node (`netB`, also
+    /// force-fetch enabled) and a third, NPN-mode node (`netC`: no listen
+    /// address, `relay_messages: false`, `force_fetch_transactions: false`,
+    /// dialed via `netA`'s address exactly like go's `phoneBookAddresses`).
+    /// go's assertion is two-sided: `netB` must receive every broadcast tx
+    /// (`netBpeerStatsA.txReceived.Load() == 10`), while `netC` must never
+    /// even get a `peerStats` entry for `netA` — i.e. it never processes an
+    /// inbound tx message at all, because `wantTXGossip` (issue #1221) never
+    /// subscribes an NPN node to the `TX` gossipsub topic in the first
+    /// place. This is a genuinely different scenario from the existing
+    /// 2-node `two_transports_connect_and_propagate_a_transaction_over_p2p`
+    /// test above: that test only proves a subscribed pair propagates a tx;
+    /// it says nothing about a third, deliberately-unsubscribed NPN peer
+    /// connected to the same relay simultaneously receiving nothing, which
+    /// is the actual property go's test is pinning down.
+    #[tokio::test]
+    async fn three_node_npn_topology_submitted_tx_reaches_relay_peer_but_not_npn_peer() {
+        // netA: relay / force-fetch, listens — the node the tx is
+        // submitted (broadcast) through, matching go's `netA`.
+        let net_a = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1446".to_string(),
+            listen_multiaddr: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+            bootstrap_peers: vec![],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: false,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: true,
+            relay_messages: false,
+            force_fetch_transactions: true,
+            enable_vote_compression: true,
+            enable_gossip_service: true,
+            disable_v22_protocol: false,
+        })
+        .await
+        .expect("start netA");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while net_a.listen_addrs().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let net_a_listen_addr = net_a
+            .listen_addrs()
+            .first()
+            .cloned()
+            .expect("netA bound an address");
+        let net_a_dial_addr = net_a_listen_addr
+            .clone()
+            .with(Protocol::P2p(net_a.peer_id()));
+
+        // netB: relay / force-fetch, dials netA — matching go's `netB`
+        // (same `cfg` as netA: `ForceFetchTransactions = true`).
+        let net_b = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1446".to_string(),
+            listen_multiaddr: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+            bootstrap_peers: vec![net_a_dial_addr.clone()],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: false,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: true,
+            relay_messages: false,
+            force_fetch_transactions: true,
+            enable_vote_compression: true,
+            enable_gossip_service: true,
+            disable_v22_protocol: false,
+        })
+        .await
+        .expect("start netB");
+
+        // netC: NPN mode — no listen address (mirrors go unsetting
+        // `cfg.NetAddress` so `IsListenServer()` is false), and neither
+        // `relay_messages` nor `force_fetch_transactions`, so `wantTXGossip`
+        // stays undecided and the TX topic is never subscribed at start —
+        // matching go's `netC` exactly.
+        let net_c = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1446".to_string(),
+            listen_multiaddr: None,
+            bootstrap_peers: vec![net_a_dial_addr],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: false,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
+            enable_vote_compression: true,
+            enable_gossip_service: true,
+            disable_v22_protocol: false,
+        })
+        .await
+        .expect("start netC");
+
+        assert_eq!(
+            net_c.want_tx_gossip(),
+            WANT_TX_GOSSIP_UNK,
+            "netC (NPN mode) must never seed wantTXGossip to yes, matching go's netC"
+        );
+        assert!(
+            !net_c.is_gossipsub_subscribed(Tag::Transaction).await,
+            "netC (NPN mode) must not join the TX gossipsub topic at all"
+        );
+
+        // Wait until all three nodes see at least one connected peer,
+        // mirroring go's `netA.hasPeers() && netB.hasPeers() && netC.hasPeers()`.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (net_a.connected_peer_count() == 0
+            || net_b.connected_peer_count() == 0
+            || net_c.connected_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(net_a.connected_peer_count() > 0, "netA should have peers");
+        assert!(net_b.connected_peer_count() > 0, "netB should have peers");
+        assert!(net_c.connected_peer_count() > 0, "netC should have peers");
+
+        // Give the gossipsub mesh time to actually form on the TX topic
+        // between netA and netB (mirrors `connected_pair`'s post-connect
+        // settle time, and go's own `time.Sleep(time.Second)`).
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        net_b
+            .multiplexer()
+            .register_handlers(vec![TaggedMessageHandler {
+                tag: Tag::Transaction,
+                handler: Arc::new(RecordingHandler { tx: tx_b }),
+            }]);
+
+        let (tx_c, mut rx_c) = mpsc::unbounded_channel();
+        net_c
+            .multiplexer()
+            .register_handlers(vec![TaggedMessageHandler {
+                tag: Tag::Transaction,
+                handler: Arc::new(RecordingHandler { tx: tx_c }),
+            }]);
+
+        const NUM_TXNS: usize = 10;
+        for i in 0..NUM_TXNS {
+            net_a
+                .publish(Tag::Transaction, format!("test {i}").into_bytes())
+                .expect("publish");
+        }
+
+        // netB (relay peer) must receive every broadcast transaction.
+        let mut received_by_b = 0usize;
+        let recv_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while received_by_b < NUM_TXNS {
+            let remaining = recv_deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                remaining > std::time::Duration::ZERO,
+                "timed out waiting for netB to receive all {NUM_TXNS} transactions \
+                 (received {received_by_b})"
+            );
+            match tokio::time::timeout(remaining, rx_b.recv()).await {
+                Ok(Some(_msg)) => received_by_b += 1,
+                Ok(None) => panic!("netB's transport task closed its channel"),
+                Err(_) => panic!(
+                    "timed out waiting for netB to receive all {NUM_TXNS} transactions \
+                     (received {received_by_b})"
+                ),
+            }
+        }
+        assert_eq!(received_by_b, NUM_TXNS);
+
+        // netC (NPN peer) must never receive any of them — give it a
+        // generous window to prove absence, not just a first-message race.
+        match tokio::time::timeout(std::time::Duration::from_secs(3), rx_c.recv()).await {
+            Ok(Some(msg)) => panic!(
+                "netC (NPN mode) must never receive TX gossip, but got a message with tag {:?} \
+                 and {} bytes",
+                msg.tag,
+                msg.data.len()
+            ),
+            Ok(None) => panic!("netC's transport task closed its channel unexpectedly"),
+            Err(_) => {
+                // Timed out waiting for a message — exactly what go's test
+                // proves via the absent `peerStats` entry for netA.
+            }
+        }
+        assert!(
+            !net_c.is_gossipsub_subscribed(Tag::Transaction).await,
+            "netC must still not be subscribed to the TX topic after netA's broadcasts"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // P2pTransport as a GossipNode — TDD anchors for #559: outbound local
     // tx propagation and agreement (proposal/vote/bundle) round-trip over

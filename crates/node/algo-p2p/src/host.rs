@@ -66,6 +66,19 @@
 //!   a result for every [`gossipsub::Event::Message`] it receives via
 //!   [`P2pHost::next_event`], or that message is held back from
 //!   re-propagation indefinitely.
+//! - Message IDs (issue #1446): `MessageAuthenticity::Anonymous` means every
+//!   outbound message carries no `source`/`sequence_number`, so
+//!   `libp2p-gossipsub`'s *default* `message_id_fn` (`source + seqno`, both
+//!   absent under Anonymous) degenerates to the same constant ID for every
+//!   message ever published — the second and later distinct messages on a
+//!   topic are then silently dropped by gossipsub's own duplicate cache
+//!   before delivery. go's `network/p2p/pubsub.go` avoids this with a
+//!   content-addressed `pubsub.WithTopicMessageIdFn(txMsgID)` on the TX
+//!   topic (`blake2b.Sum256(m.Data)`); `apply_message_id_fn` below applies
+//!   the equivalent Blake2b-256-of-payload scheme globally (rust-libp2p has
+//!   no per-topic override), which also keeps IHAVE/IWANT message-ID
+//!   comparisons interoperable with a real go-algorand peer on the TX
+//!   topic.
 
 use std::time::Duration;
 
@@ -213,6 +226,25 @@ fn conn_limits_to_libp2p(limits: ConnLimitConfig) -> ConnectionLimits {
         .with_max_established_outgoing(to_connection_limit(limits.rcmgr_conns_outbound))
 }
 
+/// Content-addressed gossipsub message ID: `Blake2b-256(data)`, matching
+/// go's `network/p2p/pubsub.go` `txMsgID` (`blake2b.Sum256(m.Data)`).
+///
+/// Required because this host runs `MessageAuthenticity::Anonymous`
+/// (mirroring go's `StrictNoSign`): `libp2p-gossipsub`'s built-in default
+/// `message_id_fn` hashes `source + sequence_number`, both of which are
+/// absent under Anonymous authenticity, so every message would otherwise
+/// collide on the same ID and only the first message ever published on a
+/// topic would survive gossipsub's own duplicate-message cache. See this
+/// module's doc comment (issue #1446) for the full explanation.
+fn message_id_fn(message: &gossipsub::Message) -> MessageId {
+    use blake2::digest::consts::U32;
+    use blake2::{Blake2b, Digest};
+    type Blake2b256 = Blake2b<U32>;
+    let mut hasher = Blake2b256::new();
+    hasher.update(&message.data);
+    MessageId::from(hasher.finalize().to_vec())
+}
+
 /// Map [`derive_algorand_gossipsub_params`]'s output onto a
 /// [`gossipsub::ConfigBuilder`] — see [`GossipsubMeshParams`]'s doc comment
 /// for the field-name mapping this follows. `DirectConnectInitialDelay`
@@ -356,7 +388,8 @@ impl P2pHost {
                 let mut gossipsub_config_builder = gossipsub::ConfigBuilder::default();
                 gossipsub_config_builder
                     .validation_mode(gossipsub::ValidationMode::Anonymous)
-                    .validate_messages();
+                    .validate_messages()
+                    .message_id_fn(message_id_fn);
                 apply_gossipsub_mesh_params(&mut gossipsub_config_builder, gossipsub_params);
                 let gossipsub_config = gossipsub_config_builder
                     .build()
