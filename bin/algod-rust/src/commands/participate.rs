@@ -4989,17 +4989,34 @@ pub async fn run(
     // (`Hybrid`, via `DualGossipNode`) — matching `network_mode` exactly.
     let p2p_active_gossip_node: Arc<dyn GossipNode> = match (&network_mode, &p2p_transport) {
         (NetworkMode::P2pOnly, Some(p2p)) => p2p.clone() as Arc<dyn GossipNode>,
-        (NetworkMode::Hybrid, Some(p2p)) => Arc::new(dual_gossip_node::DualGossipNode::new(
-            gossip_node.clone() as Arc<dyn GossipNode>,
-            p2p.clone() as Arc<dyn GossipNode>,
-            // Issue #1133: reuse the P2P transport's own identity key as
-            // the signer for the WS leg's netidentity challenges, so a
-            // peer connecting over both transports presents the same
-            // verified key on each and can be recognized as a duplicate
-            // — mirroring go's `NewHybridP2PNetwork` signing its WS
-            // network's identity scheme with `p2pnet.PeerIDSigner()`.
-            p2p.identity_signing_key(),
-        )),
+        (NetworkMode::Hybrid, Some(p2p)) => Arc::new(
+            dual_gossip_node::DualGossipNode::new(
+                gossip_node.clone() as Arc<dyn GossipNode>,
+                p2p.clone() as Arc<dyn GossipNode>,
+                // Issue #1133: reuse the P2P transport's own identity key
+                // as the signer for the WS leg's netidentity challenges,
+                // so a peer connecting over both transports presents the
+                // same verified key on each and can be recognized as a
+                // duplicate — mirroring go's `NewHybridP2PNetwork` signing
+                // its WS network's identity scheme with
+                // `p2pnet.PeerIDSigner()`.
+                p2p.identity_signing_key(),
+            )
+            // Issue #1441: drive the WS-priority/P2P-fallback hybrid mesh
+            // scheduler at go's own `GossipFanout` target — matching
+            // `hybridRelayMeshCreator.create`'s
+            // `withTargetConnCount(wsnet.config.GossipFanout)`. Recomputed
+            // the same way the WS `WebsocketNetworkConfig::gossip_fanout`
+            // field above was (`resolve_gossip_fanout`), since this
+            // `Arc<dyn GossipNode>` construction only has `gossip_node`
+            // (the already-built `WebsocketNetwork`) in scope, not its
+            // config struct.
+            .with_mesh_target_conn_count(resolve_gossip_fanout(
+                &node_config,
+                is_listen_server,
+                peers.len(),
+            )),
+        ),
         _ => gossip_node.clone() as Arc<dyn GossipNode>,
     };
 

@@ -2420,6 +2420,34 @@ impl GossipNode for P2pTransport {
         // separate "reconnect outgoing" hook at this layer yet.
     }
 
+    /// Architectural divergence from go's `P2PNetwork.meshThreadInner`
+    /// (`network/p2pNetwork.go`), documented rather than force-fit: go's
+    /// version synchronously calls `service.DialPeersUntilTargetCount`,
+    /// which blocks until libp2p has dialed enough DHT-discovered peers (or
+    /// gives up), then returns the resulting outgoing peer count — a
+    /// genuine "attempt N dials now, report M achieved" call.
+    ///
+    /// `P2pTransport`'s libp2p swarm/gossipsub/Kademlia stack has no
+    /// equivalent synchronous entry point: peer discovery and mesh
+    /// formation happen continuously on the swarm's own event loop and the
+    /// periodic DHT-refresh task already spawned by `P2pTransport::start`
+    /// (`DHT_MESH_REFRESH_INTERVAL`, this file), driven by libp2p's own
+    /// internal scheduling rather than a caller-supplied target count. This
+    /// call therefore can't *initiate* additional dials the way the WS leg's
+    /// [`mesh_cycle`](GossipNode::mesh_cycle) override can — it reports
+    /// this transport's current connected-peer count (the same value
+    /// `get_peers` would produce), which is exactly the number
+    /// [`HybridMeshScheduler`](../commands/dual_gossip_node/struct.HybridMeshScheduler.html)
+    /// needs to compute how much of the hybrid target the P2P leg is
+    /// already covering, even though — unlike the WS leg — this call
+    /// itself does not cause that number to grow.
+    async fn mesh_cycle(&self, _target_conn_count: usize) -> usize {
+        self.connected_peers
+            .lock()
+            .expect("connected_peers mutex poisoned")
+            .len()
+    }
+
     fn get_peers(&self, _options: &[PeerOption]) -> Vec<Arc<dyn Peer>> {
         // PeerOption filtering (connected-in vs connected-out vs
         // phonebook-relay) has no P2P-side equivalent yet — every
