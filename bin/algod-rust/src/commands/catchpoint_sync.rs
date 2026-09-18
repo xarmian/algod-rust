@@ -1669,6 +1669,7 @@ mod tests {
             relay_messages: false,
             force_fetch_transactions: false,
             enable_vote_compression: true,
+            enable_gossip_service: true,
         })
         .await
         .expect("start listener");
@@ -1699,6 +1700,7 @@ mod tests {
             relay_messages: false,
             force_fetch_transactions: false,
             enable_vote_compression: true,
+            enable_gossip_service: true,
         })
         .await
         .expect("start dialer");
