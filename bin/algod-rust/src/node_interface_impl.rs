@@ -6767,6 +6767,76 @@ mod tests {
         );
     }
 
+    /// go's `TestDevMode` (`../go-algorand/test/e2e-go/features/devmode/devmode_test.go`)
+    /// sends two consecutive transactions after setting a timestamp offset and
+    /// asserts each new block's timestamp equals the *previous* block's
+    /// timestamp plus the offset — i.e. the offset accumulates across
+    /// consecutive dev-mode rounds, not just relative to genesis.
+    /// `dev_block_uses_timestamp_offset` above only proves the single-block
+    /// case (prev == genesis == 0); this proves `produce_dev_block`'s
+    /// `read_block_timestamp(ledger, prev_round)` correctly reads back the
+    /// *offset-modified* timestamp of the immediately preceding block (not a
+    /// stale/reset value) when producing the next one.
+    #[tokio::test]
+    async fn dev_block_uses_timestamp_offset_across_consecutive_blocks() {
+        use algo_types::{Round, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x77u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+
+        adapter
+            .set_block_timestamp_offset(1_000_000)
+            .await
+            .expect("set offset");
+
+        for note in [b"first".to_vec(), b"second".to_vec()] {
+            let txn = Transaction {
+                txn_type: TxnType::Pay,
+                sender,
+                receiver: Address([0x88u8; 32]),
+                amount: 1_000_000,
+                fee: 1000,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                genesis_hash: gh,
+                note: note.into(),
+                ..Default::default()
+            };
+            let stx = sign_txn(&txn, &sender_key);
+            adapter
+                .broadcast_signed_tx_group(vec![stx])
+                .await
+                .expect("dev broadcast");
+        }
+
+        let block_at = |round: u64| {
+            let bytes = ledger
+                .lock()
+                .unwrap()
+                .get_block_data(round)
+                .expect("read block")
+                .expect("block present");
+            algo_codec::decode_block(&bytes).expect("decode block")
+        };
+
+        let genesis_ts = block_at(0).timestamp;
+        let round1_ts = block_at(1).timestamp;
+        let round2_ts = block_at(2).timestamp;
+
+        assert_eq!(
+            round1_ts,
+            genesis_ts + 1_000_000,
+            "round 1 timestamp = genesis + offset",
+        );
+        assert_eq!(
+            round2_ts,
+            round1_ts + 1_000_000,
+            "round 2 timestamp = round 1 timestamp + offset (accumulates, matching go's TestDevMode loop)",
+        );
+    }
+
     /// Debug profiling settings start at `(0, 0)` and round-trip per provided
     /// rate, returning the previous value only for rates that were set — matching
     /// go's `PutDebugSettingsProf`.

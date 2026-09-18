@@ -1890,6 +1890,38 @@ mod tests {
         assert!(verify_sig(&stx).is_ok());
     }
 
+    /// go's `TestBasicMultisig` (`../go-algorand/test/e2e-go/features/multisig/multisig_test.go`)
+    /// creates a 2-of-3 multisig and proves all three broadcast outcomes:
+    /// 1-of-3 rejected (`verify_multisig_below_threshold_fails`), 2-of-3
+    /// accepted (`verify_multisig_2_of_3_passes` above), and 3-of-3 (every
+    /// signer, exceeding the threshold) also accepted. This closes the third
+    /// leg: a fully-signed multisig with more valid signatures than the
+    /// threshold requires must still verify (threshold is a minimum, not an
+    /// exact count).
+    #[test]
+    fn verify_multisig_3_of_3_passes() {
+        let keys: Vec<SigningKey> = (10u8..13).map(signing_key_from_seed).collect();
+        let msig_addr = compute_msig_addr(&keys, 1, 2);
+        let txn = minimal_pay_txn(msig_addr);
+
+        // Sign with all three keys (3 of 3, threshold is 2).
+        let msig = build_multisig(&keys, &[0, 1, 2], 2, &txn);
+
+        let stx = SignedTransaction {
+            txn,
+            sig: [0u8; 64],
+            msig: Some(msig),
+            lsig: None,
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        assert!(verify_multisig(&stx, stx.msig.as_ref().unwrap()).is_ok());
+        assert!(verify_sig(&stx).is_ok());
+    }
+
     #[test]
     fn verify_multisig_below_threshold_fails() {
         let keys: Vec<SigningKey> = (10u8..13).map(signing_key_from_seed).collect();
