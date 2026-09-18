@@ -83,11 +83,14 @@ use tracing::debug;
 pub struct DualGossipNode {
     primary: Arc<dyn GossipNode>,
     secondary: Arc<dyn GossipNode>,
-    /// Not read by any production call site yet — see
-    /// [`HybridIdentityCoordinator`]'s doc comment on what remains for
-    /// live-connection wiring. Exercised directly by this module's tests.
-    #[cfg_attr(not(test), allow(dead_code))]
-    identity: HybridIdentityCoordinator,
+    /// `Arc`-wrapped (issue #1445) so [`Self::identity_arc`] can hand the
+    /// *same* coordinator instance to a [`LegIdentityDedupHook`] wired into
+    /// the WS leg (`algo_network::WebsocketNetwork::set_identity`) and
+    /// another wired into the P2P leg
+    /// (`crate::commands::p2p_transport::P2pTransport::set_identity_dedup_hook`)
+    /// in `participate.rs` — both must consult the *same* claim table for
+    /// cross-transport dedup to work at all.
+    identity: Arc<HybridIdentityCoordinator>,
     /// Overall target outgoing connection count the hybrid mesh scheduler
     /// (issue #1441) drives `primary`/`secondary` toward each cycle. See
     /// [`Self::with_mesh_target_conn_count`].
@@ -115,7 +118,7 @@ impl DualGossipNode {
         Self {
             primary,
             secondary,
-            identity: HybridIdentityCoordinator::new(identity_signing_key),
+            identity: Arc::new(HybridIdentityCoordinator::new(identity_signing_key)),
             mesh_target_conn_count: DEFAULT_GOSSIP_FANOUT,
             mesh_interval: DEFAULT_MESH_INTERVAL,
             mesh_cancel: CancellationToken::new(),
@@ -153,7 +156,19 @@ impl DualGossipNode {
     /// node's WS and P2P legs. See [`HybridIdentityCoordinator`].
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn identity(&self) -> &HybridIdentityCoordinator {
-        &self.identity
+        self.identity.as_ref()
+    }
+
+    /// The same coordinator as [`Self::identity`], `Arc`-cloned (issue
+    /// #1445) so a caller can hand it to [`LegIdentityDedupHook`]s wired
+    /// into the underlying WS and P2P transports *before* this
+    /// `DualGossipNode` itself is wrapped in its own `Arc` — see
+    /// `participate.rs`'s `Hybrid`-mode construction, which needs the
+    /// coordinator to call `WebsocketNetwork::set_identity`/
+    /// `P2pTransport::set_identity_dedup_hook` on the concrete transports
+    /// in scope there.
+    pub fn identity_arc(&self) -> Arc<HybridIdentityCoordinator> {
+        Arc::clone(&self.identity)
     }
 }
 
@@ -273,10 +288,8 @@ impl HybridMeshScheduler {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IdentityLeg {
     /// The classic WS-gossip transport.
-    #[cfg_attr(not(test), allow(dead_code))]
     Ws,
     /// The libp2p P2P transport.
-    #[cfg_attr(not(test), allow(dead_code))]
     P2p,
 }
 
@@ -314,28 +327,35 @@ pub struct IdentityConnId {
 /// reproduces go's `identityVerificationHandler` duplicate-connection
 /// decision via the shared [`algo_p2p::IdentityTracker`].
 ///
-/// What is *not* included here — matching this codebase's existing,
-/// explicitly-scoped precedent in `algo_p2p::identity_tracker`'s own doc
-/// comment — is wiring this coordinator into `ws_network.rs`'s live
-/// connection-accept/-dial path so a real inbound/outbound WS handshake
-/// actually carries an `X-Algorand-IdentityChallenge` header. Today no
-/// production code path sets `algo_network::ConnectConfig::our_identity_key`
-/// at all (WS-gossip's identity exchange is exercised only by
-/// `algo-network`'s own tests), so wiring *this* coordinator's key into
-/// live WS connections is a materially larger, pre-existing gap than
-/// hybrid-mode cross-transport dedup specifically — tracked as a follow-up
-/// rather than folded into this issue.
+/// ## Live wiring (issue #1445)
+///
+/// [`LegIdentityDedupHook`] (below) is the piece that closes the gap this
+/// doc comment used to describe: it adapts `claim_identity`/
+/// `release_identity` into `algo_network::IdentityDedupHook`, and
+/// `participate.rs`'s `Hybrid`-mode construction wires one instance (tagged
+/// [`IdentityLeg::Ws`]) into `algo_network::WebsocketNetwork::set_identity`
+/// (both the inbound accept path and the outbound dial paths — see that
+/// method's doc comment) and another (tagged [`IdentityLeg::P2p`]) into
+/// `crate::commands::p2p_transport::P2pTransport::set_identity_dedup_hook`,
+/// so a real inbound/outbound WS handshake now carries an
+/// `X-Algorand-IdentityChallenge` header whenever this node is running in
+/// `Hybrid` mode, and a duplicate identity on either leg gets the newer
+/// connection closed.
 pub struct HybridIdentityCoordinator {
+    /// Only read via the `generate_challenge`/`verify_challenge_and_respond`/
+    /// `verify_challenge_response`/`public_key` wrapper methods below,
+    /// which live wiring doesn't call directly — the actual message 1/2/3
+    /// exchange runs through `algo_network`'s free functions directly
+    /// inside `WebsocketNetwork`'s accept/dial paths (which is where the
+    /// signing key *also* independently lives, via `set_identity`), not
+    /// through this coordinator. Those wrapper methods remain exercised by
+    /// this module's own tests, proving the coordinator's mechanism end to
+    /// end (see the struct doc comment above).
     #[cfg_attr(not(test), allow(dead_code))]
     signing_key: SigningKey,
-    #[cfg_attr(not(test), allow(dead_code))]
     tracker: Mutex<IdentityTracker<VerifyingKey, IdentityConnId>>,
 }
 
-// Not called by any production code path yet — see this type's doc comment
-// on what remains for live-connection wiring. Exercised directly by this
-// module's tests.
-#[cfg_attr(not(test), allow(dead_code))]
 impl HybridIdentityCoordinator {
     pub fn new(signing_key: SigningKey) -> Self {
         Self {
@@ -346,6 +366,7 @@ impl HybridIdentityCoordinator {
 
     /// This node's own verified identity public key — the same key both
     /// legs' identity material derives from.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn public_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
     }
@@ -353,6 +374,7 @@ impl HybridIdentityCoordinator {
     /// Message 1 (initiator side): build a signed identity challenge to
     /// attach to an outbound connection attempt on either leg. Go:
     /// `identityChallengePublicKeyScheme.AttachChallenge`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn generate_challenge(
         &self,
         public_address: &str,
@@ -363,6 +385,7 @@ impl HybridIdentityCoordinator {
     /// Message 2 (responder side): verify an inbound challenge and build
     /// the signed response. Go:
     /// `identityChallengePublicKeyScheme.VerifyRequestAndAttachResponse`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn verify_challenge_and_respond(
         &self,
         header_value: &str,
@@ -381,6 +404,7 @@ impl HybridIdentityCoordinator {
     /// Message 2 verification (initiator side): verify the responder's
     /// signed response and build Message 3. Go:
     /// `identityChallengePublicKeyScheme.VerifyResponse`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn verify_challenge_response(
         &self,
         response_header: &str,
@@ -449,12 +473,52 @@ impl HybridIdentityCoordinator {
 
     /// The connection currently holding `identity`, if any. Exposed for
     /// tests/diagnostics.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn claimant(&self, identity: &VerifyingKey) -> Option<IdentityConnId> {
         self.tracker
             .lock()
             .expect("identity tracker mutex poisoned")
             .get(identity)
             .cloned()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live wiring: algo_network::IdentityDedupHook adapter (issue #1445)
+// ---------------------------------------------------------------------------
+
+/// Adapts a [`HybridIdentityCoordinator`] into an
+/// [`algo_network::IdentityDedupHook`] for one specific transport leg.
+///
+/// This is the piece that was missing before issue #1445: the coordinator
+/// above implements the *mechanism* (sign/verify/track) but nothing called
+/// `claim_identity`/`release_identity` from a live connection. Two
+/// instances of this adapter — one built with [`IdentityLeg::Ws`], the
+/// other with [`IdentityLeg::P2p`], both wrapping the *same* `Arc`-shared
+/// coordinator (see [`DualGossipNode::identity_arc`]) — are what
+/// `participate.rs`'s `Hybrid`-mode construction wires into
+/// `algo_network::WebsocketNetwork::set_identity` and
+/// `crate::commands::p2p_transport::P2pTransport::set_identity_dedup_hook`
+/// respectively, so a peer's identity verified on either transport is
+/// checked against the one shared claim table.
+pub struct LegIdentityDedupHook {
+    coordinator: Arc<HybridIdentityCoordinator>,
+    leg: IdentityLeg,
+}
+
+impl LegIdentityDedupHook {
+    pub fn new(coordinator: Arc<HybridIdentityCoordinator>, leg: IdentityLeg) -> Self {
+        Self { coordinator, leg }
+    }
+}
+
+impl algo_network::IdentityDedupHook for LegIdentityDedupHook {
+    fn claim(&self, conn: &str, identity: VerifyingKey) -> bool {
+        self.coordinator.claim_identity(self.leg, conn, identity)
+    }
+
+    fn release(&self, conn: &str, identity: &VerifyingKey) {
+        self.coordinator.release_identity(self.leg, conn, identity);
     }
 }
 
@@ -1023,6 +1087,206 @@ mod tests {
         let verified_over_p2p = remote.public_key();
         assert_eq!(verified_over_ws, verified_over_p2p);
         assert!(!local.claim_identity(IdentityLeg::P2p, "QmRemotePeerId", verified_over_p2p));
+    }
+
+    // -----------------------------------------------------------------------
+    // Live wiring: TestHybridNetwork_DuplicateConn parity (issue #1445)
+    // -----------------------------------------------------------------------
+
+    /// TDD anchor for issue #1445: a real relay (`WebsocketNetwork` +
+    /// `P2pTransport`, both wired to one shared `HybridIdentityCoordinator`
+    /// via `LegIdentityDedupHook` — exactly what `participate.rs`'s
+    /// `Hybrid`-mode construction wires up) accepts a real inbound P2P
+    /// connection from a peer, then a real inbound WS connection from the
+    /// *same* logical peer (same underlying Ed25519 signing key on both
+    /// legs — reusing the peer's own P2P transport's
+    /// `identity_signing_key()` for its WS dial, exactly mirroring how
+    /// `participate.rs` derives the WS leg's key from the P2P leg's own).
+    ///
+    /// Before this issue's wiring, nothing on the WS accept path ever set
+    /// `ConnectConfig::our_identity_key`/consulted a dedup hook at all, so
+    /// this scenario left the relay with two independent connections to
+    /// the same peer. After the fix, the shared coordinator's claim table
+    /// has exactly one winner (the P2P connection, since it connects
+    /// first) — mirroring go's `TestHybridNetwork_DuplicateConn` (a hybrid
+    /// relay ends up with one connection per peer despite that peer
+    /// reaching it over both transports).
+    ///
+    /// Scoped to a 2-node scenario (relay + one dual-identity peer) rather
+    /// than go's full 3-node cluster — see this module's doc comment and
+    /// the issue for why: the mechanism under test (claim/reject/close) is
+    /// exactly the same regardless of how many other, unrelated peers are
+    /// also connected.
+    #[tokio::test]
+    async fn duplicate_connection_across_ws_and_p2p_legs_is_rejected_on_live_relay() {
+        use algo_network::connect::{try_connect_with_phonebook, ConnectConfig};
+        use algo_network::phonebook::Phonebook;
+        use algo_network::{WebsocketNetwork, WebsocketNetworkConfig};
+        use libp2p::multiaddr::Protocol;
+
+        use crate::commands::p2p_transport::{P2pTransport, P2pTransportConfig};
+
+        fn p2p_config(bootstrap_peers: Vec<libp2p::Multiaddr>, listen: bool) -> P2pTransportConfig {
+            P2pTransportConfig {
+                network_id: "test-1445".to_string(),
+                listen_multiaddr: listen.then(|| "/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+                bootstrap_peers,
+                persist_peer_id: false,
+                data_dir: None,
+                private_key_path: None,
+                enable_dht_providers: false,
+                dht_mode: String::new(),
+                gossip_fanout: 4,
+                incoming_connections_limit: -1,
+                is_listen_server: listen,
+                relay_messages: true,
+                force_fetch_transactions: false,
+                enable_vote_compression: true,
+                enable_gossip_service: true,
+                disable_v22_protocol: false,
+            }
+        }
+
+        // --- Node A: the relay under test. WS + P2P, one shared coordinator. ---
+        let ws_a_config = WebsocketNetworkConfig {
+            genesis_id: "test-1445".to_string(),
+            network_id: "test-1445".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        };
+        let phonebook_a = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let ws_a = Arc::new(WebsocketNetwork::new(ws_a_config, phonebook_a));
+        ws_a.start_arc().await.expect("netA WS relay starts");
+        let (addr_a, listening) = ws_a.address();
+        assert!(listening, "netA must bind a real WS listener");
+
+        let p2p_a = P2pTransport::start(p2p_config(vec![], true))
+            .await
+            .expect("netA P2P transport starts");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while p2p_a.listen_addrs().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let a_p2p_listen_addr = p2p_a
+            .listen_addrs()
+            .first()
+            .cloned()
+            .expect("netA P2P bound an address");
+        let a_dial_multiaddr = a_p2p_listen_addr.with(Protocol::P2p(p2p_a.peer_id()));
+
+        let coordinator_a = Arc::new(HybridIdentityCoordinator::new(p2p_a.identity_signing_key()));
+        ws_a.set_identity(
+            p2p_a.identity_signing_key(),
+            Arc::new(LegIdentityDedupHook::new(
+                coordinator_a.clone(),
+                IdentityLeg::Ws,
+            )),
+        );
+        p2p_a.set_identity_dedup_hook(Arc::new(LegIdentityDedupHook::new(
+            coordinator_a.clone(),
+            IdentityLeg::P2p,
+        )));
+
+        // --- Node B: one logical peer, connecting to A over P2P first, ---
+        // --- then over WS with the *same* underlying identity key.     ---
+        let p2p_b = P2pTransport::start(p2p_config(vec![a_dial_multiaddr], false))
+            .await
+            .expect("netB P2P transport starts");
+
+        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while (p2p_a.connected_peer_count() == 0 || p2p_b.connected_peer_count() == 0)
+            && tokio::time::Instant::now() < connect_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            p2p_a.connected_peer_count(),
+            1,
+            "netA should see exactly one P2P connection from netB"
+        );
+
+        // Reuse netB's P2P identity key for its WS dial — exactly what
+        // `participate.rs`'s `Hybrid`-mode construction does
+        // (`p2p.identity_signing_key()`), so the same peer presents the
+        // identical verified key on both transports.
+        let b_signing_key = p2p_b.identity_signing_key();
+        let b_verifying_key = b_signing_key.verifying_key();
+
+        // netA's P2P leg should already have claimed netB's identity.
+        assert_eq!(
+            coordinator_a.claimant(&b_verifying_key),
+            Some(IdentityConnId {
+                leg: IdentityLeg::P2p,
+                conn: p2p_b.peer_id().to_string(),
+            }),
+            "netA's P2P leg should have claimed netB's identity first"
+        );
+
+        let phonebook_b = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let connect_config = ConnectConfig {
+            genesis_id: "test-1445".to_string(),
+            our_identity_key: Some(b_signing_key),
+            ..ConnectConfig::default()
+        };
+        // This dial is a *real* inbound connection to netA's live axum
+        // server — netA's own `gossip_upgrade_handler`/
+        // `handle_gossip_websocket` already registers it into `ws_a`'s
+        // peer map internally, so the test must NOT also call
+        // `ws_a.add_peer` itself (that would be netB's own client-side
+        // view of the connection, not a second connection to register).
+        // `handle` must be kept alive (not dropped) for the rest of this
+        // test — `PeerHandle`'s `Drop` impl cancels/aborts the connection.
+        let handle = try_connect_with_phonebook(&addr_a, &connect_config, &phonebook_b)
+            .await
+            .expect("netB's WS dial to netA should complete the HTTP-level handshake");
+        assert!(
+            handle.identity_verified(),
+            "netB should have completed the header-level identity challenge/response \
+             with netA (netA has a signing key and netB's dial address matches netA's \
+             bound address)"
+        );
+
+        // Give netA's inbound read loop time to process netB's message 3
+        // (NetIDVerification) and consult the shared coordinator.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The critical assertion: netA's shared claim table must *still*
+        // show the P2P connection as the identity's owner — netB's WS
+        // connection's claim attempt must have been rejected as a
+        // duplicate, exactly mirroring go's `TestHybridNetwork_DuplicateConn`.
+        assert_eq!(
+            coordinator_a.claimant(&b_verifying_key),
+            Some(IdentityConnId {
+                leg: IdentityLeg::P2p,
+                conn: p2p_b.peer_id().to_string(),
+            }),
+            "netA's identity claim must still be held by the P2P connection — netB's \
+             WS connection (same identity, arriving second) must have been rejected as \
+             a duplicate rather than overwriting the claim"
+        );
+
+        // And netA's WS peer map should settle back down to zero as the
+        // rejected (closed) connection is cleaned up — proving the
+        // rejection actually tore down the redundant *connection*, not
+        // just the claim-table bookkeeping.
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if ws_a.peer_count().await == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= cleanup_deadline {
+                panic!(
+                    "netA's duplicate WS connection to netB was never cleaned up (peer_count={})",
+                    ws_a.peer_count().await
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            p2p_a.connected_peer_count(),
+            1,
+            "netA's P2P connection to netB must remain the sole surviving connection"
+        );
     }
 
     // -----------------------------------------------------------------------

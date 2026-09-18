@@ -4989,8 +4989,8 @@ pub async fn run(
     // (`Hybrid`, via `DualGossipNode`) — matching `network_mode` exactly.
     let p2p_active_gossip_node: Arc<dyn GossipNode> = match (&network_mode, &p2p_transport) {
         (NetworkMode::P2pOnly, Some(p2p)) => p2p.clone() as Arc<dyn GossipNode>,
-        (NetworkMode::Hybrid, Some(p2p)) => Arc::new(
-            dual_gossip_node::DualGossipNode::new(
+        (NetworkMode::Hybrid, Some(p2p)) => {
+            let dual = dual_gossip_node::DualGossipNode::new(
                 gossip_node.clone() as Arc<dyn GossipNode>,
                 p2p.clone() as Arc<dyn GossipNode>,
                 // Issue #1133: reuse the P2P transport's own identity key
@@ -5015,8 +5015,35 @@ pub async fn run(
                 &node_config,
                 is_listen_server,
                 peers.len(),
-            )),
-        ),
+            ));
+
+            // Issue #1445: wire `dual`'s `HybridIdentityCoordinator` into
+            // the *live* WS accept/dial path and the *live* P2P
+            // connection-establish path, tagged `IdentityLeg::Ws`/
+            // `IdentityLeg::P2p` respectively but sharing one underlying
+            // claim table — this is what actually makes a peer connecting
+            // over both transports get deduped to one logical connection
+            // (go's `TestHybridNetwork_DuplicateConn`), rather than the
+            // coordinator only being exercised by `dual_gossip_node`'s own
+            // unit tests. Must happen before `gossip_node`/`p2p` are
+            // started (both `.start()` calls happen later, below), so no
+            // live connection is ever accepted/dialed before identity
+            // exchange is armed.
+            let identity_coordinator = dual.identity_arc();
+            gossip_node.set_identity(
+                p2p.identity_signing_key(),
+                Arc::new(dual_gossip_node::LegIdentityDedupHook::new(
+                    identity_coordinator.clone(),
+                    dual_gossip_node::IdentityLeg::Ws,
+                )),
+            );
+            p2p.set_identity_dedup_hook(Arc::new(dual_gossip_node::LegIdentityDedupHook::new(
+                identity_coordinator,
+                dual_gossip_node::IdentityLeg::P2p,
+            )));
+
+            Arc::new(dual)
+        }
         _ => gossip_node.clone() as Arc<dyn GossipNode>,
     };
 

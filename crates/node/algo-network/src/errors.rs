@@ -103,6 +103,15 @@ pub enum WsConnectError {
     #[error("identity verification failed: {0}")]
     Identity(#[from] IdentityError),
 
+    /// The connection's verified identity is already claimed by a
+    /// different, already-established connection — either another
+    /// connection on this same transport, or (in `Hybrid` mode) a
+    /// connection on the *other* transport leg. Mirrors go's
+    /// `identityTracker.setIdentity` returning `false` and the caller
+    /// closing the redundant connection (issue #1445).
+    #[error("duplicate identity: already connected via another connection")]
+    DuplicateIdentity,
+
     /// Generic I/O error during connection setup.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

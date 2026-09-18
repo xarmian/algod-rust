@@ -54,6 +54,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use ed25519_dalek::VerifyingKey;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -71,6 +72,7 @@ use crate::forwarding_policy::ForwardingPolicy;
 use crate::framing::{decode_frame, encode_frame};
 use crate::gossip_node::{Peer, UnicastPeer};
 use crate::handler::Multiplexer;
+use crate::identity::{verify_identity_verification, IdentityChallengeValue, IdentityDedupHook};
 use crate::message::{IncomingMessage, OutgoingMessage};
 use crate::message_filter::{
     dedup_safe_tag, generate_message_digest, MessageFilter, MESSAGE_FILTER_SIZE,
@@ -318,6 +320,39 @@ pub struct WsPeerConfig {
     pub origin_address: Option<String>,
 }
 
+/// Shared identity state: `(verified public key if any, verified flag)`.
+///
+/// For an outbound connection this is resolved synchronously in
+/// `connect.rs` before [`WsPeer::with_config`] is even called, and never
+/// mutated again. For an inbound connection ([`PeerHandle::new_inbound`]),
+/// message 1/2 of go's netidentity exchange (issue #1445) complete
+/// synchronously over the HTTP upgrade headers in `ws_network.rs`, but
+/// message 3 (the `NetIDVerification`-tagged websocket frame) only arrives
+/// asynchronously, as (normally) the very first frame the inbound read loop
+/// decodes — so this cell starts at `(None, false)` and the read loop
+/// updates it in place once that frame is verified. [`PeerHandle::identity`]/
+/// [`PeerHandle::identity_verified`] read the same cell, so callers always
+/// see the current state regardless of which side resolved it or when.
+pub(crate) type IdentitySlot = Arc<std::sync::Mutex<(Option<VerifyingKey>, bool)>>;
+
+/// Everything [`PeerHandle::new_inbound`] needs to verify an inbound
+/// connection's message 3 (`NetIDVerification`) once it arrives on the
+/// wire, and to claim the resulting identity for cross-connection/
+/// cross-transport duplicate detection. See `new_inbound`'s doc comment.
+pub struct InboundIdentityPending {
+    /// The response challenge (`rc`) this node sent in message 2 — what
+    /// message 3's signature must cover, per go's `netidentity.go`.
+    pub expected_challenge: IdentityChallengeValue,
+    /// The peer's public key, as extracted from its (already
+    /// signature-verified) message 1.
+    pub peer_public_key: VerifyingKey,
+    /// Cross-connection/cross-transport duplicate-identity hook, consulted
+    /// once message 3 verifies. `None` skips the dedup check (identity is
+    /// still recorded on the resulting [`PeerHandle`], just never claimed
+    /// anywhere).
+    pub dedup_hook: Option<Arc<dyn IdentityDedupHook>>,
+}
+
 /// A live WebSocket peer connection.
 ///
 /// This struct owns the WebSocket connection halves and the spawned async
@@ -338,10 +373,8 @@ pub struct WsPeer {
     closing: CancellationToken,
     /// Message interest filter: only send messages whose tag is in this set.
     send_message_tags: Arc<RwLock<HashSet<Tag>>>,
-    /// The peer's identity public key (if verified during handshake).
-    identity_key: Option<ed25519_dalek::VerifyingKey>,
-    /// Whether the identity has been verified via the challenge protocol.
-    identity_verified: bool,
+    /// The peer's identity state. See [`IdentitySlot`]'s doc comment.
+    identity: IdentitySlot,
     /// Negotiated peer feature flags.
     features: PeerFeatureFlags,
     /// Negotiated network protocol version (e.g. "2.2").
@@ -415,8 +448,7 @@ impl WsPeer {
             send_bulk_rx,
             closing,
             send_message_tags,
-            identity_key,
-            identity_verified,
+            identity: Arc::new(std::sync::Mutex::new((identity_key, identity_verified))),
             features,
             version,
             remote_addr,
@@ -436,7 +468,7 @@ impl WsPeer {
         let last_packet_time = self.last_packet_time.clone();
         let remote_addr = self.remote_addr.clone();
         let features = self.features;
-        let identity_key = self.identity_key;
+        let identity = self.identity;
 
         // Extract optional config components.
         let multiplexer = self.config.multiplexer;
@@ -536,8 +568,7 @@ impl WsPeer {
             closing,
             remote_addr,
             routing_addr,
-            identity_key,
-            identity_verified: self.identity_verified,
+            identity,
             features,
             version: self.version,
             request_tracker: handle_request_tracker,
@@ -638,10 +669,11 @@ pub struct PeerHandle {
     /// construction time since [`Peer::routing_addr`] must return a
     /// borrowed `&[u8]`.
     routing_addr: Vec<u8>,
-    /// The peer's verified identity public key (if any).
-    identity_key: Option<ed25519_dalek::VerifyingKey>,
-    /// Whether identity has been verified.
-    identity_verified: bool,
+    /// The peer's identity state. See [`IdentitySlot`]'s doc comment — for
+    /// an inbound peer this cell can still be updated asynchronously by the
+    /// read loop after this `PeerHandle` is constructed, when the
+    /// `NetIDVerification` frame (message 3) arrives.
+    identity: IdentitySlot,
     /// Negotiated feature flags.
     features: PeerFeatureFlags,
     /// Negotiated protocol version.
@@ -709,13 +741,13 @@ impl PeerHandle {
     }
 
     /// The peer's verified identity public key, if available.
-    pub fn identity(&self) -> Option<&ed25519_dalek::VerifyingKey> {
-        self.identity_key.as_ref()
+    pub fn identity(&self) -> Option<ed25519_dalek::VerifyingKey> {
+        self.identity.lock().expect("identity mutex poisoned").0
     }
 
     /// Whether the peer's identity has been verified via the challenge protocol.
     pub fn identity_verified(&self) -> bool {
-        self.identity_verified
+        self.identity.lock().expect("identity mutex poisoned").1
     }
 
     /// The negotiated peer feature flags.
@@ -796,6 +828,25 @@ impl PeerHandle {
     /// The returned handle is compatible with the peer registry and supports
     /// broadcast, send, and close operations.
     ///
+    /// # Identity verification (issue #1445)
+    ///
+    /// `identity_pending`, when `Some`, means this node already completed
+    /// message 1/2 of go's netidentity challenge/response exchange
+    /// (`network/netidentity.go`) over the HTTP upgrade headers — the
+    /// caller (`ws_network.rs`'s `gossip_upgrade_handler`) verified the
+    /// client's `X-Algorand-IdentityChallenge` header and attached a signed
+    /// response. Message 3 (the `NetIDVerification`-tagged websocket frame)
+    /// arrives asynchronously, normally as the very first frame this read
+    /// loop decodes (a participating client sends it before anything else —
+    /// see `connect.rs::try_connect_inner`'s steps 11-12). When that frame
+    /// verifies against `expected_challenge`/`peer_public_key`, the returned
+    /// handle's [`PeerHandle::identity`]/[`PeerHandle::identity_verified`]
+    /// are updated in place, and — if `dedup_hook` is set — the identity is
+    /// claimed via [`IdentityDedupHook::claim`]; a rejected claim (the same
+    /// identity is already live on a different connection, e.g. the other
+    /// transport leg in `Hybrid` mode) closes this connection, mirroring
+    /// go's `identityVerificationHandler`.
+    ///
     /// # vpack vote compression
     ///
     /// `features` is the already-negotiated (intersected) feature set for
@@ -829,6 +880,9 @@ impl PeerHandle {
         // should be (the resolved *tracking* host, not the
         // `X-Algorand-Location`-aware rootURL `remote_addr` above).
         origin_address: Option<String>,
+        // Issue #1445: see this method's doc comment's "Identity
+        // verification" section.
+        identity_pending: Option<InboundIdentityPending>,
     ) -> Self {
         use futures_util::{SinkExt, StreamExt};
 
@@ -869,6 +923,14 @@ impl PeerHandle {
         let read_send_high_prio_tx = send_high_prio_tx.clone();
         let read_stateful_vote_enabled = stateful_vote_enabled.clone();
         let read_network_metrics = network_metrics.clone();
+
+        // Issue #1445: identity state shared with the returned `PeerHandle`
+        // — starts unverified and is updated in place by the read loop's
+        // `NetIDVerification` branch below, if/when message 3 arrives and
+        // verifies. See `new_inbound`'s doc comment.
+        let identity: IdentitySlot = Arc::new(std::sync::Mutex::new((None, false)));
+        let read_identity = identity.clone();
+        let read_identity_pending = identity_pending;
 
         // Read loop: reads from axum WebSocket and dispatches to incoming channel.
         let read_handle = tokio::spawn(async move {
@@ -950,6 +1012,67 @@ impl PeerHandle {
                                     // placement.
                                     if let Some(ref m) = read_network_metrics {
                                         m.record_received_uncompressed(tag, payload.len() as u64 + 2);
+                                    }
+
+                                    // --- NI (NetIDVerification) handling (issue #1445) ---
+                                    // Message 3 of go's netidentity
+                                    // challenge/response/verification
+                                    // exchange. Only meaningful when this
+                                    // connection actually ran message 1/2
+                                    // (`read_identity_pending.is_some()`) —
+                                    // otherwise a peer sending this
+                                    // unprompted has nothing to verify
+                                    // against, so it's silently dropped
+                                    // (never forwarded to the multiplexer).
+                                    if tag == Tag::NetIDVerification {
+                                        if let Some(pending) = read_identity_pending.as_ref() {
+                                            match verify_identity_verification(
+                                                &payload,
+                                                &pending.expected_challenge,
+                                                &pending.peer_public_key,
+                                            ) {
+                                                Ok(()) => {
+                                                    let claimed = match &pending.dedup_hook {
+                                                        Some(hook) => hook.claim(
+                                                            &read_addr,
+                                                            pending.peer_public_key,
+                                                        ),
+                                                        None => true,
+                                                    };
+                                                    if claimed {
+                                                        *read_identity
+                                                            .lock()
+                                                            .expect("identity mutex poisoned") =
+                                                            (Some(pending.peer_public_key), true);
+                                                        tracing::debug!(
+                                                            addr = %read_addr,
+                                                            peer_key = ?pending.peer_public_key,
+                                                            "inbound identity verified"
+                                                        );
+                                                    } else {
+                                                        tracing::info!(
+                                                            addr = %read_addr,
+                                                            peer_key = ?pending.peer_public_key,
+                                                            "duplicate identity detected on inbound \
+                                                             connection; disconnecting (already \
+                                                             connected to this peer via another \
+                                                             connection)"
+                                                        );
+                                                        read_closing.cancel();
+                                                        break;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        addr = %read_addr,
+                                                        error = %e,
+                                                        "inbound read loop: identity verification \
+                                                         message failed, treating as unverified"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        continue;
                                     }
 
                                     // --- MI (MsgOfInterest) handling ---
@@ -1162,8 +1285,7 @@ impl PeerHandle {
             closing,
             remote_addr,
             routing_addr,
-            identity_key: None,
-            identity_verified: false,
+            identity,
             features,
             version,
             request_tracker: None,
@@ -5309,8 +5431,7 @@ mod tests {
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
             routing_addr: Vec::new(),
-            identity_key: None,
-            identity_verified: false,
+            identity: Arc::new(std::sync::Mutex::new((None, false))),
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: Some(tracker),
@@ -5420,8 +5541,7 @@ mod tests {
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
             routing_addr: Vec::new(),
-            identity_key: None,
-            identity_verified: false,
+            identity: Arc::new(std::sync::Mutex::new((None, false))),
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: Some(tracker.clone()),
@@ -5513,8 +5633,7 @@ mod tests {
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
             routing_addr: Vec::new(),
-            identity_key: None,
-            identity_verified: false,
+            identity: Arc::new(std::sync::Mutex::new((None, false))),
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: None, // No tracker configured!
@@ -5559,8 +5678,7 @@ mod tests {
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
             routing_addr: Vec::new(),
-            identity_key: None,
-            identity_verified: false,
+            identity: Arc::new(std::sync::Mutex::new((None, false))),
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: Some(tracker.clone()),
@@ -5625,8 +5743,7 @@ mod tests {
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
             routing_addr: Vec::new(),
-            identity_key: None,
-            identity_verified: false,
+            identity: Arc::new(std::sync::Mutex::new((None, false))),
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: Some(tracker.clone()),
@@ -5680,8 +5797,7 @@ mod tests {
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
             routing_addr: Vec::new(),
-            identity_key: None,
-            identity_verified: false,
+            identity: Arc::new(std::sync::Mutex::new((None, false))),
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: Some(tracker.clone()),
@@ -5750,8 +5866,7 @@ mod tests {
             closing: closing.clone(),
             remote_addr: "10.0.0.1:4160".to_string(),
             routing_addr: vec![10, 0, 0, 1],
-            identity_key: None,
-            identity_verified: false,
+            identity: Arc::new(std::sync::Mutex::new((None, false))),
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: None,

@@ -153,14 +153,16 @@ pub use identity::{
     attach_challenge_header, attach_response_header, build_identity_verification,
     generate_challenge, verify_challenge_and_respond, verify_challenge_response,
     verify_identity_verification, IdentityChallengeResponseSigned, IdentityChallengeSigned,
-    IdentityVerificationMessageSigned, PeerIdentity,
+    IdentityChallengeValue, IdentityDedupHook, IdentityVerificationMessageSigned, PeerIdentity,
 };
 
 // Peer feature negotiation
 pub use peer_features::{decode_peer_features, encode_peer_features, PeerFeatureFlags};
 
 // WebSocket peer abstraction
-pub use ws_peer::{PeerHandle, PeerSender, UnicastPeerRef, WsPeer, WsPeerConfig};
+pub use ws_peer::{
+    InboundIdentityPending, PeerHandle, PeerSender, UnicastPeerRef, WsPeer, WsPeerConfig,
+};
 
 // Reconnection supervisor with exponential backoff
 pub use reconnect::{
