@@ -240,3 +240,27 @@ fn load_rejects_relative_wallets_dir() {
         "expected SQLiteWalletNotAbsolute, got {err:?}"
     );
 }
+
+/// Parity with go-algorand's `TestAbsSQLiteWalletConfigSucceeds`
+/// (`test/e2e-go/kmd/e2e_kmd_sqlite_test.go`): the counterpart to
+/// `load_rejects_relative_wallets_dir` above — a `kmd_config.json`
+/// with an *absolute* `wallets_dir` must load without error. Uses a
+/// platform-absolute literal since `Path::is_absolute()` requires a
+/// drive letter on Windows (go's own Unix-only "/very/absolute"
+/// literal wouldn't be absolute there).
+#[test]
+fn load_accepts_absolute_wallets_dir() {
+    #[cfg(windows)]
+    let abs_path = r#"C:\\very\\absolute"#;
+    #[cfg(not(windows))]
+    let abs_path = "/very/absolute";
+
+    let dir = TempDir::new().unwrap();
+    let good = format!(r#"{{"drivers": {{"sqlite": {{"wallets_dir": "{abs_path}"}}}}}}"#);
+    std::fs::write(dir.path().join(KMD_CONFIG_FILENAME), good).unwrap();
+    let cfg = load_kmd_config(dir.path()).expect("absolute wallets_dir must load without error");
+    assert_eq!(
+        cfg.driver_config.sqlite.wallets_dir,
+        abs_path.replace(r#"\\"#, r#"\"#)
+    );
+}

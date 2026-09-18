@@ -1450,8 +1450,24 @@ mod tests {
         let expires = body["wallet_handle"]["expires_seconds"].as_i64().unwrap();
         assert!(expires > 0 && expires <= 60);
 
-        // 4. Renew bumps expiry — sleep briefly, then ensure expires_seconds is at the cap again.
+        // 4. Renew bumps expiry. Parity with go's TestWalletSessionRenew:
+        // sleep, confirm expires_seconds has strictly decreased, renew,
+        // then confirm it has increased again (back past the pre-renew
+        // reading), not just "close to the original cap".
         tokio::time::sleep(Duration::from_secs(2)).await;
+        let (s, body) = post(
+            &router,
+            "/wallet/info",
+            json!({"wallet_handle_token": token}),
+        )
+        .await;
+        assert_eq!(s, 200, "info after sleep: {body}");
+        let expires_after_sleep = body["wallet_handle"]["expires_seconds"].as_i64().unwrap();
+        assert!(
+            expires_after_sleep < expires,
+            "expiry should have decreased after sleeping; got {expires_after_sleep} vs pre-sleep {expires}"
+        );
+
         let (s, body) = post(
             &router,
             "/wallet/renew",
@@ -1461,8 +1477,8 @@ mod tests {
         assert_eq!(s, 200, "renew: {body}");
         let expires_after_renew = body["wallet_handle"]["expires_seconds"].as_i64().unwrap();
         assert!(
-            expires_after_renew >= expires - 1,
-            "renew should bump expiry back to the cap; got {expires_after_renew} after pre-renew {expires}"
+            expires_after_renew > expires_after_sleep,
+            "renew should increase expiry past the pre-renew reading; got {expires_after_renew} after pre-renew {expires_after_sleep}"
         );
 
         // 5. Export MDK
@@ -1500,6 +1516,15 @@ mod tests {
         .await;
         assert_eq!(s, 401, "info after release: {body}");
         assert_eq!(body["error"], true);
+        // Parity with go's TestWalletSessionRelease's final assertion
+        // ("Should not return the wallet we created"): the error
+        // response must carry no wallet handle at all, not the
+        // pre-release wallet's name.
+        assert!(
+            body.get("wallet_handle").is_none()
+                || body["wallet_handle"]["wallet"]["name"] != "alpha",
+            "error response must not echo the released wallet's name: {body}"
+        );
     }
 
     #[tokio::test]
@@ -1679,6 +1704,115 @@ mod tests {
         assert_eq!(body["error"], true);
     }
 
+    /// Parity with go-algorand's `TestMasterKeyImportExport`
+    /// (`test/e2e-go/kmd/e2e_kmd_wallet_keyops_test.go:438`): the
+    /// happy-path halves of the scenario weren't previously pinned at
+    /// the HTTP layer (only the wrong-password 400 case above was).
+    /// This drives the full round trip through the REST API: generate
+    /// two keys in wallet 1, export its MDK (non-blank), create wallet
+    /// 2 by importing that exact MDK, and confirm wallet 2's first two
+    /// generated keys reproduce wallet 1's, and that wallet 2's own
+    /// MDK export equals wallet 1's.
+    #[tokio::test]
+    async fn master_key_export_and_reimport_into_new_wallet_round_trips() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let (router, _tmp) = make_router();
+
+        // Wallet 1: created with an auto-generated MDK.
+        let (_, body) = post(
+            &router,
+            "/wallet",
+            json!({"wallet_driver_name": "sqlite", "wallet_password": "pw1"}),
+        )
+        .await;
+        let id1 = body["wallet"]["id"].as_str().unwrap().to_string();
+        let (_, body) = post(
+            &router,
+            "/wallet/init",
+            json!({"wallet_id": id1, "wallet_password": "pw1"}),
+        )
+        .await;
+        let token1 = body["wallet_handle_token"].as_str().unwrap().to_string();
+
+        // Generate two keys in wallet 1.
+        let (s, body) = post(&router, "/key", json!({"wallet_handle_token": token1})).await;
+        assert_eq!(s, 200, "key0: {body}");
+        let key0 = body["address"].as_str().unwrap().to_string();
+        let (s, body) = post(&router, "/key", json!({"wallet_handle_token": token1})).await;
+        assert_eq!(s, 200, "key1: {body}");
+        let key1 = body["address"].as_str().unwrap().to_string();
+        assert_ne!(key0, key1);
+
+        // Export the MDK with the correct password — must succeed and
+        // be non-blank.
+        let (s, body) = post(
+            &router,
+            "/master-key/export",
+            json!({"wallet_handle_token": token1, "wallet_password": "pw1"}),
+        )
+        .await;
+        assert_eq!(s, 200, "mdk export: {body}");
+        let mdk_b64 = body["master_derivation_key"].as_str().unwrap().to_string();
+        let mdk0 = B64.decode(&mdk_b64).unwrap();
+        assert_ne!(mdk0, [0u8; 32].to_vec(), "MDK should not be blank");
+
+        // Wallet 2: created by importing wallet 1's exact MDK.
+        let (s, body) = post(
+            &router,
+            "/wallet",
+            json!({
+                "wallet_name": "related",
+                "wallet_driver_name": "sqlite",
+                "wallet_password": "pw2",
+                "master_derivation_key": mdk_b64,
+            }),
+        )
+        .await;
+        assert_eq!(s, 200, "create related wallet: {body}");
+        let id2 = body["wallet"]["id"].as_str().unwrap().to_string();
+        let (_, body) = post(
+            &router,
+            "/wallet/init",
+            json!({"wallet_id": id2, "wallet_password": "pw2"}),
+        )
+        .await;
+        let token2 = body["wallet_handle_token"].as_str().unwrap().to_string();
+
+        // Generating in wallet 2 reproduces wallet 1's key sequence
+        // (same MDK, same starting index).
+        let (s, body) = post(&router, "/key", json!({"wallet_handle_token": token2})).await;
+        assert_eq!(s, 200, "key2: {body}");
+        let key2 = body["address"].as_str().unwrap().to_string();
+        assert_eq!(
+            key2, key0,
+            "wallet 2's first generated key must equal wallet 1's first"
+        );
+        let (s, body) = post(&router, "/key", json!({"wallet_handle_token": token2})).await;
+        assert_eq!(s, 200, "key3: {body}");
+        let key3 = body["address"].as_str().unwrap().to_string();
+        assert_eq!(
+            key3, key1,
+            "wallet 2's second generated key must equal wallet 1's second"
+        );
+
+        // Exporting the MDK back out of wallet 2 yields the same bytes.
+        let (s, body) = post(
+            &router,
+            "/master-key/export",
+            json!({"wallet_handle_token": token2, "wallet_password": "pw2"}),
+        )
+        .await;
+        assert_eq!(s, 200, "mdk export from related wallet: {body}");
+        let mdk1 = B64
+            .decode(body["master_derivation_key"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            mdk0, mdk1,
+            "reimported wallet's MDK must equal the original"
+        );
+    }
+
     #[tokio::test]
     async fn create_wallet_with_unknown_driver_returns_400() {
         let (router, _tmp) = make_router();
@@ -1727,6 +1861,36 @@ mod tests {
         assert_eq!(s, 400);
         assert_eq!(body["error"], true);
         assert_eq!(body["message"], "unknown wallet driver");
+    }
+
+    /// Parity with go-algorand's `TestBlankWalletCreation`
+    /// (`test/e2e-go/kmd/e2e_kmd_wallet_test.go:83`): creating a
+    /// wallet with an explicitly blank `wallet_name` must succeed
+    /// (unlike a blank/missing `wallet_driver_name`, which is
+    /// rejected above), `GET /wallets` must list exactly the one
+    /// wallet, and its name must be non-blank and equal to its ID
+    /// (handlers.go:169's "use the ID as the name" fallback).
+    #[tokio::test]
+    async fn create_wallet_with_blank_name_uses_id_as_name() {
+        let (router, _tmp) = make_router();
+        let (s, body) = post(
+            &router,
+            "/wallet",
+            json!({"wallet_name": "", "wallet_driver_name": "sqlite", "wallet_password": "x"}),
+        )
+        .await;
+        assert_eq!(s, 200, "create: {body}");
+        let created_id = body["wallet"]["id"].as_str().unwrap().to_string();
+        let created_name = body["wallet"]["name"].as_str().unwrap().to_string();
+        assert!(!created_name.is_empty());
+        assert_eq!(created_name, created_id);
+
+        let (s, body) = get(&router, "/wallets").await;
+        assert_eq!(s, 200, "list: {body}");
+        let wallets = body["wallets"].as_array().unwrap();
+        assert_eq!(wallets.len(), 1);
+        assert!(!wallets[0]["name"].as_str().unwrap().is_empty());
+        assert_eq!(wallets[0]["name"], wallets[0]["id"]);
     }
 
     #[tokio::test]

@@ -2528,6 +2528,69 @@ mod tests {
         assert!(err.contains("Could not parse to address"), "got: {err}");
     }
 
+    /// Flips the character at `i` to a different uppercase-alphabetic
+    /// ASCII char, mirroring go's `mutateStringAtIndex`
+    /// (`test/e2e-go/restAPI/helpers.go:57`) exactly: unlike the
+    /// wholesale-garbage strings in `run_send_rejects_bad_*_address`
+    /// above, this keeps the address's length/charset well-formed and
+    /// breaks only its checksum -- the same "syntactically plausible
+    /// but wrong" shape go's `TestClientRejectsMutated*AddressWhenSending`
+    /// tests drive.
+    fn mutate_at_index(addr: &str, i: usize) -> String {
+        let mut chars: Vec<char> = addr.chars().collect();
+        let original = chars[i];
+        let mut replacement = original;
+        // Deterministic but guaranteed-different replacement -- no
+        // randomness needed since we only care that it differs.
+        for c in ('A'..='Z').chain('B'..='Z') {
+            if c != original {
+                replacement = c;
+                break;
+            }
+        }
+        chars[i] = replacement;
+        chars.into_iter().collect()
+    }
+
+    /// Parity with go-algorand's `TestClientRejectsMutatedFromAddressWhenSending`
+    /// (`test/e2e-go/restAPI/restClient_test.go:179`): go's test uses a
+    /// *checksum-valid* address with a single character flipped
+    /// (`mutateStringAtIndex(addr, 0)`) rather than wholesale garbage,
+    /// exercising the checksum-verification branch of address parsing
+    /// specifically rather than just the length/charset branch that
+    /// `run_send_rejects_bad_from_address` already covers.
+    #[test]
+    fn run_send_rejects_mutated_from_address() {
+        let tmp = TempDir::new().unwrap();
+        let valid = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
+        // Sanity check: the unmutated literal really does parse (so the
+        // rejection below is attributable to the mutation, not to the
+        // literal being bogus to begin with).
+        assert!(Address::from_algorand_string(valid).is_ok());
+        let mutated = mutate_at_index(valid, 0);
+        assert_ne!(mutated, valid);
+
+        let args = bare_send_args(Some(&mutated), valid);
+        let err = run_send_inner(args, None, vec![tmp.path().to_path_buf()], None).unwrap_err();
+        assert!(err.contains("Could not parse from address"), "got: {err}");
+    }
+
+    /// Parity with go-algorand's `TestClientRejectsMutatedToAddressWhenSending`
+    /// (`test/e2e-go/restAPI/restClient_test.go:205`): same as above, for
+    /// the receiver.
+    #[test]
+    fn run_send_rejects_mutated_to_address() {
+        let tmp = TempDir::new().unwrap();
+        let valid = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
+        assert!(Address::from_algorand_string(valid).is_ok());
+        let mutated = mutate_at_index(valid, 0);
+        assert_ne!(mutated, valid);
+
+        let args = bare_send_args(Some(valid), &mutated);
+        let err = run_send_inner(args, None, vec![tmp.path().to_path_buf()], None).unwrap_err();
+        assert!(err.contains("Could not parse to address"), "got: {err}");
+    }
+
     #[test]
     fn split_ext_matches_filepath_ext() {
         assert_eq!(
