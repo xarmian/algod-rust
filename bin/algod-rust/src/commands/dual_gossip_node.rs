@@ -63,9 +63,11 @@
 //! means precisely and what live-connection wiring remains open.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use algo_network::handler::{TaggedMessageHandler, TaggedMessageValidatorHandler};
 use algo_network::identity::IdentityChallengeValue;
+use algo_network::mesh::{DEFAULT_GOSSIP_FANOUT, DEFAULT_MESH_INTERVAL};
 use algo_network::{
     GossipNode, IdentityChallengeResponseSigned, IdentityChallengeSigned, IdentityError, Peer,
     PeerIdentity, PeerOption, Router, Tag,
@@ -73,6 +75,7 @@ use algo_network::{
 use algo_p2p::IdentityTracker;
 use async_trait::async_trait;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 /// Composes two [`GossipNode`]s so traffic flows over both. See this
@@ -85,6 +88,17 @@ pub struct DualGossipNode {
     /// live-connection wiring. Exercised directly by this module's tests.
     #[cfg_attr(not(test), allow(dead_code))]
     identity: HybridIdentityCoordinator,
+    /// Overall target outgoing connection count the hybrid mesh scheduler
+    /// (issue #1441) drives `primary`/`secondary` toward each cycle. See
+    /// [`Self::with_mesh_target_conn_count`].
+    mesh_target_conn_count: usize,
+    /// How often [`Self::start`] re-runs the mesh scheduler. See
+    /// [`Self::with_mesh_interval`].
+    mesh_interval: Duration,
+    /// Cancels the mesh-scheduler background task on [`Self::stop`].
+    mesh_cancel: CancellationToken,
+    /// The spawned mesh-scheduler loop, if [`Self::start`] has run.
+    mesh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DualGossipNode {
@@ -102,7 +116,37 @@ impl DualGossipNode {
             primary,
             secondary,
             identity: HybridIdentityCoordinator::new(identity_signing_key),
+            mesh_target_conn_count: DEFAULT_GOSSIP_FANOUT,
+            mesh_interval: DEFAULT_MESH_INTERVAL,
+            mesh_cancel: CancellationToken::new(),
+            mesh_task: Mutex::new(None),
         }
+    }
+
+    /// Override the overall target outgoing connection count the hybrid
+    /// mesh scheduler drives `primary`(WS)/`secondary`(P2P) toward each
+    /// cycle — go's `wsnet.config.GossipFanout`
+    /// (`hybridRelayMeshCreator.create`, `withTargetConnCount`,
+    /// `network/mesh.go`). Defaults to
+    /// [`DEFAULT_GOSSIP_FANOUT`](algo_network::mesh::DEFAULT_GOSSIP_FANOUT)
+    /// (4), matching both go's and this codebase's own WS
+    /// [`MeshThread`](algo_network::mesh::MeshThread) default.
+    pub fn with_mesh_target_conn_count(mut self, target_conn_count: usize) -> Self {
+        self.mesh_target_conn_count = target_conn_count;
+        self
+    }
+
+    /// Override how often the hybrid mesh scheduler re-runs — go's
+    /// `meshThreadInterval` (`network/mesh.go`, default 1 minute, same as
+    /// [`DEFAULT_MESH_INTERVAL`](algo_network::mesh::DEFAULT_MESH_INTERVAL)).
+    /// Not called by any production call site yet (`participate.rs` keeps
+    /// go's default interval); exercised by this module's own tests, which
+    /// need a short interval to observe a scheduled cycle within a test
+    /// timeout.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_mesh_interval(mut self, interval: Duration) -> Self {
+        self.mesh_interval = interval;
+        self
     }
 
     /// The cross-transport identity-challenge coordinator shared by this
@@ -110,6 +154,107 @@ impl DualGossipNode {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn identity(&self) -> &HybridIdentityCoordinator {
         &self.identity
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WS-priority hybrid mesh scheduler (issue #1441)
+// ---------------------------------------------------------------------------
+
+/// WS-priority hybrid mesh scheduler — algod-rust's port of go's
+/// `hybridRelayMeshCreator.meshFn` (`network/mesh.go`, introduced by
+/// go-algorand commit 8e6354c79 / PR #6391, "network: wsnet with p2p
+/// backup meshing strategy", first released v4.4.1-beta).
+///
+/// ## The decision go makes, mirrored exactly
+///
+/// Each mesh cycle, given an overall `target_conn_count`:
+/// 1. Compute `ws_target`: normally `target_conn_count`, but if the
+///    *previous* cycle's P2P leg reported `prev_p2p` connections and
+///    `target_conn_count > prev_p2p`, reduce it to
+///    `target_conn_count - prev_p2p` — don't re-ask WS to (re-)cover
+///    ground P2P already held last cycle. (`prev_p2p` starts as "not
+///    initialized" — the first cycle always asks WS for the *full*
+///    target, exactly mirroring go's `prevP2PConnections != -1` guard and
+///    its "skip p2p mesh reduction for the first time to give wsnet to
+///    establish connections" comment.)
+/// 2. Run the WS leg's mesh cycle with `ws_target`
+///    ([`GossipNode::mesh_cycle`]), getting back `ws_connections` — WS's
+///    *total* outgoing connection count after the attempt, not just
+///    newly-dialed connections (matches go's `meshThreadInner` return
+///    semantics exactly).
+/// 3. If `ws_connections < target_conn_count`, ask P2P to cover the
+///    shortfall: `p2p_target = target_conn_count - ws_connections`.
+///    Otherwise `p2p_target = 0` — but P2P's mesh cycle still runs (go's
+///    comment: "even if p2pTarget is zero it makes sense to call p2p
+///    meshThreadInner to fetch DHT peers").
+/// 4. Remember this cycle's `p2p_connections` as `prev_p2p` for next time.
+///
+/// The net effect: WS is *always* given first claim on the full target
+/// (or whatever P2P didn't already prove it could hold), and P2P is asked
+/// only to make up the shortfall left after WS's attempt — the two legs
+/// never compete for the same slice of the target in the same cycle, and
+/// P2P capacity is used only once WS capacity for that peer set is
+/// exhausted.
+///
+/// ## Where this is driven from
+///
+/// [`DualGossipNode::start`] spawns a background task that calls
+/// [`HybridMeshScheduler::mesh_cycle`] on a timer
+/// ([`DualGossipNode::mesh_interval`], go's `meshThreadInterval`),
+/// against `primary` (WS) as the WS leg and `secondary` (P2P) as the P2P
+/// leg — mirroring `baseMesher.meshThread`'s periodic-timer/backoff loop
+/// (`network/mesh.go`) minus its exponential-backoff-on-empty-phonebook
+/// refinement, which is a smaller, separately addressable gap (this
+/// scheduler always re-tries on the fixed interval rather than backing
+/// off when a cycle finds nothing) rather than a scheduling-*decision*
+/// divergence from `hybridRelayMeshCreator` itself.
+pub struct HybridMeshScheduler {
+    target_conn_count: usize,
+    /// `None` == go's `prevP2PConnections == -1` ("not initialized").
+    prev_p2p_connections: Option<usize>,
+}
+
+impl HybridMeshScheduler {
+    pub fn new(target_conn_count: usize) -> Self {
+        Self {
+            target_conn_count,
+            prev_p2p_connections: None,
+        }
+    }
+
+    /// This scheduler's configured overall target outgoing connection
+    /// count.
+    pub fn target_conn_count(&self) -> usize {
+        self.target_conn_count
+    }
+
+    /// Run one WS-priority/P2P-fallback mesh cycle over `ws` (the WS-leg
+    /// [`GossipNode`]) and `p2p` (the P2P-leg [`GossipNode`]). Returns
+    /// `(ws_connections, p2p_connections)` — go's `meshFn` sums these into
+    /// the single `int` its caller (`baseMesher.meshThread`) uses for
+    /// backoff-reset decisions; callers here can do the same
+    /// (`ws + p2p > 0` mirrors go's `numOutgoing > 0`).
+    pub async fn mesh_cycle(
+        &mut self,
+        ws: &Arc<dyn GossipNode>,
+        p2p: &Arc<dyn GossipNode>,
+    ) -> (usize, usize) {
+        let ws_target = match self.prev_p2p_connections {
+            Some(prev) if self.target_conn_count > prev => self.target_conn_count - prev,
+            _ => self.target_conn_count,
+        };
+        let ws_connections = ws.mesh_cycle(ws_target).await;
+
+        // Go: `if wsConnections < targetConnCount { p2pTarget = targetConnCount - wsConnections }`
+        // (else `p2pTarget` stays its zero-initialized value) — equivalent
+        // to `saturating_sub` since `ws_connections >= target_conn_count`
+        // is exactly the case this would otherwise underflow.
+        let p2p_target = self.target_conn_count.saturating_sub(ws_connections);
+        let p2p_connections = p2p.mesh_cycle(p2p_target).await;
+
+        self.prev_p2p_connections = Some(p2p_connections);
+        (ws_connections, p2p_connections)
     }
 }
 
@@ -384,10 +529,59 @@ impl GossipNode for DualGossipNode {
 
     async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.primary.start().await?;
-        self.secondary.start().await
+        self.secondary.start().await?;
+
+        // Issue #1441: drive the WS-priority/P2P-fallback hybrid mesh
+        // scheduler on a periodic timer, mirroring
+        // `baseMesher.meshThread`'s ticker loop (`network/mesh.go`). Each
+        // tick runs one `HybridMeshScheduler::mesh_cycle` against the two
+        // legs. `primary`/`secondary` are cheap `Arc` clones, so the
+        // spawned task doesn't borrow `self`.
+        let primary = Arc::clone(&self.primary);
+        let secondary = Arc::clone(&self.secondary);
+        let mut scheduler = HybridMeshScheduler::new(self.mesh_target_conn_count);
+        let mesh_interval = self.mesh_interval;
+        let cancel = self.mesh_cancel.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(mesh_interval);
+            // Consume the immediate first tick — go's ticker-driven mesh
+            // thread doesn't fire on construction either, and the WS/P2P
+            // legs each already ran their own startup mesh connect from
+            // `self.primary.start()`/`self.secondary.start()` above.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!("hybrid mesh scheduler shutting down");
+                        return;
+                    }
+                    _ = interval.tick() => {}
+                }
+                let (ws, p2p) = scheduler.mesh_cycle(&primary, &secondary).await;
+                debug!(
+                    ws,
+                    p2p,
+                    target = scheduler.target_conn_count(),
+                    "hybrid mesh cycle"
+                );
+            }
+        });
+        *self.mesh_task.lock().expect("mesh_task mutex poisoned") = Some(handle);
+
+        Ok(())
     }
 
     async fn stop(&self) {
+        self.mesh_cancel.cancel();
+        let handle = self
+            .mesh_task
+            .lock()
+            .expect("mesh_task mutex poisoned")
+            .take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
         self.primary.stop().await;
         self.secondary.stop().await;
     }
@@ -829,5 +1023,248 @@ mod tests {
         let verified_over_p2p = remote.public_key();
         assert_eq!(verified_over_ws, verified_over_p2p);
         assert!(!local.claim_identity(IdentityLeg::P2p, "QmRemotePeerId", verified_over_p2p));
+    }
+
+    // -----------------------------------------------------------------------
+    // HybridMeshScheduler (issue #1441)
+    // -----------------------------------------------------------------------
+
+    /// A [`GossipNode`] test double whose `mesh_cycle` records every
+    /// `target_conn_count` it was called with and returns a pre-scripted
+    /// sequence of connection counts (one per call; the last value repeats
+    /// once the script is exhausted) — lets a test pin exactly what target
+    /// [`HybridMeshScheduler`] computed for each leg on each cycle, not
+    /// just the final summed total.
+    struct MeshTrackingNode {
+        name: &'static str,
+        targets_seen: Mutex<Vec<usize>>,
+        script: Mutex<Vec<usize>>,
+    }
+
+    impl MeshTrackingNode {
+        fn new(name: &'static str, script: Vec<usize>) -> Self {
+            Self {
+                name,
+                targets_seen: Mutex::new(Vec::new()),
+                script: Mutex::new(script),
+            }
+        }
+
+        fn targets_seen(&self) -> Vec<usize> {
+            self.targets_seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl GossipNode for MeshTrackingNode {
+        fn address(&self) -> (String, bool) {
+            (self.name.to_string(), true)
+        }
+        async fn broadcast(
+            &self,
+            _tag: Tag,
+            _data: Vec<u8>,
+            _wait: bool,
+            _except: Option<Arc<dyn Peer>>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn relay(
+            &self,
+            _tag: Tag,
+            _data: Vec<u8>,
+            _wait: bool,
+            _except: Option<Arc<dyn Peer>>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn disconnect(&self, _peer: Arc<dyn Peer>) {}
+        fn disconnect_peers(&self) {}
+        async fn request_connect_outgoing(&self, _replace: bool) {}
+
+        async fn mesh_cycle(&self, target_conn_count: usize) -> usize {
+            self.targets_seen.lock().unwrap().push(target_conn_count);
+            let mut script = self.script.lock().unwrap();
+            if script.len() > 1 {
+                script.remove(0)
+            } else {
+                *script.first().unwrap_or(&0)
+            }
+        }
+
+        fn get_peers(&self, _options: &[PeerOption]) -> Vec<Arc<dyn Peer>> {
+            Vec::new()
+        }
+        async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn stop(&self) {}
+        fn register_handlers(&self, _dispatch: Vec<TaggedMessageHandler>) {}
+        fn clear_handlers(&self) {}
+        fn register_validator_handlers(&self, _dispatch: Vec<TaggedMessageValidatorHandler>) {}
+        fn clear_validator_handlers(&self) {}
+        fn on_network_advance(&self) {}
+        fn get_genesis_id(&self) -> &str {
+            "test-genesis"
+        }
+        fn register_http_handler(&self, _path: &str, _handler: Router) {}
+    }
+
+    /// Core WS-priority behavior: when WS alone can fill the entire
+    /// target, P2P must be asked for `0` — WS connections are preferred
+    /// over P2P whenever both are available for the same peer-count slot.
+    #[tokio::test]
+    async fn ws_covers_full_target_p2p_gets_zero_target() {
+        let ws_node = Arc::new(MeshTrackingNode::new("ws", vec![4]));
+        let p2p_node = Arc::new(MeshTrackingNode::new("p2p", vec![0]));
+        let ws: Arc<dyn GossipNode> = ws_node.clone();
+        let p2p: Arc<dyn GossipNode> = p2p_node.clone();
+        let mut scheduler = HybridMeshScheduler::new(4);
+
+        let (ws_conns, p2p_conns) = scheduler.mesh_cycle(&ws, &p2p).await;
+
+        assert_eq!(ws_conns, 4);
+        assert_eq!(p2p_conns, 0);
+        // WS was asked for the full target on the first cycle...
+        assert_eq!(
+            ws_node.targets_seen(),
+            vec![4],
+            "WS should always be asked for the full target first"
+        );
+        // ...and P2P was still invoked (to fetch DHT peers per go's
+        // comment) but with target 0, since WS already met the target.
+        assert_eq!(
+            p2p_node.targets_seen(),
+            vec![0],
+            "P2P must be asked for 0 once WS alone meets the target"
+        );
+    }
+
+    /// P2P fallback: when WS can only cover part of the target, P2P must
+    /// be asked for exactly the shortfall (`target - ws_connections`) —
+    /// P2P is used only as fallback once WS capacity is exhausted.
+    #[tokio::test]
+    async fn p2p_covers_shortfall_when_ws_capacity_exhausted() {
+        let ws_node = Arc::new(MeshTrackingNode::new("ws", vec![1]));
+        let p2p_node = Arc::new(MeshTrackingNode::new("p2p", vec![3]));
+        let ws: Arc<dyn GossipNode> = ws_node.clone();
+        let p2p: Arc<dyn GossipNode> = p2p_node.clone();
+        let mut scheduler = HybridMeshScheduler::new(4);
+
+        let (ws_conns, p2p_conns) = scheduler.mesh_cycle(&ws, &p2p).await;
+
+        assert_eq!(ws_conns, 1);
+        assert_eq!(p2p_conns, 3);
+        assert_eq!(ws_node.targets_seen(), vec![4]);
+        // Shortfall = target(4) - ws_connections(1) = 3.
+        assert_eq!(p2p_node.targets_seen(), vec![3]);
+    }
+
+    /// The `prevP2PConnections` carry-over: once P2P has proven it can
+    /// hold `prev_p2p` connections, the *next* cycle's WS target is
+    /// reduced by that amount (`target - prev_p2p`), so WS isn't re-asked
+    /// to cover ground P2P already has — go's
+    /// "skip p2p mesh reduction... to give wsnet to establish connections"
+    /// comment, applied from the second cycle onward.
+    #[tokio::test]
+    async fn ws_target_reduced_by_prior_cycles_p2p_connections() {
+        // Cycle 1: WS only manages 1 of 4; P2P covers the other 3.
+        let ws_node = Arc::new(MeshTrackingNode::new("ws", vec![1, 1]));
+        let p2p_node = Arc::new(MeshTrackingNode::new("p2p", vec![3, 3]));
+        let ws: Arc<dyn GossipNode> = ws_node.clone();
+        let p2p: Arc<dyn GossipNode> = p2p_node.clone();
+        let mut scheduler = HybridMeshScheduler::new(4);
+
+        let _ = scheduler.mesh_cycle(&ws, &p2p).await;
+        // Cycle 2: prev_p2p = 3, target(4) > 3, so ws_target = 4 - 3 = 1.
+        let _ = scheduler.mesh_cycle(&ws, &p2p).await;
+
+        assert_eq!(ws_node.targets_seen(), vec![4, 1]);
+    }
+
+    /// First cycle always asks WS for the *full* target — go's
+    /// `prevP2PConnections != -1` guard means the reduction only applies
+    /// from the second cycle onward, so a brand-new hybrid node's first
+    /// mesh cycle doesn't shortchange WS before P2P has proven anything.
+    #[tokio::test]
+    async fn first_cycle_asks_ws_for_full_target_uninfluenced_by_p2p() {
+        let ws_node = Arc::new(MeshTrackingNode::new("ws", vec![0]));
+        let p2p_node = Arc::new(MeshTrackingNode::new("p2p", vec![4]));
+        let ws: Arc<dyn GossipNode> = ws_node.clone();
+        let p2p: Arc<dyn GossipNode> = p2p_node.clone();
+        let mut scheduler = HybridMeshScheduler::new(4);
+
+        let _ = scheduler.mesh_cycle(&ws, &p2p).await;
+
+        assert_eq!(ws_node.targets_seen(), vec![4]);
+    }
+
+    /// When WS already meets or exceeds the target, P2P's mesh cycle is
+    /// still *invoked* (target 0) rather than skipped entirely — matching
+    /// go's explicit comment that a zero p2p target still fetches DHT
+    /// peers.
+    #[tokio::test]
+    async fn p2p_still_invoked_with_zero_target_when_ws_exceeds_target() {
+        let ws_node = Arc::new(MeshTrackingNode::new("ws", vec![5]));
+        let p2p_node = Arc::new(MeshTrackingNode::new("p2p", vec![0]));
+        let ws: Arc<dyn GossipNode> = ws_node.clone();
+        let p2p: Arc<dyn GossipNode> = p2p_node.clone();
+        let mut scheduler = HybridMeshScheduler::new(4);
+
+        let (ws_conns, p2p_conns) = scheduler.mesh_cycle(&ws, &p2p).await;
+
+        assert_eq!(ws_conns, 5);
+        assert_eq!(p2p_conns, 0);
+        assert_eq!(
+            p2p_node.targets_seen().len(),
+            1,
+            "p2p.mesh_cycle must still be called even with target 0"
+        );
+        assert_eq!(p2p_node.targets_seen(), vec![0]);
+    }
+
+    /// The default `GossipNode::mesh_cycle` (used by transports that
+    /// aren't a hybrid-mesh leg — bridges, mocks) returns 0 and does
+    /// nothing; the scheduler must not panic or misbehave when driven
+    /// against such a no-op leg, it just gets 0 back like any other
+    /// result.
+    #[tokio::test]
+    async fn scheduler_tolerates_default_zero_mesh_cycle_leg() {
+        let noop: Arc<dyn GossipNode> = Arc::new(MockNode::new("noop"));
+        let p2p_node = Arc::new(MeshTrackingNode::new("p2p", vec![2]));
+        let p2p: Arc<dyn GossipNode> = p2p_node.clone();
+        let mut scheduler = HybridMeshScheduler::new(4);
+
+        let (ws_conns, p2p_conns) = scheduler.mesh_cycle(&noop, &p2p).await;
+
+        assert_eq!(ws_conns, 0);
+        assert_eq!(p2p_conns, 2);
+        assert_eq!(p2p_node.targets_seen(), vec![4]);
+    }
+
+    /// `DualGossipNode::start` actually spawns and drives the hybrid mesh
+    /// scheduler — not just that `HybridMeshScheduler` exists in
+    /// isolation. Uses a short mesh interval so at least one scheduled
+    /// cycle runs within the test's timeout.
+    #[tokio::test]
+    async fn start_drives_at_least_one_scheduled_mesh_cycle() {
+        let primary: Arc<dyn GossipNode> = Arc::new(MockNode::new("ws"));
+        let secondary_tracking = Arc::new(MeshTrackingNode::new("p2p", vec![0]));
+        let secondary: Arc<dyn GossipNode> = secondary_tracking.clone();
+
+        let dual = DualGossipNode::new(primary, secondary, test_signing_key(60))
+            .with_mesh_target_conn_count(4)
+            .with_mesh_interval(Duration::from_millis(10));
+
+        dual.start().await.expect("start should succeed");
+
+        // Give the spawned scheduler task a couple of ticks to run.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        dual.stop().await;
+
+        assert!(
+            !secondary_tracking.targets_seen().is_empty(),
+            "hybrid mesh scheduler should have run at least one cycle by now"
+        );
     }
 }

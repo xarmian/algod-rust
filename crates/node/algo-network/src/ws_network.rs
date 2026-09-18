@@ -1280,6 +1280,21 @@ impl WebsocketNetwork {
     /// When `start_arc()` is used, mesh maintenance is delegated to
     /// [`MeshThread`] which provides backoff and deduplication.
     async fn mesh_connect(&self) {
+        self.mesh_connect_with_target(self.config.gossip_fanout)
+            .await;
+    }
+
+    /// [`Self::mesh_connect`] generalized to an arbitrary target outgoing
+    /// connection count rather than the fixed `self.config.gossip_fanout`.
+    ///
+    /// This is the hook [`GossipNode::mesh_cycle`] uses: go's
+    /// `meshThreadInner(targetConnCount int)` takes the target as a
+    /// parameter precisely so `hybridRelayMeshCreator.meshFn`
+    /// (`network/mesh.go`) can pass it a WS-specific target that's
+    /// sometimes less than the overall hybrid target (when the P2P leg
+    /// already covered part of it last cycle) — `mesh_connect` alone
+    /// (always `gossip_fanout`) can't express that.
+    async fn mesh_connect_with_target(&self, target_conn_count: usize) -> usize {
         let current_out = {
             let peers = self.peers.read().await;
             peers
@@ -1288,11 +1303,11 @@ impl WebsocketNetwork {
                 .count()
         };
 
-        if current_out >= self.config.gossip_fanout {
-            return;
+        if current_out >= target_conn_count {
+            return current_out;
         }
 
-        let needed = self.config.gossip_fanout - current_out;
+        let needed = target_conn_count - current_out;
         let addresses = self.phonebook.get_addresses(needed, RELAY_ROLE);
 
         for addr in addresses {
@@ -1369,6 +1384,12 @@ impl WebsocketNetwork {
                 connecting.remove(&addr);
             }
         }
+
+        let peers = self.peers.read().await;
+        peers
+            .values()
+            .filter(|e| e.direction == PeerDirection::Outbound)
+            .count()
     }
 
     /// Checks whether an existing outgoing connection should be dropped for
@@ -2005,6 +2026,10 @@ impl GossipNode for WebsocketNetwork {
             self.disconnect_peers();
         }
         self.mesh_connect().await;
+    }
+
+    async fn mesh_cycle(&self, target_conn_count: usize) -> usize {
+        self.mesh_connect_with_target(target_conn_count).await
     }
 
     fn get_peers(&self, options: &[PeerOption]) -> Vec<Arc<dyn Peer>> {

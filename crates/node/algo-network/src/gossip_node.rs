@@ -289,6 +289,33 @@ pub trait GossipNode: Send + Sync {
     /// Mirrors Go's `RequestConnectOutgoing(replace, quit)`.
     async fn request_connect_outgoing(&self, replace: bool);
 
+    /// Run one mesh-maintenance cycle against `target_conn_count` outgoing
+    /// connections and return this transport's outgoing connection count
+    /// *after* the attempt (not just newly-established connections).
+    ///
+    /// Mirrors go's `WebsocketNetwork.meshThreadInner`/
+    /// `P2PNetwork.meshThreadInner` (`network/wsNetwork.go`,
+    /// `network/p2pNetwork.go`) — both attempt to dial up to
+    /// `target_conn_count` peers and return
+    /// `len(outgoingPeers)`/`numOutgoingPeers()+numOutgoingPending()`
+    /// afterward, which is exactly the signature
+    /// `hybridRelayMeshCreator.meshFn` (`network/mesh.go`) composes over
+    /// both transports — see
+    /// [`HybridMeshScheduler`](../../algod_rust/commands/dual_gossip_node/struct.HybridMeshScheduler.html)
+    /// in `bin/algod-rust`, which drives this method on both legs of a
+    /// [`DualGossipNode`](../../algod_rust/commands/dual_gossip_node/struct.DualGossipNode.html)
+    /// with go's WS-priority/P2P-fallback target split.
+    ///
+    /// The default no-op implementation (returns 0, attempts nothing) is
+    /// correct for any `GossipNode` implementor that isn't a hybrid-mesh
+    /// transport leg — test doubles, bridges (`AgreementNetworkBridge`,
+    /// `LocalTxBroadcaster`), and any future single-transport-only node
+    /// have no scheduled variable-target mesh loop, and reporting 0 simply
+    /// tells a caller "this transport contributed nothing this cycle".
+    async fn mesh_cycle(&self, _target_conn_count: usize) -> usize {
+        0
+    }
+
     /// Returns the set of connected peers matching the given options.
     ///
     /// Mirrors Go's `GetPeers(options ...PeerOption) []Peer`.
