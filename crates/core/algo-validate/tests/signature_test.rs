@@ -468,3 +468,166 @@ fn logicsig_size_pooling_allows_large_lsig_in_group() {
         "group of 1 should reject a 3387-byte LogicSig"
     );
 }
+
+/// Build a syntactically valid, executable AVM **v1** program of exactly
+/// `total_len` bytes -- v1 is used (rather than a later version's more
+/// compact `pushbytes`/`pushint`) because this helper backs the
+/// `TestLogicSigSizeBeforePooling`-equivalent test, which specifically
+/// exercises go's v18 nettemplate (`LogicSigVersion == 1`, `pragma 1`, per
+/// go's own `GenerateUnsaltedProgramOfSize(size, pragma=1)` call).
+///
+/// Layout: `version(1) bytecblock-op(1) numconsts(1)=1 varuint-len(2) <blob>
+/// bytec_0(1) pop(1) intcblock-op(1) numconsts(1)=1 intc-val(1)=1
+/// intc_0(1)` -- 11 bytes of fixed overhead plus `blob_len` bytes of
+/// payload (a 2-byte varuint length prefix, valid for `blob_len` in
+/// `128..=16383`, which covers this test's 1000-2001-byte range). Final
+/// stack value is the int 1, so the LogicSig evaluates to approve.
+fn valid_program_of_size(total_len: usize) -> Vec<u8> {
+    let blob_len = total_len - 11;
+    assert!(
+        (128..=16383).contains(&blob_len),
+        "blob_len {blob_len} out of the 2-byte-varuint range this helper assumes"
+    );
+    let mut program = Vec::with_capacity(total_len);
+    program.push(0x01); // version 1
+    program.push(0x26); // bytecblock
+    program.push(0x01); // num constants = 1
+    program.push(((blob_len & 0x7f) | 0x80) as u8);
+    program.push((blob_len >> 7) as u8);
+    program.extend(std::iter::repeat(0u8).take(blob_len));
+    program.push(0x28); // bytec_0
+    program.push(0x48); // pop
+    program.push(0x20); // intcblock
+    program.push(0x01); // num constants = 1
+    program.push(0x01); // value = 1
+    program.push(0x22); // intc_0
+    assert_eq!(program.len(), total_len);
+    program
+}
+
+/// Build a 2-txn group mirroring go-algorand's `testLogicSize` helper
+/// (`test/e2e-go/features/transactions/logicsig_test.go`): the first txn is
+/// signed by a LogicSig program of exactly `program_len` bytes, the second
+/// is a vanilla payment with no LogicSig.
+fn two_txn_group_with_logicsig(program_len: usize) -> Vec<SignedTransaction> {
+    let program = valid_program_of_size(program_len);
+    let lsig_txn = make_contract_account_txn(&program);
+    let plain_txn = SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".into(),
+            sender: Address([0x30; 32]),
+            fee: 1_000,
+            first_valid: Round(1),
+            last_valid: Round(100),
+            receiver: Address([0x40; 32]),
+            amount: 0,
+            ..Default::default()
+        },
+        sig: [0u8; 64],
+        ..Default::default()
+    };
+    vec![lsig_txn, plain_txn]
+}
+
+/// Mirrors go-algorand's `TestLogicSigSizeBeforePooling`
+/// (`test/e2e-go/features/transactions/logicsig_test.go#L31`): on the v18
+/// protocol (`MaxAbsoluteLogicSigProgramSize == LogicSigMaxSize == 1000`,
+/// go's pre-pooling nettemplate), a LogicSig program of exactly 1000 bytes
+/// is accepted and one byte over is rejected.
+///
+/// The rejection here comes from `verify_logicsig`'s per-transaction size
+/// checks (its `!enable_logicsig_size_pooling` gate and/or its *absolute*
+/// `max_absolute_logic_sig_program_size` cap, mirroring go's
+/// `logicSigSanityCheckBatchPrep`, `data/transactions/verify/txn.go#L441`),
+/// not the group-pool check (`logic_sig_group_size_check`): at v18 the
+/// group pool for this 2-txn group is already `2 * 1000 = 2000` bytes (the
+/// pool formula is unconditional in the pinned go-algorand source -- see
+/// `logicSigGroupSizeCheck`), so a 1001-byte program would *pass* the pool
+/// check on its own. It is v18's per-txn caps (`LogicSigMaxSize` and
+/// `MaxAbsoluteLogicSigProgramSize`, both 1000, i.e. no room for pooling to
+/// help) that actually gate it, exactly mirroring the live node's per-txn
+/// rejection go's test observes.
+#[test]
+fn logicsig_before_pooling_absolute_cap_boundary() {
+    let consensus =
+        algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V18)
+            .expect("v18 must be a known protocol version");
+    assert_eq!(
+        consensus.max_absolute_logic_sig_program_size, 1000,
+        "test assumes go's v18 MaxAbsoluteLogicSigProgramSize of 1000 bytes"
+    );
+    assert_eq!(consensus.logic_sig_max_size, 1000);
+
+    let group_ok = two_txn_group_with_logicsig(1000);
+    let lsig_ok = group_ok[0].lsig.as_ref().unwrap();
+    let mut budget_ok = GroupBudget::for_logicsig(group_ok.len());
+    assert!(
+        verify_logicsig(
+            &group_ok[0],
+            lsig_ok,
+            &group_ok,
+            0,
+            &mut budget_ok,
+            &consensus
+        )
+        .is_ok(),
+        "a 1000-byte LogicSig must be accepted before pooling"
+    );
+    // The group-level pool check must also pass (it's not what's being pinned here).
+    assert!(algo_validate::signature::logic_sig_group_size_check(&group_ok, &consensus).is_ok());
+
+    let group_too_long = two_txn_group_with_logicsig(1001);
+    let lsig_too_long = group_too_long[0].lsig.as_ref().unwrap();
+    let mut budget_fail = GroupBudget::for_logicsig(group_too_long.len());
+    let err = verify_logicsig(
+        &group_too_long[0],
+        lsig_too_long,
+        &group_too_long,
+        0,
+        &mut budget_fail,
+        &consensus,
+    )
+    .expect_err("a 1001-byte LogicSig must be rejected before pooling (absolute cap)");
+    assert!(err.to_string().contains("too long"), "{err}");
+    // Confirm the group-pool check alone would NOT have caught this at v18
+    // (pool = 2 * 1000 = 2000, unconditionally) -- it's genuinely the
+    // absolute per-txn cap doing the rejecting, matching go's actual code path.
+    assert!(
+        algo_validate::signature::logic_sig_group_size_check(&group_too_long, &consensus).is_ok(),
+        "the pooled group check alone does not gate this at v18; the absolute cap does"
+    );
+}
+
+/// Mirrors go-algorand's `TestLogicSigSizeAfterPooling`
+/// (`test/e2e-go/features/transactions/logicsig_test.go#L46`): once
+/// `EnableLogicSigSizePooling` is true, the group's total LogicSig budget is
+/// `len(group) * LogicSigMaxSize` (2 * 1000 = 2000 for the 2-txn group
+/// go's `testLogicSize` submits, since the companion payment contributes no
+/// LogicSig bytes of its own) -- a single LogicSig may consume the whole
+/// pooled budget: 2000 bytes accepted, 2001 rejected.
+#[test]
+fn logicsig_group_size_check_after_pooling_boundary() {
+    // v41: pooling is on (introduced at v40) but the per-byte txn surcharge
+    // (introduced at v42) is still zero, matching go's pre-size-pricing
+    // "after pooling" nettemplate -- program bytes are pool-capped, not fee-priced.
+    let consensus =
+        algo_types::consensus::consensus_params_for_version(algo_types::consensus::CONSENSUS_V41)
+            .expect("v41 must be a known protocol version");
+    assert!(consensus.enable_logicsig_size_pooling);
+    assert_eq!(consensus.per_byte_txn_surcharge, 0);
+    assert_eq!(consensus.logic_sig_max_size, 1000);
+
+    let group_ok = two_txn_group_with_logicsig(2000);
+    assert!(
+        algo_validate::signature::logic_sig_group_size_check(&group_ok, &consensus).is_ok(),
+        "a 2000-byte LogicSig must fit the pooled 2-txn-group budget"
+    );
+
+    let group_too_long = two_txn_group_with_logicsig(2001);
+    let err = algo_validate::signature::logic_sig_group_size_check(&group_too_long, &consensus)
+        .expect_err("a 2001-byte LogicSig must exceed the pooled 2-txn-group budget");
+    assert!(
+        err.to_string().contains("more than the available pool"),
+        "{err}"
+    );
+}
