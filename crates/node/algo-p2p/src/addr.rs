@@ -89,8 +89,29 @@ pub enum AddrParseError {
 /// shape is detected up front via [`HOST_COLON_PORT_PATTERN`] and given an
 /// explicit `http://` scheme before parsing.
 pub fn parse_host_or_url(addr: &str) -> Result<Url, AddrParseError> {
+    parse_host_or_url_with_literal_port(addr).map(|(url, _)| url)
+}
+
+/// Like [`parse_host_or_url`], but also returns the literal, as-written port
+/// from `addr` when one is present — including one that equals its scheme's
+/// WHATWG default and that the returned `Url`'s own `port()`/`set_port()`
+/// therefore cannot represent (see [`literal_port`]'s doc comment).
+///
+/// [`parse_host_or_url_or_multiaddr`] uses this (instead of `Url::port()`
+/// alone) to build its returned "host:port" string, so that an explicit
+/// default port survives end to end (issue #1436). `parse_host_or_url`
+/// itself still returns a plain `Url` unchanged: nothing else in this crate
+/// inspects `.port()` on its result for a "special"-scheme default-port
+/// input, and preserving `Url`'s ordinary semantics elsewhere avoids
+/// widening this fix beyond the actual bug.
+fn parse_host_or_url_with_literal_port(addr: &str) -> Result<(Url, Option<u16>), AddrParseError> {
     if matches_host_colon_port(addr) {
-        return Url::parse(&format!("http://{addr}"))
+        let joined = format!("http://{addr}");
+        return Url::parse(&joined)
+            .map(|parsed| {
+                let port = literal_port(&joined);
+                (parsed, port)
+            })
             .map_err(|e| AddrParseError::UrlParse(e.to_string()));
     }
 
@@ -98,7 +119,8 @@ pub fn parse_host_or_url(addr: &str) -> Result<Url, AddrParseError> {
         if parsed.host_str().is_none() {
             return Err(AddrParseError::NoHost);
         }
-        return Ok(parsed);
+        let port = literal_port(addr);
+        return Ok((parsed, port));
     }
 
     if addr.starts_with("http:")
@@ -106,7 +128,6 @@ pub fn parse_host_or_url(addr: &str) -> Result<Url, AddrParseError> {
         || addr.starts_with("ws:")
         || addr.starts_with("wss:")
         || addr.starts_with("://")
-        || addr.starts_with("//")
     {
         // Go returns the original (parsed, err) pair here — both nil/zero
         // on this path in practice, since these prefixes are exactly the
@@ -115,6 +136,25 @@ pub fn parse_host_or_url(addr: &str) -> Result<Url, AddrParseError> {
         return Err(AddrParseError::UrlParse(
             "failed to parse url with recognized scheme prefix".to_string(),
         ));
+    }
+
+    // Protocol-relative URL ("//host[:port][/path]", e.g. "//somewhere.tld"
+    // or "//somewhere.tld:4601" — two of go's `TestParseHostOrURL` valid
+    // cases). Go's permissive `net/url.Parse` accepts this directly,
+    // yielding `url.URL{Scheme: "", Host: "host[:port]"}`; Rust's `url`
+    // crate requires an absolute URL with a non-empty scheme (and can't
+    // represent an empty one at all), so give it a temporary one the same
+    // way the "[::]:port" fallback below does, purely to reuse the crate's
+    // authority/port parsing and validation (e.g. still rejecting
+    // "//localhost:WAT" for its non-numeric port, matching go).
+    if let Some(rest) = addr.strip_prefix("//") {
+        let joined = format!("http://{rest}");
+        return Url::parse(&joined)
+            .map(|parsed| {
+                let port = literal_port(&joined);
+                (parsed, port)
+            })
+            .map_err(|e| AddrParseError::UrlParse(e.to_string()));
     }
 
     // Go's `net/url.Parse` is far more permissive than Rust's `url` crate:
@@ -148,7 +188,37 @@ pub fn parse_host_or_url(addr: &str) -> Result<Url, AddrParseError> {
 
     // This turns "[::]:4601" into "http://[::]:4601", which the url crate
     // (like Go's net/url) can parse directly.
-    Url::parse(&format!("http://{addr}")).map_err(|e| AddrParseError::UrlParse(e.to_string()))
+    let joined = format!("http://{addr}");
+    Url::parse(&joined)
+        .map(|parsed| {
+            let port = literal_port(&joined);
+            (parsed, port)
+        })
+        .map_err(|e| AddrParseError::UrlParse(e.to_string()))
+}
+
+/// Recovers the literal, as-written port from `url_str` (the exact string
+/// that was fed to `Url::parse` to obtain a successful parse), even when it
+/// equals the WHATWG default for the URL's "special" scheme (`ws`=80,
+/// `wss`=443, `http`=80, `https`=443, `ftp`=21) — in which case `Url::port()`
+/// (and even calling `Url::set_port()` again with that same value) returns
+/// `None`: the WHATWG URL parsing *and* port-setter algorithms both null out
+/// a special scheme's default port unconditionally, so `url::Url` has no way
+/// to represent "an explicit port was written that happens to equal the
+/// default" — that information is only recoverable from the original text.
+///
+/// Go's `net/url.Parse` has no such normalization at all — `url.URL.Host`
+/// always contains the literal parsed authority, port included — so
+/// `ParseHostOrURL("wss://localhost:443")` keeps `:443` (issue #1436).
+///
+/// Implementation: re-parses the same `scheme://host[:port]...` authority
+/// under a synthetic non-"special" scheme name, which the `url` crate never
+/// elides a port for regardless of value, and reads the port back off that.
+fn literal_port(url_str: &str) -> Option<u16> {
+    let scheme_end = url_str.find("://")?;
+    let rest = &url_str[scheme_end..];
+    let probe = format!("x-algod-rust-literal-port{rest}");
+    Url::parse(&probe).ok()?.port()
 }
 
 /// Returns `true` if `addr` looks like (and validates as) a libp2p multiaddr.
@@ -173,10 +243,11 @@ pub fn parse_host_or_url_or_multiaddr(addr: &str) -> Result<String, AddrParseErr
             .map(|_| addr.to_string())
             .map_err(|e| AddrParseError::MultiaddrParse(e.to_string()));
     }
-    let url = parse_host_or_url(addr)?;
+    let (url, literal_port) = parse_host_or_url_with_literal_port(addr)?;
+    let port = literal_port.or_else(|| url.port());
     Ok(url
         .host_str()
-        .map(|h| match url.port() {
+        .map(|h| match port {
             Some(p) => format!("{h}:{p}"),
             None => h.to_string(),
         })
@@ -270,6 +341,128 @@ mod tests {
 
         let joined = parse_host_or_url_or_multiaddr("[::]:4601").unwrap();
         assert_eq!(joined, "[::]:4601");
+    }
+
+    // Mirrors go's `TestParseHostOrURL` (network/addr/addr_test.go:33-104),
+    // porting its valid-cases table (13 of go's 14 entries — see the note
+    // below) and its full bad-URL table verbatim (issue #1436). Each valid
+    // case checks both `parse_host_or_url`'s `(scheme, host)` and
+    // `parse_host_or_url_or_multiaddr`'s joined `host:port` string, matching
+    // go's per-case `t.Run(tc.text, ...)` / `t.Run(tc.text+"-multiaddr", ...)`
+    // subtests.
+    #[test]
+    fn parse_host_or_url_matches_go_valid_cases_table() {
+        // (input, expected scheme, expected host [go's url.URL.Host, i.e.
+        // including an explicit port])
+        //
+        // go's 14th case, `{"::11.22.33.44:123", url.URL{Scheme: "http",
+        // Host: "::11.22.33.44:123"}}`, is intentionally omitted: it relies
+        // on a Go net/url stdlib quirk (`parseHost` only validates the
+        // *last* colon-separated host segment as a port, never checking
+        // whether the rest forms a real IPv6 literal) that the WHATWG-strict
+        // `url` crate has no way to replicate without bypassing its host
+        // parser entirely — a separate, narrower fix tracked in issue #1437,
+        // unrelated to this issue's port-preservation bug.
+        let cases: &[(&str, &str, &str)] = &[
+            ("localhost:123", "http", "localhost:123"),
+            ("http://localhost:123", "http", "localhost:123"),
+            ("ws://localhost:9999", "ws", "localhost:9999"),
+            ("wss://localhost:443", "wss", "localhost:443"),
+            ("https://localhost:123", "https", "localhost:123"),
+            ("https://somewhere.tld", "https", "somewhere.tld"),
+            ("http://127.0.0.1:123", "http", "127.0.0.1:123"),
+            ("//somewhere.tld", "", "somewhere.tld"),
+            ("//somewhere.tld:4601", "", "somewhere.tld:4601"),
+            ("http://[::]:123", "http", "[::]:123"),
+            ("1.2.3.4:123", "http", "1.2.3.4:123"),
+            ("[::]:123", "http", "[::]:123"),
+            (
+                "r2-devnet.devnet.algodev.network:4560",
+                "http",
+                "r2-devnet.devnet.algodev.network:4560",
+            ),
+        ];
+
+        for (input, expected_scheme, expected_host) in cases {
+            // `parse_host_or_url` itself is unavoidably lossy for a URL like
+            // "wss://localhost:443": `url::Url` implements WHATWG default-port
+            // elision on *both* parsing and `set_port()`, so a special
+            // scheme's (ws/wss/http/https/ftp) explicit-but-default port can
+            // never be represented on the `Url` object itself — only the
+            // original text carries that information (see `literal_port`'s
+            // doc comment). So this checks scheme/host (sans port) against
+            // the bare `Url`, and checks the full "host:port" string — the
+            // part go's real callers, and this module's own
+            // `parse_host_or_url_or_multiaddr`, actually consume — via the
+            // literal-port-aware helper, matching go's `url.URL.Host` exactly.
+            let (url, literal_port) = parse_host_or_url_with_literal_port(input)
+                .unwrap_or_else(|e| panic!("expected {input:?} to parse, got {e:?}"));
+            if !expected_scheme.is_empty() {
+                // Go's protocol-relative "//host" cases parse to an empty
+                // `url.URL.Scheme`; `url::Url` cannot represent an empty
+                // scheme at all (see `parse_host_or_url_with_literal_port`'s
+                // "//"-prefix branch), so those two cases are exempted here
+                // and instead validated purely on their host:port string
+                // below, which is what this module's real callers consume.
+                assert_eq!(
+                    url.scheme(),
+                    *expected_scheme,
+                    "scheme mismatch for {input:?}"
+                );
+            }
+            let port = literal_port.or_else(|| url.port());
+            let host = url
+                .host_str()
+                .map(|h| match port {
+                    Some(p) => format!("{h}:{p}"),
+                    None => h.to_string(),
+                })
+                .unwrap_or_default();
+            assert_eq!(host, *expected_host, "host mismatch for {input:?}");
+
+            let joined = parse_host_or_url_or_multiaddr(input).unwrap_or_else(|e| {
+                panic!("expected {input:?} to parse (multiaddr path), got {e:?}")
+            });
+            assert_eq!(joined, *expected_host, "joined host mismatch for {input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_host_or_url_rejects_go_bad_url_table() {
+        let bad_urls = [
+            "justahost",
+            "localhost:WAT",
+            "http://localhost:WAT",
+            "https://localhost:WAT",
+            "ws://localhost:WAT",
+            "wss://localhost:WAT",
+            "//localhost:WAT",
+            "://badaddress",
+            "://localhost:1234",
+            ":xxx",
+            ":xxx:1234",
+            "::11.22.33.44",
+            ":a:1",
+            ":a:",
+            ":1",
+            ":a",
+            ":",
+            "",
+        ];
+        for addr in bad_urls {
+            assert!(
+                parse_host_or_url(addr).is_err(),
+                "expected {addr:?} to fail to parse"
+            );
+            assert!(
+                !is_multiaddr(addr),
+                "expected {addr:?} to not be a multiaddr"
+            );
+            assert!(
+                parse_host_or_url_or_multiaddr(addr).is_err(),
+                "expected {addr:?} to fail to parse (multiaddr path)"
+            );
+        }
     }
 
     #[test]
