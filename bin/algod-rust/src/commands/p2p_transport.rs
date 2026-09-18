@@ -81,10 +81,11 @@ use algo_network::{
     DEFAULT_REQUEST_TIMEOUT, MAX_MESSAGE_QUEUE_DURATION, RESPONSE_HASH_FIELD,
 };
 use algo_p2p::{
-    build_headers, handshake_inbound, handshake_outbound, libp2p_stream, read_frame,
-    resolve_dht_mode, should_initiate_stream, write_frame, DispatchError, IdentityConfig,
-    IdentityTracker, LogLevel, MessageValidationResult, P2pBehaviourEvent, P2pHost, P2pHostConfig,
-    PeerMetaHeaders, StreamManager, ALGORAND_HTTP_PROTOCOL, ALGORAND_WS_PROTOCOL_V22,
+    build_headers, handshake_inbound, handshake_outbound, handshake_v1_inbound,
+    handshake_v1_outbound, libp2p_stream, read_frame, resolve_dht_mode, should_initiate_stream,
+    write_frame, DispatchError, IdentityConfig, IdentityTracker, LogLevel, MessageValidationResult,
+    P2pBehaviourEvent, P2pHost, P2pHostConfig, PeerMetaHeaders, StreamManager,
+    ALGORAND_HTTP_PROTOCOL, ALGORAND_WS_PROTOCOL_V1, ALGORAND_WS_PROTOCOL_V22,
 };
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
@@ -703,6 +704,161 @@ async fn handle_outbound_ws_stream(
     }
 }
 
+/// Complete the inbound (listener) side of the legacy `/algorand-ws/1.0.0`
+/// handshake (go: the `incoming` branch of `wsStreamHandlerV1`) and, on
+/// success, start this peer's read/write loop exactly as
+/// [`handle_inbound_ws_stream`] does for V22 — just with zero negotiated
+/// features, since V1 never exchanges a peer-meta-headers/feature
+/// advertisement at all (issue #1443).
+async fn handle_inbound_ws_v1_stream(
+    peer_id: PeerId,
+    mut stream: P2pRawStream,
+    mux: Arc<Multiplexer>,
+    stream_manager: StreamPeers,
+    stream_generation: Arc<AtomicU64>,
+) {
+    match handshake_v1_inbound(&mut stream).await {
+        Ok(()) => spawn_ws_peer(
+            peer_id,
+            stream,
+            mux,
+            stream_manager,
+            stream_generation,
+            PeerFeatureFlags::empty(),
+            false,
+        ),
+        Err(e) => {
+            // See `handle_inbound_ws_stream`'s matching comment: ends the
+            // in-flight attempt the accept-loop caller started, without
+            // installing a stream.
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            let dispatch_err = DispatchError::with_level(
+                format!("inbound V1 handshake failed: {e}"),
+                LogLevel::Warn,
+            );
+            log_dispatch_error(&peer_id, &dispatch_err);
+        }
+    }
+}
+
+/// Complete the outbound (dialer) side of the legacy `/algorand-ws/1.0.0`
+/// handshake (go: the `!incoming` branch of `wsStreamHandlerV1`) and, on
+/// success, start this peer's read/write loop — the V1 counterpart of
+/// [`handle_outbound_ws_stream`] (issue #1443).
+async fn handle_outbound_ws_v1_stream(
+    peer_id: PeerId,
+    mut stream: P2pRawStream,
+    mux: Arc<Multiplexer>,
+    stream_manager: StreamPeers,
+    stream_generation: Arc<AtomicU64>,
+) {
+    match handshake_v1_outbound(&mut stream).await {
+        Ok(()) => spawn_ws_peer(
+            peer_id,
+            stream,
+            mux,
+            stream_manager,
+            stream_generation,
+            PeerFeatureFlags::empty(),
+            true,
+        ),
+        Err(e) => {
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            let dispatch_err = DispatchError::with_level(
+                format!("outbound V1 handshake failed: {e}"),
+                LogLevel::Warn,
+            );
+            log_dispatch_error(&peer_id, &dispatch_err);
+        }
+    }
+}
+
+/// Open this side's `/algorand-ws` stream to `peer_id`, negotiating down to
+/// the legacy V1 protocol when the peer doesn't support V22 (issue #1443).
+///
+/// Mirrors go's `streamManager.Connected` calling `n.host.NewStream(n.ctx,
+/// remotePeer, protos...)` with an *ordered* protocol list (V22 first, V1
+/// last) and letting libp2p's own multistream-select pick the
+/// highest-priority protocol the remote peer actually has a handler
+/// registered for (`network/p2p/streams.go`). `libp2p_stream::Control::
+/// open_stream` (the rust-libp2p crate this transport is built on) only
+/// takes a single protocol ID per call — unlike go's client, it has no
+/// built-in multi-protocol negotiation — so this function reproduces the
+/// same *outcome* one dial attempt at a time instead: try V22 first (unless
+/// `disable_v22_protocol` — go's test-only `disableV22Protocol` equivalent,
+/// issue #1443's `TestP2PMetainfoV1vsV22` parity case), and on exactly an
+/// [`libp2p_stream::OpenStreamError::UnsupportedProtocol`] (the remote
+/// genuinely never registered a V22 acceptor — as opposed to a transient
+/// I/O error, which is not retried) fall back to V1 over the same
+/// already-established connection.
+#[allow(clippy::too_many_arguments)]
+async fn dial_ws_stream(
+    peer_id: PeerId,
+    mut control: libp2p_stream::Control,
+    disable_v22_protocol: bool,
+    headers: PeerMetaHeaders,
+    our_features: PeerFeatureFlags,
+    mux: Arc<Multiplexer>,
+    sp: StreamPeers,
+    gen_counter: Arc<AtomicU64>,
+) {
+    if !disable_v22_protocol {
+        match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V22).await {
+            Ok(stream) => {
+                handle_outbound_ws_stream(
+                    peer_id,
+                    stream,
+                    headers,
+                    our_features,
+                    mux,
+                    sp,
+                    gen_counter,
+                )
+                .await;
+                return;
+            }
+            Err(libp2p_stream::OpenStreamError::UnsupportedProtocol(_)) => {
+                tracing::debug!(
+                    %peer_id,
+                    "P2P: peer does not support algorand-ws V22, falling back to legacy V1"
+                );
+                // fall through to the V1 attempt below
+            }
+            Err(e) => {
+                sp.lock()
+                    .expect("stream_peers mutex poisoned")
+                    .end_peer_attempt(peer_id);
+                tracing::debug!(
+                    %peer_id, error = %e,
+                    "failed to open P2P algorand-ws stream"
+                );
+                return;
+            }
+        }
+    }
+
+    match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V1).await {
+        Ok(stream) => {
+            handle_outbound_ws_v1_stream(peer_id, stream, mux, sp, gen_counter).await;
+        }
+        Err(e) => {
+            sp.lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            tracing::debug!(
+                %peer_id, error = %e,
+                "failed to open P2P legacy algorand-ws V1 stream"
+            );
+        }
+    }
+}
+
 /// Log a [`DispatchError`] at the severity it carries — the live-wiring
 /// counterpart of go's `streamManager.logDispatchError` (issue #952):
 /// `streams.rs`'s `DispatchError`/`LogLevel` types are ported and
@@ -1092,6 +1248,18 @@ pub struct P2pTransportConfig {
     /// caller building a real node config should always set this
     /// explicitly from `algo_config::Local::enable_gossip_service`.
     pub enable_gossip_service: bool,
+    /// Test/interop-only escape hatch mirroring go's own `disableV22Protocol`
+    /// package variable (`network/p2pNetwork.go`, `// TODO: remove after
+    /// consensus v41 takes effect`): when `true`, this transport never
+    /// registers a `/algorand-ws/2.2.0` acceptor and only ever dials the
+    /// legacy `/algorand-ws/1.0.0` protocol, exactly as go's
+    /// `TestP2PMetainfoV1vsV22` (`network/p2pNetwork_test.go`) forces one
+    /// side of the pair down to V1-only to prove the other side's
+    /// negotiate-down fallback actually works (issue #1443). Not a real
+    /// user-facing config knob (no `config.json`/CLI surface, matching go's
+    /// own test-only var) — `Default::default()`'s `false` is what every
+    /// real node build uses.
+    pub disable_v22_protocol: bool,
 }
 
 /// Split a multiaddr into its dialable transport address and an optional
@@ -1365,10 +1533,36 @@ impl P2pTransport {
         // acceptor for inbound streams now, before any peer can possibly
         // dial in. `stream_control` is cloned into the background task
         // below to open an outbound stream whenever *this* node dials out.
+        // Skipped entirely when `disable_v22_protocol` is set (issue #1443,
+        // mirroring go's test-only `disableV22Protocol` var) — such a
+        // transport speaks V1 only, both for accepting and dialing.
         let mut stream_control = host.stream_control();
-        let mut incoming_ws_streams = stream_control
-            .accept(ALGORAND_WS_PROTOCOL_V22)
-            .map_err(|e| anyhow::anyhow!("failed to register algorand-ws stream acceptor: {e}"))?;
+        let incoming_ws_streams = if cfg.disable_v22_protocol {
+            None
+        } else {
+            Some(
+                stream_control
+                    .accept(ALGORAND_WS_PROTOCOL_V22)
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to register algorand-ws stream acceptor: {e}")
+                    })?,
+            )
+        };
+
+        // Legacy `/algorand-ws/1.0.0` stream setup (issue #1443): always
+        // register an acceptor for this protocol too, alongside V22 above —
+        // mirrors go's `p2pNetwork.go`'s `hm` always carrying the V1
+        // `StreamHandlerPair` unconditionally (`network/p2pNetwork.go`:
+        // "TODO: remove after consensus v41 takes effect") regardless of
+        // whether V22 is also registered, so a peer that only supports the
+        // legacy protocol (or dials it directly) can still connect instead
+        // of the connection failing outright.
+        let mut incoming_ws_v1_streams =
+            stream_control
+                .accept(ALGORAND_WS_PROTOCOL_V1)
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to register legacy algorand-ws V1 stream acceptor: {e}")
+                })?;
 
         // `/algorand-http/1.0.0` stream setup (issue #1024): register an
         // acceptor for inbound HTTP-over-libp2p-stream requests now, on the
@@ -1439,7 +1633,7 @@ impl P2pTransport {
         // in-flight counter before handing off to `handle_inbound_ws_stream`,
         // which itself ends the attempt on both the success path (inside
         // `spawn_ws_peer`, after the stream installs) and the failure path.
-        {
+        if let Some(mut incoming_ws_streams) = incoming_ws_streams {
             let mux = Arc::clone(&multiplexer);
             let sp = Arc::clone(&stream_peers);
             let gen_counter = Arc::clone(&stream_generation);
@@ -1485,6 +1679,43 @@ impl P2pTransport {
             });
         }
 
+        // Accept-loop: every inbound legacy `/algorand-ws/1.0.0` stream a
+        // peer opens to us — same `EnableGossipService` gating and
+        // begin/end-attempt bracketing as the V22 loop above, just
+        // dispatching to the V1 handshake (issue #1443).
+        {
+            let mux = Arc::clone(&multiplexer);
+            let sp = Arc::clone(&stream_peers);
+            let gen_counter = Arc::clone(&stream_generation);
+            let blocked = Arc::clone(&blocked_inbound_gossip_peers);
+            tokio::spawn(async move {
+                while let Some((peer_id, stream)) = incoming_ws_v1_streams.next().await {
+                    if blocked
+                        .lock()
+                        .expect("blocked_inbound_gossip_peers mutex poisoned")
+                        .contains(&peer_id)
+                    {
+                        tracing::debug!(
+                            %peer_id,
+                            "P2P: rejecting legacy algorand-ws V1 stream from incoming connection — EnableGossipService is false"
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                    sp.lock()
+                        .expect("stream_peers mutex poisoned")
+                        .begin_peer_attempt(peer_id);
+                    tokio::spawn(handle_inbound_ws_v1_stream(
+                        peer_id,
+                        stream,
+                        Arc::clone(&mux),
+                        Arc::clone(&sp),
+                        Arc::clone(&gen_counter),
+                    ));
+                }
+            });
+        }
+
         // Accept-loop: every inbound `/algorand-http/1.0.0` stream a peer
         // opens to us is served as a single HTTP/1.1 request/response
         // against whatever [`Router`] is currently registered (issue #1024)
@@ -1521,6 +1752,10 @@ impl P2pTransport {
         // `enable_dht_providers` above — consulted in the
         // `ConnectionEstablished` arm below.
         let enable_gossip_service = cfg.enable_gossip_service;
+        // Issue #1443: captured the same way, consulted by the outbound
+        // dial arm below to decide whether V22 is even attempted before
+        // falling back to legacy V1.
+        let disable_v22_protocol = cfg.disable_v22_protocol;
         let task = tokio::spawn(async move {
             // Mirrors go's `meshThreadInterval` (`network/mesh.go`, default
             // `time.Minute`) — the period between `P2PNetwork`'s
@@ -1727,27 +1962,21 @@ impl P2pTransport {
                                             .lock()
                                             .expect("stream_peers mutex poisoned")
                                             .begin_peer_attempt(peer_id);
-                                        let mut control = stream_control.clone();
+                                        let control = stream_control.clone();
                                         let mux = Arc::clone(&mux);
                                         let sp = Arc::clone(&sp_for_task);
                                         let gen_counter = Arc::clone(&gen_counter_for_task);
                                         let headers = our_ws_headers.clone();
-                                        tokio::spawn(async move {
-                                            match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V22).await {
-                                                Ok(stream) => {
-                                                    handle_outbound_ws_stream(peer_id, stream, headers, our_features, mux, sp, gen_counter).await;
-                                                }
-                                                Err(e) => {
-                                                    sp.lock()
-                                                        .expect("stream_peers mutex poisoned")
-                                                        .end_peer_attempt(peer_id);
-                                                    tracing::debug!(
-                                                        %peer_id, error = %e,
-                                                        "failed to open P2P algorand-ws stream"
-                                                    );
-                                                }
-                                            }
-                                        });
+                                        tokio::spawn(dial_ws_stream(
+                                            peer_id,
+                                            control,
+                                            disable_v22_protocol,
+                                            headers,
+                                            our_features,
+                                            mux,
+                                            sp,
+                                            gen_counter,
+                                        ));
                                     }
                                 }
                             }
@@ -2565,6 +2794,7 @@ mod tests {
             force_fetch_transactions: false,
             enable_vote_compression: true,
             enable_gossip_service: true,
+            disable_v22_protocol: false,
         })
         .await
         .expect("start p2p transport");
@@ -2600,6 +2830,7 @@ mod tests {
             force_fetch_transactions: false,
             enable_vote_compression: true,
             enable_gossip_service: true,
+            disable_v22_protocol: false,
         })
         .await
         .expect("start p2p transport");
@@ -2633,6 +2864,7 @@ mod tests {
             force_fetch_transactions: false,
             enable_vote_compression: true,
             enable_gossip_service: true,
+            disable_v22_protocol: false,
         })
         .await
         .expect("start p2p transport");
@@ -2673,6 +2905,7 @@ mod tests {
             force_fetch_transactions: false,
             enable_vote_compression: true,
             enable_gossip_service: true,
+            disable_v22_protocol: false,
         })
         .await
         .expect("start listener");
@@ -2704,6 +2937,7 @@ mod tests {
             force_fetch_transactions: false,
             enable_vote_compression: true,
             enable_gossip_service: true,
+            disable_v22_protocol: false,
         })
         .await
         .expect("start dialer");
@@ -2754,6 +2988,7 @@ mod tests {
             force_fetch_transactions: false,
             enable_vote_compression: true,
             enable_gossip_service: true,
+            disable_v22_protocol: false,
         }
     }
 
@@ -3112,6 +3347,7 @@ mod tests {
             force_fetch_transactions: false,
             enable_vote_compression: true,
             enable_gossip_service: true,
+            disable_v22_protocol: false,
         })
         .await
         .expect("start listener");
@@ -3140,6 +3376,7 @@ mod tests {
             force_fetch_transactions: false,
             enable_vote_compression: true,
             enable_gossip_service: true,
+            disable_v22_protocol: false,
         })
         .await
         .expect("start dialer");
@@ -3720,6 +3957,7 @@ mod tests {
             force_fetch_transactions: false,
             enable_vote_compression: true,
             enable_gossip_service: true,
+            disable_v22_protocol: false,
         })
         .await
         .expect("start transport");
@@ -3828,6 +4066,113 @@ mod tests {
             dialer_view,
             (true, 2048),
             "dialer->listener stream should negotiate stateless + stateful(2048) vpack"
+        );
+    }
+
+    /// Issue #1443, TDD anchor + parity for go's `TestP2PMetainfoV1vsV22`
+    /// (`network/p2pNetwork_test.go`): a peer that only ever offers/accepts
+    /// the legacy `/algorand-ws/1.0.0` protocol (mirrors go's test-only
+    /// `disableV22Protocol = true`) must still successfully connect to — and
+    /// exchange metainfo with — a normal peer that supports both V1 and
+    /// V22, instead of the connection failing outright. Before this issue's
+    /// fix, `ALGORAND_WS_PROTOCOL_V1` was never registered as a libp2p
+    /// stream protocol nor dialed anywhere, so a V1-only peer's dial would
+    /// hit `OpenStreamError::UnsupportedProtocol` against `full`'s
+    /// V22-registered acceptor and no stream (hence no
+    /// `StreamPeerHandle`/vote-compression negotiation) would ever come up
+    /// between the two.
+    ///
+    /// Go's assertion mirrors `peer.features&pfCompressedProposal != 0` /
+    /// `vpackVoteCompressionSupported()` both being `false` even though
+    /// both sides configured `EnableVoteCompression = true` — V1 never
+    /// exchanges a peer-meta-headers/feature advertisement at all, so no
+    /// compression can be negotiated regardless of each side's own config.
+    /// This is reproduced here via [`P2pTransport::stream_peer_vote_compression`]
+    /// returning `(false, 0)` on both sides once the V1 stream comes up.
+    #[tokio::test]
+    async fn v1_only_peer_still_connects_to_a_v22_capable_peer() {
+        let full = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1443".to_string(),
+            listen_multiaddr: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+            bootstrap_peers: vec![],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: false,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
+            enable_vote_compression: true,
+            enable_gossip_service: true,
+            disable_v22_protocol: false,
+        })
+        .await
+        .expect("start V22-capable listener");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while full.listen_addrs().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let dial_addr = full
+            .listen_addrs()
+            .first()
+            .cloned()
+            .expect("listener bound an address")
+            .with(Protocol::P2p(full.peer_id()));
+
+        let v1_only = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1443".to_string(),
+            listen_multiaddr: None,
+            bootstrap_peers: vec![dial_addr],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: false,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
+            enable_vote_compression: true,
+            enable_gossip_service: true,
+            disable_v22_protocol: true,
+        })
+        .await
+        .expect("start V1-only dialer");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (full.stream_peer_count() == 0 || v1_only.stream_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(
+            full.stream_peer_count(),
+            1,
+            "the V22-capable peer must still establish a stream with the V1-only peer"
+        );
+        assert_eq!(
+            v1_only.stream_peer_count(),
+            1,
+            "the V1-only peer must still establish a stream with the V22-capable peer"
+        );
+
+        assert_eq!(
+            full.stream_peer_vote_compression(v1_only.peer_id()),
+            Some((false, 0)),
+            "V1 never exchanges peer-meta-headers, so no features negotiate \
+             even though both sides enabled vote compression"
+        );
+        assert_eq!(
+            v1_only.stream_peer_vote_compression(full.peer_id()),
+            Some((false, 0)),
+            "V1 never exchanges peer-meta-headers, so no features negotiate \
+             even though both sides enabled vote compression"
         );
     }
 
@@ -4112,6 +4457,7 @@ mod tests {
             enable_dht_providers: true,
             is_listen_server: true,
             enable_gossip_service: false,
+            disable_v22_protocol: false,
             ..plain_non_relay_config("test-1442")
         })
         .await
@@ -4193,6 +4539,7 @@ mod tests {
             network_id: "test-1442-stream".to_string(),
             listen_multiaddr: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
             enable_gossip_service: listener_enable_gossip_service,
+            disable_v22_protocol: false,
             ..plain_non_relay_config("test-1442-stream")
         })
         .await
@@ -4213,6 +4560,7 @@ mod tests {
             network_id: "test-1442-stream".to_string(),
             bootstrap_peers: vec![dial_addr],
             enable_gossip_service: dialer_enable_gossip_service,
+            disable_v22_protocol: false,
             ..plain_non_relay_config("test-1442-stream")
         })
         .await

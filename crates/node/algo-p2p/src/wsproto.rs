@@ -78,8 +78,12 @@ use libp2p::StreamProtocol;
 
 /// go: `AlgorandWsProtocolV1 = "/algorand-ws/1.0.0"`. Retained pre-consensus-v41
 /// for peers that haven't upgraded; this crate always prefers V22 for
-/// outbound dials (see [`ALGORAND_WS_PROTOCOL_V22`]) and only accepts V1
-/// inbound for completeness.
+/// outbound dials (see [`ALGORAND_WS_PROTOCOL_V22`]) but negotiates down to
+/// V1 — both when dialing a peer that rejects a V22 stream open and when
+/// accepting an inbound stream a peer opens directly on this protocol ID —
+/// matching go's `TestP2PMetainfoV1vsV22` (`network/p2pNetwork_test.go`),
+/// which exercises exactly this fallback via `wsStreamHandlerV1`/
+/// `wsStreamHandlerV22` (issue #1443).
 pub const ALGORAND_WS_PROTOCOL_V1: StreamProtocol = StreamProtocol::new("/algorand-ws/1.0.0");
 
 /// go: `AlgorandWsProtocolV22 = "/algorand-ws/2.2.0"` — the protocol ID this
@@ -331,6 +335,48 @@ pub async fn handshake_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(meta)
 }
 
+// ---------------------------------------------------------------------------
+// V1 handshake — go: `wsStreamHandlerV1` (`network/p2pNetwork.go`)
+// ---------------------------------------------------------------------------
+//
+// The legacy `/algorand-ws/1.0.0` protocol predates peer-metainfo exchange
+// entirely: no headers, no version negotiation, no feature advertisement.
+// It only exchanges a single sentinel byte so each side can confirm the
+// stream is actually alive before falling straight into the shared
+// tag+payload framing (`baseWsStreamHandler` in go, `spawn_ws_peer` here) —
+// mirrored byte-for-byte below.
+
+/// Perform the outbound (dialer) side of the V1 handshake: write a single
+/// `'1'` sentinel byte, matching go's `wsStreamHandlerV1`'s `!incoming`
+/// branch (`stream.Write([]byte("1"))`). There is no response to read — V1
+/// never exchanges metainfo, so [`extract_peer_meta`]/[`PeerMeta`] play no
+/// part here; a caller negotiates zero peer features for a V1 stream.
+pub async fn handshake_v1_outbound<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<(), WsProtoError> {
+    stream.write_all(b"1").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Perform the inbound (listener) side of the V1 handshake: read one byte
+/// and confirm the peer actually sent something, matching go's
+/// `wsStreamHandlerV1`'s `incoming` branch (`stream.Read(initMsg[:])`,
+/// erroring when `rn == 0 || err != nil`).
+pub async fn handshake_v1_inbound<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<(), WsProtoError> {
+    let mut init_msg = [0u8; 1];
+    let n = stream.read(&mut init_msg).await?;
+    if n == 0 {
+        return Err(WsProtoError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed before sending the V1 handshake's initial byte",
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +401,34 @@ mod tests {
     fn protocol_ids_match_go_exactly() {
         assert_eq!(ALGORAND_WS_PROTOCOL_V1.as_ref(), "/algorand-ws/1.0.0");
         assert_eq!(ALGORAND_WS_PROTOCOL_V22.as_ref(), "/algorand-ws/2.2.0");
+    }
+
+    // -------------------------------------------------------------------
+    // V1 handshake — go: the `wsStreamHandlerV1` cases within
+    // `TestP2PMetainfoV1vsV22` (`network/p2pNetwork_test.go`).
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn v1_handshake_round_trips_the_sentinel_byte() {
+        let (mut a, mut b) = duplex_pair();
+        let outbound = handshake_v1_outbound(&mut a);
+        let inbound = handshake_v1_inbound(&mut b);
+        let (out_res, in_res) = tokio::join!(outbound, inbound);
+        out_res.expect("v1 outbound handshake succeeds");
+        in_res.expect("v1 inbound handshake succeeds");
+    }
+
+    #[tokio::test]
+    async fn v1_inbound_handshake_fails_when_peer_sends_nothing() {
+        // Mirrors go's `wsStreamHandlerV1`'s `rn == 0 || err != nil` check:
+        // the dialer hangs up without ever writing the sentinel byte.
+        let (a, mut b) = duplex_pair();
+        drop(a);
+        let result = handshake_v1_inbound(&mut b).await;
+        assert!(
+            matches!(result, Err(WsProtoError::Io(_))),
+            "an inbound V1 stream that never receives the sentinel byte must fail, got: {result:?}"
+        );
     }
 
     #[tokio::test]
