@@ -1519,3 +1519,184 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         String::from_utf8_lossy(&go_info.stdout)
     );
 }
+
+/// TestClientCanSendAndGetNote (go-algorand
+/// `test/e2e-go/restAPI/restClient_test.go:278`): a payment carrying a
+/// max-size note (`MaxTxnNoteBytes` = 1024, Go's `make([]byte,
+/// maxTxnNoteBytes)` is all-zero) round-trips byte-for-byte through
+/// `GET /v2/transactions/pending/{txid}`'s `txn.txn.note` field once
+/// confirmed. `localnet_dev_node_drives_goal_rust_and_go_goal` above already
+/// covers `clerk send`'s live-submit/confirm path but never asserted the note
+/// bytes it carries survive the submit -> pool -> block -> REST-readback
+/// round trip; this test closes that specific gap (issue tracked as part of
+/// #1457 batch 6, docs/phase17/parity_e2e.md).
+#[test]
+fn localnet_dev_node_note_roundtrips_through_pending_transaction_info() {
+    if !mixed_cluster_enabled() {
+        eprintln!(
+            "SKIPPED: localnet_node_e2e requires MIXED_CLUSTER=1.\n\
+             Run with: MIXED_CLUSTER=1 cargo test -p goal-rust --test localnet_node_e2e",
+        );
+        return;
+    }
+
+    let algod_rust = ensure_rust_bin("algod-rust");
+    let kmd_rust = ensure_rust_bin("kmd-rust");
+
+    let data_dir = stage_data_dir();
+    let dd = data_dir.path();
+
+    let node = spawn_daemon(
+        &algod_rust,
+        &[
+            "node",
+            "start",
+            "-d",
+            dd.to_str().unwrap(),
+            "-l",
+            "127.0.0.1:0",
+            "--dev",
+        ],
+        dd,
+        dd,
+        "node",
+        "algod",
+    );
+
+    let kmd_dir = dd.join("kmd-v0.5");
+    std::fs::create_dir_all(&kmd_dir).unwrap();
+    write_kmd_config(&kmd_dir);
+    let _kmd = spawn_daemon(
+        &kmd_rust,
+        &["serve", "--data-dir", kmd_dir.to_str().unwrap()],
+        dd,
+        &kmd_dir,
+        "kmd",
+        "kmd",
+    );
+
+    assert_cli_ok(
+        &goal_rust(dd, &["wallet", "new", "w", "-w", "pw", "--no-display-seed"]),
+        "wallet new",
+        &node,
+    );
+    assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "account",
+                "import",
+                "-w",
+                "w",
+                "--password",
+                "pw",
+                "--mnemonic",
+                DEV_MNEMONIC,
+            ],
+        ),
+        "account import",
+        &node,
+    );
+
+    // Max-size note, all-zero bytes — mirrors Go's `make([]byte,
+    // maxTxnNoteBytes)` (config.Consensus[...].MaxTxnNoteBytes == 1024 at the
+    // current consensus pin, crates/core/algo-types/src/consensus.rs).
+    const MAX_TXN_NOTE_BYTES: usize = 1_024;
+    let note = vec![0u8; MAX_TXN_NOTE_BYTES];
+    let note_b64 = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&note)
+    };
+
+    let send_out = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                "100000",
+                "-f",
+                DEV_ADDR,
+                "-t",
+                FEE_SINK,
+                "--noteb64",
+                &note_b64,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "clerk send --noteb64 (max-size note)",
+        &node,
+    );
+    assert!(
+        send_out.contains("committed in round"),
+        "max-note payment should confirm in a dev-mode round; got:\n{send_out}"
+    );
+
+    // Pull the txid out of Go's infoTxIssued line: "..., transaction ID:
+    // <txid>. Fee set to <n>" (clerk.go println mirrored at
+    // crates/tools/goal-rust/src/cmd/clerk.rs).
+    let txid = send_out
+        .split("transaction ID: ")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .unwrap_or_else(|| panic!("clerk send output missing 'transaction ID: '; got:\n{send_out}"))
+        .trim()
+        .to_string();
+    assert!(!txid.is_empty(), "parsed empty txid from:\n{send_out}");
+
+    // Read back /v2/transactions/pending/{txid} directly (the algo-rest-client
+    // wrapper's PendingTxnInfo intentionally omits the echoed txn body — see
+    // crates/node/algo-rest-client/src/types.rs — so this test talks to the
+    // REST endpoint raw to inspect txn.txn.note).
+    let algod_net = std::fs::read_to_string(dd.join("algod.net"))
+        .expect("algod.net written by spawn_daemon readiness poll")
+        .trim()
+        .to_string();
+    let algod_token = std::fs::read_to_string(dd.join("algod.token"))
+        .expect("algod.token written by spawn_daemon readiness poll")
+        .trim()
+        .to_string();
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let body: serde_json::Value = rt.block_on(async {
+        let url = format!("http://{algod_net}/v2/transactions/pending/{txid}");
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("X-Algo-API-Token", &algod_token)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("GET {url}: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "GET {url} returned {}",
+            resp.status()
+        );
+        resp.json().await.expect("pending txn info is valid JSON")
+    });
+
+    assert!(
+        body["confirmed-round"].as_u64().is_some(),
+        "pending txn info should report a confirmed-round once `clerk send` waited for \
+         confirmation; got:\n{body}"
+    );
+
+    let note_json = body["txn"]["txn"]["note"]
+        .as_array()
+        .unwrap_or_else(|| panic!("txn.txn.note missing/not an array in:\n{body}"));
+    let note_readback: Vec<u8> = note_json
+        .iter()
+        .map(|v| {
+            v.as_u64()
+                .unwrap_or_else(|| panic!("non-numeric note byte in:\n{body}")) as u8
+        })
+        .collect();
+    assert_eq!(
+        note_readback, note,
+        "note should round-trip byte-for-byte through submit -> confirm -> \
+         GET /v2/transactions/pending/{{txid}} (go's TestClientCanSendAndGetNote)"
+    );
+}

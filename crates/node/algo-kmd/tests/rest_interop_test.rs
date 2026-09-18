@@ -231,6 +231,165 @@ fn rest_interop_full_workflow() {
     assert!(!data_dir.join("kmd.pid").exists(), "kmd.pid not removed");
 }
 
+/// TestServerStartsStopsSuccessfully (go-algorand
+/// `test/e2e-go/kmd/e2e_kmd_server_client_test.go:31`): spawns a real
+/// `kmd-rust serve` subprocess (not the in-process axum-router unit tests in
+/// `crates/node/algo-kmd/src/server.rs`) and drives `GET /versions` with the
+/// daemon's own generated `kmd.token` over the wire, exactly like Go's
+/// `KMDClient.DoV1Request(VersionsRequest{}, ...)`. Closes the
+/// `docs/phase17/parity_e2e.md` `partial` gap noting the unit test proves
+/// the handler logic but not an identical live start/stop-style REST
+/// assertion (part of #1457 batch 6).
+#[cfg(unix)]
+#[tokio::test]
+async fn kmd_rust_server_starts_and_versions_endpoint_succeeds() {
+    if !mixed_cluster_enabled() {
+        eprintln!(
+            "skipping kmd_rust_server_starts_and_versions_endpoint_succeeds: \
+             set MIXED_CLUSTER=1 to enable"
+        );
+        return;
+    }
+
+    let work = TempDir::new().unwrap();
+    let data_dir = work.path().join("kmd");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    write_minimal_config(&data_dir);
+
+    let bin = kmd_rust_binary();
+    let child = Command::new(&bin)
+        .args([
+            "serve",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--address",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kmd-rust serve");
+
+    if let Err(msg) = poll_for_listening(&data_dir, Duration::from_secs(15)) {
+        send_sigterm(child.id());
+        let out = child.wait_with_output().expect("reap kmd-rust");
+        panic!(
+            "{msg}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    let net = std::fs::read_to_string(data_dir.join("kmd.net"))
+        .expect("kmd.net written by readiness poll");
+    let addr = net.trim();
+    let token = std::fs::read_to_string(data_dir.join("kmd.token"))
+        .expect("kmd-rust generates kmd.token on first start")
+        .trim()
+        .to_string();
+
+    // GET /versions with the daemon's own generated token should succeed
+    // (go's TestServerStartsStopsSuccessfully body).
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/versions"))
+        .header("X-KMD-API-Token", &token)
+        .send()
+        .await;
+
+    send_sigterm(child.id());
+    let exit = child.wait_with_output().expect("reap kmd-rust");
+
+    let resp = resp.unwrap_or_else(|e| {
+        panic!(
+            "GET /versions failed: {e}\nkmd-rust stderr:\n{}",
+            String::from_utf8_lossy(&exit.stderr)
+        )
+    });
+    assert!(
+        resp.status().is_success(),
+        "GET /versions with a valid token should succeed; got {}\nkmd-rust stderr:\n{}",
+        resp.status(),
+        String::from_utf8_lossy(&exit.stderr),
+    );
+}
+
+/// TestBadAuthErrs (go-algorand
+/// `test/e2e-go/kmd/e2e_kmd_server_client_test.go:48`): a client presenting
+/// a well-formed-but-wrong 64-char token (Go's `strings.Repeat("x", 64)`)
+/// against a live `kmd-rust serve` subprocess must be rejected on
+/// `GET /v1/wallets`, matching `crates/node/algo-kmd/src/api_v1.rs`'s
+/// `wrong_password_on_init_returns_401` in-process unit coverage but over
+/// the real wire against a spawned daemon (part of #1457 batch 6).
+#[cfg(unix)]
+#[tokio::test]
+async fn kmd_rust_bad_token_rejected_on_wallets_endpoint() {
+    if !mixed_cluster_enabled() {
+        eprintln!(
+            "skipping kmd_rust_bad_token_rejected_on_wallets_endpoint: \
+             set MIXED_CLUSTER=1 to enable"
+        );
+        return;
+    }
+
+    let work = TempDir::new().unwrap();
+    let data_dir = work.path().join("kmd");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    write_minimal_config(&data_dir);
+
+    let bin = kmd_rust_binary();
+    let child = Command::new(&bin)
+        .args([
+            "serve",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--address",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kmd-rust serve");
+
+    if let Err(msg) = poll_for_listening(&data_dir, Duration::from_secs(15)) {
+        send_sigterm(child.id());
+        let out = child.wait_with_output().expect("reap kmd-rust");
+        panic!(
+            "{msg}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    let net = std::fs::read_to_string(data_dir.join("kmd.net"))
+        .expect("kmd.net written by readiness poll");
+    let addr = net.trim();
+
+    // Go: badAPIToken := strings.Repeat("x", 64).
+    let bad_token = "x".repeat(64);
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/v1/wallets"))
+        .header("X-KMD-API-Token", &bad_token)
+        .send()
+        .await;
+
+    send_sigterm(child.id());
+    let exit = child.wait_with_output().expect("reap kmd-rust");
+
+    let resp = resp.unwrap_or_else(|e| {
+        panic!(
+            "GET /v1/wallets failed: {e}\nkmd-rust stderr:\n{}",
+            String::from_utf8_lossy(&exit.stderr)
+        )
+    });
+    assert!(
+        resp.status().is_client_error(),
+        "GET /v1/wallets with a bad-but-well-formed token should be rejected \
+         (401); got {}\nkmd-rust stderr:\n{}",
+        resp.status(),
+        String::from_utf8_lossy(&exit.stderr),
+    );
+}
+
 #[test]
 fn rest_interop_test_is_gated_by_mixed_cluster() {
     // When MIXED_CLUSTER is unset (CI default), the real test
