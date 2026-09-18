@@ -5896,6 +5896,83 @@ mod tests {
         closing.cancel();
     }
 
+    /// Go: `TestWsPeerMsgDataConverterConvert` (`network/msgCompressor_test.go`)
+    /// — a `PP` payload that does NOT carry the zstd frame magic (a peer
+    /// that advertised zstd support but failed to compress, or an older
+    /// peer) must pass through the receive path unchanged rather than
+    /// erroring or being treated as corrupt (`wsPeerMsgCodec.decompress`'s
+    /// `case protocol.ProposalPayloadTag` falls through to `c.log.Warnf(...)`
+    /// and returns the original bytes when `c.ppdec.accept(data)` is
+    /// false). The equivalent Rust branch
+    /// (`tag == Tag::ProposalPayload && is_zstd_compressed(payload)` above)
+    /// already implements this fallback; this proves it end-to-end through
+    /// a real `read_loop`, closing the previously-`partial`
+    /// `TestWsPeerMsgDataConverterConvert` row (no standalone
+    /// `wsPeerMsgCodec`-equivalent type exists here, but the behavioral
+    /// property it tests is now directly exercised).
+    #[tokio::test]
+    async fn read_loop_passes_through_non_zstd_proposal_payload_unchanged() {
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (_client_sink, client_stream) = client_ws.split();
+        let (mut server_sink, _server_stream) = server_ws.split();
+
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(10);
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+        let closing = CancellationToken::new();
+        let closing_clone = closing.clone();
+
+        // Plain, uncompressed proposal-payload bytes — no zstd magic prefix.
+        let raw_payload = b"this is not zstd-compressed proposal payload data".to_vec();
+        assert!(
+            !is_zstd_compressed(&raw_payload),
+            "test fixture must not accidentally look zstd-compressed"
+        );
+
+        let _read_task = tokio::spawn(read_loop(
+            client_stream,
+            incoming_tx,
+            high_prio_tx,
+            send_message_tags,
+            last_packet_time,
+            closing_clone,
+            "test-peer".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            None,
+            None,
+            None,
+            make_test_peer_sender(closing.clone()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        ));
+
+        let frame = encode_frame(&Tag::ProposalPayload, &raw_payload).unwrap();
+        server_sink.send(WsMessage::Binary(frame)).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
+            .await
+            .expect("timeout waiting for passed-through PP message")
+            .expect("channel closed");
+        assert_eq!(received.tag, Tag::ProposalPayload);
+        assert_eq!(received.data, raw_payload);
+
+        // Prove the connection wasn't torn down over the non-magic payload
+        // by sending a second, unrelated message and confirming it still
+        // arrives.
+        let tx_frame = encode_frame(&Tag::Transaction, b"after-pp-passthrough").unwrap();
+        server_sink.send(WsMessage::Binary(tx_frame)).await.unwrap();
+        let received2 = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
+            .await
+            .expect("timeout waiting for follow-up message")
+            .expect("channel closed");
+        assert_eq!(received2.tag, Tag::Transaction);
+        assert_eq!(received2.data, b"after-pp-passthrough");
+
+        closing.cancel();
+    }
+
     #[tokio::test]
     async fn read_loop_vp_abort_disables_stateful_and_drops_message() {
         let (client_ws, server_ws) = ws_raw_pair().await;

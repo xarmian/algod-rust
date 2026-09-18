@@ -1175,6 +1175,86 @@ mod tests {
         assert_eq!(leftover, b"EXTRA-FRAME-BYTES");
     }
 
+    /// Go: `TestTryConnectEarlyWrite` (`network/wsNetwork_test.go:4125`) —
+    /// the exact off-by-one boundary go's test pins down: it computes the
+    /// real handshake response's precise byte count (`minValidHeaderSize`),
+    /// then asserts a cap one byte under that size rejects the connection
+    /// while a cap of exactly that size accepts it and a subsequent message
+    /// still flows. `read_capped_response`'s cap check
+    /// (`consumed > max_header_bytes`) is exercised here against a
+    /// byte-for-byte known response so the boundary is provable exactly,
+    /// rather than only against a cap known to be "small" or "large" as the
+    /// other tests in this group do — closing what the
+    /// `TestTryConnectEarlyWrite` parity row was `partial` on.
+    #[tokio::test]
+    async fn read_capped_response_boundary_matches_go_off_by_one() {
+        let response_head = b"HTTP/1.1 101 Switching Protocols\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Accept: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+\r\n"
+            .to_vec();
+        let exact_size = response_head.len();
+        let trailing = b"POST-HANDSHAKE-MESSAGE-BYTES".to_vec();
+
+        // One byte under the exact response size: must fail with
+        // `HeaderTooLarge` reporting the configured cap, mirroring go's
+        // `netA.wsMaxHeaderBytes = minValidHeaderSize - 1` case.
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let head = response_head.clone();
+            let tail = trailing.clone();
+            tokio::spawn(async move {
+                let (mut server, _) = listener.accept().await.unwrap();
+                let mut body = head;
+                body.extend_from_slice(&tail);
+                server.write_all(&body).await.unwrap();
+            });
+
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let result = read_capped_response(&mut client, exact_size - 1).await;
+            match result {
+                Err(WsConnectError::HeaderTooLarge { max }) => assert_eq!(max, exact_size - 1),
+                other => panic!(
+                    "expected HeaderTooLarge at cap {} (one byte under the real response size), got: {other:?}",
+                    exact_size - 1
+                ),
+            }
+        }
+
+        // Exactly the response size: must succeed, and the bytes that
+        // immediately follow the header terminator (standing in for the
+        // next real message, go's post-connect message-of-interest-count
+        // assertion) must come back intact as `leftover`, proving the
+        // connection is fully usable at the exact threshold rather than
+        // merely "not rejected".
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let head = response_head.clone();
+            let tail = trailing.clone();
+            tokio::spawn(async move {
+                let (mut server, _) = listener.accept().await.unwrap();
+                let mut body = head;
+                body.extend_from_slice(&tail);
+                server.write_all(&body).await.unwrap();
+            });
+
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let (response, leftover) = read_capped_response(&mut client, exact_size)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("expected cap check to pass at exact size {exact_size}: {e}")
+                });
+            assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+            assert_eq!(
+                leftover, trailing,
+                "post-header bytes must flow through unmolested at the exact-size boundary"
+            );
+        }
+    }
+
     /// A non-upgrade response, padded well past any small header cap. Used
     /// to distinguish "the size cap rejected this" (`HeaderTooLarge`) from
     /// "tungstenite rejected the handshake for an unrelated reason" (e.g.
