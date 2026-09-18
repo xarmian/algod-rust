@@ -10938,6 +10938,111 @@ mod tests {
             .expect("challenge-failed account must validate via the challenge path");
     }
 
+    /// Phase 17 (e2e sweep batch 2): TestWhaleJoin / TestBigJoin /
+    /// TestBigIncrease (`test/e2e-go/features/incentives/whalejoin_test.go`).
+    ///
+    /// Go's regression: a same-block change to total online stake (a large
+    /// account keyreg'ing online) must be reflected in the `isAbsent`
+    /// stake-ratio denominator used to validate that very block's own
+    /// `absent_participation_accounts` list -- using a *stale* (pre-keyreg)
+    /// total would let a low-stake account get wrongly flagged "absent"
+    /// (its allowable lag computed against a too-small total) even though
+    /// the block that claims it absent also brings enough new stake online,
+    /// within the same block, to make that lag allowance far larger.
+    ///
+    /// This proves algod-rust's `validate_absent_online_accounts` reads the
+    /// *post-transaction* store state: `apply_block_validating` applies the
+    /// block's `payset` (including a keyreg that brings a whale online)
+    /// before running end-of-block absentee validation, so
+    /// `total_online_voting_stake` picks up the whale's stake in the very
+    /// same block it joins.
+    ///
+    /// `absent_addr`'s own stake is 5_000_000 and it was last seen 500
+    /// rounds ago:
+    /// - Computed against a *stale* total (itself alone, 5_000_000):
+    ///   ratio=1, allowable_lag = ABSENT_FACTOR(20)*1 = 20 < 500 -- would
+    ///   incorrectly accept the block's claim that it is absent.
+    /// - Computed against the *fresh* total (itself + the whale's
+    ///   ~499,999,000 stake once its same-block keyreg applies): ratio is
+    ///   ~101, allowable_lag ~= 2020 > 500 -- the account is NOT genuinely
+    ///   absent yet, so the block must be REJECTED.
+    ///
+    /// If algod-rust ever cached/staled the total (the bug these go tests
+    /// guard against), this test would wrongly pass (block accepted)
+    /// instead of failing with "is not absent".
+    #[test]
+    fn test_absent_validation_uses_fresh_total_after_same_block_whale_keyreg() {
+        let absent_addr = Address([11u8; 32]);
+        let whale_addr = Address([12u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[
+                (absent_addr, 5_000_000),
+                (whale_addr, 500_000_000),
+                (fee_sink, 0),
+            ],
+            fee_sink,
+        );
+        {
+            let acct = state.get_or_default_account_mut(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.incentive_eligible = true;
+            acct.last_heartbeat = 1; // last seen at round 1
+        }
+        // whale_addr starts Offline; it only comes Online via the keyreg
+        // transaction inside this very block's payset.
+        {
+            use crate::store_trait::LedgerStore;
+            state.set_current_round(Round(500));
+        }
+
+        let mut whale_keyreg = SignedTransaction::default();
+        whale_keyreg.txn.txn_type = "keyreg".into();
+        whale_keyreg.txn.sender = whale_addr;
+        whale_keyreg.txn.fee = 1_000;
+        whale_keyreg.txn.vote_pk = Some([1u8; 32]);
+        whale_keyreg.txn.selection_pk = Some([2u8; 32]);
+        whale_keyreg.txn.state_proof_pk = Some([3u8; 64]);
+        whale_keyreg.txn.vote_first = 1;
+        whale_keyreg.txn.vote_last = 1_000_000; // spans well past round 501
+        whale_keyreg.txn.vote_key_dilution = 10;
+        whale_keyreg.txn.last_valid = Round(1_000_000); // stay alive through round 501
+
+        let block = Block {
+            round: Round(501),
+            fee_sink,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            absent_participation_accounts: Some(vec![absent_addr]),
+            payset: vec![whale_keyreg],
+            ..Block::default()
+        };
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(
+            result.is_err(),
+            "absent_addr is NOT genuinely absent once the whale's same-block \
+             keyreg is reflected in total_online_stake -- the block's claim \
+             must be rejected, not accepted via a stale pre-keyreg total"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("is not absent"),
+            "expected 'is not absent' error (proving the fresh, post-keyreg \
+             total was used), got: {}",
+            err_msg
+        );
+
+        // Sanity check: the whale really did go online via this block's
+        // own keyreg (so the "fresh total" premise actually held).
+        let whale = state.get_account(&whale_addr).unwrap();
+        assert_eq!(
+            whale.status,
+            AccountStatus::Online,
+            "whale keyreg should have been applied before the EOB absentee check ran"
+        );
+    }
+
     // Fix #4: Gate keyreg last_heartbeat/incentive_eligible on payouts_enabled
     #[test]
     fn test_keyreg_online_payouts_disabled_no_heartbeat_or_incentive() {
