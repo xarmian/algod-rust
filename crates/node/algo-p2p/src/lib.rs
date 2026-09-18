@@ -90,8 +90,9 @@ pub use streams::{
     StreamManager,
 };
 pub use wsproto::{
-    build_headers, handshake_inbound, handshake_outbound, read_frame, write_frame, PeerMeta,
-    PeerMetaHeaders, WsProtoError, ALGORAND_WS_PROTOCOL_V1, ALGORAND_WS_PROTOCOL_V22,
+    build_headers, handshake_inbound, handshake_outbound, handshake_v1_inbound,
+    handshake_v1_outbound, read_frame, write_frame, PeerMeta, PeerMetaHeaders, WsProtoError,
+    ALGORAND_WS_PROTOCOL_V1, ALGORAND_WS_PROTOCOL_V22,
 };
 
 /// Re-exported so downstream crates (e.g. `bin/algod-rust`'s `p2p_transport`)

@@ -4892,6 +4892,13 @@ pub async fn run(
                 // transport's own DHT Gossip-capability advertisement the
                 // same way, independent of `is_listen_server` above.
                 enable_gossip_service: node_config.enable_gossip_service,
+                // Issue #1443: never disabled for a real node — this
+                // production start path always offers V22 first, falling
+                // back to legacy V1 only when a peer doesn't support it.
+                // `disable_v22_protocol` exists purely as a
+                // `TestP2PMetainfoV1vsV22`-parity test hook (mirrors go's
+                // own test-only `disableV22Protocol` package var).
+                disable_v22_protocol: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!("failed to start P2P transport: {e}"))?,
