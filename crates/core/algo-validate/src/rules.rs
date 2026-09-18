@@ -2498,6 +2498,33 @@ mod tests {
         assert!(err.to_string().contains("rekeying not yet enabled"));
     }
 
+    /// Mirrors go-algorand's `TestRekeyUpgrade`
+    /// (`test/e2e-go/upgrades/rekey_support_test.go#L32`)'s "works well
+    /// after [the upgrade]" half: the identical rekey transaction that
+    /// `test_rekey_rejected_pre_v24` proves is rejected at v18 is
+    /// well-formed once the network has upgraded to v24
+    /// (`SupportRekeying` becomes `true`). Combined with
+    /// `test_rekey_rejected_pre_v24` (the "before" half, same gate,
+    /// `algo_validate::rules::validate_transaction_wellformed`) and
+    /// `algo_ledger`'s `test_rekey_chain` (proving a well-formed rekey
+    /// actually re-keys `auth_addr` through the apply path once it clears
+    /// this gate), these three together reproduce go's full
+    /// before-upgrade-rejected / after-upgrade-accepted-and-effective
+    /// timeline without a live two-node network.
+    #[test]
+    fn test_rekey_accepted_from_v24() {
+        let params = consensus_params_for_version(algo_types::consensus::CONSENSUS_V24).unwrap();
+        assert!(params.support_rekeying);
+        let mut txn = make_valid_txn();
+        txn.rekey_to = Some(Address([0x99; 32]));
+        let result = validate_transaction_wellformed(&txn, false, &params, None);
+        assert!(
+            result.is_ok(),
+            "a rekey transaction must be well-formed once SupportRekeying is true (v24+): {:?}",
+            result.err()
+        );
+    }
+
     // ── has_heartbeat feature detection ──────────────────────────
 
     #[test]

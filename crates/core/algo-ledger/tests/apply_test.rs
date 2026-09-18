@@ -296,6 +296,54 @@ fn test_apply_block_records_state_proof_verification_context_on_voters_round() {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. Close-remainder full three-account balance split (mirrors
+// go-algorand's TestAccountsCanClose,
+// test/e2e-go/features/transactions/close_account_test.go)
+// ---------------------------------------------------------------------------
+
+/// Mirrors go-algorand's `TestAccountsCanClose`: a single payment from
+/// `acct0` to `acct1` (amount 1_000_000) with `close_remainder_to = acct2`
+/// must zero out `acct0`, credit `acct1` with exactly the payment amount,
+/// and sweep `acct0`'s entire remaining balance (after the amount and fee
+/// are deducted) into `acct2` -- applied through the full block-apply path
+/// (not just `apply_transaction` in isolation) so the round-level bookkeeping
+/// matches what a live node would produce.
+#[test]
+fn test_close_account_full_balance_split() {
+    let acct0 = Address([51u8; 32]);
+    let acct1 = Address([52u8; 32]);
+    let acct2 = Address([53u8; 32]);
+    let fee_sink = Address([54u8; 32]);
+
+    let mut state = make_state(
+        &[(acct0, 10_000_000), (acct1, 0), (acct2, 0), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let mut stx = pay_txn(acct0, acct1, 1_000_000, 1_000);
+    stx.txn.close_remainder_to = acct2;
+    let block = minimal_block(fee_sink, 1, vec![stx]);
+    apply_block(&mut state, &block).unwrap();
+
+    // acct0 is fully closed out.
+    assert_eq!(
+        state
+            .get_account(&acct0)
+            .map(|a| a.micro_algos)
+            .unwrap_or(0),
+        0,
+        "closed-out sender must have zero balance"
+    );
+    // acct1 receives exactly the payment amount.
+    assert_eq!(state.get_account(&acct1).unwrap().micro_algos, 1_000_000);
+    // acct2 receives the entire remainder: 10_000_000 - 1_000_000 (amount) - 1_000 (fee).
+    assert_eq!(
+        state.get_account(&acct2).unwrap().micro_algos,
+        10_000_000 - 1_000_000 - 1_000
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 4. Close-remainder with sender == close_to
 // ---------------------------------------------------------------------------
 
@@ -1417,6 +1465,165 @@ fn test_lease_across_blocks() {
         err_msg.contains("duplicate lease"),
         "expected duplicate lease error, got: {}",
         err_msg,
+    );
+
+    // Mirrors go-algorand's `TestLeaseTransactionsSameSender`: block2's
+    // rejection must not partially apply -- receiver's balance reflects
+    // only the first (successful) payment.
+    assert_eq!(
+        state.get_account(&receiver).unwrap().micro_algos,
+        100_000 + 1_000,
+        "rejected duplicate-lease block must not move any funds"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 15b. Lease across blocks — same sender, different lease — both succeed
+// (mirrors go-algorand's TestLeaseTransactionsSameSenderDifferentLease)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_lease_same_sender_different_lease_both_succeed() {
+    let sender = Address([31u8; 32]);
+    let receiver1 = Address([32u8; 32]);
+    let receiver2 = Address([33u8; 32]);
+    let fee_sink = Address([34u8; 32]);
+
+    let mut state = make_state(
+        &[
+            (sender, 10_000_000),
+            (receiver1, 100_000),
+            (receiver2, 100_000),
+            (fee_sink, 0),
+        ],
+        fee_sink,
+    );
+
+    let lease1: [u8; 32] = [0x11; 32];
+    let lease2: [u8; 32] = [0x22; 32];
+
+    // Two payments from the same sender in the same block, with different
+    // lease values -- both must succeed since leases only conflict when
+    // they match exactly for the same sender.
+    let mut stx1 = pay_txn(sender, receiver1, 1_000_000, 1_000);
+    stx1.txn.lease = lease1;
+    stx1.txn.last_valid = Round(10);
+
+    let mut stx2 = pay_txn(sender, receiver2, 2_000_000, 1_000);
+    stx2.txn.lease = lease2;
+    stx2.txn.last_valid = Round(10);
+
+    let block1 = minimal_block(fee_sink, 1, vec![stx1, stx2]);
+    apply_block(&mut state, &block1).expect(
+        "different lease values for the same sender must not conflict, even in the same block",
+    );
+
+    assert_eq!(
+        state.get_account(&receiver1).unwrap().micro_algos,
+        100_000 + 1_000_000
+    );
+    assert_eq!(
+        state.get_account(&receiver2).unwrap().micro_algos,
+        100_000 + 2_000_000
+    );
+    assert_eq!(
+        state.get_account(&sender).unwrap().micro_algos,
+        10_000_000 - 1_000_000 - 2_000_000 - 2_000
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 15c. Overlapping leases: second txn (same sender+lease, longer window)
+// stays rejected until the first txn's *own* (shorter) lease window expires
+// (mirrors go-algorand's TestOverlappingLeases)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_overlapping_leases_second_blocked_until_first_expires() {
+    let sender = Address([41u8; 32]);
+    let receiver1 = Address([42u8; 32]);
+    let receiver2 = Address([43u8; 32]);
+    let fee_sink = Address([44u8; 32]);
+
+    let mut state = make_state(
+        &[
+            (sender, 10_000_000),
+            (receiver1, 100_000),
+            (receiver2, 100_000),
+            (fee_sink, 0),
+        ],
+        fee_sink,
+    );
+
+    let lease_val: [u8; 32] = [0x55; 32];
+
+    const FIRST_TX_LEASE_LIFE: u64 = 20;
+
+    // tx1 at round 1: lease active through round 1 + FIRST_TX_LEASE_LIFE.
+    let mut stx1 = pay_txn(sender, receiver1, 1_000_000, 1_000);
+    stx1.txn.lease = lease_val;
+    stx1.txn.last_valid = Round(1 + FIRST_TX_LEASE_LIFE);
+    let block1 = minimal_block(fee_sink, 1, vec![stx1]);
+    apply_block(&mut state, &block1).unwrap();
+
+    // tx2: same sender+lease, but with a much longer requested window
+    // (mirrors go's secondTxLeaseLife = 100). Must be rejected while tx1's
+    // shorter lease is still active -- go's test checks this immediately
+    // after tx1 confirms, at the halfway point, and right up to expiry.
+    let build_tx2 = || {
+        let mut stx2 = pay_txn(sender, receiver2, 2_000_000, 1_000);
+        stx2.txn.lease = lease_val;
+        stx2.txn.last_valid = Round(1 + 100);
+        stx2
+    };
+
+    // Round 2 (right after tx1 confirmed): still rejected. `apply_block`
+    // fails the lease check during transaction processing, strictly before
+    // `set_current_round` runs (see apply.rs), so a rejected attempt never
+    // advances `current_round` or leaks any balance change -- proven
+    // separately by `test_lease_across_blocks`'s balance assertion above --
+    // and the next block can still legitimately target the same round.
+    let result = apply_block(&mut state, &minimal_block(fee_sink, 2, vec![build_tx2()]));
+    assert!(
+        result.is_err(),
+        "lease still active right after tx1 confirms"
+    );
+    assert!(result.unwrap_err().to_string().contains("duplicate lease"));
+
+    // Advance (with empty blocks) to the halfway point of tx1's lease
+    // window: still rejected.
+    let halfway_round = 1 + FIRST_TX_LEASE_LIFE / 2;
+    for r in 2..halfway_round {
+        apply_block(&mut state, &minimal_block(fee_sink, r, vec![])).unwrap();
+    }
+    let result = apply_block(
+        &mut state,
+        &minimal_block(fee_sink, halfway_round, vec![build_tx2()]),
+    );
+    assert!(result.is_err(), "lease still active at the halfway point");
+    assert!(result.unwrap_err().to_string().contains("duplicate lease"));
+    apply_block(&mut state, &minimal_block(fee_sink, halfway_round, vec![])).unwrap();
+
+    // Advance past tx1's lease expiry (last_valid = 1 + FIRST_TX_LEASE_LIFE):
+    // the lease check requires round > last_valid, so tx2 must succeed once
+    // applied at last_valid + 1.
+    let expiry_round = 1 + FIRST_TX_LEASE_LIFE;
+    for r in (halfway_round + 1)..=expiry_round {
+        apply_block(&mut state, &minimal_block(fee_sink, r, vec![])).unwrap();
+    }
+    apply_block(
+        &mut state,
+        &minimal_block(fee_sink, expiry_round + 1, vec![build_tx2()]),
+    )
+    .expect("tx2 must succeed once tx1's lease has expired");
+
+    assert_eq!(
+        state.get_account(&receiver1).unwrap().micro_algos,
+        100_000 + 1_000_000
+    );
+    assert_eq!(
+        state.get_account(&receiver2).unwrap().micro_algos,
+        100_000 + 2_000_000
     );
 }
 
