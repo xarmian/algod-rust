@@ -89,13 +89,21 @@ pub enum AddrParseError {
 /// shape is detected up front via [`HOST_COLON_PORT_PATTERN`] and given an
 /// explicit `http://` scheme before parsing.
 pub fn parse_host_or_url(addr: &str) -> Result<Url, AddrParseError> {
-    parse_host_or_url_with_literal_port(addr).map(|(url, _)| url)
+    parse_host_or_url_with_literal_port(addr).map(|(url, _, _)| url)
 }
 
 /// Like [`parse_host_or_url`], but also returns the literal, as-written port
 /// from `addr` when one is present — including one that equals its scheme's
 /// WHATWG default and that the returned `Url`'s own `port()`/`set_port()`
 /// therefore cannot represent (see [`literal_port`]'s doc comment).
+///
+/// Also returns the literal host override for go's unbracketed-IPv6-with-
+/// trailing-port host quirk (issue #1437) as its third element — see
+/// [`unbracketed_ipv6_with_port_host`] — since `url::Url` has no way to
+/// represent that host at all (the WHATWG URL Standard forbids a bare `:`
+/// in a host, bracketed-IPv6 or not, so `Url::host_str()` cannot carry it).
+/// `None` for every other input shape, in which case callers fall back to
+/// `Url::host_str()` as before.
 ///
 /// [`parse_host_or_url_or_multiaddr`] uses this (instead of `Url::port()`
 /// alone) to build its returned "host:port" string, so that an explicit
@@ -104,13 +112,16 @@ pub fn parse_host_or_url(addr: &str) -> Result<Url, AddrParseError> {
 /// inspects `.port()` on its result for a "special"-scheme default-port
 /// input, and preserving `Url`'s ordinary semantics elsewhere avoids
 /// widening this fix beyond the actual bug.
-fn parse_host_or_url_with_literal_port(addr: &str) -> Result<(Url, Option<u16>), AddrParseError> {
+#[allow(clippy::type_complexity)]
+fn parse_host_or_url_with_literal_port(
+    addr: &str,
+) -> Result<(Url, Option<u16>, Option<String>), AddrParseError> {
     if matches_host_colon_port(addr) {
         let joined = format!("http://{addr}");
         return Url::parse(&joined)
             .map(|parsed| {
                 let port = literal_port(&joined);
-                (parsed, port)
+                (parsed, port, None)
             })
             .map_err(|e| AddrParseError::UrlParse(e.to_string()));
     }
@@ -120,7 +131,7 @@ fn parse_host_or_url_with_literal_port(addr: &str) -> Result<(Url, Option<u16>),
             return Err(AddrParseError::NoHost);
         }
         let port = literal_port(addr);
-        return Ok((parsed, port));
+        return Ok((parsed, port, None));
     }
 
     if addr.starts_with("http:")
@@ -152,7 +163,7 @@ fn parse_host_or_url_with_literal_port(addr: &str) -> Result<(Url, Option<u16>),
         return Url::parse(&joined)
             .map(|parsed| {
                 let port = literal_port(&joined);
-                (parsed, port)
+                (parsed, port, None)
             })
             .map_err(|e| AddrParseError::UrlParse(e.to_string()));
     }
@@ -186,15 +197,65 @@ fn parse_host_or_url_with_literal_port(addr: &str) -> Result<(Url, Option<u16>),
         return Err(AddrParseError::ColonHost);
     }
 
+    // Go's `net/url.Parse` -> `parseHost` only validates the *last*
+    // colon-separated segment of a host as an optional numeric port; it
+    // never validates that the rest of the host forms a real IPv6 literal.
+    // So a bare, unbracketed, multi-colon "IPv6-looking" host followed by a
+    // numeric port (e.g. "::11.22.33.44:123") parses successfully in go,
+    // while the identical host without a trailing numeric segment
+    // ("::11.22.33.44") does not. Rust's WHATWG-strict `url` crate has no
+    // way to accept an unbracketed multi-colon host at all — even an
+    // "opaque" non-special-scheme host still forbids a bare `:` as a
+    // forbidden host code point — so detect this one specific shape here
+    // and split the literal host/port off the raw text ourselves, bypassing
+    // `url::Url`'s host parsing/validation entirely for it (issue #1437).
+    // `[::]:4601`-style bracketed hosts (handled below) are excluded via
+    // the `!host.starts_with('[')` guard.
+    if let Some((host, port_str)) = unbracketed_ipv6_with_port_host(addr) {
+        // `url::Url` can't represent the real host, so this placeholder is
+        // only used for its scheme/port; the literal host is carried
+        // separately as this function's third return element.
+        let placeholder = format!("http://placeholder-host:{port_str}");
+        if let Ok(parsed) = Url::parse(&placeholder) {
+            let port = literal_port(&placeholder);
+            return Ok((parsed, port, Some(host.to_string())));
+        }
+    }
+
     // This turns "[::]:4601" into "http://[::]:4601", which the url crate
     // (like Go's net/url) can parse directly.
     let joined = format!("http://{addr}");
     Url::parse(&joined)
         .map(|parsed| {
             let port = literal_port(&joined);
-            (parsed, port)
+            (parsed, port, None)
         })
         .map_err(|e| AddrParseError::UrlParse(e.to_string()))
+}
+
+/// Detects go's unbracketed-IPv6-with-trailing-port host quirk (issue
+/// #1437): `addr` has multiple ':'-separated segments, the *last* segment
+/// is a non-empty run of ASCII digits (a valid port), and everything before
+/// it is non-empty, contains at least one more ':' (so it "looks like"
+/// unbracketed IPv6, not a plain `host:port` pair — that shape is already
+/// handled earlier by [`matches_host_colon_port`]) and isn't already
+/// bracketed (`[...]`, handled by the normal fallback below). Returns
+/// `(host, port_str)` on a match.
+fn unbracketed_ipv6_with_port_host(addr: &str) -> Option<(&str, &str)> {
+    let (host, port_str) = addr.rsplit_once(':')?;
+    if host.is_empty() || port_str.is_empty() {
+        return None;
+    }
+    if !port_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if port_str.parse::<u16>().is_err() {
+        return None;
+    }
+    if !host.contains(':') || host.starts_with('[') {
+        return None;
+    }
+    Some((host, port_str))
 }
 
 /// Recovers the literal, as-written port from `url_str` (the exact string
@@ -243,8 +304,14 @@ pub fn parse_host_or_url_or_multiaddr(addr: &str) -> Result<String, AddrParseErr
             .map(|_| addr.to_string())
             .map_err(|e| AddrParseError::MultiaddrParse(e.to_string()));
     }
-    let (url, literal_port) = parse_host_or_url_with_literal_port(addr)?;
+    let (url, literal_port, literal_host) = parse_host_or_url_with_literal_port(addr)?;
     let port = literal_port.or_else(|| url.port());
+    if let Some(host) = literal_host {
+        return Ok(match port {
+            Some(p) => format!("{host}:{p}"),
+            None => host,
+        });
+    }
     Ok(url
         .host_str()
         .map(|h| match port {
@@ -356,13 +423,15 @@ mod tests {
         // including an explicit port])
         //
         // go's 14th case, `{"::11.22.33.44:123", url.URL{Scheme: "http",
-        // Host: "::11.22.33.44:123"}}`, is intentionally omitted: it relies
-        // on a Go net/url stdlib quirk (`parseHost` only validates the
-        // *last* colon-separated host segment as a port, never checking
-        // whether the rest forms a real IPv6 literal) that the WHATWG-strict
-        // `url` crate has no way to replicate without bypassing its host
-        // parser entirely — a separate, narrower fix tracked in issue #1437,
-        // unrelated to this issue's port-preservation bug.
+        // Host: "::11.22.33.44:123"}}`, is intentionally kept in its own
+        // test (`unbracketed_ipv6_looking_host_with_trailing_port_parses`
+        // above) rather than folded into this shared table: it relies on a
+        // Go net/url stdlib quirk (`parseHost` only validates the *last*
+        // colon-separated host segment as a port, never checking whether
+        // the rest forms a real IPv6 literal) that needed a dedicated
+        // bypass of the WHATWG-strict `url` crate's host parser (issue
+        // #1437) whose extra return value (`literal_host`) this table's
+        // assertions don't otherwise exercise.
         let cases: &[(&str, &str, &str)] = &[
             ("localhost:123", "http", "localhost:123"),
             ("http://localhost:123", "http", "localhost:123"),
@@ -395,8 +464,12 @@ mod tests {
             // part go's real callers, and this module's own
             // `parse_host_or_url_or_multiaddr`, actually consume — via the
             // literal-port-aware helper, matching go's `url.URL.Host` exactly.
-            let (url, literal_port) = parse_host_or_url_with_literal_port(input)
+            let (url, literal_port, literal_host) = parse_host_or_url_with_literal_port(input)
                 .unwrap_or_else(|e| panic!("expected {input:?} to parse, got {e:?}"));
+            assert_eq!(
+                literal_host, None,
+                "none of this table's cases use the quirky unbracketed-IPv6-with-port host override for {input:?}"
+            );
             if !expected_scheme.is_empty() {
                 // Go's protocol-relative "//host" cases parse to an empty
                 // `url.URL.Scheme`; `url::Url` cannot represent an empty
@@ -463,6 +536,45 @@ mod tests {
                 "expected {addr:?} to fail to parse (multiaddr path)"
             );
         }
+    }
+
+    // Mirrors go's `TestParseHostOrURL` 14th valid case (issue #1437):
+    // `{"::11.22.33.44:123", url.URL{Scheme: "http", Host:
+    // "::11.22.33.44:123"}}`. Go's `net/url.Parse` -> `parseHost` only
+    // validates the *last* colon-separated segment of a host as an
+    // optional numeric port; it never checks whether the rest forms a
+    // real IPv6 literal, so this unbracketed, not-actually-valid-IPv6
+    // host string followed by ":123" parses successfully. This is the one
+    // case `parse_host_or_url_matches_go_valid_cases_table` above
+    // intentionally excludes (see its comment).
+    #[test]
+    fn unbracketed_ipv6_looking_host_with_trailing_port_parses() {
+        let (url, literal_port, literal_host) =
+            parse_host_or_url_with_literal_port("::11.22.33.44:123")
+                .expect("expected go's quirky unbracketed-IPv6-with-port host shape to parse");
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(literal_port, Some(123));
+        assert_eq!(literal_host.as_deref(), Some("::11.22.33.44"));
+
+        // `parse_host_or_url` itself just needs to succeed.
+        assert!(parse_host_or_url("::11.22.33.44:123").is_ok());
+
+        // The real consumer: the joined "host:port" string must match go's
+        // `url.URL.Host` exactly.
+        let joined = parse_host_or_url_or_multiaddr("::11.22.33.44:123")
+            .expect("expected the quirky host shape to parse via the multiaddr-dispatch path");
+        assert_eq!(joined, "::11.22.33.44:123");
+    }
+
+    // Must not regress: without a trailing all-digit segment, this must
+    // keep failing exactly like go's bad-URL table entry
+    // `"::11.22.33.44"` (already covered by
+    // `parse_host_or_url_rejects_go_bad_url_table` below, restated here for
+    // direct contrast with the case above).
+    #[test]
+    fn unbracketed_ipv6_looking_host_without_port_still_rejected() {
+        assert!(parse_host_or_url("::11.22.33.44").is_err());
+        assert!(parse_host_or_url_or_multiaddr("::11.22.33.44").is_err());
     }
 
     #[test]
