@@ -3305,6 +3305,95 @@ mod tests {
         );
     }
 
+    /// Mirrors go-algorand's `TestP2PHTTPHandlerAllInterfaces`
+    /// (`network/p2pNetwork_test.go:909`, issue #1448): a node configured
+    /// with a non-routable/private listen address (go's `NetAddress = ":0"`
+    /// — an unspecified-host, ephemeral-port bind; here `127.0.0.1:0`, the
+    /// same loopback-family scenario go's test title calls out) must still
+    /// have its HTTP-over-libp2p-stream server reachable by a peer dialing
+    /// it directly via peer ID, matching go's
+    /// `httpClient, _ := p2p.MakeHTTPClient(&peerInfoA); resp, _ :=
+    /// httpClient.Get("/test")` round trip against a `"hello"`-returning
+    /// handler.
+    ///
+    /// This is deliberately distinct from
+    /// `p2p_client_fetches_a_p2p_registered_catchpoint_service_over_algorand_http`
+    /// above (issue #1024's `TestLedgerServiceP2P` counterpart, which proves
+    /// the raw HTTP-over-stream wire protocol against a real
+    /// `CatchpointService` router) and from issue #1444/PR #1447's
+    /// `filter_advertised_addresses` fix (which only narrows what addresses
+    /// are handed to peers via `identify`, not whether the HTTP-over-stream
+    /// server itself binds/serves). algod-rust has no go-`libp2phttp.Host`
+    /// counterpart that opens a *separate* all-interfaces TCP listener as a
+    /// fallback for HTTP traffic (see `algo_p2p::httpproto`'s doc comment):
+    /// HTTP-over-stream here is multiplexed entirely over the same libp2p
+    /// swarm connection every other protocol on this transport uses, so
+    /// reachability never depends on what `NetAddress`/`listen_multiaddr`
+    /// advertises — only on whether the dialing peer can open a swarm
+    /// connection to the target's `PeerId` at all (already proven possible
+    /// via a directly-dialed loopback multiaddr, exactly as this test
+    /// does). This test exists to pin that property distinctly, matching
+    /// go's dedicated test, rather than leaving it only implied by the
+    /// broader catchpoint-over-HTTP test above.
+    #[tokio::test]
+    async fn p2p_http_server_reachable_with_non_routable_net_address() {
+        use libp2p::futures::AsyncWriteExt;
+
+        // Go: `cfg.NetAddress = ":0"` — no host, so go binds an
+        // unspecified-address/all-interfaces listener; algod-rust's
+        // `listen_multiaddr` equivalent of a non-routable `NetAddress` is a
+        // loopback bind, which `connected_pair()`'s listener already uses
+        // (`/ip4/127.0.0.1/tcp/0`) — loopback is exactly the
+        // non-routable-address family go's test title targets.
+        let (listener, dialer) = connected_pair().await;
+
+        // Go: `h := &p2phttpHandler{t, "hello", nil}; netA.RegisterHTTPHandler("/test", h)`
+        // — a trivial handler that always returns the fixed body `"hello"`.
+        let handler_router = Router::new().route("/test", axum::routing::get(|| async { "hello" }));
+        GossipNode::register_http_handler(&listener, "/", handler_router);
+
+        let listener_peer_id = listener.peer_id();
+
+        // Go: `httpClient, err := p2p.MakeHTTPClient(&peerInfoA)` — dials
+        // the listener directly by its `AddrInfo` (peer-ID-addressed, not
+        // depending on any advertised "routable" address). Here: open a raw
+        // `/algorand-http/1.0.0` stream to the listener's `PeerId` over the
+        // already-established swarm connection `connected_pair()` set up.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match dialer.open_http_stream(listener_peer_id).await {
+                Ok(stream) => break stream,
+                Err(e) if tokio::time::Instant::now() < deadline => {
+                    tracing::debug!(error = %e, "retrying P2P HTTP stream open");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("failed to open P2P HTTP stream before deadline: {e}"),
+            }
+        };
+
+        // Go: `resp, err := httpClient.Get("/test")` /
+        // `body, err := io.ReadAll(resp.Body)` / `require.Equal(t, "hello", string(body))`.
+        let request = b"GET /test HTTP/1.1\r\nHost: p2p\r\nConnection: close\r\n\r\n";
+        stream.write_all(request).await.expect("write HTTP request");
+        stream.flush().await.expect("flush HTTP request");
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+            .await
+            .expect("reading the HTTP response should not time out")
+            .expect("read HTTP response");
+
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 200"),
+            "expected a 200 response from the loopback-bound P2P HTTP server, got: {response_str}"
+        );
+        assert!(
+            response_str.ends_with("hello"),
+            "expected the handler's fixed \"hello\" body, got: {response_str}"
+        );
+    }
+
     /// End-to-end proof for issue #1127, mirroring go-algorand's
     /// `TestLedgerFetcherP2P` (`catchup/ledgerFetcher_test.go`): a real
     /// `algo-rest-client` `CatchpointDownloader` built with
