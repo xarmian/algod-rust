@@ -306,6 +306,16 @@ pub struct WsPeerConfig {
     /// `None` disables counting (e.g. for tests/callers that don't need
     /// metrics).
     pub network_metrics: Option<Arc<NetworkTagMetrics>>,
+    /// The incoming peer's claimed origin address (issue #1453), mirroring
+    /// go's `wsPeerCore.originAddress` — set only for *incoming* connections,
+    /// to the connection's resolved remote host (go's
+    /// `TrackerRequest.remoteHost`; in this crate, the `tracking_ip` computed
+    /// by `ws_network.rs`'s inbound-connection validation, independently of
+    /// the `X-Algorand-Location`-aware `resolved_addr`/rootURL). When set,
+    /// this overrides [`Peer::routing_addr`]'s normalization source (but not
+    /// `ipAddr()`, which this crate doesn't separately expose). `None` for
+    /// outbound connections, matching go always passing `""` for them.
+    pub origin_address: Option<String>,
 }
 
 /// A live WebSocket peer connection.
@@ -434,6 +444,7 @@ impl WsPeer {
         let outgoing_filter = self.config.outgoing_filter;
         let request_tracker = self.config.request_tracker;
         let network_metrics = self.config.network_metrics;
+        let origin_address = self.config.origin_address;
         let request_timeout = self
             .config
             .request_timeout
@@ -515,12 +526,16 @@ impl WsPeer {
             remote_addr.clone(),
         ));
 
+        let routing_addr =
+            compute_routing_addr(parse_remote_ip(&remote_addr), origin_address.as_deref());
+
         PeerHandle {
             send_high_prio: self.send_high_prio_tx,
             send_bulk: self.send_bulk_tx,
             incoming: incoming_rx,
             closing,
             remote_addr,
+            routing_addr,
             identity_key,
             identity_verified: self.identity_verified,
             features,
@@ -618,6 +633,11 @@ pub struct PeerHandle {
     closing: CancellationToken,
     /// Remote address of the peer.
     remote_addr: String,
+    /// Precomputed `RoutingAddr()` normalization of this peer's address
+    /// (issue #1453) — see [`compute_routing_addr`]. Computed once at
+    /// construction time since [`Peer::routing_addr`] must return a
+    /// borrowed `&[u8]`.
+    routing_addr: Vec<u8>,
     /// The peer's verified identity public key (if any).
     identity_key: Option<ed25519_dalek::VerifyingKey>,
     /// Whether identity has been verified.
@@ -803,6 +823,12 @@ impl PeerHandle {
         // contract (one instance per [`crate::ws_network::WebsocketNetwork`],
         // not per peer).
         network_metrics: Option<Arc<NetworkTagMetrics>>,
+        // Issue #1453: the incoming connection's claimed origin address
+        // (go's `wsPeerCore.originAddress`) — see
+        // [`WsPeerConfig::origin_address`]'s doc comment for what this
+        // should be (the resolved *tracking* host, not the
+        // `X-Algorand-Location`-aware rootURL `remote_addr` above).
+        origin_address: Option<String>,
     ) -> Self {
         use futures_util::{SinkExt, StreamExt};
 
@@ -1126,12 +1152,16 @@ impl PeerHandle {
             keepalive_closing.cancelled().await;
         });
 
+        let routing_addr =
+            compute_routing_addr(parse_remote_ip(&remote_addr), origin_address.as_deref());
+
         PeerHandle {
             send_high_prio: send_high_prio_tx,
             send_bulk: send_bulk_tx,
             incoming: incoming_rx,
             closing,
             remote_addr,
+            routing_addr,
             identity_key: None,
             identity_verified: false,
             features,
@@ -1348,6 +1378,131 @@ impl Drop for PeerHandle {
 }
 
 // ---------------------------------------------------------------------------
+// IP address normalization (issue #1453)
+// ---------------------------------------------------------------------------
+//
+// Mirrors go-algorand's `wsPeer.ipAddr()`/`RoutingAddr()` (`network/wsPeer.go`
+// lines 344-390), which normalize a peer's IP for rate-limiting/bucketing
+// purposes:
+//
+// - `ipAddr()` returns the peer's raw remote IP, unwrapping a *standard*
+//   IPv4-mapped-in-IPv6 address (`::ffff:a.b.c.d`, i.e. the first 10 bytes
+//   zero and bytes 10-11 == 0xff, 0xff) down to its plain 4-byte IPv4 form —
+//   mirroring Go's `net.IP.To4()`. Any other IPv6 address (including a
+//   *non-standard* all-zero-prefixed form without the 0xff,0xff marker) is
+//   returned as its full 16 bytes unchanged — mirroring `net.IP.To16()`.
+// - `RoutingAddr()` returns the "meaningful routing part" of the address:
+//   the full (already-unwrapped) IPv4 for IPv4 addresses, the low 4 bytes for
+//   *any* 16-byte address whose first 10 bytes are zero (this branch is
+//   looser than `ipAddr()`'s: it doesn't check bytes 10-11, so it also
+//   catches the non-standard all-zero-prefixed form `ipAddr()` left as 16
+//   bytes), or the top 8 bytes ("routing prefix") for any other IPv6
+//   address. For an *incoming* connection with a non-empty claimed origin
+//   address (go's `wsPeerCore.originAddress`, sourced from the connection's
+//   resolved remote host — see `resolve_incoming_peer_address` in
+//   `ws_network.rs`, issue #1421's `X-Algorand-Location`/proxy-header
+//   handling), `RoutingAddr()` normalizes *that* address instead of the
+//   peer's raw `ipAddr()` — `ipAddr()` itself is never affected by the
+//   origin-address override.
+
+/// Normalizes a raw IP address the way go's `net.IP.To4()`/`To16()` does for
+/// `wsPeer.ipAddr()`: unwrap a *standard* IPv4-mapped-in-IPv6 address to
+/// plain 4-byte IPv4; otherwise return the address's bytes unchanged (4 for
+/// IPv4, 16 for any other IPv6 form).
+fn normalize_ip_addr(ip: std::net::IpAddr) -> Vec<u8> {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+        std::net::IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            let is_standard_v4_mapped =
+                octets[0..10].iter().all(|&b| b == 0) && octets[10] == 0xff && octets[11] == 0xff;
+            if is_standard_v4_mapped {
+                octets[12..16].to_vec()
+            } else {
+                octets.to_vec()
+            }
+        }
+    }
+}
+
+/// Truncates an already-normalized IP address's bytes down to its
+/// "meaningful routing part", mirroring go's `wsPeer.RoutingAddr()`'s
+/// post-normalization logic (`network/wsPeer.go` lines 362-390):
+/// non-16-byte input (i.e. already plain IPv4) is returned unchanged; a
+/// 16-byte address with an all-zero first 10 bytes (IPv4-embedded-in-IPv6,
+/// standard or not) is truncated to its low 4 bytes; any other 16-byte
+/// (genuine IPv6) address is truncated to its top 8 bytes.
+fn truncate_to_routing_addr(ip: &[u8]) -> Vec<u8> {
+    if ip.len() != 16 {
+        return ip.to_vec();
+    }
+    if ip[0..10].iter().all(|&b| b == 0) {
+        ip[12..16].to_vec()
+    } else {
+        ip[0..8].to_vec()
+    }
+}
+
+/// Parses a bare IP-address string the way go's `net.ParseIP` does for the
+/// `RoutingAddr()` origin-address override: an IPv4 literal is represented
+/// in its 16-byte IPv4-in-IPv6-mapped form (so it goes through the same
+/// [`truncate_to_routing_addr`] "all-zero first 10 bytes" branch as a real
+/// IPv4-mapped-IPv6 address), an IPv6 literal is represented as its raw 16
+/// bytes, and an unparseable string yields `None` (mirroring `net.ParseIP`
+/// returning `nil`).
+fn parse_ip_like_go(s: &str) -> Option<Vec<u8>> {
+    match s.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(v4) => {
+            let mut mapped = vec![0u8; 10];
+            mapped.push(0xff);
+            mapped.push(0xff);
+            mapped.extend_from_slice(&v4.octets());
+            Some(mapped)
+        }
+        std::net::IpAddr::V6(v6) => Some(v6.octets().to_vec()),
+    }
+}
+
+/// Computes a peer's `RoutingAddr()`: the claimed `origin_address` (if
+/// present and non-empty, and parseable) overrides the peer's own
+/// `remote_ip`; either way, the result is normalized via
+/// [`truncate_to_routing_addr`]. Mirrors go's `wsPeer.RoutingAddr()`.
+fn compute_routing_addr(
+    remote_ip: Option<std::net::IpAddr>,
+    origin_address: Option<&str>,
+) -> Vec<u8> {
+    let ip = match origin_address.filter(|s| !s.is_empty()) {
+        Some(origin) => parse_ip_like_go(origin).unwrap_or_default(),
+        None => remote_ip.map(normalize_ip_addr).unwrap_or_default(),
+    };
+    truncate_to_routing_addr(&ip)
+}
+
+/// Best-effort extraction of the connection's IP address from a
+/// `"host:port"` (or bare-host) remote-address string, for use as the
+/// `ipAddr()`/`RoutingAddr()` normalization source. Returns `None` if the
+/// string isn't a recognizable socket address or bare IP (e.g. an unresolved
+/// hostname), matching go's `ipAddr()` returning `nil` when
+/// `conn.RemoteAddr()` isn't available.
+fn parse_remote_ip(remote_addr: &str) -> Option<std::net::IpAddr> {
+    if let Ok(socket_addr) = remote_addr.parse::<std::net::SocketAddr>() {
+        return Some(socket_addr.ip());
+    }
+    if let Ok(ip) = remote_addr.parse::<std::net::IpAddr>() {
+        return Some(ip);
+    }
+    // Strip a trailing ":port" (common case: "host:port" with a bare IPv4
+    // host, which doesn't round-trip through `SocketAddr::from_str` above
+    // only for IPv6 hosts missing their required brackets).
+    if let Some((host, _port)) = remote_addr.rsplit_once(':') {
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Peer trait implementation for PeerHandle
 // ---------------------------------------------------------------------------
 
@@ -1362,9 +1517,7 @@ impl Peer for PeerHandle {
     }
 
     fn routing_addr(&self) -> &[u8] {
-        // Routing address extraction from the remote address string is
-        // deferred to a future epic where IP-based peer bucketing is needed.
-        &[]
+        &self.routing_addr
     }
 }
 
@@ -1555,6 +1708,7 @@ pub struct UnicastPeerRef {
     send_bulk: mpsc::Sender<WriteCommand>,
     closing: CancellationToken,
     remote_addr: String,
+    routing_addr: Vec<u8>,
     request_tracker: Option<Arc<RequestTracker>>,
     request_timeout: Duration,
 }
@@ -1569,7 +1723,7 @@ impl Peer for UnicastPeerRef {
     }
 
     fn routing_addr(&self) -> &[u8] {
-        &[]
+        &self.routing_addr
     }
 }
 
@@ -1644,6 +1798,7 @@ impl PeerHandle {
             send_bulk: self.send_bulk.clone(),
             closing: self.closing.clone(),
             remote_addr: self.remote_addr.clone(),
+            routing_addr: self.routing_addr.clone(),
             request_tracker: self.request_tracker.clone(),
             request_timeout: self.request_timeout,
         }
@@ -5153,6 +5308,7 @@ mod tests {
             incoming: _incoming_rx,
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
+            routing_addr: Vec::new(),
             identity_key: None,
             identity_verified: false,
             features: PeerFeatureFlags::empty(),
@@ -5263,6 +5419,7 @@ mod tests {
             incoming: incoming_rx,
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
+            routing_addr: Vec::new(),
             identity_key: None,
             identity_verified: false,
             features: PeerFeatureFlags::empty(),
@@ -5355,6 +5512,7 @@ mod tests {
             incoming: incoming_rx,
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
+            routing_addr: Vec::new(),
             identity_key: None,
             identity_verified: false,
             features: PeerFeatureFlags::empty(),
@@ -5400,6 +5558,7 @@ mod tests {
             incoming: incoming_rx,
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
+            routing_addr: Vec::new(),
             identity_key: None,
             identity_verified: false,
             features: PeerFeatureFlags::empty(),
@@ -5465,6 +5624,7 @@ mod tests {
             incoming: incoming_rx,
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
+            routing_addr: Vec::new(),
             identity_key: None,
             identity_verified: false,
             features: PeerFeatureFlags::empty(),
@@ -5519,6 +5679,7 @@ mod tests {
             incoming: incoming_rx,
             closing: closing.clone(),
             remote_addr: "127.0.0.1:9999".to_string(),
+            routing_addr: Vec::new(),
             identity_key: None,
             identity_verified: false,
             features: PeerFeatureFlags::empty(),
@@ -5588,6 +5749,7 @@ mod tests {
             incoming: incoming_rx,
             closing: closing.clone(),
             remote_addr: "10.0.0.1:4160".to_string(),
+            routing_addr: vec![10, 0, 0, 1],
             identity_key: None,
             identity_verified: false,
             features: PeerFeatureFlags::empty(),
@@ -5602,9 +5764,100 @@ mod tests {
         // Test Peer trait methods.
         assert_eq!(handle.get_address(), "10.0.0.1:4160");
         assert_eq!(handle.get_connection_latency(), Duration::ZERO);
-        assert!(handle.routing_addr().is_empty());
+        assert_eq!(handle.routing_addr(), &[10, 0, 0, 1]);
 
         closing.cancel();
+    }
+
+    // -----------------------------------------------------------------------
+    // IP address normalization (issue #1453) — pins go's exact
+    // `TestWsPeerIPAddr` table (`network/wsPeer_test.go:318-356`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ip_addr_normalization_matches_go_test_table() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        // some raw IPv4 address
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq!(normalize_ip_addr(ip), vec![127, 0, 0, 1]);
+        assert_eq!(compute_routing_addr(Some(ip), None), vec![127, 0, 0, 1]);
+
+        // IPv4 constructed differently (net.IPv4(127, 0, 0, 2) in go)
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        assert_eq!(normalize_ip_addr(ip), vec![127, 0, 0, 2]);
+        assert_eq!(compute_routing_addr(Some(ip), None), vec![127, 0, 0, 2]);
+
+        // some IPv6 address (net.IPv6linklocalallrouters == ff02::2)
+        let v6 = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
+        let ip = IpAddr::V6(v6);
+        assert_eq!(normalize_ip_addr(ip), v6.octets().to_vec());
+        assert_eq!(
+            compute_routing_addr(Some(ip), None),
+            vec![0xff, 0x02, 0, 0, 0, 0, 0, 0]
+        );
+
+        // embedded IPv4 into IPv6, standard ::ffff:127.0.0.3 mapped form
+        let ip = IpAddr::V6(Ipv6Addr::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 0, 0, 3,
+        ]));
+        assert_eq!(normalize_ip_addr(ip), vec![127, 0, 0, 3]);
+        assert_eq!(compute_routing_addr(Some(ip), None), vec![127, 0, 0, 3]);
+
+        // non-standard all-zero-prefixed IPv6 (no 0xff,0xff marker): ipAddr()
+        // does NOT unwrap it (go's To4() only recognizes the standard
+        // marker), but RoutingAddr() still truncates to the low 4 bytes
+        // (its "all zero first 10 bytes" check doesn't look at bytes 10-11).
+        let ip = IpAddr::V6(Ipv6Addr::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 4,
+        ]));
+        assert_eq!(
+            normalize_ip_addr(ip),
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 4]
+        );
+        assert_eq!(compute_routing_addr(Some(ip), None), vec![127, 0, 0, 4]);
+
+        // incoming peer with originAddress set: ipAddr() is unaffected, but
+        // RoutingAddr() uses the (normalized) origin address instead.
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq!(normalize_ip_addr(ip), vec![127, 0, 0, 1]);
+        assert_eq!(
+            compute_routing_addr(Some(ip), Some("127.0.0.2")),
+            vec![127, 0, 0, 2]
+        );
+    }
+
+    #[test]
+    fn routing_addr_falls_back_to_empty_when_no_source_available() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // Neither a remote IP nor an origin address is available — mirrors
+        // go's `ipAddr()` returning `nil` when `conn.RemoteAddr()` is nil.
+        assert_eq!(compute_routing_addr(None, None), Vec::<u8>::new());
+        // An origin address is set but unparseable — go's `net.ParseIP`
+        // returns `nil` for a bad string.
+        assert_eq!(
+            compute_routing_addr(None, Some("not-an-ip")),
+            Vec::<u8>::new()
+        );
+        // An origin address is present but empty — go's `originAddress != ""`
+        // check treats this the same as no origin address at all.
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(compute_routing_addr(Some(ip), Some("")), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn parse_remote_ip_handles_socket_addr_and_bare_ip_strings() {
+        assert_eq!(
+            parse_remote_ip("127.0.0.1:4160"),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)))
+        );
+        assert_eq!(
+            parse_remote_ip("127.0.0.1"),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)))
+        );
+        assert_eq!(parse_remote_ip("not-a-host-or-ip"), None);
+        assert_eq!(parse_remote_ip("some.hostname.example:4160"), None);
     }
 
     // -----------------------------------------------------------------------

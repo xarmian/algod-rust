@@ -2962,6 +2962,13 @@ async fn gossip_upgrade_handler(
                 version_clone,
                 remote_ip,
                 negotiated_features,
+                // Issue #1453: `tracking_ip` is go's `TrackerRequest.remoteHost`
+                // — the value `makePeerCore` passes as `originAddress` for
+                // incoming connections (`network/wsNetwork.go:1171`). It is
+                // deliberately *not* `addr_str`/`resolved_addr`, which also
+                // folds in the (untrusted) `X-Algorand-Location` header value
+                // per `resolve_incoming_peer_address`'s doc comment above.
+                Some(tracking_ip.to_string()),
             )
         })
         .into_response();
@@ -2990,6 +2997,10 @@ async fn handle_gossip_websocket(
     version: String,
     remote_ip: std::net::IpAddr,
     features: crate::peer_features::PeerFeatureFlags,
+    // Issue #1453: this connection's claimed origin address, threaded into
+    // `PeerHandle::new_inbound`'s `RoutingAddr()` normalization — see
+    // `resolve_incoming_peer_address`'s caller for what this is.
+    origin_address: Option<String>,
 ) {
     // Connection is already tracked by validate_incoming_connection().
 
@@ -3025,6 +3036,9 @@ async fn handle_gossip_websocket(
         // instance so inbound peers' traffic is counted alongside
         // outbound peers', matching go's process-global counters.
         Some(network.network_metrics().clone()),
+        // Issue #1453: this connection's claimed origin address, for
+        // `RoutingAddr()` normalization.
+        origin_address,
     );
 
     // Register the inbound peer in the peer map via add_peer, which
