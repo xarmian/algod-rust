@@ -4275,6 +4275,101 @@ async fn get_asset_returns_200_with_correct_json() {
     );
 }
 
+/// Parity with go-algorand's `TestAssetInformation`
+/// (`test/e2e-go/features/transactions/asset_test.go#L443`): go's test
+/// creates several assets, then for every entry in the creator's
+/// `AccountInformation(...).CreatedAssets`, calls `AssetInformation(index)`
+/// (`GET /v2/assets/{id}`) and asserts the two are byte-for-byte `a.Equal`.
+/// This pins that cross-endpoint consistency directly: the same
+/// `AssetParams` (and the same numeric asset id) configured once must be
+/// reported identically by both `GET /v2/accounts/{addr}`'s
+/// `created-assets[]` entry and `GET /v2/assets/{id}`'s `params`, exercising
+/// both handlers against the same underlying `NodeInterface` data the way
+/// go's test exercises both API calls against the same live ledger state.
+#[tokio::test]
+async fn get_asset_matches_account_created_assets_entry() {
+    const ASSET_ID: u64 = 777;
+    // TEST_ADDR is the zero address (see its own doc comment) -- the account
+    // being queried IS the asset's creator here, matching go's test where
+    // `AccountInformation(account0).CreatedAssets` only ever lists assets
+    // `account0` itself created, so `params.creator` must equal `account0`.
+    let creator = Address([0u8; 32]);
+    let params = AssetParams {
+        total: 5_000_000,
+        decimals: 2,
+        default_frozen: false,
+        asset_name: "testname0".to_string(),
+        unit_name: "test0".to_string(),
+        url: "foo://bar".to_string(),
+        metadata_hash: None,
+        manager: Some(creator),
+        reserve: Some(creator),
+        freeze: Some(creator),
+        clawback: Some(creator),
+    };
+
+    let mut created_assets = BTreeMap::new();
+    created_assets.insert(ASSET_ID, params.clone());
+    let account_lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 1_000_000,
+            total_created_assets: 1,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 1_000_000,
+        assets: BTreeMap::new(),
+        created_assets,
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    };
+
+    let mut node = MockNode::synced();
+    node.account_lookup = Some(account_lookup);
+    node.asset_lookups.insert(
+        ASSET_ID,
+        AssetLookup {
+            asset_params: Some(params),
+            creator,
+            last_round: 1000,
+        },
+    );
+    let server = TestServer::start(node).await;
+
+    let account_resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(account_resp.status(), 200);
+    let account_body: serde_json::Value = account_resp.json().await.unwrap();
+    let created = account_body["created-assets"].as_array().unwrap();
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0]["index"].as_u64().unwrap(), ASSET_ID);
+    let from_account_params = created[0]["params"].clone();
+
+    let asset_resp = server
+        .client
+        .get(server.url(&format!("/v2/assets/{}", ASSET_ID)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(asset_resp.status(), 200);
+    let asset_body: serde_json::Value = asset_resp.json().await.unwrap();
+    assert_eq!(asset_body["index"].as_u64().unwrap(), ASSET_ID);
+    let from_asset_params = asset_body["params"].clone();
+
+    assert_eq!(
+        from_account_params, from_asset_params,
+        "GET /v2/accounts/{{addr}}'s created-assets[].params must equal GET \
+         /v2/assets/{{id}}'s params for the same asset, matching go's \
+         a.Equal(cp, asset) assertion"
+    );
+}
+
 #[tokio::test]
 async fn get_asset_returns_404_when_not_found() {
     // No asset configured for asset_id 999
@@ -6362,6 +6457,67 @@ async fn raw_transaction_fee_below_minimum_returns_400() {
     stxn.txn.fee = 1; // well below MinTxnFee (1000)
     let body = encode_signed_txn_for_post(&stxn);
 
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"].as_str().unwrap().contains("below minimum"),
+        "error should mention the fee being below minimum, got: {}",
+        json["message"]
+    );
+}
+
+/// A transaction whose `Note` field exceeds the free/soft cap
+/// (`MaxTxnNoteBytes`) requires a higher fee to cover the note-size
+/// surcharge (issue #657 size pricing); paying only the flat `MinTxnFee` is
+/// then rejected the same way as any other underpaid fee. This mirrors
+/// go-algorand's `TestClientOversizedNote`
+/// (`test/e2e-go/restAPI/restClient_test.go#L250`): at the current
+/// (`ConsensusCurrentVersion`) protocol, go's test constructs a
+/// `MaxTxnNoteBytes+1`-byte note and sends it at `SuggestedParams().MinFee`,
+/// asserting `a.Error(err)` -- the client-visible failure is exactly the
+/// fee-too-low rejection this test pins at the REST layer, complementing
+/// `algo_validate::fee`'s existing unit coverage
+/// (`txn_fee_factor_oversized_note_charges_surcharge`,
+/// `test_note_over_soft_cap_v42_is_well_formed_but_needs_higher_fee`) of the
+/// same surcharge formula with a live `POST /v2/transactions` passthrough
+/// test, using `MockNode.broadcast_result` the same way every other
+/// `raw_transaction_*_returns_400` test in this file stands in for the real
+/// pool/validate rejection.
+#[tokio::test]
+async fn raw_transaction_oversized_note_fee_too_low_returns_400() {
+    let params = ConsensusParams::default(); // v42, matches ConsensusCurrentVersion
+    let mut stxn = make_test_signed_txn();
+    stxn.txn.note = serde_bytes::ByteBuf::from(vec![0u8; params.max_txn_note_bytes + 1]);
+    let (required_fee, overflow) = algo_validate::fee::required_fee_for_txn(&stxn.txn, &params);
+    assert!(!overflow);
+    assert!(
+        required_fee > params.min_txn_fee,
+        "an oversized note must require more than the flat minimum fee"
+    );
+    // Pay only the flat minimum -- exactly what go's SuggestedParams().MinFee
+    // would supply, unaware of the surcharge -- and let the mock stand in
+    // for the real "transaction fee {} is below minimum {}" rejection that
+    // `algo_validate::rules::validate_transaction_wellformed` produces.
+    stxn.txn.fee = params.min_txn_fee;
+
+    let mut node = MockNode::synced();
+    node.broadcast_result = Some(format!(
+        "transaction fee {} is below minimum {}",
+        stxn.txn.fee, required_fee
+    ));
+    let server = TestServer::start(node).await;
+
+    let body = encode_signed_txn_for_post(&stxn);
     let resp = server
         .client
         .post(server.url("/v2/transactions"))
