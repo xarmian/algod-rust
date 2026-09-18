@@ -4886,6 +4886,12 @@ pub async fn run(
                 // same `node_config` field `net_config.enable_vote_compression`
                 // below wires for the WS transport.
                 enable_vote_compression: node_config.enable_vote_compression,
+                // Issue #1442: mirrors go's `node.Capabilities()`
+                // (`node/node.go:449`), which only advertises `p2p.Gossip`
+                // when `EnableGossipService` is true — gates this
+                // transport's own DHT Gossip-capability advertisement the
+                // same way, independent of `is_listen_server` above.
+                enable_gossip_service: node_config.enable_gossip_service,
             })
             .await
             .map_err(|e| anyhow::anyhow!("failed to start P2P transport: {e}"))?,

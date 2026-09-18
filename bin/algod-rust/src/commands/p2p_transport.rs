@@ -1076,6 +1076,22 @@ pub struct P2pTransportConfig {
     /// `algo_config::Local::enable_vote_compression`, same caveat as
     /// `gossip_fanout` above.
     pub enable_vote_compression: bool,
+    /// Matches go's `cfg.EnableGossipService` (`config/localTemplate.go:407`,
+    /// go default `true`). Go's `AlgorandFullNode.Capabilities()`
+    /// (`node/node.go:449`) only appends `p2p.Gossip` when
+    /// `EnableGossipService && IsListenServer()` — so this field gates
+    /// whether the P2P host advertises the `Gossip` capability on the DHT,
+    /// independent of `is_listen_server` (issue #1442). This is a separate
+    /// knob from `WebsocketNetworkConfig::net_address` suppression (issue
+    /// #748, wired in `participate.rs` before this struct is even built):
+    /// that gates the legacy WS-gossip HTTP listener, this gates the P2P
+    /// transport's DHT capability advertisement — go gates both off the
+    /// same config field, but through separate mechanisms.
+    /// `Default::default()` gives `false` (bool default), unlike go's real
+    /// `true` default — same caveat as `enable_vote_compression` above, a
+    /// caller building a real node config should always set this
+    /// explicitly from `algo_config::Local::enable_gossip_service`.
+    pub enable_gossip_service: bool,
 }
 
 /// Split a multiaddr into its dialable transport address and an optional
@@ -1312,12 +1328,10 @@ impl P2pTransport {
         // `if caps := n.nodeInfo.Capabilities(); len(caps) > 0 && ... {
         // n.capabilitiesDiscovery.AdvertiseCapabilities(caps...) }`) and
         // `node.go`'s `AlgorandFullNode.Capabilities()`, which only includes
-        // `p2p.Gossip` when `EnableGossipService && IsListenServer()`.
-        // `EnableGossipService` itself isn't yet a tracked config knob in
-        // this crate (go defaults it to `true`) — a pre-existing gap
-        // tracked separately, not introduced here — so this mirrors that
-        // default by gating on `is_listen_server` alone.
-        if cfg.enable_dht_providers && cfg.is_listen_server {
+        // `p2p.Gossip` when `EnableGossipService && IsListenServer()`
+        // (issue #1442: `EnableGossipService` is now wired through
+        // `cfg.enable_gossip_service`).
+        if cfg.enable_dht_providers && cfg.is_listen_server && cfg.enable_gossip_service {
             if let Err(e) = host
                 .advertise_capability(algo_p2p::Capability::Gossip)
                 .await
@@ -1403,6 +1417,16 @@ impl P2pTransport {
         let stream_generation: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let identity_tracker: Arc<Mutex<IdentityTracker<PeerId, ConnectionId>>> =
             Arc::new(Mutex::new(IdentityTracker::new()));
+        // `EnableGossipService` (issue #1442): peers whose libp2p connection
+        // to us was inbound (they dialed us) while our own gossip service
+        // is disabled — mirrors go's `streamManager.allowIncomingGossip`
+        // gate (`network/p2p/streams.go`'s `Connected`/`streamHandler`).
+        // Populated in the `ConnectionEstablished` arm below, consulted by
+        // both that arm (to skip proactively opening our own outbound
+        // `/algorand-ws/2.2.0` stream) and the inbound-stream accept loop
+        // above (to reject a stream even if the peer opens one anyway).
+        let blocked_inbound_gossip_peers: Arc<Mutex<std::collections::HashSet<PeerId>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
         let http_router: Arc<Mutex<Router>> = Arc::new(Mutex::new(Router::new()));
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<P2pCommand>();
         let local_peer_id = host.peer_id();
@@ -1420,8 +1444,31 @@ impl P2pTransport {
             let sp = Arc::clone(&stream_peers);
             let gen_counter = Arc::clone(&stream_generation);
             let headers = our_ws_headers.clone();
+            let blocked = Arc::clone(&blocked_inbound_gossip_peers);
             tokio::spawn(async move {
                 while let Some((peer_id, stream)) = incoming_ws_streams.next().await {
+                    // `EnableGossipService` (issue #1442): mirrors go's
+                    // `streamManager.streamHandler`'s own
+                    // `stream.Conn().Stat().Direction == network.DirInbound
+                    // && !n.allowIncomingGossip` check — a peer that dials
+                    // *us* while our own gossip service is disabled gets its
+                    // stream rejected outright, even if it still tries to
+                    // open one despite our side never having offered to.
+                    // The `ConnectionEstablished` arm below is what actually
+                    // populates `blocked_inbound_gossip_peers`, mirroring
+                    // go's parallel check in `streamManager.Connected`.
+                    if blocked
+                        .lock()
+                        .expect("blocked_inbound_gossip_peers mutex poisoned")
+                        .contains(&peer_id)
+                    {
+                        tracing::debug!(
+                            %peer_id,
+                            "P2P: rejecting algorand-ws stream from incoming connection — EnableGossipService is false"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     sp.lock()
                         .expect("stream_peers mutex poisoned")
                         .begin_peer_attempt(peer_id);
@@ -1465,10 +1512,15 @@ impl P2pTransport {
         let sp_for_task = Arc::clone(&stream_peers);
         let gen_counter_for_task = Arc::clone(&stream_generation);
         let identity_tracker_for_task = Arc::clone(&identity_tracker);
+        let blocked_inbound_gossip_peers_for_task = Arc::clone(&blocked_inbound_gossip_peers);
         // Periodic DHT-driven mesh discovery (issue #1073): captured before
         // `cfg` is otherwise consumed below (`cfg.network_id` moves into
         // `Self` at the end of this function).
         let enable_dht_providers = cfg.enable_dht_providers;
+        // `EnableGossipService` (issue #1442): captured the same way as
+        // `enable_dht_providers` above — consulted in the
+        // `ConnectionEstablished` arm below.
+        let enable_gossip_service = cfg.enable_gossip_service;
         let task = tokio::spawn(async move {
             // Mirrors go's `meshThreadInterval` (`network/mesh.go`, default
             // `time.Minute`) — the period between `P2PNetwork`'s
@@ -1584,7 +1636,7 @@ impl P2pTransport {
                             SwarmEvent::NewListenAddr { address, .. } => {
                                 la.lock().expect("listen_addrs mutex poisoned").push(address);
                             }
-                            SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+                            SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                                 // Connection-identity dedup (issue #952):
                                 // go's `baseWsStreamHandler` runs
                                 // `identityTracker.setIdentity(wsp)` keyed
@@ -1614,6 +1666,35 @@ impl P2pTransport {
                                 }
 
                                 cp.lock().expect("connected_peers mutex poisoned").push(peer_id);
+
+                                // `EnableGossipService` (issue #1442): mirrors
+                                // go's `streamManager.Connected`'s own
+                                // `conn.Stat().Direction == network.DirInbound
+                                // && !n.allowIncomingGossip` check — a
+                                // connection this node did not dial (the
+                                // remote peer dialed us) is never allowed to
+                                // become an `/algorand-ws/2.2.0` peer while
+                                // our gossip service is disabled, even though
+                                // the raw libp2p connection itself (tracked
+                                // in `connected_peers` above) still stands.
+                                // The other direction (we dialed out) is
+                                // unaffected — matches go's test names this
+                                // mirrors (`TestP2PEnableGossipService_
+                                // NodeDisable`/`_BothDisable`): a
+                                // gossip-disabled node can still dial out and
+                                // gossip normally, it just refuses unsolicited
+                                // inbound gossip connections.
+                                if !enable_gossip_service && !endpoint.is_dialer() {
+                                    blocked_inbound_gossip_peers_for_task
+                                        .lock()
+                                        .expect("blocked_inbound_gossip_peers mutex poisoned")
+                                        .insert(peer_id);
+                                    tracing::debug!(
+                                        %peer_id,
+                                        "P2P: not opening algorand-ws stream on inbound connection — EnableGossipService is false"
+                                    );
+                                    continue;
+                                }
 
                                 // Which side opens the `/algorand-ws/2.2.0`
                                 // stream is decided by peer-ID order, not by
@@ -1682,6 +1763,17 @@ impl P2pTransport {
                                     .lock()
                                     .expect("stream_peers mutex poisoned")
                                     .remove_stream(&peer_id);
+                                // Issue #1442: drop any stale block entry so
+                                // a later reconnect (e.g. after this peer
+                                // starts dialing *us* instead, or after our
+                                // own `EnableGossipService` is reconfigured
+                                // across a restart) is re-evaluated fresh
+                                // rather than permanently blocked from this
+                                // one earlier inbound connection.
+                                blocked_inbound_gossip_peers_for_task
+                                    .lock()
+                                    .expect("blocked_inbound_gossip_peers mutex poisoned")
+                                    .remove(&peer_id);
                             }
                             SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(
                                 gossipsub::Event::Message {
@@ -2472,6 +2564,7 @@ mod tests {
             relay_messages: false,
             force_fetch_transactions: false,
             enable_vote_compression: true,
+            enable_gossip_service: true,
         })
         .await
         .expect("start p2p transport");
@@ -2506,6 +2599,7 @@ mod tests {
             relay_messages: false,
             force_fetch_transactions: false,
             enable_vote_compression: true,
+            enable_gossip_service: true,
         })
         .await
         .expect("start p2p transport");
@@ -2538,6 +2632,7 @@ mod tests {
             relay_messages: false,
             force_fetch_transactions: false,
             enable_vote_compression: true,
+            enable_gossip_service: true,
         })
         .await
         .expect("start p2p transport");
@@ -2577,6 +2672,7 @@ mod tests {
             relay_messages: true,
             force_fetch_transactions: false,
             enable_vote_compression: true,
+            enable_gossip_service: true,
         })
         .await
         .expect("start listener");
@@ -2607,6 +2703,7 @@ mod tests {
             relay_messages: true,
             force_fetch_transactions: false,
             enable_vote_compression: true,
+            enable_gossip_service: true,
         })
         .await
         .expect("start dialer");
@@ -2656,6 +2753,7 @@ mod tests {
             relay_messages: false,
             force_fetch_transactions: false,
             enable_vote_compression: true,
+            enable_gossip_service: true,
         }
     }
 
@@ -3013,6 +3111,7 @@ mod tests {
             relay_messages: false,
             force_fetch_transactions: false,
             enable_vote_compression: true,
+            enable_gossip_service: true,
         })
         .await
         .expect("start listener");
@@ -3040,6 +3139,7 @@ mod tests {
             relay_messages: false,
             force_fetch_transactions: false,
             enable_vote_compression: true,
+            enable_gossip_service: true,
         })
         .await
         .expect("start dialer");
@@ -3619,6 +3719,7 @@ mod tests {
             relay_messages: false,
             force_fetch_transactions: false,
             enable_vote_compression: true,
+            enable_gossip_service: true,
         })
         .await
         .expect("start transport");
@@ -3983,6 +4084,219 @@ mod tests {
         assert!(
             result.is_err(),
             "a write that blocks past its budget must be reported as failed, not hang forever"
+        );
+    }
+
+    /// TDD anchor for issue #1442: go's `AlgorandFullNode.Capabilities()`
+    /// (`node/node.go:449`) only appends `p2p.Gossip` to the capabilities
+    /// list advertised on the DHT when `EnableGossipService &&
+    /// IsListenServer()` — mirroring go's `TestP2PEnableGossipService_
+    /// NodeDisable` (`network/p2pNetwork_test.go`). Before this issue's
+    /// fix, `P2pTransport::start`'s DHT-advertisement gate ignored
+    /// `EnableGossipService` entirely (it wasn't even a field on
+    /// `P2pTransportConfig`) and only checked `enable_dht_providers &&
+    /// is_listen_server`, so a node with the gossip service explicitly
+    /// disabled would still advertise itself as a Gossip-capable peer.
+    ///
+    /// `relay` is otherwise a fully qualifying listen-server DHT node
+    /// (`enable_dht_providers: true`, `is_listen_server: true`) but sets
+    /// `enable_gossip_service: false`; a bare `P2pHost` "seeker" dials it
+    /// directly (so connectivity itself is never in question) and then
+    /// looks it up purely via DHT capability lookup, which must come back
+    /// empty.
+    #[tokio::test]
+    async fn enable_gossip_service_false_omits_gossip_capability_advertisement() {
+        let relay = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1442".to_string(),
+            listen_multiaddr: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+            enable_dht_providers: true,
+            is_listen_server: true,
+            enable_gossip_service: false,
+            ..plain_non_relay_config("test-1442")
+        })
+        .await
+        .expect("start relay");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while relay.listen_addrs().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let listen_addr = relay
+            .listen_addrs()
+            .first()
+            .cloned()
+            .expect("relay bound an address");
+        let dial_addr = listen_addr.with(Protocol::P2p(relay.peer_id()));
+
+        // Give `relay`'s startup-time DHT-advertisement gate (evaluated
+        // once inside `P2pTransport::start`, before this test can observe
+        // anything) a moment to have already run one way or the other.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let identity_cfg = IdentityConfig {
+            private_key_path: None,
+            data_dir: None,
+            persist_peer_id: false,
+        };
+        let host_cfg = P2pHostConfig {
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
+            enable_dht_providers: true,
+            filter_advertised_addresses: false,
+        };
+        let mut seeker =
+            P2pHost::new(&identity_cfg, "test-1442", &host_cfg).expect("build seeker host");
+        seeker.set_dht_mode(Some(libp2p::kad::Mode::Server));
+        seeker
+            .dial(dial_addr)
+            .expect("seeker should be able to dial relay directly");
+
+        let mut connected = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !connected && tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                ev = seeker.next_event() => {
+                    if let SwarmEvent::ConnectionEstablished { .. } = ev {
+                        connected = true;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+        }
+        assert!(
+            connected,
+            "seeker must establish a real connection to relay before looking it up"
+        );
+
+        let found = seeker
+            .find_peers_for_capability(algo_p2p::Capability::Gossip, 5, Duration::from_secs(5))
+            .await;
+
+        assert!(
+            !found.contains(&relay.peer_id()),
+            "relay has enable_gossip_service=false and must not advertise the Gossip \
+             capability on the DHT, but the seeker found it anyway: {found:?}"
+        );
+    }
+
+    /// Start two real [`P2pTransport`]s directly dialed to each other (no
+    /// DHT bootstrap involved — `listener` is dialed by `dialer` via a
+    /// concrete loopback multiaddr, exactly like [`connected_pair`]), each
+    /// built from its own `P2pTransportConfig` so tests can independently
+    /// vary `enable_gossip_service` per side.
+    async fn connected_pair_with_gossip_service(
+        listener_enable_gossip_service: bool,
+        dialer_enable_gossip_service: bool,
+    ) -> (P2pTransport, P2pTransport) {
+        let listener = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1442-stream".to_string(),
+            listen_multiaddr: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+            enable_gossip_service: listener_enable_gossip_service,
+            ..plain_non_relay_config("test-1442-stream")
+        })
+        .await
+        .expect("start listener");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while listener.listen_addrs().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let listen_addr = listener
+            .listen_addrs()
+            .first()
+            .cloned()
+            .expect("listener bound an address");
+        let dial_addr = listen_addr.with(Protocol::P2p(listener.peer_id()));
+
+        let dialer = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1442-stream".to_string(),
+            bootstrap_peers: vec![dial_addr],
+            enable_gossip_service: dialer_enable_gossip_service,
+            ..plain_non_relay_config("test-1442-stream")
+        })
+        .await
+        .expect("start dialer");
+
+        (listener, dialer)
+    }
+
+    /// TDD anchor for issue #1442, go's `TestP2PEnableGossipService_
+    /// BothDisable` (`network/p2pNetwork_test.go`): when *both* sides have
+    /// `EnableGossipService = false`, the underlying libp2p connection
+    /// still comes up (raw connectivity is unaffected — go's own test
+    /// asserts `netAConnected`/`netBConnected` via a bare `Connected`
+    /// notifiee), but neither side ever becomes an `/algorand-ws/2.2.0`
+    /// peer (go: `require.False(t, netA.hasPeers())` /
+    /// `require.False(t, netB.hasPeers())`).
+    ///
+    /// Before this issue's fix, `P2pTransport` never gated the inbound-
+    /// connection side at all: `dialer` (numerically-ordered non-initiator
+    /// or initiator depending on peer ID, but either way whichever side
+    /// dialed in in connected_pair's constructed shape) would still
+    /// establish a live algorand-ws stream against `listener` regardless of
+    /// `enable_gossip_service`.
+    #[tokio::test]
+    async fn enable_gossip_service_false_on_both_sides_prevents_ws_stream_peering() {
+        let (listener, dialer) = connected_pair_with_gossip_service(false, false).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while (listener.connected_peer_count() == 0 || dialer.connected_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            listener.connected_peer_count() > 0 && dialer.connected_peer_count() > 0,
+            "the raw libp2p connection must still come up even with EnableGossipService=false \
+             on both sides — only the algorand-ws stream layer is gated"
+        );
+
+        // Give any (incorrectly) proactively-opened algorand-ws stream a
+        // real chance to establish before asserting neither side has one.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            listener.stream_peer_count(),
+            0,
+            "listener has EnableGossipService=false and must not have an algorand-ws peer"
+        );
+        assert_eq!(
+            dialer.stream_peer_count(),
+            0,
+            "dialer has EnableGossipService=false and must not have an algorand-ws peer"
+        );
+    }
+
+    /// TDD anchor for issue #1442, go's `TestP2PEnableGossipService_
+    /// NodeDisable` (`network/p2pNetwork_test.go`): a node with
+    /// `EnableGossipService = false` can still *dial out* and gossip
+    /// normally — the gate only rejects gossip on connections it did not
+    /// initiate itself. `dialer` disables its own gossip service but
+    /// dials `listener` (which has it enabled); both sides must still end
+    /// up with a live algorand-ws peer, exactly as go's test broadcasts 10
+    /// messages each way and asserts both handler counts reach 10.
+    #[tokio::test]
+    async fn enable_gossip_service_false_on_dialer_only_still_allows_outbound_ws_stream_peering() {
+        let (listener, dialer) = connected_pair_with_gossip_service(true, false).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while (listener.stream_peer_count() == 0 || dialer.stream_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(
+            listener.stream_peer_count(),
+            1,
+            "listener has EnableGossipService=true and should peer normally"
+        );
+        assert_eq!(
+            dialer.stream_peer_count(),
+            1,
+            "dialer disabling its own EnableGossipService must not stop it from dialing out \
+             and gossiping normally — the gate only rejects connections it did not initiate"
         );
     }
 }
