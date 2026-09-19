@@ -252,7 +252,10 @@ return",
     // "int 1; return"; override it to match go's test (same program for
     // both approval and clear state) so the ClearState call actually hits
     // the ApplicationArgs-indexing error.
-    let mut app_params = state.get_app_params(app_id).expect("app registered").clone();
+    let mut app_params = state
+        .get_app_params(app_id)
+        .expect("app registered")
+        .clone();
     app_params.clear_state_program = program;
     state.set_app_params(app_id, app_params);
 

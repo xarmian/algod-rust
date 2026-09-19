@@ -37,14 +37,22 @@ use algo_config::{Local, CONFIG_FILENAME};
 /// absent — go: `config.LoadConfigFromDisk` tolerating `os.IsNotExist`
 /// (`cmd/algocfg/getCommand.go:48-53`).
 fn load(data_dir: &Path) -> anyhow::Result<Local> {
-    Local::load_from_data_dir(data_dir)
-        .map_err(|e| anyhow::anyhow!("Error loading config file from '{}' - {e}", data_dir.display()))
+    Local::load_from_data_dir(data_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "Error loading config file from '{}' - {e}",
+            data_dir.display()
+        )
+    })
 }
 
 fn save(cfg: &Local, data_dir: &Path) -> anyhow::Result<()> {
     let path = data_dir.join(CONFIG_FILENAME);
-    cfg.save_non_default_to_path(&path)
-        .map_err(|e| anyhow::anyhow!("Error saving updated config file '{}' - {e}", path.display()))
+    cfg.save_non_default_to_path(&path).map_err(|e| {
+        anyhow::anyhow!(
+            "Error saving updated config file '{}' - {e}",
+            path.display()
+        )
+    })
 }
 
 /// `algod-rust algocfg get -p <parameter> [-d <data-dir>]`.
@@ -96,8 +104,7 @@ pub fn run_profile_list() {
 
 /// `algod-rust algocfg profile print <name>`.
 pub fn run_profile_print(name: &str) -> anyhow::Result<()> {
-    let cfg = algo_config::algocfg::config_for_profile(name)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cfg = algo_config::algocfg::config_for_profile(name).map_err(|e| anyhow::anyhow!("{e}"))?;
     let json = cfg
         .to_json_minimized()
         .map_err(|e| anyhow::anyhow!("Error writing config file to stdout: {e}"))?;
