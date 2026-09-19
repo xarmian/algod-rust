@@ -259,7 +259,7 @@ impl GossipBlockSource {
         // Decode block+cert from their raw msgpack bytes. decode_block_cert
         // borrows the data, so we can move block_data into the return tuple
         // afterward — avoiding a clone.
-        let response = decode_block_cert(&data.block_data, &data.cert_data)?;
+        let response = decode_block_cert(&data.block_data, &data.cert_data, round)?;
         Ok((response, data.block_data))
     }
 
@@ -388,15 +388,43 @@ impl GossipBlockSource {
 // Conversion helpers
 // ---------------------------------------------------------------------------
 
-/// Decode separate block and certificate msgpack blobs into a [`BlockResponse`].
+/// Decode separate block and certificate msgpack blobs into a [`BlockResponse`],
+/// checking both against the round that was actually requested.
 ///
 /// In the WS protocol the block and cert arrive as distinct topic values
 /// (unlike the REST API which wraps them in a `{block: ..., cert: ...}`
 /// envelope). This function decodes each independently and assembles the
 /// response struct.
-pub fn decode_block_cert(block_data: &[u8], cert_data: &[u8]) -> Result<BlockResponse> {
+///
+/// Mirrors go's `processBlockBytes(fetchedBuf, r, peerAddr)`
+/// (`catchup/universalFetcher.go`): after decoding, the block's round is
+/// checked against the requested round first (`errWrongBlockFromPeer` /
+/// [`AlgoError::WrongBlockFromPeer`] on mismatch), then the certificate's
+/// round (`errWrongCertFromPeer` / [`AlgoError::WrongCertFromPeer`]). A
+/// wrong-round response here is caught at the fetch/decode layer with a
+/// typed error, in addition to (not instead of) `sync_cert`'s later
+/// digest-mismatch safety net in `algo_ledger::CatchupService`, which still
+/// guards against a peer that answers with the *correct* round but the
+/// *wrong* block content.
+///
+/// An empty `cert_data` decodes to `cert: None` with no round check, since
+/// some callers (and the `decode_block_cert_empty_cert` test) intentionally
+/// omit certificate data; go's `processBlockBytes` has no such no-cert path
+/// because `EncodedBlockCert`'s `Certificate` field is always present.
+pub fn decode_block_cert(
+    block_data: &[u8],
+    cert_data: &[u8],
+    expected_round: Round,
+) -> Result<BlockResponse> {
     // Decode the block.
     let block = decode_block(block_data)?;
+
+    if block.round != expected_round {
+        return Err(AlgoError::WrongBlockFromPeer {
+            expected: expected_round.0,
+            got: block.round.0,
+        });
+    }
 
     // Decode the certificate as an opaque msgpack Value (same representation
     // used by BlockResponse::cert from the REST path).
@@ -409,6 +437,33 @@ pub fn decode_block_cert(block_data: &[u8], cert_data: &[u8]) -> Result<BlockRes
         })?;
         Some(val)
     };
+
+    if let Some(ref cert_val) = cert {
+        // The certificate round is encoded under the "rnd" key (see
+        // algo_network::Certificate's `#[serde(rename = "rnd", ...
+        // skip_serializing_if = "is_default_round")]`), and — like the
+        // block header's own round field — is omitted from the wire
+        // encoding entirely when it is the default (round 0), so a missing
+        // key means round 0, not "no round present to check".
+        let cert_round = cert_val
+            .as_map()
+            .and_then(|entries| {
+                entries.iter().find_map(|(k, v)| {
+                    if k.as_str() == Some("rnd") {
+                        v.as_u64()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(0);
+        if cert_round != expected_round.0 {
+            return Err(AlgoError::WrongCertFromPeer {
+                expected: expected_round.0,
+                got: cert_round,
+            });
+        }
+    }
 
     Ok(BlockResponse { block, cert })
 }
@@ -657,10 +712,17 @@ mod tests {
         rmp_serde::to_vec_named(&block).expect("msgpack encode")
     }
 
-    /// Create a minimal Certificate encoded as msgpack.
-    fn make_cert_msgpack() -> Vec<u8> {
-        // Empty map is a valid default certificate.
-        let cert = algo_network::Certificate::default();
+    /// Create a minimal Certificate for a specific round, encoded as
+    /// msgpack. `round: 0` encodes to the same empty-map form as
+    /// `Certificate::default()` (the "rnd" key is omitted when zero) —
+    /// every call site must pass the round it will actually request, since
+    /// [`decode_block_cert`] now checks the certificate's round against the
+    /// requested round (issue #1504 row 5).
+    fn make_cert_msgpack_for_round(round: u64) -> Vec<u8> {
+        let cert = algo_network::Certificate {
+            round: Round(round),
+            ..Default::default()
+        };
         rmp_serde::to_vec_named(&cert).expect("msgpack encode cert")
     }
 
@@ -669,9 +731,9 @@ mod tests {
     #[test]
     fn decode_block_cert_success() {
         let block_bytes = make_block_msgpack(42);
-        let cert_bytes = make_cert_msgpack();
+        let cert_bytes = make_cert_msgpack_for_round(42);
 
-        let resp = decode_block_cert(&block_bytes, &cert_bytes).unwrap();
+        let resp = decode_block_cert(&block_bytes, &cert_bytes, Round(42)).unwrap();
         assert_eq!(resp.block.round.0, 42);
         assert!(resp.cert.is_some());
     }
@@ -681,15 +743,56 @@ mod tests {
         let block_bytes = make_block_msgpack(10);
         let cert_bytes = Vec::new();
 
-        let resp = decode_block_cert(&block_bytes, &cert_bytes).unwrap();
+        let resp = decode_block_cert(&block_bytes, &cert_bytes, Round(10)).unwrap();
         assert_eq!(resp.block.round.0, 10);
         assert!(resp.cert.is_none());
     }
 
     #[test]
     fn decode_block_cert_invalid_block() {
-        let result = decode_block_cert(b"not-valid-msgpack", b"");
+        let result = decode_block_cert(b"not-valid-msgpack", b"", Round(0));
         assert!(result.is_err());
+    }
+
+    /// Mirrors go's `TestProcessBlockBytesErrors`
+    /// (`catchup/universalFetcher_test.go`): a block whose round matches the
+    /// request but whose certificate round does not should fail with a
+    /// typed `errWrongCertFromPeer`-equivalent, and a block whose own round
+    /// does not match should fail with a typed `errWrongBlockFromPeer`-
+    /// equivalent, distinguishable from each other and from a plain decode
+    /// failure.
+    #[test]
+    fn decode_block_cert_wrong_cert_round() {
+        // Block is for round 22 (matches the request); cert is for a
+        // different round (5) — go's "Check for cert error" case.
+        let block_bytes = make_block_msgpack(22);
+        let cert_bytes = make_cert_msgpack_for_round(5);
+
+        let err = decode_block_cert(&block_bytes, &cert_bytes, Round(22)).unwrap_err();
+        match err {
+            AlgoError::WrongCertFromPeer { expected, got } => {
+                assert_eq!(expected, 22);
+                assert_eq!(got, 5);
+            }
+            other => panic!("expected AlgoError::WrongCertFromPeer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_block_cert_wrong_block_round() {
+        // Block is for round 22; the request was for round 20 — go's
+        // "Check for round error" case.
+        let block_bytes = make_block_msgpack(22);
+        let cert_bytes = make_cert_msgpack_for_round(22);
+
+        let err = decode_block_cert(&block_bytes, &cert_bytes, Round(20)).unwrap_err();
+        match err {
+            AlgoError::WrongBlockFromPeer { expected, got } => {
+                assert_eq!(expected, 20);
+                assert_eq!(got, 22);
+            }
+            other => panic!("expected AlgoError::WrongBlockFromPeer, got {other:?}"),
+        }
     }
 
     // -- GossipBlockSource tests -------------------------------------------
@@ -709,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn successful_single_peer_fetch() {
         let block_bytes = make_block_msgpack(5);
-        let cert_bytes = make_cert_msgpack();
+        let cert_bytes = make_cert_msgpack_for_round(5);
 
         let peer =
             Arc::new(MockPeer::new("10.0.0.1:4160").with_success(5, block_bytes, cert_bytes));
@@ -732,7 +835,7 @@ mod tests {
     async fn single_peer_no_block_for_next_round_returns_error() {
         let next = 5u64;
         let block_bytes = make_block_msgpack(next);
-        let cert_bytes = make_cert_msgpack();
+        let cert_bytes = make_cert_msgpack_for_round(next);
 
         // Only round `next` is configured; the peer has no data for
         // `next + 1`, so MockPeer::request falls through to its default
@@ -765,12 +868,13 @@ mod tests {
         // the peer that actually has the requested round.
         let block1 = make_block_msgpack(1);
         let block2 = make_block_msgpack(2);
-        let cert = make_cert_msgpack();
+        let cert1 = make_cert_msgpack_for_round(1);
+        let cert2 = make_cert_msgpack_for_round(2);
 
         let peer_a: Arc<dyn UnicastPeer> =
-            Arc::new(MockPeer::new("peer-a:4160").with_success(1, block1.clone(), cert.clone()));
+            Arc::new(MockPeer::new("peer-a:4160").with_success(1, block1.clone(), cert1));
         let peer_b: Arc<dyn UnicastPeer> =
-            Arc::new(MockPeer::new("peer-b:4160").with_success(2, block2.clone(), cert.clone()));
+            Arc::new(MockPeer::new("peer-b:4160").with_success(2, block2.clone(), cert2));
 
         let src = GossipBlockSource::new(vec![peer_a, peer_b]);
 
@@ -794,7 +898,6 @@ mod tests {
         // outcomes, so the unreliable peer would still be picked roughly
         // half the time) and pass once ranked selection with feedback is
         // wired in.
-        let cert = make_cert_msgpack();
         let bad: Arc<MockPeer> = Arc::new(MockPeer::new("bad-peer:4160").always_failing());
         let good: Arc<MockPeer> = Arc::new(MockPeer::new("good-peer:4160"));
 
@@ -807,7 +910,7 @@ mod tests {
                     round,
                     MockResponse::Success {
                         block_data: make_block_msgpack(round),
-                        cert_data: cert.clone(),
+                        cert_data: make_cert_msgpack_for_round(round),
                     },
                 );
             }
@@ -847,7 +950,7 @@ mod tests {
     #[tokio::test]
     async fn failover_to_next_peer() {
         let block = make_block_msgpack(10);
-        let cert = make_cert_msgpack();
+        let cert = make_cert_msgpack_for_round(10);
 
         // First peer always fails, second peer has the block.
         let bad_peer: Arc<dyn UnicastPeer> = Arc::new(
@@ -864,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn service_error_triggers_failover() {
         let block = make_block_msgpack(7);
-        let cert = make_cert_msgpack();
+        let cert = make_cert_msgpack_for_round(7);
 
         let err_peer: Arc<dyn UnicastPeer> =
             Arc::new(MockPeer::new("err-peer:4160").with_service_error(7, "block not available"));
@@ -891,7 +994,7 @@ mod tests {
     #[tokio::test]
     async fn get_status_reflects_last_fetched_round() {
         let block = make_block_msgpack(42);
-        let cert = make_cert_msgpack();
+        let cert = make_cert_msgpack_for_round(42);
 
         let peer: Arc<dyn UnicastPeer> =
             Arc::new(MockPeer::new("peer:4160").with_success(42, block, cert));
@@ -911,7 +1014,7 @@ mod tests {
     #[tokio::test]
     async fn get_block_raw_returns_reencoded_msgpack() {
         let block = make_block_msgpack(99);
-        let cert = make_cert_msgpack();
+        let cert = make_cert_msgpack_for_round(99);
 
         let peer: Arc<dyn UnicastPeer> =
             Arc::new(MockPeer::new("peer:4160").with_success(99, block, cert));
