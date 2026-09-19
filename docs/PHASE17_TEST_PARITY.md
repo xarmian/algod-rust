@@ -51,17 +51,17 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 1,173 | 37% |
+| `matched-1:1` | 1,174 | 37% |
 | `matched-1:many` | 929 | 29% |
 | `out-of-scope` | 713 | 22% |
 | `matched-many:1` | 284 | 9% |
-| `partial` | 80 | 3% |
+| `partial` | 79 | 2% |
 | `missing-test` | 2 | 0% |
 | `not-implemented` | 0 | 0% |
 
 **2 rows (`not-implemented` + `missing-test`, 0%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
-implements but never tests. `partial` (80, 3%) is coverage that exists
+implements but never tests. `partial` (79, 2%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
 most are diminishing-returns edge cases. See
 [`docs/PHASE17_PROPOSAL.md`](PHASE17_PROPOSAL.md) for how the real gaps
@@ -82,9 +82,9 @@ were triaged into tracked issues.
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 62 | 69 | 1 | 2 | 0 | 0 | 10 |
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 138 | 40 | 47 | 17 | 0 | 0 | 32 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 30 | 41 | 0 | 8 | 0 | 0 | 40 |
-| Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 24 | 11 | 0 | 17 | 0 | 0 | 66 |
+| Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 25 | 11 | 0 | 16 | 0 | 0 | 66 |
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 39 | 29 | 7 | 11 | 0 | 0 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 15 | 0 | 11 | 0 | 0 | 4 |
-| **Total** | | **3,181** | **1173** | **929** | **284** | **80** | **0** | **2** | **713** |
+| **Total** | | **3,181** | **1174** | **929** | **284** | **79** | **0** | **2** | **713** |
 
