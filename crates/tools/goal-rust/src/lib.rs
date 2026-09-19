@@ -117,6 +117,10 @@ pub enum RootCommand {
 
     /// Manage assets.
     Asset {
+        /// Wallet to use for the operation. Mirrors Go's *persistent* `-w`
+        /// flag on the `asset` command group (`asset.go:67`).
+        #[arg(short = 'w', long = "wallet", global = true)]
+        wallet: Option<String>,
         #[command(subcommand)]
         cmd: Option<groups::asset::AssetCmd>,
     },
@@ -229,8 +233,11 @@ pub fn run() -> ExitCode {
             wallet,
         } => groups::app::run(c, wallet),
         RootCommand::App { cmd: None, .. } => print_group_help(&["app"]),
-        RootCommand::Asset { cmd: Some(c) } => groups::asset::run(c),
-        RootCommand::Asset { cmd: None } => print_group_help(&["asset"]),
+        RootCommand::Asset {
+            cmd: Some(c),
+            wallet,
+        } => groups::asset::run(c, wallet),
+        RootCommand::Asset { cmd: None, .. } => print_group_help(&["asset"]),
         RootCommand::Clerk {
             cmd: Some(c),
             wallet,
