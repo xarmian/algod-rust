@@ -820,6 +820,108 @@ mod tests {
         assert_eq!(last_result.event_type(), EventType::NextThreshold);
     }
 
+    /// Mirrors Go's `TestVoteTrackerRoundForwardsVoteAccepted`
+    /// (`agreement/voteAuxiliary_test.go:318`).
+    ///
+    /// Go's version builds a bare `roundRouter` (period/step router
+    /// machines only, no `Player`) and feeds individual `voteAccepted`
+    /// events through it one at a time, asserting: every vote before the
+    /// NEXT-step threshold-reaching one produces `emptyEvent`; the
+    /// threshold-reaching vote itself produces `thresholdEvent{nextThreshold}`;
+    /// and a subsequent full SOFT-step bundle's votes (individually) each
+    /// still produce `emptyEvent`, because a next-threshold is fresher than
+    /// a soft-threshold for the same round/period and so does not overwrite
+    /// `voteTrackerRound.Freshest`/re-fire.
+    ///
+    /// algod-rust's `Player`/`ProposalStore`/`VoteAggregator` do not mirror
+    /// Go's per-period/per-step router-machine composition 1:1, so this is
+    /// not a router-for-router port. It instead drives the same property
+    /// through algod-rust's own real analogous composition:
+    /// `VoteAggregator::handle` (the production `VoteVerified` entry point)
+    /// dispatching to `VoteTrackerRound::handle` (per-round) which dispatches
+    /// to the per-period/per-step trackers and finally back up through
+    /// `VoteTrackerRound::handle_threshold`'s `fresher_than` check — the
+    /// same object graph a real running node's demux feeds one verified vote
+    /// at a time. One-vote-at-a-time delivery + per-call assertions (not
+    /// just the final call, unlike `vote_aggregator_next_threshold_detection`
+    /// above) is what proves the freshness-suppression claim end-to-end
+    /// rather than as an isolated `VoteTrackerRound` unit fact.
+    #[test]
+    fn vote_aggregator_next_threshold_suppresses_less_fresh_soft_votes() {
+        let mut agg = VoteAggregator::default();
+        let params = test_params();
+        let proposal = test_proposal();
+        let round = Round(10);
+        let period = Period(0);
+
+        // Distinct sender-address ranges for the NEXT-step and SOFT-step
+        // votes below, so none of the two batches can be mistaken for
+        // duplicates of each other.
+        let sender = |batch: u8, i: u64| {
+            Address({
+                let mut a = [0u8; 32];
+                a[0] = batch;
+                a[1] = (i & 0xff) as u8;
+                a[2] = ((i >> 8) & 0xff) as u8;
+                a
+            })
+        };
+
+        // --- NEXT-step votes one at a time: every vote but the last must
+        // produce Empty; the threshold-reaching vote must produce
+        // NextThreshold for `proposal`.
+        let next_threshold = NEXT.committee_threshold(&params);
+        assert!(
+            next_threshold > 1,
+            "test case malformed: need at least 2 votes to exercise the pre-threshold Empty path"
+        );
+        let next_fresh_data = make_fresh_data(round, period, NEXT);
+        for i in 0..next_threshold - 1 {
+            let vote = make_verified_vote(sender(1, i), round, period, NEXT, proposal, 1);
+            let event = make_vote_verified_event(vote, next_fresh_data);
+            let result = agg.handle(&event, &params);
+            assert_eq!(
+                result.event_type(),
+                EventType::None,
+                "vote {i}/{next_threshold} of NEXT batch must not yet reach threshold"
+            );
+        }
+        let last_vote = make_verified_vote(
+            sender(1, next_threshold - 1),
+            round,
+            period,
+            NEXT,
+            proposal,
+            1,
+        );
+        let last_event = make_vote_verified_event(last_vote, next_fresh_data);
+        let result = agg.handle(&last_event, &params);
+        assert_eq!(result.event_type(), EventType::NextThreshold);
+        if let Event::Threshold(te) = result {
+            assert_eq!(te.proposal, proposal);
+            assert_eq!(te.round, round);
+        } else {
+            panic!("expected a threshold event");
+        }
+
+        // --- Now a full SOFT-step bundle's votes, one at a time: every
+        // single one must produce Empty, since NEXT is fresher than SOFT
+        // for this round/period and a next-threshold has already been
+        // recorded as `VoteTrackerRound::freshest`.
+        let soft_threshold = SOFT.committee_threshold(&params);
+        let soft_fresh_data = make_fresh_data(round, period, SOFT);
+        for i in 0..soft_threshold {
+            let vote = make_verified_vote(sender(2, i), round, period, SOFT, proposal, 1);
+            let event = make_vote_verified_event(vote, soft_fresh_data);
+            let result = agg.handle(&event, &params);
+            assert_eq!(
+                result.event_type(),
+                EventType::None,
+                "SOFT vote {i}/{soft_threshold} must be suppressed as less fresh than the recorded NextThreshold"
+            );
+        }
+    }
+
     // ---- Duplicate vote filter ----
 
     #[test]
@@ -884,7 +986,8 @@ mod tests {
 
         // A vote for round 100 (far stale relative to player round 1) must
         // be filtered.
-        let stale_vote = make_verified_vote(Address([0x01; 32]), Round(100), Period(1), SOFT, pv, 0);
+        let stale_vote =
+            make_verified_vote(Address([0x01; 32]), Round(100), Period(1), SOFT, pv, 0);
         let event = make_vote_verified_event(stale_vote, fresh_data);
         let result = agg.handle(&event, &params);
         assert_eq!(
@@ -906,7 +1009,8 @@ mod tests {
 
         // A vote for the next round (2) must not be filtered either — the
         // aggregator pipelines one round ahead.
-        let next_round_vote = make_verified_vote(Address([0x03; 32]), Round(2), Period(0), SOFT, pv, 0);
+        let next_round_vote =
+            make_verified_vote(Address([0x03; 32]), Round(2), Period(0), SOFT, pv, 0);
         let event = make_vote_verified_event(next_round_vote, fresh_data);
         let result = agg.handle(&event, &params);
         assert_ne!(
