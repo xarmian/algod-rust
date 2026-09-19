@@ -30,7 +30,7 @@ use algo_codec::{
     decode_block, decode_block_fast, decode_block_response, decode_block_response_fast,
     encode_block,
 };
-use algo_types::BlockResponse;
+use algo_types::{Address, Block, BlockResponse, SignedTransaction, Transaction, TxnType};
 
 // ── Fixture data ──────────────────────────────────────────────────
 
@@ -161,6 +161,37 @@ fn roundtrip_double_serde_fast_decode() {
             "double roundtrip mismatch on {name}"
         );
     }
+}
+
+/// Mirrors go's `TestBlockWithTxnEncoding`
+/// (`data/bookkeeping/encoding_test.go:40`): a block whose payset holds a
+/// single hand-built payment transaction (not a captured fixture) survives a
+/// canonical `encode_block`/`decode_block` round trip byte-for-byte,
+/// including the payment-specific `amt`/`snd` fields and the
+/// zero-valued ApplyData fields flattened onto `SignedTransaction`.
+#[test]
+fn block_with_single_payment_txn_roundtrips_through_canonical_codec() {
+    let mut sender_bytes = [0u8; 32];
+    sender_bytes[0] = 0x01; // matches go's `basics.Address{0x01}` (first byte only)
+    let txn = Transaction {
+        txn_type: TxnType::Pay,
+        sender: Address(sender_bytes),
+        amount: 1,
+        ..Transaction::default()
+    };
+    let sigtxn = SignedTransaction {
+        txn,
+        ..SignedTransaction::default()
+    };
+    let block = Block {
+        payset: vec![sigtxn],
+        ..Block::default()
+    };
+
+    let encoded = encode_block(&block).expect("encode_block must succeed");
+    let decoded = decode_block(&encoded).expect("decode_block must succeed");
+
+    assert_eq!(decoded, block, "block-with-txn round trip must be exact");
 }
 
 // ════════════════════════════════════════════════════════════════════
