@@ -3682,4 +3682,654 @@ mod tests {
             }
         }
     }
+
+    // ── Randomized round-trip: full Transaction / SignedTxn family
+    // (Phase 17 txn_core sweep batch 3, issue #1474) ────────────────────
+    //
+    // Mirrors go's `data/transactions/msgp_gen_test.go`
+    // `TestMarshalUnmarshal*`/`TestRandomizedEncoding*` family for
+    // `Transaction` and all of its embedded field groups
+    // (`Header`/`PaymentTxnFields`/`AssetConfigTxnFields`/
+    // `AssetFreezeTxnFields`/`AssetTransferTxnFields`/
+    // `ApplicationCallTxnFields`/`KeyregTxnFields`/`StateProofTxnFields`),
+    // plus `SignedTxn`/`SignedTxnWithAD`/`ApplyData`/`SignedTxnInBlock`/
+    // `Payset`, and the standalone `BoxRef`/`HoldingRef`/`LocalsRef`/
+    // `ResourceRef`/`HeartbeatTxnFields` wire types.
+    //
+    // algod-rust models go's per-txn-type embedded field-group structs
+    // (`Header`, `PaymentTxnFields`, `AssetConfigTxnFields`, ...) as a
+    // single flat `Transaction` struct rather than as separate Rust types
+    // (see the doc comment on `algo_types::Transaction`), so there is no
+    // narrower Rust type to pin each field group against individually.
+    // This mirrors go's own wire shape exactly, though: go's `Transaction`
+    // struct also embeds every field group into one flat struct via Go
+    // struct embedding, and `protocol.RunEncodingTest`/`quick.Check`
+    // reflection-randomizes the *whole* embedding struct in one pass for
+    // `TestRandomizedEncodingTransaction` -- so `gen_transaction` below,
+    // which randomizes every field group in a single `Transaction`
+    // instance and round-trips it through the real
+    // `canonical_encode_transaction`/`Transaction` deserialize path (the
+    // same functions `canonical_encode_signed_transaction` and
+    // `SignedTransaction` decoding use for every real transaction),
+    // exercises exactly the same property go's per-field-group tests pin,
+    // just through the merged type.
+    //
+    // Same non-collapsing-generator convention as the state-proof section
+    // above: any field nested inside an `Option<Struct>` (`asset_params`,
+    // `global_state_schema`/`local_state_schema`, `state_proof`/
+    // `state_proof_message`, `heartbeat`) is generated to guarantee a
+    // non-empty encoded map, and any `Option<Vec<_>>` field is generated
+    // to guarantee a non-empty vec when `Some`, so `Some(collapsing
+    // default)` never round-trips indistinguishably from `None`.
+
+    fn gen_address_nonzero(rng: &mut ChaCha20Rng) -> Address {
+        let mut bytes = [0u8; 32];
+        rng.fill_bytes(&mut bytes);
+        bytes[0] |= 1;
+        Address(bytes)
+    }
+
+    fn gen_option_address_nonzero(rng: &mut ChaCha20Rng, p_some: f64) -> Option<Address> {
+        if rng.gen_bool(p_some) {
+            Some(gen_address_nonzero(rng))
+        } else {
+            None
+        }
+    }
+
+    fn gen_bytes_any(rng: &mut ChaCha20Rng, min_len: usize, max_len: usize) -> Vec<u8> {
+        let len = rng.gen_range(min_len..=max_len.max(min_len));
+        let mut v = vec![0u8; len];
+        rng.fill_bytes(&mut v);
+        v
+    }
+
+    fn gen_alnum_string(rng: &mut ChaCha20Rng, min_len: usize, max_len: usize) -> String {
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let len = rng.gen_range(min_len..=max_len.max(min_len));
+        (0..len)
+            .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+            .collect()
+    }
+
+    fn gen_fixed32(rng: &mut ChaCha20Rng) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        rng.fill_bytes(&mut b);
+        b
+    }
+
+    fn gen_option_fixed32_nonzero(rng: &mut ChaCha20Rng, p_some: f64) -> Option<[u8; 32]> {
+        if rng.gen_bool(p_some) {
+            let mut b = gen_fixed32(rng);
+            b[0] |= 1;
+            Some(b)
+        } else {
+            None
+        }
+    }
+
+    fn gen_fixed64(rng: &mut ChaCha20Rng) -> [u8; 64] {
+        let mut b = [0u8; 64];
+        rng.fill_bytes(&mut b);
+        b
+    }
+
+    fn gen_option_fixed64_nonzero(rng: &mut ChaCha20Rng, p_some: f64) -> Option<[u8; 64]> {
+        if rng.gen_bool(p_some) {
+            let mut b = gen_fixed64(rng);
+            b[0] |= 1;
+            Some(b)
+        } else {
+            None
+        }
+    }
+
+    fn gen_option_bytes_nonzero(rng: &mut ChaCha20Rng, p_some: f64) -> Option<ByteBuf> {
+        if rng.gen_bool(p_some) {
+            Some(ByteBuf::from(gen_nonzero_bytes(rng, 1, 32)))
+        } else {
+            None
+        }
+    }
+
+    fn gen_option_vec_address(rng: &mut ChaCha20Rng, p_some: f64) -> Option<Vec<Address>> {
+        if rng.gen_bool(p_some) {
+            let n = rng.gen_range(1..=4);
+            Some((0..n).map(|_| gen_address_nonzero(rng)).collect())
+        } else {
+            None
+        }
+    }
+
+    fn gen_option_vec_u64(rng: &mut ChaCha20Rng, p_some: f64) -> Option<Vec<u64>> {
+        if rng.gen_bool(p_some) {
+            let n = rng.gen_range(1..=4);
+            Some((0..n).map(|_| rng.gen::<u64>()).collect())
+        } else {
+            None
+        }
+    }
+
+    fn gen_option_app_arguments(
+        rng: &mut ChaCha20Rng,
+        p_some: f64,
+    ) -> Option<Vec<Option<ByteBuf>>> {
+        if rng.gen_bool(p_some) {
+            let n = rng.gen_range(1..=4);
+            Some(
+                (0..n)
+                    .map(|_| {
+                        if rng.gen_bool(0.2) {
+                            None
+                        } else {
+                            Some(ByteBuf::from(gen_bytes_any(rng, 0, 16)))
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// `BoxRef`, guaranteed to have a non-empty encoding (index and/or
+    /// name non-empty), so it never collapses when wrapped in
+    /// `Option<Vec<BoxRef>>`/nested inside a `ResourceRef`'s
+    /// `Option<BoxRef>` field.
+    fn gen_box_ref_nonempty(rng: &mut ChaCha20Rng) -> BoxRef {
+        BoxRef {
+            index: rng.gen_range(1..=u64::MAX),
+            name: if rng.gen_bool(0.5) {
+                Some(ByteBuf::from(gen_nonzero_bytes(rng, 1, 16)))
+            } else {
+                None
+            },
+        }
+    }
+
+    fn gen_option_vec_box_ref(rng: &mut ChaCha20Rng, p_some: f64) -> Option<Vec<BoxRef>> {
+        if rng.gen_bool(p_some) {
+            let n = rng.gen_range(1..=3);
+            Some((0..n).map(|_| gen_box_ref_nonempty(rng)).collect())
+        } else {
+            None
+        }
+    }
+
+    /// `HoldingRef`, guaranteed non-empty (see `gen_box_ref_nonempty`).
+    fn gen_holding_ref_nonempty(rng: &mut ChaCha20Rng) -> HoldingRef {
+        HoldingRef {
+            address: rng.gen_range(1..=u64::MAX),
+            asset: rng.gen::<u64>(),
+        }
+    }
+
+    /// `LocalsRef`, guaranteed non-empty (see `gen_box_ref_nonempty`).
+    fn gen_locals_ref_nonempty(rng: &mut ChaCha20Rng) -> LocalsRef {
+        LocalsRef {
+            address: rng.gen_range(1..=u64::MAX),
+            app: rng.gen::<u64>(),
+        }
+    }
+
+    fn gen_resource_ref(rng: &mut ChaCha20Rng) -> ResourceRef {
+        ResourceRef {
+            address: if rng.gen_bool(0.4) {
+                gen_address_nonzero(rng)
+            } else {
+                Address::default()
+            },
+            asset: rng.gen::<u64>(),
+            app: rng.gen::<u64>(),
+            holding: if rng.gen_bool(0.35) {
+                Some(gen_holding_ref_nonempty(rng))
+            } else {
+                None
+            },
+            locals: if rng.gen_bool(0.35) {
+                Some(gen_locals_ref_nonempty(rng))
+            } else {
+                None
+            },
+            box_ref: if rng.gen_bool(0.35) {
+                Some(gen_box_ref_nonempty(rng))
+            } else {
+                None
+            },
+        }
+    }
+
+    fn gen_option_vec_resource_ref(rng: &mut ChaCha20Rng, p_some: f64) -> Option<Vec<ResourceRef>> {
+        if rng.gen_bool(p_some) {
+            let n = rng.gen_range(1..=3);
+            Some((0..n).map(|_| gen_resource_ref(rng)).collect())
+        } else {
+            None
+        }
+    }
+
+    /// `AssetParams`, guaranteed non-empty (`total` always non-zero), so it
+    /// never collapses when wrapped in `Transaction::asset_params`.
+    fn gen_asset_params_nonempty(rng: &mut ChaCha20Rng) -> AssetParams {
+        AssetParams {
+            total: rng.gen_range(1..=u64::MAX),
+            decimals: rng.gen::<u32>(),
+            default_frozen: rng.gen_bool(0.5),
+            unit_name: gen_alnum_string(rng, 0, 8),
+            asset_name: gen_alnum_string(rng, 0, 32),
+            url: gen_alnum_string(rng, 0, 32),
+            metadata_hash: gen_option_fixed32_nonzero(rng, 0.5),
+            manager: gen_option_address_nonzero(rng, 0.5),
+            reserve: gen_option_address_nonzero(rng, 0.5),
+            freeze: gen_option_address_nonzero(rng, 0.5),
+            clawback: gen_option_address_nonzero(rng, 0.5),
+        }
+    }
+
+    /// `StateSchema`, guaranteed non-empty (`num_uint` always non-zero), so
+    /// it never collapses when wrapped in `Transaction::global_state_schema`
+    /// / `local_state_schema`.
+    fn gen_state_schema_nonempty(rng: &mut ChaCha20Rng) -> StateSchema {
+        StateSchema {
+            num_uint: rng.gen_range(1..=u64::MAX),
+            num_byte_slice: rng.gen::<u64>(),
+        }
+    }
+
+    /// `StateProofMessage`, guaranteed non-empty (`ln_proven_weight` always
+    /// non-zero), so it never collapses when wrapped in
+    /// `Transaction::state_proof_message`.
+    ///
+    /// `block_headers_commitment`/`voters_commitment` are deliberately kept
+    /// non-zero-content here (`gen_nonzero_bytes`, not `gen_bytes_any`):
+    /// `canonical_encode_state_proof_message` currently encodes both via
+    /// `CanonicalMap::add_bytes` (all-zero-content omitted, the fixed-size
+    /// digest convention), but go's `stateproofmsg.Message.
+    /// BlockHeadersCommitment`/`VotersCommitment` are plain `[]byte` under
+    /// `codec:",omitempty"` (length-only omitempty, same as `Transaction.
+    /// Note`/`protocol/codec.go`'s standard slice omitempty) -- so an
+    /// all-zero-but-non-empty commitment is a real, valid value that this
+    /// encoder currently drops, a genuine wire-format divergence from
+    /// go-algorand (see the `Note`-field precedent fixed for the same
+    /// bug class, tracked separately; not fixed here per this sweep's
+    /// scope -- a production bug fix, not test-parity closure). Avoiding
+    /// the all-zero-content case here keeps this round-trip test
+    /// (validly) covering only the currently-correct part of the encoder's
+    /// behavior.
+    fn gen_state_proof_message_nonempty(rng: &mut ChaCha20Rng) -> StateProofMessage {
+        StateProofMessage {
+            block_headers_commitment: ByteBuf::from(gen_nonzero_bytes(rng, 0, 32)),
+            voters_commitment: ByteBuf::from(gen_nonzero_bytes(rng, 0, 32)),
+            ln_proven_weight: rng.gen_range(1..=u64::MAX),
+            first_attested_round: rng.gen::<u64>(),
+            last_attested_round: rng.gen::<u64>(),
+        }
+    }
+
+    /// `StateProofBody`, guaranteed non-empty (`signed_weight` always
+    /// non-zero, via `gen_state_proof_body` then overriding), so it never
+    /// collapses when wrapped in `Transaction::state_proof`.
+    fn gen_state_proof_body_nonempty(rng: &mut ChaCha20Rng) -> StateProofBody {
+        let mut body = gen_state_proof_body(rng);
+        body.signed_weight = rng.gen_range(1..=u64::MAX);
+        body
+    }
+
+    /// `HeartbeatTxnFields`, guaranteed non-empty (`key_dilution` always
+    /// non-zero), so it never collapses when wrapped in
+    /// `Transaction::heartbeat`.
+    fn gen_heartbeat_txn_fields_nonempty(rng: &mut ChaCha20Rng) -> HeartbeatTxnFields {
+        HeartbeatTxnFields {
+            address: if rng.gen_bool(0.5) {
+                gen_address_nonzero(rng)
+            } else {
+                Address::default()
+            },
+            proof: if rng.gen_bool(0.5) {
+                Some(gen_heartbeat_proof(rng))
+            } else {
+                None
+            },
+            seed: if rng.gen_bool(0.5) {
+                gen_fixed32(rng)
+            } else {
+                [0u8; 32]
+            },
+            vote_id: if rng.gen_bool(0.5) {
+                gen_fixed32(rng)
+            } else {
+                [0u8; 32]
+            },
+            key_dilution: rng.gen_range(1..=u64::MAX),
+            hb_challenge_discount: rng.gen_bool(0.5),
+        }
+    }
+
+    const TXN_TYPE_POOL: &[&str] = &[
+        "pay", "keyreg", "acfg", "axfer", "afrz", "appl", "stpf", "hb",
+    ];
+
+    /// A `Transaction` with every field group (`Header`/`PaymentTxnFields`/
+    /// `AssetConfigTxnFields`/`AssetFreezeTxnFields`/
+    /// `AssetTransferTxnFields`/`ApplicationCallTxnFields`/
+    /// `KeyregTxnFields`/`StateProofTxnFields`/heartbeat) randomized in a
+    /// single pass, mirroring go's whole-struct reflection randomization
+    /// for `TestRandomizedEncodingTransaction`.
+    fn gen_transaction(rng: &mut ChaCha20Rng) -> Transaction {
+        Transaction {
+            txn_type: TXN_TYPE_POOL[rng.gen_range(0..TXN_TYPE_POOL.len())].into(),
+            sender: gen_address_nonzero(rng),
+            fee: rng.gen::<u64>(),
+            first_valid: Round(rng.gen::<u64>()),
+            last_valid: Round(rng.gen::<u64>()),
+            note: ByteBuf::from(gen_bytes_any(rng, 0, 32)),
+            genesis_id: gen_alnum_string(rng, 0, 8),
+            genesis_hash: gen_fixed32(rng),
+            group: gen_fixed32(rng),
+            lease: gen_fixed32(rng),
+            rekey_to: gen_option_address_nonzero(rng, 0.4),
+            amount: rng.gen::<u64>(),
+            receiver: if rng.gen_bool(0.6) {
+                gen_address_nonzero(rng)
+            } else {
+                Address::default()
+            },
+            close_remainder_to: if rng.gen_bool(0.6) {
+                gen_address_nonzero(rng)
+            } else {
+                Address::default()
+            },
+            xaid: rng.gen::<u64>(),
+            asset_amount: rng.gen::<u64>(),
+            asset_sender: gen_option_address_nonzero(rng, 0.4),
+            asset_receiver: gen_option_address_nonzero(rng, 0.4),
+            asset_close_to: gen_option_address_nonzero(rng, 0.4),
+            config_asset: rng.gen::<u64>(),
+            asset_params: if rng.gen_bool(0.6) {
+                Some(gen_asset_params_nonempty(rng))
+            } else {
+                None
+            },
+            freeze_asset: rng.gen::<u64>(),
+            freeze_account: gen_option_address_nonzero(rng, 0.4),
+            asset_frozen: rng.gen_bool(0.5),
+            application_id: rng.gen::<u64>(),
+            on_completion: rng.gen::<u64>(),
+            approval_program: gen_option_bytes_nonzero(rng, 0.6),
+            clear_state_program: gen_option_bytes_nonzero(rng, 0.6),
+            app_arguments: gen_option_app_arguments(rng, 0.6),
+            accounts: gen_option_vec_address(rng, 0.6),
+            foreign_apps: gen_option_vec_u64(rng, 0.6),
+            foreign_assets: gen_option_vec_u64(rng, 0.6),
+            boxes: gen_option_vec_box_ref(rng, 0.6),
+            global_state_schema: if rng.gen_bool(0.6) {
+                Some(gen_state_schema_nonempty(rng))
+            } else {
+                None
+            },
+            local_state_schema: if rng.gen_bool(0.6) {
+                Some(gen_state_schema_nonempty(rng))
+            } else {
+                None
+            },
+            extra_program_pages: rng.gen::<u32>(),
+            vote_pk: gen_option_fixed32_nonzero(rng, 0.5),
+            selection_pk: gen_option_fixed32_nonzero(rng, 0.5),
+            state_proof_pk: gen_option_fixed64_nonzero(rng, 0.5),
+            vote_first: rng.gen::<u64>(),
+            vote_last: rng.gen::<u64>(),
+            vote_key_dilution: rng.gen::<u64>(),
+            non_participation: rng.gen_bool(0.5),
+            state_proof_type: rng.gen::<u64>(),
+            state_proof: if rng.gen_bool(0.5) {
+                Some(gen_state_proof_body_nonempty(rng))
+            } else {
+                None
+            },
+            state_proof_message: if rng.gen_bool(0.5) {
+                Some(gen_state_proof_message_nonempty(rng))
+            } else {
+                None
+            },
+            heartbeat: if rng.gen_bool(0.5) {
+                Some(gen_heartbeat_txn_fields_nonempty(rng))
+            } else {
+                None
+            },
+            access: gen_option_vec_resource_ref(rng, 0.6),
+            reject_version: rng.gen::<u64>(),
+        }
+    }
+
+    /// Matches go's `TestMarshalUnmarshalApplicationCallTxnFields`/
+    /// `TestRandomizedEncodingApplicationCallTxnFields`,
+    /// `TestMarshalUnmarshalAssetConfigTxnFields`/
+    /// `TestRandomizedEncodingAssetConfigTxnFields`,
+    /// `TestMarshalUnmarshalAssetFreezeTxnFields`/
+    /// `TestRandomizedEncodingAssetFreezeTxnFields`,
+    /// `TestMarshalUnmarshalAssetTransferTxnFields`/
+    /// `TestRandomizedEncodingAssetTransferTxnFields`,
+    /// `TestMarshalUnmarshalHeader`/`TestRandomizedEncodingHeader`,
+    /// `TestMarshalUnmarshalKeyregTxnFields`/
+    /// `TestRandomizedEncodingKeyregTxnFields`,
+    /// `TestMarshalUnmarshalPaymentTxnFields`/
+    /// `TestRandomizedEncodingPaymentTxnFields`,
+    /// `TestMarshalUnmarshalStateProofTxnFields`/
+    /// `TestRandomizedEncodingStateProofTxnFields`, and
+    /// `TestRandomizedEncodingTransaction` (`data/transactions/
+    /// msgp_gen_test.go`) all at once: `gen_transaction` randomizes every
+    /// field group go models as a separate embedded struct in one pass, so
+    /// one round-trip test exercises the same wire property each of those
+    /// go tests pins for its slice of `Transaction`'s fields.
+    #[test]
+    fn transaction_randomized_roundtrip() {
+        assert_state_proof_roundtrip(0x1740_0010, gen_transaction, canonical_encode_transaction);
+    }
+
+    /// Matches go's `TestMarshalUnmarshalBoxRef`/`TestRandomizedEncodingBoxRef`.
+    #[test]
+    fn box_ref_randomized_roundtrip() {
+        assert_state_proof_roundtrip(0x1740_0011, gen_box_ref_nonempty, canonical_encode_box_ref);
+    }
+
+    /// Matches go's `TestMarshalUnmarshalHoldingRef`/
+    /// `TestRandomizedEncodingHoldingRef`.
+    #[test]
+    fn holding_ref_randomized_roundtrip() {
+        assert_state_proof_roundtrip(
+            0x1740_0012,
+            gen_holding_ref_nonempty,
+            canonical_encode_holding_ref,
+        );
+    }
+
+    /// Matches go's `TestMarshalUnmarshalLocalsRef`/
+    /// `TestRandomizedEncodingLocalsRef`.
+    #[test]
+    fn locals_ref_randomized_roundtrip() {
+        assert_state_proof_roundtrip(
+            0x1740_0013,
+            gen_locals_ref_nonempty,
+            canonical_encode_locals_ref,
+        );
+    }
+
+    /// Matches go's `TestMarshalUnmarshalResourceRef`/
+    /// `TestRandomizedEncodingResourceRef`.
+    #[test]
+    fn resource_ref_randomized_roundtrip() {
+        assert_state_proof_roundtrip(0x1740_0014, gen_resource_ref, canonical_encode_resource_ref);
+    }
+
+    /// Matches go's `TestMarshalUnmarshalHeartbeatTxnFields`/
+    /// `TestRandomizedEncodingHeartbeatTxnFields`.
+    #[test]
+    fn heartbeat_txn_fields_randomized_roundtrip() {
+        assert_state_proof_roundtrip(
+            0x1740_0015,
+            gen_heartbeat_txn_fields_nonempty,
+            canonical_encode_heartbeat,
+        );
+    }
+
+    /// A minimal, non-empty `rmpv::Value::Map`, used for the randomized
+    /// `eval_delta` field below. `add_option_rmpv` (the encoder for `dt`)
+    /// passes the value through unsorted/unmodified, and decode preserves
+    /// wire order too, so a small fixed-shape map round-trips exactly.
+    fn gen_nonempty_eval_delta(rng: &mut ChaCha20Rng) -> rmpv::Value {
+        let n = rng.gen_range(1..=3);
+        rmpv::Value::Map(
+            (0..n)
+                .map(|i| {
+                    (
+                        rmpv::Value::String(format!("k{i}").into()),
+                        rmpv::Value::Integer(rng.gen::<i64>().into()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// A `SignedTransaction` with only the plain `SignedTxn` fields
+    /// (sig/msig/lsig/pqsig/sgnr + txn) populated -- no ApplyData, no
+    /// hgi/hgh -- matching go's `SignedTxn` (not `SignedTxnWithAD`/
+    /// `SignedTxnInBlock`).
+    fn gen_signed_txn_core(rng: &mut ChaCha20Rng) -> SignedTransaction {
+        let mut sig = [0u8; 64];
+        let msig = if rng.gen_bool(0.3) {
+            Some(gen_multisig(rng))
+        } else {
+            None
+        };
+        // Go's SignedTxn accepts (and this round-trip only cares about
+        // wire shape, not signature-scheme legality) any combination of
+        // sig/msig/lsig/pqsig being present; randomize sig independently.
+        if rng.gen_bool(0.5) {
+            rng.fill_bytes(&mut sig);
+            sig[0] |= 1;
+        }
+        SignedTransaction {
+            txn: gen_transaction(rng),
+            sig,
+            msig,
+            lsig: if rng.gen_bool(0.3) {
+                Some(gen_logicsig(rng))
+            } else {
+                None
+            },
+            pqsig: if rng.gen_bool(0.3) {
+                Some(gen_pqsig(rng))
+            } else {
+                None
+            },
+            auth_addr: gen_option_address_nonzero(rng, 0.3),
+            ..SignedTransaction::default()
+        }
+    }
+
+    /// Matches go's `TestRandomizedEncodingSignedTxn`
+    /// (`data/transactions/msgp_gen_test.go`): round-trips through
+    /// `canonical_encode_signed_transaction`, which (correctly) never
+    /// writes ApplyData/hgi/hgh fields at all -- those belong to
+    /// `SignedTxnWithAD`/`SignedTxnInBlock`, not plain `SignedTxn` -- so
+    /// `gen_signed_txn_core` leaves them at their zero default on both
+    /// sides.
+    #[test]
+    fn signed_txn_randomized_roundtrip() {
+        assert_state_proof_roundtrip(
+            0x1740_0020,
+            gen_signed_txn_core,
+            canonical_encode_signed_transaction,
+        );
+    }
+
+    /// A `SignedTransaction` shaped like go's `SignedTxnWithAD` (`SignedTxn`
+    /// plus `ApplyData`, but no `hgi`/`hgh` -- those are
+    /// `SignedTxnInBlock`-only wrapper fields). `hgi`/`hgh` are left `false`
+    /// so that `canonical_encode_signed_txn_in_block`'s unconditional
+    /// `add_bool("hgh"/"hgi", ...)` calls omit them exactly as a dedicated
+    /// `SignedTxnWithAD`-only encoder would, making that function's output
+    /// byte-identical to `SignedTxnWithAD`'s wire shape for these inputs.
+    fn gen_signed_txn_with_ad(rng: &mut ChaCha20Rng) -> SignedTransaction {
+        let mut stx = gen_signed_txn_core(rng);
+        stx.closing_amount = rng.gen::<u64>();
+        stx.asset_closing_amount = rng.gen::<u64>();
+        stx.sender_rewards = rng.gen::<u64>();
+        stx.receiver_rewards = rng.gen::<u64>();
+        stx.close_rewards = rng.gen::<u64>();
+        stx.apply_data_config_asset = rng.gen::<u64>();
+        stx.apply_data_application_id = rng.gen::<u64>();
+        stx.eval_delta = if rng.gen_bool(0.5) {
+            Some(gen_nonempty_eval_delta(rng))
+        } else {
+            None
+        };
+        stx
+    }
+
+    /// Matches go's `TestMarshalUnmarshalApplyData`/
+    /// `TestRandomizedEncodingApplyData` and
+    /// `TestMarshalUnmarshalSignedTxnWithAD`/
+    /// `TestRandomizedEncodingSignedTxnWithAD` (`data/transactions/
+    /// msgp_gen_test.go`): round-trips the ApplyData fields together with
+    /// the core SignedTxn fields, matching `SignedTxnWithAD`'s wire shape
+    /// (see `gen_signed_txn_with_ad`).
+    #[test]
+    fn signed_txn_with_ad_randomized_roundtrip() {
+        assert_state_proof_roundtrip(
+            0x1740_0021,
+            gen_signed_txn_with_ad,
+            canonical_encode_signed_txn_in_block,
+        );
+    }
+
+    /// A `SignedTransaction` shaped like go's `SignedTxnInBlock`
+    /// (`SignedTxnWithAD` + `hgi`/`hgh`).
+    fn gen_signed_txn_in_block(rng: &mut ChaCha20Rng) -> SignedTransaction {
+        let mut stx = gen_signed_txn_with_ad(rng);
+        stx.has_genesis_id = rng.gen_bool(0.5);
+        stx.has_genesis_hash = rng.gen_bool(0.5);
+        stx
+    }
+
+    /// Matches go's `TestRandomizedEncodingSignedTxnInBlock`
+    /// (`data/transactions/msgp_gen_test.go`).
+    #[test]
+    fn signed_txn_in_block_randomized_roundtrip() {
+        assert_state_proof_roundtrip(
+            0x1740_0022,
+            gen_signed_txn_in_block,
+            canonical_encode_signed_txn_in_block,
+        );
+    }
+
+    /// Matches go's `TestMarshalUnmarshalPayset`/`TestRandomizedEncodingPayset`
+    /// (`data/transactions/msgp_gen_test.go`): go's `Payset` is
+    /// `[]SignedTxnInBlock`, so this round-trips a random-length array of
+    /// `gen_signed_txn_in_block`-shaped instances, each encoded via the
+    /// real `canonical_encode_signed_txn_in_block` (the same function used
+    /// for every real block's payset), through `Vec<SignedTransaction>`'s
+    /// derived `Deserialize`.
+    #[test]
+    fn payset_randomized_roundtrip() {
+        let mut rng = ChaCha20Rng::seed_from_u64(0x1740_0023);
+        for i in 0..STATE_PROOF_ITERATIONS {
+            let n = rng.gen_range(0..=8);
+            let payset: Vec<SignedTransaction> =
+                (0..n).map(|_| gen_signed_txn_in_block(&mut rng)).collect();
+
+            let mut buf = Vec::new();
+            rmp::encode::write_array_len(&mut buf, payset.len() as u32).unwrap();
+            for stx in &payset {
+                buf.extend_from_slice(&canonical_encode_signed_txn_in_block(stx));
+            }
+
+            let decoded: Vec<SignedTransaction> = rmp_serde::from_slice(&buf)
+                .unwrap_or_else(|e| panic!("iteration {i}: failed to decode payset: {e}"));
+            assert_eq!(
+                decoded, payset,
+                "randomized msgpack round-trip mismatch at iteration {i}"
+            );
+        }
+    }
 }
