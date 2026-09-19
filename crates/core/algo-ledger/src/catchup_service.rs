@@ -1470,6 +1470,110 @@ mod tests {
         svc.stop();
     }
 
+    /// A fetcher that serves rounds `1..=up_to`, each with a correctly
+    /// digest-matched block, and injects a small per-round delay to widen
+    /// the race window against a concurrent writer.
+    struct DelayedRoundServingBlockFetcher {
+        up_to: u64,
+        calls: AtomicU64,
+    }
+
+    impl BlockFetcher for DelayedRoundServingBlockFetcher {
+        fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if round.0 > self.up_to {
+                return Err(FetchError::NoBlockForRound { round });
+            }
+            // Deterministic (not random) small stagger, varying by round,
+            // to widen the window in which the racing writer thread below
+            // can commit the same round out from under this fetch.
+            thread::sleep(Duration::from_micros(200 * (round.0 % 5)));
+            let block = make_valid_empty_block(round.0);
+            Ok(FetchedBlockCert {
+                block,
+                cert: None,
+                raw_payset_blobs: None,
+            })
+        }
+    }
+
+    /// Regression-shaped analog of Go's `TestAbruptWrites`
+    /// (`catchup/service_test.go:419`): Go's test races a concurrent
+    /// goroutine that writes blocks directly to the local ledger (emulating
+    /// agreement making progress on its own) against `Service.sync()`
+    /// fetching the same rounds, and asserts the final round matches
+    /// without any panic, deadlock, or corrupted state from the two writers
+    /// racing on `Ledger.AddBlock`.
+    ///
+    /// algod-rust's `CatchupService` is certificate-driven: `sync_cert`
+    /// already re-checks `ledger.next_round()` at the top of its retry loop
+    /// (see `skips_already_committed_round` above) specifically so a round
+    /// committed by a concurrent writer — real agreement in production, the
+    /// `writer` thread here — is detected and skipped rather than
+    /// re-applied. This test proves that guard actually holds under a real
+    /// race, not just when the racing write happens strictly before
+    /// `sync_cert` starts: a background thread commits blocks for rounds
+    /// `1..=NUM_ROUNDS` directly to the shared `MockCatchupLedger` (racing
+    /// with `MockCatchupLedger::ensure_block`'s own `Mutex`) while the
+    /// catchup service concurrently fetches and commits certificates for
+    /// the very same rounds through `DelayedRoundServingBlockFetcher`.
+    #[test]
+    fn abrupt_writes_race_with_concurrent_ledger_commits() {
+        const NUM_ROUNDS: u64 = 20;
+
+        let (tx, rx) =
+            crossbeam_channel::bounded::<PendingUnmatchedCertificate>(NUM_ROUNDS as usize);
+        let ledger_ref = Arc::new(MockCatchupLedger::new(Round(0)));
+        let ledger: Arc<dyn CatchupLedger> = Arc::clone(&ledger_ref) as Arc<dyn CatchupLedger>;
+
+        let fetcher = Arc::new(DelayedRoundServingBlockFetcher {
+            up_to: NUM_ROUNDS,
+            calls: AtomicU64::new(0),
+        });
+        let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
+
+        let mut svc = CatchupService::start_with_parallelism(rx, ledger, fetcher_ref, 4);
+
+        // Background "agreement" writer: commits every round directly to
+        // the shared ledger, racing the catchup service's own commits of
+        // the same rounds via certificates sent below.
+        let writer_ledger = Arc::clone(&ledger_ref);
+        let writer = thread::spawn(move || {
+            for round in 1..=NUM_ROUNDS {
+                // Deterministic stagger, offset from the fetcher's so the
+                // two writers interleave rather than always racing in
+                // lockstep.
+                thread::sleep(Duration::from_micros(150 * ((round * 3) % 7)));
+                let block = make_valid_empty_block(round);
+                let cert = make_cert(round);
+                writer_ledger.ensure_block(&block, &cert);
+            }
+        });
+
+        // Send certs for every round with the correct digest, so the
+        // catchup service races the writer thread above to commit each one.
+        for round in 1..=NUM_ROUNDS {
+            let digest = algo_codec::compute_block_digest(&make_valid_empty_block(round));
+            tx.send(make_pending_cert_with_digest(round, digest))
+                .unwrap();
+        }
+
+        writer.join().expect("writer thread should not panic");
+
+        // Both writers target the same final round; whichever one gets
+        // there last, the ledger should end up fully caught up with no
+        // corruption (mirrors Go's `require.Equal(t, remote.LastRound(),
+        // local.LastRound())`).
+        poll_until(
+            move || ledger_ref.next_round() == Round(NUM_ROUNDS + 1),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+            "ledger should reach the final round despite racing writers",
+        );
+
+        svc.stop();
+    }
+
     // -- DigestMatchingBlockFetcher: returns a block whose digest matches the cert --
 
     /// A fetcher that returns a block whose digest can be pre-computed.
