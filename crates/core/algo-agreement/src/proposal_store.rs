@@ -780,6 +780,158 @@ mod tests {
         }
     }
 
+    /// Extract the `err` field's message from a `PayloadProcessed` event,
+    /// panicking if the event isn't `PayloadProcessed` or carries no error.
+    fn expect_payload_rejected_err(e: Event) -> String {
+        match e {
+            Event::PayloadProcessed(pe) => {
+                assert_eq!(pe.t, EventType::PayloadRejected);
+                pe.err.expect("PayloadRejected event must carry an err").0
+            }
+            other => panic!("expected PayloadProcessed(PayloadRejected), got {other:?}"),
+        }
+    }
+
+    /// Port of go-algorand's `TestProposalStoreHandle`
+    /// (`agreement/proposalStore_test.go:473`).
+    ///
+    /// Go's version drives `proposalStore.handle` directly through a full
+    /// sequence of `payloadPresent`/`payloadVerified`/`newPeriodEvent`
+    /// scenarios (valid + each rejection branch) plus the `newRoundEvent`
+    /// "too many assemblers" implementation-invariant panic. This ports
+    /// the same sequence against `ProposalStore::handle`, asserting on
+    /// both the returned `EventType` and (where Go asserts on
+    /// `makeSerErrStr(...)`) the exact rejection-reason string, so a
+    /// future edit to any of these error messages or branch conditions is
+    /// caught here rather than only by go-algorand's own test suite.
+    #[test]
+    fn proposal_store_handle_full_sequence() {
+        let proposer = Address([0x11; 32]);
+        let period = Period(0);
+        let payload = proposal_for_regression(period, proposer);
+        let pv = payload.unauthenticated_proposal.value();
+
+        // 1. payloadPresent with no accepting blockAssembler -> rejected.
+        let mut store = ProposalStore::default();
+        let res = store.handle(
+            period,
+            payload_event(EventType::PayloadPresent, payload.clone()),
+        );
+        assert_eq!(
+            expect_payload_rejected_err(res),
+            "proposalStore: no accepting blockAssembler found on payloadPresent"
+        );
+
+        // 2. Install an accepting (empty, unfilled) assembler -> a valid
+        //    payloadPresent pipelines the proposal.
+        store.assemblers.insert(pv, BlockAssembler::default());
+        store.relevant.insert(period, pv);
+        store.pinned = pv;
+        let res = store.handle(
+            period,
+            payload_event(EventType::PayloadPresent, payload.clone()),
+        );
+        assert_eq!(res.event_type(), EventType::PayloadPipelined);
+
+        // 3. The same payloadPresent again -> blockAssembler is now
+        //    `filled`, so pipelining is rejected as redundant.
+        let res = store.handle(
+            period,
+            payload_event(EventType::PayloadPresent, payload.clone()),
+        );
+        assert_eq!(
+            expect_payload_rejected_err(res),
+            "blockAssembler.pipeline: already filled"
+        );
+
+        // 4. payloadVerified with no accepting blockAssembler -> rejected
+        //    (fresh store; nothing pipelined for this proposal-value yet).
+        let mut store2 = ProposalStore::default();
+        let res = store2.handle(
+            period,
+            payload_event(EventType::PayloadVerified, payload.clone()),
+        );
+        assert_eq!(
+            expect_payload_rejected_err(res),
+            "proposalStore: no accepting blockAssembler found on payloadVerified"
+        );
+
+        // 5. Install an accepting assembler -> a valid payloadVerified is
+        //    accepted (bound to the blockAssembler).
+        store2.assemblers.insert(pv, BlockAssembler::default());
+        store2.relevant.insert(period, pv);
+        store2.pinned = pv;
+        let res = store2.handle(
+            period,
+            payload_event(EventType::PayloadVerified, payload.clone()),
+        );
+        assert_eq!(res.event_type(), EventType::PayloadAccepted);
+
+        // 6. The same payloadVerified again -> blockAssembler is now
+        //    `assembled`, so binding is rejected as redundant.
+        let res = store2.handle(
+            period,
+            payload_event(EventType::PayloadVerified, payload.clone()),
+        );
+        assert_eq!(
+            expect_payload_rejected_err(res),
+            "blockAssembler.pipeline: already assembled"
+        );
+
+        // 7. newPeriodEvent: a period already present in `relevant` (the
+        //    proposal is still current) returns emptyEvent without
+        //    mutating `pinned` away from what step 5 set.
+        let res = store2.handle(
+            period,
+            Event::NewPeriod(NewPeriodEvent {
+                period: Period(3),
+                proposal: pv,
+            }),
+        );
+        assert_eq!(res.event_type(), EventType::None);
+        assert_eq!(store2.pinned, pv);
+
+        // 8. newPeriodEvent with `proposal == BOTTOM`: falls back to
+        //    whatever is currently staged (nothing staged here), so
+        //    `pinned` is left unchanged and the event is still empty.
+        let res = store2.handle(
+            period,
+            Event::NewPeriod(NewPeriodEvent {
+                period: Period(4),
+                proposal: BOTTOM,
+            }),
+        );
+        assert_eq!(res.event_type(), EventType::None);
+        assert_eq!(store2.pinned, pv);
+    }
+
+    /// Port of the `newRoundEvent` half of go-algorand's
+    /// `TestProposalStoreHandle` (`agreement/proposalStore_test.go:601`),
+    /// which asserts `require.Panics` when `proposalStore.handle`
+    /// receives a `newRoundEvent` while more than one blockAssembler is
+    /// present (`assemblers` should be trimmed to at most one entry by
+    /// round-transition time; seeing more is an implementation
+    /// invariant violation in both go-algorand and this port).
+    #[test]
+    fn proposal_store_new_round_too_many_assemblers_panics() {
+        let mut store = ProposalStore::default();
+        store
+            .assemblers
+            .insert(make_proposal_value(1), BlockAssembler::default());
+        store
+            .assemblers
+            .insert(make_proposal_value(2), BlockAssembler::default());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.handle(Period(0), Event::NewRound(crate::events::NewRoundEvent))
+        }));
+        assert!(
+            result.is_err(),
+            "handle(NewRound) with >1 assembler must panic, mirroring go's \
+             `proposalStore: too many assemblers` invariant check"
+        );
+    }
+
     // ───────────────────────────────────────────────────────────────────
     // BF-5 tests (TASK-94): port of go-algorand
     // agreement/proposalStore_test.go.
