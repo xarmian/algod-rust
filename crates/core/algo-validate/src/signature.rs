@@ -1658,6 +1658,63 @@ mod tests {
     }
 
     #[test]
+    fn sign_verify_empty_message() {
+        // TestSignVerifyEmptyMessage (crypto/curve25519_test.go): signing and
+        // verifying a zero-length message must succeed through the exact
+        // production verify path (`ed25519_bv_compatible_verify`), not just
+        // indirectly via full-transaction signing.
+        use ed25519_dalek::Signer;
+        let key = test_signing_key();
+        let pk_bytes = key.verifying_key().to_bytes();
+        let empty: [u8; 0] = [];
+        let sig = key.sign(&empty);
+        assert!(
+            ed25519_bv_compatible_verify(&pk_bytes, &empty, &sig.to_bytes()),
+            "sig of an empty message failed to verify"
+        );
+    }
+
+    #[test]
+    fn curve25519_sign_verify_roundtrip() {
+        // TestCurve25519SignVerify (crypto/curve25519_test.go), via the
+        // shared `signVerify` helper (crypto/crypto_test.go): exercises a
+        // correct-signature accept plus the three "one component wrong"
+        // rejections (wrong message, wrong key, wrong message+key) directly
+        // against the production `ed25519_bv_compatible_verify` path, using
+        // two independently generated signing keys the way go's
+        // `signVerify(t, makeCurve25519Secret(), makeCurve25519Secret())`
+        // does.
+        use ed25519_dalek::Signer;
+        let c = test_signing_key();
+        let c_pk = c.verifying_key().to_bytes();
+        let c2 = signing_key_from_seed(0xAB);
+
+        let msg = b"the quick brown fox jumps over the lazy dog";
+        let sig = c.sign(msg).to_bytes();
+        assert!(
+            ed25519_bv_compatible_verify(&c_pk, msg, &sig),
+            "correct signature failed to verify (plain)"
+        );
+
+        let msg2 = b"a completely different message body";
+        let sig2 = c.sign(msg2).to_bytes();
+        assert!(
+            !ed25519_bv_compatible_verify(&c_pk, msg, &sig2),
+            "wrong message incorrectly verified (plain)"
+        );
+
+        let sig3 = c2.sign(msg).to_bytes();
+        assert!(
+            !ed25519_bv_compatible_verify(&c_pk, msg, &sig3),
+            "wrong key incorrectly verified (plain)"
+        );
+        assert!(
+            !ed25519_bv_compatible_verify(&c_pk, msg2, &sig3),
+            "wrong message+key incorrectly verified (plain)"
+        );
+    }
+
+    #[test]
     fn verify_correct_single_sig() {
         let key = test_signing_key();
         let pk = key.verifying_key();
@@ -1930,6 +1987,45 @@ mod tests {
 
         // Sign with only key 1 (1 of 3, threshold is 2).
         let msig = build_multisig(&keys, &[1], 2, &txn);
+
+        let stx = SignedTransaction {
+            txn,
+            sig: [0u8; 64],
+            msig: Some(msig),
+            lsig: None,
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("threshold not met"));
+    }
+
+    /// TestOneSignatureIsEmpty (`crypto/multisig_test.go`): a threshold ==
+    /// N (all signers required) multisig, fully signed, then the *first*
+    /// subsig's signature alone is cleared to zero (its public key stays a
+    /// real, non-zero key -- unlike `verify_multisig_rejects_all_zero_first_subsig`
+    /// above, which zeroes the pubkey too and trips a different guard).
+    /// Clearing only the signature must fall through the
+    /// `MultisigSubsig{}`-placeholder guard untouched and instead be
+    /// treated as "this signer didn't sign", landing on the ordinary
+    /// below-threshold rejection go asserts via `errInvalidNumberOfSignature`
+    /// (both `MultisigVerify` and `MultisigBatchPrep` in go's test).
+    #[test]
+    fn verify_multisig_one_signature_empty_fails() {
+        let keys: Vec<SigningKey> = (10u8..16).map(signing_key_from_seed).collect();
+        let multi_sig_len = keys.len() as u8;
+        let msig_addr = compute_msig_addr(&keys, 1, multi_sig_len);
+        let txn = minimal_pay_txn(msig_addr);
+
+        // Sign with every key (threshold == len), then blank out subsig[0]'s
+        // signature only -- its public key is left intact and non-zero.
+        let all_indices: Vec<usize> = (0..keys.len()).collect();
+        let mut msig = build_multisig(&keys, &all_indices, multi_sig_len, &txn);
+        assert_ne!(msig.subsigs[0].public_key, [0u8; 32]);
+        msig.subsigs[0].signature = [0u8; 64];
 
         let stx = SignedTransaction {
             txn,
