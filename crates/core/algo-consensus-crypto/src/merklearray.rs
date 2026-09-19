@@ -2249,6 +2249,115 @@ mod tests {
         assert_eq!(repr[0], slp.proof.tree_depth);
     }
 
+    /// Mirrors go's `TestProofSerialization` (`crypto/merklearray/proof_test.go:28`):
+    /// asserts the exact zero-padding layout of
+    /// `GetFixedLengthHashableRepresentation`, not just its overall length —
+    /// leading `MAX_ENCODED_TREE_DEPTH - tree_depth` digest-sized slots are
+    /// all zero, and each real slot exactly matches (or, for a nil/empty
+    /// path entry, is itself zero-filled) the corresponding `proof.path`
+    /// element — for both a plain tree and a vector-commitment tree.
+    #[test]
+    fn single_leaf_proof_fixed_length_representation_zero_padding_layout() {
+        const DIGEST_SIZE: usize = 32;
+        let zero_digest = vec![0u8; DIGEST_SIZE];
+
+        // ── Plain tree, 3 leaves, prove leaf 2 (missing child) ──────────
+        let data: Vec<[u8; 32]> = (0..3u8).map(|i| [i + 1; 32]).collect();
+        let arr = TestArray(data);
+        let factory = HashFactory::new(HashType::Sha512_256);
+        let tree = build(&arr, factory).unwrap();
+        let slp = tree.prove_single_leaf(2).unwrap();
+
+        let repr = slp.get_fixed_length_hashable_representation();
+        assert_eq!(repr.len(), 1 + MAX_ENCODED_TREE_DEPTH * DIGEST_SIZE);
+        let proof_data = &repr[1..];
+
+        let mut i = 0;
+        while i < MAX_ENCODED_TREE_DEPTH - 2 {
+            assert_eq!(
+                &proof_data[DIGEST_SIZE * i..DIGEST_SIZE * (i + 1)],
+                zero_digest.as_slice(),
+                "leading pad slot {i} must be zero"
+            );
+            i += 1;
+        }
+
+        // First proof digest is nil -> its slot is zero-filled too.
+        assert!(
+            slp.proof.path[0].is_empty(),
+            "expected path[0] to be the nil/missing-child sentinel"
+        );
+        assert_eq!(
+            &proof_data[DIGEST_SIZE * i..DIGEST_SIZE * (i + 1)],
+            zero_digest.as_slice()
+        );
+        i += 1;
+
+        assert_eq!(
+            &proof_data[DIGEST_SIZE * i..DIGEST_SIZE * (i + 1)],
+            slp.proof.path[1].as_slice()
+        );
+
+        // ── Vector-commitment tree, 3 leaves, prove leaf 2 ───────────────
+        let data_vc: Vec<[u8; 32]> = (0..3u8).map(|i| [i + 1; 32]).collect();
+        let arr_vc = TestArray(data_vc);
+        let tree_vc =
+            build_vector_commitment_tree(&arr_vc, HashFactory::new(HashType::Sha512_256)).unwrap();
+        let slp_vc = tree_vc.prove_single_leaf(2).unwrap();
+
+        let repr_vc = slp_vc.get_fixed_length_hashable_representation();
+        assert_eq!(repr_vc.len(), 1 + MAX_ENCODED_TREE_DEPTH * DIGEST_SIZE);
+        let proof_data_vc = &repr_vc[1..];
+
+        let mut j = 0;
+        while j < MAX_ENCODED_TREE_DEPTH - 2 {
+            assert_eq!(
+                &proof_data_vc[DIGEST_SIZE * j..DIGEST_SIZE * (j + 1)],
+                zero_digest.as_slice(),
+                "VC leading pad slot {j} must be zero"
+            );
+            j += 1;
+        }
+        assert_eq!(
+            &proof_data_vc[DIGEST_SIZE * j..DIGEST_SIZE * (j + 1)],
+            slp_vc.proof.path[0].as_slice()
+        );
+        j += 1;
+        assert_eq!(
+            &proof_data_vc[DIGEST_SIZE * j..DIGEST_SIZE * (j + 1)],
+            slp_vc.proof.path[1].as_slice()
+        );
+    }
+
+    /// Mirrors go's `TestProofSerializationOneLeafTree`
+    /// (`crypto/merklearray/proof_test.go:111`): a single-leaf
+    /// vector-commitment tree's proof (`tree_depth == 0`, empty `path`)
+    /// serializes to a representation that is entirely zero-padded (no real
+    /// path elements at all), distinct from `single_leaf_proof_fixed_length_representation`'s
+    /// 4-leaf case.
+    #[test]
+    fn single_leaf_proof_fixed_length_representation_one_leaf_tree_is_fully_zero() {
+        const DIGEST_SIZE: usize = 32;
+        let zero_digest = vec![0u8; DIGEST_SIZE];
+
+        let arr = TestArray(vec![[7u8; 32]]);
+        let tree =
+            build_vector_commitment_tree(&arr, HashFactory::new(HashType::Sha512_256)).unwrap();
+        let slp = tree.prove_single_leaf(0).unwrap();
+
+        let repr = slp.get_fixed_length_hashable_representation();
+        assert_eq!(repr.len(), 1 + MAX_ENCODED_TREE_DEPTH * DIGEST_SIZE);
+        let proof_data = &repr[1..];
+
+        for i in 0..MAX_ENCODED_TREE_DEPTH {
+            assert_eq!(
+                &proof_data[DIGEST_SIZE * i..DIGEST_SIZE * (i + 1)],
+                zero_digest.as_slice(),
+                "one-leaf-tree proof slot {i} must be zero"
+            );
+        }
+    }
+
     // ── Prove out-of-bounds ──────────────────────────────────────────
 
     #[test]
@@ -2558,6 +2667,34 @@ mod tests {
             pos += data.len();
         }
         assert_eq!(pos, buffer.len());
+    }
+
+    #[test]
+    fn test_hash_sum_matches_direct_sha512_256() {
+        // TestHashSum (crypto/hashes_test.go): go's `HashFactory{Sha512_256}.NewHash()`
+        // (a streaming `hash.Hash`) fed the same bytes as `crypto.HashObj`
+        // must produce the identical digest — i.e.
+        // `HashObj(h) == GenericHashObj(factory.NewHash(), h)`. algod-rust's
+        // `HashFactory` has no separate streaming-hash-object abstraction
+        // (see `TestHashFactoryCreatingNewHashes` row), but `hash_bytes`
+        // dispatch IS the code path every merkle-tree/vector-commitment leaf
+        // hash goes through for a given `HashType` — so the equivalent,
+        // non-vacuous cross-check is: does that dispatch path, for
+        // `Sha512_256`, produce byte-identical output to hashing the same
+        // `HashRep` bytes directly with the `Sha512_256` primitive?
+        let msg = SizedMessage(37);
+        let (prefix, data) = msg.to_be_hashed();
+
+        let direct = {
+            let mut hasher = Sha512_256::new();
+            hasher.update(prefix);
+            hasher.update(&data);
+            hasher.finalize().to_vec()
+        };
+
+        let via_factory = HashFactory::new(HashType::Sha512_256).hash_bytes(&[prefix, &data]);
+
+        assert_eq!(via_factory, direct);
     }
 
     #[test]

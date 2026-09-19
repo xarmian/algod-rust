@@ -1845,6 +1845,64 @@ mod tests {
         }
     }
 
+    /// Standalone randomized round-trip for go's `crypto.OneTimeSignature`
+    /// (`TestMarshalUnmarshalOneTimeSignature`/`TestRandomizedEncodingOneTimeSignature`,
+    /// `crypto/msgp_gen_test.go`), exercised directly through the same
+    /// `encode_one_time_signature`/`decode_one_time_signature` functions
+    /// used for the real `unauthenticatedVote.Sig`/`vote.Cred` wire fields,
+    /// rather than only indirectly (via `Secrets::sign`/msgpack-roundtrip as
+    /// the previous mapping did). 1000 randomized instances, matching go's
+    /// `protocol.RunEncodingTest` iteration count.
+    #[test]
+    fn one_time_signature_standalone_randomized_roundtrip() {
+        use rand::{RngCore, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0x0751_5300);
+        for i in 0..1000 {
+            let mut sig = [0u8; 64];
+            let mut pk = [0u8; 32];
+            let mut pk_sig_old = [0u8; 64];
+            let mut pk2 = [0u8; 32];
+            let mut pk1_sig = [0u8; 64];
+            let mut pk2_sig = [0u8; 64];
+            rng.fill_bytes(&mut sig);
+            rng.fill_bytes(&mut pk);
+            rng.fill_bytes(&mut pk_sig_old);
+            rng.fill_bytes(&mut pk2);
+            rng.fill_bytes(&mut pk1_sig);
+            rng.fill_bytes(&mut pk2_sig);
+            let original = OneTimeSignature {
+                sig,
+                pk,
+                pk_sig_old,
+                pk2,
+                pk1_sig,
+                pk2_sig,
+            };
+
+            let encoded = encode_one_time_signature(&original);
+            let mut cursor = Cursor::new(encoded.as_slice());
+            let decoded = decode_one_time_signature(&mut cursor).expect("decode should succeed");
+
+            assert_eq!(decoded.sig, original.sig, "iteration {i}: sig mismatch");
+            assert_eq!(decoded.pk, original.pk, "iteration {i}: pk mismatch");
+            assert_eq!(
+                decoded.pk_sig_old, original.pk_sig_old,
+                "iteration {i}: pk_sig_old mismatch"
+            );
+            assert_eq!(decoded.pk2, original.pk2, "iteration {i}: pk2 mismatch");
+            assert_eq!(
+                decoded.pk1_sig, original.pk1_sig,
+                "iteration {i}: pk1_sig mismatch"
+            );
+            assert_eq!(
+                decoded.pk2_sig, original.pk2_sig,
+                "iteration {i}: pk2_sig mismatch"
+            );
+        }
+    }
+
     // ── Vote round-trip tests ────────────────────────────────────────────
 
     #[test]

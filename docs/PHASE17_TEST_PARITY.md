@@ -51,17 +51,17 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 1,126 | 35% |
+| `matched-1:1` | 1,152 | 36% |
 | `matched-1:many` | 919 | 29% |
 | `out-of-scope` | 696 | 22% |
-| `matched-many:1` | 277 | 9% |
-| `partial` | 161 | 5% |
+| `matched-many:1` | 279 | 9% |
+| `partial` | 133 | 4% |
 | `missing-test` | 2 | 0% |
 | `not-implemented` | 0 | 0% |
 
 **2 rows (`not-implemented` + `missing-test`, 0%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
-implements but never tests. `partial` (161, 5%) is coverage that exists
+implements but never tests. `partial` (133, 4%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
 most are diminishing-returns edge cases. See
 [`docs/PHASE17_PROPOSAL.md`](PHASE17_PROPOSAL.md) for how the real gaps
@@ -78,7 +78,7 @@ were triaged into tracked issues.
 | Agreement protocol (`agreement`) | [parity_agreement.md](phase17/parity_agreement.md) | 326 | 159 | 60 | 88 | 12 | 0 | 0 | 7 |
 | e2e integration (`test/e2e-go`) | [parity_e2e.md](phase17/parity_e2e.md) | 195 | 80 | 45 | 3 | 0 | 0 | 0 | 67 |
 | Networking (`network`, `network/p2p`, ...) | [parity_network.md](phase17/parity_network.md) | 263 | 113 | 94 | 12 | 0 | 0 | 2 | 42 |
-| Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 132 | 42 | 21 | 37 | 0 | 0 | 44 |
+| Crypto (`crypto`, `crypto/stateproof`, ...) | [parity_crypto.md](phase17/parity_crypto.md) | 276 | 158 | 42 | 23 | 9 | 0 | 0 | 44 |
 | Daemon/node/rpcs (`daemon/algod`, `node`, `rpcs`) | [parity_daemon_node.md](phase17/parity_daemon_node.md) | 144 | 62 | 69 | 1 | 2 | 0 | 0 | 10 |
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 127 | 36 | 45 | 41 | 0 | 0 | 25 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 25 | 35 | 0 | 28 | 0 | 0 | 31 |
@@ -86,5 +86,5 @@ were triaged into tracked issues.
 | Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 39 | 29 | 7 | 11 | 0 | 0 | 87 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 27 | 15 | 0 | 11 | 0 | 0 | 4 |
-| **Total** | | **3,181** | **1126** | **919** | **277** | **161** | **0** | **2** | **696** |
+| **Total** | | **3,181** | **1152** | **919** | **279** | **133** | **0** | **2** | **696** |
 
