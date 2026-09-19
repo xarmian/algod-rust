@@ -6054,6 +6054,58 @@ dup
         );
     }
 
+    /// Port of go-algorand's `data/txntest/program.go`'s
+    /// `GenerateUnsaltedProgramOfSize`: builds a TEAL source with
+    /// `#pragma autosalt false` and enough `intc_0`/`pop` padding
+    /// instructions to land the assembled program at exactly `size` bytes
+    /// (`size` must be at least 5), for a given `#pragma version`.
+    fn generate_unsalted_program_of_size(size: usize, pragma: u8) -> Vec<u8> {
+        assert!(size >= 5, "size must be at least 5 bytes; got {size}");
+        let mut src = format!("#pragma version {pragma}\n#pragma autosalt false\n");
+        if size % 2 == 0 {
+            src.push_str("intcblock 1 1\n");
+        } else {
+            src.push_str("intcblock 1\n");
+        }
+        let mut i = 7usize;
+        while i <= size {
+            src.push_str("intc_0\npop\n");
+            i += 2;
+        }
+        src.push_str("intc_0");
+        let ops = assemble_string(&src).unwrap_or_else(|e| {
+            panic!("assembling unsalted program of size {size} (pragma {pragma}) failed: {e:?}")
+        });
+        assert_eq!(
+            ops.program.len(),
+            size,
+            "wanted to create a program of size {size} but got a program of size {}",
+            ops.program.len()
+        );
+        ops.program
+    }
+
+    /// Port of go-algorand's `TestGenerateUnsaltedProgramOfSize`
+    /// (`data/txntest/program_test.go`): the fixture-program generator used
+    /// by other size-boundary tests (e.g. `TestLogicSigSizeBeforePooling`)
+    /// must be able to produce an exact-size, unsalted program for every
+    /// size in `5..80`, at both `#pragma version 1` (the oldest LogicSig
+    /// version) and `LOGIC_SIG_OFF_CURVE_VERSION` (go's
+    /// `LogicSigOffCurveVersion`, where auto-salting first becomes
+    /// possible -- exercised here with autosalt explicitly forced off, the
+    /// version boundary this row's `#[test]
+    /// test_v12_program_is_never_auto_salted` and sibling tests otherwise
+    /// cover only via fixed-size fixtures).
+    #[test]
+    fn test_generate_unsalted_program_of_size() {
+        for pragma in [1u8, LOGIC_SIG_OFF_CURVE_VERSION] {
+            for size in 5usize..80 {
+                let program = generate_unsalted_program_of_size(size, pragma);
+                assert_eq!(program.len(), size, "pragma {pragma}, size {size}");
+            }
+        }
+    }
+
     #[test]
     fn test_pragma_autosalt_true_forces_salting_below_v13() {
         // `#pragma autosalt true` overrides the version gate and forces
