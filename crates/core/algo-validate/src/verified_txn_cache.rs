@@ -834,6 +834,186 @@ mod tests {
         );
     }
 
+    /// Port of go's `TestTxnGroupCacheUpdateLogicWithMultiSig`
+    /// (`data/transactions/verify/txn_test.go:1498`), pinning the specific
+    /// combination `verifyGroup` exercises there that neither the plain
+    /// delegated-multisig test (`verify_logicsig_delegated_multisig` in
+    /// `signature.rs`) nor the cache tests above pin on their own: a
+    /// LogicSig delegated via a 2-of-3 `MultisigSig` whose program itself
+    /// evaluates a real condition (`sha256(arg0) == <fixed digest>`),
+    /// driven through the cache-integrated `verify_transaction_group_cached`
+    /// entry point (algod-rust's equivalent of go's `TxnGroup` +
+    /// `VerifiedTransactionCache` pairing).
+    ///
+    /// Covers both of go's `verifyGroup` failure modes for this scenario:
+    /// (1) a broken multisig subsig byte fails signature verification and
+    /// the group is never cached, and (2) a correct signature but a
+    /// tampered logic argument fails program evaluation (`"rejected by
+    /// logic"` in go, `"LogicSig program rejected the transaction"` here)
+    /// -- also never cached. A subsequent verification with everything
+    /// restored succeeds and the group becomes cache-covered.
+    #[test]
+    fn verify_transaction_group_cached_delegated_multisig_logicsig() {
+        use algo_types::{LogicSig, MultisigSig, MultisigSubsig};
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::{Digest as Sha2Digest, Sha512_256};
+
+        const PROGRAM_PREFIX: &[u8] = b"Program";
+        const MSIG_ADDR_PREFIX: &[u8] = b"MultisigAddr";
+
+        // `sha256(arg0) == byte base64 5rZMNsevs5sULO+54aN+OvU6lQ503z2X+SSYUABIx7E=`
+        // -- the exact program and satisfying/breaking argument go's
+        // TestTxnGroupCacheUpdateLogicWithMultiSig uses.
+        let program = algo_avm::assemble_string(
+            "arg 0\nsha256\nbyte base64 5rZMNsevs5sULO+54aN+OvU6lQ503z2X+SSYUABIx7E=\n==\n",
+        )
+        .expect("program must assemble")
+        .program;
+        let good_arg: Vec<u8> = vec![
+            0x3D, 0x30, 0x97, 0x53, 0x85, 0x48, 0xE9, 0x91, 0x42, 0xFD, 0xDB, 0x3B, 0x31, 0xF5,
+            0x5A, 0xAE, 0x63, 0x3F, 0xAE, 0xF2, 0x49, 0x93, 0x08, 0x12, 0x94, 0xAA, 0x7E, 0x06,
+            0x08, 0x84, 0x39, 0x62,
+        ];
+
+        let keys: [SigningKey; 3] = [
+            SigningKey::from_bytes(&[70u8; 32]),
+            SigningKey::from_bytes(&[71u8; 32]),
+            SigningKey::from_bytes(&[72u8; 32]),
+        ];
+
+        // Multisig contract-account address: SHA512/256("MultisigAddr" ||
+        // version || threshold || pk1 || pk2 || pk3).
+        let multisig_addr = {
+            let mut hasher = Sha512_256::new();
+            hasher.update(MSIG_ADDR_PREFIX);
+            hasher.update([1u8]); // version
+            hasher.update([2u8]); // threshold
+            for key in &keys {
+                hasher.update(key.verifying_key().to_bytes());
+            }
+            Address(hasher.finalize().into())
+        };
+
+        let sign_program = |key: &SigningKey, program: &[u8]| -> [u8; 64] {
+            let mut msg = Vec::with_capacity(PROGRAM_PREFIX.len() + program.len());
+            msg.extend_from_slice(PROGRAM_PREFIX);
+            msg.extend_from_slice(program);
+            key.sign(&msg).to_bytes()
+        };
+
+        // 2-of-3 multisig: keys 0 and 1 sign, key 2's subsig slot is blank.
+        let build_lsig = |program: &[u8], arg: &[u8]| -> LogicSig {
+            let subsigs: Vec<MultisigSubsig> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, key)| MultisigSubsig {
+                    public_key: key.verifying_key().to_bytes(),
+                    signature: if i < 2 {
+                        sign_program(key, program)
+                    } else {
+                        [0u8; 64]
+                    },
+                })
+                .collect();
+            LogicSig {
+                logic: serde_bytes::ByteBuf::from(program.to_vec()),
+                args: Some(vec![serde_bytes::ByteBuf::from(arg.to_vec())]),
+                msig: Some(MultisigSig {
+                    version: 1,
+                    threshold: 2,
+                    subsigs,
+                }),
+                ..Default::default()
+            }
+        };
+
+        let build_group = |lsig: LogicSig, note: u64| -> Vec<SignedTransaction> {
+            vec![SignedTransaction {
+                txn: Transaction {
+                    sender: multisig_addr,
+                    ..test_txn(note)
+                },
+                lsig: Some(lsig),
+                ..Default::default()
+            }]
+        };
+
+        // `LogicSigMsig` (classic, pre-v41 delegated multisig) is still
+        // accepted under v40 -- see `crates/core/algo-types/src/
+        // consensus.rs`'s v41 note ("retires LogicSigMsig in favor of
+        // LogicSigLMsig"). Use v40 so this test exercises the same `Msig`
+        // (not `LMsig`) field go's non-LMsig subtest does.
+        let v40 = algo_types::consensus::CONSENSUS_V40;
+        let context = VerificationContext {
+            spec_addrs: SpecialAddresses::default(),
+            consensus_version: v40.to_string(),
+        };
+        let params = crate::rules::consensus_params_for_version(v40)
+            .expect("v40 consensus params must be registered");
+        assert!(
+            !params.logic_sig_lmsig,
+            "sanity: v40 must still use the classic Msig delegation field"
+        );
+
+        let cache = VerifiedTransactionCache::new(100);
+
+        // 1. A broken multisig subsig byte fails signature verification and
+        //    is never cached.
+        let mut broken_lsig = build_lsig(&program, &good_arg);
+        broken_lsig.msig.as_mut().unwrap().subsigs[0].signature[0] ^= 1;
+        let broken_group = build_group(broken_lsig, 1);
+        let err = verify_transaction_group_cached(&broken_group, &context, &params, &cache)
+            .expect_err("a broken multisig subsig byte must fail verification");
+        assert!(
+            err.to_string().to_lowercase().contains("sig")
+                || err.to_string().to_lowercase().contains("multisig"),
+            "expected a signature-related error, got: {err}"
+        );
+        let unverified =
+            cache.get_unverified_transaction_groups(std::slice::from_ref(&broken_group), &context);
+        assert_eq!(
+            unverified.len(),
+            1,
+            "a group that failed signature verification must not be cached"
+        );
+
+        // 2. A correct signature but a tampered logic argument fails
+        //    program evaluation and is also never cached.
+        let mut bad_arg = good_arg.clone();
+        bad_arg[0] ^= 1;
+        let logic_fail_lsig = build_lsig(&program, &bad_arg);
+        let logic_fail_group = build_group(logic_fail_lsig, 2);
+        let err = verify_transaction_group_cached(&logic_fail_group, &context, &params, &cache)
+            .expect_err("a tampered logic argument must be rejected by the LogicSig program");
+        assert!(
+            err.to_string().contains("rejected the transaction"),
+            "expected a LogicSig-program-rejection error, got: {err}"
+        );
+        let unverified = cache
+            .get_unverified_transaction_groups(std::slice::from_ref(&logic_fail_group), &context);
+        assert_eq!(
+            unverified.len(),
+            1,
+            "a group rejected by the LogicSig program must not be cached"
+        );
+
+        // 3. Everything correct: signature and logic both pass, and the
+        //    group becomes cache-covered.
+        let good_lsig = build_lsig(&program, &good_arg);
+        let good_group = build_group(good_lsig, 3);
+        let ok = verify_transaction_group_cached(&good_group, &context, &params, &cache);
+        assert!(
+            ok.is_ok(),
+            "a correctly signed and logic-satisfying group must verify: {ok:?}"
+        );
+        let unverified =
+            cache.get_unverified_transaction_groups(std::slice::from_ref(&good_group), &context);
+        assert!(
+            unverified.is_empty(),
+            "a successfully-verified group must be fully cache-covered"
+        );
+    }
+
     // ── Issue #1253: EnableLogicSigCostPooling must gate group-wide
     // LogicSig budget pooling ──
     //

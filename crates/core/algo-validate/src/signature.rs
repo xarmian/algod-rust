@@ -3863,6 +3863,73 @@ mod tests {
         );
     }
 
+    /// Mirrors go's `TestTxnValidationEd25519SigWithPQSenderAuthAddr`
+    /// (`data/transactions/verify/txn_test.go:414`): the transaction's
+    /// `Sender` is set to an address that happens to have been *derived*
+    /// from a PQ (Falcon) public key, but the transaction itself carries a
+    /// perfectly ordinary ed25519 delegated signature (not a `PQsig`) with
+    /// `AuthAddr` pointing at the signer's own ed25519-derived address.
+    /// Nothing about verification here is PQ-specific: this is exactly the
+    /// generic "ed25519 signature verified against a rekeyed `AuthAddr`
+    /// that differs from `Sender`" path, and the value used for `Sender`
+    /// (a PQ-style address vs. any other 32 arbitrary bytes) is irrelevant
+    /// to the dispatch, since ordinary ed25519 verification never inspects
+    /// `Sender` for anything beyond "is it equal to `AuthAddr`". Driven
+    /// through the same group-level `verify_transaction_signature` entry
+    /// point go's `TxnGroup` calls, covering both halves of the upstream
+    /// test: (1) the rekeyed signature is accepted while `AuthAddr` is set,
+    /// and (2) clearing `AuthAddr` makes verification fall back to
+    /// `Sender` as the purported ed25519 public key, which then fails
+    /// (`Sender` here is a PQ-derived address, not an ed25519 point coding
+    /// to the signer's key).
+    #[test]
+    fn ed25519_sig_with_pq_derived_sender_and_matching_auth_addr() {
+        let (pk, _sk, _salt, pq_sender) = falcon_identity(9);
+        assert_ne!(
+            pq_sender.0.len(),
+            0,
+            "sanity: a PQ-derived address must exist"
+        );
+        let _ = pk; // only the derived address is used as Sender here.
+
+        let key = test_signing_key();
+        let signer_addr = Address(key.verifying_key().to_bytes());
+
+        // Sender is the PQ-derived address; the txn is delegated ed25519,
+        // so it must be authorized via AuthAddr == the signer's own
+        // ed25519-derived address (a plain rekey, unrelated to PQ schemes).
+        let txn = minimal_pay_txn(pq_sender);
+        let sig = sign_txn(&key, &txn);
+
+        let mut stx = SignedTransaction {
+            txn,
+            sig,
+            auth_addr: Some(signer_addr),
+            ..Default::default()
+        };
+
+        let consensus = ConsensusParams::default();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        assert!(
+            verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus).is_ok(),
+            "an ordinary ed25519 delegated signature authorized via AuthAddr \
+             must be accepted regardless of what address value Sender holds"
+        );
+
+        // Clearing AuthAddr makes verification fall back to Sender as the
+        // purported ed25519 public key -- which is a PQ-derived address,
+        // not a point encoding the signer's actual key, so it must fail.
+        stx.auth_addr = None;
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        assert!(
+            verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus).is_err(),
+            "with AuthAddr cleared, verification must fall back to (and fail \
+             against) Sender's bytes as an ed25519 public key"
+        );
+    }
+
     #[test]
     fn pqsig_and_regular_sig_both_set_rejected() {
         // Two mutually-exclusive signature categories set at once (regular
@@ -3978,6 +4045,67 @@ mod tests {
         let mut budget = GroupBudget::for_logicsig(1);
         let err = verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus)
             .expect_err("a PQ-delegated LogicSig with a tampered program must be rejected");
+        assert!(
+            err.to_string().contains("pq delegated logic signature"),
+            "expected a pq-delegated-logic-signature error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pq_delegated_logicsig_signature_over_digest_of_delegation_rejected() {
+        // Mirrors go's TestTxnValidationPQDelegatedLogicSigSignsRawProgram
+        // (data/transactions/verify/txn_test.go): the PQ-delegated LogicSig
+        // signature must cover the raw HashRep preimage
+        // `"PQProgram" || addr || program` directly (Falcon signs the tagged
+        // bytes, it does not additionally hash them first). A signature
+        // computed over the SHA-512/256 digest of that same preimage (the
+        // pre-hashed form) is a signature over a DIFFERENT message and must
+        // be rejected, even though it authenticates the same logical
+        // delegation.
+        let (pk, sk, salt, addr) = falcon_identity(21);
+        let program = int1_program();
+
+        let dp = PQDelegatedProgram {
+            addr,
+            program: program.clone(),
+        };
+        let raw_bytes = dp.to_be_signed();
+
+        // Sanity: the valid path signs the raw bytes directly and verifies.
+        let raw_sig = algo_falcon::falcon_sign(&sk, &raw_bytes).expect("falcon sign");
+
+        // The rejected path signs the digest of those same bytes instead.
+        let digest = Sha512_256::digest(&raw_bytes);
+        let digest_sig = algo_falcon::falcon_sign(&sk, &digest).expect("falcon sign");
+        assert_ne!(
+            raw_sig, digest_sig,
+            "signing the raw bytes vs. their digest must produce different signatures"
+        );
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(digest_sig),
+        };
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            pqsig: Some(pqsig),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(addr),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_logicsig(&stx, &lsig, &group, 0, &mut budget, &consensus).expect_err(
+            "a PQ-delegated LogicSig signed over the digest of the delegation, \
+             rather than the raw HashRep preimage, must be rejected",
+        );
         assert!(
             err.to_string().contains("pq delegated logic signature"),
             "expected a pq-delegated-logic-signature error, got: {err}"
