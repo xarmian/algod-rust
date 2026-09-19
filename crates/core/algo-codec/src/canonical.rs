@@ -1661,10 +1661,10 @@ pub fn canonical_encode_state_proof_body(sp: &StateProofBody) -> Vec<u8> {
 pub fn canonical_encode_state_proof_message(msg: &StateProofMessage) -> Vec<u8> {
     let mut m = CanonicalMap::new();
     m.add_u64("P", msg.ln_proven_weight);
-    m.add_bytes("b", &msg.block_headers_commitment);
+    m.add_var_bytes("b", &msg.block_headers_commitment);
     m.add_u64("f", msg.first_attested_round);
     m.add_u64("l", msg.last_attested_round);
-    m.add_bytes("v", &msg.voters_commitment);
+    m.add_var_bytes("v", &msg.voters_commitment);
     m.encode()
 }
 
@@ -2231,6 +2231,69 @@ mod tests {
         assert!(
             !keys_empty.contains(&"note".to_string()),
             "expected no 'note' key for an empty note, got keys: {keys_empty:?}"
+        );
+    }
+
+    #[test]
+    fn test_all_zero_nonempty_state_proof_commitments_round_trip() {
+        // `BlockHeadersCommitment`/`VotersCommitment` are Go's variable-length
+        // `[]byte` fields (`data/stateproofmsg/message.go`) under
+        // `codec:",omitempty"` -- length-only omitempty, same convention as
+        // `Transaction.Note` above -- not the fixed-size `[N]byte` digest
+        // all-zero-content omission rule. An all-zero-but-non-empty
+        // commitment is a real, present value that must survive the wire.
+        // Regression test for issue #1479.
+        let msg = StateProofMessage {
+            block_headers_commitment: ByteBuf::from(vec![0u8; 32]),
+            voters_commitment: ByteBuf::from(vec![0u8; 32]),
+            ln_proven_weight: 12345,
+            first_attested_round: 100,
+            last_attested_round: 200,
+        };
+
+        let encoded = canonical_encode_state_proof_message(&msg);
+        let val = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
+        let rmpv::Value::Map(pairs) = val else {
+            panic!("expected map");
+        };
+        let keys: Vec<String> = pairs
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            keys.contains(&"b".to_string()),
+            "expected 'b' key for a non-empty all-zero block_headers_commitment, got keys: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"v".to_string()),
+            "expected 'v' key for a non-empty all-zero voters_commitment, got keys: {keys:?}"
+        );
+
+        // Full round-trip through rmp_serde decode back into StateProofMessage.
+        let decoded: StateProofMessage = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.block_headers_commitment, msg.block_headers_commitment);
+        assert_eq!(decoded.voters_commitment, msg.voters_commitment);
+
+        // An empty (zero-length) commitment must still be omitted.
+        let msg_empty = StateProofMessage {
+            block_headers_commitment: ByteBuf::from(Vec::new()),
+            voters_commitment: ByteBuf::from(Vec::new()),
+            ln_proven_weight: 12345,
+            first_attested_round: 100,
+            last_attested_round: 200,
+        };
+        let encoded_empty = canonical_encode_state_proof_message(&msg_empty);
+        let val_empty = rmpv::decode::read_value(&mut &encoded_empty[..]).unwrap();
+        let rmpv::Value::Map(pairs_empty) = val_empty else {
+            panic!("expected map");
+        };
+        let keys_empty: Vec<String> = pairs_empty
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !keys_empty.contains(&"b".to_string()) && !keys_empty.contains(&"v".to_string()),
+            "expected no 'b'/'v' keys for empty commitments, got keys: {keys_empty:?}"
         );
     }
 
@@ -3940,26 +4003,18 @@ mod tests {
     /// non-zero), so it never collapses when wrapped in
     /// `Transaction::state_proof_message`.
     ///
-    /// `block_headers_commitment`/`voters_commitment` are deliberately kept
-    /// non-zero-content here (`gen_nonzero_bytes`, not `gen_bytes_any`):
-    /// `canonical_encode_state_proof_message` currently encodes both via
-    /// `CanonicalMap::add_bytes` (all-zero-content omitted, the fixed-size
-    /// digest convention), but go's `stateproofmsg.Message.
-    /// BlockHeadersCommitment`/`VotersCommitment` are plain `[]byte` under
-    /// `codec:",omitempty"` (length-only omitempty, same as `Transaction.
-    /// Note`/`protocol/codec.go`'s standard slice omitempty) -- so an
-    /// all-zero-but-non-empty commitment is a real, valid value that this
-    /// encoder currently drops, a genuine wire-format divergence from
-    /// go-algorand (see the `Note`-field precedent fixed for the same
-    /// bug class, tracked separately; not fixed here per this sweep's
-    /// scope -- a production bug fix, not test-parity closure). Avoiding
-    /// the all-zero-content case here keeps this round-trip test
-    /// (validly) covering only the currently-correct part of the encoder's
-    /// behavior.
+    /// `block_headers_commitment`/`voters_commitment` cover the full byte
+    /// space including all-zero-but-non-empty content (`gen_bytes_any`, not
+    /// `gen_nonzero_bytes`): `canonical_encode_state_proof_message` encodes
+    /// both via `CanonicalMap::add_var_bytes` (length-only omitempty,
+    /// matching go's `stateproofmsg.Message.BlockHeadersCommitment`/
+    /// `VotersCommitment` plain `[]byte` `codec:",omitempty"` semantics,
+    /// same as `Transaction.Note`), so an all-zero-but-non-empty commitment
+    /// round-trips correctly (issue #1479).
     fn gen_state_proof_message_nonempty(rng: &mut ChaCha20Rng) -> StateProofMessage {
         StateProofMessage {
-            block_headers_commitment: ByteBuf::from(gen_nonzero_bytes(rng, 0, 32)),
-            voters_commitment: ByteBuf::from(gen_nonzero_bytes(rng, 0, 32)),
+            block_headers_commitment: ByteBuf::from(gen_bytes_any(rng, 1, 32)),
+            voters_commitment: ByteBuf::from(gen_bytes_any(rng, 1, 32)),
             ln_proven_weight: rng.gen_range(1..=u64::MAX),
             first_attested_round: rng.gen::<u64>(),
             last_attested_round: rng.gen::<u64>(),
