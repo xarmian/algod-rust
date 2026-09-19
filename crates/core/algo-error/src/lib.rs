@@ -64,6 +64,30 @@ pub enum AlgoError {
         context: String,
     },
 
+    /// A peer answered a round-specific block fetch with a block for the
+    /// wrong round. Mirrors go's `errWrongBlockFromPeer`
+    /// (`catchup/universalFetcher.go`), raised by `processBlockBytes` when
+    /// `decodedEntry.Block.Round() != r`.
+    #[error("wrong block from peer: requested round {expected}, got block for round {got}")]
+    WrongBlockFromPeer {
+        /// The round that was requested.
+        expected: u64,
+        /// The round the peer's block was actually for.
+        got: u64,
+    },
+
+    /// A peer answered a round-specific block fetch with a certificate for
+    /// the wrong round. Mirrors go's `errWrongCertFromPeer`
+    /// (`catchup/universalFetcher.go`), raised by `processBlockBytes` when
+    /// `decodedEntry.Certificate.Round != r`.
+    #[error("wrong cert from peer: requested round {expected}, got cert for round {got}")]
+    WrongCertFromPeer {
+        /// The round that was requested.
+        expected: u64,
+        /// The round the peer's certificate was actually for.
+        got: u64,
+    },
+
     #[error("conformance error: {message}")]
     Conformance { message: String },
 

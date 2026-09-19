@@ -108,6 +108,25 @@ pub trait CatchupLedger: Send + Sync {
         false
     }
 
+    /// Whether the ledger is currently lagging on committing account-delta
+    /// changes to disk and catchup should apply backpressure.
+    ///
+    /// Mirrors Go's `Ledger.IsBehindCommittingDeltas()`
+    /// (`catchup/service.go`), checked by `pipelinedFetch` after each round
+    /// commits successfully: `if s.ledger.IsBehindCommittingDeltas() { ...
+    /// return errCatchupBehindDeltas }`. When this returns `true`,
+    /// [`CatchupService`]'s periodic sync pass stops early (after
+    /// committing whatever it has already fetched) rather than continuing
+    /// to pile up unflushed state, the same partial-but-bounded-progress
+    /// behavior go's `TestServiceLedgerUnavailable` pins.
+    ///
+    /// The default implementation returns `false` (never behind), so
+    /// existing `CatchupLedger` implementations are unaffected unless they
+    /// opt in.
+    fn is_behind_committing_deltas(&self) -> bool {
+        false
+    }
+
     /// Authenticate a block fetched by the *periodic* catchup path against
     /// the certificate the serving peer supplied.
     ///
@@ -224,6 +243,13 @@ pub struct CatchupService {
     /// either (`syncCert` never touches `syncStartNS`), so it is
     /// intentionally excluded here too.
     syncing_since_ns: Arc<AtomicI64>,
+    /// Sender for [`Self::sync_now`]'s trigger-and-wait requests. The
+    /// worker thread selects on the matching receiver alongside the
+    /// certificate channel and shutdown signal (mirrors go's `syncNow`
+    /// channel selected in `periodicSync`), runs a [`Self::sync_pass`], and
+    /// replies with the [`SyncExitReason`] on the one-shot channel sent
+    /// along with the request.
+    trigger_tx: Option<crossbeam_channel::Sender<crossbeam_channel::Sender<SyncExitReason>>>,
 }
 
 /// Outcome of a single worker's fetch attempt in [`CatchupService::sync_pass`],
@@ -243,6 +269,47 @@ enum FetchOutcome {
     Unsupported,
     /// The fetch itself failed or returned the wrong round's block.
     Fetch(Box<Result<FetchedBlockCert, FetchError>>),
+}
+
+/// Typed exit reason for a sync pass ([`CatchupService::sync_pass_inner`])
+/// or a single certificate-driven fetch ([`CatchupService::sync_cert`]).
+///
+/// Mirrors go's typed `pipelinedFetch`/`fetchAndWrite` exit errors
+/// (`errCatchupNoPeer`, `errFetchNoBlock`/`errFetchRetryLimit`,
+/// `errCatchupStopping`, `errCatchupBehindDeltas`, and — implicitly, via a
+/// `nil` error — successful/normal completion) from `catchup/service.go`.
+/// Every outcome used to be only observable indirectly via tracing log
+/// level or mock-state polling; this gives callers (and tests, mirroring
+/// go's `TestPipelinedFetchExitReason`) a value to assert on directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncExitReason {
+    /// The pass/fetch completed normally: every requested round was
+    /// fetched and committed (or, for `sync_cert`, the target round was
+    /// already in the ledger). Go's `nil` return from `pipelinedFetch` /
+    /// `fetchAndWrite` (the loop exits only because there is nothing left
+    /// to do, not because of an error).
+    Done,
+    /// No peer was available to fetch from. Mirrors go's
+    /// `errCatchupNoPeer`.
+    NoPeer,
+    /// The remote peer(s) do not have the block, or repeated fetch
+    /// attempts exhausted the retry budget without success. Mirrors go's
+    /// `errFetchNoBlock` / `errFetchRetryLimit`.
+    NoBlock,
+    /// Shutdown was signaled mid-pass. Mirrors go's `errCatchupStopping`.
+    Stopping,
+    /// The ledger reported it is behind on committing deltas and catchup
+    /// backed off to relieve memory pressure. Mirrors go's
+    /// `errCatchupBehindDeltas`; see
+    /// [`CatchupLedger::is_behind_committing_deltas`].
+    BehindDeltas,
+    /// The next round requires a protocol version this node does not
+    /// support. Not a distinct typed error in go (go's
+    /// `unsupportedRoundMonitor` cancels the whole service's context
+    /// instead of `pipelinedFetch` returning a specific error for it), but
+    /// distinguished here since it is a meaningfully different exit cause
+    /// from the fetch failures above.
+    Unsupported,
 }
 
 impl CatchupService {
@@ -287,6 +354,8 @@ impl CatchupService {
         parallel_blocks: u64,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+        let (trigger_tx, trigger_rx) =
+            crossbeam_channel::unbounded::<crossbeam_channel::Sender<SyncExitReason>>();
         let fork_count = Arc::new(AtomicU64::new(0));
         let fork_count_inner = Arc::clone(&fork_count);
         let syncing_since_ns = Arc::new(AtomicI64::new(0));
@@ -299,6 +368,7 @@ impl CatchupService {
                 Self::run_loop(
                     cert_rx,
                     shutdown_rx,
+                    trigger_rx,
                     ledger,
                     fetcher,
                     fork_count_inner,
@@ -313,6 +383,7 @@ impl CatchupService {
             join_handle: Some(join_handle),
             fork_count,
             syncing_since_ns,
+            trigger_tx: Some(trigger_tx),
         }
     }
 
@@ -367,9 +438,11 @@ impl CatchupService {
     ///
     /// Mirrors the `case cert := <-s.unmatchedPendingCertificates` branch of
     /// Go's `periodicSync`.
+    #[allow(clippy::too_many_arguments)]
     fn run_loop(
         cert_rx: Receiver<PendingUnmatchedCertificate>,
         shutdown_rx: Receiver<()>,
+        trigger_rx: Receiver<crossbeam_channel::Sender<SyncExitReason>>,
         ledger: Arc<dyn CatchupLedger>,
         fetcher: Arc<dyn BlockFetcher>,
         fork_count: Arc<AtomicU64>,
@@ -403,6 +476,7 @@ impl CatchupService {
             let mut sel = Select::new();
             let cert_idx = sel.recv(&cert_rx);
             let shutdown_idx = sel.recv(&shutdown_rx);
+            let trigger_idx = sel.recv(&trigger_rx);
 
             let oper = match sel.select_timeout(Self::PERIODIC_SYNC_INTERVAL) {
                 Ok(oper) => oper,
@@ -466,6 +540,23 @@ impl CatchupService {
                         }
                     }
                 }
+                i if i == trigger_idx => {
+                    // Mirrors go's `case <-s.syncNow: ... s.sync()` branch
+                    // in `periodicSync` — an explicit, caller-triggered
+                    // sync pass, answered synchronously via the one-shot
+                    // reply channel sent along with the request.
+                    if let Ok(reply_tx) = oper.recv(&trigger_rx) {
+                        let reason = Self::sync_pass(
+                            &ledger,
+                            &fetcher,
+                            &shutdown_rx,
+                            &syncing_since_ns,
+                            parallel_blocks,
+                        );
+                        last_round = ledger.next_round();
+                        let _ = reply_tx.send(reason);
+                    }
+                }
                 _ => unreachable!(),
             }
             drop(sel);
@@ -510,7 +601,7 @@ impl CatchupService {
         shutdown_rx: &Receiver<()>,
         syncing_since_ns: &Arc<AtomicI64>,
         parallel_blocks: u64,
-    ) {
+    ) -> SyncExitReason {
         // Mirrors Go's `sync()`: `syncStartNS.CompareAndSwap(0, timeInNS)`.
         // A CAS (not an unconditional store) so a pass that starts while
         // `synchronizing_time()` observers are mid-read never resets the
@@ -523,13 +614,64 @@ impl CatchupService {
         let _ =
             syncing_since_ns.compare_exchange(0, now_ns.max(1), Ordering::SeqCst, Ordering::SeqCst);
 
-        Self::sync_pass_inner(ledger, fetcher, shutdown_rx, parallel_blocks);
+        let exit_reason = Self::sync_pass_inner(ledger, fetcher, shutdown_rx, parallel_blocks);
 
         // Mirrors Go's `s.syncStartNS.Store(0)` at the end of `sync()`
         // (algod-rust has no `suspendForLedgerOps`-equivalent state that
         // would keep the timer running across a pass, so this always
         // clears it).
         syncing_since_ns.store(0, Ordering::SeqCst);
+
+        exit_reason
+    }
+
+    /// Public, directly-callable range-sync entry point mirroring go's
+    /// `Service.sync()` (`catchup/service.go`) as exercised by
+    /// `TestServiceFetchBlocksSameRange`: fetch and commit whatever
+    /// consecutive range of rounds `[ledger.next_round(), ...]` the
+    /// configured peers have, driven entirely by the peer-selecting
+    /// `fetcher` with no certificate required per round — the block's own
+    /// fetcher-supplied certificate is what gets authenticated (see
+    /// [`CatchupLedger::authenticate_block`]), exactly like go's
+    /// certificate-less `pipelinedFetch`/`fetchAndWrite` path.
+    ///
+    /// Unlike [`Self::sync_cert`] (which waits on a specific
+    /// agreement-verified certificate for one round), this can be called
+    /// directly — by a running [`CatchupService`] via
+    /// [`CatchupService::sync_now`], or standalone in a test with mock
+    /// `ledger`/`fetcher` implementations — without requiring the
+    /// background worker thread to be involved at all.
+    pub fn sync_range(
+        ledger: &Arc<dyn CatchupLedger>,
+        fetcher: &Arc<dyn BlockFetcher>,
+        shutdown_rx: &Receiver<()>,
+        parallel_blocks: u64,
+    ) -> SyncExitReason {
+        Self::sync_pass_inner(ledger, fetcher, shutdown_rx, parallel_blocks)
+    }
+
+    /// Trigger an immediate, synchronous range-sync pass on a running
+    /// [`CatchupService`] and block until it completes, returning the
+    /// [`SyncExitReason`].
+    ///
+    /// Mirrors go's `syncer.sync()` being callable directly on a live
+    /// `Service` (as `TestServiceFetchBlocksSameRange` does after
+    /// `testStart()`), rather than only ever running implicitly off the
+    /// periodic timer. Internally this hands the request to the worker
+    /// thread (so it still runs serialized with any certificate-driven
+    /// fetch already in flight) and waits for the reply.
+    pub fn sync_now(&self) -> SyncExitReason {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded::<SyncExitReason>(1);
+        if let Some(tx) = &self.trigger_tx {
+            if tx.send(reply_tx).is_ok() {
+                if let Ok(reason) = reply_rx.recv() {
+                    return reason;
+                }
+            }
+        }
+        // The worker thread is gone (already stopped) or dropped the
+        // reply sender without answering — nothing more to synchronize on.
+        SyncExitReason::Stopping
     }
 
     /// The actual periodic-sync fetch/apply work, wrapped by
@@ -539,7 +681,8 @@ impl CatchupService {
         fetcher: &Arc<dyn BlockFetcher>,
         shutdown_rx: &Receiver<()>,
         parallel_blocks: u64,
-    ) {
+    ) -> SyncExitReason {
+        let mut exit_reason = SyncExitReason::Done;
         let start_round = ledger.next_round();
         let limit_round = start_round.0.saturating_add(Self::MAX_BLOCKS_PER_SYNC_PASS);
         let parallel_blocks = parallel_blocks.clamp(1, Self::MAX_BLOCKS_PER_SYNC_PASS);
@@ -617,6 +760,7 @@ impl CatchupService {
             'apply: while let Some(outcome) = buffer.remove(&next_apply) {
                 if shutdown_rx.try_recv().is_ok() {
                     debug!("catchup service: shutdown received during periodic sync");
+                    exit_reason = SyncExitReason::Stopping;
                     stop.store(true, Ordering::SeqCst);
                     stopped = true;
                     break 'apply;
@@ -629,6 +773,7 @@ impl CatchupService {
                             "catchup service: periodic sync stopping, round requires \
                              an unsupported protocol version"
                         );
+                        exit_reason = SyncExitReason::Unsupported;
                         stop.store(true, Ordering::SeqCst);
                         stopped = true;
                         break 'apply;
@@ -642,6 +787,12 @@ impl CatchupService {
                             error = %e,
                             "catchup service: periodic sync stopping"
                         );
+                        exit_reason = match &e {
+                            FetchError::NoPeersAvailable => SyncExitReason::NoPeer,
+                            FetchError::NoBlockForRound { .. }
+                            | FetchError::NetworkError(_)
+                            | FetchError::Timeout => SyncExitReason::NoBlock,
+                        };
                         stop.store(true, Ordering::SeqCst);
                         stopped = true;
                         break 'apply;
@@ -656,6 +807,7 @@ impl CatchupService {
                                 fetched_round = %block.round,
                                 "catchup service: periodic sync got wrong round, stopping"
                             );
+                            exit_reason = SyncExitReason::NoBlock;
                             stop.store(true, Ordering::SeqCst);
                             stopped = true;
                             break 'apply;
@@ -667,6 +819,7 @@ impl CatchupService {
                                 "catchup service: periodic sync got a block with no \
                                  certificate, refusing to commit it"
                             );
+                            exit_reason = SyncExitReason::NoBlock;
                             stop.store(true, Ordering::SeqCst);
                             stopped = true;
                             break 'apply;
@@ -679,6 +832,7 @@ impl CatchupService {
                                 "catchup service: periodic sync could not authenticate \
                                  the fetched block, stopping"
                             );
+                            exit_reason = SyncExitReason::NoBlock;
                             stop.store(true, Ordering::SeqCst);
                             stopped = true;
                             break 'apply;
@@ -695,6 +849,7 @@ impl CatchupService {
                                     "catchup service: periodic sync block contents do not \
                                      match header commitments, stopping"
                                 );
+                                exit_reason = SyncExitReason::NoBlock;
                                 stop.store(true, Ordering::SeqCst);
                                 stopped = true;
                                 break 'apply;
@@ -706,6 +861,7 @@ impl CatchupService {
                                     "catchup service: periodic sync cannot verify block \
                                      contents, stopping"
                                 );
+                                exit_reason = SyncExitReason::NoBlock;
                                 stop.store(true, Ordering::SeqCst);
                                 stopped = true;
                                 break 'apply;
@@ -724,6 +880,27 @@ impl CatchupService {
                                 "catchup service: periodic sync committed a block but the \
                                  ledger did not advance, stopping"
                             );
+                            exit_reason = SyncExitReason::NoBlock;
+                            stop.store(true, Ordering::SeqCst);
+                            stopped = true;
+                            break 'apply;
+                        }
+
+                        // Backpressure: mirrors go's `pipelinedFetch` check
+                        // after a round successfully commits —
+                        // `if s.ledger.IsBehindCommittingDeltas() { ...
+                        // return errCatchupBehindDeltas }`. Stop here so
+                        // the pass reports genuine partial-but-bounded
+                        // progress (this round and everything before it
+                        // committed; nothing after it was even fetched)
+                        // rather than piling on more unflushed state.
+                        if ledger.is_behind_committing_deltas() {
+                            info!(
+                                round = %expected_round,
+                                "catchup service: periodic sync stopping, ledger is \
+                                 behind on committing deltas"
+                            );
+                            exit_reason = SyncExitReason::BehindDeltas;
                             stop.store(true, Ordering::SeqCst);
                             stopped = true;
                             break 'apply;
@@ -753,6 +930,8 @@ impl CatchupService {
                 "catchup service: periodic sync advanced the ledger"
             );
         }
+
+        exit_reason
     }
 
     /// Base delay between retry attempts (doubles with each attempt,
@@ -770,16 +949,48 @@ impl CatchupService {
     /// 3. Validate the fetched block's digest against the certificate.
     /// 4. Commit it to the ledger via `ensure_block`.
     ///
-    /// Unlike a bounded retry loop, this mirrors Go's `fetchRound` which
-    /// retries indefinitely (`for s.ledger.LastRound() < cert.Round`) until
-    /// either the block is committed (by any path) or shutdown is signaled.
+    /// Unlike an unconditionally-bounded retry loop, this mirrors Go's
+    /// `fetchRound` (`for s.ledger.LastRound() < cert.Round`): it keeps
+    /// retrying until the block is committed (by any path), shutdown is
+    /// signaled, *or* [`Self::CATCHUP_RETRY_LIMIT`] attempts have been made
+    /// — go's `catchupRetryLimit` (`catchup/service.go:47`), which exists
+    /// specifically so a round that genuinely has no block available
+    /// anywhere eventually gives up (with one log line) instead of
+    /// retrying, and logging, forever.
     fn sync_cert(
         pending: &PendingUnmatchedCertificate,
         ledger: &Arc<dyn CatchupLedger>,
         fetcher: &Arc<dyn BlockFetcher>,
         shutdown_rx: &Receiver<()>,
         fork_count: &Arc<AtomicU64>,
-    ) {
+    ) -> SyncExitReason {
+        Self::sync_cert_with_retry_limit(
+            pending,
+            ledger,
+            fetcher,
+            shutdown_rx,
+            fork_count,
+            Self::CATCHUP_RETRY_LIMIT,
+        )
+    }
+
+    /// Go's `catchupRetryLimit` (`catchup/service.go:47`): "this should be
+    /// at least the number of relays". Bounds [`Self::sync_cert`]'s retry
+    /// loop so a round with no block available anywhere eventually gives up
+    /// with a single log line instead of retrying (and logging) forever.
+    const CATCHUP_RETRY_LIMIT: u32 = 500;
+
+    /// [`Self::sync_cert`]'s actual implementation, parameterized on the
+    /// retry-attempt cap so tests can pin exhaustion behavior without
+    /// waiting through 500 real backoff delays.
+    fn sync_cert_with_retry_limit(
+        pending: &PendingUnmatchedCertificate,
+        ledger: &Arc<dyn CatchupLedger>,
+        fetcher: &Arc<dyn BlockFetcher>,
+        shutdown_rx: &Receiver<()>,
+        fork_count: &Arc<AtomicU64>,
+        retry_limit: u32,
+    ) -> SyncExitReason {
         let cert = &pending.cert;
         let target_round = cert.round;
 
@@ -797,12 +1008,13 @@ impl CatchupService {
                 round = %target_round,
                 "catchup service: round requires unsupported protocol version, skipping"
             );
-            return;
+            return SyncExitReason::Unsupported;
         }
 
         // Retry loop: mirrors Go's `for s.ledger.LastRound() < cert.Round`.
         // Continues until the ledger has the block, shutdown is signaled,
-        // or the block is successfully fetched and committed.
+        // the retry limit is exceeded, or the block is successfully
+        // fetched and committed.
         let mut attempt: u32 = 0;
         loop {
             // Check if the ledger already has this block (committed by
@@ -817,7 +1029,7 @@ impl CatchupService {
                         next_round = %next,
                         "catchup service: ledger already has block, skipping"
                     );
-                    return;
+                    return SyncExitReason::Done;
                 }
             }
 
@@ -827,10 +1039,27 @@ impl CatchupService {
                     round = %target_round,
                     "catchup service: shutdown received during sync_cert"
                 );
-                return;
+                return SyncExitReason::Stopping;
             }
 
             attempt = attempt.saturating_add(1);
+
+            // Stop retrying after a while. Mirrors go's
+            // `if i > catchupRetryLimit { ... return errFetchRetryLimit }`
+            // (`catchup/service.go`'s `fetchAndWrite`) — this is the
+            // certificate-driven path's analog, since a certificate that
+            // agreement already committed to means the round must
+            // eventually be applied, so this only fires for a genuinely
+            // unfetchable round (or a test exercising the bound directly).
+            if attempt > retry_limit {
+                warn!(
+                    round = %target_round,
+                    attempts = attempt - 1,
+                    retry_limit = retry_limit,
+                    "catchup service: certificate-driven fetch exceeded retry limit, giving up"
+                );
+                return SyncExitReason::NoBlock;
+            }
 
             match fetcher.fetch_block(target_round) {
                 Ok(fetched) => {
@@ -851,7 +1080,7 @@ impl CatchupService {
                                 round = %target_round,
                                 "catchup service: shutdown received during backoff"
                             );
-                            return;
+                            return SyncExitReason::Stopping;
                         }
                         continue;
                     }
@@ -938,7 +1167,7 @@ impl CatchupService {
                                 round = %target_round,
                                 "catchup service: shutdown received during backoff"
                             );
-                            return;
+                            return SyncExitReason::Stopping;
                         }
                         continue;
                     }
@@ -963,7 +1192,7 @@ impl CatchupService {
                                     round = %target_round,
                                     "catchup service: shutdown received during backoff"
                                 );
-                                return;
+                                return SyncExitReason::Stopping;
                             }
                             continue;
                         }
@@ -977,7 +1206,7 @@ impl CatchupService {
                                 error = %reason,
                                 "catchup service: cannot verify block contents (fatal), aborting"
                             );
-                            return;
+                            return SyncExitReason::NoBlock;
                         }
                     }
 
@@ -995,7 +1224,7 @@ impl CatchupService {
                         round = %target_round,
                         "catchup service: successfully fetched and committed block"
                     );
-                    return;
+                    return SyncExitReason::Done;
                 }
                 Err(e) => {
                     // Mirror Go's pattern: NoBlockForRound is a normal
@@ -1032,7 +1261,7 @@ impl CatchupService {
                             round = %target_round,
                             "catchup service: shutdown received during backoff"
                         );
-                        return;
+                        return SyncExitReason::Stopping;
                     }
                 }
             }
@@ -2190,6 +2419,30 @@ mod tests {
         crossbeam_channel::bounded::<()>(0).1
     }
 
+    /// A ledger that reports [`CatchupLedger::is_behind_committing_deltas`]
+    /// once the last committed round reaches `behind_after_round`, so tests
+    /// can simulate go's `mockedLedger.behindDeltas` commit-backpressure
+    /// signal (`TestServiceLedgerUnavailable`).
+    struct BehindDeltasAfterCatchupLedger {
+        inner: MockCatchupLedger,
+        behind_after_round: u64,
+    }
+
+    impl CatchupLedger for BehindDeltasAfterCatchupLedger {
+        fn next_round(&self) -> Round {
+            self.inner.next_round()
+        }
+        fn ensure_block(&self, block: &Block, cert: &Certificate) {
+            self.inner.ensure_block(block, cert)
+        }
+        fn authenticate_block(&self, _block: &Block, _cert: &Certificate) -> Result<(), String> {
+            Ok(())
+        }
+        fn is_behind_committing_deltas(&self) -> bool {
+            self.inner.next_round().0.saturating_sub(1) >= self.behind_after_round
+        }
+    }
+
     /// Port of go's `TestOnSwitchToUnSupportedProtocol1`: the interruption
     /// happens on the very first round of the pass ("This cannot happen in
     /// practice, but is used to test the code" — go's own comment). No
@@ -2448,5 +2701,277 @@ mod tests {
         svc.stop();
 
         assert_eq!(svc.synchronizing_time(), Duration::ZERO);
+    }
+
+    // -- Issue #1504 batch 3: closing the remaining catchup parity rows --
+
+    /// Row 1: port of go's `TestServiceFetchBlocksSameRange`
+    /// (`catchup/service_test.go`). `CatchupService::sync_range` is a
+    /// directly-callable, certificate-less, arbitrary-range entry point —
+    /// mirroring go's `Service.sync()` — reachable with no running worker
+    /// thread at all, proving the range-sync logic is its own callable unit
+    /// and not only ever reachable implicitly off the periodic timer.
+    #[test]
+    fn sync_range_static_entry_point_fetches_arbitrary_range() {
+        let ledger = Arc::new(PermissiveCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to: 10,
+            calls: AtomicU64::new(0),
+        });
+        let shutdown_rx = never_shutdown();
+
+        let exit = CatchupService::sync_range(&ledger_dyn, &fetcher, &shutdown_rx, 4);
+
+        assert_eq!(
+            ledger.next_round(),
+            Round(11),
+            "local ledger must catch up to remote's last round (10) with no certificate involved"
+        );
+        assert_eq!(
+            exit,
+            SyncExitReason::NoBlock,
+            "the pass should stop because the peer has nothing past round 10"
+        );
+    }
+
+    /// Row 1: same scenario, but driven through a live [`CatchupService`]'s
+    /// [`CatchupService::sync_now`] — a caller can trigger an immediate,
+    /// synchronous range-sync pass on a running service and get back its
+    /// [`SyncExitReason`], the same shape as go's `syncer.testStart();
+    /// syncer.sync()` in `TestServiceFetchBlocksSameRange`.
+    #[test]
+    fn sync_now_fetches_arbitrary_range_without_certificate() {
+        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger = Arc::new(PermissiveCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to: 10,
+            calls: AtomicU64::new(0),
+        });
+
+        let mut svc = CatchupService::start(rx, ledger_dyn, fetcher);
+
+        // `start()`'s own startup pass (mirroring go's `periodicSync`
+        // running one `sync()` immediately) runs to completion on the
+        // worker thread before it ever reaches the select loop that reads
+        // `sync_now()`'s trigger channel, so by the time this returns the
+        // ledger is guaranteed to reflect the outcome of at least one full
+        // range-sync pass — deterministic, not a race with the startup
+        // pass.
+        let exit = svc.sync_now();
+
+        assert_eq!(
+            ledger.next_round(),
+            Round(11),
+            "local ledger must catch up to remote's last round (10) with no certificate involved"
+        );
+        assert_eq!(
+            exit,
+            SyncExitReason::NoBlock,
+            "the pass should stop because the peer has nothing past round 10"
+        );
+
+        svc.stop();
+    }
+
+    /// Row 2: port of go's `TestServiceLedgerUnavailable`
+    /// (`catchup/service_test.go`). When the ledger reports it is behind on
+    /// committing deltas ([`CatchupLedger::is_behind_committing_deltas`]),
+    /// the periodic sync pass must make partial-but-bounded progress:
+    /// commit whatever it already has in hand and then stop, rather than
+    /// stalling forever or piling on more unflushed state.
+    #[test]
+    fn sync_pass_inner_stops_early_when_ledger_behind_committing_deltas() {
+        let ledger = Arc::new(BehindDeltasAfterCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+            behind_after_round: 3,
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        // The peer has far more than the pass should ever reach.
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to: 50,
+            calls: AtomicU64::new(0),
+        });
+        let shutdown_rx = never_shutdown();
+
+        let exit = CatchupService::sync_pass_inner(&ledger_dyn, &fetcher, &shutdown_rx, 2);
+
+        assert_eq!(
+            exit,
+            SyncExitReason::BehindDeltas,
+            "pass must report it stopped for backpressure, not just silently stall"
+        );
+        assert_eq!(
+            ledger.next_round(),
+            Round(4),
+            "rounds 1..=3 should commit (partial progress) before backpressure stops the pass"
+        );
+        assert!(
+            ledger.next_round().0 < 50,
+            "progress must be bounded — the pass must not run all the way to the peer's tip"
+        );
+    }
+
+    /// Row 3: port of go's `TestServiceNoBlockForRound`
+    /// (`catchup/service_test.go`). Go bounds `fetchAndWrite`'s retry loop
+    /// at `catchupRetryLimit = 500` specifically so a round that genuinely
+    /// has no block available anywhere eventually gives up (one log line)
+    /// instead of retrying forever. This exercises
+    /// `sync_cert_with_retry_limit` with a small limit so the exhaustion
+    /// path itself — not just the existence of a cap — is proven, without
+    /// waiting through hundreds of real backoff delays.
+    #[test]
+    fn sync_cert_gives_up_after_retry_limit_exceeded() {
+        // Always fails — this round genuinely has no block anywhere.
+        let unused_block = make_valid_empty_block(0);
+        let fetcher = Arc::new(CountingFailFetcher::new(unused_block, u64::MAX));
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
+        let fork_count = Arc::new(AtomicU64::new(0));
+        let shutdown_rx = never_shutdown();
+
+        let exit = CatchupService::sync_cert_with_retry_limit(
+            &make_pending_cert(5),
+            &ledger,
+            &fetcher_dyn,
+            &shutdown_rx,
+            &fork_count,
+            3,
+        );
+
+        assert_eq!(
+            exit,
+            SyncExitReason::NoBlock,
+            "must give up with a typed exit reason once the retry limit is exceeded"
+        );
+        assert_eq!(
+            fetcher.total_calls(),
+            3,
+            "should attempt exactly retry_limit fetches before giving up, not fewer or more"
+        );
+    }
+
+    /// Row 4: port of go's `TestPipelinedFetchExitReason`
+    /// (`catchup/service_test.go`). `pipelinedFetch`/`fetchAndWrite` return
+    /// a typed exit reason distinguishing *why* a pass stopped. This
+    /// exercises a representative subset of [`SyncExitReason`]'s variants
+    /// across both `sync_pass_inner` (the periodic, certificate-less path)
+    /// and `sync_cert` (the certificate-driven path).
+    #[test]
+    fn sync_pass_inner_and_sync_cert_report_typed_exit_reasons() {
+        // -- Done: sync_cert finds the target round already committed --
+        {
+            let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(5)));
+            let fetcher: Arc<dyn BlockFetcher> = Arc::new(MockBlockFetcher::new(None));
+            let fork_count = Arc::new(AtomicU64::new(0));
+            let shutdown_rx = never_shutdown();
+            let exit = CatchupService::sync_cert(
+                &make_pending_cert(3),
+                &ledger,
+                &fetcher,
+                &shutdown_rx,
+                &fork_count,
+            );
+            assert_eq!(
+                exit,
+                SyncExitReason::Done,
+                "round 3 is already committed (ledger is at round 5)"
+            );
+        }
+
+        // -- Unsupported: sync_cert bails out on an unsupported round --
+        {
+            let ledger = Arc::new(SwitchingCatchupLedger {
+                inner: MockCatchupLedger::new(Round(0)),
+                switch_round: 1,
+            });
+            let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+            let fetcher: Arc<dyn BlockFetcher> = Arc::new(MockBlockFetcher::new(None));
+            let fork_count = Arc::new(AtomicU64::new(0));
+            let shutdown_rx = never_shutdown();
+            let exit = CatchupService::sync_cert(
+                &make_pending_cert(1),
+                &ledger_dyn,
+                &fetcher,
+                &shutdown_rx,
+                &fork_count,
+            );
+            assert_eq!(exit, SyncExitReason::Unsupported);
+        }
+
+        // -- Stopping: shutdown already signaled before the first fetch --
+        {
+            let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
+            let fetcher: Arc<dyn BlockFetcher> = Arc::new(MockBlockFetcher::new(None));
+            let fork_count = Arc::new(AtomicU64::new(0));
+            let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+            shutdown_tx.send(()).unwrap();
+            let exit = CatchupService::sync_cert(
+                &make_pending_cert(5),
+                &ledger,
+                &fetcher,
+                &shutdown_rx,
+                &fork_count,
+            );
+            assert_eq!(exit, SyncExitReason::Stopping);
+        }
+
+        // -- NoBlock: sync_pass_inner stops because the peer has nothing to offer --
+        {
+            let ledger = Arc::new(PermissiveCatchupLedger {
+                inner: MockCatchupLedger::new(Round(0)),
+            });
+            let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+            let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+                up_to: 0,
+                calls: AtomicU64::new(0),
+            });
+            let shutdown_rx = never_shutdown();
+            let exit = CatchupService::sync_pass_inner(&ledger_dyn, &fetcher, &shutdown_rx, 2);
+            assert_eq!(exit, SyncExitReason::NoBlock);
+            assert_eq!(
+                ledger.next_round(),
+                Round(1),
+                "no blocks were available; nothing should have been committed"
+            );
+        }
+
+        // -- Unsupported: sync_pass_inner stops at an unsupported protocol switch --
+        {
+            let ledger = Arc::new(SwitchingCatchupLedger {
+                inner: MockCatchupLedger::new(Round(0)),
+                switch_round: 1,
+            });
+            let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+            let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+                up_to: 10,
+                calls: AtomicU64::new(0),
+            });
+            let shutdown_rx = never_shutdown();
+            let exit = CatchupService::sync_pass_inner(&ledger_dyn, &fetcher, &shutdown_rx, 2);
+            assert_eq!(exit, SyncExitReason::Unsupported);
+        }
+
+        // -- BehindDeltas: sync_pass_inner stops once backpressure kicks in --
+        {
+            let ledger = Arc::new(BehindDeltasAfterCatchupLedger {
+                inner: MockCatchupLedger::new(Round(0)),
+                behind_after_round: 3,
+            });
+            let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+            let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+                up_to: 10,
+                calls: AtomicU64::new(0),
+            });
+            let shutdown_rx = never_shutdown();
+            let exit = CatchupService::sync_pass_inner(&ledger_dyn, &fetcher, &shutdown_rx, 2);
+            assert_eq!(exit, SyncExitReason::BehindDeltas);
+            assert_eq!(ledger.next_round(), Round(4));
+        }
     }
 }
