@@ -2271,7 +2271,10 @@ mod tests {
 
         // Full round-trip through rmp_serde decode back into StateProofMessage.
         let decoded: StateProofMessage = rmp_serde::from_slice(&encoded).unwrap();
-        assert_eq!(decoded.block_headers_commitment, msg.block_headers_commitment);
+        assert_eq!(
+            decoded.block_headers_commitment,
+            msg.block_headers_commitment
+        );
         assert_eq!(decoded.voters_commitment, msg.voters_commitment);
 
         // An empty (zero-length) commitment must still be omitted.
@@ -3634,6 +3637,22 @@ mod tests {
             public_key,
             signature,
         }
+    }
+
+    /// Matches go's `TestMarshalUnmarshalMultisigSubsig` +
+    /// `TestRandomizedEncodingMultisigSubsig` (`crypto/msgp_gen_test.go`):
+    /// `MultisigSubsig` is embedded inside `MultisigSig`'s `subsig` array on
+    /// the wire (no standalone Rust wrapper type), but its own two-field
+    /// msgpack shape (`pk`, `s`) still round-trips independently of its
+    /// parent, so a dedicated randomized round trip (subsuming go's
+    /// single-fixed-value marshal test) is directly portable.
+    #[test]
+    fn multisig_subsig_randomized_roundtrip() {
+        assert_state_proof_roundtrip(
+            0x1740_0030,
+            gen_multisig_subsig,
+            canonical_encode_multisig_subsig,
+        );
     }
 
     fn gen_multisig(rng: &mut ChaCha20Rng) -> MultisigSig {
