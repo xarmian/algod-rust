@@ -3518,4 +3518,168 @@ mod tests {
             );
         }
     }
+
+    // ── Randomized round-trip: PQSig / LogicSig / TxGroup (Phase 17
+    // txn_core sweep, issue #1474) ──────────────────────────────────────
+    //
+    // Mirrors go's `TestRandomizedEncodingPQSig`, `TestRandomizedEncodingLogicSig`,
+    // and `TestRandomizedEncodingTxGroup` (`data/transactions/msgp_gen_test.go`):
+    // each is a `protocol.RunEncodingTest` reflection-randomized round trip.
+    // These follow the same `assert_state_proof_roundtrip`-style pattern used
+    // for the state-proof wire types above (issue #956).
+
+    fn gen_pqsig(rng: &mut ChaCha20Rng) -> PQSig {
+        let mut scheme = [0u8; 2];
+        rng.fill_bytes(&mut scheme);
+        // "sch" is the only always-encoded scalar field aside from the
+        // byte/salt ones; keep it non-zero so this PQSig's own encoding
+        // never collapses to the empty map (matches the module's general
+        // non-collapsing-generator convention above).
+        if scheme == [0u8; 2] {
+            scheme = *b"f1";
+        }
+        PQSig {
+            scheme,
+            salt: algo_types::PQAddressSalt(rng.gen_range(1..=u8::MAX)),
+            public_key: ByteBuf::from(gen_nonzero_bytes(rng, 1, 1793)),
+            signature: ByteBuf::from(gen_nonzero_bytes(rng, 1, 64)),
+        }
+    }
+
+    /// Matches go's `TestRandomizedEncodingPQSig`
+    /// (`data/transactions/msgp_gen_test.go`).
+    #[test]
+    fn pqsig_randomized_roundtrip() {
+        assert_state_proof_roundtrip(0x1740_0001, gen_pqsig, canonical_encode_pqsig);
+    }
+
+    fn gen_multisig_subsig(rng: &mut ChaCha20Rng) -> MultisigSubsig {
+        let mut public_key = [0u8; 32];
+        rng.fill_bytes(&mut public_key);
+        let signature = if rng.gen_bool(0.5) {
+            let mut s = [0u8; 64];
+            rng.fill_bytes(&mut s);
+            // Guarantee non-zero so `is_zero_64`'s skip_serializing_if
+            // doesn't drop it, matching an unsigned-vs-signed subsig
+            // distinction rather than an accidental collapse.
+            s[0] |= 1;
+            s
+        } else {
+            [0u8; 64]
+        };
+        MultisigSubsig {
+            public_key,
+            signature,
+        }
+    }
+
+    fn gen_multisig(rng: &mut ChaCha20Rng) -> MultisigSig {
+        MultisigSig {
+            // Always non-zero: `canonical_encode_multisig` uses `add_u64`
+            // (skip-if-zero) for "v"/"thr", but `MultisigSig`'s Deserialize
+            // has no `#[serde(default)]` on those fields, so a zero value
+            // would round-trip-fail for a codec reason unrelated to the
+            // thing this test is pinning (real MultisigSigs always carry a
+            // non-zero version/threshold).
+            version: rng.gen_range(1..=10u8),
+            threshold: rng.gen_range(1..=255u8),
+            // Always non-empty for the same reason: an empty `subsig`
+            // array is omitted on the wire, which `Vec<MultisigSubsig>`'s
+            // non-defaulted Deserialize can't reconstruct from absence.
+            subsigs: (0..rng.gen_range(1..=3))
+                .map(|_| gen_multisig_subsig(rng))
+                .collect(),
+        }
+    }
+
+    fn gen_logicsig(rng: &mut ChaCha20Rng) -> LogicSig {
+        LogicSig {
+            logic: ByteBuf::from(gen_nonzero_bytes(rng, 1, 64)),
+            sig: if rng.gen_bool(0.3) {
+                let mut s = [0u8; 64];
+                rng.fill_bytes(&mut s);
+                s[0] |= 1;
+                s
+            } else {
+                [0u8; 64]
+            },
+            msig: if rng.gen_bool(0.3) {
+                Some(gen_multisig(rng))
+            } else {
+                None
+            },
+            args: if rng.gen_bool(0.3) {
+                let n = rng.gen_range(1..=3);
+                Some(
+                    (0..n)
+                        .map(|_| ByteBuf::from(gen_nonzero_bytes(rng, 1, 16)))
+                        .collect(),
+                )
+            } else {
+                None
+            },
+            lmsig: if rng.gen_bool(0.3) {
+                Some(gen_multisig(rng))
+            } else {
+                None
+            },
+            pqsig: if rng.gen_bool(0.3) {
+                Some(gen_pqsig(rng))
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Matches go's `TestRandomizedEncodingLogicSig`
+    /// (`data/transactions/msgp_gen_test.go`).
+    #[test]
+    fn logicsig_randomized_roundtrip() {
+        assert_state_proof_roundtrip(0x1740_0002, gen_logicsig, canonical_encode_logicsig);
+    }
+
+    /// Matches go's `TestRandomizedEncodingTxGroup`
+    /// (`data/transactions/msgp_gen_test.go`). `TxGroup` has no dedicated
+    /// algod-rust wire struct (`canonical_encode_tx_group` takes a plain
+    /// `&[Digest]` and is only ever consumed by group-ID hashing, not
+    /// decoded back into a typed value elsewhere in this codebase), so this
+    /// round-trips through the generic `rmpv::Value` decoder instead of a
+    /// `#[derive(Deserialize)]` struct, and asserts the decoded
+    /// `txlist` array matches the original hash list exactly.
+    #[test]
+    fn tx_group_randomized_roundtrip() {
+        use algo_types::Digest;
+        let mut rng = ChaCha20Rng::seed_from_u64(0x1740_0003);
+        for i in 0..STATE_PROOF_ITERATIONS {
+            let n = rng.gen_range(1..=16);
+            let hashes: Vec<Digest> = (0..n)
+                .map(|_| {
+                    let mut bytes = [0u8; 32];
+                    rng.fill_bytes(&mut bytes);
+                    Digest(bytes)
+                })
+                .collect();
+
+            let encoded = canonical_encode_tx_group(&hashes);
+            let val = rmpv::decode::read_value(&mut &encoded[..])
+                .unwrap_or_else(|e| panic!("iteration {i}: failed to decode: {e}"));
+            let rmpv::Value::Map(pairs) = val else {
+                panic!("iteration {i}: expected a map");
+            };
+            assert_eq!(pairs.len(), 1, "iteration {i}: expected exactly 1 key");
+            let (key, value) = &pairs[0];
+            assert_eq!(key.as_str().unwrap(), "txlist");
+            let rmpv::Value::Array(arr) = value else {
+                panic!("iteration {i}: expected an array for txlist");
+            };
+            assert_eq!(arr.len(), hashes.len(), "iteration {i}: length mismatch");
+            for (got, want) in arr.iter().zip(hashes.iter()) {
+                assert_eq!(
+                    got.as_slice().unwrap(),
+                    want.as_bytes(),
+                    "iteration {i}: hash mismatch"
+                );
+            }
+        }
+    }
 }

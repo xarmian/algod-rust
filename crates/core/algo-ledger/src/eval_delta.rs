@@ -910,6 +910,180 @@ mod tests {
         assert_eq!(parsed.inner_txns.expect("inner txns").len(), 1);
     }
 
+    /// Matches go's `TestRandomizedEncodingEvalDelta`
+    /// (`data/transactions/msgp_gen_test.go`): a fuzz/randomized-instance
+    /// variant of [`encode_eval_delta_round_trips_through_parse`] above,
+    /// covering many random combinations of global-delta keys/values,
+    /// multi-account local deltas, inner-transaction counts, and logs
+    /// through the same real `encode_eval_delta` -> `parse_eval_delta`
+    /// pair, rather than a single hand-picked scenario.
+    #[test]
+    fn encode_eval_delta_randomized_roundtrip() {
+        use rand::{Rng, RngCore, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        fn gen_bytes(rng: &mut ChaCha20Rng, min_len: usize, max_len: usize) -> Vec<u8> {
+            let len = rng.gen_range(min_len.max(1)..=max_len.max(min_len.max(1)));
+            let mut v = vec![0u8; len];
+            rng.fill_bytes(&mut v);
+            v
+        }
+
+        fn gen_teal_value(rng: &mut ChaCha20Rng) -> Option<TealValue> {
+            match rng.gen_range(0..3) {
+                0 => None,
+                1 => Some(TealValue::Uint(rng.gen())),
+                _ => Some(TealValue::Bytes(gen_bytes(rng, 1, 24))),
+            }
+        }
+
+        fn gen_address(rng: &mut ChaCha20Rng) -> Address {
+            let mut bytes = [0u8; 32];
+            rng.fill_bytes(&mut bytes);
+            Address(bytes)
+        }
+
+        const ITERATIONS: usize = 200;
+        let mut rng = ChaCha20Rng::seed_from_u64(0x1740_0004);
+
+        for i in 0..ITERATIONS {
+            // Build a random set of `accounts[]` addresses on the txn so
+            // local-delta account indices resolve deterministically.
+            let n_accounts = rng.gen_range(0..=3);
+            let accounts: Vec<Address> = (0..n_accounts).map(|_| gen_address(&mut rng)).collect();
+            let sender = gen_address(&mut rng);
+            let txn = Transaction {
+                sender,
+                accounts: if accounts.is_empty() {
+                    None
+                } else {
+                    Some(accounts.clone())
+                },
+                ..Default::default()
+            };
+
+            let n_global = rng.gen_range(0..=4);
+            let mut global_delta = HashMap::new();
+            for _ in 0..n_global {
+                global_delta.insert(gen_bytes(&mut rng, 1, 8), gen_teal_value(&mut rng));
+            }
+
+            let n_local_accts = rng.gen_range(0..=(1 + accounts.len()));
+            let mut local_deltas = HashMap::new();
+            let mut candidates = accounts.clone();
+            candidates.push(sender);
+            for _ in 0..n_local_accts {
+                let addr = candidates[rng.gen_range(0..candidates.len())];
+                let n_keys = rng.gen_range(0..=3);
+                let mut per_key = HashMap::new();
+                for _ in 0..n_keys {
+                    per_key.insert(gen_bytes(&mut rng, 1, 8), gen_teal_value(&mut rng));
+                }
+                local_deltas.insert(addr, per_key);
+            }
+
+            let n_logs = rng.gen_range(0..=3);
+            let logs: Vec<Vec<u8>> = (0..n_logs).map(|_| gen_bytes(&mut rng, 1, 16)).collect();
+
+            let n_inner = rng.gen_range(0..=2);
+            let inner: Vec<SignedTransaction> =
+                (0..n_inner).map(|_| SignedTransaction::default()).collect();
+
+            let result = avm_result(
+                global_delta.clone(),
+                local_deltas.clone(),
+                inner.clone(),
+                logs.clone(),
+            );
+
+            let encoded = encode_eval_delta(&result, &txn, false);
+            let expect_empty = global_delta.is_empty()
+                && local_deltas.is_empty()
+                && logs.is_empty()
+                && inner.is_empty();
+            if expect_empty {
+                assert!(
+                    encoded.is_none(),
+                    "iteration {i}: expected no delta for an all-empty result"
+                );
+                continue;
+            }
+            let encoded =
+                encoded.unwrap_or_else(|| panic!("iteration {i}: expected non-empty delta"));
+            let parsed = parse_eval_delta(&encoded)
+                .unwrap_or_else(|e| panic!("iteration {i}: failed to parse: {e}"));
+
+            // Global delta: every original key must decode to the same
+            // action/value (a `None` value maps to a Delete action).
+            for (k, v) in &global_delta {
+                let vd = parsed
+                    .global_delta
+                    .as_ref()
+                    .and_then(|gd| gd.get(k.as_slice()))
+                    .unwrap_or_else(|| panic!("iteration {i}: missing global delta key {k:?}"));
+                match v {
+                    None => assert_eq!(vd.action, DeltaAction::Delete, "iteration {i}"),
+                    Some(TealValue::Uint(u)) => {
+                        assert_eq!(vd.action, DeltaAction::SetUint, "iteration {i}");
+                        assert_eq!(vd.uint, *u, "iteration {i}");
+                    }
+                    Some(TealValue::Bytes(b)) => {
+                        assert_eq!(vd.action, DeltaAction::SetBytes, "iteration {i}");
+                        assert_eq!(&vd.bytes, b, "iteration {i}");
+                    }
+                }
+            }
+
+            // Local deltas: every original address's per-key map must
+            // appear at its resolved wire index (sender = 0, accounts[j] =
+            // j+1), with the same action/value per key.
+            for (addr, per_key) in &local_deltas {
+                let idx = if *addr == sender {
+                    0u64
+                } else {
+                    accounts
+                        .iter()
+                        .position(|a| a == addr)
+                        .unwrap_or_else(|| panic!("iteration {i}: address not in accounts"))
+                        as u64
+                        + 1
+                };
+                let entry = parsed
+                    .local_deltas
+                    .as_ref()
+                    .and_then(|ld| ld.get(&idx))
+                    .unwrap_or_else(|| panic!("iteration {i}: missing local delta index {idx}"));
+                for (k, v) in per_key {
+                    let vd = entry
+                        .get(k.as_slice())
+                        .unwrap_or_else(|| panic!("iteration {i}: missing local key {k:?}"));
+                    match v {
+                        None => assert_eq!(vd.action, DeltaAction::Delete, "iteration {i}"),
+                        Some(TealValue::Uint(u)) => {
+                            assert_eq!(vd.action, DeltaAction::SetUint, "iteration {i}");
+                            assert_eq!(vd.uint, *u, "iteration {i}");
+                        }
+                        Some(TealValue::Bytes(b)) => {
+                            assert_eq!(vd.action, DeltaAction::SetBytes, "iteration {i}");
+                            assert_eq!(&vd.bytes, b, "iteration {i}");
+                        }
+                    }
+                }
+            }
+
+            assert_eq!(
+                parsed.inner_txns.as_ref().map(|v| v.len()).unwrap_or(0),
+                inner.len(),
+                "iteration {i}: inner txn count"
+            );
+            assert_eq!(
+                parsed.logs.clone().unwrap_or_default(),
+                logs,
+                "iteration {i}: logs"
+            );
+        }
+    }
+
     #[test]
     fn encode_eval_delta_empty_is_none() {
         let result = avm_result(HashMap::new(), HashMap::new(), vec![], vec![]);
