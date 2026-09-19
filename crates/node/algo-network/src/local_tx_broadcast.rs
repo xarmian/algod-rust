@@ -59,7 +59,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
-use algo_codec::compute_txn_id;
+use algo_codec::{canonical_encode_signed_transaction, compute_txn_id};
 use algo_pool::TransactionPool;
 use algo_types::{Digest, SignedTransaction};
 
@@ -141,13 +141,33 @@ impl PoolIngest for PoolIngestAdapter {
 
 /// Encode a transaction group as the TX-tag wire payload.
 ///
-/// The wire format is a concatenation of `rmp_serde::to_vec_named`
-/// outputs — same shape `decode_tx_message` expects.
+/// The wire format is a concatenation of each txn's **canonical**
+/// (`SignedTxn.MarshalMsg`-equivalent, lexicographically-sorted-key)
+/// msgpack encoding, via [`canonical_encode_signed_transaction`] — the
+/// same shape `decode_tx_message` expects, and byte-identical to what
+/// `TxTagHandler`'s canonical-form check (issue #1491) computes when it
+/// re-derives a decoded group's canonical bytes.
+///
+/// This must NOT use `rmp_serde::to_vec_named`: serde's derived
+/// `Serialize` emits map keys in struct-declaration order, not
+/// lexicographically sorted, so its output is almost never
+/// byte-identical to the canonical form for any txn with more than one
+/// present field. Before issue #1491, that mismatch was harmless (no
+/// gossip-layer code compared raw bytes against a canonical
+/// re-encoding). Issue #1491 added exactly that comparison — mirroring
+/// go-algorand's `TxHandler.validateIncomingTxMessage`
+/// (`data/txHandler.go:827-834`, `!bytes.Equal(rawmsg.Data, reencoded)`)
+/// — to `TxTagHandler::handle`, so every group this node relays or
+/// locally broadcasts must now be canonically encoded, or every peer
+/// that receives it (including another algod-rust node) would disconnect
+/// us as if we were misbehaving. go's own `reencode()` (`data/txHandler.go:285`)
+/// always uses `protocol.Encode`, which is unconditionally canonical for
+/// these types — this brings algod-rust's outbound gossip encoding to
+/// the same guarantee.
 pub fn encode_tx_group(group: &[SignedTransaction]) -> Result<Vec<u8>, LocalTxError> {
     let mut out = Vec::with_capacity(group.len().saturating_mul(256));
     for tx in group {
-        let bytes = rmp_serde::to_vec_named(tx).map_err(|e| LocalTxError::Encode(e.to_string()))?;
-        out.extend_from_slice(&bytes);
+        out.extend_from_slice(&canonical_encode_signed_transaction(tx));
     }
     Ok(out)
 }
@@ -399,6 +419,15 @@ mod tests {
     fn make_signed_txn(fee: u64) -> SignedTransaction {
         let mut stx = SignedTransaction::default();
         stx.txn.fee = fee;
+        // `type` and `snd` are both `codec:"...,required"` in go — always
+        // encoded, never omitted — and
+        // [`canonical_encode_signed_transaction`] (now used by
+        // `encode_tx_group`, issue #1491) correctly omits an *empty*
+        // string / zero address via its omitempty rules, so both must be
+        // set to a real (non-default) value here for the encoded payload
+        // to decode successfully.
+        stx.txn.txn_type = algo_types::TxnType::Pay;
+        stx.txn.sender = algo_types::Address([0xABu8; 32]);
         stx
     }
 
