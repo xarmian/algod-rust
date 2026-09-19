@@ -173,10 +173,48 @@ fn create_genesis_ledger_dir(
     data_dir: &Path,
     genesis_id: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let ledger_dir = data_dir.join(genesis_id);
+    // Go's `ensureAbsGenesisDir` (`config/config.go`) resolves `data_dir` to
+    // an absolute, lexically-cleaned path via `filepath.Abs` *before* joining
+    // the genesis id, so a relative or `..`-containing `data_dir` still
+    // yields a clean absolute result (`TestEnsureAbsDir`,
+    // `config/config_test.go`, issue #1498). `lexical_absolute` below is the
+    // closest Rust match: purely lexical (prepends the cwd, collapses `.`/
+    // `..` components) with no filesystem access, unlike `canonicalize()`
+    // which would also resolve symlinks and require the path to exist. (Not
+    // `std::path::absolute`: it's stable only since Rust 1.79, above this
+    // workspace's `rust-version = "1.75"` MSRV.)
+    let abs_data_dir = lexical_absolute(data_dir)
+        .with_context(|| format!("resolving absolute path for {}", data_dir.display()))?;
+    let ledger_dir = abs_data_dir.join(genesis_id);
     std::fs::create_dir_all(&ledger_dir)
         .with_context(|| format!("creating ledger directory {}", ledger_dir.display()))?;
     Ok(ledger_dir)
+}
+
+/// Resolve `path` to an absolute path the way go's `filepath.Abs` does:
+/// join onto the current working directory if relative, then lexically
+/// clean `.`/`..` components -- no filesystem access, no symlink
+/// resolution, and no requirement that the path exist (unlike
+/// `Path::canonicalize`). MSRV-safe stand-in for `std::path::absolute`
+/// (stable only since Rust 1.79; this workspace pins `rust-version =
+/// "1.75"`).
+fn lexical_absolute(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut cleaned = std::path::PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                cleaned.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => cleaned.push(other.as_os_str()),
+        }
+    }
+    Ok(cleaned)
 }
 
 async fn run_start(
@@ -1113,6 +1151,32 @@ mod config_json_wiring_tests {
         let dir2 = create_genesis_ledger_dir(tmp.path(), "test-genesis-id")
             .expect("second creation is a no-op success");
         assert_eq!(dir1, dir2);
+    }
+
+    /// Issue #1498 / `TestEnsureAbsDir` (`config/config_test.go#L839`)
+    /// second case: a `data_dir` containing a `..` segment must resolve to
+    /// the clean absolute path (`<parent>/<genesis_id>`, with the `..`
+    /// segment and the directory it backs out of both gone), not stay
+    /// relative/unclean in the returned ledger dir.
+    #[test]
+    fn create_genesis_ledger_dir_resolves_unclean_relative_data_dir() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let test_directory = tmp
+            .path()
+            .canonicalize()
+            .expect("canonicalize temp dir for comparison");
+
+        // Mirrors go's `filepath.Join(testDirectory, "test2", "..")`: joins
+        // on a "test2" segment and then immediately backs out of it via
+        // "..", leaving `data_dir` pointing back at `test_directory` itself
+        // but with an unclean path string.
+        let unclean_data_dir = test_directory.join("test2").join("..");
+
+        let ledger_dir = create_genesis_ledger_dir(&unclean_data_dir, "myGenesisID")
+            .expect("creation succeeds despite the unclean input path");
+
+        assert!(ledger_dir.is_dir());
+        assert_eq!(ledger_dir, test_directory.join("myGenesisID"));
     }
 }
 
