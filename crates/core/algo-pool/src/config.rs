@@ -73,6 +73,15 @@ pub struct PoolConfig {
     ///
     /// go-algorand: `data/pools/transactionPool.go` `generateBlockTransactionDuration = 2155 * time.Nanosecond`
     pub generate_block_transaction_duration: Duration,
+
+    /// Whether `assemble_block()` emits an assembly-stats telemetry event
+    /// (included-txn count, min/max/average fee, min/max/total encoded
+    /// length) after producing a block.
+    ///
+    /// go-algorand: `config/local_defaults.go` `EnableAssembleStats: false`,
+    /// consulted as `transactionPool.logAssembleStats` in
+    /// `data/pools/transactionPool.go`'s `AssembleBlock`.
+    pub enable_assemble_stats: bool,
 }
 
 impl Default for PoolConfig {
@@ -86,6 +95,7 @@ impl Default for PoolConfig {
             assembly_wait_eps: Duration::from_millis(150),
             generate_block_base_duration: Duration::from_millis(2),
             generate_block_transaction_duration: Duration::from_nanos(2155),
+            enable_assemble_stats: false,
         }
     }
 }

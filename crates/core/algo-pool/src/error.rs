@@ -286,6 +286,18 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
 ///   mirroring Go's `ledgercore.MinBalanceError` case.
 /// - `"...insufficient balance ... for fee/payment ..."` => `Overspend`,
 ///   mirroring Go's `ledgercore.OverspendError` case.
+/// - `"block does not have space for transaction"` (Go's
+///   `ledgercore.ErrNoSpace.Error()` verbatim) => `NoSpace`, mirroring Go's
+///   `errors.Is(err, ledgercore.ErrNoSpace)` case. In practice this branch
+///   is unreachable through `remember()` today: algod-rust's
+///   `add_to_pending_block_evaluator` (`pool.rs`) intercepts a
+///   evaluator "no space" condition *before* it is ever wrapped in a
+///   `PoolError::Evaluator` and rolls straight into the next pending block,
+///   rather than letting go's `ErrNoSpace` propagate out to
+///   `ClassifyTxPoolError` the way it does upstream. The branch is kept
+///   anyway — proving `PoolErrorTag::NoSpace`'s decode-shape genuinely
+///   matches go's `ClassifyTxPoolError`'s `ErrNoSpace` text match, should a
+///   future evaluator error surface this message through a different path.
 fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
     if msg.contains("approval program rejected transaction:") {
         PoolErrorTag::TealErr
@@ -297,6 +309,8 @@ fn classify_evaluator_message(msg: &str) -> PoolErrorTag {
         PoolErrorTag::MinBalance
     } else if msg.contains("insufficient balance") {
         PoolErrorTag::Overspend
+    } else if msg.contains("does not have space for transaction") {
+        PoolErrorTag::NoSpace
     } else {
         PoolErrorTag::EvalGeneric
     }
@@ -412,6 +426,34 @@ mod tests {
             }),
             PoolErrorTag::Fee
         );
+    }
+
+    /// Mirrors go's `TestClassifyTxPoolErrorGeneralCoverage`'s
+    /// `"no_space"`/`"no_space_wrapped"` cases
+    /// (`../go-algorand/data/pools/errors_test.go:51`): go's
+    /// `ClassifyTxPoolError` maps `ledgercore.ErrNoSpace` (bare or
+    /// `fmt.Errorf`-wrapped) to `TxPoolErrTagNoSpace`. algod-rust's
+    /// `PoolError::Evaluator` carries only a message string, so this feeds
+    /// `ledgercore.ErrNoSpace.Error()`'s exact text
+    /// (`"block does not have space for transaction"`,
+    /// `../go-algorand/ledger/ledgercore/error.go:28`) through
+    /// `classify_evaluator_message` and confirms the decode path (not the
+    /// production call site, which never reaches this branch — see
+    /// `classify_evaluator_message`'s doc comment) produces
+    /// `PoolErrorTag::NoSpace`, proving the tag's decode-shape genuinely
+    /// matches go's rather than being unreachable dead code with no
+    /// verified behavior at all.
+    #[test]
+    fn classify_pool_error_recognizes_no_space_message() {
+        let err = PoolError::Evaluator("block does not have space for transaction".to_string());
+        assert_eq!(classify_pool_error(&err), PoolErrorTag::NoSpace);
+
+        // Wrapped, the way `fmt.Errorf("...: %w", ledgercore.ErrNoSpace)`
+        // would render — substring matching still finds it.
+        let wrapped = PoolError::Evaluator(
+            "TransactionPool.ingest: block does not have space for transaction".to_string(),
+        );
+        assert_eq!(classify_pool_error(&wrapped), PoolErrorTag::NoSpace);
     }
 
     #[test]

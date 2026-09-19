@@ -870,7 +870,91 @@ impl TransactionPool {
     /// 4. If the deadline expires, try assembling an empty block as fallback
     /// 5. Wait an additional `assembly_wait_eps` for the full block
     /// 6. Return whichever block is available
+    ///
+    /// When [`PoolConfig::enable_assemble_stats`] is set, emits an
+    /// `assemble_block_stats` tracing event on success — mirroring go's
+    /// `transactionPool.logAssembleStats`-gated `pool.log.Metrics(...,
+    /// telemetryspec.AssembleBlockMetrics{...}, ...)` call in
+    /// `AssembleBlock()` (`../go-algorand/data/pools/transactionPool.go:839`).
     pub fn assemble_block(&self, round: Round, deadline: Instant) -> Result<Block, PoolError> {
+        let result = self.assemble_block_inner(round, deadline);
+        if self.config.enable_assemble_stats {
+            if let Ok(ref block) = result {
+                Self::emit_assemble_block_stats(round, block);
+            }
+        }
+        result
+    }
+
+    /// Compute and emit the `assemble_block_stats` tracing event for a
+    /// successfully assembled block.
+    ///
+    /// Fields mirror the numeric core of go's `telemetryspec.AssembleBlockMetrics`
+    /// (`IncludedCount`, `MinFee`/`MaxFee`/`AverageFee`,
+    /// `MinLength`/`MaxLength`/`TotalLength`); go additionally attaches a
+    /// per-state-proof-transaction `StateProofStats` sub-record (reveal/
+    /// position counts, proven weight) resolved via
+    /// `pool.ledger.GetStateProofVerificationContext` — algod-rust's pool
+    /// has no ledger handle to resolve that verification context from at
+    /// this layer, so this instead reports `state_proof_txn_count` (how
+    /// many payset entries are state-proof transactions), a coarser but
+    /// still meaningful signal that the assembled block reached a
+    /// state-proof interval boundary.
+    fn emit_assemble_block_stats(round: Round, block: &Block) {
+        let payset = &block.payset;
+        if payset.is_empty() {
+            tracing::info!(
+                target: "algo_pool::assemble_block_stats",
+                round = round.0,
+                included_count = 0u64,
+                "assemble_block_stats"
+            );
+            return;
+        }
+
+        let mut min_fee = u64::MAX;
+        let mut max_fee = 0u64;
+        let mut min_length = usize::MAX;
+        let mut max_length = 0usize;
+        let mut total_length: u64 = 0;
+        let mut total_fees: u64 = 0;
+        let mut state_proof_txn_count: u64 = 0;
+
+        for stxn in payset {
+            let fee = stxn.txn.fee;
+            let encoded_len = algo_codec::canonical_encode_signed_transaction(stxn).len();
+
+            min_fee = min_fee.min(fee);
+            max_fee = max_fee.max(fee);
+            min_length = min_length.min(encoded_len);
+            max_length = max_length.max(encoded_len);
+            total_length += encoded_len as u64;
+            total_fees += fee;
+
+            if stxn.txn.txn_type == TxnType::Stpf {
+                state_proof_txn_count += 1;
+            }
+        }
+
+        let included_count = payset.len() as u64;
+        let average_fee = total_fees / included_count;
+
+        tracing::info!(
+            target: "algo_pool::assemble_block_stats",
+            round = round.0,
+            included_count,
+            min_fee,
+            max_fee,
+            average_fee,
+            min_length = min_length as u64,
+            max_length = max_length as u64,
+            total_length,
+            state_proof_txn_count,
+            "assemble_block_stats"
+        );
+    }
+
+    fn assemble_block_inner(&self, round: Round, deadline: Instant) -> Result<Block, PoolError> {
         {
             let mut asm = self.assembly_mu.lock();
 
@@ -2214,6 +2298,214 @@ mod tests {
             "assemble_block should succeed: {:?}",
             result.err()
         );
+    }
+
+    /// Port of the telemetry-logging substance of go's `TestStateProofLogging`
+    /// (`../go-algorand/data/pools/transactionPool_test.go#L1295`): with
+    /// assembly-stats logging enabled (go's `logAssembleStats` /
+    /// `EnableAssembleStats`, here [`PoolConfig::enable_assemble_stats`]),
+    /// assembling a block with pending transactions must emit an
+    /// `assemble_block_stats` telemetry event carrying real per-block
+    /// aggregate numbers. Uses the tracing-capture pattern from
+    /// `crates/core/algo-ledger/src/account_manager.rs`'s
+    /// `state_proof_keys_nil_state_proof_participation_logs_nothing` test.
+    ///
+    /// Narrower than go's test: go's harness advances a real ledger/pool
+    /// through 512 rounds up to a state-proof interval boundary and
+    /// verifies `StateProofStats` (reveal/position counts, proven weight)
+    /// resolved via `pool.ledger.GetStateProofVerificationContext` for an
+    /// actual `StateProofTx` in the payset. algod-rust's pool has no ledger
+    /// handle to resolve that verification context from at the
+    /// `assemble_block` layer (see `emit_assemble_block_stats`'s doc
+    /// comment), so this proves the general assembly-stats event fires with
+    /// correct aggregate fields (included count, min/max/average fee,
+    /// min/max/total length) rather than the state-proof-specific
+    /// sub-stats, which remain unimplemented.
+    #[test]
+    fn test_assemble_block_stats_emits_tracing_event_when_enabled() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        /// An evaluator that actually accumulates accepted transaction
+        /// groups into the block it generates, unlike `FilteringEvaluator`
+        /// (which always returns `Block::default()`'s empty payset) —
+        /// needed here because `emit_assemble_block_stats` reads the real
+        /// assembled `block.payset`.
+        struct PaysetTrackingEvaluator {
+            round: Round,
+            payset: Vec<SignedTransaction>,
+        }
+
+        impl BlockEvaluator for PaysetTrackingEvaluator {
+            fn round(&self) -> Round {
+                self.round
+            }
+
+            fn pay_set_size(&self) -> usize {
+                self.payset.len()
+            }
+
+            fn test_transaction_group(
+                &self,
+                _txgroup: &[SignedTransaction],
+            ) -> Result<(), AlgoError> {
+                Ok(())
+            }
+
+            fn transaction_group(
+                &mut self,
+                txgroup: &[SignedTransaction],
+            ) -> Result<(), AlgoError> {
+                self.payset.extend_from_slice(txgroup);
+                Ok(())
+            }
+
+            fn generate_block(&mut self, _voting_accounts: &[Address]) -> Result<Block, AlgoError> {
+                Ok(Block {
+                    round: self.round,
+                    payset: self.payset.clone(),
+                    ..Block::default()
+                })
+            }
+
+            fn reset_txn_bytes(&mut self) {}
+        }
+
+        /// A `PoolLedger` whose `start_evaluator` produces
+        /// `PaysetTrackingEvaluator`s (unlike `AdvancingLedger`, which
+        /// always produces payset-discarding `FilteringEvaluator`s) — so
+        /// that `on_new_block`'s evaluator rebuild (`recompute_block_evaluator`)
+        /// keeps producing an evaluator that actually accumulates the
+        /// re-fed pending transactions into its generated block.
+        struct PaysetTrackingLedger {
+            round: std::sync::atomic::AtomicU64,
+        }
+
+        impl PoolLedger for PaysetTrackingLedger {
+            fn latest(&self) -> Round {
+                Round(self.round.load(std::sync::atomic::Ordering::SeqCst))
+            }
+
+            fn block_hdr(&self, _round: Round) -> Result<BlockHeader, AlgoError> {
+                Ok(BlockHeader::default())
+            }
+
+            fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, AlgoError> {
+                Ok(ConsensusParams::default())
+            }
+
+            fn start_evaluator(
+                &self,
+                _hdr: BlockHeader,
+                _payset_hint: usize,
+                _max_txn_bytes_per_block: usize,
+            ) -> Result<Box<dyn BlockEvaluator>, AlgoError> {
+                Ok(Box::new(PaysetTrackingEvaluator {
+                    round: self.latest().next(),
+                    payset: Vec::new(),
+                }))
+            }
+        }
+
+        let ledger = Arc::new(PaysetTrackingLedger {
+            round: std::sync::atomic::AtomicU64::new(1),
+        });
+        let config = PoolConfig {
+            pool_size: 1000,
+            enable_assemble_stats: true,
+            ..Default::default()
+        };
+        let pool = TransactionPool::new(config, ledger.clone());
+        {
+            let mut inner = pool.mu.lock();
+            inner.evaluator = Some(Box::new(PaysetTrackingEvaluator {
+                round: Round(2),
+                payset: Vec::new(),
+            }));
+        }
+
+        pool.remember_one(make_test_txn(1)).unwrap();
+        pool.remember_one(make_test_txn(2)).unwrap();
+
+        let block = Block {
+            round: Round(2),
+            ..Block::default()
+        };
+        pool.on_new_block(&block, &HashSet::new());
+
+        let eval_round = {
+            let inner = pool.mu.lock();
+            inner.evaluator.as_ref().unwrap().round()
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        #[derive(Default, Clone)]
+        struct CapturedFields {
+            included_count: Option<u64>,
+            min_fee: Option<u64>,
+            max_fee: Option<u64>,
+        }
+        let captured = Arc::new(Mutex::new(Vec::<CapturedFields>::new()));
+
+        struct CapturingLayer {
+            captured: Arc<Mutex<Vec<CapturedFields>>>,
+        }
+        struct FieldVisitor(CapturedFields);
+        impl tracing::field::Visit for FieldVisitor {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                match field.name() {
+                    "included_count" => self.0.included_count = Some(value),
+                    "min_fee" => self.0.min_fee = Some(value),
+                    "max_fee" => self.0.max_fee = Some(value),
+                    _ => {}
+                }
+            }
+            fn record_debug(
+                &mut self,
+                _field: &tracing::field::Field,
+                _value: &dyn std::fmt::Debug,
+            ) {
+            }
+        }
+        impl<S> tracing_subscriber::Layer<S> for CapturingLayer
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() == "algo_pool::assemble_block_stats" {
+                    let mut visitor = FieldVisitor(CapturedFields::default());
+                    event.record(&mut visitor);
+                    self.captured.lock().push(visitor.0);
+                }
+            }
+        }
+        let layer = CapturingLayer {
+            captured: captured.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let result = tracing::subscriber::with_default(subscriber, || {
+            pool.assemble_block(eval_round, deadline)
+        });
+        assert!(result.is_ok(), "assemble_block should succeed");
+
+        let events = captured.lock();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one assemble_block_stats event"
+        );
+        let fields = &events[0];
+        assert_eq!(fields.included_count, Some(2), "both txns were included");
+        assert_eq!(
+            fields.min_fee,
+            Some(1_000_000),
+            "both test txns share the same fee"
+        );
+        assert_eq!(fields.max_fee, Some(1_000_000));
     }
 
     #[test]
