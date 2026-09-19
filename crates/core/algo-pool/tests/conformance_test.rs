@@ -1371,3 +1371,25 @@ fn test_close_to_account_below_min_balance() {
     );
     assert_eq!(classify_pool_error(&err), PoolErrorTag::MinBalance);
 }
+
+/// Port of Go's `TestMinBalanceOK`: a non-closing payment that leaves the
+/// sender's balance at *exactly* the minimum balance (not below it) is
+/// accepted -- the boundary case for the min-balance check, complementing
+/// `test_close_to_account_below_min_balance`'s below-the-boundary reject.
+#[test]
+fn test_min_balance_ok() {
+    let addr0 = Address([33u8; 32]);
+    let addr1 = Address([34u8; 32]);
+
+    let (pool, ledger) =
+        make_balance_pool(1, &[(addr0, 2 * CLOSE_TEST_MIN_BALANCE + CLOSE_TEST_FEE)]);
+
+    // sender ends at exactly CLOSE_TEST_MIN_BALANCE after fee + amount:
+    // (2*min + fee) - fee - min == min.
+    let tx = make_payment(1, addr0, addr1, CLOSE_TEST_MIN_BALANCE, Address::ZERO);
+    pool.remember_one(tx)
+        .expect("sender ending at exactly the minimum balance should be accepted");
+
+    assert_eq!(ledger.balance_of(addr0), CLOSE_TEST_MIN_BALANCE);
+    assert_eq!(ledger.balance_of(addr1), CLOSE_TEST_MIN_BALANCE);
+}
