@@ -2521,4 +2521,92 @@ mod tests {
         store.register(&id, Round(150)).unwrap();
         assert!(store.take_last_error().is_none());
     }
+
+    /// Mirrors go's `TestParticipationDBInstallWhileReading`
+    /// (`../go-algorand/data/account/participationRegistry_test.go:1279`):
+    /// 50 concurrent `GetStateProofSecretsForRound` reads racing a writer
+    /// thread that is installing a brand-new key
+    /// (`Insert`+`AppendStateProofKeys`) at the same time, asserting none of
+    /// the reads ever error.
+    ///
+    /// go's `participationDB` drives the writer through an async queue on a
+    /// *second* SQLite connection sharing one file, so the property under
+    /// test is that SQLite's own locking (WAL mode + go's queue) never
+    /// surfaces "database is locked" to a concurrent reader. algod-rust has
+    /// no such second-connection queue: every production call site
+    /// (`node_interface_impl.rs`'s `AlgodNodeInterface::part_store`) already
+    /// wraps `ParticipationStore` in `Arc<Mutex<ParticipationStore>>` because
+    /// the underlying `rusqlite::Connection` is `Send` but not `Sync`. This
+    /// test drives the same 50-readers-racing-a-writer shape through that
+    /// exact production wrapper: a `Mutex` makes SQLite-level lock
+    /// contention structurally impossible (all access is serialized before
+    /// it reaches the connection), so this proves the *production*
+    /// concurrency-safety property that matters for algod-rust's
+    /// architecture — concurrent callers never observe a locked-database
+    /// error, deadlock, or panic — rather than reproducing go's
+    /// two-connection race mechanism, which algod-rust's design doesn't
+    /// have.
+    #[test]
+    fn install_while_reading_never_errors_under_concurrent_access() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let store = Arc::new(Mutex::new(ParticipationStore::open_in_memory().unwrap()));
+
+        // Seed 3 existing participation keys with small state-proof key sets
+        // (mirrors go's loop of 3 `makeTestParticipation` inserts), and
+        // sample the first one's ID to read from concurrently.
+        let mut sampled_id = None;
+        for i in 0..3u8 {
+            let part = Participation::generate(
+                Address([i; 32]),
+                Round(0),
+                Round(511),
+                10_000,
+                merklesig::KEY_LIFETIME_DEFAULT,
+            )
+            .unwrap();
+            let id = store.lock().unwrap().insert(&part).unwrap();
+            if i == 0 {
+                sampled_id = Some(id);
+            }
+        }
+        let sampled_id = sampled_id.unwrap();
+
+        // Writer thread: install a brand-new key (Insert, which — like go's
+        // Insert+AppendKeys pair — writes the Keysets/Rolling/StateProofKeys
+        // rows transactionally), racing the readers below.
+        let writer_store = Arc::clone(&store);
+        let writer = thread::spawn(move || {
+            let new_part = Participation::generate(
+                Address([9u8; 32]),
+                Round(0),
+                Round(511),
+                10_000,
+                merklesig::KEY_LIFETIME_DEFAULT,
+            )
+            .unwrap();
+            let id = writer_store.lock().unwrap().insert(&new_part).unwrap();
+            assert_eq!(id, new_part.id());
+        });
+
+        // 50 concurrent reads of the sampled key's state-proof secrets,
+        // racing the writer's install above. None may error.
+        let mut readers = Vec::with_capacity(50);
+        for _ in 0..50 {
+            let reader_store = Arc::clone(&store);
+            readers.push(thread::spawn(move || {
+                reader_store
+                    .lock()
+                    .unwrap()
+                    .get_state_proof_secrets_for_round(&sampled_id, Round(256))
+            }));
+        }
+
+        for reader in readers {
+            let result = reader.join().expect("reader thread panicked");
+            assert!(result.is_ok(), "concurrent read raced the writer's install");
+        }
+        writer.join().expect("writer thread panicked");
+    }
 }
