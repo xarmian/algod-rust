@@ -4,6 +4,7 @@ members = [
     "crates/core/algo-error",
     "crates/core/algo-types",
     "crates/core/algo-codec",
+    "crates/core/algo-metrics",
     "crates/node/algo-rest-client",
     "crates/node/algo-config",
     "crates/tools/algo-fixtures",
@@ -114,6 +115,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 algo-error = { path = "crates/core/algo-error" }
 algo-types = { path = "crates/core/algo-types" }
 algo-codec = { path = "crates/core/algo-codec" }
+algo-metrics = { path = "crates/core/algo-metrics" }
 algo-rest-client = { path = "crates/node/algo-rest-client" }
 algo-config = { path = "crates/node/algo-config" }
 algo-fixtures = { path = "crates/tools/algo-fixtures" }

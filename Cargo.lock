@@ -427,6 +427,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-metrics"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+]
+
+[[package]]
 name = "algo-network"
 version = "0.1.0"
 dependencies = [
@@ -526,6 +533,7 @@ dependencies = [
  "algo-consensus-crypto",
  "algo-error",
  "algo-ledger",
+ "algo-metrics",
  "algo-types",
  "algo-validate",
  "async-trait",
