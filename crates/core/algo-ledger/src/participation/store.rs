@@ -46,8 +46,36 @@ use algo_consensus_crypto::merklesig::{self, index_to_round, FalconSigner};
 use algo_consensus_crypto::{OneTimeSignatureSecrets, VrfKeypair};
 use algo_types::{Address, Round};
 use rusqlite::{params, Connection, OptionalExtension};
+use thiserror::Error;
 
 use super::{Participation, ParticipationAction, ParticipationID, ParticipationRecord};
+
+/// Errors from [`ParticipationStore::get_state_proof_secrets_for_round`].
+///
+/// Mirrors go-algorand's `GetStateProofSecretsForRound`
+/// (`../go-algorand/data/account/participationRegistry.go:771`), which
+/// delegates to `GetForRound` (any of its errors, e.g.
+/// `ErrParticipationIDNotFound` / `ErrRequestedRoundOutOfRange`, propagate
+/// unchanged) and then returns `ErrStateProofVerifierNotFound`
+/// (`../go-algorand/data/account/participationRegistry.go:227`) when the
+/// resolved record's `StateProof` field is `nil`.
+#[derive(Debug, Error)]
+pub enum GetStateProofSecretsError {
+    /// Underlying sqlite read failure.
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    /// No record exists for this `ParticipationID`, or `round` is outside
+    /// its `[firstValid, lastValid]` validity window. Corresponds to go's
+    /// `ErrParticipationIDNotFound` / `ErrRequestedRoundOutOfRange`, which
+    /// `GetForRound` would have returned.
+    #[error("no participation record found for the requested (ParticipationID, round)")]
+    RecordNotFound,
+    /// The resolved record has no state-proof signing material (its
+    /// `StateProof` field is nil/absent). Corresponds to go's
+    /// `ErrStateProofVerifierNotFound`.
+    #[error("record contains no StateProofVerifier: for participation ID {0}")]
+    StateProofVerifierNotFound(ParticipationID),
+}
 
 // ---------------------------------------------------------------------------
 // Schema DDL
@@ -532,6 +560,38 @@ impl ParticipationStore {
             key_dilution: key_dilution as u64,
             state_proof_secrets,
         }))
+    }
+
+    /// Get a full `Participation` with state-proof signing secrets for a
+    /// specific round.
+    ///
+    /// Matches go's `participationDB.GetStateProofSecretsForRound`
+    /// (`../go-algorand/data/account/participationRegistry.go:771`):
+    /// resolves the record the same way [`get_for_round`](Self::get_for_round)
+    /// does, then requires that its `state_proof_secrets` field be present.
+    ///
+    /// Returns [`GetStateProofSecretsError::RecordNotFound`] when no record
+    /// exists for `id`, or `round` falls outside its validity window (the
+    /// cases in which go's `GetForRound` would have returned
+    /// `ErrParticipationIDNotFound` / `ErrRequestedRoundOutOfRange`), and
+    /// [`GetStateProofSecretsError::StateProofVerifierNotFound`] when a
+    /// record is found but carries no state-proof signing material — e.g.
+    /// state proofs are disabled for this key, or the cached record's
+    /// `StateProof` field was nil, mirroring go's
+    /// `ErrStateProofVerifierNotFound`
+    /// (`../go-algorand/data/account/participationRegistry.go:227`).
+    pub fn get_state_proof_secrets_for_round(
+        &self,
+        id: &ParticipationID,
+        round: Round,
+    ) -> Result<Participation, GetStateProofSecretsError> {
+        let participation = self
+            .get_for_round(id, round)?
+            .ok_or(GetStateProofSecretsError::RecordNotFound)?;
+        if participation.state_proof_secrets.is_none() {
+            return Err(GetStateProofSecretsError::StateProofVerifierNotFound(*id));
+        }
+        Ok(participation)
     }
 
     /// Update the serialized voting secrets for a participation key.
@@ -1841,9 +1901,18 @@ mod tests {
         let restored_secrets = restored
             .state_proof_secrets
             .expect("state proof secrets should round-trip");
-        assert_eq!(restored_secrets.signer_context, original_secrets.signer_context);
-        assert_eq!(restored_secrets.first_key_offset, original_secrets.first_key_offset);
-        assert_eq!(restored_secrets.ephemeral_keys, original_secrets.ephemeral_keys);
+        assert_eq!(
+            restored_secrets.signer_context,
+            original_secrets.signer_context
+        );
+        assert_eq!(
+            restored_secrets.first_key_offset,
+            original_secrets.first_key_offset
+        );
+        assert_eq!(
+            restored_secrets.ephemeral_keys,
+            original_secrets.ephemeral_keys
+        );
     }
 
     #[test]
@@ -2188,6 +2257,80 @@ mod tests {
             full.state_proof_secrets.is_none(),
             "secrets should be None for keys without state proof"
         );
+    }
+
+    // -- get_state_proof_secrets_for_round tests -----------------------------
+    //
+    // Mirrors go-algorand's `TestGetRoundSecretsWithNilStateProofVerifier`
+    // (`../go-algorand/data/account/participationRegistry_test.go#L959`):
+    // a record whose `StateProof` field is nil must produce
+    // `ErrStateProofVerifierNotFound`, not a panic or a generic error, while
+    // a record with a real state proof returns its secrets successfully.
+
+    #[test]
+    fn get_state_proof_secrets_for_round_returns_secrets() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation_with_state_proof(1, 0, 1024, 32);
+        let id = store.insert(&part).unwrap();
+
+        let result = store
+            .get_state_proof_secrets_for_round(&id, Round(500))
+            .expect("record has state proof secrets");
+
+        assert!(result.state_proof_secrets.is_some());
+    }
+
+    #[test]
+    fn get_state_proof_secrets_for_round_nil_state_proof_errors() {
+        // Ensuring that get_state_proof_secrets_for_round fails with
+        // StateProofVerifierNotFound for a record without a StateProof
+        // field, mirroring go's
+        // `TestGetRoundSecretsWithNilStateProofVerifier`.
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation(1, 0, 1024, 32);
+        let id = store.insert(&part).unwrap();
+
+        let result = store.get_state_proof_secrets_for_round(&id, Round(500));
+        let err = match result {
+            Ok(_) => panic!("expected an error, got Ok"),
+            Err(e) => e,
+        };
+
+        match err {
+            GetStateProofSecretsError::StateProofVerifierNotFound(err_id) => {
+                assert_eq!(err_id, id);
+            }
+            other => panic!("expected StateProofVerifierNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_state_proof_secrets_for_round_record_not_found() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let id = ParticipationID([7u8; 32]);
+
+        let result = store.get_state_proof_secrets_for_round(&id, Round(100));
+        let err = match result {
+            Ok(_) => panic!("expected an error, got Ok"),
+            Err(e) => e,
+        };
+
+        assert!(matches!(err, GetStateProofSecretsError::RecordNotFound));
+    }
+
+    #[test]
+    fn get_state_proof_secrets_for_round_out_of_range_is_record_not_found() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation_with_state_proof(1, 100, 200, 32);
+        let id = store.insert(&part).unwrap();
+
+        let result = store.get_state_proof_secrets_for_round(&id, Round(1000));
+        let err = match result {
+            Ok(_) => panic!("expected an error, got Ok"),
+            Err(e) => e,
+        };
+
+        assert!(matches!(err, GetStateProofSecretsError::RecordNotFound));
     }
 
     // -- Key-updated event subscription tests --------------------------------
