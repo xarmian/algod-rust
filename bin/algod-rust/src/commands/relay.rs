@@ -986,3 +986,104 @@ pub async fn run(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! Integration-level coverage for the peer-facing catchpoint-serving
+    //! wiring (issue #955), closing the remaining gap in go-algorand's
+    //! `TestCatchpointGetCatchpointStream`
+    //! (`../go-algorand/ledger/catchpointtracker_test.go#L97`): the go test
+    //! and `crates/core/algo-ledger/src/catchpoint/stream.rs`'s own unit
+    //! tests already prove `get_catchpoint_stream`'s lookup semantics in
+    //! isolation, but neither proved that a real HTTP request for a round
+    //! actually reaches [`CatchpointFileLedger`] and, through it,
+    //! `get_catchpoint_stream` -- i.e. that the wiring documented in this
+    //! file's `serve_ledger_endpoint`/`CatchpointFileLedger` actually
+    //! connects the two. This module closes that gap end-to-end: a real
+    //! gzip-compressed file written to a temp directory in this crate's
+    //! flat naming convention, served through the exact same
+    //! `CatchpointService::http_router()` a live relay node registers, with
+    //! no mock in between.
+
+    use super::*;
+    use algo_ledger::catchpoint::catchpoint_filename;
+    use axum::body::Body;
+    use hyper::http::{Request, StatusCode};
+    use std::io::Write;
+    use tower::ServiceExt; // for `oneshot`
+
+    fn gzip(plaintext: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plaintext).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A peer's HTTP request for a round whose catchpoint file exists on
+    /// disk (this crate's flat naming convention) is served all the way
+    /// through `CatchpointService`'s router -> `CatchpointFileLedger` ->
+    /// `get_catchpoint_stream`, decompressed, with the exact original
+    /// bytes.
+    #[tokio::test]
+    async fn peer_http_request_for_a_round_streams_the_real_on_disk_catchpoint_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let round = 1u64;
+        let plaintext = b"real-catchpoint-tarball-bytes";
+        std::fs::write(dir.path().join(catchpoint_filename(round)), gzip(plaintext)).unwrap();
+
+        let ledger = Arc::new(CatchpointFileLedger {
+            dir: dir.path().to_path_buf(),
+        });
+        let service = CatchpointService::new(
+            ledger as Arc<dyn LedgerForCatchpointService>,
+            "testnet-v1.0".to_string(),
+        );
+        let app = service.http_router();
+
+        let req = Request::builder()
+            .uri(format!(
+                "/v1/testnet-v1.0/ledger/{}",
+                algo_network::format_round_base36(round)
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &plaintext[..]);
+    }
+
+    /// A peer's HTTP request for a round with no catchpoint file anywhere
+    /// on disk gets go's real `ErrNoEntry`-equivalent 404 through the same
+    /// live path, not just a mock's canned response.
+    #[tokio::test]
+    async fn peer_http_request_for_an_unknown_round_returns_404_through_the_real_ledger_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let ledger = Arc::new(CatchpointFileLedger {
+            dir: dir.path().to_path_buf(),
+        });
+        let service = CatchpointService::new(
+            ledger as Arc<dyn LedgerForCatchpointService>,
+            "testnet-v1.0".to_string(),
+        );
+        let app = service.http_router();
+
+        let req = Request::builder()
+            .uri(format!(
+                "/v1/testnet-v1.0/ledger/{}",
+                algo_network::format_round_base36(404)
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
