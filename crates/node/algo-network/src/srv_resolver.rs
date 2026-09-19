@@ -67,6 +67,37 @@ pub enum SrvResolveError {
     /// A single resolver attempt failed.
     #[error("DNS SRV lookup failed: {0}")]
     ResolveFailed(#[from] ResolveError),
+
+    /// [`HickorySrvResolver::lookup_srv_via_stage`] was called with
+    /// [`ResolverStage::Fallback`] but no fallback address is configured (or
+    /// the configured address does not parse as an IP).
+    #[error("fallback resolver not configured or address invalid")]
+    FallbackNotConfigured,
+}
+
+// ---------------------------------------------------------------------------
+// ResolverStage
+// ---------------------------------------------------------------------------
+
+/// Selects a single stage of [`HickorySrvResolver`]'s
+/// `system -> fallback -> default` resolution chain, bypassing the automatic
+/// fallthrough that [`SrvResolver::lookup_srv`] performs.
+///
+/// Exists so tests can force resolution through exactly one named resolver
+/// (mirroring go-algorand's `tools/network.ResolveController`, which exposes
+/// `SystemResolver()`/`FallbackResolver()`/`DefaultResolver()` as separately
+/// callable methods) without changing `lookup_srv`'s own default behaviour,
+/// which always tries all three stages in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolverStage {
+    /// The OS-configured system resolver.
+    System,
+    /// The configured fallback DNS server (errors with
+    /// [`SrvResolveError::FallbackNotConfigured`] if none is set or it fails
+    /// to parse as an IP address).
+    Fallback,
+    /// The well-known public default resolver (Cloudflare + Google).
+    Default,
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +303,56 @@ impl HickorySrvResolver {
             .collect();
         sort_and_randomize_srv_records(&mut records);
         Ok(records)
+    }
+
+    /// Look up SRV records through exactly one named [`ResolverStage`],
+    /// rather than `lookup_srv`'s automatic `system -> fallback -> default`
+    /// fallthrough chain.
+    ///
+    /// This is the Rust equivalent of go-algorand's
+    /// `ResolveController.SystemResolver()`/`FallbackResolver()`/
+    /// `DefaultResolver()` being separately callable: it lets a test force
+    /// resolution through (and observe the result/error of) one specific
+    /// stage, matching `resolver_test.go`'s
+    /// `TestResolverWithDefaultDNSResolution`/
+    /// `TestResolverWithCloudflareDNSResolution`/
+    /// `TestResolverWithInvalidDNSResolution` and
+    /// `resolveController_test.go`'s `TestRealNamesWithResolver`. It does
+    /// not change `lookup_srv`'s own default fallthrough behaviour at all.
+    pub async fn lookup_srv_via_stage(
+        &self,
+        service: &str,
+        protocol: &str,
+        name: &str,
+        stage: ResolverStage,
+    ) -> Result<Vec<SrvRecord>, SrvResolveError> {
+        if name.is_empty() {
+            return Err(SrvResolveError::EmptyName);
+        }
+        if protocol != "tcp" && protocol != "udp" && protocol != "tls" {
+            return Err(SrvResolveError::UnsupportedProtocol(protocol.to_string()));
+        }
+        let srv_name = format!("_{service}._{protocol}.{name}");
+
+        match stage {
+            ResolverStage::System => {
+                let resolver = Self::system_resolver(self.validate_dnssec)?;
+                Ok(Self::do_lookup(&resolver, &srv_name).await?)
+            }
+            ResolverStage::Fallback => {
+                let addr = self
+                    .fallback_dns
+                    .as_ref()
+                    .ok_or(SrvResolveError::FallbackNotConfigured)?;
+                let resolver = Self::fallback_resolver(addr, self.validate_dnssec)
+                    .ok_or(SrvResolveError::FallbackNotConfigured)?;
+                Ok(Self::do_lookup(&resolver, &srv_name).await?)
+            }
+            ResolverStage::Default => {
+                let resolver = Self::default_resolver(self.validate_dnssec);
+                Ok(Self::do_lookup(&resolver, &srv_name).await?)
+            }
+        }
     }
 }
 
@@ -1000,6 +1081,65 @@ mod tests {
         ];
         sort_and_randomize_srv_records(&mut arr);
         assert_eq!(arr.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // lookup_srv_via_stage tests
+    // -----------------------------------------------------------------------
+
+    /// Requesting [`ResolverStage::Fallback`] with no fallback address
+    /// configured must fail fast with [`SrvResolveError::FallbackNotConfigured`],
+    /// not silently fall through to another stage (that would defeat the
+    /// point of per-stage selection).
+    #[tokio::test]
+    async fn lookup_srv_via_stage_fallback_not_configured() {
+        let resolver = HickorySrvResolver::new(None);
+        let err = resolver
+            .lookup_srv_via_stage("svc", "tcp", "example.com", ResolverStage::Fallback)
+            .await
+            .expect_err("fallback stage with no fallback configured must error");
+        assert!(
+            matches!(err, SrvResolveError::FallbackNotConfigured),
+            "expected FallbackNotConfigured, got: {err}"
+        );
+    }
+
+    /// Requesting [`ResolverStage::Fallback`] with an unparseable fallback
+    /// address must also fail with [`SrvResolveError::FallbackNotConfigured`]
+    /// rather than falling through.
+    #[tokio::test]
+    async fn lookup_srv_via_stage_fallback_invalid_address() {
+        let resolver = HickorySrvResolver::new(Some("not-an-ip".to_string()));
+        let err = resolver
+            .lookup_srv_via_stage("svc", "tcp", "example.com", ResolverStage::Fallback)
+            .await
+            .expect_err("fallback stage with an invalid address must error");
+        assert!(
+            matches!(err, SrvResolveError::FallbackNotConfigured),
+            "expected FallbackNotConfigured, got: {err}"
+        );
+    }
+
+    /// `lookup_srv_via_stage` validates its `name`/`protocol` arguments the
+    /// same way `lookup_srv` does, regardless of stage.
+    #[tokio::test]
+    async fn lookup_srv_via_stage_validates_inputs() {
+        let resolver = HickorySrvResolver::new(None);
+
+        let empty_name_err = resolver
+            .lookup_srv_via_stage("svc", "tcp", "", ResolverStage::Default)
+            .await
+            .expect_err("empty name must error");
+        assert!(matches!(empty_name_err, SrvResolveError::EmptyName));
+
+        let bad_protocol_err = resolver
+            .lookup_srv_via_stage("svc", "quic", "example.com", ResolverStage::System)
+            .await
+            .expect_err("unsupported protocol must error");
+        assert!(matches!(
+            bad_protocol_err,
+            SrvResolveError::UnsupportedProtocol(_)
+        ));
     }
 
     /// Verify the archival service SRV query pattern.
