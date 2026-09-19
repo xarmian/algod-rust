@@ -184,8 +184,19 @@ impl HickorySrvResolver {
         Ok(builder.build())
     }
 
-    /// Build a fallback resolver targeting a specific DNS server IP.
-    fn fallback_resolver(addr: &str, validate: bool) -> Option<TokioResolver> {
+    /// Build the [`ResolverConfig`] for a fallback resolver targeting a
+    /// specific DNS server IP, or `None` if `addr` doesn't parse as an IP
+    /// address.
+    ///
+    /// Split out from [`Self::fallback_resolver`] so tests can inspect the
+    /// resulting name-server list without building a live `TokioResolver` —
+    /// mirrors go-algorand's `ResolveController.FallbackResolver()`, whose
+    /// tests (`tools/network/resolveController_test.go`'s
+    /// `TestFallbackResolver`/`TestFallbackResolverInvalidAddress`) assert
+    /// on `EffectiveResolverDNS()` (a valid address is used verbatim; an
+    /// invalid one causes the fallback to be unavailable, so callers degrade
+    /// to the default resolver instead of panicking).
+    fn fallback_resolver_config(addr: &str) -> Option<ResolverConfig> {
         let ip: IpAddr = match addr.parse() {
             Ok(ip) => ip,
             Err(e) => {
@@ -194,18 +205,32 @@ impl HickorySrvResolver {
             }
         };
         let group = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
-        let config = ResolverConfig::from_parts(None, vec![], group);
+        Some(ResolverConfig::from_parts(None, vec![], group))
+    }
+
+    /// Build a fallback resolver targeting a specific DNS server IP.
+    fn fallback_resolver(addr: &str, validate: bool) -> Option<TokioResolver> {
+        let config = Self::fallback_resolver_config(addr)?;
         Some(Self::build_resolver(config, validate))
+    }
+
+    /// Build the [`ResolverConfig`] for the default resolver, using
+    /// well-known public DNS servers (Cloudflare + Google) — mirrors
+    /// go-algorand's `ResolveController.DefaultResolver()`
+    /// (`defaultDNSAddress`/`dnssec.DefaultDnssecAwareNSServers`). Split out
+    /// from [`Self::default_resolver`] for the same testability reason as
+    /// [`Self::fallback_resolver_config`].
+    fn default_resolver_config() -> ResolverConfig {
+        // Combine Cloudflare and Google name servers for redundancy.
+        let mut group = NameServerConfigGroup::cloudflare();
+        group.merge(NameServerConfigGroup::google());
+        ResolverConfig::from_parts(None, vec![], group)
     }
 
     /// Build a default resolver using well-known public DNS servers
     /// (Cloudflare + Google), mirroring go-algorand's `DefaultResolver`.
     fn default_resolver(validate: bool) -> TokioResolver {
-        // Combine Cloudflare and Google name servers for redundancy.
-        let mut group = NameServerConfigGroup::cloudflare();
-        group.merge(NameServerConfigGroup::google());
-        let config = ResolverConfig::from_parts(None, vec![], group);
-        Self::build_resolver(config, validate)
+        Self::build_resolver(Self::default_resolver_config(), validate)
     }
 
     /// Perform an SRV lookup using the given resolver, returning parsed
@@ -701,6 +726,101 @@ mod tests {
             HickorySrvResolver::new_with_dnssec_validation(Some("8.8.8.8".to_string()), false);
         assert!(!resolver.validate_dnssec);
         assert_eq!(resolver.fallback_dns.as_deref(), Some("8.8.8.8"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Resolver-selection tests
+    //
+    // go-algorand's `tools/network.ResolveController` exposes
+    // `SystemResolver()`/`FallbackResolver()`/`DefaultResolver()` as three
+    // separately-constructible, separately-typed resolvers so its own tests
+    // (`resolveController_test.go`) can assert on each one's concrete type
+    // and `EffectiveResolverDNS()` in isolation. `HickorySrvResolver`
+    // collapses all three into private helpers used internally by the
+    // `system -> fallback -> default` chain in `lookup_srv` (there's no
+    // separate "DNSSEC resolver type" in hickory — a single `TokioResolver`
+    // either validates or doesn't, per `opts.validate`), so the closest
+    // equivalent tests exercise those same helpers directly and assert on
+    // the resulting `ResolverConfig`'s name-server list — the Rust
+    // equivalent of `EffectiveResolverDNS()`.
+    // -----------------------------------------------------------------------
+
+    /// Mirrors `TestFallbackResolver`: a valid fallback address is used
+    /// verbatim as the resolver's only name server, on port 53.
+    #[test]
+    fn fallback_resolver_config_uses_given_address() {
+        let config = HickorySrvResolver::fallback_resolver_config("127.0.0.1")
+            .expect("valid IP must produce a config");
+        let servers = config.name_servers();
+        // `from_ips_clear` registers both a UDP and a TCP entry for the
+        // address; every entry must point at exactly this address and port.
+        assert!(!servers.is_empty());
+        for ns in servers {
+            assert_eq!(ns.socket_addr.ip().to_string(), "127.0.0.1");
+            assert_eq!(ns.socket_addr.port(), 53);
+        }
+    }
+
+    /// Mirrors `TestFallbackResolverInvalidAddress`: an unresolvable
+    /// fallback address (consecutive dots form an empty, syntactically
+    /// invalid label, so this fails locally without a network lookup) must
+    /// produce no config — the caller (`lookup_srv`) then falls through to
+    /// the default resolver rather than building a resolver around a
+    /// nonsense address or panicking.
+    #[test]
+    fn fallback_resolver_config_returns_none_for_invalid_address() {
+        assert!(
+            HickorySrvResolver::fallback_resolver_config("invalid..fallback..address").is_none()
+        );
+    }
+
+    /// A hostname (not a bare IP) is also not a valid fallback address in
+    /// go's `net.ParseIP`-based check, nor in Rust's `IpAddr::parse`.
+    #[test]
+    fn fallback_resolver_config_returns_none_for_hostname() {
+        assert!(HickorySrvResolver::fallback_resolver_config("example.com").is_none());
+    }
+
+    /// Mirrors `TestDefaultResolver`: the default resolver's name-server
+    /// list is go's well-known public DNS set (Cloudflare + Google), not
+    /// empty and not the OS-configured system resolver.
+    #[test]
+    fn default_resolver_config_uses_cloudflare_and_google_nameservers() {
+        let config = HickorySrvResolver::default_resolver_config();
+        let ips: Vec<String> = config
+            .name_servers()
+            .iter()
+            .map(|ns| ns.socket_addr.ip().to_string())
+            .collect();
+        assert!(!ips.is_empty());
+        // Cloudflare's well-known resolver address.
+        assert!(
+            ips.iter().any(|ip| ip == "1.1.1.1"),
+            "expected Cloudflare 1.1.1.1 among default name servers, got {ips:?}"
+        );
+        // Google's well-known resolver address.
+        assert!(
+            ips.iter().any(|ip| ip == "8.8.8.8"),
+            "expected Google 8.8.8.8 among default name servers, got {ips:?}"
+        );
+    }
+
+    /// Mirrors `TestSystemResolver`: building the system resolver succeeds
+    /// (returns a usable resolver rather than erroring or panicking)
+    /// regardless of whether DNSSEC validation is requested — go's test
+    /// asserts a `*dnssec.Resolver` is produced when `secure`, a plain
+    /// `*net.Resolver` when not; hickory has one resolver type either way,
+    /// so the parity assertion is "both `validate` settings build cleanly".
+    #[test]
+    fn system_resolver_builds_for_both_dnssec_settings() {
+        assert!(
+            HickorySrvResolver::system_resolver(false).is_ok(),
+            "system resolver must build with DNSSEC validation off"
+        );
+        assert!(
+            HickorySrvResolver::system_resolver(true).is_ok(),
+            "system resolver must build with DNSSEC validation on"
+        );
     }
 
     // -----------------------------------------------------------------------
