@@ -9921,10 +9921,16 @@ mod tests {
 
     #[test]
     fn axfer_with_receiver_does_not_credit_algo_balance() {
-        // Even when an axfer has receiver and amount fields set (which they
-        // could be due to the flat Transaction struct), the Algo balance of
-        // the receiver should NOT be credited. Only payment transactions
-        // move Algos via the receiver/amount fields.
+        // Historically this test built an axfer with receiver/amount
+        // (payment-only) fields set and asserted those fields were silently
+        // ignored. Issue #1273's `check_txn_type_field_isolation`
+        // (crates/core/algo-validate/src/rules.rs) now correctly mirrors
+        // go-algorand's `Transaction.WellFormed`'s `nonZeroFields` check: a
+        // transaction carrying non-zero fields belonging to a different
+        // declared type than its own `txn_type` is rejected outright, not
+        // silently ignored. This test now asserts that rejection directly
+        // (issue #1468), which is the real, current behavior that the
+        // original test's "ignored" premise predates.
         let ledger = test_ledger();
         let params = v41_params();
         let (sender, key) = test_keypair(115);
@@ -9936,8 +9942,9 @@ mod tests {
             &[(sender, 1_000_000), (receiver, 500_000)],
         );
 
-        // Build an axfer that happens to have payment fields set (should be
-        // ignored for balance purposes).
+        // Build an axfer that has payment fields set — this is now rejected
+        // by the type-field-isolation check rather than accepted with the
+        // fields ignored.
         let txn = Transaction {
             txn_type: TxnType::Axfer,
             sender,
@@ -9946,7 +9953,7 @@ mod tests {
             last_valid: Round(1100),
             genesis_id: "test-v1".to_string(),
             genesis_hash: [0xAA; 32],
-            // These are payment fields — should be ignored for axfer:
+            // These are payment fields — non-zero and invalid for axfer:
             receiver,
             amount: 100_000,
             ..Default::default()
@@ -9958,21 +9965,30 @@ mod tests {
             ..Default::default()
         };
 
+        let err = eval
+            .transaction_group(&[stx])
+            .expect_err("axfer with payment fields set should be rejected by field isolation");
         assert!(
-            eval.transaction_group(&[stx]).is_ok(),
-            "axfer should be accepted even with payment fields set"
+            err.to_string().contains("has non-zero fields for type"),
+            "unexpected error: {err}"
         );
-        // Sender: only fee deducted (amount is payment-specific, ignored for axfer)
-        assert_eq!(eval.effective_balance(&sender), 999_000);
-        // Receiver: unchanged (amount is not credited for non-payment txns)
+        // Balances unchanged: the transaction never applied.
+        assert_eq!(eval.effective_balance(&sender), 1_000_000);
         assert_eq!(eval.effective_balance(&receiver), 500_000);
     }
 
     #[test]
     fn non_payment_close_remainder_to_ignored() {
-        // The close_remainder_to field is a payment-specific field. If a
-        // non-payment transaction somehow has it set, it should NOT cause
-        // the sender's balance to be closed out.
+        // Historically this test built a keyreg with close_remainder_to (a
+        // payment-only field) set and asserted the field was silently
+        // ignored. Issue #1273's `check_txn_type_field_isolation`
+        // (crates/core/algo-validate/src/rules.rs) now correctly mirrors
+        // go-algorand's `Transaction.WellFormed`'s `nonZeroFields` check: a
+        // transaction carrying non-zero fields belonging to a different
+        // declared type than its own `txn_type` is rejected outright, not
+        // silently ignored. This test now asserts that rejection directly
+        // (issue #1468), which is the real, current behavior that the
+        // original test's "ignored" premise predates.
         let ledger = test_ledger();
         let params = v41_params();
         let (sender, key) = test_keypair(117);
@@ -9984,7 +10000,9 @@ mod tests {
             &[(sender, 1_000_000), (close_addr, 500_000)],
         );
 
-        // Build a keyreg with close_remainder_to set (should be ignored).
+        // Build a keyreg with close_remainder_to set — this is now rejected
+        // by the type-field-isolation check rather than accepted with the
+        // field ignored.
         let txn = Transaction {
             txn_type: TxnType::Keyreg,
             sender,
@@ -10003,13 +10021,15 @@ mod tests {
             ..Default::default()
         };
 
+        let err = eval
+            .transaction_group(&[stx])
+            .expect_err("keyreg with close_remainder_to set should be rejected by field isolation");
         assert!(
-            eval.transaction_group(&[stx]).is_ok(),
-            "keyreg with close_remainder_to should be accepted (field ignored)"
+            err.to_string().contains("has non-zero fields for type"),
+            "unexpected error: {err}"
         );
-        // Sender: only fee deducted, NOT closed out
-        assert_eq!(eval.effective_balance(&sender), 999_000);
-        // Close address: unchanged
+        // Balances unchanged: the transaction never applied.
+        assert_eq!(eval.effective_balance(&sender), 1_000_000);
         assert_eq!(eval.effective_balance(&close_addr), 500_000);
     }
 
