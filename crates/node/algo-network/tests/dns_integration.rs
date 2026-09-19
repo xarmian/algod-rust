@@ -37,7 +37,7 @@ use std::time::Duration;
 use algo_network::dns_bootstrap::parse_dns_bootstrap_array;
 use algo_network::peer_role::RELAY_ROLE;
 use algo_network::phonebook::Phonebook;
-use algo_network::srv_resolver::{resolve_addresses, HickorySrvResolver};
+use algo_network::srv_resolver::{resolve_addresses, HickorySrvResolver, ResolverStage};
 
 // ---------------------------------------------------------------------------
 // Test gating
@@ -351,6 +351,182 @@ async fn test_nonexistent_domain_returns_empty_or_error() {
         Err(e) => {
             // Error is the expected path for NXDOMAIN.
             eprintln!("bogus domain returned error (expected): {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-stage resolution tests (`lookup_srv_via_stage`)
+//
+// These mirror go-algorand's `tools/network/resolver_test.go` tests, which
+// each force resolution through one specific resolver and assert on
+// `Resolver.EffectiveResolverDNS()`. `HickorySrvResolver` has no equivalent
+// "effective DNS" accessor (a `TokioResolver` doesn't expose which name
+// server actually answered), so these tests instead assert on the
+// success/failure of resolution *forced through* the named stage, which is
+// the externally-observable half of go's assertion.
+// ---------------------------------------------------------------------------
+
+/// Mirrors `TestResolverWithDefaultDNSResolution`: with no fallback
+/// configured, forcing resolution through [`ResolverStage::Default`] (the
+/// well-known Cloudflare/Google resolver, go's `defaultDNSAddress` == 8.8.8.8
+/// equivalent) against a real SRV record succeeds.
+#[tokio::test]
+async fn test_resolver_with_default_dns_resolution() {
+    if skip_unless_network_tests() {
+        eprintln!("SKIPPED: ALGO_NETWORK_TESTS != 1");
+        return;
+    }
+
+    let resolver = HickorySrvResolver::new(None);
+    let records = resolver
+        .lookup_srv_via_stage(
+            "algobootstrap",
+            "tcp",
+            "mainnet.algorand.network",
+            ResolverStage::Default,
+        )
+        .await
+        .expect("default-resolver SRV lookup should succeed");
+
+    assert!(
+        !records.is_empty(),
+        "default resolver should return at least one SRV record"
+    );
+}
+
+/// Mirrors `TestResolverWithCloudflareDNSResolution`: a resolver whose
+/// fallback is pinned to Cloudflare's secondary DNS server (`1.0.0.1` — go's
+/// own comment notes CI providers have blocked `1.1.1.1`) resolves a real SRV
+/// record when forced through [`ResolverStage::Fallback`].
+#[tokio::test]
+async fn test_resolver_with_cloudflare_dns_resolution() {
+    if skip_unless_network_tests() {
+        eprintln!("SKIPPED: ALGO_NETWORK_TESTS != 1");
+        return;
+    }
+
+    let resolver = HickorySrvResolver::new(Some("1.0.0.1".to_string()));
+    let records = resolver
+        .lookup_srv_via_stage(
+            "algobootstrap",
+            "tcp",
+            "mainnet.algorand.network",
+            ResolverStage::Fallback,
+        )
+        .await
+        .expect("Cloudflare fallback-resolver SRV lookup should succeed");
+
+    assert!(
+        !records.is_empty(),
+        "Cloudflare fallback resolver should return at least one SRV record"
+    );
+}
+
+/// Mirrors `TestResolverWithInvalidDNSResolution`: a resolver whose fallback
+/// is pinned to an unreachable IP (`255.255.128.1`, go's own dummy address)
+/// fails rather than hanging, within a short timeout.
+#[tokio::test]
+async fn test_resolver_with_invalid_dns_resolution() {
+    if skip_unless_network_tests() {
+        eprintln!("SKIPPED: ALGO_NETWORK_TESTS != 1");
+        return;
+    }
+
+    let resolver = HickorySrvResolver::new(Some("255.255.128.1".to_string()));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        resolver.lookup_srv_via_stage(
+            "algobootstrap",
+            "tcp",
+            "mainnet.algorand.network",
+            ResolverStage::Fallback,
+        ),
+    )
+    .await;
+
+    match result {
+        // The lookup itself returned in time -- it must have errored (an
+        // unreachable resolver can never produce a valid answer).
+        Ok(lookup_result) => {
+            assert!(
+                lookup_result.is_err(),
+                "lookup via an unreachable fallback resolver should fail, got: {lookup_result:?}"
+            );
+        }
+        // The outer `tokio::time::timeout` fired first -- also an acceptable
+        // "did not succeed" outcome, matching go's own context-timeout-based
+        // test (a 100ms context timeout that also just needs `err != nil`).
+        Err(_) => {
+            eprintln!("lookup via unreachable fallback resolver timed out (expected)");
+        }
+    }
+}
+
+/// Mirrors `TestRealNamesWithResolver` (itself `t.Skip()`-disabled in
+/// go-algorand's own suite -- "skip real network tests in autotest"): forcing
+/// resolution through each named stage in turn (system, fallback pinned to
+/// `1.1.1.1`, default) all succeed for a real SRV record, and a fallback
+/// pinned to an unreachable private-range IP (`192.168.12.34`, go's own
+/// dummy address) errors.
+#[tokio::test]
+async fn test_real_names_with_resolver_per_stage() {
+    if skip_unless_network_tests() {
+        eprintln!("SKIPPED: ALGO_NETWORK_TESTS != 1");
+        return;
+    }
+
+    let name = "mainnet.algorand.network";
+
+    // System resolver: OS-configured DNS should resolve the real record.
+    let system_only = HickorySrvResolver::new(None);
+    let system_records = system_only
+        .lookup_srv_via_stage("algobootstrap", "tcp", name, ResolverStage::System)
+        .await
+        .expect("system resolver should resolve a real SRV record");
+    assert!(!system_records.is_empty());
+
+    for validate_dnssec in [false, true] {
+        let resolver = HickorySrvResolver::new_with_dnssec_validation(
+            Some("1.1.1.1".to_string()),
+            validate_dnssec,
+        );
+
+        let fallback_records = resolver
+            .lookup_srv_via_stage("algobootstrap", "tcp", name, ResolverStage::Fallback)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("fallback resolver (dnssec={validate_dnssec}) should succeed: {e}")
+            });
+        assert!(!fallback_records.is_empty());
+
+        let default_records = resolver
+            .lookup_srv_via_stage("algobootstrap", "tcp", name, ResolverStage::Default)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("default resolver (dnssec={validate_dnssec}) should succeed: {e}")
+            });
+        assert!(!default_records.is_empty());
+
+        // An unreachable private-range fallback address must error out
+        // (within a bounded timeout) rather than hang or silently succeed.
+        let unreachable = HickorySrvResolver::new_with_dnssec_validation(
+            Some("192.168.12.34".to_string()),
+            validate_dnssec,
+        );
+        let unreachable_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            unreachable.lookup_srv_via_stage("algobootstrap", "tcp", name, ResolverStage::Fallback),
+        )
+        .await;
+        match unreachable_result {
+            Ok(lookup_result) => assert!(
+                lookup_result.is_err(),
+                "lookup via unreachable private-range fallback should fail"
+            ),
+            Err(_) => eprintln!(
+                "lookup via unreachable private-range fallback (dnssec={validate_dnssec}) timed out (expected)"
+            ),
         }
     }
 }

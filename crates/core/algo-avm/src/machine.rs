@@ -526,21 +526,33 @@ impl AvmMachine {
     }
 
     /// Deduct cost from the budget. Returns an error if the budget is exceeded.
+    ///
+    /// Checks *before* charging, matching go-algorand's `step()`
+    /// (`data/transactions/logic/eval.go`: `if opcost > cx.remainingBudget()
+    /// { return error }` runs before `cx.cost += opcost`) — an opcode whose
+    /// own cost would exceed the remaining budget is never added to `self.cost`
+    /// or subtracted from `self.budget`. Previously this charged first and
+    /// checked after, which left the failing opcode's own cost included in
+    /// the reported total (a purely cosmetic divergence in the diagnostic
+    /// `AppBudgetConsumed` figure simulate reports for an over-budget
+    /// transaction -- see issue tracked in `docs/phase17/parity_ledger_sim.md`'s
+    /// `TestAppCallOverBudget` row). The opcode's actual handler is never
+    /// dispatched in either case (the caller returns this error before
+    /// calling `ops::dispatch`), so real execution outcomes are unaffected.
     pub fn charge_cost(&mut self, cost: u64) -> Result<(), AlgoError> {
+        if cost as i64 > self.budget {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "cost budget exceeded: budget is {} after charging {cost}",
+                    self.budget - cost as i64
+                ),
+            });
+        }
         // Track this program's own cumulative cost independently of the shared
         // (pooled) budget, mirroring go-algorand's `cx.cost`.
         self.cost = self.cost.saturating_add(cost);
         self.budget -= cost as i64;
-        if self.budget < 0 {
-            Err(AlgoError::Avm {
-                message: format!(
-                    "cost budget exceeded: budget is {} after charging {cost}",
-                    self.budget
-                ),
-            })
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     /// Resolve a branch target from an instruction index + int16 offset.

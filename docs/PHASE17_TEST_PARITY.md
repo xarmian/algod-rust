@@ -51,17 +51,17 @@ per-area split of the former).
 
 | status | count | share |
 |---|---|---|
-| `matched-1:1` | 1,199 | 38% |
-| `matched-1:many` | 942 | 30% |
+| `matched-1:1` | 1,203 | 38% |
+| `matched-1:many` | 943 | 30% |
 | `out-of-scope` | 732 | 23% |
 | `matched-many:1` | 285 | 9% |
-| `partial` | 21 | 1% |
+| `partial` | 16 | 1% |
 | `missing-test` | 2 | 0% |
 | `not-implemented` | 0 | 0% |
 
 **2 rows (`not-implemented` + `missing-test`, 0%) are real, actionable
 gaps** — either a behavior algod-rust doesn't implement yet, or one it
-implements but never tests. `partial` (21, 1%) is coverage that exists
+implements but never tests. `partial` (16, 1%) is coverage that exists
 but is weaker than go-algorand's; some of these are worth strengthening,
 most are diminishing-returns edge cases. See
 [`docs/PHASE17_PROPOSAL.md`](PHASE17_PROPOSAL.md) for how the real gaps
@@ -74,7 +74,7 @@ were triaged into tracked issues.
 | AVM/TEAL opcodes (`data/transactions/logic`) | [parity_txn_logic.md](phase17/parity_txn_logic.md) | 449 | 147 | 255 | 6 | 0 | 0 | 0 | 41 |
 | Transactions core (`data/transactions`) | [parity_txn_core.md](phase17/parity_txn_core.md) | 175 | 77 | 47 | 32 | 0 | 0 | 0 | 19 |
 | Ledger core (`ledger`, `ledger/eval`, `ledger/apply`, `ledger/ledgercore`, `ledger/store`, `ledger/encoded`) | [parity_ledger_core.md](phase17/parity_ledger_core.md) | 503 | 78 | 152 | 62 | 0 | 0 | 0 | 211 |
-| Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 36 | 30 | 0 | 1 | 0 | 0 | 1 |
+| Ledger simulation (`ledger/simulation`) | [parity_ledger_sim.md](phase17/parity_ledger_sim.md) | 68 | 37 | 30 | 0 | 0 | 0 | 0 | 1 |
 | Agreement protocol (`agreement`) | [parity_agreement.md](phase17/parity_agreement.md) | 326 | 160 | 61 | 88 | 7 | 0 | 0 | 10 |
 | e2e integration (`test/e2e-go`) | [parity_e2e.md](phase17/parity_e2e.md) | 195 | 80 | 45 | 3 | 0 | 0 | 0 | 67 |
 | Networking (`network`, `network/p2p`, ...) | [parity_network.md](phase17/parity_network.md) | 263 | 113 | 94 | 12 | 0 | 0 | 2 | 42 |
@@ -83,8 +83,8 @@ were triaged into tracked issues.
 | Data structures (`data/basics`, `data/bookkeeping`, ...) | [parity_data_misc.md](phase17/parity_data_misc.md) | 274 | 144 | 41 | 48 | 2 | 0 | 0 | 39 |
 | Config/stateproof/protocol | [parity_config_proto_sp.md](phase17/parity_config_proto_sp.md) | 119 | 31 | 41 | 0 | 1 | 0 | 0 | 46 |
 | Util (`util/*`) | [parity_util.md](phase17/parity_util.md) | 118 | 34 | 14 | 0 | 4 | 0 | 0 | 66 |
-| Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 43 | 29 | 7 | 4 | 0 | 0 | 90 |
+| Tools/CLI (`tools/*`, `cmd/*`, ...) | [parity_tools_cmd.md](phase17/parity_tools_cmd.md) | 173 | 46 | 30 | 7 | 0 | 0 | 0 | 90 |
 | Logging (`logging/*`) | [parity_logging.md](phase17/parity_logging.md) | 41 | 0 | 0 | 0 | 0 | 0 | 0 | 41 |
 | Catchup (`catchup`) | [parity_catchup.md](phase17/parity_catchup.md) | 57 | 31 | 22 | 0 | 0 | 0 | 0 | 4 |
-| **Total** | | **3,181** | **1199** | **942** | **285** | **21** | **0** | **2** | **732** |
+| **Total** | | **3,181** | **1203** | **943** | **285** | **16** | **0** | **2** | **732** |
 

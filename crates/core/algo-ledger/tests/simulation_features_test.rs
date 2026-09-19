@@ -393,15 +393,94 @@ fn extra_opcode_budget_insufficient_still_fails_with_partial_accounting() {
         group.app_budget_consumed,
         group.txn_results[0].app_budget_consumed + group.txn_results[1].app_budget_consumed
     );
-    // The group failed precisely because it ran the budget out, so the
-    // reported consumption reaches (or, having charged the one opcode that
-    // pushed it negative, slightly exceeds) what was made available.
-    assert!(
-        group.app_budget_consumed >= group.app_budget_added,
-        "consumed ({}) should reach the available budget ({}) when the group fails on budget",
-        group.app_budget_consumed,
-        group.app_budget_added
+    // `charge_cost` (`algo-avm/src/machine.rs`) checks before charging,
+    // matching go-algorand's `step()` exactly (issue tracked in
+    // `docs/phase17/parity_ledger_sim.md`'s `TestAppCallOverBudget` row): the
+    // opcode whose own cost would exceed the remaining budget is never added
+    // to the reported total, so consumption never exceeds what was
+    // available. This program's every opcode costs exactly 1, so it stops
+    // precisely AT the available budget (a program with a costlier final
+    // opcode would stop strictly short of it, as go's own
+    // `TestAppCallOverBudget` -- 1396 reported of 1398 attempted, against an
+    // available 1400 -- demonstrates).
+    assert_eq!(
+        group.app_budget_consumed, group.app_budget_added,
+        "consumed ({}) should reach exactly the available budget ({}) when every opcode costs 1",
+        group.app_budget_consumed, group.app_budget_added
     );
+}
+
+/// go: `TestAppCallOverBudget` (`ledger/simulation/simulation_eval_test.go`)
+/// -- byte-level parity for the exact reported `AppBudgetConsumed` figures on
+/// an over-budget group, using the *same* program shape go's test does
+/// (`txn ApplicationID; bz end; <697 x int 1/pop>; end: int 1`) so the
+/// resulting numbers can be checked against go's own documented values (4,
+/// 1396, 1400) directly rather than only self-consistency. Closes phase17
+/// `parity_ledger_sim.md`'s `TestAppCallOverBudget` row: `charge_cost`'s
+/// check-before-charge fix (see the sibling test above) makes the *reported*
+/// number match go exactly, not just the pass/fail outcome.
+#[test]
+fn app_call_over_budget_matches_go_reported_figures_exactly() {
+    let sender = Address([0xAA; 32]);
+    let mut state = setup_state(sender);
+
+    let expensive_source = {
+        let mut s = String::from("#pragma version 6\ntxn ApplicationID\nbz end\n");
+        for _ in 0..697 {
+            s.push_str("int 1\npop\n");
+        }
+        s.push_str("end:\nint 1\n");
+        s
+    };
+    let expensive_program_bytes = algo_avm::assembler::assemble_string(&expensive_source)
+        .expect("expensive program must assemble")
+        .program;
+    let clear_state_bytes = algo_avm::assembler::assemble_string("#pragma version 6\nint 0\n")
+        .expect("clear-state program must assemble")
+        .program;
+
+    // Real app-create call (`ApplicationID: 0` in the txn, `approval_program`
+    // set inline) -- at creation time `txn ApplicationID` reads 0, so
+    // `bz end` branches straight past the 697-rep loop to `end:`, running
+    // only `intcblock 1; txn ApplicationID; bz end; intc_0` (go's documented
+    // cost: 4). A fresh `LedgerState` starts `txn_counter` at 0, so the
+    // created app is assigned id 1 (`txn_counter + 1`).
+    let mut create_txn = make_appl_txn(sender, 0);
+    create_txn.txn.approval_program = Some(expensive_program_bytes.clone().into());
+    create_txn.txn.clear_state_program = Some(clear_state_bytes.into());
+
+    // App call against the just-created app (id 1): `ApplicationID` now
+    // reads 1, so `bz end` does NOT branch and the full 697-rep loop runs,
+    // attempting a total cost of 1398 -- go's documented figure for this
+    // exact program.
+    let expensive_txn = make_appl_txn(sender, 1);
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![create_txn, expensive_txn]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+
+    let result = simulate(&mut state, request).expect("request itself is well-formed");
+    let group = &result.txn_groups[0];
+
+    let failure_message = group
+        .failure_message
+        .as_deref()
+        .expect("group must fail: over budget");
+    assert!(
+        failure_message.contains("cost budget exceeded"),
+        "expected a cost-budget-exceeded failure, got: {failure_message}"
+    );
+    assert_eq!(group.failed_at, Some(vec![1]));
+    // go's exact documented figures for this program (`TestAppCallOverBudget`):
+    // AppBudgetAdded 1400, AppBudgetConsumed 1400 (4 + 1396), with the
+    // second txn reporting 1396 of the 1398 it attempted -- stopping short
+    // by the 2-cost `int 1; pop` pair that would have exceeded the budget.
+    assert_eq!(group.app_budget_added, 1400);
+    assert_eq!(group.app_budget_consumed, 1400);
+    assert_eq!(group.txn_results[0].app_budget_consumed, 4);
+    assert_eq!(group.txn_results[1].app_budget_consumed, 1396);
 }
 
 // ---------------------------------------------------------------------------
