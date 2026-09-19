@@ -27,9 +27,9 @@ use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::{
-    AccountInfo, AlgodVersions, Application, BlockSource, BoxResponse, BoxesResponse, NodeStatus,
-    ParticipationKey, ParticipationKeyAdded, PendingTxnInfo, PostTransactionResponse,
-    SuggestedParams, TealCompileResult, TxId,
+    AccountAssetInfo, AccountInfo, AlgodVersions, Application, AssetInfo, BlockSource, BoxResponse,
+    BoxesResponse, NodeStatus, ParticipationKey, ParticipationKeyAdded, PendingTxnInfo,
+    PostTransactionResponse, SuggestedParams, TealCompileResult, TxId,
 };
 
 /// Configuration for the REST client.
@@ -633,6 +633,49 @@ impl AlgodClient {
             .map_err(|e| AlgoError::RestClient {
                 source: Box::new(e),
                 context: format!("reading GET {path} response body"),
+            })
+    }
+}
+
+// ---- Asset info surface (issue #1466) ----
+//
+// Mirrors go's `client.AssetInformation`/`client.AccountAssetInformation`
+// (`libgoal/libgoal.go`). Used by `goal-rust asset ...`.
+
+impl AlgodClient {
+    /// `GET /v2/assets/{asset_id}` — asset info (JSON). Used by
+    /// `goal asset info` (Go's `client.AssetInformation`,
+    /// `daemon/algod/api/client/restClient.go:451`). A nonexistent asset
+    /// returns [`AlgoError::NotFound`].
+    pub async fn get_asset(&self, asset_id: u64) -> Result<AssetInfo> {
+        let path = format!("/v2/assets/{asset_id}");
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.json::<AssetInfo>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("parsing GET {path} response"),
+            })
+    }
+
+    /// `GET /v2/accounts/{address}/assets/{asset_id}` — this account's
+    /// holding of / creation params for the given asset (JSON). Used by
+    /// `goal asset info`'s reserve-amount lookup (Go's
+    /// `client.AccountAssetInformation`, `daemon/algod/api/client/restClient.go:530`).
+    /// Returns [`AlgoError::NotFound`] when the address has neither a
+    /// holding nor created-asset params for `asset_id`.
+    pub async fn get_account_asset(
+        &self,
+        address: &str,
+        asset_id: u64,
+    ) -> Result<AccountAssetInfo> {
+        let path = format!("/v2/accounts/{address}/assets/{asset_id}");
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.json::<AccountAssetInfo>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("parsing GET {path} response"),
             })
     }
 }

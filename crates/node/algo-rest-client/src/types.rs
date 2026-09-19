@@ -143,6 +143,11 @@ pub struct AccountInfo {
     /// Total number of apps created by this account.
     #[serde(rename = "total-created-apps", default)]
     pub total_created_apps: u64,
+    /// \[apar\] parameters of assets created by this account. Present on the
+    /// plain (no `exclude`) `GET /v2/accounts/{addr}` this client issues;
+    /// used by `goal asset ...`'s `--unitname`/`--creator` lookup.
+    #[serde(rename = "created-assets", default)]
+    pub created_assets: Option<Vec<CreatedAssetEntry>>,
 }
 
 /// Serde adapter for `Vec<u8>` ↔ base64-string-on-the-wire. Algorand's
@@ -371,6 +376,11 @@ pub struct PendingTxnInfo {
     /// `--create`) transaction. `None` for every other transaction.
     #[serde(rename = "application-index", default)]
     pub application_index: Option<u64>,
+
+    /// The asset ID created by an `asset create` transaction. `None` for
+    /// every other transaction.
+    #[serde(rename = "asset-index", default)]
+    pub asset_index: Option<u64>,
 }
 
 impl PendingTxnInfo {
@@ -602,4 +612,105 @@ pub struct Application {
     pub id: u64,
     /// Stores the global information associated with an application.
     pub params: ApplicationParams,
+}
+
+// ---------------------------------------------------------------------------
+// Asset info surface (issue #1466) — mirrors go's `client.AssetInformation`/
+// `client.AccountAssetInformation` (`libgoal/libgoal.go`), used by
+// `goal asset create/destroy/config/send/freeze/optin/info`'s `lookupAssetID`
+// (unit-name → asset-id resolution) and `goal asset info`'s reserve-amount
+// lookup.
+// ---------------------------------------------------------------------------
+
+/// Asset parameters, matching go-algorand's `model.AssetParams` JSON shape
+/// (`daemon/algod/api/server/v2/generated/model/types.go`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetParamsInfo {
+    /// The address that created this asset.
+    pub creator: String,
+    /// \[t\] the total number of units of this asset.
+    pub total: u64,
+    /// \[dc\] number of digits to use after the decimal point.
+    #[serde(default)]
+    pub decimals: u64,
+    /// \[df\] whether holdings of this asset are frozen by default.
+    #[serde(rename = "default-frozen", default)]
+    pub default_frozen: bool,
+    /// \[un\] name of a unit of this asset, as supplied by the creator.
+    #[serde(rename = "unit-name", default)]
+    pub unit_name: Option<String>,
+    /// \[an\] name of this asset, as supplied by the creator.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// \[au\] URL where more information about the asset can be retrieved.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// \[am\] a commitment to some unspecified asset metadata.
+    #[serde(rename = "metadata-hash", default, with = "optional_base64_bytes")]
+    pub metadata_hash: Option<Vec<u8>>,
+    /// \[m\] address of account used to manage the keys of this asset.
+    #[serde(default)]
+    pub manager: Option<String>,
+    /// \[r\] address of account holding reserve (non-minted) units.
+    #[serde(default)]
+    pub reserve: Option<String>,
+    /// \[f\] address of account used to freeze holdings of this asset.
+    #[serde(default)]
+    pub freeze: Option<String>,
+    /// \[c\] address of account used to clawback holdings of this asset.
+    #[serde(default)]
+    pub clawback: Option<String>,
+}
+
+/// Response from `GET /v2/assets/{asset-id}`.
+///
+/// Matches go-algorand's `model.Asset`. Used by `goal asset info`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssetInfo {
+    /// Unique asset identifier.
+    pub index: u64,
+    /// AssetParams specifies the parameters for an asset.
+    pub params: AssetParamsInfo,
+}
+
+/// An entry in `AccountInfo.created_assets` (`GET /v2/accounts/{addr}`'s
+/// `created-assets` field): asset index plus its params. Used to resolve
+/// `--unitname`/`--creator` into an asset id, mirroring go's
+/// `lookupAssetID` (`cmd/goal/asset.go:150-186`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedAssetEntry {
+    /// Unique asset identifier.
+    pub index: u64,
+    /// Omitted when `exclude=created-assets-params` was requested; always
+    /// present for the plain `GET /v2/accounts/{addr}` this client issues.
+    #[serde(default)]
+    pub params: Option<AssetParamsInfo>,
+}
+
+/// Describes an asset held by an account, matching go-algorand's
+/// `model.AssetHolding`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssetHoldingInfo {
+    /// \[a\] number of units held.
+    pub amount: u64,
+    /// Asset ID of the holding.
+    #[serde(rename = "asset-id")]
+    pub asset_id: u64,
+    /// \[f\] whether or not the holding is frozen.
+    #[serde(rename = "is-frozen")]
+    pub is_frozen: bool,
+}
+
+/// Response from `GET /v2/accounts/{address}/assets/{asset-id}`. Used by
+/// `goal asset info` to look up the reserve address's holding amount.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountAssetInfo {
+    /// Describes an asset held by this account, if any.
+    #[serde(rename = "asset-holding", default)]
+    pub asset_holding: Option<AssetHoldingInfo>,
+    /// This account's asset params, if it created this asset.
+    #[serde(rename = "created-asset", default)]
+    pub created_asset: Option<AssetParamsInfo>,
+    /// The round for which this information is relevant.
+    pub round: u64,
 }

@@ -24,6 +24,7 @@
 pub mod account;
 pub mod app;
 mod app_state_json;
+pub mod asset;
 pub mod clerk;
 pub mod clerk_sign;
 pub mod node;
