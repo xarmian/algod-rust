@@ -713,6 +713,25 @@ mod tests {
         }
     }
 
+    // `total_money` must satisfy go-algorand's `UnauthenticatedCredential.Verify`
+    // invariant `committeeSize <= m.TotalMoney.Raw` (data/committee/credential.go;
+    // ported at credential.rs's `committee_size > membership.total_money` guard,
+    // issue #1283/PR #1284) for *every* committee these tests exercise — the
+    // largest at v41 is the down-committee at 6000 (`down_committee_size`,
+    // config/consensus.go). 1_000_000 leaves a wide margin above that for every
+    // step used below (SOFT 2990, CERT 1500, DOWN 6000, PROPOSE 20, …).
+    //
+    // `balance` keeps the original 1:10 stake-fraction ratio the fixture used
+    // before both constants were scaled up (balance 10 / total_money 100 =
+    // 10%, now 100_000 / 1_000_000) so `sortition::select`'s expected weight
+    // (`balance * committee_size / total_money`) stays comfortably away from 0
+    // for every committee used here (e.g. ~299 for the 2990-seat soft
+    // committee) without relying on `balance == total_money` (probability 1,
+    // which would make every vote trivially "selected" and defeat the point of
+    // exercising real sortition math).
+    const TOTAL_MONEY: u64 = 1_000_000;
+    const BALANCE: u64 = 100_000;
+
     fn ctx(step: Step, proposal: ProposalValue) -> VoteContext {
         VoteContext {
             sender: Address([0x42; 32]),
@@ -721,8 +740,8 @@ mod tests {
             step,
             proposal,
             seed: Seed([0x11; 32]),
-            balance: 10,
-            total_money: 100,
+            balance: BALANCE,
+            total_money: TOTAL_MONEY,
             key_dilution: KEY_DILUTION,
             vote_first_valid: Round(0),
             vote_last_valid: Round(30_000),
