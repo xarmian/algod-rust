@@ -1360,6 +1360,206 @@ mod tests {
         assert_eq!(ranker.pools[0].peers[0].peer_id, "p1");
     }
 
+    // -- long-run selection convergence: fastest peer wins, penalty caps
+    //    domination, and repeated failures evict a whole class
+    //    (TestPeerSelector_HistoricData / TestPeerSelector_PeersDownloadError /
+    //    TestPeerSelector_Penalty) --
+    //
+    // Go derives a per-iteration "random" duration multiplier from
+    // `peerSelectorTestRandVal`, which SHA-512/256-hashes the loop counter
+    // and decodes a `binary.ReadUvarint` from a 0x00-prefixed copy of that
+    // digest. Because the prepended 0x00 byte's continuation bit is clear,
+    // `ReadUvarint` always stops on that very first byte and returns 0,
+    // regardless of the hash -- so go's "random" multiplier is always
+    // exactly `1 + (0 % 100) / 100 == 1.0` on every iteration of every one
+    // of these three tests (verified against go's source at
+    // `catchup/peerSelector_test.go`). The only real randomness in go's
+    // test -- and in `PeerRanker`, matching it -- is which same-rank pool
+    // member `getNextPeer`/`get_next_peer` draws, via a true RNG
+    // (`crypto.RandUint64` / `rand::thread_rng`). These three ports use the
+    // resulting fixed multiplier directly rather than re-deriving it.
+
+    #[test]
+    fn historic_data_biases_the_selector_toward_the_fastest_peer() {
+        let retriever: Arc<dyn PeersRetriever> = Arc::new(StubRetriever(|class| match class {
+            PeerClassKind::PhonebookArchivalNodes => {
+                vec![peer("a1"), peer("a2"), peer("a3")]
+            }
+            _ => vec![peer("b1"), peer("b2")],
+        }));
+        let mut ranker = PeerRanker::new(
+            retriever,
+            vec![
+                PeerClass {
+                    initial_rank: PEER_RANK_INITIAL_FIRST_PRIORITY,
+                    class: PeerClassKind::PhonebookArchivalNodes,
+                },
+                PeerClass {
+                    initial_rank: PEER_RANK_INITIAL_SECOND_PRIORITY,
+                    class: PeerClassKind::PhonebookRelays,
+                },
+            ],
+        );
+
+        let mut counters = [0u32; 5];
+        for _ in 0..1000 {
+            let psp = ranker.get_next_peer().unwrap();
+            let idx = match psp.peer_id.as_str() {
+                "a1" => 0,
+                "a2" => 1,
+                "a3" => 2,
+                "b1" => 3,
+                "b2" => 4,
+                other => panic!("unexpected peer address `{other}`"),
+            };
+            counters[idx] += 1;
+
+            let duration = match psp.peer_id.as_str() {
+                "a1" => Duration::from_millis(1500),
+                "a2" => Duration::from_millis(500),
+                "a3" => Duration::from_millis(100),
+                _ => Duration::from_millis(0),
+            };
+            let rank = ranker.peer_download_duration_to_rank(&psp, duration);
+            ranker.rank_peer(&psp, rank);
+        }
+
+        assert!(
+            counters[2] >= counters[1],
+            "a3 (fastest) should be selected at least as often as a2: {counters:?}"
+        );
+        assert!(
+            counters[2] >= counters[0],
+            "a3 (fastest) should be selected at least as often as a1: {counters:?}"
+        );
+        assert_eq!(
+            counters[3], 0,
+            "relay-class b1 must never be picked while the archival pool has a non-failed peer"
+        );
+        assert_eq!(
+            counters[4], 0,
+            "relay-class b2 must never be picked while the archival pool has a non-failed peer"
+        );
+    }
+
+    #[test]
+    fn peers_download_error_evicts_failing_archival_peers_after_ramp_up() {
+        let retriever: Arc<dyn PeersRetriever> = Arc::new(StubRetriever(|class| match class {
+            PeerClassKind::PhonebookArchivalNodes => {
+                vec![peer("a1"), peer("a2"), peer("a3")]
+            }
+            _ => vec![peer("b1"), peer("b2")],
+        }));
+        let mut ranker = PeerRanker::new(
+            retriever,
+            vec![
+                PeerClass {
+                    initial_rank: PEER_RANK_INITIAL_FIRST_PRIORITY,
+                    class: PeerClassKind::PhonebookArchivalNodes,
+                },
+                PeerClass {
+                    initial_rank: PEER_RANK_INITIAL_SECOND_PRIORITY,
+                    class: PeerClassKind::PhonebookRelays,
+                },
+            ],
+        );
+
+        let mut counters = [0u32; 5];
+        for i in 0..1000u32 {
+            let psp = ranker.get_next_peer().unwrap();
+            let idx = match psp.peer_id.as_str() {
+                "a1" => 0,
+                "a2" => 1,
+                "a3" => 2,
+                "b1" => 3,
+                "b2" => 4,
+                other => panic!("unexpected peer address `{other}`"),
+            };
+            counters[idx] += 1;
+
+            let is_b = psp.peer_id == "b1" || psp.peer_id == "b2";
+            if i < 500 || is_b {
+                let duration = Duration::from_millis(100);
+                let rank = ranker.peer_download_duration_to_rank(&psp, duration);
+                ranker.rank_peer(&psp, rank);
+            } else {
+                ranker.rank_peer(&psp, PEER_RANK_DOWNLOAD_FAILED);
+            }
+        }
+
+        assert!(counters[3] >= 20, "b1 selections: {}", counters[3]);
+        assert!(counters[4] >= 20, "b2 selections: {}", counters[4]);
+
+        let is_b_addr = |id: &str| id == "b1" || id == "b2";
+        assert!(is_b_addr(&ranker.pools[0].peers[0].peer_id));
+        if ranker.pools.len() == 2 {
+            assert!(is_b_addr(&ranker.pools[0].peers[1].peer_id));
+            assert_eq!(ranker.pools[1].rank, PEER_RANK_DOWNLOAD_FAILED);
+            assert_eq!(ranker.pools[1].peers.len(), 3);
+        } else {
+            assert_eq!(ranker.pools.len(), 3);
+            assert!(is_b_addr(&ranker.pools[1].peers[0].peer_id));
+            assert_eq!(ranker.pools[2].rank, PEER_RANK_DOWNLOAD_FAILED);
+            assert_eq!(ranker.pools[2].peers.len(), 3);
+        }
+    }
+
+    #[test]
+    fn penalty_prevents_the_fastest_peer_from_fully_dominating_selection() {
+        let retriever: Arc<dyn PeersRetriever> = Arc::new(StubRetriever(|class| match class {
+            PeerClassKind::PhonebookArchivalNodes => {
+                vec![peer("a1"), peer("a2"), peer("a3")]
+            }
+            _ => vec![peer("b1"), peer("b2")],
+        }));
+        let mut ranker = PeerRanker::new(
+            retriever,
+            vec![
+                PeerClass {
+                    initial_rank: PEER_RANK_INITIAL_FIRST_PRIORITY,
+                    class: PeerClassKind::PhonebookArchivalNodes,
+                },
+                PeerClass {
+                    initial_rank: PEER_RANK_INITIAL_SECOND_PRIORITY,
+                    class: PeerClassKind::PhonebookRelays,
+                },
+            ],
+        );
+
+        let mut counters = [0u32; 5];
+        for _ in 0..1000 {
+            let psp = ranker.get_next_peer().unwrap();
+            let idx = match psp.peer_id.as_str() {
+                "a1" => 0,
+                "a2" => 1,
+                "a3" => 2,
+                "b1" => 3,
+                "b2" => 4,
+                other => panic!("unexpected peer address `{other}`"),
+            };
+            counters[idx] += 1;
+
+            let duration = match psp.peer_id.as_str() {
+                "a1" => Duration::from_millis(1500),
+                "a2" => Duration::from_millis(500),
+                "a3" => Duration::from_millis(100),
+                _ => Duration::from_millis(0),
+            };
+            let rank = ranker.peer_download_duration_to_rank(&psp, duration);
+            ranker.rank_peer(&psp, rank);
+        }
+
+        assert!(counters[1] >= 50, "a2 selections: {}", counters[1]);
+        assert!(
+            counters[2] >= 2 * counters[1],
+            "a3 selections should be at least 2x a2's: a3={} a2={}",
+            counters[2],
+            counters[1]
+        );
+        assert_eq!(counters[3], 0);
+        assert_eq!(counters[4], 0);
+    }
+
     // -- construction preserves caller-supplied priority order
     //    (TestClassBasedPeerSelector_makeClassBasedPeerSelector) --
 
