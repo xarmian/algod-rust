@@ -579,6 +579,63 @@ mod tests {
     }
 
     #[test]
+    fn test_nrs_errs_without_fix_overspends_pool() {
+        // Mirrors go's TestNextRewardsRateErrsWithoutFix
+        // (data/bookkeeping/block_test.go:762), driven through go's
+        // `performRewardsRateCalculation` harness: with the pre-v31 fix
+        // (using the *stale* pre-refresh rate for the level advance) and
+        // total_reward_units=1, the rate that gets disbursed every round no
+        // longer tracks the shrinking pool balance, so the incentive pool
+        // drains below MinBalance well before the 3-refresh-interval budget
+        // runs out — the exact bug RewardsCalculationFix (v31) exists to fix.
+        let mut params = v41();
+        params.rewards_calculation_fix = false;
+
+        let mut cur = RewardsState {
+            rewards_level: 0,
+            rewards_rate: 0,
+            rewards_residue: 0,
+            rewards_recalculation_round: 1_000_000,
+        };
+        let total_reward_units = 1u64;
+        let starting_round = 1_000_000u64;
+        let mut pool_balance = params.min_balance + 500_000_000_000;
+        assert!(pool_balance >= params.min_balance);
+
+        let mut overspent = false;
+        for rnd in starting_round..starting_round + params.rewards_rate_refresh_interval * 3 {
+            let next = next_rewards_state(cur, rnd, &params, pool_balance, total_reward_units);
+
+            let rewards_per_unit = next
+                .rewards_level
+                .checked_sub(cur.rewards_level)
+                .expect("rewards_level must never decrease");
+
+            let disbursed = total_reward_units.checked_mul(rewards_per_unit);
+            match disbursed.and_then(|d| pool_balance.checked_sub(d)) {
+                Some(new_balance) => pool_balance = new_balance,
+                None => {
+                    overspent = true;
+                    break;
+                }
+            }
+
+            if pool_balance < params.min_balance {
+                overspent = true;
+                break;
+            }
+
+            cur = next;
+        }
+
+        assert!(
+            overspent,
+            "pre-fix (RewardsCalculationFix=false) accounting must overspend the pool in \
+             this scenario, matching go's regression proof of the bug the fix addresses"
+        );
+    }
+
+    #[test]
     fn test_nrs_rewards_calculation_fix_pre_v31_uses_stale_rate() {
         // Before v31, a rate refresh that happens on the SAME round as a
         // level advance must use the *previous* round's rate for that
@@ -766,6 +823,38 @@ mod tests {
         };
         let next = next_rewards_state(prev, 10, &v41(), 10_000_000, 100);
         assert_eq!(next, prev);
+    }
+
+    #[test]
+    fn test_nrs_tiny_fractional_advance_not_lost_to_residue() {
+        // Mirrors go's TestTinyLevel (data/bookkeeping/block_test.go:382): a
+        // reward rate that is far smaller than the (huge) total reward-unit
+        // count advances the level by 0 whole units on integer division, but
+        // the leftover MUST still land in RewardsResidue rather than being
+        // silently discarded to zero — proving the fractional remainder is
+        // preserved even when the level itself doesn't move.
+        let units_in_algos = 1_000_000u64;
+        let algos_in_system = 1_000_000_000u64;
+        let params = v41();
+        let prev = RewardsState {
+            rewards_level: 0,
+            rewards_rate: 10 * units_in_algos,
+            rewards_residue: 0,
+            rewards_recalculation_round: 0, // != next_round(1) → no rate refresh
+        };
+        let total_reward_units = algos_in_system * units_in_algos / params.reward_unit;
+        let next = next_rewards_state(prev, 1, &params, 0, total_reward_units);
+        assert!(
+            next.rewards_level > 0 || next.rewards_residue > 0,
+            "a nonzero rate must not vanish entirely: level={}, residue={}",
+            next.rewards_level,
+            next.rewards_residue
+        );
+        // Pin the exact numeric outcome for this scenario: rate (1e7) is
+        // smaller than total_reward_units (1e9), so the level does not
+        // advance at all and the full rate lands in the residue.
+        assert_eq!(next.rewards_level, 0);
+        assert_eq!(next.rewards_residue, 10 * units_in_algos);
     }
 
     #[test]
