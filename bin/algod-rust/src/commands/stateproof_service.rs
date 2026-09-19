@@ -73,6 +73,7 @@ use algo_ledger::stateproof_worker::{
     StateProofRuntime, StateProofSigningKey,
 };
 use algo_ledger::store_trait::LedgerStore;
+use algo_ledger::AccountManager;
 use algo_ledger::SqliteLedger;
 use algo_network::handler::{MessageHandler, TaggedMessageHandler};
 use algo_network::local_tx_broadcast::LocalTxBroadcaster;
@@ -473,7 +474,7 @@ fn run_loop(
         // go's `Worker.builder`'s per-round `broadcastSigs` call
         // (`stateproof/builder.go:470-474`); reuses the same
         // header/consensus-params lookup the pruning step below needs.
-        let (needed_round, interval) = {
+        let (needed_round, interval, default_key_dilution) = {
             let l = match ledger.lock() {
                 Ok(l) => l,
                 Err(_) => break,
@@ -484,12 +485,12 @@ fn run_loop(
                 .map(|h| {
                     let needed =
                         algo_ledger::block_header::state_proof_next_round(&h.state_proof_tracking);
-                    let interval = consensus_params_for_version(&h.current_protocol)
-                        .map(|p| p.state_proof_interval)
-                        .unwrap_or(0);
-                    (needed, interval)
+                    let params = consensus_params_for_version(&h.current_protocol);
+                    let interval = params.as_ref().map(|p| p.state_proof_interval).unwrap_or(0);
+                    let default_key_dilution = params.map(|p| p.default_key_dilution).unwrap_or(0);
+                    (needed, interval, default_key_dilution)
                 })
-                .unwrap_or((0, 0))
+                .unwrap_or((0, 0, 0))
         };
         let rebroadcast_sigs = {
             let conn = match sig_conn.lock() {
@@ -573,6 +574,25 @@ fn run_loop(
                         warn!(needed_round, error = %e, "stateproof: failed to prune confirmed-accepted state-proof keys");
                     }
                 }
+            }
+        }
+
+        // 1d. Forward-secure key pruning: delete fully-expired participations
+        // and trim ephemeral one-time-signature key material for rounds
+        // already passed. Matches go's `node.go` calling
+        // `AccountManager.DeleteOldKeys(latestHdr, agreementProto)` on every
+        // new block -- this loop's own per-round header/consensus-params
+        // read (just above, for the rebroadcast/pruning steps) is the
+        // natural equivalent "on new block" hook, and this was previously
+        // dead code with no production call site at all (issue #1493).
+        if default_key_dilution > 0 {
+            let deleted =
+                AccountManager::new(part_store).delete_old_keys(current, default_key_dilution);
+            if deleted > 0 {
+                info!(
+                    current_round = current.0,
+                    deleted, "stateproof: pruned old participation key material"
+                );
             }
         }
 

@@ -111,11 +111,7 @@ fn client() -> reqwest::Client {
         .expect("build reqwest client")
 }
 
-async fn wait_for_params(
-    c: &reqwest::Client,
-    base: &str,
-    token: &str,
-) -> serde_json::Value {
+async fn wait_for_params(c: &reqwest::Client, base: &str, token: &str) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(resp) = c

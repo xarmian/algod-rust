@@ -142,7 +142,11 @@ int 1
     let approval_b = assemble(&hop(app_c));
     let approval_c = assemble(leaf_err);
 
-    for (id, approval) in [(app_a, approval_a), (app_b, approval_b), (app_c, approval_c)] {
+    for (id, approval) in [
+        (app_a, approval_a),
+        (app_b, approval_b),
+        (app_c, approval_c),
+    ] {
         register_app(&mut state, sender, id, approval);
         fund(&mut state, Address(app_address(id)), 2_000_000);
     }

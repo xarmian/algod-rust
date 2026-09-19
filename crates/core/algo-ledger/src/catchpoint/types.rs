@@ -1006,8 +1006,7 @@ mod tests {
         // leftover bytes, and so must a populated one.
         let record = BalanceRecordV6::default();
         let bytes = rmp_serde::to_vec_named(&record).expect("msgpack serialize");
-        let round_tripped: BalanceRecordV6 =
-            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        let round_tripped: BalanceRecordV6 = rmp_serde::from_slice(&bytes).expect("msgpack decode");
         assert_eq!(round_tripped, record);
 
         let mut resources = HashMap::new();
@@ -1019,8 +1018,7 @@ mod tests {
             expecting_more_entries: true,
         };
         let bytes = rmp_serde::to_vec_named(&populated).expect("msgpack serialize");
-        let round_tripped: BalanceRecordV6 =
-            rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        let round_tripped: BalanceRecordV6 = rmp_serde::from_slice(&bytes).expect("msgpack decode");
         assert_eq!(round_tripped, populated);
     }
 

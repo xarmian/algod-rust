@@ -74,7 +74,9 @@ pub fn fetch_light_headers<L: LedgerStore>(
     state_proof_interval: u64,
     latest_round: u64,
 ) -> Result<Vec<LightBlockHeader>, AlgoError> {
-    let first_round = latest_round.saturating_sub(state_proof_interval).saturating_add(1);
+    let first_round = latest_round
+        .saturating_sub(state_proof_interval)
+        .saturating_add(1);
     let mut out = Vec::with_capacity(state_proof_interval as usize);
     for round in first_round..=latest_round {
         let hdr = store.get_block_header(round)?.ok_or_else(|| {
@@ -151,8 +153,9 @@ pub fn generate_state_proof_message<L: LedgerStore>(
     let commitment = create_header_commitment(store, &params, &hdr)?;
 
     let total_weight = state_proof_online_total_weight(&hdr.state_proof_tracking);
-    let ln_proven_weight = calculate_ln_proven_weight(total_weight, params.state_proof_weight_threshold)
-        .map_err(|e| ledger_err(format!("generate_state_proof_message: {e}")))?;
+    let ln_proven_weight =
+        calculate_ln_proven_weight(total_weight, params.state_proof_weight_threshold)
+            .map_err(|e| ledger_err(format!("generate_state_proof_message: {e}")))?;
 
     Ok(StateProofMessage {
         block_headers_commitment: ByteBuf::from(commitment),
