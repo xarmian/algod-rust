@@ -1921,6 +1921,252 @@ mod tests {
         verifier.verify(round, msg, &proof).expect("must verify");
     }
 
+    // ── Multi-node simulated gossip (issue #1496 batch 2) ──────────────
+    //
+    // go's `TestWorkerAllSigs`/`TestWorkerPartialSigs`/`TestWorkerInsufficientSigs`
+    // (`stateproof/worker_test.go`) each spin up several independent
+    // `Worker` instances wired to a fake in-process network, have some
+    // subset of them locally sign and broadcast a `StateProofSig`, and
+    // assert every worker's own prover converges (or correctly fails to
+    // converge) purely from gossip -- including workers that never
+    // produced a signature themselves. That's a genuine multi-node
+    // property (weight gathered from *peers*, not just locally inserted),
+    // distinct from the single-collector tests above.
+    //
+    // The previous notes on these three parity rows said this needed real
+    // multi-node gossip infrastructure to reproduce. It doesn't: every
+    // node's `SigCollector` is a pure, synchronous, in-memory object (no
+    // network/thread/async machinery), and every node derives an
+    // identical `participants`/`part_tree`/`addr_to_pos` from the same
+    // ledger snapshot in reality -- so N independent `SigCollector`s
+    // sharing that same deterministic setup, with a plain in-process loop
+    // standing in for "broadcast this signature to every peer", faithfully
+    // reproduces the multi-node property without needing real sockets or
+    // a network simulator.
+
+    /// Build `n` independent nodes' [`SigCollector`]s for the same
+    /// round/voter set (byte-identical `participants`/`part_tree`/
+    /// `addr_to_pos` across all of them, as every node would derive
+    /// deterministically from the same ledger snapshot in reality), each
+    /// starting with zero gathered signatures -- the multi-node analogue
+    /// of `build_collector` above.
+    fn build_multi_node_collectors(
+        round: u64,
+        msg: MessageHash,
+        n: usize,
+        per_signer_weight: u64,
+        proven_weight: u64,
+    ) -> (Vec<SigCollector>, Vec<merklesig::Secrets>, Vec<Address>) {
+        let mut secrets_list = Vec::with_capacity(n);
+        let mut participants = Vec::with_capacity(n);
+        let mut addrs = Vec::with_capacity(n);
+        let mut addr_to_pos = BTreeMap::new();
+        for i in 0..n {
+            let secrets = merklesig::Secrets::new(round, round, 1).unwrap();
+            participants.push(Participant {
+                pk: secrets.get_verifier(),
+                weight: per_signer_weight,
+            });
+            let addr = Address([(i as u8) + 1; 32]);
+            addr_to_pos.insert(addr, i as u64);
+            addrs.push(addr);
+            secrets_list.push(secrets);
+        }
+        let factory = merklearray::HashFactory::new(merklearray::HashType::Sumhash);
+        struct PartArray(Vec<Participant>);
+        impl merklearray::Array for PartArray {
+            fn length(&self) -> u64 {
+                self.0.len() as u64
+            }
+            fn marshal(
+                &self,
+                pos: u64,
+            ) -> Result<Box<dyn merklearray::Hashable>, merklearray::MerkleError> {
+                Ok(Box::new(self.0[pos as usize].clone()))
+            }
+        }
+        let part_tree =
+            merklearray::build_vector_commitment_tree(&PartArray(participants.clone()), factory)
+                .unwrap();
+
+        let collectors = (0..n)
+            .map(|_| {
+                let prover = Prover::make_prover(
+                    msg,
+                    round,
+                    proven_weight,
+                    participants.clone(),
+                    part_tree.clone(),
+                    0,
+                )
+                .unwrap();
+                SigCollector::new(prover, addr_to_pos.clone())
+            })
+            .collect();
+        (collectors, secrets_list, addrs)
+    }
+
+    /// Simulate broadcasting `signer_idx`'s own signature to every node's
+    /// collector (including itself) -- the in-process stand-in for a
+    /// `StateProofSig` gossip message reaching every peer.
+    fn gossip_sig(
+        collectors: &mut [SigCollector],
+        secrets_list: &[merklesig::Secrets],
+        addrs: &[Address],
+        round: u64,
+        msg: &MessageHash,
+        signer_idx: usize,
+    ) {
+        let sig = secrets_list[signer_idx]
+            .get_signer(round)
+            .sign_bytes(msg)
+            .unwrap();
+        for collector in collectors.iter_mut() {
+            collector
+                .insert_sig(addrs[signer_idx], sig.clone(), true)
+                .unwrap();
+        }
+    }
+
+    /// go: `TestWorkerAllSigs` (`stateproof/worker_test.go:564`) -- every
+    /// online signer broadcasts its signature; every node (there is no
+    /// "did I sign" special case) must independently converge on a
+    /// verifiable proof purely from the gossip it received.
+    #[test]
+    fn multi_node_simulated_gossip_all_signers_converge_on_a_verifiable_proof() {
+        let round = 40u64;
+        let msg: MessageHash = [10u8; 32];
+        let n = 4;
+        let (mut collectors, secrets_list, addrs) =
+            build_multi_node_collectors(round, msg, n, 1000, 3000);
+        let part_commit = collectors[0].prover.part_tree.root();
+
+        for signer_idx in 0..n {
+            gossip_sig(
+                &mut collectors,
+                &secrets_list,
+                &addrs,
+                round,
+                &msg,
+                signer_idx,
+            );
+        }
+
+        for (i, collector) in collectors.iter().enumerate() {
+            assert_eq!(
+                collector.prover.signed_weight(),
+                4000,
+                "node {i} should have gathered every signer's weight via gossip"
+            );
+            assert!(collector.prover.ready(), "node {i} should be ready");
+        }
+
+        let verifier = stateproof::Verifier::new(part_commit, 3000, 0).unwrap();
+        for (i, mut collector) in collectors.into_iter().enumerate() {
+            let proof = collector
+                .prover
+                .create_proof()
+                .unwrap_or_else(|e| panic!("node {i}: create_proof: {e}"));
+            verifier
+                .verify(round, msg, &proof)
+                .unwrap_or_else(|e| panic!("node {i}: proof must verify: {e}"));
+        }
+    }
+
+    /// go: `TestWorkerPartialSigs` (`stateproof/worker_test.go:628`) -- only
+    /// some signers broadcast, but enough combined weight is gathered that
+    /// every node -- including the ones that never signed themselves --
+    /// converges on a verifiable proof purely from the sigs it received
+    /// over gossip.
+    #[test]
+    fn multi_node_simulated_gossip_partial_signers_still_converge_via_gossip() {
+        let round = 41u64;
+        let msg: MessageHash = [11u8; 32];
+        let n = 5;
+        let (mut collectors, secrets_list, addrs) =
+            build_multi_node_collectors(round, msg, n, 1000, 2000);
+        let part_commit = collectors[0].prover.part_tree.root();
+
+        // Only signers 0, 2, 4 actually sign (3000 of 5000 possible
+        // weight, comfortably above the 2000 proven-weight threshold) --
+        // signers 1 and 3 never produce a signature at all, and must
+        // still converge purely from what gossip delivers them.
+        for signer_idx in [0usize, 2, 4] {
+            gossip_sig(
+                &mut collectors,
+                &secrets_list,
+                &addrs,
+                round,
+                &msg,
+                signer_idx,
+            );
+        }
+
+        for (i, collector) in collectors.iter().enumerate() {
+            assert_eq!(
+                collector.prover.signed_weight(),
+                3000,
+                "node {i} should have gathered exactly the 3 broadcast signers' weight"
+            );
+            assert!(
+                collector.prover.ready(),
+                "node {i} (including non-signers 1 and 3) should be ready from gossip alone"
+            );
+        }
+
+        let verifier = stateproof::Verifier::new(part_commit, 2000, 0).unwrap();
+        for (i, mut collector) in collectors.into_iter().enumerate() {
+            let proof = collector
+                .prover
+                .create_proof()
+                .unwrap_or_else(|e| panic!("node {i}: create_proof: {e}"));
+            verifier
+                .verify(round, msg, &proof)
+                .unwrap_or_else(|e| panic!("node {i}: proof must verify: {e}"));
+        }
+    }
+
+    /// go: `TestWorkerInsufficientSigs` (`stateproof/worker_test.go:690`) --
+    /// too few signers broadcast to ever reach the proven-weight threshold;
+    /// every node, having gathered every signature that will ever arrive,
+    /// must correctly stay not-ready and refuse to build a proof.
+    #[test]
+    fn multi_node_simulated_gossip_insufficient_signers_never_converge() {
+        let round = 42u64;
+        let msg: MessageHash = [12u8; 32];
+        let n = 5;
+        let (mut collectors, secrets_list, addrs) =
+            build_multi_node_collectors(round, msg, n, 1000, 3000);
+
+        // Only signer 0 broadcasts (1000 of the 3000 proven_weight
+        // threshold) -- every node has now seen every signature it ever
+        // will, and none should reach readiness.
+        gossip_sig(&mut collectors, &secrets_list, &addrs, round, &msg, 0);
+
+        for (i, collector) in collectors.iter_mut().enumerate() {
+            assert_eq!(
+                collector.prover.signed_weight(),
+                1000,
+                "node {i} should have gathered only signer 0's weight"
+            );
+            assert!(
+                !collector.prover.ready(),
+                "node {i} must not be ready below the proven-weight threshold"
+            );
+            let err = collector
+                .prover
+                .create_proof()
+                .expect_err("node {i}: create_proof must reject insufficient signed weight");
+            assert!(matches!(
+                err,
+                StateProofError::SignedWeightLessThanProvenWeight {
+                    signed: 1000,
+                    proven: 3000
+                }
+            ));
+        }
+    }
+
     // ── DB persistence ───────────────────────────────────────────────
 
     fn fresh_db() -> Connection {
