@@ -59,6 +59,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use algo_ledger::participation::{ParticipationID, ParticipationRecord};
+use algo_metrics::{default_registry, Counter};
 use algo_types::Address;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -3656,19 +3657,45 @@ pub async fn get_participation_status<N: NodeInterface>(
 ///
 /// Returns 404 when the node is not participating in consensus, which is how
 /// a scraper distinguishes an un-instrumented process from a zeroed one.
+///
+/// Also records this endpoint's own hit count via `algo-metrics`'s
+/// [`Registry`](algo_metrics::Registry)-backed [`Counter`] (issue #1500) —
+/// a real, if small, production call site for the shared metrics primitive
+/// family, appended to the exposition alongside the per-subsystem counters
+/// go-algorand's `Registry.WriteMetrics` would also aggregate.
 pub async fn metrics<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
+    metrics_requests_counter().inc();
     match node.metrics_exposition() {
-        Some(text) => (
-            StatusCode::OK,
-            // `version=0.0.4` is the Prometheus text exposition content type;
-            // scrapers accept `text/plain` without it, but naming the version
-            // is what the exposition spec asks for.
-            [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-            text,
-        )
-            .into_response(),
+        Some(mut text) => {
+            text.push_str(&default_registry().render(""));
+            (
+                StatusCode::OK,
+                // `version=0.0.4` is the Prometheus text exposition content
+                // type; scrapers accept `text/plain` without it, but naming
+                // the version is what the exposition spec asks for.
+                [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+                text,
+            )
+                .into_response()
+        }
         None => error::not_found("metrics are not available on this node"),
     }
+}
+
+/// The process-wide counter of `GET /metrics` hits, registered with
+/// `algo-metrics`'s default registry the first time this endpoint is
+/// served.
+fn metrics_requests_counter() -> &'static Arc<Counter> {
+    use std::sync::OnceLock;
+    static COUNTER: OnceLock<Arc<Counter>> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        let counter = Arc::new(Counter::new(
+            "algod_rust_metrics_endpoint_requests_total",
+            "Total number of requests served by GET /metrics",
+        ));
+        default_registry().register(counter.clone());
+        counter
+    })
 }
 
 // ---------------------------------------------------------------------------

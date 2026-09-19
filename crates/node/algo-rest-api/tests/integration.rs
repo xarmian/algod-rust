@@ -10506,6 +10506,55 @@ async fn metrics_endpoint_returns_prometheus_text_without_auth() {
     assert!(body.contains("# TYPE algod_rust_agreement_votes_total counter"));
 }
 
+/// The `GET /metrics` handler increments a real `algo-metrics` `Counter`
+/// (issue #1500) each time it's served, and that counter's own series is
+/// appended to the exposition alongside the per-subsystem counters.
+#[tokio::test]
+async fn metrics_endpoint_reports_its_own_request_counter() {
+    let server = TestServer::start(mock_participating()).await;
+
+    let resp1 = server
+        .client
+        .get(server.url("/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), 200);
+    let body1 = resp1.text().await.unwrap();
+    assert!(
+        body1.contains("# TYPE algod_rust_metrics_endpoint_requests_total counter"),
+        "{body1}"
+    );
+
+    let resp2 = server
+        .client
+        .get(server.url("/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), 200);
+    let body2 = resp2.text().await.unwrap();
+
+    // Extract the counter's rendered value from each response and confirm
+    // it strictly increased across the two requests (the counter is a
+    // process-wide singleton shared across every test in this binary, so
+    // an exact value can't be pinned — only that serving the endpoint
+    // increments it).
+    let extract = |body: &str| -> u64 {
+        body.lines()
+            .find(|l| l.starts_with("algod_rust_metrics_endpoint_requests_total "))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("counter line not found in: {body}"))
+    };
+    let v1 = extract(&body1);
+    let v2 = extract(&body2);
+    assert!(
+        v2 > v1,
+        "expected request counter to increase: {v1} -> {v2}"
+    );
+}
+
 #[tokio::test]
 async fn metrics_endpoint_404s_when_not_participating() {
     let server = TestServer::start(MockNode::synced()).await;

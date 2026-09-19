@@ -13,6 +13,7 @@ algo-ledger.workspace = true
 algo-consensus-crypto.workspace = true
 algo-abi.workspace = true
 algo-error.workspace = true
+algo-metrics.workspace = true
 sha2.workspace = true
 axum.workspace = true
 tower.workspace = true
