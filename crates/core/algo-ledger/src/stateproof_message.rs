@@ -207,6 +207,25 @@ mod tests {
 
     const INTERVAL: u64 = 256; // v41's StateProofInterval
 
+    /// Mirrors go's `TestConvertSha256Header`: directly exercise the
+    /// `BlockHeader -> LightBlockHeader` field mapping (round /
+    /// genesis_hash / sha256_txn_commitment), rather than only through the
+    /// full `fetch_light_headers`/`generate_state_proof_message` pipeline
+    /// tests below.
+    #[test]
+    fn to_light_block_header_maps_fields_directly() {
+        use algo_types::consensus::consensus_params_for_version;
+
+        let params = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        let hdr = header_at(200, None);
+
+        let light = to_light_block_header(&hdr, &params);
+
+        assert_eq!(light.round, 200);
+        assert_eq!(light.genesis_hash, [0xAB; 32]);
+        assert_eq!(light.sha256_txn_commitment, hdr.txn256);
+    }
+
     #[test]
     fn fetch_light_headers_errors_when_a_round_is_missing() {
         let store = LedgerState::new();

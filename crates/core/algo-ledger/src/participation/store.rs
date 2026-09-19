@@ -1346,6 +1346,50 @@ mod tests {
         assert_eq!(all[0].account, Address([2u8; 32]));
     }
 
+    /// Mirrors go's `TestParticipation_CleanupTablesAfterDeleteExpired`
+    /// exactly: after `DeleteExpired`, the go test queries the raw SQLite
+    /// `Keysets`/`Rolling`/`stateproofkeys` tables directly and asserts each
+    /// is empty (`count(*) == 0`), not just that the higher-level API no
+    /// longer returns the record. `delete_expired_removes_old_keys` above
+    /// only checks the latter via `get_all()`. This strengthens coverage to
+    /// the same raw-table-emptiness assertion go makes, including state
+    /// proof keys (which go's loop also inserts via `AppendKeys`).
+    #[test]
+    fn delete_expired_empties_all_backing_tables() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        for i in 10u8..20 {
+            let part = make_test_participation_with_state_proof(
+                i,
+                i as u64,
+                i as u64 + merklesig::KEY_LIFETIME_DEFAULT,
+                1,
+            );
+            store.insert(&part).unwrap();
+        }
+
+        let latest_round = 10 + merklesig::KEY_LIFETIME_DEFAULT * 20;
+        let deleted = store.delete_expired(Round(latest_round)).unwrap();
+        assert_eq!(deleted, 10);
+
+        let keysets_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM Keysets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(keysets_count, 0);
+
+        let rolling_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM Rolling", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rolling_count, 0);
+
+        let state_proof_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM StateProofKeys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state_proof_count, 0);
+    }
+
     #[test]
     fn has_live_keys_basic() {
         let store = ParticipationStore::open_in_memory().unwrap();
@@ -1764,6 +1808,42 @@ mod tests {
         assert_eq!(restored.voting.verifier(), original_verifier);
         assert_eq!(restored.vrf.pk, original_vrf_pk);
         assert!(restored.state_proof_secrets.is_none());
+    }
+
+    /// Mirrors go's `TestRetrieveFromDB`: insert a full `Participation`
+    /// (including state proof secrets, matching `setupParticipationKey`'s
+    /// `RestoreParticipation`/`intoComparable` deep-equality check) and
+    /// confirm every field round-trips, not just the non-state-proof fields
+    /// already covered by `get_for_round_restores_all_fields` or the raw key
+    /// count already covered by `state_proof_keys_roundtrip`.
+    #[test]
+    fn get_for_round_restores_participation_with_state_proof_secrets() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let key_dilution = 32u64;
+        let part = make_test_participation_with_state_proof(7, 0, 1024, key_dilution);
+        let original_verifier = part.voting.verifier();
+        let original_vrf_pk = part.vrf.pk;
+        let original_secrets = part.state_proof_secrets.clone().unwrap();
+        let id = store.insert(&part).unwrap();
+
+        let restored = store
+            .get_for_round(&id, Round(500))
+            .unwrap()
+            .expect("should find key");
+
+        assert_eq!(restored.parent, Address([7u8; 32]));
+        assert_eq!(restored.first_valid, Round(0));
+        assert_eq!(restored.last_valid, Round(1024));
+        assert_eq!(restored.key_dilution, key_dilution);
+        assert_eq!(restored.voting.verifier(), original_verifier);
+        assert_eq!(restored.vrf.pk, original_vrf_pk);
+
+        let restored_secrets = restored
+            .state_proof_secrets
+            .expect("state proof secrets should round-trip");
+        assert_eq!(restored_secrets.signer_context, original_secrets.signer_context);
+        assert_eq!(restored_secrets.first_key_offset, original_secrets.first_key_offset);
+        assert_eq!(restored_secrets.ephemeral_keys, original_secrets.ephemeral_keys);
     }
 
     #[test]
