@@ -5571,6 +5571,52 @@ async fn get_light_block_header_proof_happy_path() {
     assert_eq!(body["index"].as_u64().unwrap(), 1); // round 2 - first_attested 1 = 1
 }
 
+/// go: `TestGenerateBlockProofOnSmallArray`
+/// (`stateproof/stateproofMessageGenerator_test.go#L244`) exercises the
+/// same `GenerateProofOfLightBlockHeaders`/`VerifyVectorCommitment` proof
+/// path as `TestGenerateBlockProof` above, but specifically with a small
+/// (2-element) light-header array -- pinning the small-array edge case of
+/// the Merkle vector-commitment proof (single-level tree, minimal reveal
+/// set) that `get_light_block_header_proof_happy_path`'s 4-round interval
+/// doesn't exercise. Mirrors that test's REST-endpoint shape (this repo's
+/// equivalent of go's `GenerateBlockProof`, see that row's note) with a
+/// 2-round state-proof interval instead.
+#[tokio::test]
+async fn get_light_block_header_proof_small_array() {
+    let mut node = MockNode::synced();
+
+    // A minimal 2-round interval: rounds 1-2 covered by one state proof.
+    node.state_proof_txns.insert(1, (1, 2));
+    for r in 1..=2 {
+        node.block_headers.insert(r, make_test_block_header(r));
+    }
+
+    let server = TestServer::start(node).await;
+
+    // Every round in the small interval must independently produce a
+    // valid proof, mirroring go's `verifyLightBlockHeaderProof` loop over
+    // `[FirstAttestedRound, LastAttestedRound)`.
+    for (round, expected_index) in [(1u64, 0u64)] {
+        let resp = server
+            .client
+            .get(server.url(&format!("/v2/blocks/{round}/lightheader/proof")))
+            .header("X-Algo-API-Token", &server.api_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "round {round}");
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body.get("index").is_some(), "should have 'index' field");
+        assert!(body.get("proof").is_some(), "should have 'proof' field");
+        assert!(
+            body.get("treedepth").is_some(),
+            "should have 'treedepth' field"
+        );
+        assert_eq!(body["index"].as_u64().unwrap(), expected_index);
+    }
+}
+
 #[tokio::test]
 async fn get_light_block_header_proof_no_state_proof() {
     let node = MockNode::synced();
