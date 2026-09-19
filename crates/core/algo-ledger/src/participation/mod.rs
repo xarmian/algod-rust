@@ -52,7 +52,7 @@ pub use stateproof_persist::{
     install_state_proof_table, persist_secrets, StateProofPersistError,
     MERKLE_SIGNATURE_SCHEMA_VERSION, MERKLE_SIGNATURE_TABLE_SCHEMA_NAME,
 };
-pub use store::ParticipationStore;
+pub use store::{GetStateProofSecretsError, ParticipationStore};
 
 use algo_consensus_crypto::merklesig;
 use algo_consensus_crypto::{
