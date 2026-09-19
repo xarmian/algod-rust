@@ -741,6 +741,99 @@ mod tests {
         );
     }
 
+    /// Port of go's `TestSigVerifier` (`data/transactions/verify/
+    /// txnBatch_test.go`): a single synchronous entry point that verifies a
+    /// good group (succeeds, and the group becomes cache-covered so a
+    /// resubmission is skipped) and a bad group (fails, and never becomes
+    /// cache-covered). go's `SigVerifier` is a small synchronous wrapper
+    /// around the same cache-consulting group-verify go's async
+    /// `BatchVerifier` pool also uses; `verify_transaction_group_cached` is
+    /// algod-rust's single synchronous entry point serving that same role
+    /// (see its doc comment: "the single call site both the
+    /// gossip/mempool-admission path ... and block verification ... should
+    /// use").
+    #[test]
+    fn verify_transaction_group_cached_good_then_bad_mirrors_sig_verifier() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let cache = VerifiedTransactionCache::new(100);
+        let context = VerificationContext {
+            spec_addrs: SpecialAddresses::default(),
+            consensus_version: "future".to_string(),
+        };
+        let params = crate::rules::consensus_params_for_version("future")
+            .expect("future consensus params must be registered");
+
+        let build_signed_txn = |note: u64, key: &SigningKey| -> SignedTransaction {
+            let pk = key.verifying_key();
+            let sender = Address(pk.to_bytes());
+            let txn = Transaction {
+                txn_type: "pay".into(),
+                sender,
+                fee: 1000,
+                first_valid: Round(1),
+                last_valid: Round(1000),
+                receiver: Address([0x42; 32]),
+                amount: 1000,
+                genesis_id: "test-v1".into(),
+                genesis_hash: [0xAA; 32],
+                note: serde_bytes::ByteBuf::from(note.to_be_bytes().to_vec()),
+                ..Default::default()
+            };
+            let canonical = algo_codec::canonical_encode_transaction(&txn);
+            let mut msg = Vec::with_capacity(2 + canonical.len());
+            msg.extend_from_slice(b"TX");
+            msg.extend_from_slice(&canonical);
+            let sig = key.sign(&msg);
+            SignedTransaction {
+                txn,
+                sig: sig.to_bytes(),
+                ..Default::default()
+            }
+        };
+
+        // Good group: valid ed25519 signature over the canonical encoding.
+        let good_key = SigningKey::from_bytes(&[9u8; 32]);
+        let good_group = vec![build_signed_txn(1, &good_key)];
+        let ok = verify_transaction_group_cached(&good_group, &context, &params, &cache);
+        assert!(
+            ok.is_ok(),
+            "a validly-signed group must verify successfully: {ok:?}"
+        );
+
+        // Once verified, the group must be cache-covered: a lookup for the
+        // identical group under the identical context returns no unverified
+        // groups (mirrors go's `TxnGroup` "already verified" skip path).
+        let unverified =
+            cache.get_unverified_transaction_groups(std::slice::from_ref(&good_group), &context);
+        assert!(
+            unverified.is_empty(),
+            "a successfully-verified group must be fully cache-covered"
+        );
+
+        // Bad group: signed by a *different* key than the one whose pubkey
+        // the sender address is derived from, so the signature check fails.
+        let wrong_key = SigningKey::from_bytes(&[0xFFu8; 32]);
+        let mut bad_stxn = build_signed_txn(2, &wrong_key);
+        bad_stxn.txn.sender = Address(good_key.verifying_key().to_bytes());
+        let bad_group = vec![bad_stxn];
+        let err = verify_transaction_group_cached(&bad_group, &context, &params, &cache);
+        assert!(
+            err.is_err(),
+            "a group with an invalid signature must fail verification"
+        );
+
+        // A failed group must never become cache-covered (so a later
+        // resubmission with a corrected signature is verified for real).
+        let still_unverified =
+            cache.get_unverified_transaction_groups(std::slice::from_ref(&bad_group), &context);
+        assert_eq!(
+            still_unverified.len(),
+            1,
+            "a group that failed verification must not be cached as verified"
+        );
+    }
+
     // ── Issue #1253: EnableLogicSigCostPooling must gate group-wide
     // LogicSig budget pooling ──
     //

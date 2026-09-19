@@ -18,8 +18,10 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use algo_codec::{compute_block_digest, compute_txn_id, decode_block_response};
-use algo_types::BlockResponse;
+use algo_codec::{
+    canonical_encode_transaction, compute_block_digest, compute_txn_id, decode_block_response,
+};
+use algo_types::{Address, BlockResponse, Transaction, TxnType};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {
@@ -162,6 +164,68 @@ fn mutated_transaction_changes_txn_id() {
     assert_ne!(
         original_id, mutated_id,
         "txn ID should change when transaction is mutated"
+    );
+}
+
+// ── Domain-separation / round-trip test (go: TestEncoding) ───────
+
+/// Mirrors go-algorand's `TestEncoding`
+/// (data/transactions/signedtxn_test.go): two zero-valued transactions of
+/// different types but the *same* sender must still get distinct txn IDs
+/// (type participates in ID domain separation, not just field values),
+/// distinct canonical encodings, and each must round-trip through
+/// encode/decode preserving its type and sender.
+#[test]
+fn zero_payment_and_zero_keyreg_have_distinct_ids_and_round_trip() {
+    let mut sender_bytes = [0u8; 32];
+    sender_bytes[0] = 0x01;
+    let sender = Address(sender_bytes);
+
+    let zero_payment = Transaction {
+        txn_type: TxnType::Pay,
+        sender,
+        ..Transaction::default()
+    };
+    let zero_keyreg = Transaction {
+        txn_type: TxnType::Keyreg,
+        sender,
+        ..Transaction::default()
+    };
+
+    let payment_id = compute_txn_id(&zero_payment);
+    let keyreg_id = compute_txn_id(&zero_keyreg);
+    assert_ne!(
+        payment_id, keyreg_id,
+        "payment and keyreg with identical header fields must have distinct \
+         txn IDs -- type must participate in ID domain separation"
+    );
+
+    let payment_bytes = canonical_encode_transaction(&zero_payment);
+    let keyreg_bytes = canonical_encode_transaction(&zero_keyreg);
+    assert_ne!(
+        payment_bytes, keyreg_bytes,
+        "canonical encoding of a zero payment and a zero keyreg must differ"
+    );
+
+    let decoded_payment = Transaction::decode_from_reader(&mut payment_bytes.as_slice())
+        .expect("decoding encoded zero payment must succeed");
+    let decoded_keyreg = Transaction::decode_from_reader(&mut keyreg_bytes.as_slice())
+        .expect("decoding encoded zero keyreg must succeed");
+
+    assert_eq!(decoded_payment.txn_type, TxnType::Pay);
+    assert_eq!(decoded_payment.sender, sender);
+    assert_eq!(decoded_keyreg.txn_type, TxnType::Keyreg);
+    assert_eq!(decoded_keyreg.sender, sender);
+
+    assert_eq!(
+        compute_txn_id(&decoded_payment),
+        payment_id,
+        "round-tripped payment must hash back to the same txn ID"
+    );
+    assert_eq!(
+        compute_txn_id(&decoded_keyreg),
+        keyreg_id,
+        "round-tripped keyreg must hash back to the same txn ID"
     );
 }
 
