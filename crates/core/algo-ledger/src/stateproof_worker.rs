@@ -1407,6 +1407,226 @@ mod tests {
         );
     }
 
+    // ── handle_sig: go's `Worker.handleSig` entrypoint (builder.go:343) ──
+    //
+    // The tests above already pin `handle_sig`'s anti-spam gate (already-
+    // complete round, broadcast-policy window) and `SigCollector::insert_sig`
+    // already pins the underlying wrong-signature/unknown-address/duplicate
+    // rejections at the collector layer. These tests exercise the same
+    // rejections one layer up, through `handle_sig` itself -- the direct
+    // Rust equivalent of go's `handleSig` daemon entrypoint that go's
+    // `TestWorkerHandleSigWrongSignature`/`TestWorkerHandleSigAddrsNotInTopN`/
+    // `TestWorkerHandleSigAlreadyIn`/`TestWorkerHandleSigIntervalZero`/
+    // `TestWorkerHandleSigNotOnInterval` (`stateproof/worker_test.go`) each
+    // call, proving the anti-spam gate and the collector rejection are wired
+    // together correctly, not just correct in isolation.
+
+    /// A minimal ledger with one real online voter (`ADDR`) registered for
+    /// `STATE_PROOF_ROUND`'s voters snapshot -- enough for `handle_sig` to
+    /// pass its anti-spam gate and successfully build a real prover entry
+    /// via `create_prover_entry`, so signature-insertion rejections can be
+    /// exercised through the full `handle_sig` call path (not just
+    /// `SigCollector::insert_sig` directly).
+    fn store_with_one_voter() -> (crate::state::LedgerState, Address, merklesig::Secrets, u64) {
+        let params = consensus_params_for_version(algo_types::consensus::CONSENSUS_V41).unwrap();
+        let mut store = crate::state::LedgerState::new();
+
+        const SNAPSHOT_ROUND: u64 = 240;
+        const VOTERS_ROUND: u64 = 256;
+        const STATE_PROOF_ROUND: u64 = 512;
+
+        let secrets =
+            merklesig::Secrets::new(STATE_PROOF_ROUND, STATE_PROOF_ROUND, 1).expect("mss keygen");
+        let commitment = secrets.get_verifier().commitment;
+        let addr = Address([1u8; 32]);
+        store.set_account(
+            &addr,
+            algo_types::AccountData {
+                micro_algos: 5_000_000,
+                status: algo_types::AccountStatus::Online,
+                vote_first_valid: 0,
+                vote_last_valid: STATE_PROOF_ROUND + 1000,
+                state_proof_id: Some(commitment),
+                ..Default::default()
+            },
+        );
+        crate::voters_tracker::record_voters_snapshot(&mut store, SNAPSHOT_ROUND, 0, &params)
+            .unwrap();
+        let (root, total_weight) = store.get_voters_snapshot(SNAPSHOT_ROUND).unwrap().unwrap();
+
+        let put_header =
+            |store: &mut crate::state::LedgerState, round: u64, tracking: Option<rmpv::Value>| {
+                let hdr = algo_types::BlockHeader {
+                    round: algo_types::Round(round),
+                    current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+                    genesis_hash: [0xABu8; 32],
+                    txn256: [(round % 256) as u8; 32],
+                    state_proof_tracking: tracking,
+                    ..algo_types::BlockHeader::default()
+                };
+                let bytes = algo_codec::canonical_encode_block_header(&hdr);
+                store
+                    .put_block(round, &hdr.current_protocol, &bytes, &[])
+                    .unwrap();
+            };
+        let tracking = |next_round: u64| {
+            Some(rmpv::Value::Map(vec![(
+                rmpv::Value::from(0u64),
+                rmpv::Value::Map(vec![
+                    (rmpv::Value::from("v"), rmpv::Value::Binary(root.to_vec())),
+                    (rmpv::Value::from("t"), rmpv::Value::from(total_weight)),
+                    (rmpv::Value::from("n"), rmpv::Value::from(next_round)),
+                ]),
+            )]))
+        };
+        put_header(&mut store, VOTERS_ROUND, tracking(0));
+        for r in (VOTERS_ROUND + 1)..STATE_PROOF_ROUND {
+            put_header(&mut store, r, None);
+        }
+        put_header(&mut store, STATE_PROOF_ROUND, tracking(0));
+
+        (store, addr, secrets, STATE_PROOF_ROUND)
+    }
+
+    /// go's `TestWorkerHandleSigWrongSignature` (`stateproof/worker_test.go:1465`):
+    /// a cryptographically invalid signature from an otherwise-legitimate
+    /// voter must be rejected, not silently accepted or ignored.
+    #[test]
+    fn handle_sig_rejects_forged_signature_through_the_full_handler() {
+        let (store, addr, secrets, round) = store_with_one_voter();
+        let mut runtime = StateProofRuntime::new();
+        let forged = SigFromAddr {
+            signer_address: addr,
+            round,
+            // Signed over the wrong message -- the prover's real message
+            // hash for this round is whatever `create_prover_entry` computed
+            // from the ledger, not this arbitrary byte string.
+            sig: secrets.get_signer(round).sign_bytes(&[0xAAu8; 32]).unwrap(),
+        };
+        let err = runtime
+            .handle_sig(&store, &forged, round, false)
+            .expect_err("forged signature must be rejected");
+        assert!(matches!(
+            err,
+            HandleSigError::InsertSig(InsertSigError::VerificationFailed(_))
+        ));
+    }
+
+    /// go's `TestWorkerHandleSigAddrsNotInTopN` (`stateproof/worker_test.go:1483`):
+    /// a signature from an address that isn't among the selected voters for
+    /// this round must be rejected.
+    #[test]
+    fn handle_sig_rejects_address_not_in_voters_through_the_full_handler() {
+        let (store, _addr, _secrets, round) = store_with_one_voter();
+        let mut runtime = StateProofRuntime::new();
+        let stranger_secrets = merklesig::Secrets::new(round, round, 1).unwrap();
+        let stranger = SigFromAddr {
+            signer_address: Address([0xFFu8; 32]),
+            round,
+            sig: stranger_secrets
+                .get_signer(round)
+                .sign_bytes(&[0u8; 32])
+                .unwrap(),
+        };
+        let err = runtime
+            .handle_sig(&store, &stranger, round, false)
+            .expect_err("address not among this round's selected voters must be rejected");
+        assert!(matches!(
+            err,
+            HandleSigError::InsertSig(InsertSigError::AddressNotInVoters)
+        ));
+    }
+
+    /// go's `TestWorkerHandleSigAlreadyIn` (`stateproof/worker_test.go:1527`):
+    /// a signature already gathered for this (round, address) is harmlessly
+    /// ignored on redelivery, not treated as an error or double-counted.
+    #[test]
+    fn handle_sig_ignores_already_gathered_signature_through_the_full_handler() {
+        let (store, addr, secrets, round) = store_with_one_voter();
+        let mut runtime = StateProofRuntime::new();
+
+        // Force prover creation with a throwaway (intentionally wrong,
+        // discarded) signature -- `ensure_prover` runs before signature
+        // verification, so this populates `runtime`'s prover entry (and
+        // its real message hash) even though the insert itself is
+        // rejected.
+        let warmup = SigFromAddr {
+            signer_address: addr,
+            round,
+            sig: secrets.get_signer(round).sign_bytes(&[0u8; 32]).unwrap(),
+        };
+        let _ = runtime.handle_sig(&store, &warmup, round, false);
+        assert!(
+            runtime.has_prover(round),
+            "warmup call must create the prover entry"
+        );
+
+        let msg = runtime
+            .message_for(round)
+            .expect("prover entry now exists")
+            .clone();
+        let msg_hash = crate::apply_stateproof::state_proof_message_hash(&msg);
+        let sfa = SigFromAddr {
+            signer_address: addr,
+            round,
+            sig: secrets.get_signer(round).sign_bytes(&msg_hash).unwrap(),
+        };
+        let first = runtime
+            .handle_sig(&store, &sfa, round, false)
+            .expect("first delivery of a validly-signed message must be accepted");
+        assert_eq!(first, SigOutcome::Broadcast);
+
+        let second = runtime
+            .handle_sig(&store, &sfa, round, false)
+            .expect("redelivery of an already-gathered signature must not error");
+        assert_eq!(
+            second,
+            SigOutcome::Ignore,
+            "duplicate must be silently ignored"
+        );
+    }
+
+    /// go's `TestWorkerHandleSigIntervalZero` (`stateproof/worker_test.go:1644`):
+    /// a signature for a round is rejected outright when state proofs are
+    /// disabled for the active protocol (`StateProofInterval == 0`),
+    /// exercised through `handle_sig` itself rather than the standalone
+    /// `is_eligible_signing_round` helper.
+    #[test]
+    fn handle_sig_ignores_signature_when_state_proofs_disabled_via_full_handler() {
+        let mut store = crate::state::LedgerState::new();
+        let hdr = algo_types::BlockHeader {
+            round: algo_types::Round(300),
+            current_protocol: algo_types::consensus::CONSENSUS_V33.to_string(),
+            ..algo_types::BlockHeader::default()
+        };
+        let bytes = algo_codec::canonical_encode_block_header(&hdr);
+        store
+            .put_block(300, &hdr.current_protocol, &bytes, &[])
+            .unwrap();
+
+        let mut runtime = StateProofRuntime::new();
+        let outcome = runtime
+            .handle_sig(&store, &dummy_sfa(256), 300, false)
+            .unwrap();
+        assert_eq!(outcome, SigOutcome::Ignore);
+        assert!(!runtime.has_prover(256));
+    }
+
+    /// go's `TestWorkerHandleSigNotOnInterval` (`stateproof/worker_test.go:1670`):
+    /// a signature for a round that isn't an exact multiple of the active
+    /// `StateProofInterval` is rejected, exercised through `handle_sig`.
+    #[test]
+    fn handle_sig_ignores_signature_for_round_not_on_interval_via_full_handler() {
+        let store = store_with_header_at(5000, 0);
+        let mut runtime = StateProofRuntime::new();
+        // CONSENSUS_V41's interval is 256; round 300 is not a multiple.
+        let outcome = runtime
+            .handle_sig(&store, &dummy_sfa(300), 5000, false)
+            .unwrap();
+        assert_eq!(outcome, SigOutcome::Ignore);
+        assert!(!runtime.has_prover(300));
+    }
+
     /// Mirrors go's `TestRoundDownToMultipleOf`
     /// (`data/basics/units_test.go:216`): pins the `round - (round % n)`
     /// round-down-to-a-multiple formula this module inlines at

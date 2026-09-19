@@ -645,6 +645,17 @@ static MAX_API_BOX_PER_APPLICATION: VersionedDefault<u64> =
 /// whichever follow-up issue adds that filtering layer.
 static TX_INCOMING_FILTERING_FLAGS: VersionedDefault<u32> = VersionedDefault::new(&[(26, || 1)]);
 
+/// Go: `txFilterRawMsg = 0x01` (`config/localTemplate.go`, unexported
+/// constant next to `TxIncomingFilteringFlags`'s doc comment) -- checked for
+/// raw tx message duplicates. See
+/// [`Local::tx_filter_raw_msg_enabled`](Local::tx_filter_raw_msg_enabled).
+const TX_FILTER_RAW_MSG: u32 = 0x01;
+
+/// Go: `txFilterCanonical = 0x02` -- checked for canonical tx group
+/// duplicates. See
+/// [`Local::tx_filter_canonical_enabled`](Local::tx_filter_canonical_enabled).
+const TX_FILTER_CANONICAL: u32 = 0x02;
+
 /// Go: `EnableExperimentalAPI bool` `version[26]:"false"`
 /// (`localTemplate.go:588`). Was previously a hardcoded trait-default
 /// `false` with no config wiring at all (unlike `EnableDeveloperAPI`, this
@@ -4492,6 +4503,28 @@ impl Local {
         }
     }
 
+    /// Go: `Local.TxFilterRawMsgEnabled` (`config/localTemplate.go:769`) --
+    /// `cfg.TxIncomingFilteringFlags & txFilterRawMsg != 0` where
+    /// `txFilterRawMsg = 0x01`. Pure bitflag decode of
+    /// [`tx_incoming_filtering_flags`](Self::tx_incoming_filtering_flags);
+    /// like that field itself, this has no runtime consumer yet (algod-rust
+    /// has no per-message-hash dedup filtering stage to gate — see
+    /// [`TX_INCOMING_FILTERING_FLAGS`]'s doc comment), but the decode
+    /// function itself is a pure, gate-free computation worth matching
+    /// exactly so a future filtering layer can call it directly.
+    pub fn tx_filter_raw_msg_enabled(&self) -> bool {
+        self.tx_incoming_filtering_flags & TX_FILTER_RAW_MSG != 0
+    }
+
+    /// Go: `Local.TxFilterCanonicalEnabled` (`config/localTemplate.go:774`) --
+    /// `cfg.TxIncomingFilteringFlags & txFilterCanonical != 0` where
+    /// `txFilterCanonical = 0x02`. See
+    /// [`tx_filter_raw_msg_enabled`](Self::tx_filter_raw_msg_enabled)'s doc
+    /// comment for the same no-consumer-yet caveat.
+    pub fn tx_filter_canonical_enabled(&self) -> bool {
+        self.tx_incoming_filtering_flags & TX_FILTER_CANONICAL != 0
+    }
+
     // --- IsListenServer/IsHybridServer state matrix (issue #949) ----------
     //
     // Go's `Local.IsWsListenServer`/`IsP2PListenServer`/`IsListenServer`/
@@ -5535,6 +5568,39 @@ mod tests {
         .expect("parses");
         assert_eq!(cfg.tx_incoming_filtering_flags, 3);
         assert_eq!(cfg.tx_incoming_filter_max_size, 42);
+    }
+
+    /// go-algorand's `TestLocal_TxFiltering`
+    /// (`config/config_test.go:629`): the default is raw-only (flag `1`),
+    /// `0` disables both, `1` is raw-only, `2` is canonical-only, `3` is
+    /// both. Exercises the derived
+    /// [`Local::tx_filter_raw_msg_enabled`]/[`Local::tx_filter_canonical_enabled`]
+    /// bitflag-decode helpers directly, matching go's assertions exactly
+    /// (both helpers are pure decodes of `tx_incoming_filtering_flags` with
+    /// no runtime consumer yet -- see that field's doc comment).
+    #[test]
+    fn tx_filter_enabled_helpers_decode_flags_like_go() {
+        let mut cfg = Local::default();
+
+        // Default: raw-only.
+        assert!(cfg.tx_filter_raw_msg_enabled());
+        assert!(!cfg.tx_filter_canonical_enabled());
+
+        cfg.tx_incoming_filtering_flags = 0;
+        assert!(!cfg.tx_filter_raw_msg_enabled());
+        assert!(!cfg.tx_filter_canonical_enabled());
+
+        cfg.tx_incoming_filtering_flags = 1;
+        assert!(cfg.tx_filter_raw_msg_enabled());
+        assert!(!cfg.tx_filter_canonical_enabled());
+
+        cfg.tx_incoming_filtering_flags = 2;
+        assert!(!cfg.tx_filter_raw_msg_enabled());
+        assert!(cfg.tx_filter_canonical_enabled());
+
+        cfg.tx_incoming_filtering_flags = 3;
+        assert!(cfg.tx_filter_raw_msg_enabled());
+        assert!(cfg.tx_filter_canonical_enabled());
     }
 
     #[test]
