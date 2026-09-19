@@ -247,7 +247,10 @@ fn parse_state_json(out: &str) -> serde_json::Value {
 /// The `ui` (uint) field of a TealValue JSON entry for `key`, or `None` if
 /// the key/field is absent (Go's zero-uint omitempty).
 fn state_uint(state: &serde_json::Value, key: &str) -> Option<u64> {
-    state.get(key).and_then(|v| v.get("ui")).and_then(|v| v.as_u64())
+    state
+        .get(key)
+        .and_then(|v| v.get("ui"))
+        .and_then(|v| v.as_u64())
 }
 
 /// GET a raw `/v2/...` endpoint against the node under test, returning the
@@ -451,7 +454,8 @@ fn localnet_app_create_logs_confirmed_txn() {
                 .iter()
                 .map(|b| {
                     b.as_u64()
-                        .unwrap_or_else(|| panic!("non-numeric log byte in:\n{body}")) as u8
+                        .unwrap_or_else(|| panic!("non-numeric log byte in:\n{body}"))
+                        as u8
                 })
                 .collect();
             String::from_utf8(bytes).unwrap_or_else(|e| panic!("log entry not UTF-8: {e}"))
@@ -604,7 +608,9 @@ fn localnet_app_lifecycle_global_local_counter_state() {
     let creator_local_after_create = parse_state_json(&assert_cli_ok(
         &goal_rust(
             dd,
-            &["app", "read", "--app-id", &app_id_s, "--local", "-f", DEV_ADDR],
+            &[
+                "app", "read", "--app-id", &app_id_s, "--local", "-f", DEV_ADDR,
+            ],
         ),
         "app read --local (creator, after create)",
         &node,
@@ -653,7 +659,9 @@ fn localnet_app_lifecycle_global_local_counter_state() {
     let user_local_after_optin = parse_state_json(&assert_cli_ok(
         &goal_rust(
             dd,
-            &["app", "read", "--app-id", &app_id_s, "--local", "-f", &user_addr],
+            &[
+                "app", "read", "--app-id", &app_id_s, "--local", "-f", &user_addr,
+            ],
         ),
         "app read --local (user, after optin)",
         &node,
@@ -717,7 +725,9 @@ fn localnet_app_lifecycle_global_local_counter_state() {
     let user_local_after_call = parse_state_json(&assert_cli_ok(
         &goal_rust(
             dd,
-            &["app", "read", "--app-id", &app_id_s, "--local", "-f", &user_addr],
+            &[
+                "app", "read", "--app-id", &app_id_s, "--local", "-f", &user_addr,
+            ],
         ),
         "app read --local (user, after noop call)",
         &node,
@@ -730,7 +740,9 @@ fn localnet_app_lifecycle_global_local_counter_state() {
     let creator_local_after_call = parse_state_json(&assert_cli_ok(
         &goal_rust(
             dd,
-            &["app", "read", "--app-id", &app_id_s, "--local", "-f", DEV_ADDR],
+            &[
+                "app", "read", "--app-id", &app_id_s, "--local", "-f", DEV_ADDR,
+            ],
         ),
         "app read --local (creator, after noop call)",
         &node,
@@ -777,9 +789,7 @@ fn localnet_app_extra_program_pages_accounting() {
     let big_teal = dd.join("big.teal");
     std::fs::write(
         &big_teal,
-        format!(
-            "#pragma version 4\nbyte base64({big_bytes_b64})\npop\nint 1\nreturn\n"
-        ),
+        format!("#pragma version 4\nbyte base64({big_bytes_b64})\npop\nint 1\nreturn\n"),
     )
     .unwrap();
 
@@ -910,7 +920,18 @@ fn localnet_app_extra_program_pages_accounting() {
     let delete1 = assert_cli_ok(
         &goal_rust(
             dd,
-            &["app", "delete", "-f", DEV_ADDR, "--app-id", &app1_id, "-w", "w", "--password", "pw"],
+            &[
+                "app",
+                "delete",
+                "-f",
+                DEV_ADDR,
+                "--app-id",
+                &app1_id,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
         ),
         "app delete (app1)",
         &node,
@@ -929,7 +950,18 @@ fn localnet_app_extra_program_pages_accounting() {
     let delete2 = assert_cli_ok(
         &goal_rust(
             dd,
-            &["app", "delete", "-f", DEV_ADDR, "--app-id", &app2_id, "-w", "w", "--password", "pw"],
+            &[
+                "app",
+                "delete",
+                "-f",
+                DEV_ADDR,
+                "--app-id",
+                &app2_id,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
         ),
         "app delete (app2)",
         &node,
