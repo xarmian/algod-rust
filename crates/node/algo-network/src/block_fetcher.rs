@@ -358,6 +358,33 @@ mod tests {
         assert_eq!(decoded, topics);
     }
 
+    /// Port of go-algorand's `TestMaxBlockRequestSize`
+    /// (`catchup/universalFetcher_test.go`): the block-request topics are a
+    /// handrolled msgpack-free message with a deterministic worst-case size.
+    /// This pins that the largest possible request (max-u64 round, max-u64
+    /// nonce) matches `protocol.UniEnsBlockReqTag.MaxMessageSize()` (67
+    /// bytes upstream) so the wire-framing limit in `Tag::max_message_size`
+    /// (`crate::tag::Tag::UniEnsBlockReq`) never truncates a legitimate
+    /// request.
+    #[test]
+    fn max_block_request_size_matches_uni_ens_block_req_tag_limit() {
+        use crate::request_response::REQUEST_NONCE_FIELD;
+        use crate::tag::Tag;
+
+        // Worst case: the largest possible round and the largest possible
+        // nonce (both u64::MAX, the maximum uvarint encoding length).
+        let mut topics = make_block_request_topics(u64::MAX);
+        let nonce_bytes = encode_uvarint(u64::MAX);
+        topics.0.push(Topic::new(REQUEST_NONCE_FIELD, nonce_bytes));
+
+        let serialized = topics.marshal();
+        assert_eq!(
+            serialized.len(),
+            Tag::UniEnsBlockReq.max_message_size(),
+            "worst-case block-request topics size must match the wire-framing limit"
+        );
+    }
+
     // -- Response parsing: success --
 
     #[test]
