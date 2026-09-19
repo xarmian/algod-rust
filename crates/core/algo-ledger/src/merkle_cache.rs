@@ -611,6 +611,46 @@ impl MerkleTrieCache {
         Ok(())
     }
 
+    /// Cross-module test invariant checker, ported from go-algorand's
+    /// `crypto/merkletrie/cache_test.go` `verifyCacheNodeCount` (used by
+    /// `TestCacheEvictionFuzzer`/`Fuzzer2`/`TestRandomAddingAndRemoving`).
+    /// Go inspects `trie.cache.pageToNIDsPtr`/`cachedNodeCount`/
+    /// `pagesPrioritizationMap`/`pagesPrioritizationList` directly because
+    /// the test file shares its package; Rust's equivalent fields
+    /// (`pages`, `cached_node_count`, `pages_priority_set`,
+    /// `pages_priority`) are private to this module, so this `pub(crate)`
+    /// helper exposes the same invariant check to `merkle_trie`'s test
+    /// module without loosening field visibility for non-test code.
+    ///
+    /// Panics (via `assert!`/`assert_eq!`) on violation, exactly like
+    /// go's `require.Equal` calls inside `verifyCacheNodeCount`.
+    #[cfg(test)]
+    pub(crate) fn debug_verify_invariants(&self) {
+        let node_sum: usize = self.pages.values().map(|p| p.len()).sum();
+        assert_eq!(
+            node_sum, self.cached_node_count,
+            "cached_node_count must equal the sum of in-memory page node counts"
+        );
+
+        assert_eq!(
+            self.pages_priority_set.len(),
+            self.pages_priority.len(),
+            "pages_priority_set and pages_priority must track the same page count"
+        );
+        for page in &self.pages_priority {
+            assert!(
+                self.pages_priority_set.contains(page),
+                "page {page} in the LRU list is missing from the priority set"
+            );
+        }
+
+        let pages_keys: std::collections::HashSet<u64> = self.pages.keys().copied().collect();
+        assert_eq!(
+            pages_keys, self.pages_priority_set,
+            "every in-memory page must have exactly one LRU priority entry"
+        );
+    }
+
     /// True iff node `id` is in memory **right now** (no lazy load).
     /// Used by tests + diagnostics; the trie's algorithms always go
     /// through `get` / `get_mut` so they see lazy-loaded pages.

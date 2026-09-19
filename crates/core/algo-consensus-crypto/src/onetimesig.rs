@@ -1704,6 +1704,72 @@ mod tests {
         assert_eq!(&encoded[1..7], &[0xa5, b'b', b'a', b't', b'c', b'h']);
     }
 
+    /// Ports go's `TestRandomizedEncodingOneTimeSignatureSubkeyOffsetID`
+    /// (`protocol.RunEncodingTest`'s randomized `MarshalMsg`->
+    /// `UnmarshalMsg` round trip). `encode_offset_id` has no production
+    /// decoder — `OffsetID` is write-only in this codebase, built once to
+    /// feed the `"OT2"`-prefixed signed message and never decoded back out
+    /// anywhere real (go's own generated `UnmarshalMsg` exists only
+    /// because msgp codegen produces it unconditionally, not because
+    /// go-algorand ever calls it either). This test implements a minimal
+    /// msgpack decoder *scoped to the test itself* — matching the same
+    /// `rmp::decode` idiom `light_block_header.rs`/`vrf.rs` already use
+    /// for their own randomized-round-trip tests — purely to verify the
+    /// encoder round-trips correctly across many random inputs; it adds
+    /// no production API surface.
+    #[test]
+    fn encode_offset_id_randomized_round_trip() {
+        fn decode_offset_id(bytes: &[u8]) -> ([u8; 32], u64, u64) {
+            let mut rd = bytes;
+            let len = rmp::decode::read_map_len(&mut rd).expect("map len");
+            assert_eq!(len, 3, "OffsetID always encodes exactly 3 fields");
+
+            let mut batch = None;
+            let mut offset = None;
+            let mut pk = None;
+            for _ in 0..3 {
+                let key_len = rmp::decode::read_str_len(&mut rd).expect("key len") as usize;
+                let mut key_buf = vec![0u8; key_len];
+                std::io::Read::read_exact(&mut rd, &mut key_buf).expect("key bytes");
+                match key_buf.as_slice() {
+                    b"batch" => {
+                        batch = Some(rmp::decode::read_int::<u64, _>(&mut rd).expect("batch"))
+                    }
+                    b"off" => {
+                        offset = Some(rmp::decode::read_int::<u64, _>(&mut rd).expect("offset"))
+                    }
+                    b"pk" => {
+                        let bin_len = rmp::decode::read_bin_len(&mut rd).expect("bin len");
+                        assert_eq!(bin_len, 32, "pk field must be exactly 32 bytes");
+                        let mut buf = [0u8; 32];
+                        std::io::Read::read_exact(&mut rd, &mut buf).expect("pk bytes");
+                        pk = Some(buf);
+                    }
+                    other => panic!("unexpected OffsetID field key: {other:?}"),
+                }
+            }
+            (
+                pk.expect("pk field present"),
+                batch.expect("batch field present"),
+                offset.expect("off field present"),
+            )
+        }
+
+        let mut rng = rand::thread_rng();
+        for _ in 0..200 {
+            let mut pk = [0u8; 32];
+            rng.fill(&mut pk);
+            let batch: u64 = rng.gen();
+            let offset: u64 = rng.gen();
+
+            let encoded = encode_offset_id(&pk, batch, offset);
+            let (decoded_pk, decoded_batch, decoded_offset) = decode_offset_id(&encoded);
+            assert_eq!(decoded_pk, pk);
+            assert_eq!(decoded_batch, batch);
+            assert_eq!(decoded_offset, offset);
+        }
+    }
+
     /// Start batch is nonzero.
     #[test]
     fn nonzero_start_batch() {

@@ -831,8 +831,7 @@ impl Prover {
         if verify_sig {
             sig.validate_salt_version(MERKLE_SIGNATURE_SCHEME_SALT_VERSION)
                 .map_err(|_| StateProofError::SaltVersionMismatch)?;
-            p.pk
-                .verify_bytes(self.round, &self.data[..], sig)
+            p.pk.verify_bytes(self.round, &self.data[..], sig)
                 .map_err(|e| StateProofError::SignatureVerificationFailed {
                     pos,
                     reason: e.to_string(),
@@ -940,8 +939,9 @@ impl Prover {
         }
 
         let hfactory = merklearray::HashFactory::new(merklearray::HashType::Sumhash);
-        let sig_tree = merklearray::build_vector_commitment_tree(&ProverSigArray(&self.sigs), hfactory)
-            .map_err(|e| StateProofError::Internal(e.to_string()))?;
+        let sig_tree =
+            merklearray::build_vector_commitment_tree(&ProverSigArray(&self.sigs), hfactory)
+                .map_err(|e| StateProofError::Internal(e.to_string()))?;
 
         let mut s = StateProof {
             sig_commit: sig_tree.root(),
@@ -950,7 +950,11 @@ impl Prover {
             ..Default::default()
         };
 
-        let nr = num_reveals(self.signed_weight, self.ln_proven_weight, self.strength_target)?;
+        let nr = num_reveals(
+            self.signed_weight,
+            self.ln_proven_weight,
+            self.strength_target,
+        )?;
 
         let part_commitment = self.part_tree.root();
         let choice = CoinChoiceSeed {
@@ -1581,6 +1585,65 @@ mod tests {
     }
 
     #[test]
+    fn participation_commitment_binary_format_matches_manual_hash() {
+        // Ports TestParticipationCommitmentBinaryFormat
+        // (crypto/stateproof/prover_test.go): build a 4-participant vector
+        // commitment tree, independently recompute every leaf and internal
+        // node hash by hand using the exact byte layout the spec pins
+        // (`"spp" || weight(LE u64) || key_lifetime(LE u64) || commitment`
+        // for a leaf; `"MA" || left || right` for an internal node,
+        // go's `protocol.StateProofPart`/`protocol.MerkleArrayNode`), and
+        // assert the tree's real `Root()` equals the by-hand computation.
+        // For n=4 (already a power of 2) the vector-commitment bit-reversal
+        // permutation pairs (leaf0, leaf2) and (leaf1, leaf3) at the first
+        // level — go's test hard-codes this exact pairing, which we
+        // reproduce identically.
+        let factory = merklearray::HashFactory::new(merklearray::HashType::Sumhash);
+
+        let participants: Vec<Participant> = (0u64..4)
+            .map(|i| Participant {
+                pk: merklesig::Verifier {
+                    commitment: [i as u8 + 1; merklesig::MERKLE_SIGNATURE_SCHEME_ROOT_SIZE],
+                    key_lifetime: 256 + i,
+                },
+                weight: 1_000_000 + i * 777,
+            })
+            .collect();
+
+        let part_tree =
+            merklearray::build_vector_commitment_tree(&PartArray(participants.clone()), factory)
+                .expect("part tree");
+        let part_commitment_root = part_tree.root();
+
+        let leaf_hash = |p: &Participant| -> merklearray::GenericDigest {
+            let (prefix, data) = p.to_be_hashed();
+            factory.hash_bytes(&[prefix, &data])
+        };
+        let internal_hash = |left: &merklearray::GenericDigest,
+                             right: &merklearray::GenericDigest|
+         -> merklearray::GenericDigest {
+            let mut buf = Vec::with_capacity(left.len() + right.len());
+            buf.extend_from_slice(left);
+            buf.extend_from_slice(right);
+            factory.hash_bytes(&[b"MA", &buf])
+        };
+
+        let leaf0 = leaf_hash(&participants[0]);
+        let leaf1 = leaf_hash(&participants[1]);
+        let leaf2 = leaf_hash(&participants[2]);
+        let leaf3 = leaf_hash(&participants[3]);
+
+        let inner1 = internal_hash(&leaf0, &leaf2);
+        let inner2 = internal_hash(&leaf1, &leaf3);
+        let calc_root = internal_hash(&inner1, &inner2);
+
+        assert_eq!(
+            part_commitment_root, calc_root,
+            "tree root must match the hand-computed binary layout"
+        );
+    }
+
+    #[test]
     fn test_verify_rejects_position_with_no_reveal() {
         // TestVerifyRevelForEachPosition (crypto/stateproof/verifier_test.go):
         // pointing a revealed position at an index with no corresponding
@@ -1768,7 +1831,10 @@ mod tests {
             .expect_err("must reject: no signatures added");
         assert!(matches!(
             err,
-            StateProofError::SignedWeightLessThanProvenWeight { signed: 0, proven: 1000 }
+            StateProofError::SignedWeightLessThanProvenWeight {
+                signed: 0,
+                proven: 1000
+            }
         ));
     }
 
@@ -1779,7 +1845,9 @@ mod tests {
         let (_, participants, part_tree) = build_prover_participants(2, round, 100);
         let prover =
             Prover::make_prover(msg, round, 50, participants, part_tree, 0).expect("make_prover");
-        let err = prover.present(5).expect_err("pos 5 is out of bounds for 2 participants");
+        let err = prover
+            .present(5)
+            .expect_err("pos 5 is out of bounds for 2 participants");
         assert_eq!(
             err,
             StateProofError::PositionOutOfBound { pos: 5, bound: 2 }

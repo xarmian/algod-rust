@@ -1767,6 +1767,177 @@ mod tests {
     // from_elements
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Cache fuzz/invariant ports (crypto/merkletrie/cache_test.go,
+    // crypto/merkletrie/trie_test.go). These use
+    // `MerkleTrieCache::debug_verify_invariants` (pub(crate),
+    // `#[cfg(test)]`) — the cross-module equivalent of go's
+    // `verifyCacheNodeCount`, which can inspect `trie.cache`'s private
+    // fields directly only because go's test file shares its package.
+    // -----------------------------------------------------------------------
+
+    /// Ports go's `TestCachePagedOutTip`: after committing half of a large
+    /// trie and adding the rest uncommitted, evicting down to a tight
+    /// target must never flush the page holding the (possibly
+    /// commit-relocated) root. Go's `Evict(true)` commits-then-evicts in
+    /// one call; Rust splits that into explicit `commit()` + `evict()`,
+    /// so this reproduces the same net effect.
+    #[test]
+    fn cache_paged_out_tip_root_page_survives_eviction() {
+        let committer = InMemoryPageCommitter::new();
+        let mut trie = MerkleTrie::with_cache_target(32, 600);
+        trie.set_lazy_loader(Box::new(committer.clone()));
+
+        let hashes: Vec<[u8; 32]> = (0u32..2048)
+            .map(|i| {
+                let mut hasher = Sha512_256::new();
+                hasher.update([(i % 256) as u8, ((i / 256) % 256) as u8, (i / 65536) as u8]);
+                hasher.finalize().into()
+            })
+            .collect();
+
+        for h in &hashes[..1024] {
+            trie.add(h).unwrap();
+        }
+        trie.commit(&committer).unwrap();
+
+        for h in &hashes[1024..] {
+            trie.add(h).unwrap();
+        }
+
+        trie.commit(&committer).unwrap();
+        trie.evict().unwrap();
+
+        // Root may have been relocated by commit's page-packing pass —
+        // recheck the *current* root. The tip page must never be evicted.
+        let root_after = trie.root_id().expect("trie is still non-empty");
+        assert!(
+            trie.cache.contains_in_memory(root_after),
+            "the page holding the root must survive eviction"
+        );
+    }
+
+    /// Ports go's `TestRandomAddingAndRemoving`: 100,000 Add/Delete
+    /// operations driven by a fully deterministic (not RNG-based)
+    /// pseudo-random index derived from previously-generated hash bytes
+    /// and the loop counter — go never calls a real RNG in this test, so
+    /// this reproduces the exact same algorithmic shape. Periodic
+    /// `Commit` + cache-invariant checks mirror go's `verifyCacheNodeCount`
+    /// calls.
+    #[test]
+    fn random_adding_and_removing_matches_cache_invariants() {
+        let committer = InMemoryPageCommitter::new();
+        let mut trie = MerkleTrie::new(32);
+
+        let mut to_add: Vec<[u8; 32]> = (0u32..10_000)
+            .map(|i| {
+                let mut hasher = Sha512_256::new();
+                hasher.update([(i % 256) as u8, (i / 256) as u8]);
+                hasher.finalize().into()
+            })
+            .collect();
+        let mut to_remove: Vec<[u8; 32]> = Vec::with_capacity(10_000);
+
+        let mut next_operation = 0u8; // 0 = add, 1 = remove
+        for i in 0usize..100_000 {
+            if next_operation == 0 && to_add.is_empty() {
+                next_operation = 1;
+            }
+            if next_operation == 1 && to_remove.is_empty() {
+                next_operation = 0;
+            }
+
+            let processed: [u8; 32];
+            if next_operation == 0 {
+                let h = to_add[0];
+                let idx = (h[0] as usize + (h[1] as usize) * 256 + (h[3] as usize) * 65536 + i)
+                    % to_add.len();
+                processed = to_add[idx];
+                assert!(trie.add(&processed).unwrap(), "element must be newly added");
+                to_remove.push(processed);
+                to_add.remove(idx);
+            } else {
+                let h = to_remove[0];
+                let idx = (h[0] as usize + (h[1] as usize) * 256 + (h[3] as usize) * 65536 + i)
+                    % to_remove.len();
+                processed = to_remove[idx];
+                assert!(
+                    trie.delete(&processed).unwrap(),
+                    "element must be present to remove"
+                );
+                to_add.push(processed);
+                to_remove.remove(idx);
+            }
+
+            next_operation = if processed[0] > 128 { 0 } else { 1 };
+
+            if i % (1 + processed[0] as usize) == 42 {
+                trie.commit(&committer).unwrap();
+                trie.cache.debug_verify_invariants();
+            }
+        }
+    }
+
+    /// Ports go's `TestCacheEvictionFuzzer`/`TestCacheEvictionFuzzer2`
+    /// (shared `cacheEvictionFuzzer` helper): bursts of Add/Delete driven
+    /// by a fully deterministic hash-byte-derived index sequence (not a
+    /// real RNG — the same shape go uses), with periodic
+    /// `debug_verify_invariants` checks mirroring go's
+    /// `verifyCacheNodeCount`. Two intentional scope simplifications vs.
+    /// go, both from real Rust/Go architectural differences rather than a
+    /// weaker invariant check:
+    ///  - go's `MemoryConfig.NodesCountPerPage` is fuzzed per-run
+    ///    (2/3/8/12/17, or randomly in Fuzzer2); Rust's page size
+    ///    (`NODES_PER_PAGE`) is a fixed module constant, not a per-trie
+    ///    runtime config, so that axis can't be swept — the
+    ///    `cached_node_count_target` axis (go's `evictSize`) is swept
+    ///    instead, covering both go tests' evictSize value ranges.
+    ///  - go's `smallPageMemoryCommitter` injects transient
+    ///    LoadPage/StorePage failures whose *only* effect in the go test
+    ///    is that the (unchecked) `Add`/`Delete`/`Evict` return values are
+    ///    silently dropped; Rust's `add`/`delete`/`commit` return a
+    ///    `Result` a real test can't drop the same way without just
+    ///    testing "does `.ok()` swallow the error", so fault injection is
+    ///    omitted and every operation is asserted to succeed.
+    #[test]
+    fn cache_eviction_fuzzer_stresses_invariants_across_evict_targets() {
+        let hashes: Vec<[u8; 32]> = (0u32..2000)
+            .map(|i| {
+                let mut hasher = Sha512_256::new();
+                hasher.update([(i % 256) as u8, ((i / 256) % 256) as u8, (i / 65536) as u8]);
+                hasher.finalize().into()
+            })
+            .collect();
+
+        for &evict_size in &[5usize, 10, 13, 30, 47, 91] {
+            let committer = InMemoryPageCommitter::new();
+            let mut trie = MerkleTrie::with_cache_target(32, evict_size);
+            trie.set_lazy_loader(Box::new(committer.clone()));
+
+            for h in &hashes[..10] {
+                trie.add(h).unwrap();
+            }
+
+            for i in 10..hashes.len() - 10 {
+                let k_bound = (hashes[i - 2][0] % 5) as usize;
+                for k in 0..k_bound {
+                    if hashes[i + k][0] % 7 == 0 {
+                        let del_idx = i + k - (hashes[i][0] % 7) as usize;
+                        trie.delete(&hashes[del_idx]).unwrap();
+                    }
+                    let add_idx = i + k + 3 - (hashes[i + k - 1][0] % 7) as usize;
+                    trie.add(&hashes[add_idx]).unwrap();
+                }
+                if hashes[i][0] % 5 == 0 {
+                    trie.cache.debug_verify_invariants();
+                    trie.commit(&committer).unwrap();
+                    trie.evict().unwrap();
+                    trie.cache.debug_verify_invariants();
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_from_elements_matches_incremental_add() {
         let elems: Vec<[u8; 36]> = (0..10u8)
