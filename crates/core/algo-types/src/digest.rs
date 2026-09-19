@@ -18,8 +18,10 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use algo_error::AlgoError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
 /// A 32-byte cryptographic digest (SHA512/256 output).
 ///
@@ -56,6 +58,30 @@ impl From<[u8; 32]> for Digest {
     }
 }
 
+/// Parses the base32 (RFC 4648, no padding) string produced by [`Display`]
+/// back into a `Digest`, mirroring go-algorand's `crypto.DigestFromString`
+/// (`crypto/util.go`) — the decode half of the round trip go's
+/// `TestEncodeDecode` (`crypto/util_test.go`) pins.
+///
+/// [`Display`]: fmt::Display
+impl FromStr for Digest {
+    type Err = AlgoError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let decoded = data_encoding::BASE32_NOPAD
+            .decode(s.as_bytes())
+            .map_err(|e| AlgoError::Config(format!("invalid digest base32: {e}")))?;
+        if decoded.len() != 32 {
+            return Err(AlgoError::Config(format!(
+                "attempted to decode a string which was not a Digest: {s:?}"
+            )));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&decoded);
+        Ok(Digest(out))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +109,34 @@ mod tests {
         assert!(!Digest(last).is_zero());
 
         assert!(!Digest([0xffu8; 32]).is_zero());
+    }
+
+    /// Mirrors go's `TestEncodeDecode` (`crypto/util_test.go:29`): hash some
+    /// bytes, `String()`/`Display` it to base32, `DigestFromString`/
+    /// `FromStr` it back, and confirm the round trip is lossless.
+    #[test]
+    fn from_str_round_trips_through_display() {
+        let mut sha = sha2::Sha512_256::default();
+        sha2::Digest::update(&mut sha, b"this is a test");
+        let hashed_bytes: [u8; 32] = sha2::Digest::finalize(sha).into();
+        let hashed = Digest(hashed_bytes);
+
+        let hashed_str = hashed.to_string();
+        let recovered: Digest = hashed_str.parse().expect("valid base32 digest");
+
+        assert_eq!(recovered, hashed);
+    }
+
+    #[test]
+    fn from_str_rejects_wrong_length() {
+        // Valid base32 but decodes to fewer than 32 bytes.
+        let err = "AAAA".parse::<Digest>();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn from_str_rejects_invalid_base32() {
+        let err = "not-valid-base32!!!".parse::<Digest>();
+        assert!(err.is_err());
     }
 }

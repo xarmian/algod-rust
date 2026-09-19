@@ -239,6 +239,43 @@ impl SeedProvider for DeterministicSeedProvider {
 mod tests {
     use super::*;
 
+    /// Mirrors go's `TestBuilderSanity` (`crypto/merklesignature/keysBuilder_test.go:28`):
+    /// a direct `KeysBuilder(100)` call produces exactly 100 keys, and
+    /// `keys[0]` is a usable Falcon signer (sign a byte and verify it).
+    #[test]
+    fn builder_sanity_100_keys_sign_and_verify() {
+        let keys = keys_builder(100).expect("100 keys must succeed");
+        assert_eq!(keys.len(), 100);
+
+        let sig = algo_falcon::falcon_sign(&keys[0].private_key, &[0u8])
+            .expect("sign_bytes should succeed");
+        let ok = algo_falcon::falcon_verify(&keys[0].public_key, &sig, &[0u8])
+            .expect("verify_bytes should not error");
+        assert!(ok, "keys[0] signature must verify");
+    }
+
+    /// Mirrors go's `TestBuilderFitsToCPUs` (`crypto/merklesignature/keysBuilder_test.go:45`):
+    /// a direct `KeysBuilder(NumCPU()*2)` call returns exactly that many
+    /// keys — the multi-worker partitioning must account for every key even
+    /// when `num_keys` lands exactly on the worker-count boundary.
+    #[test]
+    fn builder_fits_to_cpus_end_to_end() {
+        let num_cpus = thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(1);
+        let num_of_keys = num_cpus * 2;
+        let keys = keys_builder(num_of_keys).expect("must succeed");
+        assert_eq!(keys.len() as u64, num_of_keys);
+    }
+
+    /// Mirrors go's `TestBuilderOneKey` (`crypto/merklesignature/keysBuilder_test.go:55`):
+    /// a direct `KeysBuilder(1)` call returns exactly one key.
+    #[test]
+    fn builder_one_key_direct_call() {
+        let keys = keys_builder(1).expect("1 key must succeed");
+        assert_eq!(keys.len(), 1);
+    }
+
     #[test]
     fn calculate_ranges_matches_go_semantics() {
         // num_keys ≤ num_workers ⇒ per_worker = 1

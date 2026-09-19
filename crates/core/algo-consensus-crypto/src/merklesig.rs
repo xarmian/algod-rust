@@ -1838,6 +1838,113 @@ mod tests {
         assert!(decoded.is_zero());
     }
 
+    /// Mirrors go's `TestSignAndVerifyFalconHashable` (`crypto/falconWrapper_test.go`):
+    /// `FalconSigner.Sign(Hashable)`/`FalconVerifier.Verify(Hashable, sig)`
+    /// sign/verify a `Hashable`-typed message (as opposed to
+    /// `SignBytes`/`VerifyBytes`'s raw-bytes path, already covered by
+    /// `test_keygen_sign_verify_roundtrip` in `algo-falcon`).
+    ///
+    /// algod-rust's `algo_falcon::falcon_sign`/`falcon_verify` take raw
+    /// bytes only — there is no `Hashable`-typed wrapper in that low-level
+    /// crate (it doesn't depend on `merklearray::Hashable`). This test
+    /// reproduces go's `Sign(Hashable)`/`Verify(Hashable)` semantics
+    /// directly: go's implementation is exactly `SignBytes(HashRep(msg))` /
+    /// `VerifyBytes(HashRep(msg), sig)` (`crypto/falconWrapper.go`), so
+    /// building the `HashRep` bytes via `merklearray::Hashable` and passing
+    /// them through the same raw sign/verify path exercises the identical
+    /// production code go's `Sign`/`Verify` call, closing the gap that only
+    /// the msgpack-roundtrip (not sign/verify) half was previously tested.
+    #[test]
+    fn test_falcon_sign_verify_hashable() {
+        struct TestingHashable {
+            data: Vec<u8>,
+        }
+        impl merklearray::Hashable for TestingHashable {
+            fn to_be_hashed(&self) -> (&[u8], Vec<u8>) {
+                (b"TX", self.data.clone())
+            }
+        }
+
+        let msg = TestingHashable {
+            data: b"Neque porro quisquam est qui dolorem ipsum quia dolor sit amet".to_vec(),
+        };
+        let (prefix, data) = merklearray::Hashable::to_be_hashed(&msg);
+        let mut hash_rep = Vec::with_capacity(prefix.len() + data.len());
+        hash_rep.extend_from_slice(prefix);
+        hash_rep.extend_from_slice(&data);
+
+        let seed = [0x77u8; algo_falcon::FALCON_SEED_SIZE];
+        let (pk, sk) = algo_falcon::falcon_keygen(&seed).expect("keygen should succeed");
+
+        let sig = algo_falcon::falcon_sign(&sk, &hash_rep).expect("sign(Hashable) should succeed");
+        let ok = algo_falcon::falcon_verify(&pk, &sig, &hash_rep)
+            .expect("verify(Hashable) should not error");
+        assert!(ok, "verify(Hashable) should accept a genuine signature");
+    }
+
+    /// Standalone randomized round-trip for go's `crypto.FalconPrivateKey`
+    /// (`[FalconPrivateKeySize]byte`, `TestMarshalUnmarshalFalconPrivateKey`/
+    /// `TestRandomizedEncodingFalconPrivateKey`, `crypto/msgp_gen_test.go`).
+    ///
+    /// Rust has no standalone `FalconPrivateKey` type — `FalconSigner.sk` is
+    /// a raw `[u8; FALCON_DET1024_PRIVKEY_SIZE]` array, encoded field-by-field
+    /// in `FalconSigner::to_msgpack` via `rmp::encode::write_bin` (matching
+    /// go's `msgp.AppendBytes`, both the msgpack `bin` family). This test
+    /// exercises exactly that same array-of-bytes wire encode/decode pair in
+    /// isolation, with 1000 randomized instances (matching go's
+    /// `protocol.RunEncodingTest` iteration count), closing the gap that the
+    /// only prior coverage was indirect (as a field of `FalconSigner`).
+    #[test]
+    fn test_falcon_private_key_standalone_randomized_roundtrip() {
+        use rand::{RngCore, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0x4641_4c43_0001);
+        for i in 0..1000 {
+            let mut sk = [0u8; FALCON_DET1024_PRIVKEY_SIZE];
+            rng.fill_bytes(&mut sk);
+
+            let mut buf = Vec::new();
+            rmp::encode::write_bin(&mut buf, &sk).unwrap();
+
+            let (decoded, rest) = read_bin(&buf).expect("decode falcon private key bin");
+            assert!(
+                rest.is_empty(),
+                "iteration {i}: leftover bytes after decode"
+            );
+            assert_eq!(decoded, sk.as_slice(), "iteration {i}: round-trip mismatch");
+        }
+    }
+
+    /// Standalone randomized round-trip for go's `crypto.FalconPublicKey`
+    /// (`[FalconPublicKeySize]byte`, `TestMarshalUnmarshalFalconPublicKey`/
+    /// `TestRandomizedEncodingFalconPublicKey`, `crypto/msgp_gen_test.go`).
+    ///
+    /// Same rationale as `test_falcon_private_key_standalone_randomized_roundtrip`
+    /// above, but for `FalconSigner.pk` / `FalconVerifier.k`
+    /// (`[u8; FALCON_DET1024_PUBKEY_SIZE]`).
+    #[test]
+    fn test_falcon_public_key_standalone_randomized_roundtrip() {
+        use rand::{RngCore, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0x4641_4c43_0002);
+        for i in 0..1000 {
+            let mut pk = [0u8; FALCON_DET1024_PUBKEY_SIZE];
+            rng.fill_bytes(&mut pk);
+
+            let mut buf = Vec::new();
+            rmp::encode::write_bin(&mut buf, &pk).unwrap();
+
+            let (decoded, rest) = read_bin(&buf).expect("decode falcon public key bin");
+            assert!(
+                rest.is_empty(),
+                "iteration {i}: leftover bytes after decode"
+            );
+            assert_eq!(decoded, pk.as_slice(), "iteration {i}: round-trip mismatch");
+        }
+    }
+
     #[test]
     fn test_verifier_roundtrip() {
         let mut v = Verifier::default();

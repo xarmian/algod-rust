@@ -3655,6 +3655,44 @@ mod tests {
         );
     }
 
+    /// Standalone randomized round-trip for go's `crypto.Sha512Digest`
+    /// (`[64]byte`, `TestMarshalUnmarshalSha512Digest`/
+    /// `TestRandomizedEncodingSha512Digest`, `crypto/msgp_gen_test.go`).
+    ///
+    /// go's generated codec is plain `msgp.AppendBytes`/`ReadExactBytes`
+    /// (msgpack `bin`), no map wrapper. algod-rust never ports
+    /// `Sha512Digest` as a standalone type either — its two real
+    /// production wire sites are `BlockHeader.Branch512`/`.Sha512Commitment`
+    /// (`"prev512"`/`"txn512"` fields), encoded via the identical
+    /// `add_bytes`/`rmp::encode::write_bin` path in
+    /// `canonical_encode_block_header`. This test exercises that same
+    /// `write_bin`/`read_bin_len` pair directly on 64-byte arrays in
+    /// isolation, with 1000 randomized instances.
+    #[test]
+    fn sha512_digest_standalone_randomized_roundtrip() {
+        use rand::RngCore;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0x5348_4132_0001);
+        for i in 0..1000 {
+            let mut digest = [0u8; 64];
+            rng.fill_bytes(&mut digest);
+
+            let mut buf = Vec::new();
+            rmp::encode::write_bin(&mut buf, &digest).unwrap();
+
+            let mut rd: &[u8] = &buf;
+            let len = rmp::decode::read_bin_len(&mut rd).expect("bin len") as usize;
+            assert_eq!(len, 64, "iteration {i}: unexpected bin length");
+            let mut decoded = [0u8; 64];
+            decoded.copy_from_slice(&rd[..64]);
+
+            assert_eq!(
+                decoded, digest,
+                "iteration {i}: Sha512Digest round-trip mismatch"
+            );
+        }
+    }
+
     fn gen_multisig(rng: &mut ChaCha20Rng) -> MultisigSig {
         MultisigSig {
             // Always non-zero: `canonical_encode_multisig` uses `add_u64`

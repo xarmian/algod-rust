@@ -1042,4 +1042,92 @@ mod tests {
         let result = kp.pk.verify(&proof, b"msg");
         assert!(result.is_none(), "Corrupted proof should fail verification");
     }
+
+    // ── Standalone wire-format randomized round-trips ───────────────────
+    //
+    // go's `crypto.VrfPubkey`/`VrfProof`/`VrfOutput` are `[N]byte` arrays
+    // whose generated `MarshalMsg`/`UnmarshalMsg` (`crypto/msgp_gen.go`) is
+    // `msgp.AppendBytes`/`ReadExactBytes` — i.e. plain msgpack `bin`
+    // encoding of the raw bytes, with no map wrapper of their own
+    // (`TestMarshalUnmarshalVrfPubkey`/`VrfProof`/`VrfOutput` and their
+    // `TestRandomizedEncodingX` counterparts, `crypto/msgp_gen_test.go`).
+    //
+    // algod-rust never ports these as standalone msgp-generated types
+    // either — they're raw `[u8; N]` fields encoded via
+    // `rmp::encode::write_bin` at each real wire-format call site: VrfPubkey
+    // as `basics.AccountData.SelectionID` (`"sel"` field,
+    // `algo-codec::canonical::canonical_encode_account_data`), VrfProof as
+    // `committee.Credential.Proof` / `agreement.proposal.seedProof`
+    // (`"pf"`/`"sdpf"` fields, `algo-agreement::codec`), and VrfOutput as
+    // `hashableCredential.RawOut` (`"v"` field, same module). These tests
+    // exercise that identical `write_bin`/`read_bin_len` encode/decode pair
+    // directly on `VrfPubkey`/`VrfProof`/`VrfOutput` in isolation, with 1000
+    // randomized instances (matching go's `protocol.RunEncodingTest`
+    // iteration count), closing the gap that only fixed/indirect coverage
+    // existed previously.
+
+    fn write_bin_fixed<const N: usize>(bytes: &[u8; N]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        rmp::encode::write_bin(&mut buf, bytes).unwrap();
+        buf
+    }
+
+    fn read_bin_fixed<const N: usize>(mut rd: &[u8]) -> [u8; N] {
+        let len = rmp::decode::read_bin_len(&mut rd).expect("bin len") as usize;
+        assert_eq!(len, N, "unexpected bin length");
+        let mut arr = [0u8; N];
+        arr.copy_from_slice(&rd[..N]);
+        arr
+    }
+
+    #[test]
+    fn test_vrf_pubkey_standalone_randomized_roundtrip() {
+        use rand::{RngCore, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0x5652_465f_0001);
+        for i in 0..1000 {
+            let mut pk = [0u8; 32];
+            rng.fill_bytes(&mut pk);
+            let encoded = write_bin_fixed(&pk);
+            let decoded: [u8; 32] = read_bin_fixed(&encoded);
+            assert_eq!(decoded, pk, "iteration {i}: VrfPubkey round-trip mismatch");
+        }
+    }
+
+    #[test]
+    fn test_vrf_proof_standalone_randomized_roundtrip() {
+        use rand::{RngCore, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0x5652_465f_0002);
+        for i in 0..1000 {
+            let mut proof = [0u8; 80];
+            rng.fill_bytes(&mut proof);
+            let encoded = write_bin_fixed(&proof);
+            let decoded: [u8; 80] = read_bin_fixed(&encoded);
+            assert_eq!(
+                decoded, proof,
+                "iteration {i}: VrfProof round-trip mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vrf_output_standalone_randomized_roundtrip() {
+        use rand::{RngCore, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0x5652_465f_0003);
+        for i in 0..1000 {
+            let mut output = [0u8; 64];
+            rng.fill_bytes(&mut output);
+            let encoded = write_bin_fixed(&output);
+            let decoded: [u8; 64] = read_bin_fixed(&encoded);
+            assert_eq!(
+                decoded, output,
+                "iteration {i}: VrfOutput round-trip mismatch"
+            );
+        }
+    }
 }
