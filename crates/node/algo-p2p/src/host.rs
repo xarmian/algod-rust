@@ -763,6 +763,23 @@ impl P2pHost {
         self.swarm.close_connection(connection_id)
     }
 
+    /// Forcibly close every established connection to `peer_id` (not just
+    /// one), mirroring go's `network.OutgoingMessage{Action:
+    /// network.Disconnect}` handling (`network/wsNetwork.go`) -- the
+    /// libp2p analogue of that same peer-misbehavior response. Used by
+    /// `bin/algod-rust`'s P2P transport (issue #1491) when a registered
+    /// `algo_network::handler::Multiplexer` handler (e.g. `TxTagHandler`)
+    /// reports `algo_network::ForwardingPolicy::Disconnect` for an inbound
+    /// gossipsub message -- `Swarm::disconnect_peer_id` polls every open
+    /// connection handler to completion and then closes the transport
+    /// connection(s). Returns `false` if no connection to `peer_id` was
+    /// open (mirrors `Swarm::disconnect_peer_id`'s own `Result<(), ()>`,
+    /// collapsed to a bool since the caller only needs "did we actually
+    /// have anything to close").
+    pub fn disconnect_peer(&mut self, peer_id: PeerId) -> bool {
+        self.swarm.disconnect_peer_id(peer_id).is_ok()
+    }
+
     /// Subscribe to a gossipsub topic by name (see [`crate::pubsub`] for the
     /// topic names this crate defines). Idempotent: subscribing to a topic
     /// this host is already subscribed to is a no-op that returns `Ok(())`.
@@ -1365,6 +1382,80 @@ mod tests {
             vec![dialer_peer_id],
             "the listener's transport-connections view must contain exactly the dialer"
         );
+    }
+
+    /// TDD anchor for issue #1491's acceptance criterion "confirm a
+    /// `Disconnect` returned from `TxTagHandler::handle` actually causes
+    /// peer disconnection on ... the libp2p transports": proves
+    /// [`P2pHost::disconnect_peer`] (the primitive `P2pTransport`'s
+    /// gossipsub dispatch calls on `ForwardingPolicy::Disconnect`) tears
+    /// the connection down for real, not just locally-forgotten
+    /// bookkeeping — both sides observe the teardown.
+    #[tokio::test]
+    async fn disconnect_peer_closes_the_real_connection() {
+        let mut listener = new_test_host();
+        let mut dialer = new_test_host();
+
+        let listen_addr = start_listening(&mut listener).await;
+        let listener_peer_id = listener.peer_id();
+        let dialer_peer_id = dialer.peer_id();
+        let dial_addr = listen_addr.with(libp2p::multiaddr::Protocol::P2p(listener_peer_id));
+        dialer.dial(dial_addr).expect("dial should be accepted");
+
+        let mut dialer_connected = false;
+        let mut listener_connected = false;
+        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !(dialer_connected && listener_connected) {
+            tokio::select! {
+                ev = dialer.next_event() => {
+                    if let SwarmEvent::ConnectionEstablished { .. } = ev { dialer_connected = true; }
+                }
+                ev = listener.next_event() => {
+                    if let SwarmEvent::ConnectionEstablished { .. } = ev { listener_connected = true; }
+                }
+                _ = tokio::time::sleep_until(connect_deadline) => {
+                    panic!("timed out before both sides observed ConnectionEstablished");
+                }
+            }
+        }
+        assert_eq!(listener.connected_peers(), vec![dialer_peer_id]);
+
+        // The listener disconnects the dialer -- the exact action
+        // `P2pTransport`'s gossipsub dispatch takes when a registered
+        // handler (e.g. `TxTagHandler`) reports
+        // `algo_network::ForwardingPolicy::Disconnect`.
+        assert!(
+            listener.disconnect_peer(dialer_peer_id),
+            "disconnect_peer must report a connection was actually closed"
+        );
+
+        // Both sides must observe the real transport-level teardown, not
+        // just the disconnecting side forgetting about it locally.
+        let close_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut listener_closed = false;
+        let mut dialer_closed = false;
+        while !(listener_closed && dialer_closed) {
+            tokio::select! {
+                ev = listener.next_event() => {
+                    if let SwarmEvent::ConnectionClosed { peer_id, .. } = ev {
+                        if peer_id == dialer_peer_id { listener_closed = true; }
+                    }
+                }
+                ev = dialer.next_event() => {
+                    if let SwarmEvent::ConnectionClosed { peer_id, .. } = ev {
+                        if peer_id == listener_peer_id { dialer_closed = true; }
+                    }
+                }
+                _ = tokio::time::sleep_until(close_deadline) => {
+                    panic!("timed out before both sides observed ConnectionClosed after disconnect_peer");
+                }
+            }
+        }
+        assert!(listener.connected_peers().is_empty());
+
+        // Disconnecting a peer with no open connection reports nothing to
+        // close.
+        assert!(!listener.disconnect_peer(dialer_peer_id));
     }
 
     /// TDD anchor for issue #1067: two `P2pHost`s that **each** dial the

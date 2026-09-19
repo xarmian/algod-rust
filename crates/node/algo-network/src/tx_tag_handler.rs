@@ -77,10 +77,64 @@
 //!
 //! ## Return value
 //!
-//! Always returns [`OutgoingMessage`] with [`ForwardingPolicy::Ignore`].
-//! Relay-path rebroadcast (Go's `TxHandler.net.Relay`) is intentionally
-//! out of scope for TASK-69 and tracked as a PLAN-33 follow-up. Local
-//! (REST-origin) broadcast lives in TASK-70.
+//! Returns [`OutgoingMessage`] with [`ForwardingPolicy::Ignore`] for every
+//! outcome *except* the three peer-misbehavior classes documented in
+//! "Peer disconnection on misbehavior" below, which return
+//! [`ForwardingPolicy::Disconnect`]. Relay-path rebroadcast (Go's
+//! `TxHandler.net.Relay`) is handled separately via [`Self::with_relay`]
+//! (issue found during the Phase 17 network-parity deep pass) rather than
+//! through this return value — see that method's doc comment. Local
+//! (REST-origin) broadcast lives in `local_tx_broadcast.rs`.
+//!
+//! ## Peer disconnection on misbehavior (issue #1491)
+//!
+//! go-algorand's `TxHandler.validateIncomingTxMessage`/
+//! `postProcessCheckedTxn` (`data/txHandler.go`) return
+//! `network.OutgoingMessage{Action: network.Disconnect}` — not merely
+//! `Ignore` — for three distinct classes of inbound gossip misbehavior,
+//! treating them as active peer misbehavior warranting disconnection (an
+//! anti-spam/anti-DoS measure), not just a per-message drop:
+//!
+//! 1. **Malformed/oversized msgpack decode failure** — [`decode_tx_message`]
+//!    returning any [`TxTagError`] variant. Mirrors `decodeMsg` returning
+//!    `invalid` (`data/txHandler.go:663-703`), checked in *both* of go's
+//!    transport entry points (`processIncomingTxn` for WS-gossip,
+//!    `validateIncomingTxMessage` for libp2p/P2P — `:770-773`,
+//!    `:811-816`), so it applies unconditionally here too.
+//! 2. **Non-canonical raw encoding** — the message's raw bytes don't
+//!    re-encode to their own canonical form
+//!    ([`canonical_group_bytes`] mismatch). Mirrors
+//!    `validateIncomingTxMessage`'s `!bytes.Equal(rawmsg.Data,
+//!    reencoded)` check (`:824-834`). In go this check is wired into the
+//!    libp2p/P2P entry point *only* — `processIncomingTxn` (WS-gossip)
+//!    never performs it. algod-rust's `TxTagHandler` has no separate
+//!    WS/P2P validation split (one handler type, registered on both
+//!    transports — see [`Self::with_app_rate_limiter`]'s doc comment for
+//!    the general sharing pattern), so this check runs unconditionally
+//!    for both transports here: strictly more conservative than go
+//!    (every peer that sends canonical bytes, which both go-algorand and
+//!    this node's own [`crate::local_tx_broadcast::encode_tx_group`]
+//!    always do, is unaffected), never less.
+//!    **This is distinct from the canonical-cache dedup gate above**:
+//!    dedup only fires for a digest already recorded (a legitimate
+//!    resend, dropped as `Ignore`), while this fires the first time a
+//!    group's raw bytes fail to match their own canonical form at all,
+//!    regardless of whether a canonical cache is even attached (go
+//!    computes `reencoded` unconditionally, falling back to a fresh
+//!    `reencode()` call when no cache is present, rather than only when
+//!    `txCanonicalCache != nil`).
+//! 3. **Batch signature-verification failure** — a group submitted to
+//!    [`Self::with_batch_verifier`]'s [`BatchVerifier`] that fails
+//!    verification. Mirrors `postProcessCheckedTxn`'s `if
+//!    wi.verificationErr != nil { ... disconnect ... }`
+//!    (`:407-417`), which applies to both of go's transports via the
+//!    shared `backlogWorker`.
+//!
+//! All three are distinct from a `pool.remember()`/`pool.test()`
+//! rejection (bad fee, stale `LastValid`, already-committed, app
+//! rate-limited, etc.), which stays `Ignore` in both go and here — a
+//! transaction the pool legitimately rejects is not, by itself, evidence
+//! the *peer* misbehaved.
 //!
 //! ## Application-call excessive-rate-limiter (ARL) gate (issue #821)
 //!
@@ -1028,6 +1082,20 @@ fn canonical_group_digest(group: &[SignedTransaction]) -> Digest {
     Digest(hasher.finalize().into())
 }
 
+/// Compute the canonical raw-byte re-encoding of a decoded TX group
+/// (issue #1491), mirroring go-algorand's `reencode()`
+/// (`data/txHandler.go:285`): the concatenation of each txn's canonical
+/// (`MarshalMsg`-equivalent) encoding, in group order. Used by
+/// [`TxTagHandler::handle`]'s non-canonical raw-encoding gate to compare
+/// against the message's original raw bytes.
+fn canonical_group_bytes(group: &[SignedTransaction]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(group.len().saturating_mul(256));
+    for tx in group {
+        out.extend_from_slice(&canonical_encode_signed_transaction(tx));
+    }
+    out
+}
+
 /// Build a [`BatchVerifyRequest`] for pre-admission signature verification
 /// of an inbound gossip group, from the pool's current ledger tip (issue
 /// #1043).
@@ -1083,7 +1151,15 @@ fn origin_bytes(sender: &str) -> Vec<u8> {
 #[async_trait]
 impl MessageHandler for TxTagHandler {
     async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
-        // Decode the payload.
+        // Decode the payload. A malformed/oversized msgpack payload is
+        // treated as active peer misbehavior, not just an unparseable
+        // message -- mirrors go's `TxHandler.processIncomingTxn` AND
+        // `validateIncomingTxMessage` (`data/txHandler.go:770-773`,
+        // `:811-816`) both returning `network.Disconnect` (not `Ignore`)
+        // when `decodeMsg` reports `invalid` (issue #1491). Both of go's
+        // transport-specific entry points agree on this, so it applies
+        // unconditionally here regardless of which transport this
+        // `TxTagHandler` instance is registered on.
         let group = match decode_tx_message(&msg.data) {
             Ok(g) => g,
             Err(e) => {
@@ -1091,10 +1167,10 @@ impl MessageHandler for TxTagHandler {
                     sender = %msg.sender,
                     bytes = msg.data.len(),
                     error = %e,
-                    "TxTagHandler: failed to decode TX message",
+                    "TxTagHandler: failed to decode TX message, disconnecting peer",
                 );
                 return OutgoingMessage {
-                    action: ForwardingPolicy::Ignore,
+                    action: ForwardingPolicy::Disconnect,
                     tag: Tag::Transaction,
                     payload: Vec::new(),
                     topics: None,
@@ -1129,6 +1205,50 @@ impl MessageHandler for TxTagHandler {
                 };
             }
             canonical_digest = Some(digest);
+        }
+
+        // Non-canonical raw-encoding gate (issue #1491), mirroring go's
+        // `validateIncomingTxMessage` comparing the message's raw bytes
+        // against a fresh canonical re-encoding of the decoded group
+        // (`data/txHandler.go:824-834`: `if reencoded == nil { reencoded
+        // = reencode(unverifiedTxGroup) }; if !bytes.Equal(rawmsg.Data,
+        // reencoded) { return Disconnect }`). This is a *distinct* check
+        // from the canonical-cache dedup block just above: dedup only
+        // fires for a digest this cache has already recorded (a second
+        // copy of a group we've legitimately seen before, dropped as
+        // `Ignore` — not misbehavior), whereas this check fires the
+        // *first* time a group's raw wire bytes fail to match their own
+        // canonical form at all, regardless of whether a canonical cache
+        // is even attached — exactly mirroring go computing `reencoded`
+        // unconditionally (falling back to a fresh `reencode()` call)
+        // rather than only when `txCanonicalCache != nil`.
+        //
+        // go only wires this comparison into `validateIncomingTxMessage`
+        // (the libp2p/P2P entry point), not `processIncomingTxn` (the
+        // WS-gossip entry point) -- the two diverge on this one check.
+        // algod-rust's `TxTagHandler` has no separate WS/P2P validation
+        // split (one handler type is registered on both transports, see
+        // the module doc), so this runs unconditionally for both --
+        // strictly *more* conservative than go, never less, which stays
+        // safely inside the "don't under-trigger a real anti-DoS
+        // boundary" side of the issue's acceptance bar. It is safe to do
+        // so: [`crate::local_tx_broadcast::encode_tx_group`] (this node's
+        // own relay/local-broadcast path) was fixed alongside this check
+        // to always emit canonical bytes, so a well-behaved algod-rust or
+        // go-algorand peer's own traffic never trips it.
+        let canonical_bytes = canonical_group_bytes(&group);
+        if msg.data.as_slice() != canonical_bytes.as_slice() {
+            warn!(
+                sender = %msg.sender,
+                group_len = group.len(),
+                "TxTagHandler: TX message did not re-encode to its own canonical form, disconnecting peer",
+            );
+            return OutgoingMessage {
+                action: ForwardingPolicy::Disconnect,
+                tag: Tag::Transaction,
+                payload: Vec::new(),
+                topics: None,
+            };
         }
 
         // Compute txids once up front — `compute_txn_id` hashes the
@@ -1240,13 +1360,21 @@ impl MessageHandler for TxTagHandler {
         if let Some(verifier) = &self.batch_verifier {
             if let Some(request) = build_verify_request(&self.pool, &group) {
                 if let Err(e) = verifier.verify(request).await {
+                    // Mirrors go's `postProcessCheckedTxn`: `if
+                    // wi.verificationErr != nil { ... disconnect from
+                    // peer ... }` (`data/txHandler.go:407-417`) — a batch
+                    // signature-verification failure is treated as peer
+                    // misbehavior, not a benign per-message rejection
+                    // (issue #1491). Distinct from a `pool.remember()`
+                    // failure below (bad fee, stale, etc.), which stays
+                    // `Ignore` in both go and here.
                     warn!(
                         sender = %msg.sender,
                         error = %e,
-                        "TxTagHandler: batch signature verification rejected inbound TX group",
+                        "TxTagHandler: batch signature verification rejected inbound TX group, disconnecting peer",
                     );
                     return OutgoingMessage {
-                        action: ForwardingPolicy::Ignore,
+                        action: ForwardingPolicy::Disconnect,
                         tag: Tag::Transaction,
                         payload: Vec::new(),
                         topics: None,
@@ -1532,13 +1660,30 @@ mod tests {
     fn make_signed_txn(fee: u64) -> SignedTransaction {
         let mut stx = SignedTransaction::default();
         stx.txn.fee = fee;
+        // `type` and `snd` are both `codec:"...,required"` in go
+        // (`data/transactions/transaction.go`) — always encoded, never
+        // omitted — and the canonical encoder
+        // ([`canonical_encode_signed_transaction`], now used by
+        // `encode_group` below instead of `rmp_serde::to_vec_named` per
+        // issue #1491) correctly omits an *empty* string / zero address
+        // via its omitempty rules, so both must be set to a real
+        // (non-default) value for these fixtures to round-trip through
+        // `decode_tx_message`.
+        stx.txn.txn_type = algo_types::TxnType::Pay;
+        stx.txn.sender = algo_types::Address([0xABu8; 32]);
         stx
     }
 
+    /// Builds a TX-tag wire payload the same way
+    /// [`crate::local_tx_broadcast::encode_tx_group`] does — canonical
+    /// per-txn encoding, not `rmp_serde::to_vec_named` (issue #1491's
+    /// non-canonical-form gate disconnects a group whose raw bytes don't
+    /// match their own canonical re-encoding, so test input must already
+    /// be canonical unless a test is deliberately exercising that gate).
     fn encode_group(group: &[SignedTransaction]) -> Vec<u8> {
         let mut out = Vec::new();
         for tx in group {
-            let bytes = rmp_serde::to_vec_named(tx).expect("encode stxn");
+            let bytes = canonical_encode_signed_transaction(tx);
             out.extend_from_slice(&bytes);
         }
         out
@@ -1830,10 +1975,16 @@ mod app_rate_limiter_wiring_tests {
         stx
     }
 
+    /// Builds a TX-tag wire payload the same way
+    /// [`crate::local_tx_broadcast::encode_tx_group`] does — canonical
+    /// per-txn encoding, not `rmp_serde::to_vec_named` (issue #1491's
+    /// non-canonical-form gate disconnects a group whose raw bytes don't
+    /// match their own canonical re-encoding, so test input must already
+    /// be canonical unless a test is deliberately exercising that gate).
     fn encode_group(group: &[SignedTransaction]) -> Vec<u8> {
         let mut out = Vec::new();
         for tx in group {
-            let bytes = rmp_serde::to_vec_named(tx).expect("encode stxn");
+            let bytes = canonical_encode_signed_transaction(tx);
             out.extend_from_slice(&bytes);
         }
         out
@@ -2199,10 +2350,16 @@ mod batch_verifier_wiring_tests {
         stx
     }
 
+    /// Builds a TX-tag wire payload the same way
+    /// [`crate::local_tx_broadcast::encode_tx_group`] does — canonical
+    /// per-txn encoding, not `rmp_serde::to_vec_named` (issue #1491's
+    /// non-canonical-form gate disconnects a group whose raw bytes don't
+    /// match their own canonical re-encoding, so test input must already
+    /// be canonical unless a test is deliberately exercising that gate).
     fn encode_group(group: &[SignedTransaction]) -> Vec<u8> {
         let mut out = Vec::new();
         for tx in group {
-            let bytes = rmp_serde::to_vec_named(tx).expect("encode stxn");
+            let bytes = canonical_encode_signed_transaction(tx);
             out.extend_from_slice(&bytes);
         }
         out
@@ -2259,9 +2416,13 @@ mod batch_verifier_wiring_tests {
 
     /// A group that fails batch verification must never reach the pool at
     /// all -- proving the verifier actually *gates* admission rather than
-    /// being called and ignored.
+    /// being called and ignored. It must also return `Disconnect` (issue
+    /// #1491), mirroring go's `postProcessCheckedTxn`: `if
+    /// wi.verificationErr != nil { ... disconnect from peer ... }`
+    /// (`data/txHandler.go:407-417`) -- a batch signature-verification
+    /// failure is peer misbehavior, not a benign per-message drop.
     #[tokio::test]
-    async fn failed_verification_never_reaches_the_pool() {
+    async fn failed_verification_disconnects_peer_and_never_reaches_the_pool() {
         let pool = make_pool();
         let seen = Arc::new(SeenTxCache::new(1024));
         let cache = Arc::new(VerifiedTransactionCache::new(100));
@@ -2282,7 +2443,11 @@ mod batch_verifier_wiring_tests {
         let msg = incoming(std::slice::from_ref(&tx), "5.6.7.8:4160");
         let out = handler.handle(msg).await;
 
-        assert_eq!(out.action, ForwardingPolicy::Ignore);
+        assert_eq!(
+            out.action,
+            ForwardingPolicy::Disconnect,
+            "a batch signature-verification failure must disconnect the sending peer"
+        );
         assert_eq!(
             pool.pending_count(),
             0,
@@ -2544,10 +2709,16 @@ mod canonical_cache_wiring_tests {
         stx
     }
 
+    /// Builds a TX-tag wire payload the same way
+    /// [`crate::local_tx_broadcast::encode_tx_group`] does — canonical
+    /// per-txn encoding, not `rmp_serde::to_vec_named` (issue #1491's
+    /// non-canonical-form gate disconnects a group whose raw bytes don't
+    /// match their own canonical re-encoding, so test input must already
+    /// be canonical unless a test is deliberately exercising that gate).
     fn encode_group(group: &[SignedTransaction]) -> Vec<u8> {
         let mut out = Vec::new();
         for tx in group {
-            let bytes = rmp_serde::to_vec_named(tx).expect("encode stxn");
+            let bytes = canonical_encode_signed_transaction(tx);
             out.extend_from_slice(&bytes);
         }
         out
@@ -2693,6 +2864,107 @@ mod canonical_cache_wiring_tests {
             "without a canonical cache attached, both resends must reach the evaluator"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Peer-disconnection-on-misbehavior tests (issue #1491)
+    // -----------------------------------------------------------------
+
+    /// A malformed/undecodable msgpack payload must disconnect the
+    /// sending peer, not just drop the message -- mirrors go's
+    /// `processIncomingTxn`/`validateIncomingTxMessage` both returning
+    /// `network.Disconnect` when `decodeMsg` reports `invalid`
+    /// (`data/txHandler.go:770-773`, `:811-816`). It must also never
+    /// reach the pool.
+    #[tokio::test]
+    async fn malformed_msgpack_disconnects_peer() {
+        let (pool, _fail, calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let handler = TxTagHandler::new(pool.clone(), seen);
+
+        // Not valid msgpack at all (an unterminated map header byte).
+        let garbage = vec![0x81u8];
+        let msg = IncomingMessage::new(Tag::Transaction, garbage, "6.6.6.6:4160".to_string(), 0);
+        let out = handler.handle(msg).await;
+
+        assert_eq!(
+            out.action,
+            ForwardingPolicy::Disconnect,
+            "a malformed/undecodable TX message must disconnect the sending peer"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a malformed message must never reach the pool"
+        );
+    }
+
+    /// A TX message whose raw bytes decode successfully but do not
+    /// re-encode to their own canonical form must disconnect the sending
+    /// peer -- mirrors go's `validateIncomingTxMessage`:
+    /// `!bytes.Equal(rawmsg.Data, reencoded)` (`data/txHandler.go:824-834`).
+    /// Built with the pre-#1491 `rmp_serde::to_vec_named` encoding (struct
+    /// field order, not lexicographically-sorted keys) to produce a
+    /// legal-but-non-canonical encoding of the exact same signed
+    /// transaction `encode_group`'s canonical form above decodes fine.
+    #[tokio::test]
+    async fn non_canonical_raw_encoding_disconnects_peer() {
+        let (pool, _fail, calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let handler = TxTagHandler::new(pool.clone(), seen);
+
+        let tx = make_payment_txn(9, 1, 1_000_000);
+        let non_canonical = rmp_serde::to_vec_named(&tx).expect("encode stxn (non-canonical)");
+        assert_ne!(
+            non_canonical,
+            canonical_encode_signed_transaction(&tx),
+            "test fixture must actually be non-canonical for this test to be meaningful"
+        );
+        let msg = IncomingMessage::new(
+            Tag::Transaction,
+            non_canonical,
+            "7.7.7.7:4160".to_string(),
+            0,
+        );
+        let out = handler.handle(msg).await;
+
+        assert_eq!(
+            out.action,
+            ForwardingPolicy::Disconnect,
+            "a non-canonically-encoded TX message must disconnect the sending peer"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a non-canonically-encoded message must never reach the pool"
+        );
+    }
+
+    /// Sanity/no-regression check: a canonically-encoded message (the
+    /// shape [`incoming`] builds, and the shape
+    /// [`crate::local_tx_broadcast::encode_tx_group`] now always
+    /// produces) is never disconnected by the new non-canonical-form
+    /// gate and reaches the pool normally.
+    #[tokio::test]
+    async fn canonically_encoded_message_is_not_disconnected() {
+        let (pool, _fail, calls) = make_pool();
+        let seen = Arc::new(SeenTxCache::new(1024));
+        let handler = TxTagHandler::new(pool.clone(), seen);
+
+        let tx = make_payment_txn(10, 1, 1_000_000);
+        let msg = incoming(std::slice::from_ref(&tx), "8.8.8.8:4160");
+        let out = handler.handle(msg).await;
+
+        assert_ne!(
+            out.action,
+            ForwardingPolicy::Disconnect,
+            "a canonically-encoded message must never trigger the non-canonical-form disconnect gate"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a canonically-encoded message must reach the pool"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2801,10 +3073,16 @@ mod backlog_queue_tests {
         stx
     }
 
+    /// Builds a TX-tag wire payload the same way
+    /// [`crate::local_tx_broadcast::encode_tx_group`] does — canonical
+    /// per-txn encoding, not `rmp_serde::to_vec_named` (issue #1491's
+    /// non-canonical-form gate disconnects a group whose raw bytes don't
+    /// match their own canonical re-encoding, so test input must already
+    /// be canonical unless a test is deliberately exercising that gate).
     fn encode_group(group: &[SignedTransaction]) -> Vec<u8> {
         let mut out = Vec::new();
         for tx in group {
-            let bytes = rmp_serde::to_vec_named(tx).expect("encode stxn");
+            let bytes = canonical_encode_signed_transaction(tx);
             out.extend_from_slice(&bytes);
         }
         out

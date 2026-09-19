@@ -2129,7 +2129,34 @@ impl P2pTransport {
                                         propagation_source.to_string(),
                                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
                                     );
-                                    let _ = mux.handle(msg).await;
+                                    let out = mux.handle(msg).await;
+                                    // Issue #1491: a registered handler
+                                    // (e.g. `TxTagHandler`, reporting
+                                    // malformed/non-canonical/signature-
+                                    // invalid inbound gossip) may return
+                                    // `ForwardingPolicy::Disconnect` --
+                                    // mirrors go's
+                                    // `handler.net.Disconnect(wi.rawmsg.Sender)`
+                                    // (`data/txHandler.go:415`,
+                                    // `postProcessCheckedTxn`) and
+                                    // `wsPeer`'s own Disconnect handling
+                                    // (`ws_peer.rs`'s/`ws_network.rs`'s
+                                    // `ForwardingPolicy::Disconnect` arms)
+                                    // on the WS-gossip transport. Before
+                                    // this, the result of `mux.handle` was
+                                    // discarded here entirely, so a
+                                    // misbehaving P2P peer was never
+                                    // actually disconnected even after
+                                    // `TxTagHandler` started reporting
+                                    // `Disconnect`.
+                                    if out.action == ForwardingPolicy::Disconnect {
+                                        tracing::info!(
+                                            peer = %propagation_source,
+                                            tag = %tag,
+                                            "P2P gossipsub: handler requested disconnect"
+                                        );
+                                        host.disconnect_peer(propagation_source);
+                                    }
                                 }
                             }
                             _ => {}

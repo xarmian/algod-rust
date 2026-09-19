@@ -466,11 +466,16 @@ async fn txn_propagates_from_a_to_b_via_rest() {
     let tx = make_signed_tx(TEST_NOTE, genesis_hash);
     let txid: Digest = compute_txn_id(&tx.txn);
     let txid_str = txid.to_string();
-    // The REST handler decodes concatenated `SignedTxn` msgpack
-    // entries via `SignedTransaction::decode_from_reader`, which
-    // accepts the `rmp_serde::to_vec_named` wire format used
-    // everywhere else in the codebase (e.g.,
-    // `algo_network::local_tx_broadcast::encode_tx_group`).
+    // The REST handler decodes concatenated `SignedTxn` msgpack entries
+    // via `SignedTransaction::decode_from_reader`, which is tolerant of
+    // any valid msgpack encoding of the struct (map-key order doesn't
+    // matter for decode) — unlike the gossip-layer `TxTagHandler`, which
+    // since issue #1491 requires the *canonical* (sorted-key) encoding on
+    // its raw-bytes non-canonical-form check.
+    // `algo_network::local_tx_broadcast::encode_tx_group` (used for this
+    // node's own relay/local-broadcast) was updated to emit canonical
+    // bytes for that reason, but this REST submission body is unaffected
+    // either way since it's decoded here, not gossip-relayed as-is.
     let body = rmp_serde::to_vec_named(&tx).expect("encode signed txn");
 
     // 5. POST to node A.
