@@ -420,7 +420,7 @@ impl std::error::Error for CredentialError {}
 mod tests {
     use super::*;
     use crate::seed::Seed;
-    use crate::step::{Period, Step, PROPOSE, SOFT};
+    use crate::step::{Period, Step, CERT, PROPOSE, SOFT};
     use algo_consensus_crypto::vrf::VrfKeypair;
     use algo_types::consensus::consensus_params_for_version;
     use algo_types::Round;
@@ -682,6 +682,149 @@ mod tests {
 
         let result = ucred.verify(&params, &membership);
         assert_eq!(result, Err(CredentialError::ZeroWeight));
+    }
+
+    // ---- Full VRF-authenticated committee-selection statistics ----
+    //
+    // Mirrors go-algorand's data/committee/credential_test.go statistical
+    // tests (TestAccountSelected / TestLeadersSelected / TestCommitteeSelected /
+    // TestRichAccountSelected / TestPoorAccountSelectedLeaders), which exercise
+    // the FULL VRF-authenticated pipeline (many distinct real VRF keypairs,
+    // `UnauthenticatedCredential::verify` against a `Membership`) across many
+    // synthetic accounts and check that the aggregate committee weight lands
+    // within go's own statistical tolerance bounds -- as opposed to the
+    // `algo_consensus_crypto::sortition::select` unit tests, which pin the
+    // raw binomial-CDF math directly and never touch VRF verification,
+    // `Membership`/`Selector` construction, or per-account key material at
+    // all.
+
+    /// Build `n` distinct accounts, each with an even share of `total_money`,
+    /// and return their VRF keypairs alongside the shared `total_money`.
+    fn make_n_even_accounts(n: u8, total_money: u64) -> (Vec<VrfKeypair>, u64) {
+        let per_account = total_money / n as u64;
+        let kps: Vec<VrfKeypair> = (0..n).map(|i| VrfKeypair::from_seed([i; 32])).collect();
+        (kps, per_account)
+    }
+
+    /// Sum the sortition weight across `kps`, each holding `balance` out of
+    /// `total_money`, for the given step -- mirrors go's per-account
+    /// `MakeCredential` + `Verify` accumulation loops.
+    fn sum_weights(
+        params: &ConsensusParams,
+        kps: &[VrfKeypair],
+        step: Step,
+        balance: u64,
+        total_money: u64,
+    ) -> u64 {
+        kps.iter()
+            .map(|kp| {
+                let membership = make_test_membership(kp, step, balance, total_money);
+                let ucred = make_unauthenticated_credential(kp, &membership.selector);
+                match ucred.verify(params, &membership) {
+                    Ok(cred) => cred.weight,
+                    Err(CredentialError::ZeroWeight) => 0,
+                    Err(e) => panic!("unexpected credential verify error: {e}"),
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn full_credential_pipeline_leaders_and_committee_within_statistical_bounds() {
+        // Mirrors TestAccountSelected / TestLeadersSelected / TestCommitteeSelected:
+        // 100 real VRF-keyed accounts, evenly split stake, checked against real
+        // (v41) `num_proposers` / `soft_committee_size` for the Propose and Soft
+        // steps respectively.
+        let params = v41_params();
+        let total_money: u64 = 100_000_000;
+        let (kps, balance) = make_n_even_accounts(100, total_money);
+
+        let leaders = sum_weights(&params, &kps, PROPOSE, balance, total_money);
+        // Go's TestAccountSelected bound: [NumProposers/2, 2*NumProposers].
+        let num_proposers = params.num_proposers;
+        assert!(
+            leaders >= num_proposers / 2 && leaders <= 2 * num_proposers,
+            "bad number of leaders {leaders}, expected near {num_proposers}"
+        );
+
+        let committee = sum_weights(&params, &kps, SOFT, balance, total_money);
+        // Go's TestAccountSelected/TestCommitteeSelected bound: [0.8x, 1.2x] of
+        // the configured committee size.
+        let soft_size = params.soft_committee_size;
+        let lo = (0.8 * soft_size as f64) as u64;
+        let hi = (1.2 * soft_size as f64) as u64;
+        assert!(
+            committee >= lo && committee <= hi,
+            "bad number of committee members {committee}, expected in [{lo}, {hi}]"
+        );
+    }
+
+    #[test]
+    fn full_credential_pipeline_rich_account_selected() {
+        // Mirrors TestRichAccountSelected: a single account holding half of
+        // total stake should reliably win at least one Propose-step leader
+        // seat, and its Cert-step committee weight should land within go's
+        // [0.4x, 0.6x] tolerance of the cert committee size.
+        let params = v41_params();
+        let total_money: u64 = 1 << 40;
+        let balance = total_money / 2;
+
+        let kp = VrfKeypair::from_seed([7u8; 32]);
+        let propose_membership = make_test_membership(&kp, PROPOSE, balance, total_money);
+        let ucred = make_unauthenticated_credential(&kp, &propose_membership.selector);
+        let lcred = ucred
+            .verify(&params, &propose_membership)
+            .expect("half-of-total-stake account should win at least one leader seat");
+        assert!(lcred.weight > 0);
+
+        let cert_membership = make_test_membership(&kp, CERT, balance, total_money);
+        let ucred = make_unauthenticated_credential(&kp, &cert_membership.selector);
+        let ccred = ucred
+            .verify(&params, &cert_membership)
+            .expect("half-of-total-stake account should be selected for the cert committee");
+        let cert_size = params.cert_committee_size;
+        let lo = (0.4 * cert_size as f64) as u64;
+        let hi = (0.6 * cert_size as f64) as u64;
+        assert!(
+            ccred.weight >= lo && ccred.weight <= hi,
+            "bad number of committee members {}, expected in [{lo}, {hi}]",
+            ccred.weight
+        );
+    }
+
+    #[test]
+    fn full_credential_pipeline_poor_accounts_statistical_leaders() {
+        // Mirrors TestPoorAccountSelectedLeaders: many accounts, each with a
+        // tiny fraction of the total stake, summed over 2 independent trials
+        // (2 fresh sets of keys). Go's own test tolerates exactly this much
+        // statistical noise -- it only fails when BOTH trials land outside
+        // [0.5x, 2x] of `NumProposers` (`failsLeaders == 2`) -- so we mirror
+        // that same fail-only-if-both-trials-miss tolerance rather than
+        // requiring every trial to land inside the band.
+        let params = v41_params();
+        let num_proposers = params.num_proposers;
+        let lo = num_proposers / 2;
+        let hi = 2 * num_proposers;
+
+        let mut fails = 0;
+        let mut leader_counts = Vec::new();
+        for trial in 0u8..2 {
+            let total_money: u64 = 1000;
+            let n = 100u8;
+            let balance = total_money / n as u64; // tiny per-account stake
+            let kps: Vec<VrfKeypair> = (0..n)
+                .map(|i| VrfKeypair::from_seed([trial.wrapping_mul(97).wrapping_add(i); 32]))
+                .collect();
+            let leaders = sum_weights(&params, &kps, PROPOSE, balance, total_money);
+            leader_counts.push(leaders);
+            if leaders < lo || leaders > hi {
+                fails += 1;
+            }
+        }
+        assert!(
+            fails < 2,
+            "bad number of leaders across both trials {leader_counts:?}, expected each near [{lo}, {hi}]"
+        );
     }
 
     // ---- v42 EnableSelectF128 wiring tests (issue #667) ----
