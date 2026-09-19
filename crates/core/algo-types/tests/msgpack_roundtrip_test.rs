@@ -53,7 +53,8 @@
 //! decoded-value equality check, since every type here derives `PartialEq`.
 
 use algo_types::{
-    Address, Block, BlockHeader, Round, SignedTransaction, StateProofMessage, StateSchema,
+    Address, Block, BlockHeader, BoxRef, HoldingRef, LocalsRef, ResourceRef, Round,
+    SignedTransaction, StateProofMessage, StateSchema,
 };
 use serde_bytes::ByteBuf;
 
@@ -403,4 +404,145 @@ fn block_with_payset_roundtrips() {
         ..Block::default()
     };
     assert_msgpack_roundtrips(&v);
+}
+
+// ---------------------------------------------------------------------------
+// ResourceRef::is_empty (~ go's data/transactions/application_test.go's
+// TestResourceRefEmpty)
+//
+// go's TestResourceRefEmpty asserts `ResourceRef{}.Empty()` is true and that
+// every "near-zero" variant (exactly one field nudged off its zero value,
+// via `basics_testing.NearZeros`) is *not* Empty -- i.e. `Empty()` does not
+// silently disregard any field. algod-rust models the same invariant on
+// `ResourceRef::is_empty` (and its nested `HoldingRef`/`LocalsRef`/`BoxRef`
+// counterparts) directly rather than via a fuzz harness; this test walks
+// every field by hand to get the same "no field is silently ignored"
+// coverage.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resource_ref_default_is_empty() {
+    assert!(ResourceRef::default().is_empty());
+    assert!(HoldingRef::default().is_empty());
+    assert!(LocalsRef::default().is_empty());
+    assert!(BoxRef::default().is_empty());
+}
+
+#[test]
+fn resource_ref_near_zero_and_zero_variants() {
+    // Direct address reference.
+    let mut addr_bytes = [0u8; 32];
+    addr_bytes[0] = 1;
+    let v = ResourceRef {
+        address: Address(addr_bytes),
+        ..ResourceRef::default()
+    };
+    assert!(!v.is_empty(), "non-zero address must not be Empty");
+
+    // Direct asset reference.
+    let v = ResourceRef {
+        asset: 1,
+        ..ResourceRef::default()
+    };
+    assert!(!v.is_empty(), "non-zero asset must not be Empty");
+
+    // Direct app reference.
+    let v = ResourceRef {
+        app: 1,
+        ..ResourceRef::default()
+    };
+    assert!(!v.is_empty(), "non-zero app must not be Empty");
+
+    // go's `ResourceRef.Holding` is a plain value type (`HoldingRef`, not a
+    // pointer/optional), so `rr.Holding.Empty()` never distinguishes "unset"
+    // from "present but zero-valued" -- both wire-encode identically (the
+    // `h` key is omitted whenever `Holding` is the zero value). algod-rust
+    // models the same `omitempty` field as `Option<HoldingRef>`, so
+    // `Some(HoldingRef::default())` must be treated as empty too (matching
+    // Go's value-type semantics), not merely `None`.
+    let v = ResourceRef {
+        holding: Some(HoldingRef::default()),
+        ..ResourceRef::default()
+    };
+    assert!(
+        v.is_empty(),
+        "Some(HoldingRef::default()) must still be Empty, mirroring Go's value-type Holding field"
+    );
+
+    // Holding reference with a non-zero field.
+    let v = ResourceRef {
+        holding: Some(HoldingRef {
+            address: 1,
+            ..HoldingRef::default()
+        }),
+        ..ResourceRef::default()
+    };
+    assert!(!v.is_empty(), "non-zero holding.address must not be Empty");
+
+    let v = ResourceRef {
+        holding: Some(HoldingRef {
+            asset: 1,
+            ..HoldingRef::default()
+        }),
+        ..ResourceRef::default()
+    };
+    assert!(!v.is_empty(), "non-zero holding.asset must not be Empty");
+
+    // Locals reference present but zero-valued: same value-type reasoning
+    // as Holding above.
+    let v = ResourceRef {
+        locals: Some(LocalsRef::default()),
+        ..ResourceRef::default()
+    };
+    assert!(
+        v.is_empty(),
+        "Some(LocalsRef::default()) must still be Empty, mirroring Go's value-type Locals field"
+    );
+
+    let v = ResourceRef {
+        locals: Some(LocalsRef {
+            address: 1,
+            ..LocalsRef::default()
+        }),
+        ..ResourceRef::default()
+    };
+    assert!(!v.is_empty(), "non-zero locals.address must not be Empty");
+
+    let v = ResourceRef {
+        locals: Some(LocalsRef {
+            app: 1,
+            ..LocalsRef::default()
+        }),
+        ..ResourceRef::default()
+    };
+    assert!(!v.is_empty(), "non-zero locals.app must not be Empty");
+
+    // Box reference present but zero-valued: same value-type reasoning as
+    // Holding/Locals above.
+    let v = ResourceRef {
+        box_ref: Some(BoxRef::default()),
+        ..ResourceRef::default()
+    };
+    assert!(
+        v.is_empty(),
+        "Some(BoxRef::default()) must still be Empty, mirroring Go's value-type Box field"
+    );
+
+    let v = ResourceRef {
+        box_ref: Some(BoxRef {
+            index: 1,
+            ..BoxRef::default()
+        }),
+        ..ResourceRef::default()
+    };
+    assert!(!v.is_empty(), "non-zero box_ref.index must not be Empty");
+
+    let v = ResourceRef {
+        box_ref: Some(BoxRef {
+            name: Some(ByteBuf::from(vec![1u8])),
+            ..BoxRef::default()
+        }),
+        ..ResourceRef::default()
+    };
+    assert!(!v.is_empty(), "non-empty box_ref.name must not be Empty");
 }

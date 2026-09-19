@@ -19,11 +19,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use algo_avm::group::GroupBudget;
+use algo_avm::{EvalTracer, ProgramType};
 use algo_codec::decode_block_response;
 use algo_types::consensus::ConsensusParams;
 use algo_types::{Address, LogicSig, Round, SignedTransaction, Transaction};
 use algo_validate::signature::verify_logicsig;
 use algo_validate::verify_transaction_signature;
+use algo_validate::verify_transaction_signature_with_tracer;
 use sha2::{Digest, Sha512_256};
 use std::path::PathBuf;
 
@@ -154,6 +156,77 @@ fn sig_verify_all_blocks() {
         eprintln!("SKIPPED: no block fixtures found (run `make fixtures` to generate)");
     } else {
         eprintln!("verified {verified} transaction signatures across all block fixtures");
+    }
+}
+
+/// Mirrors go-algorand's `TestTxnValidationEncodeDecode`
+/// (`data/transactions/verify/txn_test.go#L351`): a signed transaction that
+/// verifies must still verify after being encoded to msgpack and decoded
+/// back -- the wire round-trip must not silently drop or corrupt anything
+/// the signature check depends on.
+#[test]
+fn sig_verify_survives_msgpack_round_trip() {
+    let mut checked = 0;
+    for round in 1..=9 {
+        let br = match load_block(round) {
+            Some(br) => br,
+            None => continue,
+        };
+
+        let txns = restore_genesis_fields(&br);
+        let mut lsig_budget = GroupBudget::for_logicsig(txns.len());
+        // Round-trip every transaction through the plain (non-in-block)
+        // SignedTxn wire encoding first, building a parallel group so
+        // sibling references (gtxn, group ID) stay consistent across the
+        // decoded set, exactly as the original `txns` group does.
+        let round_tripped: Vec<algo_types::SignedTransaction> = txns
+            .iter()
+            .map(|stx| {
+                let encoded = algo_codec::canonical_encode_signed_transaction(stx);
+                let decoded = algo_codec::decode_signed_txn_stream(&encoded)
+                    .unwrap_or_else(|e| panic!("failed to decode round-tripped signed txn: {e}"));
+                assert_eq!(
+                    decoded.len(),
+                    1,
+                    "must decode exactly one signed transaction"
+                );
+                decoded.into_iter().next().unwrap()
+            })
+            .collect();
+        let mut lsig_budget_rt = GroupBudget::for_logicsig(round_tripped.len());
+
+        for (i, stx) in txns.iter().enumerate() {
+            verify_transaction_signature(
+                stx,
+                &txns,
+                i,
+                &mut lsig_budget,
+                &ConsensusParams::default(),
+            )
+            .unwrap_or_else(|e| {
+                panic!("original signed transaction failed to verify (block {round} txn {i}): {e}")
+            });
+
+            verify_transaction_signature(
+                &round_tripped[i],
+                &round_tripped,
+                i,
+                &mut lsig_budget_rt,
+                &ConsensusParams::default(),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "round-tripped signed transaction failed to verify (block {round} txn {i}): {e}"
+                )
+            });
+            checked += 1;
+        }
+    }
+
+    if checked == 0 {
+        eprintln!("SKIPPED: no block fixtures found (run `make fixtures` to generate)");
+    } else {
+        eprintln!("verified {checked} signed transactions survive a msgpack round-trip");
     }
 }
 
@@ -629,5 +702,108 @@ fn logicsig_group_size_check_after_pooling_boundary() {
     assert!(
         err.to_string().contains("more than the available pool"),
         "{err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// verify_transaction_signature_with_tracer (go: TestTxnGroupWithTracer,
+// data/transactions/verify/txn_test.go)
+// ---------------------------------------------------------------------------
+//
+// go's TestTxnGroupWithTracer verifies a 3-txn group (LogicSig payment,
+// normal app call, LogicSig app call) through TxnGroup's tracer-threading
+// path and asserts BeforeProgram/BeforeOpcode/AfterOpcode/AfterProgram fire
+// for the two LogicSig-signed members and *not* for the plain-signed one.
+// algod-rust's tracer-threading entry point is
+// `verify_transaction_signature_with_tracer`; this test exercises it
+// directly (not just the non-tracer `verify_transaction_signature` alias)
+// over a simplified 2-txn group -- one LogicSig-signed, one plain-signed --
+// and checks the same "events fire for the LogicSig member only" property.
+
+/// A minimal [`EvalTracer`] that records `before_program`/`after_program`
+/// calls, enough to check which group members triggered LogicSig execution.
+#[derive(Default)]
+struct RecordingTracer {
+    programs: Vec<(ProgramType, bool /* pass */)>,
+}
+
+impl EvalTracer for RecordingTracer {
+    fn before_program(&mut self, _program_type: ProgramType, _program_hash: [u8; 32]) {}
+
+    fn after_program(&mut self, program_type: ProgramType, pass: bool, _error: Option<&str>) {
+        self.programs.push((program_type, pass));
+    }
+}
+
+fn signing_key_from_seed(seed: u8) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+}
+
+/// A validly single-sig-signed pay transaction (sender's key really signs
+/// the canonical "TX"-prefixed encoding), so real ed25519 verification
+/// passes without going through the LogicSig path at all.
+fn plain_signed_txn(note: u64) -> SignedTransaction {
+    use ed25519_dalek::Signer;
+    let key = signing_key_from_seed(0x55);
+    let sender = Address(key.verifying_key().to_bytes());
+    let txn = Transaction {
+        txn_type: "pay".into(),
+        sender,
+        fee: 1_000,
+        first_valid: Round(1),
+        last_valid: Round(1000),
+        receiver: Address([0x42; 32]),
+        amount: 1,
+        note: serde_bytes::ByteBuf::from(note.to_be_bytes().to_vec()),
+        ..Default::default()
+    };
+    let canonical = algo_codec::canonical_encode_transaction(&txn);
+    let mut msg = Vec::with_capacity(2 + canonical.len());
+    msg.extend_from_slice(b"TX");
+    msg.extend_from_slice(&canonical);
+    let sig = key.sign(&msg);
+    SignedTransaction {
+        txn,
+        sig: sig.to_bytes(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn verify_transaction_signature_with_tracer_fires_only_for_logicsig_member() {
+    // Member 0: LogicSig-signed (int 1 approves unconditionally).
+    let lsig_program = prog(6, &[0x81, 0x01]); // pushint 1
+    let lsig_stxn = make_contract_account_txn(&lsig_program);
+
+    // Member 1: plain single-sig, no LogicSig at all.
+    let plain_stxn = plain_signed_txn(1);
+
+    let group = vec![lsig_stxn, plain_stxn];
+    let mut budget = GroupBudget::for_logicsig(group.len());
+    let mut tracer = RecordingTracer::default();
+    let consensus = ConsensusParams::default();
+
+    for (i, stx) in group.iter().enumerate() {
+        let result = verify_transaction_signature_with_tracer(
+            stx,
+            &group,
+            i,
+            &mut budget,
+            &consensus,
+            Some(&mut tracer),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "member {i} must verify successfully: {:?}",
+            result.err()
+        );
+    }
+
+    assert_eq!(
+        tracer.programs,
+        vec![(ProgramType::LogicSig, true)],
+        "the tracer must record exactly one LogicSig program run (for member 0, \
+         approving), and nothing for member 1 (plain-signed, no LogicSig program)"
     );
 }

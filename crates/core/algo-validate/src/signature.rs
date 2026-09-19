@@ -3488,6 +3488,63 @@ mod tests {
         assert!(verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus).is_ok());
     }
 
+    /// Port of go's `TestPQSigVerifyAcceptsSignatureOverRawTxn`
+    /// (`data/transactions/pqsig_test.go:222`), at the pqsig-over-Transaction
+    /// wiring level rather than just the Falcon crypto-primitive level
+    /// (`test_sign_verify_operate_on_raw_bytes_not_a_rehash` in
+    /// `algo-falcon`): go's test proves the signed payload is the raw `"TX"
+    /// || canonical_encode(txn)` message, not a further hash of it, by
+    /// showing that a signature over the *txid* (`crypto.Digest(txn.ID())`,
+    /// itself a hash of that message) does NOT verify even though it was
+    /// produced by the legitimate key. `pqsig_valid_signature_is_accepted`
+    /// above already exercises the positive half (a signature over the raw
+    /// message is accepted); this closes the negative half at the same
+    /// Transaction-verification layer.
+    #[test]
+    fn pqsig_rejects_signature_over_txid_instead_of_raw_message() {
+        let (pk, sk, salt, addr) = falcon_identity(2);
+        let txn = minimal_pay_txn(addr);
+
+        // The raw message PQSig.Verify actually authenticates.
+        let canonical = canonical_encode_transaction(&txn);
+        let mut raw_msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
+        raw_msg.extend_from_slice(TX_PREFIX);
+        raw_msg.extend_from_slice(&canonical);
+
+        // The txid: a *further* hash of that same raw message
+        // (SHA512/256("TX" || canonical_encode(txn))). Signing this instead
+        // of the raw message must not verify.
+        let txid = algo_codec::compute_txn_id(&txn);
+        let txid_sig =
+            algo_falcon::falcon_sign(&sk, txid.as_bytes()).expect("falcon sign over txid");
+
+        let pqsig = PQSig {
+            scheme: PQ_SCHEME_FALCON1024,
+            salt,
+            public_key: ByteBuf::from(pk),
+            signature: ByteBuf::from(txid_sig),
+        };
+        let stx = SignedTransaction {
+            txn,
+            pqsig: Some(pqsig),
+            ..Default::default()
+        };
+
+        let consensus = pq_enabled_consensus();
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        let err = verify_transaction_signature(&stx, &group, 0, &mut budget, &consensus)
+            .expect_err(
+                "a signature over the txid (a hash of the message) must not verify against \
+                 the raw \"TX\" || canonical_encode(txn) message",
+            );
+        assert!(
+            err.to_string()
+                .contains("pq falcon signature verification failed"),
+            "{err}"
+        );
+    }
+
     /// Port of go's `TestPQSigVerifyRejectsChangedTransaction`
     /// (`data/transactions/pqsig_test.go:332`), at the pqsig-over-Transaction
     /// wiring level (`verify_transaction_signature`) rather than just the
