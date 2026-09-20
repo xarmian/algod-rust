@@ -1392,6 +1392,119 @@ fn synchronous_future_upgrade_five_node() {
     sanity_check(&cluster, start_round, 10);
 }
 
+/// Port of go-algorand's `TestCircularNetworkTopology`
+/// (`agreement/fuzzer/tests_test.go`), via `TestingNetwork::ring_topology`.
+///
+/// Go's version runs a live 9/14-node `Fuzzer`+`Service` cluster restricted
+/// to a ring topology (`TopologyFilterConfig`, each node connected only to
+/// its two ring neighbors) for 50 run + 20 recovery ticks and asserts the
+/// network still converges despite the restricted connectivity. This port
+/// uses this file's own established reliable scale (5 real `Service`
+/// nodes — see `five_node_cluster_commits_four_ordinary_rounds`'s doc
+/// comment on why 5 is this harness's proven-reliable ordinary-round
+/// scale, and why a literal 9/14-node port is not attempted) rather than
+/// go's literal node count.
+///
+/// After the cluster bootstraps under normal (full-mesh) connectivity —
+/// mirroring every other scenario in this file, which settles the initial
+/// `zero()` before applying any fault/topology injection — `ring_topology`
+/// is applied: from that point on, every node can reach only its two ring
+/// neighbors directly. No new forwarding logic is added anywhere; the same
+/// `ActionType::Relay` -> `AgreementNetwork::relay` path every other node
+/// already uses for ordinary gossip (`service.rs`) is what carries a vote
+/// or proposal the rest of the way around the ring, exactly as go's
+/// `TopologyFilter` relies on `Service`'s existing relay/gossip behavior
+/// rather than any topology-aware routing of its own. Three ordinary rounds
+/// then commit and are asserted identical (by block digest) across every
+/// node, proving genuine BFT convergence under multi-hop-only delivery —
+/// not just that the message-relay substrate works (which
+/// `ring_relay_propagates_agreement_votes_around_a_five_node_ring`,
+/// `crates/node/algo-network/tests/relay_integration.rs`, already proved at
+/// the network layer), but that the full agreement state machine
+/// (`Player`/`VoteAggregator`/`ProposalStore`) reaches quorum and commits
+/// real certified blocks when every vote/proposal/bundle must travel
+/// through at least one relaying peer to reach a non-neighbor.
+///
+/// Verified reliable across repeated standalone runs before landing, per
+/// this file's established bar.
+#[test]
+fn circular_network_topology_five_node() {
+    let cluster = setup_agreement(5);
+    let start_round = cluster.start_round;
+
+    cluster.wait_for_quiet();
+    let mut round = current_round(&cluster);
+    assert_eq!(round, start_round);
+
+    cluster.network.ring_topology();
+
+    for _ in 0..3 {
+        round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+    }
+    let _ = round;
+
+    cluster.shutdown();
+    sanity_check(&cluster, start_round, 3);
+}
+
+/// Real-`Service`-driven companion to issue #954's
+/// `network_scale_regossip_elimination_reduces_growth` (`fuzzer_smoke.rs`),
+/// which proved the same qualitative claim (gossip traffic grows with node
+/// count) using the simpler `fuzzer` message-plumbing harness rather than
+/// live `Service` instances. This test measures REAL gossip traffic — every
+/// byte counted here was actually produced by a real `Service`'s real vote/
+/// proposal/bundle broadcasts and relays, via `TestingNetwork::
+/// total_bytes_delivered` (see its doc comment) — across the two cluster
+/// sizes this file has already established as reliable (2 nodes and 5
+/// nodes; see the module doc comment and
+/// `five_node_cluster_commits_four_ordinary_rounds`'s doc comment for why
+/// this port doesn't attempt more scale points), rather than go's literal
+/// `TestNetworkBandwidth`/`TestUnstakedNetworkLinearGrowth`/
+/// `TestStakedNetworkQuadricGrowth` 5..40-node sweep.
+///
+/// This is a genuine upgrade over issue #954's proof in kind (real `Service`
+/// traffic instead of fuzzer-simulated traffic) but not in scope: two data
+/// points can show traffic grows with node count, but cannot distinguish
+/// linear from quadratic growth the way go's `calcQuadricCoefficients`
+/// regression or issue #954's 4/8/16-node ratio sweep can. Documented in
+/// `docs/phase17/parity_agreement.md` as strengthened evidence for those
+/// three rows, without upgrading them to `matched-*`.
+#[test]
+fn real_service_traffic_grows_with_node_count() {
+    let mut bytes_per_round = Vec::new();
+    let num_rounds: u64 = 3;
+
+    for &n in &[2usize, 5usize] {
+        let cluster = setup_agreement(n);
+        let start_round = cluster.start_round;
+
+        cluster.wait_for_quiet();
+        let mut round = current_round(&cluster);
+        assert_eq!(round, start_round);
+
+        let bytes_before = cluster.network.total_bytes_delivered();
+        for _ in 0..num_rounds {
+            round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+        }
+        let _ = round;
+        let bytes_after = cluster.network.total_bytes_delivered();
+
+        cluster.shutdown();
+        sanity_check(&cluster, start_round, num_rounds);
+
+        let delta = bytes_after - bytes_before;
+        bytes_per_round.push(delta as f64 / num_rounds as f64);
+    }
+
+    assert!(
+        bytes_per_round[1] > bytes_per_round[0],
+        "real 5-node cluster gossip traffic per round ({:.1} bytes) must exceed \
+         real 2-node cluster gossip traffic per round ({:.1} bytes)",
+        bytes_per_round[1],
+        bytes_per_round[0]
+    );
+}
+
 /// Full 5-node port of go-algorand's
 /// `TestAgreementCertificateDoesNotStallSingleRelay`
 /// (`agreement/service_test.go`), via `TestingNetwork::make_relays`.
