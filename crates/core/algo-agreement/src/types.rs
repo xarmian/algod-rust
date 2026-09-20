@@ -31,7 +31,7 @@ use std::time::Duration;
 use algo_types::{ConsensusParams, Round};
 
 use crate::bundle::UnauthenticatedBundle;
-use crate::step::{Period, Step, CERT, LATE, NEXT, SOFT};
+use crate::step::{Period, Step, LATE, NEXT, SOFT};
 use crate::vote::UnauthenticatedVote;
 
 // ---------------------------------------------------------------------------
@@ -342,17 +342,17 @@ pub fn vote_fresh(fresh_data: &FreshnessData, vote: &UnauthenticatedVote) -> Res
 
 /// Determines whether a bundle satisfies freshness rules.
 ///
-/// Mirrors Go's `bundleFresh` in agreement/voteAggregator.go.
+/// Mirrors Go's `bundleFresh` in agreement/voteAggregator.go (v5.0.2-stable):
+/// per the spec bundle relay rule, a bundle is discarded unless it is for
+/// the current round and no more than one period behind the current
+/// period. Cert bundles are not exempt: a late cert for an already-collected
+/// period is discarded here, and the block is recovered through catchup.
 pub fn bundle_fresh(fresh_data: &FreshnessData, b: &UnauthenticatedBundle) -> Result<(), String> {
     if fresh_data.player_round != b.round {
         return Err(format!(
             "filtered bundle from different round: round {} != {}",
             fresh_data.player_round, b.round
         ));
-    }
-
-    if b.step == CERT {
-        return Ok(());
     }
 
     if fresh_data.player_period != Period(0) && fresh_data.player_period.0 - 1 > b.period.0 {
@@ -595,6 +595,7 @@ mod duration_vec_serde {
 mod tests {
     use super::*;
     use crate::credential::UnauthenticatedCredential;
+    use crate::step::CERT;
     use crate::vote::{ProposalValue, RawVote, BOTTOM};
     use algo_consensus_crypto::OneTimeSignature;
     use algo_types::{Address, Digest};
@@ -1144,23 +1145,91 @@ mod tests {
     // ---- bundle_fresh edge cases ----
 
     #[test]
-    fn bundle_fresh_cert_bundle_always_fresh() {
+    fn bundle_fresh_cert_bundle_within_bound_is_fresh() {
         let fd = FreshnessData {
             player_round: Round(10),
             player_period: Period(5),
             player_step: SOFT,
             player_last_concluding: Step(0),
         };
-        // Cert bundles are always fresh regardless of period
+        // A cert bundle no more than one period behind is fresh, same as
+        // any other step (v5.0.2-stable removed the unconditional-fresh
+        // exemption for cert bundles).
         let b = crate::bundle::UnauthenticatedBundle {
             round: Round(10),
-            period: Period(0),
+            period: Period(4),
             step: CERT,
             proposal: BOTTOM,
             votes: vec![],
             equivocation_votes: vec![],
         };
         assert!(bundle_fresh(&fd, &b).is_ok());
+    }
+
+    /// Port of go-algorand's `TestBundleFreshDiscardsStaleCertBundle`
+    /// (agreement/bundleFresh_test.go, v5.0.2-stable): a stale cert bundle
+    /// is discarded per the spec bundle relay rule, exactly like any other
+    /// step — cert bundles are no longer exempt from the period-age bound.
+    #[test]
+    fn bundle_fresh_discards_stale_cert_bundle() {
+        let fd = FreshnessData {
+            player_round: Round(10),
+            player_period: Period(4),
+            player_step: SOFT,
+            player_last_concluding: Step(0),
+        };
+        let bundle_at = |period: u64, step: Step| crate::bundle::UnauthenticatedBundle {
+            round: Round(10),
+            period: Period(period),
+            step,
+            proposal: BOTTOM,
+            votes: vec![],
+            equivocation_votes: vec![],
+        };
+
+        // Cert bundles obey the same period-age bound as every other bundle.
+        assert!(
+            bundle_fresh(&fd, &bundle_at(4, CERT)).is_ok(),
+            "current period is fresh"
+        );
+        assert!(
+            bundle_fresh(&fd, &bundle_at(3, CERT)).is_ok(),
+            "one period behind is fresh"
+        );
+        assert!(
+            bundle_fresh(&fd, &bundle_at(9, CERT)).is_ok(),
+            "a future period is fresh"
+        );
+        assert!(
+            bundle_fresh(&fd, &bundle_at(2, CERT)).is_err(),
+            "two periods behind must be discarded"
+        );
+        assert!(
+            bundle_fresh(&fd, &bundle_at(0, CERT)).is_err(),
+            "far behind must be discarded"
+        );
+
+        // Non-cert bundles are unchanged by removing the cert exception.
+        assert!(bundle_fresh(&fd, &bundle_at(3, SOFT)).is_ok());
+        assert!(bundle_fresh(&fd, &bundle_at(2, SOFT)).is_err());
+
+        // A bundle for a different round is always discarded, cert included.
+        let fd_other_round = FreshnessData {
+            player_round: Round(11),
+            player_period: Period(4),
+            player_step: SOFT,
+            player_last_concluding: Step(0),
+        };
+        assert!(bundle_fresh(&fd_other_round, &bundle_at(4, CERT)).is_err());
+
+        // At period 0 the period-age bound does not apply.
+        let fd_period_zero = FreshnessData {
+            player_round: Round(10),
+            player_period: Period(0),
+            player_step: SOFT,
+            player_last_concluding: Step(0),
+        };
+        assert!(bundle_fresh(&fd_period_zero, &bundle_at(0, CERT)).is_ok());
     }
 
     #[test]
