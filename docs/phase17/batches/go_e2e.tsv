@@ -73,7 +73,7 @@ test/e2e-go/features/stateproofs	TestTotalWeightChanges	test/e2e-go/features/sta
 test/e2e-go/features/stateproofs	TestSPWithTXPoolFull	test/e2e-go/features/stateproofs/stateproofs_test.go	892
 test/e2e-go/features/stateproofs	TestAtMostOneSPFullPool	test/e2e-go/features/stateproofs/stateproofs_test.go	955
 test/e2e-go/features/stateproofs	TestAtMostOneSPFullPoolWithLoad	test/e2e-go/features/stateproofs/stateproofs_test.go	1036
-test/e2e-go/features/stateproofs	TestStateProofCheckTotalStake	test/e2e-go/features/stateproofs/stateproofs_test.go	1184
+test/e2e-go/features/stateproofs	TestStateProofCheckTotalStake	test/e2e-go/features/stateproofs/stateproofs_test.go	1192
 test/e2e-go/features/teal	TestTealCompile	test/e2e-go/features/teal/compile_test.go	32
 test/e2e-go/features/transactions	TestAccountInformationV2	test/e2e-go/features/transactions/accountv2_test.go	79
 test/e2e-go/features/transactions	TestAccountInformationWithBadAssetIdx	test/e2e-go/features/transactions/accountv2_test.go	342
@@ -81,8 +81,8 @@ test/e2e-go/features/transactions	TestAccountInformationWithMissingAssetIdx	test
 test/e2e-go/features/transactions	TestAccountInformationWithBadAppIdx	test/e2e-go/features/transactions/accountv2_test.go	359
 test/e2e-go/features/transactions	TestAccountInformationWithMissingApp	test/e2e-go/features/transactions/accountv2_test.go	367
 test/e2e-go/features/transactions	TestAccountInformationWithMissingAddress	test/e2e-go/features/transactions/accountv2_test.go	375
-test/e2e-go/features/transactions	TestApplication	test/e2e-go/features/transactions/application_test.go	36
 test/e2e-go/features/transactions	TestExtraProgramPages	test/e2e-go/features/transactions/app_pages_test.go	35
+test/e2e-go/features/transactions	TestApplication	test/e2e-go/features/transactions/application_test.go	36
 test/e2e-go/features/transactions	TestAssetValidRounds	test/e2e-go/features/transactions/asset_test.go	57
 test/e2e-go/features/transactions	TestAssetConfig	test/e2e-go/features/transactions/asset_test.go	187
 test/e2e-go/features/transactions	TestAssetInformation	test/e2e-go/features/transactions/asset_test.go	443

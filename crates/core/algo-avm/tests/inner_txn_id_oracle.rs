@@ -144,7 +144,7 @@ fn corpus_has_inner_id_vectors() {
         !corpus.inner_id_vectors.is_empty(),
         "oracle fixture has no inner_id_vectors -- still the placeholder; \
          run `cd tools/rewards-innertxid-oracle && go run .` against a real \
-         go-algorand v5.0.1-stable checkout and commit the result"
+         go-algorand v5.0.2-stable checkout and commit the result"
     );
     // 4 transaction shapes x 2 parents x 3 indices, per the Go tool.
     assert_eq!(corpus.inner_id_vectors.len(), 4 * 2 * 3);

@@ -25,7 +25,7 @@
 // already verifies Go-produced certificates under algod-rust's verifier.
 // This tool closes the loop: it takes the certificates committed by the
 // mixed cluster during rounds where the **Rust** node was voting and runs
-// them through go-algorand v5.0.1-stable's verifier, so a certificate
+// them through go-algorand v5.0.2-stable's verifier, so a certificate
 // containing Rust votes is proven to authenticate under both
 // implementations.
 //
@@ -160,7 +160,7 @@ type report struct {
 // to be built against; it is recorded in the report so a stale build is
 // visible in the artifact. The pin is enforced by the caller (the docker
 // runner checks out this tag).
-const expectedGoAlgorandPin = "v5.0.1-stable"
+const expectedGoAlgorandPin = "v5.0.2-stable"
 
 // ── the LedgerReader Go's verifier will consult ─────────────────────────
 

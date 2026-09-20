@@ -65,5 +65,5 @@ ledger/simulation	TestFixSigners	ledger/simulation/simulation_eval_test.go	10057
 ledger/simulation	TestTxnNeedsSyntheticSignatureLogicSigContent	ledger/simulation/simulator_test.go	41
 ledger/simulation	TestNonOverridenDataLedgerMethodsUseRoundParameter	ledger/simulation/simulator_test.go	59
 ledger/simulation	TestSimulateWithTrace	ledger/simulation/simulator_test.go	114
-ledger/simulation	TestCursorEvalTracer	ledger/simulation/tracer_test.go	30
 ledger/simulation	TestPopulateFeeUsageIncludesBigLogicSigProgram	ledger/simulation/trace_test.go	31
+ledger/simulation	TestCursorEvalTracer	ledger/simulation/tracer_test.go	30

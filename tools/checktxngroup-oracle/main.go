@@ -20,7 +20,7 @@
 
 // Command checktxngroup-oracle is a parity oracle for algod-rust issue #617:
 // it builds the same scenarios as crates/core/algo-validate/src/checks.rs's
-// unit tests directly as go-algorand v5.0.1-stable transactions.Transaction
+// unit tests directly as go-algorand v5.0.2-stable transactions.Transaction
 // values and runs them through the real transactions.CheckTxnGroup /
 // CheckPayset functions, confirming the Rust port (check_txn_group /
 // check_payset) accepts/rejects each case exactly the same way.
@@ -154,7 +154,7 @@ func main() {
 		fmt.Printf("[%s] %-55s accept=%v want=%v err=%v\n", status, r.name, accepted, r.wantAccept, r.err)
 	}
 
-	fmt.Printf("\n%d/%d cases matched go-algorand v5.0.1-stable's real CheckTxnGroup\n", len(results)-failed, len(results))
+	fmt.Printf("\n%d/%d cases matched go-algorand v5.0.2-stable's real CheckTxnGroup\n", len(results)-failed, len(results))
 	if failed > 0 {
 		os.Exit(2)
 	}

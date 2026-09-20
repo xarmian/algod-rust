@@ -35,7 +35,7 @@
 //! size-pricing boundary families named in #703's acceptance criteria --
 //! note bytes, `ApplicationArgs` total bytes, app approval+clear program
 //! total bytes, and `LogicSig` program bytes -- to BOTH a real go-algorand
-//! v5.0.1-stable node and algod-rust from the shared `validate-api` genesis
+//! v5.0.2-stable node and algod-rust from the shared `validate-api` genesis
 //! (consensus V42, bumped there by issue #720/#721), and asserts that:
 //!
 //!  1. go-algorand and algod-rust agree on accept/reject for every case, and

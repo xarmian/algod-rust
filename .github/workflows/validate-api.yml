@@ -5,7 +5,7 @@
 name: Dual-Node REST Conformance
 
 # Live conformance check for issue #129: boots a real go-algorand
-# v5.0.1-stable node and a real algod-rust node from the *same* baked
+# v5.0.2-stable node and a real algod-rust node from the *same* baked
 # genesis (docker/localnet-rust/data/, see
 # docker/docker-compose.validate-api.yml's header comment), and diffs live
 # HTTP responses byte-for-byte where a shared genesis makes that meaningful.
