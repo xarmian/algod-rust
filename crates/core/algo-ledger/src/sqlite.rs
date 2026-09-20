@@ -3351,17 +3351,18 @@ impl SqliteLedger {
                 // scratch apply's entries must be truncated away or they would be
                 // consumed by the authoritative commit's trie finalization.
                 let saved_pre_mutations_len = self.pre_mutations.len();
-                // Issue #523: the scratch apply's `set_account`/`remove_account`
-                // calls also accumulate into `pending_totals_delta`; without
-                // restoring it the authoritative apply below would double-count
-                // every account touched by the scratch run on top of its own.
-                let saved_totals_delta = self.pending_totals_delta;
-
+                // Issue #523/#1521: the scratch apply's `set_account`/
+                // `remove_account` calls also accumulate into
+                // `pending_totals_delta`/`pending_online_touched`; without
+                // restoring them the authoritative apply below would
+                // double-count every account touched by the scratch run on
+                // top of its own. `snapshot`/`restore_snapshot` now save and
+                // restore both fields generically (see `SqliteSnapshot`), so
+                // no separate manual save/restore is needed here.
                 let sp = self.snapshot(&[]);
                 let _ = crate::apply::apply_block_capturing_group_deltas(self, block, &mut tracer);
                 self.restore_snapshot(sp);
                 self.pre_mutations.truncate(saved_pre_mutations_len);
-                self.pending_totals_delta = saved_totals_delta;
 
                 self.set_current_round(saved_round);
                 self.set_rewards_level(saved_level);
@@ -5647,8 +5648,34 @@ CREATE TABLE IF NOT EXISTS catchpointstateproofverification (
 // LedgerStore implementation
 // ---------------------------------------------------------------------------
 
+/// Snapshot handle returned by `SqliteLedger::snapshot`/`snapshot_with_ids`.
+///
+/// Bundles the SQLite SAVEPOINT name (which reverts `accountbase`/
+/// `assetcreators`/etc. on `restore_snapshot`) with a copy of the in-memory
+/// `pending_totals_delta`/`pending_online_touched` state at snapshot time.
+///
+/// Issue #1521: `set_account`/`remove_account` fold their contribution into
+/// `pending_totals_delta` (and record the touched address in
+/// `pending_online_touched`) eagerly, on every call -- not once per block
+/// from a final merged delta the way go-algorand's `roundCowState.
+/// CalculateTotals` does (`ledger/eval/cow.go`). A `ROLLBACK TO SAVEPOINT`
+/// alone reverts the SQL-backed account rows but leaves those two in-memory
+/// fields holding the rolled-back write's speculative contribution, so a
+/// transaction that touches an account and then fails a later check
+/// permanently double-counts into `accounttotals`. Restoring these two
+/// fields alongside the SAVEPOINT rollback closes that gap generically for
+/// every `restore_snapshot` call site (mirrors the manual save/restore the
+/// `group_delta_tracer` scratch-apply path already did locally around line
+/// 3358 for `pending_totals_delta` alone; that manual workaround becomes
+/// redundant once this snapshot/restore path covers it and is removed).
+pub struct SqliteSnapshot {
+    savepoint: String,
+    totals_delta: AccountTotalsDelta,
+    online_touched: std::collections::HashSet<Address>,
+}
+
 impl LedgerStore for SqliteLedger {
-    type Snapshot = String; // SAVEPOINT name
+    type Snapshot = SqliteSnapshot; // SAVEPOINT name + in-memory totals-delta state
 
     // ---- Accounts ----
 
@@ -6694,13 +6721,20 @@ impl LedgerStore for SqliteLedger {
     // per-transaction rollback within a block, where chain-level state does not
     // change.
 
-    fn snapshot(&self, _addrs: &[Address]) -> String {
+    fn snapshot(&self, _addrs: &[Address]) -> SqliteSnapshot {
         let n = self.savepoint_counter.fetch_add(1, Ordering::Relaxed);
         let name = format!("sp_{n}");
         self.conn
             .execute_batch(&format!("SAVEPOINT {name}"))
             .expect("savepoint");
-        name
+        // Issue #1521: capture the in-memory totals-delta state alongside the
+        // SQL SAVEPOINT so `restore_snapshot` can revert it too -- see
+        // `SqliteSnapshot`'s doc comment for why this is necessary.
+        SqliteSnapshot {
+            savepoint: name,
+            totals_delta: self.pending_totals_delta,
+            online_touched: self.pending_online_touched.clone(),
+        }
     }
 
     fn snapshot_with_ids(
@@ -6708,12 +6742,12 @@ impl LedgerStore for SqliteLedger {
         _addrs: &[Address],
         _asset_ids: &[u64],
         _app_ids: &[u64],
-    ) -> String {
+    ) -> SqliteSnapshot {
         // SQLite SAVEPOINTs capture all changes, no need to filter by addr/id.
         self.snapshot(_addrs)
     }
 
-    fn restore_snapshot(&mut self, snapshot: String) {
+    fn restore_snapshot(&mut self, snapshot: SqliteSnapshot) {
         // `ROLLBACK TO SAVEPOINT` reverts the changes made since the savepoint
         // but does NOT remove the savepoint from the transaction stack — the
         // savepoint (and, when it is the outermost one with no enclosing
@@ -6731,11 +6765,18 @@ impl LedgerStore for SqliteLedger {
         // (ledger/simulation/simulator.go) evaluates against an eval snapshot
         // and never mutates the real ledger; this keeps the SQLite ledger
         // exactly as simulate found it, with no open transaction left behind.
+        let sp = &snapshot.savepoint;
         self.conn
             .execute_batch(&format!(
-                "ROLLBACK TO SAVEPOINT {snapshot}; RELEASE SAVEPOINT {snapshot};"
+                "ROLLBACK TO SAVEPOINT {sp}; RELEASE SAVEPOINT {sp};"
             ))
             .expect("rollback to and release savepoint");
+        // Issue #1521: also revert the in-memory totals-delta state to what
+        // it was at the matching `snapshot()` call, undoing any speculative
+        // `set_account`/`remove_account` folds the rolled-back writes made.
+        // See `SqliteSnapshot`'s doc comment for the full rationale.
+        self.pending_totals_delta = snapshot.totals_delta;
+        self.pending_online_touched = snapshot.online_touched;
     }
 
     // ---- Min balance ----
@@ -10381,6 +10422,83 @@ mod tests {
         // Rollback
         ledger.restore_snapshot(sp);
         assert_eq!(ledger.get_account(&addr).unwrap().micro_algos, 1000);
+
+        ledger.commit_block().unwrap();
+    }
+
+    #[test]
+    fn restore_snapshot_reverts_pending_totals_delta_and_online_touched() {
+        // Issue #1521: `set_account`/`remove_account` fold their contribution
+        // into `pending_totals_delta` (and record the address in
+        // `pending_online_touched`) eagerly on every call, not once per block
+        // from a final merged delta the way go-algorand's
+        // `roundCowState.CalculateTotals` (`ledger/eval/cow.go`) does. A
+        // per-transaction rollback via `snapshot`/`restore_snapshot` (the
+        // SQLite SAVEPOINT mechanism used when a transaction partially
+        // applies -- e.g. touches an account -- then fails a later check)
+        // must also revert those two in-memory fields, or the rolled-back
+        // write's speculative contribution permanently double-counts into
+        // the `accounttotals` table even though `accountbase` was correctly
+        // reverted by the SQL rollback.
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.begin_block().unwrap();
+
+        let online_addr = Address([42u8; 32]);
+        ledger.set_account(
+            &online_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                status: AccountStatus::Online,
+                ..Default::default()
+            },
+        );
+
+        let totals_before = ledger.pending_totals_delta;
+        let touched_before = ledger.pending_online_touched.clone();
+        assert!(
+            !totals_before.is_zero(),
+            "sanity: setting an online account must have folded into pending_totals_delta"
+        );
+        assert!(
+            touched_before.contains(&online_addr),
+            "sanity: setting the account must have recorded it as touched"
+        );
+
+        // Snapshot, then simulate a transaction that partially applies (bumps
+        // the online account's balance further) and then fails a later check
+        // -- rolled back via restore_snapshot, exactly like
+        // `apply_transaction_inner`'s real failure path.
+        let sp = ledger.snapshot(&[online_addr]);
+        ledger.set_account(
+            &online_addr,
+            AccountData {
+                micro_algos: 999_000_000,
+                status: AccountStatus::Online,
+                ..Default::default()
+            },
+        );
+        assert_ne!(
+            ledger.pending_totals_delta, totals_before,
+            "sanity: the speculative write must have changed pending_totals_delta"
+        );
+        ledger.restore_snapshot(sp);
+
+        assert_eq!(
+            ledger.get_account(&online_addr).unwrap().micro_algos,
+            10_000_000,
+            "restore_snapshot must revert the SQL-backed account row"
+        );
+        assert_eq!(
+            ledger.pending_totals_delta, totals_before,
+            "restore_snapshot must also revert pending_totals_delta to its \
+             pre-snapshot value -- otherwise the rolled-back write's \
+             speculative balance change permanently double-counts into \
+             accounttotals"
+        );
+        assert_eq!(
+            ledger.pending_online_touched, touched_before,
+            "restore_snapshot must also revert pending_online_touched"
+        );
 
         ledger.commit_block().unwrap();
     }
