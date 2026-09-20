@@ -5366,6 +5366,184 @@ mod tests {
         server_net.stop().await;
     }
 
+    /// A minimal counting [`IdentityDedupHook`], mirroring go's
+    /// `mockIdentityTracker.getSetCount()` — used by the two tests below to
+    /// prove a relay's identity claim table was (or, in these "no identity
+    /// exchange" scenarios, was *not*) ever consulted.
+    #[derive(Default)]
+    struct CountingDedupHook {
+        claim_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingDedupHook {
+        fn claim_count(&self) -> usize {
+            self.claim_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl IdentityDedupHook for CountingDedupHook {
+        fn claim(&self, _conn: &str, _identity: ed25519_dalek::VerifyingKey) -> bool {
+            self.claim_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+
+        fn release(&self, _conn: &str, _identity: &ed25519_dalek::VerifyingKey) {}
+    }
+
+    /// Go: `TestPeeringReceiverIdentityChallengeOnly` (`network/wsNetwork_test.go:1669`)
+    /// — "if only the Receiver Uses Identity, no identity exchange happens
+    /// in the connection." Complements `sender_only_identity_key_yields_no_identity_exchange`
+    /// above (the opposite direction, where the *dialer* has identity but
+    /// the relay never wires up any accept-side identity handling at all):
+    /// here the relay DOES have identity wired via [`WebsocketNetwork::set_identity`]
+    /// (issue #1445's `gossip_upgrade_handler`/`handle_gossip_websocket`),
+    /// but the dialer never attaches an `X-Algorand-IdentityChallenge`
+    /// header (`ConnectConfig::our_identity_key` left `None`) — go's
+    /// dial-side `identityScheme.AttachChallenge` never runs when the
+    /// dialer's own `PublicAddress` is empty, mirrored here by simply not
+    /// configuring `our_identity_key`. `gossip_upgrade_handler`'s
+    /// `headers.get(...IDENTITYCHALLENGE...)?` lookup (`ws_network.rs`)
+    /// short-circuits to `None` when that header is absent, so
+    /// `identity_pending` is never populated and the dedup hook is never
+    /// consulted — matching go's `getSetCount() == 0` on both sides.
+    #[tokio::test]
+    async fn receiver_only_identity_key_yields_no_identity_exchange() {
+        use crate::connect::try_connect;
+
+        let (server_net, _captured) = start_capturing_relay("testnet-v1.0").await;
+        let (addr, _) = server_net.address();
+
+        let relay_signing_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let hook = Arc::new(CountingDedupHook::default());
+        server_net.set_identity(relay_signing_key, hook.clone());
+
+        // Dialer has no identity key at all -- mirrors go's netA with an
+        // empty `PublicAddress` (so `identityScheme` is nil and
+        // `AttachChallenge` never runs).
+        let connect_config = ConnectConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            ..ConnectConfig::default()
+        };
+
+        let handle = try_connect(&addr, &connect_config).await.expect(
+            "a relay with identity configured must still accept a dialer that sends no \
+             identity challenge",
+        );
+        assert!(
+            !handle.identity_verified(),
+            "receiver-only identity (dialer never attaches a challenge) must not yield a \
+             verified identity, mirroring go's getSetCount() == 0 on both sides"
+        );
+        assert!(handle.identity().is_none());
+
+        // Give the relay's inbound accept/read path a moment to run --
+        // identity handling happens inside `gossip_upgrade_handler` before
+        // the 101 response is even sent, so this is generous, not required
+        // for correctness.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            hook.claim_count(),
+            0,
+            "the relay's dedup hook must never be consulted when the dialer never attaches \
+             an identity challenge header"
+        );
+        assert_eq!(
+            server_net.peer_count().await,
+            1,
+            "peering must still succeed even though no identity exchange happened"
+        );
+
+        handle.close();
+        server_net.stop().await;
+    }
+
+    /// Go: `TestPeeringIncorrectDeduplicationName` (`network/wsNetwork_test.go:1755`)
+    /// — "if the receiver can't match the Address in the challenge to its
+    /// PublicAddress, identities aren't exchanged, but peering continues."
+    /// go constructs this by giving the *receiving* side a `PublicAddress`
+    /// that doesn't match the address the dialer actually used to reach it
+    /// (`"no:3333"` vs. its real bound address), so
+    /// `identityChallengePublicKeyScheme.VerifyRequestAndAttachResponse`'s
+    /// address-consistency check fails and the receiver skips attaching a
+    /// response, even though it does have identity wired up.
+    ///
+    /// This crate's equivalent check lives in
+    /// `identity::verify_challenge_and_respond` (called from
+    /// `gossip_upgrade_handler`): it verifies the challenge's embedded
+    /// `public_address` (the address the *dialer* claims it dialed) against
+    /// [`WebsocketNetwork::own_addresses`] (the relay's configured
+    /// `net_address` plus its actual bound `listen_addr`) and returns
+    /// `IdentityError::AddressNotMatched` on a mismatch — which
+    /// `gossip_upgrade_handler` treats as "skip identity, but let the
+    /// connection through" (its `Err(e) => { ...; None }` arm), exactly
+    /// mirroring go's "peering continues" outcome.
+    ///
+    /// Reproduced here with a real dialer that has identity configured but
+    /// reaches the relay through a hostname alias (`localhost:<port>`)
+    /// instead of the relay's actual bound address (`127.0.0.1:<port>`) —
+    /// a real, live "the name the dialer claims doesn't match who actually
+    /// answered" mismatch, the same shape as go's inconsistent
+    /// `PublicAddress`, without needing this crate to support a
+    /// `PublicAddress`-style config override just to construct it.
+    #[tokio::test]
+    async fn incorrect_dedup_name_skips_identity_but_peering_continues() {
+        use crate::connect::try_connect;
+
+        let (server_net, _captured) = start_capturing_relay("testnet-v1.0").await;
+        let (addr, _) = server_net.address();
+
+        let relay_signing_key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let hook = Arc::new(CountingDedupHook::default());
+        server_net.set_identity(relay_signing_key, hook.clone());
+
+        // Dial through a hostname alias for the same loopback address --
+        // resolves to the same relay over TCP, but its string form
+        // ("localhost:<port>") is not in `own_addresses()`
+        // ("127.0.0.1:0" configured + the real "127.0.0.1:<port>" bound
+        // address), reproducing go's "claimed address doesn't match my
+        // PublicAddress" mismatch on a live connection.
+        let port = addr
+            .rsplit(':')
+            .next()
+            .expect("relay address must have a port");
+        let alias_addr = format!("localhost:{port}");
+
+        let dialer_signing_key = ed25519_dalek::SigningKey::from_bytes(&[14u8; 32]);
+        let connect_config = ConnectConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            our_identity_key: Some(dialer_signing_key),
+            ..ConnectConfig::default()
+        };
+
+        let handle = try_connect(&alias_addr, &connect_config).await.expect(
+            "an address-mismatched identity challenge must not fail the handshake -- \
+             peering must continue",
+        );
+        assert!(
+            !handle.identity_verified(),
+            "a challenge whose claimed address doesn't match the relay's own_addresses() \
+             must not yield a verified identity"
+        );
+        assert!(handle.identity().is_none());
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            hook.claim_count(),
+            0,
+            "the relay's dedup hook must never be consulted when the challenge's address \
+             doesn't match the relay's own address"
+        );
+        assert_eq!(
+            server_net.peer_count().await,
+            1,
+            "peering must still succeed despite the address mismatch"
+        );
+
+        handle.close();
+        server_net.stop().await;
+    }
+
     /// Go: `TestMaxHeaderSize` (`network/wsNetwork_test.go:4077`) —
     /// `ConnectConfig::max_header_bytes` caps the HTTP upgrade response
     /// header size on the outbound dial (issue #1158). Ported as three
