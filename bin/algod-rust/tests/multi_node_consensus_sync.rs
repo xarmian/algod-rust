@@ -524,6 +524,73 @@ fn spawn_participate_node_full(
     }
 }
 
+/// Kill `node`'s child process (simulating an abrupt loss of connectivity --
+/// the closest real lever this harness has to go's in-process
+/// `DisconnectPeers`/`RequestConnectOutgoing` API calls; see this file's
+/// module doc comment and issue investigation notes below) and immediately
+/// respawn a fresh `algod-rust participate` process pointed at the *same*
+/// `--data-dir` (so it reopens the same `ledger.sqlite`/`partkey.sqlite` and
+/// resumes from whatever round it had already persisted, rather than
+/// re-bootstrapping from genesis) and the same gossip/REST ports, re-peered
+/// at `peer_gossip_addr`. Returns a `NodeProcess` that owns the same
+/// underlying `TempDir` (kept alive across the restart) with a new `Child`.
+fn respawn_participate_node(mut node: NodeProcess, peer_gossip_addr: Option<&str>) -> NodeProcess {
+    // Ensure the old process has fully released its listen sockets before a
+    // new one tries to rebind the identical gossip/REST addresses.
+    let _ = node.child.kill();
+    let _ = node.child.wait();
+
+    let genesis_path = node.data_dir_path.join("genesis.json");
+    let ledger_path = node.data_dir_path.join("ledger.sqlite");
+    let partkey_path = node.data_dir_path.join("partkey.sqlite");
+
+    let bin = env!("CARGO_BIN_EXE_algod-rust");
+    let mut cmd = Command::new(bin);
+    cmd.arg("participate")
+        .arg("--ledger-path")
+        .arg(&ledger_path)
+        .arg("--partkey-path")
+        .arg(&partkey_path)
+        .arg("--genesis-id")
+        .arg(GENESIS_ID)
+        .arg("--network")
+        .arg("custom")
+        .arg("--genesis-json")
+        .arg(&genesis_path)
+        .arg("--genesis-path")
+        .arg(&genesis_path)
+        .arg("--listen-address")
+        .arg(&node.gossip_addr)
+        .arg("--rest-listen")
+        .arg(&node.rest_addr)
+        .arg("--data-dir")
+        .arg(&node.data_dir_path)
+        .env(
+            "RUST_LOG",
+            std::env::var("MULTINODE_RUST_LOG").unwrap_or_else(|_| "warn".to_string()),
+        );
+    if let Some(peer) = peer_gossip_addr {
+        cmd.arg("--peers").arg(peer);
+    }
+
+    // Append to the same log file rather than truncating, so the tail
+    // dumped by `dump_node_logs` on failure still shows the pre-restart
+    // history too.
+    let log_path = node.data_dir_path.join("algod.stderr.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("open log file for append");
+    let log_file_dup = log_file.try_clone().expect("clone log fd");
+    cmd.stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_dup));
+
+    let child = cmd.spawn().expect("respawn algod-rust participate");
+    node.child = child;
+    node
+}
+
 // ---------------------------------------------------------------------------
 // REST client helpers
 // ---------------------------------------------------------------------------
@@ -1428,6 +1495,189 @@ async fn follower_catches_up_via_live_catchpoint_catchup_from_a_real_catchpoint(
         hash_a, hash_b,
         "node B's block at the catchpoint round {catchpoint_round} (reached at round \
          {round_b_after} via live catchpoint catchup) does not match node A's"
+    );
+}
+
+/// A smaller-scale, different-mechanism stand-in for go-algorand's
+/// `TestSyncingFullNode` (`../go-algorand/node/node_test.go:300`) partition
+/// drill (Phase 17, `docs/phase17/parity_daemon_node.md`).
+///
+/// Go's test runs several **in-process** `AlgorandFullNode`s and calls
+/// `net.DisconnectPeers`/`net.RequestConnectOutgoing` directly on their
+/// `network.GossipNode` objects mid-run to force a topology split, then
+/// reconnects and asserts every node converges back to the same chain.
+/// algod-rust's `GossipNode` trait *does* define the equivalent primitives
+/// (`disconnect`/`disconnect_peers`/`request_connect_outgoing`,
+/// `crates/node/algo-network/src/gossip_node.rs`) and `PeerHandle::close()`
+/// can force-close one WebSocket connection from one side
+/// (`crates/node/algo-network/src/ws_peer.rs`) -- but none of that is wired
+/// to anything an external caller can trigger: confirmed via a full sweep of
+/// `crates/node/algo-rest-api/src/router.rs` (only `GET /v2/node/peers`,
+/// read-only, and the unrelated `/v2/shutdown` full-process route exist) and
+/// of `bin/algod-rust/src/commands/participate.rs`/`relay.rs` (only
+/// `ctrl_c()` graceful shutdown is handled -- no SIGHUP/config-reload/dynamic
+/// `--peers` mutation). Since this test harness drives real, separate OS
+/// processes (not go's in-process objects the test harness can reach
+/// directly), and no admin/debug endpoint exists to call those internal
+/// primitives from outside the process, there is no way to force a live
+/// mid-run disconnect+reconnect without either adding new production wiring
+/// (out of scope for a parity *test* fix) or actually killing a process.
+///
+/// This test uses the harness's real, already-existing lever instead: kill
+/// node B's process outright (the closest available stand-in for "node B is
+/// unreachable"), let node A keep independently producing real certified
+/// blocks while node B is down, then respawn node B pointed at the *same*
+/// `--data-dir` (so it resumes from its own last-persisted round rather than
+/// re-bootstrapping from genesis) and the same peer address, and confirm it
+/// re-establishes gossip and catches back up to node A's chain, matching
+/// block hashes at a round produced entirely after the restart. This proves
+/// a genuine, if narrower, recovery property than go's test: reconnection
+/// after a real connectivity loss converges back to the same chain -- just
+/// via process kill/restart (2 nodes) rather than live topology
+/// manipulation (10 nodes, no process restart).
+#[tokio::test]
+#[ignore = "spawns child algod-rust processes and runs real BFT agreement; run with --ignored"]
+async fn follower_reconnects_and_converges_after_process_restart() {
+    let online = build_online_genesis();
+
+    let gossip_a = alloc_loopback_port();
+    let rest_a = alloc_loopback_port();
+    let gossip_b = alloc_loopback_port();
+    let rest_b = alloc_loopback_port();
+    let peer_a_addr = format!("127.0.0.1:{gossip_a}");
+
+    let mut node_a = spawn_participate_node(
+        gossip_a,
+        rest_a,
+        &online.genesis_json,
+        Some(&online.participation),
+        None,
+    );
+    let mut node_b = spawn_participate_node(
+        gossip_b,
+        rest_b,
+        &online.genesis_json,
+        None,
+        Some(&peer_a_addr),
+    );
+
+    let client = http_client();
+    let overall_deadline = Instant::now() + Duration::from_secs(240);
+
+    wait_for_rest_ready(&client, &node_a.rest_addr, overall_deadline).await;
+    wait_for_rest_ready(&client, &node_b.rest_addr, overall_deadline).await;
+    let token_a = read_api_token(&node_a.data_dir_path, overall_deadline).await;
+    let _token_b = read_api_token(&node_b.data_dir_path, overall_deadline).await;
+
+    // Node B does its ordinary initial catch-up first, proving the "before"
+    // half of the property (same as the sibling lockstep test above).
+    const PRE_KILL_ROUND: u64 = 2;
+    let _round_a_pre = wait_for_round(
+        &client,
+        &node_a.rest_addr,
+        &token_a,
+        PRE_KILL_ROUND,
+        overall_deadline,
+        "node A (pre-kill)",
+    )
+    .await;
+    let token_b_pre = read_api_token(&node_b.data_dir_path, overall_deadline).await;
+    let round_b_pre = wait_for_round(
+        &client,
+        &node_b.rest_addr,
+        &token_b_pre,
+        PRE_KILL_ROUND,
+        overall_deadline,
+        "node B (pre-kill)",
+    )
+    .await;
+    assert!(
+        round_b_pre >= PRE_KILL_ROUND,
+        "node B must complete its initial catch-up before the simulated disconnect"
+    );
+
+    // Kill node B outright (no respawn yet) -- the "partition" -- and let
+    // node A keep producing real certified blocks entirely on its own (100%
+    // online stake) with nobody to gossip to, well past where B left off.
+    let _ = node_b.child.kill();
+    let _ = node_b.child.wait();
+
+    const POST_GAP_TARGET: u64 = 6;
+    let round_a_after_gap = wait_for_round(
+        &client,
+        &node_a.rest_addr,
+        &token_a,
+        POST_GAP_TARGET,
+        overall_deadline,
+        "node A (during node B's downtime)",
+    )
+    .await;
+    assert!(
+        round_a_after_gap > round_b_pre,
+        "node A must have advanced past node B's last-known round while B was down"
+    );
+
+    // Respawn node B against the same data-dir/ports, re-peered at node A --
+    // the reconnect half of the drill.
+    node_b = respawn_participate_node(node_b, Some(&peer_a_addr));
+
+    wait_for_rest_ready(&client, &node_b.rest_addr, overall_deadline).await;
+    let token_b_post = read_api_token(&node_b.data_dir_path, overall_deadline).await;
+
+    // Confirms this is a genuine *resume*, not a re-bootstrap from genesis:
+    // node B's round right after restart must already be at or above where
+    // it was before the kill.
+    let round_b_immediately_after_restart = wait_for_round(
+        &client,
+        &node_b.rest_addr,
+        &token_b_post,
+        round_b_pre,
+        overall_deadline,
+        "node B (immediately after restart)",
+    )
+    .await;
+    assert!(
+        round_b_immediately_after_restart >= round_b_pre,
+        "node B must resume from its own last-persisted round ({round_b_pre}), not restart from \
+         genesis"
+    );
+
+    // Node B must now catch back up to (and converge with) node A's chain,
+    // which advanced further while node B was down.
+    let round_a_final = wait_for_round(
+        &client,
+        &node_a.rest_addr,
+        &token_a,
+        round_a_after_gap,
+        overall_deadline,
+        "node A (final)",
+    )
+    .await;
+    let round_b_final = wait_for_round(
+        &client,
+        &node_b.rest_addr,
+        &token_b_post,
+        round_a_after_gap,
+        overall_deadline,
+        "node B (post-reconnect)",
+    )
+    .await;
+
+    let compare_round = round_a_final.min(round_b_final);
+    let hash_a = get_block_hash(&client, &node_a.rest_addr, &token_a, compare_round).await;
+    let hash_b = get_block_hash(&client, &node_b.rest_addr, &token_b_post, compare_round).await;
+
+    if hash_a != hash_b {
+        dump_node_logs(&node_a, "A");
+        dump_node_logs(&node_b, "B");
+    }
+    node_b.shutdown();
+    node_a.shutdown();
+
+    assert_eq!(
+        hash_a, hash_b,
+        "node B did not converge with node A's chain (round {compare_round}) after \
+         reconnecting post-restart"
     );
 }
 

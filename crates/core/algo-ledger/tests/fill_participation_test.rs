@@ -29,7 +29,8 @@ use std::path::PathBuf;
 
 use algo_ledger::erasable_db::ErasableDb;
 use algo_ledger::participation::{
-    fill_db_with_participation_keys, restore_participation, FillError,
+    fill_db_with_participation_keys, fill_db_with_participation_keys_bounded,
+    restore_participation, FillError,
 };
 use algo_types::{Address, Round};
 
@@ -146,6 +147,68 @@ fn fill_rejects_validity_period_exceeding_consensus_limit() {
         other => panic!("expected ValidityPeriodTooLarge, got {other:?}"),
     }
 
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Ports go's `TestKeyregValidityPeriod`
+/// (`../go-algorand/data/account/participation_test.go:534`): proves both
+/// legs of the `MaxKeyregValidPeriod` guard — exactly at the bound
+/// succeeds, one round over the bound fails — using the exact same
+/// inclusive-boundary comparison (`> max_valid_period`, not `>=`) as the
+/// production guard.
+///
+/// go's test affords the at-the-bound-succeeds leg cheaply by *patching*
+/// the global `config.Consensus[...]` table down to
+/// `256*(1<<4) - 1 = 4095` rounds for the duration of the test. algod-rust
+/// has no mutable global consensus table to patch, so this test uses
+/// `fill_db_with_participation_keys_bounded` (the test-only override seam
+/// added alongside this test) with an even smaller bound
+/// (`256*2 - 1 = 511` rounds, ~2 MSS ephemeral keys) to keep real Falcon-1024
+/// keygen cheap while exercising the identical guard logic the production
+/// `fill_db_with_participation_keys` runs (which is always called with the
+/// real, unpatchable `CONSENSUS_CURRENT_VERSION`-derived bound — see
+/// `fill_rejects_validity_period_exceeding_consensus_limit` above for that
+/// real-bound coverage).
+#[test]
+fn fill_at_bound_succeeds_one_over_bound_fails_with_injected_max_valid_period() {
+    const MAX_VALID_PERIOD: u64 = 256 * 2 - 1; // 511
+
+    // Exactly at the bound: must succeed.
+    let path = tmp_db_path("atbound");
+    let mut db = ErasableDb::open(&path).expect("open");
+    let part = fill_db_with_participation_keys_bounded(
+        &mut db,
+        Address([0x55; 32]),
+        Round(0),
+        Round(MAX_VALID_PERIOD),
+        100,
+        MAX_VALID_PERIOD,
+    )
+    .expect("exactly-at-the-bound window must succeed");
+    assert_eq!(part.last_valid, Round(MAX_VALID_PERIOD));
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+
+    // One round over the bound: must fail with ValidityPeriodTooLarge.
+    let path = tmp_db_path("overbound");
+    let mut db = ErasableDb::open(&path).expect("open");
+    let err = fill_db_with_participation_keys_bounded(
+        &mut db,
+        Address([0x55; 32]),
+        Round(0),
+        Round(MAX_VALID_PERIOD + 1),
+        100,
+        MAX_VALID_PERIOD,
+    )
+    .err()
+    .expect("one-over-the-bound window must fail");
+    match err {
+        FillError::ValidityPeriodTooLarge { limit } => {
+            assert_eq!(limit, MAX_VALID_PERIOD);
+        }
+        other => panic!("expected ValidityPeriodTooLarge, got {other:?}"),
+    }
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
