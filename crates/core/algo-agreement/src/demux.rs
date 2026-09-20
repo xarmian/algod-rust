@@ -607,6 +607,17 @@ impl Demux {
     fn handle_raw_vote(&self, msg: Message) -> Option<ExternalEvent> {
         match codec::decode_vote(&msg.data) {
             Ok(vote) => {
+                // Mirrors Go's `decodeVote` (agreement/message.go,
+                // v5.0.2-stable): a stateless well-formedness check
+                // (step > down rejected) is enforced at decode time, as
+                // defense in depth ahead of `verify()`'s own check.
+                if let Err(e) = vote.well_formed() {
+                    warn!("error decoding vote message: {}", e);
+                    if let Some(ref net) = self.network {
+                        net.disconnect(&msg.handle);
+                    }
+                    return None;
+                }
                 let internal = InternalMessage {
                     message_handle: msg.handle,
                     tag: AGREEMENT_VOTE_TAG.to_string(),
@@ -646,6 +657,23 @@ impl Demux {
     ) -> Option<ExternalEvent> {
         match codec::decode_compound_message(&msg.data) {
             Ok(compound) => {
+                // Mirrors Go's `decodeProposal` (agreement/message.go,
+                // v5.0.2-stable): the embedded prior-vote's stateless
+                // well-formedness (step > down rejected) is checked at
+                // decode time, as defense in depth ahead of `verify()`'s
+                // own check.
+                if let Err(e) = compound.vote.well_formed() {
+                    warn!(
+                        len = msg.data.len(),
+                        prefix = %hex_prefix(&msg.data, 96),
+                        "error decoding proposal message: {}",
+                        e
+                    );
+                    if let Some(ref net) = self.network {
+                        net.disconnect(&msg.handle);
+                    }
+                    return None;
+                }
                 // Group-level structural screen (Go: `agreement/message.go`'s
                 // `proposalCarriesInvalidTxn`, called from `demux.go`'s
                 // `tokenizeMessages`). A proposal whose payset fails this
@@ -709,6 +737,17 @@ impl Demux {
     fn handle_raw_bundle(&self, msg: Message) -> Option<ExternalEvent> {
         match codec::decode_bundle(&msg.data) {
             Ok(bundle) => {
+                // Mirrors Go's `decodeBundle` (agreement/message.go,
+                // v5.0.2-stable): a stateless well-formedness check
+                // (step > down rejected) is enforced at decode time, as
+                // defense in depth ahead of `verify()`'s own check.
+                if let Err(e) = bundle.well_formed() {
+                    warn!("error decoding bundle message: {}", e);
+                    if let Some(ref net) = self.network {
+                        net.disconnect(&msg.handle);
+                    }
+                    return None;
+                }
                 let internal = InternalMessage {
                     message_handle: msg.handle,
                     tag: VOTE_BUNDLE_TAG.to_string(),
@@ -1502,6 +1541,121 @@ mod tests {
         assert!(
             stub.disconnected.lock().unwrap().is_empty(),
             "an oversized-group proposal must be dropped, not disconnect the peer"
+        );
+    }
+
+    /// Port of go-algorand's `TestDecodeRejectsStepAboveDown`
+    /// (agreement/message_test.go, v5.0.2-stable): `decodeVote` enforces
+    /// `wellFormed` at decode time, disconnecting the peer just like any
+    /// other malformed message.
+    #[test]
+    fn demux_raw_vote_with_step_above_down_is_dropped_and_disconnects() {
+        use crate::step::{Step, DOWN};
+        use crate::stubs::StubNetwork;
+
+        let (mut demux, ..) = make_test_demux();
+
+        let stub = Arc::new(StubNetwork::new());
+        demux.set_network(stub.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
+
+        let mut vote = UnauthenticatedVote::default();
+        vote.raw_vote.step = Step(DOWN.0 + 1);
+        let encoded = codec::encode_vote(&vote);
+
+        let result = demux.handle_raw_vote(Message {
+            data: encoded,
+            handle: None,
+        });
+
+        assert!(
+            result.is_none(),
+            "an out-of-bound-step vote must be dropped"
+        );
+        assert_eq!(
+            stub.disconnected.lock().unwrap().len(),
+            1,
+            "an out-of-bound-step vote must disconnect the peer, like any other malformed decode"
+        );
+    }
+
+    /// Port of go-algorand's `TestDecodeRejectsStepAboveDown` (bundle case).
+    #[test]
+    fn demux_raw_bundle_with_step_above_down_is_dropped_and_disconnects() {
+        use crate::step::{Step, DOWN};
+        use crate::stubs::StubNetwork;
+
+        let (mut demux, ..) = make_test_demux();
+
+        let stub = Arc::new(StubNetwork::new());
+        demux.set_network(stub.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
+
+        let bundle = crate::bundle::UnauthenticatedBundle {
+            step: Step(DOWN.0 + 1),
+            ..crate::bundle::UnauthenticatedBundle::default()
+        };
+        let encoded = codec::encode_bundle(&bundle);
+
+        let result = demux.handle_raw_bundle(Message {
+            data: encoded,
+            handle: None,
+        });
+
+        assert!(
+            result.is_none(),
+            "an out-of-bound-step bundle must be dropped"
+        );
+        assert_eq!(
+            stub.disconnected.lock().unwrap().len(),
+            1,
+            "an out-of-bound-step bundle must disconnect the peer, like any other malformed decode"
+        );
+    }
+
+    /// Port of go-algorand's `TestDecodeRejectsStepAboveDown` (proposal
+    /// case): the embedded `PriorVote`'s step bound is checked too.
+    #[test]
+    fn demux_raw_proposal_with_prior_vote_step_above_down_is_dropped_and_disconnects() {
+        use crate::step::{Step, DOWN};
+        use crate::stubs::StubNetwork;
+
+        let (mut demux, ..) = make_test_demux();
+
+        let stub = Arc::new(StubNetwork::new());
+        demux.set_network(stub.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
+
+        let mut prior_vote = UnauthenticatedVote::default();
+        prior_vote.raw_vote.step = Step(DOWN.0 + 1);
+        let compound = CompoundMessage {
+            vote: prior_vote,
+            proposal: crate::proposal::UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(1),
+                    ..algo_types::Block::default()
+                },
+                seed_proof: [0u8; crate::VRF_PROOF_SIZE],
+                original_period: crate::step::Period(0),
+                original_proposer: Address([0u8; 32]),
+                ..crate::proposal::UnauthenticatedProposal::default()
+            },
+        };
+        let encoded = codec::encode_compound_message(&compound);
+
+        let result = demux.handle_raw_proposal(
+            Message {
+                data: encoded,
+                handle: None,
+            },
+            &ConsensusVersionView::default(),
+        );
+
+        assert!(
+            result.is_none(),
+            "a proposal whose prior vote has an out-of-bound step must be dropped"
+        );
+        assert_eq!(
+            stub.disconnected.lock().unwrap().len(),
+            1,
+            "an out-of-bound prior-vote step must disconnect the peer, like any other malformed decode"
         );
     }
 
