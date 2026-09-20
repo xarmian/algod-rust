@@ -797,6 +797,363 @@ async fn relay_forwards_agreement_tags_across_a_three_node_mesh_with_exact_count
 }
 
 // ---------------------------------------------------------------------------
+// Test 7c: ring_relay_propagates_agreement_votes_around_a_five_node_ring
+// ---------------------------------------------------------------------------
+//
+// go-algorand's `TestCircularNetworkTopology`
+// (`agreement/fuzzer/tests_test.go:107`) runs a live 9/14-node
+// `Fuzzer`+`Service` cluster restricted to a ring topology
+// (`TopologyFilterConfig`, each node connected to only its two ring
+// neighbors) for 50 run + 20 recovery ticks, and asserts the cluster still
+// reaches BFT consensus (converges on the same certified chain) despite the
+// restricted connectivity.
+//
+// algod-rust's fuzzer harness has no live multi-`Service` integration and no
+// `TopologyFilter` port (documented in
+// `crates/core/algo-agreement/tests/fuzzer/mod.rs`'s "Out of scope" note),
+// so this test does NOT attempt to reproduce that — it does not run the
+// agreement `Service`/`Player` state machine at all, and proves nothing
+// about BFT convergence under restricted connectivity.
+//
+// What it DOES prove, honestly and narrowly: the network/gossip layer
+// (`WebsocketNetwork`) that a live ring-restricted agreement cluster would
+// have to run on top of actually propagates a message end-to-end around a
+// literal ring — no node dialing or being dialed by more than its two ring
+// neighbors — via multi-hop relay, with an exact per-node receive count
+// (each non-origin node sees the vote exactly once, via
+// `enable_incoming_message_filter`'s AV/TX dedup preventing the two
+// counter-rotating flood waves from double-delivering or looping forever).
+// This is the network-layer precondition for go's consensus-convergence
+// property, not the property itself.
+#[tokio::test]
+async fn ring_relay_propagates_agreement_votes_around_a_five_node_ring() {
+    use algo_network::forwarding_policy::ForwardingPolicy;
+    use algo_network::handler::{MessageHandler, TaggedMessageHandler};
+    use algo_network::message::{IncomingMessage, OutgoingMessage};
+    use tokio::sync::mpsc;
+
+    init_tracing();
+
+    const RING_SIZE: usize = 5;
+
+    /// Records every inbound `AV` message and always re-broadcasts it —
+    /// the same forwarding shape as production's `BlockNotifyHandler`
+    /// (`bin/algod-rust/src/commands/relay.rs`).
+    struct RecordAndForward {
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageHandler for RecordAndForward {
+        async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+            let _ = self.tx.send(msg.data.clone());
+            OutgoingMessage {
+                action: ForwardingPolicy::Broadcast,
+                tag: msg.tag,
+                payload: msg.data,
+                topics: None,
+            }
+        }
+    }
+
+    /// Build a ring-capable node. `enable_incoming_message_filter` is
+    /// required: without it, a message flooded around a literal ring (every
+    /// node relays every inbound message onward, and a ring node has no
+    /// third connection to simply not re-send on) produces two
+    /// counter-rotating waves that circle forever — this is the same
+    /// AV/TX-scoped dedup go-algorand's real network relies on
+    /// (`network/wsNetwork.go`), not a test-only workaround.
+    fn build_ring_node(genesis_id: &str) -> Arc<WebsocketNetwork> {
+        let config = WebsocketNetworkConfig {
+            genesis_id: genesis_id.to_string(),
+            network_id: "test".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            gossip_fanout: 2,
+            mesh_interval: Duration::from_secs(3600),
+            max_connections_per_ip: 100,
+            connections_rate_limiting_count: 1000,
+            enable_incoming_message_filter: true,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        Arc::new(WebsocketNetwork::new(config, phonebook))
+    }
+
+    // Build the ring: node i dials node (i+1) % RING_SIZE. Each node ends up
+    // with exactly one inbound connection (from its predecessor) and one
+    // outbound connection (to its successor) -- degree 2, no shortcuts.
+    let mut nodes = Vec::with_capacity(RING_SIZE);
+    let mut receivers = Vec::with_capacity(RING_SIZE);
+    for _ in 0..RING_SIZE {
+        let net = build_ring_node("test-v1.0");
+        let (tx, rx) = mpsc::unbounded_channel();
+        net.register_handlers(vec![TaggedMessageHandler {
+            tag: Tag::AgreementVote,
+            handler: Arc::new(RecordAndForward { tx }),
+        }]);
+        net.start_arc().await.expect("ring node should start");
+        nodes.push(net);
+        receivers.push(rx);
+    }
+
+    let addrs: Vec<String> = nodes
+        .iter()
+        .map(|n| {
+            let (addr, listening) = n.address();
+            assert!(listening, "ring node should be listening");
+            addr
+        })
+        .collect();
+
+    // Two different indices (i and (i+1)%RING_SIZE) are needed at once to
+    // wire each node to its ring successor, so a plain iterator/enumerate
+    // doesn't fit here.
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..RING_SIZE {
+        let next = (i + 1) % RING_SIZE;
+        dial(&nodes[i], &addrs[next]).await;
+    }
+
+    // Wait for the ring to fully connect: every node should reach exactly
+    // 2 peers (one inbound from its predecessor, one outbound to its
+    // successor).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut all_connected = true;
+        for n in &nodes {
+            if n.peer_count().await < 2 {
+                all_connected = false;
+                break;
+            }
+        }
+        if all_connected || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for (i, n) in nodes.iter().enumerate() {
+        let count = n.peer_count().await;
+        assert_eq!(
+            count, 2,
+            "ring node {i} should have exactly 2 peers (its ring neighbors only), got {count}"
+        );
+    }
+
+    // Broadcast one AgreementVote from node 0 -- the origin.
+    let payload = b"ring-agreement-vote-payload".to_vec();
+    nodes[0]
+        .broadcast(Tag::AgreementVote, payload.clone(), true, None)
+        .await
+        .expect("origin broadcast should succeed");
+
+    // Every OTHER node in the ring must receive the vote exactly once, via
+    // multi-hop relay -- none of them dialed or were dialed by node 0
+    // directly except nodes 1 and 4 (its immediate ring neighbors); nodes 2
+    // and 3 are two hops away and can only see it via relay.
+    for (i, rx) in receivers.iter_mut().enumerate().skip(1) {
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("node {i} should receive the vote within 5s"))
+            .unwrap_or_else(|| panic!("node {i}'s channel closed unexpectedly"));
+        assert_eq!(
+            got, payload,
+            "node {i} should receive the vote byte-for-byte unmodified"
+        );
+        // Exact count: the dedup filter must prevent the two
+        // counter-rotating flood waves from delivering it twice.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .is_err(),
+            "node {i} should receive the vote exactly once, not a second time \
+             from the other direction around the ring"
+        );
+    }
+
+    // The origin must never see its own broadcast echoed back around the
+    // ring.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), receivers[0].recv())
+            .await
+            .is_err(),
+        "origin node 0 should never receive its own broadcast back"
+    );
+
+    for n in nodes.iter().rev() {
+        n.stop().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 7d: ring_relay_isolated_without_forwarding (negative control for
+// ring_relay_propagates_agreement_votes_around_a_five_node_ring)
+// ---------------------------------------------------------------------------
+//
+// Sanity check proving the ring test above is actually exercising relay,
+// not silently passing because of some hidden direct connection: break
+// forwarding at BOTH of the origin's immediate ring neighbors (nodes 1 and
+// 4), so neither of the two flood waves leaving the origin can propagate
+// past its first hop. The two farthest nodes (2 and 3), each two hops away,
+// must then receive nothing at all.
+//
+// (Breaking only a single node's forwarding is not a useful negative check
+// here: a ring gives every node two independent paths from the origin, so
+// disabling relay at one node alone does not isolate anything -- the other
+// direction still delivers. Breaking both of the origin's neighbors closes
+// both paths at once.)
+#[tokio::test]
+async fn ring_relay_isolated_without_forwarding() {
+    use algo_network::forwarding_policy::ForwardingPolicy;
+    use algo_network::handler::{MessageHandler, TaggedMessageHandler};
+    use algo_network::message::{IncomingMessage, OutgoingMessage};
+    use tokio::sync::mpsc;
+
+    init_tracing();
+
+    const RING_SIZE: usize = 5;
+
+    struct RecordAndForward {
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageHandler for RecordAndForward {
+        async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+            let _ = self.tx.send(msg.data.clone());
+            OutgoingMessage {
+                action: ForwardingPolicy::Broadcast,
+                tag: msg.tag,
+                payload: msg.data,
+                topics: None,
+            }
+        }
+    }
+
+    /// Records inbound messages but never forwards them (`Ignore`) --
+    /// simulates a broken/missing relay handler.
+    struct RecordOnlyNoForward {
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageHandler for RecordOnlyNoForward {
+        async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+            let _ = self.tx.send(msg.data.clone());
+            OutgoingMessage {
+                action: ForwardingPolicy::Ignore,
+                tag: msg.tag,
+                payload: Vec::new(),
+                topics: None,
+            }
+        }
+    }
+
+    fn build_ring_node(genesis_id: &str) -> Arc<WebsocketNetwork> {
+        let config = WebsocketNetworkConfig {
+            genesis_id: genesis_id.to_string(),
+            network_id: "test".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            gossip_fanout: 2,
+            mesh_interval: Duration::from_secs(3600),
+            max_connections_per_ip: 100,
+            connections_rate_limiting_count: 1000,
+            enable_incoming_message_filter: true,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        Arc::new(WebsocketNetwork::new(config, phonebook))
+    }
+
+    let mut nodes = Vec::with_capacity(RING_SIZE);
+    let mut receivers = Vec::with_capacity(RING_SIZE);
+    for i in 0..RING_SIZE {
+        let net = build_ring_node("test-v1.0");
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Nodes 1 and 4 (origin's immediate neighbors) do NOT forward.
+        let handler: Arc<dyn MessageHandler> = if i == 1 || i == 4 {
+            Arc::new(RecordOnlyNoForward { tx })
+        } else {
+            Arc::new(RecordAndForward { tx })
+        };
+        net.register_handlers(vec![TaggedMessageHandler {
+            tag: Tag::AgreementVote,
+            handler,
+        }]);
+        net.start_arc().await.expect("ring node should start");
+        nodes.push(net);
+        receivers.push(rx);
+    }
+
+    let addrs: Vec<String> = nodes
+        .iter()
+        .map(|n| {
+            let (addr, listening) = n.address();
+            assert!(listening, "ring node should be listening");
+            addr
+        })
+        .collect();
+
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..RING_SIZE {
+        let next = (i + 1) % RING_SIZE;
+        dial(&nodes[i], &addrs[next]).await;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut all_connected = true;
+        for n in &nodes {
+            if n.peer_count().await < 2 {
+                all_connected = false;
+                break;
+            }
+        }
+        if all_connected || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for n in &nodes {
+        assert_eq!(n.peer_count().await, 2, "ring should still be fully wired");
+    }
+
+    let payload = b"ring-agreement-vote-payload".to_vec();
+    nodes[0]
+        .broadcast(Tag::AgreementVote, payload.clone(), true, None)
+        .await
+        .expect("origin broadcast should succeed");
+
+    // Nodes 1 and 4 still receive it directly (they're the origin's direct
+    // peers -- direct delivery doesn't need relay).
+    for i in [1usize, 4usize] {
+        let got = tokio::time::timeout(Duration::from_secs(5), receivers[i].recv())
+            .await
+            .unwrap_or_else(|_| panic!("node {i} should still receive the vote directly"))
+            .unwrap_or_else(|| panic!("node {i}'s channel closed unexpectedly"));
+        assert_eq!(got, payload);
+    }
+
+    // Nodes 2 and 3 are two hops away and depend entirely on relay through
+    // 1 or 4 respectively -- with both neighbors' forwarding disabled, they
+    // must receive NOTHING.
+    for i in [2usize, 3usize] {
+        let result = tokio::time::timeout(Duration::from_millis(800), receivers[i].recv()).await;
+        assert!(
+            result.is_err(),
+            "node {i} should receive nothing -- both of the origin's neighbors have \
+             forwarding disabled, so no path can reach it, proving the passing ring test's \
+             delivery to 2-hop nodes genuinely depends on relay"
+        );
+    }
+
+    for n in nodes.iter().rev() {
+        n.stop().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test 7: inbound_zstd_proposal_is_decompressed (regression: issue #478)
 // ---------------------------------------------------------------------------
 
