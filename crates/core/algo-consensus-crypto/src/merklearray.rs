@@ -252,6 +252,15 @@ pub enum MerkleError {
         bound: u64,
     },
     ProofLengthDigestSizeMismatch,
+    /// A non-empty proof-path element's length didn't match the proof's own
+    /// hash algorithm's digest size, matching go-algorand's
+    /// `ErrPathElementSizeMismatch` (`crypto/merklearray/merkle.go`,
+    /// `v5.0.1-stable`).
+    PathElementSizeMismatch {
+        index: usize,
+        len: usize,
+        digest_size: usize,
+    },
     NoMoreSiblingHints,
     LevelBeyondTreeHeight {
         level: u64,
@@ -288,6 +297,16 @@ impl std::fmt::Display for MerkleError {
             }
             Self::ProofLengthDigestSizeMismatch => {
                 write!(f, "proof length and digest size mismatched")
+            }
+            Self::PathElementSizeMismatch {
+                index,
+                len,
+                digest_size,
+            } => {
+                write!(
+                    f,
+                    "proof path element length does not match digest size: path element {index} length {len}, digest size {digest_size}"
+                )
             }
             Self::NoMoreSiblingHints => write!(f, "no more sibling hints"),
             Self::LevelBeyondTreeHeight { level, height } => {
@@ -819,6 +838,24 @@ fn verify_path(
     mut pl: Vec<LayerItem>,
     digest_size: usize,
 ) -> Result<(), MerkleError> {
+    // Empty elements represent missing siblings; every present sibling must
+    // be exactly one complete digest of the proof's own hash algorithm.
+    // Matches go-algorand's `v5.0.1-stable` `verifyPath` fix
+    // (`crypto/merklearray/merkle.go`, `ErrPathElementSizeMismatch`): before
+    // this check existed, a wrong-sized hint was silently zero-padded or
+    // truncated by `partial_layer_up` instead of being rejected, letting a
+    // proof substitute a differently-sized (and differently-algorithmed)
+    // hash into the tree without failing verification.
+    for (i, hint) in proof.path.iter().enumerate() {
+        if !hint.is_empty() && hint.len() != digest_size {
+            return Err(MerkleError::PathElementSizeMismatch {
+                index: i,
+                len: hint.len(),
+                digest_size,
+            });
+        }
+    }
+
     let mut hint_idx = 0;
 
     let mut l = 0u64;
@@ -947,18 +984,7 @@ fn partial_layer_up(
                 (&sibling_hash, &pos_hash)
             };
 
-            // Hash internal node: H("MA" || left_padded || right_padded)
-            let mut buf = Vec::with_capacity(2 * digest_size);
-            buf.extend_from_slice(left);
-            if left.len() < digest_size {
-                buf.resize(digest_size, 0);
-            }
-            buf.extend_from_slice(right);
-            if buf.len() < 2 * digest_size {
-                buf.resize(2 * digest_size, 0);
-            }
-
-            factory.hash_bytes(&[MA_PREFIX, &buf])
+            factory.hash_bytes(&[MA_PREFIX, &pair_to_be_hashed(left, right, digest_size)])
         } else {
             Vec::new()
         };
@@ -972,6 +998,31 @@ fn partial_layer_up(
     }
 
     Ok(result)
+}
+
+/// Build the fixed-width hash input for an internal Merkle node from its two
+/// children, matching go-algorand's `crypto/merklearray/layer.go`'s
+/// `pair.ToBeHashed()`.
+///
+/// Each child is copied into its own `digest_size`-wide slot in the output
+/// buffer, rather than being appended at a variable offset determined by its
+/// own length. Before go-algorand's `v5.0.1-stable` fix
+/// (`9d20718f964d7c1ccbd19b01c9a3fe85df5eeaeb`), the buggy version built this
+/// buffer as `buf[:len(left)] = left; buf[len(left):] = right`: an
+/// oversized/mismatched-length `left` (already supposed to be rejected by
+/// the path-element size check in [`verify_path`], but this function must
+/// also be safe on its own) would shift or overwrite `right`'s bytes instead
+/// of leaving them in the second slot — silently erasing the sibling from
+/// the hash input. Using fixed slots here means a wrong-sized child can only
+/// ever be truncated or zero-padded within its own slot, never spill into
+/// the other child's.
+fn pair_to_be_hashed(left: &[u8], right: &[u8], digest_size: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; 2 * digest_size];
+    let l_len = left.len().min(digest_size);
+    buf[..l_len].copy_from_slice(&left[..l_len]);
+    let r_len = right.len().min(digest_size);
+    buf[digest_size..digest_size + r_len].copy_from_slice(&right[..r_len]);
+    buf
 }
 
 // ── Canonical msgpack serialization ──────────────────────────────────
@@ -2102,6 +2153,69 @@ mod tests {
         // Valid position plus an extra out-of-bounds position.
         let result = verify(&root, &[(3, &elem3), (4, &elem3)], &proof);
         assert!(matches!(result, Err(MerkleError::PosOutOfBound { .. })));
+    }
+
+    /// Mirrors go's `TestVerifyRejectsOversizedPathElement`
+    /// (`crypto/merklearray/merkle_test.go`, `v5.0.1-stable`): a valid proof
+    /// is accepted, but tampering one non-empty path element to twice the
+    /// hash algorithm's digest size must be rejected with
+    /// `PathElementSizeMismatch` rather than silently truncated/zero-padded.
+    #[test]
+    fn verify_rejects_oversized_path_element() {
+        let data: Vec<[u8; 32]> = (0..8u8).map(|i| [i; 32]).collect();
+        let arr = TestArray(data.clone());
+        let factory = HashFactory::new(HashType::Sha256);
+        let tree = build(&arr, factory).unwrap();
+        let root = tree.root();
+
+        let mut proof = tree.prove(&[0]).unwrap();
+        let elem0 = TestMessage(data[0].to_vec());
+
+        // A valid proof is accepted.
+        verify(&root, &[(0, &elem0)], &proof).expect("valid proof must verify");
+
+        // Tamper a present (non-empty) path element to double the digest size.
+        let digest_size = proof.hash_factory.digest_size();
+        let tampered_index = proof
+            .path
+            .iter()
+            .position(|p| !p.is_empty())
+            .expect("expected at least one non-empty path element");
+        let mut oversized = proof.path[tampered_index].clone();
+        oversized.resize(2 * digest_size, 0xAA);
+        proof.path[tampered_index] = oversized;
+
+        let result = verify(&root, &[(0, &elem0)], &proof);
+        assert!(
+            matches!(
+                result,
+                Err(MerkleError::PathElementSizeMismatch { index, digest_size: ds, .. })
+                    if index == tampered_index && ds == digest_size
+            ),
+            "got: {result:?}"
+        );
+    }
+
+    /// Mirrors go's `TestToBeHashedDoesNotEraseSibling`
+    /// (`crypto/merklearray/merkle_test.go`, `v5.0.1-stable`): an oversized
+    /// left child must be truncated within its own digest-sized slot, never
+    /// spill into (and overwrite) the right child's slot.
+    #[test]
+    fn pair_to_be_hashed_does_not_erase_sibling() {
+        const DIGEST_SIZE: usize = 32;
+
+        let mut right = vec![0u8; DIGEST_SIZE];
+        right[0] = 0xAA;
+
+        let oversized_left = vec![0xFFu8; 2 * DIGEST_SIZE];
+
+        let buf = pair_to_be_hashed(&oversized_left, &right, DIGEST_SIZE);
+
+        assert_eq!(buf.len(), 2 * DIGEST_SIZE);
+        // Left occupies exactly the first slot, truncated to digest_size.
+        assert_eq!(&buf[..DIGEST_SIZE], &oversized_left[..DIGEST_SIZE]);
+        // Right is untouched in the second slot.
+        assert_eq!(&buf[DIGEST_SIZE..], right.as_slice());
     }
 
     /// VC-tree counterpart of `verify_extra_out_of_bounds_position_in_map_fails`,

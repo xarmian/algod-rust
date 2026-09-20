@@ -125,6 +125,19 @@ pub enum StateProofError {
     /// Underlying Falcon/merkle-signature error while building a committable
     /// signature slot.
     Internal(String),
+    /// `SigProofs`, `PartProofs`, or a reveal's nested Merkle signature
+    /// proof declared a hash algorithm other than the protocol-fixed one.
+    /// Matches go's `ErrInvalidHashType` (`crypto/stateproof/verifier.go`,
+    /// `v5.0.1-stable`).
+    InvalidHashType {
+        field: &'static str,
+        actual: merklearray::HashType,
+        expected: merklearray::HashType,
+    },
+    /// `SigCommit`'s length didn't match the protocol-fixed hash size.
+    /// Matches go's `ErrInvalidSigCommitSize`
+    /// (`crypto/stateproof/verifier.go`, `v5.0.1-stable`).
+    InvalidSigCommitSize { actual: usize, expected: usize },
 
     // ── Prover-side errors (crypto/stateproof/prover.go) ────────────────
     /// `Present`/`IsValid`/`Add`: `pos` is out of bounds for the prover's
@@ -185,6 +198,18 @@ impl std::fmt::Display for StateProofError {
                 "coin is not within slot weight range: for reveal pos {pos} and coin {coin}"
             ),
             Self::Internal(msg) => write!(f, "internal state-proof error: {msg}"),
+            Self::InvalidHashType {
+                field,
+                actual,
+                expected,
+            } => write!(
+                f,
+                "state proof uses an unexpected hash algorithm: {field} uses {actual:?}, expected {expected:?}"
+            ),
+            Self::InvalidSigCommitSize { actual, expected } => write!(
+                f,
+                "state proof SigCommit has an unexpected size: SigCommit is {actual} bytes, expected {expected}"
+            ),
             Self::PositionOutOfBound { pos, bound } => write!(
                 f,
                 "requested position is out of bounds: pos {pos} >= bound {bound}"
@@ -611,6 +636,8 @@ impl Verifier {
         data: MessageHash,
         s: &StateProof,
     ) -> Result<(), StateProofError> {
+        verify_state_proof_algorithms(s)?;
+
         verify_state_proof_trees_depth(s)?;
 
         let nr = s.positions_to_reveal.len() as u64;
@@ -692,6 +719,64 @@ impl Verifier {
 
         Ok(())
     }
+}
+
+/// Validate the cryptographic suite parameters a `StateProof` declares.
+///
+/// Matches go-algorand's `verifyStateProofAlgorithms` (`verifier.go`,
+/// `v5.0.1-stable`), called first thing inside `Verify`. `StateProofBasic`
+/// pins every hash factory in the proof to Sumhash (`stateproof.HashType`)
+/// and `SigCommit` to exactly `HashSize` bytes; without this check, a proof
+/// carrying a different (or absent-but-decoded-as-zero-value) hash factory
+/// would verify self-consistently against whatever algorithm it claims,
+/// rather than being pinned to the one the protocol actually committed to.
+fn verify_state_proof_algorithms(s: &StateProof) -> Result<(), StateProofError> {
+    let expected = merklearray::HashType::Sumhash;
+    let hash_size = expected.digest_size();
+
+    if s.sig_proofs.hash_factory.hash_type != expected {
+        return Err(StateProofError::InvalidHashType {
+            field: "SigProofs",
+            actual: s.sig_proofs.hash_factory.hash_type,
+            expected,
+        });
+    }
+
+    if s.part_proofs.hash_factory.hash_type != expected {
+        return Err(StateProofError::InvalidHashType {
+            field: "PartProofs",
+            actual: s.part_proofs.hash_factory.hash_type,
+            expected,
+        });
+    }
+
+    if s.sig_commit.len() != hash_size {
+        return Err(StateProofError::InvalidSigCommitSize {
+            actual: s.sig_commit.len(),
+            expected: hash_size,
+        });
+    }
+
+    // Each reveal's nested Merkle signature proof must use the Merkle
+    // signature scheme's own fixed hash function (also Sumhash). A reveal
+    // whose signature is entirely the zero value carries no data and is
+    // skipped, matching go's `sig.MsgIsZero()` guard.
+    for reveal in s.reveals.values() {
+        let sig = &reveal.sig_slot.sig;
+        if sig.is_zero() {
+            continue;
+        }
+        let actual = sig.proof.proof.hash_factory.hash_type;
+        if actual != expected {
+            return Err(StateProofError::InvalidHashType {
+                field: "reveal Merkle signature proof",
+                actual,
+                expected,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Check that neither commitment tree exceeds [`MAX_TREE_DEPTH`].
@@ -1267,13 +1352,148 @@ mod tests {
         assert!(verify_weights(1000, ln_pw, MAX_REVEALS, 256).is_ok());
     }
 
+    /// Minimal `StateProof` that passes `verify_state_proof_algorithms` on
+    /// its own -- correctly Sumhash-typed `SigProofs`/`PartProofs` and a
+    /// correctly-sized `SigCommit`, no reveals. Matches go's
+    /// `wellFormedAlgorithmProof` (`verifier_test.go`, `v5.0.1-stable`).
+    fn well_formed_algorithm_proof() -> StateProof {
+        StateProof {
+            sig_commit: vec![0u8; merklearray::HashType::Sumhash.digest_size()],
+            sig_proofs: Proof {
+                hash_factory: merklearray::HashFactory::new(merklearray::HashType::Sumhash),
+                ..Default::default()
+            },
+            part_proofs: Proof {
+                hash_factory: merklearray::HashFactory::new(merklearray::HashType::Sumhash),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn verify_rejects_tree_depth_too_large() {
-        let mut s = StateProof::default();
+        let mut s = well_formed_algorithm_proof();
         s.sig_proofs.tree_depth = MAX_TREE_DEPTH + 1;
         let v = Verifier::with_ln_proven_weight(vec![0u8; 64], 0, 256);
         let err = v.verify(1, [0u8; 32], &s).unwrap_err();
         assert_eq!(err, StateProofError::TreeDepthTooLarge);
+    }
+
+    // ── verify_state_proof_algorithms (go: TestVerifyStateProofAlgorithms) ──
+
+    #[test]
+    fn verify_state_proof_algorithms_accepts_well_formed_proof() {
+        verify_state_proof_algorithms(&well_formed_algorithm_proof()).unwrap();
+    }
+
+    #[test]
+    fn verify_state_proof_algorithms_rejects_non_sumhash_sig_proofs() {
+        let mut s = well_formed_algorithm_proof();
+        s.sig_proofs.hash_factory = merklearray::HashFactory::new(merklearray::HashType::Sha256);
+        let err = verify_state_proof_algorithms(&s).unwrap_err();
+        assert_eq!(
+            err,
+            StateProofError::InvalidHashType {
+                field: "SigProofs",
+                actual: merklearray::HashType::Sha256,
+                expected: merklearray::HashType::Sumhash,
+            }
+        );
+    }
+
+    #[test]
+    fn verify_state_proof_algorithms_rejects_non_sumhash_part_proofs() {
+        let mut s = well_formed_algorithm_proof();
+        s.part_proofs.hash_factory =
+            merklearray::HashFactory::new(merklearray::HashType::Sha512_256);
+        let err = verify_state_proof_algorithms(&s).unwrap_err();
+        assert_eq!(
+            err,
+            StateProofError::InvalidHashType {
+                field: "PartProofs",
+                actual: merklearray::HashType::Sha512_256,
+                expected: merklearray::HashType::Sumhash,
+            }
+        );
+    }
+
+    #[test]
+    fn verify_state_proof_algorithms_rejects_wrong_sig_commit_size() {
+        let mut s = well_formed_algorithm_proof();
+        s.sig_commit = vec![0u8; 32]; // Sha256-sized, not Sumhash-sized (64)
+        let err = verify_state_proof_algorithms(&s).unwrap_err();
+        assert_eq!(
+            err,
+            StateProofError::InvalidSigCommitSize {
+                actual: 32,
+                expected: 64,
+            }
+        );
+    }
+
+    /// `Reveal` has no `Default` impl (its `Participant`/`merklesig::Verifier`
+    /// fields don't derive one), so build the all-zero reveal by hand --
+    /// equivalent to go's zero-value `stateproof.Reveal{}`.
+    fn zero_reveal() -> Reveal {
+        Reveal {
+            sig_slot: SigSlotCommit::default(),
+            part: Participant {
+                pk: merklesig::Verifier {
+                    commitment: [0u8; 64],
+                    key_lifetime: 0,
+                },
+                weight: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn verify_state_proof_algorithms_accepts_reveal_with_sumhash_proof() {
+        let mut s = well_formed_algorithm_proof();
+        let mut reveal = zero_reveal();
+        reveal.sig_slot.sig.signature = vec![1, 2];
+        reveal.sig_slot.sig.proof.proof.hash_factory =
+            merklearray::HashFactory::new(merklearray::HashType::Sumhash);
+        s.reveals.insert(7, reveal);
+        verify_state_proof_algorithms(&s).unwrap();
+    }
+
+    #[test]
+    fn verify_state_proof_algorithms_rejects_reveal_with_non_sumhash_proof() {
+        let mut s = well_formed_algorithm_proof();
+        let mut reveal = zero_reveal();
+        reveal.sig_slot.sig.signature = vec![1, 2];
+        reveal.sig_slot.sig.proof.proof.hash_factory =
+            merklearray::HashFactory::new(merklearray::HashType::Sha256);
+        s.reveals.insert(7, reveal);
+
+        let err = verify_state_proof_algorithms(&s).unwrap_err();
+        assert_eq!(
+            err,
+            StateProofError::InvalidHashType {
+                field: "reveal Merkle signature proof",
+                actual: merklearray::HashType::Sha256,
+                expected: merklearray::HashType::Sumhash,
+            }
+        );
+
+        // The public `Verifier::verify` entry point surfaces the same
+        // rejection, first thing, ahead of any other check.
+        let v = Verifier::with_ln_proven_weight(vec![0u8; 64], 0, 256);
+        let verify_err = v.verify(1, [0u8; 32], &s).unwrap_err();
+        assert_eq!(verify_err, err);
+    }
+
+    #[test]
+    fn verify_state_proof_algorithms_skips_zero_reveal() {
+        // A reveal whose signature is entirely the zero value ("MsgIsZero")
+        // carries no data and must not be checked against the hash-type
+        // pin, even though its (unused) proof hash factory is the default
+        // (non-Sumhash) value.
+        let mut s = well_formed_algorithm_proof();
+        s.reveals.insert(3, zero_reveal());
+        verify_state_proof_algorithms(&s).unwrap();
     }
 
     #[test]
@@ -1366,7 +1586,10 @@ mod tests {
         };
         let sig_slot = SigSlotCommit { sig, l: 0 };
 
-        let factory = merklearray::HashFactory::new(merklearray::HashType::Sha512_256);
+        // Sumhash is the protocol-fixed algorithm for StateProofBasic
+        // (`stateproof.HashType`); `verify_state_proof_algorithms` (added in
+        // go-algorand `v5.0.1-stable`) now rejects anything else.
+        let factory = merklearray::HashFactory::new(merklearray::HashType::Sumhash);
         let sig_tree =
             merklearray::build_vector_commitment_tree(&SigArray(vec![sig_slot.clone()]), factory)
                 .expect("sig tree");

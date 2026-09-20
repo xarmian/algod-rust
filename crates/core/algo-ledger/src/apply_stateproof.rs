@@ -464,16 +464,37 @@ pub fn state_proof_message_hash(msg: &StateProofMessage) -> crypto_sp::MessageHa
 
 // ── Wire → crypto type conversion ───────────────────────────────────────
 
-fn convert_hash_factory(hf: Option<&algo_types::HashFactory>) -> merklearray::HashFactory {
-    let hash_type = hf
-        .and_then(|h| merklearray::HashType::from_u16(h.hash_type))
-        .unwrap_or_default();
-    merklearray::HashFactory::new(hash_type)
+/// Convert a wire `HashFactory` to its crypto-layer equivalent.
+///
+/// A missing wire field decodes as go-algorand's zero value (`HashType(0)` =
+/// `Sha512_256`) -- a *valid* (if, for `StateProofBasic`, wrong) hash type,
+/// matching go's non-pointer struct field semantics. Only a raw `hash_type`
+/// that doesn't correspond to any known [`merklearray::HashType`] variant is
+/// an error: go-algorand's own decoder places no such restriction (the wire
+/// value is just a `uint16`), and letting an out-of-range value flow to
+/// `HashType::from_u16` producing `None` here — rather than silently
+/// substituting a default, as the pre-fix code did — surfaces it as a real
+/// rejection instead of masking it as an ordinary (if wrong) algorithm
+/// choice that `verify_state_proof_algorithms` would otherwise catch.
+fn convert_hash_factory(
+    hf: Option<&algo_types::HashFactory>,
+) -> Result<merklearray::HashFactory, String> {
+    match hf {
+        None => Ok(merklearray::HashFactory::default()),
+        Some(h) => merklearray::HashType::from_u16(h.hash_type)
+            .map(merklearray::HashFactory::new)
+            .ok_or_else(|| {
+                format!(
+                    "state proof uses an unrecognized hash algorithm: {}",
+                    h.hash_type
+                )
+            }),
+    }
 }
 
-fn convert_merkle_proof(p: Option<&WireMerkleProof>) -> merklearray::Proof {
+fn convert_merkle_proof(p: Option<&WireMerkleProof>) -> Result<merklearray::Proof, String> {
     let Some(p) = p else {
-        return merklearray::Proof::default();
+        return Ok(merklearray::Proof::default());
     };
     let path = p
         .path
@@ -485,11 +506,11 @@ fn convert_merkle_proof(p: Option<&WireMerkleProof>) -> merklearray::Proof {
                 .collect()
         })
         .unwrap_or_default();
-    merklearray::Proof {
+    Ok(merklearray::Proof {
         path,
-        hash_factory: convert_hash_factory(p.hash_factory.as_ref()),
+        hash_factory: convert_hash_factory(p.hash_factory.as_ref())?,
         tree_depth: p.tree_depth,
-    }
+    })
 }
 
 fn convert_falcon_verifier(fv: Option<&WireFalconVerifier>) -> merklesig::FalconVerifier {
@@ -501,27 +522,29 @@ fn convert_falcon_verifier(fv: Option<&WireFalconVerifier>) -> merklesig::Falcon
     out
 }
 
-fn convert_merkle_signature(sig: Option<&WireMerkleSignature>) -> merklesig::Signature {
+fn convert_merkle_signature(
+    sig: Option<&WireMerkleSignature>,
+) -> Result<merklesig::Signature, String> {
     let Some(sig) = sig else {
-        return merklesig::Signature::default();
+        return Ok(merklesig::Signature::default());
     };
-    merklesig::Signature {
+    Ok(merklesig::Signature {
         signature: sig.signature.to_vec(),
         vector_commitment_index: sig.vector_commitment_index,
         proof: merklearray::SingleLeafProof {
-            proof: convert_merkle_proof(sig.proof.as_ref()),
+            proof: convert_merkle_proof(sig.proof.as_ref())?,
         },
         verifying_key: convert_falcon_verifier(sig.verifying_key.as_ref()),
-    }
+    })
 }
 
-fn convert_sig_slot(slot: Option<&WireSigSlotCommit>) -> crypto_sp::SigSlotCommit {
+fn convert_sig_slot(slot: Option<&WireSigSlotCommit>) -> Result<crypto_sp::SigSlotCommit, String> {
     match slot {
-        None => crypto_sp::SigSlotCommit::default(),
-        Some(s) => crypto_sp::SigSlotCommit {
-            sig: convert_merkle_signature(s.sig.as_ref()),
+        None => Ok(crypto_sp::SigSlotCommit::default()),
+        Some(s) => Ok(crypto_sp::SigSlotCommit {
+            sig: convert_merkle_signature(s.sig.as_ref())?,
             l: s.l,
-        },
+        }),
     }
 }
 
@@ -545,25 +568,25 @@ fn convert_participant(p: Option<&WireParticipant>) -> crypto_sp::Participant {
     }
 }
 
-fn convert_reveal(r: &WireReveal) -> crypto_sp::Reveal {
-    crypto_sp::Reveal {
-        sig_slot: convert_sig_slot(r.sig_slot.as_ref()),
+fn convert_reveal(r: &WireReveal) -> Result<crypto_sp::Reveal, String> {
+    Ok(crypto_sp::Reveal {
+        sig_slot: convert_sig_slot(r.sig_slot.as_ref())?,
         part: convert_participant(r.part.as_ref()),
-    }
+    })
 }
 
 fn convert_state_proof(sp: &StateProofBody) -> Result<crypto_sp::StateProof, String> {
     let mut reveals = BTreeMap::new();
     if let Some(rs) = &sp.reveals {
         for (pos, r) in rs {
-            reveals.insert(*pos, convert_reveal(r));
+            reveals.insert(*pos, convert_reveal(r)?);
         }
     }
     Ok(crypto_sp::StateProof {
         sig_commit: sp.sig_commit.to_vec(),
         signed_weight: sp.signed_weight,
-        sig_proofs: convert_merkle_proof(sp.sig_proofs.as_ref()),
-        part_proofs: convert_merkle_proof(sp.part_proofs.as_ref()),
+        sig_proofs: convert_merkle_proof(sp.sig_proofs.as_ref())?,
+        part_proofs: convert_merkle_proof(sp.part_proofs.as_ref())?,
         merkle_signature_salt_version: sp.merkle_signature_salt_version,
         reveals,
         positions_to_reveal: sp.positions_to_reveal.clone().unwrap_or_default(),
@@ -1197,7 +1220,10 @@ mod tests {
             }
         }
 
-        let factory = merklearray::HashFactory::new(merklearray::HashType::Sha512_256);
+        // Sumhash is the protocol-fixed algorithm for StateProofBasic
+        // (`stateproof.HashType`); `verify_state_proof_algorithms`
+        // (go-algorand `v5.0.1-stable`) rejects anything else.
+        let factory = merklearray::HashFactory::new(merklearray::HashType::Sumhash);
 
         // Participant-commitment tree first: `voters_commitment` (its root)
         // is part of the message the participant signs over, so it must be
@@ -1383,5 +1409,91 @@ mod tests {
             ),
             positions_to_reveal: Some(sp.positions_to_reveal.clone()),
         }
+    }
+
+    // ── convert_hash_factory / convert_state_proof: reject, don't default ──
+    //
+    // Before this fix, `convert_hash_factory` silently substituted
+    // `HashType::Sha512_256` (the enum's `#[default]`) for any wire
+    // `hash_type` value `HashType::from_u16` didn't recognize, instead of
+    // surfacing an error. That would have let a state proof with a
+    // nonsensical hash-type byte decode "successfully" into a plausible
+    // (if wrong) algorithm rather than being rejected outright.
+
+    #[test]
+    fn convert_hash_factory_accepts_known_hash_types() {
+        for (raw, expected) in [
+            (0u16, merklearray::HashType::Sha512_256),
+            (1u16, merklearray::HashType::Sumhash),
+            (2u16, merklearray::HashType::Sha256),
+            (3u16, merklearray::HashType::Sha512),
+        ] {
+            let wire = algo_types::HashFactory { hash_type: raw };
+            let got = convert_hash_factory(Some(&wire)).unwrap();
+            assert_eq!(got.hash_type, expected, "raw hash_type {raw}");
+        }
+    }
+
+    #[test]
+    fn convert_hash_factory_absent_field_decodes_as_go_zero_value() {
+        // Matches go's non-pointer `HashFactory` struct field: an absent
+        // wire field decodes as `HashType(0)` == `Sha512_256`, a *valid*
+        // (if, for StateProofBasic, wrong) algorithm -- not an error here.
+        // `verify_state_proof_algorithms` is what rejects it as the wrong
+        // algorithm for the protocol.
+        let got = convert_hash_factory(None).unwrap();
+        assert_eq!(got.hash_type, merklearray::HashType::Sha512_256);
+    }
+
+    #[test]
+    fn convert_hash_factory_rejects_unrecognized_hash_type() {
+        let wire = algo_types::HashFactory { hash_type: 99 };
+        let err = convert_hash_factory(Some(&wire)).unwrap_err();
+        assert!(err.contains("unrecognized hash algorithm"), "got: {err}");
+    }
+
+    #[test]
+    fn convert_state_proof_propagates_unrecognized_hash_type_from_sig_proofs() {
+        let sp = StateProofBody {
+            sig_commit: ByteBuf::from(vec![0u8; 64]),
+            sig_proofs: Some(WireMerkleProof {
+                path: None,
+                hash_factory: Some(algo_types::HashFactory { hash_type: 12345 }),
+                tree_depth: 0,
+            }),
+            ..Default::default()
+        };
+        let err = convert_state_proof(&sp).unwrap_err();
+        assert!(err.contains("unrecognized hash algorithm"), "got: {err}");
+    }
+
+    #[test]
+    fn convert_state_proof_propagates_unrecognized_hash_type_from_a_reveal() {
+        let mut reveals = StdBTreeMap::new();
+        reveals.insert(
+            0u64,
+            WireReveal {
+                sig_slot: Some(WireSigSlotCommit {
+                    sig: Some(WireMerkleSignature {
+                        signature: ByteBuf::from(vec![1, 2]),
+                        vector_commitment_index: 0,
+                        proof: Some(WireMerkleProof {
+                            path: None,
+                            hash_factory: Some(algo_types::HashFactory { hash_type: 7 }),
+                            tree_depth: 0,
+                        }),
+                        verifying_key: None,
+                    }),
+                    l: 0,
+                }),
+                part: None,
+            },
+        );
+        let sp = StateProofBody {
+            reveals: Some(reveals),
+            ..Default::default()
+        };
+        let err = convert_state_proof(&sp).unwrap_err();
+        assert!(err.contains("unrecognized hash algorithm"), "got: {err}");
     }
 }

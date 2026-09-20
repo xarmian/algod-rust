@@ -26,9 +26,16 @@
 //! verification, rejecting a group that is structurally malformed in ways
 //! signature verification alone wouldn't catch.
 
-use algo_consensus_crypto::merklearray::MAX_ENCODED_TREE_DEPTH;
+use algo_consensus_crypto::merklearray::{HashType, MAX_ENCODED_TREE_DEPTH};
+use algo_consensus_crypto::merklesig::MERKLE_SIGNATURE_SCHEME_ROOT_SIZE;
 use algo_error::AlgoError;
-use algo_types::{MerkleSignature, SignedTransaction, Transaction};
+use algo_types::{MerkleProof, MerkleSignature, SignedTransaction, StateProofBody, Transaction};
+
+/// `protocol.StateProofBasic` -- the only currently-supported state-proof
+/// type. Matches `algo_ledger::apply_stateproof::STATE_PROOF_BASIC`
+/// (duplicated here rather than shared, since `algo-validate` doesn't
+/// depend on `algo-ledger`).
+const STATE_PROOF_BASIC: u64 = 0;
 
 fn err(message: impl Into<String>) -> AlgoError {
     AlgoError::Validation {
@@ -43,14 +50,65 @@ fn triggers_resource_availability(txn: &Transaction) -> bool {
     txn.txn_type == "appl" || (txn.txn_type == "acfg" && txn.config_asset == 0)
 }
 
-/// Mirrors Go's `checkStateProofReveals`: for a state-proof txn, every
-/// reveal whose signature isn't the zero value must have a signature of at
-/// least 2 bytes and a proof `TreeDepth` that is both within
-/// `MAX_ENCODED_TREE_DEPTH` and consistent with the proof's own path length.
-fn check_state_proof_reveals(txn: &Transaction) -> Result<(), AlgoError> {
-    let Some(ref sp) = txn.state_proof else {
+/// Mirrors Go's `checkBasicStateProofPath` (`data/transactions/checks.go`,
+/// `v5.0.1-stable`): a Merkle proof's `HashFactory.HashType` must equal
+/// `expected_hash`, and every non-empty path element must be exactly
+/// `digest_size` bytes (an empty element represents a missing sibling and is
+/// always allowed).
+fn check_basic_state_proof_path(
+    proof: Option<&MerkleProof>,
+    expected_hash: HashType,
+    digest_size: usize,
+) -> Result<(), AlgoError> {
+    let raw_hash_type = proof
+        .and_then(|p| p.hash_factory.as_ref())
+        .map_or(0, |hf| hf.hash_type);
+    if HashType::from_u16(raw_hash_type) != Some(expected_hash) {
+        return Err(err(format!(
+            "state proof uses an unexpected hash algorithm: uses {raw_hash_type}, expected {}",
+            expected_hash as u16
+        )));
+    }
+
+    let Some(path) = proof.and_then(|p| p.path.as_ref()) else {
         return Ok(());
     };
+    for (i, elem) in path.iter().enumerate() {
+        let len = elem.as_ref().map_or(0, |b| b.len());
+        if len != 0 && len != digest_size {
+            return Err(err(format!(
+                "state proof has a Merkle path element with an unexpected size: element {i} has length {len}, expected {digest_size}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Mirrors Go's `checkBasicStateProof` (`data/transactions/checks.go`,
+/// `v5.0.1-stable`): `SigCommit` must be exactly `HashSize` bytes,
+/// `SigProofs`/`PartProofs` must both use the protocol-fixed Sumhash
+/// algorithm (with correctly-sized path elements), and every reveal whose
+/// signature isn't the zero value must have a signature of at least 2
+/// bytes, a proof `TreeDepth` that is both within `MAX_ENCODED_TREE_DEPTH`
+/// and consistent with the proof's own path length, and a nested Merkle
+/// signature proof that itself uses the Merkle-signature-scheme's fixed
+/// Sumhash algorithm with correctly-sized path elements.
+fn check_basic_state_proof(sp: &StateProofBody) -> Result<(), AlgoError> {
+    // `stateproof.HashType` / `stateproof.HashSize`: StateProofBasic pins
+    // every hash factory in the proof to Sumhash (64-byte digest).
+    const HASH_TYPE: HashType = HashType::Sumhash;
+    let hash_size = HASH_TYPE.digest_size();
+
+    if sp.sig_commit.len() != hash_size {
+        return Err(err(format!(
+            "state proof SigCommit has an unexpected size: SigCommit is {} bytes, expected {hash_size}",
+            sp.sig_commit.len()
+        )));
+    }
+
+    check_basic_state_proof_path(sp.sig_proofs.as_ref(), HASH_TYPE, hash_size)?;
+    check_basic_state_proof_path(sp.part_proofs.as_ref(), HASH_TYPE, hash_size)?;
+
     let Some(ref reveals) = sp.reveals else {
         return Ok(());
     };
@@ -80,8 +138,35 @@ fn check_state_proof_reveals(txn: &Transaction) -> Result<(), AlgoError> {
         if (tree_depth as usize) > path_len || tree_depth as usize > MAX_ENCODED_TREE_DEPTH {
             return Err(err("state proof reveal has an invalid Merkle proof depth"));
         }
+        // `merklesignature.MerkleSignatureSchemeHashFunction` is also
+        // Sumhash, but with the Merkle-signature-scheme's own (equal, in
+        // this repo) root size constant, matching go's use of a separate
+        // named constant rather than reusing `stateproof.HashSize`.
+        check_basic_state_proof_path(proof, HashType::Sumhash, MERKLE_SIGNATURE_SCHEME_ROOT_SIZE)?;
     }
     Ok(())
+}
+
+/// Mirrors Go's `checkStateProof` (`data/transactions/checks.go`,
+/// `v5.0.1-stable`): dispatches on `StateProofType`, rejecting any type
+/// other than `StateProofBasic`.
+fn check_state_proof(state_proof_type: u64, sp: &StateProofBody) -> Result<(), AlgoError> {
+    match state_proof_type {
+        STATE_PROOF_BASIC => check_basic_state_proof(sp),
+        other => Err(err(format!("state proof has an unsupported type: {other}"))),
+    }
+}
+
+/// Mirrors Go's `StateProofTxnFields.wellFormed` calling `checkStateProof`
+/// (`data/transactions/stateproof.go`, `v5.0.1-stable`): every state-proof
+/// txn is checked, including one whose `StateProof` field was entirely
+/// absent on the wire -- go's `StateProof` is a plain (non-pointer) struct
+/// field, so an absent wire value still decodes to (and must pass checks
+/// as) its zero value, not be skipped.
+fn check_state_proof_reveals(txn: &Transaction) -> Result<(), AlgoError> {
+    let default_sp = StateProofBody::default();
+    let sp = txn.state_proof.as_ref().unwrap_or(&default_sp);
+    check_state_proof(txn.state_proof_type, sp)
 }
 
 /// Mirrors Go's `checkApplicationCallBoxes`: when a txn doesn't use the
@@ -250,6 +335,17 @@ mod tests {
 
     // ── StateProof reveal bounds ──────────────────────────────────
 
+    fn sumhash_wire_factory() -> algo_types::HashFactory {
+        algo_types::HashFactory {
+            hash_type: HashType::Sumhash as u16,
+        }
+    }
+
+    /// A reveal's nested Merkle signature proof, correctly Sumhash-typed
+    /// with `path_len` correctly-sized (`MERKLE_SIGNATURE_SCHEME_ROOT_SIZE`)
+    /// elements -- so tests below exercise only the signature-length/
+    /// tree-depth bound they're named for, not the hash-algorithm/
+    /// path-element-size checks added in `v5.0.1-stable`.
     fn reveal_with(sig_len: usize, tree_depth: u8, path_len: usize) -> Reveal {
         Reveal {
             sig_slot: Some(SigSlotCommit {
@@ -257,8 +353,14 @@ mod tests {
                     signature: ByteBuf::from(vec![7u8; sig_len]),
                     vector_commitment_index: 0,
                     proof: Some(MerkleProof {
-                        path: Some(vec![Some(ByteBuf::from(vec![0u8; 32])); path_len]),
-                        hash_factory: None,
+                        path: Some(vec![
+                            Some(ByteBuf::from(vec![
+                                0u8;
+                                MERKLE_SIGNATURE_SCHEME_ROOT_SIZE
+                            ]));
+                            path_len
+                        ]),
+                        hash_factory: Some(sumhash_wire_factory()),
                         tree_depth,
                     }),
                     verifying_key: None,
@@ -269,13 +371,35 @@ mod tests {
         }
     }
 
+    /// A well-formed base `StateProofBody`: correctly-sized `SigCommit` and
+    /// Sumhash-typed, empty-path `SigProofs`/`PartProofs` -- everything
+    /// `check_basic_state_proof` requires outside of the per-reveal checks.
+    /// Matches go's `stateProofTxnForCheck` (`checks_test.go`,
+    /// `v5.0.1-stable`).
+    fn well_formed_state_proof_body() -> StateProofBody {
+        StateProofBody {
+            sig_commit: ByteBuf::from(vec![0u8; HashType::Sumhash.digest_size()]),
+            sig_proofs: Some(MerkleProof {
+                path: None,
+                hash_factory: Some(sumhash_wire_factory()),
+                tree_depth: 0,
+            }),
+            part_proofs: Some(MerkleProof {
+                path: None,
+                hash_factory: Some(sumhash_wire_factory()),
+                tree_depth: 0,
+            }),
+            ..Default::default()
+        }
+    }
+
     fn stpf_txn_with_reveal(reveal: Reveal) -> Transaction {
         let mut txn = base_txn("stpf");
         let mut reveals = BTreeMap::new();
         reveals.insert(0u64, reveal);
         txn.state_proof = Some(StateProofBody {
             reveals: Some(reveals),
-            ..Default::default()
+            ..well_formed_state_proof_body()
         });
         txn
     }
@@ -388,7 +512,14 @@ mod tests {
 
     #[test]
     fn every_known_type_is_accepted() {
-        for t in ["pay", "keyreg", "acfg", "axfer", "afrz", "appl", "stpf"] {
+        // "stpf" is checked separately below: since `v5.0.1-stable`, an
+        // all-default `StateProofBody` is itself malformed (its zero-value
+        // `SigCommit`/hash factories fail `check_basic_state_proof`), so it
+        // no longer belongs in a loop of types accepted with zero fields
+        // set. Matches go's own test split
+        // (`TestCheckTxnGroupUnknownType`/`TestCheckTxnGroupStateProofBasicSuite`,
+        // `checks_test.go`, `v5.0.1-stable`).
+        for t in ["pay", "keyreg", "acfg", "axfer", "afrz", "appl"] {
             let txn = base_txn(t);
             check_txn_group(&[signed(txn)])
                 .unwrap_or_else(|e| panic!("type {t:?} should be accepted, got: {e}"));
@@ -397,6 +528,162 @@ mod tests {
         let mut hb = base_txn("hb");
         hb.heartbeat = Some(HeartbeatTxnFields::default());
         check_txn_group(&[signed(hb)]).unwrap();
+
+        let mut stpf = base_txn("stpf");
+        stpf.state_proof = Some(well_formed_state_proof_body());
+        check_txn_group(&[signed(stpf)]).unwrap();
+    }
+
+    // ── check_basic_state_proof / check_state_proof (go:
+    //    TestCheckTxnGroupStateProofBasicSuite, checks_test.go,
+    //    v5.0.1-stable) ─────────────────────────────────────────────
+
+    fn well_formed_stpf_txn() -> Transaction {
+        let mut txn = base_txn("stpf");
+        txn.state_proof = Some(well_formed_state_proof_body());
+        txn
+    }
+
+    #[test]
+    fn state_proof_basic_suite_accepts_a_well_formed_proof() {
+        check_txn_group(&[signed(well_formed_stpf_txn())]).unwrap();
+    }
+
+    #[test]
+    fn state_proof_basic_suite_rejects_unsupported_state_proof_type() {
+        let mut txn = well_formed_stpf_txn();
+        txn.state_proof_type = 1;
+        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        assert!(err.to_string().contains("unsupported"), "got: {err}");
+    }
+
+    #[test]
+    fn state_proof_basic_suite_rejects_wrong_sig_proofs_hash_type() {
+        let mut txn = well_formed_stpf_txn();
+        if let Some(sp) = txn.state_proof.as_mut() {
+            sp.sig_proofs.as_mut().unwrap().hash_factory = Some(algo_types::HashFactory {
+                hash_type: HashType::Sha256 as u16,
+            });
+        }
+        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        assert!(err.to_string().contains("hash algorithm"), "got: {err}");
+    }
+
+    #[test]
+    fn state_proof_basic_suite_rejects_wrong_part_proofs_hash_type() {
+        let mut txn = well_formed_stpf_txn();
+        if let Some(sp) = txn.state_proof.as_mut() {
+            sp.part_proofs.as_mut().unwrap().hash_factory = Some(algo_types::HashFactory {
+                hash_type: HashType::Sha256 as u16,
+            });
+        }
+        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        assert!(err.to_string().contains("hash algorithm"), "got: {err}");
+    }
+
+    #[test]
+    fn state_proof_basic_suite_rejects_wrong_sized_path_element() {
+        let mut txn = well_formed_stpf_txn();
+        if let Some(sp) = txn.state_proof.as_mut() {
+            sp.part_proofs.as_mut().unwrap().path = Some(vec![Some(ByteBuf::from(vec![0u8; 32]))]);
+        }
+        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        assert!(err.to_string().contains("unexpected size"), "got: {err}");
+    }
+
+    #[test]
+    fn state_proof_basic_suite_rejects_wrong_sig_commit_size() {
+        let mut txn = well_formed_stpf_txn();
+        if let Some(sp) = txn.state_proof.as_mut() {
+            sp.sig_commit = ByteBuf::from(vec![0u8; 32]);
+        }
+        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        assert!(err.to_string().contains("SigCommit"), "got: {err}");
+    }
+
+    #[test]
+    fn state_proof_basic_suite_rejects_nested_merkle_signature_proof_hash_type() {
+        let mut txn = well_formed_stpf_txn();
+        let reveal = Reveal {
+            sig_slot: Some(SigSlotCommit {
+                sig: Some(MerkleSignature {
+                    signature: ByteBuf::from(vec![1u8, 2]),
+                    vector_commitment_index: 0,
+                    proof: Some(MerkleProof {
+                        path: None,
+                        hash_factory: Some(algo_types::HashFactory {
+                            hash_type: HashType::Sha256 as u16,
+                        }),
+                        tree_depth: 0,
+                    }),
+                    verifying_key: None,
+                }),
+                l: 0,
+            }),
+            part: None,
+        };
+        let mut reveals = BTreeMap::new();
+        reveals.insert(0u64, reveal);
+        if let Some(sp) = txn.state_proof.as_mut() {
+            sp.reveals = Some(reveals);
+        }
+        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        assert!(err.to_string().contains("hash algorithm"), "got: {err}");
+    }
+
+    #[test]
+    fn state_proof_basic_suite_rejects_nested_merkle_signature_proof_path_size() {
+        let mut txn = well_formed_stpf_txn();
+        let reveal = Reveal {
+            sig_slot: Some(SigSlotCommit {
+                sig: Some(MerkleSignature {
+                    signature: ByteBuf::from(vec![1u8, 2]),
+                    vector_commitment_index: 0,
+                    proof: Some(MerkleProof {
+                        path: Some(vec![Some(ByteBuf::from(vec![0u8; 32]))]),
+                        hash_factory: Some(sumhash_wire_factory()),
+                        tree_depth: 0,
+                    }),
+                    verifying_key: None,
+                }),
+                l: 0,
+            }),
+            part: None,
+        };
+        let mut reveals = BTreeMap::new();
+        reveals.insert(0u64, reveal);
+        if let Some(sp) = txn.state_proof.as_mut() {
+            sp.reveals = Some(reveals);
+        }
+        let err = check_txn_group(&[signed(txn)]).unwrap_err();
+        assert!(err.to_string().contains("unexpected size"), "got: {err}");
+    }
+
+    #[test]
+    fn state_proof_basic_suite_accepts_well_formed_nested_merkle_signature_proof() {
+        let mut txn = well_formed_stpf_txn();
+        let reveal = Reveal {
+            sig_slot: Some(SigSlotCommit {
+                sig: Some(MerkleSignature {
+                    signature: ByteBuf::from(vec![1u8, 2]),
+                    vector_commitment_index: 0,
+                    proof: Some(MerkleProof {
+                        path: None,
+                        hash_factory: Some(sumhash_wire_factory()),
+                        tree_depth: 0,
+                    }),
+                    verifying_key: None,
+                }),
+                l: 0,
+            }),
+            part: None,
+        };
+        let mut reveals = BTreeMap::new();
+        reveals.insert(0u64, reveal);
+        if let Some(sp) = txn.state_proof.as_mut() {
+            sp.reveals = Some(reveals);
+        }
+        check_txn_group(&[signed(txn)]).unwrap();
     }
 
     // ── check_payset: contiguous-group walking ─────────────────────
