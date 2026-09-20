@@ -73,7 +73,7 @@
 // transactions x a few (parent, index) pairs covers that; a full version
 // sweep would add no signal since the formula itself is invariant.
 //
-// go-algorand references (v5.0.1-stable):
+// go-algorand references (v5.0.2-stable):
 //
 //	data/bookkeeping/block.go:413   — RewardsState.NextRewardsState
 //	config/consensus.go:1058        — v18.PendingResidueRewards = true
@@ -104,7 +104,7 @@ import (
 	"github.com/algorand/go-algorand/protocol"
 )
 
-const expectedGoAlgorandPin = "v5.0.1-stable"
+const expectedGoAlgorandPin = "v5.0.2-stable"
 
 func goAlgorandDir() string {
 	_, thisFile, _, ok := runtime.Caller(0)
