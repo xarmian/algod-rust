@@ -106,6 +106,18 @@
 // caveat that the first pass's un-recovered code may or may not have hit
 // this exact same bug.
 //
+// `restrict_topology`/`ring_topology` (a full point-to-point adjacency-graph
+// delivery gate, independent of `partition`/`crown`/`make_relays`) is ported
+// here for `TestCircularNetworkTopology` (`agreement/fuzzer/
+// topologyFilter.go`'s `TopologyFilter`), covered by
+// `ring_topology_restricts_delivery_to_neighbors_only` below. Its target
+// scenario, `TestCircularNetworkTopology`, is landed as
+// `circular_network_topology_five_node` (`service_multi_node_test.rs`): a
+// real 5-node cluster, every node restricted to its two ring neighbors,
+// committing ordinary rounds purely via the existing `ActionType::Relay`
+// path every node already runs for normal gossip -- no new forwarding logic
+// was needed, only the new delivery gate.
+//
 // `intercept` (arbitrary per-message rewriting/redirection) is still not
 // ported — no scenario landed so far needed anything beyond the structured
 // filters above (`partition`/`crown`/`make_relays`/the pocket family); a
@@ -218,6 +230,18 @@ struct NetworkState {
     /// given nodes at the center").
     relay_nodes: Option<Vec<bool>>,
 
+    /// `Some(matrix)` while a topology restriction is active:
+    /// `matrix[i][j]` is true if node `i` can directly reach node `j`.
+    /// Independent of `partitioned`/`crowned`/`relay_nodes` (all, if set,
+    /// must pass for delivery — an additional, independent gate on
+    /// `multicast`, same pattern as those three). Mirrors go's
+    /// `TopologyFilter`/`TopologyFilterConfig.NodesConnection`
+    /// (`agreement/fuzzer/topologyFilter.go`): unlike `partition`/`crown`/
+    /// `make_relays` (each defined by simple boolean group membership),
+    /// a topology restriction is a full point-to-point adjacency graph, so
+    /// it needs an NxN matrix rather than a single per-node flag vector.
+    topology: Option<Vec<Vec<bool>>>,
+
     /// Bounded FIFO of the most recently, normally-delivered (i.e. not
     /// pocketed) `PROPOSAL_PAYLOAD_TAG` broadcasts — a harness-only
     /// payload-catch-up mechanism with no go equivalent, because go's real
@@ -233,6 +257,20 @@ struct NetworkState {
     /// healed — see [`TestingNetwork::repair_all`], which calls it
     /// automatically.
     payload_history: Vec<PocketedMessage>,
+
+    /// Running total of message bytes actually delivered across the whole
+    /// cluster (summed over every successful per-peer `try_send`, i.e. real
+    /// wire-equivalent gossip traffic — a dropped/filtered/full-channel
+    /// delivery attempt contributes nothing). No go equivalent by name, but
+    /// mirrors the traffic-accounting role of go's `TrafficStatisticsFilter`
+    /// (`agreement/fuzzer/`), which this harness has no live-`Service`
+    /// integration for — this is a much simpler substitute: a single
+    /// cluster-wide byte counter rather than go's richer per-node,
+    /// per-direction breakdown, used to compare total real-`Service` gossip
+    /// traffic across different cluster sizes (see
+    /// `real_service_traffic_grows_with_node_count` in
+    /// `service_multi_node_test.rs`).
+    total_bytes_delivered: u64,
 }
 
 /// Cap on [`NetworkState::payload_history`] — bounds memory for
@@ -284,7 +322,9 @@ impl TestingNetwork {
                 partitioned: None,
                 crowned: None,
                 relay_nodes: None,
+                topology: None,
                 payload_history: Vec::new(),
+                total_bytes_delivered: 0,
             }),
         })
     }
@@ -364,6 +404,7 @@ impl TestingNetwork {
         state.partitioned = None;
         state.crowned = None;
         state.relay_nodes = None;
+        state.topology = None;
     }
 
     /// Re-multicast every proposal-payload broadcast currently held in
@@ -563,6 +604,38 @@ impl TestingNetwork {
         state.relay_nodes = Some(flags);
     }
 
+    /// Mirrors go's `TopologyFilter`/`TopologyFilterConfig` (`agreement/
+    /// fuzzer/topologyFilter.go`): from now on, a message is delivered from
+    /// `source` to `peer` only if `adjacency(source, peer)` is true, on top
+    /// of (not instead of) whatever `partition`/`crown`/`make_relays` state
+    /// is already active. `adjacency` need not be symmetric, matching go's
+    /// `NodesConnection: map[int][]int` (a per-node outbound adjacency
+    /// list) — most callers (e.g. [`Self::ring_topology`]) pass a symmetric
+    /// function. To revert, call [`Self::repair_all`].
+    pub fn restrict_topology(&self, adjacency: impl Fn(usize, usize) -> bool) {
+        let mut state = self.state.lock().expect("TestingNetwork poisoned");
+        let n = state.channels.len();
+        let mut matrix = vec![vec![false; n]; n];
+        for (i, row) in matrix.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = adjacency(i, j);
+            }
+        }
+        state.topology = Some(matrix);
+    }
+
+    /// Mirrors go's `TestCircularNetworkTopology`'s per-node adjacency
+    /// (`agreement/fuzzer/tests_test.go`): node `i` can directly reach only
+    /// its two ring neighbors, `(i - 1) mod n` and `(i + 1) mod n`. A
+    /// message can still reach a non-neighbor node via multi-hop relay
+    /// (every node's real `Service` relays what it receives — see
+    /// `AsyncCryptoVerifier`'s consumer in `service.rs`), the same as go's
+    /// literal ring topology.
+    pub fn ring_topology(self: &Arc<Self>) {
+        let n = self.node_count();
+        self.restrict_topology(move |i, j| j == (i + n - 1) % n || j == (i + 1) % n);
+    }
+
     /// Total number of messages currently sitting unconsumed in every node's
     /// inbound channels, across all three tags. Used by the harness's
     /// quiescence poll (see `activity_monitor.rs`) as a direct, exact signal
@@ -575,6 +648,17 @@ impl TestingNetwork {
             .iter()
             .map(|c| c.vote_rx.len() + c.payload_rx.len() + c.bundle_rx.len())
             .sum()
+    }
+
+    /// Cumulative message bytes delivered across the whole cluster so far —
+    /// see [`NetworkState::total_bytes_delivered`]'s doc comment. Never
+    /// reset by [`Self::repair_all`] (it's a traffic statistic, not
+    /// delivery-gate state).
+    pub fn total_bytes_delivered(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("TestingNetwork poisoned")
+            .total_bytes_delivered
     }
 }
 
@@ -761,6 +845,11 @@ fn multicast(
                 continue;
             }
         }
+        if let Some(topology) = &state.topology {
+            if !topology[source][peer] {
+                continue;
+            }
+        }
         let msg = Message {
             handle: handle.clone(),
             data: data.to_vec(),
@@ -777,7 +866,9 @@ fn multicast(
         // go's testingNetwork just drops the message rather than blocking
         // the sender (which would deadlock the whole cluster under a single
         // shared mutex, exactly as it would here).
-        let _ = sender.try_send(msg);
+        if sender.try_send(msg).is_ok() {
+            state.total_bytes_delivered += data.len() as u64;
+        }
     }
 }
 
@@ -1032,6 +1123,70 @@ mod tests {
             recv_vote_count(&leaf2.messages(&Tag(AGREEMENT_VOTE_TAG))),
             1,
             "leaf-to-leaf delivery must resume after repair_all"
+        );
+    }
+
+    /// Mirrors go's `TopologyFilter` ring semantics used by
+    /// `TestCircularNetworkTopology`: each node can directly reach only its
+    /// two ring neighbors, not the rest of the cluster; `repair_all` clears
+    /// it again.
+    #[test]
+    fn ring_topology_restricts_delivery_to_neighbors_only() {
+        let net = TestingNetwork::new(5, 16);
+        net.ring_topology();
+
+        let node0 = net.endpoint(0);
+        let node1 = net.endpoint(1);
+        let node2 = net.endpoint(2);
+        let node3 = net.endpoint(3);
+        let node4 = net.endpoint(4);
+
+        // Node 0's ring neighbors are 4 and 1; 2 and 3 are unreachable
+        // directly.
+        node0
+            .broadcast(
+                &Tag(AGREEMENT_VOTE_TAG),
+                &codec::encode_vote(&vote_with_step(SOFT)),
+            )
+            .unwrap();
+        assert_eq!(
+            recv_vote_count(&node1.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            1,
+            "ring neighbor node1 must receive the broadcast"
+        );
+        assert_eq!(
+            recv_vote_count(&node4.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            1,
+            "ring neighbor node4 must receive the broadcast"
+        );
+        assert_eq!(
+            recv_vote_count(&node2.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            0,
+            "non-neighbor node2 must not receive the broadcast directly"
+        );
+        assert_eq!(
+            recv_vote_count(&node3.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            0,
+            "non-neighbor node3 must not receive the broadcast directly"
+        );
+
+        // repair_all clears the restriction; full-mesh delivery resumes.
+        net.repair_all();
+        node0
+            .broadcast(
+                &Tag(AGREEMENT_VOTE_TAG),
+                &codec::encode_vote(&vote_with_step(SOFT)),
+            )
+            .unwrap();
+        assert_eq!(
+            recv_vote_count(&node2.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            1,
+            "delivery to every connected peer must resume after repair_all"
+        );
+        assert_eq!(
+            recv_vote_count(&node3.messages(&Tag(AGREEMENT_VOTE_TAG))),
+            1,
+            "delivery to every connected peer must resume after repair_all"
         );
     }
 
