@@ -86,13 +86,6 @@ pub fn fill_db_with_participation_keys(
     last_valid: Round,
     key_dilution: u64,
 ) -> Result<Participation, FillError> {
-    if last_valid.0 < first_valid.0 {
-        return Err(FillError::InvalidRange {
-            first: first_valid.0,
-            last: last_valid.0,
-        });
-    }
-
     // Enforce `MaxKeyregValidPeriod` from the *current* consensus version,
     // matching go's `FillDBWithParticipationKeys`, which reads
     // `config.Consensus[protocol.ConsensusCurrentVersion].MaxKeyregValidPeriod`
@@ -105,6 +98,48 @@ pub fn fill_db_with_participation_keys(
     let max_valid_period = consensus_params_for_version(CONSENSUS_CURRENT_VERSION)
         .map(|p| p.max_keyreg_valid_period)
         .unwrap_or(0);
+    fill_db_with_participation_keys_bounded(
+        db,
+        address,
+        first_valid,
+        last_valid,
+        key_dilution,
+        max_valid_period,
+    )
+}
+
+/// Test-only seam for [`fill_db_with_participation_keys`]: identical logic,
+/// but takes the `MaxKeyregValidPeriod` bound as an explicit parameter
+/// instead of resolving it from `CONSENSUS_CURRENT_VERSION`.
+///
+/// go's `TestKeyregValidityPeriod`
+/// (`../go-algorand/data/account/participation_test.go:534`) exercises both
+/// the at-the-bound-succeeds and one-over-the-bound-fails legs of the
+/// `MaxKeyregValidPeriod` guard cheaply by *patching* the global
+/// `config.Consensus[...]` table down to a tiny value for the duration of
+/// the test. algod-rust has no mutable global consensus-params table to
+/// patch (by design — the bound is consensus-critical, immutable data), so
+/// this function exists purely to give a test the same cheap access to the
+/// at-the-bound-succeeds leg: it runs the exact same guard and key-generation
+/// logic as the public function, just parameterized on the bound rather than
+/// hardcoded to resolve it from `CONSENSUS_CURRENT_VERSION`. The production
+/// path (`fill_db_with_participation_keys`) always calls this with the real,
+/// consensus-derived value — this seam changes no production behavior.
+pub fn fill_db_with_participation_keys_bounded(
+    db: &mut ErasableDb,
+    address: Address,
+    first_valid: Round,
+    last_valid: Round,
+    key_dilution: u64,
+    max_valid_period: u64,
+) -> Result<Participation, FillError> {
+    if last_valid.0 < first_valid.0 {
+        return Err(FillError::InvalidRange {
+            first: first_valid.0,
+            last: last_valid.0,
+        });
+    }
+
     if max_valid_period != 0 && last_valid.0.saturating_sub(first_valid.0) > max_valid_period {
         return Err(FillError::ValidityPeriodTooLarge {
             limit: max_valid_period,
