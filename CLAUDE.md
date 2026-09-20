@@ -180,6 +180,21 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   raw inputs (`docs/phase17/go_tests.tsv`, `docs/phase17/rust_tests.tsv`) if
   a fuller re-sweep is ever needed — re-run after a future go-algorand
   version bump, or whenever the counts look stale.
+- **The map is an invariant, not a snapshot: at the current pin, every Go
+  test has a row and `not-implemented` = `missing-test` = `partial` = 0.**
+  `python3 scripts/phase17_parity_delta.py check` verifies this (pinned
+  links, row↔inventory completeness, zero gap rows; add
+  `--go-algorand ../go-algorand` to also confirm the checkout tag and a fresh
+  inventory match). Every go-algorand version upgrade must keep it true:
+  the `algod-version-upgrade` skill's Pass C (`report`: tests added /
+  removed / moved / body-changed between OLD and NEW), stage 5 (`repin`:
+  re-links every row to NEW, regenerates the TSV/batches, inserts an
+  `unclassified` placeholder row per added Go test) and stage 7 hard gate
+  (`check` must exit 0 before the epic closes) are how. `unclassified` is a
+  transient placeholder only — `update_phase17_summary.py` refuses to run
+  while any remain, and an issue whose acceptance criteria name a Go test
+  is not done while that test's row is `unclassified` / `missing-test` /
+  `not-implemented` / `partial`.
 - `docs/epics/Epic-27-Test-Parity-Audit.md` and epic issue #830 track
   which of the 22 Phase 17 sub-issues are open/closed — check that box too
   when a sub-issue's PR merges.

@@ -60,15 +60,29 @@ ROW_RE = re.compile(
     r"^\|.*\|\s*(matched-1:1|matched-1:many|matched-many:1|partial|not-implemented|missing-test|out-of-scope)\s*\|.*\|\s*$"
 )
 
+# Placeholder rows inserted by `scripts/phase17_parity_delta.py repin` for
+# tests a go-algorand version bump added. They carry no real status yet, so
+# the summary must not be regenerated (and silently under-count) while any
+# remain — classify them first.
+PLACEHOLDER_RE = re.compile(r"^\|.*\|\s*unclassified\s*\|.*\|\s*$")
+
 
 def count_statuses(path: Path) -> dict:
     counts = {s: 0 for s in STATUSES}
     total = 0
+    placeholders = 0
     for line in path.read_text(encoding="utf-8").splitlines():
         m = ROW_RE.match(line)
         if m:
             counts[m.group(1)] += 1
             total += 1
+        elif PLACEHOLDER_RE.match(line):
+            placeholders += 1
+    if placeholders:
+        raise SystemExit(
+            f"{path.relative_to(REPO_ROOT).as_posix()}: {placeholders} `unclassified` placeholder row(s) "
+            "remain (from phase17_parity_delta.py repin); classify them before regenerating the summary"
+        )
     return counts, total
 
 
