@@ -1169,6 +1169,62 @@ impl SyncOrchestrator {
             message: "catchpoint round not known — earlier phases did not complete".to_string(),
         })?;
 
+        // Issue #1463: algod-rust's own catchpoint exporter
+        // (`SqliteLedger::maybe_spawn_automatic_catchpoint`) embeds the
+        // *live* account snapshot into every catchpoint whose label round
+        // is above `CatchpointLookback` -- there's no separate historical
+        // account-state source in this synchronous architecture to draw a
+        // genuine balances_round-only snapshot from (see that function's
+        // doc comment) -- even though `atomic_cutover` stamps
+        // `acctrounds('acctbase')` with `balances_round` to match go's
+        // wire-format shape (issue #1056/`validate_post_import`). That
+        // means the account content imported by `run_import_ledger` is
+        // already `catchpoint_round`-equivalent by the time this phase
+        // runs, and `start_round` below deliberately begins applying real
+        // blocks at `catchpoint_round + 1` rather than `balances_round +
+        // 1` (see the `_ => catchpoint_round + 1` fallback just below) --
+        // re-applying that gap via `apply_block` would double-count state
+        // already baked into the import, which is exactly what produced
+        // "expected round balances_round+1, got catchpoint_round+1"
+        // failures before this fix. Bump `acctrounds` (both `acctbase` and
+        // `hashbase`) forward to `catchpoint_round` here so `apply_block`'s
+        // round-monotonicity check agrees with that choice, using the real
+        // header `run_download_lookback` (phase 4) already downloaded for
+        // `catchpoint_round` -- not synthesized data. Guarded so a resumed
+        // run that's already past `catchpoint_round` (or one where
+        // balances_round == catchpoint_round, i.e. below the
+        // `CatchpointLookback` floor) is left untouched.
+        {
+            use rusqlite::OptionalExtension;
+            let conn = self.open_db()?;
+            let current: Option<i64> = conn
+                .query_row(
+                    "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("read acctrounds before replay fast-forward: {e}"),
+                })?;
+            if let Some(current) = current {
+                if (current as u64) < catchpoint_round {
+                    conn.execute(
+                        "UPDATE acctrounds SET rnd = ?1 WHERE id IN ('acctbase', 'hashbase')",
+                        rusqlite::params![catchpoint_round as i64],
+                    )
+                    .map_err(|e| AlgoError::Ledger {
+                        message: format!("fast-forward acctrounds to catchpoint_round: {e}"),
+                    })?;
+                    tracing::info!(
+                        from = current,
+                        to = catchpoint_round,
+                        "fast-forwarded acctrounds past the balances_round/catchpoint_round gap"
+                    );
+                }
+            }
+        }
+
         // Determine target: current network round, capped by end_round if set.
         let network_round = self.backend.get_current_round()?;
         let target_round = match self.config.end_round {

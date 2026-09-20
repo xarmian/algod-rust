@@ -1222,6 +1222,31 @@ async fn two_nodes_stay_in_sync_through_consensus_protocol_upgrade() {
 ///   already been imported correctly. Fixed by adding `default` to that
 ///   field (`crates/core/algo-types/src/header.rs`), matching every other
 ///   zero-valued field's existing `default`/`skip_serializing_if` pairing.
+/// - Issue #1463: this test's round targets (2/4) predated issue #1054's
+///   `CatchpointLookback` floor of 320 rounds, so it had never actually
+///   exercised a catchpoint whose label round (`blocks_round`) is above the
+///   floor -- the only real-world shape once #1054 landed. Bumping the
+///   round targets past 320 surfaced a genuine, previously-latent bug: a
+///   live catchpoint-catchup that imports such a catchpoint (`blocks_round
+///   == balances_round + CatchpointLookback`) got node B's ledger
+///   irrecoverably stuck at `balances_round` forever (`apply_block failed
+///   during replay ... expected round balances_round+1, got
+///   blocks_round+1`). Root cause: `maybe_spawn_automatic_catchpoint`
+///   (`crates/core/algo-ledger/src/sqlite.rs`) embeds the *live* account
+///   snapshot into every catchpoint above the lookback floor (there's no
+///   separate historical account-state source in this synchronous
+///   architecture to draw a genuine `balances_round`-only snapshot from),
+///   even though `atomic_cutover` stamps `acctrounds('acctbase')` with
+///   `balances_round` to match go's wire-format shape (issue
+///   #1056/`validate_post_import`) -- so the account content imported is
+///   already `blocks_round`-equivalent, but `SyncOrchestrator`'s replay
+///   phase (correctly) starts applying real blocks at `blocks_round + 1`,
+///   which the ledger's still-`balances_round` round tracking then
+///   rejected as a monotonicity violation. Fixed by having
+///   `SyncOrchestrator::run_replay_blocks` (`crates/core/algo-ledger/src/
+///   sync/mod.rs`) fast-forward `acctrounds` from `balances_round` to
+///   `blocks_round` (using the real header `run_download_lookback` already
+///   downloaded for that round) before computing where replay resumes.
 #[tokio::test]
 #[ignore = "spawns child algod-rust processes and runs real BFT agreement; run with --ignored"]
 async fn follower_catches_up_via_live_catchpoint_catchup_from_a_real_catchpoint() {
@@ -1267,24 +1292,45 @@ async fn follower_catches_up_via_live_catchpoint_catchup_from_a_real_catchpoint(
     );
 
     let client = http_client();
-    let overall_deadline = Instant::now() + Duration::from_secs(180);
+    // Issue #1054 introduced a `CatchpointLookback` floor of 320 rounds
+    // (`p.catchpoint_lookback` for V41 -- `crates/core/algo-types/src/
+    // consensus.rs`), so `maybe_spawn_automatic_catchpoint`
+    // (`crates/core/algo-ledger/src/sqlite.rs`) now unconditionally skips
+    // exporting a catchpoint for any round `<= catchpoint_lookback`, and
+    // `update_reenable_catchpoints_round`'s post-genesis latch (issue
+    // #1285) pushes the first eligible round to
+    // `round_of_first_sp_contexts_block + catchpoint_lookback` (~round
+    // 321 here, since the chain runs V41 -- `enable_catchpoints_with_sp_
+    // contexts` -- from genesis). Reaching several hundred rounds of real
+    // BFT agreement takes much longer wall-clock than the handful of
+    // rounds the rest of this file's tests need, hence the generous
+    // deadline.
+    let overall_deadline = Instant::now() + Duration::from_secs(5400);
+    let test_start = Instant::now();
 
     wait_for_rest_ready(&client, &node_a.rest_addr, overall_deadline).await;
     let token_a = read_api_token(&node_a.data_dir_path, overall_deadline).await;
 
-    // Reach round 4 -- past the interval-2 boundary a second time, which is
-    // what actually joins round 2's export thread and persists its label
-    // (see `wait_for_last_catchpoint`'s doc comment). Comfortable margin
-    // past the minimum needed.
+    // Reach round 324 -- past the interval-2 boundary a second time *after*
+    // clearing the `CatchpointLookback` floor (round 322 is the first
+    // interval-2 boundary strictly greater than 321, the first round the
+    // lookback/reenable-latch guards above allow an export at all), which
+    // is what actually joins round 322's export thread and persists its
+    // label (see `wait_for_last_catchpoint`'s doc comment). Comfortable
+    // margin past the minimum needed.
     wait_for_round(
         &client,
         &node_a.rest_addr,
         &token_a,
-        4,
+        324,
         overall_deadline,
         "node A",
     )
     .await;
+    eprintln!(
+        "[timing] node A reached round 324 at +{:?}",
+        test_start.elapsed()
+    );
     let label = wait_for_last_catchpoint(
         &client,
         &node_a.rest_addr,
@@ -1293,14 +1339,18 @@ async fn follower_catches_up_via_live_catchpoint_catchup_from_a_real_catchpoint(
         "node A",
     )
     .await;
+    eprintln!(
+        "[timing] node A last-catchpoint = {label:?} at +{:?}",
+        test_start.elapsed()
+    );
     let catchpoint_round: u64 = label
         .split('#')
         .next()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("could not parse round out of catchpoint label {label:?}"));
     assert!(
-        catchpoint_round > 0,
-        "catchpoint label {label:?} must not be for genesis"
+        catchpoint_round > 320,
+        "catchpoint label {label:?} must be past the CatchpointLookback floor (320)"
     );
 
     // Node B: same genesis, empty partkey registry, deliberately **not**
@@ -1339,8 +1389,16 @@ async fn follower_catches_up_via_live_catchpoint_catchup_from_a_real_catchpoint(
         "node B must start at round 0 -- it has no gossip peers to have caught up any other way"
     );
 
+    eprintln!(
+        "[timing] starting live catchup on node B at +{:?}",
+        test_start.elapsed()
+    );
     start_catchup(&client, &node_b.rest_addr, &admin_token_b, &label).await;
     wait_for_catchup_to_finish(&client, &node_b.rest_addr, &token_b, overall_deadline).await;
+    eprintln!(
+        "[timing] node B live catchup reported finished at +{:?}",
+        test_start.elapsed()
+    );
 
     let round_b_after = wait_for_round(
         &client,
@@ -1351,6 +1409,10 @@ async fn follower_catches_up_via_live_catchpoint_catchup_from_a_real_catchpoint(
         "node B (post-catchup)",
     )
     .await;
+    eprintln!(
+        "[timing] node B reached round {round_b_after} at +{:?}",
+        test_start.elapsed()
+    );
 
     let hash_a = get_block_hash(&client, &node_a.rest_addr, &token_a, catchpoint_round).await;
     let hash_b = get_block_hash(&client, &node_b.rest_addr, &token_b, catchpoint_round).await;
