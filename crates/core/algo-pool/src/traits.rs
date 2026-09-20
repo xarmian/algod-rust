@@ -113,4 +113,26 @@ pub trait PoolLedger: Send + Sync {
     fn contains_confirmed_txid(&self, _txid: Digest) -> bool {
         false
     }
+
+    /// Resolve the state-proof verification context for a state proof
+    /// attesting to `last_round_in_interval` — returns
+    /// `(online_total_weight, state_proof_weight_threshold)` for the
+    /// protocol version that governed that voting round.
+    ///
+    /// Mirrors go's `pool.ledger.GetStateProofVerificationContext`
+    /// (`ledgercore.StateProofVerificationContext`), used by
+    /// `data/pools/transactionPool.go`'s `getStateProofStats` to compute
+    /// `ProvenWeight` (`Muldiv(OnlineTotalWeight, StateProofWeightThreshold,
+    /// 1<<32)`) for the `StateProofStats` sub-record of assemble-block
+    /// telemetry.
+    ///
+    /// Default implementation returns `None` (no state-proof telemetry
+    /// data) — test doubles that don't model state-proof-verification
+    /// tracking can ignore this.
+    fn state_proof_verification_context(
+        &self,
+        _last_round_in_interval: Round,
+    ) -> Option<(u64, u32)> {
+        None
+    }
 }

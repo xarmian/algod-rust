@@ -2808,6 +2808,30 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
             verified_txn_cache: Some(self.verified_txn_cache.clone()),
         }))
     }
+
+    fn state_proof_verification_context(
+        &self,
+        last_round_in_interval: Round,
+    ) -> Option<(u64, u32)> {
+        // Mirrors go's `pool.ledger.GetStateProofVerificationContext`
+        // (`data/pools/transactionPool.go:825`): resolve the online total
+        // weight and protocol version for the voting round behind
+        // `last_round_in_interval`, then look up that version's
+        // `StateProofWeightThreshold`. Used only for assemble-block
+        // telemetry (`getStateProofStats`'s `ProvenWeight`); any failure
+        // (poisoned lock, no tracked/header context, unknown protocol)
+        // yields `None` so the caller falls back to omitting the stat,
+        // same as go's `err != nil` early-return leaving `ProvenWeight: 0`.
+        let ledger = self.ledger.lock().ok()?;
+        let (online_total_weight, version) =
+            algo_ledger::apply_stateproof::state_proof_verification_context_weight_and_version(
+                &*ledger,
+                last_round_in_interval.0,
+            )
+            .ok()?;
+        let params = algo_types::consensus::consensus_params_for_version(&version)?;
+        Some((online_total_weight, params.state_proof_weight_threshold))
+    }
 }
 
 // ---------------------------------------------------------------------------

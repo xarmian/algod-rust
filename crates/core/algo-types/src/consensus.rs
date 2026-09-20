@@ -180,6 +180,72 @@ pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
     CONSENSUS_VFNET4,
 ];
 
+/// Historical record of every `vN.ApprovedUpgrades[vM] = delay` edge in
+/// go-algorand's real `config/consensus.go` (v7 through v42), as
+/// `(from_version, to_version, delay_rounds)`.
+///
+/// **This table is deliberately separate from, and never read by, live
+/// block-production logic** (unlike [`ConsensusParams::approved_upgrade`],
+/// which `algo_ledger::block_header::process_upgrade_params` reads to
+/// auto-propose/auto-vote-yes for a live upgrade target — see that field's
+/// doc comment). `approved_upgrade` only ever holds the single still-live
+/// v41→v42 edge; backfilling the ~30 historical pre-v42 edges into it would
+/// change real upgrade-proposal behavior for every historical consensus
+/// version a ledger might replay at, which is out of proportion for what
+/// this table exists to do (see the `TestConsensusUpgrades` row in
+/// `docs/phase17/parity_config_proto_sp.md` for the full investigation).
+///
+/// Instead, this table exists purely so a test can prove the full
+/// `v7`→`v42` upgrade-proposal chain go-algorand shipped actually existed,
+/// without touching or risking `approved_upgrade`'s live behavior at all.
+/// Each entry was read directly off `config/consensus.go` at
+/// `v5.0.0-stable` (the `vN.ApprovedUpgrades[vM] = delay` assignment
+/// lines) — not derived from `approved_upgrade` or guessed. Some versions
+/// have more than one outbound edge recorded here (e.g. both `v17`→`v19`
+/// and `v18`→`v19`, and both `v21`→`v23` and `v22`→`v23`, existed
+/// simultaneously in go's map — a proposer running at either source
+/// version could name that same target) even though `approved_upgrade`'s
+/// `Option<(target, delay)>` shape only ever models one live edge per
+/// version. The test-network-only `vAlphaN`/`vFnetN` edges are excluded —
+/// this table covers only the real v7-v42 release chain.
+pub const HISTORICAL_APPROVED_UPGRADES: &[(&str, &str, u64)] = &[
+    (CONSENSUS_V7, CONSENSUS_V8, 0),
+    (CONSENSUS_V8, CONSENSUS_V9, 0),
+    (CONSENSUS_V9, CONSENSUS_V10, 0),
+    (CONSENSUS_V10, CONSENSUS_V11, 0),
+    (CONSENSUS_V11, CONSENSUS_V12, 0),
+    (CONSENSUS_V12, CONSENSUS_V13, 0),
+    (CONSENSUS_V13, CONSENSUS_V14, 0),
+    (CONSENSUS_V14, CONSENSUS_V15, 0),
+    (CONSENSUS_V15, CONSENSUS_V16, 0),
+    (CONSENSUS_V16, CONSENSUS_V17, 0),
+    (CONSENSUS_V17, CONSENSUS_V19, 0),
+    (CONSENSUS_V18, CONSENSUS_V19, 0),
+    (CONSENSUS_V19, CONSENSUS_V20, 0),
+    (CONSENSUS_V20, CONSENSUS_V21, 0),
+    (CONSENSUS_V21, CONSENSUS_V23, 0),
+    (CONSENSUS_V22, CONSENSUS_V23, 10_000),
+    (CONSENSUS_V23, CONSENSUS_V24, 140_000),
+    (CONSENSUS_V24, CONSENSUS_V26, 140_000),
+    (CONSENSUS_V25, CONSENSUS_V26, 140_000),
+    (CONSENSUS_V26, CONSENSUS_V27, 60_000),
+    (CONSENSUS_V27, CONSENSUS_V28, 140_000),
+    (CONSENSUS_V28, CONSENSUS_V29, 60_000),
+    (CONSENSUS_V29, CONSENSUS_V30, 140_000),
+    (CONSENSUS_V30, CONSENSUS_V31, 140_000),
+    (CONSENSUS_V31, CONSENSUS_V32, 140_000),
+    (CONSENSUS_V32, CONSENSUS_V33, 140_000),
+    (CONSENSUS_V33, CONSENSUS_V35, 10_000),
+    (CONSENSUS_V34, CONSENSUS_V35, 10_000),
+    (CONSENSUS_V35, CONSENSUS_V36, 140_000),
+    (CONSENSUS_V36, CONSENSUS_V37, 140_000),
+    (CONSENSUS_V37, CONSENSUS_V38, 10_000),
+    (CONSENSUS_V38, CONSENSUS_V39, 150_000),
+    (CONSENSUS_V39, CONSENSUS_V40, 208_000),
+    (CONSENSUS_V40, CONSENSUS_V41, 208_000),
+    (CONSENSUS_V41, CONSENSUS_V42, 208_000),
+];
+
 // ── ConsensusParams ─────────────────────────────────────────────────
 
 /// Comprehensive consensus parameters mirroring go-algorand's
@@ -600,7 +666,12 @@ pub struct ConsensusParams {
     /// every version boundary and then populated with at most one
     /// `vN.ApprovedUpgrades[vN+1] = delay` entry (`config/consensus.go`), so
     /// it is modeled here as `Option<(target version, delay)>` rather than a
-    /// full map. `None` means this version proposes no upgrade.
+    /// full map. `None` means this version proposes no upgrade. Only the
+    /// current live v41→v42 edge is populated here; see
+    /// [`HISTORICAL_APPROVED_UPGRADES`] for a read-only historical record
+    /// of every earlier `ApprovedUpgrades` edge go-algorand ever shipped,
+    /// kept deliberately out of this field to avoid changing live
+    /// upgrade-proposal behavior for historical consensus versions.
     pub approved_upgrade: Option<(&'static str, u64)>,
     /// Rounds an upgrade proposal is voted on before its fate (accepted or
     /// expired) is decided (Go: `UpgradeVoteRounds`).
@@ -2552,6 +2623,77 @@ mod tests {
             checked_at_least_one,
             "expected at least one known version to carry an approved upgrade to sweep"
         );
+    }
+
+    /// Ports go's `TestConsensusUpgrades` (`config/config_test.go:390`) —
+    /// proves the full historical v7→v42 `ApprovedUpgrades` chain go-algorand
+    /// shipped actually existed, against the separate, production-inert
+    /// [`HISTORICAL_APPROVED_UPGRADES`] table (never read by
+    /// `approved_upgrade`/`process_upgrade_params`; see that const's doc
+    /// comment for why the two are kept apart). Does not port go's
+    /// upgrade-name URL/whitelist provenance check, which has no algod-rust
+    /// equivalent (`KNOWN_PROTOCOL_VERSIONS` names carry no separate
+    /// provenance metadata).
+    #[test]
+    fn historical_approved_upgrades_chain_reaches_v42_from_every_version_v7_through_v41() {
+        use std::collections::{HashMap, HashSet};
+
+        // Every (from, to) pair must name real, known protocol versions.
+        for &(from, to, _delay) in HISTORICAL_APPROVED_UPGRADES {
+            assert!(
+                KNOWN_PROTOCOL_VERSIONS.contains(&from),
+                "HISTORICAL_APPROVED_UPGRADES: unknown source version {from}"
+            );
+            assert!(
+                KNOWN_PROTOCOL_VERSIONS.contains(&to),
+                "HISTORICAL_APPROVED_UPGRADES: unknown target version {to}"
+            );
+        }
+
+        // Every version from v7 through v41 has at least one outbound edge
+        // recorded (some, like v17/v18->v19 and v21/v22->v23, have more
+        // than one — go's real map allowed several source versions to
+        // name the same target).
+        let sources: HashSet<&str> = HISTORICAL_APPROVED_UPGRADES
+            .iter()
+            .map(|&(from, _, _)| from)
+            .collect();
+        let v7_through_v41 = &KNOWN_PROTOCOL_VERSIONS[..35]; // CONSENSUS_V7..=CONSENSUS_V41
+        for &version in v7_through_v41 {
+            assert!(
+                sources.contains(version),
+                "version {version} has no recorded historical outbound ApprovedUpgrades edge"
+            );
+        }
+
+        // Walk the DAG from v7 and confirm v42 (the current live version)
+        // is reachable -- i.e. the chain go shipped is unbroken end to end.
+        let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+        for &(from, to, _delay) in HISTORICAL_APPROVED_UPGRADES {
+            edges.entry(from).or_default().push(to);
+        }
+        let mut frontier = vec![CONSENSUS_V7];
+        let mut reached: HashSet<&str> = HashSet::new();
+        reached.insert(CONSENSUS_V7);
+        while let Some(version) = frontier.pop() {
+            if let Some(targets) = edges.get(version) {
+                for &target in targets {
+                    if reached.insert(target) {
+                        frontier.push(target);
+                    }
+                }
+            }
+        }
+        assert!(
+            reached.contains(CONSENSUS_V42),
+            "v42 is not reachable from v7 via HISTORICAL_APPROVED_UPGRADES"
+        );
+
+        // The live edge this table intentionally overlaps with
+        // `approved_upgrade` must agree with it exactly.
+        let v41 = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        assert_eq!(v41.approved_upgrade, Some((CONSENSUS_V42, 208_000)));
+        assert!(HISTORICAL_APPROVED_UPGRADES.contains(&(CONSENSUS_V41, CONSENSUS_V42, 208_000)));
     }
 
     #[test]

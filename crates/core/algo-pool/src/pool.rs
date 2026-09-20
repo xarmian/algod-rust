@@ -880,7 +880,7 @@ impl TransactionPool {
         let result = self.assemble_block_inner(round, deadline);
         if self.config.enable_assemble_stats {
             if let Ok(ref block) = result {
-                Self::emit_assemble_block_stats(round, block);
+                self.emit_assemble_block_stats(round, block);
             }
         }
         result
@@ -891,16 +891,22 @@ impl TransactionPool {
     ///
     /// Fields mirror the numeric core of go's `telemetryspec.AssembleBlockMetrics`
     /// (`IncludedCount`, `MinFee`/`MaxFee`/`AverageFee`,
-    /// `MinLength`/`MaxLength`/`TotalLength`); go additionally attaches a
-    /// per-state-proof-transaction `StateProofStats` sub-record (reveal/
-    /// position counts, proven weight) resolved via
-    /// `pool.ledger.GetStateProofVerificationContext` — algod-rust's pool
-    /// has no ledger handle to resolve that verification context from at
-    /// this layer, so this instead reports `state_proof_txn_count` (how
-    /// many payset entries are state-proof transactions), a coarser but
-    /// still meaningful signal that the assembled block reached a
-    /// state-proof interval boundary.
-    fn emit_assemble_block_stats(round: Round, block: &Block) {
+    /// `MinLength`/`MaxLength`/`TotalLength`). For a state-proof
+    /// transaction in the payset, also emits the `StateProofStats`
+    /// sub-record fields go computes in `getStateProofStats`
+    /// (`data/pools/transactionPool.go:816`): `state_proof_signed_weight`,
+    /// `state_proof_num_reveals`, `state_proof_num_pos_to_reveal`, and
+    /// `state_proof_proven_weight` (`Muldiv(OnlineTotalWeight,
+    /// StateProofWeightThreshold, 1<<32)`, resolved via
+    /// [`PoolLedger::state_proof_verification_context`]). Like go, only the
+    /// *last* state-proof transaction encountered in the payset is
+    /// reported (go's loop unconditionally overwrites
+    /// `stats.StateProofStats` on every `StateProofTx` it sees). If no
+    /// state-proof transaction is present, or the ledger can't resolve a
+    /// verification context for it (mirroring go's `err != nil` early
+    /// return leaving `ProvenWeight: 0`), only the coarser
+    /// `state_proof_txn_count` is emitted.
+    fn emit_assemble_block_stats(&self, round: Round, block: &Block) {
         let payset = &block.payset;
         if payset.is_empty() {
             tracing::info!(
@@ -919,6 +925,7 @@ impl TransactionPool {
         let mut total_length: u64 = 0;
         let mut total_fees: u64 = 0;
         let mut state_proof_txn_count: u64 = 0;
+        let mut state_proof_stats: Option<(u64, usize, usize, u64)> = None;
 
         for stxn in payset {
             let fee = stxn.txn.fee;
@@ -933,11 +940,74 @@ impl TransactionPool {
 
             if stxn.txn.txn_type == TxnType::Stpf {
                 state_proof_txn_count += 1;
+
+                let signed_weight = stxn
+                    .txn
+                    .state_proof
+                    .as_ref()
+                    .map(|sp| sp.signed_weight)
+                    .unwrap_or(0);
+                let num_reveals = stxn
+                    .txn
+                    .state_proof
+                    .as_ref()
+                    .and_then(|sp| sp.reveals.as_ref())
+                    .map(|r| r.len())
+                    .unwrap_or(0);
+                let num_pos_to_reveal = stxn
+                    .txn
+                    .state_proof
+                    .as_ref()
+                    .and_then(|sp| sp.positions_to_reveal.as_ref())
+                    .map(|p| p.len())
+                    .unwrap_or(0);
+
+                let proven_weight = stxn
+                    .txn
+                    .state_proof_message
+                    .as_ref()
+                    .and_then(|msg| {
+                        self.ledger
+                            .state_proof_verification_context(Round(msg.last_attested_round))
+                    })
+                    .map(|(online_total_weight, weight_threshold)| {
+                        // Mirrors go's `basics.Muldiv(totalWeight,
+                        // uint64(threshold), 1<<32)`.
+                        ((online_total_weight as u128 * weight_threshold as u128) / (1u128 << 32))
+                            as u64
+                    })
+                    .unwrap_or(0);
+
+                state_proof_stats =
+                    Some((signed_weight, num_reveals, num_pos_to_reveal, proven_weight));
             }
         }
 
         let included_count = payset.len() as u64;
         let average_fee = total_fees / included_count;
+
+        if let Some((signed_weight, num_reveals, num_pos_to_reveal, proven_weight)) =
+            state_proof_stats
+        {
+            tracing::info!(
+                target: "algo_pool::assemble_block_stats",
+                round = round.0,
+                included_count,
+                min_fee,
+                max_fee,
+                average_fee,
+                min_length = min_length as u64,
+                max_length = max_length as u64,
+                total_length,
+                state_proof_txn_count,
+                state_proof_signed_weight = signed_weight,
+                state_proof_num_reveals = num_reveals as u64,
+                state_proof_num_pos_to_reveal = num_pos_to_reveal as u64,
+                state_proof_proven_weight = proven_weight,
+                "assemble_block_stats"
+            );
+            return;
+        }
 
         tracing::info!(
             target: "algo_pool::assemble_block_stats",
@@ -1177,7 +1247,9 @@ impl TransactionPool {
 mod tests {
     use super::*;
     use crate::traits::{BlockEvaluator, PoolLedger};
-    use algo_types::{Block, BlockHeader, ConsensusParams, TxnType};
+    use algo_types::{
+        Block, BlockHeader, ConsensusParams, Reveal, StateProofBody, StateProofMessage, TxnType,
+    };
 
     /// Minimal stub ledger for unit tests.
     struct StubLedger {
@@ -2506,6 +2578,155 @@ mod tests {
             "both test txns share the same fee"
         );
         assert_eq!(fields.max_fee, Some(1_000_000));
+    }
+
+    /// Ports the state-proof half of go's `TestStateProofLogging`
+    /// (`data/pools/transactionPool_test.go:1295`): when the assembled
+    /// payset carries a `StateProofTx` and the `PoolLedger` can resolve a
+    /// verification context for it, `emit_assemble_block_stats` reports
+    /// the `StateProofStats` sub-fields (`getStateProofStats`,
+    /// `data/pools/transactionPool.go:816`) — signed weight, reveal/
+    /// position-to-reveal counts, and `ProvenWeight` computed the same way
+    /// go does (`Muldiv(OnlineTotalWeight, StateProofWeightThreshold,
+    /// 1<<32)`). Calls `emit_assemble_block_stats` directly (bypassing full
+    /// pool assembly, which doesn't validate/accept `Stpf`-type
+    /// transactions through the normal txn-group path) since the ledger
+    /// hookup is what this test targets, not assembly itself.
+    #[test]
+    fn test_assemble_block_stats_includes_state_proof_stats_when_ledger_resolves_context() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct SpLedger;
+        impl PoolLedger for SpLedger {
+            fn latest(&self) -> Round {
+                Round(1)
+            }
+            fn block_hdr(&self, _round: Round) -> Result<BlockHeader, AlgoError> {
+                Ok(BlockHeader::default())
+            }
+            fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, AlgoError> {
+                Ok(ConsensusParams::default())
+            }
+            fn start_evaluator(
+                &self,
+                _hdr: BlockHeader,
+                _payset_hint: usize,
+                _max_txn_bytes_per_block: usize,
+            ) -> Result<Box<dyn BlockEvaluator>, AlgoError> {
+                Err(AlgoError::Ledger {
+                    message: "not used by this test".to_string(),
+                })
+            }
+            fn state_proof_verification_context(
+                &self,
+                last_round_in_interval: Round,
+            ) -> Option<(u64, u32)> {
+                assert_eq!(last_round_in_interval, Round(1000));
+                // online_total_weight = 1_000_000, threshold = 30% of 2^32
+                // (matches v34+'s real StateProofWeightThreshold).
+                Some((1_000_000, ((1u64 << 32) * 30 / 100) as u32))
+            }
+        }
+
+        let ledger = Arc::new(SpLedger);
+        let config = PoolConfig {
+            enable_assemble_stats: true,
+            ..Default::default()
+        };
+        let pool = TransactionPool::new(config, ledger);
+
+        let mut stxn = make_test_txn(9);
+        stxn.txn.txn_type = TxnType::Stpf;
+        let mut reveals = std::collections::BTreeMap::new();
+        reveals.insert(0u64, Reveal::default());
+        reveals.insert(1u64, Reveal::default());
+        stxn.txn.state_proof = Some(StateProofBody {
+            signed_weight: 555,
+            reveals: Some(reveals),
+            positions_to_reveal: Some(vec![0, 1, 2]),
+            ..StateProofBody::default()
+        });
+        stxn.txn.state_proof_message = Some(StateProofMessage {
+            last_attested_round: 1000,
+            ..StateProofMessage::default()
+        });
+
+        let block = Block {
+            round: Round(1),
+            payset: vec![stxn],
+            ..Block::default()
+        };
+
+        #[derive(Default, Clone)]
+        struct CapturedFields {
+            state_proof_txn_count: Option<u64>,
+            state_proof_signed_weight: Option<u64>,
+            state_proof_num_reveals: Option<u64>,
+            state_proof_num_pos_to_reveal: Option<u64>,
+            state_proof_proven_weight: Option<u64>,
+        }
+        let captured = Arc::new(Mutex::new(Vec::<CapturedFields>::new()));
+
+        struct CapturingLayer {
+            captured: Arc<Mutex<Vec<CapturedFields>>>,
+        }
+        struct FieldVisitor(CapturedFields);
+        impl tracing::field::Visit for FieldVisitor {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                match field.name() {
+                    "state_proof_txn_count" => self.0.state_proof_txn_count = Some(value),
+                    "state_proof_signed_weight" => self.0.state_proof_signed_weight = Some(value),
+                    "state_proof_num_reveals" => self.0.state_proof_num_reveals = Some(value),
+                    "state_proof_num_pos_to_reveal" => {
+                        self.0.state_proof_num_pos_to_reveal = Some(value)
+                    }
+                    "state_proof_proven_weight" => self.0.state_proof_proven_weight = Some(value),
+                    _ => {}
+                }
+            }
+            fn record_debug(
+                &mut self,
+                _field: &tracing::field::Field,
+                _value: &dyn std::fmt::Debug,
+            ) {
+            }
+        }
+        impl<S> tracing_subscriber::Layer<S> for CapturingLayer
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() == "algo_pool::assemble_block_stats" {
+                    let mut visitor = FieldVisitor(CapturedFields::default());
+                    event.record(&mut visitor);
+                    self.captured.lock().push(visitor.0);
+                }
+            }
+        }
+        let layer = CapturingLayer {
+            captured: captured.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            pool.emit_assemble_block_stats(Round(1), &block);
+        });
+
+        let events = captured.lock();
+        assert_eq!(events.len(), 1, "expected exactly one tracing event");
+        let fields = &events[0];
+        assert_eq!(fields.state_proof_txn_count, Some(1));
+        assert_eq!(fields.state_proof_signed_weight, Some(555));
+        assert_eq!(fields.state_proof_num_reveals, Some(2));
+        assert_eq!(fields.state_proof_num_pos_to_reveal, Some(3));
+        // Muldiv(1_000_000, threshold, 1<<32) where threshold =
+        // (1<<32)*30/100 = 1_288_490_188 (integer division truncates, so
+        // this isn't exactly 30% of 1_000_000).
+        assert_eq!(fields.state_proof_proven_weight, Some(299_999));
     }
 
     #[test]
