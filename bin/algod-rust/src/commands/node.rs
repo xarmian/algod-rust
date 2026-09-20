@@ -1367,7 +1367,13 @@ mod follower_resource_path_tests {
         std::fs::set_permissions(&readonly_parent, std::fs::Permissions::from_mode(0o700))
             .expect("restore parent dir permissions");
 
-        let err = result.expect_err("directory creation under a write-only parent must fail");
+        // `.err().expect(..)` rather than `.expect_err(..)`: the latter
+        // requires the `Ok` type (`SqliteLedger`, which wraps a
+        // `rusqlite::Connection` with no `Debug` impl) to implement `Debug`
+        // for its panic message, which it doesn't.
+        let err = result
+            .err()
+            .expect("directory creation under a write-only parent must fail");
         let msg = format!("{err:#}").to_lowercase();
         assert!(
             msg.contains("permission denied"),
