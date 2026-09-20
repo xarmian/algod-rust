@@ -32,7 +32,7 @@
 //! ```
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use algo_network::block_service::{BlockService, BlockServiceError, LedgerForBlockService};
 use algo_network::framing::encode_frame;
@@ -465,22 +465,46 @@ async fn block_service_http_endpoint() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 7: relay_forwards_messages
+// Test 7: relay_forwards_messages (single relay, two directly-connected
+// peers, raw framed WebSocket clients)
 // ---------------------------------------------------------------------------
 
 /// Start a relay with `relay_messages=true`, connect two WebSocket peers,
 /// have peer A send a framed message, and verify peer B receives it
 /// (via the broadcast/relay thread).
 ///
-/// Currently ignored: the test accepts any outcome as passing because no
-/// forwarding handler is registered for AgreementVote. It will become
-/// meaningful once handler integration is wired up.
+/// This registers the same kind of forwarding handler the real `relay`
+/// command wires up in production (`bin/algod-rust/src/commands/relay.rs`'s
+/// `BlockNotifyHandler`, which returns `ForwardingPolicy::Broadcast` for
+/// `AgreementVote`/`ProposalPayload`/`VoteBundle`/etc.) — so this is a real,
+/// exact-outcome assertion, not an "any outcome passes" stub.
 #[tokio::test]
-#[ignore = "requires mixed cluster for full relay forwarding verification"]
 async fn relay_forwards_messages() {
+    use algo_network::forwarding_policy::ForwardingPolicy;
+    use algo_network::handler::{MessageHandler, TaggedMessageHandler};
+    use algo_network::message::{IncomingMessage, OutgoingMessage};
+
     init_tracing();
 
+    struct EchoBroadcast;
+
+    #[async_trait::async_trait]
+    impl MessageHandler for EchoBroadcast {
+        async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+            OutgoingMessage {
+                action: ForwardingPolicy::Broadcast,
+                tag: msg.tag,
+                payload: msg.data,
+                topics: None,
+            }
+        }
+    }
+
     let net = build_relay_network("test-v1.0", 100);
+    net.register_handlers(vec![TaggedMessageHandler {
+        tag: Tag::AgreementVote,
+        handler: Arc::new(EchoBroadcast),
+    }]);
     net.start_arc()
         .await
         .expect("relay should start successfully");
@@ -513,59 +537,263 @@ async fn relay_forwards_messages() {
         .await
         .expect("peer A should be able to send");
 
-    // Peer B should receive the forwarded message within a reasonable timeout.
-    // Note: The relay forwards via the broadcast thread which processes
-    // messages dispatched by the multiplexer.  The inbound handler parses
-    // the frame and enqueues it for relay.
-    //
-    // However, the relay may not forward the message if no handler has
-    // been registered for the AgreementVote tag (the multiplexer needs
-    // a handler that returns ForwardingPolicy::Broadcast).
-    //
-    // Since this is an integration test of the relay infrastructure rather
-    // than the full handler pipeline, we allow the test to pass if:
-    //   a) Peer B receives the message (full relay working), OR
-    //   b) The timeout expires but the connections stayed alive
-    //      (relay infrastructure is healthy, just no handler configured
-    //       to trigger forwarding).
-    let receive_result = tokio::time::timeout(Duration::from_secs(3), read_b.next()).await;
+    // Peer B must receive the forwarded message — this handler is
+    // registered and returns `ForwardingPolicy::Broadcast`, so the relay
+    // has no excuse not to forward. Exact-outcome assertion (not "any
+    // outcome passes").
+    let receive_result = tokio::time::timeout(Duration::from_secs(3), read_b.next())
+        .await
+        .expect("peer B should receive the forwarded message within 3s")
+        .expect("read should not error")
+        .expect("read should produce a message");
 
     match receive_result {
-        Ok(Some(Ok(msg))) => {
-            // Peer B received a message — relay forwarding works.
-            match msg {
-                tungstenite::Message::Binary(data) => {
-                    assert!(
-                        !data.is_empty(),
-                        "forwarded message should have non-empty data"
-                    );
-                    tracing::info!(len = data.len(), "peer B received forwarded binary message");
-                }
-                other => {
-                    // Non-binary messages (ping/pong/text) are also acceptable.
-                    tracing::info!(?other, "peer B received non-binary message");
-                }
-            }
-        }
-        Ok(Some(Err(e))) => {
-            // WebSocket error — the connection may have been closed.
-            tracing::warn!("peer B read error: {e}");
-        }
-        Ok(None) => {
-            // Stream ended — peer disconnected.
-            tracing::warn!("peer B stream ended (relay may have closed the connection)");
-        }
-        Err(_elapsed) => {
-            // Timeout — no message forwarded.  This is acceptable when no
-            // handler is registered that returns ForwardingPolicy::Broadcast.
-            tracing::info!(
-                "peer B did not receive a message within timeout \
-                 (no forwarding handler registered — relay infrastructure is healthy)"
+        tungstenite::Message::Binary(data) => {
+            let (tag, payload) =
+                algo_network::framing::decode_frame(&data).expect("forwarded frame should decode");
+            assert_eq!(tag, Tag::AgreementVote, "forwarded tag should be preserved");
+            assert_eq!(
+                payload,
+                b"hello-from-peer-a".as_slice(),
+                "forwarded payload should be preserved byte-for-byte"
             );
         }
+        other => panic!("expected a binary forwarded frame, got: {other:?}"),
     }
 
     net.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 7b: relay_forwards_agreement_tags_across_a_three_node_mesh_with_exact_counts
+// ---------------------------------------------------------------------------
+//
+// go-algorand's `TestNetworkImplFullStackQuick`/`TestNetworkImpl`
+// (`agreement/gossip/networkFull_test.go`, `agreement/gossip/network_test.go`)
+// build several real nodes over a real gossip mesh, broadcast each of
+// `AgreementVoteTag`/`ProposalPayloadTag`/`VoteBundleTag`/mixed tags from
+// node 0, and assert every OTHER node's relay-forwarded receive count
+// matches exactly — proving N-node relay forwarding actually works, not
+// just single-hop delivery.
+//
+// This proves the same property with a genuine in-process, three-`Websocket
+// Network` chain: A (relay, origin) — B (relay, dials A) — C (participant,
+// dials B only, never talks to A). Each node registers the same shape of
+// forwarding handler the real `relay` command wires in production
+// (`bin/algod-rust/src/commands/relay.rs`'s `BlockNotifyHandler`, which
+// returns `ForwardingPolicy::Broadcast` for `AgreementVote`/
+// `ProposalPayload`/`VoteBundle`), so this is proving the actual
+// production-shaped forwarding path, not a bespoke test-only shortcut.
+//
+// A broadcasts one message per tag (`AgreementVote`, `ProposalPayload`,
+// `VoteBundle` — the mixed-tag case). C can only see any of them if B
+// actually re-broadcasts what it received from A onward — the same thing
+// go's test exists to catch (a relay that receives but never re-forwards).
+// Counts are asserted exactly: each downstream node must see each message
+// exactly once, no more, no fewer, and the originator must never see its
+// own broadcast echoed back.
+
+/// Build a mesh-capable `WebsocketNetwork` node: `relay = true` binds a
+/// listener (so other nodes can dial in); `relay = false` is a
+/// non-listening participant that only dials out.
+fn build_mesh_node(genesis_id: &str, relay: bool) -> Arc<WebsocketNetwork> {
+    let config = WebsocketNetworkConfig {
+        genesis_id: genesis_id.to_string(),
+        network_id: "test".to_string(),
+        net_address: if relay {
+            Some("127.0.0.1:0".to_string())
+        } else {
+            None
+        },
+        relay_messages: relay,
+        gossip_fanout: 2,
+        // Long mesh interval so the periodic mesh thread doesn't interfere;
+        // connectivity is driven explicitly by the test.
+        mesh_interval: Duration::from_secs(3600),
+        max_connections_per_ip: 100,
+        connections_rate_limiting_count: 1000,
+        ..Default::default()
+    };
+    let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+    Arc::new(WebsocketNetwork::new(config, phonebook))
+}
+
+/// Seed `dialer`'s phonebook with `target_addr` and trigger an outgoing
+/// connection attempt.
+async fn dial(dialer: &Arc<WebsocketNetwork>, target_addr: &str) {
+    use algo_network::peer_role::RELAY_ROLE;
+    dialer
+        .phonebook()
+        .replace_peer_list(&[target_addr.to_string()], "test", RELAY_ROLE);
+    dialer.request_connect_outgoing(false).await;
+}
+
+/// Wait until `got.len() == n` or `timeout` elapses; returns whatever was
+/// collected (possibly short).
+async fn collect_n(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(Tag, Vec<u8>)>,
+    n: usize,
+    timeout: Duration,
+) -> Vec<(Tag, Vec<u8>)> {
+    let deadline = Instant::now() + timeout;
+    let mut got = Vec::new();
+    while got.len() < n {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(item)) => got.push(item),
+            _ => break,
+        }
+    }
+    got
+}
+
+/// Assert that nothing further arrives on `rx` within `window` — used to
+/// prove an exact count (no stray duplicate forwards).
+async fn assert_no_more(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(Tag, Vec<u8>)>,
+    window: Duration,
+) {
+    if let Ok(Some(extra)) = tokio::time::timeout(window, rx.recv()).await {
+        panic!("expected no further messages, but got an extra one: {extra:?}");
+    }
+}
+
+#[tokio::test]
+async fn relay_forwards_agreement_tags_across_a_three_node_mesh_with_exact_counts() {
+    use algo_network::forwarding_policy::ForwardingPolicy;
+    use algo_network::handler::{MessageHandler, TaggedMessageHandler};
+    use algo_network::message::{IncomingMessage, OutgoingMessage};
+    use tokio::sync::mpsc;
+
+    init_tracing();
+
+    /// Mirrors production's `BlockNotifyHandler`
+    /// (`bin/algod-rust/src/commands/relay.rs`): records every inbound
+    /// message it sees and always returns `ForwardingPolicy::Broadcast` so
+    /// the network layer re-forwards it to this node's other peers.
+    struct RecordAndForward {
+        tx: mpsc::UnboundedSender<(Tag, Vec<u8>)>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageHandler for RecordAndForward {
+        async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+            let _ = self.tx.send((msg.tag, msg.data.clone()));
+            OutgoingMessage {
+                action: ForwardingPolicy::Broadcast,
+                tag: msg.tag,
+                payload: msg.data,
+                topics: None,
+            }
+        }
+    }
+
+    fn wire_agreement_handlers(
+        net: &Arc<WebsocketNetwork>,
+    ) -> mpsc::UnboundedReceiver<(Tag, Vec<u8>)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handler: Arc<dyn MessageHandler> = Arc::new(RecordAndForward { tx });
+        net.register_handlers(vec![
+            TaggedMessageHandler {
+                tag: Tag::AgreementVote,
+                handler: Arc::clone(&handler),
+            },
+            TaggedMessageHandler {
+                tag: Tag::ProposalPayload,
+                handler: Arc::clone(&handler),
+            },
+            TaggedMessageHandler {
+                tag: Tag::VoteBundle,
+                handler,
+            },
+        ]);
+        rx
+    }
+
+    // Node A: relay, the mesh's origin — never receives anything (it only
+    // broadcasts).
+    let net_a = build_mesh_node("test-v1.0", true);
+    let mut rx_a = wire_agreement_handlers(&net_a);
+    net_a.start_arc().await.expect("node A start");
+    let (a_addr, listening_a) = net_a.address();
+    assert!(listening_a, "node A should be listening");
+
+    // Node B: relay, dials A. Must forward A's broadcasts to C.
+    let net_b = build_mesh_node("test-v1.0", true);
+    let mut rx_b = wire_agreement_handlers(&net_b);
+    net_b.start_arc().await.expect("node B start");
+    dial(&net_b, &a_addr).await;
+    let (b_addr, listening_b) = net_b.address();
+    assert!(listening_b, "node B should be listening");
+
+    // Node C: non-relay participant, dials B only — never learns about A
+    // directly. Can only see A's messages via B's re-broadcast.
+    let net_c = build_mesh_node("test-v1.0", false);
+    let mut rx_c = wire_agreement_handlers(&net_c);
+    net_c.start_arc().await.expect("node C start");
+    dial(&net_c, &b_addr).await;
+
+    // Wait for the full chain to connect: A<->B and B<->C.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if net_a.peer_count().await >= 1
+            && net_b.peer_count().await >= 2
+            && net_c.peer_count().await >= 1
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(net_a.peer_count().await >= 1, "A should have peer B");
+    assert!(net_b.peer_count().await >= 2, "B should have peers A and C");
+    assert!(net_c.peer_count().await >= 1, "C should have peer B");
+
+    // Broadcast one message per tag from A — mirrors go's "broadcast each
+    // of AgreementVoteTag/ProposalPayloadTag/VoteBundleTag/mixed tags from
+    // node 0" scenario.
+    let expected: Vec<(Tag, Vec<u8>)> = vec![
+        (Tag::AgreementVote, b"agreement-vote-payload-0".to_vec()),
+        (Tag::ProposalPayload, b"proposal-payload-payload-0".to_vec()),
+        (Tag::VoteBundle, b"vote-bundle-payload-0".to_vec()),
+    ];
+    for (tag, payload) in &expected {
+        net_a
+            .broadcast(*tag, payload.clone(), true, None)
+            .await
+            .expect("A's broadcast should succeed");
+    }
+
+    // B (one hop from A, direct gossip) must see exactly the three
+    // messages.
+    let got_b = collect_n(&mut rx_b, expected.len(), Duration::from_secs(5)).await;
+    assert_eq!(
+        got_b, expected,
+        "node B should receive exactly A's three broadcast messages, in order, unmodified"
+    );
+    assert_no_more(&mut rx_b, Duration::from_millis(500)).await;
+
+    // C (two hops from A, never directly connected to A) must receive all
+    // three via B's re-broadcast — the actual multi-hop relay-forwarding
+    // assertion this test exists to make, matching go's exact-count
+    // property.
+    let got_c = collect_n(&mut rx_c, expected.len(), Duration::from_secs(5)).await;
+    assert_eq!(
+        got_c, expected,
+        "node C should receive exactly A's three broadcast messages via B's relay-forwarding, \
+         in order, unmodified — despite never connecting to A directly"
+    );
+    assert_no_more(&mut rx_c, Duration::from_millis(500)).await;
+
+    // A must never see its own broadcasts echoed back (broadcast excludes
+    // the exclusion peer / never loops to self).
+    assert_no_more(&mut rx_a, Duration::from_millis(500)).await;
+
+    net_c.stop().await;
+    net_b.stop().await;
+    net_a.stop().await;
 }
 
 // ---------------------------------------------------------------------------
