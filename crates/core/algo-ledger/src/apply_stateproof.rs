@@ -285,6 +285,23 @@ fn resolve_verification_context<L: LedgerStore>(
     })
 }
 
+/// Public wrapper around [`resolve_verification_context`] for callers
+/// outside the apply-state-proof flow that only need the verification
+/// context's online total weight and protocol version — mirrors go's
+/// `pool.ledger.GetStateProofVerificationContext` (returns
+/// `ledgercore.StateProofVerificationContext`), used by
+/// `data/pools/transactionPool.go`'s `getStateProofStats` to compute
+/// `ProvenWeight` for assemble-block telemetry. `algo_pool`'s
+/// `PoolLedger::state_proof_verification_context` is the production
+/// caller (via `PoolLedgerAdapter` in `bin/algod-rust`).
+pub fn state_proof_verification_context_weight_and_version<L: LedgerStore>(
+    store: &L,
+    last_round_in_interval: u64,
+) -> Result<(u64, String), AlgoError> {
+    let ctx = resolve_verification_context(store, last_round_in_interval)?;
+    Ok((ctx.online_total_weight, ctx.version))
+}
+
 /// Record a verification context for the block just applied, if it's a
 /// "voters round" (`round % StateProofInterval == 0`) — mirrors go's
 /// `spVerificationTracker.newBlock`/`appendCommitContext`
