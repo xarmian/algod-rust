@@ -109,8 +109,14 @@ struct InternalBundleRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CryptoRequestCtxKey {
     period: Period,
-    /// If true, this key represents a cert bundle (period should be 0).
-    certify: bool,
+    /// If true, this key represents a bundle (period should be 0). Shared
+    /// by every bundle in the round, regardless of step — go-algorand
+    /// v5.0.2-stable generalized this from a `cert`-step-only sentinel
+    /// (`certify`) to cover every bundle step, since bundles may arrive
+    /// for arbitrarily far future periods and their unauthenticated
+    /// periods must neither allocate per-period state nor determine its
+    /// lifetime.
+    bundle: bool,
     /// If true, this key represents a pinned proposal (period should be 0).
     pinned: bool,
 }
@@ -194,7 +200,7 @@ impl PendingRequestsContext {
     fn add_vote(&mut self, round: Round, period: Period) -> Arc<AtomicBool> {
         let pkey = CryptoRequestCtxKey {
             period,
-            certify: false,
+            bundle: false,
             pinned: false,
         };
         self.get_req_ctx(round, pkey).cancelled.clone()
@@ -208,13 +214,13 @@ impl PendingRequestsContext {
         let pkey = if pinned {
             CryptoRequestCtxKey {
                 period: Period(0),
-                certify: false,
+                bundle: false,
                 pinned: true,
             }
         } else {
             CryptoRequestCtxKey {
                 period,
-                certify: false,
+                bundle: false,
                 pinned: false,
             }
         };
@@ -234,20 +240,17 @@ impl PendingRequestsContext {
 
     /// Returns a cancellation token for a bundle request.
     ///
-    /// Mirrors Go's `addBundle`.
-    fn add_bundle(&mut self, round: Round, period: Period, certify: bool) -> Arc<AtomicBool> {
-        let pkey = if certify {
-            CryptoRequestCtxKey {
-                period: Period(0),
-                certify: true,
-                pinned: false,
-            }
-        } else {
-            CryptoRequestCtxKey {
-                period,
-                certify: false,
-                pinned: false,
-            }
+    /// Mirrors Go's `addBundle` (v5.0.2-stable): shares one context among
+    /// all bundles in a round. Unlike individual votes, bundles may be
+    /// from arbitrarily far future periods; their unauthenticated periods
+    /// must neither allocate per-period state nor determine its lifetime,
+    /// so every bundle in a round — regardless of step — uses the same
+    /// round-scoped key, never keyed by the bundle's own claimed period.
+    fn add_bundle(&mut self, round: Round) -> Arc<AtomicBool> {
+        let pkey = CryptoRequestCtxKey {
+            period: Period(0),
+            bundle: true,
+            pinned: false,
         };
         self.get_req_ctx(round, pkey).cancelled.clone()
     }
@@ -256,8 +259,8 @@ impl PendingRequestsContext {
     ///
     /// Mirrors Go's `clearStaleContexts`:
     /// - At round r+2 we can clear tasks from round r.
-    /// - At period p+3 we can clear tasks from period p (unless pinned/certify).
-    fn clear_stale_contexts(&mut self, r: Round, p: Period, pinned: bool, certify: bool) {
+    /// - At period p+3 we can clear tasks from period p (unless pinned/bundle).
+    fn clear_stale_contexts(&mut self, r: Round, p: Period, pinned: bool, bundle: bool) {
         // Cancel old rounds: round + 2 <= r
         let old_rounds: Vec<Round> = self
             .rounds
@@ -278,8 +281,8 @@ impl PendingRequestsContext {
             }
         }
 
-        // If pinned or certify, do not clear period tasks.
-        if pinned || certify {
+        // If pinned or bundle, do not clear period tasks.
+        if pinned || bundle {
             return;
         }
 
@@ -288,7 +291,7 @@ impl PendingRequestsContext {
             let old_periods: Vec<CryptoRequestCtxKey> = round_ctx
                 .periods
                 .keys()
-                .filter(|pkey| !pkey.pinned && !pkey.certify && pkey.period.0 + 3 <= p.0)
+                .filter(|pkey| !pkey.pinned && !pkey.bundle && pkey.period.0 + 3 <= p.0)
                 .cloned()
                 .collect();
             for pkey in old_periods {
@@ -623,7 +626,7 @@ fn verify_vote_impl<L: LedgerReader>(
         ledger,
         &rv.sender,
         request.round,
-        request.period,
+        rv.period,
         rv.step,
     );
 
@@ -833,7 +836,7 @@ fn verify_bundle_impl<L: LedgerReader>(ledger: &L, request: &CryptoBundleRequest
             ledger,
             &va.sender,
             request.round,
-            request.period,
+            ub.period,
             uv.raw_vote.step,
         );
 
@@ -902,7 +905,7 @@ fn verify_bundle_impl<L: LedgerReader>(ledger: &L, request: &CryptoBundleRequest
                 ledger,
                 &eva.sender,
                 request.round,
-                request.period,
+                ub.period,
                 uv.raw_vote.step,
             );
 
@@ -1220,8 +1223,12 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
     fn verify_bundle(&self, request: CryptoBundleRequest) {
         let cancel = {
             let mut ctx = self.cancellation.lock().unwrap();
-            ctx.clear_stale_contexts(request.round, request.period, false, request.certify);
-            ctx.add_bundle(request.round, request.period, request.certify)
+            // Bundle freshness constrains the round, but not future
+            // periods. Do not let an unauthenticated period cancel
+            // legitimate vote or payload verification (period always 0,
+            // bundle always true — mirrors Go's `VerifyBundle`).
+            ctx.clear_stale_contexts(request.round, Period(0), false, true);
+            ctx.add_bundle(request.round)
         };
         let internal = InternalBundleRequest { request, cancel };
         // Clone the sender out of the mutex before sending so that quit()
@@ -1681,18 +1688,122 @@ mod tests {
         );
     }
 
+    /// Port of go-algorand's `TestCryptoRequestContextCleanupByRoundPinnedBundle`
+    /// (renamed from `...PinnedCertify` in v5.0.2-stable).
     #[test]
-    fn pending_requests_context_certify_skips_period_clearing() {
+    fn pending_requests_context_bundle_skips_period_clearing() {
         let mut ctx = PendingRequestsContext::new();
         let token_p0 = ctx.add_vote(Round(10), Period(0));
 
-        // With certify=true, period clearing is skipped.
+        // With bundle=true, period clearing is skipped.
         ctx.clear_stale_contexts(Round(10), Period(5), false, true);
 
         assert!(
             !token_p0.load(Ordering::Acquire),
-            "period 0 should NOT be cancelled when certify"
+            "period 0 should NOT be cancelled when bundle"
         );
+    }
+
+    /// Port of go-algorand's `TestCryptoVerifierBundleContextIsolation`
+    /// (agreement/cryptoVerifier_test.go, v5.0.2-stable): bundle admission
+    /// must never cancel unrelated vote/payload/pinned-payload work, and
+    /// every bundle in a round — regardless of its own (unauthenticated)
+    /// claimed period — shares one context. Unlike Go, algod-rust's
+    /// `CryptoBundleRequest` carries no `Period`/`Certify` fields at all
+    /// (removed in the same v5.0.2-stable change), so the "claimed period
+    /// never becomes a context key" property is enforced by the type
+    /// itself; this test exercises the remaining runtime property directly
+    /// at the `PendingRequestsContext` level.
+    #[test]
+    fn pending_requests_context_bundle_context_isolation() {
+        let mut ctx = PendingRequestsContext::new();
+        const RND: Round = Round(10);
+        const PER: Period = Period(7);
+
+        let vote_token = ctx.add_vote(RND, PER);
+        let payload_token = ctx.add_proposal(RND, PER, false);
+        let pinned_token = ctx.add_proposal(RND, Period(0), true);
+
+        // Every bundle admission in this round shares the same context,
+        // regardless of how many times it's called.
+        let bundle_token_1 = ctx.add_bundle(RND);
+        ctx.clear_stale_contexts(RND, Period(0), false, true);
+        let bundle_token_2 = ctx.add_bundle(RND);
+        ctx.clear_stale_contexts(RND, Period(0), false, true);
+        assert!(
+            Arc::ptr_eq(&bundle_token_1, &bundle_token_2),
+            "bundle periods must share a context"
+        );
+
+        // Bundle admission must not have cancelled the honest vote,
+        // payload, or pinned payload.
+        assert!(
+            !vote_token.load(Ordering::Acquire),
+            "bundle cancelled an honest vote"
+        );
+        assert!(
+            !payload_token.load(Ordering::Acquire),
+            "bundle cancelled an honest payload"
+        );
+        assert!(
+            !pinned_token.load(Ordering::Acquire),
+            "bundle cancelled a pinned payload"
+        );
+
+        // Exactly one period, one pinned payload, and one bundle context.
+        assert_eq!(ctx.rounds[&RND].periods.len(), 3);
+    }
+
+    /// Port of go-algorand's `TestCryptoVerifierBundleContextBound`
+    /// (agreement/cryptoVerifier_test.go, v5.0.2-stable): repeated bundle
+    /// admission for the same round must never grow the per-round context
+    /// map, even across many calls (no per-bundle-claim allocation).
+    #[test]
+    fn pending_requests_context_bundle_context_bound() {
+        let mut ctx = PendingRequestsContext::new();
+        const RND: Round = Round(10);
+
+        for _ in 0..100 {
+            ctx.clear_stale_contexts(RND, Period(0), false, true);
+            ctx.add_bundle(RND);
+            assert_eq!(
+                ctx.rounds[&RND].periods.len(),
+                1,
+                "bundle contexts grew with repeated admission"
+            );
+        }
+    }
+
+    /// Port of go-algorand's `TestCryptoVerifierBundleContextCleanupByRound`
+    /// (agreement/cryptoVerifier_test.go, v5.0.2-stable): bundle admission
+    /// alone must collect old round contexts; cleanup must not depend on a
+    /// vote or payload request arriving first.
+    #[test]
+    fn pending_requests_context_bundle_admission_collects_old_round_contexts() {
+        let mut ctx = PendingRequestsContext::new();
+
+        ctx.clear_stale_contexts(Round(10), Period(0), false, true);
+        let first_token = ctx.add_bundle(Round(10));
+
+        ctx.clear_stale_contexts(Round(11), Period(0), false, true);
+        ctx.add_bundle(Round(11));
+        assert!(
+            !first_token.load(Ordering::Acquire),
+            "previous-round work must remain live at round+1"
+        );
+        assert_eq!(ctx.rounds.len(), 2);
+
+        ctx.clear_stale_contexts(Round(12), Period(0), false, true);
+        ctx.add_bundle(Round(12));
+        assert!(
+            first_token.load(Ordering::Acquire),
+            "bundles must collect old round contexts without votes or payloads"
+        );
+        assert!(
+            !ctx.rounds.contains_key(&Round(10)),
+            "the stale round entry must be removed"
+        );
+        assert_eq!(ctx.rounds.len(), 2);
     }
 
     #[test]
