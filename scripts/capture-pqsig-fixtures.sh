@@ -9,7 +9,7 @@
 # `algokey pq` run, for the byte-exact conformance tests in
 # `crates/core/algo-codec/tests/pqsig_canonical_test.rs` (issue #707).
 #
-# Requires go-algorand pinned to v5.0.1-stable (this repo's pin) at
+# Requires go-algorand pinned to v5.0.2-stable (this repo's pin) at
 # ../go-algorand, plus a C toolchain to build its vendored libsodium fork
 # (`make libsodium` — see CLAUDE.md's CI-workflows note). On a plain
 # Windows dev box without a working cgo toolchain, build inside a Linux
