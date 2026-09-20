@@ -161,8 +161,6 @@ fn verify_bundle_via(
         },
         task_index: 0,
         round: Round(1),
-        period: Period(0),
-        certify: false,
     });
     verifier
         .verified(VOTE_BUNDLE_TAG)

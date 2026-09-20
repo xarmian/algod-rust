@@ -585,11 +585,12 @@ pub struct CryptoBundleRequest {
     /// Caller-specific index, passed back in the response.
     pub task_index: u64,
     /// The round to verify against.
+    ///
+    /// Unlike votes/proposals, a bundle request carries no `Period`/step
+    /// fields (go-algorand v5.0.2-stable removed them): bundle admission
+    /// is round-scoped only, never keyed by the bundle's own
+    /// unauthenticated claimed period or step.
     pub round: Round,
-    /// The period associated with the message.
-    pub period: Period,
-    /// Whether this is a cert bundle.
-    pub certify: bool,
 }
 
 /// Asynchronous cryptographic verifier for agreement messages.

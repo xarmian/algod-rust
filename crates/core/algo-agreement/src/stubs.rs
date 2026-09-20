@@ -1116,8 +1116,6 @@ mod tests {
             },
             task_index: 99,
             round: Round(20),
-            period: Period(1),
-            certify: true,
         };
 
         verifier.verify_bundle(request);

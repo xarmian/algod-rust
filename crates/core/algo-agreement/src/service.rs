@@ -1651,8 +1651,6 @@ fn do_crypto_action<C: CryptoVerifier>(ca: &CryptoAction, crypto: &C) {
                 message: ca.m.clone(),
                 task_index: ca.task_index,
                 round: ca.round,
-                period: ca.period,
-                certify: ca.step == crate::step::CERT,
             });
         }
         _ => {
