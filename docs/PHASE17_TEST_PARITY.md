@@ -35,6 +35,36 @@ tests), [`docs/phase17/rust_tests.tsv`](phase17/rust_tests.tsv) (6,644
 algod-rust tests), [`docs/phase17/batches/`](phase17/batches/) (the
 per-area split of the former).
 
+## Keeping this map current across version upgrades
+
+This map is a live invariant, not a point-in-time audit: at the current
+pin, every `func Test*` in `../go-algorand` has exactly one row pinned to
+that tag, and `not-implemented`, `missing-test` and `partial` are all zero.
+[`scripts/phase17_parity_delta.py`](../scripts/phase17_parity_delta.py)
+keeps it that way across go-algorand version bumps, and the
+`algod-version-upgrade` skill runs it at fixed points:
+
+1. `report --old-tag OLD --new-tag NEW --old-tsv <OLD go_tests.tsv> --go-algorand ../go-algorand --out docs/phase<N>/test_parity_delta.md`
+   (upgrade analysis, before the pin moves) — lists Go tests **added**,
+   **removed**, **moved** and **body-changed** between the two tags, each
+   with the `parity_<area>.md` row it affects. Every added/body-changed
+   test becomes an acceptance criterion of an upgrade sub-issue.
+2. `repin --old-tag OLD --new-tag NEW --go-algorand ../go-algorand`
+   (the pin-sweep PR) — rewrites every row link to `NEW` with `NEW`'s line
+   numbers, regenerates `go_tests.tsv` and `batches/`, and appends an
+   `unclassified` placeholder row per added test so nothing can be skipped
+   silently.
+3. `check --tag NEW --go-algorand ../go-algorand` (every sub-issue PR as
+   a progress gauge; the epic's close-out as a hard gate) — exits non-zero
+   on any stale/unpinned link, any Go test without a row, any row without
+   a Go test, or any `unclassified` / `not-implemented` / `missing-test` /
+   `partial` row.
+
+Between upgrades, any PR that adds a Rust test proving parity with a Go
+test named here updates that row in the same PR and re-runs
+[`scripts/update_phase17_summary.py`](../scripts/update_phase17_summary.py)
+so the tables below never drift from what `main` actually covers.
+
 ## Status legend
 
 | status | meaning |
@@ -46,6 +76,7 @@ per-area split of the former).
 | `missing-test` | the feature **is** implemented in algod-rust, but this specific behavior has no test — a fixable test gap |
 | `not-implemented` | the underlying feature/opcode/mechanism does not exist in algod-rust at all — a real functionality gap, not just a test gap |
 | `out-of-scope` | genuinely not applicable to algod-rust (Go-runtime specifics, CLI tooling with no Rust equivalent concept, structural differences that make the go test meaningless in Rust) |
+| `unclassified` | **transient only** — placeholder inserted by `scripts/phase17_parity_delta.py repin` for a test a go-algorand version bump added, pending classification by the upgrade epic's sub-issues; never a valid final state, and the summary tables below cannot be regenerated while any remain |
 
 ## Aggregate totals (3,181 go-algorand tests)
 
