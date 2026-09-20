@@ -32,7 +32,7 @@ use algo_types::{Address, Round};
 
 use crate::credential::UnauthenticatedCredential;
 use crate::ledger_reader::{membership_from_ledger, LedgerError, LedgerReader};
-use crate::step::{Period, Step, PROPOSE};
+use crate::step::{Period, Step, DOWN, PROPOSE};
 use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote, VoteVerifyParams};
 
 // ── VoteAuthenticator ───────────────────────────────────────────────────────
@@ -123,6 +123,9 @@ pub struct Bundle {
 /// Errors from bundle verification.
 #[derive(Debug, Clone)]
 pub enum BundleError {
+    /// The bundle's step exceeds `down`, the largest step defined by the
+    /// protocol (go-algorand v5.0.2-stable's `wellFormed` bound check).
+    StepExceedsMax { step: Step },
     /// The bundle step is `propose`, which is not allowed.
     ProposeStep,
     /// The bundle is too large (more votes than the step threshold).
@@ -148,6 +151,9 @@ pub enum BundleError {
 impl std::fmt::Display for BundleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::StepExceedsMax { step } => {
+                write!(f, "unauthenticatedBundle.wellFormed: step {step} exceeds max step")
+            }
             Self::ProposeStep => write!(f, "bundle step cannot be propose"),
             Self::TooLarge {
                 num_votes,
@@ -186,18 +192,34 @@ impl From<LedgerError> for BundleError {
 // ── Verification ────────────────────────────────────────────────────────────
 
 impl UnauthenticatedBundle {
+    /// Stateless well-formedness check on a bundle received from the
+    /// network.
+    ///
+    /// Mirrors Go's `unauthenticatedBundle.wellFormed` (v5.0.2-stable):
+    /// rejects any step greater than `down`, the largest step defined by
+    /// the protocol.
+    pub fn well_formed(&self) -> Result<(), BundleError> {
+        if self.step > DOWN {
+            return Err(BundleError::StepExceedsMax { step: self.step });
+        }
+        Ok(())
+    }
+
     /// Verify this bundle: check all votes and confirm quorum.
     ///
     /// Mirrors Go's `unauthenticatedBundle.verify()`.
     ///
     /// Steps:
-    /// 1. Reject propose step
-    /// 2. Check bundle is not too large
-    /// 3. Check for duplicate voters
-    /// 4. For each vote: reconstruct the UnauthenticatedVote, look up
+    /// 1. Well-formedness (step bound check), as defense in depth
+    /// 2. Reject propose step
+    /// 3. Check bundle is not too large
+    /// 4. Check for duplicate voters
+    /// 5. For each vote: reconstruct the UnauthenticatedVote, look up
     ///    membership from the ledger, and verify credential + OTS
-    /// 5. Sum weights and check quorum
+    /// 6. Sum weights and check quorum
     pub fn verify(&self, l: &dyn LedgerReader) -> Result<Bundle, BundleError> {
+        self.well_formed()?;
+
         // Step 1: reject propose step
         if self.step == PROPOSE {
             return Err(BundleError::ProposeStep);
@@ -512,6 +534,61 @@ mod tests {
 
         let result = bundle.verify(&ledger);
         assert!(matches!(result, Err(BundleError::ProposeStep)));
+    }
+
+    /// Port of go-algorand's `TestBundleVerifyRejectsStepAboveDown`
+    /// (agreement/bundle_test.go, v5.0.2-stable).
+    #[test]
+    fn bundle_verify_rejects_step_above_down() {
+        let ledger = MockLedgerReader::new(v41_params());
+        let bundle = UnauthenticatedBundle {
+            round: Round(100),
+            period: Period(0),
+            step: Step(DOWN.0 + 1),
+            ..UnauthenticatedBundle::default()
+        };
+
+        let result = bundle.verify(&ledger);
+        assert!(matches!(
+            result,
+            Err(BundleError::StepExceedsMax { step }) if step == Step(DOWN.0 + 1)
+        ));
+    }
+
+    /// Port of go-algorand's `TestBundleVerifyRejectsStepAboveDown`'s table:
+    /// every step up to and including `down` is well-formed; `down + 1` and
+    /// `u64::MAX` are rejected.
+    #[test]
+    fn bundle_well_formed_step_bound() {
+        for step in [
+            PROPOSE,
+            SOFT,
+            CERT,
+            crate::step::NEXT,
+            Step(crate::step::NEXT.0 + 1),
+            Step(253),
+            Step(254),
+            DOWN,
+        ] {
+            let bundle = UnauthenticatedBundle {
+                step,
+                ..UnauthenticatedBundle::default()
+            };
+            assert!(
+                bundle.well_formed().is_ok(),
+                "step {step} should be well-formed"
+            );
+        }
+        for step in [Step(DOWN.0 + 1), Step(u64::MAX)] {
+            let bundle = UnauthenticatedBundle {
+                step,
+                ..UnauthenticatedBundle::default()
+            };
+            assert!(matches!(
+                bundle.well_formed(),
+                Err(BundleError::StepExceedsMax { step: s }) if s == step
+            ));
+        }
     }
 
     #[test]

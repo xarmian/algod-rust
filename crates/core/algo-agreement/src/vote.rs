@@ -35,7 +35,7 @@ use crate::credential::{Credential, Membership, UnauthenticatedCredential};
 #[cfg(test)]
 use crate::hashable::hash_obj;
 use crate::hashable::Hashable;
-use crate::step::{Period, Step, CERT, PROPOSE, SOFT};
+use crate::step::{Period, Step, CERT, DOWN, PROPOSE, SOFT};
 use crate::types::duration_serde;
 
 // ── ProposalValue ──────────────────────────────────────────────────────────
@@ -406,6 +406,9 @@ pub enum VoteError {
     OtsVerificationFailed,
     /// VRF credential verification failed.
     CredentialVerificationFailed(String),
+    /// The vote's step exceeds `down`, the largest step defined by the
+    /// protocol (go-algorand v5.0.2-stable's `wellFormed` bound check).
+    StepExceedsMax { step: Step },
 }
 
 impl std::fmt::Display for VoteError {
@@ -439,6 +442,12 @@ impl std::fmt::Display for VoteError {
             Self::CredentialVerificationFailed(msg) => {
                 write!(f, "credential verification failed: {msg}")
             }
+            Self::StepExceedsMax { step } => {
+                write!(
+                    f,
+                    "unauthenticatedVote.wellFormed: step {step} exceeds max step"
+                )
+            }
         }
     }
 }
@@ -464,16 +473,32 @@ pub struct VoteVerifyParams {
 }
 
 impl UnauthenticatedVote {
+    /// Stateless well-formedness check on a vote received from the network.
+    ///
+    /// Mirrors Go's `unauthenticatedVote.wellFormed` (v5.0.2-stable): rejects
+    /// any step greater than `down`, the largest step defined by the
+    /// protocol.
+    pub fn well_formed(&self) -> Result<(), VoteError> {
+        if self.raw_vote.step > DOWN {
+            return Err(VoteError::StepExceedsMax {
+                step: self.raw_vote.step,
+            });
+        }
+        Ok(())
+    }
+
     /// Verify this vote against the provided parameters.
     ///
     /// Performs the same checks as Go's `unauthenticatedVote.verify`:
-    /// 1. Validate proposal constraints (bottom not allowed for propose/soft/cert)
-    /// 2. Check round validity window (VoteFirstValid..VoteLastValid)
-    /// 3. Verify the one-time signature on hash_obj(raw_vote)
-    /// 4. Verify the VRF credential
+    /// 1. Well-formedness (step bound check), as defense in depth
+    /// 2. Validate proposal constraints (bottom not allowed for propose/soft/cert)
+    /// 3. Check round validity window (VoteFirstValid..VoteLastValid)
+    /// 4. Verify the one-time signature on hash_obj(raw_vote)
+    /// 5. Verify the VRF credential
     ///
     /// On success, returns a `Vote` with the verified credential.
     pub fn verify(&self, params: &VoteVerifyParams) -> Result<Vote, VoteError> {
+        self.well_formed()?;
         let rv = &self.raw_vote;
 
         // Step-specific proposal validation (matches Go's switch in verify)
@@ -563,7 +588,7 @@ mod tests {
     use super::*;
     use crate::seed::Seed;
     use crate::selector::Selector;
-    use crate::step::{DOWN, NEXT};
+    use crate::step::NEXT;
 
     // ── ProposalValue tests ────────────────────────────────────────────
 
@@ -1402,6 +1427,54 @@ mod tests {
             uv.verify(&params).unwrap_err(),
             VoteError::BottomNotAllowed { step: CERT },
         );
+    }
+
+    /// Port of go-algorand's `TestVoteVerifyRejectsStepAboveDown`
+    /// (agreement/vote_test.go, v5.0.2-stable): `verify` enforces
+    /// `wellFormed` itself, before touching membership/ledger lookups.
+    #[test]
+    fn vote_verify_rejects_step_above_down() {
+        let mut uv = UnauthenticatedVote::default();
+        uv.raw_vote.step = Step(DOWN.0 + 1);
+        let params = make_verify_params(Round(1));
+        assert_eq!(
+            uv.verify(&params).unwrap_err(),
+            VoteError::StepExceedsMax {
+                step: Step(DOWN.0 + 1)
+            },
+        );
+    }
+
+    /// Port of go-algorand's `TestVoteVerifyRejectsStepAboveDown`'s table:
+    /// every step up to and including `down` is well-formed; `down + 1` and
+    /// `u64::MAX` are rejected.
+    #[test]
+    fn vote_well_formed_step_bound() {
+        for step in [
+            PROPOSE,
+            SOFT,
+            CERT,
+            NEXT,
+            Step(NEXT.0 + 1),
+            Step(253),
+            Step(254),
+            DOWN,
+        ] {
+            let mut uv = UnauthenticatedVote::default();
+            uv.raw_vote.step = step;
+            assert!(
+                uv.well_formed().is_ok(),
+                "step {step} should be well-formed"
+            );
+        }
+        for step in [Step(DOWN.0 + 1), Step(u64::MAX)] {
+            let mut uv = UnauthenticatedVote::default();
+            uv.raw_vote.step = step;
+            assert_eq!(
+                uv.well_formed().unwrap_err(),
+                VoteError::StepExceedsMax { step },
+            );
+        }
     }
 
     // ── ProposalValue::sort_less ─────────────────────────────────────────
