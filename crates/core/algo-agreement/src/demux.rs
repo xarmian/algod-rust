@@ -1397,6 +1397,95 @@ mod tests {
         );
     }
 
+    /// Port of go-algorand's `TestProposalCarriesMalformedStateProofPath`
+    /// (agreement/message_test.go, v5.0.2-stable — predates the
+    /// `v5.0.1-stable` → `v5.0.2-stable` sweep; it was already present at
+    /// `v5.0.1-stable`, part of issue #1538/PR #1541's StateProof
+    /// well-formedness work): a proposal whose payset carries a
+    /// `StateProofBasic` transaction with a wrong-sized Merkle path element
+    /// is dropped by the same `check_payset` group-level screen as any
+    /// other malformed-payset proposal — logged, not disconnect-worthy.
+    #[test]
+    fn demux_raw_proposal_with_malformed_state_proof_is_dropped_not_disconnected() {
+        use crate::stubs::StubNetwork;
+        use algo_consensus_crypto::merklearray::HashType;
+        use algo_types::{
+            HashFactory, MerkleProof, SignedTransaction, StateProofBody, Transaction, TxnType,
+        };
+        use serde_bytes::ByteBuf;
+
+        let (mut demux, ..) = make_test_demux();
+
+        let stub = Arc::new(StubNetwork::new());
+        demux.set_network(stub.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
+
+        let sumhash_factory = HashFactory {
+            hash_type: HashType::Sumhash as u16,
+        };
+        // A PartProofs path element sized for the wrong (doubled) digest
+        // size — the same shape as `checks.rs`'s
+        // `state_proof_basic_suite_rejects_wrong_sized_path_element`.
+        let malformed_state_proof = StateProofBody {
+            sig_commit: ByteBuf::from(vec![0u8; HashType::Sumhash.digest_size()]),
+            sig_proofs: Some(MerkleProof {
+                path: None,
+                hash_factory: Some(sumhash_factory.clone()),
+                tree_depth: 0,
+            }),
+            part_proofs: Some(MerkleProof {
+                path: Some(vec![Some(ByteBuf::from(vec![
+                    0u8;
+                    2 * HashType::Sumhash
+                        .digest_size()
+                ]))]),
+                hash_factory: Some(sumhash_factory),
+                tree_depth: 1,
+            }),
+            ..Default::default()
+        };
+        let malformed_txn = SignedTransaction {
+            txn: Transaction {
+                txn_type: TxnType::from("stpf"),
+                sender: Address([1u8; 32]),
+                state_proof: Some(malformed_state_proof),
+                ..Transaction::default()
+            },
+            ..SignedTransaction::default()
+        };
+        let compound = CompoundMessage {
+            vote: UnauthenticatedVote::default(),
+            proposal: crate::proposal::UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(1),
+                    payset: vec![malformed_txn],
+                    ..algo_types::Block::default()
+                },
+                seed_proof: [0u8; crate::VRF_PROOF_SIZE],
+                original_period: crate::step::Period(0),
+                original_proposer: Address([0u8; 32]),
+                ..crate::proposal::UnauthenticatedProposal::default()
+            },
+        };
+        let encoded = codec::encode_compound_message(&compound);
+
+        let result = demux.handle_raw_proposal(
+            Message {
+                data: encoded,
+                handle: None,
+            },
+            &ConsensusVersionView::default(),
+        );
+
+        assert!(
+            result.is_none(),
+            "a proposal carrying a malformed StateProof path must be dropped"
+        );
+        assert!(
+            stub.disconnected.lock().unwrap().is_empty(),
+            "a malformed-state-proof proposal must be dropped, not disconnect the peer"
+        );
+    }
+
     #[test]
     fn demux_raw_proposal_with_group_id_mismatch_is_dropped_not_disconnected() {
         // go-algorand v4.7.4-stable commit b07049dfb ("checks: recompute
