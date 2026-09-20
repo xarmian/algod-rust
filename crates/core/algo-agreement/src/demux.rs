@@ -1506,6 +1506,90 @@ mod tests {
     }
 
     #[test]
+    fn demux_raw_proposal_with_malformed_state_proof_path_is_dropped_not_disconnected() {
+        // TestProposalCarriesMalformedStateProofPath (go:
+        // agreement/message_test.go, v5.0.1-stable): a proposal whose payset
+        // contains a `stpf` transaction with a mismatched hash algorithm
+        // must be dropped at this same early screen (`check_payset` ->
+        // `check_txn_group` -> `check_state_proof_reveals`), before ever
+        // reaching full block validation or the AVM/ledger apply path.
+        use crate::stubs::StubNetwork;
+        use algo_types::{
+            HashFactory, MerkleProof, SignedTransaction, StateProofBody, Transaction, TxnType,
+        };
+
+        let (mut demux, _av_tx, pp_tx, _vb_tx, _vv_tx, _vp_tx, _vb_res_tx, _lr_tx, quit_tx) =
+            make_test_demux();
+
+        let stub = Arc::new(StubNetwork::new());
+        demux.set_network(stub.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
+
+        // A well-formed base (correctly-sized SigCommit) but with SigProofs
+        // declaring Sha256 instead of the protocol-fixed Sumhash -- exactly
+        // the class of malformed proof go-algorand's `v5.0.1-stable` fix
+        // added `verifyStateProofAlgorithms`/`checkBasicStateProofPath` to
+        // reject.
+        let malformed_stpf = Transaction {
+            txn_type: TxnType::from("stpf"),
+            sender: Address([3u8; 32]),
+            state_proof: Some(StateProofBody {
+                sig_commit: serde_bytes::ByteBuf::from(vec![0u8; 64]),
+                sig_proofs: Some(MerkleProof {
+                    path: None,
+                    hash_factory: Some(HashFactory { hash_type: 2 }), // Sha256, not Sumhash
+                    tree_depth: 0,
+                }),
+                part_proofs: Some(MerkleProof {
+                    path: None,
+                    hash_factory: Some(HashFactory { hash_type: 1 }), // Sumhash
+                    tree_depth: 0,
+                }),
+                ..Default::default()
+            }),
+            ..Transaction::default()
+        };
+        let compound = CompoundMessage {
+            vote: UnauthenticatedVote::default(),
+            proposal: crate::proposal::UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(1),
+                    payset: vec![SignedTransaction {
+                        txn: malformed_stpf,
+                        ..SignedTransaction::default()
+                    }],
+                    ..algo_types::Block::default()
+                },
+                seed_proof: [0u8; crate::VRF_PROOF_SIZE],
+                original_period: crate::step::Period(0),
+                original_proposer: Address([0u8; 32]),
+                ..crate::proposal::UnauthenticatedProposal::default()
+            },
+        };
+        let encoded = codec::encode_compound_message(&compound);
+        pp_tx
+            .send(Message {
+                data: encoded,
+                handle: None,
+            })
+            .unwrap();
+        // Quit so `next()` returns after retrying past the dropped message,
+        // rather than blocking forever waiting for a next event.
+        quit_tx.send(()).unwrap();
+
+        let signals = default_signals();
+        let result = demux.next(&signals, None);
+
+        assert!(
+            result.is_none(),
+            "a proposal carrying a state proof with a mismatched hash algorithm must be dropped"
+        );
+        assert!(
+            stub.disconnected.lock().unwrap().is_empty(),
+            "a malformed-state-proof proposal must be dropped, not disconnect the peer"
+        );
+    }
+
+    #[test]
     fn demux_garbage_data_does_not_crash() {
         let (mut demux, av_tx, _pp_tx, _vb_tx, _vv_tx, _vp_tx, _vb_res_tx, _lr_tx, quit_tx) =
             make_test_demux();
