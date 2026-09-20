@@ -39,7 +39,7 @@
 //! dual-node harness:
 //!
 //! - **Byte-level parity against a real go-algorand-produced root**: the
-//!   `go` iteration below drives go-algorand v5.0.0-stable's own `--dev`
+//!   `go` iteration below drives go-algorand v5.0.1-stable's own `--dev`
 //!   node to a real state-proof voters round, then independently
 //!   recomputes the expected root/weight from go's own live-observed
 //!   account and block-header state using algod-rust's *own* production

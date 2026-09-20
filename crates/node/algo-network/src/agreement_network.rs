@@ -74,7 +74,7 @@ pub const DEFAULT_VOTE_QUEUE_LEN: usize = 20_000;
 /// Mirrors Go's `config.Local.AgreementIncomingProposalsQueueLength`
 /// (`version[21]:"25" version[27]:"50"` in `config/localTemplate.go` --
 /// issue #755: this was stuck at the pre-v27 value of 25 even though the
-/// v27+ default (current at this project's v5.0.0-stable pin) is 50).
+/// v27+ default (current at this project's v5.0.1-stable pin) is 50).
 pub const DEFAULT_PROPOSAL_QUEUE_LEN: usize = 50;
 
 /// Default channel capacity for vote bundle messages.
@@ -82,7 +82,7 @@ pub const DEFAULT_PROPOSAL_QUEUE_LEN: usize = 50;
 /// Mirrors Go's `config.Local.AgreementIncomingBundlesQueueLength`
 /// (`version[21]:"7" version[27]:"15"` in `config/localTemplate.go` --
 /// issue #755: this was stuck at the pre-v27 value of 7 even though the
-/// v27+ default (current at this project's v5.0.0-stable pin) is 15).
+/// v27+ default (current at this project's v5.0.1-stable pin) is 15).
 pub const DEFAULT_BUNDLE_QUEUE_LEN: usize = 15;
 
 // ---------------------------------------------------------------------------

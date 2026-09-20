@@ -27,13 +27,13 @@
 //! oracle unit tests in `crates/core/algo-avm/tests/varint_branch.rs`
 //! written directly against go-algorand's `branchTargetVarint`/
 //! `checkBranchVarint`/`findBranchSizes`/`resolveLabels` (`../go-algorand`
-//! @ v5.0.0-stable, `data/transactions/logic/eval.go` / `assembler.go`) as
+//! @ v5.0.1-stable, `data/transactions/logic/eval.go` / `assembler.go`) as
 //! the oracle. This file closes the two live-verification gaps #661 left
 //! open:
 //!
 //!  1. `assembler_byte_diff_matches_v13_varint_branch_programs` — a
 //!     byte-for-byte diff of algod-rust's assembler output against a
-//!     *real* go-algorand v5.0.0-stable node's own `POST /v2/teal/compile`
+//!     *real* go-algorand v5.0.1-stable node's own `POST /v2/teal/compile`
 //!     (which calls the same `logic.AssembleString` `goal clerk compile`
 //!     uses) for representative v13 TEAL programs exercising `bnz`, `bz`,
 //!     `b`, and `callsub` with both a small (1-byte) and a large (2+ byte)
@@ -52,7 +52,7 @@
 //! Test 2 originally failed against this harness's shared genesis
 //! (`docker/localnet-rust/data/genesis.json`), which was pinned to
 //! consensus V41 (`LogicSigVersion` 12) rather than go-algorand
-//! v5.0.0-stable's `ConsensusCurrentVersion` V42 (`LogicSigVersion` 13) --
+//! v5.0.1-stable's `ConsensusCurrentVersion` V42 (`LogicSigVersion` 13) --
 //! confirmed live in this repo's own CI
 //! (<https://github.com/xarmian/algod-rust/actions/runs/33253102996>,
 //! `... check failed on ApprovalProgram: program version 13 greater than
@@ -74,7 +74,7 @@
 //! to AVM opcode correctness, and none of its funded genesis wallets have
 //! a signing path wired up for it. `validate-api`'s dual-node harness
 //! (used by `live_go_parity.rs`, `live_txn_cross_verification.rs`, etc.),
-//! by contrast, already boots a *real* go-algorand v5.0.0-stable node and
+//! by contrast, already boots a *real* go-algorand v5.0.1-stable node and
 //! a real algod-rust node from a shared genesis with a funded dev account
 //! and full signed-transaction submission machinery -- exactly what this
 //! verification needs -- so this file extends that established pattern
@@ -311,7 +311,7 @@ fn diff_json(
 }
 
 // ---------------------------------------------------------------------------
-// 1. Assembler byte-for-byte diff against a real go-algorand v5.0.0-stable
+// 1. Assembler byte-for-byte diff against a real go-algorand v5.0.1-stable
 //    node's own `/v2/teal/compile` (issue #691 acceptance criterion 1+2).
 // ---------------------------------------------------------------------------
 

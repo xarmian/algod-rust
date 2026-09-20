@@ -326,7 +326,7 @@ impl CatchupService {
     ///
     /// Uses [`Self::DEFAULT_PARALLEL_BLOCKS`] for the periodic path's fetch
     /// concurrency, matching go's `CatchupParallelBlocks` default (16 at
-    /// v5.0.0-stable, `config/localTemplate.go:313`). Callers that have a
+    /// v5.0.1-stable, `config/localTemplate.go:313`). Callers that have a
     /// configured value (e.g. from `algo_config::Local::catchup_parallel_blocks`)
     /// should use [`Self::start_with_parallelism`] instead.
     pub fn start(
@@ -337,7 +337,7 @@ impl CatchupService {
         Self::start_with_parallelism(cert_rx, ledger, fetcher, Self::DEFAULT_PARALLEL_BLOCKS)
     }
 
-    /// Go's v5.0.0-stable `CatchupParallelBlocks` default
+    /// Go's v5.0.1-stable `CatchupParallelBlocks` default
     /// (`config/localTemplate.go:313`, `version[5]:"16"`).
     pub const DEFAULT_PARALLEL_BLOCKS: u64 = 16;
 

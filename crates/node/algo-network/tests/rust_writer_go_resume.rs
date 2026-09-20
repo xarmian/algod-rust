@@ -48,7 +48,7 @@
 //! ## Prerequisites
 //!
 //! * Docker + Docker Compose v2
-//! * `algorand/algod:5.0.0-stable` image available locally (the script
+//! * `algorand/algod:5.0.1-stable` image available locally (the script
 //!   pulls it if missing)
 //! * `sqlite3`, `jq`, `curl`, `xxd` on PATH
 //! * Built `algod-rust` binary (the script runs `cargo build --release`
@@ -81,7 +81,7 @@ fn mixed_cluster_enabled() -> bool {
 }
 
 #[test]
-#[ignore = "requires MIXED_CLUSTER=1 + Docker + algorand/algod:5.0.0-stable image"]
+#[ignore = "requires MIXED_CLUSTER=1 + Docker + algorand/algod:5.0.1-stable image"]
 fn rust_writer_go_resume_handoff() {
     if !mixed_cluster_enabled() {
         eprintln!(

@@ -21,7 +21,7 @@
 //! Native post-quantum (Falcon-1024) account authorization wire types and
 //! address derivation.
 //!
-//! Mirrors go-algorand v5.0.0-stable:
+//! Mirrors go-algorand v5.0.1-stable:
 //! - `data/transactions/pqsig.go` (`PQSig`)
 //! - `data/basics/pq_address.go` (`PQAddressSalt`, `pqAddressPreimage`, `PQAddress`, `CanonicalPQAddressSalt`)
 //! - `data/transactions/logic/program.go` (`PQDelegatedProgram`, added by commit `ef838f4e9`)

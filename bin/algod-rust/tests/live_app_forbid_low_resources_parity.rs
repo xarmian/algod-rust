@@ -37,7 +37,7 @@
 //! table -- no live node needed or able to reach a retired protocol
 //! version). What a live node genuinely adds is: does algod-rust's
 //! `AppForbidLowResources` REJECT decision (and its exact error text) match
-//! a real go-algorand v5.0.0-stable node's, for a transaction that
+//! a real go-algorand v5.0.1-stable node's, for a transaction that
 //! *directly names* (as an AVM "available" reference, not merely a
 //! non-existent id) an asset id <= 255 -- the boundary condition that
 //! matters is the numeric value of the *resolved* id, not whether that

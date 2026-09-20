@@ -22,7 +22,7 @@
 //! parser (issue #1088, Phase 17 gap).
 //!
 //! Mirrors go-algorand's `network/addr` package (`ParseHostOrURL`,
-//! `IsMultiaddr`, `ParseHostOrURLOrMultiaddr`) at `v5.0.0-stable`. Its real
+//! `IsMultiaddr`, `ParseHostOrURLOrMultiaddr`) at `v5.0.1-stable`. Its real
 //! callers in go (`cmd/algod/main.go`, `cmd/goal/node.go`) use it to
 //! validate/normalize a single `-p`/`--peer` command-line entry that may be
 //! either a classic relay address (`host:port` or a full `ws://`/`http://`

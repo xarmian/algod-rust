@@ -21,7 +21,7 @@
 //! Outgoing-connection performance monitor (issue #1088, Phase 17 gap).
 //!
 //! Ports the *algorithm* of go-algorand's `network/connPerfMon.go`
-//! `connectionPerformanceMonitor` at `v5.0.0-stable`: watch a fixed set of
+//! `connectionPerformanceMonitor` at `v5.0.1-stable`: watch a fixed set of
 //! monitored peers through a presync/sync/accumulate/stopping/stopped stage
 //! pipeline, measuring how much each peer lags behind whichever peer
 //! delivers each (deduplicated, digest-identified) message first, and how

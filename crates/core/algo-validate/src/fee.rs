@@ -21,7 +21,7 @@
 //! Big-transaction size pricing: `feeFactor`/`FeeContribution`/`feeContribution`
 //! and the `FeeForUsage` residue-tracking fee-rounding primitive.
 //!
-//! Mirrors go-algorand v5.0.0-stable:
+//! Mirrors go-algorand v5.0.1-stable:
 //! - `data/basics/units.go` (`Micros.MulInt`)
 //! - `data/basics/overflow.go` (`MicroAlgos.FeeForUsage`, PR #6650)
 //! - `data/transactions/transaction.go` (`Transaction.feeFactor`, `Header.FeeContribution`)
@@ -354,7 +354,7 @@ pub fn logic_sig_program_fee_contribution(
 /// discount explicit in HeartbeatTransaction"), which folds the heartbeat
 /// discount into `Transaction.feeFactor` itself via the explicit
 /// `HbChallengeDiscount` flag (already modeled by [`txn_fee_factor`]).
-/// At v5.0.0-stable, `FeeFactor` unconditionally adds
+/// At v5.0.1-stable, `FeeFactor` unconditionally adds
 /// `signatureFeeContribution` on top of `feeFactor` — this mirrors that
 /// current (not the issue-description's stale) behavior.
 pub fn signature_fee_contribution(stx: &SignedTransaction, params: &ConsensusParams) -> u64 {

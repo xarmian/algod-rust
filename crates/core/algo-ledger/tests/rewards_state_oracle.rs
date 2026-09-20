@@ -122,7 +122,7 @@ fn corpus_covers_every_tracked_version_v10_through_v42() {
         !corpus.rewards_vectors.is_empty(),
         "oracle fixture has no rewards_vectors -- still the placeholder; \
          run `cd tools/rewards-innertxid-oracle && go run .` against a real \
-         go-algorand v5.0.0-stable checkout and commit the result"
+         go-algorand v5.0.1-stable checkout and commit the result"
     );
 
     const EXPECTED_VERSION_COUNT: usize = 42 - 10 + 1; // V10..V42 inclusive

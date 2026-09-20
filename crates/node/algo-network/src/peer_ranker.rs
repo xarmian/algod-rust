@@ -22,7 +22,7 @@
 //!
 //! Ports go-algorand's `catchup/peerSelector.go` (`rankPooledPeerSelector`)
 //! and `catchup/classBasedPeerSelector.go` (`classBasedPeerSelector`) at
-//! `v5.0.0-stable`. Both peer classes/pools are re-derived here from the Go
+//! `v5.0.1-stable`. Both peer classes/pools are re-derived here from the Go
 //! source's constants and algorithms so that scoring is bit-for-bit
 //! equivalent for the same inputs.
 //!

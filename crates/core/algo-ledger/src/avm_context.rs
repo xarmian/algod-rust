@@ -9738,7 +9738,7 @@ mod tests {
     /// per-write check (the `stateDelta.serialize()`/`valueDelta` all-in-one
     /// oldExists-vs-new comparison in `ledger/eval/appcow.go` is dead code
     /// for any `LogicSigVersion >= 6`, which is every currently-relevant
-    /// consensus version including the v5.0.0-stable pin -- see
+    /// consensus version including the v5.0.1-stable pin -- see
     /// `StatefulEval`'s `if cb.proto.LogicSigVersion < 6` branch). A fix that
     /// suppressed this A->B->A case entirely would therefore be a NEW
     /// divergence from go, not a parity fix.

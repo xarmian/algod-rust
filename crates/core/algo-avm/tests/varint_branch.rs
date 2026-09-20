@@ -29,7 +29,7 @@
 //! instruction (opcode byte + its own encoded varint bytes). `switch`/
 //! `match` (0x8d/0x8e) are unaffected at any version.
 //!
-//! Reference: go-algorand (`../go-algorand` @ v5.0.0-stable)
+//! Reference: go-algorand (`../go-algorand` @ v5.0.1-stable)
 //! `data/transactions/logic/eval.go` `branchTargetVarint`/`checkBranchVarint`,
 //! `data/transactions/logic/opcodes.go` `varintBranchVersion`,
 //! `data/transactions/logic/assembler.go` `findBranchSizes`/`resolveLabels`.

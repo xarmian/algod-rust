@@ -48,7 +48,7 @@
 //! ## Prerequisites
 //!
 //! * Docker + Docker Compose v2
-//! * `algorand/algod:5.0.0-stable` image available locally
+//! * `algorand/algod:5.0.1-stable` image available locally
 //! * `curl` + `python3` on PATH
 //! * The script builds the `algod-rust` image itself via `start.sh`.
 //!
@@ -77,7 +77,7 @@ fn mixed_cluster_enabled() -> bool {
 }
 
 #[test]
-#[ignore = "requires MIXED_CLUSTER=1 + Docker + algorand/algod:5.0.0-stable image"]
+#[ignore = "requires MIXED_CLUSTER=1 + Docker + algorand/algod:5.0.1-stable image"]
 fn rust_node_participates_in_mixed_cluster() {
     if !mixed_cluster_enabled() {
         eprintln!(

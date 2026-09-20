@@ -1102,7 +1102,7 @@ fn resource_ref_wellformed(
 ///
 /// A (line-for-line, in the same order) port of go-algorand's
 /// `ApplicationCallTxnFields.wellFormed` (`data/transactions/application.go`,
-/// current v5.0.0-stable structure). Originally landed (#675/PR #700) for
+/// current v5.0.1-stable structure). Originally landed (#675/PR #700) for
 /// just the schema/extra-program-pages immutability portion (post
 /// `e885e4e8a` "Txn: Check for local schema setting in update" / #6682);
 /// extended (#701) to cover every remaining sub-check: `OnCompletion`

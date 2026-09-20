@@ -40,7 +40,7 @@
 //! oversight, tracked for closing under this repo's own issue-carries-its-
 //! own-gap-forward discipline. That gap is issue #792, which this version
 //! of the module closes: the endpoint now speaks go's actual wire format,
-//! so a real go-algorand `v5.0.0-stable` relay's tx-sync endpoint can serve
+//! so a real go-algorand `v5.0.1-stable` relay's tx-sync endpoint can serve
 //! (and be served by) an algod-rust node.
 //!
 //! The #774 path is retired outright rather than kept behind a flag: the

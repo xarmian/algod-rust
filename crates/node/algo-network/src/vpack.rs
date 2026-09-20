@@ -24,7 +24,7 @@
 //! `network/vpack/msgp.go`, `network/vpack/parse.go` for the stateless
 //! layer; `network/vpack/dynamic_vpack.go`, `network/vpack/lru_table.go`,
 //! `network/vpack/proposal_window.go` for the stateful layer, pinned at
-//! `v5.0.0-stable`).
+//! `v5.0.1-stable`).
 //!
 //! `vpack` is a specialized, schema-aware compressor for the msgpack
 //! encoding of `agreement.UnauthenticatedVote` (this crate's

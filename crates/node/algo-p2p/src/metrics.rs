@@ -25,7 +25,7 @@
 //! `SendRPC`/`RecvRPC` hooks map each published/received gossipsub RPC's
 //! topic back to an Algorand protocol tag (`gossipSubTags`,
 //! `network/p2pNetwork.go` — currently just `protocol.TxnTag` →
-//! `p2p.TXTopicName`, the only tag go-algorand v5.0.0-stable relays over
+//! `p2p.TXTopicName`, the only tag go-algorand v5.0.1-stable relays over
 //! gossipsub) and increments per-tag Prometheus counters
 //! (`algod_network_p2p_{sent,received}_bytes_{TAG}`,
 //! `algod_network_p2p_message_{sent,received}_{TAG}`).

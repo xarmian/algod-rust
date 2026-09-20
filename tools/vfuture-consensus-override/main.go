@@ -63,7 +63,7 @@ import (
 // expectedGoAlgorandPin matches the workspace-wide pin documented in
 // the repo's CLAUDE.md, so two developers regenerating the override
 // against the same go-algorand pin get byte-identical output.
-const expectedGoAlgorandPin = "v5.0.0-stable"
+const expectedGoAlgorandPin = "v5.0.1-stable"
 
 // goAlgorandDir resolves the sibling go-algorand checkout relative to
 // this tool's own source location, so the pin check works regardless
