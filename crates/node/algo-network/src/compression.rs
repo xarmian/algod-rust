@@ -32,7 +32,7 @@ use thiserror::Error;
 pub const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
 /// Maximum decompressed message size. Protects against zip bombs. Matches
-/// go-algorand v5.0.0-stable's `MaxDecompressedMessageSize`
+/// go-algorand v5.0.1-stable's `MaxDecompressedMessageSize`
 /// (`network/msgCompressor.go`), which is `protocol.ProposalPayloadTagMaxSize`
 /// (`protocol/tags.go`: `const ProposalPayloadTagMaxSize = 0x501e3a`) — the
 /// actual maximum size a legitimate compressed gossip message (a proposal
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn max_decompressed_message_size_matches_go() {
-        // go-algorand v5.0.0-stable: MaxDecompressedMessageSize =
+        // go-algorand v5.0.1-stable: MaxDecompressedMessageSize =
         // protocol.ProposalPayloadTagMaxSize (protocol/tags.go: `const
         // ProposalPayloadTagMaxSize = 0x501e3a`), tightened from a flat
         // 20 MiB "some large enough value" to the actual maximum size a

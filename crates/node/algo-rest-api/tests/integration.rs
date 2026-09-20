@@ -5457,7 +5457,7 @@ async fn get_transaction_proof_requires_auth() {
 // default sha512_256 proof (covered by get_transaction_proof_happy_path
 // above) — requests a `?hashtype=sha256` proof and verifies it against
 // `merklearray.VerifyVectorCommitment`. At the algod-rust reference pin
-// (v5.0.0-stable / consensus V42), `EnableSHA256TxnCommitmentHeader` has
+// (v5.0.1-stable / consensus V42), `EnableSHA256TxnCommitmentHeader` has
 // been true since V34, so this is a happy-path 200, not a rejection.
 #[tokio::test]
 async fn get_transaction_proof_sha256_happy_path() {

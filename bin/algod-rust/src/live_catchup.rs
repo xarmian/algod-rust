@@ -23,7 +23,7 @@
 //! Mirrors go-algorand's `AlgorandFullNode.StartCatchup`/`AbortCatchup`/
 //! `SetCatchpointCatchupMode` (`node/node.go`) and
 //! `catchup.CatchpointCatchupService`'s run loop
-//! (`catchup/catchpointService.go` @ `v5.0.0-stable`): a REST client can
+//! (`catchup/catchpointService.go` @ `v5.0.1-stable`): a REST client can
 //! toggle a *running* node into catchpoint-catchup mode and back without
 //! restarting the process or dropping the REST server.
 //!

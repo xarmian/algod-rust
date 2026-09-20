@@ -1850,7 +1850,7 @@ mod tests {
     /// [`crate::pubsub::TX_TOPIC`]. Uses the real TX topic (rather than
     /// [`crate::pubsub::PROPOSAL_PAYLOAD_TOPIC`], as
     /// [`published_message_reaches_subscribed_peer_via_gossipsub`] does)
-    /// since `TX` is the one tag go-algorand v5.0.0-stable itself gossips
+    /// since `TX` is the one tag go-algorand v5.0.1-stable itself gossips
     /// and tracks metrics for.
     #[tokio::test]
     async fn gossipsub_publish_and_receive_update_per_tag_metrics() {

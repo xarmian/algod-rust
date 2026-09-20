@@ -119,7 +119,7 @@ pub const CONFIG_FILENAME: &str = "config.json";
 ///
 /// Bumped from 35 to 38 by issue #768 (`DHTMode` carries `version[38]`
 /// upstream, `localTemplate.go:638`) — go's own `Local.Version` struct tag
-/// already lists every version through 38 at this repo's `v5.0.0-stable`
+/// already lists every version through 38 at this repo's `v5.0.1-stable`
 /// pin, so this only catches algod-rust's own field set up to what a real
 /// field here now needs, not a new upstream version.
 pub const LATEST_VERSION: u32 = 38;
@@ -750,7 +750,7 @@ static ENABLE_DEVELOPER_API: VersionedDefault<bool> = VersionedDefault::new(&[(9
 //     #1088/#1157) in `bin/algod-rust/src/commands/{participate,relay}.rs`.
 //   - `EnableVerbosedTransactionSyncLogging`/`TransactionSyncDataExchangeRate`/
 //     `TransactionSyncSignificantMessageThreshold` remain **not applicable**:
-//     investigated and confirmed dead in go-algorand v5.0.0-stable itself —
+//     investigated and confirmed dead in go-algorand v5.0.1-stable itself —
 //     these fields exist only in `config/localTemplate.go`/`local_defaults.go`
 //     with zero consumers anywhere in non-test Go source (no `txnsync`
 //     package, no adaptive rate-based tx-sync protocol at this pin; that
@@ -886,7 +886,7 @@ static FORCE_FETCH_TRANSACTIONS: VersionedDefault<bool> = VersionedDefault::new(
 
 /// Go: `EnableVerbosedTransactionSyncLogging bool` `version[17]:"false"`
 /// (`localTemplate.go:523-526`). **Documented no-op** (issue #1191):
-/// investigated and confirmed dead in go-algorand v5.0.0-stable itself.
+/// investigated and confirmed dead in go-algorand v5.0.1-stable itself.
 /// This field's only intended consumer was the `data/txnsync` package's
 /// verbose peer-message-exchange logging; no such package exists at this
 /// pin (`grep -rn EnableVerbosedTransactionSyncLogging` across non-test Go
@@ -1054,7 +1054,7 @@ static VERIFIED_TRANSCATIONS_CACHE_SIZE: VersionedDefault<i64> =
 // exporter process, go's own deprecated-and-unused fields, a dev/test-only
 // bypass algod-rust never exposes), or (for three of them) the field has
 // already been *removed* from go-algorand's own `config.Local` as of the
-// current `v5.0.0-stable` pin — dead upstream too, not just here.
+// current `v5.0.1-stable` pin — dead upstream too, not just here.
 
 /// Go: `CatchupBlockValidateMode int` `version[16]:"0"` (`localTemplate.go:488-500`,
 /// "a development and testing configuration used by the catchup service").
@@ -1086,7 +1086,7 @@ static DEADLOCK_DETECTION_THRESHOLD: VersionedDefault<i64> = VersionedDefault::n
 
 /// Go: `EnableBlockServiceFallbackToArchiver bool` (present through at
 /// least go-algorand's v27 config snapshot; **no longer exists in
-/// `config/localTemplate.go` at the current `v5.0.0-stable` pin** —
+/// `config/localTemplate.go` at the current `v5.0.1-stable` pin** —
 /// go-algorand itself removed this field from `config.Local`, so an old
 /// `config.json` with this key round-trips through Go's lenient
 /// unknown-field JSON decoding the same way it does here). **Formally
@@ -1097,7 +1097,7 @@ static ENABLE_BLOCK_SERVICE_FALLBACK_TO_ARCHIVER: VersionedDefault<bool> =
 
 /// Go: `EnableCatchupFromArchiveServers bool` (present through at least
 /// go-algorand's v27 config snapshot; **no longer exists in
-/// `config/localTemplate.go` at the current `v5.0.0-stable` pin**).
+/// `config/localTemplate.go` at the current `v5.0.1-stable` pin**).
 /// **Formally retired as a no-op** — see
 /// [`ENABLE_BLOCK_SERVICE_FALLBACK_TO_ARCHIVER`]'s doc comment; dead
 /// upstream too.
@@ -1106,7 +1106,7 @@ static ENABLE_CATCHUP_FROM_ARCHIVE_SERVERS: VersionedDefault<bool> =
 
 /// Go: `IsIndexerActive bool` (present through at least go-algorand's v27
 /// config snapshot; **no longer exists in `config/localTemplate.go` at the
-/// current `v5.0.0-stable` pin**). **Formally retired as a no-op** — see
+/// current `v5.0.1-stable` pin**). **Formally retired as a no-op** — see
 /// [`ENABLE_BLOCK_SERVICE_FALLBACK_TO_ARCHIVER`]'s doc comment; dead
 /// upstream too. (algod-rust has no built-in indexer to gate in any case —
 /// indexing is an external service in this project's architecture, same
@@ -1458,7 +1458,7 @@ static HEARTBEAT_UPDATE_INTERVAL: VersionedDefault<i64> = VersionedDefault::new(
 /// Go: `ParticipationKeysRefreshInterval time.Duration` `version[16]:"60000000000"`
 /// (`localTemplate.go:510`, 60s in nanoseconds). **Documented no-op**
 /// (issue #1189): unlike every other field in this no-op group, this one
-/// has no consumer anywhere in go-algorand's `v5.0.0-stable` production
+/// has no consumer anywhere in go-algorand's `v5.0.1-stable` production
 /// code at all -- not even a telemetry-gated one. (`grep -rn
 /// ParticipationKeysRefreshInterval` across the pinned go-algorand tree
 /// turns up only its own struct-tag/default-value declarations, test files
@@ -1475,7 +1475,7 @@ static PARTICIPATION_KEYS_REFRESH_INTERVAL: VersionedDefault<i64> =
 /// "controls whether the gossip node would respond to ping messages with a
 /// pong message."). **Documented no-op** (issue #1189): like
 /// `ParticipationKeysRefreshInterval`, this field has no consumer anywhere
-/// in go-algorand's `v5.0.0-stable` production code -- `grep -rn
+/// in go-algorand's `v5.0.1-stable` production code -- `grep -rn
 /// PingHandler` across the pinned tree turns up only the struct-tag/default
 /// declarations and `network/wsNetwork_test.go` setting it directly on a
 /// `WebsocketNetwork.config` struct field in-process (never through
@@ -5808,7 +5808,7 @@ mod tests {
     /// `TransactionSyncDataExchangeRate`/
     /// `TransactionSyncSignificantMessageThreshold` are formally retired as
     /// documented no-ops — investigated and confirmed dead in go-algorand
-    /// v5.0.0-stable itself (no `data/txnsync` package, no adaptive
+    /// v5.0.1-stable itself (no `data/txnsync` package, no adaptive
     /// bandwidth-tracking tx-sync protocol at this pin exists to override).
     /// They must still round-trip through `config.json` like every other
     /// retired field, same pattern as issue #1188's
@@ -6042,7 +6042,7 @@ mod tests {
         // (see [`FORCE_FETCH_TRANSACTIONS`]); `EnableVerbosedTransactionSyncLogging`/
         // `TransactionSyncDataExchangeRate`/`TransactionSyncSignificantMessageThreshold`
         // formally retired as documented no-ops (investigated and confirmed
-        // dead in go-algorand v5.0.0-stable itself — see each field's
+        // dead in go-algorand v5.0.1-stable itself — see each field's
         // `VersionedDefault` doc comment) — all 4 removed from this list.
         // Issue #1187 closed the last 2: `EnableAccountUpdatesStats`/
         // `AccountUpdatesStatsInterval` are now wired into

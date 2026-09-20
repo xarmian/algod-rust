@@ -10,7 +10,7 @@
 #   bash scripts/capture-phase-b-fixtures.sh
 #
 # Requires:
-#   - ../go-algorand checkout pinned to v5.0.0-stable (the version this
+#   - ../go-algorand checkout pinned to v5.0.1-stable (the version this
 #     repo tracks)
 #   - `go` on PATH
 #

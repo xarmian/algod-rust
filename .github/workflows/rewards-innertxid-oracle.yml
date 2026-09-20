@@ -8,7 +8,7 @@ name: Rewards/InnerTxnID oracle drift check
 # byte-level go-algorand oracle fixture
 # (crates/core/algo-ledger/tests/fixtures/rewards_innertxid/oracle.json) is
 # not stale -- i.e. that running `tools/rewards-innertxid-oracle` against a
-# real, freshly-built go-algorand v5.0.0-stable actually reproduces the
+# real, freshly-built go-algorand v5.0.1-stable actually reproduces the
 # committed file byte-for-byte. `cargo test --workspace` (default CI) reads
 # only the committed fixture and never builds go-algorand, so this is the
 # only job that re-derives it from real go-algorand source.
@@ -41,7 +41,7 @@ concurrency:
 
 env:
   # Pin go-algorand to the same rev the rest of the repo references.
-  GO_ALGORAND_REV: "v5.0.0-stable"
+  GO_ALGORAND_REV: "v5.0.1-stable"
 
 jobs:
   oracle-drift-check:

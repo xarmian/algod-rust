@@ -130,7 +130,7 @@ localnet-rust-logs:
 ##
 ## Prerequisites:
 ##   - docker + docker compose
-##   - go-algorand@v5.0.0-stable `algokey` binary on PATH (compat matrix only;
+##   - go-algorand@v5.0.1-stable `algokey` binary on PATH (compat matrix only;
 ##     missing binary causes the matrix tests to skip-with-notice rather than fail)
 ##
 ## `--test-threads=1` serializes the e2e test binaries so they don't race on
@@ -144,7 +144,7 @@ algokey-e2e:
 	  exit $$STATUS
 
 ## ── Dual-node REST conformance harness (issue #129) ──────────
-## Boots a real go-algorand v5.0.0-stable node (in Docker) and a real
+## Boots a real go-algorand v5.0.1-stable node (in Docker) and a real
 ## algod-rust node (run *natively*, not in Docker — see
 ## docker/docker-compose.validate-api.yml's header comment: building it a
 ## second time via `docker compose up --build` on top of the native
@@ -278,7 +278,7 @@ validate-api-logs:
 ## live_varint_branch_parity runs its full ignored set here (issue #720):
 ## this harness's shared genesis (docker/localnet-rust/data/genesis.json)
 ## was bumped from consensus V41 (LogicSigVersion 12) to go-algorand
-## v5.0.0-stable's ConsensusCurrentVersion V42 (LogicSigVersion 13), so
+## v5.0.1-stable's ConsensusCurrentVersion V42 (LogicSigVersion 13), so
 ## `mixed_forward_and_back_branch_execution_trace_matches_live` (a v13
 ## program) is no longer rejected by the protocol version check before
 ## either AVM interpreter is reached, and now runs alongside
@@ -779,7 +779,7 @@ consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker
 	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py
 
 ## ops/mixed-cluster-p2p harness (issues #543, #560, #564, #589) — three
-## real go-algorand v5.0.0-stable nodes in plain P2P mode, chain-bootstrapped
+## real go-algorand v5.0.1-stable nodes in plain P2P mode, chain-bootstrapped
 ## to each other (1 <- 2 <- 3, no node told about a non-adjacent peer),
 ## dialed by algod-rust's `algo-p2p` libp2p transport to prove real
 ## cross-implementation transport interop, PLUS a 4th `rust-node-4` service
@@ -1021,7 +1021,7 @@ help:
 	@echo "algokey-rust E2E:"
 	@echo "  make algokey-e2e      Bring up localnet, run algokey-rust e2e suite (smoke +"
 	@echo "                        keyreg + Go↔Rust compat matrix), tear down. Requires"
-	@echo '                        go-algorand@v5.0.0-stable `algokey` on PATH for the'
+	@echo '                        go-algorand@v5.0.1-stable `algokey` on PATH for the'
 	@echo "                        compat matrix (else skipped). PLAN-183."
 	@echo ""
 	@echo "Dual-Node REST Conformance (issue #129):"

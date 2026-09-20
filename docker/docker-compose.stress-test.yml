@@ -75,7 +75,7 @@ x-rust-health: &rust-health
 services:
   # ── Relays ────────────────────────────────────────────────────────────
   go-relay:
-    image: algorand/algod:5.0.0-stable
+    image: algorand/algod:5.0.1-stable
     container_name: stress-go-relay
     environment:
       <<: *go-env
@@ -145,7 +145,7 @@ services:
   # START_KMD=1 so `bench-stress.sh` can drive `goal clerk send` from
   # go-part-1's wallet to fund the load-generator accounts during warmup.
   go-part-1:
-    image: algorand/algod:5.0.0-stable
+    image: algorand/algod:5.0.1-stable
     container_name: stress-go-part-1
     depends_on:
       go-relay:
@@ -163,7 +163,7 @@ services:
     networks: [stressnet]
 
   go-part-2:
-    image: algorand/algod:5.0.0-stable
+    image: algorand/algod:5.0.1-stable
     container_name: stress-go-part-2
     depends_on:
       go-relay:

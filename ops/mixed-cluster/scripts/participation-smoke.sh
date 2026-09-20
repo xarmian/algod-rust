@@ -17,7 +17,7 @@
 #       message over the whole run.
 #
 # (c) greps for go-algorand's WARN-level agreement rejection lines,
-# emitted from `agreement/trace.go` in v5.0.0-stable:
+# emitted from `agreement/trace.go` in v5.0.1-stable:
 #
 #     "malformed proposal for (round, period): err"
 #     "malformed vote for (round, period, step): err"

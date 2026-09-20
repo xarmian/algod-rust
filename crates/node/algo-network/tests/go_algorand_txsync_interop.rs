@@ -19,7 +19,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Live interop check (issue #792) against a **real go-algorand
-//! `v5.0.0-stable` binary**'s tx-sync HTTP endpoint.
+//! `v5.0.1-stable` binary**'s tx-sync HTTP endpoint.
 //!
 //! `#[ignore]`d by default: it needs a running go-algorand node reachable
 //! over the network, which this crate's default `cargo test` run cannot
@@ -93,7 +93,7 @@ fn base32_decode_no_pad(s: &str) -> Option<Vec<u8>> {
 }
 
 #[tokio::test]
-#[ignore = "requires a real go-algorand v5.0.0-stable node reachable at GO_ALGOD_TXSYNC_ADDR -- see module doc"]
+#[ignore = "requires a real go-algorand v5.0.1-stable node reachable at GO_ALGOD_TXSYNC_ADDR -- see module doc"]
 async fn real_go_algorand_txsync_endpoint_answers_our_bloom_filter_request() {
     let addr = std::env::var("GO_ALGOD_TXSYNC_ADDR").unwrap_or_else(|_| "127.0.0.1:14161".into());
     let genesis_id =
