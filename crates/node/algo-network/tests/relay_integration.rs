@@ -779,11 +779,52 @@ async fn relay_forwards_agreement_tags_across_a_three_node_mesh_with_exact_count
     // three via B's re-broadcast — the actual multi-hop relay-forwarding
     // assertion this test exists to make, matching go's exact-count
     // property.
+    //
+    // Unlike B (a single hop from A, where all three tags are enqueued by
+    // the same sequential recv_task and therefore preserve A's origination
+    // order), C is *two* hops away: B's `broadcast.rs` dual-priority queue
+    // (`is_high_priority_tag()`) routes AgreementVote/ProposalPayload to a
+    // high-priority channel drained ahead of VoteBundle's bulk channel —
+    // deliberately, mirroring go-algorand's own `broadcastThread` in
+    // `network/wsNetwork.go` (see its priority-drain `select` cascade:
+    // high-prio queue drained to exhaustion before bulk is even sampled).
+    // Because each tag's re-enqueue on B depends on B's own per-peer
+    // recv_task await points, VoteBundle can legitimately win the race to
+    // be forwarded to C before the still in-flight AgreementVote/
+    // ProposalPayload pair — go-algorand provides no cross-priority-class
+    // ordering guarantee across a relay hop, only "high-priority drains
+    // ahead of bulk", so asserting a single total order across all three
+    // tags is stronger than production ever promises. What *is* guaranteed
+    // is (a) exactly the three expected messages, unmodified, each exactly
+    // once, and (b) that AgreementVote and ProposalPayload — both
+    // high-priority, both enqueued by the same sequential recv_task, and
+    // both delivered via the same FIFO high-priority channel — keep their
+    // relative order.
     let got_c = collect_n(&mut rx_c, expected.len(), Duration::from_secs(5)).await;
+
+    let mut got_c_sorted = got_c.clone();
+    got_c_sorted.sort_by_key(|(tag, _)| format!("{tag:?}"));
+    let mut expected_sorted = expected.clone();
+    expected_sorted.sort_by_key(|(tag, _)| format!("{tag:?}"));
     assert_eq!(
-        got_c, expected,
+        got_c_sorted, expected_sorted,
         "node C should receive exactly A's three broadcast messages via B's relay-forwarding, \
-         in order, unmodified — despite never connecting to A directly"
+         unmodified, each exactly once — despite never connecting to A directly"
+    );
+
+    let av_pos = got_c
+        .iter()
+        .position(|(tag, _)| *tag == Tag::AgreementVote)
+        .expect("AgreementVote must be present");
+    let pp_pos = got_c
+        .iter()
+        .position(|(tag, _)| *tag == Tag::ProposalPayload)
+        .expect("ProposalPayload must be present");
+    assert!(
+        av_pos < pp_pos,
+        "AgreementVote and ProposalPayload are both high-priority and enqueued by the same \
+         sequential recv_task, so their relative order must be preserved across the relay hop; \
+         got order {got_c:?}"
     );
     assert_no_more(&mut rx_c, Duration::from_millis(500)).await;
 
