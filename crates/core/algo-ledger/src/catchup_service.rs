@@ -221,10 +221,18 @@ pub trait BlockFetcher: Send + Sync {
 ///    signal.
 /// 3. Call [`CatchupService::stop`] to signal shutdown and join the thread.
 pub struct CatchupService {
-    /// Shutdown signal sender — dropping or sending signals the worker to exit.
+    /// Shutdown signal sender for the periodic-sync worker thread —
+    /// dropping or sending signals it to exit.
     shutdown_tx: Option<crossbeam_channel::Sender<()>>,
-    /// Join handle for the background worker thread.
+    /// Join handle for the periodic-sync background worker thread.
     join_handle: Option<JoinHandle<()>>,
+    /// Shutdown signal sender for the certificate-driven worker thread
+    /// (issue #1576) — see [`Self::cert_loop`]'s doc comment for why this
+    /// is a second, independent thread rather than a branch of the same
+    /// select loop `join_handle` drives.
+    cert_shutdown_tx: Option<crossbeam_channel::Sender<()>>,
+    /// Join handle for the certificate-driven background worker thread.
+    cert_join_handle: Option<JoinHandle<()>>,
     /// Counter tracking the number of fork detections observed.
     /// Callers can query this via [`CatchupService::fork_count`] for
     /// monitoring / alerting purposes.
@@ -357,21 +365,39 @@ impl CatchupService {
         let (trigger_tx, trigger_rx) =
             crossbeam_channel::unbounded::<crossbeam_channel::Sender<SyncExitReason>>();
         let fork_count = Arc::new(AtomicU64::new(0));
-        let fork_count_inner = Arc::clone(&fork_count);
+        let fork_count_cert = Arc::clone(&fork_count);
         let syncing_since_ns = Arc::new(AtomicI64::new(0));
         let syncing_since_ns_inner = Arc::clone(&syncing_since_ns);
         let parallel_blocks = parallel_blocks.clamp(1, Self::MAX_BLOCKS_PER_SYNC_PASS);
+
+        // Issue #1576: the certificate-driven fetch path gets its own
+        // thread (and its own shutdown channel), independent of the
+        // periodic-sync select loop below — see `Self::cert_loop`'s doc
+        // comment for why.
+        let (cert_shutdown_tx, cert_shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+        let cert_ledger = Arc::clone(&ledger);
+        let cert_fetcher = Arc::clone(&fetcher);
+        let cert_join_handle = thread::Builder::new()
+            .name("catchup-cert-service".to_string())
+            .spawn(move || {
+                Self::cert_loop(
+                    cert_rx,
+                    cert_shutdown_rx,
+                    cert_ledger,
+                    cert_fetcher,
+                    fork_count_cert,
+                );
+            })
+            .expect("failed to spawn catchup-cert-service thread");
 
         let join_handle = thread::Builder::new()
             .name("catchup-service".to_string())
             .spawn(move || {
                 Self::run_loop(
-                    cert_rx,
                     shutdown_rx,
                     trigger_rx,
                     ledger,
                     fetcher,
-                    fork_count_inner,
                     syncing_since_ns_inner,
                     parallel_blocks,
                 );
@@ -381,6 +407,8 @@ impl CatchupService {
         Self {
             shutdown_tx: Some(shutdown_tx),
             join_handle: Some(join_handle),
+            cert_shutdown_tx: Some(cert_shutdown_tx),
+            cert_join_handle: Some(cert_join_handle),
             fork_count,
             syncing_since_ns,
             trigger_tx: Some(trigger_tx),
@@ -419,33 +447,46 @@ impl CatchupService {
     pub fn stop(&mut self) {
         debug!("catchup service is stopping");
 
-        // Signal shutdown by sending (or dropping the sender).
+        // Signal shutdown to both worker threads by sending (or dropping
+        // the sender) on each of their independent shutdown channels —
+        // issue #1576's split means one `shutdown_tx.send` no longer
+        // reaches both (a bounded(1) channel delivers to exactly one
+        // waiting receiver, not both).
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(tx) = self.cert_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
 
-        // Join the worker thread.
+        // Join both worker threads.
         if let Some(handle) = self.join_handle.take() {
             if let Err(e) = handle.join() {
                 warn!("catchup service thread panicked: {e:?}");
+            }
+        }
+        if let Some(handle) = self.cert_join_handle.take() {
+            if let Err(e) = handle.join() {
+                warn!("catchup cert-service thread panicked: {e:?}");
             }
         }
 
         debug!("catchup service has stopped");
     }
 
-    /// The main loop of the catchup service worker thread.
+    /// The main loop of the periodic-sync catchup service worker thread.
     ///
-    /// Mirrors the `case cert := <-s.unmatchedPendingCertificates` branch of
-    /// Go's `periodicSync`.
-    #[allow(clippy::too_many_arguments)]
+    /// Mirrors Go's `periodicSync` select loop, minus the
+    /// `case cert := <-s.unmatchedPendingCertificates` branch — issue
+    /// #1576 moved that branch to its own thread/loop
+    /// ([`Self::cert_loop`]) so a certificate-driven fetch is never stuck
+    /// behind an in-flight periodic pass. See `cert_loop`'s doc comment
+    /// for the full rationale.
     fn run_loop(
-        cert_rx: Receiver<PendingUnmatchedCertificate>,
         shutdown_rx: Receiver<()>,
         trigger_rx: Receiver<crossbeam_channel::Sender<SyncExitReason>>,
         ledger: Arc<dyn CatchupLedger>,
         fetcher: Arc<dyn BlockFetcher>,
-        fork_count: Arc<AtomicU64>,
         syncing_since_ns: Arc<AtomicI64>,
         parallel_blocks: u64,
     ) {
@@ -488,17 +529,8 @@ impl CatchupService {
         // stay in lockstep via this loop, but never cast another vote).
         let mut stuck_once = false;
 
-        // Once the certificate channel closes we still want the periodic
-        // path to keep the ledger following the network, so the closed
-        // receiver is swapped for one that never fires rather than ending
-        // the service (Go's `periodicSync` likewise only exits on
-        // `ctx.Done()`).
-        let never = crossbeam_channel::never::<PendingUnmatchedCertificate>();
-        let mut cert_rx = cert_rx;
-
         loop {
             let mut sel = Select::new();
-            let cert_idx = sel.recv(&cert_rx);
             let shutdown_idx = sel.recv(&shutdown_rx);
             let trigger_idx = sel.recv(&trigger_rx);
 
@@ -513,8 +545,9 @@ impl CatchupService {
                     // only thing that lets a node which started *behind*
                     // the network tip ever join: agreement will not emit
                     // an unmatched certificate for a round it is not
-                    // playing, so the certificate-driven path below never
-                    // fires in that situation (issue #478).
+                    // playing, so the certificate-driven path (now
+                    // `Self::cert_loop`, on its own thread) never fires in
+                    // that situation (issue #478).
                     let now = ledger.next_round();
                     if now != last_round {
                         // Agreement is making progress on its own. Reset
@@ -547,7 +580,6 @@ impl CatchupService {
                 }
             };
 
-            let mut certs_closed = false;
             match oper.index() {
                 i if i == shutdown_idx => {
                     // Shutdown signal received (or sender dropped).
@@ -557,26 +589,6 @@ impl CatchupService {
                     let _ = oper.recv(&shutdown_rx);
                     debug!("catchup service received shutdown signal");
                     break;
-                }
-                i if i == cert_idx => {
-                    match oper.recv(&cert_rx) {
-                        Ok(pending) => {
-                            Self::sync_cert(&pending, &ledger, &fetcher, &shutdown_rx, &fork_count);
-                            last_round = ledger.next_round();
-                        }
-                        Err(_) => {
-                            // Certificate channel closed — the agreement
-                            // service has shut down (or never had a sender).
-                            // Keep running the periodic path so the node
-                            // still follows the chain; only `stop()` ends
-                            // the service.
-                            info!(
-                                "catchup service: certificate channel closed, \
-                                 continuing with periodic sync only"
-                            );
-                            certs_closed = true;
-                        }
-                    }
                 }
                 i if i == trigger_idx => {
                     // Mirrors go's `case <-s.syncNow: ... s.sync()` branch
@@ -598,12 +610,98 @@ impl CatchupService {
                 _ => unreachable!(),
             }
             drop(sel);
-            if certs_closed {
-                cert_rx = never.clone();
-            }
         }
 
         info!("catchup service exiting");
+    }
+
+    /// The certificate-driven catchup worker thread (issue #1576).
+    ///
+    /// Mirrors the `case cert := <-s.unmatchedPendingCertificates:` branch
+    /// of Go's `periodicSync` — but on its own thread, not as a branch of
+    /// [`Self::run_loop`]'s select loop the way go's (and this crate's
+    /// pre-#1576) single loop handles it.
+    ///
+    /// # Why a separate thread
+    ///
+    /// Go's `periodicSync` handles both the periodic (certificate-less)
+    /// `s.sync()` pass and the certificate-driven `s.syncCert()` fetch in
+    /// the same `for { select { ... } }` loop, on one goroutine — a
+    /// pending certificate is only noticed between iterations of that
+    /// loop, i.e. only once whichever branch is currently running
+    /// (`s.sync()`, which can take a while: it fetches and applies
+    /// everything up to the network tip, one round at a time) returns.
+    /// This crate mirrored that exact structure prior to #1576.
+    ///
+    /// That structure means a certificate agreement already has (and is
+    /// actively waiting on, to keep voting) can sit unprocessed in the
+    /// channel for as long as an in-flight periodic sync pass takes to
+    /// finish. This is routine, not a corner case: a node's own
+    /// `sync_pass` right after a large post-restart catch-up gap is
+    /// exactly the moment agreement is also most likely to need a
+    /// certificate-driven fetch (its own StageDigestAction path,
+    /// `algo_agreement::service::do_stage_digest_action`) for the very
+    /// first round(s) it resumes participating in — so the two compete
+    /// for the same single thread at precisely the worst time. The
+    /// longer a concurrent/preceding periodic pass takes (more blocks to
+    /// fetch, slower/contended network), the longer the certificate stays
+    /// stuck, which delays the `RoundInterruption` that lets agreement's
+    /// player re-zero its next round's clock in phase with the rest of
+    /// the (uninterrupted) committee — compounding a single self-
+    /// correcting missed round (see issue #1576's investigation notes)
+    /// into a longer streak.
+    ///
+    /// Running `sync_cert` on its own thread, selecting only on its own
+    /// certificate + shutdown channels, means a certificate is served
+    /// the moment it arrives, regardless of whether `run_loop`'s
+    /// periodic-sync thread is mid-pass. This changes algod-rust's
+    /// *internal concurrency structure* relative to go-algorand, not the
+    /// certificate-verification or block-application *rules* — the same
+    /// `sync_cert`/`sync_pass_inner` functions, unchanged, run the exact
+    /// same validation either way — so it does not diverge from any
+    /// consensus-visible behavior, only from an implementation detail of
+    /// how quickly a certificate-driven fetch can be serviced.
+    fn cert_loop(
+        cert_rx: Receiver<PendingUnmatchedCertificate>,
+        shutdown_rx: Receiver<()>,
+        ledger: Arc<dyn CatchupLedger>,
+        fetcher: Arc<dyn BlockFetcher>,
+        fork_count: Arc<AtomicU64>,
+    ) {
+        debug!("catchup cert-service started");
+
+        loop {
+            let mut sel = Select::new();
+            let cert_idx = sel.recv(&cert_rx);
+            let shutdown_idx = sel.recv(&shutdown_rx);
+
+            let oper = sel.select();
+            match oper.index() {
+                i if i == shutdown_idx => {
+                    let _ = oper.recv(&shutdown_rx);
+                    debug!("catchup cert-service received shutdown signal");
+                    break;
+                }
+                i if i == cert_idx => match oper.recv(&cert_rx) {
+                    Ok(pending) => {
+                        Self::sync_cert(&pending, &ledger, &fetcher, &shutdown_rx, &fork_count);
+                    }
+                    Err(_) => {
+                        // Certificate channel closed — the agreement
+                        // service has shut down (or never had a sender).
+                        // Nothing more for this thread to do; the
+                        // periodic-sync thread keeps the ledger following
+                        // the chain on its own until `stop()`.
+                        info!("catchup cert-service: certificate channel closed, exiting");
+                        break;
+                    }
+                },
+                _ => unreachable!(),
+            }
+            drop(sel);
+        }
+
+        debug!("catchup cert-service exiting");
     }
 
     /// How long the ledger may stand still before the periodic path tries
@@ -1625,6 +1723,113 @@ mod tests {
             Round(4),
             "the writer's own commits (not periodic sync) must be what \
              advanced the ledger"
+        );
+
+        svc.stop();
+    }
+
+    /// A fetcher that answers one designated "cert round" instantly with a
+    /// valid block, but sleeps for `periodic_delay` before failing every
+    /// other round — standing in for a periodic-sync pass that is slow (a
+    /// large post-restart backlog, a contended/slow network) at exactly
+    /// the moment agreement needs a certificate-driven fetch serviced.
+    /// Used by `cert_driven_fetch_is_not_blocked_behind_a_slow_periodic_pass`
+    /// (issue #1576).
+    struct SlowPeriodicFastCertFetcher {
+        cert_round: Round,
+        cert_block: Block,
+        periodic_delay: Duration,
+    }
+
+    impl BlockFetcher for SlowPeriodicFastCertFetcher {
+        fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+            if round == self.cert_round {
+                return Ok(FetchedBlockCert {
+                    block: self.cert_block.clone(),
+                    cert: None,
+                    raw_payset_blobs: None,
+                });
+            }
+            thread::sleep(self.periodic_delay);
+            Err(FetchError::NoBlockForRound { round })
+        }
+    }
+
+    /// Regression test for issue #1576.
+    ///
+    /// Root cause (confirmed via a live SIGKILL-restart reproduction
+    /// against `ops/mixed-cluster`, correlated timestamp-for-timestamp
+    /// against the Go peers' own `ThresholdReached` telemetry): a
+    /// certificate-driven fetch (`Self::sync_cert`, triggered by
+    /// agreement's `StageDigestAction` when it has a certificate but not
+    /// yet the block) and the periodic, certificate-less catch-up pass
+    /// (`Self::sync_pass`) used to share one thread's single `Select`
+    /// loop — mirroring go-algorand's `periodicSync`, which has the exact
+    /// same structure (`catchup/service.go:611-711`: `s.sync()` and
+    /// `s.syncCert()` are both called synchronously from the same
+    /// goroutine's `for { select { ... } } ` body). A certificate arriving
+    /// on `cert_rx` while a `sync_pass` was already in flight therefore
+    /// sat unprocessed until that pass returned — which, right after a
+    /// large post-restart catch-up gap (exactly when agreement is also
+    /// most likely to need a certificate-driven fetch for the first
+    /// round(s) it resumes participating in), can take a long time. The
+    /// longer that certificate sits stuck, the longer the
+    /// `RoundInterruption` that lets agreement's player re-zero its next
+    /// round's clock in phase with the rest of the (uninterrupted)
+    /// committee is delayed — turning a single, inherently self-
+    /// correcting missed round into a longer streak of consecutive
+    /// missed local votes.
+    ///
+    /// This is a purely internal-concurrency-structure difference from
+    /// go-algorand, not a consensus-visible one: `sync_cert` and
+    /// `sync_pass_inner` still run the exact same validation
+    /// (digest match, `contents_match_header`, `ensure_block`) either
+    /// way — only *how promptly* a certificate-driven fetch can be
+    /// serviced changes, which is safe to improve unilaterally.
+    ///
+    /// Here the fetcher sleeps for `periodic_delay` (2s) before failing
+    /// every round the *periodic* path asks for (it starts at round 1,
+    /// since the ledger starts at round 0), simulating a slow/contended
+    /// network during the unconditional startup `sync_pass`. A
+    /// certificate for a much later round is sent immediately. Before
+    /// the #1576 fix (a single shared thread/loop), servicing that
+    /// certificate would have to wait for the periodic path's slow fetch
+    /// to fail out first — at least `periodic_delay`. After the fix (the
+    /// certificate-driven path on its own thread), it is serviced
+    /// immediately regardless.
+    #[test]
+    fn cert_driven_fetch_is_not_blocked_behind_a_slow_periodic_pass() {
+        let cert_round = Round(999);
+        let block = make_valid_empty_block(cert_round.0);
+        let digest = algo_codec::compute_block_digest(&block);
+
+        let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger = Arc::new(PermissiveCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(SlowPeriodicFastCertFetcher {
+            cert_round,
+            cert_block: block,
+            periodic_delay: Duration::from_secs(2),
+        });
+
+        let mut svc = CatchupService::start(rx, ledger_dyn, fetcher);
+
+        // Send the certificate right away — the startup periodic
+        // `sync_pass` (round 1, mirrors go running one `sync()`
+        // immediately) is still in flight, sleeping out its
+        // `periodic_delay` before it can even report failure.
+        tx.send(make_pending_cert_with_digest(cert_round.0, digest))
+            .unwrap();
+
+        poll_until(
+            || ledger.next_round() == Round(cert_round.0 + 1),
+            Duration::from_millis(20),
+            Duration::from_millis(500),
+            "a certificate-driven fetch must be serviced promptly even while a slow \
+             periodic sync pass is in flight (issue #1576's priority-inversion fix) — \
+             this would take at least `periodic_delay` before the #1576 fix",
         );
 
         svc.stop();
