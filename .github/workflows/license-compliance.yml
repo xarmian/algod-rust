@@ -5,7 +5,7 @@
 name: License Compliance
 
 # Part of the Phase 15 licensing-compliance epic (#732), implementing issue
-# #731 parts D/E. Two independent, fast, non-build-dependent checks that run
+# #731 parts D/E. Independent, fast, non-build-dependent checks that run
 # on every PR (no path filter — a new file anywhere can be missing a header):
 #
 #   header-check        - every in-scope tracked source file has an SPDX
@@ -18,6 +18,15 @@ name: License Compliance
 #                          Confirmed passing clean ("licenses ok") on this
 #                          PR's own CI run after fixing deny.toml's schema
 #                          (see docs/DEPENDENCY_LICENSES.md) — blocking.
+#   ci-wiring            - issue #1579: statically verifies every workflow
+#                          that clones go-algorand for a Tier 2 job also
+#                          threads GO_ALGORAND_DIR through to whichever step
+#                          shells out to tools/cert-authenticate — a
+#                          same-shape regression (a nightly-only workflow's
+#                          Tier 2 step silently missing the env var) is
+#                          otherwise invisible until a live soak run fails.
+#                          scripts/check_ci_go_algorand_dir.py, pure PyYAML,
+#                          no build.
 
 on:
   pull_request:
@@ -58,3 +67,18 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses
+
+  ci-wiring:
+    name: CI Workflow Wiring (GO_ALGORAND_DIR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+
+      - name: Check GO_ALGORAND_DIR wiring in Tier 2 workflow steps
+        run: python3 scripts/check_ci_go_algorand_dir.py
