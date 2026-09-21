@@ -1451,58 +1451,143 @@ fn circular_network_topology_five_node() {
 /// `network_scale_regossip_elimination_reduces_growth` (`fuzzer_smoke.rs`),
 /// which proved the same qualitative claim (gossip traffic grows with node
 /// count) using the simpler `fuzzer` message-plumbing harness rather than
-/// live `Service` instances. This test measures REAL gossip traffic — every
-/// byte counted here was actually produced by a real `Service`'s real vote/
-/// proposal/bundle broadcasts and relays, via `TestingNetwork::
-/// total_bytes_delivered` (see its doc comment) — across the two cluster
-/// sizes this file has already established as reliable (2 nodes and 5
-/// nodes; see the module doc comment and
-/// `five_node_cluster_commits_four_ordinary_rounds`'s doc comment for why
-/// this port doesn't attempt more scale points), rather than go's literal
-/// `TestNetworkBandwidth`/`TestUnstakedNetworkLinearGrowth`/
-/// `TestStakedNetworkQuadricGrowth` 5..40-node sweep.
+/// live `Service` instances.
 ///
-/// This is a genuine upgrade over issue #954's proof in kind (real `Service`
-/// traffic instead of fuzzer-simulated traffic) but not in scope: two data
-/// points can show traffic grows with node count, but cannot distinguish
-/// linear from quadratic growth the way go's `calcQuadricCoefficients`
-/// regression or issue #954's 4/8/16-node ratio sweep can. Documented in
-/// `docs/phase17/parity_agreement.md` as strengthened evidence for those
-/// three rows, without upgrading them to `matched-*`.
+/// Root-caused during this pass (see `docs/phase17/parity_agreement.md`'s
+/// `TestNetworkBandwidth`/`TestUnstakedNetworkLinearGrowth`/
+/// `TestStakedNetworkQuadricGrowth` rows) why the earlier version of this
+/// test was stuck at a 2-vs-5-node comparison: it measured bytes over a
+/// FIXED NUMBER OF COMMITTED ROUNDS via `pump_until_new_round`'s retry loop,
+/// whose attempt count varies noisily (1 to 11+ real-thread timeout fires
+/// per round in the same run, confirmed via ad hoc instrumentation) — each
+/// extra attempt injects a full cluster-wide re-fired-timeout gossip burst,
+/// so the accumulated byte total is dominated by that retry-count noise, not
+/// by steady-state traffic, and gets worse (not better) as node count grows.
+///
+/// The fix is to measure over a FIXED NUMBER OF TIMEOUT FIRES instead of a
+/// fixed number of committed rounds — mirroring go's own methodology in
+/// `TestNetworkBandwidth` (which drives a fixed 150-tick budget via
+/// `ValidatorConfig.NetworkRunTicks`, not a fixed number of committed
+/// rounds) rather than trying to force this harness's variable-attempt
+/// round-commit signal into a fixed-round measurement it was never suited
+/// for. `TestingClock::fire` is already fully explicit (no real wall-clock
+/// timers gate round advancement — see `testing_clock.rs`'s module doc
+/// comment), so "fixed tick count" here means literally counting
+/// `trigger_global_timeout` calls, which this measurement now does directly
+/// instead of laundering it through round-commit success.
+///
+/// This let the sweep grow from 2 points (2, 5 nodes) to 5 points (2, 5, 10,
+/// 16, 24 nodes) while staying reliable: verified via 5 consecutive
+/// standalone runs of this exact test (0 failures, strictly monotonic
+/// bytes-per-fire growth in all 5 runs — see this PR's description for the
+/// raw numbers). 24 nodes is this measurement's practical ceiling: a 32-node
+/// attempt made during this investigation hit
+/// `ActivityMonitor::wait_for_quiet`'s `MAX_TOTAL_TIMEOUT` (bounded per-tag
+/// channels backing up under this harness's real-OS-thread delivery model),
+/// confirming the existing `partial`-row rationale that this harness cannot
+/// reach go's literal 40-node scale.
+///
+/// One rare, non-fatal internal event observed during the 5 verification
+/// runs (once, at n=16): a background `Service` thread panicked with
+/// "attempt to calculate the remainder with a divisor of zero" at
+/// `player.rs`'s late-step next-vote-range delta calculation. This is not a
+/// Rust-vs-go divergence — go's `player.go` (`delta := time.Duration(
+/// e.RandomEntropy % uint64(upper-lower))`) has the byte-for-byte identical
+/// unbounded-doubling-of-`extra`/modulo-by-range formula (`types.go`'s
+/// `nextVoteRanges`), so the same integer-overflow-to-zero edge case exists
+/// in go's own logic once `extra` doubles enough times (i.e. after many
+/// consecutive periods with no quorum) — this test's rapid, real-vote-
+/// starved timeout-firing is simply the first place in this repo's test
+/// suite to reach a period run long enough to hit it. It killed one node's
+/// thread silently rather than failing the test process, and did not
+/// prevent the run's growth assertion from passing; not chased further here
+/// as it is faithful parity with go rather than a gap this issue is about,
+/// but worth a note for anyone extending this test to more fires/rounds.
+///
+/// Still not upgraded to `matched-*` for the three rows above: 5 real data
+/// points showing monotonic growth is stronger evidence than 2, but this is
+/// a single growth curve (no regossip-suppression toggle at the `Service`
+/// level), so it cannot distinguish go's literal linear-vs-quadratic growth
+/// *shape* claim the way issue #954's `fuzzer`-harness 4/8/16-node
+/// ratio-sweep already does. See `network_bandwidth_scale_convergence`
+/// below for the piece of go's `TestNetworkBandwidth` this DOES fully
+/// close (that test's own assertion bar, read from its source, is just
+/// "the network converges without stalling at increasing scale" — it has NO
+/// growth-rate assertion at all, unlike its two siblings).
 #[test]
 fn real_service_traffic_grows_with_node_count() {
-    let mut bytes_per_round = Vec::new();
-    let num_rounds: u64 = 3;
+    let num_fires: u32 = 15;
+    let mut bytes_per_fire = Vec::new();
 
-    for &n in &[2usize, 5usize] {
+    for &n in &[2usize, 5usize, 10usize, 16usize, 24usize] {
+        let cluster = setup_agreement(n);
+        cluster.wait_for_quiet();
+
+        let bytes_before = cluster.network.total_bytes_delivered();
+        for _ in 0..num_fires {
+            trigger_global_timeout(&cluster, TimeoutType::Deadline);
+        }
+        let bytes_after = cluster.network.total_bytes_delivered();
+
+        cluster.shutdown();
+
+        let delta = bytes_after - bytes_before;
+        bytes_per_fire.push(delta as f64 / num_fires as f64);
+    }
+
+    for i in 1..bytes_per_fire.len() {
+        assert!(
+            bytes_per_fire[i] > bytes_per_fire[i - 1],
+            "real gossip traffic per timeout-fire must strictly increase with node count; \
+             got {bytes_per_fire:?}"
+        );
+    }
+}
+
+/// Port of go-algorand's `TestNetworkBandwidth` (`agreement/fuzzer/tests_test.go`).
+///
+/// Read literally, go's test has NO growth-rate/bandwidth-numeric assertion
+/// at all (unlike its two siblings, `TestUnstakedNetworkLinearGrowth`'s
+/// `relayMaxBandwidth[i]/nodesRatio < relayMaxBandwidth[i-1]` check and
+/// `TestStakedNetworkQuadricGrowth`'s `calcQuadricCoefficients` regression
+/// residual check) — it just runs `MakeValidator(...).Go(netConfig)` at each
+/// of `nodeCounts := []int{5, 10, 15, 20, 40}` under a bandwidth-limiting
+/// `TopologyFilter` for a fixed 150-tick budget, and `Validator.Go` fails
+/// the test only if the network stalls (no activity) or does not converge.
+/// So this test's real bar is "the network keeps making real consensus
+/// progress at increasing scale," which this harness's real multi-`Service`
+/// cluster (not the simpler `fuzzer` message-pump harness) can port exactly,
+/// unlike its two siblings' numeric growth-shape assertions.
+///
+/// This port commits 2 real ordinary rounds at each of 5, 8, 10, 12, 16
+/// nodes (this harness's reliable-scale analogue of go's 5/10/15/20/40 —
+/// see `real_service_traffic_grows_with_node_count`'s doc comment for why
+/// 24+ nodes starts to hit this harness's real-OS-thread channel-capacity
+/// ceiling) and asserts every node in every cluster size committed
+/// identical blocks with no stall — verified via 5 consecutive standalone
+/// runs (0 failures) before landing.
+#[test]
+fn network_bandwidth_scale_convergence() {
+    for &n in &[5usize, 8usize, 10usize, 12usize, 16usize] {
         let cluster = setup_agreement(n);
         let start_round = cluster.start_round;
 
         cluster.wait_for_quiet();
         let mut round = current_round(&cluster);
-        assert_eq!(round, start_round);
+        assert_eq!(
+            round, start_round,
+            "n={n} cluster did not bootstrap cleanly"
+        );
 
-        let bytes_before = cluster.network.total_bytes_delivered();
+        let num_rounds: u64 = 2;
         for _ in 0..num_rounds {
-            round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 20);
+            round = pump_until_new_round(&cluster, round, TimeoutType::Deadline, 30);
         }
         let _ = round;
-        let bytes_after = cluster.network.total_bytes_delivered();
 
         cluster.shutdown();
         sanity_check(&cluster, start_round, num_rounds);
-
-        let delta = bytes_after - bytes_before;
-        bytes_per_round.push(delta as f64 / num_rounds as f64);
     }
-
-    assert!(
-        bytes_per_round[1] > bytes_per_round[0],
-        "real 5-node cluster gossip traffic per round ({:.1} bytes) must exceed \
-         real 2-node cluster gossip traffic per round ({:.1} bytes)",
-        bytes_per_round[1],
-        bytes_per_round[0]
-    );
 }
 
 /// Full 5-node port of go-algorand's
