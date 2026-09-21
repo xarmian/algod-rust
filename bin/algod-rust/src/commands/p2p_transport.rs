@@ -659,9 +659,37 @@ fn spawn_ws_peer(
     });
 }
 
-/// Complete the inbound (listener) side of the `/algorand-ws/2.2.0`
-/// handshake (go: the `incoming` branch of `wsStreamHandlerV22`) and, on
-/// success, start this peer's read/write loop.
+/// Complete the accepted-substream side of the `/algorand-ws/2.2.0`
+/// handshake and, on success, start this peer's read/write loop.
+///
+/// Issue #1570 (go-interop handshake deadlock, found via this issue's live
+/// Tier-2 soak against a real go-algorand node): which handshake function
+/// this calls — [`handshake_inbound`] (read first) or [`handshake_outbound`]
+/// (write first) — is picked from `we_dialed_connection`, **not** simply
+/// "inbound" because the caller accepted this substream. Go's own
+/// `wsStreamHandlerV22`/`wsStreamHandlerV1` decide read-first-vs-write-first
+/// purely from `stream.Conn().Stat().Direction` (did *this* side physically
+/// dial the raw connection), completely independent of
+/// [`should_initiate_stream`]'s peer-ID-ordering decision about which side
+/// opens the `/algorand-ws` *substream* (`network/p2p/streams.go`'s
+/// `Connected`'s `localPeer > remotePeer` gate vs `streamHandler`'s/
+/// `handleConnected`'s `incoming := ... DirInbound` — two genuinely
+/// independent checks in go, using different inputs). Those two decisions
+/// coincide whenever the substream opener is also the physical dialer — the
+/// common case, and the only one this file's own rust-vs-rust tests
+/// exercise (`p2p_stream_open_side_follows_peer_id_order_not_dial_direction`
+/// proves peer-ID ordering alone is *sufficient* for two rust nodes to
+/// agree with each other, since both sides use the same rule) — but they
+/// diverge whenever a peer's `PeerId` happens to be numerically lower than
+/// ours despite *not* having dialed us: that peer opens the substream (per
+/// peer-ID order) while go computes its handshake role from *its own*
+/// physical dial direction, which is unrelated. Before this fix, this
+/// function always called `handshake_inbound` for an accepted substream
+/// (matching only the "coincide" case) — against a real go-algorand peer in
+/// the divergent case, both sides ended up trying to read first: a
+/// permanent handshake deadlock (the connection stays "established"
+/// forever with no stream ever installing), live-reproduced in this
+/// issue's Tier-2 soak.
 #[allow(clippy::too_many_arguments)]
 async fn handle_inbound_ws_stream(
     peer_id: PeerId,
@@ -672,17 +700,26 @@ async fn handle_inbound_ws_stream(
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
     cmd_tx: mpsc::UnboundedSender<P2pCommand>,
+    we_dialed_connection: bool,
 ) {
     // Issue #1570: bounded by `HANDSHAKE_TIMEOUT` (see its doc comment) —
-    // an inbound handshake that never completes previously left this
-    // connection "established but silent forever", invisible to both the
-    // redial sweep and `connected_peer_count()`.
-    match tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        handshake_inbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
-    )
-    .await
-    {
+    // a handshake that never completes previously left this connection
+    // "established but silent forever", invisible to both the redial sweep
+    // and `connected_peer_count()`.
+    let handshake_result = if we_dialed_connection {
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake_outbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
+        )
+        .await
+    } else {
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake_inbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
+        )
+        .await
+    };
+    match handshake_result {
         Ok(Ok(meta)) => {
             let negotiated =
                 decode_peer_features(&meta.version, &meta.features).intersection(our_features);
@@ -741,9 +778,12 @@ async fn handle_inbound_ws_stream(
     }
 }
 
-/// Complete the outbound (dialer) side of the `/algorand-ws/2.2.0`
-/// handshake (go: the `!incoming` branch of `wsStreamHandlerV22`) and, on
-/// success, start this peer's read/write loop.
+/// Complete the self-opened-substream side of the `/algorand-ws/2.2.0`
+/// handshake and, on success, start this peer's read/write loop. See
+/// [`handle_inbound_ws_stream`]'s doc comment (issue #1570) for why
+/// `we_dialed_connection` — not "this side opened the substream" — is what
+/// picks [`handshake_outbound`] (write first) vs [`handshake_inbound`]
+/// (read first).
 #[allow(clippy::too_many_arguments)]
 async fn handle_outbound_ws_stream(
     peer_id: PeerId,
@@ -754,15 +794,24 @@ async fn handle_outbound_ws_stream(
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
     cmd_tx: mpsc::UnboundedSender<P2pCommand>,
+    we_dialed_connection: bool,
 ) {
     // Issue #1570: see `handle_inbound_ws_stream`'s matching comment and
     // `HANDSHAKE_TIMEOUT`'s doc comment.
-    match tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        handshake_outbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
-    )
-    .await
-    {
+    let handshake_result = if we_dialed_connection {
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake_outbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
+        )
+        .await
+    } else {
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake_inbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
+        )
+        .await
+    };
+    match handshake_result {
         Ok(Ok(meta)) => {
             let negotiated =
                 decode_peer_features(&meta.version, &meta.features).intersection(our_features);
@@ -819,10 +868,16 @@ async fn handle_inbound_ws_v1_stream(
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
     cmd_tx: mpsc::UnboundedSender<P2pCommand>,
+    we_dialed_connection: bool,
 ) {
     // Issue #1570: see `handle_inbound_ws_stream`'s matching comment and
     // `HANDSHAKE_TIMEOUT`'s doc comment.
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_inbound(&mut stream)).await {
+    let handshake_result = if we_dialed_connection {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_outbound(&mut stream)).await
+    } else {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_inbound(&mut stream)).await
+    };
+    match handshake_result {
         Ok(Ok(())) => spawn_ws_peer(
             peer_id,
             stream,
@@ -872,10 +927,16 @@ async fn handle_outbound_ws_v1_stream(
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
     cmd_tx: mpsc::UnboundedSender<P2pCommand>,
+    we_dialed_connection: bool,
 ) {
     // Issue #1570: see `handle_inbound_ws_stream`'s matching comment and
     // `HANDSHAKE_TIMEOUT`'s doc comment.
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_outbound(&mut stream)).await {
+    let handshake_result = if we_dialed_connection {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_outbound(&mut stream)).await
+    } else {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_inbound(&mut stream)).await
+    };
+    match handshake_result {
         Ok(Ok(())) => spawn_ws_peer(
             peer_id,
             stream,
@@ -940,6 +1001,7 @@ async fn dial_ws_stream(
     sp: StreamPeers,
     gen_counter: Arc<AtomicU64>,
     cmd_tx: mpsc::UnboundedSender<P2pCommand>,
+    we_dialed_connection: bool,
 ) {
     if !disable_v22_protocol {
         match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V22).await {
@@ -953,6 +1015,7 @@ async fn dial_ws_stream(
                     sp,
                     gen_counter,
                     cmd_tx,
+                    we_dialed_connection,
                 )
                 .await;
                 return;
@@ -979,7 +1042,16 @@ async fn dial_ws_stream(
 
     match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V1).await {
         Ok(stream) => {
-            handle_outbound_ws_v1_stream(peer_id, stream, mux, sp, gen_counter, cmd_tx).await;
+            handle_outbound_ws_v1_stream(
+                peer_id,
+                stream,
+                mux,
+                sp,
+                gen_counter,
+                cmd_tx,
+                we_dialed_connection,
+            )
+            .await;
         }
         Err(e) => {
             sp.lock()
@@ -1913,6 +1985,25 @@ impl P2pTransport {
         // above (to reject a stream even if the peer opens one anyway).
         let blocked_inbound_gossip_peers: Arc<Mutex<std::collections::HashSet<PeerId>>> =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
+        // Issue #1570 (go-interop handshake deadlock): per-connected-peer
+        // record of whether *we* physically dialed the raw libp2p
+        // connection (`endpoint.is_dialer()`), consulted by the inbound
+        // accept loops below to pick the correct `/algorand-ws` handshake
+        // read/write order. See `handle_inbound_ws_stream`'s doc comment
+        // for the full story — go's own `wsStreamHandlerV22`/`V1` decide
+        // read-first-vs-write-first purely from
+        // `stream.Conn().Stat().Direction` (raw connection direction),
+        // *not* from which side opened the `/algorand-ws` substream (that
+        // part — `should_initiate_stream`'s peer-ID ordering, mirroring
+        // go's own `Connected`'s `localPeer > remotePeer` gate — stays
+        // unchanged). The two decisions are independent in go and must be
+        // independent here too, or a peer whose `PeerId` happens to be
+        // numerically lower than ours despite *not* having dialed us ends
+        // up opening the substream while both sides simultaneously wait to
+        // read first — a permanent handshake deadlock, live-reproduced
+        // against a real go-algorand node in this issue's Tier-2 soak.
+        let connection_is_dialer: Arc<Mutex<std::collections::HashMap<PeerId, bool>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
         let http_router: Arc<Mutex<Router>> = Arc::new(Mutex::new(Router::new()));
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<P2pCommand>();
         let local_peer_id = host.peer_id();
@@ -1957,6 +2048,7 @@ impl P2pTransport {
             let headers = our_ws_headers.clone();
             let blocked = Arc::clone(&blocked_inbound_gossip_peers);
             let cmd_tx = cmd_tx.clone();
+            let connection_is_dialer = Arc::clone(&connection_is_dialer);
             tokio::spawn(async move {
                 while let Some((peer_id, stream)) = incoming_ws_streams.next().await {
                     // `EnableGossipService` (issue #1442): mirrors go's
@@ -1984,6 +2076,22 @@ impl P2pTransport {
                     sp.lock()
                         .expect("stream_peers mutex poisoned")
                         .begin_peer_attempt(peer_id);
+                    // Issue #1570: see `handle_inbound_ws_stream`'s doc
+                    // comment — the accepted-substream loop alone doesn't
+                    // know whether *we* physically dialed this peer's
+                    // connection, so look it up from what the
+                    // `ConnectionEstablished` arm recorded. `unwrap_or(false)`
+                    // (defensive only: `ConnectionEstablished` always
+                    // records an entry before any stream from that peer
+                    // can arrive) matches go's own default — a peer with no
+                    // recorded direction is treated as not-dialed-by-us,
+                    // i.e. we read first.
+                    let we_dialed_connection = connection_is_dialer
+                        .lock()
+                        .expect("connection_is_dialer mutex poisoned")
+                        .get(&peer_id)
+                        .copied()
+                        .unwrap_or(false);
                     tokio::spawn(handle_inbound_ws_stream(
                         peer_id,
                         stream,
@@ -1993,6 +2101,7 @@ impl P2pTransport {
                         Arc::clone(&sp),
                         Arc::clone(&gen_counter),
                         cmd_tx.clone(),
+                        we_dialed_connection,
                     ));
                 }
             });
@@ -2008,6 +2117,7 @@ impl P2pTransport {
             let gen_counter = Arc::clone(&stream_generation);
             let blocked = Arc::clone(&blocked_inbound_gossip_peers);
             let cmd_tx = cmd_tx.clone();
+            let connection_is_dialer = Arc::clone(&connection_is_dialer);
             tokio::spawn(async move {
                 while let Some((peer_id, stream)) = incoming_ws_v1_streams.next().await {
                     if blocked
@@ -2025,6 +2135,14 @@ impl P2pTransport {
                     sp.lock()
                         .expect("stream_peers mutex poisoned")
                         .begin_peer_attempt(peer_id);
+                    // Issue #1570: see the matching V22 accept-loop comment
+                    // above.
+                    let we_dialed_connection = connection_is_dialer
+                        .lock()
+                        .expect("connection_is_dialer mutex poisoned")
+                        .get(&peer_id)
+                        .copied()
+                        .unwrap_or(false);
                     tokio::spawn(handle_inbound_ws_v1_stream(
                         peer_id,
                         stream,
@@ -2032,6 +2150,7 @@ impl P2pTransport {
                         Arc::clone(&sp),
                         Arc::clone(&gen_counter),
                         cmd_tx.clone(),
+                        we_dialed_connection,
                     ));
                 }
             });
@@ -2066,6 +2185,7 @@ impl P2pTransport {
         let identity_tracker_for_task = Arc::clone(&identity_tracker);
         let identity_dedup_hook_for_task = Arc::clone(&identity_dedup_hook);
         let blocked_inbound_gossip_peers_for_task = Arc::clone(&blocked_inbound_gossip_peers);
+        let connection_is_dialer_for_task = Arc::clone(&connection_is_dialer);
         // Issue #1570: bootstrap-peer redial state/counter, captured for
         // the task the same way as the other `_for_task` clones above.
         let bootstrap_redial_attempts_for_task = Arc::clone(&bootstrap_redial_attempts);
@@ -2335,6 +2455,13 @@ impl P2pTransport {
                                 }
 
                                 cp.lock().expect("connected_peers mutex poisoned").push(peer_id);
+                                // Issue #1570: record purely for the
+                                // `/algorand-ws` handshake role decision —
+                                // see `connection_is_dialer`'s doc comment.
+                                connection_is_dialer_for_task
+                                    .lock()
+                                    .expect("connection_is_dialer mutex poisoned")
+                                    .insert(peer_id, endpoint.is_dialer());
 
                                 // `EnableGossipService` (issue #1442): mirrors
                                 // go's `streamManager.Connected`'s own
@@ -2402,6 +2529,16 @@ impl P2pTransport {
                                         let gen_counter = Arc::clone(&gen_counter_for_task);
                                         let headers = our_ws_headers.clone();
                                         let cmd_tx = cmd_tx_for_task.clone();
+                                        // Issue #1570: whether *we* dialed
+                                        // this raw connection — decides the
+                                        // `/algorand-ws` handshake
+                                        // read/write order, independent of
+                                        // `should_initiate_stream`'s
+                                        // peer-ID-based decision to open
+                                        // this substream at all (see
+                                        // `connection_is_dialer`'s doc
+                                        // comment).
+                                        let we_dialed_connection = endpoint.is_dialer();
                                         tokio::spawn(dial_ws_stream(
                                             peer_id,
                                             control,
@@ -2412,6 +2549,7 @@ impl P2pTransport {
                                             sp,
                                             gen_counter,
                                             cmd_tx,
+                                            we_dialed_connection,
                                         ));
                                     }
                                 }
@@ -2452,6 +2590,10 @@ impl P2pTransport {
                                 blocked_inbound_gossip_peers_for_task
                                     .lock()
                                     .expect("blocked_inbound_gossip_peers mutex poisoned")
+                                    .remove(&peer_id);
+                                connection_is_dialer_for_task
+                                    .lock()
+                                    .expect("connection_is_dialer mutex poisoned")
                                     .remove(&peer_id);
                                 // Issue #1570: this was previously a dead
                                 // end for a bootstrap peer — nothing ever
