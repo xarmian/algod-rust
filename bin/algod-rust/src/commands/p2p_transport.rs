@@ -59,7 +59,7 @@
 //! ever consume one delivery per `recv`/`recv_timeout` call).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -139,6 +139,60 @@ const DEFAULT_VOTE_COMPRESSION_TABLE_SIZE: u32 = 2048;
 /// `P2PNetwork`'s `meshThreadInner`/`refreshPeerStoreAddresses` calls that
 /// dial newly DHT-discovered peers advertising the `Gossip` capability.
 const DHT_MESH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Interval between periodic bootstrap-peer redial sweeps (issue #1570).
+/// Unlike [`DHT_MESH_REFRESH_INTERVAL`] above, this ticks unconditionally —
+/// regardless of `enable_dht_providers` — because staying connected to a
+/// node's own *configured* bootstrap/relay peers is a more fundamental
+/// concern than DHT-based discovery of new ones (mirrors go's
+/// `meshThreadInner`/`DialPeersUntilTargetCount`, which likewise keeps
+/// retrying the node's phonebook/configured relay addresses on every
+/// mesh-thread tick independent of DHT state). Kept short relative to go's
+/// `meshThreadInterval` (`time.Minute`) so a lost connection is noticed and
+/// redialed quickly; each individual peer is still rate-limited by its own
+/// [`RedialBackoff`] entry, so a short sweep interval does not by itself
+/// cause repeated dials — it only shortens how soon *after* a peer becomes
+/// eligible again (backoff elapsed) the redial actually fires.
+const BOOTSTRAP_REDIAL_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Base (first-retry) backoff for [`RedialBackoff`] — how long to wait
+/// after a redial attempt before trying that same bootstrap peer again, if
+/// it hasn't connected by the next sweep.
+const BOOTSTRAP_REDIAL_BASE_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Cap on [`RedialBackoff::current_backoff`]'s exponential growth — without
+/// this, a bootstrap peer that is genuinely down forever would make this
+/// node's backoff grow unboundedly; capping it instead settles into a
+/// steady, bounded retry cadence (issue #1570's explicit "avoid a tight
+/// reconnect loop hammering a genuinely-down peer" requirement, satisfied
+/// at the other end: retries never stop, but they never get closer together
+/// than the base and never further apart than this cap either).
+const BOOTSTRAP_REDIAL_MAX_BACKOFF: Duration = Duration::from_secs(120);
+
+/// Bound on the `/algorand-ws` application-level handshake
+/// (`handshake_inbound`/`handshake_outbound`/`handshake_v1_inbound`/
+/// `handshake_v1_outbound`, `algo_p2p::wsproto`), which otherwise reads off
+/// the raw stream with no timeout at all. Issue #1570's live P2P soak
+/// investigation found this: after a hard (`SIGKILL`) restart, go-node-1's
+/// own log confirmed it opened a `/algorand-ws/2.2.0` stream to the
+/// newly-reconnected rust-node-4 (multistream-select succeeded), but
+/// rust-node-4 never logged another single P2P event afterward — no
+/// handshake failure, no stream install, no redial (this transport's own
+/// `SwarmEvent::ConnectionClosed` never fired either, so the raw libp2p
+/// connection itself apparently stayed "established" from the Swarm's
+/// point of view). A handshake stuck forever mid-read (the peer is slow,
+/// or — go-node-1 was already 20+ rounds ahead and mid-soak-traffic at the
+/// time — busy) previously left that connection in exactly this
+/// unrecoverable "connected but silent forever" state: no stream ever
+/// installs (so it can't be torn down by the normal stream-generation
+/// cleanup either), and nothing ever calls `disconnect_peer`/
+/// `close_connection` on it, so `redial_disconnected_bootstrap_peers`
+/// never sees it as needing a retry. Bounding the handshake and
+/// disconnecting the peer on timeout (see the `Err`/timeout arms of
+/// `handle_inbound_ws_stream`/`handle_outbound_ws_stream`/
+/// `handle_inbound_ws_v1_stream`/`handle_outbound_ws_v1_stream`) turns this
+/// into an ordinary, redial-eligible disconnect instead.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One outbound `(tag, payload)` pair queued for a stream peer's writer
 /// task, plus the `Instant` it was enqueued at (issue #1220) — the P2P
@@ -605,9 +659,38 @@ fn spawn_ws_peer(
     });
 }
 
-/// Complete the inbound (listener) side of the `/algorand-ws/2.2.0`
-/// handshake (go: the `incoming` branch of `wsStreamHandlerV22`) and, on
-/// success, start this peer's read/write loop.
+/// Complete the accepted-substream side of the `/algorand-ws/2.2.0`
+/// handshake and, on success, start this peer's read/write loop.
+///
+/// Issue #1570 (go-interop handshake deadlock, found via this issue's live
+/// Tier-2 soak against a real go-algorand node): which handshake function
+/// this calls — [`handshake_inbound`] (read first) or [`handshake_outbound`]
+/// (write first) — is picked from `we_dialed_connection`, **not** simply
+/// "inbound" because the caller accepted this substream. Go's own
+/// `wsStreamHandlerV22`/`wsStreamHandlerV1` decide read-first-vs-write-first
+/// purely from `stream.Conn().Stat().Direction` (did *this* side physically
+/// dial the raw connection), completely independent of
+/// [`should_initiate_stream`]'s peer-ID-ordering decision about which side
+/// opens the `/algorand-ws` *substream* (`network/p2p/streams.go`'s
+/// `Connected`'s `localPeer > remotePeer` gate vs `streamHandler`'s/
+/// `handleConnected`'s `incoming := ... DirInbound` — two genuinely
+/// independent checks in go, using different inputs). Those two decisions
+/// coincide whenever the substream opener is also the physical dialer — the
+/// common case, and the only one this file's own rust-vs-rust tests
+/// exercise (`p2p_stream_open_side_follows_peer_id_order_not_dial_direction`
+/// proves peer-ID ordering alone is *sufficient* for two rust nodes to
+/// agree with each other, since both sides use the same rule) — but they
+/// diverge whenever a peer's `PeerId` happens to be numerically lower than
+/// ours despite *not* having dialed us: that peer opens the substream (per
+/// peer-ID order) while go computes its handshake role from *its own*
+/// physical dial direction, which is unrelated. Before this fix, this
+/// function always called `handshake_inbound` for an accepted substream
+/// (matching only the "coincide" case) — against a real go-algorand peer in
+/// the divergent case, both sides ended up trying to read first: a
+/// permanent handshake deadlock (the connection stays "established"
+/// forever with no stream ever installing), live-reproduced in this
+/// issue's Tier-2 soak.
+#[allow(clippy::too_many_arguments)]
 async fn handle_inbound_ws_stream(
     peer_id: PeerId,
     mut stream: P2pRawStream,
@@ -616,9 +699,28 @@ async fn handle_inbound_ws_stream(
     mux: Arc<Multiplexer>,
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
+    cmd_tx: mpsc::UnboundedSender<P2pCommand>,
+    we_dialed_connection: bool,
 ) {
-    match handshake_inbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS).await {
-        Ok(meta) => {
+    // Issue #1570: bounded by `HANDSHAKE_TIMEOUT` (see its doc comment) —
+    // a handshake that never completes previously left this connection
+    // "established but silent forever", invisible to both the redial sweep
+    // and `connected_peer_count()`.
+    let handshake_result = if we_dialed_connection {
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake_outbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
+        )
+        .await
+    } else {
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake_inbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
+        )
+        .await
+    };
+    match handshake_result {
+        Ok(Ok(meta)) => {
             let negotiated =
                 decode_peer_features(&meta.version, &meta.features).intersection(our_features);
             spawn_ws_peer(
@@ -631,7 +733,7 @@ async fn handle_inbound_ws_stream(
                 false,
             )
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             // A failed dispatch still ends the in-flight attempt
             // `begin_peer_attempt` (called by this handler's caller, the
             // accept-loop) started — go's `streamHandler` does the same via
@@ -657,12 +759,32 @@ async fn handle_inbound_ws_stream(
                 DispatchError::with_level(format!("inbound handshake failed: {e}"), LogLevel::Warn);
             log_dispatch_error(&peer_id, &dispatch_err);
         }
+        Err(_elapsed) => {
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            let dispatch_err = DispatchError::with_level(
+                format!("inbound handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
+                LogLevel::Warn,
+            );
+            log_dispatch_error(&peer_id, &dispatch_err);
+            // Issue #1570: the raw libp2p connection otherwise stays
+            // "established" forever with no stream ever installing on it —
+            // tear it down so `SwarmEvent::ConnectionClosed` fires and this
+            // peer becomes redial-eligible again.
+            let _ = cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
+        }
     }
 }
 
-/// Complete the outbound (dialer) side of the `/algorand-ws/2.2.0`
-/// handshake (go: the `!incoming` branch of `wsStreamHandlerV22`) and, on
-/// success, start this peer's read/write loop.
+/// Complete the self-opened-substream side of the `/algorand-ws/2.2.0`
+/// handshake and, on success, start this peer's read/write loop. See
+/// [`handle_inbound_ws_stream`]'s doc comment (issue #1570) for why
+/// `we_dialed_connection` — not "this side opened the substream" — is what
+/// picks [`handshake_outbound`] (write first) vs [`handshake_inbound`]
+/// (read first).
+#[allow(clippy::too_many_arguments)]
 async fn handle_outbound_ws_stream(
     peer_id: PeerId,
     mut stream: P2pRawStream,
@@ -671,9 +793,26 @@ async fn handle_outbound_ws_stream(
     mux: Arc<Multiplexer>,
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
+    cmd_tx: mpsc::UnboundedSender<P2pCommand>,
+    we_dialed_connection: bool,
 ) {
-    match handshake_outbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS).await {
-        Ok(meta) => {
+    // Issue #1570: see `handle_inbound_ws_stream`'s matching comment and
+    // `HANDSHAKE_TIMEOUT`'s doc comment.
+    let handshake_result = if we_dialed_connection {
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake_outbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
+        )
+        .await
+    } else {
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake_inbound(&mut stream, &our_headers, ALGORAND_WS_SUPPORTED_VERSIONS),
+        )
+        .await
+    };
+    match handshake_result {
+        Ok(Ok(meta)) => {
             let negotiated =
                 decode_peer_features(&meta.version, &meta.features).intersection(our_features);
             spawn_ws_peer(
@@ -686,7 +825,7 @@ async fn handle_outbound_ws_stream(
                 true,
             )
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             // See `handle_inbound_ws_stream`'s matching comment: ends the
             // in-flight attempt `begin_peer_attempt` (called by this
             // handler's caller, the swarm event loop's outbound-dial arm)
@@ -700,6 +839,18 @@ async fn handle_outbound_ws_stream(
                 LogLevel::Warn,
             );
             log_dispatch_error(&peer_id, &dispatch_err);
+        }
+        Err(_elapsed) => {
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            let dispatch_err = DispatchError::with_level(
+                format!("outbound handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
+                LogLevel::Warn,
+            );
+            log_dispatch_error(&peer_id, &dispatch_err);
+            let _ = cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
         }
     }
 }
@@ -716,9 +867,18 @@ async fn handle_inbound_ws_v1_stream(
     mux: Arc<Multiplexer>,
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
+    cmd_tx: mpsc::UnboundedSender<P2pCommand>,
+    we_dialed_connection: bool,
 ) {
-    match handshake_v1_inbound(&mut stream).await {
-        Ok(()) => spawn_ws_peer(
+    // Issue #1570: see `handle_inbound_ws_stream`'s matching comment and
+    // `HANDSHAKE_TIMEOUT`'s doc comment.
+    let handshake_result = if we_dialed_connection {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_outbound(&mut stream)).await
+    } else {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_inbound(&mut stream)).await
+    };
+    match handshake_result {
+        Ok(Ok(())) => spawn_ws_peer(
             peer_id,
             stream,
             mux,
@@ -727,7 +887,7 @@ async fn handle_inbound_ws_v1_stream(
             PeerFeatureFlags::empty(),
             false,
         ),
-        Err(e) => {
+        Ok(Err(e)) => {
             // See `handle_inbound_ws_stream`'s matching comment: ends the
             // in-flight attempt the accept-loop caller started, without
             // installing a stream.
@@ -740,6 +900,18 @@ async fn handle_inbound_ws_v1_stream(
                 LogLevel::Warn,
             );
             log_dispatch_error(&peer_id, &dispatch_err);
+        }
+        Err(_elapsed) => {
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            let dispatch_err = DispatchError::with_level(
+                format!("inbound V1 handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
+                LogLevel::Warn,
+            );
+            log_dispatch_error(&peer_id, &dispatch_err);
+            let _ = cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
         }
     }
 }
@@ -754,9 +926,18 @@ async fn handle_outbound_ws_v1_stream(
     mux: Arc<Multiplexer>,
     stream_manager: StreamPeers,
     stream_generation: Arc<AtomicU64>,
+    cmd_tx: mpsc::UnboundedSender<P2pCommand>,
+    we_dialed_connection: bool,
 ) {
-    match handshake_v1_outbound(&mut stream).await {
-        Ok(()) => spawn_ws_peer(
+    // Issue #1570: see `handle_inbound_ws_stream`'s matching comment and
+    // `HANDSHAKE_TIMEOUT`'s doc comment.
+    let handshake_result = if we_dialed_connection {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_outbound(&mut stream)).await
+    } else {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_v1_inbound(&mut stream)).await
+    };
+    match handshake_result {
+        Ok(Ok(())) => spawn_ws_peer(
             peer_id,
             stream,
             mux,
@@ -765,7 +946,7 @@ async fn handle_outbound_ws_v1_stream(
             PeerFeatureFlags::empty(),
             true,
         ),
-        Err(e) => {
+        Ok(Err(e)) => {
             stream_manager
                 .lock()
                 .expect("stream_peers mutex poisoned")
@@ -775,6 +956,18 @@ async fn handle_outbound_ws_v1_stream(
                 LogLevel::Warn,
             );
             log_dispatch_error(&peer_id, &dispatch_err);
+        }
+        Err(_elapsed) => {
+            stream_manager
+                .lock()
+                .expect("stream_peers mutex poisoned")
+                .end_peer_attempt(peer_id);
+            let dispatch_err = DispatchError::with_level(
+                format!("outbound V1 handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
+                LogLevel::Warn,
+            );
+            log_dispatch_error(&peer_id, &dispatch_err);
+            let _ = cmd_tx.send(P2pCommand::DisconnectPeer(peer_id));
         }
     }
 }
@@ -807,6 +1000,8 @@ async fn dial_ws_stream(
     mux: Arc<Multiplexer>,
     sp: StreamPeers,
     gen_counter: Arc<AtomicU64>,
+    cmd_tx: mpsc::UnboundedSender<P2pCommand>,
+    we_dialed_connection: bool,
 ) {
     if !disable_v22_protocol {
         match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V22).await {
@@ -819,6 +1014,8 @@ async fn dial_ws_stream(
                     mux,
                     sp,
                     gen_counter,
+                    cmd_tx,
+                    we_dialed_connection,
                 )
                 .await;
                 return;
@@ -845,7 +1042,16 @@ async fn dial_ws_stream(
 
     match control.open_stream(peer_id, ALGORAND_WS_PROTOCOL_V1).await {
         Ok(stream) => {
-            handle_outbound_ws_v1_stream(peer_id, stream, mux, sp, gen_counter).await;
+            handle_outbound_ws_v1_stream(
+                peer_id,
+                stream,
+                mux,
+                sp,
+                gen_counter,
+                cmd_tx,
+                we_dialed_connection,
+            )
+            .await;
         }
         Err(e) => {
             sp.lock()
@@ -1276,6 +1482,86 @@ pub struct P2pTransportConfig {
 
 /// Split a multiaddr into its dialable transport address and an optional
 /// trailing `/p2p/<peer-id>` component.
+/// Per-bootstrap-peer redial backoff state (issue #1570). Tracks, for one
+/// configured bootstrap peer that is currently disconnected, the earliest
+/// [`Instant`] this node should attempt to redial it again
+/// (`next_attempt`), and how much longer `current_backoff` should grow to
+/// if that attempt doesn't result in a connection before the next sweep.
+/// `current_backoff` doubles on every attempt up to
+/// [`BOOTSTRAP_REDIAL_MAX_BACKOFF`], and the whole entry is dropped (via
+/// [`redial_disconnected_bootstrap_peers`]) as soon as the peer is seen
+/// connected again, so a *future* disconnect always starts fresh at
+/// [`BOOTSTRAP_REDIAL_BASE_BACKOFF`] rather than resuming wherever an
+/// earlier, unrelated disconnect left off.
+struct RedialBackoff {
+    next_attempt: Instant,
+    current_backoff: Duration,
+}
+
+/// Redial every configured bootstrap peer that isn't currently connected,
+/// subject to each peer's own [`RedialBackoff`] (issue #1570). Called both
+/// from the background swarm task's periodic sweep
+/// ([`BOOTSTRAP_REDIAL_SWEEP_INTERVAL`]) and immediately on
+/// `SwarmEvent::ConnectionClosed`/[`P2pCommand::ReconnectBootstrapPeers`]
+/// (the latter driven by [`GossipNode::request_connect_outgoing`]) — all
+/// three call sites share this one function so the same backoff bookkeeping
+/// governs every trigger, rather than each path hammering independently.
+///
+/// This is the fix for the "no reconnection path" gap: previously nothing
+/// ever redialed a bootstrap peer once its connection was lost — mirrors
+/// go's `P2PNetwork.meshThreadInner`/`DialPeersUntilTargetCount`
+/// (`network/p2pNetwork.go`, `network/p2p/p2p.go`), which keeps retrying a
+/// node's configured/phonebook relay addresses on every mesh-thread tick
+/// independent of DHT-based discovery of *new* peers.
+fn redial_disconnected_bootstrap_peers(
+    host: &mut P2pHost,
+    targets: &[(Multiaddr, PeerId)],
+    connected_peers: &Mutex<Vec<PeerId>>,
+    local_peer_id: PeerId,
+    backoff_state: &mut std::collections::HashMap<PeerId, RedialBackoff>,
+    redial_attempts: &AtomicUsize,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let connected: std::collections::HashSet<PeerId> = connected_peers
+        .lock()
+        .expect("connected_peers mutex poisoned")
+        .iter()
+        .copied()
+        .collect();
+    for (addr, peer_id) in targets {
+        let peer_id = *peer_id;
+        if peer_id == local_peer_id || connected.contains(&peer_id) {
+            // Already connected (or somehow our own id): nothing to
+            // redial. Drop any stale backoff entry so a *future*
+            // disconnect starts fresh at the base backoff instead of
+            // resuming wherever a much-earlier disconnect left off.
+            backoff_state.remove(&peer_id);
+            continue;
+        }
+        let due = backoff_state
+            .get(&peer_id)
+            .map(|state| now >= state.next_attempt)
+            .unwrap_or(true);
+        if !due {
+            continue;
+        }
+        tracing::debug!(%peer_id, addr = %addr, "P2P: redialing disconnected bootstrap peer");
+        if let Err(e) = host.dial(addr.clone()) {
+            tracing::debug!(%peer_id, error = %e, "P2P: bootstrap peer redial attempt failed to start");
+        }
+        redial_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+        let state = backoff_state.entry(peer_id).or_insert(RedialBackoff {
+            next_attempt: now,
+            current_backoff: BOOTSTRAP_REDIAL_BASE_BACKOFF,
+        });
+        state.next_attempt = now + state.current_backoff;
+        state.current_backoff = (state.current_backoff * 2).min(BOOTSTRAP_REDIAL_MAX_BACKOFF);
+    }
+}
+
 fn split_peer_id(addr: &Multiaddr) -> (Multiaddr, Option<PeerId>) {
     let mut base = Multiaddr::empty();
     let mut peer = None;
@@ -1436,6 +1722,10 @@ pub struct P2pTransport {
     /// Mirrors go's `P2PNetwork.wantTXGossip` and
     /// `ws_network.rs`'s `WebsocketNetwork::want_tx_gossip`.
     want_tx_gossip: Arc<AtomicU8>,
+    /// Issue #1570 test-only introspection counter — see
+    /// [`Self::test_bootstrap_redial_attempts`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    bootstrap_redial_attempts: Arc<AtomicUsize>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -1454,6 +1744,25 @@ enum P2pCommand {
     /// flag.
     #[cfg(test)]
     QueryGossipsubSubscribed(&'static str, tokio::sync::oneshot::Sender<bool>),
+    /// Issue #1570: run an immediate bootstrap-peer redial sweep (still
+    /// subject to each peer's own backoff — see
+    /// `redial_disconnected_bootstrap_peers`) — the actual implementation
+    /// behind [`GossipNode::request_connect_outgoing`], which previously
+    /// had no effect at all.
+    ReconnectBootstrapPeers,
+    /// Force-close this transport's connection to a specific peer.
+    /// Production use: a `/algorand-ws` handshake that hits
+    /// [`HANDSHAKE_TIMEOUT`] sends this for the peer it was handshaking
+    /// with — the raw libp2p connection otherwise stays "established"
+    /// forever with a stream that will never install, which is invisible
+    /// to both `connected_peer_count()` and
+    /// `redial_disconnected_bootstrap_peers` (see [`HANDSHAKE_TIMEOUT`]'s
+    /// doc comment for the live failure this was found from). Test use: a
+    /// test can send this directly to simulate "handshake succeeded, then
+    /// the connection was lost" without needing a real network-level drop
+    /// — exercises the exact same `SwarmEvent::ConnectionClosed` path a
+    /// genuine disconnect (or a handshake-timeout disconnect) would.
+    DisconnectPeer(PeerId),
 }
 
 impl P2pTransport {
@@ -1676,9 +1985,53 @@ impl P2pTransport {
         // above (to reject a stream even if the peer opens one anyway).
         let blocked_inbound_gossip_peers: Arc<Mutex<std::collections::HashSet<PeerId>>> =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
+        // Issue #1570 (go-interop handshake deadlock): per-connected-peer
+        // record of whether *we* physically dialed the raw libp2p
+        // connection (`endpoint.is_dialer()`), consulted by the inbound
+        // accept loops below to pick the correct `/algorand-ws` handshake
+        // read/write order. See `handle_inbound_ws_stream`'s doc comment
+        // for the full story — go's own `wsStreamHandlerV22`/`V1` decide
+        // read-first-vs-write-first purely from
+        // `stream.Conn().Stat().Direction` (raw connection direction),
+        // *not* from which side opened the `/algorand-ws` substream (that
+        // part — `should_initiate_stream`'s peer-ID ordering, mirroring
+        // go's own `Connected`'s `localPeer > remotePeer` gate — stays
+        // unchanged). The two decisions are independent in go and must be
+        // independent here too, or a peer whose `PeerId` happens to be
+        // numerically lower than ours despite *not* having dialed us ends
+        // up opening the substream while both sides simultaneously wait to
+        // read first — a permanent handshake deadlock, live-reproduced
+        // against a real go-algorand node in this issue's Tier-2 soak.
+        let connection_is_dialer: Arc<Mutex<std::collections::HashMap<PeerId, bool>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
         let http_router: Arc<Mutex<Router>> = Arc::new(Mutex::new(Router::new()));
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<P2pCommand>();
         let local_peer_id = host.peer_id();
+
+        // Bootstrap-peer redial targets (issue #1570): precompute each
+        // configured bootstrap peer's `PeerId` (when its multiaddr carries
+        // a trailing `/p2p/<peer-id>` component — an address without one
+        // can be redialed for discovery but never matched back to a
+        // specific already-known peer, so it's simply not a redial target)
+        // alongside its full dial address, before `cfg.bootstrap_peers` is
+        // otherwise consumed below. Read by the background task's periodic
+        // redial sweep and its `ConnectionClosed`/`ReconnectBootstrapPeers`
+        // triggers (see `redial_disconnected_bootstrap_peers`).
+        let bootstrap_redial_targets: Vec<(Multiaddr, PeerId)> = cfg
+            .bootstrap_peers
+            .iter()
+            .filter_map(|addr| {
+                let (_, peer) = split_peer_id(addr);
+                peer.map(|p| (addr.clone(), p))
+            })
+            .collect();
+        // Test-only introspection counter (see
+        // `P2pTransport::test_bootstrap_redial_attempts`): counts every
+        // `host.dial` call `redial_disconnected_bootstrap_peers` issues,
+        // so tests can assert both that a redial happens after a
+        // disconnect *and* that repeated disconnects don't cause an
+        // unbounded number of attempts (backoff/rate-limiting).
+        let bootstrap_redial_attempts: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
         // Accept-loop: every inbound `/algorand-ws/2.2.0` stream a peer
         // opens to us gets handshaken and, on success, joins `stream_peers`.
@@ -1694,6 +2047,8 @@ impl P2pTransport {
             let gen_counter = Arc::clone(&stream_generation);
             let headers = our_ws_headers.clone();
             let blocked = Arc::clone(&blocked_inbound_gossip_peers);
+            let cmd_tx = cmd_tx.clone();
+            let connection_is_dialer = Arc::clone(&connection_is_dialer);
             tokio::spawn(async move {
                 while let Some((peer_id, stream)) = incoming_ws_streams.next().await {
                     // `EnableGossipService` (issue #1442): mirrors go's
@@ -1721,6 +2076,22 @@ impl P2pTransport {
                     sp.lock()
                         .expect("stream_peers mutex poisoned")
                         .begin_peer_attempt(peer_id);
+                    // Issue #1570: see `handle_inbound_ws_stream`'s doc
+                    // comment — the accepted-substream loop alone doesn't
+                    // know whether *we* physically dialed this peer's
+                    // connection, so look it up from what the
+                    // `ConnectionEstablished` arm recorded. `unwrap_or(false)`
+                    // (defensive only: `ConnectionEstablished` always
+                    // records an entry before any stream from that peer
+                    // can arrive) matches go's own default — a peer with no
+                    // recorded direction is treated as not-dialed-by-us,
+                    // i.e. we read first.
+                    let we_dialed_connection = connection_is_dialer
+                        .lock()
+                        .expect("connection_is_dialer mutex poisoned")
+                        .get(&peer_id)
+                        .copied()
+                        .unwrap_or(false);
                     tokio::spawn(handle_inbound_ws_stream(
                         peer_id,
                         stream,
@@ -1729,6 +2100,8 @@ impl P2pTransport {
                         Arc::clone(&mux),
                         Arc::clone(&sp),
                         Arc::clone(&gen_counter),
+                        cmd_tx.clone(),
+                        we_dialed_connection,
                     ));
                 }
             });
@@ -1743,6 +2116,8 @@ impl P2pTransport {
             let sp = Arc::clone(&stream_peers);
             let gen_counter = Arc::clone(&stream_generation);
             let blocked = Arc::clone(&blocked_inbound_gossip_peers);
+            let cmd_tx = cmd_tx.clone();
+            let connection_is_dialer = Arc::clone(&connection_is_dialer);
             tokio::spawn(async move {
                 while let Some((peer_id, stream)) = incoming_ws_v1_streams.next().await {
                     if blocked
@@ -1760,12 +2135,22 @@ impl P2pTransport {
                     sp.lock()
                         .expect("stream_peers mutex poisoned")
                         .begin_peer_attempt(peer_id);
+                    // Issue #1570: see the matching V22 accept-loop comment
+                    // above.
+                    let we_dialed_connection = connection_is_dialer
+                        .lock()
+                        .expect("connection_is_dialer mutex poisoned")
+                        .get(&peer_id)
+                        .copied()
+                        .unwrap_or(false);
                     tokio::spawn(handle_inbound_ws_v1_stream(
                         peer_id,
                         stream,
                         Arc::clone(&mux),
                         Arc::clone(&sp),
                         Arc::clone(&gen_counter),
+                        cmd_tx.clone(),
+                        we_dialed_connection,
                     ));
                 }
             });
@@ -1800,6 +2185,16 @@ impl P2pTransport {
         let identity_tracker_for_task = Arc::clone(&identity_tracker);
         let identity_dedup_hook_for_task = Arc::clone(&identity_dedup_hook);
         let blocked_inbound_gossip_peers_for_task = Arc::clone(&blocked_inbound_gossip_peers);
+        let connection_is_dialer_for_task = Arc::clone(&connection_is_dialer);
+        // Issue #1570: bootstrap-peer redial state/counter, captured for
+        // the task the same way as the other `_for_task` clones above.
+        let bootstrap_redial_attempts_for_task = Arc::clone(&bootstrap_redial_attempts);
+        // Issue #1570: cloned in so the outbound-dial arm below can hand a
+        // sender to `dial_ws_stream` (which threads it into
+        // `handle_outbound_ws_stream`/`handle_outbound_ws_v1_stream` for
+        // `HANDSHAKE_TIMEOUT` handling) — the original `cmd_tx` itself is
+        // still needed, unmoved, for `Self { cmd_tx, .. }` below.
+        let cmd_tx_for_task = cmd_tx.clone();
         // Periodic DHT-driven mesh discovery (issue #1073): captured before
         // `cfg` is otherwise consumed below (`cfg.network_id` moves into
         // `Self` at the end of this function).
@@ -1821,6 +2216,39 @@ impl P2pTransport {
             // immediate `meshRequest{}` before the ticker-driven periodic
             // passes begin.
             let mut mesh_discovery_interval = tokio::time::interval(DHT_MESH_REFRESH_INTERVAL);
+            // Issue #1570: bootstrap-peer redial sweep ticker — unlike
+            // `mesh_discovery_interval` above, this one is never gated on
+            // `enable_dht_providers` (see `BOOTSTRAP_REDIAL_SWEEP_INTERVAL`'s
+            // doc comment). `bootstrap_backoff_state` is this task's own
+            // per-peer redial bookkeeping, read/written only here, in the
+            // `ConnectionClosed`/`ConnectionEstablished` arms below, and in
+            // the `ReconnectBootstrapPeers` command arm — never shared
+            // outside this task, so a plain (non-`Arc`) `HashMap` is enough.
+            //
+            // Deliberately uses `interval_at` (skipping the immediate first
+            // tick `tokio::time::interval` would otherwise fire) rather than
+            // mirroring `mesh_discovery_interval`'s immediate-first-tick
+            // behavior above: `P2pHost::dial` (unlike `dial_peer`) has no
+            // "already connected/dialing" condition — it always issues a
+            // brand-new dial on a fresh ephemeral port (see its doc
+            // comment). A sweep firing at `t=0`, before `connected_peers` has
+            // caught up to the bootstrap dial `P2pTransport::start` already
+            // issued moments earlier, would race a genuine second dial
+            // against that still-in-flight first one purely due to startup
+            // ordering, not any real disconnect — confirmed empirically:
+            // this exact race intermittently prevented the initial
+            // connection from ever stabilizing in this file's own
+            // `connected_pair()`-based tests. Starting the ticker one full
+            // `BOOTSTRAP_REDIAL_SWEEP_INTERVAL` in the future avoids it
+            // without weakening the redial guarantee — `ConnectionClosed`'s
+            // own immediate trigger (below) still covers a *real* early
+            // disconnect long before this first periodic tick would.
+            let mut bootstrap_redial_interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + BOOTSTRAP_REDIAL_SWEEP_INTERVAL,
+                BOOTSTRAP_REDIAL_SWEEP_INTERVAL,
+            );
+            let mut bootstrap_backoff_state: std::collections::HashMap<PeerId, RedialBackoff> =
+                std::collections::HashMap::new();
             // Tracks this task's own in-flight DHT queries so the
             // `event = host.next_event()` arm below can recognize their
             // results as they stream in, without ever blocking this select
@@ -1860,6 +2288,25 @@ impl P2pTransport {
                         // nothing once `pending_capability_query` has moved
                         // on to the new id.
                         pending_capability_query = Some(host.start_capability_discovery(algo_p2p::Capability::Gossip));
+                    }
+                    // Issue #1570: unconditional (no `if enable_dht_providers`
+                    // guard, unlike the arm above) periodic sweep — redial
+                    // any configured bootstrap peer that is currently
+                    // disconnected, per its own backoff. This is what makes
+                    // `GossipNode::request_connect_outgoing` meaningful and
+                    // gives this transport a genuine reconnection path
+                    // (previously, once a bootstrap peer's connection was
+                    // lost, nothing ever redialed it — see this file's
+                    // `redial_disconnected_bootstrap_peers` doc comment).
+                    _ = bootstrap_redial_interval.tick() => {
+                        redial_disconnected_bootstrap_peers(
+                            &mut host,
+                            &bootstrap_redial_targets,
+                            &cp,
+                            local_peer_id,
+                            &mut bootstrap_backoff_state,
+                            &bootstrap_redial_attempts_for_task,
+                        );
                     }
                     event = host.next_event() => {
                         // Issue #1073: drive the non-blocking discover-then-dial
@@ -1928,6 +2375,18 @@ impl P2pTransport {
                                 la.lock().expect("listen_addrs mutex poisoned").push(address);
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                                // Issue #1570: a fresh connection to this
+                                // peer means any earlier redial backoff for
+                                // it no longer applies — drop it now so a
+                                // *future* disconnect starts over at
+                                // `BOOTSTRAP_REDIAL_BASE_BACKOFF` rather than
+                                // resuming wherever this now-resolved outage
+                                // left off. Unconditional (before the
+                                // identity-dedup checks below) since even a
+                                // redundant/losing connection still proves
+                                // this peer is currently reachable.
+                                bootstrap_backoff_state.remove(&peer_id);
+
                                 // Connection-identity dedup (issue #952):
                                 // go's `baseWsStreamHandler` runs
                                 // `identityTracker.setIdentity(wsp)` keyed
@@ -1996,6 +2455,13 @@ impl P2pTransport {
                                 }
 
                                 cp.lock().expect("connected_peers mutex poisoned").push(peer_id);
+                                // Issue #1570: record purely for the
+                                // `/algorand-ws` handshake role decision —
+                                // see `connection_is_dialer`'s doc comment.
+                                connection_is_dialer_for_task
+                                    .lock()
+                                    .expect("connection_is_dialer mutex poisoned")
+                                    .insert(peer_id, endpoint.is_dialer());
 
                                 // `EnableGossipService` (issue #1442): mirrors
                                 // go's `streamManager.Connected`'s own
@@ -2062,6 +2528,17 @@ impl P2pTransport {
                                         let sp = Arc::clone(&sp_for_task);
                                         let gen_counter = Arc::clone(&gen_counter_for_task);
                                         let headers = our_ws_headers.clone();
+                                        let cmd_tx = cmd_tx_for_task.clone();
+                                        // Issue #1570: whether *we* dialed
+                                        // this raw connection — decides the
+                                        // `/algorand-ws` handshake
+                                        // read/write order, independent of
+                                        // `should_initiate_stream`'s
+                                        // peer-ID-based decision to open
+                                        // this substream at all (see
+                                        // `connection_is_dialer`'s doc
+                                        // comment).
+                                        let we_dialed_connection = endpoint.is_dialer();
                                         tokio::spawn(dial_ws_stream(
                                             peer_id,
                                             control,
@@ -2071,6 +2548,8 @@ impl P2pTransport {
                                             mux,
                                             sp,
                                             gen_counter,
+                                            cmd_tx,
+                                            we_dialed_connection,
                                         ));
                                     }
                                 }
@@ -2112,6 +2591,27 @@ impl P2pTransport {
                                     .lock()
                                     .expect("blocked_inbound_gossip_peers mutex poisoned")
                                     .remove(&peer_id);
+                                connection_is_dialer_for_task
+                                    .lock()
+                                    .expect("connection_is_dialer mutex poisoned")
+                                    .remove(&peer_id);
+                                // Issue #1570: this was previously a dead
+                                // end for a bootstrap peer — nothing ever
+                                // redialed it again. Trigger an immediate
+                                // redial attempt now (still subject to
+                                // `bootstrap_backoff_state`, so a peer that
+                                // is flapping or genuinely down doesn't get
+                                // hammered — this just means the *first*
+                                // retry after a real disconnect doesn't have
+                                // to wait for the next periodic sweep).
+                                redial_disconnected_bootstrap_peers(
+                                    &mut host,
+                                    &bootstrap_redial_targets,
+                                    &cp,
+                                    local_peer_id,
+                                    &mut bootstrap_backoff_state,
+                                    &bootstrap_redial_attempts_for_task,
+                                );
                             }
                             SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(
                                 gossipsub::Event::Message {
@@ -2171,6 +2671,31 @@ impl P2pTransport {
                                     }
                                 }
                             }
+                            // Issue #1570: previously fell into the
+                            // catch-all `_ => {}` arm below with zero log
+                            // output — a bootstrap-peer dial (this
+                            // transport's own, or a redial from
+                            // `redial_disconnected_bootstrap_peers`) that
+                            // fails at the libp2p/TCP level (connection
+                            // refused, timeout, no route) was completely
+                            // silent: `connected_peer_count()` just stayed
+                            // 0 forever with no diagnostic anywhere,
+                            // exactly the blind spot this module's own
+                            // `P2pTransport::start` doc comment on
+                            // `MULTIADDR_1_INTERNAL_IP`-style dials already
+                            // flagged. This doesn't change behavior (the
+                            // periodic redial sweep already retries
+                            // regardless of *why* the peer is
+                            // disconnected) — it only makes a persistently
+                            // failing redial diagnosable instead of
+                            // indistinguishable from "never even tried".
+                            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                                tracing::debug!(
+                                    peer_id = ?peer_id,
+                                    error = %error,
+                                    "P2P: outbound dial failed"
+                                );
+                            }
                             _ => {}
                         }
                     }
@@ -2204,6 +2729,19 @@ impl P2pTransport {
                             Some(P2pCommand::QueryGossipsubSubscribed(topic, reply)) => {
                                 let _ = reply.send(host.gossipsub_is_subscribed(topic));
                             }
+                            Some(P2pCommand::ReconnectBootstrapPeers) => {
+                                redial_disconnected_bootstrap_peers(
+                                    &mut host,
+                                    &bootstrap_redial_targets,
+                                    &cp,
+                                    local_peer_id,
+                                    &mut bootstrap_backoff_state,
+                                    &bootstrap_redial_attempts_for_task,
+                                );
+                            }
+                            Some(P2pCommand::DisconnectPeer(peer_id)) => {
+                                host.disconnect_peer(peer_id);
+                            }
                             None => break,
                         }
                     }
@@ -2229,6 +2767,7 @@ impl P2pTransport {
             force_fetch_transactions: cfg.force_fetch_transactions,
             node_info: Arc::new(std::sync::Mutex::new(None)),
             want_tx_gossip: Arc::new(AtomicU8::new(want_tx_gossip_seed)),
+            bootstrap_redial_attempts,
             _task: task,
         })
     }
@@ -2236,6 +2775,26 @@ impl P2pTransport {
     /// This transport's libp2p `PeerId`.
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// Test-only introspection: total number of bootstrap-peer redial
+    /// attempts (`host.dial` calls issued by
+    /// `redial_disconnected_bootstrap_peers`) this transport has made so
+    /// far — used to assert both that a disconnect triggers a redial and
+    /// that repeated disconnects stay rate-limited (issue #1570).
+    #[cfg(test)]
+    pub fn test_bootstrap_redial_attempts(&self) -> usize {
+        self.bootstrap_redial_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only: force-close this transport's connection to `peer`,
+    /// simulating a real network-level disconnect (issue #1570) so a test
+    /// can assert the redial path fires without needing an actual dropped
+    /// TCP connection.
+    #[cfg(test)]
+    pub fn test_force_disconnect(&self, peer: PeerId) {
+        let _ = self.cmd_tx.send(P2pCommand::DisconnectPeer(peer));
     }
 
     /// This transport's Ed25519 identity-signing key — the same key
@@ -2569,9 +3128,20 @@ impl GossipNode for P2pTransport {
     fn disconnect_peers(&self) {}
 
     async fn request_connect_outgoing(&self, _replace: bool) {
-        // P2P connectivity is maintained via DHT discovery and the
-        // bootstrap-peer dialing done in `P2pTransport::start`; there is no
-        // separate "reconnect outgoing" hook at this layer yet.
+        // Issue #1570: this used to be an explicit no-op — P2P
+        // connectivity had no reconnection path at all once a bootstrap
+        // peer's connection was lost (the periodic mesh-discovery tick that
+        // could have picked up the slack only ever ran when
+        // `enable_dht_providers` was set, and nothing else redialed a
+        // disconnected peer). It now triggers an immediate bootstrap-peer
+        // redial sweep — still governed by each peer's own backoff (see
+        // `redial_disconnected_bootstrap_peers`), so a caller invoking this
+        // repeatedly (or a peer that is genuinely down) doesn't cause a
+        // tight reconnect loop. `_replace` has no equivalent here: unlike
+        // the WS leg's outgoing-peer-replacement semantics, this transport
+        // has no concept of "swap out one outgoing peer for another" — it
+        // only ever tries to (re)connect to its configured bootstrap peers.
+        let _ = self.cmd_tx.send(P2pCommand::ReconnectBootstrapPeers);
     }
 
     /// Architectural divergence from go's `P2PNetwork.meshThreadInner`
@@ -5026,6 +5596,113 @@ mod tests {
             1,
             "dialer disabling its own EnableGossipService must not stop it from dialing out \
              and gossiping normally — the gate only rejects connections it did not initiate"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bootstrap-peer redial (issue #1570) — this transport previously had no
+    // reconnection path at all once a bootstrap peer's connection was lost:
+    // `GossipNode::request_connect_outgoing` was an explicit no-op, and the
+    // only thing that could redial (the DHT mesh-discovery tick) never ran
+    // unless `enable_dht_providers` was set. These tests exercise the fix
+    // directly against this module (`redial_disconnected_bootstrap_peers`,
+    // the `bootstrap_redial_interval` sweep, and the `ConnectionClosed`
+    // trigger) in isolation, rather than requiring the full Docker P2P soak
+    // harness.
+    // -----------------------------------------------------------------------
+
+    /// After a bootstrap peer's connection is lost while the peer itself is
+    /// still reachable, this transport must redial it and re-establish the
+    /// connection on its own — without any external caller intervening
+    /// (issue #1570's core "no reconnection path" gap). `connected_pair()`
+    /// gives `dialer` a `bootstrap_peers` entry pointing at `listener`
+    /// (unlike most of this file's other test pairs, which never set
+    /// `bootstrap_peers` at all), so `dialer` is exactly the side this fix
+    /// applies to.
+    #[tokio::test]
+    async fn dialer_redials_and_reconnects_bootstrap_peer_after_disconnect() {
+        let (listener, dialer) = connected_pair().await;
+        assert_eq!(dialer.connected_peer_count(), 1, "must start connected");
+        assert_eq!(
+            dialer.test_bootstrap_redial_attempts(),
+            0,
+            "no redial should have happened yet"
+        );
+
+        dialer.test_force_disconnect(listener.peer_id());
+
+        // The `ConnectionClosed` handler triggers an immediate redial
+        // attempt (subject to backoff) as soon as the forced disconnect
+        // actually lands — reconnection on loopback typically completes in
+        // well under a second, so this deliberately doesn't try to also
+        // catch the brief disconnected window itself (its duration isn't
+        // guaranteed to be long enough for 20ms polling to reliably
+        // observe): it waits for both the redial attempt and the resulting
+        // reconnection, which together are sufficient evidence that a real
+        // disconnect-then-redial-then-reconnect cycle happened.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while (dialer.test_bootstrap_redial_attempts() == 0 || dialer.connected_peer_count() == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            dialer.test_bootstrap_redial_attempts() >= 1,
+            "forced disconnect must have triggered at least one redial attempt"
+        );
+        assert_eq!(
+            dialer.connected_peer_count(),
+            1,
+            "dialer must redial and reconnect to its bootstrap peer on its own \
+             after the connection is lost — issue #1570"
+        );
+    }
+
+    /// A bootstrap peer that never comes back (its process is gone, not
+    /// just this one connection) must not be hammered with an unbounded
+    /// stream of redial attempts — issue #1570's explicit "avoid a tight
+    /// reconnect loop hammering a genuinely-down peer" requirement. Proves
+    /// the exponential backoff in `redial_disconnected_bootstrap_peers`
+    /// actually bounds the attempt rate rather than firing on every
+    /// `BOOTSTRAP_REDIAL_SWEEP_INTERVAL` tick unconditionally: a naive,
+    /// unthrottled implementation ticking every `BOOTSTRAP_REDIAL_SWEEP_INTERVAL`
+    /// (5s) would produce roughly 4 attempts in the ~17s window below
+    /// (~t=0, 5, 10, 15); doubling backoff (5s -> 10s -> ...) produces at
+    /// most 3 (~t=0, 5, 15).
+    #[tokio::test]
+    async fn bootstrap_redial_backs_off_instead_of_hammering_a_down_peer() {
+        let (listener, dialer) = connected_pair().await;
+        let listener_peer_id = listener.peer_id();
+        assert_eq!(dialer.connected_peer_count(), 1);
+
+        // Take the peer down for good (not just this one connection) —
+        // aborting its background task drops its `P2pHost` (closing its
+        // listener and every connection it held), so nothing on that
+        // address will ever accept a new connection again.
+        listener._task.abort();
+        dialer.test_force_disconnect(listener_peer_id);
+
+        let disconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while dialer.connected_peer_count() != 0
+            && tokio::time::Instant::now() < disconnect_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(dialer.connected_peer_count(), 0);
+
+        tokio::time::sleep(Duration::from_secs(17)).await;
+
+        assert_eq!(
+            dialer.connected_peer_count(),
+            0,
+            "the bootstrap peer is gone for good — must never reconnect"
+        );
+        let attempts = dialer.test_bootstrap_redial_attempts();
+        assert!(
+            (1..=3).contains(&attempts),
+            "expected a small, backed-off number of redial attempts (~3) in this \
+             window, got {attempts} — an unthrottled implementation would produce ~4+"
         );
     }
 }
