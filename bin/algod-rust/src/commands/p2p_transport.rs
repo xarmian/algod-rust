@@ -310,6 +310,43 @@ async fn timed_write_frame<S: libp2p::futures::AsyncWrite + Unpin>(
     }
 }
 
+/// Applies zstd compression to an outgoing `ProposalPayload` (PP) tag
+/// payload, returning an already-tag-prefixed frame on success.
+///
+/// Returns `Ok(None)` when compression does not apply (a different tag, an
+/// empty payload, or the peer never negotiated [`PeerFeatureFlags::COMPRESSED_PROPOSAL`])
+/// — the caller falls back to a plain, uncompressed frame via
+/// [`algo_network::framing::encode_frame`] in that case. Returns `Err` only
+/// when `zstd_compress` itself fails, so the caller can log and fall back
+/// the same way.
+///
+/// Mirrors go-algorand's `msgBroadcaster.preparePeerData`
+/// (`network/wsNetwork.go`), which zstd-compresses every proposal
+/// broadcast unconditionally once the wsnet protocol version is 2.2, and
+/// `ws_peer.rs`'s `write_loop`, which applies the identical compression to
+/// the classic WS-gossip transport's outgoing PP frames. Factored out (like
+/// [`algo_network::ws_peer::compress_outgoing_vote`] is for vote
+/// compression) so the exact production logic is directly unit-testable
+/// without a live tokio stream — see
+/// `p2p_outgoing_proposal_is_zstd_compressed` below.
+fn compress_outgoing_proposal(
+    tag: Tag,
+    payload: &[u8],
+    negotiated_features: PeerFeatureFlags,
+) -> Result<Option<Vec<u8>>, algo_network::compression::CompressionError> {
+    if tag != Tag::ProposalPayload
+        || payload.is_empty()
+        || !negotiated_features.contains(PeerFeatureFlags::COMPRESSED_PROPOSAL)
+    {
+        return Ok(None);
+    }
+    let compressed = algo_network::compression::zstd_compress(payload)?;
+    let mut frame = Vec::with_capacity(2 + compressed.len());
+    frame.extend_from_slice(&Tag::ProposalPayload.as_bytes());
+    frame.extend_from_slice(&compressed);
+    Ok(Some(frame))
+}
+
 /// Run the post-handshake read/write loop for one peer's `/algorand-ws`
 /// stream: registers a [`StreamPeerHandle`] in `stream_peers` (its sender is
 /// what [`P2pTransport::stream_broadcast`] fans agreement traffic out to,
@@ -470,7 +507,38 @@ fn spawn_ws_peer(
                     None
                 };
 
+                // Optionally zstd-compress PP (ProposalPayload) tag
+                // payloads — mirrors `ws_peer.rs`'s `write_loop` (issue
+                // #478's fix for the classic transport) and go-algorand's
+                // `msgBroadcaster.preparePeerData` (`network/wsNetwork.go`),
+                // which compresses every proposal unconditionally once the
+                // wsnet protocol version is 2.2. This stream's read side
+                // already decompresses incoming zstd-compressed PP payloads
+                // (see this file's read loop below), but until now nothing
+                // compressed *outgoing* PP payloads before writing them —
+                // found live while investigating issue #1580: a real
+                // go-algorand peer logs `"peer %s supported zstd but sent
+                // non-compressed data"` for every single proposal this
+                // stream sends, and the resulting oversized, uncompressed
+                // frames share this same per-peer write queue/task with
+                // time-critical agreement votes, so a large uncompressed
+                // proposal write can delay a vote queued right behind it.
+                let proposal_compressed =
+                    match compress_outgoing_proposal(tag, &payload, negotiated_features) {
+                        Ok(frame) => frame,
+                        Err(e) => {
+                            tracing::warn!(
+                                %peer_id,
+                                error = %e,
+                                "P2P algorand-ws stream: PP compression failed, sending uncompressed"
+                            );
+                            None
+                        }
+                    };
+
                 let frame = if let Some(frame) = vote_compressed {
+                    frame
+                } else if let Some(frame) = proposal_compressed {
                     frame
                 } else {
                     match algo_network::framing::encode_frame(&tag, &payload) {
@@ -5318,6 +5386,101 @@ mod tests {
         assert_eq!(decode_tag, Tag::AgreementVote);
 
         drop(client_read);
+    }
+
+    /// TDD anchor for issue #1580's investigation: pins that
+    /// [`compress_outgoing_proposal`] — the function `spawn_ws_peer`'s
+    /// writer loop now calls for every outgoing `ProposalPayload` (PP) tag
+    /// message — actually zstd-compresses the payload and prefixes the PP
+    /// tag, exactly like `ws_peer.rs`'s classic-transport write loop
+    /// already does (`write_command_proposal_payload_is_zstd_compressed_with_magic_prefix`).
+    ///
+    /// Before this fix, this stream's writer task never compressed
+    /// outgoing PP frames at all (only the *read* side decompressed
+    /// incoming ones) — confirmed live against a real go-algorand P2P peer
+    /// via `ops/mixed-cluster-p2p/`: every single proposal this stream
+    /// sent logged go's `wsPeerMsgCodec.decompress()` warning `"peer %s
+    /// supported zstd but sent non-compressed data"` (174 times in one
+    /// ~10-minute run). This test fails against the pre-fix code (which
+    /// had no `compress_outgoing_proposal` function at all — the writer
+    /// loop fell straight through to `encode_frame`, producing raw,
+    /// uncompressed bytes for every PP tag message) and passes now that
+    /// the writer loop applies the same compression the classic WS-gossip
+    /// transport already does.
+    #[test]
+    fn p2p_outgoing_proposal_is_zstd_compressed() {
+        let negotiated = advertise_vote_compression(true, DEFAULT_VOTE_COMPRESSION_TABLE_SIZE);
+        assert!(
+            negotiated.contains(PeerFeatureFlags::COMPRESSED_PROPOSAL),
+            "COMPRESSED_PROPOSAL is always advertised regardless of vote-compression config"
+        );
+
+        let payload = b"a genuine block proposal payload, repeated repeated repeated repeated repeated repeated repeated repeated repeated to be compressible".to_vec();
+
+        let frame = compress_outgoing_proposal(Tag::ProposalPayload, &payload, negotiated)
+            .expect("zstd compression must not fail for well-formed input")
+            .expect("PP tag with negotiated COMPRESSED_PROPOSAL must produce a compressed frame");
+
+        let (tag, wire_payload) =
+            algo_network::framing::decode_frame(&frame).expect("decode tag+payload");
+        assert_eq!(tag, Tag::ProposalPayload, "wire tag must stay PP");
+        assert_ne!(
+            wire_payload, payload,
+            "the bytes on the wire must not be the plain uncompressed proposal"
+        );
+        assert!(
+            algo_network::compression::is_zstd_compressed(wire_payload),
+            "the compressed frame must carry the zstd magic prefix go's \
+             wsPeerMsgCodec.ppdec.accept() checks for"
+        );
+
+        let decompressed = algo_network::compression::zstd_decompress(
+            wire_payload,
+            algo_network::compression::MAX_DECOMPRESSED_MESSAGE_SIZE,
+        )
+        .expect("a real peer must be able to zstd-decompress what this function produced");
+        assert_eq!(
+            decompressed, payload,
+            "decompressing the wire bytes must recover the original proposal payload"
+        );
+    }
+
+    /// A tag other than `ProposalPayload` (e.g. `AgreementVote`, handled by
+    /// its own vpack path) must never be zstd-compressed by this function.
+    #[test]
+    fn p2p_outgoing_proposal_compression_only_applies_to_pp_tag() {
+        let negotiated = advertise_vote_compression(true, DEFAULT_VOTE_COMPRESSION_TABLE_SIZE);
+        let payload = b"not a proposal".to_vec();
+        assert_eq!(
+            compress_outgoing_proposal(Tag::AgreementVote, &payload, negotiated).unwrap(),
+            None
+        );
+        assert_eq!(
+            compress_outgoing_proposal(Tag::VoteBundle, &payload, negotiated).unwrap(),
+            None
+        );
+    }
+
+    /// An empty payload, or a peer that never negotiated
+    /// `COMPRESSED_PROPOSAL`, must fall back to `None` (plain frame) rather
+    /// than compressing.
+    #[test]
+    fn p2p_outgoing_proposal_compression_skipped_when_not_applicable() {
+        let payload = b"a proposal payload".to_vec();
+
+        // Empty payload: never compressed regardless of negotiation.
+        let negotiated = advertise_vote_compression(true, DEFAULT_VOTE_COMPRESSION_TABLE_SIZE);
+        assert_eq!(
+            compress_outgoing_proposal(Tag::ProposalPayload, &[], negotiated).unwrap(),
+            None
+        );
+
+        // Peer never advertised/negotiated COMPRESSED_PROPOSAL.
+        let no_compression = PeerFeatureFlags::empty();
+        assert_eq!(
+            compress_outgoing_proposal(Tag::ProposalPayload, &payload, no_compression).unwrap(),
+            None
+        );
     }
 
     // -------------------------------------------------------------------
