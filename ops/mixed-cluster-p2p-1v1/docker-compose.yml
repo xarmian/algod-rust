@@ -1,0 +1,129 @@
+# Copyright (c) 2026 Algod DAO
+# SPDX-License-Identifier: MIT
+# See the LICENSE-MIT file in the repository root for the full license text.
+
+# Issue #1580 (fourth investigation round): a minimal 1 go-algorand + 1
+# algod-rust P2pOnly node cluster with a 50/50 online-stake split, built to
+# turn "does Rust's vote get accepted often enough" into an unambiguous
+# signal. go-algorand's own CertCommitteeThreshold/CertCommitteeSize is
+# 720/1000 (72%, see config/consensus.go) — with only two participants at
+# 50% stake each, the lone go node's own votes can NEVER reach quorum by
+# themselves. If Rust's votes are systematically dropped or rejected, the
+# network does not "occasionally miss a check" the way a 3-go+1-rust 30/30/
+# 30/10 split can absorb — it visibly, totally stalls. This is the
+# `ops/mixed-cluster-p2p/` 3-go+1-rust harness's direct analogue, reduced
+# to the minimal topology that makes the signal unambiguous (see that
+# harness's docker-compose.yml for the fuller commentary on flags shared
+# with this one). It also halves the number of containers contending for
+# host CPU (2 vs. 4), which doubles as a natural experiment on the
+# CPU-contention hypothesis from the third investigation round (PR #1583).
+#
+# Usage:
+#   ops/mixed-cluster-p2p-1v1/scripts/start.sh   # generate netroot + start
+#                                                 # both nodes, print the go
+#                                                 # node's dialable multiaddr
+#   ops/mixed-cluster-p2p-1v1/scripts/status.sh  # per-node round snapshot
+#   ops/mixed-cluster-p2p-1v1/scripts/stop.sh    # tear down + cleanup
+
+services:
+  go-node-1:
+    image: algorand/algod:5.0.2-stable
+    container_name: p2pinterop1v1-go-node-1
+    environment:
+      - ALGORAND_DATA=/algod/data
+      - ALGOD_PORT=8080
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ports:
+      - "127.0.0.1:5101:8080"
+      - "127.0.0.1:5261:4161"
+    volumes:
+      - ./netroot/Node1:/algod/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    # Explicit per-container CPU budget so this harness's own containers
+    # never starve each other under host load — see start.sh / the
+    # investigation notes in issue #1580 for why this matters as a
+    # contention-isolation control, distinct from the *external* host
+    # contention this topology is also probing.
+    cpus: "2.0"
+    networks:
+      p2pinterop1v1:
+        # Static, non-unspecified NetAddress — see
+        # ops/mixed-cluster-p2p/docker-compose.yml's go-node-1 comment for
+        # why (issue #566: go-algorand's addressFilter strips every
+        # candidate address when NetAddress binds 0.0.0.0/::).
+        ipv4_address: 172.29.0.11
+
+  # Issue #1580: a stake-holding algod-rust `P2pOnly` participation node
+  # with 50% of online stake (Wallet2 in ../template.json). Outbound-only,
+  # same rationale as ops/mixed-cluster-p2p/'s rust-node-4.
+  rust-node-2:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: runtime
+    image: algod-rust-p2pinterop1v1:local
+    container_name: p2pinterop1v1-rust-node-2
+    depends_on:
+      go-node-1:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=${P2PINTEROP1V1_RUST_LOG:-info,algod_rust=debug,algo_p2p=debug,algo_agreement=debug}
+    entrypoint:
+      - algod-rust
+      - participate
+      - --ledger-path=/app/ledger
+      - --partkey-path=/app/partkeys.sqlite
+      - --partkey-dir=/netroot/Node2Rust/${P2PINTEROP1V1_GENESIS_ID:-p2pinterop1v1-v1}
+      - --genesis-json=/netroot/genesis.json
+      - --genesis-path=/netroot/genesis.json
+      - --genesis-id=${P2PINTEROP1V1_GENESIS_ID:-p2pinterop1v1-v1}
+      - --genesis-hash=${P2PINTEROP1V1_GENESIS_HASH:-}
+      - --network=p2pinterop1v1
+      - --enable-p2p
+      - --p2p-bootstrap-peers=${P2PINTEROP1V1_GO1_MULTIADDR:-}
+      - --rest-listen=0.0.0.0:8080
+      - --data-dir=/data
+    ports:
+      - "127.0.0.1:5102:8080"
+    volumes:
+      - rust-node-2-data:/app
+      - ./netroot:/netroot:ro
+      - ./netroot/rust-node-2-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+    cpus: "2.0"
+    networks:
+      - p2pinterop1v1
+
+volumes:
+  rust-node-2-data:
+
+networks:
+  p2pinterop1v1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24

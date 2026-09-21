@@ -1,0 +1,28 @@
+{
+    "Genesis": {
+        "NetworkName": "p2pinterop1v1",
+        "FirstPartKeyRound": 0,
+        "LastPartKeyRound": NUM_ROUNDS,
+        "ConsensusProtocol": "future",
+        "Wallets": [
+            { "Name": "Wallet1", "Stake": 50, "Online": true },
+            { "Name": "Wallet2", "Stake": 50, "Online": true }
+        ]
+    },
+    "Nodes": [
+        {
+            "Name": "Node1",
+            "IsRelay": true,
+            "Wallets": [
+                { "Name": "Wallet1", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "Node2Rust",
+            "IsRelay": false,
+            "Wallets": [
+                { "Name": "Wallet2", "ParticipationOnly": false }
+            ]
+        }
+    ]
+}
