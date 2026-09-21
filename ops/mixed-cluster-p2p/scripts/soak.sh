@@ -18,11 +18,19 @@
 #   scripts/soak.sh [--rounds N] [--out PATH] [--interval S]
 #                   [--stall-timeout S] [--overall-timeout S]
 #
+# Env:
+#   PREFLIGHT_RETRIES    status.sh retries before giving up   (default 29)
+#   PREFLIGHT_INTERVAL   seconds between preflight retries     (default 10)
+#                        (29 * 10s + 1 final attempt ~= the same ~5 minute
+#                        grace period Tier 1's own workflow-level lockstep
+#                        gate uses — see issue #1567)
+#
 # Exit codes:
 #   0 — target rounds reached cleanly
 #   1 — metrics.py exited with a non-target-reached phase (stall,
 #       interrupt, timeout). The JSONL is still captured; inspect it.
-#   2 — preflight failed (cluster not healthy). Nothing captured.
+#   2 — preflight failed (cluster not healthy after the retry budget).
+#       Nothing captured.
 
 set -euo pipefail
 
@@ -46,8 +54,9 @@ Options:
   --interval S          Poll interval in seconds (default: 0.5).
   --stall-timeout S     Abort if no REST node advances for S s (default: 60).
   --overall-timeout S   Abort after S wall-clock s (default: 0 = no cap).
-  --skip-preflight      Skip the status.sh health check (useful when
-                        chaining runs and the cluster is known healthy).
+  --skip-preflight      Skip the retrying status.sh health check (useful
+                        when chaining runs and the cluster is known
+                        healthy).
   -h, --help            Show this help.
 
 This script expects start.sh to have been run. Tear down afterwards
@@ -105,10 +114,45 @@ case "$OUT" in
 esac
 
 # -- Preflight -----------------------------------------------------------
+#
+# Issue #1567: between Tier 1 and Tier 2 of the nightly soak workflow,
+# stop.sh's `docker compose down -v` wipes the Rust node's named data
+# volume (back to round 0) while leaving the Go nodes' bind-mounted
+# netroot/ on disk, so start.sh's "reusing existing netroot/" path lets
+# the 3 Go nodes resume ~30 rounds ahead of a freshly-recreated
+# rust-node-4. A single-shot status.sh call fired seconds after start.sh
+# returns and failed on that transient, expected startup lag rather than
+# a real health problem — unlike Tier 1's own workflow-level lockstep
+# gate (.github/workflows/p2p-consensus-soak.yml "Tier 1 — cluster
+# status"), which retries for up to ~5 minutes for exactly this reason.
+# Mirror that same retry/grace-period budget here so Tier 2's preflight
+# measures steady-state lockstep, not boot/catch-up ordering.
+PREFLIGHT_RETRIES="${PREFLIGHT_RETRIES:-29}"
+PREFLIGHT_INTERVAL="${PREFLIGHT_INTERVAL:-10}"
 if [ "$SKIP_PREFLIGHT" = "0" ]; then
+    preflight_budget=$(( (PREFLIGHT_RETRIES + 1) * PREFLIGHT_INTERVAL ))
     echo "==> preflight: running status.sh to verify cluster health"
-    if ! "$HERE/status.sh" >/dev/null 2>&1; then
-        echo "error: status.sh reports the cluster is unhealthy or not running." >&2
+    echo "    (retrying for up to ${preflight_budget}s to allow the Rust node to catch up"
+    echo "     after its data volume was wiped between tiers — see issue #1567)"
+    preflight_ok=0
+    attempt=1
+    while [ "$attempt" -le "$PREFLIGHT_RETRIES" ]; do
+        if "$HERE/status.sh" >/dev/null 2>&1; then
+            preflight_ok=1
+            break
+        fi
+        sleep "$PREFLIGHT_INTERVAL"
+        attempt=$(( attempt + 1 ))
+    done
+    # Last attempt runs with output shown (not suppressed) so a genuine
+    # failure's reason ends up in the log, mirroring Tier 1's own
+    # "the last invocation is the one that decides the step" pattern.
+    if [ "$preflight_ok" != "1" ] && "$HERE/status.sh"; then
+        preflight_ok=1
+    fi
+    if [ "$preflight_ok" != "1" ]; then
+        echo "error: status.sh reports the cluster is unhealthy or not running" \
+            "after ${preflight_budget}s of retries." >&2
         echo "       run scripts/start.sh first, or pass --skip-preflight to override." >&2
         exit 2
     fi
