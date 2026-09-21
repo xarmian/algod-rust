@@ -464,6 +464,30 @@ impl CatchupService {
 
         let mut last_round = ledger.next_round();
 
+        // Mirrors Go's `periodicSync` two-stage backoff (`catchup/service.go:664-705`):
+        // the FIRST tick that observes no ledger advance since the previous
+        // check does not resync — it only re-arms for one more interval
+        // (Go: `sleepDuration = s.roundTimeEstimate; continue`, having
+        // already burned a shorter, randomized "de-synchronizing" wait on
+        // the tick right after the last real advance). Only a SECOND
+        // consecutive no-advance tick (a full extra `PERIODIC_SYNC_INTERVAL`
+        // with zero progress) is treated as "the ledger has genuinely
+        // stalled" and triggers `sync_pass`.
+        //
+        // Without this hysteresis, any round whose own agreement-driven
+        // vote/cert collection takes longer than one `PERIODIC_SYNC_INTERVAL`
+        // (routine under load, and essentially guaranteed for a node that
+        // just resumed from a large post-restart catch-up gap) gets its
+        // `RoundInterruption` fired by this periodic path's own
+        // network-fetched block before the local player ever finishes
+        // voting. That commit itself then counts as "an advance", so the
+        // very next tick again sees no *further* progress and fires
+        // another periodic fetch — a self-sustaining loop that permanently
+        // pre-empts the agreement service's own vote-based commit path and
+        // silences it (issue #1564: post-SIGKILL-restart nodes rejoin and
+        // stay in lockstep via this loop, but never cast another vote).
+        let mut stuck_once = false;
+
         // Once the certificate channel closes we still want the periodic
         // path to keep the ledger following the network, so the closed
         // receiver is swapped for one that never fires rather than ending
@@ -493,8 +517,21 @@ impl CatchupService {
                     // fires in that situation (issue #478).
                     let now = ledger.next_round();
                     if now != last_round {
-                        // Agreement is making progress on its own.
+                        // Agreement is making progress on its own. Reset
+                        // the stall counter too — go's `WaitMem(currBlock+1)`
+                        // branch resets `stuckInARow` the same way on every
+                        // genuine advance.
                         last_round = now;
+                        stuck_once = false;
+                        continue;
+                    }
+                    if !stuck_once {
+                        // First tick with no progress since the last check:
+                        // give the local agreement service one more full
+                        // interval before assuming it has actually stalled
+                        // (see `stuck_once`'s definition above for why this
+                        // hysteresis is required — issue #1564).
+                        stuck_once = true;
                         continue;
                     }
                     Self::sync_pass(
@@ -505,6 +542,7 @@ impl CatchupService {
                         parallel_blocks,
                     );
                     last_round = ledger.next_round();
+                    stuck_once = false;
                     continue;
                 }
             };
@@ -1512,6 +1550,81 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_secs(10),
             "periodic sync should have pulled rounds 1..=5 with no certificate from agreement",
+        );
+
+        svc.stop();
+    }
+
+    /// Regression test for issue #1564.
+    ///
+    /// After a node resumes from a large post-restart catch-up gap, its own
+    /// agreement service can take noticeably longer than one
+    /// `PERIODIC_SYNC_INTERVAL` tick to complete a round's own soft/cert
+    /// vote collection — that is routine, not a stall. Before this fix, the
+    /// periodic path treated the very first such missed tick as "the
+    /// ledger has stalled" and immediately ran its own network `sync_pass`,
+    /// which — being certificate-free and needing no timers — always won
+    /// the race and committed the round out from under the local player.
+    /// That commit itself counted as "progress", so the next tick saw no
+    /// *further* advance and fired again: a self-sustaining loop that
+    /// permanently silenced the agreement service's own vote/attest path
+    /// (reproduced live in `consensus-cluster.yml`'s restart-rejoin suite:
+    /// `sigkill/resumed_voting` and `proposer-1/resumed_voting` failed for
+    /// the rest of the run after a SIGKILL restart with a large catch-up
+    /// gap, while a graceful restart's small gap recovered in one round).
+    ///
+    /// Here a slower-but-live writer (standing in for the local agreement
+    /// service) commits one round every 5.5s — longer than the single 4s
+    /// `PERIODIC_SYNC_INTERVAL`, but well inside the fixed two-tick (~8s)
+    /// grace window this fix adds, mirroring go's `periodicSync` two-stage
+    /// backoff (`catchup/service.go:664-705`). The fetcher can never supply
+    /// a real block (`up_to: 0`), so if the periodic path ever actually
+    /// fires a fresh `sync_pass` during the writer's run, that is
+    /// observable as a `calls` increase past the startup baseline —
+    /// proving the starvation bug would still be present.
+    #[test]
+    fn periodic_sync_does_not_race_a_slower_but_live_writer() {
+        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger = Arc::new(PermissiveCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher = Arc::new(BoundedBlockFetcher {
+            up_to: 0,
+            calls: AtomicU64::new(0),
+        });
+        let fetcher_dyn: Arc<dyn BlockFetcher> = fetcher.clone();
+
+        let mut svc = CatchupService::start(rx, ledger_dyn, fetcher_dyn);
+
+        // Let the startup `sync_pass` (unconditional, mirrors go running one
+        // `sync()` immediately) settle before measuring — it fails
+        // immediately (round 1 > up_to 0) and is unrelated to the periodic
+        // hysteresis under test here.
+        thread::sleep(Duration::from_millis(300));
+        let baseline_calls = fetcher.calls.load(Ordering::SeqCst);
+
+        // Simulate a live-but-slower agreement service: one committed round
+        // every 5.5s, for three rounds (~16.5s total, comfortably spanning
+        // several `PERIODIC_SYNC_INTERVAL` ticks).
+        for round in 1..=3u64 {
+            thread::sleep(Duration::from_millis(5_500));
+            let block = make_valid_empty_block(round);
+            ledger.inner.ensure_block(&block, &make_cert(round));
+        }
+
+        assert_eq!(
+            fetcher.calls.load(Ordering::SeqCst),
+            baseline_calls,
+            "periodic sync must not attempt a network fetch while a slower \
+             but live writer is still making progress within the grace \
+             window (issue #1564)"
+        );
+        assert_eq!(
+            ledger.next_round(),
+            Round(4),
+            "the writer's own commits (not periodic sync) must be what \
+             advanced the ledger"
         );
 
         svc.stop();
