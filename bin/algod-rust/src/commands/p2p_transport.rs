@@ -981,6 +981,18 @@ async fn p2p_request_with_timeout_via_tracker(
         tracker.cancel_request(hash).await;
         return Err(PeerError::ConnectionClosed);
     }
+    // Only now that the request has actually been handed off to the send
+    // queue do we count it as outstanding — mirroring go's
+    // `wp.outstandingTopicRequests.Add(1)` (`network/wsPeer.go:1064`) and
+    // `ws_peer.rs`'s `request_with_timeout_via_tracker`. Without this,
+    // `RequestTracker::handle_response`'s outstanding-counter decrement
+    // (added for issue #1429's flow control) goes negative on the very
+    // first reply, which makes it return `UnrequestedResponse` and bail out
+    // *before* ever consulting the `pending` map — so the real response is
+    // silently dropped and the waiting `request`/`request_with_timeout`
+    // call always times out (issue: P2P unicast block fetch never
+    // completes).
+    tracker.mark_request_sent();
 
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(response_topics)) => Ok(response_topics),
