@@ -155,6 +155,80 @@ const DHT_MESH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// eligible again (backoff elapsed) the redial actually fires.
 const BOOTSTRAP_REDIAL_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Number of OS worker threads dedicated to [`p2p_critical_runtime`]. Kept
+/// small (rather than defaulting to `num_cpus`, like the ambient
+/// `#[tokio::main]` runtime does) since this pool exists purely to give the
+/// P2P swarm-driving task and its accept-loops their own execution lane —
+/// not to maximize throughput. A larger pool would also, on a
+/// CPU-constrained CI runner (issue #1580's soak job runs 4 full
+/// consensus-participant containers sharing 2-4 vCPUs), simply add more
+/// total OS threads contending for the same scarce CPU, working against the
+/// isolation this runtime exists to provide.
+const P2P_CRITICAL_RUNTIME_WORKER_THREADS: usize = 2;
+
+/// Issue #1580 ("real participation votes never register as `VoteAccepted`
+/// by any go-algorand peer over the P2P transport"): dedicated multi-thread
+/// tokio runtime whose OS worker threads exclusively drive the libp2p
+/// `Swarm` event loop, [`P2pTransport`]'s accept-loops, and — critically —
+/// the `host.gossipsub_publish` call inside that event loop that actually
+/// puts an agreement vote/proposal/bundle frame on the wire.
+///
+/// # Why this exists
+///
+/// Before this fix, every one of those tasks was spawned with a bare
+/// `tokio::spawn`, which schedules onto whatever runtime is "current" —
+/// in production, the single ambient `#[tokio::main]` runtime
+/// (`bin/algod-rust/src/main.rs`) this process *also* uses for the REST API
+/// server, block-sync/catchup, the heartbeat service, and the state-proof
+/// service. A live multi-node investigation (issue #1580, deep-dive
+/// comment) directly measured go-algorand's own local quorum-closing
+/// window at ~638µs on a 3-node cluster, and reproduced — with nothing
+/// else changed except adding host CPU contention (a concurrent `cargo
+/// build --release`) — 264 consecutive rounds of zero vote acceptance that
+/// fully recovered within 90s of the build finishing. The per-peer
+/// writer-queue-wait and reader-dispatch-latency hypotheses were directly
+/// instrumented and refuted (both stayed under ~1ms throughout); the
+/// remaining, previously-unconfirmed explanation was that this task's own
+/// turn on a shared, small tokio worker pool was being delayed by
+/// unrelated same-process work under contention, pushing total
+/// cast-to-wire latency past go's sub-millisecond window on individual
+/// rounds.
+///
+/// Giving this task pool its own OS threads, disjoint from the ambient
+/// runtime's, removes that specific *same-process* source of scheduling
+/// delay: the OS scheduler can now dispatch CPU time to the P2P-critical
+/// threads without algod-rust's own REST/catchup/etc. tasks ever being
+/// able to fill up the same worker queue ahead of them. It does **not**
+/// (and cannot) fix contention from processes *outside* this one, such as
+/// a neighboring container on a shared CI runner, or a concurrent build on
+/// the same host — that remains a genuine, documented limit; see issue
+/// #1580's disposition notes.
+///
+/// # Why a process-wide `OnceLock`, not a per-[`P2pTransport`] field
+///
+/// A `tokio::runtime::Runtime` (unlike a bare `Handle`) panics if it is
+/// dropped from inside another runtime's async context — exactly what
+/// happens if a `P2pTransport` (and so an owned `Runtime` field) is
+/// dropped at the end of an `#[tokio::test]` async test function, which
+/// this file has dozens of. Production only ever constructs one
+/// `P2pTransport` for the lifetime of the process, so a single
+/// process-wide runtime that is simply never dropped (mirroring how the
+/// ambient `#[tokio::main]` runtime itself is never manually dropped
+/// either) sidesteps that hazard entirely while still giving every
+/// `P2pTransport` instance — including the several independent ones many
+/// of this file's tests construct — the same isolation production gets.
+fn p2p_critical_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(P2P_CRITICAL_RUNTIME_WORKER_THREADS)
+            .thread_name("algod-p2p-critical")
+            .enable_all()
+            .build()
+            .expect("failed to build dedicated P2P-critical tokio runtime")
+    })
+}
+
 /// Base (first-retry) backoff for [`RedialBackoff`] — how long to wait
 /// after a redial attempt before trying that same bootstrap peer again, if
 /// it hasn't connected by the next sweep.
@@ -1812,6 +1886,19 @@ enum P2pCommand {
     /// flag.
     #[cfg(test)]
     QueryGossipsubSubscribed(&'static str, tokio::sync::oneshot::Sender<bool>),
+    /// Issue #1580 test-only introspection: report the OS thread name this
+    /// select loop is currently executing on. Proves the swarm-driving
+    /// task actually landed on [`p2p_critical_runtime`]'s dedicated
+    /// `"algod-p2p-critical"` worker pool rather than whatever runtime was
+    /// "current" when `P2pTransport::start` was called — the concrete,
+    /// deterministic mechanism the fix relies on, as opposed to a
+    /// timing-based proxy for it (this file's own testing found tokio's
+    /// scheduler already protects a freshly-woken reactive task from
+    /// queueing behind heavy same-runtime work even under extreme
+    /// synthetic contention, so a latency-threshold assertion here would
+    /// not reliably discriminate fixed from unfixed placement).
+    #[cfg(test)]
+    QueryWorkerThreadName(tokio::sync::oneshot::Sender<Option<String>>),
     /// Issue #1570: run an immediate bootstrap-peer redial sweep (still
     /// subject to each peer's own backoff — see
     /// `redial_disconnected_bootstrap_peers`) — the actual implementation
@@ -2109,6 +2196,16 @@ impl P2pTransport {
         // in-flight counter before handing off to `handle_inbound_ws_stream`,
         // which itself ends the attempt on both the success path (inside
         // `spawn_ws_peer`, after the stream installs) and the failure path.
+        // Issue #1580: every task spawned in this function from here on —
+        // this accept-loop, the ones below it, and the big swarm-driving
+        // task — runs on `p2p_critical_runtime()`'s own dedicated OS
+        // threads rather than whatever runtime happens to be "current"
+        // when `P2pTransport::start` is called. See that function's doc
+        // comment for why. A bare `tokio::spawn` inside any of these
+        // tasks' own bodies (e.g. `dial_ws_stream` below) still lands on
+        // the same dedicated runtime, since tokio ties spawning to
+        // whichever runtime is currently polling the calling task.
+        let dedicated_rt_handle = p2p_critical_runtime().handle().clone();
         if let Some(mut incoming_ws_streams) = incoming_ws_streams {
             let mux = Arc::clone(&multiplexer);
             let sp = Arc::clone(&stream_peers);
@@ -2117,7 +2214,7 @@ impl P2pTransport {
             let blocked = Arc::clone(&blocked_inbound_gossip_peers);
             let cmd_tx = cmd_tx.clone();
             let connection_is_dialer = Arc::clone(&connection_is_dialer);
-            tokio::spawn(async move {
+            dedicated_rt_handle.spawn(async move {
                 while let Some((peer_id, stream)) = incoming_ws_streams.next().await {
                     // `EnableGossipService` (issue #1442): mirrors go's
                     // `streamManager.streamHandler`'s own
@@ -2186,7 +2283,7 @@ impl P2pTransport {
             let blocked = Arc::clone(&blocked_inbound_gossip_peers);
             let cmd_tx = cmd_tx.clone();
             let connection_is_dialer = Arc::clone(&connection_is_dialer);
-            tokio::spawn(async move {
+            dedicated_rt_handle.spawn(async move {
                 while let Some((peer_id, stream)) = incoming_ws_v1_streams.next().await {
                     if blocked
                         .lock()
@@ -2237,7 +2334,7 @@ impl P2pTransport {
         // picked up by the next request.
         {
             let hr = Arc::clone(&http_router);
-            tokio::spawn(async move {
+            dedicated_rt_handle.spawn(async move {
                 while let Some((peer_id, stream)) = incoming_http_streams.next().await {
                     let router = hr.lock().expect("http_router mutex poisoned").clone();
                     tokio::spawn(serve_p2p_http_stream(peer_id, stream, router));
@@ -2275,7 +2372,7 @@ impl P2pTransport {
         // dial arm below to decide whether V22 is even attempted before
         // falling back to legacy V1.
         let disable_v22_protocol = cfg.disable_v22_protocol;
-        let task = tokio::spawn(async move {
+        let task = dedicated_rt_handle.spawn(async move {
             // Mirrors go's `meshThreadInterval` (`network/mesh.go`, default
             // `time.Minute`) — the period between `P2PNetwork`'s
             // `meshThreadInner`/`refreshPeerStoreAddresses` passes. Ticking
@@ -2797,6 +2894,12 @@ impl P2pTransport {
                             Some(P2pCommand::QueryGossipsubSubscribed(topic, reply)) => {
                                 let _ = reply.send(host.gossipsub_is_subscribed(topic));
                             }
+                            #[cfg(test)]
+                            Some(P2pCommand::QueryWorkerThreadName(reply)) => {
+                                let _ = reply.send(
+                                    std::thread::current().name().map(str::to_string),
+                                );
+                            }
                             Some(P2pCommand::ReconnectBootstrapPeers) => {
                                 redial_disconnected_bootstrap_peers(
                                     &mut host,
@@ -3044,6 +3147,23 @@ impl P2pTransport {
             return false;
         }
         reply_rx.await.unwrap_or(false)
+    }
+
+    /// Issue #1580 test-only introspection: the OS thread name the
+    /// swarm-driving task is currently executing on, round-tripped through
+    /// [`P2pCommand::QueryWorkerThreadName`] the same way
+    /// [`Self::is_gossipsub_subscribed`] round-trips
+    /// [`P2pCommand::QueryGossipsubSubscribed`]. `None` if the background
+    /// task has already stopped, or if the executing thread has no name
+    /// (shouldn't happen for a `tokio::runtime::Builder`-named pool, but
+    /// tokio does not guarantee it).
+    #[cfg(test)]
+    pub async fn swarm_task_thread_name(&self) -> Option<String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(P2pCommand::QueryWorkerThreadName(reply_tx))
+            .ok()?;
+        reply_rx.await.ok().flatten()
     }
 
     /// Publish `data` on the gossipsub topic corresponding to `tag` and,
@@ -5866,6 +5986,67 @@ mod tests {
             (1..=3).contains(&attempts),
             "expected a small, backed-off number of redial attempts (~3) in this \
              window, got {attempts} — an unthrottled implementation would produce ~4+"
+        );
+    }
+
+    /// Issue #1580 ("real participation votes never register as
+    /// `VoteAccepted` by any go-algorand peer over the P2P transport"): a
+    /// live multi-node investigation found that the swarm-driving task
+    /// (which is what actually calls `host.gossipsub_publish` — the real
+    /// vote/proposal broadcast path) used to share the ambient
+    /// `#[tokio::main]` runtime with every other subsystem in the process
+    /// (REST API, catchup, heartbeat, state-proof service), and flagged
+    /// (unconfirmed) that this shared placement might be why that task's
+    /// own scheduling turn was sometimes delayed enough, under host CPU
+    /// contention, to lose the race against go-algorand's own
+    /// sub-millisecond local quorum-closing window.
+    ///
+    /// `p2p_critical_runtime` moves that task (and this transport's
+    /// accept-loops) onto their own dedicated OS worker threads, disjoint
+    /// from whatever runtime the caller happens to be running on when
+    /// `P2pTransport::start` is invoked. This test pins the concrete,
+    /// deterministic mechanism the fix relies on — the task actually runs
+    /// on that dedicated pool — rather than a timing-based proxy for it:
+    /// this file's own investigation (see `p2p_critical_runtime`'s doc
+    /// comment) found that even extreme synthetic same-runtime CPU
+    /// contention (16 non-cooperative hog tasks on a single-worker-thread
+    /// runtime) never reproduced observable added latency, because
+    /// tokio's scheduler already prioritizes a freshly-woken reactive task
+    /// (its "LIFO slot" optimization) over queued background work — so a
+    /// latency-threshold assertion would not reliably distinguish fixed
+    /// from unfixed placement, and is deliberately not used here.
+    #[tokio::test]
+    async fn swarm_task_runs_on_dedicated_p2p_critical_runtime() {
+        let transport = P2pTransport::start(P2pTransportConfig {
+            network_id: "test-1580-isolation".to_string(),
+            listen_multiaddr: Some("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+            bootstrap_peers: vec![],
+            persist_peer_id: false,
+            data_dir: None,
+            private_key_path: None,
+            enable_dht_providers: false,
+            dht_mode: String::new(),
+            gossip_fanout: 4,
+            incoming_connections_limit: -1,
+            is_listen_server: false,
+            relay_messages: false,
+            force_fetch_transactions: false,
+            enable_vote_compression: true,
+            enable_gossip_service: true,
+            disable_v22_protocol: false,
+        })
+        .await
+        .expect("start p2p transport");
+
+        let thread_name = transport
+            .swarm_task_thread_name()
+            .await
+            .expect("swarm-driving task must report a thread name");
+        assert_eq!(
+            thread_name, "algod-p2p-critical",
+            "the swarm-driving task (which calls host.gossipsub_publish — the real \
+             vote/proposal broadcast path) is not running on p2p_critical_runtime's \
+             dedicated worker pool; issue #1580's isolation fix is not wired up"
         );
     }
 }
