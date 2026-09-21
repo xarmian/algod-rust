@@ -2406,6 +2406,31 @@ impl P2pTransport {
                                     }
                                 }
                             }
+                            // Issue #1570: previously fell into the
+                            // catch-all `_ => {}` arm below with zero log
+                            // output — a bootstrap-peer dial (this
+                            // transport's own, or a redial from
+                            // `redial_disconnected_bootstrap_peers`) that
+                            // fails at the libp2p/TCP level (connection
+                            // refused, timeout, no route) was completely
+                            // silent: `connected_peer_count()` just stayed
+                            // 0 forever with no diagnostic anywhere,
+                            // exactly the blind spot this module's own
+                            // `P2pTransport::start` doc comment on
+                            // `MULTIADDR_1_INTERNAL_IP`-style dials already
+                            // flagged. This doesn't change behavior (the
+                            // periodic redial sweep already retries
+                            // regardless of *why* the peer is
+                            // disconnected) — it only makes a persistently
+                            // failing redial diagnosable instead of
+                            // indistinguishable from "never even tried".
+                            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                                tracing::debug!(
+                                    peer_id = ?peer_id,
+                                    error = %error,
+                                    "P2P: outbound dial failed"
+                                );
+                            }
                             _ => {}
                         }
                     }
