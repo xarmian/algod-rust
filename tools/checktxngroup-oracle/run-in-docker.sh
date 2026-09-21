@@ -83,7 +83,14 @@ if [ ! -f "$CLONE/crypto/libs/linux/amd64/lib/libsodium.a" ]; then
     echo "    (first run) preparing a clean go-algorand clone + libsodium"
     apt-get update -qq
     apt-get install -y -qq autoconf automake libtool build-essential git >/dev/null
-    git config --global --add safe.directory /src
+    # A `--shared`/`--no-checkout` clone of the /src bind mount makes git
+    # check ownership against the resolved /src/.git path, not the /src
+    # mount point registered above (safe.directory matches exactly, no
+    # subpath match) -- so a cold container whose UID differs from the
+    # host mount owner still hits "dubious ownership". This is a
+    # single-purpose, ephemeral builder touching only its own bind mounts
+    # and named volumes, so wildcard-trusting every directory in it is safe.
+    git config --global --add safe.directory '"'"'*'"'"'
     rm -rf "$CLONE"
     git clone --shared --no-checkout /src "$CLONE"
     git -C "$CLONE" checkout -q "$GO_ALGORAND_PIN"
