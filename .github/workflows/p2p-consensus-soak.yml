@@ -252,6 +252,14 @@ jobs:
           VERIFY_STAGE: "1"
           RESTART_SCENARIOS: "1"
           NEGATIVE_CASES: "1"
+          # Issue #1579: this step's VERIFY_STAGE=1 path shells out (via
+          # ops/mixed-cluster-p2p/scripts/verify-soak.sh) to
+          # tools/cert-authenticate/run-in-docker.sh, which falls back to a
+          # nonexistent $REPO_ROOT/../go-algorand when GO_ALGORAND_DIR isn't
+          # set — a runner has no sibling checkout. Must match the "Clone
+          # pinned go-algorand" step above (same pattern as
+          # consensus-cluster.yml's own Tier 2 step).
+          GO_ALGORAND_DIR: ${{ runner.temp }}/go-algorand-src
         run: make p2p-interop-soak-test
 
       # ── Diagnostics + artifacts ───────────────────────────────────────
