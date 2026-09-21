@@ -111,6 +111,23 @@ if [ "$NEEDS_BOOTSTRAP" = "1" ]; then
         network create -n phase6net -r /netroot -t /template.json
 
     rm -f "$RENDERED"
+
+    # `goal network create` (run as uid 1001 inside the container above)
+    # leaves every file/dir under netroot/ owned by that uid. On a real
+    # Linux Docker host (e.g. GitHub Actions runners) that ownership is
+    # enforced for real, unlike a Docker Desktop dev box where bind-mount
+    # UID translation usually hides it. Host-side readers that later open
+    # a `.partkey` under here read-only still need the *directory* to be
+    # writable — sqlite must be able to (re)create WAL `-shm`/`-wal`
+    # side-car files even for a pure read if no live writer already holds
+    # them open (see issue #1560) — so fix the tree up to be host-writable
+    # right away, the same way the purge step above already has to reach
+    # into a container to deal with this same uid-1001 ownership.
+    MSYS_NO_PATHCONV=1 docker run --rm \
+        -v "$(host_path "$NETROOT"):/netroot" \
+        --entrypoint sh \
+        "$ALGOD_IMG" \
+        -c 'chmod -R a+rwX /netroot'
 else
     echo "==> reusing existing netroot/ (run stop.sh to reset)"
 fi
